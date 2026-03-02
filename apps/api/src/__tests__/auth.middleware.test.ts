@@ -118,5 +118,29 @@ describe("auth middleware", () => {
     expect(body.agent.tenantId).toBe(TENANT_ID);
     expect(body.agent.externalId).toBe(EXTERNAL_ID);
     expect(body.agent.isAutonomous).toBe(false);
+    expect(body.agent.userId).toBeNull();
+  });
+
+  it("sets userId when agent has a userId", async () => {
+    const rawKey = generateApiKey(EXTERNAL_ID);
+    const { hash, salt } = hashApiKey(rawKey);
+    const USER_ID = "00000000-0000-0000-0000-000000000099";
+
+    const app = createTestApp({
+      id: AGENT_ID,
+      externalId: EXTERNAL_ID,
+      tenantId: TENANT_ID,
+      isAutonomous: false,
+      userId: USER_ID,
+      apiKeyHash: hash,
+      apiKeySalt: salt,
+    });
+
+    const res = await app.request("/test", {
+      headers: { Authorization: `Bearer ${rawKey}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.agent.userId).toBe(USER_ID);
   });
 });

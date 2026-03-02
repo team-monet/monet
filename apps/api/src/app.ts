@@ -5,6 +5,8 @@ import type postgres from "postgres";
 import { health } from "./routes/health.js";
 import { tenantsRouter } from "./routes/tenants.js";
 import { agentsRouter } from "./routes/agents.js";
+import { memoriesRouter } from "./routes/memories.js";
+import { groupsRouter } from "./routes/groups.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { tenantMiddleware } from "./middleware/tenant.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
@@ -40,6 +42,8 @@ export function createApp(db: Database | null, sql: postgres.Sql | null) {
   authenticated.use("*", tenantMiddleware);
   authenticated.use("*", rateLimitMiddleware);
   authenticated.route("/agents", agentsRouter);
+  authenticated.route("/memories", memoriesRouter);
+  authenticated.route("/groups", groupsRouter);
 
   app.route("/api", authenticated);
 

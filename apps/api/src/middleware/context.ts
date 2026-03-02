@@ -7,6 +7,8 @@ export interface AgentContext {
   externalId: string;
   tenantId: string;
   isAutonomous: boolean;
+  userId: string | null;
+  role: string | null;
 }
 
 export interface AppEnv extends Env {

@@ -8,6 +8,13 @@
       "when": 1772472437972,
       "tag": "0000_low_puff_adder",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1772487272247,
+      "tag": "0001_damp_harrier",
+      "breakpoints": true
     }
   ]
 }

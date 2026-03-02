@@ -44,6 +44,8 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
     externalId: agent.externalId,
     tenantId: agent.tenantId,
     isAutonomous: agent.isAutonomous,
+    userId: agent.userId ?? null,
+    role: agent.role ?? null,
   });
 
   await next();

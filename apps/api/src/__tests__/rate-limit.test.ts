@@ -13,6 +13,8 @@ function createTestApp(agentId: string) {
       externalId: "test",
       tenantId: "tenant-1",
       isAutonomous: false,
+      userId: null,
+      role: null,
     });
     await next();
   });

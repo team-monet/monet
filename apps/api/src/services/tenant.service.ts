@@ -49,10 +49,10 @@ export async function provisionTenant(
     // Create the tenant schema with all DDL
     await createTenantSchema(txSql, tenant.id);
 
-    // Create the first admin agent
+    // Create the first admin agent with tenant_admin role
     const [agent] = await tx`
-      INSERT INTO agents (external_id, tenant_id, api_key_hash, api_key_salt, is_autonomous)
-      VALUES (${adminExternalId}, ${tenant.id}, ${hash}, ${salt}, ${false})
+      INSERT INTO agents (external_id, tenant_id, api_key_hash, api_key_salt, is_autonomous, role)
+      VALUES (${adminExternalId}, ${tenant.id}, ${hash}, ${salt}, ${false}, ${"tenant_admin"})
       RETURNING id, external_id
     `;
 

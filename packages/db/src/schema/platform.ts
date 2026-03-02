@@ -48,6 +48,7 @@ export const agents = pgTable("agents", {
     .notNull()
     .references(() => tenants.id),
   userId: uuid("user_id").references(() => humanUsers.id),
+  role: userRoleEnum("role"),
   apiKeyHash: varchar("api_key_hash", { length: 255 }).notNull(),
   apiKeySalt: varchar("api_key_salt", { length: 255 }).notNull(),
   isAutonomous: boolean("is_autonomous").notNull().default(false),
