@@ -1,8 +1,8 @@
 import { z } from "zod";
-import { MemoryScope, MemoryType } from "@amp/types";
+import { MemoryScope, MemoryType } from "@monet/types";
 
 /**
- * MCP tool definitions for the Agent Memory Platform.
+ * MCP tool definitions for the Monet.
  * These define the input schemas for each tool exposed by the MCP server.
  */
 

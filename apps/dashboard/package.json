@@ -1,5 +1,5 @@
 {
-  "name": "@amp/dashboard",
+  "name": "@monet/dashboard",
   "version": "0.0.1",
   "private": true,
   "scripts": {
@@ -10,7 +10,7 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@amp/types": "workspace:*",
+    "@monet/types": "workspace:*",
     "next": "^15",
     "react": "^19",
     "react-dom": "^19"

@@ -1,5 +1,5 @@
 export const metadata = {
-  title: "Agent Memory Platform",
+  title: "Monet",
   description: "Browse and manage AI agent memories",
 };
 

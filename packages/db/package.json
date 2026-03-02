@@ -1,5 +1,5 @@
 {
-  "name": "@amp/db",
+  "name": "@monet/db",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -26,7 +26,7 @@
   "dependencies": {
     "drizzle-orm": "^0.39",
     "postgres": "^3.4",
-    "@amp/types": "workspace:*"
+    "@monet/types": "workspace:*"
   },
   "devDependencies": {
     "drizzle-kit": "^0.30",

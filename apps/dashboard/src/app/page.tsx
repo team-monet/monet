@@ -1,7 +1,7 @@
 export default function Home() {
   return (
     <main>
-      <h1>Agent Memory Platform</h1>
+      <h1>Monet</h1>
       <p>Dashboard coming soon.</p>
     </main>
   );

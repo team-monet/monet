@@ -14,18 +14,18 @@ importers:
 
   apps/api:
     dependencies:
-      '@amp/db':
-        specifier: workspace:*
-        version: link:../../packages/db
-      '@amp/mcp-tools':
-        specifier: workspace:*
-        version: link:../../packages/mcp-tools
-      '@amp/types':
-        specifier: workspace:*
-        version: link:../../packages/types
       '@hono/node-server':
         specifier: ^1
         version: 1.19.9(hono@4.12.3)
+      '@monet/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@monet/mcp-tools':
+        specifier: workspace:*
+        version: link:../../packages/mcp-tools
+      '@monet/types':
+        specifier: workspace:*
+        version: link:../../packages/types
       hono:
         specifier: ^4
         version: 4.12.3
@@ -45,7 +45,7 @@ importers:
 
   apps/dashboard:
     dependencies:
-      '@amp/types':
+      '@monet/types':
         specifier: workspace:*
         version: link:../../packages/types
       next:
@@ -73,7 +73,7 @@ importers:
 
   packages/db:
     dependencies:
-      '@amp/types':
+      '@monet/types':
         specifier: workspace:*
         version: link:../types
       drizzle-orm:
@@ -92,7 +92,7 @@ importers:
 
   packages/mcp-tools:
     dependencies:
-      '@amp/types':
+      '@monet/types':
         specifier: workspace:*
         version: link:../types
       zod:

@@ -1,5 +1,5 @@
 {
-  "name": "agent-memory-platform",
+  "name": "monet",
   "private": true,
   "scripts": {
     "dev": "turbo dev",
@@ -9,9 +9,9 @@
     "test:integration": "turbo test:integration",
     "lint": "turbo lint",
     "typecheck": "turbo typecheck",
-    "db:migrate": "pnpm --filter @amp/db migrate",
-    "db:generate": "pnpm --filter @amp/db generate",
-    "db:studio": "pnpm --filter @amp/db studio"
+    "db:migrate": "pnpm --filter @monet/db migrate",
+    "db:generate": "pnpm --filter @monet/db generate",
+    "db:studio": "pnpm --filter @monet/db studio"
   },
   "devDependencies": {
     "turbo": "^2"

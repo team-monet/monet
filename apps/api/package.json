@@ -1,5 +1,5 @@
 {
-  "name": "@amp/api",
+  "name": "@monet/api",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -14,9 +14,9 @@
     "test:integration": "vitest run --dir test"
   },
   "dependencies": {
-    "@amp/db": "workspace:*",
-    "@amp/mcp-tools": "workspace:*",
-    "@amp/types": "workspace:*",
+    "@monet/db": "workspace:*",
+    "@monet/mcp-tools": "workspace:*",
+    "@monet/types": "workspace:*",
     "@hono/node-server": "^1",
     "hono": "^4"
   },

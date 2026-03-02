@@ -18,7 +18,7 @@ jobs:
       postgres:
         image: pgvector/pgvector:pg16
         env:
-          POSTGRES_DB: agent_memory_test
+          POSTGRES_DB: monet_test
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
         ports:
@@ -30,7 +30,7 @@ jobs:
           --health-retries=5
 
     env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agent_memory_test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/monet_test
 
     steps:
       - uses: actions/checkout@v4
