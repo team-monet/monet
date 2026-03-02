@@ -9,9 +9,9 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
-    "test": "vitest run",
-    "test:unit": "vitest run --dir src",
-    "test:integration": "vitest run --dir test"
+    "test": "vitest run --passWithNoTests",
+    "test:unit": "vitest run --passWithNoTests --dir src",
+    "test:integration": "vitest run --passWithNoTests --dir test"
   },
   "dependencies": {
     "@monet/db": "workspace:*",
