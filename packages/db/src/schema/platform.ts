@@ -2,6 +2,7 @@ import {
   pgTable,
   uuid,
   varchar,
+  boolean,
   timestamp,
   pgEnum,
 } from "drizzle-orm/pg-core";
@@ -49,7 +50,7 @@ export const agents = pgTable("agents", {
   userId: uuid("user_id").references(() => humanUsers.id),
   apiKeyHash: varchar("api_key_hash", { length: 255 }).notNull(),
   apiKeySalt: varchar("api_key_salt", { length: 255 }).notNull(),
-  isAutonomous: varchar("is_autonomous").notNull().default("false"),
+  isAutonomous: boolean("is_autonomous").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

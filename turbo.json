@@ -16,7 +16,9 @@
       "dependsOn": ["build"]
     },
     "test:integration": {
-      "dependsOn": ["build"]
+      "dependsOn": ["build"],
+      "env": ["DATABASE_URL"],
+      "cache": false
     },
     "lint": {},
     "typecheck": {

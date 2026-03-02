@@ -24,11 +24,12 @@
     "studio": "drizzle-kit studio"
   },
   "dependencies": {
+    "@monet/types": "workspace:*",
     "drizzle-orm": "^0.39",
-    "postgres": "^3.4",
-    "@monet/types": "workspace:*"
+    "postgres": "^3.4"
   },
   "devDependencies": {
+    "@types/node": "^25.3.3",
     "drizzle-kit": "^0.30",
     "typescript": "^5.7"
   }

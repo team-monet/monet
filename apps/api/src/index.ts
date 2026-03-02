@@ -1,5 +1,15 @@
 import { serve } from "@hono/node-server";
-import { app } from "./app.js";
+import { createClient } from "@monet/db";
+import { createApp } from "./app.js";
+
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  console.error("DATABASE_URL environment variable is required");
+  process.exit(1);
+}
+
+const { db, sql } = createClient(databaseUrl);
+const app = createApp(db, sql);
 
 const port = parseInt(process.env.API_PORT || "3001", 10);
 

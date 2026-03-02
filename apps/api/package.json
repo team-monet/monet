@@ -11,14 +11,16 @@
     "lint": "eslint src/",
     "test": "vitest run --passWithNoTests",
     "test:unit": "vitest run --passWithNoTests --dir src",
-    "test:integration": "vitest run --passWithNoTests --dir test"
+    "test:integration": "vitest run --passWithNoTests --dir test --fileParallelism=false"
   },
   "dependencies": {
+    "@hono/node-server": "^1",
     "@monet/db": "workspace:*",
     "@monet/mcp-tools": "workspace:*",
     "@monet/types": "workspace:*",
-    "@hono/node-server": "^1",
-    "hono": "^4"
+    "drizzle-orm": "^0.39.3",
+    "hono": "^4",
+    "postgres": "^3.4.8"
   },
   "devDependencies": {
     "@types/node": "^25.3.3",
