@@ -58,6 +58,9 @@ jobs:
       - name: Unit tests
         run: pnpm test:unit
 
+      - name: Enable pgvector extension
+        run: psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
       - name: Push database schema
         run: pnpm --filter @monet/db exec drizzle-kit push --force
 
