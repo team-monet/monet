@@ -62,12 +62,13 @@ export async function cleanupTestData() {
     await s.unsafe(`DROP SCHEMA IF EXISTS "${row.schema_name}" CASCADE`);
   }
 
-  // Truncate platform tables in correct order (respect FK constraints)
-  await s`TRUNCATE TABLE agent_group_members CASCADE`;
-  await s`TRUNCATE TABLE agent_groups CASCADE`;
-  await s`TRUNCATE TABLE agents CASCADE`;
-  await s`TRUNCATE TABLE human_users CASCADE`;
-  await s`TRUNCATE TABLE tenants CASCADE`;
+  // Truncate platform tables — skip gracefully if tables don't exist yet
+  await s.unsafe(`
+    DO $$ BEGIN
+      TRUNCATE TABLE agent_group_members, agent_groups, agents, human_users, tenants CASCADE;
+    EXCEPTION WHEN undefined_table THEN NULL;
+    END $$
+  `);
 }
 
 /**

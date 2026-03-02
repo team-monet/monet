@@ -31,6 +31,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/monet_test
+      PLATFORM_ADMIN_SECRET: ci-test-secret
 
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +57,9 @@ jobs:
 
       - name: Unit tests
         run: pnpm test:unit
+
+      - name: Push database schema
+        run: pnpm --filter @monet/db exec drizzle-kit push --force
 
       - name: Integration tests
         run: pnpm test:integration
