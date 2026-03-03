@@ -4,6 +4,7 @@ import {
   encodeCursor,
   decodeCursor,
   buildScopeFilter,
+  createMemory,
 } from "../services/memory.service.js";
 import type { AgentContext } from "../middleware/context.js";
 
@@ -122,5 +123,30 @@ describe("scope promotion validation", () => {
     const order: Record<string, number> = { private: 0, user: 1, group: 2 };
     expect(order["private"]).toBeLessThan(order["user"]);
     expect(order["user"]).toBeLessThan(order["group"]);
+  });
+});
+
+describe("createMemory", () => {
+  it("rejects autonomous agents storing user-scoped memories", async () => {
+    const sql = (() => {
+      throw new Error("should not query");
+    }) as unknown as import("postgres").Sql;
+
+    const result = await createMemory(
+      sql as unknown as import("postgres").TransactionSql,
+      makeAgent({ isAutonomous: true }),
+      {
+        content: "test",
+        memoryType: "fact",
+        memoryScope: "user",
+        tags: ["test"],
+      },
+      null,
+    );
+
+    expect(result).toEqual({
+      error: "validation",
+      message: "Autonomous agents cannot store user-scoped memories",
+    });
   });
 });

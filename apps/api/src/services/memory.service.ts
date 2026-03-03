@@ -55,14 +55,15 @@ function mapVersion(row: Record<string, unknown>) {
 
 export async function writeAuditLog(
   tx: postgres.Sql,
+  tenantId: string,
   agentId: string,
   action: string,
   targetId: string | null,
   outcome: string,
 ) {
   await tx`
-    INSERT INTO audit_log (actor_id, actor_type, action, target_id, outcome)
-    VALUES (${agentId}, ${"agent"}, ${action}, ${targetId}, ${outcome})
+    INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, target_id, outcome)
+    VALUES (${tenantId}, ${agentId}, ${"agent"}, ${action}, ${targetId}, ${outcome})
   `;
 }
 
@@ -125,8 +126,8 @@ export async function checkQuota(
       LIMIT 1
     `;
     if (groups.length > 0 && groups[0].memory_quota) {
-      const parsed = parseInt(groups[0].memory_quota as string, 10);
-      if (!isNaN(parsed) && parsed > 0) quota = parsed;
+      const parsed = groups[0].memory_quota as number;
+      if (parsed > 0) quota = parsed;
     }
   }
 
@@ -199,7 +200,7 @@ export async function createMemory(
   `;
 
   // Audit log
-  await writeAuditLog(tx, agent.id, "memory.create", entry.id as string, "success");
+  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.create", entry.id as string, "success");
 
   return mapRow(entry as Record<string, unknown>);
 }
@@ -335,9 +336,8 @@ export async function updateMemory(
 ) {
   const tx = txSql as unknown as postgres.Sql;
 
-  // SELECT FOR UPDATE to prevent concurrent modifications
   const [entry] = await tx`
-    SELECT * FROM memory_entries WHERE id = ${id} FOR UPDATE
+    SELECT * FROM memory_entries WHERE id = ${id}
   `;
 
   if (!entry) {
@@ -348,31 +348,41 @@ export async function updateMemory(
   const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent);
   if (scopeErr) return scopeErr;
 
-  // Version check
-  if ((entry.version as number) !== input.expectedVersion) {
-    return { error: "conflict" as const, currentVersion: entry.version as number };
-  }
-
   const newVersion = (entry.version as number) + 1;
   const newContent = input.content ?? (entry.content as string);
   const newTags = input.tags ?? (entry.tags as string[]);
-
-  // Insert version snapshot
-  await tx`
-    INSERT INTO memory_versions (memory_entry_id, content, version, author_agent_id)
-    VALUES (${id}, ${newContent}, ${newVersion}, ${agent.id})
-  `;
-
-  // Update the entry
   const [updated] = await tx`
-    UPDATE memory_entries
-    SET content = ${newContent}, tags = ${newTags}, version = ${newVersion}, last_accessed_at = NOW()
-    WHERE id = ${id}
-    RETURNING *
+    WITH updated AS (
+      UPDATE memory_entries
+      SET
+        content = ${newContent},
+        tags = ${newTags},
+        version = ${newVersion},
+        last_accessed_at = NOW()
+      WHERE id = ${id} AND version = ${input.expectedVersion}
+      RETURNING *
+    ),
+    inserted_version AS (
+      INSERT INTO memory_versions (memory_entry_id, content, version, author_agent_id)
+      SELECT id, content, version, ${agent.id}
+      FROM updated
+      RETURNING id
+    )
+    SELECT * FROM updated
   `;
+
+  if (!updated) {
+    const [current] = await tx`
+      SELECT version FROM memory_entries WHERE id = ${id}
+    `;
+    return {
+      error: "conflict" as const,
+      currentVersion: (current?.version as number) ?? input.expectedVersion,
+    };
+  }
 
   // Audit log
-  await writeAuditLog(tx, agent.id, "memory.update", id, "success");
+  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.update", id, "success");
 
   return { entry: mapRow(updated as Record<string, unknown>) };
 }
@@ -400,7 +410,7 @@ export async function deleteMemory(
   await tx`DELETE FROM memory_entries WHERE id = ${id}`;
 
   // Audit log
-  await writeAuditLog(tx, agent.id, "memory.delete", id, "success");
+  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.delete", id, "success");
 
   return { success: true };
 }
@@ -428,7 +438,7 @@ export async function markOutdated(
     UPDATE memory_entries SET outdated = true WHERE id = ${id}
   `;
 
-  await writeAuditLog(tx, agent.id, "memory.mark_outdated", id, "success");
+  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.mark_outdated", id, "success");
 
   return { success: true };
 }
@@ -476,7 +486,7 @@ export async function promoteScope(
   `;
 
   // Audit log
-  await writeAuditLog(tx, agent.id, "memory.scope_change", id, "success");
+  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.scope_change", id, "success");
 
   return { success: true, scope: newScope };
 }

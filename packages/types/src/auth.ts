@@ -21,16 +21,11 @@ export const CreateTenantResponse = z.object({
 });
 export type CreateTenantResponse = z.infer<typeof CreateTenantResponse>;
 
-export const RegisterAgentApiInput = z.object({
-  externalId: z.string().min(1, "External agent ID is required"),
-  isAutonomous: z.boolean().default(false),
-});
-export type RegisterAgentApiInput = z.infer<typeof RegisterAgentApiInput>;
-
 export const RegisterAgentApiResponse = z.object({
   agent: z.object({
     id: z.string().uuid(),
     externalId: z.string(),
+    userId: z.string().uuid().nullable().optional(),
     isAutonomous: z.boolean(),
     createdAt: z.date(),
   }),

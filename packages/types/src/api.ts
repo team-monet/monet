@@ -26,3 +26,11 @@ export const ApiError = z.object({
   details: z.record(z.string(), z.unknown()).optional(),
 });
 export type ApiError = z.infer<typeof ApiError>;
+
+export const RegisterAgentApiInput = z.object({
+  externalId: z.string().min(1, "External agent ID is required"),
+  isAutonomous: z.boolean().default(false),
+  userId: z.string().uuid().optional(),
+  groupId: z.string().uuid().optional(),
+});
+export type RegisterAgentApiInput = z.infer<typeof RegisterAgentApiInput>;

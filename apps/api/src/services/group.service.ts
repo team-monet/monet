@@ -39,7 +39,7 @@ export function isGroupAdminOrAbove(role: string | null): boolean {
 export async function createGroup(
   sql: postgres.Sql,
   tenantId: string,
-  input: { name: string; description?: string; memoryQuota?: string },
+  input: { name: string; description?: string; memoryQuota?: number },
 ) {
   const [group] = await sql`
     INSERT INTO agent_groups (tenant_id, name, description, memory_quota)
@@ -52,7 +52,7 @@ export async function createGroup(
     tenantId: group.tenant_id as string,
     name: group.name as string,
     description: group.description as string,
-    memoryQuota: (group.memory_quota as string) ?? null,
+    memoryQuota: (group.memory_quota as number) ?? null,
     createdAt: group.created_at as string,
   };
 }
@@ -144,7 +144,7 @@ export async function listGroups(
     tenantId: g.tenant_id as string,
     name: g.name as string,
     description: g.description as string,
-    memoryQuota: (g.memory_quota as string) ?? null,
+    memoryQuota: (g.memory_quota as number) ?? null,
     createdAt: g.created_at as string,
   }));
 }

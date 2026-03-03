@@ -92,6 +92,7 @@ export async function createTenantSchema(
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "${schemaName}".audit_log (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL,
       actor_id UUID NOT NULL,
       actor_type VARCHAR(20) NOT NULL,
       action VARCHAR(50) NOT NULL,
@@ -100,6 +101,23 @@ export async function createTenantSchema(
       reason TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
+  `);
+
+  await sql.unsafe(`
+    CREATE OR REPLACE FUNCTION "${schemaName}".prevent_audit_log_mutation()
+    RETURNS trigger AS $$
+    BEGIN
+      RAISE EXCEPTION 'audit_log is append-only';
+    END;
+    $$ LANGUAGE plpgsql
+  `);
+
+  await sql.unsafe(`DROP TRIGGER IF EXISTS audit_log_append_only ON "${schemaName}".audit_log`);
+  await sql.unsafe(`
+    CREATE TRIGGER audit_log_append_only
+    BEFORE UPDATE OR DELETE ON "${schemaName}".audit_log
+    FOR EACH ROW
+    EXECUTE FUNCTION "${schemaName}".prevent_audit_log_mutation()
   `);
 
   // Rules table

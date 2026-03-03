@@ -87,6 +87,16 @@ describe("groups route", () => {
       });
       expect(res.status).toBe(400);
     });
+
+    it("returns 400 for invalid memoryQuota", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "test-group", memoryQuota: "2" }),
+      });
+      expect(res.status).toBe(400);
+    });
   });
 
   describe("POST /:id/members", () => {
@@ -117,6 +127,21 @@ describe("groups route", () => {
       const res = await app.request(
         "/groups/group-1/members/00000000-0000-0000-0000-000000000002",
         { method: "DELETE" },
+      );
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe("POST /users/:userId/admin", () => {
+    it("returns 403 for non-admin", async () => {
+      const app = createTestApp(makeAgent({ role: null }));
+      const res = await app.request(
+        "/groups/users/00000000-0000-0000-0000-000000000099/admin",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ role: "group_admin" }),
+        },
       );
       expect(res.status).toBe(403);
     });

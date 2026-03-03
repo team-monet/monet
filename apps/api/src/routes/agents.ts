@@ -4,6 +4,7 @@ import {
   generateApiKey,
   hashApiKey,
 } from "../services/api-key.service.js";
+import { addMember } from "../services/group.service.js";
 import type { AppEnv } from "../middleware/context.js";
 
 export const agentsRouter = new Hono<AppEnv>();
@@ -32,17 +33,44 @@ agentsRouter.post("/register", async (c) => {
   const rawApiKey = generateApiKey(parsed.data.externalId);
   const { hash, salt } = hashApiKey(rawApiKey);
 
+  if (parsed.data.userId) {
+    const [user] = await sql`
+      SELECT id FROM human_users WHERE id = ${parsed.data.userId} AND tenant_id = ${agent.tenantId}
+    `;
+    if (!user) {
+      return c.json({ error: "not_found", message: "User not found" }, 404);
+    }
+  }
+
   const [newAgent] = await sql`
-    INSERT INTO agents (external_id, tenant_id, api_key_hash, api_key_salt, is_autonomous)
-    VALUES (${parsed.data.externalId}, ${agent.tenantId}, ${hash}, ${salt}, ${parsed.data.isAutonomous})
-    RETURNING id, external_id, is_autonomous, created_at
+    INSERT INTO agents (external_id, tenant_id, user_id, api_key_hash, api_key_salt, is_autonomous)
+    VALUES (${parsed.data.externalId}, ${agent.tenantId}, ${parsed.data.userId ?? null}, ${hash}, ${salt}, ${parsed.data.isAutonomous})
+    RETURNING id, external_id, user_id, is_autonomous, created_at
   `;
+
+  if (parsed.data.groupId) {
+    const membershipResult = await addMember(
+      sql,
+      agent.tenantId,
+      parsed.data.groupId,
+      newAgent.id as string,
+    );
+
+    if ("error" in membershipResult) {
+      await sql`DELETE FROM agents WHERE id = ${newAgent.id}`;
+      if (membershipResult.error === "not_found") {
+        return c.json({ error: "not_found", message: membershipResult.message }, 404);
+      }
+      return c.json({ error: "conflict", message: membershipResult.message }, 409);
+    }
+  }
 
   return c.json(
     {
       agent: {
         id: newAgent.id,
         externalId: newAgent.external_id,
+        userId: newAgent.user_id,
         isAutonomous: newAgent.is_autonomous,
         createdAt: newAgent.created_at,
       },

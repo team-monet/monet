@@ -1,6 +1,7 @@
 import { Hono } from "hono";
+import type { AppEnv } from "../middleware/context.js";
 
-export const health = new Hono();
+export const health = new Hono<AppEnv>();
 
 health.get("/health", (c) => {
   return c.json({
@@ -14,7 +15,13 @@ health.get("/health/live", (c) => {
   return c.json({ status: "ok" });
 });
 
-health.get("/health/ready", (c) => {
-  // TODO: Check database connectivity
-  return c.json({ status: "ok" });
+health.get("/health/ready", async (c) => {
+  const sql = c.get("sql");
+
+  try {
+    await sql`SELECT 1`;
+    return c.json({ status: "ok" });
+  } catch {
+    return c.json({ status: "error", message: "database unreachable" }, 503);
+  }
 });

@@ -5,6 +5,7 @@ import {
   boolean,
   timestamp,
   pgEnum,
+  integer,
 } from "drizzle-orm/pg-core";
 
 export const isolationModeEnum = pgEnum("isolation_mode", [
@@ -65,7 +66,7 @@ export const agentGroups = pgTable("agent_groups", {
     .references(() => tenants.id),
   name: varchar("name", { length: 255 }).notNull(),
   description: varchar("description", { length: 1024 }).default(""),
-  memoryQuota: varchar("memory_quota"),
+  memoryQuota: integer("memory_quota"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

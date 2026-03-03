@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS vector;--> statement-breakpoint
+CREATE EXTENSION IF NOT EXISTS pgcrypto;--> statement-breakpoint
 CREATE TYPE "public"."isolation_mode" AS ENUM('logical', 'physical');--> statement-breakpoint
 CREATE TYPE "public"."user_role" AS ENUM('user', 'group_admin', 'tenant_admin');--> statement-breakpoint
 CREATE TYPE "public"."memory_scope" AS ENUM('group', 'user', 'private');--> statement-breakpoint
@@ -13,7 +15,7 @@ CREATE TABLE "agent_groups" (
 	"tenant_id" uuid NOT NULL,
 	"name" varchar(255) NOT NULL,
 	"description" varchar(1024) DEFAULT '',
-	"memory_quota" varchar,
+	"memory_quota" integer,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
@@ -51,6 +53,7 @@ CREATE TABLE "agent_rule_sets" (
 --> statement-breakpoint
 CREATE TABLE "audit_log" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"tenant_id" uuid NOT NULL,
 	"actor_id" uuid NOT NULL,
 	"actor_type" varchar(20) NOT NULL,
 	"action" varchar(50) NOT NULL,
@@ -59,6 +62,14 @@ CREATE TABLE "audit_log" (
 	"reason" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION "public"."prevent_audit_log_mutation"() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'audit_log is append-only';
+END;
+$$ LANGUAGE plpgsql;
+--> statement-breakpoint
+CREATE TRIGGER "audit_log_append_only" BEFORE UPDATE OR DELETE ON "audit_log" FOR EACH ROW EXECUTE FUNCTION "public"."prevent_audit_log_mutation"();
 --> statement-breakpoint
 CREATE TABLE "memory_entries" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,

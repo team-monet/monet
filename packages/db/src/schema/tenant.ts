@@ -78,6 +78,7 @@ export const memoryVersions = pgTable("memory_versions", {
 
 export const auditLog = pgTable("audit_log", {
   id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull(),
   actorId: uuid("actor_id").notNull(),
   actorType: varchar("actor_type", { length: 20 }).notNull(),
   action: varchar("action", { length: 50 }).notNull(),

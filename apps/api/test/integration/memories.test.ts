@@ -230,7 +230,7 @@ describe("memories integration", () => {
     const sql = getTestSql();
     const logs = await withTenantScope(sql, schemaName, async (txSql) => {
       return txSql`
-        SELECT action, target_id, outcome FROM audit_log
+        SELECT action, target_id, outcome, tenant_id FROM audit_log
         WHERE target_id = ${memId}
         ORDER BY created_at ASC
       `;
@@ -240,6 +240,7 @@ describe("memories integration", () => {
     expect(logs[0].action).toBe("memory.create");
     expect(logs[1].action).toBe("memory.update");
     expect(logs[2].action).toBe("memory.delete");
+    expect(logs[0].tenant_id).toBe(tenantId);
   });
 
   // ---------- Tags endpoint ----------
@@ -262,6 +263,37 @@ describe("memories integration", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.tags.sort()).toEqual(["alpha", "beta", "gamma"]);
+  });
+
+  it("returns 409 when group quota is exceeded", async () => {
+    const sql = getTestSql();
+    await sql`
+      UPDATE agent_groups
+      SET memory_quota = 2
+      WHERE tenant_id = ${tenantId}
+    `;
+
+    const first = await storeMemory({
+      content: "mem-1",
+      memoryType: "fact",
+      tags: ["quota"],
+    });
+    expect(first.res.status).toBe(201);
+
+    const second = await storeMemory({
+      content: "mem-2",
+      memoryType: "fact",
+      tags: ["quota"],
+    });
+    expect(second.res.status).toBe(201);
+
+    const third = await storeMemory({
+      content: "mem-3",
+      memoryType: "fact",
+      tags: ["quota"],
+    });
+    expect(third.res.status).toBe(409);
+    expect(third.body.error).toBe("quota_exceeded");
   });
 
   // ---------- Expired memories excluded ----------
@@ -391,6 +423,31 @@ describe("memories integration", () => {
       `;
     });
     expect(logs).toHaveLength(1);
+  });
+
+  it("rejects audit log update and delete operations", async () => {
+    const { body: created } = await storeMemory({
+      content: "append-only",
+      memoryType: "fact",
+      tags: ["audit-append-only"],
+    });
+
+    const sql = getTestSql();
+
+    await expect(withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`
+        UPDATE audit_log
+        SET action = 'tampered'
+        WHERE target_id = ${created.id}
+      `;
+    })).rejects.toThrow();
+
+    await expect(withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`
+        DELETE FROM audit_log
+        WHERE target_id = ${created.id}
+      `;
+    })).rejects.toThrow();
   });
 
   it("rejects scope demotion by non-author", async () => {

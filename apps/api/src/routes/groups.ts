@@ -14,16 +14,19 @@ import {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const VALID_PROMOTE_ROLES = ["group_admin", "user"] as const;
 
-function parseCreateGroupInput(body: unknown): { data: { name: string; description?: string; memoryQuota?: string } } | { error: string } {
+function parseCreateGroupInput(body: unknown): { data: { name: string; description?: string; memoryQuota?: number } } | { error: string } {
   const b = body as Record<string, unknown>;
   if (!b || typeof b.name !== "string" || b.name.length === 0) {
     return { error: "Name is required" };
+  }
+  if (b.memoryQuota !== undefined && (!Number.isInteger(b.memoryQuota) || Number(b.memoryQuota) <= 0)) {
+    return { error: "memoryQuota must be a positive integer" };
   }
   return {
     data: {
       name: b.name,
       description: typeof b.description === "string" ? b.description : undefined,
-      memoryQuota: typeof b.memoryQuota === "string" ? b.memoryQuota : undefined,
+      memoryQuota: typeof b.memoryQuota === "number" ? b.memoryQuota : undefined,
     },
   };
 }

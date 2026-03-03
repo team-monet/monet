@@ -33,8 +33,8 @@ export const rateLimitMiddleware = createMiddleware<AppEnv>(async (c, next) => {
     return;
   }
 
-  const maxRequests = DEFAULT_MAX_REQUESTS;
-  const windowMs = DEFAULT_WINDOW_MS;
+  const maxRequests = parseInt(process.env.RATE_LIMIT_MAX || "100", 10);
+  const windowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
   const now = Date.now();
 
   cleanup(now, windowMs);

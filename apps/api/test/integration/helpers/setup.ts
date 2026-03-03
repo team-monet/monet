@@ -15,7 +15,13 @@ export function getTestSql() {
     // Disable prepared statement caching so that dropping & recreating
     // tenant schemas (which carry per-schema enum types) between tests
     // does not cause stale type-OID errors (XX000 / getTypeInputInfo).
-    sql = postgres(TEST_DB_URL, { prepare: false });
+    sql = postgres(TEST_DB_URL, {
+      prepare: false,
+      // Integration cleanup drops tenant schemas between tests, which emits
+      // expected NOTICE messages from Postgres. Suppress them to keep test
+      // output readable.
+      onnotice: () => {},
+    });
   }
   return sql;
 }

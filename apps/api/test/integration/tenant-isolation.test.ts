@@ -47,6 +47,9 @@ describe("tenant isolation integration", () => {
         VALUES ('secret-data-A', 'fact', 'group', ${(bodyA.agent as { id: string }).id})
       `;
     });
+    const [{ id: memoryIdA }] = await withTenantScope(sql, schemaA, async (txSql) => {
+      return txSql`SELECT id FROM memory_entries WHERE content = 'secret-data-A'`;
+    }) as Array<{ id: string }>;
 
     // Insert a memory entry in tenant B's schema
     const schemaB = `tenant_${tenantB.id.replace(/-/g, "_")}`;
@@ -87,5 +90,10 @@ describe("tenant isolation integration", () => {
     const meBBody = await meB.json();
     expect(meBBody.tenantId).toBe(tenantB.id);
     expect(meBBody.tenantId).not.toBe(meABody.tenantId);
+
+    const crossFetch = await app.request(`/api/memories/${memoryIdA}`, {
+      headers: { Authorization: `Bearer ${keyB}` },
+    });
+    expect(crossFetch.status).toBe(404);
   });
 });

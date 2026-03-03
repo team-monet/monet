@@ -169,4 +169,46 @@ describe("groups integration", () => {
     const body = await res.json();
     expect(body.groups).toHaveLength(2);
   });
+
+  it("tenant admin can promote a user to group_admin", async () => {
+    const sql = getTestSql();
+    const [user] = await sql`
+      INSERT INTO human_users (external_id, tenant_id, role)
+      VALUES ('user-promote', ${tenantId}, 'user')
+      RETURNING id
+    `;
+
+    const res = await app.request(`/api/groups/users/${user.id}/admin`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ role: "group_admin" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.role).toBe("group_admin");
+  });
+
+  it("non-admin cannot promote a user", async () => {
+    const sql = getTestSql();
+    const [user] = await sql`
+      INSERT INTO human_users (external_id, tenant_id, role)
+      VALUES ('user-no-promote', ${tenantId}, 'user')
+      RETURNING id
+    `;
+
+    const regRes = await app.request("/api/agents/register", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ externalId: "regular-agent" }),
+    });
+    const regBody = await regRes.json();
+    const regularKey = regBody.apiKey as string;
+
+    const res = await app.request(`/api/groups/users/${user.id}/admin`, {
+      method: "POST",
+      headers: authHeaders(regularKey),
+      body: JSON.stringify({ role: "group_admin" }),
+    });
+    expect(res.status).toBe(403);
+  });
 });
