@@ -158,6 +158,16 @@ export async function createMemory(
     return { error: "validation" as const, message: "Autonomous agents cannot store user-scoped memories" };
   }
 
+  // Group-scoped entries require group membership (M2 spec)
+  if (input.memoryScope === "group" && platformSql) {
+    const [membership] = await platformSql`
+      SELECT 1 FROM agent_group_members WHERE agent_id = ${agent.id} LIMIT 1
+    `;
+    if (!membership) {
+      return { error: "validation" as const, message: "Agent must belong to a group to store group-scoped memories" };
+    }
+  }
+
   // Quota enforcement
   const quotaErr = await checkQuota(tx, platformSql, agent);
   if (quotaErr) return quotaErr;
@@ -417,6 +427,8 @@ export async function markOutdated(
   await tx`
     UPDATE memory_entries SET outdated = true WHERE id = ${id}
   `;
+
+  await writeAuditLog(tx, agent.id, "memory.mark_outdated", id, "success");
 
   return { success: true };
 }

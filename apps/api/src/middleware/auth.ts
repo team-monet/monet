@@ -34,6 +34,11 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
 
   const agent = agentRows[0];
 
+  // Check if API key has been revoked
+  if (agent.revokedAt) {
+    return c.json({ error: "unauthorized", message: "API key has been revoked" }, 401);
+  }
+
   const isValid = validateApiKey(rawKey, agent.apiKeyHash, agent.apiKeySalt);
   if (!isValid) {
     return c.json({ error: "unauthorized", message: "Invalid API key" }, 401);

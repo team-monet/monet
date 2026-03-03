@@ -52,6 +52,7 @@ export const agents = pgTable("agents", {
   apiKeyHash: varchar("api_key_hash", { length: 255 }).notNull(),
   apiKeySalt: varchar("api_key_salt", { length: 255 }).notNull(),
   isAutonomous: boolean("is_autonomous").notNull().default(false),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

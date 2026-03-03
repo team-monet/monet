@@ -15,6 +15,13 @@
       "when": 1772487272247,
       "tag": "0001_damp_harrier",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1772537375034,
+      "tag": "0002_aspiring_zarda",
+      "breakpoints": true
     }
   ]
 }
