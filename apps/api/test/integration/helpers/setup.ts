@@ -12,7 +12,10 @@ let db: ReturnType<typeof drizzle>;
 
 export function getTestSql() {
   if (!sql) {
-    sql = postgres(TEST_DB_URL);
+    // Disable prepared statement caching so that dropping & recreating
+    // tenant schemas (which carry per-schema enum types) between tests
+    // does not cause stale type-OID errors (XX000 / getTypeInputInfo).
+    sql = postgres(TEST_DB_URL, { prepare: false });
   }
   return sql;
 }

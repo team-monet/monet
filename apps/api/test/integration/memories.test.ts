@@ -29,6 +29,19 @@ describe("memories integration", () => {
     agentId = (body.agent as { id: string }).id;
     tenantId = (body.tenant as { id: string }).id;
     schemaName = `tenant_${tenantId.replace(/-/g, "_")}`;
+
+    // Create a group and add the agent so it can store group-scoped memories
+    const groupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "test-group" }),
+    });
+    const group = (await groupRes.json()) as { id: string };
+    await app.request(`/api/groups/${group.id}/members`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId }),
+    });
   });
 
   afterAll(async () => {
