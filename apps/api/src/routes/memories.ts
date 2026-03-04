@@ -5,6 +5,7 @@ import type { AppEnv } from "../middleware/context.js";
 import {
   createMemory,
   searchMemories,
+  listAgentMemories,
   fetchMemory,
   updateMemory,
   deleteMemory,
@@ -12,6 +13,7 @@ import {
   promoteScope,
   listTags,
 } from "../services/memory.service.js";
+import { enqueueEnrichment } from "../services/enrichment.service.js";
 
 export const memoriesRouter = new Hono<AppEnv>();
 
@@ -57,6 +59,8 @@ memoriesRouter.post("/", async (c) => {
     );
   }
 
+  enqueueEnrichment(sql, schemaName, result.id);
+
   return c.json(result, 201);
 });
 
@@ -88,14 +92,35 @@ memoriesRouter.get("/", async (c) => {
     memoryType: c.req.query("memoryType"),
     includeUser: c.req.query("includeUser") === "true",
     includePrivate: c.req.query("includePrivate") === "true",
-    fromDate: c.req.query("fromDate"),
-    toDate: c.req.query("toDate"),
+    createdAfter: c.req.query("createdAfter"),
+    createdBefore: c.req.query("createdBefore"),
+    accessedAfter: c.req.query("accessedAfter"),
+    accessedBefore: c.req.query("accessedBefore"),
     cursor: c.req.query("cursor"),
     limit: c.req.query("limit") ? Number(c.req.query("limit")) : undefined,
   };
 
   const result = await withTenantScope(sql, schemaName, (txSql) =>
     searchMemories(txSql, agent, query),
+  );
+
+  return c.json(result);
+});
+
+// GET /agent/:agentId — list group memories contributed by a specific agent
+memoriesRouter.get("/agent/:agentId", async (c) => {
+  const agent = c.get("agent");
+  const sql = c.get("sql");
+  const schemaName = c.get("tenantSchemaName");
+  const targetAgentId = c.req.param("agentId");
+
+  const query = {
+    cursor: c.req.query("cursor"),
+    limit: c.req.query("limit") ? Number(c.req.query("limit")) : undefined,
+  };
+
+  const result = await withTenantScope(sql, schemaName, (txSql) =>
+    listAgentMemories(txSql, agent, targetAgentId, query),
   );
 
   return c.json(result);

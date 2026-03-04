@@ -37,9 +37,6 @@ export function getTestApp() {
   return createApp(getTestDb() as unknown as Parameters<typeof createApp>[0], getTestSql());
 }
 
-/**
- * Provision a tenant via the API and return the result.
- */
 export async function provisionTestTenant(
   app: ReturnType<typeof createApp>,
   name: string,
@@ -56,13 +53,9 @@ export async function provisionTestTenant(
   return { res, body: (await res.json()) as Record<string, unknown> };
 }
 
-/**
- * Clean up all test data. Drops tenant schemas and truncates platform tables.
- */
 export async function cleanupTestData() {
   const s = getTestSql();
 
-  // Find and drop all tenant schemas
   const schemas = await s`
     SELECT schema_name FROM information_schema.schemata
     WHERE schema_name LIKE 'tenant_%'
@@ -71,7 +64,6 @@ export async function cleanupTestData() {
     await s.unsafe(`DROP SCHEMA IF EXISTS "${row.schema_name}" CASCADE`);
   }
 
-  // Truncate platform tables — skip gracefully if tables don't exist yet
   await s.unsafe(`
     DO $$ BEGIN
       TRUNCATE TABLE agent_group_members, agent_groups, agents, human_users, tenants CASCADE;
@@ -80,9 +72,6 @@ export async function cleanupTestData() {
   `);
 }
 
-/**
- * Close the test database connection.
- */
 export async function closeTestDb() {
   if (sql) {
     await sql.end();

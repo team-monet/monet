@@ -5,6 +5,7 @@ import {
   decodeCursor,
   buildScopeFilter,
   createMemory,
+  buildSummary,
 } from "../services/memory.service.js";
 import type { AgentContext } from "../middleware/context.js";
 
@@ -111,7 +112,6 @@ describe("CreateMemoryEntryInput schema", () => {
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
     const after = Date.now();
 
-    // Verify the computed expiry is approximately 1 hour from now
     expect(expiresAt.getTime()).toBeGreaterThanOrEqual(before + ttlSeconds * 1000);
     expect(expiresAt.getTime()).toBeLessThanOrEqual(after + ttlSeconds * 1000);
   });
@@ -119,7 +119,6 @@ describe("CreateMemoryEntryInput schema", () => {
 
 describe("scope promotion validation", () => {
   it("private < user < group ordering", () => {
-    // This tests the SCOPE_ORDER constant logic used in promoteScope
     const order: Record<string, number> = { private: 0, user: 1, group: 2 };
     expect(order["private"]).toBeLessThan(order["user"]);
     expect(order["user"]).toBeLessThan(order["group"]);
@@ -148,5 +147,22 @@ describe("createMemory", () => {
       error: "validation",
       message: "Autonomous agents cannot store user-scoped memories",
     });
+  });
+});
+
+describe("buildSummary", () => {
+  it("prefers the stored summary when present", () => {
+    expect(buildSummary("stored summary", "full content")).toBe("stored summary");
+  });
+
+  it("falls back to content when summary is missing", () => {
+    expect(buildSummary(null, "full content")).toBe("full content");
+  });
+
+  it("truncates fallback summary at the last word boundary within 200 chars", () => {
+    const content = `${"word ".repeat(45)}tail`;
+    const summary = buildSummary(null, content);
+    expect(summary.length).toBeLessThanOrEqual(200);
+    expect(summary.endsWith(" ")).toBe(false);
   });
 });

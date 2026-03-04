@@ -4,6 +4,7 @@ CREATE TYPE "public"."isolation_mode" AS ENUM('logical', 'physical');--> stateme
 CREATE TYPE "public"."user_role" AS ENUM('user', 'group_admin', 'tenant_admin');--> statement-breakpoint
 CREATE TYPE "public"."memory_scope" AS ENUM('group', 'user', 'private');--> statement-breakpoint
 CREATE TYPE "public"."memory_type" AS ENUM('decision', 'pattern', 'issue', 'preference', 'fact', 'procedure');--> statement-breakpoint
+CREATE TYPE "public"."enrichment_status" AS ENUM('pending', 'processing', 'completed', 'failed');--> statement-breakpoint
 CREATE TABLE "agent_group_members" (
 	"agent_id" uuid NOT NULL,
 	"group_id" uuid NOT NULL,
@@ -75,6 +76,7 @@ CREATE TABLE "memory_entries" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"content" text NOT NULL,
 	"summary" varchar(200),
+	"enrichment_status" "enrichment_status" DEFAULT 'pending' NOT NULL,
 	"memory_type" "memory_type" NOT NULL,
 	"memory_scope" "memory_scope" DEFAULT 'group' NOT NULL,
 	"tags" text[] DEFAULT '{}' NOT NULL,

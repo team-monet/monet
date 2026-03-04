@@ -26,12 +26,22 @@ export const memoryTypeEnum = pgEnum("memory_type", [
   "procedure",
 ]);
 
+export const enrichmentStatusEnum = pgEnum("enrichment_status", [
+  "pending",
+  "processing",
+  "completed",
+  "failed",
+]);
+
 export const memoryEntries = pgTable(
   "memory_entries",
   {
     id: uuid("id").primaryKey().defaultRandom(),
     content: text("content").notNull(),
     summary: varchar("summary", { length: 200 }),
+    enrichmentStatus: enrichmentStatusEnum("enrichment_status")
+      .notNull()
+      .default("pending"),
     memoryType: memoryTypeEnum("memory_type").notNull(),
     memoryScope: memoryScopeEnum("memory_scope").notNull().default("group"),
     tags: text("tags").array().notNull().default([]),

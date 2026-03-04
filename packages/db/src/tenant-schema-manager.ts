@@ -26,6 +26,9 @@ export async function createTenantSchema(
     throw new Error(`Invalid tenant schema name: ${schemaName}`);
   }
 
+  // Ensure shared extensions exist before creating tenant tables that depend on them.
+  await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS vector`);
+
   await sql.unsafe(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
 
   // Create enum types in the tenant schema
@@ -43,12 +46,20 @@ export async function createTenantSchema(
     END $$
   `);
 
+  await sql.unsafe(`
+    DO $$ BEGIN
+      CREATE TYPE "${schemaName}".enrichment_status AS ENUM ('pending', 'processing', 'completed', 'failed');
+    EXCEPTION WHEN duplicate_object THEN null;
+    END $$
+  `);
+
   // Memory entries table
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "${schemaName}".memory_entries (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       content TEXT NOT NULL,
       summary VARCHAR(200),
+      enrichment_status "${schemaName}".enrichment_status NOT NULL DEFAULT 'pending',
       memory_type "${schemaName}".memory_type NOT NULL,
       memory_scope "${schemaName}".memory_scope NOT NULL DEFAULT 'group',
       tags TEXT[] NOT NULL DEFAULT '{}',

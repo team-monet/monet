@@ -29,20 +29,24 @@ vi.mock("@monet/db", () => ({
 const serviceMocks = {
   createMemory: vi.fn(),
   searchMemories: vi.fn(),
+  listAgentMemories: vi.fn(),
   fetchMemory: vi.fn(),
   updateMemory: vi.fn(),
   deleteMemory: vi.fn(),
   markOutdated: vi.fn(),
+  promoteScope: vi.fn(),
   listTags: vi.fn(),
 };
 
 vi.mock("../services/memory.service.js", () => ({
   createMemory: (...args: unknown[]) => serviceMocks.createMemory(...args),
   searchMemories: (...args: unknown[]) => serviceMocks.searchMemories(...args),
+  listAgentMemories: (...args: unknown[]) => serviceMocks.listAgentMemories(...args),
   fetchMemory: (...args: unknown[]) => serviceMocks.fetchMemory(...args),
   updateMemory: (...args: unknown[]) => serviceMocks.updateMemory(...args),
   deleteMemory: (...args: unknown[]) => serviceMocks.deleteMemory(...args),
   markOutdated: (...args: unknown[]) => serviceMocks.markOutdated(...args),
+  promoteScope: (...args: unknown[]) => serviceMocks.promoteScope(...args),
   listTags: (...args: unknown[]) => serviceMocks.listTags(...args),
 }));
 
@@ -158,14 +162,65 @@ describe("memories route", () => {
   describe("GET /memories", () => {
     it("returns search results", async () => {
       serviceMocks.searchMemories.mockResolvedValue({
-        items: [],
+        items: [
+          {
+            id: "mem-1",
+            summary: "summary only",
+            memoryType: "fact",
+            tags: ["a"],
+            autoTags: ["b"],
+            usefulnessScore: 1,
+            outdated: false,
+            createdAt: "2026-03-03T00:00:00.000Z",
+          },
+        ],
         nextCursor: null,
       });
 
-      const res = await app.request("/memories?tags=a,b&memoryType=fact");
+      const res = await app.request(
+        "/memories?tags=a,b&memoryType=fact&createdAfter=2026-03-01T00:00:00.000Z&accessedBefore=2026-03-04T00:00:00.000Z",
+      );
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body.items).toEqual([]);
+      expect(body.items[0].summary).toBe("summary only");
+      expect(body.items[0].content).toBeUndefined();
+      expect(serviceMocks.searchMemories).toHaveBeenCalledWith(
+        expect.anything(),
+        AGENT,
+        expect.objectContaining({
+          createdAfter: "2026-03-01T00:00:00.000Z",
+          accessedBefore: "2026-03-04T00:00:00.000Z",
+        }),
+      );
+    });
+  });
+
+  describe("GET /memories/agent/:agentId", () => {
+    it("returns agent-specific Tier 1 results", async () => {
+      serviceMocks.listAgentMemories.mockResolvedValue({
+        items: [
+          {
+            id: "mem-2",
+            summary: "agent memory",
+            memoryType: "fact",
+            tags: ["agent"],
+            autoTags: [],
+            usefulnessScore: 2,
+            outdated: true,
+            createdAt: "2026-03-03T00:00:00.000Z",
+          },
+        ],
+        nextCursor: null,
+      });
+
+      const res = await app.request(
+        "/memories/agent/00000000-0000-0000-0000-000000000099?limit=5",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.items).toHaveLength(1);
+      expect(body.items[0].summary).toBe("agent memory");
+      expect(serviceMocks.listAgentMemories).toHaveBeenCalled();
     });
   });
 

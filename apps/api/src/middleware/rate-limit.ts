@@ -5,9 +5,6 @@ interface SlidingWindowEntry {
   timestamps: number[];
 }
 
-const DEFAULT_MAX_REQUESTS = 100;
-const DEFAULT_WINDOW_MS = 60_000; // 1 minute
-
 const windows = new Map<string, SlidingWindowEntry>();
 
 // Clean up stale entries every 5 minutes

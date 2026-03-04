@@ -1,18 +1,26 @@
 import type postgres from "postgres";
 import type { AgentContext } from "../middleware/context.js";
-import type { CreateMemoryEntryInput, UpdateMemoryEntryInput } from "@monet/types";
+import type {
+  CreateMemoryEntryInput,
+  MemoryEntryTier1,
+  UpdateMemoryEntryInput,
+} from "@monet/types";
+import { computeQueryEmbedding } from "./enrichment.service.js";
 
 // ---------- Cursor helpers ----------
 
-export function encodeCursor(createdAt: string, id: string): string {
-  return Buffer.from(JSON.stringify({ createdAt, id })).toString("base64url");
+interface SearchCursorPayload {
+  createdAt: string;
+  id: string;
+  rank?: number;
 }
 
-export function decodeCursor(cursor: string): { createdAt: string; id: string } {
-  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8")) as {
-    createdAt: string;
-    id: string;
-  };
+export function encodeCursor(createdAt: string, id: string, rank?: number): string {
+  return Buffer.from(JSON.stringify({ createdAt, id, rank })).toString("base64url");
+}
+
+export function decodeCursor(cursor: string): SearchCursorPayload {
+  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8")) as SearchCursorPayload;
 }
 
 // ---------- Row mapping ----------
@@ -48,6 +56,19 @@ function mapVersion(row: Record<string, unknown>) {
     version: row.version as number,
     authorAgentId: row.author_agent_id as string,
     createdAt: row.created_at as string,
+  };
+}
+
+function mapTier1Row(row: Record<string, unknown>): MemoryEntryTier1 {
+  return {
+    id: row.id as string,
+    summary: buildSummary((row.summary as string) ?? null, row.content as string),
+    memoryType: row.memory_type as MemoryEntryTier1["memoryType"],
+    tags: (row.tags as string[]) ?? [],
+    autoTags: (row.auto_tags as string[]) ?? [],
+    usefulnessScore: row.usefulness_score as number,
+    outdated: row.outdated as boolean,
+    createdAt: new Date(asTimestamp(row.created_at)),
   };
 }
 
@@ -214,14 +235,17 @@ export async function searchMemories(
     memoryType?: string;
     includeUser?: boolean;
     includePrivate?: boolean;
-    fromDate?: string;
-    toDate?: string;
+    createdAfter?: string;
+    createdBefore?: string;
+    accessedAfter?: string;
+    accessedBefore?: string;
     cursor?: string;
     limit?: number;
   },
 ) {
   const tx = txSql as unknown as postgres.Sql;
   const limit = query.limit ?? 20;
+  const queryEmbedding = query.query ? await computeQueryEmbedding(query.query) : null;
 
   // Build WHERE clauses
   const conditions: string[] = [];
@@ -238,11 +262,8 @@ export async function searchMemories(
     `(expires_at IS NULL OR expires_at > NOW())`,
   );
 
-  // Exclude outdated
-  conditions.push(`outdated = false`);
-
   // Text search
-  if (query.query) {
+  if (query.query && !queryEmbedding) {
     conditions.push(`content ILIKE '%' || ${escapeLiteral(query.query)} || '%'`);
   }
 
@@ -257,14 +278,74 @@ export async function searchMemories(
   }
 
   // Date range
-  if (query.fromDate) {
-    conditions.push(`created_at >= ${escapeLiteral(query.fromDate)}::timestamptz`);
+  if (query.createdAfter) {
+    conditions.push(`created_at >= ${escapeLiteral(query.createdAfter)}::timestamptz`);
   }
-  if (query.toDate) {
-    conditions.push(`created_at <= ${escapeLiteral(query.toDate)}::timestamptz`);
+  if (query.createdBefore) {
+    conditions.push(`created_at <= ${escapeLiteral(query.createdBefore)}::timestamptz`);
+  }
+  if (query.accessedAfter) {
+    conditions.push(`last_accessed_at >= ${escapeLiteral(query.accessedAfter)}::timestamptz`);
+  }
+  if (query.accessedBefore) {
+    conditions.push(`last_accessed_at <= ${escapeLiteral(query.accessedBefore)}::timestamptz`);
   }
 
   // Cursor pagination (created_at, id)
+  if (query.cursor) {
+    const decoded = decodeCursor(query.cursor);
+    if (decoded.rank !== undefined) {
+      const cursorRank = escapeNumberLiteral(decoded.rank);
+      conditions.push(
+        `(((CASE WHEN embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) < ${cursorRank}) OR ((CASE WHEN embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) = ${cursorRank} AND (created_at, id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)))`,
+      );
+    } else {
+      conditions.push(
+        `(created_at, id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)`,
+      );
+    }
+  }
+
+  const where = conditions.join(" AND ");
+  const rankExpression = buildRankExpression(queryEmbedding);
+  const orderBy = `ORDER BY search_rank DESC NULLS LAST, created_at DESC, id DESC`;
+  const sql = `SELECT *, ${rankExpression} AS search_rank FROM memory_entries WHERE ${where} ${orderBy} LIMIT ${limit + 1}`;
+
+  const rows = await tx.unsafe(sql);
+
+  const hasMore = rows.length > limit;
+  const items = (rows.slice(0, limit) as Record<string, unknown>[]).map(mapTier1Row);
+
+  let nextCursor: string | null = null;
+  if (hasMore && items.length > 0) {
+    const last = rows[Math.min(limit - 1, rows.length - 1)] as Record<string, unknown>;
+    nextCursor = encodeCursor(
+      asTimestamp(last.created_at),
+      last.id as string,
+      Number(last.search_rank),
+    );
+  }
+
+  return { items, nextCursor };
+}
+
+export async function listAgentMemories(
+  txSql: postgres.TransactionSql,
+  agent: AgentContext,
+  targetAgentId: string,
+  query: {
+    cursor?: string;
+    limit?: number;
+  },
+) {
+  const tx = txSql as unknown as postgres.Sql;
+  const limit = query.limit ?? 20;
+  const conditions = [
+    `author_agent_id = ${escapeLiteral(targetAgentId)}`,
+    `memory_scope = 'group'`,
+    `(expires_at IS NULL OR expires_at > NOW())`,
+  ];
+
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
     conditions.push(
@@ -272,19 +353,22 @@ export async function searchMemories(
     );
   }
 
-  const where = conditions.join(" AND ");
-  const sql = `SELECT * FROM memory_entries WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ${limit + 1}`;
-
-  const rows = await tx.unsafe(sql);
+  // Group memories are visible to all group members. The current codebase treats
+  // group scope as globally visible within the tenant schema, so match that here.
+  const rows = await tx.unsafe(
+    `SELECT * FROM memory_entries WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT ${limit + 1}`,
+  );
 
   const hasMore = rows.length > limit;
-  const items = (rows.slice(0, limit) as Record<string, unknown>[]).map(mapRow);
+  const items = (rows.slice(0, limit) as Record<string, unknown>[]).map(mapTier1Row);
 
   let nextCursor: string | null = null;
   if (hasMore && items.length > 0) {
     const last = items[items.length - 1];
-    nextCursor = encodeCursor(last.createdAt, last.id);
+    nextCursor = encodeCursor(last.createdAt.toISOString(), last.id);
   }
+
+  void agent;
 
   return { items, nextCursor };
 }
@@ -534,4 +618,54 @@ function checkScopeAccess(
 function escapeLiteral(value: string): string {
   // Escape single quotes by doubling them, wrap in single quotes
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function escapeNumberLiteral(value: number): string {
+  if (!Number.isFinite(value)) {
+    throw new Error("Cursor rank must be finite");
+  }
+  return value.toString();
+}
+
+export function buildSummary(summary: string | null, content: string): string {
+  if (summary && summary.trim()) {
+    return summary.trim().slice(0, 200);
+  }
+
+  if (content.length <= 200) {
+    return content.trim();
+  }
+
+  const candidate = content.slice(0, 200);
+  const lastSpace = candidate.lastIndexOf(" ");
+  if (lastSpace > 0) {
+    return candidate.slice(0, lastSpace).trim();
+  }
+  return candidate.trim();
+}
+
+function toVectorLiteral(embedding: number[]): string {
+  return `[${embedding.map((value) => {
+    if (!Number.isFinite(value)) {
+      throw new Error("Embedding contains non-finite values");
+    }
+    return value.toString();
+  }).join(",")}]`;
+}
+
+function asTimestamp(value: unknown): string {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  return String(value);
+}
+
+function buildRankExpression(queryEmbedding: number[] | null): string {
+  const usefulnessWeight = "GREATEST(usefulness_score, 1)";
+  const outdatedWeight = "CASE WHEN outdated THEN 0.5 ELSE 1.0 END";
+  if (!queryEmbedding) {
+    return `(${usefulnessWeight} * ${outdatedWeight})`;
+  }
+
+  return `((1 - (embedding <=> ${escapeLiteral(toVectorLiteral(queryEmbedding))}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
 }

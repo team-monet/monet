@@ -368,7 +368,7 @@ describe("memories integration", () => {
 
   // ---------- Mark outdated ----------
 
-  it("marks a memory as outdated and excludes from search", async () => {
+  it("marks a memory as outdated and keeps it searchable", async () => {
     const { body: created } = await storeMemory({
       content: "old info",
       memoryType: "fact",
@@ -382,13 +382,14 @@ describe("memories integration", () => {
     );
     expect(markRes.status).toBe(200);
 
-    // Search should exclude outdated
+    // Search should still return the entry, but flagged as outdated
     const searchRes = await app.request(
       "/api/memories?tags=outdated-test",
       { headers: authHeaders() },
     );
     const searchBody = await searchRes.json();
-    expect(searchBody.items).toHaveLength(0);
+    expect(searchBody.items).toHaveLength(1);
+    expect(searchBody.items[0].outdated).toBe(true);
   });
 
   // ---------- Scope promotion ----------

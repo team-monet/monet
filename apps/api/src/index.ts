@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { createClient } from "@monet/db";
 import { createApp } from "./app.js";
+import { recoverPendingEnrichments } from "./services/enrichment.service.js";
 import { startTtlExpiryJob } from "./services/ttl-expiry.service.js";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -25,3 +26,4 @@ console.log(`API server running at http://localhost:${port}`);
 
 // Start TTL expiry background job (runs on startup + every 60 minutes)
 startTtlExpiryJob(sql);
+void recoverPendingEnrichments(sql);
