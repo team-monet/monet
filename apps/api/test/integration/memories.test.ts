@@ -7,8 +7,51 @@ import {
   closeTestDb,
 } from "./helpers/setup.js";
 import { withTenantScope } from "@monet/db";
+import {
+  resetEnrichmentStateForTests,
+  setEnrichmentProviderForTests,
+} from "../../src/services/enrichment.service.js";
+import type { EnrichmentProvider } from "../../src/providers/enrichment.js";
 
 const ADMIN_SECRET = "test-admin-secret-for-ci";
+const EMBEDDING_DIMENSIONS = 1536;
+
+function embedding(fill: number) {
+  return Array.from({ length: EMBEDDING_DIMENSIONS }, () => fill);
+}
+
+function makeProvider(overrides: Partial<EnrichmentProvider> = {}): EnrichmentProvider {
+  return {
+    generateSummary: async (content) => `summary:${content.slice(0, 24)}`,
+    computeEmbedding: async (content) => {
+      if (content.includes("banana")) return embedding(0.9);
+      if (content.includes("apple")) return embedding(0.2);
+      return embedding(0.5);
+    },
+    extractTags: async (content) =>
+      content
+        .split(/\s+/)
+        .map((part) => part.toLowerCase().replace(/[^a-z0-9]/g, ""))
+        .filter(Boolean)
+        .slice(0, 4),
+    ...overrides,
+  };
+}
+
+async function waitFor(
+  check: () => Promise<boolean>,
+  timeoutMs = 3000,
+  intervalMs = 50,
+) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await check()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`Condition not met within ${timeoutMs}ms`);
+}
 
 describe("memories integration", () => {
   const app = getTestApp();
@@ -22,6 +65,7 @@ describe("memories integration", () => {
   });
 
   beforeEach(async () => {
+    resetEnrichmentStateForTests();
     await cleanupTestData();
     // Provision a fresh tenant for each test
     const { body } = await provisionTestTenant(app, "mem-test", ADMIN_SECRET);
@@ -45,6 +89,7 @@ describe("memories integration", () => {
   });
 
   afterAll(async () => {
+    resetEnrichmentStateForTests();
     await cleanupTestData();
     await closeTestDb();
   });
@@ -138,6 +183,55 @@ describe("memories integration", () => {
     expect(searchBody2.items).toHaveLength(0);
   });
 
+  it("search returns Tier 1 entries with summary fallback and fetch returns Tier 2 content", async () => {
+    const content = "This memory should expose only its summary in Tier 1 search responses.";
+    const { body: created } = await storeMemory({
+      content,
+      memoryType: "fact",
+      tags: ["tier1-tier2"],
+    });
+
+    const searchRes = await app.request("/api/memories?tags=tier1-tier2", {
+      headers: authHeaders(),
+    });
+    expect(searchRes.status).toBe(200);
+    const searchBody = await searchRes.json();
+    expect(searchBody.items).toHaveLength(1);
+    expect(searchBody.items[0].summary).toBe(content);
+    expect(searchBody.items[0].content).toBeUndefined();
+    expect(searchBody.items[0].version).toBeUndefined();
+
+    const fetchRes = await app.request(`/api/memories/${created.id}`, {
+      headers: authHeaders(),
+    });
+    expect(fetchRes.status).toBe(200);
+    const fetchBody = await fetchRes.json();
+    expect(fetchBody.entry.content).toBe(content);
+    expect(fetchBody.entry.summary).toBeNull();
+    expect(fetchBody.entry.version).toBe(0);
+  });
+
+  it("fetch increments usefulness_score for Tier 2 retrieval", async () => {
+    const { body: created } = await storeMemory({
+      content: "Track fetch usefulness",
+      memoryType: "fact",
+      tags: ["usefulness"],
+    });
+
+    const fetchRes = await app.request(`/api/memories/${created.id}`, {
+      headers: authHeaders(),
+    });
+    expect(fetchRes.status).toBe(200);
+
+    const sql = getTestSql();
+    const [row] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
+      SELECT usefulness_score
+      FROM memory_entries
+      WHERE id = ${created.id}
+    `);
+    expect(row.usefulness_score).toBe(1);
+  });
+
   // ---------- Scope visibility ----------
 
   it("private memory is invisible to another agent", async () => {
@@ -172,6 +266,28 @@ describe("memories integration", () => {
       headers: authHeaders(key2),
     });
     expect(fetchRes.status).toBe(403);
+  });
+
+  it("includePrivate exposes the author's private memories in search", async () => {
+    await storeMemory({
+      content: "my private note",
+      memoryType: "fact",
+      memoryScope: "private",
+      tags: ["private-only"],
+    });
+
+    const hiddenRes = await app.request("/api/memories?tags=private-only", {
+      headers: authHeaders(),
+    });
+    const hiddenBody = await hiddenRes.json();
+    expect(hiddenBody.items).toHaveLength(0);
+
+    const visibleRes = await app.request("/api/memories?tags=private-only&includePrivate=true", {
+      headers: authHeaders(),
+    });
+    const visibleBody = await visibleRes.json();
+    expect(visibleBody.items).toHaveLength(1);
+    expect(visibleBody.items[0].summary).toBe("my private note");
   });
 
   // ---------- Version conflict ----------
@@ -390,6 +506,187 @@ describe("memories integration", () => {
     const searchBody = await searchRes.json();
     expect(searchBody.items).toHaveLength(1);
     expect(searchBody.items[0].outdated).toBe(true);
+  });
+
+  it("ranks outdated entries below fresh entries", async () => {
+    const fresh = await storeMemory({
+      content: "apple fresh memory",
+      memoryType: "fact",
+      tags: ["ranking"],
+    });
+    const stale = await storeMemory({
+      content: "apple stale memory",
+      memoryType: "fact",
+      tags: ["ranking"],
+    });
+
+    const staleMarkRes = await app.request(`/api/memories/${stale.body.id}/outdated`, {
+      method: "PATCH",
+      headers: authHeaders(),
+    });
+    expect(staleMarkRes.status).toBe(200);
+
+    const searchRes = await app.request("/api/memories?query=apple&tags=ranking", {
+      headers: authHeaders(),
+    });
+    const searchBody = await searchRes.json();
+    expect(searchBody.items).toHaveLength(2);
+    expect(searchBody.items[0].id).toBe(fresh.body.id);
+    expect(searchBody.items[1].id).toBe(stale.body.id);
+    expect(searchBody.items[1].outdated).toBe(true);
+  });
+
+  it("applies temporal and memoryType filters to search", async () => {
+    const oldFact = await storeMemory({
+      content: "old fact",
+      memoryType: "fact",
+      tags: ["temporal"],
+    });
+    const recentDecision = await storeMemory({
+      content: "recent decision",
+      memoryType: "decision",
+      tags: ["temporal"],
+    });
+
+    const sql = getTestSql();
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`
+        UPDATE memory_entries
+        SET created_at = '2026-02-01T00:00:00.000Z', last_accessed_at = '2026-02-01T00:00:00.000Z'
+        WHERE id = ${oldFact.body.id}
+      `;
+      await txSql`
+        UPDATE memory_entries
+        SET created_at = '2026-03-03T00:00:00.000Z', last_accessed_at = '2026-03-03T00:00:00.000Z'
+        WHERE id = ${recentDecision.body.id}
+      `;
+    });
+
+    const searchRes = await app.request(
+      "/api/memories?tags=temporal&memoryType=decision&createdAfter=2026-03-01T00:00:00.000Z&accessedAfter=2026-03-01T00:00:00.000Z",
+      { headers: authHeaders() },
+    );
+    expect(searchRes.status).toBe(200);
+    const searchBody = await searchRes.json();
+    expect(searchBody.items).toHaveLength(1);
+    expect(searchBody.items[0].id).toBe(recentDecision.body.id);
+  });
+
+  it("lists only group memories for the requested agent via /agent/:agentId", async () => {
+    const groupOne = await storeMemory({
+      content: "agent one group memory",
+      memoryType: "fact",
+      tags: ["agent-list"],
+    });
+    await storeMemory({
+      content: "agent one private memory",
+      memoryType: "fact",
+      memoryScope: "private",
+      tags: ["agent-list"],
+    });
+
+    const regRes = await app.request("/api/agents/register", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ externalId: "agent-list-2" }),
+    });
+    const regBody = await regRes.json();
+    const key2 = regBody.apiKey as string;
+    const agentId2 = (regBody.agent as { id: string }).id;
+
+    const groupsRes = await app.request("/api/groups", { headers: authHeaders() });
+    const groupsBody = await groupsRes.json();
+    const groupId = groupsBody.groups[0].id as string;
+    await app.request(`/api/groups/${groupId}/members`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ agentId: agentId2 }),
+    });
+
+    await storeMemory({
+      content: "agent two group memory",
+      memoryType: "fact",
+      tags: ["agent-list"],
+    }, key2);
+
+    const listRes = await app.request(`/api/memories/agent/${agentId}`, {
+      headers: authHeaders(),
+    });
+    expect(listRes.status).toBe(200);
+    const listBody = await listRes.json();
+    expect(listBody.items).toHaveLength(1);
+    expect(listBody.items[0].id).toBe(groupOne.body.id);
+    expect(listBody.items[0].summary).toBe("agent one group memory");
+  });
+
+  it("falls back to text search when query embedding is unavailable", async () => {
+    setEnrichmentProviderForTests(null);
+    await storeMemory({
+      content: "semantic fallback works via plain text",
+      memoryType: "fact",
+      tags: ["fallback"],
+    });
+
+    const searchRes = await app.request("/api/memories?query=plain%20text", {
+      headers: authHeaders(),
+    });
+    expect(searchRes.status).toBe(200);
+    const searchBody = await searchRes.json();
+    expect(searchBody.items).toHaveLength(1);
+    expect(searchBody.items[0].summary).toContain("semantic fallback");
+  });
+
+  it("completes enrichment asynchronously and records completed status", async () => {
+    setEnrichmentProviderForTests(makeProvider());
+    const { body: created } = await storeMemory({
+      content: "banana roadmap planning memory",
+      memoryType: "decision",
+      tags: ["async-enrichment"],
+    });
+
+    const sql = getTestSql();
+    await waitFor(async () => {
+      const [row] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
+        SELECT enrichment_status
+        FROM memory_entries
+        WHERE id = ${created.id}
+      `);
+      return row.enrichment_status === "completed";
+    }, 3000);
+
+    const [enriched] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
+      SELECT summary, auto_tags, embedding, related_memory_ids
+      FROM memory_entries
+      WHERE id = ${created.id}
+    `);
+    expect(typeof enriched.summary).toBe("string");
+    expect(enriched.summary).toContain("summary:");
+    expect(enriched.auto_tags).toBeTruthy();
+    expect(enriched.embedding).not.toBeNull();
+    expect(enriched.related_memory_ids).toBeTruthy();
+  });
+
+  it("marks enrichment as failed when the provider errors", async () => {
+    setEnrichmentProviderForTests(makeProvider({
+      computeEmbedding: async () => {
+        throw new Error("embedding failure");
+      },
+    }));
+    const { body: created } = await storeMemory({
+      content: "failed enrichment memory",
+      memoryType: "fact",
+      tags: ["enrichment-failed"],
+    });
+
+    const sql = getTestSql();
+    await waitFor(async () => {
+      const [row] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
+        SELECT enrichment_status
+        FROM memory_entries
+        WHERE id = ${created.id}
+      `);
+      return row.enrichment_status === "failed";
+    });
   });
 
   // ---------- Scope promotion ----------

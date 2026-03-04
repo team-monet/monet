@@ -19,7 +19,7 @@ export async function withTenantScope<T>(
 
   const result = await sql.begin(async (txSql) => {
     await txSql.unsafe(
-      `SET LOCAL search_path TO "${schemaName}"`,
+      `SET LOCAL search_path TO "${schemaName}", public`,
     );
     return fn(txSql);
   });
