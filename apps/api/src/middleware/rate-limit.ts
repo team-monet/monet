@@ -23,6 +23,41 @@ function cleanup(now: number, windowMs: number) {
   }
 }
 
+function currentRateLimitConfig() {
+  return {
+    maxRequests: parseInt(process.env.RATE_LIMIT_MAX || "100", 10),
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10),
+  };
+}
+
+export function checkRateLimit(
+  agentId: string,
+): { allowed: true } | { allowed: false; retryAfterSeconds: number } {
+  const { maxRequests, windowMs } = currentRateLimitConfig();
+  const now = Date.now();
+
+  cleanup(now, windowMs);
+
+  let entry = windows.get(agentId);
+  if (!entry) {
+    entry = { timestamps: [] };
+    windows.set(agentId, entry);
+  }
+
+  entry.timestamps = entry.timestamps.filter((t) => now - t < windowMs);
+
+  if (entry.timestamps.length >= maxRequests) {
+    const oldestInWindow = entry.timestamps[0];
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.ceil((oldestInWindow + windowMs - now) / 1000),
+    };
+  }
+
+  entry.timestamps.push(now);
+  return { allowed: true };
+}
+
 export const rateLimitMiddleware = createMiddleware<AppEnv>(async (c, next) => {
   const agent = c.get("agent");
   if (!agent) {
@@ -30,36 +65,14 @@ export const rateLimitMiddleware = createMiddleware<AppEnv>(async (c, next) => {
     return;
   }
 
-  const maxRequests = parseInt(process.env.RATE_LIMIT_MAX || "100", 10);
-  const windowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
-  const now = Date.now();
-
-  cleanup(now, windowMs);
-
-  // Key by agent ID (unique per API key holder)
-  const key = agent.id;
-
-  let entry = windows.get(key);
-  if (!entry) {
-    entry = { timestamps: [] };
-    windows.set(key, entry);
-  }
-
-  // Remove timestamps outside the window
-  entry.timestamps = entry.timestamps.filter((t) => now - t < windowMs);
-
-  if (entry.timestamps.length >= maxRequests) {
-    const oldestInWindow = entry.timestamps[0];
-    const retryAfterSeconds = Math.ceil((oldestInWindow + windowMs - now) / 1000);
-
-    c.header("Retry-After", String(retryAfterSeconds));
+  const result = checkRateLimit(agent.id);
+  if (!result.allowed) {
+    c.header("Retry-After", String(result.retryAfterSeconds));
     return c.json(
       { error: "rate_limited", message: "Too many requests" },
       429,
     );
   }
-
-  entry.timestamps.push(now);
 
   await next();
 });

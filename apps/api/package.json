@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@monet/db": "workspace:*",
     "@monet/mcp-tools": "workspace:*",
     "@monet/types": "workspace:*",

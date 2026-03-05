@@ -1,5 +1,11 @@
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { MemoryScope, MemoryType } from "@monet/types";
+import {
+  MemoryScope,
+  MemoryType,
+  UpdateMemoryEntryInput,
+} from "@monet/types";
 
 /**
  * MCP tool definitions for the Monet.
@@ -9,7 +15,9 @@ import { MemoryScope, MemoryType } from "@monet/types";
 export const TOOL_MEMORY_STORE = "memory_store" as const;
 export const TOOL_MEMORY_SEARCH = "memory_search" as const;
 export const TOOL_MEMORY_FETCH = "memory_fetch" as const;
+export const TOOL_MEMORY_UPDATE = "memory_update" as const;
 export const TOOL_MEMORY_DELETE = "memory_delete" as const;
+export const TOOL_MEMORY_PROMOTE_SCOPE = "memory_promote_scope" as const;
 export const TOOL_MEMORY_MARK_OUTDATED = "memory_mark_outdated" as const;
 export const TOOL_MEMORY_LIST_TAGS = "memory_list_tags" as const;
 
@@ -27,6 +35,11 @@ export const MemorySearchInput = z.object({
   memoryType: MemoryType.optional().describe("Filter by memory type"),
   includeUser: z.boolean().default(false).describe("Include user-scoped memories"),
   includePrivate: z.boolean().default(false).describe("Include private memories"),
+  createdAfter: z.string().datetime().optional().describe("Only include memories created on or after this timestamp"),
+  createdBefore: z.string().datetime().optional().describe("Only include memories created on or before this timestamp"),
+  accessedAfter: z.string().datetime().optional().describe("Only include memories accessed on or after this timestamp"),
+  accessedBefore: z.string().datetime().optional().describe("Only include memories accessed on or before this timestamp"),
+  cursor: z.string().optional().describe("Opaque cursor for ranked pagination"),
   limit: z.number().int().positive().max(50).default(10).describe("Max results to return"),
 });
 
@@ -34,12 +47,26 @@ export const MemoryFetchInput = z.object({
   id: z.string().uuid().describe("Memory entry ID to fetch full content"),
 });
 
+export const MemoryUpdateInput = UpdateMemoryEntryInput.extend({
+  id: z.string().uuid().describe("Memory entry ID to update"),
+});
+
 export const MemoryDeleteInput = z.object({
   id: z.string().uuid().describe("Memory entry ID to delete"),
 });
 
+export const MemoryPromoteScopeInput = z.object({
+  id: z.string().uuid().describe("Memory entry ID whose scope should change"),
+  scope: MemoryScope.describe("New scope for the memory entry"),
+});
+
 export const MemoryMarkOutdatedInput = z.object({
   id: z.string().uuid().describe("Memory entry ID to mark as outdated"),
+});
+
+export const MemoryListTagsInput = z.object({
+  includeUser: z.boolean().default(false).describe("Include user-scoped memories"),
+  includePrivate: z.boolean().default(false).describe("Include private memories"),
 });
 
 export const toolDefinitions = [
@@ -59,9 +86,19 @@ export const toolDefinitions = [
     inputSchema: MemoryFetchInput,
   },
   {
+    name: TOOL_MEMORY_UPDATE,
+    description: "Update the content or tags of a memory entry using optimistic concurrency via expectedVersion.",
+    inputSchema: MemoryUpdateInput,
+  },
+  {
     name: TOOL_MEMORY_DELETE,
     description: "Delete a memory entry you authored. Removes the entry and all its version history.",
     inputSchema: MemoryDeleteInput,
+  },
+  {
+    name: TOOL_MEMORY_PROMOTE_SCOPE,
+    description: "Change a memory's visibility scope. Promotion supports sharing a memory with a wider audience.",
+    inputSchema: MemoryPromoteScopeInput,
   },
   {
     name: TOOL_MEMORY_MARK_OUTDATED,
@@ -71,6 +108,70 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_LIST_TAGS,
     description: "List all unique tags across memories in your accessible scopes.",
-    inputSchema: z.object({}),
+    inputSchema: MemoryListTagsInput,
   },
 ] as const;
+
+function toolDescription(name: (typeof toolDefinitions)[number]["name"]) {
+  const def = toolDefinitions.find((tool) => tool.name === name);
+  if (!def) {
+    throw new Error(`Missing tool definition for ${name}`);
+  }
+  return def.description;
+}
+
+export interface McpToolHandlers {
+  memoryStore: (args: z.infer<typeof MemoryStoreInput>) => Promise<CallToolResult>;
+  memorySearch: (args: z.infer<typeof MemorySearchInput>) => Promise<CallToolResult>;
+  memoryFetch: (args: z.infer<typeof MemoryFetchInput>) => Promise<CallToolResult>;
+  memoryUpdate: (args: z.infer<typeof MemoryUpdateInput>) => Promise<CallToolResult>;
+  memoryDelete: (args: z.infer<typeof MemoryDeleteInput>) => Promise<CallToolResult>;
+  memoryPromoteScope: (args: z.infer<typeof MemoryPromoteScopeInput>) => Promise<CallToolResult>;
+  memoryMarkOutdated: (args: z.infer<typeof MemoryMarkOutdatedInput>) => Promise<CallToolResult>;
+  memoryListTags: (args: z.infer<typeof MemoryListTagsInput>) => Promise<CallToolResult>;
+}
+
+export function registerAllTools(
+  server: McpServer,
+  handlers: McpToolHandlers,
+) {
+  server.registerTool(TOOL_MEMORY_STORE, {
+    description: toolDescription(TOOL_MEMORY_STORE),
+    inputSchema: MemoryStoreInput,
+  }, handlers.memoryStore);
+
+  server.registerTool(TOOL_MEMORY_SEARCH, {
+    description: toolDescription(TOOL_MEMORY_SEARCH),
+    inputSchema: MemorySearchInput,
+  }, handlers.memorySearch);
+
+  server.registerTool(TOOL_MEMORY_FETCH, {
+    description: toolDescription(TOOL_MEMORY_FETCH),
+    inputSchema: MemoryFetchInput,
+  }, handlers.memoryFetch);
+
+  server.registerTool(TOOL_MEMORY_UPDATE, {
+    description: toolDescription(TOOL_MEMORY_UPDATE),
+    inputSchema: MemoryUpdateInput,
+  }, handlers.memoryUpdate);
+
+  server.registerTool(TOOL_MEMORY_DELETE, {
+    description: toolDescription(TOOL_MEMORY_DELETE),
+    inputSchema: MemoryDeleteInput,
+  }, handlers.memoryDelete);
+
+  server.registerTool(TOOL_MEMORY_PROMOTE_SCOPE, {
+    description: toolDescription(TOOL_MEMORY_PROMOTE_SCOPE),
+    inputSchema: MemoryPromoteScopeInput,
+  }, handlers.memoryPromoteScope);
+
+  server.registerTool(TOOL_MEMORY_MARK_OUTDATED, {
+    description: toolDescription(TOOL_MEMORY_MARK_OUTDATED),
+    inputSchema: MemoryMarkOutdatedInput,
+  }, handlers.memoryMarkOutdated);
+
+  server.registerTool(TOOL_MEMORY_LIST_TAGS, {
+    description: toolDescription(TOOL_MEMORY_LIST_TAGS),
+    inputSchema: MemoryListTagsInput,
+  }, handlers.memoryListTags);
+}
