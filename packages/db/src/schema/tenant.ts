@@ -9,6 +9,7 @@ import {
   pgEnum,
   vector,
   index,
+  primaryKey,
 } from "drizzle-orm/pg-core";
 
 export const memoryScopeEnum = pgEnum("memory_scope", [
@@ -104,6 +105,9 @@ export const rules = pgTable("rules", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: varchar("name", { length: 255 }).notNull(),
   description: text("description").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -117,18 +121,30 @@ export const ruleSets = pgTable("rule_sets", {
     .defaultNow(),
 });
 
-export const ruleSetRules = pgTable("rule_set_rules", {
-  ruleSetId: uuid("rule_set_id")
-    .notNull()
-    .references(() => ruleSets.id, { onDelete: "cascade" }),
-  ruleId: uuid("rule_id")
-    .notNull()
-    .references(() => rules.id, { onDelete: "cascade" }),
-});
+export const ruleSetRules = pgTable(
+  "rule_set_rules",
+  {
+    ruleSetId: uuid("rule_set_id")
+      .notNull()
+      .references(() => ruleSets.id, { onDelete: "cascade" }),
+    ruleId: uuid("rule_id")
+      .notNull()
+      .references(() => rules.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.ruleSetId, table.ruleId] }),
+  ],
+);
 
-export const agentRuleSets = pgTable("agent_rule_sets", {
-  agentId: uuid("agent_id").notNull(),
-  ruleSetId: uuid("rule_set_id")
-    .notNull()
-    .references(() => ruleSets.id, { onDelete: "cascade" }),
-});
+export const agentRuleSets = pgTable(
+  "agent_rule_sets",
+  {
+    agentId: uuid("agent_id").notNull(),
+    ruleSetId: uuid("rule_set_id")
+      .notNull()
+      .references(() => ruleSets.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.agentId, table.ruleSetId] }),
+  ],
+);

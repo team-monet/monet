@@ -14,7 +14,7 @@ if (!databaseUrl) {
 }
 
 const { db, sql } = createClient(databaseUrl);
-const app = createApp(db, sql);
+const app = createApp(db, sql, sessionStore);
 const mcpHandler = createMcpHandler({ db, sql, sessionStore });
 const honoRequestListener = getRequestListener(app.fetch);
 
@@ -40,11 +40,11 @@ startTtlExpiryJob(sql);
 void recoverPendingEnrichments(sql);
 sessionStore.startIdleSweep(async (sessionId, session) => {
   console.info(`Closing idle MCP session ${sessionId}`);
-  sessionStore.remove(sessionId);
   await Promise.allSettled([
     session.transport.close(),
     session.server.close(),
   ]);
+  sessionStore.remove(sessionId);
 });
 
 async function shutdown(signal: string) {

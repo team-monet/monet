@@ -6,6 +6,7 @@ import type { Database } from "@monet/db";
 import { checkRateLimit } from "../middleware/rate-limit.js";
 import { tenantSchemaName } from "../middleware/tenant.js";
 import { authenticateAgentFromBearerToken } from "../services/agent-auth.service.js";
+import { pushRulesToAgent } from "../services/rule-notification.service.js";
 import { createMcpServer } from "./server.js";
 import type { SessionStore } from "./session-store.js";
 
@@ -110,6 +111,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             connectedAt: new Date(),
             lastActivityAt: new Date(),
           });
+          await pushRulesToAgent(auth.agent.id, sessionStore, sql, schemaName);
 
           try {
             // The MCP SDK reads POST request bodies from the raw Node stream.

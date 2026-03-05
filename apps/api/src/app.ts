@@ -7,12 +7,19 @@ import { tenantsRouter } from "./routes/tenants.js";
 import { agentsRouter } from "./routes/agents.js";
 import { memoriesRouter } from "./routes/memories.js";
 import { groupsRouter } from "./routes/groups.js";
+import { rulesRouter } from "./routes/rules.js";
+import { auditRouter } from "./routes/audit.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { tenantMiddleware } from "./middleware/tenant.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
 import type { AppEnv } from "./middleware/context.js";
+import type { SessionStore } from "./mcp/session-store.js";
 
-export function createApp(db: Database | null, sql: postgres.Sql | null) {
+export function createApp(
+  db: Database | null,
+  sql: postgres.Sql | null,
+  sessionStore: SessionStore | null = null,
+) {
   const app = new Hono<AppEnv>();
 
   // Logging middleware — Authorization header redacted (threat model I4)
@@ -27,6 +34,7 @@ export function createApp(db: Database | null, sql: postgres.Sql | null) {
   app.use("*", async (c, next) => {
     if (db) c.set("db", db);
     if (sql) c.set("sql", sql);
+    if (sessionStore) c.set("sessionStore", sessionStore);
     await next();
   });
 
@@ -44,6 +52,8 @@ export function createApp(db: Database | null, sql: postgres.Sql | null) {
   authenticated.route("/agents", agentsRouter);
   authenticated.route("/memories", memoriesRouter);
   authenticated.route("/groups", groupsRouter);
+  authenticated.route("/audit", auditRouter);
+  authenticated.route("/", rulesRouter);
 
   app.route("/api", authenticated);
 
