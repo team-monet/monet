@@ -21,9 +21,14 @@ async function ensurePlatformSchemaReady() {
         SELECT to_regclass('public.tenants') AS "tenantsTable"
       `;
 
-      if (!tenantsTable) {
-        await s.unsafe(`DROP TABLE IF EXISTS drizzle.__drizzle_migrations`);
+      // CI can prepare platform tables via `drizzle-kit push`, which creates
+      // schema objects without migration history rows. Running migrator on top
+      // of that state would replay 0000 and fail on already-existing tables.
+      if (tenantsTable) {
+        return;
       }
+
+      await s.unsafe(`DROP TABLE IF EXISTS drizzle.__drizzle_migrations`);
 
       const migrationDb = drizzle(s);
       const migrationsFolder = path.resolve(process.cwd(), "../../packages/db/drizzle");
