@@ -37,6 +37,27 @@ export const humanUsers = pgTable("human_users", {
     .notNull()
     .references(() => tenants.id),
   role: userRoleEnum("role").notNull().default("user"),
+  dashboardApiKeyEncrypted: varchar("dashboard_api_key_encrypted", {
+    length: 1024,
+  }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const tenantOauthConfigs = pgTable("tenant_oauth_configs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id")
+    .notNull()
+    .references(() => tenants.id)
+    .unique(),
+  provider: varchar("provider", { length: 50 }).notNull().default("oidc"),
+  issuer: varchar("issuer", { length: 255 }).notNull(),
+  issuerUrl: varchar("issuer_url", { length: 512 }),
+  clientId: varchar("client_id", { length: 255 }).notNull(),
+  clientSecretEncrypted: varchar("client_secret_encrypted", {
+    length: 1024,
+  }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

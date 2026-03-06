@@ -8,16 +8,14 @@ import type { AppEnv } from "../middleware/context.js";
 import { resolveAgentRole, isTenantAdmin } from "../services/group.service.js";
 import {
   addRuleToSet,
-  associateRuleSetWithAgent,
   createRule,
   createRuleSet,
   deleteRule,
   deleteRuleSet,
-  dissociateRuleSetFromAgent,
-  getActiveRulesForAgent,
   getAgentIdsForRule,
   getAgentIdsForRuleSet,
   getRule,
+  listRuleSets,
   listRules,
   removeRuleFromSet,
   updateRule,
@@ -34,16 +32,6 @@ function parseRuleSetMembershipInput(body: unknown): { data: { ruleId: string } 
   return { data: { ruleId: b.ruleId } };
 }
 
-function parseAgentRuleSetAssociationInput(
-  body: unknown,
-): { data: { ruleSetId: string } } | { error: string } {
-  const b = body as Record<string, unknown>;
-  if (!b || typeof b.ruleSetId !== "string" || !UUID_RE.test(b.ruleSetId)) {
-    return { error: "Valid ruleSetId (UUID) is required" };
-  }
-  return { data: { ruleSetId: b.ruleSetId } };
-}
-
 export const rulesRouter = new Hono<AppEnv>();
 
 async function requireTenantAdmin(c: Context<AppEnv>) {
@@ -58,12 +46,6 @@ async function requireTenantAdmin(c: Context<AppEnv>) {
   return null;
 }
 
-async function ensureAgentInTenant(sql: AppEnv["Variables"]["sql"], tenantId: string, agentId: string) {
-  const [row] = await sql`
-    SELECT id FROM agents WHERE id = ${agentId} AND tenant_id = ${tenantId}
-  `;
-  return Boolean(row);
-}
 
 rulesRouter.post("/rules", async (c) => {
   const forbidden = await requireTenantAdmin(c);
@@ -100,6 +82,16 @@ rulesRouter.get("/rules", async (c) => {
   const schemaName = c.get("tenantSchemaName");
   const rules = await listRules(sql, schemaName);
   return c.json({ rules });
+});
+
+rulesRouter.get("/rule-sets", async (c) => {
+  const forbidden = await requireTenantAdmin(c);
+  if (forbidden) return forbidden;
+
+  const sql = c.get("sql");
+  const schemaName = c.get("tenantSchemaName");
+  const ruleSets = await listRuleSets(sql, schemaName);
+  return c.json({ ruleSets });
 });
 
 rulesRouter.get("/rules/:id", async (c) => {
@@ -307,90 +299,4 @@ rulesRouter.delete("/rule-sets/:id/rules/:ruleId", async (c) => {
   ));
 
   return c.json({ success: true });
-});
-
-rulesRouter.post("/agents/:id/rule-sets", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
-  const body = await c.req.json();
-  const parsed = parseAgentRuleSetAssociationInput(body);
-  if ("error" in parsed) {
-    return c.json({ error: "validation_error", message: parsed.error }, 400);
-  }
-
-  const sql = c.get("sql");
-  const sessionStore = c.get("sessionStore");
-  const agent = c.get("agent");
-  const tenantId = c.get("tenantId");
-  const schemaName = c.get("tenantSchemaName");
-  const targetAgentId = c.req.param("id");
-
-  const exists = await ensureAgentInTenant(sql, tenantId, targetAgentId);
-  if (!exists) {
-    return c.json({ error: "not_found", message: "Agent not found" }, 404);
-  }
-
-  const result = await associateRuleSetWithAgent(sql, tenantId, schemaName, {
-    actorId: agent.id,
-    actorType: "agent",
-  }, targetAgentId, parsed.data.ruleSetId);
-
-  if ("error" in result) {
-    if (result.error === "not_found") {
-      return c.json({ error: "not_found", message: "Rule set not found" }, 404);
-    }
-    return c.json({ error: "conflict", message: "Rule set is already associated with this agent" }, 409);
-  }
-
-  await pushRulesToAgent(targetAgentId, sessionStore, sql, schemaName);
-  return c.json({ success: true }, 201);
-});
-
-rulesRouter.delete("/agents/:id/rule-sets/:ruleSetId", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
-  const sql = c.get("sql");
-  const sessionStore = c.get("sessionStore");
-  const agent = c.get("agent");
-  const tenantId = c.get("tenantId");
-  const schemaName = c.get("tenantSchemaName");
-  const targetAgentId = c.req.param("id");
-  const ruleSetId = c.req.param("ruleSetId");
-
-  const exists = await ensureAgentInTenant(sql, tenantId, targetAgentId);
-  if (!exists) {
-    return c.json({ error: "not_found", message: "Agent not found" }, 404);
-  }
-
-  const result = await dissociateRuleSetFromAgent(sql, tenantId, schemaName, {
-    actorId: agent.id,
-    actorType: "agent",
-  }, targetAgentId, ruleSetId);
-
-  if ("error" in result) {
-    return c.json({ error: "not_found", message: "Agent/rule-set association not found" }, 404);
-  }
-
-  await pushRulesToAgent(targetAgentId, sessionStore, sql, schemaName);
-  return c.json({ success: true });
-});
-
-rulesRouter.get("/agents/:id/rules", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
-  const sql = c.get("sql");
-  const tenantId = c.get("tenantId");
-  const schemaName = c.get("tenantSchemaName");
-  const targetAgentId = c.req.param("id");
-
-  const exists = await ensureAgentInTenant(sql, tenantId, targetAgentId);
-  if (!exists) {
-    return c.json({ error: "not_found", message: "Agent not found" }, 404);
-  }
-
-  const rules = await getActiveRulesForAgent(sql, schemaName, targetAgentId);
-  return c.json({ rules });
 });

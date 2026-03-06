@@ -1,10 +1,8 @@
 import postgres from "postgres";
 import type { Database } from "@monet/db";
-import { createTenantSchema } from "@monet/db";
-import {
-  generateApiKey,
-  hashApiKey,
-} from "./api-key.service.js";
+import { createTenantSchema, tenantOauthConfigs } from "@monet/db";
+import { generateApiKey, hashApiKey } from "./api-key.service.js";
+import { encrypt } from "../lib/crypto.js";
 
 export interface ProvisionTenantResult {
   tenant: {
@@ -18,6 +16,37 @@ export interface ProvisionTenantResult {
     externalId: string;
   };
   rawApiKey: string;
+}
+
+/**
+ * Configure OAuth for a tenant.
+ */
+export async function configureTenantOauth(
+  db: Database,
+  tenantId: string,
+  input: { issuer: string; clientId: string; clientSecret: string },
+) {
+  const encryptedSecret = encrypt(input.clientSecret);
+
+  const [result] = await db
+    .insert(tenantOauthConfigs)
+    .values({
+      tenantId,
+      issuer: input.issuer,
+      clientId: input.clientId,
+      clientSecretEncrypted: encryptedSecret,
+    })
+    .onConflictDoUpdate({
+      target: tenantOauthConfigs.tenantId,
+      set: {
+        issuer: input.issuer,
+        clientId: input.clientId,
+        clientSecretEncrypted: encryptedSecret,
+      },
+    })
+    .returning();
+
+  return result;
 }
 
 /**

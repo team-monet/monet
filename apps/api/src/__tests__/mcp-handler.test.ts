@@ -6,6 +6,7 @@ import { createMcpHandler } from "../mcp/handler.js";
 const authMock = vi.fn();
 const rateLimitMock = vi.fn();
 const createMcpServerMock = vi.fn();
+const pushRulesToAgentMock = vi.fn();
 
 const transportHandleRequestMock = vi.fn();
 const transportCloseMock = vi.fn();
@@ -20,6 +21,10 @@ vi.mock("../middleware/rate-limit.js", () => ({
 
 vi.mock("../mcp/server.js", () => ({
   createMcpServer: (...args: unknown[]) => createMcpServerMock(...args),
+}));
+
+vi.mock("../services/rule-notification.service.js", () => ({
+  pushRulesToAgent: (...args: unknown[]) => pushRulesToAgentMock(...args),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/streamableHttp.js", () => ({
@@ -86,6 +91,7 @@ describe("mcp handler", () => {
       connect: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     });
+    pushRulesToAgentMock.mockResolvedValue(undefined);
     transportHandleRequestMock.mockImplementation(async (_req: IncomingMessage, res: ServerResponse) => {
       res.statusCode = 200;
     });

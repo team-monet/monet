@@ -1,0 +1,311 @@
+import {
+  Agent,
+  MemoryEntry,
+  MemoryEntryTier1,
+  AgentGroup,
+  MemoryScope,
+  MemoryType,
+  CreateMemoryEntryInput,
+  UpdateMemoryEntryInput,
+  Rule,
+  RuleSet,
+  AuditLog,
+} from "@monet/types";
+import { auth } from "./auth";
+import { db } from "./db";
+import { humanUsers } from "@monet/db";
+import { eq } from "drizzle-orm";
+import { decrypt } from "./crypto";
+import { ensureDashboardAgent } from "./dashboard-agent";
+
+export interface ApiClientOptions {
+  baseUrl: string;
+  apiKey: string;
+}
+
+export class MonetApiClient {
+  private baseUrl: string;
+  private apiKey: string;
+
+  constructor(options: ApiClientOptions) {
+    this.baseUrl = options.baseUrl;
+    this.apiKey = options.apiKey;
+  }
+
+  private async fetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+        ...options.headers,
+      },
+    });
+
+    if (!response.ok) {
+      const status = response.status;
+      let message = "An unexpected error occurred. Please try again later.";
+
+      if (status === 400) message = "Invalid request. Please check your input.";
+      else if (status === 401) message = "Your session has expired. Please log in again.";
+      else if (status === 403) message = "Access denied. You do not have permission to perform this action.";
+      else if (status === 404) message = "The requested resource was not found.";
+      else if (status === 409) message = "There was a conflict with the current state.";
+      else if (status === 429) message = "Too many requests. Please slow down.";
+      else if (status >= 500) message = "A server error occurred. Our team has been notified.";
+
+      throw new Error(message);
+    }
+
+    return response.json();
+  }
+
+  // Agents
+  async getMe(): Promise<Agent> {
+    return this.fetch<Agent>("/api/agents/me");
+  }
+
+  async getAgentStatus(
+    id: string,
+  ): Promise<{ activeSessions: number; revoked: boolean }> {
+    return this.fetch<{ activeSessions: number; revoked: boolean }>(
+      `/api/agents/${id}/status`,
+    );
+  }
+
+  async listAgents(): Promise<Agent[]> {
+    return this.fetch<Agent[]>("/api/agents");
+  }
+
+  // Memories
+  async listMemories(params?: {
+    memoryType?: MemoryType;
+    tags?: string;
+    includeUser?: boolean;
+    includePrivate?: boolean;
+    cursor?: string;
+    limit?: number;
+    query?: string;
+  }): Promise<{ items: MemoryEntryTier1[]; nextCursor: string | null }> {
+    const query = new URLSearchParams();
+    if (params) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined) query.set(key, String(value));
+      });
+    }
+    return this.fetch<{ items: MemoryEntryTier1[]; nextCursor: string | null }>(
+      `/api/memories?${query.toString()}`,
+    );
+  }
+
+  async getMemoryEntry(id: string): Promise<{ entry: MemoryEntry; versions: { id: string; version: number; createdAt: string; content: string }[] }> {
+    return this.fetch<{ entry: MemoryEntry; versions: { id: string; version: number; createdAt: string; content: string }[] }>(`/api/memories/${id}`);
+  }
+
+  async searchMemories(query: string, limit?: number): Promise<{ items: MemoryEntryTier1[]; nextCursor: string | null }> {
+    const searchParams = new URLSearchParams({ query });
+    if (limit) searchParams.set("limit", String(limit));
+    return this.fetch<{ items: MemoryEntryTier1[]; nextCursor: string | null }>(
+      `/api/memories?${searchParams.toString()}`,
+    );
+  }
+
+  async createMemoryEntry(input: CreateMemoryEntryInput): Promise<MemoryEntry> {
+    return this.fetch<MemoryEntry>("/api/memories", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async updateMemoryEntry(
+    id: string,
+    input: UpdateMemoryEntryInput,
+  ): Promise<MemoryEntry> {
+    return this.fetch<MemoryEntry>(`/api/memories/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async deleteMemoryEntry(id: string): Promise<void> {
+    return this.fetch<void>(`/api/memories/${id}`, {
+      method: "DELETE",
+    });
+  }
+
+  async markMemoryOutdated(id: string): Promise<void> {
+    return this.fetch<void>(`/api/memories/${id}/outdated`, {
+      method: "PATCH",
+    });
+  }
+
+  async promoteMemoryScope(id: string, scope: MemoryScope): Promise<void> {
+    return this.fetch<void>(`/api/memories/${id}/scope`, {
+      method: "PATCH",
+      body: JSON.stringify({ scope }),
+    });
+  }
+
+  // Groups
+  async listGroups(): Promise<{ groups: AgentGroup[] }> {
+    return this.fetch<{ groups: AgentGroup[] }>("/api/groups");
+  }
+
+  async createGroup(input: {
+    name: string;
+    description?: string;
+    memoryQuota?: number;
+  }): Promise<AgentGroup> {
+    return this.fetch<AgentGroup>("/api/groups", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async getGroup(id: string): Promise<AgentGroup> {
+    return this.fetch<AgentGroup>(`/api/groups/${id}`);
+  }
+
+  async listGroupMembers(id: string): Promise<{ members: Agent[] }> {
+    return this.fetch<{ members: Agent[] }>(`/api/groups/${id}/members`);
+  }
+
+  async addGroupMember(id: string, agentId: string): Promise<void> {
+    return this.fetch<void>(`/api/groups/${id}/members`, {
+      method: "POST",
+      body: JSON.stringify({ agentId }),
+    });
+  }
+
+  async removeGroupMember(id: string, agentId: string): Promise<void> {
+    return this.fetch<void>(`/api/groups/${id}/members/${agentId}`, {
+      method: "DELETE",
+    });
+  }
+
+  async updateGroup(
+    id: string,
+    input: { name?: string; description?: string; memoryQuota?: number },
+  ): Promise<AgentGroup> {
+    return this.fetch<AgentGroup>(`/api/groups/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  // Rules
+  async listRules(): Promise<{ rules: Rule[] }> {
+    return this.fetch<{ rules: Rule[] }>("/api/rules");
+  }
+
+  async createRule(input: { name: string; description: string }): Promise<Rule> {
+    return this.fetch<Rule>("/api/rules", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async updateRule(
+    id: string,
+    input: { name?: string; description?: string },
+  ): Promise<Rule> {
+    return this.fetch<Rule>(`/api/rules/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async listRuleSets(): Promise<{ ruleSets: RuleSet[] }> {
+    return this.fetch<{ ruleSets: RuleSet[] }>("/api/rule-sets");
+  }
+
+  async createRuleSet(input: { name: string }): Promise<RuleSet> {
+    return this.fetch<RuleSet>("/api/rule-sets", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async deleteRuleSet(id: string): Promise<void> {
+    return this.fetch<void>(`/api/rule-sets/${id}`, {
+      method: "DELETE",
+    });
+  }
+
+  async addRuleToSet(ruleSetId: string, ruleId: string): Promise<void> {
+    return this.fetch<void>(`/api/rule-sets/${ruleSetId}/rules`, {
+      method: "POST",
+      body: JSON.stringify({ ruleId }),
+    });
+  }
+
+  async removeRuleFromSet(ruleSetId: string, ruleId: string): Promise<void> {
+    return this.fetch<void>(`/api/rule-sets/${ruleSetId}/rules/${ruleId}`, {
+      method: "DELETE",
+    });
+  }
+
+  // Audit (Step 10)
+  async getAuditLogs(params?: {
+    actorId?: string;
+    action?: string;
+    startDate?: string;
+    endDate?: string;
+    cursor?: string;
+    limit?: number;
+  }): Promise<{ items: AuditLog[]; nextCursor: string | null }> {
+    const query = new URLSearchParams();
+    if (params) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined) query.set(key, String(value));
+      });
+    }
+    return this.fetch<{ items: AuditLog[]; nextCursor: string | null }>(
+      "/api/audit?" + query.toString(),
+    );
+  }
+}
+
+interface ExtendedUser {
+  id?: string;
+  role?: string;
+  tenantId?: string;
+}
+
+export async function getApiClient() {
+  const session = await auth();
+  if (!session || !session.user) {
+    throw new Error("No session found");
+  }
+
+  const sessionUser = session.user as ExtendedUser;
+  if (!sessionUser.id) {
+    throw new Error("User ID not found in session");
+  }
+  if (!sessionUser.tenantId) {
+    throw new Error("Tenant ID not found in session");
+  }
+
+  // Keep dashboard agent credentials/role in sync with the linked human user.
+  await ensureDashboardAgent(sessionUser.id, sessionUser.id, sessionUser.tenantId);
+
+  // Fetch human user to get encrypted API key
+  const userRows = await db
+    .select({ dashboardApiKeyEncrypted: humanUsers.dashboardApiKeyEncrypted })
+    .from(humanUsers)
+    .where(eq(humanUsers.id, sessionUser.id))
+    .limit(1);
+
+  if (userRows.length === 0 || !userRows[0].dashboardApiKeyEncrypted) {
+    throw new Error("Dashboard agent not initialized");
+  }
+
+  const apiKey = decrypt(userRows[0].dashboardApiKeyEncrypted);
+  const apiUrl = process.env.INTERNAL_API_URL || "http://localhost:3001";
+
+  return new MonetApiClient({
+    baseUrl: apiUrl,
+    apiKey,
+  });
+}

@@ -7,7 +7,15 @@
     },
     "dev": {
       "cache": false,
-      "persistent": true
+      "persistent": true,
+      "env": [
+        "DATABASE_URL",
+        "ENCRYPTION_KEY",
+        "AUTH_SECRET",
+        "NEXTAUTH_SECRET",
+        "NEXTAUTH_URL",
+        "DEV_BYPASS_AUTH"
+      ]
     },
     "test": {
       "dependsOn": ["build"]

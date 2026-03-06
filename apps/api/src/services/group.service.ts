@@ -57,6 +57,40 @@ export async function createGroup(
   };
 }
 
+export async function updateGroup(
+  sql: postgres.Sql,
+  tenantId: string,
+  groupId: string,
+  input: { name?: string; description?: string; memoryQuota?: number },
+) {
+  // Verify group belongs to this tenant
+  const [existing] = await sql`
+    SELECT id FROM agent_groups WHERE id = ${groupId} AND tenant_id = ${tenantId}
+  `;
+  if (!existing) {
+    return { error: "not_found" as const, message: "Group not found" };
+  }
+
+  const [group] = await sql`
+    UPDATE agent_groups
+    SET
+      name = ${input.name ?? sql`name`},
+      description = ${input.description ?? sql`description`},
+      memory_quota = ${input.memoryQuota !== undefined ? input.memoryQuota : sql`memory_quota`}
+    WHERE id = ${groupId} AND tenant_id = ${tenantId}
+    RETURNING id, tenant_id, name, description, memory_quota, created_at
+  `;
+
+  return {
+    id: group.id as string,
+    tenantId: group.tenant_id as string,
+    name: group.name as string,
+    description: group.description as string,
+    memoryQuota: (group.memory_quota as number) ?? null,
+    createdAt: group.created_at as string,
+  };
+}
+
 export async function addMember(
   sql: postgres.Sql,
   tenantId: string,

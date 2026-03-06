@@ -18,6 +18,10 @@ health.get("/health/live", (c) => {
 health.get("/health/ready", async (c) => {
   const sql = c.get("sql");
 
+  if (!sql) {
+    return c.json({ status: "error", message: "database not configured" }, 503);
+  }
+
   try {
     await sql`SELECT 1`;
     return c.json({ status: "ok" });

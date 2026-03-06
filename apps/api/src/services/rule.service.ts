@@ -22,6 +22,10 @@ export interface RuleSetRecord {
   createdAt: string;
 }
 
+export interface RuleSetWithRulesRecord extends RuleSetRecord {
+  ruleIds: string[];
+}
+
 function mapRule(row: Record<string, unknown>): RuleRecord {
   return {
     id: row.id as string,
@@ -216,6 +220,37 @@ export async function createRuleSet(
   });
 
   return created;
+}
+
+export async function listRuleSets(
+  sql: postgres.Sql,
+  schemaName: string,
+): Promise<RuleSetWithRulesRecord[]> {
+  return withTenantScope(sql, schemaName, async (txSql) => {
+    const tx = txSql as unknown as postgres.Sql;
+    const rows = await tx`
+      SELECT
+        rs.id,
+        rs.name,
+        rs.created_at,
+        COALESCE(
+          ARRAY_AGG(rsr.rule_id ORDER BY rsr.rule_id)
+            FILTER (WHERE rsr.rule_id IS NOT NULL),
+          ARRAY[]::uuid[]
+        ) AS rule_ids
+      FROM rule_sets rs
+      LEFT JOIN rule_set_rules rsr ON rsr.rule_set_id = rs.id
+      GROUP BY rs.id, rs.name, rs.created_at
+      ORDER BY rs.created_at ASC, rs.id ASC
+    `;
+
+    return (rows as Record<string, unknown>[]).map((row) => ({
+      id: row.id as string,
+      name: row.name as string,
+      createdAt: row.created_at as string,
+      ruleIds: Array.isArray(row.rule_ids) ? (row.rule_ids as string[]) : [],
+    }));
+  });
 }
 
 export async function deleteRuleSet(

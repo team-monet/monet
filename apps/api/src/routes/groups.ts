@@ -5,6 +5,7 @@ import {
   isTenantAdmin,
   isGroupAdminOrAbove,
   createGroup,
+  updateGroup,
   addMember,
   removeMember,
   listGroups,
@@ -47,6 +48,23 @@ function parsePromoteUserInput(body: unknown): { data: { role: "group_admin" | "
   return { data: { role: b.role as "group_admin" | "user" } };
 }
 
+function parseUpdateGroupInput(body: unknown): { data: { name?: string; description?: string; memoryQuota?: number } } | { error: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "Invalid request body" };
+  }
+  const b = body as Record<string, unknown>;
+  if (b.memoryQuota !== undefined && b.memoryQuota !== null && (!Number.isInteger(b.memoryQuota) || Number(b.memoryQuota) <= 0)) {
+    return { error: "memoryQuota must be a positive integer" };
+  }
+  return {
+    data: {
+      name: typeof b.name === "string" ? b.name : undefined,
+      description: typeof b.description === "string" ? b.description : undefined,
+      memoryQuota: typeof b.memoryQuota === "number" ? b.memoryQuota : undefined,
+    },
+  };
+}
+
 export const groupsRouter = new Hono<AppEnv>();
 
 // POST / — create a group (Tenant_Admin only)
@@ -67,6 +85,31 @@ groupsRouter.post("/", async (c) => {
 
   const group = await createGroup(sql, agent.tenantId, parsed.data);
   return c.json(group, 201);
+});
+
+// PATCH /:id — update group (Tenant_Admin only)
+groupsRouter.patch("/:id", async (c) => {
+  const agent = c.get("agent");
+  const sql = c.get("sql");
+  const groupId = c.req.param("id");
+
+  const role = await resolveAgentRole(sql, agent);
+  if (!isTenantAdmin(role)) {
+    return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
+  }
+
+  const body = await c.req.json();
+  const parsed = parseUpdateGroupInput(body);
+  if ("error" in parsed) {
+    return c.json({ error: "validation_error", message: parsed.error }, 400);
+  }
+
+  const result = await updateGroup(sql, agent.tenantId, groupId, parsed.data);
+  if ("error" in result) {
+    return c.json({ error: "not_found", message: result.message }, 404);
+  }
+
+  return c.json(result);
 });
 
 // GET / — list groups in tenant

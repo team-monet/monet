@@ -25,6 +25,9 @@ export type CreateMemoryEntryInput = z.infer<typeof CreateMemoryEntryInput>;
 export const UpdateMemoryEntryInput = z.object({
   content: z.string().min(1).optional(),
   tags: z.array(z.string()).min(1).optional(),
+  memoryScope: MemoryScope.optional(),
+  memoryType: MemoryType.optional(),
+  outdated: z.boolean().optional(),
   expectedVersion: z.number().int().nonnegative(),
 });
 export type UpdateMemoryEntryInput = z.infer<typeof UpdateMemoryEntryInput>;
@@ -41,10 +44,12 @@ export const MemoryEntry = z.object({
   usefulnessScore: z.number().int().nonnegative(),
   outdated: z.boolean(),
   ttlSeconds: z.number().positive().nullable(),
-  expiresAt: z.date().nullable(),
-  createdAt: z.date(),
-  lastAccessedAt: z.date(),
+  expiresAt: z.coerce.date().nullable(),
+  createdAt: z.coerce.date(),
+  lastAccessedAt: z.coerce.date(),
   authorAgentId: z.string().uuid(),
+  groupId: z.string().uuid().nullable(),
+  userId: z.string().uuid().nullable(),
   version: z.number().int().nonnegative(),
 });
 export type MemoryEntry = z.infer<typeof MemoryEntry>;
@@ -53,11 +58,13 @@ export const MemoryEntryTier1 = MemoryEntry.pick({
   id: true,
   summary: true,
   memoryType: true,
+  memoryScope: true,
   tags: true,
   autoTags: true,
   usefulnessScore: true,
   outdated: true,
   createdAt: true,
+  authorAgentId: true,
 });
 export type MemoryEntryTier1 = z.infer<typeof MemoryEntryTier1>;
 

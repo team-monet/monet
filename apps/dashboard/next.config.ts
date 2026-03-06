@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  transpilePackages: ["@monet/types"],
+  transpilePackages: ["@monet/types", "@monet/db"],
 };
 
 export default nextConfig;

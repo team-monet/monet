@@ -10,9 +10,10 @@ export type RegisterAgentInput = z.infer<typeof RegisterAgentInput>;
 export const Agent = z.object({
   id: z.string().uuid(),
   externalId: z.string(),
+  tenantId: z.string().uuid(),
   userId: z.string().uuid().nullable(),
   isAutonomous: z.boolean(),
-  createdAt: z.date(),
+  createdAt: z.coerce.date(),
 });
 export type Agent = z.infer<typeof Agent>;
 
@@ -21,7 +22,7 @@ export const AgentGroup = z.object({
   name: z.string(),
   description: z.string(),
   memoryQuota: z.number().int().positive().nullable(),
-  createdAt: z.date(),
+  createdAt: z.coerce.date(),
 });
 export type AgentGroup = z.infer<typeof AgentGroup>;
 
@@ -35,7 +36,7 @@ export const Tenant = z.object({
   id: z.string().uuid(),
   name: z.string(),
   isolationMode: z.enum(["logical", "physical"]),
-  createdAt: z.date(),
+  createdAt: z.coerce.date(),
 });
 export type Tenant = z.infer<typeof Tenant>;
 
@@ -44,6 +45,6 @@ export const HumanUser = z.object({
   externalId: z.string(),
   tenantId: z.string().uuid(),
   role: z.enum(["user", "group_admin", "tenant_admin"]),
-  createdAt: z.date(),
+  createdAt: z.coerce.date(),
 });
 export type HumanUser = z.infer<typeof HumanUser>;

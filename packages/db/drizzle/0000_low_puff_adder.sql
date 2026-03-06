@@ -1,10 +1,30 @@
 CREATE EXTENSION IF NOT EXISTS vector;--> statement-breakpoint
 CREATE EXTENSION IF NOT EXISTS pgcrypto;--> statement-breakpoint
-CREATE TYPE "public"."isolation_mode" AS ENUM('logical', 'physical');--> statement-breakpoint
-CREATE TYPE "public"."user_role" AS ENUM('user', 'group_admin', 'tenant_admin');--> statement-breakpoint
-CREATE TYPE "public"."memory_scope" AS ENUM('group', 'user', 'private');--> statement-breakpoint
-CREATE TYPE "public"."memory_type" AS ENUM('decision', 'pattern', 'issue', 'preference', 'fact', 'procedure');--> statement-breakpoint
-CREATE TYPE "public"."enrichment_status" AS ENUM('pending', 'processing', 'completed', 'failed');--> statement-breakpoint
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'isolation_mode') THEN
+        CREATE TYPE "public"."isolation_mode" AS ENUM('logical', 'physical');
+    END IF;
+END $$;--> statement-breakpoint
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_role') THEN
+        CREATE TYPE "public"."user_role" AS ENUM('user', 'group_admin', 'tenant_admin');
+    END IF;
+END $$;--> statement-breakpoint
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'memory_scope') THEN
+        CREATE TYPE "public"."memory_scope" AS ENUM('group', 'user', 'private');
+    END IF;
+END $$;--> statement-breakpoint
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'memory_type') THEN
+        CREATE TYPE "public"."memory_type" AS ENUM('decision', 'pattern', 'issue', 'preference', 'fact', 'procedure');
+    END IF;
+END $$;--> statement-breakpoint
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'enrichment_status') THEN
+        CREATE TYPE "public"."enrichment_status" AS ENUM('pending', 'processing', 'completed', 'failed');
+    END IF;
+END $$;--> statement-breakpoint
 CREATE TABLE "agent_group_members" (
 	"agent_id" uuid NOT NULL,
 	"group_id" uuid NOT NULL,

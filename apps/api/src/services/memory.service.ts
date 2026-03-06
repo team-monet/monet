@@ -64,11 +64,13 @@ function mapTier1Row(row: Record<string, unknown>): MemoryEntryTier1 {
     id: row.id as string,
     summary: buildSummary((row.summary as string) ?? null, row.content as string),
     memoryType: row.memory_type as MemoryEntryTier1["memoryType"],
+    memoryScope: row.memory_scope as MemoryEntryTier1["memoryScope"],
     tags: (row.tags as string[]) ?? [],
     autoTags: (row.auto_tags as string[]) ?? [],
     usefulnessScore: row.usefulness_score as number,
     outdated: row.outdated as boolean,
     createdAt: new Date(asTimestamp(row.created_at)),
+    authorAgentId: row.author_agent_id as string,
   };
 }
 
@@ -110,12 +112,12 @@ export function buildScopeFilter(
   const conditions: string[] = ["memory_scope = 'group'"];
 
   if (opts.includeUser && agent.userId) {
-    conditions.push(`(memory_scope = 'user' AND user_id = '${agent.userId}')`);
+    conditions.push(`(memory_scope = 'user' AND user_id = ${escapeLiteral(agent.userId)})`);
   }
 
   if (opts.includePrivate) {
     conditions.push(
-      `(memory_scope = 'private' AND author_agent_id = '${agent.id}')`,
+      `(memory_scope = 'private' AND author_agent_id = ${escapeLiteral(agent.id)})`,
     );
   }
 

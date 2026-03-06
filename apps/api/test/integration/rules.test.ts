@@ -31,6 +31,7 @@ describe("Rules integration", () => {
   let adminAgentId: string;
 
   beforeAll(async () => {
+    console.log("TEST_DB_URL:", process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/monet_test");
     process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
 
     server = createServer((req, res) => {

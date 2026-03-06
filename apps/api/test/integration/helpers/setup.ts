@@ -1,7 +1,9 @@
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
+import { migrate } from "drizzle-orm/postgres-js/migrator";
 import * as platformSchema from "@monet/db/schema";
 import { createApp } from "../../../src/app.js";
+import path from "node:path";
 
 const TEST_DB_URL =
   process.env.DATABASE_URL ??
@@ -9,6 +11,28 @@ const TEST_DB_URL =
 
 let sql: ReturnType<typeof postgres>;
 let db: ReturnType<typeof drizzle>;
+let schemaReadyPromise: Promise<void> | null = null;
+
+async function ensurePlatformSchemaReady() {
+  if (!schemaReadyPromise) {
+    schemaReadyPromise = (async () => {
+      const s = getTestSql();
+      const [{ tenantsTable }] = await s<{ tenantsTable: string | null }[]>`
+        SELECT to_regclass('public.tenants') AS "tenantsTable"
+      `;
+
+      if (!tenantsTable) {
+        await s.unsafe(`DROP TABLE IF EXISTS drizzle.__drizzle_migrations`);
+      }
+
+      const migrationDb = drizzle(s);
+      const migrationsFolder = path.resolve(process.cwd(), "../../packages/db/drizzle");
+      await migrate(migrationDb, { migrationsFolder });
+    })();
+  }
+
+  await schemaReadyPromise;
+}
 
 export function getTestSql() {
   if (!sql) {
@@ -42,6 +66,8 @@ export async function provisionTestTenant(
   name: string,
   adminSecret: string,
 ) {
+  await ensurePlatformSchemaReady();
+
   const res = await app.request("/api/tenants", {
     method: "POST",
     headers: {
@@ -54,6 +80,8 @@ export async function provisionTestTenant(
 }
 
 export async function cleanupTestData() {
+  await ensurePlatformSchemaReady();
+
   const s = getTestSql();
 
   const schemas = await s`
