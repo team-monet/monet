@@ -1,7 +1,21 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../app.js";
 
 describe("health endpoints", () => {
+  const originalProvider = process.env.ENRICHMENT_PROVIDER;
+
+  beforeEach(() => {
+    process.env.ENRICHMENT_PROVIDER = "ollama";
+  });
+
+  afterEach(() => {
+    if (originalProvider === undefined) {
+      delete process.env.ENRICHMENT_PROVIDER;
+    } else {
+      process.env.ENRICHMENT_PROVIDER = originalProvider;
+    }
+  });
+
   it("GET /health returns status ok", async () => {
     const app = createApp(null, null);
     const res = await app.request("/health");
@@ -24,7 +38,11 @@ describe("health endpoints", () => {
     const app = createApp(null, sql as never);
     const res = await app.request("/health/ready");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: "ok" });
+    expect(await res.json()).toEqual({
+      status: "ok",
+      db: "connected",
+      enrichment: "configured",
+    });
   });
 
   it("GET /health/ready returns 503 when database is unreachable", async () => {
@@ -34,9 +52,23 @@ describe("health endpoints", () => {
     const app = createApp(null, sql as never);
     const res = await app.request("/health/ready");
     expect(res.status).toBe(503);
-    expect(await res.json()).toEqual({
-      status: "error",
-      message: "database unreachable",
+    expect(await res.json()).toMatchObject({
+      status: "not_ready",
+      db: "disconnected",
+      enrichment: "configured",
+    });
+  });
+
+  it("GET /health/ready returns 503 when enrichment provider is not configured", async () => {
+    delete process.env.ENRICHMENT_PROVIDER;
+    const sql = vi.fn(async () => [{ "?column?": 1 }]);
+    const app = createApp(null, sql as never);
+    const res = await app.request("/health/ready");
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({
+      status: "not_ready",
+      db: "connected",
+      enrichment: "not_configured",
     });
   });
 });

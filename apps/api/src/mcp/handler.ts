@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { performance } from "node:perf_hooks";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type postgres from "postgres";
 import type { Database } from "@monet/db";
@@ -7,6 +8,7 @@ import { checkRateLimit } from "../middleware/rate-limit.js";
 import { tenantSchemaName } from "../middleware/tenant.js";
 import { authenticateAgentFromBearerToken } from "../services/agent-auth.service.js";
 import { pushRulesToAgent } from "../services/rule-notification.service.js";
+import { logRequest } from "../lib/log.js";
 import { createMcpServer } from "./server.js";
 import type { SessionStore } from "./session-store.js";
 
@@ -18,6 +20,16 @@ interface McpHandlerDeps {
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function requestPath(req: IncomingMessage): string {
+  if (!req.url) return "/mcp";
+
+  try {
+    return new URL(req.url, "http://127.0.0.1").pathname;
+  } catch {
+    return "/mcp";
+  }
 }
 
 function writeJson(
@@ -59,72 +71,108 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
   return {
     async handle(req: IncomingMessage, res: ServerResponse) {
       const method = req.method ?? "GET";
+      const path = requestPath(req);
       const sessionId = headerValue(req.headers["mcp-session-id"]);
+      const requestId = randomUUID();
+      const startedAt = performance.now();
+      let agentId: string | undefined;
+      let tenantId: string | undefined;
 
-      if (method === "POST") {
-        const auth = await authenticateAgentFromBearerToken(
-          db,
-          headerValue(req.headers.authorization),
-        );
-        if (!auth.ok) {
-          writeJson(res, auth.status, {
-            error: auth.error,
-            message: auth.message,
-          });
-          return;
-        }
+      if (!res.headersSent) {
+        res.setHeader("X-Request-Id", requestId);
+      }
 
-        const limit = checkRateLimit(auth.agent.id);
-        if (!limit.allowed) {
-          // Intentionally count every POST request (session init + tool invocation),
-          // matching the shared MCP/REST budget defined in the M5 plan.
-          writeJson(
-            res,
-            429,
-            { error: "rate_limited", message: "Too many requests" },
-            { "Retry-After": String(limit.retryAfterSeconds) },
+      try {
+        if (method === "POST") {
+          const auth = await authenticateAgentFromBearerToken(
+            db,
+            headerValue(req.headers.authorization),
           );
-          return;
-        }
+          if (!auth.ok) {
+            writeJson(res, auth.status, {
+              error: auth.error,
+              message: auth.message,
+            });
+            return;
+          }
+          agentId = auth.agent.id;
+          tenantId = auth.agent.tenantId;
 
-        if (!sessionId) {
-          const newSessionId = randomUUID();
-          const schemaName = tenantSchemaName(auth.agent.tenantId);
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => newSessionId,
-          });
-          const server = createMcpServer(auth.agent, schemaName, sql);
+          const limit = checkRateLimit(auth.agent.id);
+          if (!limit.allowed) {
+            // Intentionally count every POST request (session init + tool invocation),
+            // matching the shared MCP/REST budget defined in the M5 plan.
+            writeJson(
+              res,
+              429,
+              { error: "rate_limited", message: "Too many requests" },
+              { "Retry-After": String(limit.retryAfterSeconds) },
+            );
+            return;
+          }
 
-          transport.onclose = () => {
-            sessionStore.remove(newSessionId);
-          };
-          transport.onerror = (error) => {
-            console.error("MCP transport error", error);
-          };
+          if (!sessionId) {
+            const newSessionId = randomUUID();
+            const schemaName = tenantSchemaName(auth.agent.tenantId);
+            const transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => newSessionId,
+            });
+            const server = createMcpServer(auth.agent, schemaName, sql);
 
-          await server.connect(transport);
-          sessionStore.add(newSessionId, {
-            transport,
-            server,
-            agentContext: auth.agent,
-            tenantSchemaName: schemaName,
-            connectedAt: new Date(),
-            lastActivityAt: new Date(),
-          });
-          await pushRulesToAgent(auth.agent.id, sessionStore, sql, schemaName);
+            transport.onclose = () => {
+              sessionStore.remove(newSessionId);
+            };
+            transport.onerror = (error) => {
+              console.error("MCP transport error", error);
+            };
 
-          try {
-            // The MCP SDK reads POST request bodies from the raw Node stream.
-            // Do not pre-consume req here.
-            await transport.handleRequest(req, res);
-            if (res.statusCode >= 400) {
+            await server.connect(transport);
+            sessionStore.add(newSessionId, {
+              transport,
+              server,
+              agentContext: auth.agent,
+              tenantSchemaName: schemaName,
+              connectedAt: new Date(),
+              lastActivityAt: new Date(),
+            });
+            await pushRulesToAgent(auth.agent.id, sessionStore, sql, schemaName);
+
+            try {
+              // The MCP SDK reads POST request bodies from the raw Node stream.
+              // Do not pre-consume req here.
+              await transport.handleRequest(req, res);
+              if (res.statusCode >= 400) {
+                await closeSession(sessionStore, newSessionId);
+                return;
+              }
+              sessionStore.touch(newSessionId);
+              return;
+            } catch (error) {
               await closeSession(sessionStore, newSessionId);
+              writeJson(res, 500, {
+                error: "internal",
+                message: error instanceof Error ? error.message : "Internal server error",
+              });
               return;
             }
-            sessionStore.touch(newSessionId);
+          }
+
+          const session = sessionStore.get(sessionId);
+          if (!session) {
+            writeJson(res, 404, { error: "not_found", message: "Session not found" });
+            return;
+          }
+
+          if (session.agentContext.id !== auth.agent.id) {
+            writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
+            return;
+          }
+
+          sessionStore.touch(sessionId);
+          try {
+            await session.transport.handleRequest(req, res);
             return;
           } catch (error) {
-            await closeSession(sessionStore, newSessionId);
             writeJson(res, 500, {
               error: "internal",
               message: error instanceof Error ? error.message : "Internal server error",
@@ -133,119 +181,111 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
           }
         }
 
-        const session = sessionStore.get(sessionId);
-        if (!session) {
-          writeJson(res, 404, { error: "not_found", message: "Session not found" });
-          return;
-        }
+        if (method === "GET") {
+          if (!sessionId) {
+            writeJson(res, 400, { error: "validation_error", message: "Missing Mcp-Session-Id header" });
+            return;
+          }
 
-        if (session.agentContext.id !== auth.agent.id) {
-          writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
-          return;
-        }
-
-        sessionStore.touch(sessionId);
-        try {
-          await session.transport.handleRequest(req, res);
-          return;
-        } catch (error) {
-          writeJson(res, 500, {
-            error: "internal",
-            message: error instanceof Error ? error.message : "Internal server error",
-          });
-          return;
-        }
-      }
-
-      if (method === "GET") {
-        if (!sessionId) {
-          writeJson(res, 400, { error: "validation_error", message: "Missing Mcp-Session-Id header" });
-          return;
-        }
-
-        const auth = await authenticateAgentFromBearerToken(
-          db,
-          headerValue(req.headers.authorization),
-        );
-        if (!auth.ok) {
-          writeJson(res, auth.status, {
-            error: auth.error,
-            message: auth.message,
-          });
-          return;
-        }
-
-        const session = sessionStore.get(sessionId);
-        if (!session) {
-          writeJson(res, 404, { error: "not_found", message: "Session not found" });
-          return;
-        }
-
-        if (session.agentContext.id !== auth.agent.id) {
-          writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
-          return;
-        }
-
-        sessionStore.touch(sessionId);
-        try {
-          await session.transport.handleRequest(req, res);
-          return;
-        } catch (error) {
-          writeJson(res, 500, {
-            error: "internal",
-            message: error instanceof Error ? error.message : "Internal server error",
-          });
-          return;
-        }
-      }
-
-      if (method === "DELETE") {
-        if (!sessionId) {
-          writeJson(res, 400, { error: "validation_error", message: "Missing Mcp-Session-Id header" });
-          return;
-        }
-
-        const auth = await authenticateAgentFromBearerToken(
-          db,
-          headerValue(req.headers.authorization),
-        );
-        if (!auth.ok) {
-          writeJson(res, auth.status, {
-            error: auth.error,
-            message: auth.message,
-          });
-          return;
-        }
-
-        const limit = checkRateLimit(auth.agent.id);
-        if (!limit.allowed) {
-          // DELETE is explicitly counted by design, while GET /mcp is not.
-          writeJson(
-            res,
-            429,
-            { error: "rate_limited", message: "Too many requests" },
-            { "Retry-After": String(limit.retryAfterSeconds) },
+          const auth = await authenticateAgentFromBearerToken(
+            db,
+            headerValue(req.headers.authorization),
           );
+          if (!auth.ok) {
+            writeJson(res, auth.status, {
+              error: auth.error,
+              message: auth.message,
+            });
+            return;
+          }
+          agentId = auth.agent.id;
+          tenantId = auth.agent.tenantId;
+
+          const session = sessionStore.get(sessionId);
+          if (!session) {
+            writeJson(res, 404, { error: "not_found", message: "Session not found" });
+            return;
+          }
+
+          if (session.agentContext.id !== auth.agent.id) {
+            writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
+            return;
+          }
+
+          sessionStore.touch(sessionId);
+          try {
+            await session.transport.handleRequest(req, res);
+            return;
+          } catch (error) {
+            writeJson(res, 500, {
+              error: "internal",
+              message: error instanceof Error ? error.message : "Internal server error",
+            });
+            return;
+          }
+        }
+
+        if (method === "DELETE") {
+          if (!sessionId) {
+            writeJson(res, 400, { error: "validation_error", message: "Missing Mcp-Session-Id header" });
+            return;
+          }
+
+          const auth = await authenticateAgentFromBearerToken(
+            db,
+            headerValue(req.headers.authorization),
+          );
+          if (!auth.ok) {
+            writeJson(res, auth.status, {
+              error: auth.error,
+              message: auth.message,
+            });
+            return;
+          }
+          agentId = auth.agent.id;
+          tenantId = auth.agent.tenantId;
+
+          const limit = checkRateLimit(auth.agent.id);
+          if (!limit.allowed) {
+            // DELETE is explicitly counted by design, while GET /mcp is not.
+            writeJson(
+              res,
+              429,
+              { error: "rate_limited", message: "Too many requests" },
+              { "Retry-After": String(limit.retryAfterSeconds) },
+            );
+            return;
+          }
+
+          const session = sessionStore.get(sessionId);
+          if (!session) {
+            writeJson(res, 404, { error: "not_found", message: "Session not found" });
+            return;
+          }
+
+          if (session.agentContext.id !== auth.agent.id) {
+            writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
+            return;
+          }
+
+          await closeSession(sessionStore, sessionId);
+          writeJson(res, 200, { success: true });
           return;
         }
 
-        const session = sessionStore.get(sessionId);
-        if (!session) {
-          writeJson(res, 404, { error: "not_found", message: "Session not found" });
-          return;
-        }
-
-        if (session.agentContext.id !== auth.agent.id) {
-          writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
-          return;
-        }
-
-        await closeSession(sessionStore, sessionId);
-        writeJson(res, 200, { success: true });
-        return;
+        writeJson(res, 405, { error: "method_not_allowed", message: "Method not allowed" });
+      } finally {
+        logRequest({
+          requestId,
+          method,
+          path,
+          statusCode: res.statusCode || 200,
+          latencyMs: performance.now() - startedAt,
+          tenantId,
+          agentId,
+          message: "mcp_request",
+        });
       }
-
-      writeJson(res, 405, { error: "method_not_allowed", message: "Method not allowed" });
     },
   };
 }

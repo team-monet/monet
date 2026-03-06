@@ -32,6 +32,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/monet_test
       PLATFORM_ADMIN_SECRET: ci-test-secret
+      RUN_PERF: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && (contains(github.event.pull_request.title, '[perf]') || contains(join(github.event.pull_request.labels.*.name, ','), 'perf'))) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -66,3 +67,59 @@ jobs:
 
       - name: Integration tests
         run: pnpm test:integration
+
+      - name: Setup k6
+        if: env.RUN_PERF == 'true'
+        uses: grafana/setup-k6-action@v1
+
+      - name: Start API server for load tests
+        if: env.RUN_PERF == 'true'
+        run: |
+          ENRICHMENT_PROVIDER=ollama \
+          RATE_LIMIT_MAX=100000 \
+          API_PORT=3001 \
+          pnpm --filter @monet/api start >/tmp/monet-api.log 2>&1 &
+          echo $! >/tmp/monet-api.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3001/health/live >/dev/null; then
+              echo "API server ready for load tests"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API server failed to become ready"
+          cat /tmp/monet-api.log
+          exit 1
+
+      - name: Seed load test data
+        if: env.RUN_PERF == 'true'
+        run: |
+          LOAD_SEED_FILE=/tmp/monet-load-seed.json \
+          API_BASE_URL=http://127.0.0.1:3001 \
+          LOAD_GROUP_COUNT=2 \
+          LOAD_AGENT_COUNT=10 \
+          LOAD_MEMORIES_PER_GROUP=1000 \
+          pnpm --filter @monet/api test:load:seed
+
+      - name: Load test gate
+        if: env.RUN_PERF == 'true'
+        run: |
+          LOAD_SEED_FILE=/tmp/monet-load-seed.json \
+          API_BASE_URL=http://127.0.0.1:3001 \
+          LOAD_DURATION=30s \
+          LOAD_VUS=10 \
+          pnpm --filter @monet/api test:load
+
+      - name: Stop API server after load tests
+        if: always() && env.RUN_PERF == 'true'
+        run: |
+          if [ -f /tmp/monet-api.pid ]; then
+            kill $(cat /tmp/monet-api.pid) || true
+          fi
+
+      - name: Print API server log on perf failure
+        if: failure() && env.RUN_PERF == 'true'
+        run: |
+          if [ -f /tmp/monet-api.log ]; then
+            cat /tmp/monet-api.log
+          fi

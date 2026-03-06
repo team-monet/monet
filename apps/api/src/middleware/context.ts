@@ -14,6 +14,7 @@ export interface AgentContext {
 
 export interface AppEnv extends Env {
   Variables: {
+    requestId: string;
     agent: AgentContext;
     tenantId: string;
     tenantSchemaName: string;

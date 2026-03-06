@@ -16,6 +16,7 @@ let providerOverride: EnrichmentProvider | null | undefined;
 let cachedProvider: EnrichmentProvider | null | undefined;
 let activeJobs = 0;
 const queue: EnrichmentJob[] = [];
+const drainWaiters = new Set<() => void>();
 
 export function setEnrichmentProviderForTests(
   provider: EnrichmentProvider | null | undefined,
@@ -29,6 +30,50 @@ export function resetEnrichmentStateForTests() {
   cachedProvider = undefined;
   activeJobs = 0;
   queue.length = 0;
+  for (const resolve of drainWaiters) {
+    resolve();
+  }
+  drainWaiters.clear();
+}
+
+export function getActiveEnrichmentCount(): number {
+  return activeJobs;
+}
+
+export function getQueuedEnrichmentCount(): number {
+  return queue.length;
+}
+
+export async function waitForEnrichmentDrain(timeoutMs: number): Promise<void> {
+  if (isQueueDrained()) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      drainWaiters.delete(onDrain);
+      resolve();
+    };
+
+    const onDrain = () => {
+      done();
+    };
+
+    const timer = setTimeout(() => {
+      done();
+    }, timeoutMs);
+
+    drainWaiters.add(onDrain);
+
+    if (isQueueDrained()) {
+      done();
+    }
+  });
 }
 
 export function enqueueEnrichment(
@@ -127,6 +172,8 @@ function drainQueue(sql: postgres.Sql) {
       drainQueue(sql);
     });
   }
+
+  notifyDrainWaiters();
 }
 
 async function runJob(sql: postgres.Sql, job: EnrichmentJob) {
@@ -260,4 +307,17 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
       },
     );
   });
+}
+
+function isQueueDrained(): boolean {
+  return activeJobs === 0 && queue.length === 0;
+}
+
+function notifyDrainWaiters(): void {
+  if (!isQueueDrained()) return;
+
+  for (const resolve of drainWaiters) {
+    resolve();
+  }
+  drainWaiters.clear();
 }

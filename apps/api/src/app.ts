@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { logger } from "hono/logger";
 import type { Database } from "@monet/db";
 import type postgres from "postgres";
 import { health } from "./routes/health.js";
@@ -12,6 +11,7 @@ import { auditRouter } from "./routes/audit.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { tenantMiddleware } from "./middleware/tenant.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
+import { structuredLogger } from "./middleware/structured-logger.js";
 import type { AppEnv } from "./middleware/context.js";
 import type { SessionStore } from "./mcp/session-store.js";
 
@@ -22,13 +22,8 @@ export function createApp(
 ) {
   const app = new Hono<AppEnv>();
 
-  // Logging middleware — Authorization header redacted (threat model I4)
-  app.use(
-    "*",
-    logger((message) => {
-      console.log(message.replace(/Bearer\s+\S+/g, "Bearer [REDACTED]"));
-    }),
-  );
+  // Structured logging middleware with per-request correlation IDs.
+  app.use("*", structuredLogger);
 
   // Inject db and sql into context for all routes
   app.use("*", async (c, next) => {

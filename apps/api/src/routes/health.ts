@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../middleware/context.js";
+import { getEnrichmentProviderConfigStatus } from "../providers/index.js";
 
 export const health = new Hono<AppEnv>();
 
@@ -16,16 +17,36 @@ health.get("/health/live", (c) => {
 });
 
 health.get("/health/ready", async (c) => {
-  const sql = c.get("sql");
-
-  if (!sql) {
-    return c.json({ status: "error", message: "database not configured" }, 503);
-  }
-
+  const sql = c.get("sql") as AppEnv["Variables"]["sql"] | undefined;
+  let db: "connected" | "disconnected" = "disconnected";
   try {
-    await sql`SELECT 1`;
-    return c.json({ status: "ok" });
+    if (sql) {
+      await sql`SELECT 1`;
+      db = "connected";
+    }
   } catch {
-    return c.json({ status: "error", message: "database unreachable" }, 503);
+    db = "disconnected";
   }
+
+  const enrichmentConfig = getEnrichmentProviderConfigStatus();
+  const enrichment: "configured" | "not_configured" =
+    enrichmentConfig.configured ? "configured" : "not_configured";
+
+  if (db === "connected" && enrichment === "configured") {
+    return c.json({
+      status: "ok",
+      db,
+      enrichment,
+    });
+  }
+
+  return c.json(
+    {
+      status: "not_ready",
+      db,
+      enrichment,
+      reason: enrichmentConfig.reason,
+    },
+    503,
+  );
 });
