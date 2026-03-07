@@ -2,7 +2,13 @@ node_modules/
 dist/
 .next/
 .turbo/
+.pnpm-store/
 .env
 .env.local
+.env.internal-testing
+.env.local-dev
+.internal-testing/
+.local-dev/
+apps/api/.local-dev/
 *.tsbuildinfo
 *.log

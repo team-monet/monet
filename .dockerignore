@@ -1,0 +1,16 @@
+.git
+.gitignore
+node_modules
+.pnpm-store
+.turbo
+.next
+dist
+coverage
+.local-dev
+.internal-testing
+apps/api/.local-dev
+.env
+.env.local
+.env.local-dev
+.env.internal-testing
+*.log

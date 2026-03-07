@@ -12,7 +12,19 @@
     "typecheck": "turbo typecheck",
     "db:migrate": "pnpm --filter @monet/db migrate",
     "db:generate": "pnpm --filter @monet/db generate",
-    "db:studio": "pnpm --filter @monet/db studio"
+    "db:studio": "pnpm --filter @monet/db studio",
+    "local:up": "./scripts/local-env.sh up",
+    "local:up:dashboard": "./scripts/local-env.sh up-dashboard",
+    "local:migrate": "./scripts/local-env.sh migrate",
+    "local:bootstrap": "./scripts/local-env.sh bootstrap",
+    "local:init": "./scripts/local-env.sh init",
+    "local:init:dashboard": "./scripts/local-env.sh init-dashboard",
+    "local:down": "./scripts/local-env.sh down",
+    "local:status": "./scripts/local-env.sh status",
+    "local:logs": "./scripts/local-env.sh logs",
+    "local:reset": "./scripts/local-env.sh reset",
+    "local:mcp:smoke": "./scripts/local-env.sh mcp-smoke",
+    "local:metrics": "./scripts/local-env.sh metrics"
   },
   "devDependencies": {
     "eslint": "^10.0.2",

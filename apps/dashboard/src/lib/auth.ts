@@ -23,6 +23,7 @@ interface ExtendedJWT {
 
 const TEST_ORG_SLUG = "test-org";
 const TEST_ORG_NAME = "Test Org";
+const LOCAL_TENANT_NAME = cleanEnvValue(process.env.LOCAL_TENANT_NAME) || TEST_ORG_NAME;
 const MISSING_RELATION_ERROR_CODE = "42P01";
 
 function isMissingRelationError(error: unknown) {
@@ -34,8 +35,22 @@ function isMissingRelationError(error: unknown) {
   );
 }
 
+function cleanEnvValue(value: string | undefined) {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
 function isDevBypassEnabled() {
-  return process.env.NODE_ENV === "development" && process.env.DEV_BYPASS_AUTH !== "false";
+  const bypassEnabled = process.env.DEV_BYPASS_AUTH !== "false";
+  const allowInProduction = process.env.DASHBOARD_LOCAL_AUTH === "true";
+  return bypassEnabled && (process.env.NODE_ENV === "development" || allowInProduction);
 }
 
 function normalizeTenantSlug(value: string) {
@@ -45,7 +60,7 @@ function normalizeTenantSlug(value: string) {
 function tenantLookupNameFromSlug(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return "";
-  return normalizeTenantSlug(trimmed) === TEST_ORG_SLUG ? TEST_ORG_NAME : trimmed;
+  return normalizeTenantSlug(trimmed) === TEST_ORG_SLUG ? LOCAL_TENANT_NAME : trimmed;
 }
 
 async function refreshAccessToken(token: ExtendedJWT) {
@@ -205,36 +220,36 @@ const result = NextAuth(async (req) => {
           orgSlug: { label: "Organization Slug", type: "text" },
         },
         async authorize(credentials) {
-          const requestedOrgSlug = typeof credentials?.orgSlug === "string"
-            ? normalizeTenantSlug(credentials.orgSlug)
+          const requestedOrgInput = typeof credentials?.orgSlug === "string"
+            ? credentials.orgSlug
             : "";
+          const tenantLookupName = requestedOrgInput ? tenantLookupNameFromSlug(requestedOrgInput) : "";
 
-          if (requestedOrgSlug === TEST_ORG_SLUG) {
-            const [tenant] = await db
-              .select()
-              .from(tenants)
-              .where(eq(tenants.name, TEST_ORG_NAME))
-              .limit(1);
-            
-            if (!tenant) return null;
+          if (!tenantLookupName) return null;
 
-            const [user] = await db
-              .select()
-              .from(humanUsers)
-              .where(eq(humanUsers.tenantId, tenant.id))
-              .limit(1);
-            
-            if (!user) return null;
+          const [tenant] = await db
+            .select()
+            .from(tenants)
+            .where(eq(tenants.name, tenantLookupName))
+            .limit(1);
+          
+          if (!tenant) return null;
 
-            return {
-              id: user.externalId,
-              tenantId: tenant.id,
-              role: user.role,
-              name: "Test User",
-              email: "test@example.com",
-            } as ExtendedUser;
-          }
-          return null;
+          const [user] = await db
+            .select()
+            .from(humanUsers)
+            .where(eq(humanUsers.tenantId, tenant.id))
+            .limit(1);
+          
+          if (!user) return null;
+
+          return {
+            id: user.externalId,
+            tenantId: tenant.id,
+            role: user.role,
+            name: "Local User",
+            email: "local@example.com",
+          } as ExtendedUser;
         },
       })
     );
