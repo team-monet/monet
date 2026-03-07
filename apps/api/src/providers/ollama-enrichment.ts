@@ -26,25 +26,42 @@ export class OllamaEnrichmentProvider implements EnrichmentProvider {
   }
 
   async computeEmbedding(content: string): Promise<number[]> {
-    const response = await fetch(`${this.baseUrl}/api/embeddings`, {
+    let response = await fetch(`${this.baseUrl}/api/embed`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         model: this.embeddingModel,
-        prompt: content,
+        input: content,
+        dimensions: EMBEDDING_DIMENSIONS,
       }),
     });
+
+    // Fallback for older Ollama versions that only expose /api/embeddings.
+    if (response.status === 404) {
+      response = await fetch(`${this.baseUrl}/api/embeddings`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: this.embeddingModel,
+          prompt: content,
+        }),
+      });
+    }
 
     if (!response.ok) {
       throw new Error(`Ollama embedding request failed: ${response.status}`);
     }
 
-    const body = await response.json() as { embedding?: number[] };
-    if (!Array.isArray(body.embedding) || body.embedding.length !== EMBEDDING_DIMENSIONS) {
-      throw new Error("Ollama embedding response was not a 1536-dimensional vector");
+    const body = await response.json() as { embeddings?: number[][]; embedding?: number[] };
+    const embedding = Array.isArray(body.embeddings?.[0]) ? body.embeddings[0] : body.embedding;
+    if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIMENSIONS) {
+      throw new Error(
+        `Ollama embedding response was not a ${EMBEDDING_DIMENSIONS}-dimensional vector` +
+          (Array.isArray(embedding) ? ` (got ${embedding.length})` : ""),
+      );
     }
 
-    return body.embedding;
+    return embedding;
   }
 
   async extractTags(content: string): Promise<string[]> {

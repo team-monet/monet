@@ -35,11 +35,13 @@ pnpm install
 cp .env.local-dev.example .env.local-dev
 ```
 
-3. Start API stack (Postgres + migrations + API):
+3. Start API stack (Postgres + Ollama + migrations + API):
 
 ```bash
 pnpm local:up
 ```
+
+First startup may take several minutes while Ollama models are pulled.
 
 4. Bootstrap local tenant/admin/agent credentials:
 
@@ -128,7 +130,8 @@ Optional:
 Provider-specific:
 
 - Anthropic: `ENRICHMENT_API_KEY`, `EMBEDDING_API_KEY`, `ANTHROPIC_MODEL`, `EMBEDDING_MODEL`.
-- Ollama: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `OLLAMA_EMBEDDING_MODEL`.
+- Ollama: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `OLLAMA_EMBEDDING_MODEL`, `OLLAMA_MODELS_DIR`.
+  - Monet expects 1536-dimensional embeddings and requests that size from Ollama.
 
 ## API Startup
 
@@ -181,6 +184,20 @@ Response includes tenant metadata, initial admin agent, and one-time API key.
 Set `ENRICHMENT_PROVIDER=anthropic` or `ENRICHMENT_PROVIDER=ollama`, configure provider vars, then restart API.
 
 Pending enrichment jobs are recovered on startup.
+
+For local Ollama in the compose stack, keep:
+
+```bash
+OLLAMA_BASE_URL=http://ollama:11434
+OLLAMA_EMBEDDING_MODEL=qwen3-embedding:4b
+OLLAMA_MODELS_DIR=${HOME}/.ollama
+```
+
+For host-installed Ollama instead of compose service:
+
+```bash
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+```
 
 ## Backup and Restore
 
@@ -243,6 +260,46 @@ Rotation:
 1. Register replacement key via `POST /api/agents/register`.
 2. Update clients.
 3. Revoke old key via `agents.revoked_at`.
+
+## Agent Enrollment
+
+Register a new agent in an existing tenant:
+
+```bash
+curl -sS -X POST "$API_BASE_URL/api/agents/register" \
+  -H "Authorization: Bearer $EXISTING_AGENT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "externalId": "my-new-agent",
+    "isAutonomous": true,
+    "groupId": "00000000-0000-0000-0000-000000000000"
+  }'
+```
+
+Response includes:
+
+- `agent` metadata (`id`, `externalId`, `isAutonomous`, `createdAt`)
+- one-time `apiKey` for the new agent
+
+For platform bootstrap flows (no tenant agent key yet), use the platform secret and tenant header:
+
+```bash
+curl -sS -X POST "$API_BASE_URL/api/agents/register" \
+  -H "Authorization: Bearer $PLATFORM_ADMIN_SECRET" \
+  -H "X-Tenant-Id: $TENANT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "externalId": "bootstrap-agent",
+    "isAutonomous": true
+  }'
+```
+
+Verify a newly issued key:
+
+```bash
+curl -sS "$API_BASE_URL/api/agents/me" \
+  -H "Authorization: Bearer $NEW_AGENT_API_KEY"
+```
 
 ## MCP Connection (Local)
 

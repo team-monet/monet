@@ -120,7 +120,7 @@ cmd_status() {
 cmd_logs() {
   require_env_file
   load_env_file
-  compose --profile dashboard logs --tail 200 postgres migrate api dashboard
+  compose --profile dashboard logs --tail 200 postgres ollama ollama-model-pull migrate api dashboard
 }
 
 cmd_reset() {
@@ -147,15 +147,15 @@ usage() {
 Usage: ./scripts/local-env.sh <command>
 
 Commands:
-  up         Start postgres + api and wait for /health/ready
-  up-dashboard Start postgres + migrate + api + dashboard profile
+  up         Start postgres + ollama + api and wait for /health/ready
+  up-dashboard Start postgres + ollama + api + dashboard profile
   migrate    Run platform migrations via the migrate service
   bootstrap  Provision/reuse tenant context and create a local MCP agent API key
   init       up + bootstrap (long-lived local setup)
   init-dashboard up-dashboard + bootstrap (also starts dashboard profile)
   down       Stop stack without deleting database volume
   status     Show container status for the local project
-  logs       Tail postgres + api logs
+  logs       Tail postgres + ollama + api logs
   metrics    Generate local usage metrics snapshot
   mcp-smoke  Run MCP connection smoke test (requires MCP_API_KEY env var)
   reset      Destructive reset (removes containers + DB volume + local bootstrap output)
