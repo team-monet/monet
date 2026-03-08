@@ -15,6 +15,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 interface ExtendedUser extends User {
   role?: string;
   tenantId?: string;
+  scope?: "tenant" | "platform";
 }
 
 export const metadata = {
@@ -29,6 +30,7 @@ export default async function RootLayout({
 }) {
   const session = await auth();
   const user = session?.user as ExtendedUser | undefined;
+  const isTenantSession = user?.scope !== "platform";
 
   return (
     <html lang="en" suppressHydrationWarning>
@@ -44,7 +46,7 @@ export default async function RootLayout({
           `}
         </Script>
         <TooltipProvider>
-          {session ? (
+          {session && isTenantSession ? (
             <SidebarProvider>
               <AppSidebar user={user} />
               <SidebarInset>

@@ -95,6 +95,30 @@ export const platformSetupSessions = pgTable("platform_setup_sessions", {
     .defaultNow(),
 });
 
+export const platformOauthConfigs = pgTable("platform_oauth_configs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  provider: varchar("provider", { length: 50 }).notNull().default("oidc"),
+  issuer: varchar("issuer", { length: 255 }).notNull(),
+  clientId: varchar("client_id", { length: 255 }).notNull(),
+  clientSecretEncrypted: varchar("client_secret_encrypted", {
+    length: 1024,
+  }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const platformAdmins = pgTable("platform_admins", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  email: varchar("email", { length: 255 }).notNull().unique(),
+  externalId: varchar("external_id", { length: 255 }),
+  displayName: varchar("display_name", { length: 255 }),
+  lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 export const agents = pgTable("agents", {
   id: uuid("id").primaryKey().defaultRandom(),
   externalId: varchar("external_id", { length: 255 }).notNull(),

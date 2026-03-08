@@ -4,8 +4,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { getBootstrapStatus, getSetupSessionToken } from "@/lib/bootstrap";
-import { exchangeBootstrapTokenAction } from "./actions";
+import {
+  getBootstrapStatus,
+  getPlatformSetupState,
+} from "@/lib/bootstrap";
+import {
+  exchangeBootstrapTokenAction,
+  savePlatformSetupAction,
+} from "./actions";
 
 type SetupPageProps = {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
@@ -21,7 +27,7 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
   const errorParam = params.error;
   const error =
     typeof errorParam === "string" ? decodeURIComponent(errorParam) : "";
-  const setupSessionToken = await getSetupSessionToken();
+  const setupState = await getPlatformSetupState();
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-muted/40 p-4">
@@ -43,16 +49,7 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
             </Alert>
           ) : null}
 
-          {setupSessionToken ? (
-            <Alert>
-              <AlertTitle>Bootstrap session ready</AlertTitle>
-              <AlertDescription>
-                The one-time bootstrap token has been exchanged successfully.
-                Platform OIDC and first admin setup land next on top of this
-                session.
-              </AlertDescription>
-            </Alert>
-          ) : (
+          {!setupState.hasSetupSession ? (
             <form action={exchangeBootstrapTokenAction} className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="bootstrap-token">Bootstrap token</Label>
@@ -68,6 +65,76 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
 
               <Button type="submit" className="w-full">
                 Start setup
+              </Button>
+            </form>
+          ) : setupState.platformAuthConfigured ? (
+            <div className="space-y-4">
+              <Alert>
+                <AlertTitle>Platform OIDC configured</AlertTitle>
+                <AlertDescription>
+                  Continue with platform sign-in to bind the first platform admin.
+                </AlertDescription>
+              </Alert>
+
+              <Button asChild className="w-full">
+                <a href="/platform/login">Continue to platform login</a>
+              </Button>
+            </div>
+          ) : (
+            <form action={savePlatformSetupAction} className="space-y-4">
+              <Alert>
+                <AlertTitle>Bootstrap session ready</AlertTitle>
+                <AlertDescription>
+                  Configure the platform OIDC provider and seed the first
+                  platform-admin email.
+                </AlertDescription>
+              </Alert>
+
+              <div className="space-y-2">
+                <Label htmlFor="platform-issuer">OIDC issuer</Label>
+                <Input
+                  id="platform-issuer"
+                  name="issuer"
+                  type="url"
+                  placeholder="https://keycloak.local/realms/monet"
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="platform-client-id">Client ID</Label>
+                <Input
+                  id="platform-client-id"
+                  name="clientId"
+                  type="text"
+                  placeholder="monet-platform"
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="platform-client-secret">Client secret</Label>
+                <Input
+                  id="platform-client-secret"
+                  name="clientSecret"
+                  type="password"
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="platform-admin-email">Platform admin email</Label>
+                <Input
+                  id="platform-admin-email"
+                  name="adminEmail"
+                  type="email"
+                  placeholder="admin@example.com"
+                  required
+                />
+              </div>
+
+              <Button type="submit" className="w-full">
+                Save platform setup
               </Button>
             </form>
           )}
