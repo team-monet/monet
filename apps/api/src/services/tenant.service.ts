@@ -1,6 +1,7 @@
 import postgres from "postgres";
 import type { Database } from "@monet/db";
 import { createTenantSchema, tenantOauthConfigs } from "@monet/db";
+import { slugifyTenantName } from "@monet/types";
 import { generateApiKey, hashApiKey } from "./api-key.service.js";
 import { encrypt } from "../lib/crypto.js";
 
@@ -8,6 +9,7 @@ export interface ProvisionTenantResult {
   tenant: {
     id: string;
     name: string;
+    slug: string;
     isolationMode: string;
     createdAt: Date;
   };
@@ -56,12 +58,13 @@ export async function configureTenantOauth(
 export async function provisionTenant(
   db: Database,
   sql: postgres.Sql,
-  input: { name: string; isolationMode?: "logical" | "physical" },
+  input: { name: string; slug?: string; isolationMode?: "logical" | "physical" },
 ): Promise<ProvisionTenantResult> {
-  const rawApiKey = generateApiKey(`admin@${input.name}`);
+  const tenantSlug = input.slug?.trim() || slugifyTenantName(input.name);
+  const adminExternalId = `admin@${tenantSlug}`;
+  const rawApiKey = generateApiKey(adminExternalId);
   const { hash, salt } = hashApiKey(rawApiKey);
   const isolationMode = input.isolationMode ?? "logical";
-  const adminExternalId = `admin@${input.name}`;
 
   // Use a transaction for atomicity of tenant + agent creation
   const result = await sql.begin(async (txSql) => {
@@ -70,9 +73,9 @@ export async function provisionTenant(
 
     // Insert tenant
     const [tenant] = await tx`
-      INSERT INTO tenants (name, isolation_mode)
-      VALUES (${input.name}, ${isolationMode})
-      RETURNING id, name, isolation_mode, created_at
+      INSERT INTO tenants (name, slug, isolation_mode)
+      VALUES (${input.name}, ${tenantSlug}, ${isolationMode})
+      RETURNING id, name, slug, isolation_mode, created_at
     `;
 
     // Create the tenant schema with all DDL
@@ -89,6 +92,7 @@ export async function provisionTenant(
       tenant: {
         id: tenant.id as string,
         name: tenant.name as string,
+        slug: tenant.slug as string,
         isolationMode: tenant.isolation_mode as string,
         createdAt: tenant.created_at as Date,
       },

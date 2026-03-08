@@ -8,6 +8,15 @@ import type { AppEnv } from "../middleware/context.js";
 
 export const tenantsRouter = new Hono<AppEnv>();
 
+function isUniqueViolation(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: string }).code === "23505"
+  );
+}
+
 function parseTenantOauthInput(body: unknown):
   | { data: { issuer: string; clientId: string; clientSecret: string } }
   | { error: string } {
@@ -89,12 +98,9 @@ tenantsRouter.post("/", async (c) => {
       201,
     );
   } catch (err: unknown) {
-    if (
-      err instanceof Error &&
-      err.message.includes("unique constraint")
-    ) {
+    if (isUniqueViolation(err)) {
       return c.json(
-        { error: "conflict", message: "Tenant name already exists" },
+        { error: "conflict", message: "Tenant name or slug already exists" },
         409,
       );
     }

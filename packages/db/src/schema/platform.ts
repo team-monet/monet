@@ -22,6 +22,7 @@ export const userRoleEnum = pgEnum("user_role", [
 export const tenants = pgTable("tenants", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: varchar("name", { length: 255 }).notNull().unique(),
+  slug: varchar("slug", { length: 63 }).notNull().unique(),
   isolationMode: isolationModeEnum("isolation_mode")
     .notNull()
     .default("logical"),

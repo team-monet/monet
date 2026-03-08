@@ -16,6 +16,10 @@ function getClient() {
   return client;
 }
 
+export function getSqlClient() {
+  return getClient().sql;
+}
+
 export const db = new Proxy({} as ReturnType<typeof createClient>["db"], {
   get(_target, prop) {
     const dbClient = getClient().db;

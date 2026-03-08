@@ -9,6 +9,7 @@ import {
   tenantOauthConfigs,
   tenants,
 } from "@monet/db";
+import { normalizeTenantSlug } from "@monet/types";
 import { redirect } from "next/navigation";
 import { db } from "./db";
 import { decrypt } from "./crypto";
@@ -35,10 +36,6 @@ interface ExtendedJWT {
   error?: string;
 }
 
-const TEST_ORG_SLUG = "test-org";
-const TEST_ORG_NAME = "Test Org";
-const LOCAL_TENANT_NAME =
-  cleanEnvValue(process.env.LOCAL_TENANT_NAME) || TEST_ORG_NAME;
 const MISSING_RELATION_ERROR_CODE = "42P01";
 
 function isMissingRelationError(error: unknown) {
@@ -48,30 +45,6 @@ function isMissingRelationError(error: unknown) {
     "code" in error &&
     (error as { code?: string }).code === MISSING_RELATION_ERROR_CODE
   );
-}
-
-function cleanEnvValue(value: string | undefined) {
-  if (!value) return "";
-  const trimmed = value.trim();
-  if (
-    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1).trim();
-  }
-  return trimmed;
-}
-
-function normalizeTenantSlug(value: string) {
-  return value.trim().toLowerCase();
-}
-
-function tenantLookupNameFromSlug(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  return normalizeTenantSlug(trimmed) === TEST_ORG_SLUG
-    ? LOCAL_TENANT_NAME
-    : trimmed;
 }
 
 function normalizeEmail(value: string | null | undefined) {
@@ -310,16 +283,16 @@ const result = NextAuth(async (req) => {
         async authorize(credentials) {
           const requestedOrgInput =
             typeof credentials?.orgSlug === "string" ? credentials.orgSlug : "";
-          const tenantLookupName = requestedOrgInput
-            ? tenantLookupNameFromSlug(requestedOrgInput)
+          const requestedSlug = requestedOrgInput
+            ? normalizeTenantSlug(requestedOrgInput)
             : "";
 
-          if (!tenantLookupName) return null;
+          if (!requestedSlug) return null;
 
           const [tenant] = await db
             .select()
             .from(tenants)
-            .where(eq(tenants.name, tenantLookupName))
+            .where(eq(tenants.slug, requestedSlug))
             .limit(1);
           if (!tenant) return null;
 
@@ -383,13 +356,13 @@ const result = NextAuth(async (req) => {
   const tenantSlug =
     req?.nextUrl.searchParams.get("tenant") ||
     req?.cookies.get("tenant-slug")?.value;
-  const tenantLookupName = tenantSlug ? tenantLookupNameFromSlug(tenantSlug) : "";
+  const normalizedTenantSlug = tenantSlug ? normalizeTenantSlug(tenantSlug) : "";
 
-  if (tenantLookupName) {
+  if (normalizedTenantSlug) {
     const [tenant] = await db
       .select()
       .from(tenants)
-      .where(eq(tenants.name, tenantLookupName))
+      .where(eq(tenants.slug, normalizedTenantSlug))
       .limit(1);
 
     if (tenant) {

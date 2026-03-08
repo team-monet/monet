@@ -28,6 +28,7 @@ describe("auth flow integration", () => {
     const { res, body } = await provisionTestTenant(app, "test-org", ADMIN_SECRET);
     expect(res.status).toBe(201);
     expect(body.tenant).toBeDefined();
+    expect(body.tenant.slug).toBe("test-org");
     expect(body.apiKey).toBeDefined();
 
     const apiKey = body.apiKey as string;
@@ -41,6 +42,28 @@ describe("auth flow integration", () => {
     const meBody = await meRes.json();
     expect(meBody.externalId).toBe("admin@test-org");
     expect(meBody.tenantId).toBeDefined();
+  });
+
+  it("accepts a custom tenant slug and uses it for the bootstrap admin", async () => {
+    const res = await app.request("/api/tenants", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ADMIN_SECRET}`,
+      },
+      body: JSON.stringify({ name: "Acme Corporation", slug: "acme" }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.tenant.slug).toBe("acme");
+
+    const meRes = await app.request("/api/agents/me", {
+      headers: { Authorization: `Bearer ${body.apiKey}` },
+    });
+    expect(meRes.status).toBe(200);
+    const meBody = await meRes.json();
+    expect(meBody.externalId).toBe("admin@acme");
   });
 
   it("registers a second agent using the first agent's key", async () => {

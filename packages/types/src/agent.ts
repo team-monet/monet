@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TenantSlug } from "./auth.js";
 
 export const RegisterAgentInput = z.object({
   agentId: z.string().min(1, "Agent identifier is required"),
@@ -35,6 +36,7 @@ export type CreateGroupInput = z.infer<typeof CreateGroupInput>;
 export const Tenant = z.object({
   id: z.string().uuid(),
   name: z.string(),
+  slug: TenantSlug,
   isolationMode: z.enum(["logical", "physical"]),
   createdAt: z.coerce.date(),
 });

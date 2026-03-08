@@ -2,6 +2,7 @@
 
 import { db } from "@/lib/db";
 import { tenants, tenantOauthConfigs } from "@monet/db";
+import { normalizeTenantSlug } from "@monet/types";
 import { eq } from "drizzle-orm";
 
 type LoginValidationSuccess = {
@@ -18,9 +19,7 @@ type LoginValidationError = {
 type LoginValidationResult = LoginValidationSuccess | LoginValidationError;
 
 const TEST_ORG_SLUG = "test-org";
-const TEST_ORG_NAME = "Test Org";
 const MISSING_RELATION_ERROR_CODE = "42P01";
-const LOCAL_TENANT_NAME = cleanEnvValue(process.env.LOCAL_TENANT_NAME) || TEST_ORG_NAME;
 
 function isMissingRelationError(error: unknown) {
   return (
@@ -31,18 +30,6 @@ function isMissingRelationError(error: unknown) {
   );
 }
 
-function cleanEnvValue(value: string | undefined) {
-  if (!value) return "";
-  const trimmed = value.trim();
-  if (
-    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1).trim();
-  }
-  return trimmed;
-}
-
 function isDevBypassEnabled() {
   const bypassEnabled = process.env.DEV_BYPASS_AUTH !== "false";
   const allowInProduction = process.env.DASHBOARD_LOCAL_AUTH === "true";
@@ -51,12 +38,18 @@ function isDevBypassEnabled() {
 
 export async function validateTenantAction(slug: string): Promise<LoginValidationResult> {
   const trimmedSlug = slug.trim();
-  const normalizedSlug = trimmedSlug.toLowerCase();
+  const normalizedSlug = normalizeTenantSlug(trimmedSlug);
   const isTestOrg = normalizedSlug === TEST_ORG_SLUG;
   const devBypassEnabled = isDevBypassEnabled();
 
   if (!trimmedSlug) {
     return { error: "Please enter your organization slug" };
+  }
+
+  if (!normalizedSlug) {
+    return {
+      error: "Organization slugs may only use lowercase letters, numbers, and hyphens",
+    };
   }
 
   if (isTestOrg && devBypassEnabled) {
@@ -68,13 +61,10 @@ export async function validateTenantAction(slug: string): Promise<LoginValidatio
     };
   }
 
-  // test-org maps to local tenant in development/local auth mode.
-  const searchTerm = isTestOrg ? LOCAL_TENANT_NAME : trimmedSlug;
-
   const [tenant] = await db
     .select({ id: tenants.id })
     .from(tenants)
-    .where(eq(tenants.name, searchTerm))
+    .where(eq(tenants.slug, normalizedSlug))
     .limit(1);
 
   if (!tenant) {
@@ -117,6 +107,6 @@ export async function validateTenantAction(slug: string): Promise<LoginValidatio
   return {
     success: true,
     provider: "tenant-oauth",
-    cookieTenantSlug: isTestOrg ? TEST_ORG_SLUG : trimmedSlug,
+    cookieTenantSlug: normalizedSlug,
   };
 }

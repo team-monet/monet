@@ -71,6 +71,13 @@
       "when": 1777863600000,
       "tag": "0009_add_platform_auth",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1772952764636,
+      "tag": "0010_brave_jack_power",
+      "breakpoints": true
     }
   ]
 }

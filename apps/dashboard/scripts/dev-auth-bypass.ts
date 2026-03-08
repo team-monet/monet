@@ -10,7 +10,7 @@ export async function getDevBypassUser() {
   const [tenant] = await db
     .select()
     .from(tenants)
-    .where(eq(tenants.name, "Test Org"))
+    .where(eq(tenants.slug, "test-org"))
     .limit(1);
 
   if (!tenant) {

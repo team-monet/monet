@@ -79,6 +79,7 @@ async function seed() {
   console.log("Creating test tenant...");
   const [tenant] = await db.insert(tenants).values({
     name: "Test Org",
+    slug: "test-org",
     isolationMode: "logical",
   }).returning();
 
