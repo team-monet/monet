@@ -5,6 +5,7 @@ import { createClient } from "@monet/db";
 import { createApp } from "./app.js";
 import { createMcpHandler } from "./mcp/handler.js";
 import { sessionStore } from "./mcp/session-store.js";
+import { ensureBootstrapToken } from "./services/bootstrap.service.js";
 import {
   getActiveEnrichmentCount,
   getQueuedEnrichmentCount,
@@ -32,6 +33,7 @@ const auditPurgeSql = auditPurgeDatabaseUrl
   ? postgres(auditPurgeDatabaseUrl)
   : sql;
 const hasDedicatedAuditPurgeClient = Boolean(auditPurgeDatabaseUrl);
+const bootstrapToken = await ensureBootstrapToken(db);
 const app = createApp(db, sql, sessionStore);
 const mcpHandler = createMcpHandler({ db, sql, sessionStore });
 const honoRequestListener = getRequestListener(app.fetch);
@@ -39,6 +41,11 @@ const honoRequestListener = getRequestListener(app.fetch);
 const port = parseInt(process.env.API_PORT || "3001", 10);
 
 console.log(`Starting Monet API on port ${port}`);
+if (bootstrapToken) {
+  console.log(
+    `Platform bootstrap token (expires ${bootstrapToken.expiresAt.toISOString()}): ${bootstrapToken.rawToken}`,
+  );
+}
 
 let activeHttpRequests = 0;
 

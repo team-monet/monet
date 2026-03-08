@@ -17,14 +17,49 @@ async function ensurePlatformSchemaReady() {
   if (!schemaReadyPromise) {
     schemaReadyPromise = (async () => {
       const s = getTestSql();
-      const [{ tenantsTable }] = await s<{ tenantsTable: string | null }[]>`
-        SELECT to_regclass('public.tenants') AS "tenantsTable"
+      const [{ tenantsTable, platformInstallationsTable }] = await s<{
+        tenantsTable: string | null;
+        platformInstallationsTable: string | null;
+      }[]>`
+        SELECT
+          to_regclass('public.tenants') AS "tenantsTable",
+          to_regclass('public.platform_installations') AS "platformInstallationsTable"
       `;
 
       // CI can prepare platform tables via `drizzle-kit push`, which creates
       // schema objects without migration history rows. Running migrator on top
       // of that state would replay 0000 and fail on already-existing tables.
-      if (tenantsTable) {
+      if (tenantsTable && platformInstallationsTable) {
+        return;
+      }
+
+      // Older prepared schemas may have the original platform tables but not
+      // newer additive migrations. Apply the bootstrap tables idempotently so
+      // integration tests can run without replaying the full migration history.
+      if (tenantsTable && !platformInstallationsTable) {
+        await s.unsafe(`
+          CREATE TABLE IF NOT EXISTS "platform_installations" (
+            "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+            "initialized_at" timestamp with time zone,
+            "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+            "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS "platform_bootstrap_tokens" (
+            "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+            "token_hash" varchar(255) NOT NULL,
+            "token_salt" varchar(255) NOT NULL,
+            "expires_at" timestamp with time zone NOT NULL,
+            "used_at" timestamp with time zone,
+            "created_at" timestamp with time zone DEFAULT now() NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS "platform_setup_sessions" (
+            "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+            "token_hash" varchar(255) NOT NULL,
+            "token_salt" varchar(255) NOT NULL,
+            "expires_at" timestamp with time zone NOT NULL,
+            "created_at" timestamp with time zone DEFAULT now() NOT NULL
+          );
+        `);
         return;
       }
 
@@ -99,7 +134,16 @@ export async function cleanupTestData() {
 
   await s.unsafe(`
     DO $$ BEGIN
-      TRUNCATE TABLE agent_group_members, agent_groups, agents, human_users, tenants CASCADE;
+      TRUNCATE TABLE
+        platform_setup_sessions,
+        platform_bootstrap_tokens,
+        platform_installations,
+        agent_group_members,
+        agent_groups,
+        agents,
+        human_users,
+        tenants
+      CASCADE;
     EXCEPTION WHEN undefined_table THEN NULL;
     END $$
   `);

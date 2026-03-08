@@ -57,6 +57,13 @@
       "when": 1772802000000,
       "tag": "0007_create_tenant_oauth_configs",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1777863000000,
+      "tag": "0008_add_platform_bootstrap",
+      "breakpoints": true
     }
   ]
 }

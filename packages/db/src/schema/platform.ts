@@ -63,6 +63,38 @@ export const tenantOauthConfigs = pgTable("tenant_oauth_configs", {
     .defaultNow(),
 });
 
+export const platformInstallations = pgTable("platform_installations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  initializedAt: timestamp("initialized_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const platformBootstrapTokens = pgTable("platform_bootstrap_tokens", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tokenHash: varchar("token_hash", { length: 255 }).notNull(),
+  tokenSalt: varchar("token_salt", { length: 255 }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  usedAt: timestamp("used_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const platformSetupSessions = pgTable("platform_setup_sessions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tokenHash: varchar("token_hash", { length: 255 }).notNull(),
+  tokenSalt: varchar("token_salt", { length: 255 }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 export const agents = pgTable("agents", {
   id: uuid("id").primaryKey().defaultRandom(),
   externalId: varchar("external_id", { length: 255 }).notNull(),
