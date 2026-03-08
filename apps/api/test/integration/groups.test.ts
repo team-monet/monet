@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, afterAll, beforeEach } from "vitest";
 import {
   getTestApp,
   getTestSql,
@@ -7,20 +7,14 @@ import {
   closeTestDb,
 } from "./helpers/setup.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
-
 describe("groups integration", () => {
   const app = getTestApp();
   let adminKey: string;
   let tenantId: string;
 
-  beforeAll(() => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
-  });
-
   beforeEach(async () => {
     await cleanupTestData();
-    const { body } = await provisionTestTenant(app, "group-test", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "group-test" });
     adminKey = body.apiKey as string;
     tenantId = (body.tenant as { id: string }).id;
   });

@@ -2,11 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${ROOT_DIR}/docker-compose.prod.yml"
+COMPOSE_FILE="${ROOT_DIR}/docker-compose.local.yml"
 ENV_FILE="${MONET_LOCAL_ENV_FILE:-${ROOT_DIR}/.env.local-dev}"
 PROJECT_NAME_DEFAULT="monet"
 PROJECT_NAME="${PROJECT_NAME_DEFAULT}"
-LOCAL_BOOTSTRAP_OUTPUT="${ROOT_DIR}/.local-dev/bootstrap.json"
 
 compose() {
   docker compose \
@@ -41,6 +40,11 @@ api_base_url() {
   printf "http://127.0.0.1:%s" "${api_port}"
 }
 
+keycloak_base_url() {
+  local keycloak_port="${KEYCLOAK_PORT:-3400}"
+  printf "%s" "${KEYCLOAK_BASE_URL:-http://keycloak.localhost:${keycloak_port}}"
+}
+
 wait_for_ready() {
   local url="$1"
   local timeout_seconds="${2:-120}"
@@ -65,21 +69,15 @@ wait_for_ready() {
 cmd_up() {
   require_env_file
   load_env_file
-  compose up -d
+  compose --profile dashboard up -d --build
   wait_for_ready "$(api_base_url)/health/ready" 120
+  wait_for_ready "$(keycloak_base_url)" 180
+  wait_for_ready "$(dashboard_base_url)/login" 180
 }
 
 dashboard_base_url() {
   local dashboard_port="${DASHBOARD_PORT:-3310}"
   printf "http://127.0.0.1:%s" "${dashboard_port}"
-}
-
-cmd_up_dashboard() {
-  require_env_file
-  load_env_file
-  compose --profile dashboard up -d
-  wait_for_ready "$(api_base_url)/health/ready" 120
-  wait_for_ready "$(dashboard_base_url)/login" 180
 }
 
 cmd_migrate() {
@@ -88,21 +86,10 @@ cmd_migrate() {
   compose run --rm migrate
 }
 
-cmd_bootstrap() {
+cmd_build() {
   require_env_file
   load_env_file
-  LOCAL_BOOTSTRAP_OUTPUT="${LOCAL_BOOTSTRAP_OUTPUT:-${ROOT_DIR}/.local-dev/bootstrap.json}" \
-    pnpm --filter @monet/api exec node scripts/local-bootstrap.mjs
-}
-
-cmd_init() {
-  cmd_up
-  cmd_bootstrap
-}
-
-cmd_init_dashboard() {
-  cmd_up_dashboard
-  cmd_bootstrap
+  compose --profile dashboard build
 }
 
 cmd_down() {
@@ -120,14 +107,29 @@ cmd_status() {
 cmd_logs() {
   require_env_file
   load_env_file
-  compose --profile dashboard logs --tail 200 postgres ollama ollama-model-pull migrate api dashboard
+  compose --profile dashboard logs --tail 200 postgres ollama ollama-model-pull migrate api keycloak dashboard
 }
 
 cmd_reset() {
   require_env_file
   load_env_file
   compose --profile dashboard down --volumes --remove-orphans
-  rm -f "${LOCAL_BOOTSTRAP_OUTPUT}"
+}
+
+remove_volume_if_exists() {
+  local volume_name="$1"
+  if docker volume inspect "${volume_name}" >/dev/null 2>&1; then
+    docker volume rm "${volume_name}" >/dev/null
+  fi
+}
+
+cmd_db_reset() {
+  require_env_file
+  load_env_file
+  compose --profile dashboard down --remove-orphans
+  remove_volume_if_exists "${PROJECT_NAME}_postgres_prod_data"
+  echo "Removed Postgres volume: ${PROJECT_NAME}_postgres_prod_data"
+  echo "Run pnpm local:up to recreate the database and rerun migrations."
 }
 
 cmd_metrics() {
@@ -142,23 +144,28 @@ cmd_mcp_smoke() {
   pnpm --filter @monet/api exec node scripts/mcp-local-smoke.mjs
 }
 
+cmd_keycloak_setup() {
+  require_env_file
+  load_env_file
+  node "${ROOT_DIR}/scripts/local-keycloak-setup.mjs"
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./scripts/local-env.sh <command>
 
 Commands:
-  up         Start postgres + ollama + api and wait for /health/ready
-  up-dashboard Start postgres + ollama + api + dashboard profile
+  up         Build images, start postgres + ollama + api + dashboard, and wait for readiness
+  build      Build local API and dashboard images
   migrate    Run platform migrations via the migrate service
-  bootstrap  Provision/reuse tenant context and create a local MCP agent API key
-  init       up + bootstrap (long-lived local setup)
-  init-dashboard up-dashboard + bootstrap (also starts dashboard profile)
   down       Stop stack without deleting database volume
   status     Show container status for the local project
   logs       Tail postgres + ollama + api logs
   metrics    Generate local usage metrics snapshot
   mcp-smoke  Run MCP connection smoke test (requires MCP_API_KEY env var)
-  reset      Destructive reset (removes containers + DB volume + local bootstrap output)
+  keycloak-setup Bootstrap local Keycloak realms, clients, and sample users
+  db-reset   Remove the local Postgres volume and force a fresh database
+  reset      Destructive reset (removes containers, Postgres data, and Keycloak data)
 EOF
 }
 
@@ -169,16 +176,15 @@ fi
 
 case "$1" in
   up) cmd_up ;;
-  up-dashboard) cmd_up_dashboard ;;
+  build) cmd_build ;;
   migrate) cmd_migrate ;;
-  bootstrap) cmd_bootstrap ;;
-  init) cmd_init ;;
-  init-dashboard) cmd_init_dashboard ;;
   down) cmd_down ;;
   status) cmd_status ;;
   logs) cmd_logs ;;
   metrics) cmd_metrics ;;
   mcp-smoke) cmd_mcp_smoke ;;
+  keycloak-setup) cmd_keycloak_setup ;;
+  db-reset) cmd_db_reset ;;
   reset) cmd_reset ;;
   *)
     usage

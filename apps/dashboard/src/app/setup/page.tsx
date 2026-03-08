@@ -96,7 +96,7 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
                   id="platform-issuer"
                   name="issuer"
                   type="url"
-                  placeholder="https://keycloak.local/realms/monet"
+                  placeholder="http://keycloak.localhost:3400/realms/monet"
                   required
                 />
               </div>

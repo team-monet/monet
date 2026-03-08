@@ -136,7 +136,7 @@ export default async function PlatformTenantDetailPage({
                   name="issuer"
                   type="url"
                   defaultValue={oidcConfig?.issuer ?? ""}
-                  placeholder="https://keycloak.local/realms/acme"
+                  placeholder="http://keycloak.localhost:3400/realms/acme"
                   required
                 />
               </div>

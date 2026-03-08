@@ -43,7 +43,9 @@ async function main() {
         LIMIT 1
       `;
       if (!rows[0]?.id) {
-        throw new Error(`Tenant not found: ${tenantName}`);
+        throw new Error(
+          `Tenant not found: ${tenantName}. Set LOCAL_TENANT_ID or LOCAL_TENANT_NAME to target an existing tenant.`,
+        );
       }
       tenantId = rows[0].id;
     }

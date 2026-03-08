@@ -1,16 +1,8 @@
 import "./globals.css";
 import { auth } from "@/lib/auth";
 import { User } from "next-auth";
-import { AppSidebar } from "@/components/app-sidebar";
-import {
-  SidebarInset,
-  SidebarProvider,
-  SidebarTrigger,
-} from "@/components/ui/sidebar";
-import { Separator } from "@/components/ui/separator";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import Script from "next/script";
-import { ThemeToggle } from "@/components/theme-toggle";
+import { AppShell } from "@/components/app-shell";
 
 interface ExtendedUser extends User {
   role?: string;
@@ -30,7 +22,6 @@ export default async function RootLayout({
 }) {
   const session = await auth();
   const user = session?.user as ExtendedUser | undefined;
-  const isTenantSession = user?.scope !== "platform";
 
   return (
     <html lang="en" suppressHydrationWarning>
@@ -45,34 +36,9 @@ export default async function RootLayout({
             } catch (_) {}
           `}
         </Script>
-        <TooltipProvider>
-          {session && isTenantSession ? (
-            <SidebarProvider>
-              <AppSidebar user={user} />
-              <SidebarInset>
-                <header className="flex h-16 shrink-0 items-center gap-2 transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12 border-b">
-                  <div className="flex items-center gap-2 px-4">
-                    <SidebarTrigger className="-ml-1" />
-                    <Separator orientation="vertical" className="mr-2 h-4" />
-                  </div>
-                  <div className="ml-auto px-4">
-                    <ThemeToggle />
-                  </div>
-                </header>
-                <main className="flex flex-1 flex-col gap-4 p-4 pt-0">
-                  {children}
-                </main>
-              </SidebarInset>
-            </SidebarProvider>
-          ) : (
-            <div className="min-h-screen">
-              <div className="fixed right-4 top-4 z-50">
-                <ThemeToggle />
-              </div>
-              {children}
-            </div>
-          )}
-        </TooltipProvider>
+        <AppShell hasSession={Boolean(session)} user={user}>
+          {children}
+        </AppShell>
       </body>
     </html>
   );

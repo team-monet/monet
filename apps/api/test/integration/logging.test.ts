@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupTestData,
   closeTestDb,
@@ -6,19 +6,13 @@ import {
   provisionTestTenant,
 } from "./helpers/setup.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
-
 describe("logging integration", () => {
   const app = getTestApp();
   let apiKey: string;
 
-  beforeAll(() => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
-  });
-
   beforeEach(async () => {
     await cleanupTestData();
-    const { body } = await provisionTestTenant(app, "logging-test", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "logging-test" });
     apiKey = body.apiKey as string;
   });
 

@@ -14,6 +14,10 @@ import { redirect } from "next/navigation";
 import { db } from "./db";
 import { decrypt } from "./crypto";
 import { finalizePlatformInitialization } from "./bootstrap";
+import {
+  fetchOidcDiscoveryDocument,
+  resolveOidcIssuerForServer,
+} from "./oidc";
 import { upsertTenantUserFromLogin } from "./tenant-user-binding";
 
 interface ExtendedUser extends User {
@@ -91,11 +95,12 @@ async function refreshAccessToken(token: ExtendedJWT) {
       throw new Error("Missing config or refresh token");
     }
 
-    const discoveryRes = await fetch(
-      `${config.issuer}/.well-known/openid-configuration`,
-    );
-    const discovery = await discoveryRes.json();
+    const discovery = await fetchOidcDiscoveryDocument(config.issuer);
     const tokenEndpoint = discovery.token_endpoint;
+
+    if (!tokenEndpoint) {
+      throw new Error("OIDC discovery document is missing token_endpoint");
+    }
 
     const response = await fetch(tokenEndpoint, {
       method: "POST",
@@ -315,11 +320,12 @@ const result = NextAuth(async (req) => {
   }
 
   if (platformConfig) {
+    const platformIssuer = resolveOidcIssuerForServer(platformConfig.issuer);
     providers.push({
       id: "platform-oauth",
       name: "Monet Platform",
       type: "oidc" as const,
-      issuer: platformConfig.issuer,
+      issuer: platformIssuer,
       clientId: platformConfig.clientId,
       clientSecret: decrypt(platformConfig.clientSecretEncrypted),
       authorization: {
@@ -365,11 +371,12 @@ const result = NextAuth(async (req) => {
       }
 
       if (config) {
+        const tenantIssuer = resolveOidcIssuerForServer(config.issuer);
         providers.push({
           id: "tenant-oauth",
           name: tenant.name,
           type: "oidc" as const,
-          issuer: config.issuer,
+          issuer: tenantIssuer,
           clientId: config.clientId,
           clientSecret: decrypt(config.clientSecretEncrypted),
           authorization: {

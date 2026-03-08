@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, afterAll, beforeEach } from "vitest";
 import {
   getTestApp,
   getTestSql,
@@ -13,7 +13,6 @@ import {
 } from "../../src/services/enrichment.service.js";
 import type { EnrichmentProvider } from "../../src/providers/enrichment.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
 const EMBEDDING_DIMENSIONS = 1536;
 
 function embedding(fill: number) {
@@ -60,15 +59,11 @@ describe("memories integration", () => {
   let tenantId: string;
   let schemaName: string;
 
-  beforeAll(() => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
-  });
-
   beforeEach(async () => {
     resetEnrichmentStateForTests();
     await cleanupTestData();
     // Provision a fresh tenant for each test
-    const { body } = await provisionTestTenant(app, "mem-test", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "mem-test" });
     apiKey = body.apiKey as string;
     agentId = (body.agent as { id: string }).id;
     tenantId = (body.tenant as { id: string }).id;

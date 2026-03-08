@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, afterAll, beforeEach } from "vitest";
 import {
   getTestApp,
   provisionTestTenant,
@@ -6,14 +6,8 @@ import {
   closeTestDb,
 } from "./helpers/setup.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
-
 describe("auth flow integration", () => {
   const app = getTestApp();
-
-  beforeAll(() => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
-  });
 
   beforeEach(async () => {
     await cleanupTestData();
@@ -25,7 +19,7 @@ describe("auth flow integration", () => {
   });
 
   it("provisions a tenant and returns a working API key", async () => {
-    const { res, body } = await provisionTestTenant(app, "test-org", ADMIN_SECRET);
+    const { res, body } = await provisionTestTenant({ name: "test-org" });
     expect(res.status).toBe(201);
     expect(body.tenant).toBeDefined();
     expect(body.tenant.slug).toBe("test-org");
@@ -45,17 +39,11 @@ describe("auth flow integration", () => {
   });
 
   it("accepts a custom tenant slug and uses it for the bootstrap admin", async () => {
-    const res = await app.request("/api/tenants", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${ADMIN_SECRET}`,
-      },
-      body: JSON.stringify({ name: "Acme Corporation", slug: "acme" }),
+    const { res, body } = await provisionTestTenant({
+      name: "Acme Corporation",
+      slug: "acme",
     });
-
     expect(res.status).toBe(201);
-    const body = await res.json();
     expect(body.tenant.slug).toBe("acme");
 
     const meRes = await app.request("/api/agents/me", {
@@ -67,7 +55,7 @@ describe("auth flow integration", () => {
   });
 
   it("registers a second agent using the first agent's key", async () => {
-    const { body } = await provisionTestTenant(app, "test-org-2", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "test-org-2" });
     const firstKey = body.apiKey as string;
 
     // Register second agent
@@ -105,15 +93,16 @@ describe("auth flow integration", () => {
     expect(res.status).toBe(401);
   });
 
-  it("returns 403 for wrong admin secret on tenant creation", async () => {
+  it("does not expose the deprecated tenant provisioning route", async () => {
+    const { body } = await provisionTestTenant({ name: "tenant-with-auth" });
     const res = await app.request("/api/tenants", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: "Bearer wrong-secret",
+        Authorization: `Bearer ${body.apiKey as string}`,
       },
       body: JSON.stringify({ name: "bad-tenant" }),
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
   });
 });

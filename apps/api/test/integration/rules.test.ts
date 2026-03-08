@@ -14,8 +14,6 @@ import {
   provisionTestTenant,
 } from "./helpers/setup.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
-
 describe("Rules integration", () => {
   const db = getTestDb();
   const sql = getTestSql();
@@ -32,7 +30,6 @@ describe("Rules integration", () => {
 
   beforeAll(async () => {
     console.log("TEST_DB_URL:", process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/monet_test");
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
 
     server = createServer((req, res) => {
       if (req.url?.startsWith("/mcp")) {
@@ -53,7 +50,7 @@ describe("Rules integration", () => {
   beforeEach(async () => {
     await cleanupTestData();
 
-    const { body } = await provisionTestTenant(app, "rules-integration", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "rules-integration" });
     tenantId = (body.tenant as { id: string }).id;
     schemaName = `tenant_${tenantId.replace(/-/g, "_")}`;
     adminApiKey = body.apiKey as string;

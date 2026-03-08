@@ -9,6 +9,7 @@ import {
 } from "@monet/db";
 import { db } from "./db";
 import { encrypt } from "./crypto";
+import { resolveOidcIssuerForServer, validateOidcIssuer } from "./oidc";
 
 export const SETUP_SESSION_COOKIE_NAME = "monet_setup_session";
 
@@ -128,7 +129,7 @@ export async function savePlatformSetup(input: SavePlatformSetupInput) {
     throw new Error("Setup session expired. Exchange the bootstrap token again.");
   }
 
-  const issuer = input.issuer.trim();
+  const issuer = resolveOidcIssuerForServer(input.issuer);
   const clientId = input.clientId.trim();
   const clientSecret = input.clientSecret.trim();
   const adminEmail = normalizeEmail(input.adminEmail);
@@ -136,6 +137,8 @@ export async function savePlatformSetup(input: SavePlatformSetupInput) {
   if (!issuer || !clientId || !clientSecret || !adminEmail) {
     throw new Error("All platform OIDC fields are required.");
   }
+
+  await validateOidcIssuer(issuer);
 
   const encryptedSecret = encrypt(clientSecret);
   const [existingConfig] = await db

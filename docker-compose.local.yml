@@ -1,6 +1,5 @@
 x-monet-api-env: &monet_api_env
   DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-monet}
-  PLATFORM_ADMIN_SECRET: ${PLATFORM_ADMIN_SECRET:-monet-local-admin-secret}
   ENRICHMENT_PROVIDER: ${ENRICHMENT_PROVIDER:-ollama}
   ENRICHMENT_API_KEY: ${ENRICHMENT_API_KEY:-}
   EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
@@ -126,6 +125,27 @@ services:
         max-size: "10m"
         max-file: "10"
 
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    restart: unless-stopped
+    profiles: ["dashboard"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    command:
+      - start-dev
+      - --http-port=8080
+      - --hostname-strict=false
+    ports:
+      - "${KEYCLOAK_PORT:-3400}:8080"
+    volumes:
+      - keycloak_local_data:/opt/keycloak/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "10"
+
   dashboard:
     image: monet-dashboard:local
     build:
@@ -137,11 +157,14 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      keycloak:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-monet}
       INTERNAL_API_URL: http://api:${API_PORT:-3001}
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:${DASHBOARD_PORT:-3310}}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-monet-local-nextauth-secret}
+      LOCAL_OIDC_BASE_URL: ${LOCAL_OIDC_BASE_URL:-http://keycloak.localhost:3400}
       AUTH_TRUST_HOST: "true"
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
       DEV_BYPASS_AUTH: ${DEV_BYPASS_AUTH:-true}
@@ -159,6 +182,9 @@ services:
       options:
         max-size: "10m"
         max-file: "10"
+    extra_hosts:
+      - "keycloak.localhost:host-gateway"
 
 volumes:
   postgres_prod_data:
+  keycloak_local_data:

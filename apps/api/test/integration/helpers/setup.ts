@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import * as platformSchema from "@monet/db/schema";
 import { createApp } from "../../../src/app.js";
+import { provisionTenant } from "../../../src/services/tenant.service.js";
 import path from "node:path";
 
 const TEST_DB_URL =
@@ -295,21 +296,28 @@ export function getTestApp() {
 }
 
 export async function provisionTestTenant(
-  app: ReturnType<typeof createApp>,
-  name: string,
-  adminSecret: string,
+  input: {
+    name: string;
+    slug?: string;
+    isolationMode?: "logical" | "physical";
+  },
 ) {
   await ensurePlatformSchemaReady();
 
-  const res = await app.request("/api/tenants", {
-    method: "POST",
+  const result = await provisionTenant(getTestDb(), getTestSql(), input);
+  const body = {
+    tenant: result.tenant,
+    agent: result.agent,
+    apiKey: result.rawApiKey,
+  };
+  const res = new Response(JSON.stringify(body), {
+    status: 201,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${adminSecret}`,
     },
-    body: JSON.stringify({ name }),
   });
-  return { res, body: (await res.json()) as Record<string, unknown> };
+
+  return { res, body };
 }
 
 export async function cleanupTestData() {

@@ -12,8 +12,6 @@ import {
 } from "../../src/services/enrichment.service.js";
 import type { EnrichmentProvider } from "../../src/providers/enrichment.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
-
 function tenantSchemaName(tenantId: string): string {
   return `tenant_${tenantId.replace(/-/g, "_")}`;
 }
@@ -27,7 +25,6 @@ describe("threat model verification", () => {
   const sql = getTestSql();
 
   beforeAll(() => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
     process.env.ENRICHMENT_PROVIDER = "ollama";
   });
 
@@ -56,7 +53,7 @@ describe("threat model verification", () => {
     };
     setEnrichmentProviderForTests(failingProvider);
 
-    const { body } = await provisionTestTenant(app, "security-logs", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "security-logs" });
     const apiKey = body.apiKey as string;
     const sensitiveContent = "TOP_SECRET_VALUE_12345";
 
@@ -103,7 +100,7 @@ describe("threat model verification", () => {
   });
 
   it("audit_log does not grant UPDATE or DELETE to PUBLIC", async () => {
-    const { body } = await provisionTestTenant(app, "security-audit", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "security-audit" });
     const tenantId = (body.tenant as { id: string }).id;
     const schemaName = tenantSchemaName(tenantId);
     const auditTableName = `${schemaName}.audit_log`;
@@ -119,8 +116,8 @@ describe("threat model verification", () => {
   });
 
   it("authenticated tenant identity is not overridden by request headers", async () => {
-    const first = await provisionTestTenant(app, "security-tenant-a", ADMIN_SECRET);
-    const second = await provisionTestTenant(app, "security-tenant-b", ADMIN_SECRET);
+    const first = await provisionTestTenant({ name: "security-tenant-a" });
+    const second = await provisionTestTenant({ name: "security-tenant-b" });
 
     const firstApiKey = first.body.apiKey as string;
     const secondTenantId = (second.body.tenant as { id: string }).id;

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
   cleanupTestData,
   closeTestDb,
@@ -6,21 +6,15 @@ import {
   provisionTestTenant,
 } from "./helpers/setup.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
-
 describe("rate limit integration", () => {
   const app = getTestApp();
   let apiKey: string;
-
-  beforeAll(() => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
-  });
 
   beforeEach(async () => {
     await cleanupTestData();
     process.env.RATE_LIMIT_MAX = "100";
     process.env.RATE_LIMIT_WINDOW_MS = "60000";
-    const { body } = await provisionTestTenant(app, "rate-limit-test", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "rate-limit-test" });
     apiKey = body.apiKey as string;
   });
 

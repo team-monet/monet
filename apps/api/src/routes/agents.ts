@@ -1,9 +1,5 @@
 import { Hono, type Context } from "hono";
 import { RegisterAgentApiInput } from "@monet/types";
-import {
-  generateApiKey,
-  hashApiKey,
-} from "../services/api-key.service.js";
 import { addMember, resolveAgentRole, isTenantAdmin } from "../services/group.service.js";
 import {
   associateRuleSetWithAgent,
@@ -12,6 +8,7 @@ import {
 } from "../services/rule.service.js";
 import { pushRulesToAgent } from "../services/rule-notification.service.js";
 import type { AppEnv } from "../middleware/context.js";
+import { provisionAgentWithApiKey } from "../services/agent-provisioning.service.js";
 
 export const agentsRouter = new Hono<AppEnv>();
 
@@ -65,9 +62,6 @@ agentsRouter.post("/register", async (c) => {
     );
   }
 
-  const rawApiKey = generateApiKey(parsed.data.externalId);
-  const { hash, salt } = hashApiKey(rawApiKey);
-
   if (parsed.data.userId) {
     const [user] = await sql`
       SELECT id FROM human_users WHERE id = ${parsed.data.userId} AND tenant_id = ${agent.tenantId}
@@ -77,18 +71,20 @@ agentsRouter.post("/register", async (c) => {
     }
   }
 
-  const [newAgent] = await sql`
-    INSERT INTO agents (external_id, tenant_id, user_id, api_key_hash, api_key_salt, is_autonomous)
-    VALUES (${parsed.data.externalId}, ${agent.tenantId}, ${parsed.data.userId ?? null}, ${hash}, ${salt}, ${parsed.data.isAutonomous})
-    RETURNING id, external_id, user_id, is_autonomous, created_at
-  `;
+  const provisionedAgent = await provisionAgentWithApiKey(sql, {
+    externalId: parsed.data.externalId,
+    tenantId: agent.tenantId,
+    userId: parsed.data.userId ?? null,
+    isAutonomous: parsed.data.isAutonomous,
+  });
+  const { agent: newAgent, rawApiKey } = provisionedAgent;
 
   if (parsed.data.groupId) {
     const membershipResult = await addMember(
       sql,
       agent.tenantId,
       parsed.data.groupId,
-      newAgent.id as string,
+      newAgent.id,
     );
 
     if ("error" in membershipResult) {
@@ -104,10 +100,10 @@ agentsRouter.post("/register", async (c) => {
     {
       agent: {
         id: newAgent.id,
-        externalId: newAgent.external_id,
-        userId: newAgent.user_id,
-        isAutonomous: newAgent.is_autonomous,
-        createdAt: newAgent.created_at,
+        externalId: newAgent.externalId,
+        userId: newAgent.userId,
+        isAutonomous: newAgent.isAutonomous,
+        createdAt: newAgent.createdAt,
       },
       apiKey: rawApiKey,
     },

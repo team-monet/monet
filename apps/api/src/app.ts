@@ -3,7 +3,6 @@ import type { Database } from "@monet/db";
 import type postgres from "postgres";
 import { health } from "./routes/health.js";
 import { bootstrapRouter } from "./routes/bootstrap.js";
-import { tenantsRouter } from "./routes/tenants.js";
 import { agentsRouter } from "./routes/agents.js";
 import { memoriesRouter } from "./routes/memories.js";
 import { groupsRouter } from "./routes/groups.js";
@@ -37,9 +36,6 @@ export function createApp(
   // Health routes — unauthenticated
   app.route("/", health);
   app.route("/api/bootstrap", bootstrapRouter);
-
-  // Tenant provisioning — uses its own admin secret auth, not API key auth
-  app.route("/api/tenants", tenantsRouter);
 
   // Authenticated API sub-app with middleware chain: auth → tenant → rate-limit
   const authenticated = new Hono<AppEnv>();

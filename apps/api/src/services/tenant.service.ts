@@ -2,8 +2,8 @@ import postgres from "postgres";
 import type { Database } from "@monet/db";
 import { createTenantSchema, tenantOauthConfigs } from "@monet/db";
 import { slugifyTenantName } from "@monet/types";
-import { generateApiKey, hashApiKey } from "./api-key.service.js";
 import { encrypt } from "../lib/crypto.js";
+import { provisionAgentWithApiKey } from "./agent-provisioning.service.js";
 
 export interface ProvisionTenantResult {
   tenant: {
@@ -62,8 +62,6 @@ export async function provisionTenant(
 ): Promise<ProvisionTenantResult> {
   const tenantSlug = input.slug?.trim() || slugifyTenantName(input.name);
   const adminExternalId = `admin@${tenantSlug}`;
-  const rawApiKey = generateApiKey(adminExternalId);
-  const { hash, salt } = hashApiKey(rawApiKey);
   const isolationMode = input.isolationMode ?? "logical";
 
   // Use a transaction for atomicity of tenant + agent creation
@@ -82,11 +80,12 @@ export async function provisionTenant(
     await createTenantSchema(txSql, tenant.id);
 
     // Create the first admin agent with tenant_admin role
-    const [agent] = await tx`
-      INSERT INTO agents (external_id, tenant_id, api_key_hash, api_key_salt, is_autonomous, role)
-      VALUES (${adminExternalId}, ${tenant.id}, ${hash}, ${salt}, ${false}, ${"tenant_admin"})
-      RETURNING id, external_id
-    `;
+    const adminAgent = await provisionAgentWithApiKey(tx, {
+      externalId: adminExternalId,
+      tenantId: tenant.id as string,
+      isAutonomous: false,
+      role: "tenant_admin",
+    });
 
     return {
       tenant: {
@@ -97,15 +96,16 @@ export async function provisionTenant(
         createdAt: tenant.created_at as Date,
       },
       agent: {
-        id: agent.id as string,
-        externalId: agent.external_id as string,
+        id: adminAgent.agent.id,
+        externalId: adminAgent.agent.externalId,
       },
+      rawApiKey: adminAgent.rawApiKey,
     };
   });
 
   return {
     tenant: (result as { tenant: ProvisionTenantResult["tenant"] }).tenant,
     agent: (result as { agent: ProvisionTenantResult["agent"] }).agent,
-    rawApiKey,
+    rawApiKey: (result as { rawApiKey: string }).rawApiKey,
   };
 }

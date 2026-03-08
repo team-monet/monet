@@ -12,6 +12,7 @@ import { and, desc, eq, isNull } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
 import { encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
+import { resolveOidcIssuerForServer, validateOidcIssuer } from "./oidc";
 
 type PgError = {
   code?: string;
@@ -278,13 +279,15 @@ type SaveTenantOidcConfigInput = {
 
 export async function saveTenantOidcConfig(input: SaveTenantOidcConfigInput) {
   const tenantId = input.tenantId.trim();
-  const issuer = input.issuer.trim();
+  const issuer = resolveOidcIssuerForServer(input.issuer);
   const clientId = input.clientId.trim();
   const clientSecret = input.clientSecret?.trim() || "";
 
   if (!tenantId || !issuer || !clientId) {
     throw new Error("Tenant, issuer, and client ID are required.");
   }
+
+  await validateOidcIssuer(issuer);
 
   const [tenant] = await db
     .select({ id: tenants.id })

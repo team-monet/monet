@@ -26,11 +26,15 @@ cp .env.local-dev.example .env.local-dev
 pnpm local:up
 ```
 
-4. Bootstrap tenant and local credentials:
+`pnpm local:up` rebuilds the local images before starting containers.
 
-```bash
-pnpm local:bootstrap
-```
+4. Complete the setup flow:
+
+- Open `http://127.0.0.1:3310/setup`
+- Retrieve the one-time bootstrap token from `pnpm local:logs`
+- Run `pnpm local:keycloak:setup`
+- Use the generated values in `.local-dev/keycloak.json` to configure platform OIDC against local Keycloak at `http://keycloak.localhost:3400`
+- Create the first tenant, configure tenant OIDC from the same file, and finish login through the dashboard
 
 ## Branch and PR Flow
 
@@ -84,20 +88,19 @@ pnpm db:migrate
 
 ## Local Verification for MCP + Dashboard
 
-1. Get API key from `.local-dev/bootstrap.json`.
-2. Validate MCP:
+1. For real dashboard verification, run the compose stack and complete `/setup`.
+2. For fast UI-only verification without OIDC, use:
+
+```bash
+pnpm --filter @monet/dashboard dev:seeded
+```
+
+3. Sign in with organization slug `test-org` when using seeded mode.
+4. Validate MCP only if you already have a tenant agent API key:
 
 ```bash
 MCP_API_KEY="<apiKey>" pnpm local:mcp:smoke
 ```
-
-3. Start dashboard if needed:
-
-```bash
-pnpm local:up:dashboard
-```
-
-4. Confirm dashboard login with organization `test-org`.
 
 ## CI Notes
 

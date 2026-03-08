@@ -22,7 +22,6 @@ import {
 } from "../../src/services/enrichment.service.js";
 import type { EnrichmentProvider } from "../../src/providers/enrichment.js";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
 const EMBEDDING_DIMENSIONS = 1536;
 
 function embedding(fill: number) {
@@ -64,7 +63,6 @@ describe("MCP integration", () => {
   let agentId: string;
 
   beforeAll(async () => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
     server = createServer((req, res) => {
       if (req.url?.startsWith("/mcp")) {
         void mcpHandler.handle(req, res);
@@ -86,7 +84,7 @@ describe("MCP integration", () => {
     setEnrichmentProviderForTests(provider());
     await cleanupTestData();
 
-    const { body } = await provisionTestTenant(app, "mcp-test", ADMIN_SECRET);
+    const { body } = await provisionTestTenant({ name: "mcp-test" });
     apiKey = body.apiKey as string;
     agentId = (body.agent as { id: string }).id;
 

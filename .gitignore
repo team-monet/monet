@@ -12,3 +12,4 @@ dist/
 apps/api/.local-dev/
 *.tsbuildinfo
 *.log
+.omc

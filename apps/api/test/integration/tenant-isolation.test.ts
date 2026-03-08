@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, afterAll, beforeEach } from "vitest";
 import {
   getTestApp,
   getTestSql,
@@ -8,14 +8,8 @@ import {
 } from "./helpers/setup.js";
 import { withTenantScope } from "@monet/db";
 
-const ADMIN_SECRET = "test-admin-secret-for-ci";
-
 describe("tenant isolation integration", () => {
   const app = getTestApp();
-
-  beforeAll(() => {
-    process.env.PLATFORM_ADMIN_SECRET = ADMIN_SECRET;
-  });
 
   beforeEach(async () => {
     await cleanupTestData();
@@ -28,12 +22,12 @@ describe("tenant isolation integration", () => {
 
   it("two tenants have separate schemas with no cross-access", async () => {
     // Provision tenant A
-    const { body: bodyA } = await provisionTestTenant(app, "tenant-a", ADMIN_SECRET);
+    const { body: bodyA } = await provisionTestTenant({ name: "tenant-a" });
     const keyA = bodyA.apiKey as string;
     const tenantA = bodyA.tenant as { id: string };
 
     // Provision tenant B
-    const { body: bodyB } = await provisionTestTenant(app, "tenant-b", ADMIN_SECRET);
+    const { body: bodyB } = await provisionTestTenant({ name: "tenant-b" });
     const keyB = bodyB.apiKey as string;
     const tenantB = bodyB.tenant as { id: string };
 
