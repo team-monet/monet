@@ -46,7 +46,9 @@ export const HumanUser = z.object({
   id: z.string().uuid(),
   externalId: z.string(),
   tenantId: z.string().uuid(),
+  email: z.string().email().nullable().optional(),
   role: z.enum(["user", "group_admin", "tenant_admin"]),
+  lastLoginAt: z.coerce.date().nullable().optional(),
   createdAt: z.coerce.date(),
 });
 export type HumanUser = z.infer<typeof HumanUser>;

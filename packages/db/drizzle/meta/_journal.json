@@ -78,6 +78,13 @@
       "when": 1772952764636,
       "tag": "0010_brave_jack_power",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1772954918227,
+      "tag": "0011_fixed_stick",
+      "breakpoints": true
     }
   ]
 }

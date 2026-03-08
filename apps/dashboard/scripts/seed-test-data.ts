@@ -92,6 +92,7 @@ async function seed() {
   const [user] = await db.insert(humanUsers).values({
     externalId: "test-user-id",
     tenantId: tenantId,
+    email: "test@example.com",
     role: "tenant_admin",
   }).returning();
 

@@ -1,8 +1,14 @@
 import type postgres from "postgres";
-import { createTenantSchema, tenantOauthConfigs, tenants } from "@monet/db";
+import {
+  createTenantSchema,
+  humanUsers,
+  tenantAdminNominations,
+  tenantOauthConfigs,
+  tenants,
+} from "@monet/db";
 import type { CreateTenantInput } from "@monet/types";
 import { slugifyTenantName } from "@monet/types";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
 import { encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
@@ -28,6 +34,15 @@ export type PlatformTenantOidcConfig = {
   issuer: string;
   clientId: string;
   createdAt: Date;
+};
+
+export type PlatformTenantAdminNomination = {
+  id: string;
+  email: string;
+  claimedAt: Date | null;
+  createdAt: Date;
+  claimedByHumanUserId: string | null;
+  claimedByExternalId: string | null;
 };
 
 export type CreatePlatformTenantResult = {
@@ -135,6 +150,28 @@ export async function getPlatformTenant(tenantId: string) {
     return null;
   }
 
+  const adminNominations = await db
+    .select({
+      id: tenantAdminNominations.id,
+      email: tenantAdminNominations.email,
+      claimedAt: tenantAdminNominations.claimedAt,
+      createdAt: tenantAdminNominations.createdAt,
+      claimedByHumanUserId: tenantAdminNominations.claimedByHumanUserId,
+      claimedByExternalId: humanUsers.externalId,
+    })
+    .from(tenantAdminNominations)
+    .leftJoin(
+      humanUsers,
+      eq(humanUsers.id, tenantAdminNominations.claimedByHumanUserId),
+    )
+    .where(
+      and(
+        eq(tenantAdminNominations.tenantId, tenantId),
+        isNull(tenantAdminNominations.revokedAt),
+      ),
+    )
+    .orderBy(desc(tenantAdminNominations.createdAt));
+
   return {
     tenant: {
       id: row.id,
@@ -152,6 +189,14 @@ export async function getPlatformTenant(tenantId: string) {
           createdAt: row.oidcCreatedAt!,
         }
       : null,
+    adminNominations: adminNominations.map((nomination) => ({
+      id: nomination.id,
+      email: nomination.email,
+      claimedAt: nomination.claimedAt,
+      createdAt: nomination.createdAt,
+      claimedByHumanUserId: nomination.claimedByHumanUserId,
+      claimedByExternalId: nomination.claimedByExternalId,
+    })),
   };
 }
 
@@ -294,4 +339,68 @@ export async function saveTenantOidcConfig(input: SaveTenantOidcConfigInput) {
     });
 
   return config satisfies PlatformTenantOidcConfig;
+}
+
+type SaveTenantAdminNominationInput = {
+  tenantId: string;
+  email: string;
+  createdByPlatformAdminId: string;
+};
+
+function normalizeEmail(value: string) {
+  return value.trim().toLowerCase();
+}
+
+export async function saveTenantAdminNomination(
+  input: SaveTenantAdminNominationInput,
+) {
+  const tenantId = input.tenantId.trim();
+  const email = normalizeEmail(input.email);
+  const createdByPlatformAdminId = input.createdByPlatformAdminId.trim();
+
+  if (!tenantId || !email || !createdByPlatformAdminId) {
+    throw new Error("Tenant and admin email are required.");
+  }
+
+  if (!email.includes("@")) {
+    throw new Error("A valid admin email is required.");
+  }
+
+  const [tenant] = await db
+    .select({ id: tenants.id })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+
+  if (!tenant) {
+    throw new Error("Tenant not found.");
+  }
+
+  const [nomination] = await db
+    .insert(tenantAdminNominations)
+    .values({
+      tenantId,
+      email,
+      createdByPlatformAdminId,
+      revokedAt: null,
+    })
+    .onConflictDoUpdate({
+      target: [
+        tenantAdminNominations.tenantId,
+        tenantAdminNominations.email,
+      ],
+      set: {
+        createdByPlatformAdminId,
+        revokedAt: null,
+      },
+    })
+    .returning({
+      id: tenantAdminNominations.id,
+      email: tenantAdminNominations.email,
+      claimedAt: tenantAdminNominations.claimedAt,
+      createdAt: tenantAdminNominations.createdAt,
+      claimedByHumanUserId: tenantAdminNominations.claimedByHumanUserId,
+    });
+
+  return nomination;
 }

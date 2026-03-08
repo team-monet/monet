@@ -13,172 +13,246 @@ let sql: ReturnType<typeof postgres>;
 let db: ReturnType<typeof drizzle>;
 let schemaReadyPromise: Promise<void> | null = null;
 
+async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
+  await s.unsafe(`
+    CREATE TABLE IF NOT EXISTS "platform_installations" (
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+      "initialized_at" timestamp with time zone,
+      "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+      "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS "platform_bootstrap_tokens" (
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+      "token_hash" varchar(255) NOT NULL,
+      "token_salt" varchar(255) NOT NULL,
+      "expires_at" timestamp with time zone NOT NULL,
+      "used_at" timestamp with time zone,
+      "created_at" timestamp with time zone DEFAULT now() NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS "platform_setup_sessions" (
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+      "token_hash" varchar(255) NOT NULL,
+      "token_salt" varchar(255) NOT NULL,
+      "expires_at" timestamp with time zone NOT NULL,
+      "created_at" timestamp with time zone DEFAULT now() NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS "platform_oauth_configs" (
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+      "provider" varchar(50) DEFAULT 'oidc' NOT NULL,
+      "issuer" varchar(255) NOT NULL,
+      "client_id" varchar(255) NOT NULL,
+      "client_secret_encrypted" varchar(1024) NOT NULL,
+      "created_at" timestamp with time zone DEFAULT now() NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS "platform_admins" (
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+      "email" varchar(255) NOT NULL,
+      "external_id" varchar(255),
+      "display_name" varchar(255),
+      "last_login_at" timestamp with time zone,
+      "created_at" timestamp with time zone DEFAULT now() NOT NULL
+    );
+
+    ALTER TABLE "tenants" ADD COLUMN IF NOT EXISTS "slug" varchar(63);
+    WITH normalized AS (
+      SELECT
+        id,
+        COALESCE(
+          NULLIF(
+            LEFT(
+              REGEXP_REPLACE(
+                TRIM(BOTH '-' FROM REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g')),
+                '-{2,}',
+                '-',
+                'g'
+              ),
+              63
+            ),
+            ''
+          ),
+          'tenant'
+        ) AS base_slug,
+        created_at
+      FROM "tenants"
+    ),
+    ranked AS (
+      SELECT
+        id,
+        base_slug,
+        ROW_NUMBER() OVER (PARTITION BY base_slug ORDER BY created_at, id) AS slug_rank
+      FROM normalized
+    )
+    UPDATE "tenants" AS tenants
+    SET "slug" = CASE
+      WHEN ranked.slug_rank = 1 THEN ranked.base_slug
+      ELSE LEFT(ranked.base_slug, 54) || '-' || SUBSTRING(tenants.id::text, 1, 8)
+    END
+    FROM ranked
+    WHERE tenants.id = ranked.id
+      AND tenants.slug IS NULL;
+
+    ALTER TABLE "tenants" ALTER COLUMN "slug" SET NOT NULL;
+    ALTER TABLE "human_users" ADD COLUMN IF NOT EXISTS "email" varchar(255);
+    ALTER TABLE "human_users" ADD COLUMN IF NOT EXISTS "last_login_at" timestamp with time zone;
+
+    CREATE TABLE IF NOT EXISTS "tenant_admin_nominations" (
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+      "tenant_id" uuid NOT NULL,
+      "email" varchar(255) NOT NULL,
+      "claimed_by_human_user_id" uuid,
+      "created_by_platform_admin_id" uuid NOT NULL,
+      "claimed_at" timestamp with time zone,
+      "revoked_at" timestamp with time zone,
+      "created_at" timestamp with time zone DEFAULT now() NOT NULL
+    );
+  `);
+
+  await s.unsafe(`
+    DO $do$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'platform_admins_email_unique'
+      ) THEN
+        ALTER TABLE "platform_admins"
+        ADD CONSTRAINT "platform_admins_email_unique" UNIQUE("email");
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'tenants_slug_unique'
+      ) THEN
+        ALTER TABLE "tenants"
+        ADD CONSTRAINT "tenants_slug_unique" UNIQUE("slug");
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'human_users_tenant_id_external_id_unique'
+      ) THEN
+        ALTER TABLE "human_users"
+        ADD CONSTRAINT "human_users_tenant_id_external_id_unique"
+        UNIQUE("tenant_id", "external_id");
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'tenant_admin_nominations_tenant_fk'
+      ) THEN
+        ALTER TABLE "tenant_admin_nominations"
+        ADD CONSTRAINT "tenant_admin_nominations_tenant_fk"
+        FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'tenant_admin_nominations_claimed_user_fk'
+      ) THEN
+        ALTER TABLE "tenant_admin_nominations"
+        ADD CONSTRAINT "tenant_admin_nominations_claimed_user_fk"
+        FOREIGN KEY ("claimed_by_human_user_id") REFERENCES "public"."human_users"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'tenant_admin_nominations_created_admin_fk'
+      ) THEN
+        ALTER TABLE "tenant_admin_nominations"
+        ADD CONSTRAINT "tenant_admin_nominations_created_admin_fk"
+        FOREIGN KEY ("created_by_platform_admin_id") REFERENCES "public"."platform_admins"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'tenant_admin_nominations_tenant_id_email_unique'
+      ) THEN
+        ALTER TABLE "tenant_admin_nominations"
+        ADD CONSTRAINT "tenant_admin_nominations_tenant_id_email_unique"
+        UNIQUE("tenant_id", "email");
+      END IF;
+    END
+    $do$;
+  `);
+}
+
 async function ensurePlatformSchemaReady() {
   if (!schemaReadyPromise) {
     schemaReadyPromise = (async () => {
       const s = getTestSql();
-      const [{ tenantsTable, platformInstallationsTable, tenantSlugColumn }] = await s<{
+      const [
+        {
+          tenantsTable,
+          platformInstallationsTable,
+          tenantSlugColumn,
+          platformAdminsTable,
+          humanUsersEmailColumn,
+          humanUsersLastLoginColumn,
+          tenantAdminNominationsTable,
+        },
+      ] = await s<{
         tenantsTable: string | null;
         platformInstallationsTable: string | null;
         tenantSlugColumn: string | null;
+        platformAdminsTable: string | null;
+        humanUsersEmailColumn: string | null;
+        humanUsersLastLoginColumn: string | null;
+        tenantAdminNominationsTable: string | null;
       }[]>`
         SELECT
           to_regclass('public.tenants') AS "tenantsTable",
           to_regclass('public.platform_installations') AS "platformInstallationsTable",
+          to_regclass('public.platform_admins') AS "platformAdminsTable",
+          to_regclass('public.tenant_admin_nominations') AS "tenantAdminNominationsTable",
           (
             SELECT column_name
             FROM information_schema.columns
             WHERE table_schema = 'public'
               AND table_name = 'tenants'
               AND column_name = 'slug'
-          ) AS "tenantSlugColumn"
+          ) AS "tenantSlugColumn",
+          (
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'human_users'
+              AND column_name = 'email'
+          ) AS "humanUsersEmailColumn",
+          (
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'human_users'
+              AND column_name = 'last_login_at'
+          ) AS "humanUsersLastLoginColumn"
       `;
 
       // CI can prepare platform tables via `drizzle-kit push`, which creates
       // schema objects without migration history rows. Running migrator on top
       // of that state would replay 0000 and fail on already-existing tables.
-      if (tenantsTable && platformInstallationsTable && tenantSlugColumn) {
+      if (
+        tenantsTable &&
+        platformInstallationsTable &&
+        tenantSlugColumn &&
+        platformAdminsTable &&
+        humanUsersEmailColumn &&
+        humanUsersLastLoginColumn &&
+        tenantAdminNominationsTable
+      ) {
         return;
       }
 
-      // Older prepared schemas may have the original platform tables but not
-      // newer additive migrations. Apply the bootstrap tables idempotently so
-      // integration tests can run without replaying the full migration history.
-      if (tenantsTable && !platformInstallationsTable) {
-        await s.unsafe(`
-          CREATE TABLE IF NOT EXISTS "platform_installations" (
-            "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-            "initialized_at" timestamp with time zone,
-            "created_at" timestamp with time zone DEFAULT now() NOT NULL,
-            "updated_at" timestamp with time zone DEFAULT now() NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS "platform_bootstrap_tokens" (
-            "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-            "token_hash" varchar(255) NOT NULL,
-            "token_salt" varchar(255) NOT NULL,
-            "expires_at" timestamp with time zone NOT NULL,
-            "used_at" timestamp with time zone,
-            "created_at" timestamp with time zone DEFAULT now() NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS "platform_setup_sessions" (
-            "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-            "token_hash" varchar(255) NOT NULL,
-            "token_salt" varchar(255) NOT NULL,
-            "expires_at" timestamp with time zone NOT NULL,
-            "created_at" timestamp with time zone DEFAULT now() NOT NULL
-          );
-
-          ALTER TABLE "tenants" ADD COLUMN IF NOT EXISTS "slug" varchar(63);
-          WITH normalized AS (
-            SELECT
-              id,
-              COALESCE(
-                NULLIF(
-                  LEFT(
-                    REGEXP_REPLACE(
-                      TRIM(BOTH '-' FROM REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g')),
-                      '-{2,}',
-                      '-',
-                      'g'
-                    ),
-                    63
-                  ),
-                  ''
-                ),
-                'tenant'
-              ) AS base_slug,
-              created_at
-            FROM "tenants"
-          ),
-          ranked AS (
-            SELECT
-              id,
-              base_slug,
-              ROW_NUMBER() OVER (PARTITION BY base_slug ORDER BY created_at, id) AS slug_rank
-            FROM normalized
-          )
-          UPDATE "tenants" AS tenants
-          SET "slug" = CASE
-            WHEN ranked.slug_rank = 1 THEN ranked.base_slug
-            ELSE LEFT(ranked.base_slug, 54) || '-' || SUBSTRING(tenants.id::text, 1, 8)
-          END
-          FROM ranked
-          WHERE tenants.id = ranked.id
-            AND tenants.slug IS NULL;
-
-          ALTER TABLE "tenants" ALTER COLUMN "slug" SET NOT NULL;
-
-          DO $do$
-          BEGIN
-            IF NOT EXISTS (
-              SELECT 1
-              FROM pg_constraint
-              WHERE conname = 'tenants_slug_unique'
-            ) THEN
-              ALTER TABLE "tenants"
-              ADD CONSTRAINT "tenants_slug_unique" UNIQUE("slug");
-            END IF;
-          END
-          $do$;
-        `);
-        return;
-      }
-
-      if (tenantsTable && platformInstallationsTable && !tenantSlugColumn) {
-        await s.unsafe(`
-          ALTER TABLE "tenants" ADD COLUMN IF NOT EXISTS "slug" varchar(63);
-          WITH normalized AS (
-            SELECT
-              id,
-              COALESCE(
-                NULLIF(
-                  LEFT(
-                    REGEXP_REPLACE(
-                      TRIM(BOTH '-' FROM REGEXP_REPLACE(LOWER(name), '[^a-z0-9]+', '-', 'g')),
-                      '-{2,}',
-                      '-',
-                      'g'
-                    ),
-                    63
-                  ),
-                  ''
-                ),
-                'tenant'
-              ) AS base_slug,
-              created_at
-            FROM "tenants"
-          ),
-          ranked AS (
-            SELECT
-              id,
-              base_slug,
-              ROW_NUMBER() OVER (PARTITION BY base_slug ORDER BY created_at, id) AS slug_rank
-            FROM normalized
-          )
-          UPDATE "tenants" AS tenants
-          SET "slug" = CASE
-            WHEN ranked.slug_rank = 1 THEN ranked.base_slug
-            ELSE LEFT(ranked.base_slug, 54) || '-' || SUBSTRING(tenants.id::text, 1, 8)
-          END
-          FROM ranked
-          WHERE tenants.id = ranked.id
-            AND tenants.slug IS NULL;
-
-          ALTER TABLE "tenants" ALTER COLUMN "slug" SET NOT NULL;
-
-          DO $do$
-          BEGIN
-            IF NOT EXISTS (
-              SELECT 1
-              FROM pg_constraint
-              WHERE conname = 'tenants_slug_unique'
-            ) THEN
-              ALTER TABLE "tenants"
-              ADD CONSTRAINT "tenants_slug_unique" UNIQUE("slug");
-            END IF;
-          END
-          $do$;
-        `);
+      // Older prepared schemas may have some or all platform tables already
+      // pushed without migration rows. Apply all additive upgrades idempotently
+      // so integration tests can use the current platform schema state.
+      if (tenantsTable) {
+        await applyPreparedSchemaUpgrades(s);
         return;
       }
 
@@ -254,6 +328,9 @@ export async function cleanupTestData() {
   await s.unsafe(`
     DO $$ BEGIN
       TRUNCATE TABLE
+        tenant_admin_nominations,
+        platform_oauth_configs,
+        platform_admins,
         platform_setup_sessions,
         platform_bootstrap_tokens,
         platform_installations,

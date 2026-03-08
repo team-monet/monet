@@ -1,7 +1,7 @@
 import NextAuth from "next-auth";
 import type { NextAuthConfig, User, Profile } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
-import { and, desc, eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import {
   humanUsers,
   platformAdmins,
@@ -13,8 +13,8 @@ import { normalizeTenantSlug } from "@monet/types";
 import { redirect } from "next/navigation";
 import { db } from "./db";
 import { decrypt } from "./crypto";
-import { ensureDashboardAgent } from "./dashboard-agent";
 import { finalizePlatformInitialization } from "./bootstrap";
+import { upsertTenantUserFromLogin } from "./tenant-user-binding";
 
 interface ExtendedUser extends User {
   role?: string;
@@ -195,27 +195,12 @@ export const authConfig: NextAuthConfig = {
           throw new Error("No tenant ID found in user profile");
         }
 
-        let [dbUser] = await db
-          .select()
-          .from(humanUsers)
-          .where(
-            and(eq(humanUsers.externalId, user.id!), eq(humanUsers.tenantId, tenantId)),
-          )
-          .limit(1);
-
-        if (!dbUser) {
-          const [newUser] = await db
-            .insert(humanUsers)
-            .values({
-              externalId: user.id!,
-              tenantId,
-              role: "user",
-            })
-            .returning();
-          dbUser = newUser;
-        }
-
-        await ensureDashboardAgent(dbUser.id, dbUser.externalId, dbUser.tenantId);
+        const dbUser = await upsertTenantUserFromLogin({
+          tenantId,
+          externalId: user.id!,
+          email: user.email,
+          emailVerified: extendedUser.emailVerified === true,
+        });
 
         return {
           id: dbUser.id,
@@ -395,6 +380,7 @@ const result = NextAuth(async (req) => {
               id: profile.sub || (profile as any).id, // eslint-disable-line @typescript-eslint/no-explicit-any
               name: profile.name,
               email: profile.email,
+              emailVerified: isProfileEmailVerified(profile),
               tenantId: tenant.id,
               scope: "tenant",
             } as ExtendedUser;

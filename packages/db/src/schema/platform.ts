@@ -6,6 +6,7 @@ import {
   timestamp,
   pgEnum,
   integer,
+  unique,
 } from "drizzle-orm/pg-core";
 
 export const isolationModeEnum = pgEnum("isolation_mode", [
@@ -31,20 +32,31 @@ export const tenants = pgTable("tenants", {
     .defaultNow(),
 });
 
-export const humanUsers = pgTable("human_users", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  externalId: varchar("external_id", { length: 255 }).notNull(),
-  tenantId: uuid("tenant_id")
-    .notNull()
-    .references(() => tenants.id),
-  role: userRoleEnum("role").notNull().default("user"),
-  dashboardApiKeyEncrypted: varchar("dashboard_api_key_encrypted", {
-    length: 1024,
+export const humanUsers = pgTable(
+  "human_users",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    externalId: varchar("external_id", { length: 255 }).notNull(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    email: varchar("email", { length: 255 }),
+    role: userRoleEnum("role").notNull().default("user"),
+    dashboardApiKeyEncrypted: varchar("dashboard_api_key_encrypted", {
+      length: 1024,
+    }),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => ({
+    tenantExternalIdUnique: unique("human_users_tenant_id_external_id_unique").on(
+      table.tenantId,
+      table.externalId,
+    ),
   }),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+);
 
 export const tenantOauthConfigs = pgTable("tenant_oauth_configs", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -119,6 +131,34 @@ export const platformAdmins = pgTable("platform_admins", {
     .notNull()
     .defaultNow(),
 });
+
+export const tenantAdminNominations = pgTable(
+  "tenant_admin_nominations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    email: varchar("email", { length: 255 }).notNull(),
+    claimedByHumanUserId: uuid("claimed_by_human_user_id").references(
+      () => humanUsers.id,
+    ),
+    createdByPlatformAdminId: uuid("created_by_platform_admin_id")
+      .notNull()
+      .references(() => platformAdmins.id),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => ({
+    tenantEmailUnique: unique("tenant_admin_nominations_tenant_id_email_unique").on(
+      table.tenantId,
+      table.email,
+    ),
+  }),
+);
 
 export const agents = pgTable("agents", {
   id: uuid("id").primaryKey().defaultRandom(),

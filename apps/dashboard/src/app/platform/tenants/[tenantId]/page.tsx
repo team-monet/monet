@@ -8,7 +8,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { saveTenantOidcConfigAction } from "../../actions";
+import {
+  saveTenantAdminNominationAction,
+  saveTenantOidcConfigAction,
+} from "../../actions";
 
 type PageProps = {
   params: Promise<{ tenantId: string }>;
@@ -35,8 +38,10 @@ export default async function PlatformTenantDetailPage({
   const query = searchParams ? await searchParams : {};
   const created = getSingleParam(query.created) === "1";
   const oidcSaved = getSingleParam(query.oidcSaved) === "1";
+  const nominationSaved = getSingleParam(query.nominationSaved) === "1";
   const configError = getSingleParam(query.configError);
-  const { tenant, oidcConfig } = tenantState;
+  const nominationError = getSingleParam(query.nominationError);
+  const { tenant, oidcConfig, adminNominations } = tenantState;
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col gap-6 p-4">
@@ -92,6 +97,23 @@ export default async function PlatformTenantDetailPage({
         <Alert variant="destructive">
           <AlertTitle>Could not save tenant OIDC</AlertTitle>
           <AlertDescription>{configError}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {nominationSaved ? (
+        <Alert>
+          <AlertTitle>Tenant admin nominated</AlertTitle>
+          <AlertDescription>
+            The nominated user will become a tenant admin on their first
+            verified OIDC login.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {nominationError ? (
+        <Alert variant="destructive">
+          <AlertTitle>Could not save tenant admin nomination</AlertTitle>
+          <AlertDescription>{nominationError}</AlertDescription>
         </Alert>
       ) : null}
 
@@ -192,6 +214,89 @@ export default async function PlatformTenantDetailPage({
               <div className="text-muted-foreground">OIDC status</div>
               <div>{oidcConfig ? "Configured" : "Pending configuration"}</div>
             </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <Card className="shadow-sm">
+          <CardHeader className="space-y-2">
+            <CardTitle>Tenant Admin Nomination</CardTitle>
+            <CardDescription>
+              Nominate the first tenant admin by verified email. The first
+              matching OIDC login with
+              {" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">email_verified=true</code>
+              {" "}
+              will bind that user as
+              {" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">tenant_admin</code>
+              .
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <form action={saveTenantAdminNominationAction} className="space-y-4">
+              <input type="hidden" name="tenantId" value={tenant.id} />
+
+              <div className="space-y-2">
+                <Label htmlFor="adminEmail">Tenant admin email</Label>
+                <Input
+                  id="adminEmail"
+                  name="email"
+                  type="email"
+                  placeholder="admin@acme.example"
+                  required
+                />
+              </div>
+
+              <Button type="submit">Save tenant admin nomination</Button>
+            </form>
+
+            <div className="space-y-3">
+              <div className="text-sm font-medium">Current nominations</div>
+              {adminNominations.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No tenant admin has been nominated yet.
+                </p>
+              ) : (
+                <div className="space-y-3">
+                  {adminNominations.map((nomination) => (
+                    <div
+                      key={nomination.id}
+                      className="rounded-lg border border-border bg-muted/30 p-3"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="font-medium">{nomination.email}</div>
+                        <Badge variant={nomination.claimedAt ? "default" : "secondary"}>
+                          {nomination.claimedAt ? "Claimed" : "Pending"}
+                        </Badge>
+                      </div>
+                      <div className="mt-2 text-xs text-muted-foreground">
+                        Nominated {new Date(nomination.createdAt).toLocaleString()}
+                        {nomination.claimedAt
+                          ? `, claimed ${new Date(nomination.claimedAt).toLocaleString()}${nomination.claimedByExternalId ? ` by ${nomination.claimedByExternalId}` : ""}`
+                          : ""}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="shadow-sm">
+          <CardHeader className="space-y-2">
+            <CardTitle>Binding Rules</CardTitle>
+            <CardDescription>
+              The login-time checks used for first tenant admin elevation.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm text-muted-foreground">
+            <p>Tenant login must come through the configured OIDC provider.</p>
+            <p>The profile must include an email that exactly matches the nomination.</p>
+            <p>The IdP must assert that the email is verified.</p>
+            <p>Once claimed, the nomination stays bound to that human user.</p>
           </CardContent>
         </Card>
       </div>

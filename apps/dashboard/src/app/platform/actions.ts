@@ -10,6 +10,7 @@ import {
 import { requirePlatformAdmin } from "@/lib/auth";
 import {
   createPlatformTenant,
+  saveTenantAdminNomination,
   saveTenantOidcConfig,
 } from "@/lib/platform-tenants";
 
@@ -100,4 +101,45 @@ export async function saveTenantOidcConfigAction(formData: FormData) {
   revalidatePath("/platform");
   revalidatePath(tenantDetailPath(tenantId));
   redirect(`${tenantDetailPath(tenantId)}?oidcSaved=1`);
+}
+
+export async function saveTenantAdminNominationAction(formData: FormData) {
+  const session = await requirePlatformAdmin();
+  const sessionUser = session.user as { id?: string };
+
+  const tenantId = toSingle(formData.get("tenantId"));
+  const email = toSingle(formData.get("email"));
+
+  if (!tenantId) {
+    redirect("/platform?nominationError=Tenant%20ID%20is%20required");
+  }
+
+  if (!email) {
+    redirect(
+      `${tenantDetailPath(tenantId)}?nominationError=${encodeURIComponent("Admin email is required.")}`,
+    );
+  }
+
+  if (!sessionUser.id) {
+    redirect(
+      `${tenantDetailPath(tenantId)}?nominationError=${encodeURIComponent("Platform admin session is invalid.")}`,
+    );
+  }
+
+  try {
+    await saveTenantAdminNomination({
+      tenantId,
+      email,
+      createdByPlatformAdminId: sessionUser.id,
+    });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to save tenant admin nomination";
+    redirect(
+      `${tenantDetailPath(tenantId)}?nominationError=${encodeURIComponent(message)}`,
+    );
+  }
+
+  revalidatePath(tenantDetailPath(tenantId));
+  redirect(`${tenantDetailPath(tenantId)}?nominationSaved=1`);
 }
