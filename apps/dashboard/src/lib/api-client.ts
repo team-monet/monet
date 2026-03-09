@@ -302,10 +302,10 @@ export async function getApiClient() {
     throw new Error("Tenant ID not found in session");
   }
 
-  // Keep dashboard agent credentials/role in sync with the linked human user.
+  // Keep dashboard agent credentials/role in sync with the linked user.
   await ensureDashboardAgent(sessionUser.id, sessionUser.id, sessionUser.tenantId);
 
-  // Fetch human user to get encrypted API key
+  // Fetch the user record to get the encrypted dashboard API key.
   const userRows = await db
     .select({ dashboardApiKeyEncrypted: humanUsers.dashboardApiKeyEncrypted })
     .from(humanUsers)

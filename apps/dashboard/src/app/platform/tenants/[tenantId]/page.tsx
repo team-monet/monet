@@ -296,7 +296,7 @@ export default async function PlatformTenantDetailPage({
             <p>Tenant login must come through the configured OIDC provider.</p>
             <p>The profile must include an email that exactly matches the nomination.</p>
             <p>The IdP must assert that the email is verified.</p>
-            <p>Once claimed, the nomination stays bound to that human user.</p>
+            <p>Once claimed, the nomination stays bound to that user.</p>
           </CardContent>
         </Card>
       </div>

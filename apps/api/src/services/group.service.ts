@@ -15,7 +15,7 @@ export async function resolveAgentRole(
   // Agent has a direct role (e.g., provisioning admin)
   if (agent.role) return agent.role;
 
-  // Fall back to linked human user's role
+  // Fall back to the linked user's role
   if (agent.userId) {
     const [user] = await sql`
       SELECT role FROM human_users WHERE id = ${agent.userId}

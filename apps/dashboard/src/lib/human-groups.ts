@@ -19,7 +19,7 @@ export type HumanGroupSummary = {
 
 export const DEFAULT_HUMAN_GROUP_NAME = "Everyone";
 export const DEFAULT_HUMAN_GROUP_DESCRIPTION =
-  "Default human-user group assigned automatically on first login.";
+  "Default user group assigned automatically on first login.";
 
 export async function listHumanGroupsForTenant(
   tenantId: string,
@@ -200,7 +200,7 @@ export async function ensureDefaultHumanGroupMembership(
     }
 
     if (!defaultGroup) {
-      throw new Error("Failed to resolve default human group");
+      throw new Error("Failed to resolve default user group");
     }
 
     await tx

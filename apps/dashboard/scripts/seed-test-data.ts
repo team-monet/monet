@@ -88,7 +88,7 @@ async function seed() {
   console.log(`Creating tenant schema: ${schemaName}`);
   await createTenantSchema(sql, tenantId);
 
-  console.log("Creating test human user...");
+  console.log("Creating test user...");
   const [user] = await db.insert(humanUsers).values({
     externalId: "test-user-id",
     tenantId: tenantId,

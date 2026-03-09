@@ -235,7 +235,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
               <Users className="h-4 w-4" />
               Members
             </CardTitle>
-            <CardDescription>Add or remove human users from this access group.</CardDescription>
+            <CardDescription>Add or remove users from this access group.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <form action={addHumanGroupMemberAction} className="flex flex-col gap-3 md:flex-row md:items-end">

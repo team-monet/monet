@@ -22,7 +22,7 @@ export async function ensureDashboardAgent(
 
   const user = userRows[0];
   if (!user) {
-    throw new Error("Human user not found for dashboard agent sync");
+    throw new Error("User not found for dashboard agent sync");
   }
 
   const dashboardExternalId = `dashboard:${userId}`;

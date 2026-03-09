@@ -15,6 +15,10 @@ It provides:
 - `packages/mcp-tools` - MCP tool definitions.
 - `packages/types` - shared types.
 
+## Documentation
+
+- [User and Agent Group Model](docs/user-and-agent-group-model.md)
+
 ## Prerequisites
 
 - Node.js 22+

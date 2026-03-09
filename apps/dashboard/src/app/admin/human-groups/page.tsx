@@ -59,7 +59,7 @@ export default async function HumanGroupsPage({ searchParams }: PageProps) {
         <div>
           <h1 className="text-3xl font-bold tracking-tight">User Groups</h1>
           <p className="text-muted-foreground mt-1">
-            Manage human-user memberships and control which agent groups they may use during registration.
+            Manage user memberships and control which agent groups they may use during registration.
           </p>
         </div>
 
@@ -74,7 +74,7 @@ export default async function HumanGroupsPage({ searchParams }: PageProps) {
             <DialogHeader>
               <DialogTitle>Create User Group</DialogTitle>
               <DialogDescription>
-                Group human users together to control access to agent groups.
+                Group users together to control access to agent groups.
               </DialogDescription>
             </DialogHeader>
             <form action={createHumanGroupAction} className="grid gap-4">

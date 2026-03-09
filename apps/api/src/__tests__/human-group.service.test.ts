@@ -5,7 +5,7 @@ const TENANT_ID = "00000000-0000-0000-0000-000000000010";
 const USER_ID = "00000000-0000-0000-0000-000000000099";
 const GROUP_ID = "00000000-0000-0000-0000-000000000088";
 
-describe("human group agent access", () => {
+describe("user group agent access", () => {
   it("returns false when the target agent group is outside the tenant", async () => {
     const sql = vi
       .fn()
