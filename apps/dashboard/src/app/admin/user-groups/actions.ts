@@ -21,8 +21,8 @@ function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function humanGroupDetailPath(humanGroupId: string) {
-  return `/admin/human-groups/${humanGroupId}`;
+function userGroupDetailPath(humanGroupId: string) {
+  return `/admin/user-groups/${humanGroupId}`;
 }
 
 async function requireAdminTenantId() {
@@ -54,7 +54,7 @@ export async function createHumanGroupAction(formData: FormData) {
   const description = toSingle(formData.get("description"));
 
   if (!name) {
-    redirect("/admin/human-groups?createError=User%20group%20name%20is%20required");
+    redirect("/admin/user-groups?createError=User%20group%20name%20is%20required");
   }
 
   try {
@@ -65,11 +65,11 @@ export async function createHumanGroupAction(formData: FormData) {
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to create user group";
-    redirect(`/admin/human-groups?createError=${encodeURIComponent(message)}`);
+    redirect(`/admin/user-groups?createError=${encodeURIComponent(message)}`);
   }
 
-  revalidatePath("/admin/human-groups");
-  redirect("/admin/human-groups?created=1");
+  revalidatePath("/admin/user-groups");
+  redirect("/admin/user-groups?created=1");
 }
 
 export async function updateHumanGroupAction(formData: FormData) {
@@ -78,8 +78,8 @@ export async function updateHumanGroupAction(formData: FormData) {
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
   const redirectPath = humanGroupId
-    ? humanGroupDetailPath(humanGroupId)
-    : "/admin/human-groups";
+    ? userGroupDetailPath(humanGroupId)
+    : "/admin/user-groups";
 
   if (!humanGroupId || !name) {
     redirect(`${redirectPath}?updateError=Group%20ID%20and%20name%20are%20required`);
@@ -100,7 +100,7 @@ export async function updateHumanGroupAction(formData: FormData) {
     redirect(`${redirectPath}?updateError=${encodeURIComponent(message)}`);
   }
 
-  revalidatePath("/admin/human-groups");
+  revalidatePath("/admin/user-groups");
   revalidatePath(redirectPath);
   redirect(`${redirectPath}?updated=1`);
 }
@@ -110,8 +110,8 @@ export async function addHumanGroupMemberAction(formData: FormData) {
   const humanGroupId = toSingle(formData.get("humanGroupId"));
   const userId = toSingle(formData.get("userId"));
   const redirectPath = humanGroupId
-    ? humanGroupDetailPath(humanGroupId)
-    : "/admin/human-groups";
+    ? userGroupDetailPath(humanGroupId)
+    : "/admin/user-groups";
 
   if (!humanGroupId || !userId) {
     redirect(`${redirectPath}?memberError=User%20group%20and%20user%20are%20required`);
@@ -136,7 +136,7 @@ export async function addHumanGroupMemberAction(formData: FormData) {
     .values({ humanGroupId, userId })
     .onConflictDoNothing();
 
-  revalidatePath("/admin/human-groups");
+  revalidatePath("/admin/user-groups");
   revalidatePath(redirectPath);
   redirect(`${redirectPath}?memberAdded=1`);
 }
@@ -146,8 +146,8 @@ export async function removeHumanGroupMemberAction(formData: FormData) {
   const humanGroupId = toSingle(formData.get("humanGroupId"));
   const userId = toSingle(formData.get("userId"));
   const redirectPath = humanGroupId
-    ? humanGroupDetailPath(humanGroupId)
-    : "/admin/human-groups";
+    ? userGroupDetailPath(humanGroupId)
+    : "/admin/user-groups";
 
   if (!humanGroupId || !userId) {
     redirect(`${redirectPath}?memberError=User%20group%20and%20user%20are%20required`);
@@ -167,7 +167,7 @@ export async function removeHumanGroupMemberAction(formData: FormData) {
       ),
     );
 
-  revalidatePath("/admin/human-groups");
+  revalidatePath("/admin/user-groups");
   revalidatePath(redirectPath);
   redirect(`${redirectPath}?memberRemoved=1`);
 }
@@ -176,8 +176,8 @@ export async function saveHumanGroupAgentPermissionsAction(formData: FormData) {
   const tenantId = await requireAdminTenantId();
   const humanGroupId = toSingle(formData.get("humanGroupId"));
   const redirectPath = humanGroupId
-    ? humanGroupDetailPath(humanGroupId)
-    : "/admin/human-groups";
+    ? userGroupDetailPath(humanGroupId)
+    : "/admin/user-groups";
 
   if (!humanGroupId) {
     redirect(`${redirectPath}?permissionsError=User%20group%20is%20required`);
@@ -225,7 +225,7 @@ export async function saveHumanGroupAgentPermissionsAction(formData: FormData) {
     }
   });
 
-  revalidatePath("/admin/human-groups");
+  revalidatePath("/admin/user-groups");
   revalidatePath(redirectPath);
   revalidatePath("/agents");
   redirect(`${redirectPath}?permissionsSaved=1`);

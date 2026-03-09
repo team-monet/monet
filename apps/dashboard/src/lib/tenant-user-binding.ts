@@ -5,7 +5,7 @@ import {
 } from "@monet/db";
 import { db } from "./db";
 import { ensureDashboardAgent } from "./dashboard-agent";
-import { ensureDefaultHumanGroupMembership } from "./human-groups";
+import { ensureDefaultHumanGroupMembership } from "./user-groups";
 
 function normalizeEmail(value: string | null | undefined) {
   return value?.trim().toLowerCase() || "";

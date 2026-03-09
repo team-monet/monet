@@ -10,7 +10,7 @@ import {
 import { pushRulesToAgent } from "../services/rule-notification.service.js";
 import type { AppEnv } from "../middleware/context.js";
 import { provisionAgentWithApiKey } from "../services/agent-provisioning.service.js";
-import { userCanSelectAgentGroup } from "../services/human-group.service.js";
+import { userCanSelectAgentGroup } from "../services/user-group.service.js";
 
 export const agentsRouter = new Hono<AppEnv>();
 const DASHBOARD_AGENT_PREFIX = "dashboard:";

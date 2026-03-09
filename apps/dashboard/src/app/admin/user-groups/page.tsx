@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { AlertTriangle, Calendar, Plus, ShieldCheck, Users } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
-import { listHumanGroupsForTenant } from "@/lib/human-groups";
+import { listHumanGroupsForTenant } from "@/lib/user-groups";
 import { createHumanGroupAction } from "./actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -170,7 +170,7 @@ export default async function HumanGroupsPage({ searchParams }: PageProps) {
                       </TableCell>
                       <TableCell className="text-right">
                         <Button asChild variant="secondary" size="sm">
-                          <Link href={`/admin/human-groups/${group.id}`}>Manage</Link>
+                          <Link href={`/admin/user-groups/${group.id}`}>Manage</Link>
                         </Button>
                       </TableCell>
                     </TableRow>

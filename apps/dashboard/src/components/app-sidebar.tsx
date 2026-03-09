@@ -80,9 +80,9 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
   const adminNav = [
     {
       title: "User Groups",
-      url: "/admin/human-groups",
+      url: "/admin/user-groups",
       icon: User,
-      isActive: pathname.startsWith("/admin/human-groups"),
+      isActive: pathname.startsWith("/admin/user-groups"),
     },
     {
       title: "Groups",

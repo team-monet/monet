@@ -18,7 +18,7 @@ vi.mock("../services/group.service.js", () => ({
   isTenantAdmin: (role: string | null) => role === "tenant_admin",
 }));
 
-vi.mock("../services/human-group.service.js", () => ({
+vi.mock("../services/user-group.service.js", () => ({
   userCanSelectAgentGroup: (...args: unknown[]) => userCanSelectAgentGroupMock(...args),
 }));
 

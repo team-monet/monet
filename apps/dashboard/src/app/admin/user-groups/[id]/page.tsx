@@ -9,7 +9,7 @@ import {
   Users,
 } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
-import { getHumanGroupDetail } from "@/lib/human-groups";
+import { getHumanGroupDetail } from "@/lib/user-groups";
 import {
   addHumanGroupMemberAction,
   removeHumanGroupMemberAction,
@@ -83,7 +83,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
     return (
       <div className="flex flex-col gap-6 p-4">
         <Button asChild variant="outline" className="w-fit">
-          <Link href="/admin/human-groups">
+          <Link href="/admin/user-groups">
             <ArrowLeft className="mr-2 h-4 w-4" />
             Back to User Groups
           </Link>
@@ -105,7 +105,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
       <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div className="space-y-2">
           <Button asChild variant="outline" size="sm" className="w-fit">
-            <Link href="/admin/human-groups">
+            <Link href="/admin/user-groups">
               <ArrowLeft className="mr-2 h-4 w-4" />
               Back to User Groups
             </Link>
