@@ -6,6 +6,7 @@ import {
   timestamp,
   pgEnum,
   integer,
+  primaryKey,
   unique,
 } from "drizzle-orm/pg-core";
 
@@ -160,6 +161,45 @@ export const tenantAdminNominations = pgTable(
   }),
 );
 
+export const humanGroups = pgTable(
+  "human_groups",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: varchar("description", { length: 1024 }).notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => ({
+    tenantNameUnique: unique("human_groups_tenant_id_name_unique").on(
+      table.tenantId,
+      table.name,
+    ),
+  }),
+);
+
+export const humanGroupMembers = pgTable(
+  "human_group_members",
+  {
+    humanGroupId: uuid("human_group_id")
+      .notNull()
+      .references(() => humanGroups.id),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => humanUsers.id),
+    joinedAt: timestamp("joined_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.humanGroupId, table.userId] }),
+  }),
+);
+
 export const agents = pgTable("agents", {
   id: uuid("id").primaryKey().defaultRandom(),
   externalId: varchar("external_id", { length: 255 }).notNull(),
@@ -201,3 +241,18 @@ export const agentGroupMembers = pgTable("agent_group_members", {
     .notNull()
     .defaultNow(),
 });
+
+export const humanGroupAgentGroupPermissions = pgTable(
+  "human_group_agent_group_permissions",
+  {
+    humanGroupId: uuid("human_group_id")
+      .notNull()
+      .references(() => humanGroups.id),
+    agentGroupId: uuid("agent_group_id")
+      .notNull()
+      .references(() => agentGroups.id),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.humanGroupId, table.agentGroupId] }),
+  }),
+);
