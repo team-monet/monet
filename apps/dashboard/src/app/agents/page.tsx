@@ -7,7 +7,10 @@ import {
 } from "@monet/db";
 import type { Agent } from "@monet/types";
 import { getApiClient } from "@/lib/api-client";
-import { listAllowedAgentGroupsForUserByHumanGroups } from "@/lib/agent-group-access";
+import {
+  listAllowedAgentGroupsForUserByHumanGroups,
+  userHasHumanGroupMembershipsByHumanGroups,
+} from "@/lib/agent-group-access";
 import { requireAuth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import AgentList from "./agent-list";
@@ -42,7 +45,14 @@ export default async function AgentsPage() {
     const client = await getApiClient();
     agents = await client.listAgents();
 
-    const [allTenantGroups, allowedGroupsByHumanGroup, ownedGroups, userRows, membershipRows] = await Promise.all([
+    const [
+      allTenantGroups,
+      hasHumanGroupMemberships,
+      allowedGroupsByHumanGroup,
+      ownedGroups,
+      userRows,
+      membershipRows,
+    ] = await Promise.all([
       db
         .select({
           id: agentGroupsTable.id,
@@ -51,6 +61,9 @@ export default async function AgentsPage() {
         .from(agentGroupsTable)
         .where(eq(agentGroupsTable.tenantId, tenantId))
         .orderBy(asc(agentGroupsTable.name)),
+      isAdmin
+        ? Promise.resolve(false)
+        : userHasHumanGroupMembershipsByHumanGroups(tenantId, userId),
       isAdmin
         ? Promise.resolve([])
         : listAllowedAgentGroupsForUserByHumanGroups(tenantId, userId),
@@ -105,7 +118,7 @@ export default async function AgentsPage() {
     // pre-existing inferred behavior until the new group model is fully wired.
     availableGroups = isAdmin
       ? allTenantGroups
-      : allowedGroupsByHumanGroup.length > 0
+      : hasHumanGroupMemberships
         ? allowedGroupsByHumanGroup
         : ownedGroups.length > 0
           ? ownedGroups

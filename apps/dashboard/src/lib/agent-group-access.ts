@@ -1,6 +1,7 @@
 import { and, asc, eq } from "drizzle-orm";
 import {
   agentGroups,
+  humanGroups,
   humanGroupAgentGroupPermissions,
   humanGroupMembers,
 } from "@monet/db";
@@ -34,4 +35,26 @@ export async function listAllowedAgentGroupsForUserByHumanGroups(
       ),
     )
     .orderBy(asc(agentGroups.name));
+}
+
+export async function userHasHumanGroupMembershipsByHumanGroups(
+  tenantId: string,
+  userId: string,
+) {
+  const rows = await db
+    .select({ userId: humanGroupMembers.userId })
+    .from(humanGroupMembers)
+    .innerJoin(
+      humanGroups,
+      eq(humanGroups.id, humanGroupMembers.humanGroupId),
+    )
+    .where(
+      and(
+        eq(humanGroupMembers.userId, userId),
+        eq(humanGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
+
+  return rows.length > 0;
 }

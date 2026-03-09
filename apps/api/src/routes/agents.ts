@@ -10,6 +10,7 @@ import {
 import { pushRulesToAgent } from "../services/rule-notification.service.js";
 import type { AppEnv } from "../middleware/context.js";
 import { provisionAgentWithApiKey } from "../services/agent-provisioning.service.js";
+import { userCanSelectAgentGroup } from "../services/human-group.service.js";
 
 export const agentsRouter = new Hono<AppEnv>();
 const DASHBOARD_AGENT_PREFIX = "dashboard:";
@@ -197,6 +198,13 @@ agentsRouter.post("/register", async (c) => {
     );
   }
 
+  if (!admin && !parsed.data.groupId) {
+    return c.json(
+      { error: "validation_error", message: "Group selection is required for normal users" },
+      400,
+    );
+  }
+
   const userId = admin ? (parsed.data.isAutonomous ? null : (parsed.data.userId ?? null)) : agent.userId;
   const isAutonomous = admin ? parsed.data.isAutonomous : false;
 
@@ -205,6 +213,22 @@ agentsRouter.post("/register", async (c) => {
       { error: "validation_error", message: "User binding is required for Human Proxy agents" },
       400,
     );
+  }
+
+  if (!admin && userId && parsed.data.groupId) {
+    const canSelectGroup = await userCanSelectAgentGroup(
+      sql,
+      agent.tenantId,
+      userId,
+      parsed.data.groupId,
+    );
+
+    if (!canSelectGroup) {
+      return c.json(
+        { error: "forbidden", message: "You do not have access to register agents in that group" },
+        403,
+      );
+    }
   }
 
   let owner: { id: string; externalId: string; email: string | null; label: string } | null = null;

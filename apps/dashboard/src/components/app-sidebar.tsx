@@ -4,6 +4,7 @@ import * as React from "react"
 import {
   BookOpen,
   Bot,
+  User,
   LayoutDashboard,
   Search,
   Users,
@@ -77,6 +78,12 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
   ]
 
   const adminNav = [
+    {
+      title: "User Groups",
+      url: "/admin/human-groups",
+      icon: User,
+      isActive: pathname.startsWith("/admin/human-groups"),
+    },
     {
       title: "Groups",
       url: "/admin/groups",

@@ -85,6 +85,13 @@
       "when": 1772954918227,
       "tag": "0011_fixed_stick",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1773015000000,
+      "tag": "0012_human_groups_permissions",
+      "breakpoints": true
     }
   ]
 }

@@ -10,11 +10,16 @@ const GROUP_ID = "00000000-0000-0000-0000-000000000088";
 const sqlMock = vi.fn();
 const addMemberMock = vi.fn();
 const resolveAgentRoleMock = vi.fn();
+const userCanSelectAgentGroupMock = vi.fn();
 
 vi.mock("../services/group.service.js", () => ({
   addMember: (...args: unknown[]) => addMemberMock(...args),
   resolveAgentRole: (...args: unknown[]) => resolveAgentRoleMock(...args),
   isTenantAdmin: (role: string | null) => role === "tenant_admin",
+}));
+
+vi.mock("../services/human-group.service.js", () => ({
+  userCanSelectAgentGroup: (...args: unknown[]) => userCanSelectAgentGroupMock(...args),
 }));
 
 function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
@@ -48,6 +53,7 @@ describe("agents route", () => {
     vi.clearAllMocks();
     addMemberMock.mockResolvedValue({ success: true });
     resolveAgentRoleMock.mockImplementation(async (_sql: unknown, agent: AgentContext) => agent.role);
+    userCanSelectAgentGroupMock.mockResolvedValue(true);
     sqlMock.mockReset();
   });
 
@@ -117,13 +123,37 @@ describe("agents route", () => {
     const res = await app.request("/agents/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ externalId: "self-bound" }),
+      body: JSON.stringify({ externalId: "self-bound", groupId: GROUP_ID }),
     });
 
     expect(res.status).toBe(201);
     const body = await res.json();
     expect(body.agent.userId).toBe(USER_ID);
     expect(body.agent.isAutonomous).toBe(false);
+  });
+
+  it("requires group selection for normal-user registrations", async () => {
+    const app = createTestApp({ role: "user", userId: USER_ID });
+    const res = await app.request("/agents/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ externalId: "missing-group" }),
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects normal-user registration into unauthorized groups", async () => {
+    userCanSelectAgentGroupMock.mockResolvedValue(false);
+
+    const app = createTestApp({ role: "user", userId: USER_ID });
+    const res = await app.request("/agents/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ externalId: "forbidden-group", groupId: GROUP_ID }),
+    });
+
+    expect(res.status).toBe(403);
   });
 
   it("registers with groupId and adds the agent to the group", async () => {
