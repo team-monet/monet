@@ -13,6 +13,7 @@ const addMemberMock = vi.fn();
 const resolveAgentRoleMock = vi.fn();
 const userCanSelectAgentGroupMock = vi.fn();
 const logAuditEventMock = vi.fn();
+const listRuleSetsForAgentMock = vi.fn();
 
 vi.mock("../services/group.service.js", () => ({
   addMember: (...args: unknown[]) => addMemberMock(...args),
@@ -26,6 +27,13 @@ vi.mock("../services/user-group.service.js", () => ({
 
 vi.mock("../services/audit.service.js", () => ({
   logAuditEvent: (...args: unknown[]) => logAuditEventMock(...args),
+}));
+
+vi.mock("../services/rule.service.js", () => ({
+  associateRuleSetWithAgent: vi.fn(),
+  dissociateRuleSetFromAgent: vi.fn(),
+  getActiveRulesForAgent: vi.fn(),
+  listRuleSetsForAgent: (...args: unknown[]) => listRuleSetsForAgentMock(...args),
 }));
 
 function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
@@ -71,6 +79,7 @@ describe("agents route", () => {
     resolveAgentRoleMock.mockImplementation(async (_sql: unknown, agent: AgentContext) => agent.role);
     userCanSelectAgentGroupMock.mockResolvedValue(true);
     logAuditEventMock.mockResolvedValue(undefined);
+    listRuleSetsForAgentMock.mockResolvedValue([]);
     sqlMock.mockReset();
   });
 
@@ -381,5 +390,46 @@ describe("agents route", () => {
         outcome: "success",
       }),
     );
+  });
+
+  it("returns empty rule sets for non-admin agent detail requests", async () => {
+    listRuleSetsForAgentMock.mockResolvedValue([
+      { id: "rule-set-1", name: "Sensitive Set" },
+    ]);
+    sqlMock
+      .mockResolvedValueOnce([
+        {
+          id: AGENT_ID,
+          external_id: "self-bound",
+          tenant_id: TENANT_ID,
+          user_id: USER_ID,
+          role: "user",
+          is_autonomous: false,
+          revoked_at: null,
+          created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: USER_ID,
+          owner_external_id: "bound-user",
+          owner_email: "bound@example.com",
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: GROUP_ID,
+          name: "General",
+          description: "",
+          memory_quota: null,
+          created_at: "2026-03-01T00:00:00.000Z",
+        },
+      ]);
+
+    const app = createTestApp({ role: "user", userId: USER_ID });
+    const res = await app.request(`/agents/${AGENT_ID}`, {
+      method: "GET",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ruleSets).toEqual([]);
+    expect(listRuleSetsForAgentMock).not.toHaveBeenCalled();
   });
 });

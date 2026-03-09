@@ -97,57 +97,61 @@ export async function addMember(
   groupId: string,
   agentId: string,
 ) {
-  // Verify group belongs to this tenant
-  const [group] = await sql`
-    SELECT id FROM agent_groups WHERE id = ${groupId} AND tenant_id = ${tenantId}
-  `;
-  if (!group) {
-    return { error: "not_found" as const, message: "Group not found" };
-  }
+  return sql.begin(async (tx) => {
+    const scopedSql = tx as unknown as postgres.Sql;
 
-  // Verify agent belongs to this tenant
-  const [agent] = await sql`
-    SELECT id FROM agents WHERE id = ${agentId} AND tenant_id = ${tenantId}
-  `;
-  if (!agent) {
-    return { error: "not_found" as const, message: "Agent not found" };
-  }
+    // Verify group belongs to this tenant.
+    const [group] = await scopedSql`
+      SELECT id FROM agent_groups WHERE id = ${groupId} AND tenant_id = ${tenantId}
+    `;
+    if (!group) {
+      return { error: "not_found" as const, message: "Group not found" };
+    }
 
-  const existingMemberships = await sql`
-    SELECT group_id FROM agent_group_members
-    WHERE agent_id = ${agentId}
-    ORDER BY joined_at ASC, group_id ASC
-  `;
+    // Verify agent belongs to this tenant.
+    const [agent] = await scopedSql`
+      SELECT id FROM agents WHERE id = ${agentId} AND tenant_id = ${tenantId}
+    `;
+    if (!agent) {
+      return { error: "not_found" as const, message: "Agent not found" };
+    }
 
-  const alreadyInTargetGroup = existingMemberships.some(
-    (membership) => membership.group_id === groupId,
-  );
-
-  if (alreadyInTargetGroup && existingMemberships.length === 1) {
-    return { error: "conflict" as const, message: "Agent is already a member of this group" };
-  }
-
-  if (existingMemberships.length > 0) {
-    await sql`
-      DELETE FROM agent_group_members
+    const existingMemberships = (await scopedSql`
+      SELECT group_id FROM agent_group_members
       WHERE agent_id = ${agentId}
-    `;
-  }
+      ORDER BY joined_at ASC, group_id ASC
+    `) as Array<{ group_id: string }>;
 
-  if (!alreadyInTargetGroup || existingMemberships.length > 1) {
-    await sql`
-      INSERT INTO agent_group_members (agent_id, group_id)
-      VALUES (${agentId}, ${groupId})
-    `;
-  }
+    const alreadyInTargetGroup = existingMemberships.some(
+      (membership) => membership.group_id === groupId,
+    );
 
-  return {
-    success: true,
-    operation:
-      existingMemberships.length > 0
-        ? ("moved" as const)
-        : ("created" as const),
-  };
+    if (alreadyInTargetGroup && existingMemberships.length === 1) {
+      return { error: "conflict" as const, message: "Agent is already a member of this group" };
+    }
+
+    if (existingMemberships.length > 0) {
+      await scopedSql`
+        DELETE FROM agent_group_members
+        WHERE agent_id = ${agentId}
+      `;
+    }
+
+    if (!alreadyInTargetGroup || existingMemberships.length > 1) {
+      await scopedSql`
+        INSERT INTO agent_group_members (agent_id, group_id)
+        VALUES (${agentId}, ${groupId})
+      `;
+    }
+
+    return {
+      success: true,
+      operation:
+        existingMemberships.length > 0
+          ? ("moved" as const)
+          : ("created" as const),
+    };
+  });
 }
 
 export async function removeMember(
@@ -237,12 +241,8 @@ export async function listGroupMembers(
       a.role,
       a.is_autonomous,
       a.revoked_at,
-      a.created_at,
-      u.id AS owner_id,
-      u.external_id AS owner_external_id,
-      u.email AS owner_email
+      a.created_at
     FROM agents a
-    LEFT JOIN human_users u ON u.id = a.user_id
     JOIN agent_group_members m ON m.agent_id = a.id
     WHERE m.group_id = ${groupId}
     ORDER BY m.joined_at ASC
@@ -250,9 +250,6 @@ export async function listGroupMembers(
 
   return {
     members: (members as Record<string, unknown>[]).map((m) => {
-      const label =
-        (m.owner_email as string | null) ?? (m.owner_external_id as string | null);
-
       return {
         id: m.id as string,
         externalId: m.external_id as string,
@@ -263,18 +260,8 @@ export async function listGroupMembers(
         revokedAt: (m.revoked_at as string | Date | null) ?? null,
         displayName: m.is_autonomous
           ? `${m.external_id as string} (Autonomous)`
-          : label
-            ? `${m.external_id as string} · ${label}`
-            : (m.external_id as string),
-        owner:
-          (m.owner_id as string | null) && label
-            ? {
-                id: m.owner_id as string,
-                externalId: (m.owner_external_id as string | null) ?? label,
-                email: (m.owner_email as string | null) ?? null,
-                label,
-              }
-            : null,
+          : (m.external_id as string),
+        owner: null,
         createdAt: m.created_at as string,
       };
     }),

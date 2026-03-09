@@ -647,7 +647,9 @@ agentsRouter.get("/:id", async (c) => {
       WHERE gm.agent_id = ${targetId}
       ORDER BY g.name ASC, g.created_at ASC
     `,
-    listRuleSetsForAgent(sql, schemaName, targetId),
+    access.isAdmin
+      ? listRuleSetsForAgent(sql, schemaName, targetId)
+      : Promise.resolve([]),
   ]);
 
   return c.json({
