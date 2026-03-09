@@ -4,6 +4,8 @@ import { agents } from "@monet/db/schema";
 import type { AgentContext } from "../middleware/context.js";
 import { parseApiKey, validateApiKey } from "./api-key.service.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export type AuthenticationResult =
   | { ok: true; agent: AgentContext; rawKey: string }
   | { ok: false; status: 401; error: string; message: string };
@@ -52,10 +54,19 @@ export async function authenticateAgentFromBearerToken(
     };
   }
 
+  if (!UUID_RE.test(parsed.agentId)) {
+    return {
+      ok: false,
+      status: 401,
+      error: "unauthorized",
+      message: "Invalid API key",
+    };
+  }
+
   const agentRows = await db
     .select()
     .from(agents)
-    .where(eq(agents.externalId, parsed.agentId))
+    .where(eq(agents.id, parsed.agentId))
     .limit(1);
 
   if (agentRows.length === 0) {

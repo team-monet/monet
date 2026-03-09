@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type postgres from "postgres";
 import { generateApiKey, hashApiKey } from "./api-key.service.js";
 
@@ -25,11 +26,13 @@ export async function provisionAgentWithApiKey(
   sql: postgres.Sql,
   input: ProvisionAgentInput,
 ): Promise<ProvisionAgentResult> {
-  const rawApiKey = generateApiKey(input.externalId);
+  const agentId = randomUUID();
+  const rawApiKey = generateApiKey(agentId);
   const { hash, salt } = hashApiKey(rawApiKey);
 
   const [agent] = await sql`
     INSERT INTO agents (
+      id,
       external_id,
       tenant_id,
       user_id,
@@ -39,6 +42,7 @@ export async function provisionAgentWithApiKey(
       is_autonomous
     )
     VALUES (
+      ${agentId},
       ${input.externalId},
       ${input.tenantId},
       ${input.userId ?? null},
@@ -52,11 +56,11 @@ export async function provisionAgentWithApiKey(
 
   return {
     agent: {
-      id: agent.id as string,
-      externalId: agent.external_id as string,
-      userId: (agent.user_id as string | null) ?? null,
-      role: (agent.role as ProvisionAgentResult["agent"]["role"]) ?? null,
-      isAutonomous: agent.is_autonomous as boolean,
+      id: agentId,
+      externalId: input.externalId,
+      userId: input.userId ?? null,
+      role: input.role ?? null,
+      isAutonomous: input.isAutonomous ?? false,
       createdAt: agent.created_at as Date,
     },
     rawApiKey,

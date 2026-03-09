@@ -11,12 +11,14 @@ describe("groups integration", () => {
   const app = getTestApp();
   let adminKey: string;
   let tenantId: string;
+  let defaultGroupId: string;
 
   beforeEach(async () => {
     await cleanupTestData();
     const { body } = await provisionTestTenant({ name: "group-test" });
     adminKey = body.apiKey as string;
     tenantId = (body.tenant as { id: string }).id;
+    defaultGroupId = body.defaultGroupId as string;
   });
 
   afterAll(async () => {
@@ -48,7 +50,7 @@ describe("groups integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "regular-agent" }),
+      body: JSON.stringify({ externalId: "regular-agent", groupId: defaultGroupId }),
     });
     const regBody = await regRes.json();
     const regularKey = regBody.apiKey as string;
@@ -61,7 +63,7 @@ describe("groups integration", () => {
     expect(res.status).toBe(403);
   });
 
-  it("admin can add and remove members", async () => {
+  it("admin can move members and cannot remove the final group", async () => {
     // Create group
     const groupRes = await app.request("/api/groups", {
       method: "POST",
@@ -75,7 +77,7 @@ describe("groups integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "member-agent" }),
+      body: JSON.stringify({ externalId: "member-agent", groupId: defaultGroupId }),
     });
     const regBody = await regRes.json();
     const memberId = regBody.agent.id as string;
@@ -86,7 +88,7 @@ describe("groups integration", () => {
       headers: authHeaders(),
       body: JSON.stringify({ agentId: memberId }),
     });
-    expect(addRes.status).toBe(201);
+    expect(addRes.status).toBe(200);
 
     // List members
     const listRes = await app.request(`/api/groups/${groupId}/members`, {
@@ -102,14 +104,14 @@ describe("groups integration", () => {
       `/api/groups/${groupId}/members/${memberId}`,
       { method: "DELETE", headers: authHeaders() },
     );
-    expect(removeRes.status).toBe(200);
+    expect(removeRes.status).toBe(409);
 
-    // Verify removed
+    // Verify the agent still has a group assignment
     const listRes2 = await app.request(`/api/groups/${groupId}/members`, {
       headers: authHeaders(),
     });
     const listBody2 = await listRes2.json();
-    expect(listBody2.members).toHaveLength(0);
+    expect(listBody2.members).toHaveLength(1);
   });
 
   it("adding duplicate member returns 409", async () => {
@@ -125,7 +127,7 @@ describe("groups integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "dup-agent" }),
+      body: JSON.stringify({ externalId: "dup-agent", groupId: defaultGroupId }),
     });
     const regBody = await regRes.json();
 
@@ -161,7 +163,7 @@ describe("groups integration", () => {
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.groups).toHaveLength(2);
+    expect(body.groups).toHaveLength(3);
   });
 
   it("tenant admin can promote a user to group_admin", async () => {
@@ -193,7 +195,7 @@ describe("groups integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "regular-agent" }),
+      body: JSON.stringify({ externalId: "regular-agent", groupId: defaultGroupId }),
     });
     const regBody = await regRes.json();
     const regularKey = regBody.apiKey as string;

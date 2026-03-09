@@ -106,6 +106,25 @@ async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
       "revoked_at" timestamp with time zone,
       "created_at" timestamp with time zone DEFAULT now() NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS "human_groups" (
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+      "tenant_id" uuid NOT NULL,
+      "name" varchar(255) NOT NULL,
+      "description" varchar(1024) DEFAULT '' NOT NULL,
+      "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+      CONSTRAINT "human_groups_tenant_id_name_unique" UNIQUE("tenant_id","name")
+    );
+    CREATE TABLE IF NOT EXISTS "human_group_members" (
+      "human_group_id" uuid NOT NULL,
+      "user_id" uuid NOT NULL,
+      "joined_at" timestamp with time zone DEFAULT now() NOT NULL,
+      CONSTRAINT "human_group_members_human_group_id_user_id_pk" PRIMARY KEY("human_group_id","user_id")
+    );
+    CREATE TABLE IF NOT EXISTS "human_group_agent_group_permissions" (
+      "human_group_id" uuid NOT NULL,
+      "agent_group_id" uuid NOT NULL,
+      CONSTRAINT "human_group_agent_group_permissions_human_group_id_agent_group_id_pk" PRIMARY KEY("human_group_id","agent_group_id")
+    );
   `);
 
   await s.unsafe(`
@@ -178,6 +197,56 @@ async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
         ADD CONSTRAINT "tenant_admin_nominations_tenant_id_email_unique"
         UNIQUE("tenant_id", "email");
       END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'human_groups_tenant_fk'
+      ) THEN
+        ALTER TABLE "human_groups"
+        ADD CONSTRAINT "human_groups_tenant_fk"
+        FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'human_group_members_group_fk'
+      ) THEN
+        ALTER TABLE "human_group_members"
+        ADD CONSTRAINT "human_group_members_group_fk"
+        FOREIGN KEY ("human_group_id") REFERENCES "public"."human_groups"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'human_group_members_user_fk'
+      ) THEN
+        ALTER TABLE "human_group_members"
+        ADD CONSTRAINT "human_group_members_user_fk"
+        FOREIGN KEY ("user_id") REFERENCES "public"."human_users"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'human_group_agent_group_permissions_group_fk'
+      ) THEN
+        ALTER TABLE "human_group_agent_group_permissions"
+        ADD CONSTRAINT "human_group_agent_group_permissions_group_fk"
+        FOREIGN KEY ("human_group_id") REFERENCES "public"."human_groups"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'human_group_agent_group_permissions_agent_group_fk'
+      ) THEN
+        ALTER TABLE "human_group_agent_group_permissions"
+        ADD CONSTRAINT "human_group_agent_group_permissions_agent_group_fk"
+        FOREIGN KEY ("agent_group_id") REFERENCES "public"."agent_groups"("id") ON DELETE no action ON UPDATE no action;
+      END IF;
     END
     $do$;
   `);
@@ -196,6 +265,9 @@ async function ensurePlatformSchemaReady() {
           humanUsersEmailColumn,
           humanUsersLastLoginColumn,
           tenantAdminNominationsTable,
+          humanGroupsTable,
+          humanGroupMembersTable,
+          humanGroupAgentGroupPermissionsTable,
         },
       ] = await s<{
         tenantsTable: string | null;
@@ -205,12 +277,18 @@ async function ensurePlatformSchemaReady() {
         humanUsersEmailColumn: string | null;
         humanUsersLastLoginColumn: string | null;
         tenantAdminNominationsTable: string | null;
+        humanGroupsTable: string | null;
+        humanGroupMembersTable: string | null;
+        humanGroupAgentGroupPermissionsTable: string | null;
       }[]>`
         SELECT
           to_regclass('public.tenants') AS "tenantsTable",
           to_regclass('public.platform_installations') AS "platformInstallationsTable",
           to_regclass('public.platform_admins') AS "platformAdminsTable",
           to_regclass('public.tenant_admin_nominations') AS "tenantAdminNominationsTable",
+          to_regclass('public.human_groups') AS "humanGroupsTable",
+          to_regclass('public.human_group_members') AS "humanGroupMembersTable",
+          to_regclass('public.human_group_agent_group_permissions') AS "humanGroupAgentGroupPermissionsTable",
           (
             SELECT column_name
             FROM information_schema.columns
@@ -244,7 +322,10 @@ async function ensurePlatformSchemaReady() {
         platformAdminsTable &&
         humanUsersEmailColumn &&
         humanUsersLastLoginColumn &&
-        tenantAdminNominationsTable
+        tenantAdminNominationsTable &&
+        humanGroupsTable &&
+        humanGroupMembersTable &&
+        humanGroupAgentGroupPermissionsTable
       ) {
         return;
       }
@@ -305,10 +386,18 @@ export async function provisionTestTenant(
   await ensurePlatformSchemaReady();
 
   const result = await provisionTenant(getTestDb(), getTestSql(), input);
+  const [defaultMembership] = await getTestSql()`
+    SELECT group_id
+    FROM agent_group_members
+    WHERE agent_id = ${result.agent.id}
+    ORDER BY joined_at ASC, group_id ASC
+    LIMIT 1
+  `;
   const body = {
     tenant: result.tenant,
     agent: result.agent,
     apiKey: result.rawApiKey,
+    defaultGroupId: defaultMembership?.group_id as string | undefined,
   };
   const res = new Response(JSON.stringify(body), {
     status: 201,
@@ -342,6 +431,9 @@ export async function cleanupTestData() {
         platform_setup_sessions,
         platform_bootstrap_tokens,
         platform_installations,
+        human_group_agent_group_permissions,
+        human_group_members,
+        human_groups,
         agent_group_members,
         agent_groups,
         agents,

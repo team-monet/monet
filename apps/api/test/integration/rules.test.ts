@@ -27,6 +27,7 @@ describe("Rules integration", () => {
   let schemaName: string;
   let adminApiKey: string;
   let adminAgentId: string;
+  let defaultGroupId: string;
 
   beforeAll(async () => {
     console.log("TEST_DB_URL:", process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/monet_test");
@@ -55,6 +56,7 @@ describe("Rules integration", () => {
     schemaName = `tenant_${tenantId.replace(/-/g, "_")}`;
     adminApiKey = body.apiKey as string;
     adminAgentId = (body.agent as { id: string }).id;
+    defaultGroupId = body.defaultGroupId as string;
   });
 
   afterAll(async () => {
@@ -75,7 +77,7 @@ describe("Rules integration", () => {
         Authorization: `Bearer ${adminApiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ externalId }),
+      body: JSON.stringify({ externalId, groupId: defaultGroupId }),
     });
     const body = await res.json();
     return {

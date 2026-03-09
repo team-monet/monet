@@ -74,7 +74,7 @@ describe("group membership helpers", () => {
     expect(result).toEqual({ success: true, operation: "moved" });
   });
 
-  it("does not expose owner identities in group member payloads", async () => {
+  it("includes owner identities in admin group member payloads", async () => {
     const sql = makeTaggedSql([
       [{ id: GROUP_ID }],
       [
@@ -87,6 +87,9 @@ describe("group membership helpers", () => {
           is_autonomous: false,
           revoked_at: null,
           created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: "00000000-0000-0000-0000-000000000099",
+          owner_external_id: "bound-user",
+          owner_email: "bound@example.com",
         },
       ],
     ]) as unknown as import("postgres").Sql;
@@ -101,8 +104,13 @@ describe("group membership helpers", () => {
     expect(result.members[0]).toMatchObject({
       id: AGENT_ID,
       externalId: "Claude",
-      displayName: "Claude",
-      owner: null,
+      displayName: "Claude · bound@example.com",
+      owner: {
+        id: "00000000-0000-0000-0000-000000000099",
+        externalId: "bound-user",
+        email: "bound@example.com",
+        label: "bound@example.com",
+      },
     });
   });
 });

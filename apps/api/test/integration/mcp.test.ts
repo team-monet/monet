@@ -61,6 +61,7 @@ describe("MCP integration", () => {
   let baseUrl: URL;
   let apiKey: string;
   let agentId: string;
+  let groupId: string;
 
   beforeAll(async () => {
     server = createServer((req, res) => {
@@ -94,8 +95,9 @@ describe("MCP integration", () => {
       body: JSON.stringify({ name: "test-group" }),
     });
     const group = (await groupRes.json()) as { id: string };
+    groupId = group.id;
 
-    await app.request(`/api/groups/${group.id}/members`, {
+    await app.request(`/api/groups/${groupId}/members`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({ agentId }),
@@ -243,7 +245,7 @@ describe("MCP integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ externalId: "agent-2" }),
+      body: JSON.stringify({ externalId: "agent-2", groupId }),
     });
     const regBody = await regRes.json();
     const secondKey = regBody.apiKey as string;

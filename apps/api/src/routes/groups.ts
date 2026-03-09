@@ -126,6 +126,11 @@ groupsRouter.get("/:id/members", async (c) => {
   const agent = c.get("agent");
   const sql = c.get("sql");
   const groupId = c.req.param("id");
+  const role = await resolveAgentRole(sql, agent);
+
+  if (!isTenantAdmin(role)) {
+    return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
+  }
 
   const result = await listGroupMembers(sql, agent.tenantId, groupId);
   if ("error" in result) {

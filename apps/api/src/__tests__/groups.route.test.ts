@@ -137,6 +137,20 @@ describe("groups route", () => {
     });
   });
 
+  describe("GET /:id/members", () => {
+    it("returns 200 for tenant admin", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/group-1/members");
+      expect(res.status).toBe(200);
+    });
+
+    it("returns 403 for group admin", async () => {
+      const app = createTestApp(makeAgent({ role: "group_admin" }));
+      const res = await app.request("/groups/group-1/members");
+      expect(res.status).toBe(403);
+    });
+  });
+
   describe("DELETE /:id/members/:agentId", () => {
     it("returns 403 for regular agent", async () => {
       const app = createTestApp(makeAgent({ role: null }));

@@ -119,7 +119,7 @@ async function main() {
             "content-type": "application/json",
             authorization: `Bearer ${bootstrapApiKey}`,
           },
-          body: JSON.stringify({ externalId: `load-agent-${i + 1}` }),
+          body: JSON.stringify({ externalId: `load-agent-${i + 1}`, groupId: groupIds[0] }),
         },
       );
 

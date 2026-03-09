@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { db } from "./db";
 import {
   agentGroupMembers,
@@ -57,7 +58,8 @@ export async function ensureDashboardAgent(
 
   // 2. If missing dashboard API key or missing dashboard agent, create/repair both together.
   if (!dashboardAgentId || !encryptedApiKey) {
-    const apiKey = generateApiKey(dashboardExternalId);
+    const targetAgentId = dashboardAgentId ?? randomUUID();
+    const apiKey = generateApiKey(targetAgentId);
     const { hash, salt } = hashApiKey(apiKey);
 
     encryptedApiKey = await db.transaction(async (tx) => {
@@ -65,6 +67,7 @@ export async function ensureDashboardAgent(
         const [newAgent] = await tx
           .insert(agents)
           .values({
+            id: targetAgentId,
             externalId: dashboardExternalId,
             tenantId,
             userId,

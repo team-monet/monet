@@ -332,7 +332,7 @@ agentsRouter.post("/:id/regenerate-token", async (c) => {
     return access.response;
   }
 
-  const rawApiKey = generateApiKey(access.row.external_id);
+  const rawApiKey = generateApiKey(access.row.id);
   const { hash, salt } = hashApiKey(rawApiKey);
 
   await sql`

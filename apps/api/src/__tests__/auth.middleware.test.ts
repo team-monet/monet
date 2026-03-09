@@ -66,8 +66,16 @@ describe("auth middleware", () => {
     expect(res.status).toBe(401);
   });
 
+  it("returns 401 when the decoded agent id is not a UUID", async () => {
+    const app = createTestApp(null);
+    const res = await app.request("/test", {
+      headers: { Authorization: `Bearer ${generateApiKey("not-a-uuid")}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
   it("returns 401 when agent not found in DB", async () => {
-    const rawKey = generateApiKey(EXTERNAL_ID);
+    const rawKey = generateApiKey(AGENT_ID);
     const app = createTestApp(null);
     const res = await app.request("/test", {
       headers: { Authorization: `Bearer ${rawKey}` },
@@ -76,9 +84,9 @@ describe("auth middleware", () => {
   });
 
   it("returns 401 when key hash does not match", async () => {
-    const rawKey = generateApiKey(EXTERNAL_ID);
+    const rawKey = generateApiKey(AGENT_ID);
     // Hash a different key
-    const wrongKey = generateApiKey(EXTERNAL_ID);
+    const wrongKey = generateApiKey(AGENT_ID);
     const { hash, salt } = hashApiKey(wrongKey);
 
     const app = createTestApp({
@@ -97,7 +105,7 @@ describe("auth middleware", () => {
   });
 
   it("sets agent context on success", async () => {
-    const rawKey = generateApiKey(EXTERNAL_ID);
+    const rawKey = generateApiKey(AGENT_ID);
     const { hash, salt } = hashApiKey(rawKey);
 
     const app = createTestApp({
@@ -122,7 +130,7 @@ describe("auth middleware", () => {
   });
 
   it("sets userId when agent has a userId", async () => {
-    const rawKey = generateApiKey(EXTERNAL_ID);
+    const rawKey = generateApiKey(AGENT_ID);
     const { hash, salt } = hashApiKey(rawKey);
     const USER_ID = "00000000-0000-0000-0000-000000000099";
 

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type postgres from "postgres";
 import {
   createTenantSchema,
@@ -212,7 +213,8 @@ export async function createPlatformTenant(
 ): Promise<CreatePlatformTenantResult> {
   const tenantInput = normalizeTenantInput(input);
   const adminExternalId = `admin@${tenantInput.slug}`;
-  const rawApiKey = generateApiKey(adminExternalId);
+  const adminAgentId = randomUUID();
+  const rawApiKey = generateApiKey(adminAgentId);
   const { hash, salt } = hashApiKey(rawApiKey);
 
   try {
@@ -249,6 +251,7 @@ export async function createPlatformTenant(
 
       const [agent] = await tx`
         INSERT INTO agents (
+          id,
           external_id,
           tenant_id,
           api_key_hash,
@@ -257,6 +260,7 @@ export async function createPlatformTenant(
           role
         )
         VALUES (
+          ${adminAgentId},
           ${adminExternalId},
           ${tenant.id},
           ${hash},

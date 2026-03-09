@@ -57,6 +57,7 @@ describe("auth flow integration", () => {
   it("registers a second agent using the first agent's key", async () => {
     const { body } = await provisionTestTenant({ name: "test-org-2" });
     const firstKey = body.apiKey as string;
+    const defaultGroupId = body.defaultGroupId as string;
 
     // Register second agent
     const registerRes = await app.request("/api/agents/register", {
@@ -65,7 +66,7 @@ describe("auth flow integration", () => {
         "Content-Type": "application/json",
         Authorization: `Bearer ${firstKey}`,
       },
-      body: JSON.stringify({ externalId: "agent-2" }),
+      body: JSON.stringify({ externalId: "agent-2", groupId: defaultGroupId }),
     });
     expect(registerRes.status).toBe(201);
     const registerBody = await registerRes.json();

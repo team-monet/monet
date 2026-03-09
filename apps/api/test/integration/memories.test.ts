@@ -58,6 +58,7 @@ describe("memories integration", () => {
   let agentId: string;
   let tenantId: string;
   let schemaName: string;
+  let groupId: string;
 
   beforeEach(async () => {
     resetEnrichmentStateForTests();
@@ -76,7 +77,8 @@ describe("memories integration", () => {
       body: JSON.stringify({ name: "test-group" }),
     });
     const group = (await groupRes.json()) as { id: string };
-    await app.request(`/api/groups/${group.id}/members`, {
+    groupId = group.id;
+    await app.request(`/api/groups/${groupId}/members`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({ agentId }),
@@ -243,7 +245,7 @@ describe("memories integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "agent-2" }),
+      body: JSON.stringify({ externalId: "agent-2", groupId }),
     });
     const regBody = await regRes.json();
     const key2 = regBody.apiKey as string;
@@ -465,7 +467,7 @@ describe("memories integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "agent-del-test" }),
+      body: JSON.stringify({ externalId: "agent-del-test", groupId }),
     });
     const regBody = await regRes.json();
     const key2 = regBody.apiKey as string;
@@ -583,20 +585,10 @@ describe("memories integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "agent-list-2" }),
+      body: JSON.stringify({ externalId: "agent-list-2", groupId }),
     });
     const regBody = await regRes.json();
     const key2 = regBody.apiKey as string;
-    const agentId2 = (regBody.agent as { id: string }).id;
-
-    const groupsRes = await app.request("/api/groups", { headers: authHeaders() });
-    const groupsBody = await groupsRes.json();
-    const groupId = groupsBody.groups[0].id as string;
-    await app.request(`/api/groups/${groupId}/members`, {
-      method: "POST",
-      headers: authHeaders(),
-      body: JSON.stringify({ agentId: agentId2 }),
-    });
 
     await storeMemory({
       content: "agent two group memory",
@@ -754,7 +746,7 @@ describe("memories integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "scope-demote-agent" }),
+      body: JSON.stringify({ externalId: "scope-demote-agent", groupId }),
     });
     const regBody = await regRes.json();
     const key2 = regBody.apiKey as string;
@@ -778,7 +770,7 @@ describe("memories integration", () => {
     const regRes = await app.request("/api/agents/register", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ externalId: "auto-agent", isAutonomous: true }),
+      body: JSON.stringify({ externalId: "auto-agent", isAutonomous: true, groupId }),
     });
     const regBody = await regRes.json();
     const autoKey = regBody.apiKey as string;

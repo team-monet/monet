@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import type { AppEnv, AgentContext } from "../middleware/context.js";
 import { agentsRouter } from "../routes/agents.js";
+import { parseApiKey } from "../services/api-key.service.js";
 
 const TENANT_ID = "00000000-0000-0000-0000-000000000010";
 const USER_ID = "00000000-0000-0000-0000-000000000099";
 const GROUP_ID = "00000000-0000-0000-0000-000000000088";
 const AGENT_ID = "00000000-0000-0000-0000-000000000077";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const sqlMock = vi.fn();
 const addMemberMock = vi.fn();
@@ -104,6 +106,8 @@ describe("agents route", () => {
     expect(res.status).toBe(201);
     const body = await res.json();
     expect(body.agent.isAutonomous).toBe(true);
+    expect(body.agent.id).toMatch(UUID_RE);
+    expect(parseApiKey(body.apiKey)?.agentId).toBe(body.agent.id);
   });
 
   it("registers with userId after validating tenant ownership", async () => {
@@ -212,12 +216,14 @@ describe("agents route", () => {
     });
 
     expect(res.status).toBe(201);
+    const body = await res.json();
     expect(addMemberMock).toHaveBeenCalledWith(
       sqlMock,
       TENANT_ID,
       GROUP_ID,
-      "00000000-0000-0000-0000-000000000002",
+      body.agent.id,
     );
+    expect(parseApiKey(body.apiKey)?.agentId).toBe(body.agent.id);
   });
 
   it("returns 400 for missing externalId", async () => {
@@ -262,6 +268,7 @@ describe("agents route", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.apiKey).toMatch(/^mnt_/);
+    expect(parseApiKey(body.apiKey)?.agentId).toBe(AGENT_ID);
     expect(closeSessionsForAgent).toHaveBeenCalledWith(AGENT_ID);
     expect(logAuditEventMock).toHaveBeenCalledWith(
       sqlMock,
