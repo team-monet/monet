@@ -19,11 +19,11 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AgentCredentialHandoff } from "./agent-credential-handoff";
+import { registerAgentAction } from "./actions";
 import {
   initialRegisterAgentFormState,
-  registerAgentAction,
   type RegisterAgentFormState,
-} from "./actions";
+} from "./actions-shared";
 
 type GroupOption = {
   id: string;

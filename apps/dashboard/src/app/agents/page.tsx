@@ -28,7 +28,7 @@ export default async function AgentsPage() {
   const userId = sessionUser.id;
 
   let agents: Agent[] = [];
-  let groupMemberships: Record<string, string[]> = {};
+  const groupMemberships: Record<string, string[]> = {};
   let availableGroups: Array<{ id: string; name: string }> = [];
   let bindableUsers: Array<{ id: string; externalId: string; email: string | null }> = [];
   let error = "";

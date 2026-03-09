@@ -140,6 +140,7 @@ async function syncAgentGroups(
     const allowedGroups = await db
       .selectDistinct({
         id: agentGroups.id,
+        name: agentGroups.name,
       })
       .from(humanGroupMembers)
       .innerJoin(

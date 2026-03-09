@@ -1,10 +1,8 @@
 export function resolvePublicMcpUrl() {
   const baseUrl =
-    process.env.MCP_BASE_URL ||
+    process.env.MCP_PUBLIC_URL ||
     process.env.PUBLIC_API_URL ||
     process.env.API_BASE_URL ||
-    process.env.INTERNAL_API_URL ||
-    process.env.NEXTAUTH_URL ||
     "http://localhost:3001";
 
   try {

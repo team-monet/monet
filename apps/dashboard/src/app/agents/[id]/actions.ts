@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { getApiClient } from "@/lib/api-client";
 import { buildMcpConfig, resolvePublicMcpUrl } from "@/lib/agent-connection";
+import type { AgentTokenActionState, AgentMutationActionState } from "./actions-shared";
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
@@ -12,45 +13,6 @@ function revalidateAgentPaths(agentId: string) {
   revalidatePath("/agents");
   revalidatePath(`/agents/${agentId}`);
 }
-
-export type AgentTokenActionState =
-  | {
-      status: "idle";
-      message?: string;
-    }
-  | {
-      status: "error";
-      message: string;
-    }
-  | {
-      status: "success";
-      message: string;
-      apiKey: string;
-      mcpUrl: string;
-      mcpConfig: string;
-    };
-
-export type AgentMutationActionState =
-  | {
-      status: "idle";
-      message?: string;
-    }
-  | {
-      status: "error";
-      message: string;
-    }
-  | {
-      status: "success";
-      message: string;
-    };
-
-export const initialAgentTokenActionState: AgentTokenActionState = {
-  status: "idle",
-};
-
-export const initialAgentMutationActionState: AgentMutationActionState = {
-  status: "idle",
-};
 
 export async function regenerateAgentTokenAction(
   _previousState: AgentTokenActionState,

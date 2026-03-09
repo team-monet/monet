@@ -4,32 +4,11 @@ import { auth } from "@/lib/auth";
 import { getApiClient } from "@/lib/api-client";
 import { buildMcpConfig, resolvePublicMcpUrl } from "@/lib/agent-connection";
 import { revalidatePath } from "next/cache";
+import type { RegisterAgentFormState } from "./actions-shared";
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
-
-export type RegisterAgentFormState =
-  | {
-      status: "idle";
-      message?: string;
-    }
-  | {
-      status: "error";
-      message: string;
-    }
-  | {
-      status: "success";
-      message: string;
-      agentId: string;
-      apiKey: string;
-      mcpUrl: string;
-      mcpConfig: string;
-    };
-
-export const initialRegisterAgentFormState: RegisterAgentFormState = {
-  status: "idle",
-};
 
 export async function getAgentStatusAction(id: string) {
   const client = await getApiClient();

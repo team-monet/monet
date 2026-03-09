@@ -4,7 +4,6 @@ import { useState, type ReactNode } from "react";
 import { Check, Copy, KeyRound } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
 function CopyButton({ value, label }: { value: string; label: string }) {
@@ -40,36 +39,40 @@ export function AgentCredentialHandoff({
   footer?: ReactNode;
 }) {
   return (
-    <div className="space-y-4">
+    <div className="min-w-0 space-y-4">
       <Alert>
         <KeyRound className="h-4 w-4" />
         <AlertTitle>{title}</AlertTitle>
         <AlertDescription>{description}</AlertDescription>
       </Alert>
 
-      <div className="space-y-2">
+      <div className="min-w-0 space-y-2">
         <div className="flex items-center justify-between gap-3">
           <Label htmlFor="agent-api-key">API Key</Label>
           <CopyButton value={apiKey} label="Copy key" />
         </div>
-        <Input id="agent-api-key" readOnly value={apiKey} className="font-mono text-xs" />
+        <div className="overflow-hidden rounded-md border bg-muted px-3 py-2">
+          <code className="block truncate font-mono text-xs">{apiKey}</code>
+        </div>
       </div>
 
-      <div className="space-y-2">
+      <div className="min-w-0 space-y-2">
         <div className="flex items-center justify-between gap-3">
           <Label htmlFor="agent-mcp-url">MCP URL</Label>
           <CopyButton value={mcpUrl} label="Copy URL" />
         </div>
-        <Input id="agent-mcp-url" readOnly value={mcpUrl} className="font-mono text-xs" />
+        <div className="overflow-hidden rounded-md border bg-muted px-3 py-2">
+          <code className="block truncate font-mono text-xs">{mcpUrl}</code>
+        </div>
       </div>
 
-      <div className="space-y-2">
+      <div className="min-w-0 space-y-2">
         <div className="flex items-center justify-between gap-3">
           <Label>MCP Config</Label>
           <CopyButton value={mcpConfig} label="Copy config" />
         </div>
-        <pre className="max-h-64 overflow-auto rounded-md border bg-muted p-3 text-xs">
-          <code>{mcpConfig}</code>
+        <pre className="max-h-64 overflow-auto break-all rounded-md border bg-muted p-3 text-xs">
+          <code className="whitespace-pre-wrap">{mcpConfig}</code>
         </pre>
         <p className="text-xs text-muted-foreground">
           Paste this into your MCP client config, such as Claude Code `~/.claude.json` or Cursor MCP settings.

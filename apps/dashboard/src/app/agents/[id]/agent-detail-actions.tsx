@@ -17,14 +17,16 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import {
-  initialAgentMutationActionState,
-  initialAgentTokenActionState,
   regenerateAgentTokenAction,
   revokeAgentAction,
   unrevokeAgentAction,
+} from "./actions";
+import {
+  initialAgentMutationActionState,
+  initialAgentTokenActionState,
   type AgentMutationActionState,
   type AgentTokenActionState,
-} from "./actions";
+} from "./actions-shared";
 
 function SubmitButton({
   label,
