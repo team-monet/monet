@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import type { AppEnv, AgentContext } from "../middleware/context.js";
+import { resetRateLimits } from "../middleware/rate-limit.js";
 import { agentsRouter } from "../routes/agents.js";
 import { parseApiKey } from "../services/api-key.service.js";
 
@@ -77,6 +78,9 @@ function createTestApp(
 describe("agents route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRateLimits();
+    delete process.env.RATE_LIMIT_MAX;
+    delete process.env.RATE_LIMIT_WINDOW_MS;
     addMemberMock.mockResolvedValue({ success: true });
     resolveAgentRoleMock.mockImplementation(async (_sql: unknown, agent: AgentContext) => agent.role);
     userCanSelectAgentGroupMock.mockResolvedValue(true);
@@ -308,6 +312,55 @@ describe("agents route", () => {
     expect(res.status).toBe(404);
   });
 
+  it("rejects non-admin agents without a user binding from regenerating a token", async () => {
+    const app = createTestApp({ role: "user", userId: null, isAutonomous: true });
+    const res = await app.request(`/agents/${AGENT_ID}/regenerate-token`, {
+      method: "POST",
+    });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({
+      error: "forbidden",
+      message: "User-bound agent access required",
+    });
+    expect(sqlMock).not.toHaveBeenCalled();
+  });
+
+  it("rate limits regenerate-token requests", async () => {
+    process.env.RATE_LIMIT_MAX = "1";
+    process.env.RATE_LIMIT_WINDOW_MS = "60000";
+
+    sqlMock
+      .mockResolvedValueOnce([
+        {
+          id: AGENT_ID,
+          external_id: "self-bound",
+          tenant_id: TENANT_ID,
+          user_id: USER_ID,
+          role: "user",
+          is_autonomous: false,
+          revoked_at: null,
+          created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: USER_ID,
+          owner_external_id: "bound-user",
+          owner_email: "bound@example.com",
+        },
+      ])
+      .mockResolvedValueOnce([]);
+
+    const app = createTestApp({ role: "user", userId: USER_ID });
+
+    const firstRes = await app.request(`/agents/${AGENT_ID}/regenerate-token`, {
+      method: "POST",
+    });
+    const secondRes = await app.request(`/agents/${AGENT_ID}/regenerate-token`, {
+      method: "POST",
+    });
+
+    expect(firstRes.status).toBe(200);
+    expect(secondRes.status).toBe(429);
+  });
+
   it("allows a tenant admin to revoke an agent and terminate sessions", async () => {
     const closeSessionsForAgent = vi.fn().mockResolvedValue(2);
     const revokedAt = "2026-03-09T10:00:00.000Z";
@@ -360,6 +413,40 @@ describe("agents route", () => {
     expect(res.status).toBe(403);
   });
 
+  it("rate limits revoke requests", async () => {
+    process.env.RATE_LIMIT_MAX = "1";
+    process.env.RATE_LIMIT_WINDOW_MS = "60000";
+
+    sqlMock
+      .mockResolvedValueOnce([
+        {
+          id: AGENT_ID,
+          external_id: "worker",
+          tenant_id: TENANT_ID,
+          user_id: null,
+          role: null,
+          is_autonomous: true,
+          revoked_at: null,
+          created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: null,
+          owner_external_id: null,
+          owner_email: null,
+        },
+      ])
+      .mockResolvedValueOnce([{ revoked_at: "2026-03-09T10:00:00.000Z" }]);
+
+    const app = createTestApp();
+    const firstRes = await app.request(`/agents/${AGENT_ID}/revoke`, {
+      method: "POST",
+    });
+    const secondRes = await app.request(`/agents/${AGENT_ID}/revoke`, {
+      method: "POST",
+    });
+
+    expect(firstRes.status).toBe(200);
+    expect(secondRes.status).toBe(429);
+  });
+
   it("allows a tenant admin to unrevoke an agent", async () => {
     sqlMock
       .mockResolvedValueOnce([
@@ -397,6 +484,40 @@ describe("agents route", () => {
         outcome: "success",
       }),
     );
+  });
+
+  it("rate limits unrevoke requests", async () => {
+    process.env.RATE_LIMIT_MAX = "1";
+    process.env.RATE_LIMIT_WINDOW_MS = "60000";
+
+    sqlMock
+      .mockResolvedValueOnce([
+        {
+          id: AGENT_ID,
+          external_id: "worker",
+          tenant_id: TENANT_ID,
+          user_id: null,
+          role: null,
+          is_autonomous: true,
+          revoked_at: "2026-03-08T10:00:00.000Z",
+          created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: null,
+          owner_external_id: null,
+          owner_email: null,
+        },
+      ])
+      .mockResolvedValueOnce([]);
+
+    const app = createTestApp();
+    const firstRes = await app.request(`/agents/${AGENT_ID}/unrevoke`, {
+      method: "POST",
+    });
+    const secondRes = await app.request(`/agents/${AGENT_ID}/unrevoke`, {
+      method: "POST",
+    });
+
+    expect(firstRes.status).toBe(200);
+    expect(secondRes.status).toBe(429);
   });
 
   it("returns empty rule sets for non-admin agent detail requests", async () => {

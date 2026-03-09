@@ -14,6 +14,7 @@ import { userCanSelectAgentGroup } from "../services/user-group.service.js";
 import { generateApiKey, hashApiKey } from "../services/api-key.service.js";
 import type { AuditEntry } from "../services/audit.service.js";
 import { logAuditEvent } from "../services/audit.service.js";
+import { rateLimitMiddleware } from "../middleware/rate-limit.js";
 
 export const agentsRouter = new Hono<AppEnv>();
 const DASHBOARD_AGENT_PREFIX = "dashboard:";
@@ -107,6 +108,13 @@ async function loadAccessibleAgentRow(
   const sql = c.get("sql");
   const role = await resolveAgentRole(sql, requester);
   const admin = isTenantAdmin(role);
+
+  if (!admin && !requester.userId) {
+    return {
+      response: c.json({ error: "forbidden", message: "User-bound agent access required" }, 403),
+    };
+  }
+
   const row = await loadAgentRow(sql, requester.tenantId, agentId);
 
   if (!row) {
@@ -320,7 +328,7 @@ agentsRouter.post("/register", async (c) => {
 /**
  * POST /api/agents/:id/regenerate-token — rotate an agent API key and return the raw key once.
  */
-agentsRouter.post("/:id/regenerate-token", async (c) => {
+agentsRouter.post("/:id/regenerate-token", rateLimitMiddleware, async (c) => {
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
   const schemaName = c.get("tenantSchemaName");
@@ -358,7 +366,7 @@ agentsRouter.post("/:id/regenerate-token", async (c) => {
 /**
  * POST /api/agents/:id/revoke — revoke an agent token and terminate active MCP sessions.
  */
-agentsRouter.post("/:id/revoke", async (c) => {
+agentsRouter.post("/:id/revoke", rateLimitMiddleware, async (c) => {
   const forbidden = await requireTenantAdmin(c);
   if (forbidden) return forbidden;
 
@@ -399,7 +407,7 @@ agentsRouter.post("/:id/revoke", async (c) => {
 /**
  * POST /api/agents/:id/unrevoke — restore a revoked agent token.
  */
-agentsRouter.post("/:id/unrevoke", async (c) => {
+agentsRouter.post("/:id/unrevoke", rateLimitMiddleware, async (c) => {
   const forbidden = await requireTenantAdmin(c);
   if (forbidden) return forbidden;
 

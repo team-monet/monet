@@ -31,6 +31,6 @@ export const RegisterAgentApiInput = z.object({
   externalId: z.string().min(1, "External agent ID is required"),
   isAutonomous: z.boolean().default(false),
   userId: z.string().uuid().optional(),
-  groupId: z.string().uuid().optional(),
+  groupId: z.string().uuid(),
 });
 export type RegisterAgentApiInput = z.infer<typeof RegisterAgentApiInput>;
