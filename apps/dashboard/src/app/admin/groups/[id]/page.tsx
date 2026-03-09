@@ -7,6 +7,7 @@ import { addGroupMemberAction, removeGroupMemberAction } from "../actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { SubmitButton } from "@/components/ui/submit-button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { AlertTriangle, ArrowLeft, Bot, User, Users } from "lucide-react";
@@ -131,9 +132,7 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
                     ))}
                   </select>
                 </div>
-                <Button type="submit" disabled={availableAgents.length === 0}>
-                  Add Member
-                </Button>
+                <SubmitButton label="Add Member" pendingLabel="Adding..." disabled={availableAgents.length === 0} />
               </form>
               {availableAgents.length === 0 && (
                 <p className="text-[11px] text-muted-foreground mt-2">
@@ -188,9 +187,7 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
                           <form action={removeGroupMemberAction}>
                             <input type="hidden" name="groupId" value={groupId} />
                             <input type="hidden" name="agentId" value={member.id} />
-                            <Button type="submit" variant="outline" size="sm">
-                              Remove
-                            </Button>
+                            <SubmitButton label="Remove" pendingLabel="Removing..." variant="outline" size="sm" />
                           </form>
                         </TableCell>
                       </TableRow>

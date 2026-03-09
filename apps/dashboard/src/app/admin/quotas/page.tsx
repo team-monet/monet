@@ -3,7 +3,7 @@ import { requireAdmin } from "@/lib/auth";
 import { AgentGroup } from "@monet/types";
 import { updateGroupQuotaAction } from "./actions";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { SubmitButton } from "@/components/ui/submit-button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -121,10 +121,10 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                             placeholder={group.memoryQuota === null ? "e.g. 1000" : "Enter a new quota"}
                             className="h-9"
                           />
-                          <Button size="sm" type="submit" className="h-9 px-3">
+                          <SubmitButton size="sm" type="submit" className="h-9 px-3">
                             <Save className="h-4 w-4" />
                             <span className="sr-only">Save</span>
-                          </Button>
+                          </SubmitButton>
                         </div>
                       </div>
                     </form>

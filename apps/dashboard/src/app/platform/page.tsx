@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SubmitButton } from "@/components/ui/submit-button";
 import {
   Table,
   TableBody,
@@ -105,9 +106,7 @@ export default async function PlatformPage({ searchParams }: PageProps) {
                 </select>
               </div>
 
-              <Button type="submit" className="w-full">
-                Create tenant
-              </Button>
+              <SubmitButton label="Create tenant" pendingLabel="Creating..." className="w-full" />
             </form>
           </CardContent>
         </Card>

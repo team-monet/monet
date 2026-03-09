@@ -1,12 +1,12 @@
 "use client";
 
 import { startTransition, useActionState, useEffect, useState } from "react";
-import { useFormStatus } from "react-dom";
 import { useRouter } from "next/navigation";
 import { KeyRound, ShieldAlert, ShieldCheck } from "lucide-react";
 import { AgentCredentialHandoff } from "@/app/agents/agent-credential-handoff";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { SubmitButton } from "@/components/ui/submit-button";
 import {
   Dialog,
   DialogContent,
@@ -27,24 +27,6 @@ import {
   type AgentMutationActionState,
   type AgentTokenActionState,
 } from "./actions-shared";
-
-function SubmitButton({
-  label,
-  pendingLabel,
-  variant = "default",
-}: {
-  label: string;
-  pendingLabel: string;
-  variant?: "default" | "destructive" | "outline" | "secondary";
-}) {
-  const { pending } = useFormStatus();
-
-  return (
-    <Button type="submit" variant={variant} disabled={pending}>
-      {pending ? pendingLabel : label}
-    </Button>
-  );
-}
 
 function MutationError({ state }: { state: AgentMutationActionState | AgentTokenActionState }) {
   if (state.status !== "error") {

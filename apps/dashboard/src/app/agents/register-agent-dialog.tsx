@@ -2,10 +2,10 @@
 
 import Link from "next/link";
 import { startTransition, useActionState, useEffect, useState } from "react";
-import { useFormStatus } from "react-dom";
 import { useRouter } from "next/navigation";
 import { Bot, KeyRound, Plus, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { SubmitButton } from "@/components/ui/submit-button";
 import {
   Dialog,
   DialogContent,
@@ -35,16 +35,6 @@ type UserOption = {
   externalId: string;
   email: string | null;
 };
-
-function SubmitButton({ disabled }: { disabled: boolean }) {
-  const { pending } = useFormStatus();
-
-  return (
-    <Button type="submit" disabled={disabled || pending}>
-      {pending ? "Registering..." : "Register Agent"}
-    </Button>
-  );
-}
 
 function RegistrationSuccess({
   state,
@@ -205,7 +195,11 @@ function RegisterAgentForm({
       </div>
 
       <DialogFooter>
-        <SubmitButton disabled={!hasGroupOptions || missingUserOptions} />
+        <SubmitButton 
+          label="Register Agent" 
+          pendingLabel="Registering..." 
+          disabled={!hasGroupOptions || missingUserOptions} 
+        />
       </DialogFooter>
     </form>
   );

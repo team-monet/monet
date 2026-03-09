@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SubmitButton } from "@/components/ui/submit-button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 interface ExtendedUser {
@@ -91,7 +92,7 @@ export default async function HumanGroupsPage({ searchParams }: PageProps) {
                 />
               </div>
               <DialogFooter>
-                <Button type="submit">Create Group</Button>
+                <SubmitButton label="Create Group" pendingLabel="Creating..." />
               </DialogFooter>
             </form>
           </DialogContent>

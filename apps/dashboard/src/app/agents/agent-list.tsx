@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Agent } from "@monet/types";
-import { Activity, Bot, Calendar, ChevronRight, ShieldAlert, User } from "lucide-react";
+import { Activity, Bot, Calendar, ChevronRight, Loader2, ShieldAlert, User } from "lucide-react";
 import { getAgentStatusAction } from "./actions";
 import { formatAgentDisplayName } from "@/lib/agent-display";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -22,6 +22,7 @@ export default function AgentList({
   isAdmin,
 }: AgentListProps) {
   const router = useRouter();
+  const [isPending, startTransition] = useTransition();
   const [statuses, setStatuses] = useState<Record<string, { activeSessions: number; revoked: boolean }>>({});
 
   useEffect(() => {
@@ -83,12 +84,18 @@ export default function AgentList({
                 return (
                   <TableRow
                     key={agent.id}
-                    className="cursor-pointer hover:bg-muted/50 transition-colors"
-                    onClick={() => router.push(`/agents/${agent.id}`)}
+                    className="cursor-pointer hover:bg-muted/50 transition-colors relative"
+                    onClick={() => {
+                      startTransition(() => {
+                        router.push(`/agents/${agent.id}`);
+                      });
+                    }}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
-                        router.push(`/agents/${agent.id}`);
+                        startTransition(() => {
+                          router.push(`/agents/${agent.id}`);
+                        });
                       }
                     }}
                     tabIndex={0}
@@ -111,7 +118,11 @@ export default function AgentList({
                             {agent.id}
                           </span>
                         </div>
-                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                        {isPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                        ) : (
+                          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                        )}
                       </div>
                     </TableCell>
 

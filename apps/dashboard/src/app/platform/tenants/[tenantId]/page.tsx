@@ -5,6 +5,7 @@ import { getPlatformTenant } from "@/lib/platform-tenants";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { SubmitButton } from "@/components/ui/submit-button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -166,7 +167,7 @@ export default async function PlatformTenantDetailPage({
                 />
               </div>
 
-              <Button type="submit">Save tenant OIDC</Button>
+              <SubmitButton label="Save tenant OIDC" pendingLabel="Saving..." />
             </form>
           </CardContent>
         </Card>
@@ -249,7 +250,7 @@ export default async function PlatformTenantDetailPage({
                 />
               </div>
 
-              <Button type="submit">Save tenant admin nomination</Button>
+              <SubmitButton label="Save tenant admin nomination" pendingLabel="Saving..." />
             </form>
 
             <div className="space-y-3">

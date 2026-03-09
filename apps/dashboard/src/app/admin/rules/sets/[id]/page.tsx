@@ -6,6 +6,7 @@ import { addRuleToSetAction, deleteRuleSetAction, removeRuleFromSetAction } from
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { SubmitButton } from "@/components/ui/submit-button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { ArrowLeft, AlertTriangle, Layers, Plus, Trash2 } from "lucide-react";
@@ -120,9 +121,7 @@ export default async function RuleSetDetailPage({ params, searchParams }: PagePr
                         <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
                         <input type="hidden" name="ruleId" value={rule.id} />
                         <input type="hidden" name="returnTo" value={returnTo} />
-                        <Button type="submit" variant="ghost" size="sm">
-                          Remove
-                        </Button>
+                        <SubmitButton label="Remove" pendingLabel="Removing..." variant="ghost" size="sm" />
                       </form>
                     </div>
                   ))
@@ -163,9 +162,7 @@ export default async function RuleSetDetailPage({ params, searchParams }: PagePr
                     )}
                   </select>
                 </div>
-                <Button type="submit" disabled={availableRules.length === 0}>
-                  Add Rule
-                </Button>
+                <SubmitButton label="Add Rule" pendingLabel="Adding..." disabled={availableRules.length === 0} />
               </form>
             </CardContent>
           </Card>
@@ -179,10 +176,10 @@ export default async function RuleSetDetailPage({ params, searchParams }: PagePr
               <form action={deleteRuleSetAction}>
                 <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
                 <input type="hidden" name="returnTo" value="/admin/rules" />
-                <Button type="submit" variant="destructive">
+                <SubmitButton pendingLabel="Deleting..." variant="destructive">
                   <Trash2 className="mr-2 h-4 w-4" />
                   Delete Rule Set
-                </Button>
+                </SubmitButton>
               </form>
             </CardFooter>
           </Card>

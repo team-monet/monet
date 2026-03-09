@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { SubmitButton } from "@/components/ui/submit-button";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import Link from "next/link";
@@ -105,7 +106,7 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                 />
               </div>
               <DialogFooter>
-                <Button type="submit">Create Rule</Button>
+                <SubmitButton label="Create Rule" pendingLabel="Creating..." />
               </DialogFooter>
             </form>
           </DialogContent>
@@ -261,7 +262,7 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                                     />
                                   </div>
                                   <DialogFooter>
-                                    <Button type="submit">Save changes</Button>
+                                    <SubmitButton label="Save changes" pendingLabel="Saving..." />
                                   </DialogFooter>
                                 </form>
                               </DialogContent>
@@ -300,7 +301,7 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                       <Label htmlFor="rule-set-name">Rule Set Name</Label>
                       <Input id="rule-set-name" name="name" required placeholder="e.g. Default Agent Set" />
                     </div>
-                    <Button type="submit" className="w-full">Create Rule Set</Button>
+                    <SubmitButton label="Create Rule Set" pendingLabel="Creating..." className="w-full" />
                   </form>
                 </CardContent>
               </Card>
@@ -343,10 +344,14 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                     <form action={deleteRuleSetAction}>
                       <input type="hidden" name="ruleSetId" value={ruleSet.id} />
                       <input type="hidden" name="returnTo" value="/admin/rules" />
-                      <Button type="submit" variant="ghost" size="icon" className="h-8 w-8 text-destructive">
+                      <SubmitButton 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-8 w-8 text-destructive"
+                      >
                         <Trash2 className="h-4 w-4" />
                         <span className="sr-only">Delete</span>
-                      </Button>
+                      </SubmitButton>
                     </form>
                   </CardFooter>
                 </Card>

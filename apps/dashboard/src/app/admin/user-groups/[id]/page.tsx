@@ -19,6 +19,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { SubmitButton } from "@/components/ui/submit-button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
@@ -143,7 +144,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                 <Input id="description" name="description" defaultValue={detail.group.description} />
               </div>
               <DialogFooter>
-                <Button type="submit">Save changes</Button>
+                <SubmitButton label="Save changes" pendingLabel="Saving..." />
               </DialogFooter>
             </form>
           </DialogContent>
@@ -260,9 +261,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                   ))}
                 </select>
               </div>
-              <Button type="submit" disabled={availableUsers.length === 0}>
-                Add Member
-              </Button>
+              <SubmitButton label="Add Member" pendingLabel="Adding..." disabled={availableUsers.length === 0} />
             </form>
 
             <Table>
@@ -303,9 +302,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                         <form action={removeHumanGroupMemberAction}>
                           <input type="hidden" name="humanGroupId" value={detail.group.id} />
                           <input type="hidden" name="userId" value={member.id} />
-                          <Button type="submit" variant="outline" size="sm">
-                            Remove
-                          </Button>
+                          <SubmitButton label="Remove" pendingLabel="Removing..." variant="outline" size="sm" />
                         </form>
                       </TableCell>
                     </TableRow>
@@ -382,9 +379,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                 ))
               )}
             </div>
-            <Button type="submit" disabled={detail.tenantAgentGroups.length === 0}>
-              Save Permissions
-            </Button>
+            <SubmitButton label="Save Permissions" pendingLabel="Saving..." disabled={detail.tenantAgentGroups.length === 0} />
           </form>
         </CardContent>
       </Card>

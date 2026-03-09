@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SubmitButton } from "@/components/ui/submit-button";
 import {
   getBootstrapStatus,
   getPlatformSetupState,
@@ -63,9 +64,7 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
                 />
               </div>
 
-              <Button type="submit" className="w-full">
-                Start setup
-              </Button>
+              <SubmitButton label="Start setup" pendingLabel="Starting..." className="w-full" />
             </form>
           ) : setupState.platformAuthConfigured ? (
             <div className="space-y-4">
@@ -133,9 +132,7 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
                 />
               </div>
 
-              <Button type="submit" className="w-full">
-                Save platform setup
-              </Button>
+              <SubmitButton label="Save platform setup" pendingLabel="Saving..." className="w-full" />
             </form>
           )}
         </CardContent>

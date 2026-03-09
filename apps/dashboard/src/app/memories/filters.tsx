@@ -3,6 +3,7 @@
 import { MemoryType } from "@monet/types";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
+import { useTransition } from "react";
 import { 
   Select as ShadSelect, 
   SelectContent as ShadSelectContent, 
@@ -13,7 +14,7 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
-import { X } from "lucide-react";
+import { Loader2, X } from "lucide-react";
 
 interface MemoryFiltersProps {
   initialType?: MemoryType;
@@ -28,6 +29,7 @@ export function MemoryFilters({
 }: MemoryFiltersProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const [isPending, startTransition] = useTransition();
 
   const updateUrl = (updates: Record<string, string | boolean | undefined>) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -39,11 +41,18 @@ export function MemoryFilters({
       }
     });
     params.delete("cursor");
-    router.push(`/memories?${params.toString()}`);
+    startTransition(() => {
+      router.push(`/memories?${params.toString()}`);
+    });
   };
 
   return (
-    <div className="flex flex-wrap gap-6 items-end p-4 border rounded-lg bg-card mb-6 shadow-sm">
+    <div className="flex flex-wrap gap-6 items-end p-4 border rounded-lg bg-card mb-6 shadow-sm relative">
+      {isPending && (
+        <div className="absolute inset-0 bg-background/50 flex items-center justify-center z-10 rounded-lg">
+          <Loader2 className="h-6 w-6 animate-spin text-primary" />
+        </div>
+      )}
       <div className="grid gap-2 min-w-[180px]">
         <Label className="text-xs uppercase text-muted-foreground font-semibold">Memory Type</Label>
         <ShadSelect 

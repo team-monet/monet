@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { SubmitButton } from "@/components/ui/submit-button";
 
 interface PageProps {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
@@ -87,7 +88,7 @@ export default async function AdminGroupsPage({ searchParams }: PageProps) {
                 <Input id="memoryQuota" name="memoryQuota" type="number" min={1} step={1} placeholder="Optional. Leave blank for unlimited" />
               </div>
               <DialogFooter>
-                <Button type="submit">Create Group</Button>
+                <SubmitButton label="Create Group" pendingLabel="Creating..." />
               </DialogFooter>
             </form>
           </DialogContent>
@@ -219,7 +220,7 @@ export default async function AdminGroupsPage({ searchParams }: PageProps) {
                                   </p>
                                 </div>
                                 <DialogFooter>
-                                  <Button type="submit">Save changes</Button>
+                                  <SubmitButton label="Save changes" pendingLabel="Saving..." />
                                 </DialogFooter>
                               </form>
                             </DialogContent>
