@@ -28,22 +28,6 @@ export async function listAllowedAgentGroupsForUserByHumanGroups(
       agentGroups,
       eq(agentGroups.id, humanGroupAgentGroupPermissions.agentGroupId),
     )
-    .where(
-      and(
-        eq(humanGroupMembers.userId, userId),
-        eq(agentGroups.tenantId, tenantId),
-      ),
-    )
-    .orderBy(asc(agentGroups.name));
-}
-
-export async function userHasHumanGroupMembershipsByHumanGroups(
-  tenantId: string,
-  userId: string,
-) {
-  const rows = await db
-    .select({ userId: humanGroupMembers.userId })
-    .from(humanGroupMembers)
     .innerJoin(
       humanGroups,
       eq(humanGroups.id, humanGroupMembers.humanGroupId),
@@ -52,9 +36,8 @@ export async function userHasHumanGroupMembershipsByHumanGroups(
       and(
         eq(humanGroupMembers.userId, userId),
         eq(humanGroups.tenantId, tenantId),
+        eq(agentGroups.tenantId, tenantId),
       ),
     )
-    .limit(1);
-
-  return rows.length > 0;
+    .orderBy(asc(agentGroups.name));
 }

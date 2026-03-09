@@ -1,22 +1,5 @@
 import type postgres from "postgres";
 
-export async function userHasHumanGroupMemberships(
-  sql: postgres.Sql,
-  tenantId: string,
-  userId: string,
-): Promise<boolean> {
-  const [row] = await sql`
-    SELECT 1
-    FROM human_group_members hgm
-    JOIN human_groups hg ON hg.id = hgm.human_group_id
-    WHERE hgm.user_id = ${userId}
-      AND hg.tenant_id = ${tenantId}
-    LIMIT 1
-  `;
-
-  return Boolean(row);
-}
-
 export async function listAllowedAgentGroupIdsForUser(
   sql: postgres.Sql,
   tenantId: string,
@@ -53,18 +36,6 @@ export async function userCanSelectAgentGroup(
 
   if (!group) {
     return false;
-  }
-
-  const hasExplicitMemberships = await userHasHumanGroupMemberships(
-    sql,
-    tenantId,
-    userId,
-  );
-
-  // Legacy fallback: until every tenant configures human groups, preserve the
-  // previous behavior for users without any human-group memberships.
-  if (!hasExplicitMemberships) {
-    return true;
   }
 
   const allowedGroupIds = await listAllowedAgentGroupIdsForUser(

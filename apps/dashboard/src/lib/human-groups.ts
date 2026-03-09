@@ -17,6 +17,10 @@ export type HumanGroupSummary = {
   allowedAgentGroupCount: number;
 };
 
+export const DEFAULT_HUMAN_GROUP_NAME = "Everyone";
+export const DEFAULT_HUMAN_GROUP_DESCRIPTION =
+  "Default human-user group assigned automatically on first login.";
+
 export async function listHumanGroupsForTenant(
   tenantId: string,
 ): Promise<HumanGroupSummary[]> {
@@ -136,4 +140,75 @@ export async function getHumanGroupDetail(tenantId: string, humanGroupId: string
       permissionRows.map((row) => row.agentGroupId),
     ),
   };
+}
+
+export async function ensureDefaultHumanGroupMembership(
+  tenantId: string,
+  userId: string,
+) {
+  const existingMemberships = await db
+    .select({ humanGroupId: humanGroupMembers.humanGroupId })
+    .from(humanGroupMembers)
+    .innerJoin(humanGroups, eq(humanGroups.id, humanGroupMembers.humanGroupId))
+    .where(
+      and(
+        eq(humanGroupMembers.userId, userId),
+        eq(humanGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
+
+  if (existingMemberships.length > 0) {
+    return;
+  }
+
+  await db.transaction(async (tx) => {
+    let [defaultGroup] = await tx
+      .select({ id: humanGroups.id })
+      .from(humanGroups)
+      .where(
+        and(
+          eq(humanGroups.tenantId, tenantId),
+          eq(humanGroups.name, DEFAULT_HUMAN_GROUP_NAME),
+        ),
+      )
+      .limit(1);
+
+    if (!defaultGroup) {
+      [defaultGroup] = await tx
+        .insert(humanGroups)
+        .values({
+          tenantId,
+          name: DEFAULT_HUMAN_GROUP_NAME,
+          description: DEFAULT_HUMAN_GROUP_DESCRIPTION,
+        })
+        .onConflictDoNothing()
+        .returning({ id: humanGroups.id });
+
+      if (!defaultGroup) {
+        [defaultGroup] = await tx
+          .select({ id: humanGroups.id })
+          .from(humanGroups)
+          .where(
+            and(
+              eq(humanGroups.tenantId, tenantId),
+              eq(humanGroups.name, DEFAULT_HUMAN_GROUP_NAME),
+            ),
+          )
+          .limit(1);
+      }
+    }
+
+    if (!defaultGroup) {
+      throw new Error("Failed to resolve default human group");
+    }
+
+    await tx
+      .insert(humanGroupMembers)
+      .values({
+        humanGroupId: defaultGroup.id,
+        userId,
+      })
+      .onConflictDoNothing();
+  });
 }

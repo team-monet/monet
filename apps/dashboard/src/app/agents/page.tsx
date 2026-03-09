@@ -1,16 +1,12 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import {
   agentGroupMembers,
   agentGroups as agentGroupsTable,
-  agents as agentsTable,
   humanUsers,
 } from "@monet/db";
 import type { Agent } from "@monet/types";
 import { getApiClient } from "@/lib/api-client";
-import {
-  listAllowedAgentGroupsForUserByHumanGroups,
-  userHasHumanGroupMembershipsByHumanGroups,
-} from "@/lib/agent-group-access";
+import { listAllowedAgentGroupsForUserByHumanGroups } from "@/lib/agent-group-access";
 import { requireAuth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import AgentList from "./agent-list";
@@ -45,48 +41,17 @@ export default async function AgentsPage() {
     const client = await getApiClient();
     agents = await client.listAgents();
 
-    const [
-      allTenantGroups,
-      hasHumanGroupMemberships,
-      allowedGroupsByHumanGroup,
-      ownedGroups,
-      userRows,
-      membershipRows,
-    ] = await Promise.all([
-      db
-        .select({
-          id: agentGroupsTable.id,
-          name: agentGroupsTable.name,
-        })
-        .from(agentGroupsTable)
-        .where(eq(agentGroupsTable.tenantId, tenantId))
-        .orderBy(asc(agentGroupsTable.name)),
+    const [availableGroupsForSession, userRows, membershipRows] = await Promise.all([
       isAdmin
-        ? Promise.resolve(false)
-        : userHasHumanGroupMembershipsByHumanGroups(tenantId, userId),
-      isAdmin
-        ? Promise.resolve([])
-        : listAllowedAgentGroupsForUserByHumanGroups(tenantId, userId),
-      isAdmin
-        ? Promise.resolve([])
-        : db
+        ? db
             .selectDistinct({
               id: agentGroupsTable.id,
               name: agentGroupsTable.name,
             })
             .from(agentGroupsTable)
-            .innerJoin(
-              agentGroupMembers,
-              eq(agentGroupMembers.groupId, agentGroupsTable.id),
-            )
-            .innerJoin(agentsTable, eq(agentsTable.id, agentGroupMembers.agentId))
-            .where(
-              and(
-                eq(agentGroupsTable.tenantId, tenantId),
-                eq(agentsTable.userId, userId),
-              ),
-            )
-            .orderBy(asc(agentGroupsTable.name)),
+            .where(eq(agentGroupsTable.tenantId, tenantId))
+            .orderBy(asc(agentGroupsTable.name))
+        : listAllowedAgentGroupsForUserByHumanGroups(tenantId, userId),
       isAdmin
         ? db
             .select({
@@ -114,15 +79,7 @@ export default async function AgentsPage() {
             .orderBy(asc(agentGroupsTable.name)),
     ]);
 
-    // Prefer explicit human-group permissions when present. Fall back to the
-    // pre-existing inferred behavior until the new group model is fully wired.
-    availableGroups = isAdmin
-      ? allTenantGroups
-      : hasHumanGroupMemberships
-        ? allowedGroupsByHumanGroup
-        : ownedGroups.length > 0
-          ? ownedGroups
-          : allTenantGroups;
+    availableGroups = availableGroupsForSession;
     bindableUsers = userRows;
 
     for (const membership of membershipRows) {
