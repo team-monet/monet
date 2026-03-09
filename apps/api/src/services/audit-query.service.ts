@@ -37,24 +37,47 @@ export async function queryAuditLogs(
 
   return withTenantScope(sql, schemaName, async (tx) => {
     // Start building the query
-    let queryText = 'SELECT * FROM audit_log WHERE 1=1';
+    let queryText = `
+      SELECT
+        al.*,
+        CASE
+          WHEN al.actor_type = 'agent' AND actor_agent.id IS NOT NULL THEN
+            CASE
+              WHEN actor_agent.is_autonomous THEN actor_agent.external_id || ' (Autonomous)'
+              WHEN actor_agent_owner.email IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.email
+              WHEN actor_agent_owner.external_id IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.external_id
+              ELSE actor_agent.external_id
+            END
+          WHEN al.actor_type = 'human_user' THEN COALESCE(actor_user.email, actor_user.external_id)
+          WHEN al.actor_type = 'system' THEN 'System'
+          ELSE NULL
+        END AS actor_display_name
+      FROM audit_log al
+      LEFT JOIN public.agents actor_agent
+        ON al.actor_type = 'agent' AND actor_agent.id = al.actor_id
+      LEFT JOIN public.human_users actor_agent_owner
+        ON actor_agent_owner.id = actor_agent.user_id
+      LEFT JOIN public.human_users actor_user
+        ON al.actor_type = 'human_user' AND actor_user.id = al.actor_id
+      WHERE 1=1
+    `;
     const queryParams: postgres.ParameterOrJSON<never>[] = [];
 
     if (options.actorId) {
       queryParams.push(options.actorId);
-      queryText += ` AND actor_id = $${queryParams.length}`;
+      queryText += ` AND al.actor_id = $${queryParams.length}`;
     }
     if (options.action) {
       queryParams.push(options.action);
-      queryText += ` AND action = $${queryParams.length}`;
+      queryText += ` AND al.action = $${queryParams.length}`;
     }
     if (options.startDate) {
       queryParams.push(options.startDate);
-      queryText += ` AND created_at >= $${queryParams.length}`;
+      queryText += ` AND al.created_at >= $${queryParams.length}`;
     }
     if (options.endDate) {
       queryParams.push(options.endDate);
-      queryText += ` AND created_at <= $${queryParams.length}`;
+      queryText += ` AND al.created_at <= $${queryParams.length}`;
     }
 
     // Cursor pagination (created_at, id)
@@ -64,10 +87,10 @@ export async function queryAuditLogs(
       const createdAtIdx = queryParams.length;
       queryParams.push(decoded.id);
       const idIdx = queryParams.length;
-      queryText += ` AND (created_at, id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`;
+      queryText += ` AND (al.created_at, al.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`;
     }
 
-    queryText += ` ORDER BY created_at DESC, id DESC LIMIT ${limit + 1}`;
+    queryText += ` ORDER BY al.created_at DESC, al.id DESC LIMIT ${limit + 1}`;
 
     const rows = await tx.unsafe(queryText, queryParams);
 

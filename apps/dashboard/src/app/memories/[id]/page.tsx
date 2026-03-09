@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ChevronLeft, Calendar, Tag, Info, History, FileText } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
+import { formatMemoryAuthor } from "@/lib/memory-display";
 
 interface PageProps {
   params: Promise<{ id: string }>;
@@ -164,8 +165,11 @@ export default async function MemoryEntryDetailPage({ params }: PageProps) {
                 <div>
                   <h4 className="text-sm font-semibold mb-2">Source</h4>
                   <dl className="grid grid-cols-1 gap-2 text-sm">
-                    <dt className="text-muted-foreground">Author Agent ID</dt>
-                    <dd className="font-mono text-xs bg-muted p-1.5 rounded border">{memory.authorAgentId}</dd>
+                    <dt className="text-muted-foreground">Author Agent</dt>
+                    <dd className="space-y-1">
+                      <div className="font-medium">{formatMemoryAuthor(memory)}</div>
+                      <div className="font-mono text-xs bg-muted p-1.5 rounded border">{memory.authorAgentId}</div>
+                    </dd>
                     
                     {memory.groupId && (
                       <>

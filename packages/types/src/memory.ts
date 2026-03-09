@@ -48,6 +48,7 @@ export const MemoryEntry = z.object({
   createdAt: z.coerce.date(),
   lastAccessedAt: z.coerce.date(),
   authorAgentId: z.string().uuid(),
+  authorAgentDisplayName: z.string().nullable().optional(),
   groupId: z.string().uuid().nullable(),
   userId: z.string().uuid().nullable(),
   version: z.number().int().nonnegative(),
@@ -65,6 +66,7 @@ export const MemoryEntryTier1 = MemoryEntry.pick({
   outdated: true,
   createdAt: true,
   authorAgentId: true,
+  authorAgentDisplayName: true,
 });
 export type MemoryEntryTier1 = z.infer<typeof MemoryEntryTier1>;
 

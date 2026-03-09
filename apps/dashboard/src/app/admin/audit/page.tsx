@@ -11,7 +11,7 @@ import {
   PaginationNext, 
 } from "@/components/ui/pagination";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { AlertTriangle, Calendar, User, Bot } from "lucide-react";
+import { AlertTriangle, Calendar, User, Bot, ShieldCheck } from "lucide-react";
 import { AuditFilters } from "./filters";
 
 interface PageProps {
@@ -20,6 +20,19 @@ interface PageProps {
 
 function getSingleParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function actorTypeLabel(actorType: string) {
+  if (actorType === "human_user") {
+    return "User";
+  }
+  if (actorType === "system") {
+    return "System";
+  }
+  if (actorType === "agent") {
+    return "Agent";
+  }
+  return actorType;
 }
 
 export default async function AdminAuditPage({ searchParams }: PageProps) {
@@ -105,11 +118,19 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center gap-2">
-                            {log.actor_type === "agent" ? <Bot className="h-4 w-4 text-primary" /> : <User className="h-4 w-4 text-muted-foreground" />}
+                            {log.actor_type === "agent" ? (
+                              <Bot className="h-4 w-4 text-primary" />
+                            ) : log.actor_type === "system" ? (
+                              <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+                            ) : (
+                              <User className="h-4 w-4 text-muted-foreground" />
+                            )}
                             <div className="flex flex-col">
-                              <span className="font-medium">{log.actor_type}</span>
+                              <span className="font-medium">
+                                {log.actor_display_name ?? actorTypeLabel(log.actor_type)}
+                              </span>
                               <span className="text-[10px] font-mono text-muted-foreground truncate max-w-[120px]" title={log.actor_id}>
-                                {log.actor_id}
+                                {actorTypeLabel(log.actor_type)} · {log.actor_id}
                               </span>
                             </div>
                           </div>

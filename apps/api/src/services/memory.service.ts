@@ -42,6 +42,7 @@ function mapRow(row: Record<string, unknown>) {
     createdAt: row.created_at as string,
     lastAccessedAt: row.last_accessed_at as string,
     authorAgentId: row.author_agent_id as string,
+    authorAgentDisplayName: (row.author_agent_display_name as string | null) ?? null,
     groupId: (row.group_id as string) ?? null,
     userId: (row.user_id as string) ?? null,
     version: row.version as number,
@@ -71,7 +72,33 @@ function mapTier1Row(row: Record<string, unknown>): MemoryEntryTier1 {
     outdated: row.outdated as boolean,
     createdAt: new Date(asTimestamp(row.created_at)),
     authorAgentId: row.author_agent_id as string,
+    authorAgentDisplayName: (row.author_agent_display_name as string | null) ?? null,
   };
+}
+
+const MEMORY_AUTHOR_DISPLAY_SELECT = `
+  CASE
+    WHEN author_agent.id IS NULL THEN NULL
+    WHEN author_agent.is_autonomous THEN author_agent.external_id || ' (Autonomous)'
+    WHEN author_owner.email IS NOT NULL THEN author_agent.external_id || ' · ' || author_owner.email
+    WHEN author_owner.external_id IS NOT NULL THEN author_agent.external_id || ' · ' || author_owner.external_id
+    ELSE author_agent.external_id
+  END AS author_agent_display_name
+`;
+
+function buildMemoryEntrySelect(rankExpression?: string) {
+  const rankSelect = rankExpression
+    ? `${rankExpression} AS search_rank,\n    `
+    : "";
+
+  return `
+    SELECT
+      me.*,
+      ${rankSelect}${MEMORY_AUTHOR_DISPLAY_SELECT}
+    FROM memory_entries me
+    LEFT JOIN public.agents author_agent ON author_agent.id = me.author_agent_id
+    LEFT JOIN public.human_users author_owner ON author_owner.id = author_agent.user_id
+  `;
 }
 
 // ---------- Audit log ----------
@@ -109,15 +136,15 @@ export function buildScopeFilter(
   agent: AgentContext,
   opts: ScopeFilterOpts,
 ): string[] {
-  const conditions: string[] = ["memory_scope = 'group'"];
+  const conditions: string[] = ["me.memory_scope = 'group'"];
 
   if (opts.includeUser && agent.userId) {
-    conditions.push(`(memory_scope = 'user' AND user_id = ${escapeLiteral(agent.userId)})`);
+    conditions.push(`(me.memory_scope = 'user' AND me.user_id = ${escapeLiteral(agent.userId)})`);
   }
 
   if (opts.includePrivate) {
     conditions.push(
-      `(memory_scope = 'private' AND author_agent_id = ${escapeLiteral(agent.id)})`,
+      `(me.memory_scope = 'private' AND me.author_agent_id = ${escapeLiteral(agent.id)})`,
     );
   }
 
@@ -261,36 +288,36 @@ export async function searchMemories(
 
   // Exclude expired
   conditions.push(
-    `(expires_at IS NULL OR expires_at > NOW())`,
+    `(me.expires_at IS NULL OR me.expires_at > NOW())`,
   );
 
   // Text search
   if (query.query && !queryEmbedding) {
-    conditions.push(`content ILIKE '%' || ${escapeLiteral(query.query)} || '%'`);
+    conditions.push(`me.content ILIKE '%' || ${escapeLiteral(query.query)} || '%'`);
   }
 
   // Tag overlap
   if (query.tags && query.tags.length > 0) {
-    conditions.push(`tags && ARRAY[${query.tags.map(escapeLiteral).join(",")}]::text[]`);
+    conditions.push(`me.tags && ARRAY[${query.tags.map(escapeLiteral).join(",")}]::text[]`);
   }
 
   // Memory type
   if (query.memoryType) {
-    conditions.push(`memory_type = ${escapeLiteral(query.memoryType)}`);
+    conditions.push(`me.memory_type = ${escapeLiteral(query.memoryType)}`);
   }
 
   // Date range
   if (query.createdAfter) {
-    conditions.push(`created_at >= ${escapeLiteral(query.createdAfter)}::timestamptz`);
+    conditions.push(`me.created_at >= ${escapeLiteral(query.createdAfter)}::timestamptz`);
   }
   if (query.createdBefore) {
-    conditions.push(`created_at <= ${escapeLiteral(query.createdBefore)}::timestamptz`);
+    conditions.push(`me.created_at <= ${escapeLiteral(query.createdBefore)}::timestamptz`);
   }
   if (query.accessedAfter) {
-    conditions.push(`last_accessed_at >= ${escapeLiteral(query.accessedAfter)}::timestamptz`);
+    conditions.push(`me.last_accessed_at >= ${escapeLiteral(query.accessedAfter)}::timestamptz`);
   }
   if (query.accessedBefore) {
-    conditions.push(`last_accessed_at <= ${escapeLiteral(query.accessedBefore)}::timestamptz`);
+    conditions.push(`me.last_accessed_at <= ${escapeLiteral(query.accessedBefore)}::timestamptz`);
   }
 
   // Cursor pagination (created_at, id)
@@ -299,19 +326,24 @@ export async function searchMemories(
     if (decoded.rank !== undefined) {
       const cursorRank = escapeNumberLiteral(decoded.rank);
       conditions.push(
-        `(((CASE WHEN embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) < ${cursorRank}) OR ((CASE WHEN embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) = ${cursorRank} AND (created_at, id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)))`,
+        `(((CASE WHEN me.embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) < ${cursorRank}) OR ((CASE WHEN me.embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) = ${cursorRank} AND (me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)))`,
       );
     } else {
       conditions.push(
-        `(created_at, id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)`,
+        `(me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)`,
       );
     }
   }
 
   const where = conditions.join(" AND ");
   const rankExpression = buildRankExpression(queryEmbedding);
-  const orderBy = `ORDER BY search_rank DESC NULLS LAST, created_at DESC, id DESC`;
-  const sql = `SELECT *, ${rankExpression} AS search_rank FROM memory_entries WHERE ${where} ${orderBy} LIMIT ${limit + 1}`;
+  const orderBy = `ORDER BY search_rank DESC NULLS LAST, me.created_at DESC, me.id DESC`;
+  const sql = `
+    ${buildMemoryEntrySelect(rankExpression)}
+    WHERE ${where}
+    ${orderBy}
+    LIMIT ${limit + 1}
+  `;
 
   const rows = await tx.unsafe(sql);
 
@@ -343,22 +375,27 @@ export async function listAgentMemories(
   const tx = txSql as unknown as postgres.Sql;
   const limit = query.limit ?? 20;
   const conditions = [
-    `author_agent_id = ${escapeLiteral(targetAgentId)}`,
-    `memory_scope = 'group'`,
-    `(expires_at IS NULL OR expires_at > NOW())`,
+    `me.author_agent_id = ${escapeLiteral(targetAgentId)}`,
+    `me.memory_scope = 'group'`,
+    `(me.expires_at IS NULL OR me.expires_at > NOW())`,
   ];
 
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
     conditions.push(
-      `(created_at, id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)`,
+      `(me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)`,
     );
   }
 
   // Group memories are visible to all group members. The current codebase treats
   // group scope as globally visible within the tenant schema, so match that here.
   const rows = await tx.unsafe(
-    `SELECT * FROM memory_entries WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT ${limit + 1}`,
+    `
+      ${buildMemoryEntrySelect()}
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY me.created_at DESC, me.id DESC
+      LIMIT ${limit + 1}
+    `,
   );
 
   const hasMore = rows.length > limit;
@@ -382,9 +419,14 @@ export async function fetchMemory(
 ) {
   const tx = txSql as unknown as postgres.Sql;
 
-  const [entry] = await tx`
-    SELECT * FROM memory_entries WHERE id = ${id}
-  `;
+  const [entry] = await tx.unsafe(
+    `
+      ${buildMemoryEntrySelect()}
+      WHERE me.id = $1::uuid
+      LIMIT 1
+    `,
+    [id],
+  );
 
   if (!entry) {
     return { error: "not_found" as const };
@@ -588,7 +630,7 @@ export async function listTags(
   const where = scopeConditions.join(" OR ");
 
   const rows = await tx.unsafe(
-    `SELECT DISTINCT unnest(tags) AS tag FROM memory_entries WHERE (${where}) AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY tag`,
+    `SELECT DISTINCT unnest(me.tags) AS tag FROM memory_entries me WHERE (${where}) AND (me.expires_at IS NULL OR me.expires_at > NOW()) ORDER BY tag`,
   );
 
   return (rows as Record<string, unknown>[]).map((r) => r.tag as string);
@@ -663,11 +705,11 @@ function asTimestamp(value: unknown): string {
 }
 
 function buildRankExpression(queryEmbedding: number[] | null): string {
-  const usefulnessWeight = "GREATEST(usefulness_score, 1)";
-  const outdatedWeight = "CASE WHEN outdated THEN 0.5 ELSE 1.0 END";
+  const usefulnessWeight = "GREATEST(me.usefulness_score, 1)";
+  const outdatedWeight = "CASE WHEN me.outdated THEN 0.5 ELSE 1.0 END";
   if (!queryEmbedding) {
     return `(${usefulnessWeight} * ${outdatedWeight})`;
   }
 
-  return `((1 - (embedding <=> ${escapeLiteral(toVectorLiteral(queryEmbedding))}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
+  return `((1 - (me.embedding <=> ${escapeLiteral(toVectorLiteral(queryEmbedding))}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
 }

@@ -12,6 +12,8 @@ import type { AppEnv } from "../middleware/context.js";
 import { provisionAgentWithApiKey } from "../services/agent-provisioning.service.js";
 import { userCanSelectAgentGroup } from "../services/user-group.service.js";
 import { generateApiKey, hashApiKey } from "../services/api-key.service.js";
+import type { AuditEntry } from "../services/audit.service.js";
+import { logAuditEvent } from "../services/audit.service.js";
 
 export const agentsRouter = new Hono<AppEnv>();
 const DASHBOARD_AGENT_PREFIX = "dashboard:";
@@ -147,6 +149,14 @@ async function closeAgentSessionsIfPresent(
 ) {
   if (!sessionStore) return 0;
   return sessionStore.closeSessionsForAgent(agentId);
+}
+
+function auditActor(requester: AppEnv["Variables"]["agent"]): Pick<AuditEntry, "actorId" | "actorType"> {
+  if (requester.userId) {
+    return { actorId: requester.userId, actorType: "human_user" };
+  }
+
+  return { actorId: requester.id, actorType: "agent" };
 }
 
 function parseAgentRuleSetAssociationInput(
@@ -313,6 +323,8 @@ agentsRouter.post("/register", async (c) => {
 agentsRouter.post("/:id/regenerate-token", async (c) => {
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
+  const schemaName = c.get("tenantSchemaName");
+  const requester = c.get("agent");
   const targetId = c.req.param("id");
   const access = await loadAccessibleAgentRow(c, targetId);
 
@@ -332,6 +344,13 @@ agentsRouter.post("/:id/regenerate-token", async (c) => {
   `;
 
   await closeAgentSessionsIfPresent(sessionStore, targetId);
+  await logAuditEvent(sql, schemaName, {
+    tenantId: requester.tenantId,
+    ...auditActor(requester),
+    action: "agent.token_regenerate",
+    targetId,
+    outcome: "success",
+  });
 
   return c.json({ apiKey: rawApiKey });
 });
@@ -345,6 +364,7 @@ agentsRouter.post("/:id/revoke", async (c) => {
 
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
+  const schemaName = c.get("tenantSchemaName");
   const requester = c.get("agent");
   const targetId = c.req.param("id");
   const row = await loadAgentRow(sql, requester.tenantId, targetId);
@@ -362,6 +382,13 @@ agentsRouter.post("/:id/revoke", async (c) => {
   `;
 
   await closeAgentSessionsIfPresent(sessionStore, targetId);
+  await logAuditEvent(sql, schemaName, {
+    tenantId: requester.tenantId,
+    ...auditActor(requester),
+    action: "agent.revoke",
+    targetId,
+    outcome: "success",
+  });
 
   return c.json({
     success: true,
@@ -377,6 +404,7 @@ agentsRouter.post("/:id/unrevoke", async (c) => {
   if (forbidden) return forbidden;
 
   const sql = c.get("sql");
+  const schemaName = c.get("tenantSchemaName");
   const requester = c.get("agent");
   const targetId = c.req.param("id");
   const row = await loadAgentRow(sql, requester.tenantId, targetId);
@@ -391,6 +419,13 @@ agentsRouter.post("/:id/unrevoke", async (c) => {
     WHERE id = ${targetId}
       AND tenant_id = ${requester.tenantId}
   `;
+  await logAuditEvent(sql, schemaName, {
+    tenantId: requester.tenantId,
+    ...auditActor(requester),
+    action: "agent.unrevoke",
+    targetId,
+    outcome: "success",
+  });
 
   return c.json({ success: true, revokedAt: null });
 });

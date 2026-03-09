@@ -12,6 +12,7 @@ const sqlMock = vi.fn();
 const addMemberMock = vi.fn();
 const resolveAgentRoleMock = vi.fn();
 const userCanSelectAgentGroupMock = vi.fn();
+const logAuditEventMock = vi.fn();
 
 vi.mock("../services/group.service.js", () => ({
   addMember: (...args: unknown[]) => addMemberMock(...args),
@@ -21,6 +22,10 @@ vi.mock("../services/group.service.js", () => ({
 
 vi.mock("../services/user-group.service.js", () => ({
   userCanSelectAgentGroup: (...args: unknown[]) => userCanSelectAgentGroupMock(...args),
+}));
+
+vi.mock("../services/audit.service.js", () => ({
+  logAuditEvent: (...args: unknown[]) => logAuditEventMock(...args),
 }));
 
 function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
@@ -65,6 +70,7 @@ describe("agents route", () => {
     addMemberMock.mockResolvedValue({ success: true });
     resolveAgentRoleMock.mockImplementation(async (_sql: unknown, agent: AgentContext) => agent.role);
     userCanSelectAgentGroupMock.mockResolvedValue(true);
+    logAuditEventMock.mockResolvedValue(undefined);
     sqlMock.mockReset();
   });
 
@@ -248,6 +254,17 @@ describe("agents route", () => {
     const body = await res.json();
     expect(body.apiKey).toMatch(/^mnt_/);
     expect(closeSessionsForAgent).toHaveBeenCalledWith(AGENT_ID);
+    expect(logAuditEventMock).toHaveBeenCalledWith(
+      sqlMock,
+      `tenant_${TENANT_ID.replace(/-/g, "_")}`,
+      expect.objectContaining({
+        actorId: USER_ID,
+        actorType: "human_user",
+        action: "agent.token_regenerate",
+        targetId: AGENT_ID,
+        outcome: "success",
+      }),
+    );
   });
 
   it("hides regenerate token for agents owned by another user", async () => {
@@ -306,6 +323,16 @@ describe("agents route", () => {
     expect(body.success).toBe(true);
     expect(body.revokedAt).toBe(revokedAt);
     expect(closeSessionsForAgent).toHaveBeenCalledWith(AGENT_ID);
+    expect(logAuditEventMock).toHaveBeenCalledWith(
+      sqlMock,
+      `tenant_${TENANT_ID.replace(/-/g, "_")}`,
+      expect.objectContaining({
+        actorType: "agent",
+        action: "agent.revoke",
+        targetId: AGENT_ID,
+        outcome: "success",
+      }),
+    );
   });
 
   it("rejects revoke requests from non-admin users", async () => {
@@ -344,5 +371,15 @@ describe("agents route", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ success: true, revokedAt: null });
+    expect(logAuditEventMock).toHaveBeenCalledWith(
+      sqlMock,
+      `tenant_${TENANT_ID.replace(/-/g, "_")}`,
+      expect.objectContaining({
+        actorType: "agent",
+        action: "agent.unrevoke",
+        targetId: AGENT_ID,
+        outcome: "success",
+      }),
+    );
   });
 });

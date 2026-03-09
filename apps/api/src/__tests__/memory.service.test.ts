@@ -46,7 +46,7 @@ describe("buildScopeFilter", () => {
       includeUser: false,
       includePrivate: false,
     });
-    expect(conditions).toContain("memory_scope = 'group'");
+    expect(conditions).toContain("me.memory_scope = 'group'");
     expect(conditions).toHaveLength(1);
   });
 
@@ -56,7 +56,7 @@ describe("buildScopeFilter", () => {
       includePrivate: false,
     });
     expect(conditions).toHaveLength(2);
-    expect(conditions[1]).toContain("memory_scope = 'user'");
+    expect(conditions[1]).toContain("me.memory_scope = 'user'");
     expect(conditions[1]).toContain(USER_ID);
   });
 
@@ -74,7 +74,7 @@ describe("buildScopeFilter", () => {
       includePrivate: true,
     });
     expect(conditions).toHaveLength(2);
-    expect(conditions[1]).toContain("memory_scope = 'private'");
+    expect(conditions[1]).toContain("me.memory_scope = 'private'");
     expect(conditions[1]).toContain(AGENT_ID);
   });
 

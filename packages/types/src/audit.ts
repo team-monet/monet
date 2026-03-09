@@ -5,6 +5,7 @@ export const AuditLog = z.object({
   tenant_id: z.string().uuid(),
   actor_id: z.string().uuid(),
   actor_type: z.string(),
+  actor_display_name: z.string().nullable().optional(),
   action: z.string(),
   target_id: z.string().nullable().optional(),
   outcome: z.string(),

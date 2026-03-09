@@ -14,6 +14,7 @@ import {
   PaginationNext, 
 } from "@/components/ui/pagination";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { formatMemoryAuthor } from "@/lib/memory-display";
 
 interface PageProps {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
@@ -155,7 +156,7 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
                             </div>
                             <div className="flex items-center gap-1.5 truncate max-w-[150px]">
                               <Bot className="h-3 w-3 shrink-0" />
-                              <span className="truncate">{m.authorAgentId}</span>
+                              <span className="truncate">{formatMemoryAuthor(m)}</span>
                             </div>
                           </div>
                         </TableCell>

@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Search, Loader2, Calendar, Bot, ArrowRight, AlertTriangle, Tag, Sparkles } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
+import { formatMemoryAuthor } from "@/lib/memory-display";
 
 function getMemoryTypeVariant(type: MemoryType): "default" | "secondary" | "outline" | "destructive" {
   switch (type) {
@@ -163,7 +164,7 @@ export default function SearchPage() {
                 <div className="flex flex-col gap-1 text-[11px] text-muted-foreground">
                   <div className="flex items-center gap-1.5">
                     <Bot className="h-3 w-3" />
-                    <span className="truncate max-w-[200px]">{m.authorAgentId}</span>
+                    <span className="truncate max-w-[200px]">{formatMemoryAuthor(m)}</span>
                   </div>
                   <div>Score: {m.usefulnessScore}</div>
                 </div>
