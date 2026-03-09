@@ -1,7 +1,13 @@
 import postgres from "postgres";
 import type { Database } from "@monet/db";
 import { createTenantSchema, tenantOauthConfigs } from "@monet/db";
-import { slugifyTenantName } from "@monet/types";
+import {
+  DEFAULT_AGENT_GROUP_DESCRIPTION,
+  DEFAULT_AGENT_GROUP_NAME,
+  DEFAULT_USER_GROUP_DESCRIPTION,
+  DEFAULT_USER_GROUP_NAME,
+  slugifyTenantName,
+} from "@monet/types";
 import { encrypt } from "../lib/crypto.js";
 import { provisionAgentWithApiKey } from "./agent-provisioning.service.js";
 
@@ -79,6 +85,26 @@ export async function provisionTenant(
     // Create the tenant schema with all DDL
     await createTenantSchema(txSql, tenant.id);
 
+    const [defaultUserGroup] = await tx`
+      INSERT INTO human_groups (tenant_id, name, description)
+      VALUES (
+        ${tenant.id},
+        ${DEFAULT_USER_GROUP_NAME},
+        ${DEFAULT_USER_GROUP_DESCRIPTION}
+      )
+      RETURNING id
+    `;
+
+    const [defaultAgentGroup] = await tx`
+      INSERT INTO agent_groups (tenant_id, name, description)
+      VALUES (
+        ${tenant.id},
+        ${DEFAULT_AGENT_GROUP_NAME},
+        ${DEFAULT_AGENT_GROUP_DESCRIPTION}
+      )
+      RETURNING id
+    `;
+
     // Create the first admin agent with tenant_admin role
     const adminAgent = await provisionAgentWithApiKey(tx, {
       externalId: adminExternalId,
@@ -86,6 +112,16 @@ export async function provisionTenant(
       isAutonomous: false,
       role: "tenant_admin",
     });
+
+    await tx`
+      INSERT INTO agent_group_members (agent_id, group_id)
+      VALUES (${adminAgent.agent.id}, ${defaultAgentGroup.id})
+    `;
+
+    await tx`
+      INSERT INTO human_group_agent_group_permissions (human_group_id, agent_group_id)
+      VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
+    `;
 
     return {
       tenant: {

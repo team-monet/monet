@@ -1,6 +1,14 @@
 import { db } from "./db";
-import { humanUsers, agents, agentGroupMembers } from "@monet/db";
-import { eq, inArray, and, ne } from "drizzle-orm";
+import {
+  agentGroupMembers,
+  agentGroups,
+  agents,
+  humanGroupAgentGroupPermissions,
+  humanGroupMembers,
+  humanGroups,
+  humanUsers,
+} from "@monet/db";
+import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import { encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
 
@@ -91,27 +99,71 @@ export async function ensureDashboardAgent(
 
   // 3. Sync group memberships
   if (dashboardAgentId) {
-    await syncAgentGroups(userId, dashboardAgentId);
+    await syncAgentGroups(userId, dashboardAgentId, tenantId);
   }
 
   return encryptedApiKey!;
 }
 
-async function syncAgentGroups(userId: string, dashboardAgentId: string) {
-  // Find all groups user's other agents belong to
+async function syncAgentGroups(
+  userId: string,
+  dashboardAgentId: string,
+  tenantId: string,
+) {
+  // Find the preferred group from the user's other agents first.
   const userAgents = await db
     .select({ id: agents.id })
     .from(agents)
     .where(and(eq(agents.userId, userId), ne(agents.id, dashboardAgentId)));
 
-  let targetGroups: string[] = [];
+  let preferredGroupId: string | null = null;
   if (userAgents.length > 0) {
     const agentIds = userAgents.map((a) => a.id);
     const memberships = await db
-      .select({ groupId: agentGroupMembers.groupId })
+      .select({
+        groupId: agentGroupMembers.groupId,
+        joinedAt: agentGroupMembers.joinedAt,
+      })
       .from(agentGroupMembers)
-      .where(inArray(agentGroupMembers.agentId, agentIds));
-    targetGroups = [...new Set(memberships.map((m) => m.groupId))];
+      .where(inArray(agentGroupMembers.agentId, agentIds))
+      .orderBy(asc(agentGroupMembers.joinedAt), asc(agentGroupMembers.groupId));
+
+    const orderedGroupIds = [...new Set(memberships.map((membership) => membership.groupId))];
+    preferredGroupId = orderedGroupIds[0] ?? null;
+  }
+
+  // Fall back to the first agent group the user's user-group memberships allow.
+  if (!preferredGroupId) {
+    const allowedGroups = await db
+      .selectDistinct({
+        id: agentGroups.id,
+      })
+      .from(humanGroupMembers)
+      .innerJoin(
+        humanGroups,
+        eq(humanGroups.id, humanGroupMembers.humanGroupId),
+      )
+      .innerJoin(
+        humanGroupAgentGroupPermissions,
+        eq(
+          humanGroupAgentGroupPermissions.humanGroupId,
+          humanGroupMembers.humanGroupId,
+        ),
+      )
+      .innerJoin(
+        agentGroups,
+        eq(agentGroups.id, humanGroupAgentGroupPermissions.agentGroupId),
+      )
+      .where(
+        and(
+          eq(humanGroupMembers.userId, userId),
+          eq(humanGroups.tenantId, tenantId),
+          eq(agentGroups.tenantId, tenantId),
+        ),
+      )
+      .orderBy(asc(agentGroups.name));
+
+    preferredGroupId = allowedGroups[0]?.id ?? null;
   }
 
   // Current memberships for dashboard agent
@@ -120,7 +172,7 @@ async function syncAgentGroups(userId: string, dashboardAgentId: string) {
     .from(agentGroupMembers)
     .where(eq(agentGroupMembers.agentId, dashboardAgentId));
 
-  if (targetGroups.length === 0) {
+  if (!preferredGroupId) {
     if (currentMemberships.length > 0) {
       await db
         .delete(agentGroupMembers)
@@ -129,28 +181,21 @@ async function syncAgentGroups(userId: string, dashboardAgentId: string) {
     return;
   }
 
-  const currentGroups = new Set(currentMemberships.map((m) => m.groupId));
-  const targetGroupSet = new Set(targetGroups);
-  const groupsToAdd = targetGroups.filter((id) => !currentGroups.has(id));
-  const groupsToRemove = [...currentGroups].filter((id) => !targetGroupSet.has(id));
-
-  if (groupsToAdd.length > 0) {
-    await db.insert(agentGroupMembers).values(
-      groupsToAdd.map((groupId) => ({
-        agentId: dashboardAgentId,
-        groupId,
-      }))
-    );
+  if (
+    currentMemberships.length === 1 &&
+    currentMemberships[0].groupId === preferredGroupId
+  ) {
+    return;
   }
 
-  if (groupsToRemove.length > 0) {
-    await db
+  await db.transaction(async (tx) => {
+    await tx
       .delete(agentGroupMembers)
-      .where(
-        and(
-          eq(agentGroupMembers.agentId, dashboardAgentId),
-          inArray(agentGroupMembers.groupId, groupsToRemove),
-        ),
-      );
-  }
+      .where(eq(agentGroupMembers.agentId, dashboardAgentId));
+
+    await tx.insert(agentGroupMembers).values({
+      agentId: dashboardAgentId,
+      groupId: preferredGroupId,
+    });
+  });
 }

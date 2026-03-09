@@ -160,7 +160,10 @@ groupsRouter.post("/:id/members", async (c) => {
     return c.json({ error: "conflict", message: result.message }, 409);
   }
 
-  return c.json({ success: true }, 201);
+  return c.json(
+    { success: true, operation: result.operation },
+    result.operation === "created" ? 201 : 200,
+  );
 });
 
 // POST /users/:userId/admin — promote user to Group_Admin (Tenant_Admin only)
@@ -209,6 +212,9 @@ groupsRouter.delete("/:id/members/:agentId", async (c) => {
 
   const result = await removeMember(sql, agent.tenantId, groupId, agentId);
   if ("error" in result) {
+    if (result.error === "conflict") {
+      return c.json({ error: "conflict", message: result.message }, 409);
+    }
     return c.json({ error: "not_found", message: result.message }, 404);
   }
 

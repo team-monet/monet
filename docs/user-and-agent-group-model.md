@@ -11,6 +11,7 @@ Use these terms in product copy, docs, tickets, and API discussions:
 - `User Group`: a collection of users used to grant access to agent groups.
 - `Agent Group`: an operational grouping for agents. Agent groups control runtime scope such as memory, quotas, and policy attachment.
 - `Default User Group`: the tenant-local `Everyone` group created or reused automatically on first login.
+- `Default Agent Group`: the tenant-local `General` agent group used for baseline agent registration access.
 
 Avoid `human user`, `human group`, and similar terms in product-facing language.
 
@@ -68,24 +69,29 @@ On tenant login:
 
 This guarantees every tenant user has at least one user-group membership.
 
+If a tenant has no agent groups yet, Monet also creates the default `General` agent group and grants `Everyone` access to it.
+
+## New Tenant Bootstrap
+
+New tenants are provisioned with:
+
+1. a default user group named `Everyone`
+2. a default agent group named `General`
+3. a permission edge from `Everyone` to `General`
+4. the initial tenant-admin agent assigned to `General`
+
 ## Important Operational Rule
 
-The default `Everyone` group does not automatically grant access to any agent groups.
+For new or otherwise empty tenants, `Everyone` is granted access to `General` automatically.
 
-That means:
-
-- users can log in successfully
-- users will belong to `Everyone`
-- users still cannot register agents until a tenant admin grants `Everyone` or another user group access to at least one agent group
-
-This is deliberate. Membership and access are separate decisions.
+For already-configured tenants, membership and access remain separate decisions.
 
 ## Recommended Tenant Setup
 
 Use this baseline unless the tenant needs something more specialized:
 
 1. Keep `Everyone` as the default user group for all tenant users.
-2. Grant `Everyone` access to exactly one low-risk default agent group.
+2. Keep `General` as the baseline low-risk agent group for `Everyone`.
 3. Create narrower user groups such as `Support`, `Ops`, or `Research` for elevated or specialized access.
 4. Use `tenant_admin` and `group_admin` as roles, not as substitutes for user groups.
 

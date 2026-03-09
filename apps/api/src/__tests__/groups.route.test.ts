@@ -31,7 +31,7 @@ vi.mock("../services/group.service.js", async () => {
       memoryQuota: null,
       createdAt: "2025-01-01",
     })),
-    addMember: vi.fn(async () => ({ success: true })),
+    addMember: vi.fn(async () => ({ success: true, operation: "created" })),
     removeMember: vi.fn(async () => ({ success: true })),
     listGroups: vi.fn(async () => []),
     listGroupMembers: vi.fn(async () => ({ members: [] })),
@@ -119,6 +119,22 @@ describe("groups route", () => {
       });
       expect(res.status).toBe(201);
     });
+
+    it("returns 200 when reassigning an agent to a new group", async () => {
+      const groupService = await import("../services/group.service.js");
+      vi.mocked(groupService.addMember).mockResolvedValueOnce({
+        success: true,
+        operation: "moved",
+      });
+
+      const app = createTestApp(makeAgent({ role: "group_admin" }));
+      const res = await app.request("/groups/group-1/members", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId: "00000000-0000-0000-0000-000000000002" }),
+      });
+      expect(res.status).toBe(200);
+    });
   });
 
   describe("DELETE /:id/members/:agentId", () => {
@@ -129,6 +145,22 @@ describe("groups route", () => {
         { method: "DELETE" },
       );
       expect(res.status).toBe(403);
+    });
+
+    it("returns 409 when removing the agent's final group", async () => {
+      const groupService = await import("../services/group.service.js");
+      vi.mocked(groupService.removeMember).mockResolvedValueOnce({
+        error: "conflict",
+        message:
+          "Agents must remain assigned to a group. Move the agent to a new group instead.",
+      });
+
+      const app = createTestApp(makeAgent({ role: "group_admin" }));
+      const res = await app.request(
+        "/groups/group-1/members/00000000-0000-0000-0000-000000000002",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(409);
     });
   });
 

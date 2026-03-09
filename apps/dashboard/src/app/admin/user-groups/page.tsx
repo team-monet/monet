@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { AlertTriangle, Calendar, Plus, ShieldCheck, Users } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
-import { listHumanGroupsForTenant } from "@/lib/user-groups";
+import { listUserGroupsForTenant } from "@/lib/user-groups";
 import { createHumanGroupAction } from "./actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -41,14 +41,14 @@ export default async function HumanGroupsPage({ searchParams }: PageProps) {
   const created = getSingleParam(params.created) === "1";
   const createError = getSingleParam(params.createError);
   let error = "";
-  let groups = [] as Awaited<ReturnType<typeof listHumanGroupsForTenant>>;
+  let groups = [] as Awaited<ReturnType<typeof listUserGroupsForTenant>>;
 
   try {
     if (!tenantId) {
       throw new Error("Tenant ID not found in session");
     }
 
-    groups = await listHumanGroupsForTenant(tenantId);
+    groups = await listUserGroupsForTenant(tenantId);
   } catch (err: unknown) {
     error = err instanceof Error ? err.message : "An unexpected error occurred";
   }

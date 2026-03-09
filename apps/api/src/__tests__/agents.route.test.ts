@@ -72,7 +72,7 @@ describe("agents route", () => {
     const res = await app.request("/agents/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ externalId: "worker", isAutonomous: true }),
+      body: JSON.stringify({ externalId: "worker", isAutonomous: true, groupId: GROUP_ID }),
     });
 
     expect(res.status).toBe(201);
@@ -97,7 +97,7 @@ describe("agents route", () => {
     const res = await app.request("/agents/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ externalId: "user-bound", userId: USER_ID }),
+      body: JSON.stringify({ externalId: "user-bound", userId: USER_ID, groupId: GROUP_ID }),
     });
 
     expect(res.status).toBe(201);
@@ -132,12 +132,23 @@ describe("agents route", () => {
     expect(body.agent.isAutonomous).toBe(false);
   });
 
-  it("requires group selection for normal-user registrations", async () => {
+  it("requires group selection for registrations", async () => {
     const app = createTestApp({ role: "user", userId: USER_ID });
     const res = await app.request("/agents/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ externalId: "missing-group" }),
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("requires group selection for tenant-admin registrations", async () => {
+    const app = createTestApp();
+    const res = await app.request("/agents/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ externalId: "missing-group-admin", isAutonomous: true }),
     });
 
     expect(res.status).toBe(400);

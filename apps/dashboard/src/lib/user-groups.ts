@@ -1,5 +1,11 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import {
+  DEFAULT_AGENT_GROUP_DESCRIPTION,
+  DEFAULT_AGENT_GROUP_NAME,
+  DEFAULT_USER_GROUP_DESCRIPTION,
+  DEFAULT_USER_GROUP_NAME,
+} from "@monet/types";
+import {
   agentGroups,
   humanGroupAgentGroupPermissions,
   humanGroupMembers,
@@ -8,7 +14,7 @@ import {
 } from "@monet/db";
 import { db } from "./db";
 
-export type HumanGroupSummary = {
+export type UserGroupSummary = {
   id: string;
   name: string;
   description: string;
@@ -17,13 +23,9 @@ export type HumanGroupSummary = {
   allowedAgentGroupCount: number;
 };
 
-export const DEFAULT_HUMAN_GROUP_NAME = "Everyone";
-export const DEFAULT_HUMAN_GROUP_DESCRIPTION =
-  "Default user group assigned automatically on first login.";
-
-export async function listHumanGroupsForTenant(
+export async function listUserGroupsForTenant(
   tenantId: string,
-): Promise<HumanGroupSummary[]> {
+): Promise<UserGroupSummary[]> {
   const groups = await db
     .select({
       id: humanGroups.id,
@@ -73,7 +75,7 @@ export async function listHumanGroupsForTenant(
   }));
 }
 
-export async function getHumanGroupDetail(tenantId: string, humanGroupId: string) {
+export async function getUserGroupDetail(tenantId: string, userGroupId: string) {
   const [group] = await db
     .select({
       id: humanGroups.id,
@@ -83,7 +85,7 @@ export async function getHumanGroupDetail(tenantId: string, humanGroupId: string
     })
     .from(humanGroups)
     .where(
-      and(eq(humanGroups.id, humanGroupId), eq(humanGroups.tenantId, tenantId)),
+      and(eq(humanGroups.id, userGroupId), eq(humanGroups.tenantId, tenantId)),
     )
     .limit(1);
 
@@ -102,7 +104,7 @@ export async function getHumanGroupDetail(tenantId: string, humanGroupId: string
       })
       .from(humanGroupMembers)
       .innerJoin(humanUsers, eq(humanUsers.id, humanGroupMembers.userId))
-      .where(eq(humanGroupMembers.humanGroupId, humanGroupId))
+      .where(eq(humanGroupMembers.humanGroupId, userGroupId))
       .orderBy(asc(humanUsers.email), asc(humanUsers.externalId)),
     db
       .select({
@@ -128,7 +130,7 @@ export async function getHumanGroupDetail(tenantId: string, humanGroupId: string
         agentGroupId: humanGroupAgentGroupPermissions.agentGroupId,
       })
       .from(humanGroupAgentGroupPermissions)
-      .where(eq(humanGroupAgentGroupPermissions.humanGroupId, humanGroupId)),
+      .where(eq(humanGroupAgentGroupPermissions.humanGroupId, userGroupId)),
   ]);
 
   return {
@@ -142,7 +144,7 @@ export async function getHumanGroupDetail(tenantId: string, humanGroupId: string
   };
 }
 
-export async function ensureDefaultHumanGroupMembership(
+export async function ensureDefaultUserGroupMembership(
   tenantId: string,
   userId: string,
 ) {
@@ -169,7 +171,7 @@ export async function ensureDefaultHumanGroupMembership(
       .where(
         and(
           eq(humanGroups.tenantId, tenantId),
-          eq(humanGroups.name, DEFAULT_HUMAN_GROUP_NAME),
+          eq(humanGroups.name, DEFAULT_USER_GROUP_NAME),
         ),
       )
       .limit(1);
@@ -179,8 +181,8 @@ export async function ensureDefaultHumanGroupMembership(
         .insert(humanGroups)
         .values({
           tenantId,
-          name: DEFAULT_HUMAN_GROUP_NAME,
-          description: DEFAULT_HUMAN_GROUP_DESCRIPTION,
+          name: DEFAULT_USER_GROUP_NAME,
+          description: DEFAULT_USER_GROUP_DESCRIPTION,
         })
         .onConflictDoNothing()
         .returning({ id: humanGroups.id });
@@ -192,7 +194,7 @@ export async function ensureDefaultHumanGroupMembership(
           .where(
             and(
               eq(humanGroups.tenantId, tenantId),
-              eq(humanGroups.name, DEFAULT_HUMAN_GROUP_NAME),
+              eq(humanGroups.name, DEFAULT_USER_GROUP_NAME),
             ),
           )
           .limit(1);
@@ -201,6 +203,31 @@ export async function ensureDefaultHumanGroupMembership(
 
     if (!defaultGroup) {
       throw new Error("Failed to resolve default user group");
+    }
+
+    const [existingAgentGroup] = await tx
+      .select({ id: agentGroups.id })
+      .from(agentGroups)
+      .where(eq(agentGroups.tenantId, tenantId))
+      .limit(1);
+
+    if (!existingAgentGroup) {
+      const [defaultAgentGroup] = await tx
+        .insert(agentGroups)
+        .values({
+          tenantId,
+          name: DEFAULT_AGENT_GROUP_NAME,
+          description: DEFAULT_AGENT_GROUP_DESCRIPTION,
+        })
+        .returning({ id: agentGroups.id });
+
+      await tx
+        .insert(humanGroupAgentGroupPermissions)
+        .values({
+          humanGroupId: defaultGroup.id,
+          agentGroupId: defaultAgentGroup.id,
+        })
+        .onConflictDoNothing();
     }
 
     await tx

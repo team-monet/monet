@@ -113,21 +113,41 @@ export async function addMember(
     return { error: "not_found" as const, message: "Agent not found" };
   }
 
-  // Check if already a member
-  const [existing] = await sql`
-    SELECT agent_id FROM agent_group_members
-    WHERE agent_id = ${agentId} AND group_id = ${groupId}
+  const existingMemberships = await sql`
+    SELECT group_id FROM agent_group_members
+    WHERE agent_id = ${agentId}
+    ORDER BY joined_at ASC, group_id ASC
   `;
-  if (existing) {
+
+  const alreadyInTargetGroup = existingMemberships.some(
+    (membership) => membership.group_id === groupId,
+  );
+
+  if (alreadyInTargetGroup && existingMemberships.length === 1) {
     return { error: "conflict" as const, message: "Agent is already a member of this group" };
   }
 
-  await sql`
-    INSERT INTO agent_group_members (agent_id, group_id)
-    VALUES (${agentId}, ${groupId})
-  `;
+  if (existingMemberships.length > 0) {
+    await sql`
+      DELETE FROM agent_group_members
+      WHERE agent_id = ${agentId}
+    `;
+  }
 
-  return { success: true };
+  if (!alreadyInTargetGroup || existingMemberships.length > 1) {
+    await sql`
+      INSERT INTO agent_group_members (agent_id, group_id)
+      VALUES (${agentId}, ${groupId})
+    `;
+  }
+
+  return {
+    success: true,
+    operation:
+      existingMemberships.length > 0
+        ? ("moved" as const)
+        : ("created" as const),
+  };
 }
 
 export async function removeMember(
@@ -151,6 +171,18 @@ export async function removeMember(
   `;
   if (!membership) {
     return { error: "not_found" as const, message: "Agent is not a member of this group" };
+  }
+
+  const memberships = await sql`
+    SELECT group_id FROM agent_group_members
+    WHERE agent_id = ${agentId}
+  `;
+
+  if (memberships.length <= 1) {
+    return {
+      error: "conflict" as const,
+      message: "Agents must remain assigned to a group. Move the agent to a new group instead.",
+    };
   }
 
   // Remove membership only — authored entries are retained (M2 spec)

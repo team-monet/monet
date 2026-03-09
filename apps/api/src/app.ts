@@ -6,6 +6,7 @@ import { bootstrapRouter } from "./routes/bootstrap.js";
 import { agentsRouter } from "./routes/agents.js";
 import { memoriesRouter } from "./routes/memories.js";
 import { groupsRouter } from "./routes/groups.js";
+import { userGroupsRouter } from "./routes/user-groups.js";
 import { rulesRouter } from "./routes/rules.js";
 import { auditRouter } from "./routes/audit.js";
 import { authMiddleware } from "./middleware/auth.js";
@@ -45,6 +46,7 @@ export function createApp(
   authenticated.route("/agents", agentsRouter);
   authenticated.route("/memories", memoriesRouter);
   authenticated.route("/groups", groupsRouter);
+  authenticated.route("/user-groups", userGroupsRouter);
   authenticated.route("/audit", auditRouter);
   authenticated.route("/", rulesRouter);
 

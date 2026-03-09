@@ -7,7 +7,13 @@ import {
   tenants,
 } from "@monet/db";
 import type { CreateTenantInput } from "@monet/types";
-import { slugifyTenantName } from "@monet/types";
+import {
+  DEFAULT_AGENT_GROUP_DESCRIPTION,
+  DEFAULT_AGENT_GROUP_NAME,
+  DEFAULT_USER_GROUP_DESCRIPTION,
+  DEFAULT_USER_GROUP_NAME,
+  slugifyTenantName,
+} from "@monet/types";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
 import { encrypt } from "./crypto";
@@ -221,6 +227,26 @@ export async function createPlatformTenant(
 
       await createTenantSchema(txSql, tenant.id);
 
+      const [defaultUserGroup] = await tx`
+        INSERT INTO human_groups (tenant_id, name, description)
+        VALUES (
+          ${tenant.id},
+          ${DEFAULT_USER_GROUP_NAME},
+          ${DEFAULT_USER_GROUP_DESCRIPTION}
+        )
+        RETURNING id
+      `;
+
+      const [defaultAgentGroup] = await tx`
+        INSERT INTO agent_groups (tenant_id, name, description)
+        VALUES (
+          ${tenant.id},
+          ${DEFAULT_AGENT_GROUP_NAME},
+          ${DEFAULT_AGENT_GROUP_DESCRIPTION}
+        )
+        RETURNING id
+      `;
+
       const [agent] = await tx`
         INSERT INTO agents (
           external_id,
@@ -239,6 +265,16 @@ export async function createPlatformTenant(
           ${"tenant_admin"}
         )
         RETURNING id, external_id
+      `;
+
+      await tx`
+        INSERT INTO agent_group_members (agent_id, group_id)
+        VALUES (${agent.id}, ${defaultAgentGroup.id})
+      `;
+
+      await tx`
+        INSERT INTO human_group_agent_group_permissions (human_group_id, agent_group_id)
+        VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
       `;
 
       return {

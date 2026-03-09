@@ -4,3 +4,4 @@ export * from "./rule.js";
 export * from "./api.js";
 export * from "./auth.js";
 export * from "./audit.js";
+export * from "./defaults.js";

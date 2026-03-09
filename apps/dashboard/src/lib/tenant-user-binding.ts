@@ -5,7 +5,7 @@ import {
 } from "@monet/db";
 import { db } from "./db";
 import { ensureDashboardAgent } from "./dashboard-agent";
-import { ensureDefaultHumanGroupMembership } from "./user-groups";
+import { ensureDefaultUserGroupMembership } from "./user-groups";
 
 function normalizeEmail(value: string | null | undefined) {
   return value?.trim().toLowerCase() || "";
@@ -99,7 +99,7 @@ export async function upsertTenantUserFromLogin(
       .where(eq(tenantAdminNominations.id, nomination.id));
   }
 
-  await ensureDefaultHumanGroupMembership(dbUser.tenantId, dbUser.id);
+  await ensureDefaultUserGroupMembership(dbUser.tenantId, dbUser.id);
   await ensureDashboardAgent(dbUser.id, dbUser.externalId, dbUser.tenantId);
   return dbUser;
 }

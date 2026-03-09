@@ -198,9 +198,9 @@ agentsRouter.post("/register", async (c) => {
     );
   }
 
-  if (!admin && !parsed.data.groupId) {
+  if (!parsed.data.groupId) {
     return c.json(
-      { error: "validation_error", message: "Group selection is required for normal users" },
+      { error: "validation_error", message: "Agent group selection is required" },
       400,
     );
   }
@@ -259,21 +259,19 @@ agentsRouter.post("/register", async (c) => {
   });
   const { agent: newAgent, rawApiKey } = provisionedAgent;
 
-  if (parsed.data.groupId) {
-    const membershipResult = await addMember(
-      sql,
-      agent.tenantId,
-      parsed.data.groupId,
-      newAgent.id,
-    );
+  const membershipResult = await addMember(
+    sql,
+    agent.tenantId,
+    parsed.data.groupId,
+    newAgent.id,
+  );
 
-    if ("error" in membershipResult) {
-      await sql`DELETE FROM agents WHERE id = ${newAgent.id}`;
-      if (membershipResult.error === "not_found") {
-        return c.json({ error: "not_found", message: membershipResult.message }, 404);
-      }
-      return c.json({ error: "conflict", message: membershipResult.message }, 409);
+  if ("error" in membershipResult) {
+    await sql`DELETE FROM agents WHERE id = ${newAgent.id}`;
+    if (membershipResult.error === "not_found") {
+      return c.json({ error: "not_found", message: membershipResult.message }, 404);
     }
+    return c.json({ error: "conflict", message: membershipResult.message }, 409);
   }
 
   return c.json(

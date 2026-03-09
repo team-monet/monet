@@ -9,7 +9,7 @@ import {
   Users,
 } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
-import { getHumanGroupDetail } from "@/lib/user-groups";
+import { getUserGroupDetail } from "@/lib/user-groups";
 import {
   addHumanGroupMemberAction,
   removeHumanGroupMemberAction,
@@ -64,14 +64,14 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
   const permissionsError = getSingleParam(query.permissionsError);
 
   let error = "";
-  let detail: Awaited<ReturnType<typeof getHumanGroupDetail>> = null;
+  let detail: Awaited<ReturnType<typeof getUserGroupDetail>> = null;
 
   try {
     if (!tenantId) {
       throw new Error("Tenant ID not found in session");
     }
 
-    detail = await getHumanGroupDetail(tenantId, id);
+    detail = await getUserGroupDetail(tenantId, id);
     if (!detail) {
       error = "User group not found.";
     }
