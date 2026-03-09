@@ -6,6 +6,7 @@ import { agentsRouter } from "../routes/agents.js";
 const TENANT_ID = "00000000-0000-0000-0000-000000000010";
 const USER_ID = "00000000-0000-0000-0000-000000000099";
 const GROUP_ID = "00000000-0000-0000-0000-000000000088";
+const AGENT_ID = "00000000-0000-0000-0000-000000000077";
 
 const sqlMock = vi.fn();
 const addMemberMock = vi.fn();
@@ -34,13 +35,23 @@ function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
   };
 }
 
-function createTestApp(agentOverrides: Partial<AgentContext> = {}) {
+function createTestApp(
+  agentOverrides: Partial<AgentContext> = {},
+  sessionStore?: {
+    closeSessionsForAgent?: (agentId: string) => Promise<number>;
+    getByAgentId?: (agentId: string) => unknown[];
+  },
+) {
   const app = new Hono<AppEnv>();
 
   app.use("*", async (c, next) => {
     c.set("agent", makeAgent(agentOverrides));
     c.set("sql", sqlMock as unknown as AppEnv["Variables"]["sql"]);
+    c.set("tenantId", TENANT_ID);
     c.set("tenantSchemaName", `tenant_${TENANT_ID.replace(/-/g, "_")}`);
+    if (sessionStore) {
+      c.set("sessionStore", sessionStore as AppEnv["Variables"]["sessionStore"]);
+    }
     await next();
   });
 
@@ -203,5 +214,135 @@ describe("agents route", () => {
     });
 
     expect(res.status).toBe(400);
+  });
+
+  it("allows an owning user to regenerate an agent token", async () => {
+    const closeSessionsForAgent = vi.fn().mockResolvedValue(1);
+    sqlMock
+      .mockResolvedValueOnce([
+        {
+          id: AGENT_ID,
+          external_id: "self-bound",
+          tenant_id: TENANT_ID,
+          user_id: USER_ID,
+          role: "user",
+          is_autonomous: false,
+          revoked_at: null,
+          created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: USER_ID,
+          owner_external_id: "bound-user",
+          owner_email: "bound@example.com",
+        },
+      ])
+      .mockResolvedValueOnce([]);
+
+    const app = createTestApp(
+      { role: "user", userId: USER_ID },
+      { closeSessionsForAgent },
+    );
+    const res = await app.request(`/agents/${AGENT_ID}/regenerate-token`, {
+      method: "POST",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.apiKey).toMatch(/^mnt_/);
+    expect(closeSessionsForAgent).toHaveBeenCalledWith(AGENT_ID);
+  });
+
+  it("hides regenerate token for agents owned by another user", async () => {
+    sqlMock.mockResolvedValueOnce([
+      {
+        id: AGENT_ID,
+        external_id: "other-user-agent",
+        tenant_id: TENANT_ID,
+        user_id: "00000000-0000-0000-0000-000000000123",
+        role: "user",
+        is_autonomous: false,
+        revoked_at: null,
+        created_at: "2026-03-03T00:00:00.000Z",
+        owner_id: "00000000-0000-0000-0000-000000000123",
+        owner_external_id: "other-user",
+        owner_email: "other@example.com",
+      },
+    ]);
+
+    const app = createTestApp({ role: "user", userId: USER_ID });
+    const res = await app.request(`/agents/${AGENT_ID}/regenerate-token`, {
+      method: "POST",
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("allows a tenant admin to revoke an agent and terminate sessions", async () => {
+    const closeSessionsForAgent = vi.fn().mockResolvedValue(2);
+    const revokedAt = "2026-03-09T10:00:00.000Z";
+    sqlMock
+      .mockResolvedValueOnce([
+        {
+          id: AGENT_ID,
+          external_id: "worker",
+          tenant_id: TENANT_ID,
+          user_id: null,
+          role: null,
+          is_autonomous: true,
+          revoked_at: null,
+          created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: null,
+          owner_external_id: null,
+          owner_email: null,
+        },
+      ])
+      .mockResolvedValueOnce([{ revoked_at: revokedAt }]);
+
+    const app = createTestApp({}, { closeSessionsForAgent });
+    const res = await app.request(`/agents/${AGENT_ID}/revoke`, {
+      method: "POST",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.revokedAt).toBe(revokedAt);
+    expect(closeSessionsForAgent).toHaveBeenCalledWith(AGENT_ID);
+  });
+
+  it("rejects revoke requests from non-admin users", async () => {
+    const app = createTestApp({ role: "user", userId: USER_ID });
+    const res = await app.request(`/agents/${AGENT_ID}/revoke`, {
+      method: "POST",
+    });
+
+    expect(res.status).toBe(403);
+  });
+
+  it("allows a tenant admin to unrevoke an agent", async () => {
+    sqlMock
+      .mockResolvedValueOnce([
+        {
+          id: AGENT_ID,
+          external_id: "worker",
+          tenant_id: TENANT_ID,
+          user_id: null,
+          role: null,
+          is_autonomous: true,
+          revoked_at: "2026-03-08T10:00:00.000Z",
+          created_at: "2026-03-03T00:00:00.000Z",
+          owner_id: null,
+          owner_external_id: null,
+          owner_email: null,
+        },
+      ])
+      .mockResolvedValueOnce([]);
+
+    const app = createTestApp();
+    const res = await app.request(`/agents/${AGENT_ID}/unrevoke`, {
+      method: "POST",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ success: true, revokedAt: null });
   });
 });

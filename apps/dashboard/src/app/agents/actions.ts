@@ -2,26 +2,11 @@
 
 import { auth } from "@/lib/auth";
 import { getApiClient } from "@/lib/api-client";
+import { buildMcpConfig, resolvePublicMcpUrl } from "@/lib/agent-connection";
 import { revalidatePath } from "next/cache";
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function resolvePublicMcpUrl() {
-  const baseUrl =
-    process.env.MCP_BASE_URL ||
-    process.env.PUBLIC_API_URL ||
-    process.env.API_BASE_URL ||
-    process.env.INTERNAL_API_URL ||
-    process.env.NEXTAUTH_URL ||
-    "http://localhost:3001";
-
-  try {
-    return new URL("/mcp", baseUrl).toString();
-  } catch {
-    return `${baseUrl.replace(/\/$/, "")}/mcp`;
-  }
 }
 
 export type RegisterAgentFormState =
@@ -100,20 +85,7 @@ export async function registerAgentAction(
     revalidatePath(`/agents/${result.agent.id}`);
 
     const mcpUrl = resolvePublicMcpUrl();
-    const mcpConfig = JSON.stringify(
-      {
-        mcpServers: {
-          monet: {
-            url: mcpUrl,
-            headers: {
-              Authorization: `Bearer ${result.apiKey}`,
-            },
-          },
-        },
-      },
-      null,
-      2,
-    );
+    const mcpConfig = buildMcpConfig(result.apiKey, mcpUrl);
 
     return {
       status: "success",

@@ -11,6 +11,7 @@ import { pushRulesToAgent } from "../services/rule-notification.service.js";
 import type { AppEnv } from "../middleware/context.js";
 import { provisionAgentWithApiKey } from "../services/agent-provisioning.service.js";
 import { userCanSelectAgentGroup } from "../services/user-group.service.js";
+import { generateApiKey, hashApiKey } from "../services/api-key.service.js";
 
 export const agentsRouter = new Hono<AppEnv>();
 const DASHBOARD_AGENT_PREFIX = "dashboard:";
@@ -138,6 +139,14 @@ async function ensureAgentInTenant(sql: AppEnv["Variables"]["sql"], tenantId: st
     SELECT id FROM agents WHERE id = ${agentId} AND tenant_id = ${tenantId}
   `;
   return Boolean(row);
+}
+
+async function closeAgentSessionsIfPresent(
+  sessionStore: AppEnv["Variables"]["sessionStore"] | undefined,
+  agentId: string,
+) {
+  if (!sessionStore) return 0;
+  return sessionStore.closeSessionsForAgent(agentId);
 }
 
 function parseAgentRuleSetAssociationInput(
@@ -296,6 +305,94 @@ agentsRouter.post("/register", async (c) => {
     },
     201,
   );
+});
+
+/**
+ * POST /api/agents/:id/regenerate-token — rotate an agent API key and return the raw key once.
+ */
+agentsRouter.post("/:id/regenerate-token", async (c) => {
+  const sql = c.get("sql");
+  const sessionStore = c.get("sessionStore");
+  const targetId = c.req.param("id");
+  const access = await loadAccessibleAgentRow(c, targetId);
+
+  if ("response" in access) {
+    return access.response;
+  }
+
+  const rawApiKey = generateApiKey(access.row.external_id);
+  const { hash, salt } = hashApiKey(rawApiKey);
+
+  await sql`
+    UPDATE agents
+    SET api_key_hash = ${hash},
+        api_key_salt = ${salt}
+    WHERE id = ${targetId}
+      AND tenant_id = ${access.row.tenant_id}
+  `;
+
+  await closeAgentSessionsIfPresent(sessionStore, targetId);
+
+  return c.json({ apiKey: rawApiKey });
+});
+
+/**
+ * POST /api/agents/:id/revoke — revoke an agent token and terminate active MCP sessions.
+ */
+agentsRouter.post("/:id/revoke", async (c) => {
+  const forbidden = await requireTenantAdmin(c);
+  if (forbidden) return forbidden;
+
+  const sql = c.get("sql");
+  const sessionStore = c.get("sessionStore");
+  const requester = c.get("agent");
+  const targetId = c.req.param("id");
+  const row = await loadAgentRow(sql, requester.tenantId, targetId);
+
+  if (!row) {
+    return c.json({ error: "not_found", message: "Agent not found" }, 404);
+  }
+
+  const [updated] = await sql`
+    UPDATE agents
+    SET revoked_at = COALESCE(revoked_at, now())
+    WHERE id = ${targetId}
+      AND tenant_id = ${requester.tenantId}
+    RETURNING revoked_at
+  `;
+
+  await closeAgentSessionsIfPresent(sessionStore, targetId);
+
+  return c.json({
+    success: true,
+    revokedAt: (updated?.revoked_at as Date | null | undefined) ?? row.revoked_at,
+  });
+});
+
+/**
+ * POST /api/agents/:id/unrevoke — restore a revoked agent token.
+ */
+agentsRouter.post("/:id/unrevoke", async (c) => {
+  const forbidden = await requireTenantAdmin(c);
+  if (forbidden) return forbidden;
+
+  const sql = c.get("sql");
+  const requester = c.get("agent");
+  const targetId = c.req.param("id");
+  const row = await loadAgentRow(sql, requester.tenantId, targetId);
+
+  if (!row) {
+    return c.json({ error: "not_found", message: "Agent not found" }, 404);
+  }
+
+  await sql`
+    UPDATE agents
+    SET revoked_at = NULL
+    WHERE id = ${targetId}
+      AND tenant_id = ${requester.tenantId}
+  `;
+
+  return c.json({ success: true, revokedAt: null });
 });
 
 /**

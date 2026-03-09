@@ -93,6 +93,26 @@ export class MonetApiClient {
     });
   }
 
+  async regenerateAgentToken(id: string): Promise<{ apiKey: string }> {
+    return this.fetch<{ apiKey: string }>(`/api/agents/${id}/regenerate-token`, {
+      method: "POST",
+    });
+  }
+
+  async revokeAgent(id: string): Promise<{ success: true; revokedAt: string | null }> {
+    return this.fetch<{ success: true; revokedAt: string | null }>(
+      `/api/agents/${id}/revoke`,
+      { method: "POST" },
+    );
+  }
+
+  async unrevokeAgent(id: string): Promise<{ success: true; revokedAt: null }> {
+    return this.fetch<{ success: true; revokedAt: null }>(
+      `/api/agents/${id}/unrevoke`,
+      { method: "POST" },
+    );
+  }
+
   // Memories
   async listMemories(params?: {
     memoryType?: MemoryType;

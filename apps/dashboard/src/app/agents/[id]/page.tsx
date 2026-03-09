@@ -8,6 +8,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import AgentDetailActions from "./agent-detail-actions";
 
 interface ExtendedUser {
   id?: string;
@@ -56,6 +57,7 @@ export default async function AgentDetailPage({ params }: PageProps) {
   }
 
   const yours = agent.userId === sessionUser.id && isOwnAgent;
+  const canRegenerate = isAdmin || yours;
 
   return (
     <div className="flex flex-col gap-6 p-4">
@@ -88,24 +90,32 @@ export default async function AgentDetailPage({ params }: PageProps) {
           </div>
         </div>
 
-        <div className="flex gap-2">
-          <Badge variant="outline" className="font-normal uppercase">
-            {agent.isAutonomous ? (
-              <>
-                <Bot className="mr-1 h-3 w-3" />
-                Autonomous
-              </>
-            ) : (
-              <>
-                <User className="mr-1 h-3 w-3" />
-                Human Proxy
-              </>
-            )}
-          </Badge>
-          <Badge variant={status.activeSessions > 0 ? "default" : "secondary"} className={status.activeSessions > 0 ? "bg-green-600 hover:bg-green-600" : ""}>
-            <Activity className="mr-1 h-3 w-3" />
-            {status.activeSessions} active session{status.activeSessions === 1 ? "" : "s"}
-          </Badge>
+        <div className="flex flex-col items-start gap-2 md:items-end">
+          <div className="flex gap-2">
+            <Badge variant="outline" className="font-normal uppercase">
+              {agent.isAutonomous ? (
+                <>
+                  <Bot className="mr-1 h-3 w-3" />
+                  Autonomous
+                </>
+              ) : (
+                <>
+                  <User className="mr-1 h-3 w-3" />
+                  Human Proxy
+                </>
+              )}
+            </Badge>
+            <Badge variant={status.activeSessions > 0 ? "default" : "secondary"} className={status.activeSessions > 0 ? "bg-green-600 hover:bg-green-600" : ""}>
+              <Activity className="mr-1 h-3 w-3" />
+              {status.activeSessions} active session{status.activeSessions === 1 ? "" : "s"}
+            </Badge>
+          </div>
+          <AgentDetailActions
+            agentId={agent.id}
+            canRegenerate={canRegenerate}
+            isAdmin={isAdmin}
+            isRevoked={status.revoked}
+          />
         </div>
       </div>
 

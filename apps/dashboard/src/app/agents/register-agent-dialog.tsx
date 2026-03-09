@@ -4,7 +4,7 @@ import Link from "next/link";
 import { startTransition, useActionState, useEffect, useState } from "react";
 import { useFormStatus } from "react-dom";
 import { useRouter } from "next/navigation";
-import { Bot, Check, Copy, KeyRound, Plus, User } from "lucide-react";
+import { Bot, KeyRound, Plus, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -18,6 +18,7 @@ import {
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { AgentCredentialHandoff } from "./agent-credential-handoff";
 import {
   initialRegisterAgentFormState,
   registerAgentAction,
@@ -34,23 +35,6 @@ type UserOption = {
   externalId: string;
   email: string | null;
 };
-
-function CopyButton({ value, label }: { value: string; label: string }) {
-  const [copied, setCopied] = useState(false);
-
-  async function handleCopy() {
-    await navigator.clipboard.writeText(value);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  }
-
-  return (
-    <Button type="button" variant="outline" size="sm" onClick={handleCopy}>
-      {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-      {copied ? "Copied" : label}
-    </Button>
-  );
-}
 
 function SubmitButton({ disabled }: { disabled: boolean }) {
   const { pending } = useFormStatus();
@@ -72,59 +56,26 @@ function RegistrationSuccess({
   onClose: () => void;
 }) {
   return (
-    <div className="space-y-4">
-      <Alert>
-        <KeyRound className="h-4 w-4" />
-        <AlertTitle>API key issued</AlertTitle>
-        <AlertDescription>
-          This key is shown once. Store it now before closing this dialog.
-        </AlertDescription>
-      </Alert>
-
-      <div className="space-y-2">
-        <div className="flex items-center justify-between gap-3">
-          <Label htmlFor="agent-api-key">API Key</Label>
-          <CopyButton value={state.apiKey} label="Copy key" />
-        </div>
-        <Input id="agent-api-key" readOnly value={state.apiKey} className="font-mono text-xs" />
-      </div>
-
-      <div className="space-y-2">
-        <div className="flex items-center justify-between gap-3">
-          <Label htmlFor="agent-mcp-url">MCP URL</Label>
-          <CopyButton value={state.mcpUrl} label="Copy URL" />
-        </div>
-        <Input id="agent-mcp-url" readOnly value={state.mcpUrl} className="font-mono text-xs" />
-      </div>
-
-      <div className="space-y-2">
-        <div className="flex items-center justify-between gap-3">
-          <Label>MCP Config</Label>
-          <CopyButton value={state.mcpConfig} label="Copy config" />
-        </div>
-        <pre className="max-h-64 overflow-auto rounded-md border bg-muted p-3 text-xs">
-          <code>{state.mcpConfig}</code>
-        </pre>
-        <p className="text-xs text-muted-foreground">
-          Paste this into your MCP client config, such as Claude Code `~/.claude.json` or Cursor MCP settings.
-          Update the URL if your public MCP endpoint differs from the detected host.
-        </p>
-      </div>
-
-      <DialogFooter className="gap-2 sm:justify-between">
-        <div className="flex gap-2">
-          <Button type="button" variant="outline" onClick={onRegisterAnother}>
-            Register Another
+    <AgentCredentialHandoff
+      apiKey={state.apiKey}
+      mcpUrl={state.mcpUrl}
+      mcpConfig={state.mcpConfig}
+      footer={(
+        <DialogFooter className="gap-2 sm:justify-between">
+          <div className="flex gap-2">
+            <Button type="button" variant="outline" onClick={onRegisterAnother}>
+              Register Another
+            </Button>
+            <Button type="button" variant="outline" asChild>
+              <Link href={`/agents/${state.agentId}`}>View Agent</Link>
+            </Button>
+          </div>
+          <Button type="button" onClick={onClose}>
+            Close
           </Button>
-          <Button type="button" variant="outline" asChild>
-            <Link href={`/agents/${state.agentId}`}>View Agent</Link>
-          </Button>
-        </div>
-        <Button type="button" onClick={onClose}>
-          Close
-        </Button>
-      </DialogFooter>
-    </div>
+        </DialogFooter>
+      )}
+    />
   );
 }
 

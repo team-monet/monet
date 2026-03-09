@@ -53,20 +53,6 @@ function writeJson(
   res.end(JSON.stringify(body));
 }
 
-async function closeSession(
-  sessionStore: SessionStore,
-  sessionId: string,
-) {
-  const session = sessionStore.get(sessionId);
-  if (!session) return;
-
-  sessionStore.remove(sessionId);
-  await Promise.allSettled([
-    session.transport.close(),
-    session.server.close(),
-  ]);
-}
-
 export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
   return {
     async handle(req: IncomingMessage, res: ServerResponse) {
@@ -142,13 +128,13 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               // Do not pre-consume req here.
               await transport.handleRequest(req, res);
               if (res.statusCode >= 400) {
-                await closeSession(sessionStore, newSessionId);
+                await sessionStore.closeSession(newSessionId);
                 return;
               }
               sessionStore.touch(newSessionId);
               return;
             } catch (error) {
-              await closeSession(sessionStore, newSessionId);
+              await sessionStore.closeSession(newSessionId);
               writeJson(res, 500, {
                 error: "internal",
                 message: error instanceof Error ? error.message : "Internal server error",
@@ -268,7 +254,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             return;
           }
 
-          await closeSession(sessionStore, sessionId);
+          await sessionStore.closeSession(sessionId);
           writeJson(res, 200, { success: true });
           return;
         }

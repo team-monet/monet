@@ -46,6 +46,29 @@ export class SessionStore {
     );
   }
 
+  getEntriesByAgentId(agentId: string): Array<[string, McpSession]> {
+    return Array.from(this.sessions.entries()).filter(
+      ([, session]) => session.agentContext.id === agentId,
+    );
+  }
+
+  async closeSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    this.sessions.delete(sessionId);
+    await Promise.allSettled([
+      session.transport.close(),
+      session.server.close(),
+    ]);
+  }
+
+  async closeSessionsForAgent(agentId: string): Promise<number> {
+    const sessionIds = this.getEntriesByAgentId(agentId).map(([sessionId]) => sessionId);
+    await Promise.all(sessionIds.map((sessionId) => this.closeSession(sessionId)));
+    return sessionIds.length;
+  }
+
   count(): number {
     return this.sessions.size;
   }
