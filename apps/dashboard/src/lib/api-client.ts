@@ -1,5 +1,6 @@
 import {
   Agent,
+  AgentDetail,
   MemoryEntry,
   MemoryEntryTier1,
   AgentGroup,
@@ -10,6 +11,7 @@ import {
   Rule,
   RuleSet,
   AuditLog,
+  RegisterAgentApiInput,
 } from "@monet/types";
 import { auth } from "./auth";
 import { db } from "./db";
@@ -76,6 +78,19 @@ export class MonetApiClient {
 
   async listAgents(): Promise<Agent[]> {
     return this.fetch<Agent[]>("/api/agents");
+  }
+
+  async getAgent(id: string): Promise<AgentDetail> {
+    return this.fetch<AgentDetail>(`/api/agents/${id}`);
+  }
+
+  async registerAgent(
+    input: RegisterAgentApiInput,
+  ): Promise<{ agent: Agent; apiKey: string }> {
+    return this.fetch<{ agent: Agent; apiKey: string }>("/api/agents/register", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
   }
 
   // Memories

@@ -1,47 +1,133 @@
-import { getApiClient } from "@/lib/api-client";
-import AgentList from "./agent-list";
+import { and, asc, eq, inArray } from "drizzle-orm";
+import {
+  agentGroupMembers,
+  agentGroups as agentGroupsTable,
+  agents as agentsTable,
+  humanUsers,
+} from "@monet/db";
 import type { Agent } from "@monet/types";
+import { getApiClient } from "@/lib/api-client";
+import { requireAuth } from "@/lib/auth";
+import { db } from "@/lib/db";
+import AgentList from "./agent-list";
+import RegisterAgentDialog from "./register-agent-dialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertTriangle } from "lucide-react";
 
+interface ExtendedUser {
+  id?: string;
+  role?: string | null;
+  tenantId?: string;
+}
+
 export default async function AgentsPage() {
+  const session = await requireAuth();
+  const sessionUser = session.user as ExtendedUser;
+  const isAdmin = sessionUser.role === "tenant_admin";
+  const tenantId = sessionUser.tenantId;
+  const userId = sessionUser.id;
+
   let agents: Agent[] = [];
   let groupMemberships: Record<string, string[]> = {};
+  let availableGroups: Array<{ id: string; name: string }> = [];
+  let bindableUsers: Array<{ id: string; externalId: string; email: string | null }> = [];
   let error = "";
 
   try {
-    const client = await getApiClient();
-    const [allAgents, groupsResult] = await Promise.all([
-      client.listAgents(),
-      client.listGroups(),
-    ]);
-    agents = allAgents;
-
-    const membershipRows = await Promise.all(
-      groupsResult.groups.map(async (group) => {
-        const result = await client.listGroupMembers(group.id);
-        return { groupName: group.name, members: result.members };
-      }),
-    );
-
-    const membershipMap: Record<string, string[]> = {};
-    for (const row of membershipRows) {
-      for (const member of row.members) {
-        membershipMap[member.id] = [...(membershipMap[member.id] ?? []), row.groupName];
-      }
+    if (!tenantId || !userId) {
+      throw new Error("Session is missing tenant or user information.");
     }
-    groupMemberships = membershipMap;
+
+    const client = await getApiClient();
+    agents = await client.listAgents();
+
+    const [allTenantGroups, ownedGroups, userRows, membershipRows] = await Promise.all([
+      db
+        .select({
+          id: agentGroupsTable.id,
+          name: agentGroupsTable.name,
+        })
+        .from(agentGroupsTable)
+        .where(eq(agentGroupsTable.tenantId, tenantId))
+        .orderBy(asc(agentGroupsTable.name)),
+      isAdmin
+        ? Promise.resolve([])
+        : db
+            .selectDistinct({
+              id: agentGroupsTable.id,
+              name: agentGroupsTable.name,
+            })
+            .from(agentGroupsTable)
+            .innerJoin(
+              agentGroupMembers,
+              eq(agentGroupMembers.groupId, agentGroupsTable.id),
+            )
+            .innerJoin(agentsTable, eq(agentsTable.id, agentGroupMembers.agentId))
+            .where(
+              and(
+                eq(agentGroupsTable.tenantId, tenantId),
+                eq(agentsTable.userId, userId),
+              ),
+            )
+            .orderBy(asc(agentGroupsTable.name)),
+      isAdmin
+        ? db
+            .select({
+              id: humanUsers.id,
+              externalId: humanUsers.externalId,
+              email: humanUsers.email,
+            })
+            .from(humanUsers)
+            .where(eq(humanUsers.tenantId, tenantId))
+            .orderBy(asc(humanUsers.email), asc(humanUsers.externalId))
+        : Promise.resolve([]),
+      agents.length === 0
+        ? Promise.resolve([])
+        : db
+            .select({
+              agentId: agentGroupMembers.agentId,
+              groupName: agentGroupsTable.name,
+            })
+            .from(agentGroupMembers)
+            .innerJoin(
+              agentGroupsTable,
+              eq(agentGroupsTable.id, agentGroupMembers.groupId),
+            )
+            .where(inArray(agentGroupMembers.agentId, agents.map((agent) => agent.id)))
+            .orderBy(asc(agentGroupsTable.name)),
+    ]);
+
+    availableGroups =
+      isAdmin || ownedGroups.length === 0 ? allTenantGroups : ownedGroups;
+    bindableUsers = userRows;
+
+    for (const membership of membershipRows) {
+      groupMemberships[membership.agentId] = [
+        ...(groupMemberships[membership.agentId] ?? []),
+        membership.groupName,
+      ];
+    }
   } catch (err: unknown) {
     error = err instanceof Error ? err.message : "An unexpected error occurred";
   }
 
   return (
     <div className="flex flex-col gap-6 p-4">
-      <div className="space-y-1">
-        <h1 className="text-3xl font-bold tracking-tight">Agents</h1>
-        <p className="text-muted-foreground mt-1">
-          Monitor and manage your organization's AI agents.
-        </p>
+      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+        <div className="space-y-1">
+          <h1 className="text-3xl font-bold tracking-tight">Agents</h1>
+          <p className="text-muted-foreground mt-1">
+            {isAdmin
+              ? "Register and manage all AI agents in your tenant."
+              : "Register and manage the AI agents bound to your account."}
+          </p>
+        </div>
+
+        <RegisterAgentDialog
+          availableGroups={availableGroups}
+          bindableUsers={bindableUsers}
+          isAdmin={isAdmin}
+        />
       </div>
 
       {error ? (
@@ -51,7 +137,11 @@ export default async function AgentsPage() {
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       ) : (
-        <AgentList initialAgents={agents} initialGroupMemberships={groupMemberships} />
+        <AgentList
+          initialAgents={agents}
+          initialGroupMemberships={groupMemberships}
+          isAdmin={isAdmin}
+        />
       )}
     </div>
   );

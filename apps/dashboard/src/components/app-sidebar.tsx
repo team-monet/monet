@@ -72,7 +72,7 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       title: "Agents",
       url: "/agents",
       icon: Bot,
-      isActive: pathname === "/agents",
+      isActive: pathname.startsWith("/agents"),
     },
   ]
 
@@ -81,7 +81,7 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       title: "Groups",
       url: "/admin/groups",
       icon: Users,
-      isActive: pathname === "/admin/groups",
+      isActive: pathname.startsWith("/admin/groups"),
     },
     {
       title: "Rules",

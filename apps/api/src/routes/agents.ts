@@ -5,12 +5,120 @@ import {
   associateRuleSetWithAgent,
   dissociateRuleSetFromAgent,
   getActiveRulesForAgent,
+  listRuleSetsForAgent,
 } from "../services/rule.service.js";
 import { pushRulesToAgent } from "../services/rule-notification.service.js";
 import type { AppEnv } from "../middleware/context.js";
 import { provisionAgentWithApiKey } from "../services/agent-provisioning.service.js";
 
 export const agentsRouter = new Hono<AppEnv>();
+const DASHBOARD_AGENT_PREFIX = "dashboard:";
+
+type AgentRow = {
+  id: string;
+  external_id: string;
+  tenant_id: string;
+  user_id: string | null;
+  role: "user" | "group_admin" | "tenant_admin" | null;
+  is_autonomous: boolean;
+  revoked_at: Date | null;
+  created_at: Date;
+  owner_id: string | null;
+  owner_external_id: string | null;
+  owner_email: string | null;
+};
+
+function ownerLabel(row: AgentRow) {
+  return row.owner_email ?? row.owner_external_id ?? null;
+}
+
+function displayName(row: AgentRow) {
+  if (row.is_autonomous) {
+    return `${row.external_id} (Autonomous)`;
+  }
+
+  const label = ownerLabel(row);
+  return label ? `${row.external_id} · ${label}` : row.external_id;
+}
+
+function mapAgent(row: AgentRow) {
+  const label = ownerLabel(row);
+
+  return {
+    id: row.id,
+    externalId: row.external_id,
+    tenantId: row.tenant_id,
+    userId: row.user_id,
+    isAutonomous: row.is_autonomous,
+    role: row.role,
+    revokedAt: row.revoked_at,
+    displayName: displayName(row),
+    owner:
+      row.owner_id && label
+        ? {
+            id: row.owner_id,
+            externalId: row.owner_external_id ?? label,
+            email: row.owner_email,
+            label,
+          }
+        : null,
+    createdAt: row.created_at,
+  };
+}
+
+async function loadAgentRow(
+  sql: AppEnv["Variables"]["sql"],
+  tenantId: string,
+  agentId: string,
+): Promise<AgentRow | null> {
+  const [row] = await sql`
+    SELECT
+      a.id,
+      a.external_id,
+      a.tenant_id,
+      a.user_id,
+      a.role,
+      a.is_autonomous,
+      a.revoked_at,
+      a.created_at,
+      u.id AS owner_id,
+      u.external_id AS owner_external_id,
+      u.email AS owner_email
+    FROM agents a
+    LEFT JOIN human_users u ON u.id = a.user_id
+    WHERE a.id = ${agentId}
+      AND a.tenant_id = ${tenantId}
+      AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
+    LIMIT 1
+  `;
+
+  return (row as AgentRow | undefined) ?? null;
+}
+
+async function loadAccessibleAgentRow(
+  c: Context<AppEnv>,
+  agentId: string,
+): Promise<{ row: AgentRow; isAdmin: boolean } | { response: Response }> {
+  const requester = c.get("agent");
+  const sql = c.get("sql");
+  const role = await resolveAgentRole(sql, requester);
+  const admin = isTenantAdmin(role);
+  const row = await loadAgentRow(sql, requester.tenantId, agentId);
+
+  if (!row) {
+    return {
+      response: c.json({ error: "not_found", message: "Agent not found" }, 404),
+    };
+  }
+
+  if (!admin && (!requester.userId || row.user_id !== requester.userId)) {
+    return {
+      response: c.json({ error: "not_found", message: "Agent not found" }, 404),
+    };
+  }
+
+  return { row, isAdmin: admin };
+}
 
 async function requireTenantAdmin(c: Context<AppEnv>) {
   const agent = c.get("agent");
@@ -48,6 +156,8 @@ function parseAgentRuleSetAssociationInput(
 agentsRouter.post("/register", async (c) => {
   const agent = c.get("agent");
   const sql = c.get("sql");
+  const role = await resolveAgentRole(sql, agent);
+  const admin = isTenantAdmin(role);
 
   const body = await c.req.json();
   const parsed = RegisterAgentApiInput.safeParse(body);
@@ -62,20 +172,66 @@ agentsRouter.post("/register", async (c) => {
     );
   }
 
-  if (parsed.data.userId) {
+  if (!admin && !agent.userId) {
+    return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
+  }
+
+  if (!admin && parsed.data.isAutonomous) {
+    return c.json(
+      { error: "forbidden", message: "Only tenant admins can register autonomous agents" },
+      403,
+    );
+  }
+
+  if (!admin && parsed.data.userId && parsed.data.userId !== agent.userId) {
+    return c.json(
+      { error: "forbidden", message: "Normal users can only register agents bound to themselves" },
+      403,
+    );
+  }
+
+  if (parsed.data.isAutonomous && parsed.data.userId) {
+    return c.json(
+      { error: "validation_error", message: "Autonomous agents cannot have a user binding" },
+      400,
+    );
+  }
+
+  const userId = admin ? (parsed.data.isAutonomous ? null : (parsed.data.userId ?? null)) : agent.userId;
+  const isAutonomous = admin ? parsed.data.isAutonomous : false;
+
+  if (!admin && !isAutonomous && !userId) {
+    return c.json(
+      { error: "validation_error", message: "User binding is required for Human Proxy agents" },
+      400,
+    );
+  }
+
+  let owner: { id: string; externalId: string; email: string | null; label: string } | null = null;
+  if (userId) {
     const [user] = await sql`
-      SELECT id FROM human_users WHERE id = ${parsed.data.userId} AND tenant_id = ${agent.tenantId}
+      SELECT id, external_id, email
+      FROM human_users
+      WHERE id = ${userId} AND tenant_id = ${agent.tenantId}
     `;
     if (!user) {
       return c.json({ error: "not_found", message: "User not found" }, 404);
     }
+
+    const label = (user.email as string | null) ?? (user.external_id as string);
+    owner = {
+      id: user.id as string,
+      externalId: user.external_id as string,
+      email: (user.email as string | null) ?? null,
+      label,
+    };
   }
 
   const provisionedAgent = await provisionAgentWithApiKey(sql, {
     externalId: parsed.data.externalId,
     tenantId: agent.tenantId,
-    userId: parsed.data.userId ?? null,
-    isAutonomous: parsed.data.isAutonomous,
+    userId,
+    isAutonomous,
   });
   const { agent: newAgent, rawApiKey } = provisionedAgent;
 
@@ -101,8 +257,17 @@ agentsRouter.post("/register", async (c) => {
       agent: {
         id: newAgent.id,
         externalId: newAgent.externalId,
+        tenantId: agent.tenantId,
         userId: newAgent.userId,
         isAutonomous: newAgent.isAutonomous,
+        role: newAgent.role,
+        revokedAt: null,
+        displayName: newAgent.isAutonomous
+          ? `${newAgent.externalId} (Autonomous)`
+          : owner
+            ? `${newAgent.externalId} · ${owner.label}`
+            : newAgent.externalId,
+        owner,
         createdAt: newAgent.createdAt,
       },
       apiKey: rawApiKey,
@@ -216,41 +381,55 @@ agentsRouter.get("/:id/rules", async (c) => {
 agentsRouter.get("/", async (c) => {
   const agent = c.get("agent");
   const sql = c.get("sql");
+  const role = await resolveAgentRole(sql, agent);
+  const admin = isTenantAdmin(role);
 
-  const rows = await sql`
-    SELECT id, external_id as "externalId", tenant_id as "tenantId", user_id as "userId", is_autonomous as "isAutonomous", role, created_at as "createdAt"
-    FROM agents
-    WHERE tenant_id = ${agent.tenantId}
-    ORDER BY created_at DESC
-  `;
-
-  return c.json(rows);
-});
-
-/**
- * GET /api/agents/:id/status — get an agent's connection status.
- */
-agentsRouter.get("/:id/status", async (c) => {
-  const agent = c.get("agent");
-  const sql = c.get("sql");
-  const sessionStore = c.get("sessionStore");
-  const targetId = c.req.param("id");
-
-  // Check if agent exists in this tenant
-  const [target] = await sql`
-    SELECT id, revoked_at FROM agents WHERE id = ${targetId} AND tenant_id = ${agent.tenantId}
-  `;
-
-  if (!target) {
-    return c.json({ error: "not_found", message: "Agent not found" }, 404);
+  if (!admin && !agent.userId) {
+    return c.json([]);
   }
 
-  const activeSessions = sessionStore ? sessionStore.getByAgentId(targetId).length : 0;
+  const rows = admin
+    ? await sql`
+        SELECT
+          a.id,
+          a.external_id,
+          a.tenant_id,
+          a.user_id,
+          a.role,
+          a.is_autonomous,
+          a.revoked_at,
+          a.created_at,
+          u.id AS owner_id,
+          u.external_id AS owner_external_id,
+          u.email AS owner_email
+        FROM agents a
+        LEFT JOIN human_users u ON u.id = a.user_id
+        WHERE a.tenant_id = ${agent.tenantId}
+          AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
+        ORDER BY a.created_at DESC
+      `
+    : await sql`
+        SELECT
+          a.id,
+          a.external_id,
+          a.tenant_id,
+          a.user_id,
+          a.role,
+          a.is_autonomous,
+          a.revoked_at,
+          a.created_at,
+          u.id AS owner_id,
+          u.external_id AS owner_external_id,
+          u.email AS owner_email
+        FROM agents a
+        LEFT JOIN human_users u ON u.id = a.user_id
+        WHERE a.tenant_id = ${agent.tenantId}
+          AND a.user_id = ${agent.userId}
+          AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
+        ORDER BY a.created_at DESC
+      `;
 
-  return c.json({
-    activeSessions,
-    revoked: !!target.revoked_at,
-  });
+  return c.json((rows as unknown as AgentRow[]).map(mapAgent));
 });
 
 /**
@@ -264,5 +443,68 @@ agentsRouter.get("/me", async (c) => {
     externalId: agent.externalId,
     tenantId: agent.tenantId,
     isAutonomous: agent.isAutonomous,
+  });
+});
+
+/**
+ * GET /api/agents/:id/status — get an agent's connection status.
+ */
+agentsRouter.get("/:id/status", async (c) => {
+  const sql = c.get("sql");
+  const sessionStore = c.get("sessionStore");
+  const targetId = c.req.param("id");
+  const access = await loadAccessibleAgentRow(c, targetId);
+
+  if ("response" in access) {
+    return access.response;
+  }
+
+  const activeSessions = sessionStore ? sessionStore.getByAgentId(targetId).length : 0;
+
+  return c.json({
+    activeSessions,
+    revoked: Boolean(access.row.revoked_at),
+  });
+});
+
+/**
+ * GET /api/agents/:id — get an agent detail record.
+ */
+agentsRouter.get("/:id", async (c) => {
+  const sql = c.get("sql");
+  const schemaName = c.get("tenantSchemaName");
+  const targetId = c.req.param("id");
+  const access = await loadAccessibleAgentRow(c, targetId);
+
+  if ("response" in access) {
+    return access.response;
+  }
+
+  const [groups, ruleSets] = await Promise.all([
+    sql`
+      SELECT
+        g.id,
+        g.name,
+        g.description,
+        g.memory_quota,
+        g.created_at
+      FROM agent_group_members gm
+      JOIN agent_groups g ON g.id = gm.group_id
+      WHERE gm.agent_id = ${targetId}
+      ORDER BY g.name ASC, g.created_at ASC
+    `,
+    listRuleSetsForAgent(sql, schemaName, targetId),
+  ]);
+
+  return c.json({
+    ...mapAgent(access.row),
+    groups: (groups as Record<string, unknown>[]).map((group) => ({
+      id: group.id as string,
+      name: group.name as string,
+      description: (group.description as string) ?? "",
+      memoryQuota: (group.memory_quota as number | null) ?? null,
+      createdAt: group.created_at as Date,
+    })),
+    ruleSets,
   });
 });

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { TenantSlug } from "./auth.js";
+import { RuleSet } from "./rule.js";
 
 export const RegisterAgentInput = z.object({
   agentId: z.string().min(1, "Agent identifier is required"),
@@ -8,15 +9,16 @@ export const RegisterAgentInput = z.object({
 });
 export type RegisterAgentInput = z.infer<typeof RegisterAgentInput>;
 
-export const Agent = z.object({
+export const UserRole = z.enum(["user", "group_admin", "tenant_admin"]);
+export type UserRole = z.infer<typeof UserRole>;
+
+export const AgentOwner = z.object({
   id: z.string().uuid(),
   externalId: z.string(),
-  tenantId: z.string().uuid(),
-  userId: z.string().uuid().nullable(),
-  isAutonomous: z.boolean(),
-  createdAt: z.coerce.date(),
+  email: z.string().email().nullable().optional(),
+  label: z.string(),
 });
-export type Agent = z.infer<typeof Agent>;
+export type AgentOwner = z.infer<typeof AgentOwner>;
 
 export const AgentGroup = z.object({
   id: z.string().uuid(),
@@ -26,6 +28,26 @@ export const AgentGroup = z.object({
   createdAt: z.coerce.date(),
 });
 export type AgentGroup = z.infer<typeof AgentGroup>;
+
+export const Agent = z.object({
+  id: z.string().uuid(),
+  externalId: z.string(),
+  tenantId: z.string().uuid(),
+  userId: z.string().uuid().nullable(),
+  isAutonomous: z.boolean(),
+  role: UserRole.nullable().optional(),
+  revokedAt: z.coerce.date().nullable().optional(),
+  displayName: z.string().optional(),
+  owner: AgentOwner.nullable().optional(),
+  createdAt: z.coerce.date(),
+});
+export type Agent = z.infer<typeof Agent>;
+
+export const AgentDetail = Agent.extend({
+  groups: z.array(AgentGroup),
+  ruleSets: z.array(RuleSet),
+});
+export type AgentDetail = z.infer<typeof AgentDetail>;
 
 export const CreateGroupInput = z.object({
   name: z.string().min(1, "Group name is required"),
@@ -47,7 +69,7 @@ export const HumanUser = z.object({
   externalId: z.string(),
   tenantId: z.string().uuid(),
   email: z.string().email().nullable().optional(),
-  role: z.enum(["user", "group_admin", "tenant_admin"]),
+  role: UserRole,
   lastLoginAt: z.coerce.date().nullable().optional(),
   createdAt: z.coerce.date(),
 });

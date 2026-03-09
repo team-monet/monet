@@ -197,19 +197,54 @@ export async function listGroupMembers(
   }
 
   const members = await sql`
-    SELECT a.id, a.external_id, a.is_autonomous, a.created_at
+    SELECT
+      a.id,
+      a.external_id,
+      a.tenant_id,
+      a.user_id,
+      a.role,
+      a.is_autonomous,
+      a.revoked_at,
+      a.created_at,
+      u.id AS owner_id,
+      u.external_id AS owner_external_id,
+      u.email AS owner_email
     FROM agents a
+    LEFT JOIN human_users u ON u.id = a.user_id
     JOIN agent_group_members m ON m.agent_id = a.id
     WHERE m.group_id = ${groupId}
     ORDER BY m.joined_at ASC
   `;
 
   return {
-    members: (members as Record<string, unknown>[]).map((m) => ({
-      id: m.id as string,
-      externalId: m.external_id as string,
-      isAutonomous: m.is_autonomous as boolean,
-      createdAt: m.created_at as string,
-    })),
+    members: (members as Record<string, unknown>[]).map((m) => {
+      const label =
+        (m.owner_email as string | null) ?? (m.owner_external_id as string | null);
+
+      return {
+        id: m.id as string,
+        externalId: m.external_id as string,
+        tenantId: m.tenant_id as string,
+        userId: (m.user_id as string | null) ?? null,
+        isAutonomous: m.is_autonomous as boolean,
+        role: (m.role as "user" | "group_admin" | "tenant_admin" | null) ?? null,
+        revokedAt: (m.revoked_at as string | Date | null) ?? null,
+        displayName: m.is_autonomous
+          ? `${m.external_id as string} (Autonomous)`
+          : label
+            ? `${m.external_id as string} · ${label}`
+            : (m.external_id as string),
+        owner:
+          (m.owner_id as string | null) && label
+            ? {
+                id: m.owner_id as string,
+                externalId: (m.owner_external_id as string | null) ?? label,
+                email: (m.owner_email as string | null) ?? null,
+                label,
+              }
+            : null,
+        createdAt: m.created_at as string,
+      };
+    }),
   };
 }

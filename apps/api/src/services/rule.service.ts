@@ -253,6 +253,40 @@ export async function listRuleSets(
   });
 }
 
+export async function listRuleSetsForAgent(
+  sql: postgres.Sql,
+  schemaName: string,
+  agentId: string,
+): Promise<RuleSetWithRulesRecord[]> {
+  return withTenantScope(sql, schemaName, async (txSql) => {
+    const tx = txSql as unknown as postgres.Sql;
+    const rows = await tx`
+      SELECT
+        rs.id,
+        rs.name,
+        rs.created_at,
+        COALESCE(
+          ARRAY_AGG(rsr.rule_id ORDER BY rsr.rule_id)
+            FILTER (WHERE rsr.rule_id IS NOT NULL),
+          ARRAY[]::uuid[]
+        ) AS rule_ids
+      FROM agent_rule_sets ars
+      JOIN rule_sets rs ON rs.id = ars.rule_set_id
+      LEFT JOIN rule_set_rules rsr ON rsr.rule_set_id = rs.id
+      WHERE ars.agent_id = ${agentId}
+      GROUP BY rs.id, rs.name, rs.created_at
+      ORDER BY rs.created_at ASC, rs.id ASC
+    `;
+
+    return (rows as Record<string, unknown>[]).map((row) => ({
+      id: row.id as string,
+      name: row.name as string,
+      createdAt: row.created_at as string,
+      ruleIds: Array.isArray(row.rule_ids) ? (row.rule_ids as string[]) : [],
+    }));
+  });
+}
+
 export async function deleteRuleSet(
   sql: postgres.Sql,
   tenantId: string,

@@ -2,6 +2,7 @@ import Link from "next/link";
 import { getApiClient } from "@/lib/api-client";
 import { requireAdmin } from "@/lib/auth";
 import type { Agent, AgentGroup } from "@monet/types";
+import { formatAgentDisplayName } from "@/lib/agent-display";
 import { addGroupMemberAction, removeGroupMemberAction } from "../actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -125,7 +126,7 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
                     </option>
                     {availableAgents.map((agent) => (
                       <option key={agent.id} value={agent.id}>
-                        {agent.externalId} ({agent.isAutonomous ? "autonomous" : "human proxy"})
+                        {formatAgentDisplayName(agent)}
                       </option>
                     ))}
                   </select>
@@ -164,7 +165,7 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
                       <TableRow key={member.id}>
                         <TableCell>
                           <div className="flex flex-col">
-                            <span className="font-medium">{member.externalId}</span>
+                            <span className="font-medium">{formatAgentDisplayName(member)}</span>
                             <span className="font-mono text-[10px] text-muted-foreground">{member.id}</span>
                           </div>
                         </TableCell>
