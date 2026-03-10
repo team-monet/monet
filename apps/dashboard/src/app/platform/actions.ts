@@ -60,15 +60,20 @@ export async function createPlatformTenantAction(formData: FormData) {
     redirect(`/platform?createError=${encodeURIComponent(message)}`);
   }
 
+  let tenantId: string;
+
   try {
     const result = await createPlatformTenant(parsed.data);
-    revalidatePath("/platform");
-    redirect(`${tenantDetailPath(result.tenant.id)}?created=1`);
+    tenantId = result.tenant.id;
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to create tenant";
     redirect(`/platform?createError=${encodeURIComponent(message)}`);
   }
+
+  revalidatePath("/platform");
+  revalidatePath(tenantDetailPath(tenantId));
+  redirect(`${tenantDetailPath(tenantId)}?created=1`);
 }
 
 export async function saveTenantOidcConfigAction(formData: FormData) {

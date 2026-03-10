@@ -20,18 +20,19 @@ pnpm install
 cp .env.local-dev.example .env.local-dev
 ```
 
-3. Start local stack:
+3. Start local infrastructure:
 
 ```bash
 pnpm local:up
 ```
 
-`pnpm local:up` rebuilds the local images before starting containers.
+`pnpm local:up` starts PostgreSQL, pgAdmin, and Keycloak, and ensures the shared Ollama stack is running.
 
 4. Complete the setup flow:
 
 - Open `http://127.0.0.1:3310/setup`
-- Retrieve the one-time bootstrap token from `pnpm local:logs`
+- Start `pnpm local:dev:api` and retrieve the one-time bootstrap token from that terminal output
+- Start `pnpm local:dev:dashboard`
 - Run `pnpm local:keycloak:setup`
 - Use the generated values in `.local-dev/keycloak.json` to configure platform OIDC against local Keycloak at `http://keycloak.localhost:3400`
 - Create the first tenant, configure tenant OIDC from the same file, and finish login through the dashboard
@@ -88,7 +89,7 @@ pnpm db:migrate
 
 ## Local Verification for MCP + Dashboard
 
-1. For real dashboard verification, run the compose stack and complete `/setup`.
+1. For real dashboard verification, run `pnpm local:up`, then `pnpm local:dev:api` and `pnpm local:dev:dashboard`, and complete `/setup`.
 2. For fast UI-only verification without OIDC, use:
 
 ```bash

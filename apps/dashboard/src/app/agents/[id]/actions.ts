@@ -32,7 +32,7 @@ export async function regenerateAgentTokenAction(
     const result = await client.regenerateAgentToken(agentId);
     revalidateAgentPaths(agentId);
 
-    const mcpUrl = resolvePublicMcpUrl();
+    const mcpUrl = await resolvePublicMcpUrl();
     return {
       status: "success",
       message: "Agent token regenerated.",

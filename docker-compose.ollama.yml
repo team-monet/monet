@@ -1,0 +1,47 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    hostname: ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - "${OLLAMA_MODELS_DIR:-${HOME}/.ollama}:/root/.ollama"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      shared:
+        aliases:
+          - ollama-shared
+
+  ollama-model-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:7b}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:4b}
+    entrypoint: ["/bin/sh"]
+    command:
+      - -lc
+      - |
+        set -e
+        if ! ollama show "$$OLLAMA_CHAT_MODEL" >/dev/null 2>&1; then ollama pull "$$OLLAMA_CHAT_MODEL"; fi
+        if ! ollama show "$$OLLAMA_EMBEDDING_MODEL" >/dev/null 2>&1; then ollama pull "$$OLLAMA_EMBEDDING_MODEL"; fi
+    restart: "no"
+    networks:
+      - shared
+
+networks:
+  shared:
+    name: ${MONET_SHARED_NETWORK:-monet-shared}

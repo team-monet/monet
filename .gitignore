@@ -10,6 +10,8 @@ dist/
 .internal-testing/
 .local-dev/
 apps/api/.local-dev/
+.runtime/
 *.tsbuildinfo
 *.log
 .omc
+.env.runtime

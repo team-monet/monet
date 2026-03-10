@@ -2,16 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${ROOT_DIR}/docker-compose.local.yml"
+DEV_COMPOSE_FILE="${ROOT_DIR}/docker-compose.dev.yml"
 ENV_FILE="${MONET_LOCAL_ENV_FILE:-${ROOT_DIR}/.env.local-dev}"
-PROJECT_NAME_DEFAULT="monet"
+PROJECT_NAME_DEFAULT="monet-dev"
 PROJECT_NAME="${PROJECT_NAME_DEFAULT}"
 
-compose() {
+compose_dev() {
   docker compose \
     --project-name "${PROJECT_NAME}" \
     --env-file "${ENV_FILE}" \
-    -f "${COMPOSE_FILE}" \
+    -f "${DEV_COMPOSE_FILE}" \
     "$@"
 }
 
@@ -33,11 +33,6 @@ load_env_file() {
   source "${ENV_FILE}"
   set +a
   PROJECT_NAME="${MONET_LOCAL_COMPOSE_PROJECT:-${PROJECT_NAME_DEFAULT}}"
-}
-
-api_base_url() {
-  local api_port="${API_PORT:-3001}"
-  printf "http://127.0.0.1:%s" "${api_port}"
 }
 
 keycloak_base_url() {
@@ -66,54 +61,81 @@ wait_for_ready() {
   echo "Readiness passed."
 }
 
+with_ollama_env() {
+  MONET_OLLAMA_ENV_FILE="${ENV_FILE}" "${ROOT_DIR}/scripts/ollama-env.sh" "$@"
+}
+
+build_release_image() {
+  local target="$1"
+  local tag="$2"
+
+  docker build \
+    --file "${ROOT_DIR}/docker/monet.Dockerfile" \
+    --target "${target}" \
+    --tag "${tag}" \
+    "${ROOT_DIR}"
+}
+
 cmd_up() {
   require_env_file
   load_env_file
-  compose --profile dashboard up -d --build
-  wait_for_ready "$(api_base_url)/health/ready" 120
+  with_ollama_env up
+  compose_dev up -d
   wait_for_ready "$(keycloak_base_url)" 180
-  wait_for_ready "$(dashboard_base_url)/login" 180
-}
+  cat <<EOF
+Infrastructure is ready.
 
-dashboard_base_url() {
-  local dashboard_port="${DASHBOARD_PORT:-3310}"
-  printf "http://127.0.0.1:%s" "${dashboard_port}"
+Shared Ollama remains in its own stack:
+  pnpm ollama:status
+
+Run the app processes on the host in separate terminals:
+  pnpm local:dev:api
+  pnpm local:dev:dashboard
+EOF
 }
 
 cmd_migrate() {
-  require_env_file
-  load_env_file
-  compose run --rm migrate
+  "${ROOT_DIR}/scripts/with-local-env.sh" pnpm db:migrate
 }
 
 cmd_build() {
   require_env_file
   load_env_file
-  compose --profile dashboard build
+  build_release_image migrate-runtime "${MIGRATE_IMAGE:-monet-migrate:local}"
+  build_release_image api-runtime "${API_IMAGE:-monet-api:local}"
+  build_release_image dashboard-runtime "${DASHBOARD_IMAGE:-monet-dashboard:local}"
 }
 
 cmd_down() {
   require_env_file
   load_env_file
-  compose --profile dashboard down --remove-orphans
+  compose_dev down --remove-orphans
 }
 
 cmd_status() {
   require_env_file
   load_env_file
-  compose --profile dashboard ps
+  echo "Local infrastructure:"
+  compose_dev ps
+  echo
+  echo "Shared Ollama:"
+  with_ollama_env status
 }
 
 cmd_logs() {
   require_env_file
   load_env_file
-  compose --profile dashboard logs --tail 200 postgres ollama ollama-model-pull migrate api keycloak dashboard
+  echo "Local infrastructure logs:"
+  compose_dev logs --tail 200 postgres pgadmin keycloak
+  echo
+  echo "Shared Ollama logs:"
+  with_ollama_env logs
 }
 
 cmd_reset() {
   require_env_file
   load_env_file
-  compose --profile dashboard down --volumes --remove-orphans
+  compose_dev down --volumes --remove-orphans
 }
 
 remove_volume_if_exists() {
@@ -126,22 +148,18 @@ remove_volume_if_exists() {
 cmd_db_reset() {
   require_env_file
   load_env_file
-  compose --profile dashboard down --remove-orphans
-  remove_volume_if_exists "${PROJECT_NAME}_postgres_prod_data"
-  echo "Removed Postgres volume: ${PROJECT_NAME}_postgres_prod_data"
-  echo "Run pnpm local:up to recreate the database and rerun migrations."
+  compose_dev down --remove-orphans
+  remove_volume_if_exists "${PROJECT_NAME}_postgres_data"
+  echo "Removed Postgres volume: ${PROJECT_NAME}_postgres_data"
+  echo "Run pnpm local:up to recreate the database."
 }
 
 cmd_metrics() {
-  require_env_file
-  load_env_file
-  pnpm --filter @monet/api exec node scripts/local-usage-metrics.mjs
+  "${ROOT_DIR}/scripts/with-local-env.sh" pnpm --filter @monet/api exec node scripts/local-usage-metrics.mjs
 }
 
 cmd_mcp_smoke() {
-  require_env_file
-  load_env_file
-  pnpm --filter @monet/api exec node scripts/mcp-local-smoke.mjs
+  "${ROOT_DIR}/scripts/with-local-env.sh" pnpm --filter @monet/api exec node scripts/mcp-local-smoke.mjs
 }
 
 cmd_keycloak_setup() {
@@ -155,17 +173,17 @@ usage() {
 Usage: ./scripts/local-env.sh <command>
 
 Commands:
-  up         Build images, start postgres + ollama + api + dashboard, and wait for readiness
-  build      Build local API and dashboard images
-  migrate    Run platform migrations via the migrate service
+  up         Start local infrastructure (postgres, pgadmin, keycloak) and ensure shared Ollama is ready
+  build      Build release images for api, dashboard, and migrate
+  migrate    Run platform migrations from the host against the local database
   down       Stop stack without deleting database volume
   status     Show container status for the local project
-  logs       Tail postgres + ollama + api logs
+  logs       Tail local infrastructure and shared Ollama logs
   metrics    Generate local usage metrics snapshot
   mcp-smoke  Run MCP connection smoke test (requires MCP_API_KEY env var)
   keycloak-setup Bootstrap local Keycloak realms, clients, and sample users
   db-reset   Remove the local Postgres volume and force a fresh database
-  reset      Destructive reset (removes containers, Postgres data, and Keycloak data)
+  reset      Destructive reset (removes local infra containers and local volumes)
 EOF
 }
 

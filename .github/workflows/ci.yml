@@ -32,6 +32,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/monet_test
       PLATFORM_ADMIN_SECRET: ci-test-secret
+      TURBO_TELEMETRY_DISABLED: 1
       RUN_PERF: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && (contains(github.event.pull_request.title, '[perf]') || contains(join(github.event.pull_request.labels.*.name, ','), 'perf'))) }}
 
     steps:
@@ -67,6 +68,12 @@ jobs:
 
       - name: Integration tests
         run: pnpm test:integration
+
+      - name: Build release images
+        run: |
+          docker build --file docker/monet.Dockerfile --target api-runtime --tag monet-api:ci .
+          docker build --file docker/monet.Dockerfile --target dashboard-runtime --tag monet-dashboard:ci .
+          docker build --file docker/monet.Dockerfile --target migrate-runtime --tag monet-migrate:ci .
 
       - name: Setup k6
         if: env.RUN_PERF == 'true'

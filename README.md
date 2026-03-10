@@ -25,7 +25,7 @@ It provides:
 - pnpm 10+
 - Docker or Podman
 
-## Quick Start (Long-Lived Local Environment)
+## Quick Start (Local Dev Environment)
 
 1. Install dependencies:
 
@@ -39,21 +39,19 @@ pnpm install
 cp .env.local-dev.example .env.local-dev
 ```
 
-3. Start the local stack:
+3. Start the local infrastructure:
 
 ```bash
 pnpm local:up
 ```
 
-`pnpm local:up` rebuilds the local images before starting the stack. First startup may take several minutes while images build and Ollama models are pulled.
+`pnpm local:up` starts PostgreSQL, pgAdmin, and Keycloak, and ensures the shared Ollama stack is running. First startup may take several minutes while Ollama models are pulled.
 
-4. Open the setup flow:
-
-- URL: `http://127.0.0.1:3310/setup`
-- Retrieve the one-time bootstrap token from API logs:
+4. Start the API and dashboard on the host in separate terminals:
 
 ```bash
-pnpm local:logs
+pnpm local:dev:api
+pnpm local:dev:dashboard
 ```
 
 5. Bootstrap local Keycloak:
@@ -65,7 +63,12 @@ pnpm local:keycloak:setup
 This writes `.local-dev/keycloak.json` with the exact local issuers, client IDs,
 client secrets, and sample user credentials.
 
-6. Complete `/setup`:
+6. Open the setup flow:
+
+- URL: `http://127.0.0.1:3310/setup`
+- Retrieve the one-time bootstrap token from the `pnpm local:dev:api` terminal output.
+
+7. Complete `/setup`:
 
 - Keycloak admin console: `http://keycloak.localhost:3400/admin/`
 - Default local Keycloak credentials come from `.env.local-dev`:
@@ -75,9 +78,9 @@ client secrets, and sample user credentials.
 - create a tenant and configure tenant OIDC with the `tenant.*` values from `.local-dev/keycloak.json`
 - nominate the generated tenant admin email
 
-7. Sign in through the normal dashboard login for your tenant slug.
+8. Sign in through the normal dashboard login for your tenant slug.
 
-8. Generate local usage metrics snapshot:
+9. Generate local usage metrics snapshot:
 
 ```bash
 pnpm local:metrics
@@ -87,9 +90,16 @@ Metrics output is written to `.local-dev/metrics.json`.
 
 ## Dashboard Login (Local)
 
-- The compose-based local stack does not auto-seed a default tenant anymore.
+- The local infra stack does not auto-seed a default tenant anymore.
 - Real local testing should go through `/setup` and the bundled local Keycloak service.
 - For fast UI-only development without OIDC, use `pnpm --filter @monet/dashboard dev:seeded` and sign in with `test-org`.
+
+## Shared Ollama
+
+- Ollama now runs in its own shared stack so local dev and the image-based runtime can reuse the same model cache.
+- Start it directly with `pnpm ollama:up` or let `pnpm local:up` / `pnpm runtime:up` ensure it is already running.
+- Stop it independently with `pnpm ollama:down`.
+- By default the shared stack exposes Ollama on `http://127.0.0.1:11434` for host-run processes and `http://ollama-shared:11434` for containerized runtime services.
 
 ## Keycloak (Local)
 
@@ -105,7 +115,7 @@ Metrics output is written to `.local-dev/metrics.json`.
   - tenant admin user `tenant-admin@example.com` with password `MonetTenantAdmin1!`
   - tenant user `tenant-user@example.com` with password `MonetTenantUser1!`
 - The script also captures the generated confidential client secrets, so you do not need to look them up in the Keycloak admin UI.
-- Use the generated issuer values as-is. The local Docker dashboard cannot use `http://127.0.0.1:3400/...` as an OIDC issuer.
+- Use the generated issuer values as-is. The local dashboard cannot use `http://127.0.0.1:3400/...` as an OIDC issuer.
 - You can override the default realm, client, and user settings with env vars in `.env.local-dev`.
 
 Use the generated values like this:
@@ -125,14 +135,17 @@ Use the generated values like this:
 
 ## Daily Local Commands
 
-- `pnpm local:up` - build images, then start the full local stack including dashboard.
-- `pnpm local:build` - rebuild the local API and dashboard images without starting the stack.
+- `pnpm local:up` - start the local infrastructure stack and ensure shared Ollama is running.
+- `pnpm local:dev:api` - run the API on the host with `.env.local-dev`-derived settings.
+- `pnpm local:dev:dashboard` - run the dashboard on the host with `.env.local-dev`-derived settings.
+- `pnpm local:build` - build the release images for `api`, `dashboard`, and `migrate`.
 - `pnpm local:keycloak:setup` - create or refresh the local Keycloak realms, clients, and sample users.
-- `pnpm local:status` - show service status.
-- `pnpm local:logs` - tail service logs.
-- `pnpm local:down` - stop services and preserve DB volume.
+- `pnpm local:status` - show local infra and shared Ollama status.
+- `pnpm local:logs` - tail local infra and shared Ollama logs.
+- `pnpm local:down` - stop local infra services and preserve DB volume.
 - `pnpm local:db:reset` - remove only the local Postgres volume and recreate the DB on the next `local:up`.
-- `pnpm local:reset` - destructive reset (removes containers, Postgres data, and Keycloak data).
+- `pnpm local:reset` - destructive reset (removes local infra containers and local volumes).
+- `pnpm ollama:up` / `pnpm ollama:down` - manage the shared Ollama stack directly.
 
 ## Development Workflow
 
@@ -142,13 +155,19 @@ Use the generated values like this:
 pnpm local:up
 ```
 
-2. For full workspace development:
+2. Run the API:
 
 ```bash
-pnpm dev
+pnpm local:dev:api
 ```
 
-3. Common quality checks:
+3. Run the dashboard:
+
+```bash
+pnpm local:dev:dashboard
+```
+
+4. Common quality checks:
 
 ```bash
 pnpm typecheck
@@ -217,7 +236,53 @@ Tenant schemas are created during provisioning (`createTenantSchema(...)`).
 Initial platform setup and tenant provisioning now live in the dashboard control plane.
 
 - Fresh installs: use `/setup` with the one-time bootstrap token emitted by the API on first startup.
-- Local long-lived dev: start the stack with `pnpm local:up` and complete `/setup`.
+- Local long-lived dev: start infra with `pnpm local:up`, run `pnpm local:dev:api` and `pnpm local:dev:dashboard`, then complete `/setup`.
+
+## Release Images
+
+Release-style images are built separately from the day-to-day local dev loop.
+
+Build them with:
+
+```bash
+pnpm local:build
+```
+
+This builds the `api`, `dashboard`, and `migrate` targets from `docker/monet.Dockerfile`.
+
+## Runtime Stack
+
+The runtime stack is image-only and isolated from the host-run local dev workflow.
+
+1. Create runtime config:
+
+```bash
+cp .env.runtime.example .env.runtime
+```
+
+2. Choose image sources:
+
+- use `pnpm local:build` if you want to run the locally built `monet-*:local` images
+- or set `API_IMAGE`, `DASHBOARD_IMAGE`, and `MIGRATE_IMAGE` in `.env.runtime` to registry tags and run `pnpm runtime:pull`
+
+3. Start the runtime stack:
+
+```bash
+pnpm runtime:up
+```
+
+`pnpm runtime:up` ensures the shared Ollama stack is running, starts Postgres and Keycloak, runs migrations in the dedicated migrate image, then starts the API and dashboard containers.
+
+Useful runtime commands:
+
+- `pnpm runtime:status`
+- `pnpm runtime:logs`
+- `pnpm runtime:migrate`
+- `pnpm runtime:keycloak:setup`
+- `pnpm runtime:down`
+- `pnpm runtime:reset`
+
+`pnpm runtime:keycloak:setup` writes the generated runtime Keycloak details to `.runtime/keycloak.json` by default.
 
 ## Enrichment Provider Swap
 
@@ -225,18 +290,18 @@ Set `ENRICHMENT_PROVIDER=anthropic` or `ENRICHMENT_PROVIDER=ollama`, configure p
 
 Pending enrichment jobs are recovered on startup.
 
-For local Ollama in the compose stack, keep:
+For the shared Ollama stack, containerized runtime services should use:
 
 ```bash
-OLLAMA_BASE_URL=http://ollama:11434
+OLLAMA_BASE_URL=http://ollama-shared:11434
 OLLAMA_EMBEDDING_MODEL=qwen3-embedding:4b
 OLLAMA_MODELS_DIR=${HOME}/.ollama
 ```
 
-For host-installed Ollama instead of compose service:
+For host-run API and dashboard processes against the shared Ollama service, the local wrapper scripts map `OLLAMA_BASE_URL` to `http://127.0.0.1:${OLLAMA_PORT}` automatically. To override it explicitly, set:
 
 ```bash
-OLLAMA_BASE_URL=http://host.docker.internal:11434
+HOST_OLLAMA_BASE_URL=http://127.0.0.1:11434
 ```
 
 ## Backup and Restore

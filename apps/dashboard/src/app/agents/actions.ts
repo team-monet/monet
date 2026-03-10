@@ -63,7 +63,7 @@ export async function registerAgentAction(
     revalidatePath("/agents");
     revalidatePath(`/agents/${result.agent.id}`);
 
-    const mcpUrl = resolvePublicMcpUrl();
+    const mcpUrl = await resolvePublicMcpUrl();
     const mcpConfig = buildMcpConfig(result.apiKey, mcpUrl);
 
     return {

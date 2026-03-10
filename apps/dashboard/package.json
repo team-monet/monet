@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "set -a; [ -f ../../.env ] && . ../../.env; set +a; next dev --port 3000",
+    "dev:local": "next dev --port 3000",
     "dev:seeded": "./scripts/seed-and-start.sh",
     "build": "next build",
     "start": "next start",
