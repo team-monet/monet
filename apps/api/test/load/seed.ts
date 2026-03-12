@@ -146,8 +146,10 @@ async function main() {
         },
       );
 
-      if (![201, 409].includes(membershipRes.status)) {
-        throw new Error(`Failed to add agent ${agentIds[i]} to group ${groupId}`);
+      if (![200, 201, 409].includes(membershipRes.status)) {
+        throw new Error(
+          `Failed to add agent ${agentIds[i]} to group ${groupId}: ${JSON.stringify(membershipRes.body)}`,
+        );
       }
     }
 
