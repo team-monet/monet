@@ -25,6 +25,7 @@ const memoryServiceMocks = {
 };
 
 const enqueueEnrichment = vi.fn();
+const computeQueryEmbedding = vi.fn().mockResolvedValue(null);
 
 vi.mock("../services/memory.service.js", () => ({
   createMemory: (...args: unknown[]) => memoryServiceMocks.createMemory(...args),
@@ -38,6 +39,7 @@ vi.mock("../services/memory.service.js", () => ({
 }));
 
 vi.mock("../services/enrichment.service.js", () => ({
+  computeQueryEmbedding: (...args: unknown[]) => computeQueryEmbedding(...args),
   enqueueEnrichment: (...args: unknown[]) => enqueueEnrichment(...args),
 }));
 

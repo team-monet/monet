@@ -5,7 +5,6 @@ import type {
   MemoryEntryTier1,
   UpdateMemoryEntryInput,
 } from "@monet/types";
-import { computeQueryEmbedding } from "./enrichment.service.js";
 
 // ---------- Cursor helpers ----------
 
@@ -271,10 +270,10 @@ export async function searchMemories(
     cursor?: string;
     limit?: number;
   },
+  queryEmbedding: number[] | null = null,
 ) {
   const tx = txSql as unknown as postgres.Sql;
   const limit = query.limit ?? 20;
-  const queryEmbedding = query.query ? await computeQueryEmbedding(query.query) : null;
 
   // Build WHERE clauses
   const conditions: string[] = [];

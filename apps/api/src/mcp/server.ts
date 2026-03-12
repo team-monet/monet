@@ -7,7 +7,7 @@ import {
 } from "@monet/mcp-tools";
 import type postgres from "postgres";
 import type { AgentContext } from "../middleware/context.js";
-import { enqueueEnrichment } from "../services/enrichment.service.js";
+import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service.js";
 import {
   createMemory,
   deleteMemory,
@@ -91,8 +91,9 @@ export function createMcpServer(
     },
     memorySearch: async (args) => {
       try {
+        const queryEmbedding = args.query ? await computeQueryEmbedding(args.query) : null;
         const result = await withTenantScope(sql, tenantSchemaName, (txSql) =>
-          searchMemories(txSql, agentContext, args),
+          searchMemories(txSql, agentContext, args, queryEmbedding),
         );
         return asToolResult(result);
       } catch (error) {

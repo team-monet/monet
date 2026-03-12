@@ -50,6 +50,11 @@ vi.mock("../services/memory.service.js", () => ({
   listTags: (...args: unknown[]) => serviceMocks.listTags(...args),
 }));
 
+vi.mock("../services/enrichment.service.js", () => ({
+  computeQueryEmbedding: vi.fn().mockResolvedValue(null),
+  enqueueEnrichment: vi.fn(),
+}));
+
 function createTestApp() {
   const app = new Hono<AppEnv>();
 
@@ -191,6 +196,7 @@ describe("memories route", () => {
           createdAfter: "2026-03-01T00:00:00.000Z",
           accessedBefore: "2026-03-04T00:00:00.000Z",
         }),
+        null,
       );
     });
   });

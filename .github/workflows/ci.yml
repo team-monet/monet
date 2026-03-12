@@ -82,7 +82,6 @@ jobs:
       - name: Start API server for load tests
         if: env.RUN_PERF == 'true'
         run: |
-          ENRICHMENT_PROVIDER=ollama \
           RATE_LIMIT_MAX=100000 \
           API_PORT=3001 \
           pnpm --filter @monet/api start >/tmp/monet-api.log 2>&1 &

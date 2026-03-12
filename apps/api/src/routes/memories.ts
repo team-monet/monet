@@ -13,7 +13,7 @@ import {
   promoteScope,
   listTags,
 } from "../services/memory.service.js";
-import { enqueueEnrichment } from "../services/enrichment.service.js";
+import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service.js";
 
 export const memoriesRouter = new Hono<AppEnv>();
 
@@ -99,9 +99,10 @@ memoriesRouter.get("/", async (c) => {
     cursor: c.req.query("cursor"),
     limit: c.req.query("limit") ? Number(c.req.query("limit")) : undefined,
   };
+  const queryEmbedding = query.query ? await computeQueryEmbedding(query.query) : null;
 
   const result = await withTenantScope(sql, schemaName, (txSql) =>
-    searchMemories(txSql, agent, query),
+    searchMemories(txSql, agent, query, queryEmbedding),
   );
 
   return c.json(result);
