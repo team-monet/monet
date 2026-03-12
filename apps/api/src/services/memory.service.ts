@@ -123,6 +123,11 @@ export interface ScopeFilterOpts {
   includePrivate: boolean;
 }
 
+export interface MemoryWritePreflight {
+  hasGroupMembership: boolean;
+  memoryQuota: number | null;
+}
+
 /**
  * Build scope visibility filter fragments.
  * Returns an array of SQL conditions that should be OR'd together.
@@ -154,31 +159,45 @@ export function buildScopeFilter(
 
 const DEFAULT_MEMORY_QUOTA = 10000;
 
+export async function resolveMemoryWritePreflight(
+  platformSql: postgres.Sql | null,
+  agent: AgentContext,
+): Promise<MemoryWritePreflight | null> {
+  if (!platformSql) {
+    return null;
+  }
+
+  const rows = await platformSql`
+    SELECT ag.memory_quota
+    FROM agent_group_members agm
+    JOIN agent_groups ag ON ag.id = agm.group_id
+    WHERE agm.agent_id = ${agent.id}
+    LIMIT 1
+  `;
+
+  if (rows.length === 0) {
+    return {
+      hasGroupMembership: false,
+      memoryQuota: null,
+    };
+  }
+
+  return {
+    hasGroupMembership: true,
+    memoryQuota: (rows[0].memory_quota as number | null) ?? null,
+  };
+}
+
 /**
  * Check memory quota before insert. Returns error if exceeded.
  * Quota is resolved from the agent's group (memory_quota column) or falls back to a default.
  */
 export async function checkQuota(
   tx: postgres.Sql,
-  platformSql: postgres.Sql | null,
   agent: AgentContext,
+  quotaOverride: number | null = null,
 ): Promise<{ error: "quota_exceeded"; limit: number; current: number } | null> {
-  let quota = DEFAULT_MEMORY_QUOTA;
-
-  // Try to resolve quota from agent's group (platform schema query)
-  if (platformSql) {
-    const groups = await platformSql`
-      SELECT ag.memory_quota
-      FROM agent_group_members agm
-      JOIN agent_groups ag ON ag.id = agm.group_id
-      WHERE agm.agent_id = ${agent.id}
-      LIMIT 1
-    `;
-    if (groups.length > 0 && groups[0].memory_quota) {
-      const parsed = groups[0].memory_quota as number;
-      if (parsed > 0) quota = parsed;
-    }
-  }
+  const quota = quotaOverride && quotaOverride > 0 ? quotaOverride : DEFAULT_MEMORY_QUOTA;
 
   // Count current entries by this agent in the tenant schema
   const [result] = await tx`
@@ -199,7 +218,7 @@ export async function createMemory(
   txSql: postgres.TransactionSql,
   agent: AgentContext,
   input: CreateMemoryEntryInput,
-  platformSql: postgres.Sql | null = null,
+  preflight: MemoryWritePreflight | null = null,
 ) {
   const tx = txSql as unknown as postgres.Sql;
 
@@ -209,17 +228,12 @@ export async function createMemory(
   }
 
   // Group-scoped entries require group membership (M2 spec)
-  if (input.memoryScope === "group" && platformSql) {
-    const [membership] = await platformSql`
-      SELECT 1 FROM agent_group_members WHERE agent_id = ${agent.id} LIMIT 1
-    `;
-    if (!membership) {
+  if (input.memoryScope === "group" && preflight && !preflight.hasGroupMembership) {
       return { error: "validation" as const, message: "Agent must belong to a group to store group-scoped memories" };
-    }
   }
 
   // Quota enforcement
-  const quotaErr = await checkQuota(tx, platformSql, agent);
+  const quotaErr = await checkQuota(tx, agent, preflight?.memoryQuota ?? null);
   if (quotaErr) return quotaErr;
 
   const expiresAt = input.ttlSeconds

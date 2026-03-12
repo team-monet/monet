@@ -15,6 +15,7 @@ import {
   listTags,
   markOutdated,
   promoteScope,
+  resolveMemoryWritePreflight,
   searchMemories,
   updateMemory,
 } from "../services/memory.service.js";
@@ -74,8 +75,9 @@ export function createMcpServer(
   const handlers: McpToolHandlers = {
     memoryStore: async (args) => {
       try {
+        const preflight = await resolveMemoryWritePreflight(sql, agentContext);
         const result = await withTenantScope(sql, tenantSchemaName, (txSql) =>
-          createMemory(txSql, agentContext, args, sql),
+          createMemory(txSql, agentContext, args, preflight),
         );
 
         if (hasError(result)) {

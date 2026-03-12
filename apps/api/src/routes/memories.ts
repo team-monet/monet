@@ -12,6 +12,7 @@ import {
   markOutdated,
   promoteScope,
   listTags,
+  resolveMemoryWritePreflight,
 } from "../services/memory.service.js";
 import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service.js";
 
@@ -36,8 +37,10 @@ memoriesRouter.post("/", async (c) => {
     );
   }
 
+  const preflight = await resolveMemoryWritePreflight(sql, agent);
+
   const result = await withTenantScope(sql, schemaName, (txSql) =>
-    createMemory(txSql, agent, parsed.data, sql),
+    createMemory(txSql, agent, parsed.data, preflight),
   );
 
   if ("error" in result && result.error === "validation") {

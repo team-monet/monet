@@ -140,7 +140,6 @@ describe("createMemory", () => {
         memoryScope: "user",
         tags: ["test"],
       },
-      null,
     );
 
     expect(result).toEqual({

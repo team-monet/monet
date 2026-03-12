@@ -36,6 +36,7 @@ vi.mock("../services/memory.service.js", () => ({
   promoteScope: (...args: unknown[]) => memoryServiceMocks.promoteScope(...args),
   markOutdated: (...args: unknown[]) => memoryServiceMocks.markOutdated(...args),
   listTags: (...args: unknown[]) => memoryServiceMocks.listTags(...args),
+  resolveMemoryWritePreflight: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("../services/enrichment.service.js", () => ({
