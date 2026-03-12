@@ -11,9 +11,10 @@ import {
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
 } from "../../src/services/enrichment.service.js";
-import type { EnrichmentProvider } from "../../src/providers/enrichment.js";
-
-const EMBEDDING_DIMENSIONS = 1536;
+import {
+  EMBEDDING_DIMENSIONS,
+  type EnrichmentProvider,
+} from "../../src/providers/enrichment.js";
 
 function embedding(fill: number) {
   return Array.from({ length: EMBEDDING_DIMENSIONS }, () => fill);

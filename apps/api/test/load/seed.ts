@@ -3,8 +3,7 @@ import path from "node:path";
 import postgres from "postgres";
 import { createClient, withTenantScope } from "@monet/db";
 import { provisionTenant } from "../../src/services/tenant.service.js";
-
-const EMBEDDING_DIMENSIONS = 1536;
+import { EMBEDDING_DIMENSIONS } from "../../src/providers/enrichment.js";
 
 interface GroupResponse {
   id: string;
