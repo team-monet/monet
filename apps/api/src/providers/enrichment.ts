@@ -14,6 +14,14 @@ export interface EnrichmentConfig {
   ollamaBaseUrl?: string;
   ollamaChatModel?: string;
   ollamaEmbeddingModel?: string;
+  openaiBaseUrl?: string;
+  openaiApiKey?: string;
+  openaiChatBaseUrl?: string;
+  openaiChatApiKey?: string;
+  openaiChatModel?: string;
+  openaiEmbeddingBaseUrl?: string;
+  openaiEmbeddingApiKey?: string;
+  openaiEmbeddingModel?: string;
 }
 
-export const EMBEDDING_DIMENSIONS = 1536;
+export const EMBEDDING_DIMENSIONS = 1024;

@@ -1,6 +1,7 @@
 import { AnthropicEnrichmentProvider } from "./anthropic-enrichment.js";
 import type { EnrichmentProvider } from "./enrichment.js";
 import { OllamaEnrichmentProvider } from "./ollama-enrichment.js";
+import { OpenAICompatibleEnrichmentProvider } from "./openai-enrichment.js";
 
 export interface EnrichmentProviderConfigStatus {
   configured: boolean;
@@ -19,8 +20,12 @@ export function createEnrichmentProvider(): EnrichmentProvider {
     return new OllamaEnrichmentProvider();
   }
 
+  if (provider === "openai") {
+    return new OpenAICompatibleEnrichmentProvider();
+  }
+
   if (!provider) {
-    throw new Error("ENRICHMENT_PROVIDER is required (anthropic | ollama)");
+    throw new Error("ENRICHMENT_PROVIDER is required (anthropic | ollama | openai)");
   }
 
   throw new Error(`Unknown ENRICHMENT_PROVIDER: ${provider}`);

@@ -64,7 +64,7 @@ export async function createTenantSchema(
       memory_scope "${schemaName}".memory_scope NOT NULL DEFAULT 'group',
       tags TEXT[] NOT NULL DEFAULT '{}',
       auto_tags TEXT[] NOT NULL DEFAULT '{}',
-      embedding vector(1536),
+      embedding vector(1024),
       related_memory_ids UUID[] NOT NULL DEFAULT '{}',
       usefulness_score INTEGER NOT NULL DEFAULT 0,
       outdated BOOLEAN NOT NULL DEFAULT false,
