@@ -612,7 +612,6 @@ agentsRouter.get("/me", async (c) => {
  * GET /api/agents/:id/status — get an agent's connection status.
  */
 agentsRouter.get("/:id/status", async (c) => {
-  const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
   const targetId = c.req.param("id");
   const access = await loadAccessibleAgentRow(c, targetId);
