@@ -47,10 +47,10 @@ export default async function DashboardPage() {
       client.listMemories({ limit: 20, includeUser: true, includePrivate: true }),
       client.listAgents(),
       client.listGroups(),
+      client.listRules(),
     ];
 
     if (isAdmin) {
-      requests.push(client.listRules());
       requests.push(client.getAuditLogs({ limit: 5 }));
     }
 
@@ -79,14 +79,14 @@ export default async function DashboardPage() {
       partialErrors.push("Groups could not be loaded.");
     }
 
-    if (isAdmin) {
-      const rulesResult = results[3];
-      if (rulesResult?.status === "fulfilled") {
-        rules = (rulesResult.value as { rules: Rule[] }).rules;
-      } else {
-        partialErrors.push("Rules summary could not be loaded.");
-      }
+    const rulesResult = results[3];
+    if (rulesResult?.status === "fulfilled") {
+      rules = (rulesResult.value as { rules: Rule[] }).rules;
+    } else {
+      partialErrors.push("Rules summary could not be loaded.");
+    }
 
+    if (isAdmin) {
       const auditResult = results[4];
       if (auditResult?.status === "fulfilled") {
         audit = (auditResult.value as { items: AuditLog[] }).items;
@@ -245,25 +245,27 @@ export default async function DashboardPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Admin Snapshot</CardTitle>
+            <CardTitle>{isAdmin ? "Rules & Audit" : "Rules"}</CardTitle>
             <CardDescription>
-              {isAdmin ? "Recent control-plane activity." : "Available when signed in as tenant admin."}
+              {isAdmin
+                ? "Shared guidance and recent control-plane activity."
+                : "Shared guidance available to every tenant user."}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="rounded-md border p-3">
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Scale className="h-4 w-4" />
+                Rules
+              </div>
+              <p className="mt-1 text-2xl font-semibold">{rules.length}</p>
+              <Button asChild size="sm" variant="ghost" className="px-0 mt-1">
+                <Link href="/admin/rules">{isAdmin ? "Manage Rules" : "View Rules"}</Link>
+              </Button>
+            </div>
+
             {isAdmin ? (
               <>
-                <div className="rounded-md border p-3">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <Scale className="h-4 w-4" />
-                    Rules
-                  </div>
-                  <p className="mt-1 text-2xl font-semibold">{rules.length}</p>
-                  <Button asChild size="sm" variant="ghost" className="px-0 mt-1">
-                    <Link href="/admin/rules">Manage Rules</Link>
-                  </Button>
-                </div>
-
                 <div className="rounded-md border p-3">
                   <div className="flex items-center gap-2 text-sm text-muted-foreground">
                     <History className="h-4 w-4" />
@@ -288,7 +290,7 @@ export default async function DashboardPage() {
               </>
             ) : (
               <p className="text-sm text-muted-foreground">
-                You are signed in as a non-admin user. Contact a tenant admin for elevated access.
+                Tenant admins can create and edit shared rules, and you can apply available rule sets to your own agents.
               </p>
             )}
           </CardContent>

@@ -75,9 +75,6 @@ rulesRouter.post("/rules", async (c) => {
 });
 
 rulesRouter.get("/rules", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
   const sql = c.get("sql");
   const schemaName = c.get("tenantSchemaName");
   const rules = await listRules(sql, schemaName);
@@ -85,9 +82,6 @@ rulesRouter.get("/rules", async (c) => {
 });
 
 rulesRouter.get("/rule-sets", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
   const sql = c.get("sql");
   const schemaName = c.get("tenantSchemaName");
   const ruleSets = await listRuleSets(sql, schemaName);
@@ -95,9 +89,6 @@ rulesRouter.get("/rule-sets", async (c) => {
 });
 
 rulesRouter.get("/rules/:id", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
   const sql = c.get("sql");
   const schemaName = c.get("tenantSchemaName");
   const rule = await getRule(sql, schemaName, c.req.param("id"));

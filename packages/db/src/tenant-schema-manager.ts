@@ -12,7 +12,7 @@ export function tenantSchemaNameFromId(tenantId: string): string {
 /**
  * Create a new tenant schema with all required tables, indexes, and security constraints.
  * The schema contains: memory_entries, memory_versions, audit_log, rules, rule_sets,
- * rule_set_rules, agent_rule_sets.
+ * rule_set_rules, agent_rule_sets, group_rule_sets.
  *
  * Audit log has UPDATE and DELETE revoked to ensure append-only behavior.
  */
@@ -166,6 +166,15 @@ export async function createTenantSchema(
       agent_id UUID NOT NULL,
       rule_set_id UUID NOT NULL REFERENCES "${schemaName}".rule_sets(id) ON DELETE CASCADE,
       PRIMARY KEY (agent_id, rule_set_id)
+    )
+  `);
+
+  // Group rule sets join table
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".group_rule_sets (
+      group_id UUID NOT NULL,
+      rule_set_id UUID NOT NULL REFERENCES "${schemaName}".rule_sets(id) ON DELETE CASCADE,
+      PRIMARY KEY (group_id, rule_set_id)
     )
   `);
 

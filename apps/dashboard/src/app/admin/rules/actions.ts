@@ -1,6 +1,7 @@
 "use server";
 
 import { getApiClient } from "@/lib/api-client";
+import { requireAdmin } from "@/lib/auth";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
@@ -9,6 +10,7 @@ function toSingle(value: FormDataEntryValue | null) {
 }
 
 export async function createRuleAction(formData: FormData) {
+  await requireAdmin();
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
 
@@ -29,6 +31,7 @@ export async function createRuleAction(formData: FormData) {
 }
 
 export async function updateRuleAction(formData: FormData) {
+  await requireAdmin();
   const ruleId = toSingle(formData.get("ruleId"));
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
@@ -50,6 +53,7 @@ export async function updateRuleAction(formData: FormData) {
 }
 
 export async function createRuleSetAction(formData: FormData) {
+  await requireAdmin();
   const name = toSingle(formData.get("name"));
 
   if (!name) {
@@ -69,6 +73,7 @@ export async function createRuleSetAction(formData: FormData) {
 }
 
 export async function deleteRuleSetAction(formData: FormData) {
+  await requireAdmin();
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const returnTo = toSingle(formData.get("returnTo")) || "/admin/rules";
 
@@ -90,6 +95,7 @@ export async function deleteRuleSetAction(formData: FormData) {
 }
 
 export async function addRuleToSetAction(formData: FormData) {
+  await requireAdmin();
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const ruleId = toSingle(formData.get("ruleId"));
   const returnTo = toSingle(formData.get("returnTo")) || `/admin/rules/sets/${ruleSetId}`;
@@ -112,6 +118,7 @@ export async function addRuleToSetAction(formData: FormData) {
 }
 
 export async function removeRuleFromSetAction(formData: FormData) {
+  await requireAdmin();
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const ruleId = toSingle(formData.get("ruleId"));
   const returnTo = toSingle(formData.get("returnTo")) || `/admin/rules/sets/${ruleSetId}`;

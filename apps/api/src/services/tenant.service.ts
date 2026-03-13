@@ -9,6 +9,7 @@ import {
   slugifyTenantName,
 } from "@monet/types";
 import { encrypt } from "../lib/crypto";
+import { seedDefaultGeneralGuidance } from "./default-rule-seed.service";
 import { provisionAgentWithApiKey } from "./agent-provisioning.service";
 
 export interface ProvisionTenantResult {
@@ -57,6 +58,20 @@ export async function configureTenantOauth(
   return result;
 }
 
+export async function ensureTenantSchemasCurrent(sql: postgres.Sql): Promise<number> {
+  const tenants = await sql`
+    SELECT id
+    FROM tenants
+    ORDER BY created_at ASC, id ASC
+  `;
+
+  for (const tenant of tenants as unknown as Array<{ id: string }>) {
+    await createTenantSchema(sql, tenant.id);
+  }
+
+  return tenants.length;
+}
+
 /**
  * Provision a new tenant: create tenant row, tenant schema, and the first admin agent.
  * All operations are atomic — if any step fails, the entire operation rolls back.
@@ -83,7 +98,7 @@ export async function provisionTenant(
     `;
 
     // Create the tenant schema with all DDL
-    await createTenantSchema(txSql, tenant.id);
+    const tenantSchemaName = await createTenantSchema(txSql, tenant.id);
 
     const [defaultUserGroup] = await tx`
       INSERT INTO human_groups (tenant_id, name, description)
@@ -122,6 +137,12 @@ export async function provisionTenant(
       INSERT INTO human_group_agent_group_permissions (human_group_id, agent_group_id)
       VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
     `;
+
+    await seedDefaultGeneralGuidance(
+      tx,
+      tenantSchemaName,
+      defaultAgentGroup.id as string,
+    );
 
     return {
       tenant: {

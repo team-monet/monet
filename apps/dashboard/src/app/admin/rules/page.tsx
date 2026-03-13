@@ -1,5 +1,5 @@
 import { getApiClient } from "@/lib/api-client";
-import { requireAdmin } from "@/lib/auth";
+import { requireAuth } from "@/lib/auth";
 import type { Rule, RuleSet } from "@monet/types";
 import { createRuleAction, createRuleSetAction, deleteRuleSetAction, updateRuleAction } from "./actions";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -32,8 +32,9 @@ function getSingleParam(value: string | string[] | undefined) {
 }
 
 export default async function AdminRulesPage({ searchParams }: PageProps) {
-  const params = await searchParams;
-  await requireAdmin();
+  const [params, session] = await Promise.all([searchParams, requireAuth()]);
+  const sessionUser = session.user as { role?: string | null };
+  const isAdmin = sessionUser.role === "tenant_admin";
 
   const createError = getSingleParam(params.createError);
   const created = getSingleParam(params.created) === "1";
@@ -65,52 +66,56 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
     <div className="flex flex-col gap-6 p-4">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">System Rules</h1>
+          <h1 className="text-3xl font-bold tracking-tight">Shared Rules</h1>
           <p className="text-muted-foreground mt-1">
-            Define and manage rules that govern agent behavior and memory access.
+            {isAdmin
+              ? "Review and manage the shared rules and rule sets available across this tenant."
+              : "Review the shared rules and reusable rule sets available across this tenant."}
           </p>
         </div>
-        
-        <Dialog>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="mr-2 h-4 w-4" />
-              Create Rule
-            </Button>
-          </DialogTrigger>
-          <DialogContent className="max-w-2xl">
-            <DialogHeader>
-              <DialogTitle>Create New Rule</DialogTitle>
-              <DialogDescription>
-                Add a new rule to govern your AI agents.
-              </DialogDescription>
-            </DialogHeader>
-            <form action={createRuleAction} className="grid gap-4 py-4">
-              <div className="grid gap-2">
-                <Label htmlFor="name">Rule Name</Label>
-                <Input
-                  id="name"
-                  name="name"
-                  required
-                  placeholder="e.g. Data Privacy Compliance"
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="description">Rule Description</Label>
-                <Textarea
-                  id="description"
-                  name="description"
-                  required
-                  placeholder="Describe the rule and its application..."
-                  className="min-h-[100px]"
-                />
-              </div>
-              <DialogFooter>
-                <SubmitButton label="Create Rule" pendingLabel="Creating..." />
-              </DialogFooter>
-            </form>
-          </DialogContent>
-        </Dialog>
+
+        {isAdmin && (
+          <Dialog>
+            <DialogTrigger asChild>
+              <Button>
+                <Plus className="mr-2 h-4 w-4" />
+                Create Rule
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>Create New Rule</DialogTitle>
+                <DialogDescription>
+                  Add a new rule to govern your AI agents.
+                </DialogDescription>
+              </DialogHeader>
+              <form action={createRuleAction} className="grid gap-4 py-4">
+                <div className="grid gap-2">
+                  <Label htmlFor="name">Rule Name</Label>
+                  <Input
+                    id="name"
+                    name="name"
+                    required
+                    placeholder="e.g. Data Privacy Compliance"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="description">Rule Description</Label>
+                  <Textarea
+                    id="description"
+                    name="description"
+                    required
+                    placeholder="Describe the rule and its application..."
+                    className="min-h-[100px]"
+                  />
+                </div>
+                <DialogFooter>
+                  <SubmitButton label="Create Rule" pendingLabel="Creating..." />
+                </DialogFooter>
+              </form>
+            </DialogContent>
+          </Dialog>
+        )}
       </div>
 
       {created && (
@@ -226,47 +231,49 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                             </div>
                           </TableCell>
                           <TableCell className="text-right">
-                            <Dialog>
-                              <DialogTrigger asChild>
-                                <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
-                                  <Settings2 className="h-4 w-4" />
-                                  <span className="sr-only">Edit</span>
-                                </Button>
-                              </DialogTrigger>
-                              <DialogContent className="max-w-2xl">
-                                <DialogHeader>
-                                  <DialogTitle>Edit Rule</DialogTitle>
-                                  <DialogDescription>
-                                    Update this rule's name or description.
-                                  </DialogDescription>
-                                </DialogHeader>
-                                <form action={updateRuleAction} className="grid gap-4 py-4">
-                                  <input type="hidden" name="ruleId" value={r.id} />
-                                  <div className="grid gap-2">
-                                    <Label htmlFor={`edit-name-${r.id}`}>Rule Name</Label>
-                                    <Input
-                                      id={`edit-name-${r.id}`}
-                                      name="name"
-                                      required
-                                      defaultValue={r.name}
-                                    />
-                                  </div>
-                                  <div className="grid gap-2">
-                                    <Label htmlFor={`edit-description-${r.id}`}>Rule Description</Label>
-                                    <Textarea
-                                      id={`edit-description-${r.id}`}
-                                      name="description"
-                                      required
-                                      defaultValue={r.description}
-                                      className="min-h-[100px]"
-                                    />
-                                  </div>
-                                  <DialogFooter>
-                                    <SubmitButton label="Save changes" pendingLabel="Saving..." />
-                                  </DialogFooter>
-                                </form>
-                              </DialogContent>
-                            </Dialog>
+                            {isAdmin && (
+                              <Dialog>
+                                <DialogTrigger asChild>
+                                  <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <Settings2 className="h-4 w-4" />
+                                    <span className="sr-only">Edit</span>
+                                  </Button>
+                                </DialogTrigger>
+                                <DialogContent className="max-w-2xl">
+                                  <DialogHeader>
+                                    <DialogTitle>Edit Rule</DialogTitle>
+                                    <DialogDescription>
+                                      Update this rule's name or description.
+                                    </DialogDescription>
+                                  </DialogHeader>
+                                  <form action={updateRuleAction} className="grid gap-4 py-4">
+                                    <input type="hidden" name="ruleId" value={r.id} />
+                                    <div className="grid gap-2">
+                                      <Label htmlFor={`edit-name-${r.id}`}>Rule Name</Label>
+                                      <Input
+                                        id={`edit-name-${r.id}`}
+                                        name="name"
+                                        required
+                                        defaultValue={r.name}
+                                      />
+                                    </div>
+                                    <div className="grid gap-2">
+                                      <Label htmlFor={`edit-description-${r.id}`}>Rule Description</Label>
+                                      <Textarea
+                                        id={`edit-description-${r.id}`}
+                                        name="description"
+                                        required
+                                        defaultValue={r.description}
+                                        className="min-h-[100px]"
+                                      />
+                                    </div>
+                                    <DialogFooter>
+                                      <SubmitButton label="Save changes" pendingLabel="Saving..." />
+                                    </DialogFooter>
+                                  </form>
+                                </DialogContent>
+                              </Dialog>
+                            )}
                           </TableCell>
                         </TableRow>
                       ))
@@ -287,24 +294,26 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
             </Alert>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              <Card className="border-dashed">
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2 text-lg">
-                    <Plus className="h-5 w-5 text-primary" />
-                    New Rule Set
-                  </CardTitle>
-                  <CardDescription>Create a reusable bundle of rules for agents.</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <form action={createRuleSetAction} className="space-y-3">
-                    <div className="grid gap-2">
-                      <Label htmlFor="rule-set-name">Rule Set Name</Label>
-                      <Input id="rule-set-name" name="name" required placeholder="e.g. Default Agent Set" />
-                    </div>
-                    <SubmitButton label="Create Rule Set" pendingLabel="Creating..." className="w-full" />
-                  </form>
-                </CardContent>
-              </Card>
+              {isAdmin && (
+                <Card className="border-dashed">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2 text-lg">
+                      <Plus className="h-5 w-5 text-primary" />
+                      New Rule Set
+                    </CardTitle>
+                    <CardDescription>Create a reusable bundle of rules for agents.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <form action={createRuleSetAction} className="space-y-3">
+                      <div className="grid gap-2">
+                        <Label htmlFor="rule-set-name">Rule Set Name</Label>
+                        <Input id="rule-set-name" name="name" required placeholder="e.g. Default Agent Set" />
+                      </div>
+                      <SubmitButton label="Create Rule Set" pendingLabel="Creating..." className="w-full" />
+                    </form>
+                  </CardContent>
+                </Card>
+              )}
 
               {ruleSets.map((ruleSet) => (
                 <Card key={ruleSet.id} className="hover:shadow-md transition-shadow">
@@ -337,22 +346,24 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                   <CardFooter className="pt-0 flex gap-2">
                     <Button asChild variant="outline" size="sm" className="flex-1">
                       <Link href={`/admin/rules/sets/${ruleSet.id}`}>
-                        Manage Set
+                        {isAdmin ? "Manage Set" : "View Set"}
                         <ArrowRight className="ml-2 h-3.5 w-3.5" />
                       </Link>
                     </Button>
-                    <form action={deleteRuleSetAction}>
-                      <input type="hidden" name="ruleSetId" value={ruleSet.id} />
-                      <input type="hidden" name="returnTo" value="/admin/rules" />
-                      <SubmitButton 
-                        variant="ghost" 
-                        size="icon" 
-                        className="h-8 w-8 text-destructive"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                        <span className="sr-only">Delete</span>
-                      </SubmitButton>
-                    </form>
+                    {isAdmin && (
+                      <form action={deleteRuleSetAction}>
+                        <input type="hidden" name="ruleSetId" value={ruleSet.id} />
+                        <input type="hidden" name="returnTo" value="/admin/rules" />
+                        <SubmitButton
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-destructive"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          <span className="sr-only">Delete</span>
+                        </SubmitButton>
+                      </form>
+                    )}
                   </CardFooter>
                 </Card>
               ))}

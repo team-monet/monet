@@ -17,6 +17,9 @@ const resolveAgentRoleMock = vi.fn();
 const userCanSelectAgentGroupMock = vi.fn();
 const logAuditEventMock = vi.fn();
 const listRuleSetsForAgentMock = vi.fn();
+const associateRuleSetWithAgentMock = vi.fn();
+const dissociateRuleSetFromAgentMock = vi.fn();
+const getActiveRulesForAgentMock = vi.fn();
 
 vi.mock("../services/group.service.js", () => ({
   addMember: (...args: unknown[]) => addMemberMock(...args),
@@ -33,9 +36,9 @@ vi.mock("../services/audit.service.js", () => ({
 }));
 
 vi.mock("../services/rule.service.js", () => ({
-  associateRuleSetWithAgent: vi.fn(),
-  dissociateRuleSetFromAgent: vi.fn(),
-  getActiveRulesForAgent: vi.fn(),
+  associateRuleSetWithAgent: (...args: unknown[]) => associateRuleSetWithAgentMock(...args),
+  dissociateRuleSetFromAgent: (...args: unknown[]) => dissociateRuleSetFromAgentMock(...args),
+  getActiveRulesForAgent: (...args: unknown[]) => getActiveRulesForAgentMock(...args),
   listRuleSetsForAgent: (...args: unknown[]) => listRuleSetsForAgentMock(...args),
 }));
 
@@ -86,6 +89,9 @@ describe("agents route", () => {
     userCanSelectAgentGroupMock.mockResolvedValue(true);
     logAuditEventMock.mockResolvedValue(undefined);
     listRuleSetsForAgentMock.mockResolvedValue([]);
+    associateRuleSetWithAgentMock.mockResolvedValue({ success: true });
+    dissociateRuleSetFromAgentMock.mockResolvedValue({ success: true });
+    getActiveRulesForAgentMock.mockResolvedValue([]);
     sqlMock.mockReset();
   });
 
@@ -520,9 +526,14 @@ describe("agents route", () => {
     expect(secondRes.status).toBe(429);
   });
 
-  it("returns empty rule sets for non-admin agent detail requests", async () => {
+  it("returns direct rule sets for non-admin agent detail requests", async () => {
     listRuleSetsForAgentMock.mockResolvedValue([
-      { id: "rule-set-1", name: "Sensitive Set" },
+      {
+        id: "00000000-0000-0000-0000-000000000111",
+        name: "Sensitive Set",
+        ruleIds: [],
+        createdAt: "2026-03-03T00:00:00.000Z",
+      },
     ]);
     sqlMock
       .mockResolvedValueOnce([
@@ -557,7 +568,92 @@ describe("agents route", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.ruleSets).toEqual([]);
-    expect(listRuleSetsForAgentMock).not.toHaveBeenCalled();
+    expect(body.ruleSets).toHaveLength(1);
+    expect(body.ruleSets[0]).toMatchObject({ name: "Sensitive Set" });
+    expect(listRuleSetsForAgentMock).toHaveBeenCalledWith(
+      sqlMock,
+      `tenant_${TENANT_ID.replace(/-/g, "_")}`,
+      AGENT_ID,
+    );
+  });
+
+  it("allows an owning user to attach a rule set to their agent", async () => {
+    const sessionStore = { getByAgentId: vi.fn().mockReturnValue([]) };
+    sqlMock.mockResolvedValueOnce([
+      {
+        id: AGENT_ID,
+        external_id: "self-bound",
+        tenant_id: TENANT_ID,
+        user_id: USER_ID,
+        role: "user",
+        is_autonomous: false,
+        revoked_at: null,
+        created_at: "2026-03-03T00:00:00.000Z",
+        owner_id: USER_ID,
+        owner_external_id: "bound-user",
+        owner_email: "bound@example.com",
+      },
+    ]);
+
+    const app = createTestApp({ role: "user", userId: USER_ID }, sessionStore);
+    const res = await app.request(`/agents/${AGENT_ID}/rule-sets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000222" }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(associateRuleSetWithAgentMock).toHaveBeenCalledWith(
+      sqlMock,
+      TENANT_ID,
+      `tenant_${TENANT_ID.replace(/-/g, "_")}`,
+      {
+        actorId: USER_ID,
+        actorType: "human_user",
+      },
+      AGENT_ID,
+      "00000000-0000-0000-0000-000000000222",
+    );
+  });
+
+  it("allows an owning user to view active rules for their agent", async () => {
+    getActiveRulesForAgentMock.mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000333",
+        name: "Rule A",
+        description: "Desc A",
+        createdAt: "2026-03-03T00:00:00.000Z",
+        updatedAt: "2026-03-03T00:00:00.000Z",
+      },
+    ]);
+    sqlMock.mockResolvedValueOnce([
+      {
+        id: AGENT_ID,
+        external_id: "self-bound",
+        tenant_id: TENANT_ID,
+        user_id: USER_ID,
+        role: "user",
+        is_autonomous: false,
+        revoked_at: null,
+        created_at: "2026-03-03T00:00:00.000Z",
+        owner_id: USER_ID,
+        owner_external_id: "bound-user",
+        owner_email: "bound@example.com",
+      },
+    ]);
+
+    const app = createTestApp({ role: "user", userId: USER_ID });
+    const res = await app.request(`/agents/${AGENT_ID}/rules`, {
+      method: "GET",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.rules).toHaveLength(1);
+    expect(getActiveRulesForAgentMock).toHaveBeenCalledWith(
+      sqlMock,
+      `tenant_${TENANT_ID.replace(/-/g, "_")}`,
+      AGENT_ID,
+    );
   });
 });

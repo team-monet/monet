@@ -6,6 +6,7 @@ import { createApp } from "./app";
 import { createMcpHandler } from "./mcp/handler";
 import { sessionStore } from "./mcp/session-store";
 import { ensureBootstrapToken } from "./services/bootstrap.service";
+import { ensureTenantSchemasCurrent } from "./services/tenant.service";
 import {
   getActiveEnrichmentCount,
   getQueuedEnrichmentCount,
@@ -33,6 +34,7 @@ const auditPurgeSql = auditPurgeDatabaseUrl
   ? postgres(auditPurgeDatabaseUrl)
   : sql;
 const hasDedicatedAuditPurgeClient = Boolean(auditPurgeDatabaseUrl);
+const upgradedTenantSchemaCount = await ensureTenantSchemasCurrent(sql);
 const bootstrapToken = await ensureBootstrapToken(db);
 const app = createApp(db, sql, sessionStore);
 const mcpHandler = createMcpHandler({ db, sql, sessionStore });
@@ -41,6 +43,7 @@ const honoRequestListener = getRequestListener(app.fetch);
 const port = parseInt(process.env.API_PORT || "3001", 10);
 
 console.log(`Starting Monet API on port ${port}`);
+console.log(`Ensured tenant schemas are current for ${upgradedTenantSchemaCount} tenant(s)`);
 if (bootstrapToken) {
   console.log(
     `Platform bootstrap token (expires ${bootstrapToken.expiresAt.toISOString()}): ${bootstrapToken.rawToken}`,

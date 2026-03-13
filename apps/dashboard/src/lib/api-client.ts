@@ -113,6 +113,19 @@ export class MonetApiClient {
     );
   }
 
+  async attachRuleSetToAgent(id: string, ruleSetId: string): Promise<{ success: true }> {
+    return this.fetch<{ success: true }>(`/api/agents/${id}/rule-sets`, {
+      method: "POST",
+      body: JSON.stringify({ ruleSetId }),
+    });
+  }
+
+  async detachRuleSetFromAgent(id: string, ruleSetId: string): Promise<{ success: true }> {
+    return this.fetch<{ success: true }>(`/api/agents/${id}/rule-sets/${ruleSetId}`, {
+      method: "DELETE",
+    });
+  }
+
   // Memories
   async listMemories(params?: {
     memoryType?: MemoryType;

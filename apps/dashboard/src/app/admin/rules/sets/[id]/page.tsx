@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { getApiClient } from "@/lib/api-client";
-import { requireAdmin } from "@/lib/auth";
+import { requireAuth } from "@/lib/auth";
 import type { Rule, RuleSet } from "@monet/types";
 import { addRuleToSetAction, deleteRuleSetAction, removeRuleFromSetAction } from "../../actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -21,9 +21,9 @@ function getSingleParam(value: string | string[] | undefined) {
 }
 
 export default async function RuleSetDetailPage({ params, searchParams }: PageProps) {
-  const { id } = await params;
-  const query = await searchParams;
-  await requireAdmin();
+  const [{ id }, query, session] = await Promise.all([params, searchParams, requireAuth()]);
+  const sessionUser = session.user as { role?: string | null };
+  const isAdmin = sessionUser.role === "tenant_admin";
 
   const returnTo = `/admin/rules/sets/${id}`;
   const setError = getSingleParam(query.setError);
@@ -117,12 +117,14 @@ export default async function RuleSetDetailPage({ params, searchParams }: PagePr
                         <p className="text-xs text-muted-foreground line-clamp-2">{rule.description}</p>
                         <Badge variant="outline" className="text-[10px]">Updated {new Date(rule.updatedAt).toLocaleDateString()}</Badge>
                       </div>
-                      <form action={removeRuleFromSetAction}>
-                        <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
-                        <input type="hidden" name="ruleId" value={rule.id} />
-                        <input type="hidden" name="returnTo" value={returnTo} />
-                        <SubmitButton label="Remove" pendingLabel="Removing..." variant="ghost" size="sm" />
-                      </form>
+                      {isAdmin && (
+                        <form action={removeRuleFromSetAction}>
+                          <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
+                          <input type="hidden" name="ruleId" value={rule.id} />
+                          <input type="hidden" name="returnTo" value={returnTo} />
+                          <SubmitButton label="Remove" pendingLabel="Removing..." variant="ghost" size="sm" />
+                        </form>
+                      )}
                     </div>
                   ))
                 )}
@@ -130,59 +132,63 @@ export default async function RuleSetDetailPage({ params, searchParams }: PagePr
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Plus className="h-4 w-4" />
-                Add Rule to Set
-              </CardTitle>
-              <CardDescription>Select an existing rule to add to this rule set.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <form action={addRuleToSetAction} className="space-y-3">
-                <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
-                <input type="hidden" name="returnTo" value={returnTo} />
-                <div className="grid gap-2">
-                  <Label htmlFor="ruleId">Available Rules</Label>
-                  <select
-                    id="ruleId"
-                    name="ruleId"
-                    className="h-10 rounded-md border bg-background px-3 text-sm"
-                    defaultValue={availableRules[0]?.id ?? ""}
-                    disabled={availableRules.length === 0}
-                  >
-                    {availableRules.length === 0 ? (
-                      <option value="">No available rules</option>
-                    ) : (
-                      availableRules.map((rule) => (
-                        <option key={rule.id} value={rule.id}>
-                          {rule.name}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </div>
-                <SubmitButton label="Add Rule" pendingLabel="Adding..." disabled={availableRules.length === 0} />
-              </form>
-            </CardContent>
-          </Card>
+          {isAdmin && (
+            <>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Plus className="h-4 w-4" />
+                    Add Rule to Set
+                  </CardTitle>
+                  <CardDescription>Select an existing rule to add to this rule set.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <form action={addRuleToSetAction} className="space-y-3">
+                    <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
+                    <input type="hidden" name="returnTo" value={returnTo} />
+                    <div className="grid gap-2">
+                      <Label htmlFor="ruleId">Available Rules</Label>
+                      <select
+                        id="ruleId"
+                        name="ruleId"
+                        className="h-10 rounded-md border bg-background px-3 text-sm"
+                        defaultValue={availableRules[0]?.id ?? ""}
+                        disabled={availableRules.length === 0}
+                      >
+                        {availableRules.length === 0 ? (
+                          <option value="">No available rules</option>
+                        ) : (
+                          availableRules.map((rule) => (
+                            <option key={rule.id} value={rule.id}>
+                              {rule.name}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </div>
+                    <SubmitButton label="Add Rule" pendingLabel="Adding..." disabled={availableRules.length === 0} />
+                  </form>
+                </CardContent>
+              </Card>
 
-          <Card className="border-destructive/40">
-            <CardHeader>
-              <CardTitle className="text-destructive">Delete Rule Set</CardTitle>
-              <CardDescription>This removes the set and its rule associations.</CardDescription>
-            </CardHeader>
-            <CardFooter>
-              <form action={deleteRuleSetAction}>
-                <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
-                <input type="hidden" name="returnTo" value="/admin/rules" />
-                <SubmitButton pendingLabel="Deleting..." variant="destructive">
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  Delete Rule Set
-                </SubmitButton>
-              </form>
-            </CardFooter>
-          </Card>
+              <Card className="border-destructive/40">
+                <CardHeader>
+                  <CardTitle className="text-destructive">Delete Rule Set</CardTitle>
+                  <CardDescription>This removes the set and its rule associations.</CardDescription>
+                </CardHeader>
+                <CardFooter>
+                  <form action={deleteRuleSetAction}>
+                    <input type="hidden" name="ruleSetId" value={ruleSet!.id} />
+                    <input type="hidden" name="returnTo" value="/admin/rules" />
+                    <SubmitButton pendingLabel="Deleting..." variant="destructive">
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      Delete Rule Set
+                    </SubmitButton>
+                  </form>
+                </CardFooter>
+              </Card>
+            </>
+          )}
         </>
       )}
     </div>

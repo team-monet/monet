@@ -11,6 +11,7 @@ import {
   listGroups,
   listGroupMembers,
 } from "../services/group.service";
+import { pushRulesToAgent } from "../services/rule-notification.service";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const VALID_PROMOTE_ROLES = ["group_admin", "user"] as const;
@@ -144,6 +145,8 @@ groupsRouter.get("/:id/members", async (c) => {
 groupsRouter.post("/:id/members", async (c) => {
   const agent = c.get("agent");
   const sql = c.get("sql");
+  const sessionStore = c.get("sessionStore");
+  const schemaName = c.get("tenantSchemaName");
   const groupId = c.req.param("id");
 
   const role = await resolveAgentRole(sql, agent);
@@ -163,6 +166,10 @@ groupsRouter.post("/:id/members", async (c) => {
       return c.json({ error: "not_found", message: result.message }, 404);
     }
     return c.json({ error: "conflict", message: result.message }, 409);
+  }
+
+  if (sessionStore) {
+    await pushRulesToAgent(parsed.data.agentId, sessionStore, sql, schemaName);
   }
 
   return c.json(
@@ -207,6 +214,8 @@ groupsRouter.post("/users/:userId/admin", async (c) => {
 groupsRouter.delete("/:id/members/:agentId", async (c) => {
   const agent = c.get("agent");
   const sql = c.get("sql");
+  const sessionStore = c.get("sessionStore");
+  const schemaName = c.get("tenantSchemaName");
   const groupId = c.req.param("id");
   const agentId = c.req.param("agentId");
 
@@ -221,6 +230,10 @@ groupsRouter.delete("/:id/members/:agentId", async (c) => {
       return c.json({ error: "conflict", message: result.message }, 409);
     }
     return c.json({ error: "not_found", message: result.message }, 404);
+  }
+
+  if (sessionStore) {
+    await pushRulesToAgent(agentId, sessionStore, sql, schemaName);
   }
 
   return c.json({ success: true });

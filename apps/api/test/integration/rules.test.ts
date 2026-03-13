@@ -7,6 +7,10 @@ import { createMcpHandler } from "../../src/mcp/handler";
 import { SessionStore } from "../../src/mcp/session-store";
 import type { AgentContext } from "../../src/middleware/context";
 import {
+  DEFAULT_GENERAL_GUIDANCE_RULE_SET_NAME,
+  DEFAULT_GENERAL_GUIDANCE_RULES,
+} from "../../src/services/default-rule-seed.service";
+import {
   cleanupTestData,
   closeTestDb,
   getTestDb,
@@ -28,6 +32,7 @@ describe("Rules integration", () => {
   let adminApiKey: string;
   let adminAgentId: string;
   let defaultGroupId: string;
+  const defaultRuleNames = DEFAULT_GENERAL_GUIDANCE_RULES.map((rule) => rule.name).sort();
 
   beforeAll(async () => {
     console.log("TEST_DB_URL:", process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/monet_test");
@@ -70,14 +75,22 @@ describe("Rules integration", () => {
     });
   });
 
-  async function registerAgent(externalId: string) {
+  async function registerAgent(
+    externalId: string,
+    options?: { apiKey?: string; userId?: string; isAutonomous?: boolean },
+  ) {
     const res = await app.request("/api/agents/register", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${adminApiKey}`,
+        Authorization: `Bearer ${options?.apiKey ?? adminApiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ externalId, groupId: defaultGroupId }),
+      body: JSON.stringify({
+        externalId,
+        groupId: defaultGroupId,
+        userId: options?.userId,
+        isAutonomous: options?.isAutonomous,
+      }),
     });
     const body = await res.json();
     return {
@@ -119,6 +132,39 @@ describe("Rules integration", () => {
     return { sessionId, notify };
   }
 
+  it("New tenants seed default guidance and General agents inherit it", async () => {
+    const rulesRes = await app.request("/api/rules", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${adminApiKey}` },
+    });
+
+    expect(rulesRes.status).toBe(200);
+    const rulesBody = await rulesRes.json() as { rules: Array<{ name: string }> };
+    expect(rulesBody.rules).toHaveLength(DEFAULT_GENERAL_GUIDANCE_RULES.length);
+    expect(rulesBody.rules.map((rule) => rule.name).sort()).toEqual(defaultRuleNames);
+
+    const ruleSetsRes = await app.request("/api/rule-sets", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${adminApiKey}` },
+    });
+
+    expect(ruleSetsRes.status).toBe(200);
+    const ruleSetsBody = await ruleSetsRes.json() as { ruleSets: Array<{ name: string }> };
+    expect(ruleSetsBody.ruleSets).toHaveLength(1);
+    expect(ruleSetsBody.ruleSets[0].name).toBe(DEFAULT_GENERAL_GUIDANCE_RULE_SET_NAME);
+
+    const agent = await registerAgent("worker-default-guidance");
+    const activeRes = await app.request(`/api/agents/${agent.id}/rules`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${adminApiKey}` },
+    });
+
+    expect(activeRes.status).toBe(200);
+    const active = await activeRes.json() as { rules: Array<{ name: string }> };
+    expect(active.rules).toHaveLength(DEFAULT_GENERAL_GUIDANCE_RULES.length);
+    expect(active.rules.map((rule) => rule.name).sort()).toEqual(defaultRuleNames);
+  });
+
   it("Tenant_Admin creates a rule", async () => {
     const res = await app.request("/api/rules", {
       method: "POST",
@@ -147,6 +193,32 @@ describe("Rules integration", () => {
     });
 
     expect(res.status).toBe(403);
+  });
+
+  it("Non-admin agent can view shared rules and rule sets", async () => {
+    const nonAdmin = await registerAgent("worker-rule-reader");
+
+    const [rulesRes, ruleSetsRes] = await Promise.all([
+      app.request("/api/rules", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${nonAdmin.apiKey}` },
+      }),
+      app.request("/api/rule-sets", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${nonAdmin.apiKey}` },
+      }),
+    ]);
+
+    expect(rulesRes.status).toBe(200);
+    expect(ruleSetsRes.status).toBe(200);
+
+    const rulesBody = await rulesRes.json() as { rules: Array<{ name: string }> };
+    const ruleSetsBody = await ruleSetsRes.json() as { ruleSets: Array<{ name: string }> };
+
+    expect(rulesBody.rules.map((rule) => rule.name).sort()).toEqual(defaultRuleNames);
+    expect(ruleSetsBody.ruleSets.map((ruleSet) => ruleSet.name)).toContain(
+      DEFAULT_GENERAL_GUIDANCE_RULE_SET_NAME,
+    );
   });
 
   it("Tenant_Admin creates rule set and associates rules", async () => {
@@ -212,6 +284,56 @@ describe("Rules integration", () => {
     expect(active.rules.map((r) => r.id)).toContain(rule.id);
   });
 
+  it("Owning user can attach a shared rule set to their own agent", async () => {
+    const [user] = await sql`
+      INSERT INTO human_users (external_id, tenant_id, role, email)
+      VALUES ('owner-user', ${tenantId}, 'user', 'owner@example.com')
+      RETURNING id
+    `;
+
+    const ownerAgent = await registerAgent("owner-agent", { userId: user.id as string });
+
+    const ruleRes = await app.request("/api/rules", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Owner Rule", description: "Owner Desc" }),
+    });
+    const rule = await ruleRes.json() as { id: string };
+
+    const setRes = await app.request("/api/rule-sets", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Owner Set" }),
+    });
+    const ruleSet = await setRes.json() as { id: string };
+
+    const addRuleRes = await app.request(`/api/rule-sets/${ruleSet.id}/rules`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleId: rule.id }),
+    });
+    expect(addRuleRes.status).toBe(201);
+
+    const attachRes = await app.request(`/api/agents/${ownerAgent.id}/rule-sets`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ruleSetId: ruleSet.id }),
+    });
+
+    expect(attachRes.status).toBe(201);
+
+    const detailRes = await app.request(`/api/agents/${ownerAgent.id}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${ownerAgent.apiKey}` },
+    });
+    expect(detailRes.status).toBe(200);
+    const detailBody = await detailRes.json() as { ruleSets: Array<{ name: string }> };
+    expect(detailBody.ruleSets.map((ruleSetEntry) => ruleSetEntry.name)).toContain("Owner Set");
+  });
+
   it("Removing a rule from set pushes updated rules to active session", async () => {
     const agent = await registerAgent("worker-rules-update");
     const { notify } = addMockSession(agent.id);
@@ -251,10 +373,15 @@ describe("Rules integration", () => {
 
     expect(removeRes.status).toBe(200);
     expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledWith({
-      method: "notifications/rules/updated",
-      params: { rules: [] },
-    });
+    const notification = notify.mock.calls[0]?.[0] as {
+      method: string;
+      params: { rules: Array<{ name: string }> };
+    };
+    expect(notification.method).toBe("notifications/rules/updated");
+    expect(notification.params.rules).toHaveLength(DEFAULT_GENERAL_GUIDANCE_RULES.length);
+    expect(notification.params.rules.map((activeRule) => activeRule.name).sort()).toEqual(
+      defaultRuleNames,
+    );
   });
 
   it("Multiple rule sets on same agent do not duplicate active rules", async () => {
@@ -311,8 +438,47 @@ describe("Rules integration", () => {
     });
 
     const active = await activeRes.json() as { rules: Array<{ id: string }> };
-    expect(active.rules).toHaveLength(1);
-    expect(active.rules[0].id).toBe(rule.id);
+    expect(active.rules).toHaveLength(DEFAULT_GENERAL_GUIDANCE_RULES.length + 1);
+    expect(active.rules.filter((activeRule) => activeRule.id === rule.id)).toHaveLength(1);
+  });
+
+  it("Moving an agent out of General removes inherited default guidance and pushes an update", async () => {
+    const agent = await registerAgent("worker-group-move");
+    const { notify } = addMockSession(agent.id);
+
+    const createGroupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "No Guidance", description: "Fresh group" }),
+    });
+    const group = await createGroupRes.json() as { id: string };
+
+    notify.mockClear();
+
+    const moveRes = await app.request(`/api/groups/${group.id}/members`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: agent.id }),
+    });
+
+    expect(moveRes.status).toBe(200);
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    const notification = notify.mock.calls[0]?.[0] as {
+      method: string;
+      params: { rules: Array<{ id: string }> };
+    };
+    expect(notification.method).toBe("notifications/rules/updated");
+    expect(notification.params.rules).toEqual([]);
+
+    const activeRes = await app.request(`/api/agents/${agent.id}/rules`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${adminApiKey}` },
+    });
+
+    expect(activeRes.status).toBe(200);
+    const active = await activeRes.json() as { rules: Array<{ id: string }> };
+    expect(active.rules).toEqual([]);
   });
 
   it("Audit log contains entries for rule mutations", async () => {

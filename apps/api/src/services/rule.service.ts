@@ -477,11 +477,20 @@ export async function getActiveRulesForAgent(
   return withTenantScope(sql, schemaName, async (txSql) => {
     const tx = txSql as unknown as postgres.Sql;
     const rows = await tx`
+      WITH effective_rule_sets AS (
+        SELECT rule_set_id
+        FROM agent_rule_sets
+        WHERE agent_id = ${agentId}
+        UNION
+        SELECT grs.rule_set_id
+        FROM agent_group_members agm
+        JOIN group_rule_sets grs ON grs.group_id = agm.group_id
+        WHERE agm.agent_id = ${agentId}
+      )
       SELECT DISTINCT r.id, r.name, r.description, r.updated_at, r.created_at
-      FROM agent_rule_sets ars
-      JOIN rule_set_rules rsr ON rsr.rule_set_id = ars.rule_set_id
+      FROM effective_rule_sets ers
+      JOIN rule_set_rules rsr ON rsr.rule_set_id = ers.rule_set_id
       JOIN rules r ON r.id = rsr.rule_id
-      WHERE ars.agent_id = ${agentId}
       ORDER BY r.created_at ASC, r.id ASC
     `;
 
@@ -497,9 +506,17 @@ export async function getAgentIdsForRuleSet(
   return withTenantScope(sql, schemaName, async (txSql) => {
     const tx = txSql as unknown as postgres.Sql;
     const rows = await tx`
-      SELECT agent_id
-      FROM agent_rule_sets
-      WHERE rule_set_id = ${ruleSetId}
+      SELECT DISTINCT agent_id
+      FROM (
+        SELECT agent_id
+        FROM agent_rule_sets
+        WHERE rule_set_id = ${ruleSetId}
+        UNION
+        SELECT agm.agent_id
+        FROM group_rule_sets grs
+        JOIN agent_group_members agm ON agm.group_id = grs.group_id
+        WHERE grs.rule_set_id = ${ruleSetId}
+      ) AS effective_agents
     `;
     return (rows as Record<string, unknown>[]).map((row) => row.agent_id as string);
   });
@@ -513,10 +530,19 @@ export async function getAgentIdsForRule(
   return withTenantScope(sql, schemaName, async (txSql) => {
     const tx = txSql as unknown as postgres.Sql;
     const rows = await tx`
-      SELECT DISTINCT ars.agent_id
-      FROM agent_rule_sets ars
-      JOIN rule_set_rules rsr ON rsr.rule_set_id = ars.rule_set_id
-      WHERE rsr.rule_id = ${ruleId}
+      SELECT DISTINCT agent_id
+      FROM (
+        SELECT ars.agent_id
+        FROM agent_rule_sets ars
+        JOIN rule_set_rules rsr ON rsr.rule_set_id = ars.rule_set_id
+        WHERE rsr.rule_id = ${ruleId}
+        UNION
+        SELECT agm.agent_id
+        FROM group_rule_sets grs
+        JOIN rule_set_rules rsr ON rsr.rule_set_id = grs.rule_set_id
+        JOIN agent_group_members agm ON agm.group_id = grs.group_id
+        WHERE rsr.rule_id = ${ruleId}
+      ) AS effective_agents
     `;
     return (rows as Record<string, unknown>[]).map((row) => row.agent_id as string);
   });

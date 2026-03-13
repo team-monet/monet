@@ -75,6 +75,12 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       icon: Bot,
       isActive: pathname.startsWith("/agents"),
     },
+    {
+      title: "Rules",
+      url: "/admin/rules",
+      icon: Scale,
+      isActive: pathname.startsWith("/admin/rules"),
+    },
   ]
 
   const adminNav = [
@@ -89,12 +95,6 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       url: "/admin/groups",
       icon: Users,
       isActive: pathname.startsWith("/admin/groups"),
-    },
-    {
-      title: "Rules",
-      url: "/admin/rules",
-      icon: Scale,
-      isActive: pathname.startsWith("/admin/rules"),
     },
     {
       title: "Audit Log",

@@ -144,13 +144,6 @@ async function requireTenantAdmin(c: Context<AppEnv>) {
   return null;
 }
 
-async function ensureAgentInTenant(sql: AppEnv["Variables"]["sql"], tenantId: string, agentId: string) {
-  const [row] = await sql`
-    SELECT id FROM agents WHERE id = ${agentId} AND tenant_id = ${tenantId}
-  `;
-  return Boolean(row);
-}
-
 async function closeAgentSessionsIfPresent(
   sessionStore: AppEnv["Variables"]["sessionStore"] | undefined,
   agentId: string,
@@ -442,9 +435,6 @@ agentsRouter.post("/:id/unrevoke", rateLimitMiddleware, async (c) => {
  * POST /api/agents/:id/rule-sets — associate a rule set with an agent.
  */
 agentsRouter.post("/:id/rule-sets", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
   const body = await c.req.json();
   const parsed = parseAgentRuleSetAssociationInput(body);
   if ("error" in parsed) {
@@ -453,19 +443,18 @@ agentsRouter.post("/:id/rule-sets", async (c) => {
 
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
-  const agent = c.get("agent");
+  const requester = c.get("agent");
   const tenantId = c.get("tenantId");
   const schemaName = c.get("tenantSchemaName");
   const targetAgentId = c.req.param("id");
+  const access = await loadAccessibleAgentRow(c, targetAgentId);
 
-  const exists = await ensureAgentInTenant(sql, tenantId, targetAgentId);
-  if (!exists) {
-    return c.json({ error: "not_found", message: "Agent not found" }, 404);
+  if ("response" in access) {
+    return access.response;
   }
 
   const result = await associateRuleSetWithAgent(sql, tenantId, schemaName, {
-    actorId: agent.id,
-    actorType: "agent",
+    ...auditActor(requester),
   }, targetAgentId, parsed.data.ruleSetId);
 
   if ("error" in result) {
@@ -483,25 +472,21 @@ agentsRouter.post("/:id/rule-sets", async (c) => {
  * DELETE /api/agents/:id/rule-sets/:ruleSetId — dissociate a rule set from an agent.
  */
 agentsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
-  const forbidden = await requireTenantAdmin(c);
-  if (forbidden) return forbidden;
-
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
-  const agent = c.get("agent");
+  const requester = c.get("agent");
   const tenantId = c.get("tenantId");
   const schemaName = c.get("tenantSchemaName");
   const targetAgentId = c.req.param("id");
   const ruleSetId = c.req.param("ruleSetId");
+  const access = await loadAccessibleAgentRow(c, targetAgentId);
 
-  const exists = await ensureAgentInTenant(sql, tenantId, targetAgentId);
-  if (!exists) {
-    return c.json({ error: "not_found", message: "Agent not found" }, 404);
+  if ("response" in access) {
+    return access.response;
   }
 
   const result = await dissociateRuleSetFromAgent(sql, tenantId, schemaName, {
-    actorId: agent.id,
-    actorType: "agent",
+    ...auditActor(requester),
   }, targetAgentId, ruleSetId);
 
   if ("error" in result) {
@@ -516,21 +501,13 @@ agentsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
  * GET /api/agents/:id/rules — get all active rules for an agent.
  */
 agentsRouter.get("/:id/rules", async (c) => {
-  const agent = c.get("agent");
   const sql = c.get("sql");
-  const tenantId = c.get("tenantId");
   const schemaName = c.get("tenantSchemaName");
   const targetAgentId = c.req.param("id");
+  const access = await loadAccessibleAgentRow(c, targetAgentId);
 
-  // Allow if it's the agent themselves OR if they are a tenant admin
-  if (agent.id !== targetAgentId) {
-    const forbidden = await requireTenantAdmin(c);
-    if (forbidden) return forbidden;
-  }
-
-  const exists = await ensureAgentInTenant(sql, tenantId, targetAgentId);
-  if (!exists) {
-    return c.json({ error: "not_found", message: "Agent not found" }, 404);
+  if ("response" in access) {
+    return access.response;
   }
 
   const rules = await getActiveRulesForAgent(sql, schemaName, targetAgentId);
@@ -654,9 +631,7 @@ agentsRouter.get("/:id", async (c) => {
       WHERE gm.agent_id = ${targetId}
       ORDER BY g.name ASC, g.created_at ASC
     `,
-    access.isAdmin
-      ? listRuleSetsForAgent(sql, schemaName, targetId)
-      : Promise.resolve([]),
+    listRuleSetsForAgent(sql, schemaName, targetId),
   ]);
 
   return c.json({

@@ -150,3 +150,16 @@ export const agentRuleSets = pgTable(
     primaryKey({ columns: [table.agentId, table.ruleSetId] }),
   ],
 );
+
+export const groupRuleSets = pgTable(
+  "group_rule_sets",
+  {
+    groupId: uuid("group_id").notNull(),
+    ruleSetId: uuid("rule_set_id")
+      .notNull()
+      .references(() => ruleSets.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.groupId, table.ruleSetId] }),
+  ],
+);
