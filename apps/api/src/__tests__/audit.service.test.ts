@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   getConsecutiveAuditFailureCount,
   logAuditEvent,
-} from "../services/audit.service.js";
+} from "../services/audit.service";
 
 const withTenantScopeMock = vi.fn();
 

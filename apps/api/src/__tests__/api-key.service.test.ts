@@ -6,7 +6,7 @@ import {
   hashApiKeyWithSalt,
   validateApiKey,
   constantTimeCompare,
-} from "../services/api-key.service.js";
+} from "../services/api-key.service";
 
 describe("api-key.service", () => {
   describe("generateApiKey", () => {

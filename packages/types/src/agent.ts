@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { TenantSlug } from "./auth.js";
-import { RuleSet } from "./rule.js";
+import { TenantSlug } from "./auth";
+import { RuleSet } from "./rule";
 
 export const RegisterAgentInput = z.object({
   agentId: z.string().min(1, "Agent identifier is required"),

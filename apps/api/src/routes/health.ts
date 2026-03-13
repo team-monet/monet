@@ -1,6 +1,6 @@
 import { Hono } from "hono";
-import type { AppEnv } from "../middleware/context.js";
-import { getEnrichmentProviderConfigStatus } from "../providers/index.js";
+import type { AppEnv } from "../middleware/context";
+import { getEnrichmentProviderConfigStatus } from "../providers/index";
 
 export const health = new Hono<AppEnv>();
 

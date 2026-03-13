@@ -2,17 +2,17 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { getRequestListener } from "@hono/node-server";
-import { createApp } from "../../src/app.js";
-import { createMcpHandler } from "../../src/mcp/handler.js";
-import { SessionStore } from "../../src/mcp/session-store.js";
-import type { AgentContext } from "../../src/middleware/context.js";
+import { createApp } from "../../src/app";
+import { createMcpHandler } from "../../src/mcp/handler";
+import { SessionStore } from "../../src/mcp/session-store";
+import type { AgentContext } from "../../src/middleware/context";
 import {
   cleanupTestData,
   closeTestDb,
   getTestDb,
   getTestSql,
   provisionTestTenant,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 
 describe("Rules integration", () => {
   const db = getTestDb();

@@ -1,5 +1,5 @@
 import { createMiddleware } from "hono/factory";
-import type { AppEnv } from "./context.js";
+import type { AppEnv } from "./context";
 
 const SCHEMA_NAME_REGEX = /^tenant_[a-f0-9_]{36}$/;
 

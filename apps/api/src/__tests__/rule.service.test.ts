@@ -4,7 +4,7 @@ import {
   updateRule,
   deleteRule,
   getActiveRulesForAgent,
-} from "../services/rule.service.js";
+} from "../services/rule.service";
 
 const withTenantScopeMock = vi.fn();
 const logAuditEventMock = vi.fn();

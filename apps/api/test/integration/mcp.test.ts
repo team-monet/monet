@@ -6,24 +6,24 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { eq } from "drizzle-orm";
 import { agents } from "@monet/db/schema";
-import { createApp } from "../../src/app.js";
-import { createMcpHandler } from "../../src/mcp/handler.js";
-import { SessionStore } from "../../src/mcp/session-store.js";
+import { createApp } from "../../src/app";
+import { createMcpHandler } from "../../src/mcp/handler";
+import { SessionStore } from "../../src/mcp/session-store";
 import {
   cleanupTestData,
   closeTestDb,
   getTestDb,
   getTestSql,
   provisionTestTenant,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 import {
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
-} from "../../src/services/enrichment.service.js";
+} from "../../src/services/enrichment.service";
 import {
   EMBEDDING_DIMENSIONS,
   type EnrichmentProvider,
-} from "../../src/providers/enrichment.js";
+} from "../../src/providers/enrichment";
 
 function embedding(fill: number) {
   return Array.from({ length: EMBEDDING_DIMENSIONS }, () => fill);

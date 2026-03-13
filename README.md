@@ -182,10 +182,11 @@ Required:
 
 - `DATABASE_URL` - PostgreSQL connection string.
 - `API_PORT` - API bind port (default `3001`).
-- `ENRICHMENT_PROVIDER` - `anthropic` or `ollama`.
+- `ENRICHMENT_PROVIDER` - `anthropic`, `ollama`, or `openai`.
 
 Optional:
 
+- `EMBEDDING_DIMENSIONS` - dimensionality of embedding vectors (default `1024`). Set this to match your chosen embedding model (e.g. `1536` for OpenAI `text-embedding-3-small`, `1024` for Ollama `qwen3-embedding`). Must be set **before** running the first migration, as it defines the database column width.
 - `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` (defaults `100` per `60000ms`).
 - `AUDIT_RETENTION_DAYS` (default `90`).
 - `AUDIT_PURGE_DATABASE_URL` (separate DB role for retention deletes).
@@ -193,8 +194,8 @@ Optional:
 Provider-specific:
 
 - Anthropic: `ENRICHMENT_API_KEY`, `EMBEDDING_API_KEY`, `ANTHROPIC_MODEL`, `EMBEDDING_MODEL`.
+- OpenAI-compatible: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL`, `OPENAI_EMBEDDING_MODEL`. Supports split chat/embedding providers via `OPENAI_CHAT_*` and `OPENAI_EMBEDDING_*` overrides.
 - Ollama: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `OLLAMA_EMBEDDING_MODEL`, `OLLAMA_MODELS_DIR`.
-  - Monet expects 1536-dimensional embeddings and requests that size from Ollama.
 
 ## API Startup
 
@@ -286,7 +287,7 @@ Useful runtime commands:
 
 ## Enrichment Provider Swap
 
-Set `ENRICHMENT_PROVIDER=anthropic` or `ENRICHMENT_PROVIDER=ollama`, configure provider vars, then restart API.
+Set `ENRICHMENT_PROVIDER` to `anthropic`, `ollama`, or `openai`, configure provider vars and `EMBEDDING_DIMENSIONS` to match your embedding model, then restart API.
 
 Pending enrichment jobs are recovered on startup.
 

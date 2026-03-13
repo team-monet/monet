@@ -1,7 +1,7 @@
 import { withTenantScope } from "@monet/db";
 import type { CreateRuleInput, CreateRuleSetInput, UpdateRuleInput } from "@monet/types";
 import type postgres from "postgres";
-import { logAuditEvent, type AuditEntry } from "./audit.service.js";
+import { logAuditEvent, type AuditEntry } from "./audit.service";
 
 interface RuleMutationActor {
   actorId: string;

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { SessionStore } from "../mcp/session-store.js";
-import { createMcpHandler } from "../mcp/handler.js";
+import { SessionStore } from "../mcp/session-store";
+import { createMcpHandler } from "../mcp/handler";
 
 const authMock = vi.fn();
 const rateLimitMock = vi.fn();

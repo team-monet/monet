@@ -1,7 +1,7 @@
-import { AnthropicEnrichmentProvider } from "./anthropic-enrichment.js";
-import type { EnrichmentProvider } from "./enrichment.js";
-import { OllamaEnrichmentProvider } from "./ollama-enrichment.js";
-import { OpenAICompatibleEnrichmentProvider } from "./openai-enrichment.js";
+import { AnthropicEnrichmentProvider } from "./anthropic-enrichment";
+import type { EnrichmentProvider } from "./enrichment";
+import { OllamaEnrichmentProvider } from "./ollama-enrichment";
+import { OpenAICompatibleEnrichmentProvider } from "./openai-enrichment";
 
 export interface EnrichmentProviderConfigStatus {
   configured: boolean;

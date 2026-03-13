@@ -1,7 +1,7 @@
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
-import * as platformSchema from "./schema/platform.js";
-import * as tenantSchema from "./schema/tenant.js";
+import * as platformSchema from "./schema/platform";
+import * as tenantSchema from "./schema/tenant";
 
 export function createClient(databaseUrl: string) {
   const sql = postgres(databaseUrl);

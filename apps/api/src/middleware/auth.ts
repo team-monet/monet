@@ -1,6 +1,6 @@
 import { createMiddleware } from "hono/factory";
-import type { AppEnv } from "./context.js";
-import { authenticateAgentFromBearerToken } from "../services/agent-auth.service.js";
+import type { AppEnv } from "./context";
+import { authenticateAgentFromBearerToken } from "../services/agent-auth.service";
 
 export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
   const db = c.get("db");

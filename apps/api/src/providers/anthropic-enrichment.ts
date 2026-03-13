@@ -1,5 +1,5 @@
-import type { EnrichmentConfig, EnrichmentProvider } from "./enrichment.js";
-import { EMBEDDING_DIMENSIONS } from "./enrichment.js";
+import type { EnrichmentConfig, EnrichmentProvider } from "./enrichment";
+import { EMBEDDING_DIMENSIONS } from "./enrichment";
 
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
 const DEFAULT_ANTHROPIC_MODEL = "claude-3-5-haiku-latest";

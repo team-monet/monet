@@ -4,7 +4,7 @@ import {
   closeTestDb,
   getTestApp,
   provisionTestTenant,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 
 describe("rate limit integration", () => {
   const app = getTestApp();

@@ -18,12 +18,12 @@ vi.mock("../services/bootstrap.service.js", () => {
   };
 });
 
-import { createApp } from "../app.js";
+import { createApp } from "../app";
 import {
   BootstrapTokenError,
   exchangeBootstrapToken,
   getBootstrapStatus,
-} from "../services/bootstrap.service.js";
+} from "../services/bootstrap.service";
 
 describe("bootstrap routes", () => {
   afterEach(() => {

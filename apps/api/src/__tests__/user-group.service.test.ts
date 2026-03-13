@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { userCanSelectAgentGroup } from "../services/user-group.service.js";
+import { userCanSelectAgentGroup } from "../services/user-group.service";
 
 const TENANT_ID = "00000000-0000-0000-0000-000000000010";
 const USER_ID = "00000000-0000-0000-0000-000000000099";

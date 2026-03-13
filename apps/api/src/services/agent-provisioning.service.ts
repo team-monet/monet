@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type postgres from "postgres";
-import { generateApiKey, hashApiKey } from "./api-key.service.js";
+import { generateApiKey, hashApiKey } from "./api-key.service";
 
 type ProvisionAgentInput = {
   externalId: string;

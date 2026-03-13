@@ -2,24 +2,24 @@ import { createServer } from "node:http";
 import postgres from "postgres";
 import { getRequestListener } from "@hono/node-server";
 import { createClient } from "@monet/db";
-import { createApp } from "./app.js";
-import { createMcpHandler } from "./mcp/handler.js";
-import { sessionStore } from "./mcp/session-store.js";
-import { ensureBootstrapToken } from "./services/bootstrap.service.js";
+import { createApp } from "./app";
+import { createMcpHandler } from "./mcp/handler";
+import { sessionStore } from "./mcp/session-store";
+import { ensureBootstrapToken } from "./services/bootstrap.service";
 import {
   getActiveEnrichmentCount,
   getQueuedEnrichmentCount,
   recoverPendingEnrichments,
   waitForEnrichmentDrain,
-} from "./services/enrichment.service.js";
+} from "./services/enrichment.service";
 import {
   startTtlExpiryJob,
   stopTtlExpiryJob,
-} from "./services/ttl-expiry.service.js";
+} from "./services/ttl-expiry.service";
 import {
   startAuditRetentionJob,
   stopAuditRetentionJob,
-} from "./services/audit-retention.service.js";
+} from "./services/audit-retention.service";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {

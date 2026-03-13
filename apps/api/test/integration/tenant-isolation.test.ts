@@ -5,7 +5,7 @@ import {
   provisionTestTenant,
   cleanupTestData,
   closeTestDb,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 import { withTenantScope } from "@monet/db";
 
 describe("tenant isolation integration", () => {

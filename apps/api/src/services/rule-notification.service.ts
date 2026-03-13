@@ -1,6 +1,6 @@
 import type postgres from "postgres";
-import type { SessionStore } from "../mcp/session-store.js";
-import { getActiveRulesForAgent } from "./rule.service.js";
+import type { SessionStore } from "../mcp/session-store";
+import { getActiveRulesForAgent } from "./rule.service";
 
 export async function pushRulesToAgent(
   agentId: string,

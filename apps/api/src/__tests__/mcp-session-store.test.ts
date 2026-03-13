@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SessionStore } from "../mcp/session-store.js";
+import { SessionStore } from "../mcp/session-store";
 
 describe("MCP session store", () => {
   let store: SessionStore;

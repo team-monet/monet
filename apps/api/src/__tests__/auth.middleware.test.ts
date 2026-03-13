@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { Hono } from "hono";
-import { authMiddleware } from "../middleware/auth.js";
+import { authMiddleware } from "../middleware/auth";
 import {
   generateApiKey,
   hashApiKey,
-} from "../services/api-key.service.js";
-import type { AppEnv } from "../middleware/context.js";
+} from "../services/api-key.service";
+import type { AppEnv } from "../middleware/context";
 
 // Mock agent data
 const TENANT_ID = "00000000-0000-0000-0000-000000000001";

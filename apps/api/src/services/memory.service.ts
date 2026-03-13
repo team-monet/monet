@@ -1,5 +1,5 @@
 import type postgres from "postgres";
-import type { AgentContext } from "../middleware/context.js";
+import type { AgentContext } from "../middleware/context";
 import type {
   CreateMemoryEntryInput,
   MemoryEntryTier1,

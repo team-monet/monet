@@ -1,5 +1,5 @@
-import type { EnrichmentConfig, EnrichmentProvider } from "./enrichment.js";
-import { EMBEDDING_DIMENSIONS } from "./enrichment.js";
+import type { EnrichmentConfig, EnrichmentProvider } from "./enrichment";
+import { EMBEDDING_DIMENSIONS } from "./enrichment";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_CHAT_MODEL = "llama3.1:8b";

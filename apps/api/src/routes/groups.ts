@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { AppEnv } from "../middleware/context.js";
+import type { AppEnv } from "../middleware/context";
 import {
   resolveAgentRole,
   isTenantAdmin,
@@ -10,7 +10,7 @@ import {
   removeMember,
   listGroups,
   listGroupMembers,
-} from "../services/group.service.js";
+} from "../services/group.service";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const VALID_PROMOTE_ROLES = ["group_admin", "user"] as const;

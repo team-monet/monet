@@ -1,6 +1,6 @@
 import { Hono, type Context } from "hono";
-import type { AppEnv } from "../middleware/context.js";
-import { resolveAgentRole, isTenantAdmin } from "../services/group.service.js";
+import type { AppEnv } from "../middleware/context";
+import { resolveAgentRole, isTenantAdmin } from "../services/group.service";
 import {
   addUserGroupMember,
   createUserGroup,
@@ -9,7 +9,7 @@ import {
   removeUserGroupMember,
   saveUserGroupAgentGroupPermissions,
   updateUserGroup,
-} from "../services/user-group.service.js";
+} from "../services/user-group.service";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Hono } from "hono";
-import type { AppEnv, AgentContext } from "../middleware/context.js";
-import { groupsRouter } from "../routes/groups.js";
+import type { AppEnv, AgentContext } from "../middleware/context";
+import { groupsRouter } from "../routes/groups";
 
 const TENANT_ID = "00000000-0000-0000-0000-000000000010";
 

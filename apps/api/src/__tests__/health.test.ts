@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createApp } from "../app.js";
+import { createApp } from "../app";
 
 describe("health endpoints", () => {
   const originalProvider = process.env.ENRICHMENT_PROVIDER;

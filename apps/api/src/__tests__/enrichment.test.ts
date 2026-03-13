@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { createEnrichmentProvider } from "../providers/index.js";
+import { createEnrichmentProvider } from "../providers/index";
 import {
   computeQueryEmbedding,
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
-} from "../services/enrichment.service.js";
+} from "../services/enrichment.service";
 
 describe("createEnrichmentProvider", () => {
   afterEach(() => {

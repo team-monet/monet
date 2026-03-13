@@ -5,7 +5,7 @@ import {
   provisionTestTenant,
   cleanupTestData,
   closeTestDb,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 
 describe("groups integration", () => {
   const app = getTestApp();

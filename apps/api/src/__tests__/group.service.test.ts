@@ -4,7 +4,7 @@ import {
   isTenantAdmin,
   isGroupAdminOrAbove,
   listGroupMembers,
-} from "../services/group.service.js";
+} from "../services/group.service";
 
 const TENANT_ID = "00000000-0000-0000-0000-000000000010";
 const GROUP_ID = "00000000-0000-0000-0000-000000000020";

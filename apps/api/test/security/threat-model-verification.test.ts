@@ -5,12 +5,12 @@ import {
   getTestApp,
   getTestSql,
   provisionTestTenant,
-} from "../integration/helpers/setup.js";
+} from "../integration/helpers/setup";
 import {
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
-} from "../../src/services/enrichment.service.js";
-import type { EnrichmentProvider } from "../../src/providers/enrichment.js";
+} from "../../src/services/enrichment.service";
+import type { EnrichmentProvider } from "../../src/providers/enrichment";
 
 function tenantSchemaName(tenantId: string): string {
   return `tenant_${tenantId.replace(/-/g, "_")}`;

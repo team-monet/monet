@@ -6,8 +6,8 @@ import {
   buildScopeFilter,
   createMemory,
   buildSummary,
-} from "../services/memory.service.js";
-import type { AgentContext } from "../middleware/context.js";
+} from "../services/memory.service";
+import type { AgentContext } from "../middleware/context";
 
 const AGENT_ID = "00000000-0000-0000-0000-000000000001";
 const USER_ID = "00000000-0000-0000-0000-000000000099";

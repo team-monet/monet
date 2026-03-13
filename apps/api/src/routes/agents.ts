@@ -1,20 +1,20 @@
 import { Hono, type Context } from "hono";
 import { RegisterAgentApiInput } from "@monet/types";
-import { addMember, resolveAgentRole, isTenantAdmin } from "../services/group.service.js";
+import { addMember, resolveAgentRole, isTenantAdmin } from "../services/group.service";
 import {
   associateRuleSetWithAgent,
   dissociateRuleSetFromAgent,
   getActiveRulesForAgent,
   listRuleSetsForAgent,
-} from "../services/rule.service.js";
-import { pushRulesToAgent } from "../services/rule-notification.service.js";
-import type { AppEnv } from "../middleware/context.js";
-import { provisionAgentWithApiKey } from "../services/agent-provisioning.service.js";
-import { userCanSelectAgentGroup } from "../services/user-group.service.js";
-import { generateApiKey, hashApiKey } from "../services/api-key.service.js";
-import type { AuditEntry } from "../services/audit.service.js";
-import { logAuditEvent } from "../services/audit.service.js";
-import { rateLimitMiddleware } from "../middleware/rate-limit.js";
+} from "../services/rule.service";
+import { pushRulesToAgent } from "../services/rule-notification.service";
+import type { AppEnv } from "../middleware/context";
+import { provisionAgentWithApiKey } from "../services/agent-provisioning.service";
+import { userCanSelectAgentGroup } from "../services/user-group.service";
+import { generateApiKey, hashApiKey } from "../services/api-key.service";
+import type { AuditEntry } from "../services/audit.service";
+import { logAuditEvent } from "../services/audit.service";
+import { rateLimitMiddleware } from "../middleware/rate-limit";
 
 export const agentsRouter = new Hono<AppEnv>();
 const DASHBOARD_AGENT_PREFIX = "dashboard:";

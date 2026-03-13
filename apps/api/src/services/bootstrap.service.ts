@@ -13,7 +13,7 @@ import {
   platformInstallations,
   platformSetupSessions,
 } from "@monet/db";
-import { hashApiKey, validateApiKey } from "./api-key.service.js";
+import { hashApiKey, validateApiKey } from "./api-key.service";
 
 const BOOTSTRAP_TOKEN_PREFIX = "mbt_";
 const SETUP_SESSION_PREFIX = "mss_";

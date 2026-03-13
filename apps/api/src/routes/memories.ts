@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { withTenantScope } from "@monet/db";
 import { CreateMemoryEntryInput, UpdateMemoryEntryInput, MemoryScope } from "@monet/types";
-import type { AppEnv } from "../middleware/context.js";
+import type { AppEnv } from "../middleware/context";
 import {
   createMemory,
   searchMemories,
@@ -13,8 +13,8 @@ import {
   promoteScope,
   listTags,
   resolveMemoryWritePreflight,
-} from "../services/memory.service.js";
-import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service.js";
+} from "../services/memory.service";
+import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service";
 
 export const memoriesRouter = new Hono<AppEnv>();
 

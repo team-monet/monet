@@ -4,7 +4,7 @@ import {
   provisionTestTenant,
   cleanupTestData,
   closeTestDb,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 
 describe("auth flow integration", () => {
   const app = getTestApp();

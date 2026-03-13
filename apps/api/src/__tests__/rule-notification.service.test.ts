@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { SessionStore } from "../mcp/session-store.js";
-import { pushRulesToAgent } from "../services/rule-notification.service.js";
+import type { SessionStore } from "../mcp/session-store";
+import { pushRulesToAgent } from "../services/rule-notification.service";
 
 const getActiveRulesForAgentMock = vi.fn();
 

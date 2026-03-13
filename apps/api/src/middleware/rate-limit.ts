@@ -1,5 +1,5 @@
 import { createMiddleware } from "hono/factory";
-import type { AppEnv } from "./context.js";
+import type { AppEnv } from "./context";
 
 interface SlidingWindowEntry {
   timestamps: number[];

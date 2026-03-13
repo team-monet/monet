@@ -2,8 +2,8 @@ import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import * as platformSchema from "@monet/db/schema";
-import { createApp } from "../../../src/app.js";
-import { provisionTenant } from "../../../src/services/tenant.service.js";
+import { createApp } from "../../../src/app";
+import { provisionTenant } from "../../../src/services/tenant.service";
 import path from "node:path";
 
 const TEST_DB_URL =

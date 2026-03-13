@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createMiddleware } from "hono/factory";
-import type { AppEnv } from "./context.js";
-import { logRequest } from "../lib/log.js";
+import type { AppEnv } from "./context";
+import { logRequest } from "../lib/log";
 
 export const structuredLogger = createMiddleware<AppEnv>(async (c, next) => {
   const requestId = randomUUID();

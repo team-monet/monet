@@ -1,7 +1,7 @@
 import type { Env } from "hono";
 import type { Database } from "@monet/db";
 import type postgres from "postgres";
-import type { SessionStore } from "../mcp/session-store.js";
+import type { SessionStore } from "../mcp/session-store";
 
 export interface AgentContext {
   id: string;

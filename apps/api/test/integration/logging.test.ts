@@ -4,7 +4,7 @@ import {
   closeTestDb,
   getTestApp,
   provisionTestTenant,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 
 describe("logging integration", () => {
   const app = getTestApp();

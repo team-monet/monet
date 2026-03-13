@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Hono } from "hono";
-import type { AppEnv, AgentContext } from "../middleware/context.js";
-import { memoriesRouter } from "../routes/memories.js";
+import type { AppEnv, AgentContext } from "../middleware/context";
+import { memoriesRouter } from "../routes/memories";
 
 const AGENT: AgentContext = {
   id: "00000000-0000-0000-0000-000000000001",

@@ -4,13 +4,13 @@ import { performance } from "node:perf_hooks";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type postgres from "postgres";
 import type { Database } from "@monet/db";
-import { checkRateLimit } from "../middleware/rate-limit.js";
-import { tenantSchemaName } from "../middleware/tenant.js";
-import { authenticateAgentFromBearerToken } from "../services/agent-auth.service.js";
-import { pushRulesToAgent } from "../services/rule-notification.service.js";
-import { logRequest } from "../lib/log.js";
-import { createMcpServer } from "./server.js";
-import type { SessionStore } from "./session-store.js";
+import { checkRateLimit } from "../middleware/rate-limit";
+import { tenantSchemaName } from "../middleware/tenant";
+import { authenticateAgentFromBearerToken } from "../services/agent-auth.service";
+import { pushRulesToAgent } from "../services/rule-notification.service";
+import { logRequest } from "../lib/log";
+import { createMcpServer } from "./server";
+import type { SessionStore } from "./session-store";
 
 interface McpHandlerDeps {
   db: Database;

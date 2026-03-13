@@ -6,8 +6,8 @@ import {
   type McpToolHandlers,
 } from "@monet/mcp-tools";
 import type postgres from "postgres";
-import type { AgentContext } from "../middleware/context.js";
-import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service.js";
+import type { AgentContext } from "../middleware/context";
+import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service";
 import {
   createMemory,
   deleteMemory,
@@ -18,7 +18,7 @@ import {
   resolveMemoryWritePreflight,
   searchMemories,
   updateMemory,
-} from "../services/memory.service.js";
+} from "../services/memory.service";
 import packageJson from "../../package.json" with { type: "json" };
 
 function asToolResult(data: unknown): CallToolResult {

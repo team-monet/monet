@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { getTestApp, getTestDb, cleanupTestData, closeTestDb } from "./helpers/setup.js";
+import { getTestApp, getTestDb, cleanupTestData, closeTestDb } from "./helpers/setup";
 import { platformInstallations } from "@monet/db";
-import { ensureBootstrapToken } from "../../src/services/bootstrap.service.js";
+import { ensureBootstrapToken } from "../../src/services/bootstrap.service";
 
 describe("bootstrap routes", () => {
   beforeEach(async () => {

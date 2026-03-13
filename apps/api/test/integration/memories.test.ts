@@ -5,16 +5,16 @@ import {
   provisionTestTenant,
   cleanupTestData,
   closeTestDb,
-} from "./helpers/setup.js";
+} from "./helpers/setup";
 import { withTenantScope } from "@monet/db";
 import {
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
-} from "../../src/services/enrichment.service.js";
+} from "../../src/services/enrichment.service";
 import {
   EMBEDDING_DIMENSIONS,
   type EnrichmentProvider,
-} from "../../src/providers/enrichment.js";
+} from "../../src/providers/enrichment";
 
 function embedding(fill: number) {
   return Array.from({ length: EMBEDDING_DIMENSIONS }, () => fill);

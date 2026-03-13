@@ -1,7 +1,7 @@
 import { Hono } from "hono";
-import { queryAuditLogs } from "../services/audit-query.service.js";
-import type { AppEnv } from "../middleware/context.js";
-import { resolveAgentRole, isTenantAdmin } from "../services/group.service.js";
+import { queryAuditLogs } from "../services/audit-query.service";
+import type { AppEnv } from "../middleware/context";
+import { resolveAgentRole, isTenantAdmin } from "../services/group.service";
 
 export const auditRouter = new Hono<AppEnv>();
 

@@ -2,8 +2,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import postgres from "postgres";
 import { createClient, withTenantScope } from "@monet/db";
-import { provisionTenant } from "../../src/services/tenant.service.js";
-import { EMBEDDING_DIMENSIONS } from "../../src/providers/enrichment.js";
+import { provisionTenant } from "../../src/services/tenant.service";
+import { EMBEDDING_DIMENSIONS } from "../../src/providers/enrichment";
 
 interface GroupResponse {
   id: string;

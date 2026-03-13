@@ -4,8 +4,8 @@ import {
   UpdateRuleInput,
   CreateRuleSetInput,
 } from "@monet/types";
-import type { AppEnv } from "../middleware/context.js";
-import { resolveAgentRole, isTenantAdmin } from "../services/group.service.js";
+import type { AppEnv } from "../middleware/context";
+import { resolveAgentRole, isTenantAdmin } from "../services/group.service";
 import {
   addRuleToSet,
   createRule,
@@ -19,8 +19,8 @@ import {
   listRules,
   removeRuleFromSet,
   updateRule,
-} from "../services/rule.service.js";
-import { pushRulesToAgent } from "../services/rule-notification.service.js";
+} from "../services/rule.service";
+import { pushRulesToAgent } from "../services/rule-notification.service";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

@@ -1,20 +1,20 @@
 import { Hono } from "hono";
 import type { Database } from "@monet/db";
 import type postgres from "postgres";
-import { health } from "./routes/health.js";
-import { bootstrapRouter } from "./routes/bootstrap.js";
-import { agentsRouter } from "./routes/agents.js";
-import { memoriesRouter } from "./routes/memories.js";
-import { groupsRouter } from "./routes/groups.js";
-import { userGroupsRouter } from "./routes/user-groups.js";
-import { rulesRouter } from "./routes/rules.js";
-import { auditRouter } from "./routes/audit.js";
-import { authMiddleware } from "./middleware/auth.js";
-import { tenantMiddleware } from "./middleware/tenant.js";
-import { rateLimitMiddleware } from "./middleware/rate-limit.js";
-import { structuredLogger } from "./middleware/structured-logger.js";
-import type { AppEnv } from "./middleware/context.js";
-import type { SessionStore } from "./mcp/session-store.js";
+import { health } from "./routes/health";
+import { bootstrapRouter } from "./routes/bootstrap";
+import { agentsRouter } from "./routes/agents";
+import { memoriesRouter } from "./routes/memories";
+import { groupsRouter } from "./routes/groups";
+import { userGroupsRouter } from "./routes/user-groups";
+import { rulesRouter } from "./routes/rules";
+import { auditRouter } from "./routes/audit";
+import { authMiddleware } from "./middleware/auth";
+import { tenantMiddleware } from "./middleware/tenant";
+import { rateLimitMiddleware } from "./middleware/rate-limit";
+import { structuredLogger } from "./middleware/structured-logger";
+import type { AppEnv } from "./middleware/context";
+import type { SessionStore } from "./mcp/session-store";
 
 export function createApp(
   db: Database | null,

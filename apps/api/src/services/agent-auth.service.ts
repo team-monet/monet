@@ -1,8 +1,8 @@
 import { eq } from "drizzle-orm";
 import type { Database } from "@monet/db";
 import { agents } from "@monet/db/schema";
-import type { AgentContext } from "../middleware/context.js";
-import { parseApiKey, validateApiKey } from "./api-key.service.js";
+import type { AgentContext } from "../middleware/context";
+import { parseApiKey, validateApiKey } from "./api-key.service";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

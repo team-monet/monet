@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { Hono } from "hono";
-import { rateLimitMiddleware, resetRateLimits } from "../middleware/rate-limit.js";
-import type { AppEnv } from "../middleware/context.js";
+import { rateLimitMiddleware, resetRateLimits } from "../middleware/rate-limit";
+import type { AppEnv } from "../middleware/context";
 
 function createTestApp(agentId: string) {
   const app = new Hono<AppEnv>();

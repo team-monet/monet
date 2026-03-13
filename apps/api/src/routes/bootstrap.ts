@@ -1,10 +1,10 @@
 import { Hono } from "hono";
-import type { AppEnv } from "../middleware/context.js";
+import type { AppEnv } from "../middleware/context";
 import {
   BootstrapTokenError,
   exchangeBootstrapToken,
   getBootstrapStatus,
-} from "../services/bootstrap.service.js";
+} from "../services/bootstrap.service";
 
 export const bootstrapRouter = new Hono<AppEnv>();
 

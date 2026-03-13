@@ -24,4 +24,7 @@ export interface EnrichmentConfig {
   openaiEmbeddingModel?: string;
 }
 
-export const EMBEDDING_DIMENSIONS = 1024;
+export const EMBEDDING_DIMENSIONS = parseInt(
+  process.env.EMBEDDING_DIMENSIONS || "1024",
+  10,
+);

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   encodeAuditCursor,
   queryAuditLogs,
-} from "../services/audit-query.service.js";
+} from "../services/audit-query.service";
 
 const withTenantScopeMock = vi.fn();
 

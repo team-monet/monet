@@ -47,7 +47,9 @@ export const memoryEntries = pgTable(
     memoryScope: memoryScopeEnum("memory_scope").notNull().default("group"),
     tags: text("tags").array().notNull().default([]),
     autoTags: text("auto_tags").array().notNull().default([]),
-    embedding: vector("embedding", { dimensions: 1024 }),
+    embedding: vector("embedding", {
+      dimensions: parseInt(process.env.EMBEDDING_DIMENSIONS || "1024", 10),
+    }),
     relatedMemoryIds: uuid("related_memory_ids").array().notNull().default([]),
     usefulnessScore: integer("usefulness_score").notNull().default(0),
     outdated: boolean("outdated").notNull().default(false),

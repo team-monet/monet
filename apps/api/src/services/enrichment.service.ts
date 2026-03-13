@@ -1,7 +1,7 @@
 import { withTenantScope } from "@monet/db";
 import type postgres from "postgres";
-import { createEnrichmentProvider } from "../providers/index.js";
-import type { EnrichmentProvider } from "../providers/enrichment.js";
+import { createEnrichmentProvider } from "../providers/index";
+import type { EnrichmentProvider } from "../providers/enrichment";
 
 const MAX_CONCURRENT_ENRICHMENTS = 5;
 const QUERY_EMBEDDING_TIMEOUT_MS = 3000;

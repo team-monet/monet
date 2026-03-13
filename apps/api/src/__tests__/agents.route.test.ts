@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
-import type { AppEnv, AgentContext } from "../middleware/context.js";
-import { resetRateLimits } from "../middleware/rate-limit.js";
-import { agentsRouter } from "../routes/agents.js";
-import { parseApiKey } from "../services/api-key.service.js";
+import type { AppEnv, AgentContext } from "../middleware/context";
+import { resetRateLimits } from "../middleware/rate-limit";
+import { agentsRouter } from "../routes/agents";
+import { parseApiKey } from "../services/api-key.service";
 
 const TENANT_ID = "00000000-0000-0000-0000-000000000010";
 const USER_ID = "00000000-0000-0000-0000-000000000099";

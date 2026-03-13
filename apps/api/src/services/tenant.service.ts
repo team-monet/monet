@@ -8,8 +8,8 @@ import {
   DEFAULT_USER_GROUP_NAME,
   slugifyTenantName,
 } from "@monet/types";
-import { encrypt } from "../lib/crypto.js";
-import { provisionAgentWithApiKey } from "./agent-provisioning.service.js";
+import { encrypt } from "../lib/crypto";
+import { provisionAgentWithApiKey } from "./agent-provisioning.service";
 
 export interface ProvisionTenantResult {
   tenant: {
