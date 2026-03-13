@@ -15,7 +15,7 @@ import {
 } from "@monet/types";
 import { auth } from "./auth";
 import { db } from "./db";
-import { humanUsers } from "@monet/db";
+import { tenantUsers } from "@monet/db";
 import { eq } from "drizzle-orm";
 import { decrypt } from "./crypto";
 import { ensureDashboardAgent } from "./dashboard-agent";
@@ -219,6 +219,10 @@ export class MonetApiClient {
     return this.fetch<{ members: Agent[] }>(`/api/groups/${id}/members`);
   }
 
+  async listGroupRuleSets(id: string): Promise<{ ruleSets: RuleSet[] }> {
+    return this.fetch<{ ruleSets: RuleSet[] }>(`/api/groups/${id}/rule-sets`);
+  }
+
   async addGroupMember(id: string, agentId: string): Promise<void> {
     return this.fetch<void>(`/api/groups/${id}/members`, {
       method: "POST",
@@ -340,9 +344,9 @@ export async function getApiClient() {
 
   // Fetch the user record to get the encrypted dashboard API key.
   const userRows = await db
-    .select({ dashboardApiKeyEncrypted: humanUsers.dashboardApiKeyEncrypted })
-    .from(humanUsers)
-    .where(eq(humanUsers.id, sessionUser.id))
+    .select({ dashboardApiKeyEncrypted: tenantUsers.dashboardApiKeyEncrypted })
+    .from(tenantUsers)
+    .where(eq(tenantUsers.id, sessionUser.id))
     .limit(1);
 
   if (userRows.length === 0 || !userRows[0].dashboardApiKeyEncrypted) {

@@ -166,10 +166,26 @@ describe("groups integration", () => {
     expect(body.groups).toHaveLength(3);
   });
 
+  it("lists rule sets applied to the default group", async () => {
+    const res = await app.request(`/api/groups/${defaultGroupId}/rule-sets`, {
+      headers: authHeaders(),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ruleSets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "Default General Guidance",
+        }),
+      ]),
+    );
+  });
+
   it("tenant admin can promote a user to group_admin", async () => {
     const sql = getTestSql();
     const [user] = await sql`
-      INSERT INTO human_users (external_id, tenant_id, role)
+      INSERT INTO users (external_id, tenant_id, role)
       VALUES ('user-promote', ${tenantId}, 'user')
       RETURNING id
     `;
@@ -187,7 +203,7 @@ describe("groups integration", () => {
   it("non-admin cannot promote a user", async () => {
     const sql = getTestSql();
     const [user] = await sql`
-      INSERT INTO human_users (external_id, tenant_id, role)
+      INSERT INTO users (external_id, tenant_id, role)
       VALUES ('user-no-promote', ${tenantId}, 'user')
       RETURNING id
     `;

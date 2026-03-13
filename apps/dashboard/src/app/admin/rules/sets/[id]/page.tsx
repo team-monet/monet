@@ -114,7 +114,9 @@ export default async function RuleSetDetailPage({ params, searchParams }: PagePr
                     <div key={rule.id} className="flex items-start justify-between gap-3 rounded-md border p-3">
                       <div className="space-y-1">
                         <p className="text-sm font-semibold">{rule.name}</p>
-                        <p className="text-xs text-muted-foreground line-clamp-2">{rule.description}</p>
+                        <p className="text-xs leading-5 whitespace-normal break-words text-muted-foreground line-clamp-3">
+                          {rule.description}
+                        </p>
                         <Badge variant="outline" className="text-[10px]">Updated {new Date(rule.updatedAt).toLocaleDateString()}</Badge>
                       </div>
                       {isAdmin && (

@@ -192,12 +192,12 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
           ) : (
             <Card className="shadow-sm">
               <CardContent className="p-0">
-                <Table>
+                <Table className="table-fixed">
                   <TableHeader>
                     <TableRow>
-                      <TableHead className="w-[200px]">Rule Name</TableHead>
+                      <TableHead className="w-[260px]">Rule Name</TableHead>
                       <TableHead>Description</TableHead>
-                      <TableHead className="w-[150px]">Updated</TableHead>
+                      <TableHead className="w-[140px]">Updated</TableHead>
                       <TableHead className="w-[80px] text-right"></TableHead>
                     </TableRow>
                   </TableHeader>
@@ -211,26 +211,28 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                     ) : (
                       rules.map((r) => (
                         <TableRow key={r.id} className="group transition-colors">
-                          <TableCell>
-                            <div className="flex items-center gap-2">
-                              <div className="flex h-8 w-8 items-center justify-center rounded bg-muted">
+                          <TableCell className="align-top py-3 whitespace-normal">
+                            <div className="flex items-start gap-2">
+                              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-muted">
                                 <Scale className="h-4 w-4 text-muted-foreground" />
                               </div>
-                              <span className="font-semibold text-sm">{r.name}</span>
+                              <span className="block min-w-0 break-words text-sm font-semibold leading-5 line-clamp-2">
+                                {r.name}
+                              </span>
                             </div>
                           </TableCell>
-                          <TableCell>
-                            <span className="text-sm text-muted-foreground line-clamp-2">
+                          <TableCell className="align-top py-3 whitespace-normal">
+                            <span className="block break-words text-sm leading-6 text-muted-foreground line-clamp-3">
                               {r.description}
                             </span>
                           </TableCell>
-                          <TableCell>
+                          <TableCell className="align-top py-3">
                             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                               <Calendar className="h-3 w-3" />
                               {new Date(r.updatedAt).toLocaleDateString()}
                             </div>
                           </TableCell>
-                          <TableCell className="text-right">
+                          <TableCell className="align-top py-3 text-right">
                             {isAdmin && (
                               <Dialog>
                                 <DialogTrigger asChild>

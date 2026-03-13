@@ -226,7 +226,7 @@ export default async function AdminGroupsPage({ searchParams }: PageProps) {
                             </DialogContent>
                           </Dialog>
                           <Button asChild variant="secondary" size="sm">
-                            <Link href={`/admin/groups/${g.id}`}>Manage Members</Link>
+                            <Link href={`/admin/groups/${g.id}`}>View Details</Link>
                           </Button>
                         </div>
                       </TableCell>

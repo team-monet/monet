@@ -38,6 +38,17 @@ vi.mock("../services/group.service.js", async () => {
   };
 });
 
+vi.mock("../services/rule.service.js", () => ({
+  listRuleSetsForGroup: vi.fn(async () => [
+    {
+      id: "rule-set-1",
+      name: "Default General Guidance",
+      createdAt: "2025-01-01",
+      ruleIds: ["00000000-0000-0000-0000-000000000111"],
+    },
+  ]),
+}));
+
 function createTestApp(agent: AgentContext) {
   const app = new Hono<AppEnv>();
 
@@ -147,6 +158,32 @@ describe("groups route", () => {
     it("returns 403 for group admin", async () => {
       const app = createTestApp(makeAgent({ role: "group_admin" }));
       const res = await app.request("/groups/group-1/members");
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe("GET /:id/rule-sets", () => {
+    it("returns 200 for tenant admin when the group exists", async () => {
+      const groupService = await import("../services/group.service.js");
+      vi.mocked(groupService.listGroups).mockResolvedValueOnce([
+        {
+          id: "group-1",
+          tenantId: TENANT_ID,
+          name: "General",
+          description: "",
+          memoryQuota: 100,
+          createdAt: "2025-01-01",
+        },
+      ]);
+
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/group-1/rule-sets");
+      expect(res.status).toBe(200);
+    });
+
+    it("returns 403 for group admin", async () => {
+      const app = createTestApp(makeAgent({ role: "group_admin" }));
+      const res = await app.request("/groups/group-1/rule-sets");
       expect(res.status).toBe(403);
     });
   });

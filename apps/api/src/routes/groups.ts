@@ -11,6 +11,7 @@ import {
   listGroups,
   listGroupMembers,
 } from "../services/group.service";
+import { listRuleSetsForGroup } from "../services/rule.service";
 import { pushRulesToAgent } from "../services/rule-notification.service";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -141,6 +142,27 @@ groupsRouter.get("/:id/members", async (c) => {
   return c.json(result);
 });
 
+// GET /:id/rule-sets — list rule sets applied to a group (Tenant_Admin only)
+groupsRouter.get("/:id/rule-sets", async (c) => {
+  const agent = c.get("agent");
+  const sql = c.get("sql");
+  const schemaName = c.get("tenantSchemaName");
+  const groupId = c.req.param("id");
+  const role = await resolveAgentRole(sql, agent);
+
+  if (!isTenantAdmin(role)) {
+    return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
+  }
+
+  const groups = await listGroups(sql, agent.tenantId);
+  if (!groups.some((group) => group.id === groupId)) {
+    return c.json({ error: "not_found", message: "Group not found" }, 404);
+  }
+
+  const ruleSets = await listRuleSetsForGroup(sql, schemaName, groupId);
+  return c.json({ ruleSets });
+});
+
 // POST /:id/members — add agent to group (Group_Admin or Tenant_Admin)
 groupsRouter.post("/:id/members", async (c) => {
   const agent = c.get("agent");
@@ -197,14 +219,14 @@ groupsRouter.post("/users/:userId/admin", async (c) => {
 
   // Verify user belongs to this tenant
   const [user] = await sql`
-    SELECT id, role FROM human_users WHERE id = ${userId} AND tenant_id = ${agent.tenantId}
+    SELECT id, role FROM users WHERE id = ${userId} AND tenant_id = ${agent.tenantId}
   `;
   if (!user) {
     return c.json({ error: "not_found", message: "User not found" }, 404);
   }
 
   await sql`
-    UPDATE human_users SET role = ${parsed.data.role} WHERE id = ${userId}
+    UPDATE users SET role = ${parsed.data.role} WHERE id = ${userId}
   `;
 
   return c.json({ success: true, userId, role: parsed.data.role });

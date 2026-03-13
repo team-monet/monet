@@ -1,16 +1,16 @@
 import Link from "next/link";
 import { getApiClient } from "@/lib/api-client";
 import { requireAdmin } from "@/lib/auth";
-import type { Agent, AgentGroup } from "@monet/types";
+import type { Agent, AgentGroup, RuleSet } from "@monet/types";
 import { formatAgentDisplayName } from "@/lib/agent-display";
 import { addGroupMemberAction, removeGroupMemberAction } from "../actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { SubmitButton } from "@/components/ui/submit-button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { AlertTriangle, ArrowLeft, Bot, User, Users } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Bot, Layers, User, Users } from "lucide-react";
 
 interface PageProps {
   params: Promise<{ id: string }>;
@@ -32,21 +32,26 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
   let group: AgentGroup | undefined;
   let members: Agent[] = [];
   let availableAgents: Agent[] = [];
+  let appliedRuleSets: RuleSet[] = [];
   let error = "";
 
   try {
     const client = await getApiClient();
-    const [groupsResult, agentsResult, membersResult] = await Promise.all([
+    const [groupsResult, agentsResult] = await Promise.all([
       client.listGroups(),
       client.listAgents(),
-      client.listGroupMembers(groupId),
     ]);
 
     group = groupsResult.groups.find((g) => g.id === groupId);
     if (!group) {
       error = "Group not found.";
     } else {
+      const [membersResult, ruleSetsResult] = await Promise.all([
+        client.listGroupMembers(groupId),
+        client.listGroupRuleSets(groupId),
+      ]);
       members = membersResult.members;
+      appliedRuleSets = ruleSetsResult.ruleSets;
       const memberIds = new Set(members.map((m) => m.id));
       availableAgents = agentsResult.filter((agent) => !memberIds.has(agent.id));
     }
@@ -58,9 +63,9 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
     <div className="flex flex-col gap-6 p-4">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="space-y-1">
-          <h1 className="text-3xl font-bold tracking-tight">Manage Group Members</h1>
+          <h1 className="text-3xl font-bold tracking-tight">Group Details</h1>
           <p className="text-muted-foreground mt-1">
-            Add or remove agents from this group.
+            Review applied rule sets and manage agents in this group.
           </p>
         </div>
         <Button asChild variant="outline">
@@ -101,12 +106,70 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
         </Alert>
       ) : (
         <>
+          <div className="grid gap-4 xl:grid-cols-3">
+            <Card className="xl:col-span-2">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Users className="h-4 w-4" />
+                  {group?.name}
+                </CardTitle>
+                <CardDescription>
+                  {group?.description || "No group description provided yet."}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Memory quota
+                  </p>
+                  <p className="text-sm font-medium">
+                    {group?.memoryQuota ? `${group.memoryQuota} entries` : "Unlimited"}
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Current members
+                  </p>
+                  <p className="text-sm font-medium">
+                    {members.length} {members.length === 1 ? "agent" : "agents"}
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Layers className="h-4 w-4" />
+                  Applied Rule Sets
+                </CardTitle>
+                <CardDescription>
+                  These rule sets are inherited automatically by agents in this group.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {appliedRuleSets.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No rule sets are attached to this group.</p>
+                ) : (
+                  appliedRuleSets.map((ruleSet) => (
+                    <div key={ruleSet.id} className="rounded-md border p-3">
+                      <Link href={`/admin/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
+                        {ruleSet.name}
+                      </Link>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {ruleSet.ruleIds.length} {ruleSet.ruleIds.length === 1 ? "rule" : "rules"}
+                      </p>
+                    </div>
+                  ))
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Users className="h-4 w-4" />
-                {group?.name}
-              </CardTitle>
+              <CardTitle className="text-base">Add Agent</CardTitle>
+              <CardDescription>Move an agent into this group.</CardDescription>
             </CardHeader>
             <CardContent>
               <form action={addGroupMemberAction} className="flex flex-col gap-3 md:flex-row md:items-end">
@@ -143,6 +206,10 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
           </Card>
 
           <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base">Members</CardTitle>
+              <CardDescription>Agents currently assigned to this group.</CardDescription>
+            </CardHeader>
             <CardContent className="p-0">
               <Table>
                 <TableHeader>
@@ -178,7 +245,7 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
                             ) : (
                               <>
                                 <User className="mr-1 h-3 w-3" />
-                                Human Proxy
+                                User Proxy
                               </>
                             )}
                           </Badge>
