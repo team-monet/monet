@@ -13,16 +13,16 @@ Use these terms in product copy, docs, tickets, and API discussions:
 - `Default User Group`: the tenant-local `Everyone` group created or reused automatically on first login.
 - `Default Agent Group`: the tenant-local `General` agent group used for baseline agent registration access.
 
-Avoid `human user`, `human group`, and similar terms in product-facing language.
+Avoid `user`, `user group`, and similar terms in product-facing language.
 
 ## Technical Mapping
 
 The current schema still uses older table names:
 
-- `human_users` = users
-- `human_groups` = user groups
-- `human_group_members` = user-group memberships
-- `human_group_agent_group_permissions` = user-group to agent-group permissions
+- `users` = users
+- `user_groups` = user groups
+- `user_group_members` = user-group memberships
+- `user_group_agent_group_permissions` = user-group to agent-group permissions
 
 Those names are implementation details and should not drive product terminology.
 
@@ -49,14 +49,14 @@ These two layers are intentionally separate.
 
 ### Non-admin users
 
-- Can only create Human Proxy agents bound to themselves.
+- Can only create User Proxy agents bound to themselves.
 - Must select an agent group.
 - Can only select agent groups explicitly allowed through their user-group memberships.
 
 ### Tenant admins
 
-- Can create Human Proxy or Autonomous agents.
-- Can bind Human Proxy agents to another user in the tenant.
+- Can create User Proxy or Autonomous agents.
+- Can bind User Proxy agents to another user in the tenant.
 - Can select any agent group in the tenant.
 
 ## First Login Behavior
@@ -99,8 +99,8 @@ Use this baseline unless the tenant needs something more specialized:
 
 When adding new UI, API docs, issues, or product copy:
 
-- say `user`, not `human user`
-- say `user group`, not `human group`
+- say `user`, not `user`
+- say `user group`, not `user group`
 - say `role` for `user`, `group_admin`, `tenant_admin`
 - say `agent group` for agent runtime grouping
 

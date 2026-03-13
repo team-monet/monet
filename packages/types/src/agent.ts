@@ -15,6 +15,7 @@ export type UserRole = z.infer<typeof UserRole>;
 export const AgentOwner = z.object({
   id: z.string().uuid(),
   externalId: z.string(),
+  displayName: z.string().nullable().optional(),
   email: z.string().email().nullable().optional(),
   label: z.string(),
 });
@@ -64,13 +65,14 @@ export const Tenant = z.object({
 });
 export type Tenant = z.infer<typeof Tenant>;
 
-export const HumanUser = z.object({
+export const TenantUser = z.object({
   id: z.string().uuid(),
   externalId: z.string(),
   tenantId: z.string().uuid(),
+  displayName: z.string().nullable().optional(),
   email: z.string().email().nullable().optional(),
   role: UserRole,
   lastLoginAt: z.coerce.date().nullable().optional(),
   createdAt: z.coerce.date(),
 });
-export type HumanUser = z.infer<typeof HumanUser>;
+export type TenantUser = z.infer<typeof TenantUser>;

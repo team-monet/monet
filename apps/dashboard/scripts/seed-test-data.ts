@@ -4,7 +4,7 @@ import {
   createTenantSchema, 
   tenantSchemaNameFromId,
   tenants, 
-  humanUsers, 
+  tenantUsers, 
   agents, 
   agentGroups, 
   agentGroupMembers,
@@ -59,7 +59,7 @@ async function seed() {
   // This is a destructive operation for testing
   await db.delete(agentGroupMembers).execute();
   await db.delete(agents).execute();
-  await db.delete(humanUsers).execute();
+  await db.delete(tenantUsers).execute();
   await db.delete(agentGroups).execute();
   await sql.unsafe(`
     DO $$
@@ -89,9 +89,10 @@ async function seed() {
   await createTenantSchema(sql, tenantId);
 
   console.log("Creating test user...");
-  const [user] = await db.insert(humanUsers).values({
+  const [user] = await db.insert(tenantUsers).values({
     externalId: "test-user-id",
     tenantId: tenantId,
+    displayName: "Test User",
     email: "test@example.com",
     role: "tenant_admin",
   }).returning();

@@ -30,11 +30,12 @@ type AgentRow = {
   created_at: Date;
   owner_id: string | null;
   owner_external_id: string | null;
+  owner_display_name: string | null;
   owner_email: string | null;
 };
 
 function ownerLabel(row: AgentRow) {
-  return row.owner_email ?? row.owner_external_id ?? null;
+  return row.owner_display_name ?? row.owner_email ?? row.owner_external_id ?? null;
 }
 
 function displayName(row: AgentRow) {
@@ -63,6 +64,7 @@ function mapAgent(row: AgentRow) {
         ? {
             id: row.owner_id,
             externalId: row.owner_external_id ?? label,
+            displayName: row.owner_display_name,
             email: row.owner_email,
             label,
           }
@@ -88,9 +90,10 @@ async function loadAgentRow(
       a.created_at,
       u.id AS owner_id,
       u.external_id AS owner_external_id,
+      u.display_name AS owner_display_name,
       u.email AS owner_email
     FROM agents a
-    LEFT JOIN human_users u ON u.id = a.user_id
+    LEFT JOIN users u ON u.id = a.user_id
     WHERE a.id = ${agentId}
       AND a.tenant_id = ${tenantId}
       AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
@@ -154,7 +157,7 @@ async function closeAgentSessionsIfPresent(
 
 function auditActor(requester: AppEnv["Variables"]["agent"]): Pick<AuditEntry, "actorId" | "actorType"> {
   if (requester.userId) {
-    return { actorId: requester.userId, actorType: "human_user" };
+    return { actorId: requester.userId, actorType: "user" };
   }
 
   return { actorId: requester.id, actorType: "agent" };
@@ -230,7 +233,7 @@ agentsRouter.post("/register", async (c) => {
 
   if (!admin && !isAutonomous && !userId) {
     return c.json(
-      { error: "validation_error", message: "User binding is required for Human Proxy agents" },
+      { error: "validation_error", message: "User binding is required for User Proxy agents" },
       400,
     );
   }
@@ -251,21 +254,31 @@ agentsRouter.post("/register", async (c) => {
     }
   }
 
-  let owner: { id: string; externalId: string; email: string | null; label: string } | null = null;
+  let owner: {
+    id: string;
+    externalId: string;
+    displayName: string | null;
+    email: string | null;
+    label: string;
+  } | null = null;
   if (userId) {
     const [user] = await sql`
-      SELECT id, external_id, email
-      FROM human_users
+      SELECT id, external_id, display_name, email
+      FROM users
       WHERE id = ${userId} AND tenant_id = ${agent.tenantId}
     `;
     if (!user) {
       return c.json({ error: "not_found", message: "User not found" }, 404);
     }
 
-    const label = (user.email as string | null) ?? (user.external_id as string);
+    const label =
+      (user.display_name as string | null) ??
+      (user.email as string | null) ??
+      (user.external_id as string);
     owner = {
       id: user.id as string,
       externalId: user.external_id as string,
+      displayName: (user.display_name as string | null) ?? null,
       email: (user.email as string | null) ?? null,
       label,
     };
@@ -540,9 +553,10 @@ agentsRouter.get("/", async (c) => {
           a.created_at,
           u.id AS owner_id,
           u.external_id AS owner_external_id,
+          u.display_name AS owner_display_name,
           u.email AS owner_email
         FROM agents a
-        LEFT JOIN human_users u ON u.id = a.user_id
+        LEFT JOIN users u ON u.id = a.user_id
         WHERE a.tenant_id = ${agent.tenantId}
           AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
         ORDER BY a.created_at DESC
@@ -559,9 +573,10 @@ agentsRouter.get("/", async (c) => {
           a.created_at,
           u.id AS owner_id,
           u.external_id AS owner_external_id,
+          u.display_name AS owner_display_name,
           u.email AS owner_email
         FROM agents a
-        LEFT JOIN human_users u ON u.id = a.user_id
+        LEFT JOIN users u ON u.id = a.user_id
         WHERE a.tenant_id = ${agent.tenantId}
           AND a.user_id = ${agent.userId}
           AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}

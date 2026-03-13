@@ -3,7 +3,7 @@ import type { NextAuthConfig, User, Profile } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import { desc, eq } from "drizzle-orm";
 import {
-  humanUsers,
+  tenantUsers,
   platformAdmins,
   platformOauthConfigs,
   tenantOauthConfigs,
@@ -14,10 +14,7 @@ import { redirect } from "next/navigation";
 import { db } from "./db";
 import { decrypt } from "./crypto";
 import { finalizePlatformInitialization } from "./bootstrap";
-import {
-  fetchOidcDiscoveryDocument,
-  resolveOidcIssuerForServer,
-} from "./oidc";
+import { fetchOidcDiscoveryDocument, resolveOidcProviderConfig } from "./oidc";
 import { upsertTenantUserFromLogin } from "./tenant-user-binding";
 
 interface ExtendedUser extends User {
@@ -56,8 +53,11 @@ function normalizeEmail(value: string | null | undefined) {
 }
 
 function isProfileEmailVerified(profile: Profile) {
-  const raw = (profile as Profile & { email_verified?: boolean }).email_verified;
-  return raw === true;
+  // Some IdPs send email_verified as the string "true" instead of a boolean.
+  // Treat both as verified so admin nominations can be claimed on first login.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const raw = (profile as any).email_verified;
+  return raw === true || raw === "true";
 }
 
 function isDevBypassEnabled() {
@@ -203,6 +203,7 @@ export const authConfig: NextAuthConfig = {
         const dbUser = await upsertTenantUserFromLogin({
           tenantId,
           externalId: user.id!,
+          displayName: user.name,
           email: user.email,
           emailVerified: extendedUser.emailVerified === true,
         });
@@ -212,7 +213,7 @@ export const authConfig: NextAuthConfig = {
           role: dbUser.role,
           scope: "tenant",
           tenantId: dbUser.tenantId,
-          name: user.name,
+          name: dbUser.displayName ?? user.name ?? user.email,
           email: user.email,
           accessToken: account.access_token || "dev-bypass-token",
           refreshToken: account.refresh_token || "dev-bypass-refresh-token",
@@ -288,8 +289,8 @@ const result = NextAuth(async (req) => {
 
           const [user] = await db
             .select()
-            .from(humanUsers)
-            .where(eq(humanUsers.tenantId, tenant.id))
+            .from(tenantUsers)
+            .where(eq(tenantUsers.tenantId, tenant.id))
             .limit(1);
           if (!user) return null;
 
@@ -298,7 +299,7 @@ const result = NextAuth(async (req) => {
             tenantId: tenant.id,
             role: user.role,
             scope: "tenant",
-            name: "Local User",
+            name: user.displayName ?? "Local User",
             email: "local@example.com",
           } as ExtendedUser;
         },
@@ -320,17 +321,23 @@ const result = NextAuth(async (req) => {
   }
 
   if (platformConfig) {
-    const platformIssuer = resolveOidcIssuerForServer(platformConfig.issuer);
+    const platformOidc = await resolveOidcProviderConfig(platformConfig.issuer);
     providers.push({
       id: "platform-oauth",
       name: "Monet Platform",
       type: "oidc" as const,
-      issuer: platformIssuer,
+      issuer: platformOidc.browserIssuer,
+      wellKnown: platformOidc.wellKnown,
       clientId: platformConfig.clientId,
       clientSecret: decrypt(platformConfig.clientSecretEncrypted),
       authorization: {
+        url: platformOidc.authorization,
         params: { scope: "openid email profile offline_access" },
       },
+      token: { url: platformOidc.token },
+      ...(platformOidc.userinfo
+        ? { userinfo: { url: platformOidc.userinfo } }
+        : {}),
       profile(profile: Profile) {
         return {
           id: profile.sub || (profile as any).id, // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -371,17 +378,23 @@ const result = NextAuth(async (req) => {
       }
 
       if (config) {
-        const tenantIssuer = resolveOidcIssuerForServer(config.issuer);
+        const tenantOidc = await resolveOidcProviderConfig(config.issuer);
         providers.push({
           id: "tenant-oauth",
           name: tenant.name,
           type: "oidc" as const,
-          issuer: tenantIssuer,
+          issuer: tenantOidc.browserIssuer,
+          wellKnown: tenantOidc.wellKnown,
           clientId: config.clientId,
           clientSecret: decrypt(config.clientSecretEncrypted),
           authorization: {
+            url: tenantOidc.authorization,
             params: { scope: "openid email profile offline_access" },
           },
+          token: { url: tenantOidc.token },
+          ...(tenantOidc.userinfo
+            ? { userinfo: { url: tenantOidc.userinfo } }
+            : {}),
           profile(profile: Profile) {
             return {
               id: profile.sub || (profile as any).id, // eslint-disable-line @typescript-eslint/no-explicit-any

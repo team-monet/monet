@@ -48,7 +48,7 @@
       "idx": 6,
       "version": "7",
       "when": 1772798400000,
-      "tag": "0006_add_dashboard_api_key_to_human_users",
+      "tag": "0006_add_dashboard_api_key_to_users",
       "breakpoints": true
     },
     {
@@ -90,7 +90,14 @@
       "idx": 12,
       "version": "7",
       "when": 1773015000000,
-      "tag": "0012_human_groups_permissions",
+      "tag": "0012_user_groups_permissions",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1773360000000,
+      "tag": "0013_add_user_display_name",
       "breakpoints": true
     }
   ]

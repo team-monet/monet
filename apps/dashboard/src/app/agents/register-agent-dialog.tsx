@@ -18,6 +18,7 @@ import {
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { getUserOptionLabel } from "@/lib/user-display";
 import { AgentCredentialHandoff } from "./agent-credential-handoff";
 import { registerAgentAction } from "./actions";
 import {
@@ -33,6 +34,7 @@ type GroupOption = {
 type UserOption = {
   id: string;
   externalId: string;
+  displayName: string | null;
   email: string | null;
 };
 
@@ -83,10 +85,10 @@ function RegisterAgentForm({
   onReset: () => void;
 }) {
   const router = useRouter();
-  const [agentType, setAgentType] = useState<"human_proxy" | "autonomous">("human_proxy");
+  const [agentType, setAgentType] = useState<"user_proxy" | "autonomous">("user_proxy");
   const [state, formAction] = useActionState(registerAgentAction, initialRegisterAgentFormState);
   const hasGroupOptions = availableGroups.length > 0;
-  const requiresUserBinding = isAdmin && agentType === "human_proxy";
+  const requiresUserBinding = isAdmin && agentType === "user_proxy";
   const missingUserOptions = requiresUserBinding && bindableUsers.length === 0;
 
   useEffect(() => {
@@ -130,11 +132,11 @@ function RegisterAgentForm({
             className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             value={agentType}
             onChange={(event) => {
-              const nextType = event.target.value === "autonomous" ? "autonomous" : "human_proxy";
+              const nextType = event.target.value === "autonomous" ? "autonomous" : "user_proxy";
               setAgentType(nextType);
             }}
           >
-            <option value="human_proxy">Human Proxy</option>
+            <option value="user_proxy">User Proxy</option>
             <option value="autonomous">Autonomous</option>
           </select>
         </div>
@@ -156,7 +158,7 @@ function RegisterAgentForm({
             </option>
             {bindableUsers.map((user) => (
               <option key={user.id} value={user.id}>
-                {user.email ?? user.externalId}
+                {getUserOptionLabel(user)}
               </option>
             ))}
           </select>
@@ -247,8 +249,8 @@ export default function RegisterAgentDialog({
           <DialogTitle>Register Agent</DialogTitle>
           <DialogDescription>
             {isAdmin
-              ? "Create a Human Proxy or Autonomous agent and issue a new API key."
-              : "Create a Human Proxy agent bound to your account and issue a new API key."}
+              ? "Create a User Proxy or Autonomous agent and issue a new API key."
+              : "Create a User Proxy agent bound to your account and issue a new API key."}
           </DialogDescription>
         </DialogHeader>
 
@@ -259,8 +261,8 @@ export default function RegisterAgentDialog({
               <p className="font-medium">Role-aware registration</p>
               <p className="text-muted-foreground">
                 {isAdmin
-                  ? "Tenant admins can create both Human Proxy and Autonomous agents."
-                  : "Normal users can only create Human Proxy agents bound to themselves."}
+                  ? "Tenant admins can create both User Proxy and Autonomous agents."
+                  : "Normal users can only create User Proxy agents bound to themselves."}
               </p>
             </div>
           </div>

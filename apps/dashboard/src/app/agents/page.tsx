@@ -1,12 +1,12 @@
-import { asc, eq, inArray } from "drizzle-orm";
+import { asc, eq, inArray, sql } from "drizzle-orm";
 import {
   agentGroupMembers,
   agentGroups as agentGroupsTable,
-  humanUsers,
+  tenantUsers,
 } from "@monet/db";
 import type { Agent } from "@monet/types";
 import { getApiClient } from "@/lib/api-client";
-import { listAllowedAgentGroupsForUserByHumanGroups } from "@/lib/agent-group-access";
+import { listAllowedAgentGroupsForUserByUserGroups } from "@/lib/agent-group-access";
 import { requireAuth } from "@/lib/auth";
 import { db } from "@/lib/db";
 import AgentList from "./agent-list";
@@ -30,7 +30,12 @@ export default async function AgentsPage() {
   let agents: Agent[] = [];
   const groupMemberships: Record<string, string[]> = {};
   let availableGroups: Array<{ id: string; name: string }> = [];
-  let bindableUsers: Array<{ id: string; externalId: string; email: string | null }> = [];
+  let bindableUsers: Array<{
+    id: string;
+    externalId: string;
+    displayName: string | null;
+    email: string | null;
+  }> = [];
   let error = "";
 
   try {
@@ -51,17 +56,21 @@ export default async function AgentsPage() {
             .from(agentGroupsTable)
             .where(eq(agentGroupsTable.tenantId, tenantId))
             .orderBy(asc(agentGroupsTable.name))
-        : listAllowedAgentGroupsForUserByHumanGroups(tenantId, userId),
+        : listAllowedAgentGroupsForUserByUserGroups(tenantId, userId),
       isAdmin
         ? db
             .select({
-              id: humanUsers.id,
-              externalId: humanUsers.externalId,
-              email: humanUsers.email,
+              id: tenantUsers.id,
+              externalId: tenantUsers.externalId,
+              displayName: tenantUsers.displayName,
+              email: tenantUsers.email,
             })
-            .from(humanUsers)
-            .where(eq(humanUsers.tenantId, tenantId))
-            .orderBy(asc(humanUsers.email), asc(humanUsers.externalId))
+            .from(tenantUsers)
+            .where(eq(tenantUsers.tenantId, tenantId))
+            .orderBy(
+              sql`coalesce(${tenantUsers.displayName}, ${tenantUsers.email}, ${tenantUsers.externalId})`,
+              asc(tenantUsers.externalId),
+            )
         : Promise.resolve([]),
       agents.length === 0
         ? Promise.resolve([])

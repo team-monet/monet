@@ -259,7 +259,7 @@ async function main() {
   const dashboardPort = env("DASHBOARD_PORT", "3310");
   const keycloakBaseUrl = env(
     "KEYCLOAK_BASE_URL",
-    `http://keycloak.localhost:${keycloakPort}`,
+    `http://localhost:${keycloakPort}`,
   );
   const dashboardBaseUrl = trimTrailingSlash(
     env("DASHBOARD_BASE_URL", env("NEXTAUTH_URL", `http://localhost:${dashboardPort}`)),

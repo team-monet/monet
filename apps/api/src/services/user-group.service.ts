@@ -17,6 +17,7 @@ export type UserGroupDetail = {
   members: Array<{
     id: string;
     externalId: string;
+    displayName: string | null;
     email: string | null;
     role: "user" | "group_admin" | "tenant_admin";
     joinedAt: Date;
@@ -24,6 +25,7 @@ export type UserGroupDetail = {
   tenantUsers: Array<{
     id: string;
     externalId: string;
+    displayName: string | null;
     email: string | null;
     role: "user" | "group_admin" | "tenant_admin";
   }>;
@@ -42,10 +44,10 @@ export async function listAllowedAgentGroupIdsForUser(
 ): Promise<string[]> {
   const rows = await sql`
     SELECT DISTINCT ag.id
-    FROM human_group_members hgm
-    JOIN human_groups hg ON hg.id = hgm.human_group_id
-    JOIN human_group_agent_group_permissions hgagp
-      ON hgagp.human_group_id = hgm.human_group_id
+    FROM user_group_members hgm
+    JOIN user_groups hg ON hg.id = hgm.user_group_id
+    JOIN user_group_agent_group_permissions hgagp
+      ON hgagp.user_group_id = hgm.user_group_id
     JOIN agent_groups ag ON ag.id = hgagp.agent_group_id
     WHERE hgm.user_id = ${userId}
       AND hg.tenant_id = ${tenantId}
@@ -94,17 +96,17 @@ export async function listUserGroups(
       hg.created_at,
       COALESCE(member_counts.count, 0)::int AS member_count,
       COALESCE(permission_counts.count, 0)::int AS allowed_agent_group_count
-    FROM human_groups hg
+    FROM user_groups hg
     LEFT JOIN (
-      SELECT human_group_id, COUNT(*)::int AS count
-      FROM human_group_members
-      GROUP BY human_group_id
-    ) member_counts ON member_counts.human_group_id = hg.id
+      SELECT user_group_id, COUNT(*)::int AS count
+      FROM user_group_members
+      GROUP BY user_group_id
+    ) member_counts ON member_counts.user_group_id = hg.id
     LEFT JOIN (
-      SELECT human_group_id, COUNT(*)::int AS count
-      FROM human_group_agent_group_permissions
-      GROUP BY human_group_id
-    ) permission_counts ON permission_counts.human_group_id = hg.id
+      SELECT user_group_id, COUNT(*)::int AS count
+      FROM user_group_agent_group_permissions
+      GROUP BY user_group_id
+    ) permission_counts ON permission_counts.user_group_id = hg.id
     WHERE hg.tenant_id = ${tenantId}
     ORDER BY hg.name ASC
   `;
@@ -126,7 +128,7 @@ export async function getUserGroupDetail(
 ): Promise<UserGroupDetail | null> {
   const [group] = await sql`
     SELECT id, name, description, created_at
-    FROM human_groups
+    FROM user_groups
     WHERE id = ${userGroupId}
       AND tenant_id = ${tenantId}
     LIMIT 1
@@ -141,23 +143,25 @@ export async function getUserGroupDetail(
       SELECT
         u.id,
         u.external_id,
+        u.display_name,
         u.email,
         u.role,
         hgm.joined_at
-      FROM human_group_members hgm
-      JOIN human_users u ON u.id = hgm.user_id
-      WHERE hgm.human_group_id = ${userGroupId}
-      ORDER BY u.email ASC NULLS LAST, u.external_id ASC
+      FROM user_group_members hgm
+      JOIN users u ON u.id = hgm.user_id
+      WHERE hgm.user_group_id = ${userGroupId}
+      ORDER BY COALESCE(u.display_name, u.email, u.external_id) ASC NULLS LAST, u.external_id ASC
     `,
     sql`
       SELECT
         id,
         external_id,
+        display_name,
         email,
         role
-      FROM human_users
+      FROM users
       WHERE tenant_id = ${tenantId}
-      ORDER BY email ASC NULLS LAST, external_id ASC
+      ORDER BY COALESCE(display_name, email, external_id) ASC NULLS LAST, external_id ASC
     `,
     sql`
       SELECT
@@ -170,8 +174,8 @@ export async function getUserGroupDetail(
     `,
     sql`
       SELECT agent_group_id
-      FROM human_group_agent_group_permissions
-      WHERE human_group_id = ${userGroupId}
+      FROM user_group_agent_group_permissions
+      WHERE user_group_id = ${userGroupId}
     `,
   ]);
 
@@ -185,6 +189,7 @@ export async function getUserGroupDetail(
     members: (members as Array<Record<string, unknown>>).map((row) => ({
       id: row.id as string,
       externalId: row.external_id as string,
+      displayName: (row.display_name as string | null) ?? null,
       email: (row.email as string | null) ?? null,
       role: row.role as "user" | "group_admin" | "tenant_admin",
       joinedAt: row.joined_at as Date,
@@ -192,6 +197,7 @@ export async function getUserGroupDetail(
     tenantUsers: (tenantUsers as Array<Record<string, unknown>>).map((row) => ({
       id: row.id as string,
       externalId: row.external_id as string,
+      displayName: (row.display_name as string | null) ?? null,
       email: (row.email as string | null) ?? null,
       role: row.role as "user" | "group_admin" | "tenant_admin",
     })),
@@ -212,7 +218,7 @@ export async function createUserGroup(
   input: { name: string; description?: string },
 ) {
   const [group] = await sql`
-    INSERT INTO human_groups (tenant_id, name, description)
+    INSERT INTO user_groups (tenant_id, name, description)
     VALUES (${tenantId}, ${input.name}, ${input.description ?? ""})
     RETURNING id, name, description, created_at
   `;
@@ -233,7 +239,7 @@ export async function updateUserGroup(
 ) {
   const [existing] = await sql`
     SELECT id
-    FROM human_groups
+    FROM user_groups
     WHERE id = ${userGroupId}
       AND tenant_id = ${tenantId}
     LIMIT 1
@@ -244,7 +250,7 @@ export async function updateUserGroup(
   }
 
   const [group] = await sql`
-    UPDATE human_groups
+    UPDATE user_groups
     SET
       name = ${input.name ?? sql`name`},
       description = ${input.description ?? sql`description`}
@@ -270,14 +276,14 @@ export async function addUserGroupMember(
   const [[group], [user]] = await Promise.all([
     sql`
       SELECT id
-      FROM human_groups
+      FROM user_groups
       WHERE id = ${userGroupId}
         AND tenant_id = ${tenantId}
       LIMIT 1
     `,
     sql`
       SELECT id
-      FROM human_users
+      FROM users
       WHERE id = ${userId}
         AND tenant_id = ${tenantId}
       LIMIT 1
@@ -289,7 +295,7 @@ export async function addUserGroupMember(
   }
 
   await sql`
-    INSERT INTO human_group_members (human_group_id, user_id)
+    INSERT INTO user_group_members (user_group_id, user_id)
     VALUES (${userGroupId}, ${userId})
     ON CONFLICT DO NOTHING
   `;
@@ -305,7 +311,7 @@ export async function removeUserGroupMember(
 ) {
   const [group] = await sql`
     SELECT id
-    FROM human_groups
+    FROM user_groups
     WHERE id = ${userGroupId}
       AND tenant_id = ${tenantId}
     LIMIT 1
@@ -316,8 +322,8 @@ export async function removeUserGroupMember(
   }
 
   await sql`
-    DELETE FROM human_group_members
-    WHERE human_group_id = ${userGroupId}
+    DELETE FROM user_group_members
+    WHERE user_group_id = ${userGroupId}
       AND user_id = ${userId}
   `;
 
@@ -332,7 +338,7 @@ export async function saveUserGroupAgentGroupPermissions(
 ) {
   const [group] = await sql`
     SELECT id
-    FROM human_groups
+    FROM user_groups
     WHERE id = ${userGroupId}
       AND tenant_id = ${tenantId}
     LIMIT 1
@@ -367,14 +373,14 @@ export async function saveUserGroupAgentGroupPermissions(
     const tx = txSql as unknown as postgres.Sql;
 
     await tx`
-      DELETE FROM human_group_agent_group_permissions
-      WHERE human_group_id = ${userGroupId}
+      DELETE FROM user_group_agent_group_permissions
+      WHERE user_group_id = ${userGroupId}
     `;
 
     if (agentGroupIds.length > 0) {
       for (const agentGroupId of agentGroupIds) {
         await tx`
-          INSERT INTO human_group_agent_group_permissions (human_group_id, agent_group_id)
+          INSERT INTO user_group_agent_group_permissions (user_group_id, agent_group_id)
           VALUES (${userGroupId}, ${agentGroupId})
         `;
       }

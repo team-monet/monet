@@ -286,7 +286,7 @@ describe("Rules integration", () => {
 
   it("Owning user can attach a shared rule set to their own agent", async () => {
     const [user] = await sql`
-      INSERT INTO human_users (external_id, tenant_id, role, email)
+      INSERT INTO users (external_id, tenant_id, role, email)
       VALUES ('owner-user', ${tenantId}, 'user', 'owner@example.com')
       RETURNING id
     `;

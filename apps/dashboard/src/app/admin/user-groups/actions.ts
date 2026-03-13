@@ -3,10 +3,10 @@
 import { and, eq, inArray } from "drizzle-orm";
 import {
   agentGroups,
-  humanGroupAgentGroupPermissions,
-  humanGroupMembers,
-  humanGroups,
-  humanUsers,
+  userGroupAgentGroupPermissions,
+  userGroupMembers,
+  userGroups,
+  tenantUsers,
 } from "@monet/db";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
@@ -21,8 +21,8 @@ function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function userGroupDetailPath(humanGroupId: string) {
-  return `/admin/user-groups/${humanGroupId}`;
+function userGroupDetailPath(userGroupId: string) {
+  return `/admin/user-groups/${userGroupId}`;
 }
 
 async function requireAdminTenantId() {
@@ -36,19 +36,19 @@ async function requireAdminTenantId() {
   return sessionUser.tenantId;
 }
 
-async function ensureHumanGroupInTenant(tenantId: string, humanGroupId: string) {
+async function ensureUserGroupInTenant(tenantId: string, userGroupId: string) {
   const [group] = await db
-    .select({ id: humanGroups.id })
-    .from(humanGroups)
+    .select({ id: userGroups.id })
+    .from(userGroups)
     .where(
-      and(eq(humanGroups.id, humanGroupId), eq(humanGroups.tenantId, tenantId)),
+      and(eq(userGroups.id, userGroupId), eq(userGroups.tenantId, tenantId)),
     )
     .limit(1);
 
   return group ?? null;
 }
 
-export async function createHumanGroupAction(formData: FormData) {
+export async function createUserGroupAction(formData: FormData) {
   const tenantId = await requireAdminTenantId();
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
@@ -58,7 +58,7 @@ export async function createHumanGroupAction(formData: FormData) {
   }
 
   try {
-    await db.insert(humanGroups).values({
+    await db.insert(userGroups).values({
       tenantId,
       name,
       description,
@@ -72,29 +72,29 @@ export async function createHumanGroupAction(formData: FormData) {
   redirect("/admin/user-groups?created=1");
 }
 
-export async function updateHumanGroupAction(formData: FormData) {
+export async function updateUserGroupAction(formData: FormData) {
   const tenantId = await requireAdminTenantId();
-  const humanGroupId = toSingle(formData.get("humanGroupId"));
+  const userGroupId = toSingle(formData.get("userGroupId"));
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
-  const redirectPath = humanGroupId
-    ? userGroupDetailPath(humanGroupId)
+  const redirectPath = userGroupId
+    ? userGroupDetailPath(userGroupId)
     : "/admin/user-groups";
 
-  if (!humanGroupId || !name) {
+  if (!userGroupId || !name) {
     redirect(`${redirectPath}?updateError=Group%20ID%20and%20name%20are%20required`);
   }
 
-  const group = await ensureHumanGroupInTenant(tenantId, humanGroupId);
+  const group = await ensureUserGroupInTenant(tenantId, userGroupId);
   if (!group) {
     redirect(`${redirectPath}?updateError=User%20group%20not%20found`);
   }
 
   try {
     await db
-      .update(humanGroups)
+      .update(userGroups)
       .set({ name, description })
-      .where(eq(humanGroups.id, humanGroupId));
+      .where(eq(userGroups.id, userGroupId));
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to update user group";
     redirect(`${redirectPath}?updateError=${encodeURIComponent(message)}`);
@@ -105,24 +105,24 @@ export async function updateHumanGroupAction(formData: FormData) {
   redirect(`${redirectPath}?updated=1`);
 }
 
-export async function addHumanGroupMemberAction(formData: FormData) {
+export async function addUserGroupMemberAction(formData: FormData) {
   const tenantId = await requireAdminTenantId();
-  const humanGroupId = toSingle(formData.get("humanGroupId"));
+  const userGroupId = toSingle(formData.get("userGroupId"));
   const userId = toSingle(formData.get("userId"));
-  const redirectPath = humanGroupId
-    ? userGroupDetailPath(humanGroupId)
+  const redirectPath = userGroupId
+    ? userGroupDetailPath(userGroupId)
     : "/admin/user-groups";
 
-  if (!humanGroupId || !userId) {
+  if (!userGroupId || !userId) {
     redirect(`${redirectPath}?memberError=User%20group%20and%20user%20are%20required`);
   }
 
   const [group, user] = await Promise.all([
-    ensureHumanGroupInTenant(tenantId, humanGroupId),
+    ensureUserGroupInTenant(tenantId, userGroupId),
     db
-      .select({ id: humanUsers.id })
-      .from(humanUsers)
-      .where(and(eq(humanUsers.id, userId), eq(humanUsers.tenantId, tenantId)))
+      .select({ id: tenantUsers.id })
+      .from(tenantUsers)
+      .where(and(eq(tenantUsers.id, userId), eq(tenantUsers.tenantId, tenantId)))
       .limit(1)
       .then((rows) => rows[0] ?? null),
   ]);
@@ -132,8 +132,8 @@ export async function addHumanGroupMemberAction(formData: FormData) {
   }
 
   await db
-    .insert(humanGroupMembers)
-    .values({ humanGroupId, userId })
+    .insert(userGroupMembers)
+    .values({ userGroupId, userId })
     .onConflictDoNothing();
 
   revalidatePath("/admin/user-groups");
@@ -141,29 +141,29 @@ export async function addHumanGroupMemberAction(formData: FormData) {
   redirect(`${redirectPath}?memberAdded=1`);
 }
 
-export async function removeHumanGroupMemberAction(formData: FormData) {
+export async function removeUserGroupMemberAction(formData: FormData) {
   const tenantId = await requireAdminTenantId();
-  const humanGroupId = toSingle(formData.get("humanGroupId"));
+  const userGroupId = toSingle(formData.get("userGroupId"));
   const userId = toSingle(formData.get("userId"));
-  const redirectPath = humanGroupId
-    ? userGroupDetailPath(humanGroupId)
+  const redirectPath = userGroupId
+    ? userGroupDetailPath(userGroupId)
     : "/admin/user-groups";
 
-  if (!humanGroupId || !userId) {
+  if (!userGroupId || !userId) {
     redirect(`${redirectPath}?memberError=User%20group%20and%20user%20are%20required`);
   }
 
-  const group = await ensureHumanGroupInTenant(tenantId, humanGroupId);
+  const group = await ensureUserGroupInTenant(tenantId, userGroupId);
   if (!group) {
     redirect(`${redirectPath}?memberError=User%20group%20not%20found`);
   }
 
   await db
-    .delete(humanGroupMembers)
+    .delete(userGroupMembers)
     .where(
       and(
-        eq(humanGroupMembers.humanGroupId, humanGroupId),
-        eq(humanGroupMembers.userId, userId),
+        eq(userGroupMembers.userGroupId, userGroupId),
+        eq(userGroupMembers.userId, userId),
       ),
     );
 
@@ -172,18 +172,18 @@ export async function removeHumanGroupMemberAction(formData: FormData) {
   redirect(`${redirectPath}?memberRemoved=1`);
 }
 
-export async function saveHumanGroupAgentPermissionsAction(formData: FormData) {
+export async function saveUserGroupAgentPermissionsAction(formData: FormData) {
   const tenantId = await requireAdminTenantId();
-  const humanGroupId = toSingle(formData.get("humanGroupId"));
-  const redirectPath = humanGroupId
-    ? userGroupDetailPath(humanGroupId)
+  const userGroupId = toSingle(formData.get("userGroupId"));
+  const redirectPath = userGroupId
+    ? userGroupDetailPath(userGroupId)
     : "/admin/user-groups";
 
-  if (!humanGroupId) {
+  if (!userGroupId) {
     redirect(`${redirectPath}?permissionsError=User%20group%20is%20required`);
   }
 
-  const group = await ensureHumanGroupInTenant(tenantId, humanGroupId);
+  const group = await ensureUserGroupInTenant(tenantId, userGroupId);
   if (!group) {
     redirect(`${redirectPath}?permissionsError=User%20group%20not%20found`);
   }
@@ -212,13 +212,13 @@ export async function saveHumanGroupAgentPermissionsAction(formData: FormData) {
 
   await db.transaction(async (tx) => {
     await tx
-      .delete(humanGroupAgentGroupPermissions)
-      .where(eq(humanGroupAgentGroupPermissions.humanGroupId, humanGroupId));
+      .delete(userGroupAgentGroupPermissions)
+      .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId));
 
     if (selectedAgentGroupIds.length > 0) {
-      await tx.insert(humanGroupAgentGroupPermissions).values(
+      await tx.insert(userGroupAgentGroupPermissions).values(
         selectedAgentGroupIds.map((agentGroupId) => ({
-          humanGroupId,
+          userGroupId,
           agentGroupId,
         })),
       );

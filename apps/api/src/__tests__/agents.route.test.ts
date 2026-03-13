@@ -285,7 +285,7 @@ describe("agents route", () => {
       `tenant_${TENANT_ID.replace(/-/g, "_")}`,
       expect.objectContaining({
         actorId: USER_ID,
-        actorType: "human_user",
+        actorType: "user",
         action: "agent.token_regenerate",
         targetId: AGENT_ID,
         outcome: "success",
@@ -609,7 +609,7 @@ describe("agents route", () => {
       `tenant_${TENANT_ID.replace(/-/g, "_")}`,
       {
         actorId: USER_ID,
-        actorType: "human_user",
+        actorType: "user",
       },
       AGENT_ID,
       "00000000-0000-0000-0000-000000000222",

@@ -89,6 +89,7 @@ describe("group membership helpers", () => {
           created_at: "2026-03-03T00:00:00.000Z",
           owner_id: "00000000-0000-0000-0000-000000000099",
           owner_external_id: "bound-user",
+          owner_display_name: "Bound User",
           owner_email: "bound@example.com",
         },
       ],
@@ -104,12 +105,13 @@ describe("group membership helpers", () => {
     expect(result.members[0]).toMatchObject({
       id: AGENT_ID,
       externalId: "Claude",
-      displayName: "Claude · bound@example.com",
+      displayName: "Claude · Bound User",
       owner: {
         id: "00000000-0000-0000-0000-000000000099",
         externalId: "bound-user",
+        displayName: "Bound User",
         email: "bound@example.com",
-        label: "bound@example.com",
+        label: "Bound User",
       },
     });
   });

@@ -7,10 +7,10 @@ import {
 } from "@monet/types";
 import {
   agentGroups,
-  humanGroupAgentGroupPermissions,
-  humanGroupMembers,
-  humanGroups,
-  humanUsers,
+  userGroupAgentGroupPermissions,
+  userGroupMembers,
+  userGroups,
+  tenantUsers,
 } from "@monet/db";
 import { db } from "./db";
 
@@ -28,14 +28,14 @@ export async function listUserGroupsForTenant(
 ): Promise<UserGroupSummary[]> {
   const groups = await db
     .select({
-      id: humanGroups.id,
-      name: humanGroups.name,
-      description: humanGroups.description,
-      createdAt: humanGroups.createdAt,
+      id: userGroups.id,
+      name: userGroups.name,
+      description: userGroups.description,
+      createdAt: userGroups.createdAt,
     })
-    .from(humanGroups)
-    .where(eq(humanGroups.tenantId, tenantId))
-    .orderBy(asc(humanGroups.name));
+    .from(userGroups)
+    .where(eq(userGroups.tenantId, tenantId))
+    .orderBy(asc(userGroups.name));
 
   if (groups.length === 0) {
     return [];
@@ -45,27 +45,27 @@ export async function listUserGroupsForTenant(
   const [memberCounts, permissionCounts] = await Promise.all([
     db
       .select({
-        humanGroupId: humanGroupMembers.humanGroupId,
+        userGroupId: userGroupMembers.userGroupId,
         count: sql<number>`count(*)::int`,
       })
-      .from(humanGroupMembers)
-      .where(inArray(humanGroupMembers.humanGroupId, groupIds))
-      .groupBy(humanGroupMembers.humanGroupId),
+      .from(userGroupMembers)
+      .where(inArray(userGroupMembers.userGroupId, groupIds))
+      .groupBy(userGroupMembers.userGroupId),
     db
       .select({
-        humanGroupId: humanGroupAgentGroupPermissions.humanGroupId,
+        userGroupId: userGroupAgentGroupPermissions.userGroupId,
         count: sql<number>`count(*)::int`,
       })
-      .from(humanGroupAgentGroupPermissions)
-      .where(inArray(humanGroupAgentGroupPermissions.humanGroupId, groupIds))
-      .groupBy(humanGroupAgentGroupPermissions.humanGroupId),
+      .from(userGroupAgentGroupPermissions)
+      .where(inArray(userGroupAgentGroupPermissions.userGroupId, groupIds))
+      .groupBy(userGroupAgentGroupPermissions.userGroupId),
   ]);
 
   const memberCountMap = new Map(
-    memberCounts.map((row) => [row.humanGroupId, Number(row.count)]),
+    memberCounts.map((row) => [row.userGroupId, Number(row.count)]),
   );
   const permissionCountMap = new Map(
-    permissionCounts.map((row) => [row.humanGroupId, Number(row.count)]),
+    permissionCounts.map((row) => [row.userGroupId, Number(row.count)]),
   );
 
   return groups.map((group) => ({
@@ -78,14 +78,14 @@ export async function listUserGroupsForTenant(
 export async function getUserGroupDetail(tenantId: string, userGroupId: string) {
   const [group] = await db
     .select({
-      id: humanGroups.id,
-      name: humanGroups.name,
-      description: humanGroups.description,
-      createdAt: humanGroups.createdAt,
+      id: userGroups.id,
+      name: userGroups.name,
+      description: userGroups.description,
+      createdAt: userGroups.createdAt,
     })
-    .from(humanGroups)
+    .from(userGroups)
     .where(
-      and(eq(humanGroups.id, userGroupId), eq(humanGroups.tenantId, tenantId)),
+      and(eq(userGroups.id, userGroupId), eq(userGroups.tenantId, tenantId)),
     )
     .limit(1);
 
@@ -93,29 +93,33 @@ export async function getUserGroupDetail(tenantId: string, userGroupId: string) 
     return null;
   }
 
-  const [members, tenantUsers, tenantAgentGroups, permissionRows] = await Promise.all([
+  const userSortOrder = sql`coalesce(${tenantUsers.displayName}, ${tenantUsers.email}, ${tenantUsers.externalId})`;
+
+  const [members, tenantUserRows, tenantAgentGroups, permissionRows] = await Promise.all([
     db
       .select({
-        id: humanUsers.id,
-        externalId: humanUsers.externalId,
-        email: humanUsers.email,
-        role: humanUsers.role,
-        joinedAt: humanGroupMembers.joinedAt,
+        id: tenantUsers.id,
+        externalId: tenantUsers.externalId,
+        displayName: tenantUsers.displayName,
+        email: tenantUsers.email,
+        role: tenantUsers.role,
+        joinedAt: userGroupMembers.joinedAt,
       })
-      .from(humanGroupMembers)
-      .innerJoin(humanUsers, eq(humanUsers.id, humanGroupMembers.userId))
-      .where(eq(humanGroupMembers.humanGroupId, userGroupId))
-      .orderBy(asc(humanUsers.email), asc(humanUsers.externalId)),
+      .from(userGroupMembers)
+      .innerJoin(tenantUsers, eq(tenantUsers.id, userGroupMembers.userId))
+      .where(eq(userGroupMembers.userGroupId, userGroupId))
+      .orderBy(userSortOrder, asc(tenantUsers.externalId)),
     db
       .select({
-        id: humanUsers.id,
-        externalId: humanUsers.externalId,
-        email: humanUsers.email,
-        role: humanUsers.role,
+        id: tenantUsers.id,
+        externalId: tenantUsers.externalId,
+        displayName: tenantUsers.displayName,
+        email: tenantUsers.email,
+        role: tenantUsers.role,
       })
-      .from(humanUsers)
-      .where(eq(humanUsers.tenantId, tenantId))
-      .orderBy(asc(humanUsers.email), asc(humanUsers.externalId)),
+      .from(tenantUsers)
+      .where(eq(tenantUsers.tenantId, tenantId))
+      .orderBy(userSortOrder, asc(tenantUsers.externalId)),
     db
       .select({
         id: agentGroups.id,
@@ -127,16 +131,16 @@ export async function getUserGroupDetail(tenantId: string, userGroupId: string) 
       .orderBy(asc(agentGroups.name)),
     db
       .select({
-        agentGroupId: humanGroupAgentGroupPermissions.agentGroupId,
+        agentGroupId: userGroupAgentGroupPermissions.agentGroupId,
       })
-      .from(humanGroupAgentGroupPermissions)
-      .where(eq(humanGroupAgentGroupPermissions.humanGroupId, userGroupId)),
+      .from(userGroupAgentGroupPermissions)
+      .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId)),
   ]);
 
   return {
     group,
     members,
-    tenantUsers,
+    tenantUsers: tenantUserRows,
     tenantAgentGroups,
     allowedAgentGroupIds: new Set(
       permissionRows.map((row) => row.agentGroupId),
@@ -149,13 +153,13 @@ export async function ensureDefaultUserGroupMembership(
   userId: string,
 ) {
   const existingMemberships = await db
-    .select({ humanGroupId: humanGroupMembers.humanGroupId })
-    .from(humanGroupMembers)
-    .innerJoin(humanGroups, eq(humanGroups.id, humanGroupMembers.humanGroupId))
+    .select({ userGroupId: userGroupMembers.userGroupId })
+    .from(userGroupMembers)
+    .innerJoin(userGroups, eq(userGroups.id, userGroupMembers.userGroupId))
     .where(
       and(
-        eq(humanGroupMembers.userId, userId),
-        eq(humanGroups.tenantId, tenantId),
+        eq(userGroupMembers.userId, userId),
+        eq(userGroups.tenantId, tenantId),
       ),
     )
     .limit(1);
@@ -166,35 +170,35 @@ export async function ensureDefaultUserGroupMembership(
 
   await db.transaction(async (tx) => {
     let [defaultGroup] = await tx
-      .select({ id: humanGroups.id })
-      .from(humanGroups)
+      .select({ id: userGroups.id })
+      .from(userGroups)
       .where(
         and(
-          eq(humanGroups.tenantId, tenantId),
-          eq(humanGroups.name, DEFAULT_USER_GROUP_NAME),
+          eq(userGroups.tenantId, tenantId),
+          eq(userGroups.name, DEFAULT_USER_GROUP_NAME),
         ),
       )
       .limit(1);
 
     if (!defaultGroup) {
       [defaultGroup] = await tx
-        .insert(humanGroups)
+        .insert(userGroups)
         .values({
           tenantId,
           name: DEFAULT_USER_GROUP_NAME,
           description: DEFAULT_USER_GROUP_DESCRIPTION,
         })
         .onConflictDoNothing()
-        .returning({ id: humanGroups.id });
+        .returning({ id: userGroups.id });
 
       if (!defaultGroup) {
         [defaultGroup] = await tx
-          .select({ id: humanGroups.id })
-          .from(humanGroups)
+          .select({ id: userGroups.id })
+          .from(userGroups)
           .where(
             and(
-              eq(humanGroups.tenantId, tenantId),
-              eq(humanGroups.name, DEFAULT_USER_GROUP_NAME),
+              eq(userGroups.tenantId, tenantId),
+              eq(userGroups.name, DEFAULT_USER_GROUP_NAME),
             ),
           )
           .limit(1);
@@ -222,18 +226,18 @@ export async function ensureDefaultUserGroupMembership(
         .returning({ id: agentGroups.id });
 
       await tx
-        .insert(humanGroupAgentGroupPermissions)
+        .insert(userGroupAgentGroupPermissions)
         .values({
-          humanGroupId: defaultGroup.id,
+          userGroupId: defaultGroup.id,
           agentGroupId: defaultAgentGroup.id,
         })
         .onConflictDoNothing();
     }
 
     await tx
-      .insert(humanGroupMembers)
+      .insert(userGroupMembers)
       .values({
-        humanGroupId: defaultGroup.id,
+        userGroupId: defaultGroup.id,
         userId,
       })
       .onConflictDoNothing();

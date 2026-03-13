@@ -93,37 +93,38 @@ async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
       AND tenants.slug IS NULL;
 
     ALTER TABLE "tenants" ALTER COLUMN "slug" SET NOT NULL;
-    ALTER TABLE "human_users" ADD COLUMN IF NOT EXISTS "email" varchar(255);
-    ALTER TABLE "human_users" ADD COLUMN IF NOT EXISTS "last_login_at" timestamp with time zone;
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "display_name" varchar(255);
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "email" varchar(255);
+    ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "last_login_at" timestamp with time zone;
 
     CREATE TABLE IF NOT EXISTS "tenant_admin_nominations" (
       "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
       "tenant_id" uuid NOT NULL,
       "email" varchar(255) NOT NULL,
-      "claimed_by_human_user_id" uuid,
+      "claimed_by_user_id" uuid,
       "created_by_platform_admin_id" uuid NOT NULL,
       "claimed_at" timestamp with time zone,
       "revoked_at" timestamp with time zone,
       "created_at" timestamp with time zone DEFAULT now() NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS "human_groups" (
+    CREATE TABLE IF NOT EXISTS "user_groups" (
       "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
       "tenant_id" uuid NOT NULL,
       "name" varchar(255) NOT NULL,
       "description" varchar(1024) DEFAULT '' NOT NULL,
       "created_at" timestamp with time zone DEFAULT now() NOT NULL,
-      CONSTRAINT "human_groups_tenant_id_name_unique" UNIQUE("tenant_id","name")
+      CONSTRAINT "user_groups_tenant_id_name_unique" UNIQUE("tenant_id","name")
     );
-    CREATE TABLE IF NOT EXISTS "human_group_members" (
-      "human_group_id" uuid NOT NULL,
+    CREATE TABLE IF NOT EXISTS "user_group_members" (
+      "user_group_id" uuid NOT NULL,
       "user_id" uuid NOT NULL,
       "joined_at" timestamp with time zone DEFAULT now() NOT NULL,
-      CONSTRAINT "human_group_members_human_group_id_user_id_pk" PRIMARY KEY("human_group_id","user_id")
+      CONSTRAINT "user_group_members_user_group_id_user_id_pk" PRIMARY KEY("user_group_id","user_id")
     );
-    CREATE TABLE IF NOT EXISTS "human_group_agent_group_permissions" (
-      "human_group_id" uuid NOT NULL,
+    CREATE TABLE IF NOT EXISTS "user_group_agent_group_permissions" (
+      "user_group_id" uuid NOT NULL,
       "agent_group_id" uuid NOT NULL,
-      CONSTRAINT "human_group_agent_group_permissions_human_group_id_agent_group_id_pk" PRIMARY KEY("human_group_id","agent_group_id")
+      CONSTRAINT "user_group_agent_group_permissions_user_group_id_agent_group_id_pk" PRIMARY KEY("user_group_id","agent_group_id")
     );
   `);
 
@@ -151,10 +152,10 @@ async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
       IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
-        WHERE conname = 'human_users_tenant_id_external_id_unique'
+        WHERE conname = 'users_tenant_id_external_id_unique'
       ) THEN
-        ALTER TABLE "human_users"
-        ADD CONSTRAINT "human_users_tenant_id_external_id_unique"
+        ALTER TABLE "users"
+        ADD CONSTRAINT "users_tenant_id_external_id_unique"
         UNIQUE("tenant_id", "external_id");
       END IF;
 
@@ -175,7 +176,7 @@ async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
       ) THEN
         ALTER TABLE "tenant_admin_nominations"
         ADD CONSTRAINT "tenant_admin_nominations_claimed_user_fk"
-        FOREIGN KEY ("claimed_by_human_user_id") REFERENCES "public"."human_users"("id") ON DELETE no action ON UPDATE no action;
+        FOREIGN KEY ("claimed_by_user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;
       END IF;
 
       IF NOT EXISTS (
@@ -201,50 +202,50 @@ async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
       IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
-        WHERE conname = 'human_groups_tenant_fk'
+        WHERE conname = 'user_groups_tenant_fk'
       ) THEN
-        ALTER TABLE "human_groups"
-        ADD CONSTRAINT "human_groups_tenant_fk"
+        ALTER TABLE "user_groups"
+        ADD CONSTRAINT "user_groups_tenant_fk"
         FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE no action ON UPDATE no action;
       END IF;
 
       IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
-        WHERE conname = 'human_group_members_group_fk'
+        WHERE conname = 'user_group_members_group_fk'
       ) THEN
-        ALTER TABLE "human_group_members"
-        ADD CONSTRAINT "human_group_members_group_fk"
-        FOREIGN KEY ("human_group_id") REFERENCES "public"."human_groups"("id") ON DELETE no action ON UPDATE no action;
+        ALTER TABLE "user_group_members"
+        ADD CONSTRAINT "user_group_members_group_fk"
+        FOREIGN KEY ("user_group_id") REFERENCES "public"."user_groups"("id") ON DELETE no action ON UPDATE no action;
       END IF;
 
       IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
-        WHERE conname = 'human_group_members_user_fk'
+        WHERE conname = 'user_group_members_user_fk'
       ) THEN
-        ALTER TABLE "human_group_members"
-        ADD CONSTRAINT "human_group_members_user_fk"
-        FOREIGN KEY ("user_id") REFERENCES "public"."human_users"("id") ON DELETE no action ON UPDATE no action;
+        ALTER TABLE "user_group_members"
+        ADD CONSTRAINT "user_group_members_user_fk"
+        FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;
       END IF;
 
       IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
-        WHERE conname = 'human_group_agent_group_permissions_group_fk'
+        WHERE conname = 'user_group_agent_group_permissions_group_fk'
       ) THEN
-        ALTER TABLE "human_group_agent_group_permissions"
-        ADD CONSTRAINT "human_group_agent_group_permissions_group_fk"
-        FOREIGN KEY ("human_group_id") REFERENCES "public"."human_groups"("id") ON DELETE no action ON UPDATE no action;
+        ALTER TABLE "user_group_agent_group_permissions"
+        ADD CONSTRAINT "user_group_agent_group_permissions_group_fk"
+        FOREIGN KEY ("user_group_id") REFERENCES "public"."user_groups"("id") ON DELETE no action ON UPDATE no action;
       END IF;
 
       IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
-        WHERE conname = 'human_group_agent_group_permissions_agent_group_fk'
+        WHERE conname = 'user_group_agent_group_permissions_agent_group_fk'
       ) THEN
-        ALTER TABLE "human_group_agent_group_permissions"
-        ADD CONSTRAINT "human_group_agent_group_permissions_agent_group_fk"
+        ALTER TABLE "user_group_agent_group_permissions"
+        ADD CONSTRAINT "user_group_agent_group_permissions_agent_group_fk"
         FOREIGN KEY ("agent_group_id") REFERENCES "public"."agent_groups"("id") ON DELETE no action ON UPDATE no action;
       END IF;
     END
@@ -259,36 +260,39 @@ async function ensurePlatformSchemaReady() {
       const [
         {
           tenantsTable,
+          usersTable,
           platformInstallationsTable,
           tenantSlugColumn,
           platformAdminsTable,
-          humanUsersEmailColumn,
-          humanUsersLastLoginColumn,
+          tenantUsersEmailColumn,
+          tenantUsersLastLoginColumn,
           tenantAdminNominationsTable,
-          humanGroupsTable,
-          humanGroupMembersTable,
-          humanGroupAgentGroupPermissionsTable,
+          userGroupsTable,
+          userGroupMembersTable,
+          userGroupAgentGroupPermissionsTable,
         },
       ] = await s<{
         tenantsTable: string | null;
+        usersTable: string | null;
         platformInstallationsTable: string | null;
         tenantSlugColumn: string | null;
         platformAdminsTable: string | null;
-        humanUsersEmailColumn: string | null;
-        humanUsersLastLoginColumn: string | null;
+        tenantUsersEmailColumn: string | null;
+        tenantUsersLastLoginColumn: string | null;
         tenantAdminNominationsTable: string | null;
-        humanGroupsTable: string | null;
-        humanGroupMembersTable: string | null;
-        humanGroupAgentGroupPermissionsTable: string | null;
+        userGroupsTable: string | null;
+        userGroupMembersTable: string | null;
+        userGroupAgentGroupPermissionsTable: string | null;
       }[]>`
         SELECT
           to_regclass('public.tenants') AS "tenantsTable",
+          to_regclass('public.users') AS "usersTable",
           to_regclass('public.platform_installations') AS "platformInstallationsTable",
           to_regclass('public.platform_admins') AS "platformAdminsTable",
           to_regclass('public.tenant_admin_nominations') AS "tenantAdminNominationsTable",
-          to_regclass('public.human_groups') AS "humanGroupsTable",
-          to_regclass('public.human_group_members') AS "humanGroupMembersTable",
-          to_regclass('public.human_group_agent_group_permissions') AS "humanGroupAgentGroupPermissionsTable",
+          to_regclass('public.user_groups') AS "userGroupsTable",
+          to_regclass('public.user_group_members') AS "userGroupMembersTable",
+          to_regclass('public.user_group_agent_group_permissions') AS "userGroupAgentGroupPermissionsTable",
           (
             SELECT column_name
             FROM information_schema.columns
@@ -300,16 +304,16 @@ async function ensurePlatformSchemaReady() {
             SELECT column_name
             FROM information_schema.columns
             WHERE table_schema = 'public'
-              AND table_name = 'human_users'
+              AND table_name = 'users'
               AND column_name = 'email'
-          ) AS "humanUsersEmailColumn",
+          ) AS "tenantUsersEmailColumn",
           (
             SELECT column_name
             FROM information_schema.columns
             WHERE table_schema = 'public'
-              AND table_name = 'human_users'
+              AND table_name = 'users'
               AND column_name = 'last_login_at'
-          ) AS "humanUsersLastLoginColumn"
+          ) AS "tenantUsersLastLoginColumn"
       `;
 
       // CI can prepare platform tables via `drizzle-kit push`, which creates
@@ -317,16 +321,33 @@ async function ensurePlatformSchemaReady() {
       // of that state would replay 0000 and fail on already-existing tables.
       if (
         tenantsTable &&
+        usersTable &&
         platformInstallationsTable &&
         tenantSlugColumn &&
         platformAdminsTable &&
-        humanUsersEmailColumn &&
-        humanUsersLastLoginColumn &&
+        tenantUsersEmailColumn &&
+        tenantUsersLastLoginColumn &&
         tenantAdminNominationsTable &&
-        humanGroupsTable &&
-        humanGroupMembersTable &&
-        humanGroupAgentGroupPermissionsTable
+        userGroupsTable &&
+        userGroupMembersTable &&
+        userGroupAgentGroupPermissionsTable
       ) {
+        return;
+      }
+
+      // The public schema naming changed from legacy user tables to `users`.
+      // In the dedicated integration DB it is safe to rebuild from scratch
+      // instead of trying to preserve the old local state.
+      if (tenantsTable && !usersTable) {
+        await s.unsafe(`DROP SCHEMA IF EXISTS public CASCADE`);
+        await s.unsafe(`CREATE SCHEMA public`);
+        await s.unsafe(`GRANT ALL ON SCHEMA public TO postgres`);
+        await s.unsafe(`GRANT ALL ON SCHEMA public TO public`);
+        await s.unsafe(`DROP SCHEMA IF EXISTS drizzle CASCADE`);
+
+        const migrationDb = drizzle(s);
+        const migrationsFolder = path.resolve(process.cwd(), "../../packages/db/drizzle");
+        await migrate(migrationDb, { migrationsFolder });
         return;
       }
 
@@ -431,13 +452,13 @@ export async function cleanupTestData() {
         platform_setup_sessions,
         platform_bootstrap_tokens,
         platform_installations,
-        human_group_agent_group_permissions,
-        human_group_members,
-        human_groups,
+        user_group_agent_group_permissions,
+        user_group_members,
+        user_groups,
         agent_group_members,
         agent_groups,
         agents,
-        human_users,
+        users,
         tenants
       CASCADE;
     EXCEPTION WHEN undefined_table THEN NULL;

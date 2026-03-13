@@ -8,20 +8,6 @@ const nextConfig: NextConfig = {
   output: "standalone",
   outputFileTracingRoot: workspaceRoot,
   transpilePackages: ["@monet/types", "@monet/db"],
-  async redirects() {
-    return [
-      {
-        source: "/admin/human-groups",
-        destination: "/admin/user-groups",
-        permanent: true,
-      },
-      {
-        source: "/admin/human-groups/:path*",
-        destination: "/admin/user-groups/:path*",
-        permanent: true,
-      },
-    ];
-  },
 };
 
 export default nextConfig;

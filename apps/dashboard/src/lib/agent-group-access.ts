@@ -1,13 +1,13 @@
 import { and, asc, eq } from "drizzle-orm";
 import {
   agentGroups,
-  humanGroups,
-  humanGroupAgentGroupPermissions,
-  humanGroupMembers,
+  userGroups,
+  userGroupAgentGroupPermissions,
+  userGroupMembers,
 } from "@monet/db";
 import { db } from "./db";
 
-export async function listAllowedAgentGroupsForUserByHumanGroups(
+export async function listAllowedAgentGroupsForUserByUserGroups(
   tenantId: string,
   userId: string,
 ) {
@@ -16,26 +16,26 @@ export async function listAllowedAgentGroupsForUserByHumanGroups(
       id: agentGroups.id,
       name: agentGroups.name,
     })
-    .from(humanGroupMembers)
+    .from(userGroupMembers)
     .innerJoin(
-      humanGroupAgentGroupPermissions,
+      userGroupAgentGroupPermissions,
       eq(
-        humanGroupAgentGroupPermissions.humanGroupId,
-        humanGroupMembers.humanGroupId,
+        userGroupAgentGroupPermissions.userGroupId,
+        userGroupMembers.userGroupId,
       ),
     )
     .innerJoin(
       agentGroups,
-      eq(agentGroups.id, humanGroupAgentGroupPermissions.agentGroupId),
+      eq(agentGroups.id, userGroupAgentGroupPermissions.agentGroupId),
     )
     .innerJoin(
-      humanGroups,
-      eq(humanGroups.id, humanGroupMembers.humanGroupId),
+      userGroups,
+      eq(userGroups.id, userGroupMembers.userGroupId),
     )
     .where(
       and(
-        eq(humanGroupMembers.userId, userId),
-        eq(humanGroups.tenantId, tenantId),
+        eq(userGroupMembers.userId, userId),
+        eq(userGroups.tenantId, tenantId),
         eq(agentGroups.tenantId, tenantId),
       ),
     )

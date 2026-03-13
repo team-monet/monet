@@ -1,5 +1,5 @@
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "::1"]);
-const LOCAL_KEYCLOAK_EXAMPLE_ISSUER = "http://keycloak.localhost:3400/realms/monet";
+const LOCAL_KEYCLOAK_EXAMPLE_ISSUER = "http://localhost:3400/realms/monet";
 
 type OidcDiscoveryDocument = {
   issuer?: string;
@@ -20,6 +20,28 @@ function getLocalOidcBaseUrl() {
     "";
 
   return configured ? trimTrailingSlash(configured) : null;
+}
+
+function getPublicOidcBaseUrl() {
+  const configured =
+    process.env.PUBLIC_OIDC_BASE_URL?.trim() ||
+    process.env.KEYCLOAK_BASE_URL?.trim() ||
+    "";
+
+  return configured ? trimTrailingSlash(configured) : null;
+}
+
+function replaceUrlOrigin(value: string, base: string) {
+  try {
+    const valueUrl = new URL(value);
+    const baseUrl = new URL(base);
+    valueUrl.protocol = baseUrl.protocol;
+    valueUrl.hostname = baseUrl.hostname;
+    valueUrl.port = baseUrl.port;
+    return valueUrl.toString();
+  } catch {
+    return value;
+  }
 }
 
 export function resolveOidcIssuerForServer(issuer: string) {
@@ -51,6 +73,17 @@ export function resolveOidcIssuerForServer(issuer: string) {
   return trimTrailingSlash(issuerUrl.toString());
 }
 
+export function resolveOidcIssuerForBrowser(issuer: string) {
+  const trimmedIssuer = trimTrailingSlash(issuer.trim());
+  const publicBaseUrl = getPublicOidcBaseUrl();
+
+  if (!publicBaseUrl) {
+    return trimmedIssuer;
+  }
+
+  return trimTrailingSlash(replaceUrlOrigin(trimmedIssuer, publicBaseUrl));
+}
+
 export async function fetchOidcDiscoveryDocument(
   issuer: string,
 ): Promise<OidcDiscoveryDocument> {
@@ -66,6 +99,29 @@ export async function fetchOidcDiscoveryDocument(
   }
 
   return response.json() as Promise<OidcDiscoveryDocument>;
+}
+
+export async function resolveOidcProviderConfig(issuer: string) {
+  const browserIssuer = resolveOidcIssuerForBrowser(issuer);
+  const serverIssuer = resolveOidcIssuerForServer(issuer);
+  const discovery = await fetchOidcDiscoveryDocument(issuer);
+
+  if (!discovery.authorization_endpoint || !discovery.token_endpoint) {
+    throw new Error("OIDC discovery document is missing required endpoints.");
+  }
+
+  return {
+    browserIssuer,
+    serverIssuer,
+    wellKnown: `${serverIssuer}/.well-known/openid-configuration`,
+    authorization: replaceUrlOrigin(
+      discovery.authorization_endpoint,
+      browserIssuer,
+    ),
+    token: discovery.token_endpoint,
+    userinfo: discovery.userinfo_endpoint,
+    jwksEndpoint: discovery.jwks_uri,
+  };
 }
 
 export async function validateOidcIssuer(issuer: string) {

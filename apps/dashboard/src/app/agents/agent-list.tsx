@@ -164,7 +164,7 @@ export default function AgentList({
 
                     <TableCell>
                       <Badge variant="outline" className="font-normal text-[10px] uppercase">
-                        {agent.isAutonomous ? "Autonomous" : "Human Proxy"}
+                        {agent.isAutonomous ? "Autonomous" : "User Proxy"}
                       </Badge>
                     </TableCell>
 

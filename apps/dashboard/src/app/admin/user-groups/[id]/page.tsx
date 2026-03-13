@@ -9,12 +9,13 @@ import {
   Users,
 } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
+import { getUserOptionLabel, getUserPrimaryLabel, getUserSecondaryLabel } from "@/lib/user-display";
 import { getUserGroupDetail } from "@/lib/user-groups";
 import {
-  addHumanGroupMemberAction,
-  removeHumanGroupMemberAction,
-  saveHumanGroupAgentPermissionsAction,
-  updateHumanGroupAction,
+  addUserGroupMemberAction,
+  removeUserGroupMemberAction,
+  saveUserGroupAgentPermissionsAction,
+  updateUserGroupAction,
 } from "../actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -47,7 +48,7 @@ function getSingleParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-export default async function HumanGroupDetailPage({ params, searchParams }: PageProps) {
+export default async function UserGroupDetailPage({ params, searchParams }: PageProps) {
   const [{ id }, query, session] = await Promise.all([
     params,
     searchParams,
@@ -133,8 +134,8 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                 Update the name and description used for access management.
               </DialogDescription>
             </DialogHeader>
-            <form action={updateHumanGroupAction} className="grid gap-4">
-              <input type="hidden" name="humanGroupId" value={detail.group.id} />
+            <form action={updateUserGroupAction} className="grid gap-4">
+              <input type="hidden" name="userGroupId" value={detail.group.id} />
               <div className="grid gap-2">
                 <Label htmlFor="name">Name</Label>
                 <Input id="name" name="name" required defaultValue={detail.group.name} />
@@ -239,8 +240,8 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
             <CardDescription>Add or remove users from this access group.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <form action={addHumanGroupMemberAction} className="flex flex-col gap-3 md:flex-row md:items-end">
-              <input type="hidden" name="humanGroupId" value={detail.group.id} />
+            <form action={addUserGroupMemberAction} className="flex flex-col gap-3 md:flex-row md:items-end">
+              <input type="hidden" name="userGroupId" value={detail.group.id} />
               <div className="grid flex-1 gap-2">
                 <Label htmlFor="userId">Add User</Label>
                 <select
@@ -256,7 +257,7 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                   </option>
                   {availableUsers.map((user) => (
                     <option key={user.id} value={user.id}>
-                      {user.email ?? user.externalId}
+                      {getUserOptionLabel(user)}
                     </option>
                   ))}
                 </select>
@@ -285,8 +286,12 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                     <TableRow key={member.id}>
                       <TableCell>
                         <div className="flex flex-col">
-                          <span className="font-medium">{member.email ?? member.externalId}</span>
-                          <span className="text-xs text-muted-foreground">{member.externalId}</span>
+                          <span className="font-medium">{getUserPrimaryLabel(member)}</span>
+                          {getUserSecondaryLabel(member) && (
+                            <span className="text-xs text-muted-foreground">
+                              {getUserSecondaryLabel(member)}
+                            </span>
+                          )}
                         </div>
                       </TableCell>
                       <TableCell>
@@ -299,8 +304,8 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
                         {new Date(member.joinedAt).toLocaleDateString()}
                       </TableCell>
                       <TableCell className="text-right">
-                        <form action={removeHumanGroupMemberAction}>
-                          <input type="hidden" name="humanGroupId" value={detail.group.id} />
+                        <form action={removeUserGroupMemberAction}>
+                          <input type="hidden" name="userGroupId" value={detail.group.id} />
                           <input type="hidden" name="userId" value={member.id} />
                           <SubmitButton label="Remove" pendingLabel="Removing..." variant="outline" size="sm" />
                         </form>
@@ -325,8 +330,12 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
           <CardContent className="space-y-2">
             {availableUsers.slice(0, 8).map((user) => (
               <div key={user.id} className="rounded-md border p-2 text-sm">
-                <p className="font-medium">{user.email ?? user.externalId}</p>
-                <p className="text-xs text-muted-foreground">{user.externalId}</p>
+                <p className="font-medium">{getUserPrimaryLabel(user)}</p>
+                {getUserSecondaryLabel(user) && (
+                  <p className="text-xs text-muted-foreground">
+                    {getUserSecondaryLabel(user)}
+                  </p>
+                )}
               </div>
             ))}
             {availableUsers.length > 8 && (
@@ -349,8 +358,8 @@ export default async function HumanGroupDetailPage({ params, searchParams }: Pag
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form action={saveHumanGroupAgentPermissionsAction} className="space-y-4">
-            <input type="hidden" name="humanGroupId" value={detail.group.id} />
+          <form action={saveUserGroupAgentPermissionsAction} className="space-y-4">
+            <input type="hidden" name="userGroupId" value={detail.group.id} />
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               {detail.tenantAgentGroups.length === 0 ? (
                 <p className="text-sm text-muted-foreground">

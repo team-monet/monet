@@ -4,7 +4,7 @@ import type postgres from "postgres";
 export interface AuditEntry {
   tenantId: string;
   actorId: string;
-  actorType: "agent" | "human_user" | "system";
+  actorType: "agent" | "user" | "system";
   action: string;
   targetId?: string;
   outcome: "success" | "failure";

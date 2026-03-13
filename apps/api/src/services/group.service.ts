@@ -5,7 +5,7 @@ import type { AgentContext } from "../middleware/context";
 
 /**
  * Resolve the effective role for an agent.
- * Checks agent.role first, then falls back to linked humanUser.role.
+ * Checks agent.role first, then falls back to the linked user role.
  * Roles are always resolved from the database, never from request claims (threat model E1).
  */
 export async function resolveAgentRole(
@@ -18,7 +18,7 @@ export async function resolveAgentRole(
   // Fall back to the linked user's role
   if (agent.userId) {
     const [user] = await sql`
-      SELECT role FROM human_users WHERE id = ${agent.userId}
+      SELECT role FROM users WHERE id = ${agent.userId}
     `;
     if (user) return user.role as string;
   }
@@ -244,10 +244,11 @@ export async function listGroupMembers(
       a.created_at,
       u.id AS owner_id,
       u.external_id AS owner_external_id,
+      u.display_name AS owner_display_name,
       u.email AS owner_email
     FROM agents a
     JOIN agent_group_members m ON m.agent_id = a.id
-    LEFT JOIN human_users u ON u.id = a.user_id
+    LEFT JOIN users u ON u.id = a.user_id
     WHERE m.group_id = ${groupId}
     ORDER BY m.joined_at ASC
   `;
@@ -255,7 +256,10 @@ export async function listGroupMembers(
   return {
     members: (members as Record<string, unknown>[]).map((m) => {
       const ownerLabel =
-        (m.owner_email as string | null) ?? (m.owner_external_id as string | null) ?? null;
+        (m.owner_display_name as string | null) ??
+        (m.owner_email as string | null) ??
+        (m.owner_external_id as string | null) ??
+        null;
 
       return {
         id: m.id as string,
@@ -275,6 +279,7 @@ export async function listGroupMembers(
             ? {
                 id: m.owner_id as string,
                 externalId: (m.owner_external_id as string | null) ?? ownerLabel,
+                displayName: (m.owner_display_name as string | null) ?? null,
                 email: (m.owner_email as string | null) ?? null,
                 label: ownerLabel,
               }

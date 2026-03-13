@@ -43,7 +43,7 @@ export default async function PlatformPage({ searchParams }: PageProps) {
       <div className="space-y-1">
         <h1 className="text-3xl font-bold tracking-tight">Platform Tenants</h1>
         <p className="text-muted-foreground">
-          Signed in as {user.email || user.name || "platform admin"}. Create
+          Signed in as {user.name || user.email || "platform admin"}. Create
           tenants, assign stable slugs, and configure their OIDC providers.
         </p>
       </div>

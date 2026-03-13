@@ -25,7 +25,7 @@ describe("audit query service", () => {
         id: "00000000-0000-0000-0000-000000000010",
         actor_id: "00000000-0000-0000-0000-000000000020",
         actor_type: "agent",
-        actor_display_name: "Claude · owner@example.com",
+        actor_display_name: "Claude · Owner Name",
         action: "agent.revoke",
         target_id: "00000000-0000-0000-0000-000000000030",
         outcome: "success",
@@ -34,8 +34,8 @@ describe("audit query service", () => {
       {
         id: "00000000-0000-0000-0000-000000000011",
         actor_id: "00000000-0000-0000-0000-000000000021",
-        actor_type: "human_user",
-        actor_display_name: "owner@example.com",
+        actor_type: "user",
+        actor_display_name: "Owner Name",
         action: "agent.unrevoke",
         target_id: "00000000-0000-0000-0000-000000000031",
         outcome: "success",
@@ -58,7 +58,9 @@ describe("audit query service", () => {
     const [queryText, queryParams] = unsafeMock.mock.calls[0];
     expect(queryText).toContain("AS actor_display_name");
     expect(queryText).toContain("LEFT JOIN public.agents actor_agent");
-    expect(queryText).toContain("LEFT JOIN public.human_users actor_user");
+    expect(queryText).toContain("LEFT JOIN public.users actor_user");
+    expect(queryText).toContain("actor_agent_owner.display_name");
+    expect(queryText).toContain("COALESCE(actor_user.display_name, actor_user.email, actor_user.external_id)");
     expect(queryText).toContain("ORDER BY al.created_at DESC, al.id DESC LIMIT 2");
     expect(queryParams).toEqual([
       "00000000-0000-0000-0000-000000000020",
@@ -67,7 +69,7 @@ describe("audit query service", () => {
       "00000000-0000-0000-0000-000000000099",
     ]);
     expect(result.items).toHaveLength(1);
-    expect(result.items[0].actor_display_name).toBe("Claude · owner@example.com");
+    expect(result.items[0].actor_display_name).toBe("Claude · Owner Name");
     expect(result.nextCursor).toBeTruthy();
   });
 });

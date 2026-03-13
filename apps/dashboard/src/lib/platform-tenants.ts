@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type postgres from "postgres";
 import {
   createTenantSchema,
-  humanUsers,
+  tenantUsers,
   tenantAdminNominations,
   tenantOauthConfigs,
   tenants,
@@ -49,8 +49,8 @@ export type PlatformTenantAdminNomination = {
   email: string;
   claimedAt: Date | null;
   createdAt: Date;
-  claimedByHumanUserId: string | null;
-  claimedByExternalId: string | null;
+  claimedByUserId: string | null;
+  claimedByLabel: string | null;
 };
 
 export type CreatePlatformTenantResult = {
@@ -164,13 +164,15 @@ export async function getPlatformTenant(tenantId: string) {
       email: tenantAdminNominations.email,
       claimedAt: tenantAdminNominations.claimedAt,
       createdAt: tenantAdminNominations.createdAt,
-      claimedByHumanUserId: tenantAdminNominations.claimedByHumanUserId,
-      claimedByExternalId: humanUsers.externalId,
+      claimedByUserId: tenantAdminNominations.claimedByUserId,
+      claimedByDisplayName: tenantUsers.displayName,
+      claimedByEmail: tenantUsers.email,
+      claimedByExternalId: tenantUsers.externalId,
     })
     .from(tenantAdminNominations)
     .leftJoin(
-      humanUsers,
-      eq(humanUsers.id, tenantAdminNominations.claimedByHumanUserId),
+      tenantUsers,
+      eq(tenantUsers.id, tenantAdminNominations.claimedByUserId),
     )
     .where(
       and(
@@ -202,8 +204,11 @@ export async function getPlatformTenant(tenantId: string) {
       email: nomination.email,
       claimedAt: nomination.claimedAt,
       createdAt: nomination.createdAt,
-      claimedByHumanUserId: nomination.claimedByHumanUserId,
-      claimedByExternalId: nomination.claimedByExternalId,
+      claimedByUserId: nomination.claimedByUserId,
+      claimedByLabel:
+        nomination.claimedByDisplayName ??
+        nomination.claimedByEmail ??
+        nomination.claimedByExternalId,
     })),
   };
 }
@@ -230,7 +235,7 @@ export async function createPlatformTenant(
       await createTenantSchema(txSql, tenant.id);
 
       const [defaultUserGroup] = await tx`
-        INSERT INTO human_groups (tenant_id, name, description)
+        INSERT INTO user_groups (tenant_id, name, description)
         VALUES (
           ${tenant.id},
           ${DEFAULT_USER_GROUP_NAME},
@@ -277,7 +282,7 @@ export async function createPlatformTenant(
       `;
 
       await tx`
-        INSERT INTO human_group_agent_group_permissions (human_group_id, agent_group_id)
+        INSERT INTO user_group_agent_group_permissions (user_group_id, agent_group_id)
         VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
       `;
 
@@ -442,7 +447,7 @@ export async function saveTenantAdminNomination(
       email: tenantAdminNominations.email,
       claimedAt: tenantAdminNominations.claimedAt,
       createdAt: tenantAdminNominations.createdAt,
-      claimedByHumanUserId: tenantAdminNominations.claimedByHumanUserId,
+      claimedByUserId: tenantAdminNominations.claimedByUserId,
     });
 
   return nomination;

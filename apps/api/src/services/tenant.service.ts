@@ -101,7 +101,7 @@ export async function provisionTenant(
     const tenantSchemaName = await createTenantSchema(txSql, tenant.id);
 
     const [defaultUserGroup] = await tx`
-      INSERT INTO human_groups (tenant_id, name, description)
+      INSERT INTO user_groups (tenant_id, name, description)
       VALUES (
         ${tenant.id},
         ${DEFAULT_USER_GROUP_NAME},
@@ -134,7 +134,7 @@ export async function provisionTenant(
     `;
 
     await tx`
-      INSERT INTO human_group_agent_group_permissions (human_group_id, agent_group_id)
+      INSERT INTO user_group_agent_group_permissions (user_group_id, agent_group_id)
       VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
     `;
 

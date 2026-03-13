@@ -47,7 +47,7 @@ export async function registerAgentAction(
   if (isAdmin && !isAutonomous && !userId) {
     return {
       status: "error",
-      message: "A user must be selected for Human Proxy agents.",
+      message: "A user must be selected for User Proxy agents.",
     };
   }
 

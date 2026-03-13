@@ -1,6 +1,6 @@
 import { and, eq, isNull } from "drizzle-orm";
 import {
-  humanUsers,
+  tenantUsers,
   tenantAdminNominations,
 } from "@monet/db";
 import { db } from "./db";
@@ -11,9 +11,15 @@ function normalizeEmail(value: string | null | undefined) {
   return value?.trim().toLowerCase() || "";
 }
 
+function normalizeOptionalText(value: string | null | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
 type UpsertTenantUserFromLoginInput = {
   tenantId: string;
   externalId: string;
+  displayName?: string | null;
   email?: string | null;
   emailVerified: boolean;
 };
@@ -22,15 +28,16 @@ export async function upsertTenantUserFromLogin(
   input: UpsertTenantUserFromLoginInput,
 ) {
   const normalizedEmail = normalizeEmail(input.email);
+  const normalizedDisplayName = normalizeOptionalText(input.displayName);
   const now = new Date();
 
   let [dbUser] = await db
     .select()
-    .from(humanUsers)
+    .from(tenantUsers)
     .where(
       and(
-        eq(humanUsers.tenantId, input.tenantId),
-        eq(humanUsers.externalId, input.externalId),
+        eq(tenantUsers.tenantId, input.tenantId),
+        eq(tenantUsers.externalId, input.externalId),
       ),
     )
     .limit(1);
@@ -49,18 +56,50 @@ export async function upsertTenantUserFromLogin(
         .limit(1)
     : [];
 
+  // Some tenant IdPs rotate or remap subject identifiers across reconfiguration.
+  // If that happens, fall back to a verified email match so we reuse the
+  // existing tenant user record instead of creating duplicates and losing role state.
+  if (!dbUser && normalizedEmail && input.emailVerified) {
+    if (nomination?.claimedByUserId) {
+      [dbUser] = await db
+        .select()
+        .from(tenantUsers)
+        .where(
+          and(
+            eq(tenantUsers.tenantId, input.tenantId),
+            eq(tenantUsers.id, nomination.claimedByUserId),
+          ),
+        )
+        .limit(1);
+    }
+
+    if (!dbUser) {
+      [dbUser] = await db
+        .select()
+        .from(tenantUsers)
+        .where(
+          and(
+            eq(tenantUsers.tenantId, input.tenantId),
+            eq(tenantUsers.email, normalizedEmail),
+          ),
+        )
+        .limit(1);
+    }
+  }
+
   const canClaimNomination =
     Boolean(nomination) &&
     input.emailVerified &&
-    (!nomination!.claimedByHumanUserId ||
-      nomination!.claimedByHumanUserId === dbUser?.id);
+    (!nomination!.claimedByUserId ||
+      nomination!.claimedByUserId === dbUser?.id);
 
   if (!dbUser) {
     const [newUser] = await db
-      .insert(humanUsers)
+      .insert(tenantUsers)
       .values({
         externalId: input.externalId,
         tenantId: input.tenantId,
+        displayName: normalizedDisplayName,
         email: normalizedEmail || null,
         role: canClaimNomination ? "tenant_admin" : "user",
         lastLoginAt: now,
@@ -74,13 +113,15 @@ export async function upsertTenantUserFromLogin(
         : dbUser.role;
 
     const [updatedUser] = await db
-      .update(humanUsers)
+      .update(tenantUsers)
       .set({
+        externalId: input.externalId,
+        displayName: normalizedDisplayName ?? dbUser.displayName ?? null,
         email: normalizedEmail || null,
         role: desiredRole,
         lastLoginAt: now,
       })
-      .where(eq(humanUsers.id, dbUser.id))
+      .where(eq(tenantUsers.id, dbUser.id))
       .returning();
     dbUser = updatedUser;
   }
@@ -88,12 +129,12 @@ export async function upsertTenantUserFromLogin(
   if (
     canClaimNomination &&
     nomination &&
-    nomination.claimedByHumanUserId !== dbUser.id
+    nomination.claimedByUserId !== dbUser.id
   ) {
     await db
       .update(tenantAdminNominations)
       .set({
-        claimedByHumanUserId: dbUser.id,
+        claimedByUserId: dbUser.id,
         claimedAt: nomination.claimedAt ?? now,
       })
       .where(eq(tenantAdminNominations.id, nomination.id));

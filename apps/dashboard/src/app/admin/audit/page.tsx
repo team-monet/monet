@@ -23,7 +23,7 @@ function getSingleParam(value: string | string[] | undefined) {
 }
 
 function actorTypeLabel(actorType: string) {
-  if (actorType === "human_user") {
+  if (actorType === "user") {
     return "User";
   }
   if (actorType === "system") {

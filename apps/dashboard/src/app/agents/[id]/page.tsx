@@ -106,7 +106,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
             <p className="text-muted-foreground">
               {agent.isAutonomous
                 ? "Autonomous tenant agent"
-                : `Human Proxy agent${agent.owner?.label ? ` for ${agent.owner.label}` : ""}`}
+                : `User Proxy agent${agent.owner?.label ? ` for ${agent.owner.label}` : ""}`}
             </p>
           </div>
         </div>
@@ -122,7 +122,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
               ) : (
                 <>
                   <User className="mr-1 h-3 w-3" />
-                  Human Proxy
+                  User Proxy
                 </>
               )}
             </Badge>

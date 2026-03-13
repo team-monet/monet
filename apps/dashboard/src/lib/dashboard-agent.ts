@@ -4,10 +4,10 @@ import {
   agentGroupMembers,
   agentGroups,
   agents,
-  humanGroupAgentGroupPermissions,
-  humanGroupMembers,
-  humanGroups,
-  humanUsers,
+  userGroupAgentGroupPermissions,
+  userGroupMembers,
+  userGroups,
+  tenantUsers,
 } from "@monet/db";
 import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import { encrypt } from "./crypto";
@@ -21,12 +21,12 @@ export async function ensureDashboardAgent(
   // 1. Load user and existing dashboard agent metadata.
   const userRows = await db
     .select({ 
-      id: humanUsers.id,
-      role: humanUsers.role,
-      dashboardApiKeyEncrypted: humanUsers.dashboardApiKeyEncrypted 
+      id: tenantUsers.id,
+      role: tenantUsers.role,
+      dashboardApiKeyEncrypted: tenantUsers.dashboardApiKeyEncrypted 
     })
-    .from(humanUsers)
-    .where(eq(humanUsers.id, userId))
+    .from(tenantUsers)
+    .where(eq(tenantUsers.id, userId))
     .limit(1);
 
   const user = userRows[0];
@@ -92,9 +92,9 @@ export async function ensureDashboardAgent(
       const encrypted = encrypt(apiKey);
 
       await tx
-        .update(humanUsers)
+        .update(tenantUsers)
         .set({ dashboardApiKeyEncrypted: encrypted })
-        .where(eq(humanUsers.id, userId));
+        .where(eq(tenantUsers.id, userId));
 
       return encrypted;
     });
@@ -142,26 +142,26 @@ async function syncAgentGroups(
         id: agentGroups.id,
         name: agentGroups.name,
       })
-      .from(humanGroupMembers)
+      .from(userGroupMembers)
       .innerJoin(
-        humanGroups,
-        eq(humanGroups.id, humanGroupMembers.humanGroupId),
+        userGroups,
+        eq(userGroups.id, userGroupMembers.userGroupId),
       )
       .innerJoin(
-        humanGroupAgentGroupPermissions,
+        userGroupAgentGroupPermissions,
         eq(
-          humanGroupAgentGroupPermissions.humanGroupId,
-          humanGroupMembers.humanGroupId,
+          userGroupAgentGroupPermissions.userGroupId,
+          userGroupMembers.userGroupId,
         ),
       )
       .innerJoin(
         agentGroups,
-        eq(agentGroups.id, humanGroupAgentGroupPermissions.agentGroupId),
+        eq(agentGroups.id, userGroupAgentGroupPermissions.agentGroupId),
       )
       .where(
         and(
-          eq(humanGroupMembers.userId, userId),
-          eq(humanGroups.tenantId, tenantId),
+          eq(userGroupMembers.userId, userId),
+          eq(userGroups.tenantId, tenantId),
           eq(agentGroups.tenantId, tenantId),
         ),
       )

@@ -33,14 +33,15 @@ export const tenants = pgTable("tenants", {
     .defaultNow(),
 });
 
-export const humanUsers = pgTable(
-  "human_users",
+export const tenantUsers = pgTable(
+  "users",
   {
     id: uuid("id").primaryKey().defaultRandom(),
     externalId: varchar("external_id", { length: 255 }).notNull(),
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id),
+    displayName: varchar("display_name", { length: 255 }),
     email: varchar("email", { length: 255 }),
     role: userRoleEnum("role").notNull().default("user"),
     dashboardApiKeyEncrypted: varchar("dashboard_api_key_encrypted", {
@@ -52,7 +53,7 @@ export const humanUsers = pgTable(
       .defaultNow(),
   },
   (table) => ({
-    tenantExternalIdUnique: unique("human_users_tenant_id_external_id_unique").on(
+    tenantExternalIdUnique: unique("users_tenant_id_external_id_unique").on(
       table.tenantId,
       table.externalId,
     ),
@@ -141,8 +142,8 @@ export const tenantAdminNominations = pgTable(
       .notNull()
       .references(() => tenants.id),
     email: varchar("email", { length: 255 }).notNull(),
-    claimedByHumanUserId: uuid("claimed_by_human_user_id").references(
-      () => humanUsers.id,
+    claimedByUserId: uuid("claimed_by_user_id").references(
+      () => tenantUsers.id,
     ),
     createdByPlatformAdminId: uuid("created_by_platform_admin_id")
       .notNull()
@@ -161,8 +162,8 @@ export const tenantAdminNominations = pgTable(
   }),
 );
 
-export const humanGroups = pgTable(
-  "human_groups",
+export const userGroups = pgTable(
+  "user_groups",
   {
     id: uuid("id").primaryKey().defaultRandom(),
     tenantId: uuid("tenant_id")
@@ -175,28 +176,28 @@ export const humanGroups = pgTable(
       .defaultNow(),
   },
   (table) => ({
-    tenantNameUnique: unique("human_groups_tenant_id_name_unique").on(
+    tenantNameUnique: unique("user_groups_tenant_id_name_unique").on(
       table.tenantId,
       table.name,
     ),
   }),
 );
 
-export const humanGroupMembers = pgTable(
-  "human_group_members",
+export const userGroupMembers = pgTable(
+  "user_group_members",
   {
-    humanGroupId: uuid("human_group_id")
+    userGroupId: uuid("user_group_id")
       .notNull()
-      .references(() => humanGroups.id),
+      .references(() => userGroups.id),
     userId: uuid("user_id")
       .notNull()
-      .references(() => humanUsers.id),
+      .references(() => tenantUsers.id),
     joinedAt: timestamp("joined_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
   (table) => ({
-    pk: primaryKey({ columns: [table.humanGroupId, table.userId] }),
+    pk: primaryKey({ columns: [table.userGroupId, table.userId] }),
   }),
 );
 
@@ -206,7 +207,7 @@ export const agents = pgTable("agents", {
   tenantId: uuid("tenant_id")
     .notNull()
     .references(() => tenants.id),
-  userId: uuid("user_id").references(() => humanUsers.id),
+  userId: uuid("user_id").references(() => tenantUsers.id),
   role: userRoleEnum("role"),
   apiKeyHash: varchar("api_key_hash", { length: 255 }).notNull(),
   apiKeySalt: varchar("api_key_salt", { length: 255 }).notNull(),
@@ -242,17 +243,17 @@ export const agentGroupMembers = pgTable("agent_group_members", {
     .defaultNow(),
 });
 
-export const humanGroupAgentGroupPermissions = pgTable(
-  "human_group_agent_group_permissions",
+export const userGroupAgentGroupPermissions = pgTable(
+  "user_group_agent_group_permissions",
   {
-    humanGroupId: uuid("human_group_id")
+    userGroupId: uuid("user_group_id")
       .notNull()
-      .references(() => humanGroups.id),
+      .references(() => userGroups.id),
     agentGroupId: uuid("agent_group_id")
       .notNull()
       .references(() => agentGroups.id),
   },
   (table) => ({
-    pk: primaryKey({ columns: [table.humanGroupId, table.agentGroupId] }),
+    pk: primaryKey({ columns: [table.userGroupId, table.agentGroupId] }),
   }),
 );

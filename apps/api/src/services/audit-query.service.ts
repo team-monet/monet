@@ -44,21 +44,22 @@ export async function queryAuditLogs(
           WHEN al.actor_type = 'agent' AND actor_agent.id IS NOT NULL THEN
             CASE
               WHEN actor_agent.is_autonomous THEN actor_agent.external_id || ' (Autonomous)'
+              WHEN actor_agent_owner.display_name IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.display_name
               WHEN actor_agent_owner.email IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.email
               WHEN actor_agent_owner.external_id IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.external_id
               ELSE actor_agent.external_id
             END
-          WHEN al.actor_type = 'human_user' THEN COALESCE(actor_user.email, actor_user.external_id)
+          WHEN al.actor_type = 'user' THEN COALESCE(actor_user.display_name, actor_user.email, actor_user.external_id)
           WHEN al.actor_type = 'system' THEN 'System'
           ELSE NULL
         END AS actor_display_name
       FROM audit_log al
       LEFT JOIN public.agents actor_agent
         ON al.actor_type = 'agent' AND actor_agent.id = al.actor_id
-      LEFT JOIN public.human_users actor_agent_owner
+      LEFT JOIN public.users actor_agent_owner
         ON actor_agent_owner.id = actor_agent.user_id
-      LEFT JOIN public.human_users actor_user
-        ON al.actor_type = 'human_user' AND actor_user.id = al.actor_id
+      LEFT JOIN public.users actor_user
+        ON al.actor_type = 'user' AND actor_user.id = al.actor_id
       WHERE 1=1
     `;
     const queryParams: postgres.ParameterOrJSON<never>[] = [];

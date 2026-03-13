@@ -1,5 +1,5 @@
 import { db } from "../src/lib/db";
-import { humanUsers, tenants } from "@monet/db";
+import { tenantUsers, tenants } from "@monet/db";
 import { eq } from "drizzle-orm";
 
 export async function getDevBypassUser() {
@@ -20,8 +20,8 @@ export async function getDevBypassUser() {
 
   const [user] = await db
     .select()
-    .from(humanUsers)
-    .where(eq(humanUsers.tenantId, tenant.id))
+    .from(tenantUsers)
+    .where(eq(tenantUsers.tenantId, tenant.id))
     .limit(1);
 
   if (!user) {
@@ -33,6 +33,7 @@ export async function getDevBypassUser() {
     id: user.id,
     externalId: user.externalId,
     tenantId: tenant.id,
+    displayName: user.displayName,
     role: user.role,
   };
 }
@@ -52,7 +53,7 @@ export const devBypassProvider = {
           id: user.externalId, // NextAuth uses user.id for the external ID usually
           tenantId: user.tenantId,
           role: user.role,
-          name: "Test User",
+          name: user.displayName ?? "Test User",
           email: "test@example.com",
         };
       }

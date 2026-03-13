@@ -213,10 +213,10 @@
           "onDelete": "no action",
           "onUpdate": "no action"
         },
-        "agents_user_id_human_users_id_fk": {
-          "name": "agents_user_id_human_users_id_fk",
+        "agents_user_id_users_id_fk": {
+          "name": "agents_user_id_users_id_fk",
           "tableFrom": "agents",
-          "tableTo": "human_users",
+          "tableTo": "users",
           "columnsFrom": [
             "user_id"
           ],
@@ -233,8 +233,8 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.human_users": {
-      "name": "human_users",
+    "public.users": {
+      "name": "users",
       "schema": "",
       "columns": {
         "id": {
@@ -292,9 +292,9 @@
       },
       "indexes": {},
       "foreignKeys": {
-        "human_users_tenant_id_tenants_id_fk": {
-          "name": "human_users_tenant_id_tenants_id_fk",
-          "tableFrom": "human_users",
+        "users_tenant_id_tenants_id_fk": {
+          "name": "users_tenant_id_tenants_id_fk",
+          "tableFrom": "users",
           "tableTo": "tenants",
           "columnsFrom": [
             "tenant_id"
@@ -308,8 +308,8 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
-        "human_users_tenant_id_external_id_unique": {
-          "name": "human_users_tenant_id_external_id_unique",
+        "users_tenant_id_external_id_unique": {
+          "name": "users_tenant_id_external_id_unique",
           "nullsNotDistinct": false,
           "columns": [
             "tenant_id",
@@ -591,8 +591,8 @@
           "primaryKey": false,
           "notNull": true
         },
-        "claimed_by_human_user_id": {
-          "name": "claimed_by_human_user_id",
+        "claimed_by_user_id": {
+          "name": "claimed_by_user_id",
           "type": "uuid",
           "primaryKey": false,
           "notNull": false
@@ -638,12 +638,12 @@
           "onDelete": "no action",
           "onUpdate": "no action"
         },
-        "tenant_admin_nominations_claimed_by_human_user_id_human_users_id_fk": {
-          "name": "tenant_admin_nominations_claimed_by_human_user_id_human_users_id_fk",
+        "tenant_admin_nominations_claimed_by_user_id_users_id_fk": {
+          "name": "tenant_admin_nominations_claimed_by_user_id_users_id_fk",
           "tableFrom": "tenant_admin_nominations",
-          "tableTo": "human_users",
+          "tableTo": "users",
           "columnsFrom": [
-            "claimed_by_human_user_id"
+            "claimed_by_user_id"
           ],
           "columnsTo": [
             "id"

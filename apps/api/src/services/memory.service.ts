@@ -96,7 +96,7 @@ function buildMemoryEntrySelect(rankExpression?: string) {
       ${rankSelect}${MEMORY_AUTHOR_DISPLAY_SELECT}
     FROM memory_entries me
     LEFT JOIN public.agents author_agent ON author_agent.id = me.author_agent_id
-    LEFT JOIN public.human_users author_owner ON author_owner.id = author_agent.user_id
+    LEFT JOIN public.users author_owner ON author_owner.id = author_agent.user_id
   `;
 }
 

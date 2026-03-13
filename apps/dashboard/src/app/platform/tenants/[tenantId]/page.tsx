@@ -275,7 +275,7 @@ export default async function PlatformTenantDetailPage({
                       <div className="mt-2 text-xs text-muted-foreground">
                         Nominated {new Date(nomination.createdAt).toLocaleString()}
                         {nomination.claimedAt
-                          ? `, claimed ${new Date(nomination.claimedAt).toLocaleString()}${nomination.claimedByExternalId ? ` by ${nomination.claimedByExternalId}` : ""}`
+                          ? `, claimed ${new Date(nomination.claimedAt).toLocaleString()}${nomination.claimedByLabel ? ` by ${nomination.claimedByLabel}` : ""}`
                           : ""}
                       </div>
                     </div>

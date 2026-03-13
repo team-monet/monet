@@ -2,7 +2,7 @@ import Link from "next/link";
 import { AlertTriangle, Calendar, Plus, ShieldCheck, Users } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
 import { listUserGroupsForTenant } from "@/lib/user-groups";
-import { createHumanGroupAction } from "./actions";
+import { createUserGroupAction } from "./actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,7 +33,7 @@ function getSingleParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-export default async function HumanGroupsPage({ searchParams }: PageProps) {
+export default async function UserGroupsPage({ searchParams }: PageProps) {
   const session = await requireAdmin();
   const sessionUser = session.user as ExtendedUser;
   const tenantId = sessionUser.tenantId;
@@ -78,7 +78,7 @@ export default async function HumanGroupsPage({ searchParams }: PageProps) {
                 Group users together to control access to agent groups.
               </DialogDescription>
             </DialogHeader>
-            <form action={createHumanGroupAction} className="grid gap-4">
+            <form action={createUserGroupAction} className="grid gap-4">
               <div className="grid gap-2">
                 <Label htmlFor="name">Name</Label>
                 <Input id="name" name="name" required placeholder="e.g. Customer Success" />
