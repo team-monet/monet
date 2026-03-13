@@ -19,6 +19,7 @@ import { and, desc, eq, isNull } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
 import { encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
+import { seedDefaultGeneralGuidance } from "./default-rule-seed";
 import { resolveOidcIssuerForServer, validateOidcIssuer } from "./oidc";
 
 type PgError = {
@@ -232,7 +233,7 @@ export async function createPlatformTenant(
         RETURNING id, name, slug, isolation_mode, created_at
       `;
 
-      await createTenantSchema(txSql, tenant.id);
+      const tenantSchemaName = await createTenantSchema(txSql, tenant.id);
 
       const [defaultUserGroup] = await tx`
         INSERT INTO user_groups (tenant_id, name, description)
@@ -285,6 +286,12 @@ export async function createPlatformTenant(
         INSERT INTO user_group_agent_group_permissions (user_group_id, agent_group_id)
         VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
       `;
+
+      await seedDefaultGeneralGuidance(
+        tx,
+        tenantSchemaName,
+        defaultAgentGroup.id as string,
+      );
 
       return {
         tenant: {
