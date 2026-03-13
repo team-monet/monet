@@ -48,32 +48,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build
-        run: pnpm build
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Unit tests
-        run: pnpm test:unit
-
-      - name: Enable pgvector extension
-        run: psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS vector;"
-
-      - name: Push database schema
-        run: pnpm --filter @monet/db exec drizzle-kit push --force
-
-      - name: Integration tests
-        run: pnpm test:integration
-
-      - name: Build release images
-        run: |
-          docker build --file docker/monet.Dockerfile --target api-runtime --tag monet-api:ci .
-          docker build --file docker/monet.Dockerfile --target dashboard-runtime --tag monet-dashboard:ci .
-          docker build --file docker/monet.Dockerfile --target migrate-runtime --tag monet-migrate:ci .
+      - name: Run repository CI checks
+        env:
+          MONET_CI_MANAGED_DB: "1"
+        run: pnpm ci:local
 
       - name: Setup k6
         if: env.RUN_PERF == 'true'
