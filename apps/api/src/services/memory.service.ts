@@ -109,10 +109,11 @@ export async function writeAuditLog(
   action: string,
   targetId: string | null,
   outcome: string,
+  metadata?: Record<string, unknown>,
 ) {
   await tx`
-    INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, target_id, outcome)
-    VALUES (${tenantId}, ${agentId}, ${"agent"}, ${action}, ${targetId}, ${outcome})
+    INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, target_id, outcome, metadata)
+    VALUES (${tenantId}, ${agentId}, ${"agent"}, ${action}, ${targetId}, ${outcome}, ${metadata ? JSON.stringify(metadata) : null})
   `;
 }
 

@@ -10,6 +10,7 @@ import {
   vector,
   index,
   primaryKey,
+  jsonb,
 } from "drizzle-orm/pg-core";
 
 export const memoryScopeEnum = pgEnum("memory_scope", [
@@ -98,6 +99,7 @@ export const auditLog = pgTable("audit_log", {
   targetId: varchar("target_id", { length: 255 }),
   outcome: varchar("outcome", { length: 20 }).notNull(),
   reason: text("reason"),
+  metadata: jsonb("metadata"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

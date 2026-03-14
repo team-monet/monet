@@ -110,9 +110,13 @@ export async function createTenantSchema(
       target_id VARCHAR(255),
       outcome VARCHAR(20) NOT NULL,
       reason TEXT,
+      metadata JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
+
+  // Ensure metadata column exists on pre-existing audit_log tables
+  await sql.unsafe(`ALTER TABLE "${schemaName}".audit_log ADD COLUMN IF NOT EXISTS metadata JSONB`);
 
   await sql.unsafe(`
     CREATE OR REPLACE FUNCTION "${schemaName}".prevent_audit_log_mutation()

@@ -48,6 +48,7 @@ vi.mock("../services/memory.service.js", () => ({
   markOutdated: (...args: unknown[]) => serviceMocks.markOutdated(...args),
   promoteScope: (...args: unknown[]) => serviceMocks.promoteScope(...args),
   listTags: (...args: unknown[]) => serviceMocks.listTags(...args),
+  writeAuditLog: vi.fn().mockResolvedValue(undefined),
   resolveMemoryWritePreflight: vi.fn().mockResolvedValue(null),
 }));
 
