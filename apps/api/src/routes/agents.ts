@@ -468,11 +468,14 @@ agentsRouter.post("/:id/rule-sets", async (c) => {
 
   const result = await associateRuleSetWithAgent(sql, tenantId, schemaName, {
     ...auditActor(requester),
-  }, targetAgentId, parsed.data.ruleSetId);
+  }, targetAgentId, parsed.data.ruleSetId, access.row.user_id);
 
   if ("error" in result) {
     if (result.error === "not_found") {
       return c.json({ error: "not_found", message: "Rule set not found" }, 404);
+    }
+    if (result.error === "forbidden") {
+      return c.json({ error: "forbidden", message: "This rule set cannot be attached to that agent" }, 403);
     }
     return c.json({ error: "conflict", message: "Rule set is already associated with this agent" }, 409);
   }

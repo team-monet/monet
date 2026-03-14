@@ -137,9 +137,18 @@ export async function createTenantSchema(
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name VARCHAR(255) NOT NULL,
       description TEXT NOT NULL,
+      owner_user_id UUID,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
+  `);
+  await sql.unsafe(`
+    ALTER TABLE IF EXISTS "${schemaName}".rules
+    ADD COLUMN IF NOT EXISTS owner_user_id UUID
+  `);
+  await sql.unsafe(`
+    CREATE INDEX IF NOT EXISTS idx_rules_owner_user
+    ON "${schemaName}".rules (owner_user_id)
   `);
 
   // Rule sets table
@@ -147,8 +156,17 @@ export async function createTenantSchema(
     CREATE TABLE IF NOT EXISTS "${schemaName}".rule_sets (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name VARCHAR(255) NOT NULL,
+      owner_user_id UUID,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
+  `);
+  await sql.unsafe(`
+    ALTER TABLE IF EXISTS "${schemaName}".rule_sets
+    ADD COLUMN IF NOT EXISTS owner_user_id UUID
+  `);
+  await sql.unsafe(`
+    CREATE INDEX IF NOT EXISTS idx_rule_sets_owner_user
+    ON "${schemaName}".rule_sets (owner_user_id)
   `);
 
   // Rule set rules join table

@@ -37,7 +37,8 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
 
   let agent: AgentDetail | null = null;
   let status: { activeSessions: number; revoked: boolean } | null = null;
-  let allRuleSets: RuleSet[] = [];
+  let sharedRuleSets: RuleSet[] = [];
+  let personalRuleSets: RuleSet[] = [];
   let error = "";
 
   try {
@@ -49,7 +50,10 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
 
     const canManageRuleSets = Boolean(agent) && (isAdmin || agent.userId === sessionUser.id);
     if (canManageRuleSets) {
-      allRuleSets = (await client.listRuleSets()).ruleSets;
+      sharedRuleSets = (await client.listRuleSets()).ruleSets;
+      if (agent.userId === sessionUser.id) {
+        personalRuleSets = (await client.listPersonalRuleSets()).ruleSets;
+      }
     }
   } catch (err: unknown) {
     error = err instanceof Error ? err.message : "Failed to load agent details";
@@ -75,7 +79,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
   const yours = agent.userId === sessionUser.id && isOwnAgent;
   const canRegenerate = isAdmin || yours;
   const canManageRuleSets = isAdmin || yours;
-  const availableRuleSets = allRuleSets.filter(
+  const availableRuleSets = [...sharedRuleSets, ...personalRuleSets].filter(
     (ruleSet) => !agent.ruleSets.some((attachedRuleSet) => attachedRuleSet.id === ruleSet.id),
   );
   const returnTo = `/agents/${agent.id}`;
@@ -262,11 +266,21 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
                 agent.ruleSets.map((ruleSet) => (
                   <div key={ruleSet.id} className="flex items-center justify-between gap-3 rounded-md border p-3">
                     <div className="space-y-1">
-                      <Link href={`/admin/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
-                        {ruleSet.name}
-                      </Link>
+                      {ruleSet.ownerUserId ? (
+                        ruleSet.ownerUserId === sessionUser.id ? (
+                          <Link href={`/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
+                            {ruleSet.name}
+                          </Link>
+                        ) : (
+                          <p className="font-medium">{ruleSet.name}</p>
+                        )
+                      ) : (
+                        <Link href={`/admin/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
+                          {ruleSet.name}
+                        </Link>
+                      )}
                       <p className="text-xs text-muted-foreground">
-                        {ruleSet.ruleIds.length} {ruleSet.ruleIds.length === 1 ? "rule" : "rules"}
+                        {ruleSet.ruleIds.length} {ruleSet.ruleIds.length === 1 ? "rule" : "rules"} · {ruleSet.ownerUserId ? "Personal" : "Shared"}
                       </p>
                     </div>
                     {canManageRuleSets && (
@@ -288,7 +302,9 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
               <CardTitle>Attach Rule Set</CardTitle>
               <CardDescription>
                 {canManageRuleSets
-                  ? "Apply a shared rule set from the tenant catalog to this agent."
+                  ? yours
+                    ? "Apply either a shared rule set or one of your personal rule sets to this agent."
+                    : "Apply a shared rule set from the tenant catalog to this agent."
                   : "Only tenant admins or the agent owner can modify direct rule sets."}
               </CardDescription>
             </CardHeader>
@@ -314,7 +330,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
                         ) : (
                           availableRuleSets.map((ruleSet) => (
                             <option key={ruleSet.id} value={ruleSet.id}>
-                              {ruleSet.name}
+                              {ruleSet.name} {ruleSet.ownerUserId ? "(Personal)" : "(Shared)"}
                             </option>
                           ))
                         )}
@@ -327,9 +343,16 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
                       disabled={availableRuleSets.length === 0}
                     />
                   </form>
-                  <Button asChild variant="ghost" className="px-0">
-                    <Link href="/admin/rules">Browse shared rules</Link>
-                  </Button>
+                  <div className="flex flex-col items-start gap-2">
+                    {yours && (
+                      <Button asChild variant="ghost" className="px-0">
+                        <Link href="/rules">Manage personal rules</Link>
+                      </Button>
+                    )}
+                    <Button asChild variant="ghost" className="px-0">
+                      <Link href="/admin/rules">Browse shared rules</Link>
+                    </Button>
+                  </div>
                 </>
               ) : (
                 <p className="text-sm text-muted-foreground">

@@ -613,7 +613,37 @@ describe("agents route", () => {
       },
       AGENT_ID,
       "00000000-0000-0000-0000-000000000222",
+      USER_ID,
     );
+  });
+
+  it("returns forbidden when a personal rule set does not belong to the target agent owner", async () => {
+    const sessionStore = { getByAgentId: vi.fn().mockReturnValue([]) };
+    sqlMock.mockResolvedValueOnce([
+      {
+        id: AGENT_ID,
+        external_id: "self-bound",
+        tenant_id: TENANT_ID,
+        user_id: USER_ID,
+        role: "user",
+        is_autonomous: false,
+        revoked_at: null,
+        created_at: "2026-03-03T00:00:00.000Z",
+        owner_id: USER_ID,
+        owner_external_id: "bound-user",
+        owner_email: "bound@example.com",
+      },
+    ]);
+    associateRuleSetWithAgentMock.mockResolvedValueOnce({ error: "forbidden" });
+
+    const app = createTestApp({ role: "user", userId: USER_ID }, sessionStore);
+    const res = await app.request(`/agents/${AGENT_ID}/rule-sets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000333" }),
+    });
+
+    expect(res.status).toBe(403);
   });
 
   it("allows an owning user to view active rules for their agent", async () => {

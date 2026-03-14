@@ -107,21 +107,27 @@ export const rules = pgTable("rules", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: varchar("name", { length: 255 }).notNull(),
   description: text("description").notNull(),
+  ownerUserId: uuid("owner_user_id"),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
-});
+}, (table) => [
+  index("idx_rules_owner_user").on(table.ownerUserId),
+]);
 
 export const ruleSets = pgTable("rule_sets", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: varchar("name", { length: 255 }).notNull(),
+  ownerUserId: uuid("owner_user_id"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
-});
+}, (table) => [
+  index("idx_rule_sets_owner_user").on(table.ownerUserId),
+]);
 
 export const ruleSetRules = pgTable(
   "rule_set_rules",

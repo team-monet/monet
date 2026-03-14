@@ -4,6 +4,7 @@ export const Rule = z.object({
   id: z.string().uuid(),
   name: z.string(),
   description: z.string(),
+  ownerUserId: z.string().uuid().nullable().optional(),
   updatedAt: z.coerce.date(),
   createdAt: z.coerce.date(),
 });
@@ -12,6 +13,7 @@ export type Rule = z.infer<typeof Rule>;
 export const RuleSet = z.object({
   id: z.string().uuid(),
   name: z.string(),
+  ownerUserId: z.string().uuid().nullable().optional(),
   ruleIds: z.array(z.string().uuid()),
   createdAt: z.coerce.date(),
 });

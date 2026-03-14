@@ -99,6 +99,15 @@ describe("Rules integration", () => {
     };
   }
 
+  async function createUser(externalId: string, email: string) {
+    const [user] = await sql`
+      INSERT INTO users (external_id, tenant_id, role, email)
+      VALUES (${externalId}, ${tenantId}, 'user', ${email})
+      RETURNING id
+    `;
+    return user.id as string;
+  }
+
   function addMockSession(agentId: string) {
     const notify = vi.fn().mockResolvedValue(undefined);
     const sessionId = `session-${Math.random().toString(16).slice(2)}`;
@@ -285,13 +294,9 @@ describe("Rules integration", () => {
   });
 
   it("Owning user can attach a shared rule set to their own agent", async () => {
-    const [user] = await sql`
-      INSERT INTO users (external_id, tenant_id, role, email)
-      VALUES ('owner-user', ${tenantId}, 'user', 'owner@example.com')
-      RETURNING id
-    `;
+    const userId = await createUser("owner-user", "owner@example.com");
 
-    const ownerAgent = await registerAgent("owner-agent", { userId: user.id as string });
+    const ownerAgent = await registerAgent("owner-agent", { userId });
 
     const ruleRes = await app.request("/api/rules", {
       method: "POST",
@@ -332,6 +337,131 @@ describe("Rules integration", () => {
     expect(detailRes.status).toBe(200);
     const detailBody = await detailRes.json() as { ruleSets: Array<{ name: string }> };
     expect(detailBody.ruleSets.map((ruleSetEntry) => ruleSetEntry.name)).toContain("Owner Set");
+  });
+
+  it("Owning user can manage personal rules and attach them to their own agent", async () => {
+    const ownerUserId = await createUser("personal-owner", "personal-owner@example.com");
+    const ownerAgent = await registerAgent("personal-owner-agent", { userId: ownerUserId });
+
+    const createRuleRes = await app.request("/api/me/rules", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "My Personal Rule", description: "Only for my agents" }),
+    });
+
+    expect(createRuleRes.status).toBe(201);
+    const personalRule = await createRuleRes.json() as { id: string; ownerUserId: string | null };
+    expect(personalRule.ownerUserId).toBe(ownerUserId);
+
+    const createRuleSetRes = await app.request("/api/me/rule-sets", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "My Personal Set" }),
+    });
+
+    expect(createRuleSetRes.status).toBe(201);
+    const personalRuleSet = await createRuleSetRes.json() as { id: string; ownerUserId: string | null };
+    expect(personalRuleSet.ownerUserId).toBe(ownerUserId);
+
+    const addToSetRes = await app.request(`/api/me/rule-sets/${personalRuleSet.id}/rules`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ruleId: personalRule.id }),
+    });
+
+    expect(addToSetRes.status).toBe(201);
+
+    const attachRes = await app.request(`/api/agents/${ownerAgent.id}/rule-sets`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ruleSetId: personalRuleSet.id }),
+    });
+
+    expect(attachRes.status).toBe(201);
+
+    const listPersonalRulesRes = await app.request("/api/me/rules", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${ownerAgent.apiKey}` },
+    });
+
+    expect(listPersonalRulesRes.status).toBe(200);
+    const personalRulesBody = await listPersonalRulesRes.json() as { rules: Array<{ name: string }> };
+    expect(personalRulesBody.rules.map((rule) => rule.name)).toContain("My Personal Rule");
+
+    const activeRes = await app.request(`/api/agents/${ownerAgent.id}/rules`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${ownerAgent.apiKey}` },
+    });
+
+    expect(activeRes.status).toBe(200);
+    const activeBody = await activeRes.json() as { rules: Array<{ name: string }> };
+    expect(activeBody.rules.map((rule) => rule.name)).toContain("My Personal Rule");
+  });
+
+  it("A personal rule set cannot be attached to another user's agent", async () => {
+    const ownerUserId = await createUser("personal-owner-2", "owner-two@example.com");
+    const otherUserId = await createUser("personal-other", "other-user@example.com");
+    const ownerAgent = await registerAgent("personal-owner-two-agent", { userId: ownerUserId });
+    const otherAgent = await registerAgent("personal-other-agent", { userId: otherUserId });
+
+    const createRuleRes = await app.request("/api/me/rules", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "Private Rule", description: "Not for other users" }),
+    });
+    const personalRule = await createRuleRes.json() as { id: string };
+
+    const createRuleSetRes = await app.request("/api/me/rule-sets", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "Private Set" }),
+    });
+    const personalRuleSet = await createRuleSetRes.json() as { id: string };
+
+    await app.request(`/api/me/rule-sets/${personalRuleSet.id}/rules`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ruleId: personalRule.id }),
+    });
+
+    const forbiddenAttachRes = await app.request(`/api/agents/${otherAgent.id}/rule-sets`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${otherAgent.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ruleSetId: personalRuleSet.id }),
+    });
+
+    expect(forbiddenAttachRes.status).toBe(403);
+
+    const otherPersonalRulesRes = await app.request("/api/me/rules", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${otherAgent.apiKey}` },
+    });
+    const otherPersonalRules = await otherPersonalRulesRes.json() as { rules: Array<{ name: string }> };
+    expect(otherPersonalRules.rules.map((rule) => rule.name)).not.toContain("Private Rule");
   });
 
   it("Removing a rule from set pushes updated rules to active session", async () => {

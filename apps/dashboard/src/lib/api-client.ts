@@ -258,6 +258,33 @@ export class MonetApiClient {
     });
   }
 
+  async listPersonalRules(): Promise<{ rules: Rule[] }> {
+    return this.fetch<{ rules: Rule[] }>("/api/me/rules");
+  }
+
+  async createPersonalRule(input: { name: string; description: string }): Promise<Rule> {
+    return this.fetch<Rule>("/api/me/rules", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async updatePersonalRule(
+    id: string,
+    input: { name?: string; description?: string },
+  ): Promise<Rule> {
+    return this.fetch<Rule>(`/api/me/rules/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async deletePersonalRule(id: string): Promise<void> {
+    return this.fetch<void>(`/api/me/rules/${id}`, {
+      method: "DELETE",
+    });
+  }
+
   async updateRule(
     id: string,
     input: { name?: string; description?: string },
@@ -279,8 +306,38 @@ export class MonetApiClient {
     });
   }
 
+  async listPersonalRuleSets(): Promise<{ ruleSets: RuleSet[] }> {
+    return this.fetch<{ ruleSets: RuleSet[] }>("/api/me/rule-sets");
+  }
+
+  async createPersonalRuleSet(input: { name: string }): Promise<RuleSet> {
+    return this.fetch<RuleSet>("/api/me/rule-sets", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async deletePersonalRuleSet(id: string): Promise<void> {
+    return this.fetch<void>(`/api/me/rule-sets/${id}`, {
+      method: "DELETE",
+    });
+  }
+
   async deleteRuleSet(id: string): Promise<void> {
     return this.fetch<void>(`/api/rule-sets/${id}`, {
+      method: "DELETE",
+    });
+  }
+
+  async addPersonalRuleToSet(ruleSetId: string, ruleId: string): Promise<void> {
+    return this.fetch<void>(`/api/me/rule-sets/${ruleSetId}/rules`, {
+      method: "POST",
+      body: JSON.stringify({ ruleId }),
+    });
+  }
+
+  async removePersonalRuleFromSet(ruleSetId: string, ruleId: string): Promise<void> {
+    return this.fetch<void>(`/api/me/rule-sets/${ruleSetId}/rules/${ruleId}`, {
       method: "DELETE",
     });
   }

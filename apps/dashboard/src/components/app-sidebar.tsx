@@ -76,14 +76,20 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       isActive: pathname.startsWith("/agents"),
     },
     {
-      title: "Rules",
-      url: "/admin/rules",
+      title: "My Rules",
+      url: "/rules",
       icon: Scale,
-      isActive: pathname.startsWith("/admin/rules"),
+      isActive: pathname.startsWith("/rules"),
     },
   ]
 
   const adminNav = [
+    {
+      title: "Shared Rules",
+      url: "/admin/rules",
+      icon: Scale,
+      isActive: pathname.startsWith("/admin/rules"),
+    },
     {
       title: "User Groups",
       url: "/admin/user-groups",

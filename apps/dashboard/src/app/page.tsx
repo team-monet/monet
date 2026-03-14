@@ -256,11 +256,11 @@ export default async function DashboardPage() {
             <div className="rounded-md border p-3">
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Scale className="h-4 w-4" />
-                Rules
+                Shared Rules
               </div>
               <p className="mt-1 text-2xl font-semibold">{rules.length}</p>
               <Button asChild size="sm" variant="ghost" className="px-0 mt-1">
-                <Link href="/admin/rules">{isAdmin ? "Manage Rules" : "View Rules"}</Link>
+                <Link href={isAdmin ? "/admin/rules" : "/rules"}>{isAdmin ? "Manage Rules" : "Open My Rules"}</Link>
               </Button>
             </div>
 
@@ -290,7 +290,7 @@ export default async function DashboardPage() {
               </>
             ) : (
               <p className="text-sm text-muted-foreground">
-                Tenant admins can create and edit shared rules, and you can apply available rule sets to your own agents.
+                You can create personal rules for yourself, and tenant admins still manage the shared catalog.
               </p>
             )}
           </CardContent>
