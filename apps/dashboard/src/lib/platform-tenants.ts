@@ -17,10 +17,14 @@ import {
 } from "@monet/types";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
-import { encrypt } from "./crypto";
+import { decrypt, encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
 import { seedDefaultGeneralGuidance } from "./default-rule-seed";
-import { resolveOidcIssuerForServer, validateOidcIssuer } from "./oidc";
+import {
+  resolveOidcIssuerForServer,
+  validateOidcClientConfig,
+  validateOidcIssuer,
+} from "./oidc";
 
 type PgError = {
   code?: string;
@@ -368,6 +372,18 @@ export async function saveTenantOidcConfig(input: SaveTenantOidcConfigInput) {
   if (!clientSecretEncrypted) {
     throw new Error("Client secret is required the first time OIDC is configured.");
   }
+
+  const secretForValidation =
+    clientSecret.length > 0
+      ? clientSecret
+      : decrypt(clientSecretEncrypted);
+
+  await validateOidcClientConfig({
+    issuer,
+    clientId,
+    clientSecret: secretForValidation,
+    callbackPath: "/api/auth/callback/tenant-oauth",
+  });
 
   const [config] = await db
     .insert(tenantOauthConfigs)

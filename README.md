@@ -284,6 +284,9 @@ Useful runtime commands:
 - `pnpm runtime:reset`
 
 `pnpm runtime:keycloak:setup` writes the generated runtime Keycloak details to `.runtime/keycloak.json` by default.
+Use the `platform.*` and `tenant.*` values from that file when completing
+dashboard OIDC setup in the runtime stack. Do not reuse `.local-dev/keycloak.json`
+for the runtime containers.
 
 ## Enrichment Provider Swap
 

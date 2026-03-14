@@ -9,7 +9,11 @@ import {
 } from "@monet/db";
 import { db } from "./db";
 import { encrypt } from "./crypto";
-import { resolveOidcIssuerForServer, validateOidcIssuer } from "./oidc";
+import {
+  resolveOidcIssuerForServer,
+  validateOidcClientConfig,
+  validateOidcIssuer,
+} from "./oidc";
 
 export const SETUP_SESSION_COOKIE_NAME = "monet_setup_session";
 
@@ -139,6 +143,12 @@ export async function savePlatformSetup(input: SavePlatformSetupInput) {
   }
 
   await validateOidcIssuer(issuer);
+  await validateOidcClientConfig({
+    issuer,
+    clientId,
+    clientSecret,
+    callbackPath: "/api/auth/callback/platform-oauth",
+  });
 
   const encryptedSecret = encrypt(clientSecret);
   const [existingConfig] = await db

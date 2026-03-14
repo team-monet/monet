@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requirePlatformAdmin } from "@/lib/auth";
+import { getOidcExampleIssuer } from "@/lib/oidc";
 import { getPlatformTenant } from "@/lib/platform-tenants";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -43,6 +44,7 @@ export default async function PlatformTenantDetailPage({
   const configError = getSingleParam(query.configError);
   const nominationError = getSingleParam(query.nominationError);
   const { tenant, oidcConfig, adminNominations } = tenantState;
+  const tenantIssuerExample = getOidcExampleIssuer(tenant.slug);
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col gap-6 p-4">
@@ -124,6 +126,14 @@ export default async function PlatformTenantDetailPage({
             <CardTitle>Tenant OIDC</CardTitle>
             <CardDescription>
               Configure the tenant&apos;s OIDC issuer and confidential client.
+              For local environments, use the generated values from
+              {" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">.local-dev/keycloak.json</code>
+              {" "}
+              or
+              {" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">.runtime/keycloak.json</code>
+              .
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -137,7 +147,7 @@ export default async function PlatformTenantDetailPage({
                   name="issuer"
                   type="url"
                   defaultValue={oidcConfig?.issuer ?? ""}
-                  placeholder="http://keycloak.localhost:3400/realms/acme"
+                  placeholder={tenantIssuerExample}
                   required
                 />
               </div>

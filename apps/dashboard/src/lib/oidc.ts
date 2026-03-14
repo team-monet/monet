@@ -1,5 +1,5 @@
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "::1"]);
-const LOCAL_KEYCLOAK_EXAMPLE_ISSUER = "http://localhost:3400/realms/monet";
+const DEFAULT_DASHBOARD_BASE_URL = "http://localhost:3000";
 
 type OidcDiscoveryDocument = {
   issuer?: string;
@@ -29,6 +29,15 @@ function getPublicOidcBaseUrl() {
     "";
 
   return configured ? trimTrailingSlash(configured) : null;
+}
+
+function getDashboardBaseUrl() {
+  const configured =
+    process.env.NEXTAUTH_URL?.trim() ||
+    process.env.AUTH_URL?.trim() ||
+    DEFAULT_DASHBOARD_BASE_URL;
+
+  return trimTrailingSlash(configured);
 }
 
 function replaceUrlOrigin(value: string, base: string) {
@@ -101,6 +110,13 @@ export async function fetchOidcDiscoveryDocument(
   return response.json() as Promise<OidcDiscoveryDocument>;
 }
 
+export function getOidcExampleIssuer(realm: string) {
+  const publicBaseUrl = getPublicOidcBaseUrl() || getLocalOidcBaseUrl();
+  const baseUrl = publicBaseUrl || "http://keycloak.localhost:3400";
+
+  return `${trimTrailingSlash(baseUrl)}/realms/${realm}`;
+}
+
 export async function resolveOidcProviderConfig(issuer: string) {
   const browserIssuer = resolveOidcIssuerForBrowser(issuer);
   const serverIssuer = resolveOidcIssuerForServer(issuer);
@@ -133,7 +149,7 @@ export async function validateOidcIssuer(issuer: string) {
   } catch (error) {
     const baseUrl = getLocalOidcBaseUrl();
     const localHint = baseUrl
-      ? ` For the local Docker stack, use the issuer from .local-dev/keycloak.json (for example, ${LOCAL_KEYCLOAK_EXAMPLE_ISSUER}).`
+      ? ` For local setups, use the generated issuer from .local-dev/keycloak.json or .runtime/keycloak.json (for example, ${getOidcExampleIssuer("monet")}).`
       : "";
     const reason =
       error instanceof Error ? error.message : "The issuer could not be reached.";
@@ -142,4 +158,59 @@ export async function validateOidcIssuer(issuer: string) {
       `OIDC issuer could not be reached from the dashboard server. ${reason}.${localHint}`.trim(),
     );
   }
+}
+
+type ValidateOidcClientConfigInput = {
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  callbackPath: string;
+};
+
+export async function validateOidcClientConfig(
+  input: ValidateOidcClientConfigInput,
+) {
+  const discovery = await fetchOidcDiscoveryDocument(input.issuer);
+  const tokenEndpoint = discovery.token_endpoint;
+
+  if (!tokenEndpoint) {
+    throw new Error("OIDC discovery document is missing token_endpoint");
+  }
+
+  const response = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: input.clientId,
+      client_secret: input.clientSecret,
+      grant_type: "authorization_code",
+      code: "monet-client-config-validation",
+      redirect_uri: `${getDashboardBaseUrl()}${input.callbackPath}`,
+    }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | { error?: string; error_description?: string }
+    | null;
+
+  if (response.ok) {
+    return;
+  }
+
+  const authError = payload?.error;
+  if (
+    response.status === 401 ||
+    response.status === 403 ||
+    authError === "invalid_client" ||
+    authError === "unauthorized_client"
+  ) {
+    const description =
+      payload?.error_description || "Client authentication failed.";
+    throw new Error(
+      `OIDC client credentials are invalid for this issuer. ${description}`,
+    );
+  }
+
+  // A fake authorization code should be rejected once client authentication
+  // succeeds, so non-authentication failures mean the client config is usable.
 }

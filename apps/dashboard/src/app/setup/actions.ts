@@ -32,7 +32,7 @@ export async function exchangeBootstrapTokenAction(formData: FormData) {
     redirect(`/setup?error=${encodeURIComponent(message)}`);
   }
 
-  redirect("/setup");
+  redirect("/setup?step=platform-auth");
 }
 
 export async function savePlatformSetupAction(formData: FormData) {
@@ -63,5 +63,5 @@ export async function savePlatformSetupAction(formData: FormData) {
     redirect(`/setup?error=${encodeURIComponent(message)}`);
   }
 
-  redirect("/setup");
+  redirect("/platform/login");
 }

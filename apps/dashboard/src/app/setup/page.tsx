@@ -9,6 +9,7 @@ import {
   getBootstrapStatus,
   getPlatformSetupState,
 } from "@/lib/bootstrap";
+import { getOidcExampleIssuer } from "@/lib/oidc";
 import {
   exchangeBootstrapTokenAction,
   savePlatformSetupAction,
@@ -29,6 +30,7 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
   const error =
     typeof errorParam === "string" ? decodeURIComponent(errorParam) : "";
   const setupState = await getPlatformSetupState();
+  const platformIssuerExample = getOidcExampleIssuer("monet");
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-muted/40 p-4">
@@ -39,7 +41,15 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
           </CardTitle>
           <CardDescription>
             Monet is not initialized yet. Retrieve the bootstrap token from the
-            API startup logs, then exchange it here to begin setup.
+            API startup logs, then exchange it here to begin setup. For local
+            environments, use the generated Keycloak values from
+            {" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">.local-dev/keycloak.json</code>
+            {" "}
+            or
+            {" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">.runtime/keycloak.json</code>
+            .
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -95,7 +105,7 @@ export default async function SetupPage({ searchParams }: SetupPageProps) {
                   id="platform-issuer"
                   name="issuer"
                   type="url"
-                  placeholder="http://keycloak.localhost:3400/realms/monet"
+                  placeholder={platformIssuerExample}
                   required
                 />
               </div>
