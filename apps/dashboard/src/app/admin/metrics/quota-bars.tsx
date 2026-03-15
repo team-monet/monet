@@ -39,23 +39,22 @@ export function QuotaBars({ data }: QuotaBarsProps) {
       </CardHeader>
       <CardContent className="space-y-4">
         {data.map((group) => {
-          const pct = group.quota != null && group.quota > 0 ? Math.round((group.current / group.quota) * 100) : 0;
+          const agentPct = group.effectiveQuotaPerAgent > 0
+            ? Math.round((group.maxAgentCurrent / group.effectiveQuotaPerAgent) * 100)
+            : 0;
           return (
             <div key={group.groupId} className="space-y-1.5">
               <div className="flex justify-between text-sm">
                 <span className="font-medium">{group.groupName}</span>
-                <span className={group.quota === null ? "text-muted-foreground" : quotaColor(pct)}>
-                  {group.quota === null
-                    ? `${group.current.toLocaleString()} entries`
-                    : `${group.current.toLocaleString()} / ${group.quota.toLocaleString()} (${pct}%)`}
+                <span className={quotaColor(agentPct)}>
+                  {group.maxAgentCurrent.toLocaleString()} / {group.effectiveQuotaPerAgent.toLocaleString()} ({agentPct}%)
                 </span>
               </div>
-              {group.quota !== null && <Progress value={pct} className={progressColor(pct)} />}
-              {group.quota === null && (
-                <p className="text-[11px] text-muted-foreground">
-                  No group quota set — agents enforced at {group.effectiveQuotaPerAgent.toLocaleString()} entries each
-                </p>
-              )}
+              <Progress value={Math.min(agentPct, 100)} className={progressColor(agentPct)} />
+              <p className="text-[11px] text-muted-foreground">
+                Busiest agent — {group.current.toLocaleString()} total entries across group
+                {group.quota === null ? " (no group quota)" : ` (group quota: ${group.quota.toLocaleString()})`}
+              </p>
             </div>
           );
         })}

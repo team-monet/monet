@@ -101,7 +101,9 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                           Current Quota
                         </span>
                         <span className="font-medium">
-                          {group.memoryQuota ?? "Unlimited"} {group.memoryQuota === null ? "" : "Entries"}
+                          {group.memoryQuota === null
+                            ? "Default (10,000 per agent)"
+                            : `${group.memoryQuota} Entries`}
                         </span>
                       </div>
                       {(() => {

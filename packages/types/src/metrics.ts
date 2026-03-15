@@ -102,6 +102,7 @@ export const QuotaUtilization = z.object({
   current: z.number(),
   quota: z.number().nullable(),
   effectiveQuotaPerAgent: z.number(),
+  maxAgentCurrent: z.number(),
 });
 export type QuotaUtilization = z.infer<typeof QuotaUtilization>;
 

@@ -37,7 +37,7 @@ export async function getUsageMetrics(
       ORDER BY d::date ASC
     `);
 
-    // Active agents (7d / 30d) from audit_log (agent actors only) + total from platform (exclude dashboard agents)
+    // Active agents (7d / 30d) from audit_log, excluding dashboard agents + total from platform
     const [activeAgents] = await tx.unsafe(
       `
       SELECT
@@ -45,8 +45,10 @@ export async function getUsageMetrics(
         COUNT(DISTINCT CASE WHEN al.created_at > NOW() - INTERVAL '30 days' THEN al.actor_id END)::int AS period_30d,
         (SELECT COUNT(*)::int FROM public.agents WHERE tenant_id = $1 AND external_id NOT LIKE 'dashboard:%') AS total
       FROM audit_log al
+      JOIN public.agents a ON a.id = al.actor_id
       WHERE al.created_at > NOW() - INTERVAL '30 days'
         AND al.actor_type = 'agent'
+        AND a.external_id NOT LIKE 'dashboard:%'
     `,
       [tenantId],
     );
@@ -315,18 +317,26 @@ export async function getHealthMetrics(
       ) all_entries
     `);
 
-    // Quota utilization per group (null quota = unlimited)
+    // Quota utilization per group
+    // current = total group entries, max_agent_current = highest per-agent count (matches enforcement)
     const quotaRows = await tx.unsafe(
       `
       SELECT
         ag.id AS group_id,
         ag.name AS group_name,
         COUNT(me.id)::int AS current,
-        ag.memory_quota::int AS quota
+        ag.memory_quota::int AS quota,
+        COALESCE(MAX(agent_counts.agent_count), 0)::int AS max_agent_current
       FROM public.agent_groups ag
       LEFT JOIN memory_entries me
         ON me.group_id = ag.id
         AND (me.expires_at IS NULL OR me.expires_at > NOW())
+      LEFT JOIN (
+        SELECT author_agent_id, COUNT(*)::int AS agent_count
+        FROM memory_entries
+        WHERE expires_at IS NULL OR expires_at > NOW()
+        GROUP BY author_agent_id
+      ) agent_counts ON agent_counts.author_agent_id = me.author_agent_id
       WHERE ag.tenant_id = $1
       GROUP BY ag.id, ag.name, ag.memory_quota
       ORDER BY ag.name ASC
@@ -351,6 +361,7 @@ export async function getHealthMetrics(
           effectiveQuotaPerAgent: ((r.quota as number | null) ?? null) !== null && (r.quota as number) > 0
             ? (r.quota as number)
             : DEFAULT_MEMORY_QUOTA,
+          maxAgentCurrent: r.max_agent_current as number,
         }),
       ),
     };

@@ -188,8 +188,8 @@ describe("metrics service", () => {
         [{ avg_age_days: 7.5432, outdated_pct: 12.345, expiry_rate: 3.678 }],
         // quota utilization
         [
-          { group_id: "g1", group_name: "Team A", current: 150, quota: 1000 },
-          { group_id: "g2", group_name: "Team B", current: 900, quota: 1000 },
+          { group_id: "g1", group_name: "Team A", current: 150, quota: 1000, max_agent_current: 80 },
+          { group_id: "g2", group_name: "Team B", current: 900, quota: 1000, max_agent_current: 500 },
         ],
       ]);
 
@@ -205,6 +205,7 @@ describe("metrics service", () => {
         current: 150,
         quota: 1000,
         effectiveQuotaPerAgent: 1000,
+        maxAgentCurrent: 80,
       });
     });
 
