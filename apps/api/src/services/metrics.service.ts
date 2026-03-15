@@ -217,14 +217,19 @@ export async function getBenefitMetrics(
     `);
 
     // Tier 2: Cross-agent sharing — memories written by one agent, read by another
+    // Exclude dashboard agents from both reader and writer sides
     const [[crossAgentTotal], crossAgentRows] = await Promise.all([
       tx.unsafe(`
         SELECT COUNT(*)::int AS total
         FROM audit_log al
         JOIN memory_entries me ON me.id = al.target_id::uuid
+        JOIN public.agents reader ON reader.id = al.actor_id
+        JOIN public.agents writer ON writer.id = me.author_agent_id
         WHERE al.action = 'memory.get'
           AND al.actor_id != me.author_agent_id
           AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          AND reader.external_id NOT LIKE 'dashboard:%'
+          AND writer.external_id NOT LIKE 'dashboard:%'
       `),
       tx.unsafe(`
         SELECT
@@ -233,9 +238,13 @@ export async function getBenefitMetrics(
           COUNT(*)::int AS count
         FROM audit_log al
         JOIN memory_entries me ON me.id = al.target_id::uuid
+        JOIN public.agents reader ON reader.id = al.actor_id
+        JOIN public.agents writer ON writer.id = me.author_agent_id
         WHERE al.action = 'memory.get'
           AND al.actor_id != me.author_agent_id
           AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          AND reader.external_id NOT LIKE 'dashboard:%'
+          AND writer.external_id NOT LIKE 'dashboard:%'
         GROUP BY me.author_agent_id, al.actor_id
         ORDER BY count DESC
         LIMIT 10
