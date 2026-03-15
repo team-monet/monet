@@ -25,7 +25,12 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 
 const COLORS = ["hsl(var(--chart-1))", "hsl(var(--chart-2))", "hsl(var(--chart-3))", "hsl(var(--chart-4))", "hsl(var(--chart-5))"];
-const PIE_COLORS = ["#3b82f6", "#22c55e", "#f59e0b", "#ef4444"];
+const PIE_COLORS: Record<string, string> = {
+  Pending: "#3b82f6",
+  Completed: "#22c55e",
+  Processing: "#f59e0b",
+  Failed: "#ef4444",
+};
 
 // --- Read/Write Trend ---
 
@@ -167,8 +172,8 @@ export function EnrichmentThroughputChart({ data }: EnrichmentThroughputChartPro
               dataKey="value"
               label={({ name, value }) => `${name}: ${value}`}
             >
-              {chartData.map((_, index) => (
-                <Cell key={`cell-${index}`} fill={PIE_COLORS[index % PIE_COLORS.length]} />
+              {chartData.map((entry, index) => (
+                <Cell key={`cell-${index}`} fill={PIE_COLORS[entry.name] ?? "#94a3b8"} />
               ))}
             </Pie>
             <Tooltip />

@@ -136,7 +136,9 @@ describe("metrics service", () => {
         ],
         // enrichment quality
         [{ with_summary: 40, with_embedding: 35, with_auto_tags: 30, total: 50 }],
-        // cross-agent sharing
+        // cross-agent sharing: total count
+        [{ total: 5 }],
+        // cross-agent sharing: top pairs
         [{ writer_agent_id: "a1", reader_agent_id: "a2", count: 5 }],
       ]);
 
@@ -165,7 +167,8 @@ describe("metrics service", () => {
         [], // reuse
         [], // tag diversity
         [{ with_summary: 0, with_embedding: 0, with_auto_tags: 0, total: 0 }],
-        [], // cross-agent sharing
+        [{ total: 0 }], // cross-agent sharing: total count
+        [], // cross-agent sharing: top pairs
       ]);
 
       const result = await getBenefitMetrics({} as never, TENANT_ID);

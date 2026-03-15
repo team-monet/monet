@@ -110,6 +110,6 @@ describe("GET /metrics", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.error).toBe("internal_error");
-    expect(body.message).toBe("db connection lost");
+    expect(body.message).toBe("Failed to fetch metrics");
   });
 });

@@ -98,13 +98,13 @@ describe("metrics integration", () => {
       for (let daysAgo = 0; daysAgo < 3; daysAgo++) {
         await tx.unsafe(
           `INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, outcome, created_at)
-           VALUES ($1, $2, 'agent', 'memory.search', 'success', NOW() - INTERVAL '${daysAgo} days')`,
-          [tenantId, agentId],
+           VALUES ($1, $2, 'agent', 'memory.search', 'success', NOW() - make_interval(days => $3))`,
+          [tenantId, agentId, daysAgo],
         );
         await tx.unsafe(
           `INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, outcome, created_at)
-           VALUES ($1, $2, 'agent', 'memory.get', 'success', NOW() - INTERVAL '${daysAgo} days')`,
-          [tenantId, agentId],
+           VALUES ($1, $2, 'agent', 'memory.get', 'success', NOW() - make_interval(days => $3))`,
+          [tenantId, agentId, daysAgo],
         );
       }
 

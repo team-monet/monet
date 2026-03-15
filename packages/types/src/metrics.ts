@@ -100,7 +100,7 @@ export const QuotaUtilization = z.object({
   groupId: z.string(),
   groupName: z.string(),
   current: z.number(),
-  quota: z.number(),
+  quota: z.number().nullable(),
 });
 export type QuotaUtilization = z.infer<typeof QuotaUtilization>;
 

@@ -107,10 +107,11 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                       {(() => {
                         const usage = quotaUsage.find((q) => q.groupId === group.id);
                         if (usage) {
-                          const pct = usage.quota > 0 ? Math.round((usage.current / usage.quota) * 100) : 0;
+                          const pct = usage.quota != null && usage.quota > 0 ? Math.round((usage.current / usage.quota) * 100) : 0;
                           return (
                             <p className="text-[11px] text-muted-foreground">
-                              Currently using <span className="font-medium">{usage.current.toLocaleString()}</span> entries ({pct}% of quota)
+                              Currently using <span className="font-medium">{usage.current.toLocaleString()}</span> entries
+                              {usage.quota === null ? "" : ` (${pct}% of quota)`}
                             </p>
                           );
                         }

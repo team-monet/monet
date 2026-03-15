@@ -39,16 +39,18 @@ export function QuotaBars({ data }: QuotaBarsProps) {
       </CardHeader>
       <CardContent className="space-y-4">
         {data.map((group) => {
-          const pct = group.quota > 0 ? Math.round((group.current / group.quota) * 100) : 0;
+          const pct = group.quota != null && group.quota > 0 ? Math.round((group.current / group.quota) * 100) : 0;
           return (
             <div key={group.groupId} className="space-y-1.5">
               <div className="flex justify-between text-sm">
                 <span className="font-medium">{group.groupName}</span>
-                <span className={quotaColor(pct)}>
-                  {group.current.toLocaleString()} / {group.quota.toLocaleString()} ({pct}%)
+                <span className={group.quota === null ? "text-muted-foreground" : quotaColor(pct)}>
+                  {group.quota === null
+                    ? `${group.current.toLocaleString()} entries (Unlimited)`
+                    : `${group.current.toLocaleString()} / ${group.quota.toLocaleString()} (${pct}%)`}
                 </span>
               </div>
-              <Progress value={pct} className={progressColor(pct)} />
+              {group.quota !== null && <Progress value={pct} className={progressColor(pct)} />}
             </div>
           );
         })}

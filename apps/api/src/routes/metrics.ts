@@ -25,16 +25,20 @@ metricsRouter.get("/", async (c) => {
     );
   }
 
+  if (!sql) {
+    return c.json({ error: "internal_error", message: "Database connection unavailable" }, 500);
+  }
+
   try {
     const [usage, benefit, health] = await Promise.all([
-      getUsageMetrics(sql!, agent.tenantId),
-      getBenefitMetrics(sql!, agent.tenantId),
-      getHealthMetrics(sql!, agent.tenantId),
+      getUsageMetrics(sql, agent.tenantId),
+      getBenefitMetrics(sql, agent.tenantId),
+      getHealthMetrics(sql, agent.tenantId),
     ]);
 
     return c.json({ usage, benefit, health });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return c.json({ error: "internal_error", message }, 500);
+    console.error("Failed to fetch metrics:", err);
+    return c.json({ error: "internal_error", message: "Failed to fetch metrics" }, 500);
   }
 });

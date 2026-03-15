@@ -6,8 +6,6 @@ import type {
   HealthMetrics,
 } from "@monet/types";
 
-const DEFAULT_MEMORY_QUOTA = 10000;
-
 // ---------- Usage metrics ----------
 
 export async function getUsageMetrics(
@@ -213,24 +211,30 @@ export async function getBenefitMetrics(
     `);
 
     // Tier 2: Cross-agent sharing — memories written by one agent, read by another
-    const crossAgentRows = await tx.unsafe(`
-      SELECT
-        me.author_agent_id AS writer_agent_id,
-        al.actor_id AS reader_agent_id,
-        COUNT(*)::int AS count
-      FROM audit_log al
-      JOIN memory_entries me ON me.id = al.target_id::uuid
-      WHERE al.action = 'memory.get'
-        AND al.actor_id != me.author_agent_id
-      GROUP BY me.author_agent_id, al.actor_id
-      ORDER BY count DESC
-      LIMIT 10
-    `);
+    const [[crossAgentTotal], crossAgentRows] = await Promise.all([
+      tx.unsafe(`
+        SELECT COUNT(*)::int AS total
+        FROM audit_log al
+        JOIN memory_entries me ON me.id = al.target_id::uuid
+        WHERE al.action = 'memory.get'
+          AND al.actor_id != me.author_agent_id
+      `),
+      tx.unsafe(`
+        SELECT
+          me.author_agent_id AS writer_agent_id,
+          al.actor_id AS reader_agent_id,
+          COUNT(*)::int AS count
+        FROM audit_log al
+        JOIN memory_entries me ON me.id = al.target_id::uuid
+        WHERE al.action = 'memory.get'
+          AND al.actor_id != me.author_agent_id
+        GROUP BY me.author_agent_id, al.actor_id
+        ORDER BY count DESC
+        LIMIT 10
+      `),
+    ]);
     const crossAgentPairs = crossAgentRows as Record<string, unknown>[];
-    const totalShared = crossAgentPairs.reduce(
-      (sum, r) => sum + (r.count as number),
-      0,
-    );
+    const totalShared = (crossAgentTotal?.total as number) ?? 0;
 
     return {
       usefulnessDistribution: (
@@ -257,7 +261,7 @@ export async function getBenefitMetrics(
         withAutoTags: quality.with_auto_tags as number,
         total: quality.total as number,
       },
-      crossAgentSharing: crossAgentPairs.length > 0
+      crossAgentSharing: totalShared > 0
         ? {
             totalShared,
             topPairs: crossAgentPairs.map((r) => ({
@@ -280,7 +284,7 @@ export async function getHealthMetrics(
   const schemaName = tenantSchemaNameFromId(tenantId);
 
   return withTenantScope(sql, schemaName, async (tx) => {
-    // Memory lifecycle stats
+    // Memory lifecycle stats (exclude already-expired entries for avg age / outdated)
     const [lifecycle] = await tx.unsafe(`
       SELECT
         COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400), 0)::float AS avg_age_days,
@@ -291,25 +295,26 @@ export async function getHealthMetrics(
           ELSE (COUNT(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at <= NOW())::float / COUNT(*)::float * 100)
         END AS expiry_rate
       FROM memory_entries
+      WHERE expires_at IS NULL OR expires_at > NOW()
     `);
 
-    // Quota utilization per group
+    // Quota utilization per group (null quota = unlimited)
     const quotaRows = await tx.unsafe(
       `
       SELECT
         ag.id AS group_id,
         ag.name AS group_name,
         COUNT(me.id)::int AS current,
-        COALESCE(ag.memory_quota, $1)::int AS quota
+        ag.memory_quota::int AS quota
       FROM public.agent_groups ag
       LEFT JOIN memory_entries me
         ON me.group_id = ag.id
         AND (me.expires_at IS NULL OR me.expires_at > NOW())
-      WHERE ag.tenant_id = $2
+      WHERE ag.tenant_id = $1
       GROUP BY ag.id, ag.name, ag.memory_quota
       ORDER BY ag.name ASC
     `,
-      [DEFAULT_MEMORY_QUOTA, tenantId],
+      [tenantId],
     );
 
     return {

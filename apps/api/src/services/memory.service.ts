@@ -127,6 +127,7 @@ export interface ScopeFilterOpts {
 export interface MemoryWritePreflight {
   hasGroupMembership: boolean;
   memoryQuota: number | null;
+  groupId: string | null;
 }
 
 /**
@@ -169,7 +170,7 @@ export async function resolveMemoryWritePreflight(
   }
 
   const rows = await platformSql`
-    SELECT ag.memory_quota
+    SELECT ag.memory_quota, ag.id AS group_id
     FROM agent_group_members agm
     JOIN agent_groups ag ON ag.id = agm.group_id
     WHERE agm.agent_id = ${agent.id}
@@ -180,12 +181,14 @@ export async function resolveMemoryWritePreflight(
     return {
       hasGroupMembership: false,
       memoryQuota: null,
+      groupId: null,
     };
   }
 
   return {
     hasGroupMembership: true,
     memoryQuota: (rows[0].memory_quota as number | null) ?? null,
+    groupId: (rows[0].group_id as string) ?? null,
   };
 }
 
@@ -241,8 +244,10 @@ export async function createMemory(
     ? new Date(Date.now() + input.ttlSeconds * 1000).toISOString()
     : null;
 
+  const groupId = preflight?.groupId ?? null;
+
   const [entry] = await tx`
-    INSERT INTO memory_entries (content, memory_type, memory_scope, tags, ttl_seconds, expires_at, author_agent_id, user_id, version)
+    INSERT INTO memory_entries (content, memory_type, memory_scope, tags, ttl_seconds, expires_at, author_agent_id, user_id, group_id, version)
     VALUES (
       ${input.content},
       ${input.memoryType},
@@ -252,6 +257,7 @@ export async function createMemory(
       ${expiresAt},
       ${agent.id},
       ${agent.userId},
+      ${groupId},
       ${0}
     )
     RETURNING *
