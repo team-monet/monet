@@ -327,25 +327,27 @@ export async function getHealthMetrics(
     `);
 
     // Quota utilization per group
-    // current = total group entries, max_agent_current = highest per-agent count (matches enforcement)
+    // current = total group entries, max_agent_current = highest per-agent entry count
+    // among current group members (via agent_group_members), matching enforcement semantics
     const quotaRows = await tx.unsafe(
       `
       SELECT
         ag.id AS group_id,
         ag.name AS group_name,
-        COUNT(me.id)::int AS current,
+        COUNT(DISTINCT me.id)::int AS current,
         ag.memory_quota::int AS quota,
-        COALESCE(MAX(agent_counts.agent_count), 0)::int AS max_agent_current
+        COALESCE(MAX(member_counts.agent_count), 0)::int AS max_agent_current
       FROM public.agent_groups ag
       LEFT JOIN memory_entries me
         ON me.group_id = ag.id
         AND (me.expires_at IS NULL OR me.expires_at > NOW())
       LEFT JOIN (
-        SELECT author_agent_id, COUNT(*)::int AS agent_count
-        FROM memory_entries
-        WHERE expires_at IS NULL OR expires_at > NOW()
-        GROUP BY author_agent_id
-      ) agent_counts ON agent_counts.author_agent_id = me.author_agent_id
+        SELECT agm.group_id, agm.agent_id, COUNT(me2.id)::int AS agent_count
+        FROM public.agent_group_members agm
+        JOIN memory_entries me2 ON me2.author_agent_id = agm.agent_id
+          AND (me2.expires_at IS NULL OR me2.expires_at > NOW())
+        GROUP BY agm.group_id, agm.agent_id
+      ) member_counts ON member_counts.group_id = ag.id
       WHERE ag.tenant_id = $1
       GROUP BY ag.id, ag.name, ag.memory_quota
       ORDER BY ag.name ASC
