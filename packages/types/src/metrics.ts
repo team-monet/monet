@@ -101,6 +101,7 @@ export const QuotaUtilization = z.object({
   groupName: z.string(),
   current: z.number(),
   quota: z.number().nullable(),
+  effectiveQuotaPerAgent: z.number(),
 });
 export type QuotaUtilization = z.infer<typeof QuotaUtilization>;
 

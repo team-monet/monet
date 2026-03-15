@@ -204,6 +204,7 @@ describe("metrics service", () => {
         groupName: "Team A",
         current: 150,
         quota: 1000,
+        effectiveQuotaPerAgent: 1000,
       });
     });
 

@@ -46,11 +46,16 @@ export function QuotaBars({ data }: QuotaBarsProps) {
                 <span className="font-medium">{group.groupName}</span>
                 <span className={group.quota === null ? "text-muted-foreground" : quotaColor(pct)}>
                   {group.quota === null
-                    ? `${group.current.toLocaleString()} entries (Unlimited)`
+                    ? `${group.current.toLocaleString()} entries`
                     : `${group.current.toLocaleString()} / ${group.quota.toLocaleString()} (${pct}%)`}
                 </span>
               </div>
               {group.quota !== null && <Progress value={pct} className={progressColor(pct)} />}
+              {group.quota === null && (
+                <p className="text-[11px] text-muted-foreground">
+                  No group quota set — agents enforced at {group.effectiveQuotaPerAgent.toLocaleString()} entries each
+                </p>
+              )}
             </div>
           );
         })}

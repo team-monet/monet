@@ -6,6 +6,9 @@ import type {
   HealthMetrics,
 } from "@monet/types";
 
+// Must match DEFAULT_MEMORY_QUOTA in memory.service.ts (enforcement fallback)
+const DEFAULT_MEMORY_QUOTA = 10000;
+
 // ---------- Usage metrics ----------
 
 export async function getUsageMetrics(
@@ -34,15 +37,16 @@ export async function getUsageMetrics(
       ORDER BY d::date ASC
     `);
 
-    // Active agents (7d / 30d) from audit_log + total from platform
+    // Active agents (7d / 30d) from audit_log (agent actors only) + total from platform (exclude dashboard agents)
     const [activeAgents] = await tx.unsafe(
       `
       SELECT
         COUNT(DISTINCT CASE WHEN al.created_at > NOW() - INTERVAL '7 days' THEN al.actor_id END)::int AS period_7d,
         COUNT(DISTINCT CASE WHEN al.created_at > NOW() - INTERVAL '30 days' THEN al.actor_id END)::int AS period_30d,
-        (SELECT COUNT(*)::int FROM public.agents WHERE tenant_id = $1) AS total
+        (SELECT COUNT(*)::int FROM public.agents WHERE tenant_id = $1 AND external_id NOT LIKE 'dashboard:%') AS total
       FROM audit_log al
       WHERE al.created_at > NOW() - INTERVAL '30 days'
+        AND al.actor_type = 'agent'
     `,
       [tenantId],
     );
@@ -218,6 +222,7 @@ export async function getBenefitMetrics(
         JOIN memory_entries me ON me.id = al.target_id::uuid
         WHERE al.action = 'memory.get'
           AND al.actor_id != me.author_agent_id
+          AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
       `),
       tx.unsafe(`
         SELECT
@@ -228,6 +233,7 @@ export async function getBenefitMetrics(
         JOIN memory_entries me ON me.id = al.target_id::uuid
         WHERE al.action = 'memory.get'
           AND al.actor_id != me.author_agent_id
+          AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         GROUP BY me.author_agent_id, al.actor_id
         ORDER BY count DESC
         LIMIT 10
@@ -341,7 +347,10 @@ export async function getHealthMetrics(
           groupId: r.group_id as string,
           groupName: r.group_name as string,
           current: r.current as number,
-          quota: r.quota as number,
+          quota: (r.quota as number | null) ?? null,
+          effectiveQuotaPerAgent: ((r.quota as number | null) ?? null) !== null && (r.quota as number) > 0
+            ? (r.quota as number)
+            : DEFAULT_MEMORY_QUOTA,
         }),
       ),
     };

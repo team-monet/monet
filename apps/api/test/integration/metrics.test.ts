@@ -204,6 +204,7 @@ describe("metrics integration", () => {
     const ourGroup = quotas.find((q) => q.groupId === groupId);
     expect(ourGroup).toBeDefined();
     expect(ourGroup!.quota).toBe(500);
+    expect(ourGroup!.effectiveQuotaPerAgent).toBe(500);
   });
 
   it("returns 403 for non-admin agents", async () => {
