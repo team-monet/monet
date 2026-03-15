@@ -12,6 +12,7 @@ import {
   markOutdated,
   promoteScope,
   listTags,
+  writeAuditLog,
   resolveMemoryWritePreflight,
 } from "../services/memory.service";
 import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service";
@@ -104,9 +105,22 @@ memoriesRouter.get("/", async (c) => {
   };
   const queryEmbedding = query.query ? await computeQueryEmbedding(query.query) : null;
 
-  const result = await withTenantScope(sql, schemaName, (txSql) =>
-    searchMemories(txSql, agent, query, queryEmbedding),
-  );
+  const result = await withTenantScope(sql, schemaName, async (txSql) => {
+    const searchResult = await searchMemories(txSql, agent, query, queryEmbedding);
+    await writeAuditLog(
+      txSql as unknown as import("postgres").Sql,
+      agent.tenantId,
+      agent.id,
+      "memory.search",
+      null,
+      "success",
+      {
+        resultCount: searchResult.items.length,
+        searchType: queryEmbedding ? "vector" : "text",
+      },
+    );
+    return searchResult;
+  });
 
   return c.json(result);
 });
@@ -137,9 +151,20 @@ memoriesRouter.get("/:id", async (c) => {
   const schemaName = c.get("tenantSchemaName");
   const id = c.req.param("id");
 
-  const result = await withTenantScope(sql, schemaName, (txSql) =>
-    fetchMemory(txSql, agent, id),
-  );
+  const result = await withTenantScope(sql, schemaName, async (txSql) => {
+    const fetchResult = await fetchMemory(txSql, agent, id);
+    if (!("error" in fetchResult)) {
+      await writeAuditLog(
+        txSql as unknown as import("postgres").Sql,
+        agent.tenantId,
+        agent.id,
+        "memory.get",
+        id,
+        "success",
+      );
+    }
+    return fetchResult;
+  });
 
   if ("error" in result) {
     if (result.error === "not_found") {

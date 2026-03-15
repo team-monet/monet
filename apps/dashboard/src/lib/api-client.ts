@@ -12,6 +12,7 @@ import {
   RuleSet,
   AuditLog,
   RegisterAgentApiInput,
+  MetricsResponse,
 } from "@monet/types";
 import { auth } from "./auth";
 import { db } from "./db";
@@ -353,6 +354,11 @@ export class MonetApiClient {
     return this.fetch<void>(`/api/rule-sets/${ruleSetId}/rules/${ruleId}`, {
       method: "DELETE",
     });
+  }
+
+  // Metrics
+  async getMetrics(): Promise<MetricsResponse> {
+    return this.fetch<MetricsResponse>("/api/metrics");
   }
 
   // Audit (Step 10)

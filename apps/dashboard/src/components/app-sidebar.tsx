@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   History,
   Scale,
+  BarChart3,
   LogOut,
 } from "lucide-react"
 
@@ -113,6 +114,12 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       url: "/admin/quotas",
       icon: ShieldCheck,
       isActive: pathname === "/admin/quotas",
+    },
+    {
+      title: "Metrics",
+      url: "/admin/metrics",
+      icon: BarChart3,
+      isActive: pathname === "/admin/metrics",
     },
   ]
 
