@@ -17,16 +17,16 @@ metricsRouter.get("/", async (c) => {
   const agent = c.get("agent");
   const sql = c.get("sql");
 
+  if (!sql) {
+    return c.json({ error: "internal_error", message: "Database connection unavailable" }, 500);
+  }
+
   const role = await resolveAgentRole(sql, agent);
   if (!isTenantAdmin(role)) {
     return c.json(
       { error: "forbidden", message: "Only tenant admins can view metrics" },
       403,
     );
-  }
-
-  if (!sql) {
-    return c.json({ error: "internal_error", message: "Database connection unavailable" }, 500);
   }
 
   try {

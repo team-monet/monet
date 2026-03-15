@@ -284,18 +284,29 @@ export async function getHealthMetrics(
   const schemaName = tenantSchemaNameFromId(tenantId);
 
   return withTenantScope(sql, schemaName, async (tx) => {
-    // Memory lifecycle stats (exclude already-expired entries for avg age / outdated)
+    // Memory lifecycle stats
+    // avg age & outdated: only live entries; expiry rate: all entries (expired ones are the numerator)
     const [lifecycle] = await tx.unsafe(`
       SELECT
-        COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400), 0)::float AS avg_age_days,
-        CASE WHEN COUNT(*) = 0 THEN 0
-          ELSE (COUNT(*) FILTER (WHERE outdated = true)::float / COUNT(*)::float * 100)
-        END AS outdated_pct,
-        CASE WHEN COUNT(*) = 0 THEN 0
-          ELSE (COUNT(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at <= NOW())::float / COUNT(*)::float * 100)
-        END AS expiry_rate
-      FROM memory_entries
-      WHERE expires_at IS NULL OR expires_at > NOW()
+        COALESCE(live.avg_age_days, 0)::float AS avg_age_days,
+        COALESCE(live.outdated_pct, 0)::float AS outdated_pct,
+        COALESCE(all_entries.expiry_rate, 0)::float AS expiry_rate
+      FROM (
+        SELECT
+          AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400) AS avg_age_days,
+          CASE WHEN COUNT(*) = 0 THEN 0
+            ELSE (COUNT(*) FILTER (WHERE outdated = true)::float / COUNT(*)::float * 100)
+          END AS outdated_pct
+        FROM memory_entries
+        WHERE expires_at IS NULL OR expires_at > NOW()
+      ) live,
+      (
+        SELECT
+          CASE WHEN COUNT(*) = 0 THEN 0
+            ELSE (COUNT(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at <= NOW())::float / COUNT(*)::float * 100)
+          END AS expiry_rate
+        FROM memory_entries
+      ) all_entries
     `);
 
     // Quota utilization per group (null quota = unlimited)
