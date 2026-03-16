@@ -20,6 +20,7 @@ import {
   updateMemory,
   writeAuditLog,
 } from "../services/memory.service";
+import type { RuleRecord } from "../services/rule.service";
 import packageJson from "../../package.json" with { type: "json" };
 
 function asToolResult(data: unknown): CallToolResult {
@@ -63,15 +64,106 @@ function describeServiceError(result: { error: string; message?: string }): stri
   }
 }
 
+interface CreateMcpServerOptions {
+  activeRules?: RuleRecord[];
+  onInitialized?: () => void | Promise<void>;
+}
+
+const MAX_RULE_NAME_INSTRUCTIONS_CHARS = 120;
+const MAX_RULE_DESCRIPTION_INSTRUCTIONS_CHARS = 240;
+const MAX_RULES_IN_INSTRUCTIONS = 20;
+const MAX_INSTRUCTIONS_CHARS = 4000;
+
+function normalizeInstructionText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateInstructionText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+
+  if (maxChars <= 3) {
+    return value.slice(0, maxChars);
+  }
+
+  return `${value.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+function summarizeRuleForInstructions(rule: RuleRecord, index: number): string {
+  const name = truncateInstructionText(
+    normalizeInstructionText(rule.name),
+    MAX_RULE_NAME_INSTRUCTIONS_CHARS,
+  );
+  const description = truncateInstructionText(
+    normalizeInstructionText(rule.description),
+    MAX_RULE_DESCRIPTION_INSTRUCTIONS_CHARS,
+  );
+
+  return `${index + 1}. ${name}: ${description}`;
+}
+
+function formatActiveRulesInstructions(activeRules: RuleRecord[]): string | undefined {
+  if (activeRules.length === 0) {
+    return undefined;
+  }
+
+  const header = `The following is a bounded summary of the ${activeRules.length} Monet tenant rule(s) active for this agent. Treat them as required guidance whenever you use this server.`;
+  const footer =
+    "Full active rules are also sent after initialization via notifications/rules/updated. If later updates arrive, replace this summary with the latest rules.";
+  const candidateRules = activeRules.slice(0, MAX_RULES_IN_INSTRUCTIONS);
+  const ruleLines: string[] = [];
+  let omittedCount = activeRules.length - candidateRules.length;
+
+  for (const [index, rule] of candidateRules.entries()) {
+    const nextLine = summarizeRuleForInstructions(rule, index);
+    const nextInstructions = [
+      header,
+      "",
+      ...ruleLines,
+      nextLine,
+      "",
+      footer,
+    ].join("\n");
+
+    if (nextInstructions.length > MAX_INSTRUCTIONS_CHARS) {
+      omittedCount += candidateRules.length - index;
+      break;
+    }
+
+    ruleLines.push(nextLine);
+  }
+
+  const lines = [header, "", ...ruleLines];
+
+  if (omittedCount > 0) {
+    lines.push(
+      "",
+      `Only ${ruleLines.length} rule summary item(s) are included here; ${omittedCount} additional active rule(s) are omitted to keep MCP initialization bounded.`,
+    );
+  }
+
+  lines.push("", footer);
+  return lines.join("\n");
+}
+
 export function createMcpServer(
   agentContext: AgentContext,
   tenantSchemaName: string,
   sql: postgres.Sql,
+  options: CreateMcpServerOptions = {},
 ) {
+  const instructions = formatActiveRulesInstructions(options.activeRules ?? []);
   const server = new McpServer({
     name: "monet",
     version: packageJson.version,
-  });
+  }, instructions ? { instructions } : undefined);
+
+  if (options.onInitialized) {
+    server.server.oninitialized = () => {
+      void options.onInitialized?.();
+    };
+  }
 
   const handlers: McpToolHandlers = {
     memoryStore: async (args) => {
