@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { writeFileSync, chmodSync } from "node:fs";
 import postgres from "postgres";
 import { getRequestListener } from "@hono/node-server";
 import { createClient } from "@monet/db";
@@ -45,8 +46,11 @@ const port = parseInt(process.env.API_PORT || "3001", 10);
 console.log(`Starting Monet API on port ${port}`);
 console.log(`Ensured tenant schemas are current for ${upgradedTenantSchemaCount} tenant(s)`);
 if (bootstrapToken) {
+  const tokenPath = "/tmp/monet-bootstrap-token";
+  writeFileSync(tokenPath, bootstrapToken.rawToken);
+  chmodSync(tokenPath, 0o600);
   console.log(
-    `Platform bootstrap token (expires ${bootstrapToken.expiresAt.toISOString()}): ${bootstrapToken.rawToken}`,
+    `Bootstrap token written to ${tokenPath} (expires ${bootstrapToken.expiresAt.toISOString()})`,
   );
 }
 
