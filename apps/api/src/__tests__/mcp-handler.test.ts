@@ -7,6 +7,7 @@ const authMock = vi.fn();
 const rateLimitMock = vi.fn();
 const createMcpServerMock = vi.fn();
 const pushRulesToAgentMock = vi.fn();
+const getActiveRulesForAgentMock = vi.fn();
 
 const transportHandleRequestMock = vi.fn();
 const transportCloseMock = vi.fn();
@@ -25,6 +26,10 @@ vi.mock("../mcp/server.js", () => ({
 
 vi.mock("../services/rule-notification.service.js", () => ({
   pushRulesToAgent: (...args: unknown[]) => pushRulesToAgentMock(...args),
+}));
+
+vi.mock("../services/rule.service.js", () => ({
+  getActiveRulesForAgent: (...args: unknown[]) => getActiveRulesForAgentMock(...args),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/streamableHttp.js", () => ({
@@ -75,21 +80,25 @@ const agent = {
 describe("mcp handler", () => {
   let sessionStore: SessionStore;
   let handler: ReturnType<typeof createMcpHandler>;
+  let sql: unknown;
 
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStore = new SessionStore();
+    sql = {} as never;
     handler = createMcpHandler({
       db: {} as never,
-      sql: {} as never,
+      sql: sql as never,
       sessionStore,
     });
 
     authMock.mockResolvedValue({ ok: true, agent, rawKey: "raw-key" });
     rateLimitMock.mockReturnValue({ allowed: true });
+    getActiveRulesForAgentMock.mockResolvedValue([]);
     createMcpServerMock.mockReturnValue({
       connect: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
+      server: {},
     });
     pushRulesToAgentMock.mockResolvedValue(undefined);
     transportHandleRequestMock.mockImplementation(async (_req: IncomingMessage, res: ServerResponse) => {
@@ -126,6 +135,40 @@ describe("mcp handler", () => {
     expect(sessionStore.count()).toBe(1);
     expect(rateLimitMock).toHaveBeenCalledWith("agent-1");
     expect(transportHandleRequestMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("pushes initial rules only after the MCP client finishes initialization", async () => {
+    let onInitialized: (() => void | Promise<void>) | undefined;
+    createMcpServerMock.mockImplementation(
+      (_agent: unknown, _schemaName: string, _sql: unknown, options?: { onInitialized?: () => void | Promise<void> }) => {
+        onInitialized = options?.onInitialized;
+        return {
+          connect: vi.fn().mockResolvedValue(undefined),
+          close: vi.fn().mockResolvedValue(undefined),
+          server: {},
+        };
+      },
+    );
+
+    const { res } = createRes();
+
+    await handler.handle(
+      createReq("POST", { authorization: "Bearer valid" }),
+      res,
+    );
+
+    expect(pushRulesToAgentMock).not.toHaveBeenCalled();
+    expect(onInitialized).toBeTypeOf("function");
+
+    await onInitialized?.();
+
+    expect(pushRulesToAgentMock).toHaveBeenCalledTimes(1);
+    expect(pushRulesToAgentMock).toHaveBeenCalledWith(
+      "agent-1",
+      sessionStore,
+      sql,
+      "tenant_00000000_0000_0000_0000_000000000010",
+    );
   });
 
   it("reuses an existing session on POST with session id", async () => {

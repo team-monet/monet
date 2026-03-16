@@ -53,6 +53,17 @@ const AGENT = {
   role: null,
 };
 
+const ACTIVE_RULES = [
+  {
+    id: "00000000-0000-0000-0000-000000000101",
+    name: "Stay Within Tenant Scope",
+    description: "Only use tenant-scoped data and ask before guessing beyond it.",
+    ownerUserId: null,
+    updatedAt: "2026-03-16T00:00:00.000Z",
+    createdAt: "2026-03-16T00:00:00.000Z",
+  },
+] as const;
+
 function parseToolText(result: unknown) {
   const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
   const text = content?.find((entry) => entry.type === "text")?.text;
@@ -86,6 +97,55 @@ describe("MCP server factory", () => {
       "memory_mark_outdated",
       "memory_list_tags",
     ]));
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
+  it("publishes active rules through MCP initialize instructions", async () => {
+    const server = createMcpServer(AGENT, "tenant_test", {} as never, {
+      activeRules: [...ACTIVE_RULES],
+    });
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    expect(client.getInstructions()).toContain("Stay Within Tenant Scope");
+    expect(client.getInstructions()).toContain("Only use tenant-scoped data");
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
+  it("bounds active rule instructions when rules are large", async () => {
+    const activeRules = Array.from({ length: 30 }, (_, index) => ({
+      id: `00000000-0000-0000-0000-${String(index + 200).padStart(12, "0")}`,
+      name: `Rule ${index + 1} ${"name ".repeat(20)}`,
+      description: `Description ${index + 1} ${"detail ".repeat(500)}`,
+      ownerUserId: null,
+      updatedAt: "2026-03-16T00:00:00.000Z",
+      createdAt: "2026-03-16T00:00:00.000Z",
+    }));
+
+    const server = createMcpServer(AGENT, "tenant_test", {} as never, {
+      activeRules,
+    });
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const instructions = client.getInstructions();
+    expect(instructions).toBeDefined();
+    expect(instructions?.length).toBeLessThanOrEqual(4000);
+    expect(instructions).toContain("bounded summary");
+    expect(instructions).toContain("omitted to keep MCP initialization bounded");
+    expect(instructions).toContain("notifications/rules/updated");
 
     await Promise.all([client.close(), server.close()]);
   });

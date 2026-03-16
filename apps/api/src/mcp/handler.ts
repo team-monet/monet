@@ -8,6 +8,7 @@ import { checkRateLimit } from "../middleware/rate-limit";
 import { tenantSchemaName } from "../middleware/tenant";
 import { authenticateAgentFromBearerToken } from "../services/agent-auth.service";
 import { pushRulesToAgent } from "../services/rule-notification.service";
+import { getActiveRulesForAgent } from "../services/rule.service";
 import { logRequest } from "../lib/log";
 import { createMcpServer } from "./server";
 import type { SessionStore } from "./session-store";
@@ -100,10 +101,20 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
           if (!sessionId) {
             const newSessionId = randomUUID();
             const schemaName = tenantSchemaName(auth.agent.tenantId);
+            const activeRules = await getActiveRulesForAgent(sql, schemaName, auth.agent.id);
             const transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => newSessionId,
             });
-            const server = createMcpServer(auth.agent, schemaName, sql);
+            const server = createMcpServer(auth.agent, schemaName, sql, {
+              activeRules,
+              onInitialized: async () => {
+                try {
+                  await pushRulesToAgent(auth.agent.id, sessionStore, sql, schemaName);
+                } catch (error) {
+                  console.error("Failed to push initial rules after MCP initialization", error);
+                }
+              },
+            });
 
             transport.onclose = () => {
               sessionStore.remove(newSessionId);
@@ -121,7 +132,6 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               connectedAt: new Date(),
               lastActivityAt: new Date(),
             });
-            await pushRulesToAgent(auth.agent.id, sessionStore, sql, schemaName);
 
             try {
               // The MCP SDK reads POST request bodies from the raw Node stream.
