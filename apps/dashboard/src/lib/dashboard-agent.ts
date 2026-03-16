@@ -108,6 +108,31 @@ export async function ensureDashboardAgent(
   return encryptedApiKey!;
 }
 
+/**
+ * Lightweight 1-query role sync for the hot path.  Only updates when the
+ * dashboard agent's role diverges from the user's current role.
+ */
+export async function syncDashboardAgentRole(userId: string) {
+  const dashboardExternalId = `dashboard:${userId}`;
+  const rows = await db
+    .select({
+      agentId: agents.id,
+      agentRole: agents.role,
+      userRole: tenantUsers.role,
+    })
+    .from(agents)
+    .innerJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+    .where(and(eq(agents.userId, userId), eq(agents.externalId, dashboardExternalId)))
+    .limit(1);
+
+  if (rows.length === 1 && rows[0].agentRole !== (rows[0].userRole ?? "user")) {
+    await db
+      .update(agents)
+      .set({ role: rows[0].userRole ?? "user" })
+      .where(eq(agents.id, rows[0].agentId));
+  }
+}
+
 async function syncAgentGroups(
   userId: string,
   dashboardAgentId: string,

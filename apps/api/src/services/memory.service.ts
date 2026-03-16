@@ -345,8 +345,14 @@ export async function searchMemories(
     const decoded = decodeCursor(query.cursor);
     if (decoded.rank !== undefined) {
       const cursorRank = escapeNumberLiteral(decoded.rank);
+      // Only guard with "embedding IS NULL → NULL" when doing semantic search;
+      // for plain browsing the rank expression doesn't reference me.embedding.
+      // INVARIANT: must produce the same SQL as the search_rank alias in buildMemoryEntrySelect().
+      const rankExpr = queryEmbedding
+        ? `(CASE WHEN me.embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END)`
+        : buildRankExpression(queryEmbedding);
       conditions.push(
-        `(((CASE WHEN me.embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) < ${cursorRank}) OR ((CASE WHEN me.embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END) = ${cursorRank} AND (me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)))`,
+        `((${rankExpr} < ${cursorRank}) OR (${rankExpr} = ${cursorRank} AND (me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)))`,
       );
     } else {
       conditions.push(
