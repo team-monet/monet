@@ -227,7 +227,7 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem asChild>
-                  <Link href="/api/auth/signout" className="w-full flex items-center cursor-pointer">
+                  <Link href="/signout" className="w-full flex items-center cursor-pointer">
                     <LogOut className="mr-2 h-4 w-4" />
                     Log out
                   </Link>

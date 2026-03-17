@@ -250,6 +250,7 @@ export const authConfig: NextAuthConfig = {
   },
   pages: {
     signIn: "/login",
+    signOut: "/signout",
   },
 };
 

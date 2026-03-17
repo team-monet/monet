@@ -24,12 +24,12 @@ import type {
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 
-const COLORS = ["hsl(var(--chart-1))", "hsl(var(--chart-2))", "hsl(var(--chart-3))", "hsl(var(--chart-4))", "hsl(var(--chart-5))"];
+const COLORS = ["var(--color-chart-1)", "var(--color-chart-2)", "var(--color-chart-3)", "var(--color-chart-4)", "var(--color-chart-5)"];
 const PIE_COLORS: Record<string, string> = {
-  Pending: "#3b82f6",
-  Completed: "#22c55e",
-  Processing: "#f59e0b",
-  Failed: "#ef4444",
+  Pending: "var(--color-chart-1)",
+  Completed: "var(--color-chart-2)",
+  Processing: "var(--color-chart-3)",
+  Failed: "var(--color-destructive)",
 };
 
 // --- Read/Write Trend ---
@@ -55,11 +55,18 @@ export function ReadWriteTrendChart({ data }: ReadWriteTrendChartProps) {
             <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
             <XAxis dataKey="date" className="text-xs" tick={{ fontSize: 12 }} />
             <YAxis allowDecimals={false} className="text-xs" tick={{ fontSize: 12 }} />
-            <Tooltip />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: "var(--background)",
+                borderColor: "var(--border)",
+                color: "var(--foreground)",
+              }}
+              itemStyle={{ color: "var(--foreground)" }}
+            />
             <Legend />
-            <Line type="monotone" dataKey="writes" stroke="#3b82f6" strokeWidth={2} dot={false} name="Writes" />
-            <Line type="monotone" dataKey="reads" stroke="#22c55e" strokeWidth={2} dot={false} name="Reads" />
-            <Line type="monotone" dataKey="searches" stroke="#f59e0b" strokeWidth={2} dot={false} name="Searches" />
+            <Line type="monotone" dataKey="writes" stroke="var(--color-chart-1)" strokeWidth={2} dot={false} name="Writes" />
+            <Line type="monotone" dataKey="reads" stroke="var(--color-chart-2)" strokeWidth={2} dot={false} name="Reads" />
+            <Line type="monotone" dataKey="searches" stroke="var(--color-chart-3)" strokeWidth={2} dot={false} name="Searches" />
           </LineChart>
         </ResponsiveContainer>
       </CardContent>
@@ -85,7 +92,14 @@ export function UsefulnessHistogram({ data }: UsefulnessHistogramProps) {
             <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
             <XAxis dataKey="bucket" className="text-xs" tick={{ fontSize: 12 }} />
             <YAxis allowDecimals={false} className="text-xs" tick={{ fontSize: 12 }} />
-            <Tooltip />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: "var(--background)",
+                borderColor: "var(--border)",
+                color: "var(--foreground)",
+              }}
+              itemStyle={{ color: "var(--foreground)" }}
+            />
             <Bar dataKey="count" name="Memories">
               {data.map((_, index) => (
                 <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
@@ -116,8 +130,15 @@ export function MemoryReuseChart({ data }: MemoryReuseChartProps) {
             <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
             <XAxis type="number" allowDecimals={false} className="text-xs" tick={{ fontSize: 12 }} />
             <YAxis type="category" dataKey="bucket" width={120} className="text-xs" tick={{ fontSize: 12 }} />
-            <Tooltip />
-            <Bar dataKey="count" name="Memories" fill="#3b82f6" />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: "var(--background)",
+                borderColor: "var(--border)",
+                color: "var(--foreground)",
+              }}
+              itemStyle={{ color: "var(--foreground)" }}
+            />
+            <Bar dataKey="count" name="Memories" fill="var(--color-chart-1)" />
           </BarChart>
         </ResponsiveContainer>
       </CardContent>
@@ -171,12 +192,20 @@ export function EnrichmentThroughputChart({ data }: EnrichmentThroughputChartPro
               paddingAngle={2}
               dataKey="value"
               label={({ name, value }) => `${name}: ${value}`}
+              stroke="var(--border)"
             >
               {chartData.map((entry, index) => (
-                <Cell key={`cell-${index}`} fill={PIE_COLORS[entry.name] ?? "#94a3b8"} />
+                <Cell key={`cell-${index}`} fill={PIE_COLORS[entry.name] ?? "var(--muted)"} />
               ))}
             </Pie>
-            <Tooltip />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: "var(--background)",
+                borderColor: "var(--border)",
+                color: "var(--foreground)",
+              }}
+              itemStyle={{ color: "var(--foreground)" }}
+            />
           </PieChart>
         </ResponsiveContainer>
       </CardContent>

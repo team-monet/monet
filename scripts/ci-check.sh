@@ -37,11 +37,16 @@ start_local_postgres() {
   POSTGRES_PORT=5432 \
   POSTGRES_USER=postgres \
   POSTGRES_PASSWORD=postgres \
-    docker compose -f "${DEV_COMPOSE_FILE}" up -d postgres
+    docker-compose -f "${DEV_COMPOSE_FILE}" up -d postgres
 }
 
 prepare_database() {
-  if [[ "${MONET_CI_MANAGED_DB:-0}" != "1" ]] && ! database_is_ready; then
+  if [[ "${MONET_CI_MANAGED_DB:-0}" == "1" ]]; then
+    log_step "Skipping managed database preparation"
+    return 0
+  fi
+
+  if ! database_is_ready; then
     start_local_postgres
   fi
 
@@ -50,6 +55,11 @@ prepare_database() {
 }
 
 build_release_images() {
+  if [[ "${MONET_CI_SKIP_IMAGES:-0}" == "1" ]]; then
+    log_step "Skipping image builds"
+    return 0
+  fi
+
   run_step "Build API release image" \
     docker build --file docker/monet.Dockerfile --target api-runtime --tag monet-api:ci "${ROOT_DIR}"
   run_step "Build dashboard release image" \
