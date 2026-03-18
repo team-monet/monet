@@ -1,20 +1,22 @@
 import { getApiClient } from "@/lib/api-client";
 import { MemoryEntryTier1, MemoryType } from "@monet/types";
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { MemoryFilters } from "./filters";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Search, ChevronRight, Calendar, Bot, AlertTriangle } from "lucide-react";
+import { Search, ChevronRight, Calendar, Bot } from "lucide-react";
 import { 
   Pagination, 
   PaginationContent, 
   PaginationItem, 
   PaginationNext, 
 } from "@/components/ui/pagination";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { formatMemoryAuthor } from "@/lib/memory-display";
+import { ClickableRow } from "./clickable-row";
+import { isSessionExpiredError } from "@/lib/session-errors";
 
 interface PageProps {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
@@ -63,8 +65,15 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
     });
     memories = result.items;
     nextCursor = result.nextCursor;
-  } catch (err: any) { // eslint-disable-line @typescript-eslint/no-explicit-any
-    error = err.message;
+  } catch (err: unknown) {
+    if (isSessionExpiredError(err)) {
+      redirect("/login");
+    }
+
+    error =
+      err instanceof Error
+        ? err.message
+        : "An unexpected error occurred. Please try again later.";
   }
 
   let nextPageHref: string | null = null;
@@ -94,20 +103,15 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
         </Button>
       </div>
 
-      {error ? (
-        <Alert variant="destructive">
-          <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>Error loading memories</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      ) : (
-        <>
-          <MemoryFilters 
-            initialType={type} 
-            initialIncludeUser={includeUser} 
-            initialIncludePrivate={includePrivate} 
-          />
+      <MemoryFilters 
+        initialType={type} 
+        initialIncludeUser={includeUser} 
+        initialIncludePrivate={includePrivate}
+        errorMessage={error}
+      />
 
+      {error ? null : (
+        <>
           <Card className="shadow-sm">
             <CardContent className="p-0">
               <Table>
@@ -129,7 +133,7 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
                     </TableRow>
                   ) : (
                     memories.map((m) => (
-                      <TableRow key={m.id} className="group cursor-pointer">
+                      <ClickableRow key={m.id} href={`/memories/${m.id}`} className="group">
                         <TableCell>
                           <div className="flex flex-col gap-1.5">
                             <Badge variant={getMemoryTypeVariant(m.memoryType)} className="w-fit uppercase text-[10px]">
@@ -178,7 +182,7 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
                             </Link>
                           </Button>
                         </TableCell>
-                      </TableRow>
+                      </ClickableRow>
                     ))
                   )}
                 </TableBody>

@@ -20,6 +20,10 @@ import { tenantUsers } from "@monet/db";
 import { eq } from "drizzle-orm";
 import { decrypt } from "./crypto";
 import { ensureDashboardAgent, syncDashboardAgentRole } from "./dashboard-agent";
+import {
+  SESSION_EXPIRED_ERROR_MESSAGE,
+  isRefreshAccessTokenError,
+} from "./session-errors";
 
 export interface ApiClientOptions {
   baseUrl: string;
@@ -51,7 +55,7 @@ export class MonetApiClient {
       let message = "An unexpected error occurred. Please try again later.";
 
       if (status === 400) message = "Invalid request. Please check your input.";
-      else if (status === 401) message = "Your session has expired. Please log in again.";
+      else if (status === 401) message = SESSION_EXPIRED_ERROR_MESSAGE;
       else if (status === 403) message = "Access denied. You do not have permission to perform this action.";
       else if (status === 404) message = "The requested resource was not found.";
       else if (status === 409) message = "There was a conflict with the current state.";
@@ -392,6 +396,10 @@ export async function getApiClient() {
   const session = await auth();
   if (!session || !session.user) {
     throw new Error("No session found");
+  }
+
+  if (isRefreshAccessTokenError((session as { error?: string }).error)) {
+    throw new Error(SESSION_EXPIRED_ERROR_MESSAGE);
   }
 
   const sessionUser = session.user as ExtendedUser;
