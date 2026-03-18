@@ -283,6 +283,29 @@ Useful runtime commands:
 - `pnpm runtime:down`
 - `pnpm runtime:reset`
 
+## Remote Access
+
+To sign in from another machine, use the other machine's reachable view of this
+host for public URLs and keep the server-side Keycloak URL on an address Monet
+itself can reach.
+
+For the runtime stack, set these in `.env.runtime` before rerunning
+`pnpm runtime:keycloak:setup`:
+
+- `NEXTAUTH_URL=http://<your-machine-ip>:4310`
+- `PUBLIC_API_URL=http://<your-machine-ip>:4301`
+- `PUBLIC_OIDC_BASE_URL=http://<your-machine-ip>:4400`
+- `KEYCLOAK_BASE_URL=http://keycloak.localhost:4400`
+- `LOCAL_OIDC_BASE_URL=http://keycloak.localhost:4400`
+
+For host-run local dev, do the same in `.env.local-dev`, but use the local ports
+(`3310`, `3301`, `3400`) and keep `KEYCLOAK_BASE_URL` / `LOCAL_OIDC_BASE_URL`
+pointing at a loopback or other machine-local address.
+
+If you run the API or dashboard directly on the host, `API_HOST=0.0.0.0` and
+`DASHBOARD_HOST=0.0.0.0` make them listen on the network instead of only
+loopback.
+
 `pnpm runtime:keycloak:setup` writes the generated runtime Keycloak details to `.runtime/keycloak.json` by default.
 Use the `platform.*` and `tenant.*` values from that file when completing
 dashboard OIDC setup in the runtime stack. Do not reuse `.local-dev/keycloak.json`
