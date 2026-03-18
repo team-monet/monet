@@ -1,5 +1,6 @@
 import { AnthropicEnrichmentProvider } from "./anthropic-enrichment";
 import type { EnrichmentProvider } from "./enrichment";
+import { OnnxEnrichmentProvider } from "./onnx-enrichment";
 import { OllamaEnrichmentProvider } from "./ollama-enrichment";
 import { OpenAICompatibleEnrichmentProvider } from "./openai-enrichment";
 
@@ -20,12 +21,16 @@ export function createEnrichmentProvider(): EnrichmentProvider {
     return new OllamaEnrichmentProvider();
   }
 
+  if (provider === "onnx") {
+    return new OnnxEnrichmentProvider();
+  }
+
   if (provider === "openai") {
     return new OpenAICompatibleEnrichmentProvider();
   }
 
   if (!provider) {
-    throw new Error("ENRICHMENT_PROVIDER is required (anthropic | ollama | openai)");
+    throw new Error("ENRICHMENT_PROVIDER is required (anthropic | ollama | onnx | openai)");
   }
 
   throw new Error(`Unknown ENRICHMENT_PROVIDER: ${provider}`);

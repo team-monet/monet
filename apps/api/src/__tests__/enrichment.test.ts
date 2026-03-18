@@ -25,6 +25,12 @@ describe("createEnrichmentProvider", () => {
     expect(provider).toBeDefined();
   });
 
+  it("creates an onnx provider from env", () => {
+    process.env.ENRICHMENT_PROVIDER = "onnx";
+    const provider = createEnrichmentProvider();
+    expect(provider).toBeDefined();
+  });
+
   it("throws for an unknown provider", () => {
     process.env.ENRICHMENT_PROVIDER = "unknown";
     expect(() => createEnrichmentProvider()).toThrow("Unknown ENRICHMENT_PROVIDER");

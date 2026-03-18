@@ -14,6 +14,8 @@ export interface EnrichmentConfig {
   ollamaBaseUrl?: string;
   ollamaChatModel?: string;
   ollamaEmbeddingModel?: string;
+  onnxEmbeddingModel?: string;
+  onnxQuantized?: boolean;
   openaiBaseUrl?: string;
   openaiApiKey?: string;
   openaiChatBaseUrl?: string;

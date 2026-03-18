@@ -182,11 +182,11 @@ Required:
 
 - `DATABASE_URL` - PostgreSQL connection string.
 - `API_PORT` - API bind port (default `3001`).
-- `ENRICHMENT_PROVIDER` - `anthropic`, `ollama`, or `openai`.
+- `ENRICHMENT_PROVIDER` - `anthropic`, `ollama`, `onnx`, or `openai`.
 
 Optional:
 
-- `EMBEDDING_DIMENSIONS` - dimensionality of embedding vectors (default `1024`). Set this to match your chosen embedding model (e.g. `1536` for OpenAI `text-embedding-3-small`, `1024` for Ollama `qwen3-embedding`). Must be set **before** running the first migration, as it defines the database column width.
+- `EMBEDDING_DIMENSIONS` - dimensionality of embedding vectors (default `1024`). Set this to match your chosen embedding model (e.g. `1536` for OpenAI `text-embedding-3-small`, `1024` for Ollama `qwen3-embedding` or ONNX `Snowflake/snowflake-arctic-embed-l-v2.0`). Must be set **before** running the first migration, as it defines the database column width.
 - `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` (defaults `100` per `60000ms`).
 - `AUDIT_RETENTION_DAYS` (default `90`).
 - `AUDIT_PURGE_DATABASE_URL` (separate DB role for retention deletes).
@@ -194,6 +194,7 @@ Optional:
 Provider-specific:
 
 - Anthropic: `ENRICHMENT_API_KEY`, `EMBEDDING_API_KEY`, `ANTHROPIC_MODEL`, `EMBEDDING_MODEL`.
+- ONNX: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `ONNX_EMBEDDING_MODEL`, `ONNX_QUANTIZED`. Uses Ollama for chat and defaults to `Snowflake/snowflake-arctic-embed-l-v2.0` for 1024-dimensional embeddings.
 - OpenAI-compatible: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL`, `OPENAI_EMBEDDING_MODEL`. Supports split chat/embedding providers via `OPENAI_CHAT_*` and `OPENAI_EMBEDDING_*` overrides.
 - Ollama: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `OLLAMA_EMBEDDING_MODEL`, `OLLAMA_MODELS_DIR`.
 
@@ -313,7 +314,7 @@ for the runtime containers.
 
 ## Enrichment Provider Swap
 
-Set `ENRICHMENT_PROVIDER` to `anthropic`, `ollama`, or `openai`, configure provider vars and `EMBEDDING_DIMENSIONS` to match your embedding model, then restart API.
+Set `ENRICHMENT_PROVIDER` to `anthropic`, `ollama`, `onnx`, or `openai`, configure provider vars and `EMBEDDING_DIMENSIONS` to match your embedding model, then restart API.
 
 Pending enrichment jobs are recovered on startup.
 
