@@ -67,6 +67,16 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
     error = err.message;
   }
 
+  let nextPageHref: string | null = null;
+  if (nextCursor) {
+    const nextParams = new URLSearchParams({ cursor: nextCursor });
+    if (type) nextParams.set("memoryType", type);
+    if (tag) nextParams.set("tag", tag);
+    if (includeUser) nextParams.set("includeUser", "true");
+    if (includePrivate) nextParams.set("includePrivate", "true");
+    nextPageHref = `/memories?${nextParams.toString()}`;
+  }
+
   return (
     <div className="flex flex-col gap-6 p-4">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -176,14 +186,12 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
             </CardContent>
           </Card>
 
-          {nextCursor && (
+          {nextPageHref && (
             <div className="flex justify-center mt-4">
               <Pagination>
                 <PaginationContent>
                   <PaginationItem>
-                    <PaginationNext 
-                      href={`/memories?cursor=${encodeURIComponent(nextCursor)}${type ? `&memoryType=${type}` : ""}${includeUser ? "&includeUser=true" : ""}${includePrivate ? "&includePrivate=true" : ""}`} 
-                    />
+                    <PaginationNext href={nextPageHref} />
                   </PaginationItem>
                 </PaginationContent>
               </Pagination>

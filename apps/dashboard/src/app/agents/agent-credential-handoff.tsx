@@ -10,15 +10,55 @@ function CopyButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false);
 
   async function handleCopy() {
-    await navigator.clipboard.writeText(value);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
+    try {
+      // 1. Try modern clipboard API first
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        // 2. Fallback to older execCommand approach for non-secure contexts (http)
+        const textArea = document.createElement("textarea");
+        textArea.value = value;
+        // Ensure the textarea is not visible
+        textArea.style.position = "fixed";
+        textArea.style.left = "-9999px";
+        textArea.style.top = "0";
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        
+        const successful = document.execCommand("copy");
+        document.body.removeChild(textArea);
+        
+        if (!successful) {
+          throw new Error("execCommand copy failed");
+        }
+      }
+      
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error(`Failed to copy ${label}:`, err);
+      // In worst case, at least give user feedback
+      alert(`Could not automatically copy to clipboard. Please copy it manually from the display.`);
+    }
   }
 
   return (
-    <Button type="button" variant="outline" size="sm" onClick={handleCopy}>
-      {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-      {copied ? "Copied" : label}
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      onClick={handleCopy}
+      className="h-8 min-w-[90px] gap-1.5 px-3 transition-all duration-200"
+    >
+      {copied ? (
+        <Check className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+      ) : (
+        <Copy className="h-3.5 w-3.5" />
+      )}
+      <span className="text-xs font-medium">
+        {copied ? "Copied" : label}
+      </span>
     </Button>
   );
 }

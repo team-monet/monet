@@ -12,13 +12,14 @@ import {
   RuleSet,
   AuditLog,
   RegisterAgentApiInput,
+  MetricsResponse,
 } from "@monet/types";
 import { auth } from "./auth";
 import { db } from "./db";
 import { tenantUsers } from "@monet/db";
 import { eq } from "drizzle-orm";
 import { decrypt } from "./crypto";
-import { ensureDashboardAgent } from "./dashboard-agent";
+import { ensureDashboardAgent, syncDashboardAgentRole } from "./dashboard-agent";
 
 export interface ApiClientOptions {
   baseUrl: string;
@@ -355,6 +356,11 @@ export class MonetApiClient {
     });
   }
 
+  // Metrics
+  async getMetrics(): Promise<MetricsResponse> {
+    return this.fetch<MetricsResponse>("/api/metrics");
+  }
+
   // Audit (Step 10)
   async getAuditLogs(params?: {
     actorId?: string;
@@ -396,15 +402,28 @@ export async function getApiClient() {
     throw new Error("Tenant ID not found in session");
   }
 
-  // Keep dashboard agent credentials/role in sync with the linked user.
-  await ensureDashboardAgent(sessionUser.id, sessionUser.id, sessionUser.tenantId);
-
   // Fetch the user record to get the encrypted dashboard API key.
-  const userRows = await db
+  let userRows = await db
     .select({ dashboardApiKeyEncrypted: tenantUsers.dashboardApiKeyEncrypted })
     .from(tenantUsers)
     .where(eq(tenantUsers.id, sessionUser.id))
     .limit(1);
+
+  // Only run the full ensureDashboardAgent setup when the key is missing (first
+  // visit or after a credential reset).  This avoids 5+ DB queries on every
+  // single API call just to confirm nothing changed.  A lightweight 1-query
+  // role sync always runs to keep RBAC current.
+  if (userRows.length === 0 || !userRows[0].dashboardApiKeyEncrypted) {
+    await ensureDashboardAgent(sessionUser.id, sessionUser.id, sessionUser.tenantId);
+    userRows = await db
+      .select({ dashboardApiKeyEncrypted: tenantUsers.dashboardApiKeyEncrypted })
+      .from(tenantUsers)
+      .where(eq(tenantUsers.id, sessionUser.id))
+      .limit(1);
+  } else {
+    // Hot path: 1-query role sync keeps RBAC current without the full setup cost.
+    await syncDashboardAgentRole(sessionUser.id);
+  }
 
   if (userRows.length === 0 || !userRows[0].dashboardApiKeyEncrypted) {
     throw new Error("Dashboard agent not initialized");

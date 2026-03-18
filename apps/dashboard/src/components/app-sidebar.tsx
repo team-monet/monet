@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   History,
   Scale,
+  BarChart3,
   LogOut,
 } from "lucide-react"
 
@@ -113,6 +114,12 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       url: "/admin/quotas",
       icon: ShieldCheck,
       isActive: pathname === "/admin/quotas",
+    },
+    {
+      title: "Metrics",
+      url: "/admin/metrics",
+      icon: BarChart3,
+      isActive: pathname === "/admin/metrics",
     },
   ]
 
@@ -220,7 +227,7 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem asChild>
-                  <Link href="/api/auth/signout" className="w-full flex items-center cursor-pointer">
+                  <Link href="/signout" className="w-full flex items-center cursor-pointer">
                     <LogOut className="mr-2 h-4 w-4" />
                     Log out
                   </Link>

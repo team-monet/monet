@@ -9,6 +9,7 @@ export interface AuditEntry {
   targetId?: string;
   outcome: "success" | "failure";
   reason?: string;
+  metadata?: Record<string, unknown>;
 }
 
 let consecutiveAuditFailures = 0;
@@ -26,7 +27,7 @@ export async function logAuditEvent(
     await withTenantScope(sql, schemaName, async (txSql) => {
       const tx = txSql as unknown as postgres.Sql;
       await tx`
-        INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, target_id, outcome, reason)
+        INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, target_id, outcome, reason, metadata)
         VALUES (
           ${entry.tenantId},
           ${entry.actorId},
@@ -34,7 +35,8 @@ export async function logAuditEvent(
           ${entry.action},
           ${entry.targetId ?? null},
           ${entry.outcome},
-          ${entry.reason ?? null}
+          ${entry.reason ?? null},
+          ${entry.metadata ? JSON.stringify(entry.metadata) : null}
         )
       `;
     });

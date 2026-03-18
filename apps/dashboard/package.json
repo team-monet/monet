@@ -6,7 +6,7 @@
     "dev": "set -a; [ -f ../../.env ] && . ../../.env; set +a; next dev --port 3000",
     "dev:local": "next dev --port 3000",
     "dev:seeded": "./scripts/seed-and-start.sh",
-    "build": "next build",
+    "build": "node ./scripts/build-with-retry.mjs",
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/"
@@ -25,6 +25,7 @@
     "radix-ui": "^1.4.3",
     "react": "^19",
     "react-dom": "^19",
+    "recharts": "^3.8.0",
     "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {

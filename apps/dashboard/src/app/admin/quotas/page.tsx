@@ -1,6 +1,6 @@
 import { getApiClient } from "@/lib/api-client";
 import { requireAdmin } from "@/lib/auth";
-import { AgentGroup } from "@monet/types";
+import { AgentGroup, QuotaUtilization } from "@monet/types";
 import { updateGroupQuotaAction } from "./actions";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { SubmitButton } from "@/components/ui/submit-button";
@@ -25,12 +25,19 @@ export default async function QuotasPage({ searchParams }: PageProps) {
   const updateError = getSingleParam(params.updateError);
 
   let groups: AgentGroup[] = [];
+  let quotaUsage: QuotaUtilization[] = [];
   let error = "";
 
   try {
     const client = await getApiClient();
-    const result = await client.listGroups();
-    groups = result.groups;
+    const [groupResult, metricsResult] = await Promise.all([
+      client.listGroups(),
+      client.getMetrics().catch(() => null),
+    ]);
+    groups = groupResult.groups;
+    if (metricsResult) {
+      quotaUsage = metricsResult.health.quotaUtilization;
+    }
   } catch (err: unknown) {
     error = err instanceof Error ? err.message : "An unexpected error occurred";
   }
@@ -94,12 +101,30 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                           Current Quota
                         </span>
                         <span className="font-medium">
-                          {group.memoryQuota ?? "Unlimited"} {group.memoryQuota === null ? "" : "Entries"}
+                          {group.memoryQuota === null
+                            ? "Default (10,000 per agent)"
+                            : `${group.memoryQuota} Entries`}
                         </span>
                       </div>
-                      <p className="text-[11px] text-muted-foreground">
-                        Live usage metrics are not available yet on this page.
-                      </p>
+                      {(() => {
+                        const usage = quotaUsage.find((q) => q.groupId === group.id);
+                        if (usage) {
+                          const agentPct = usage.effectiveQuotaPerAgent > 0
+                            ? Math.round((usage.maxAgentCurrent / usage.effectiveQuotaPerAgent) * 100)
+                            : 0;
+                          return (
+                            <p className="text-[11px] text-muted-foreground">
+                              Busiest agent: <span className="font-medium">{usage.maxAgentCurrent.toLocaleString()}</span> / {usage.effectiveQuotaPerAgent.toLocaleString()} entries ({agentPct}%)
+                              {" · "}{usage.current.toLocaleString()} total in group
+                            </p>
+                          );
+                        }
+                        return (
+                          <p className="text-[11px] text-muted-foreground">
+                            Usage data loading...
+                          </p>
+                        );
+                      })()}
                       <p className="text-[11px] text-muted-foreground">
                         Use a positive integer. Clearing quota to unlimited is not available yet.
                       </p>

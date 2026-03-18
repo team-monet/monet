@@ -18,6 +18,7 @@ import {
   resolveMemoryWritePreflight,
   searchMemories,
   updateMemory,
+  writeAuditLog,
 } from "../services/memory.service";
 import type { RuleRecord } from "../services/rule.service";
 import packageJson from "../../package.json" with { type: "json" };
@@ -186,9 +187,22 @@ export function createMcpServer(
     memorySearch: async (args) => {
       try {
         const queryEmbedding = args.query ? await computeQueryEmbedding(args.query) : null;
-        const result = await withTenantScope(sql, tenantSchemaName, (txSql) =>
-          searchMemories(txSql, agentContext, args, queryEmbedding),
-        );
+        const result = await withTenantScope(sql, tenantSchemaName, async (txSql) => {
+          const searchResult = await searchMemories(txSql, agentContext, args, queryEmbedding);
+          await writeAuditLog(
+            txSql as unknown as import("postgres").Sql,
+            agentContext.tenantId,
+            agentContext.id,
+            "memory.search",
+            null,
+            "success",
+            {
+              resultCount: searchResult.items.length,
+              searchType: queryEmbedding ? "vector" : "text",
+            },
+          );
+          return searchResult;
+        });
         return asToolResult(result);
       } catch (error) {
         return asToolError(error instanceof Error ? error.message : "Internal server error");
@@ -196,9 +210,20 @@ export function createMcpServer(
     },
     memoryFetch: async (args) => {
       try {
-        const result = await withTenantScope(sql, tenantSchemaName, (txSql) =>
-          fetchMemory(txSql, agentContext, args.id),
-        );
+        const result = await withTenantScope(sql, tenantSchemaName, async (txSql) => {
+          const fetchResult = await fetchMemory(txSql, agentContext, args.id);
+          if (!hasError(fetchResult)) {
+            await writeAuditLog(
+              txSql as unknown as import("postgres").Sql,
+              agentContext.tenantId,
+              agentContext.id,
+              "memory.get",
+              args.id,
+              "success",
+            );
+          }
+          return fetchResult;
+        });
         if (hasError(result)) {
           return asToolError(describeServiceError(result));
         }
