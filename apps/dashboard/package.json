@@ -3,11 +3,11 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "set -a; [ -f ../../.env ] && . ../../.env; set +a; sh -c 'dashboard_host=\"${DASHBOARD_HOST:-0.0.0.0}\"; next dev --hostname \"$dashboard_host\" --port \"${PORT:-3000}\"'",
-    "dev:local": "sh -c 'dashboard_host=\"${DASHBOARD_HOST:-0.0.0.0}\"; next dev --hostname \"$dashboard_host\" --port \"${PORT:-3000}\"'",
+    "dev": "set -a; [ -f ../../.env ] && . ../../.env; set +a; next dev --hostname \"${DASHBOARD_HOST:-0.0.0.0}\" --port \"${PORT:-3000}\"",
+    "dev:local": "next dev --hostname \"${DASHBOARD_HOST:-0.0.0.0}\" --port \"${PORT:-3000}\"",
     "dev:seeded": "./scripts/seed-and-start.sh",
     "build": "node ./scripts/build-with-retry.mjs",
-    "start": "sh -c 'dashboard_host=\"${DASHBOARD_HOST:-${HOSTNAME:-0.0.0.0}}\"; next start --hostname \"$dashboard_host\" --port \"${PORT:-3000}\"'",
+    "start": "next start --hostname \"${DASHBOARD_HOST:-0.0.0.0}\" --port \"${PORT:-3000}\"",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/"
   },
