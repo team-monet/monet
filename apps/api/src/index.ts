@@ -41,6 +41,7 @@ const mcpHandler = createMcpHandler({ db, sql, sessionStore });
 const honoRequestListener = getRequestListener(app.fetch);
 
 const port = parseInt(process.env.API_PORT || "3001", 10);
+const host = process.env.API_HOST || "0.0.0.0";
 
 console.log(`Starting Monet API on port ${port}`);
 console.log(`Ensured tenant schemas are current for ${upgradedTenantSchemaCount} tenant(s)`);
@@ -71,9 +72,10 @@ const server = createServer((req, res) => {
   honoRequestListener(req, res);
 });
 
-server.listen(port);
+server.listen(port, host);
 
-console.log(`API server running at http://localhost:${port}`);
+const loggedHost = host.includes(":") ? `[${host}]` : host;
+console.log(`API server running at http://${loggedHost}:${port}`);
 
 // Start TTL expiry background job (runs on startup + every 60 minutes)
 startTtlExpiryJob(sql);
