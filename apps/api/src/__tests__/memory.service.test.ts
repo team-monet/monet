@@ -30,8 +30,9 @@ describe("encodeCursor / decodeCursor", () => {
     const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const cursor = encodeCursor(createdAt, id);
     const decoded = decodeCursor(cursor);
-    expect(decoded.createdAt).toBe(createdAt);
-    expect(decoded.id).toBe(id);
+    expect(decoded).not.toBeNull();
+    expect(decoded!.createdAt).toBe(createdAt);
+    expect(decoded!.id).toBe(id);
   });
 
   it("produces a URL-safe base64 string", () => {
