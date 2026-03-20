@@ -543,48 +543,27 @@ agentsRouter.get("/", async (c) => {
     return c.json([]);
   }
 
-  const rows = admin
-    ? await sql`
-        SELECT
-          a.id,
-          a.external_id,
-          a.tenant_id,
-          a.user_id,
-          a.role,
-          a.is_autonomous,
-          a.revoked_at,
-          a.created_at,
-          u.id AS owner_id,
-          u.external_id AS owner_external_id,
-          u.display_name AS owner_display_name,
-          u.email AS owner_email
-        FROM agents a
-        LEFT JOIN users u ON u.id = a.user_id
-        WHERE a.tenant_id = ${agent.tenantId}
-          AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
-        ORDER BY a.created_at DESC
-      `
-    : await sql`
-        SELECT
-          a.id,
-          a.external_id,
-          a.tenant_id,
-          a.user_id,
-          a.role,
-          a.is_autonomous,
-          a.revoked_at,
-          a.created_at,
-          u.id AS owner_id,
-          u.external_id AS owner_external_id,
-          u.display_name AS owner_display_name,
-          u.email AS owner_email
-        FROM agents a
-        LEFT JOIN users u ON u.id = a.user_id
-        WHERE a.tenant_id = ${agent.tenantId}
-          AND a.user_id = ${agent.userId}
-          AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
-        ORDER BY a.created_at DESC
-      `;
+  const rows = await sql`
+    SELECT
+      a.id,
+      a.external_id,
+      a.tenant_id,
+      a.user_id,
+      a.role,
+      a.is_autonomous,
+      a.revoked_at,
+      a.created_at,
+      u.id AS owner_id,
+      u.external_id AS owner_external_id,
+      u.display_name AS owner_display_name,
+      u.email AS owner_email
+    FROM agents a
+    LEFT JOIN users u ON u.id = a.user_id
+    WHERE a.tenant_id = ${agent.tenantId}
+      AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
+      AND (${admin} OR a.user_id = ${agent.userId})
+    ORDER BY a.created_at DESC
+  `;
 
   return c.json((rows as unknown as AgentRow[]).map(mapAgent));
 });
