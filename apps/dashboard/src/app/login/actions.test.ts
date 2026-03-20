@@ -64,10 +64,9 @@ function setupDbMocks(
 describe("validateTenantAction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     // Defaults: not development, no bypass flags
-    process.env.NODE_ENV = "test";
-    delete process.env.DEV_BYPASS_AUTH;
-    delete process.env.DASHBOARD_LOCAL_AUTH;
+    vi.stubEnv("NODE_ENV", "test");
   });
 
   // ---- Input validation ----------------------------------------------------
@@ -129,7 +128,7 @@ describe("validateTenantAction", () => {
 
   describe("dev bypass for test-org (#29)", () => {
     it("returns dev-bypass provider when DEV_BYPASS_AUTH is enabled in development", async () => {
-      process.env.NODE_ENV = "development";
+      vi.stubEnv("NODE_ENV", "development");
       // DEV_BYPASS_AUTH is not set to "false", so bypass is enabled by default
 
       const result = await validateTenantAction("test-org");
@@ -142,8 +141,8 @@ describe("validateTenantAction", () => {
     });
 
     it("returns dev-bypass when DASHBOARD_LOCAL_AUTH is true even outside development", async () => {
-      process.env.NODE_ENV = "production";
-      process.env.DASHBOARD_LOCAL_AUTH = "true";
+      vi.stubEnv("NODE_ENV", "production");
+      vi.stubEnv("DASHBOARD_LOCAL_AUTH", "true");
 
       const result = await validateTenantAction("test-org");
       expect(result).toEqual({
@@ -155,8 +154,8 @@ describe("validateTenantAction", () => {
     });
 
     it("does not bypass when DEV_BYPASS_AUTH is explicitly false", async () => {
-      process.env.NODE_ENV = "development";
-      process.env.DEV_BYPASS_AUTH = "false";
+      vi.stubEnv("NODE_ENV", "development");
+      vi.stubEnv("DEV_BYPASS_AUTH", "false");
       setupDbMocks([{ id: "tenant-uuid-test" }], [{ id: "oauth-uuid" }]);
 
       const result = await validateTenantAction("test-org");
@@ -168,7 +167,7 @@ describe("validateTenantAction", () => {
     });
 
     it("returns error for test-org when DEV_BYPASS_AUTH is disabled and no OAuth config (#29)", async () => {
-      process.env.DEV_BYPASS_AUTH = "false";
+      vi.stubEnv("DEV_BYPASS_AUTH", "false");
       setupDbMocks([{ id: "tenant-uuid-test" }], []);
 
       const result = await validateTenantAction("test-org");
@@ -183,7 +182,7 @@ describe("validateTenantAction", () => {
 
   describe("missing tenant_oauth_configs table (#31)", () => {
     it("returns graceful error for test-org when table is missing", async () => {
-      process.env.DEV_BYPASS_AUTH = "false";
+      vi.stubEnv("DEV_BYPASS_AUTH", "false");
       const missingTableError = Object.assign(
         new Error('relation "tenant_oauth_configs" does not exist'),
         { code: "42P01" },
