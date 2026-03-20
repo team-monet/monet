@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../middleware/context";
 import { getEnrichmentProviderConfigStatus } from "../providers/index";
+import { getAuditHealth } from "../services/audit.service";
 
 export const health = new Hono<AppEnv>();
 
@@ -32,11 +33,14 @@ health.get("/health/ready", async (c) => {
   const enrichment: "configured" | "not_configured" =
     enrichmentConfig.configured ? "configured" : "not_configured";
 
+  const audit = getAuditHealth();
+
   if (db === "connected" && enrichment === "configured") {
     return c.json({
       status: "ok",
       db,
       enrichment,
+      audit: audit.status,
     });
   }
 
@@ -45,6 +49,7 @@ health.get("/health/ready", async (c) => {
       status: "not_ready",
       db,
       enrichment,
+      audit: audit.status,
       reason: enrichmentConfig.reason,
     },
     503,

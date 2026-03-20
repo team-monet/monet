@@ -42,6 +42,7 @@ describe("health endpoints", () => {
       status: "ok",
       db: "connected",
       enrichment: "configured",
+      audit: "healthy",
     });
   });
 
