@@ -11,6 +11,7 @@ import { pushRulesToAgent } from "../services/rule-notification.service";
 import { getActiveRulesForAgent } from "../services/rule.service";
 import { logRequest } from "../lib/log";
 import { createMcpServer } from "./server";
+import { SessionLimitError } from "./session-store";
 import type { SessionStore } from "./session-store";
 
 interface McpHandlerDeps {
@@ -124,14 +125,26 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             };
 
             await server.connect(transport);
-            sessionStore.add(newSessionId, {
-              transport,
-              server,
-              agentContext: auth.agent,
-              tenantSchemaName: schemaName,
-              connectedAt: new Date(),
-              lastActivityAt: new Date(),
-            });
+            try {
+              sessionStore.add(newSessionId, {
+                transport,
+                server,
+                agentContext: auth.agent,
+                tenantSchemaName: schemaName,
+                connectedAt: new Date(),
+                lastActivityAt: new Date(),
+              });
+            } catch (error) {
+              if (error instanceof SessionLimitError) {
+                await Promise.allSettled([transport.close(), server.close()]);
+                writeJson(res, 429, {
+                  error: "session_limit",
+                  message: "Session limit exceeded",
+                });
+                return;
+              }
+              throw error;
+            }
 
             try {
               // The MCP SDK reads POST request bodies from the raw Node stream.
@@ -144,10 +157,11 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               sessionStore.touch(newSessionId);
               return;
             } catch (error) {
+              console.error("MCP request error (new session)", error);
               await sessionStore.closeSession(newSessionId);
               writeJson(res, 500, {
                 error: "internal",
-                message: error instanceof Error ? error.message : "Internal server error",
+                message: "An internal error occurred",
               });
               return;
             }
@@ -169,9 +183,10 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             await session.transport.handleRequest(req, res);
             return;
           } catch (error) {
+            console.error("MCP request error (existing session)", error);
             writeJson(res, 500, {
               error: "internal",
-              message: error instanceof Error ? error.message : "Internal server error",
+              message: "An internal error occurred",
             });
             return;
           }
@@ -213,9 +228,10 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             await session.transport.handleRequest(req, res);
             return;
           } catch (error) {
+            console.error("MCP request error (GET session)", error);
             writeJson(res, 500, {
               error: "internal",
-              message: error instanceof Error ? error.message : "Internal server error",
+              message: "An internal error occurred",
             });
             return;
           }

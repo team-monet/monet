@@ -2,8 +2,17 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { AgentContext } from "../middleware/context";
 
+export class SessionLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionLimitError";
+  }
+}
+
 const IDLE_TTL_MS = 30 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_SESSIONS_PER_AGENT = 5;
+const MAX_TOTAL_SESSIONS = 1000;
 
 export interface McpSession {
   transport: StreamableHTTPServerTransport;
@@ -19,6 +28,13 @@ export class SessionStore {
   private sweepTimer: NodeJS.Timeout | null = null;
 
   add(sessionId: string, session: McpSession): void {
+    if (this.sessions.size >= MAX_TOTAL_SESSIONS) {
+      throw new SessionLimitError("Total session limit reached");
+    }
+    const agentSessionCount = this.getByAgentId(session.agentContext.id).length;
+    if (agentSessionCount >= MAX_SESSIONS_PER_AGENT) {
+      throw new SessionLimitError("Per-agent session limit reached");
+    }
     this.sessions.set(sessionId, session);
   }
 

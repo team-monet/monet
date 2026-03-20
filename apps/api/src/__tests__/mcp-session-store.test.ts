@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SessionStore } from "../mcp/session-store";
+import { SessionStore, SessionLimitError } from "../mcp/session-store";
 
 describe("MCP session store", () => {
   let store: SessionStore;
@@ -168,6 +168,93 @@ describe("MCP session store", () => {
     expect(transportCloseB).toHaveBeenCalledTimes(1);
     expect(serverCloseA).toHaveBeenCalledTimes(1);
     expect(serverCloseB).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws SessionLimitError when per-agent limit is reached", () => {
+    const base = {
+      transport: {} as never,
+      server: {} as never,
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    };
+    const agentContext = {
+      id: "agent-1",
+      externalId: "agent-1",
+      tenantId: "tenant-1",
+      isAutonomous: false,
+      userId: null,
+      role: null,
+    };
+
+    for (let i = 0; i < 5; i++) {
+      store.add(`session-${i}`, { ...base, agentContext });
+    }
+
+    expect(() => store.add("session-6", { ...base, agentContext }))
+      .toThrow(SessionLimitError);
+  });
+
+  it("throws SessionLimitError when total session limit is reached", () => {
+    const base = {
+      transport: {} as never,
+      server: {} as never,
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    };
+
+    for (let i = 0; i < 1000; i++) {
+      store.add(`session-${i}`, {
+        ...base,
+        agentContext: {
+          id: `agent-${i}`,
+          externalId: `agent-${i}`,
+          tenantId: "tenant-1",
+          isAutonomous: false,
+          userId: null,
+          role: null,
+        },
+      });
+    }
+
+    expect(() => store.add("session-overflow", {
+      ...base,
+      agentContext: {
+        id: "agent-new",
+        externalId: "agent-new",
+        tenantId: "tenant-1",
+        isAutonomous: false,
+        userId: null,
+        role: null,
+      },
+    })).toThrow(SessionLimitError);
+  });
+
+  it("allows new sessions after removing one that hit the per-agent limit", () => {
+    const base = {
+      transport: {} as never,
+      server: {} as never,
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    };
+    const agentContext = {
+      id: "agent-1",
+      externalId: "agent-1",
+      tenantId: "tenant-1",
+      isAutonomous: false,
+      userId: null,
+      role: null,
+    };
+
+    for (let i = 0; i < 5; i++) {
+      store.add(`session-${i}`, { ...base, agentContext });
+    }
+
+    store.remove("session-0");
+    expect(() => store.add("session-new", { ...base, agentContext })).not.toThrow();
+    expect(store.count()).toBe(5);
   });
 
   it("idle sweep expires stale sessions and preserves active ones", () => {
