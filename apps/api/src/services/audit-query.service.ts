@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { z } from "zod";
 import { tenantSchemaNameFromId, withTenantScope } from "@monet/db";
 
 export interface AuditQueryOptions {
@@ -19,8 +20,14 @@ export function encodeAuditCursor(createdAt: string, id: string): string {
   return Buffer.from(JSON.stringify({ createdAt, id })).toString("base64url");
 }
 
+const AuditCursorSchema = z.object({
+  createdAt: z.string(),
+  id: z.string(),
+});
+
 export function decodeAuditCursor(cursor: string): AuditCursorPayload {
-  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8")) as AuditCursorPayload;
+  const raw = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+  return AuditCursorSchema.parse(raw);
 }
 
 /**

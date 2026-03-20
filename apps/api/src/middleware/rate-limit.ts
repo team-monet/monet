@@ -81,5 +81,8 @@ export const rateLimitMiddleware = createMiddleware<AppEnv>(async (c, next) => {
  * Reset all rate limit state. Used in tests.
  */
 export function resetRateLimits(): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("resetRateLimits() is only available in test environment");
+  }
   windows.clear();
 }

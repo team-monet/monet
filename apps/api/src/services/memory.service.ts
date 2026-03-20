@@ -1,4 +1,5 @@
 import type postgres from "postgres";
+import { z } from "zod";
 import type { AgentContext } from "../middleware/context";
 import type {
   CreateMemoryEntryInput,
@@ -18,8 +19,15 @@ export function encodeCursor(createdAt: string, id: string, rank?: number): stri
   return Buffer.from(JSON.stringify({ createdAt, id, rank })).toString("base64url");
 }
 
+const SearchCursorSchema = z.object({
+  createdAt: z.string(),
+  id: z.string(),
+  rank: z.number().optional(),
+});
+
 export function decodeCursor(cursor: string): SearchCursorPayload {
-  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8")) as SearchCursorPayload;
+  const raw = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+  return SearchCursorSchema.parse(raw);
 }
 
 // ---------- Row mapping ----------
