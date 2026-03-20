@@ -573,10 +573,19 @@ export async function associateRuleSetWithAgent(
   actor: RuleMutationActor,
   agentId: string,
   ruleSetId: string,
-  agentUserId: string | null,
 ): Promise<{ success: true } | { error: "not_found" | "conflict" | "forbidden" }> {
   const result = await withTenantScope(sql, schemaName, async (txSql) => {
     const tx = txSql as unknown as postgres.Sql;
+
+    // Validate agent exists and belongs to this tenant
+    const [agent] = await sql`
+      SELECT user_id FROM public.agents
+      WHERE id = ${agentId} AND tenant_id = ${tenantId}
+    `;
+    if (!agent) return { error: "not_found" as const };
+
+    const agentOwnerUserId = (agent.user_id as string | null) ?? null;
+
     const [ruleSet] = await tx`
       SELECT owner_user_id
       FROM rule_sets
@@ -585,7 +594,7 @@ export async function associateRuleSetWithAgent(
     if (!ruleSet) return { error: "not_found" as const };
 
     const ownerUserId = (ruleSet.owner_user_id as string | null) ?? null;
-    if (ownerUserId && ownerUserId !== agentUserId) {
+    if (ownerUserId && ownerUserId !== agentOwnerUserId) {
       return { error: "forbidden" as const };
     }
 

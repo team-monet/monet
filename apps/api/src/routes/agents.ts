@@ -468,7 +468,7 @@ agentsRouter.post("/:id/rule-sets", async (c) => {
 
   const result = await associateRuleSetWithAgent(sql, tenantId, schemaName, {
     ...auditActor(requester),
-  }, targetAgentId, parsed.data.ruleSetId, access.row.user_id);
+  }, targetAgentId, parsed.data.ruleSetId);
 
   if ("error" in result) {
     if (result.error === "not_found") {
