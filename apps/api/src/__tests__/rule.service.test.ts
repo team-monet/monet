@@ -30,7 +30,7 @@ const actor = { actorId: "agent-1", actorType: "agent" as const };
 describe("rule service", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    logAuditEventMock.mockResolvedValue(undefined);
+    logAuditEventMock.mockResolvedValue({ success: true });
   });
 
   it("createRule returns rule with generated id", async () => {

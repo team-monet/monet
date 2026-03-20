@@ -124,7 +124,7 @@ export async function createRule(
     return mapRule(rule as Record<string, unknown>);
   });
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -172,7 +172,7 @@ export async function updateRule(
   });
 
   if (!updated) {
-    void logAuditEvent(sql, schemaName, {
+    await logAuditEvent(sql, schemaName, {
       tenantId,
       actorId: actor.actorId,
       actorType: actor.actorType,
@@ -184,7 +184,7 @@ export async function updateRule(
     return { error: "not_found" };
   }
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -223,7 +223,7 @@ export async function deleteRule(
   });
 
   if (!deleted) {
-    void logAuditEvent(sql, schemaName, {
+    await logAuditEvent(sql, schemaName, {
       tenantId,
       actorId: actor.actorId,
       actorType: actor.actorType,
@@ -235,7 +235,7 @@ export async function deleteRule(
     return { error: "not_found" };
   }
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -315,7 +315,7 @@ export async function createRuleSet(
     return mapRuleSet(row as Record<string, unknown>);
   });
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -430,7 +430,7 @@ export async function deleteRuleSet(
   });
 
   if (!deleted) {
-    void logAuditEvent(sql, schemaName, {
+    await logAuditEvent(sql, schemaName, {
       tenantId,
       actorId: actor.actorId,
       actorType: actor.actorType,
@@ -442,7 +442,7 @@ export async function deleteRuleSet(
     return { error: "not_found" };
   }
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -507,7 +507,7 @@ export async function addRuleToSet(
     return { success: true as const };
   });
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -553,7 +553,7 @@ export async function removeRuleFromSet(
     return Boolean(row);
   });
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -600,7 +600,7 @@ export async function associateRuleSetWithAgent(
     return { success: true as const };
   });
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,
@@ -631,7 +631,7 @@ export async function dissociateRuleSetFromAgent(
     return Boolean(row);
   });
 
-  void logAuditEvent(sql, schemaName, {
+  await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
     actorType: actor.actorType,

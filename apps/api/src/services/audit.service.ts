@@ -12,17 +12,37 @@ export interface AuditEntry {
   metadata?: Record<string, unknown>;
 }
 
+export interface AuditResult {
+  success: boolean;
+  error?: string;
+}
+
+export interface AuditHealth {
+  status: "healthy" | "degraded";
+  consecutiveFailures: number;
+  totalFailures: number;
+}
+
 let consecutiveAuditFailures = 0;
+let totalAuditFailures = 0;
 
 export function getConsecutiveAuditFailureCount(): number {
   return consecutiveAuditFailures;
+}
+
+export function getAuditHealth(): AuditHealth {
+  return {
+    status: consecutiveAuditFailures > 0 ? "degraded" : "healthy",
+    consecutiveFailures: consecutiveAuditFailures,
+    totalFailures: totalAuditFailures,
+  };
 }
 
 export async function logAuditEvent(
   sql: postgres.Sql,
   schemaName: string,
   entry: AuditEntry,
-): Promise<void> {
+): Promise<AuditResult> {
   try {
     await withTenantScope(sql, schemaName, async (txSql) => {
       const tx = txSql as unknown as postgres.Sql;
@@ -41,13 +61,18 @@ export async function logAuditEvent(
       `;
     });
     consecutiveAuditFailures = 0;
+    return { success: true };
   } catch (error) {
     consecutiveAuditFailures += 1;
+    totalAuditFailures += 1;
+    const message = error instanceof Error ? error.message : "Unknown audit write error";
     console.error("Failed to write audit log entry", {
       error,
       action: entry.action,
       targetId: entry.targetId,
       consecutiveFailures: consecutiveAuditFailures,
+      totalFailures: totalAuditFailures,
     });
+    return { success: false, error: message };
   }
 }

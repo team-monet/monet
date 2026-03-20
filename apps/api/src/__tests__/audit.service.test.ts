@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getAuditHealth,
   getConsecutiveAuditFailureCount,
   logAuditEvent,
 } from "../services/audit.service";
@@ -15,7 +16,47 @@ describe("audit service", () => {
     vi.clearAllMocks();
   });
 
-  it("inserts an audit log record with expected fields", async () => {
+  it("inserts an audit log record and returns success", async () => {
+    const txMock = vi.fn().mockResolvedValue([]);
+    withTenantScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
+      fn(txMock),
+    );
+
+    const result = await logAuditEvent({} as never, "tenant_test", {
+      tenantId: "00000000-0000-0000-0000-000000000001",
+      actorId: "00000000-0000-0000-0000-000000000002",
+      actorType: "agent",
+      action: "rule.create",
+      targetId: "00000000-0000-0000-0000-000000000003",
+      outcome: "success",
+      reason: "ok",
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(withTenantScopeMock).toHaveBeenCalledTimes(1);
+    expect(txMock).toHaveBeenCalledTimes(1);
+    expect(getConsecutiveAuditFailureCount()).toBe(0);
+  });
+
+  it("returns failure result when audit write fails", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    withTenantScopeMock.mockRejectedValueOnce(new Error("db down"));
+
+    const result = await logAuditEvent({} as never, "tenant_test", {
+      tenantId: "00000000-0000-0000-0000-000000000001",
+      actorId: "00000000-0000-0000-0000-000000000002",
+      actorType: "agent",
+      action: "rule.create",
+      outcome: "success",
+    });
+
+    expect(result).toEqual({ success: false, error: "db down" });
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(getConsecutiveAuditFailureCount()).toBeGreaterThan(0);
+    errorSpy.mockRestore();
+  });
+
+  it("reports healthy status when no failures have occurred", async () => {
     const txMock = vi.fn().mockResolvedValue([]);
     withTenantScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
       fn(txMock),
@@ -26,32 +67,30 @@ describe("audit service", () => {
       actorId: "00000000-0000-0000-0000-000000000002",
       actorType: "agent",
       action: "rule.create",
-      targetId: "00000000-0000-0000-0000-000000000003",
       outcome: "success",
-      reason: "ok",
     });
 
-    expect(withTenantScopeMock).toHaveBeenCalledTimes(1);
-    expect(txMock).toHaveBeenCalledTimes(1);
-    expect(getConsecutiveAuditFailureCount()).toBe(0);
+    const health = getAuditHealth();
+    expect(health.status).toBe("healthy");
+    expect(health.consecutiveFailures).toBe(0);
   });
 
-  it("does not throw when audit write fails", async () => {
+  it("reports degraded status after a failure", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     withTenantScopeMock.mockRejectedValueOnce(new Error("db down"));
 
-    await expect(
-      logAuditEvent({} as never, "tenant_test", {
-        tenantId: "00000000-0000-0000-0000-000000000001",
-        actorId: "00000000-0000-0000-0000-000000000002",
-        actorType: "agent",
-        action: "rule.create",
-        outcome: "success",
-      }),
-    ).resolves.toBeUndefined();
+    await logAuditEvent({} as never, "tenant_test", {
+      tenantId: "00000000-0000-0000-0000-000000000001",
+      actorId: "00000000-0000-0000-0000-000000000002",
+      actorType: "agent",
+      action: "rule.create",
+      outcome: "success",
+    });
 
-    expect(errorSpy).toHaveBeenCalledTimes(1);
-    expect(getConsecutiveAuditFailureCount()).toBeGreaterThan(0);
+    const health = getAuditHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.consecutiveFailures).toBeGreaterThan(0);
+    expect(health.totalFailures).toBeGreaterThan(0);
     errorSpy.mockRestore();
   });
 });

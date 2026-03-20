@@ -87,7 +87,7 @@ describe("agents route", () => {
     addMemberMock.mockResolvedValue({ success: true });
     resolveAgentRoleMock.mockImplementation(async (_sql: unknown, agent: AgentContext) => agent.role);
     userCanSelectAgentGroupMock.mockResolvedValue(true);
-    logAuditEventMock.mockResolvedValue(undefined);
+    logAuditEventMock.mockResolvedValue({ success: true });
     listRuleSetsForAgentMock.mockResolvedValue([]);
     associateRuleSetWithAgentMock.mockResolvedValue({ success: true });
     dissociateRuleSetFromAgentMock.mockResolvedValue({ success: true });
