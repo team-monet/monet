@@ -769,7 +769,7 @@ function asTimestamp(value: unknown): string {
 
 function buildRankExpression(
   queryEmbedding: number[] | null,
-  params?: postgres.ParameterOrJSON<never>[],
+  params: postgres.ParameterOrJSON<never>[],
   paramOffset = 0,
 ): string {
   const usefulnessWeight = "GREATEST(me.usefulness_score, 1)";
@@ -778,11 +778,6 @@ function buildRankExpression(
     return `(${usefulnessWeight} * ${outdatedWeight})`;
   }
 
-  if (params) {
-    params.push(toVectorLiteral(queryEmbedding));
-    return `((1 - (me.embedding <=> $${paramOffset + params.length}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
-  }
-
-  // Fallback for contexts without param accumulation (should not be reached after refactor)
-  return `((1 - (me.embedding <=> '${toVectorLiteral(queryEmbedding)}'::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
+  params.push(toVectorLiteral(queryEmbedding));
+  return `((1 - (me.embedding <=> $${paramOffset + params.length}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
 }
