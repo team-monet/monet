@@ -30,7 +30,6 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
   const [{ id }, query, session] = await Promise.all([params, searchParams, requireAuth()]);
   const sessionUser = session.user as ExtendedUser;
   const isAdmin = sessionUser.role === "tenant_admin";
-  const isOwnAgent = sessionUser.id !== undefined;
   const ruleSetAttached = getSingleParam(query.ruleSetAttached) === "1";
   const ruleSetDetached = getSingleParam(query.ruleSetDetached) === "1";
   const ruleSetError = getSingleParam(query.ruleSetError);
@@ -48,10 +47,10 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
       client.getAgentStatus(id),
     ]);
 
-    const canManageRuleSets = Boolean(agent) && (isAdmin || agent.userId === sessionUser.id);
+    const canManageRuleSets = Boolean(agent) && (isAdmin || (agent.userId != null && agent.userId === sessionUser.id));
     if (canManageRuleSets) {
       sharedRuleSets = (await client.listRuleSets()).ruleSets;
-      if (agent.userId === sessionUser.id) {
+      if (agent.userId != null && agent.userId === sessionUser.id) {
         personalRuleSets = (await client.listPersonalRuleSets()).ruleSets;
       }
     }
@@ -76,9 +75,9 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
     );
   }
 
-  const yours = agent.userId === sessionUser.id && isOwnAgent;
-  const canRegenerate = isAdmin || yours;
-  const canManageRuleSets = isAdmin || yours;
+  const isOwnedBySessionUser = agent.userId != null && agent.userId === sessionUser.id;
+  const canRegenerate = isAdmin || isOwnedBySessionUser;
+  const canManageRuleSets = isAdmin || isOwnedBySessionUser;
   const availableRuleSets = [...sharedRuleSets, ...personalRuleSets].filter(
     (ruleSet) => !agent.ruleSets.some((attachedRuleSet) => attachedRuleSet.id === ruleSet.id),
   );
@@ -99,7 +98,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
               <h1 className="text-3xl font-bold tracking-tight">
                 {formatAgentDisplayName(agent)}
               </h1>
-              {yours && <Badge variant="secondary">Yours</Badge>}
+              {isOwnedBySessionUser && <Badge variant="secondary">Yours</Badge>}
               {status.revoked && (
                 <Badge variant="destructive" className="gap-1">
                   <ShieldAlert className="h-3 w-3" />
@@ -302,7 +301,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
               <CardTitle>Attach Rule Set</CardTitle>
               <CardDescription>
                 {canManageRuleSets
-                  ? yours
+                  ? isOwnedBySessionUser
                     ? "Apply either a shared rule set or one of your personal rule sets to this agent."
                     : "Apply a shared rule set from the tenant catalog to this agent."
                   : "Only tenant admins or the agent owner can modify direct rule sets."}
@@ -344,7 +343,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
                     />
                   </form>
                   <div className="flex flex-col items-start gap-2">
-                    {yours && (
+                    {isOwnedBySessionUser && (
                       <Button asChild variant="ghost" className="px-0">
                         <Link href="/rules">Manage personal rules</Link>
                       </Button>

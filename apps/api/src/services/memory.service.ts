@@ -348,7 +348,7 @@ export async function searchMemories(
   // Memory type
   if (query.memoryType) {
     params.push(query.memoryType);
-    conditions.push(`me.memory_type = $${params.length}`);
+    conditions.push(`me.memory_type = $${params.length}::memory_type`);
   }
 
   // Date range
