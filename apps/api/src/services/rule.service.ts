@@ -577,8 +577,8 @@ export async function associateRuleSetWithAgent(
   const result = await withTenantScope(sql, schemaName, async (txSql) => {
     const tx = txSql as unknown as postgres.Sql;
 
-    // Validate agent exists and belongs to this tenant
-    const [agent] = await sql`
+    // Validate agent exists and belongs to this tenant (use tx for transactional consistency)
+    const [agent] = await tx`
       SELECT user_id FROM public.agents
       WHERE id = ${agentId} AND tenant_id = ${tenantId}
     `;
