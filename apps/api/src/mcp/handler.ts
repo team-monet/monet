@@ -136,9 +136,10 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               });
             } catch (error) {
               if (error instanceof SessionLimitError) {
+                await Promise.allSettled([transport.close(), server.close()]);
                 writeJson(res, 429, {
                   error: "session_limit",
-                  message: error.message,
+                  message: "Session limit exceeded",
                 });
                 return;
               }
