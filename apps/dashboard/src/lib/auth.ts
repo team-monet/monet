@@ -256,12 +256,14 @@ export const authConfig: NextAuthConfig = {
 
 const authSecret =
   process.env.AUTH_SECRET ??
-  process.env.NEXTAUTH_SECRET ??
-  (process.env.NODE_ENV === "production"
-    ? undefined
-    : "monet-dev-auth-secret");
+  process.env.NEXTAUTH_SECRET;
 
 const result = NextAuth(async (req) => {
+  if (!authSecret) {
+    throw new Error(
+      "AUTH_SECRET or NEXTAUTH_SECRET environment variable is required",
+    );
+  }
   const providers = [];
 
   if (isDevBypassEnabled()) {

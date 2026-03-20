@@ -47,6 +47,9 @@ importers:
       postgres:
         specifier: ^3.4.8
         version: 3.4.8
+      zod:
+        specifier: ^3.25.76
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^25.3.3

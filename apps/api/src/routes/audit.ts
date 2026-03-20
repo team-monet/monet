@@ -29,7 +29,10 @@ auditRouter.get("/", async (c) => {
       startDate: query.startDate,
       endDate: query.endDate,
       cursor: query.cursor,
-      limit: query.limit ? parseInt(query.limit) : 100,
+      limit: (() => {
+        const MAX_LIMIT = 100;
+        return query.limit ? Math.min(Math.max(1, parseInt(query.limit) || 20), MAX_LIMIT) : 100;
+      })(),
     });
 
     return c.json(result);

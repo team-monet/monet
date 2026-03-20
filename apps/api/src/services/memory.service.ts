@@ -1,4 +1,5 @@
 import type postgres from "postgres";
+import { z } from "zod";
 import type { AgentContext } from "../middleware/context";
 import type {
   CreateMemoryEntryInput,
@@ -18,8 +19,19 @@ export function encodeCursor(createdAt: string, id: string, rank?: number): stri
   return Buffer.from(JSON.stringify({ createdAt, id, rank })).toString("base64url");
 }
 
-export function decodeCursor(cursor: string): SearchCursorPayload {
-  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8")) as SearchCursorPayload;
+const SearchCursorSchema = z.object({
+  createdAt: z.string(),
+  id: z.string(),
+  rank: z.number().optional(),
+});
+
+export function decodeCursor(cursor: string): SearchCursorPayload | null {
+  try {
+    const raw = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+    return SearchCursorSchema.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 // ---------- Row mapping ----------
@@ -360,7 +372,9 @@ export async function searchMemories(
   // Cursor pagination (created_at, id)
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
-    if (decoded.rank !== undefined) {
+    if (!decoded) {
+      // Invalid cursor — ignore and return results from the start
+    } else if (decoded.rank !== undefined) {
       params.push(decoded.rank);
       const cursorRankIdx = params.length;
       // Only guard with "embedding IS NULL → NULL" when doing semantic search;
@@ -446,13 +460,15 @@ export async function listAgentMemories(
 
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
-    params.push(decoded.createdAt);
-    const createdAtIdx = params.length;
-    params.push(decoded.id);
-    const idIdx = params.length;
-    conditions.push(
-      `(me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`,
-    );
+    if (decoded) {
+      params.push(decoded.createdAt);
+      const createdAtIdx = params.length;
+      params.push(decoded.id);
+      const idIdx = params.length;
+      conditions.push(
+        `(me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`,
+      );
+    }
   }
 
   params.push(limit + 1);

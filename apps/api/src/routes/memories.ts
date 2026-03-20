@@ -101,7 +101,10 @@ memoriesRouter.get("/", async (c) => {
     accessedAfter: c.req.query("accessedAfter"),
     accessedBefore: c.req.query("accessedBefore"),
     cursor: c.req.query("cursor"),
-    limit: c.req.query("limit") ? Number(c.req.query("limit")) : undefined,
+    limit: (() => {
+      const MAX_LIMIT = 100;
+      return c.req.query("limit") ? Math.min(Math.max(1, Number(c.req.query("limit")) || 20), MAX_LIMIT) : undefined;
+    })(),
   };
   const queryEmbedding = query.query ? await computeQueryEmbedding(query.query) : null;
 
@@ -134,7 +137,10 @@ memoriesRouter.get("/agent/:agentId", async (c) => {
 
   const query = {
     cursor: c.req.query("cursor"),
-    limit: c.req.query("limit") ? Number(c.req.query("limit")) : undefined,
+    limit: (() => {
+      const MAX_LIMIT = 100;
+      return c.req.query("limit") ? Math.min(Math.max(1, Number(c.req.query("limit")) || 20), MAX_LIMIT) : undefined;
+    })(),
   };
 
   const result = await withTenantScope(sql, schemaName, (txSql) =>
