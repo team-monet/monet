@@ -25,9 +25,13 @@ const AuditCursorSchema = z.object({
   id: z.string(),
 });
 
-export function decodeAuditCursor(cursor: string): AuditCursorPayload {
-  const raw = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
-  return AuditCursorSchema.parse(raw);
+export function decodeAuditCursor(cursor: string): AuditCursorPayload | null {
+  try {
+    const raw = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+    return AuditCursorSchema.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -91,11 +95,13 @@ export async function queryAuditLogs(
     // Cursor pagination (created_at, id)
     if (options.cursor) {
       const decoded = decodeAuditCursor(options.cursor);
-      queryParams.push(decoded.createdAt);
-      const createdAtIdx = queryParams.length;
-      queryParams.push(decoded.id);
-      const idIdx = queryParams.length;
-      queryText += ` AND (al.created_at, al.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`;
+      if (decoded) {
+        queryParams.push(decoded.createdAt);
+        const createdAtIdx = queryParams.length;
+        queryParams.push(decoded.id);
+        const idIdx = queryParams.length;
+        queryText += ` AND (al.created_at, al.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`;
+      }
     }
 
     queryText += ` ORDER BY al.created_at DESC, al.id DESC LIMIT ${limit + 1}`;
