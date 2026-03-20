@@ -12,10 +12,9 @@ export interface AuditEntry {
   metadata?: Record<string, unknown>;
 }
 
-export interface AuditResult {
-  success: boolean;
-  error?: string;
-}
+export type AuditResult =
+  | { success: true }
+  | { success: false; error: string };
 
 export interface AuditHealth {
   status: "healthy" | "degraded";
@@ -28,6 +27,11 @@ let totalAuditFailures = 0;
 
 export function getConsecutiveAuditFailureCount(): number {
   return consecutiveAuditFailures;
+}
+
+export function resetAuditCounters(): void {
+  consecutiveAuditFailures = 0;
+  totalAuditFailures = 0;
 }
 
 export function getAuditHealth(): AuditHealth {
