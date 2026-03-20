@@ -1,4 +1,4 @@
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, scryptSync } from "node:crypto";
 
 const KEY_PREFIX = "mnt_";
 
@@ -17,13 +17,14 @@ export function generateApiKey(agentId: string): string {
   return `${KEY_PREFIX}${agentPart}.${secretPart}`;
 }
 
+const SCRYPT_PREFIX = "scrypt:";
+const SCRYPT_KEYLEN = 64;
+
 /**
- * Hash an API key with a random salt using SHA-256.
+ * Hash an API key with a random salt using scrypt.
  */
 export function hashApiKey(rawKey: string): HashedApiKey {
   const salt = randomBytes(16).toString("hex");
-  const hash = createHash("sha256")
-    .update(salt + rawKey)
-    .digest("hex");
-  return { hash, salt };
+  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 }).toString("hex");
+  return { hash: `${SCRYPT_PREFIX}${derived}`, salt };
 }

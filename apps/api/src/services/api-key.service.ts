@@ -57,7 +57,7 @@ const SCRYPT_KEYLEN = 64;
  */
 export function hashApiKey(rawKey: string): HashedApiKey {
   const salt = randomBytes(16).toString("hex");
-  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN).toString("hex");
+  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 }).toString("hex");
   return { hash: `${SCRYPT_PREFIX}${derived}`, salt };
 }
 
@@ -72,7 +72,7 @@ export function hashApiKeyWithSalt(rawKey: string, salt: string, storedHash?: st
       .update(salt + rawKey)
       .digest("hex");
   }
-  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN).toString("hex");
+  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 }).toString("hex");
   return `${SCRYPT_PREFIX}${derived}`;
 }
 
