@@ -132,29 +132,37 @@ export interface MemoryWritePreflight {
 
 /**
  * Build scope visibility filter fragments.
- * Returns an array of SQL conditions that should be OR'd together.
+ * Returns an array of SQL conditions (with `$N` placeholders) and a matching
+ * params array that should be OR'd together.
  *
  * - group: always visible
  * - user: visible when includeUser=true AND agent shares same userId
  * - private: visible when includePrivate=true AND agent is the author
+ *
+ * @param paramOffset - the number of params already accumulated by the caller
+ *   so that placeholder indices continue correctly (e.g. pass `params.length`).
  */
 export function buildScopeFilter(
   agent: AgentContext,
   opts: ScopeFilterOpts,
-): string[] {
+  paramOffset = 0,
+): { conditions: string[]; params: postgres.ParameterOrJSON<never>[] } {
   const conditions: string[] = ["me.memory_scope = 'group'"];
+  const params: postgres.ParameterOrJSON<never>[] = [];
 
   if (opts.includeUser && agent.userId) {
-    conditions.push(`(me.memory_scope = 'user' AND me.user_id = ${escapeLiteral(agent.userId)})`);
+    params.push(agent.userId);
+    conditions.push(`(me.memory_scope = 'user' AND me.user_id = $${paramOffset + params.length})`);
   }
 
   if (opts.includePrivate) {
+    params.push(agent.id);
     conditions.push(
-      `(me.memory_scope = 'private' AND me.author_agent_id = ${escapeLiteral(agent.id)})`,
+      `(me.memory_scope = 'private' AND me.author_agent_id = $${paramOffset + params.length})`,
     );
   }
 
-  return conditions;
+  return { conditions, params };
 }
 
 // ---------- Quota ----------
@@ -296,15 +304,17 @@ export async function searchMemories(
   const tx = txSql as unknown as postgres.Sql;
   const limit = query.limit ?? 20;
 
-  // Build WHERE clauses
+  // Build WHERE clauses with parameterized values
+  const params: postgres.ParameterOrJSON<never>[] = [];
   const conditions: string[] = [];
 
   // Scope filter
-  const scopeConditions = buildScopeFilter(agent, {
+  const scopeFilter = buildScopeFilter(agent, {
     includeUser: query.includeUser ?? false,
     includePrivate: query.includePrivate ?? false,
-  });
-  conditions.push(`(${scopeConditions.join(" OR ")})`);
+  }, params.length);
+  params.push(...scopeFilter.params);
+  conditions.push(`(${scopeFilter.conditions.join(" OR ")})`);
 
   // Exclude expired
   conditions.push(
@@ -313,65 +323,90 @@ export async function searchMemories(
 
   // Text search
   if (query.query && !queryEmbedding) {
-    conditions.push(`me.content ILIKE '%' || ${escapeLiteral(query.query)} || '%'`);
+    params.push(query.query);
+    conditions.push(`me.content ILIKE '%' || $${params.length} || '%'`);
   }
 
   // Tag overlap
   if (query.tags && query.tags.length > 0) {
-    conditions.push(`me.tags && ARRAY[${query.tags.map(escapeLiteral).join(",")}]::text[]`);
+    params.push(query.tags);
+    conditions.push(`me.tags && $${params.length}::text[]`);
   }
 
   // Memory type
   if (query.memoryType) {
-    conditions.push(`me.memory_type = ${escapeLiteral(query.memoryType)}`);
+    params.push(query.memoryType);
+    conditions.push(`me.memory_type = $${params.length}`);
   }
 
   // Date range
   if (query.createdAfter) {
-    conditions.push(`me.created_at >= ${escapeLiteral(query.createdAfter)}::timestamptz`);
+    params.push(query.createdAfter);
+    conditions.push(`me.created_at >= $${params.length}::timestamptz`);
   }
   if (query.createdBefore) {
-    conditions.push(`me.created_at <= ${escapeLiteral(query.createdBefore)}::timestamptz`);
+    params.push(query.createdBefore);
+    conditions.push(`me.created_at <= $${params.length}::timestamptz`);
   }
   if (query.accessedAfter) {
-    conditions.push(`me.last_accessed_at >= ${escapeLiteral(query.accessedAfter)}::timestamptz`);
+    params.push(query.accessedAfter);
+    conditions.push(`me.last_accessed_at >= $${params.length}::timestamptz`);
   }
   if (query.accessedBefore) {
-    conditions.push(`me.last_accessed_at <= ${escapeLiteral(query.accessedBefore)}::timestamptz`);
+    params.push(query.accessedBefore);
+    conditions.push(`me.last_accessed_at <= $${params.length}::timestamptz`);
   }
 
   // Cursor pagination (created_at, id)
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
     if (decoded.rank !== undefined) {
-      const cursorRank = escapeNumberLiteral(decoded.rank);
+      params.push(decoded.rank);
+      const cursorRankIdx = params.length;
       // Only guard with "embedding IS NULL → NULL" when doing semantic search;
       // for plain browsing the rank expression doesn't reference me.embedding.
       // INVARIANT: must produce the same SQL as the search_rank alias in buildMemoryEntrySelect().
+      const cursorRankParams: postgres.ParameterOrJSON<never>[] = [];
+      const cursorRankExprRaw = buildRankExpression(queryEmbedding, cursorRankParams, params.length);
+      params.push(...cursorRankParams);
       const rankExpr = queryEmbedding
-        ? `(CASE WHEN me.embedding IS NULL THEN NULL ELSE ${buildRankExpression(queryEmbedding)} END)`
-        : buildRankExpression(queryEmbedding);
+        ? `(CASE WHEN me.embedding IS NULL THEN NULL ELSE ${cursorRankExprRaw} END)`
+        : cursorRankExprRaw;
+      params.push(decoded.createdAt);
+      const createdAtIdx = params.length;
+      params.push(decoded.id);
+      const idIdx = params.length;
       conditions.push(
-        `((${rankExpr} < ${cursorRank}) OR (${rankExpr} = ${cursorRank} AND (me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)))`,
+        `((${rankExpr} < $${cursorRankIdx}) OR (${rankExpr} = $${cursorRankIdx} AND (me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)))`,
       );
     } else {
+      params.push(decoded.createdAt);
+      const createdAtIdx = params.length;
+      params.push(decoded.id);
+      const idIdx = params.length;
       conditions.push(
-        `(me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)`,
+        `(me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`,
       );
     }
   }
 
+  // Build the rank expression for the SELECT clause
+  const selectRankParams: postgres.ParameterOrJSON<never>[] = [];
+  const rankExpression = buildRankExpression(queryEmbedding, selectRankParams, params.length);
+  params.push(...selectRankParams);
+
   const where = conditions.join(" AND ");
-  const rankExpression = buildRankExpression(queryEmbedding);
   const orderBy = `ORDER BY search_rank DESC NULLS LAST, me.created_at DESC, me.id DESC`;
+  params.push(limit + 1);
+  const limitIdx = params.length;
   const sql = `
     ${buildMemoryEntrySelect(rankExpression)}
     WHERE ${where}
     ${orderBy}
-    LIMIT ${limit + 1}
+    LIMIT $${limitIdx}
   `;
 
-  const rows = await tx.unsafe(sql);
+  const rows = await tx.unsafe(sql, params);
 
   const hasMore = rows.length > limit;
   const items = (rows.slice(0, limit) as Record<string, unknown>[]).map(mapTier1Row);
@@ -400,18 +435,28 @@ export async function listAgentMemories(
 ) {
   const tx = txSql as unknown as postgres.Sql;
   const limit = query.limit ?? 20;
+  const params: postgres.ParameterOrJSON<never>[] = [];
+
+  params.push(targetAgentId);
   const conditions = [
-    `me.author_agent_id = ${escapeLiteral(targetAgentId)}`,
+    `me.author_agent_id = $${params.length}`,
     `me.memory_scope = 'group'`,
     `(me.expires_at IS NULL OR me.expires_at > NOW())`,
   ];
 
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
+    params.push(decoded.createdAt);
+    const createdAtIdx = params.length;
+    params.push(decoded.id);
+    const idIdx = params.length;
     conditions.push(
-      `(me.created_at, me.id) < (${escapeLiteral(decoded.createdAt)}::timestamptz, ${escapeLiteral(decoded.id)}::uuid)`,
+      `(me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`,
     );
   }
+
+  params.push(limit + 1);
+  const limitIdx = params.length;
 
   // Group memories are visible to all group members. The current codebase treats
   // group scope as globally visible within the tenant schema, so match that here.
@@ -420,8 +465,9 @@ export async function listAgentMemories(
       ${buildMemoryEntrySelect()}
       WHERE ${conditions.join(" AND ")}
       ORDER BY me.created_at DESC, me.id DESC
-      LIMIT ${limit + 1}
+      LIMIT $${limitIdx}
     `,
+    params,
   );
 
   const hasMore = rows.length > limit;
@@ -652,11 +698,14 @@ export async function listTags(
 ) {
   const tx = txSql as unknown as postgres.Sql;
 
-  const scopeConditions = buildScopeFilter(agent, opts);
-  const where = scopeConditions.join(" OR ");
+  const params: postgres.ParameterOrJSON<never>[] = [];
+  const scopeFilter = buildScopeFilter(agent, opts, params.length);
+  params.push(...scopeFilter.params);
+  const where = scopeFilter.conditions.join(" OR ");
 
   const rows = await tx.unsafe(
     `SELECT DISTINCT unnest(me.tags) AS tag FROM memory_entries me WHERE (${where}) AND (me.expires_at IS NULL OR me.expires_at > NOW()) ORDER BY tag`,
+    params,
   );
 
   return (rows as Record<string, unknown>[]).map((r) => r.tag as string);
@@ -683,18 +732,6 @@ function checkScopeAccess(
   }
 
   return null;
-}
-
-function escapeLiteral(value: string): string {
-  // Escape single quotes by doubling them, wrap in single quotes
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-function escapeNumberLiteral(value: number): string {
-  if (!Number.isFinite(value)) {
-    throw new Error("Cursor rank must be finite");
-  }
-  return value.toString();
 }
 
 export function buildSummary(summary: string | null, content: string): string {
@@ -730,12 +767,22 @@ function asTimestamp(value: unknown): string {
   return String(value);
 }
 
-function buildRankExpression(queryEmbedding: number[] | null): string {
+function buildRankExpression(
+  queryEmbedding: number[] | null,
+  params?: postgres.ParameterOrJSON<never>[],
+  paramOffset = 0,
+): string {
   const usefulnessWeight = "GREATEST(me.usefulness_score, 1)";
   const outdatedWeight = "CASE WHEN me.outdated THEN 0.5 ELSE 1.0 END";
   if (!queryEmbedding) {
     return `(${usefulnessWeight} * ${outdatedWeight})`;
   }
 
-  return `((1 - (me.embedding <=> ${escapeLiteral(toVectorLiteral(queryEmbedding))}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
+  if (params) {
+    params.push(toVectorLiteral(queryEmbedding));
+    return `((1 - (me.embedding <=> $${paramOffset + params.length}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
+  }
+
+  // Fallback for contexts without param accumulation (should not be reached after refactor)
+  return `((1 - (me.embedding <=> '${toVectorLiteral(queryEmbedding)}'::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
 }

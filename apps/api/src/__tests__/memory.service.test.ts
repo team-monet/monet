@@ -42,48 +42,62 @@ describe("encodeCursor / decodeCursor", () => {
 
 describe("buildScopeFilter", () => {
   it("always includes group scope", () => {
-    const conditions = buildScopeFilter(makeAgent(), {
+    const { conditions, params } = buildScopeFilter(makeAgent(), {
       includeUser: false,
       includePrivate: false,
     });
     expect(conditions).toContain("me.memory_scope = 'group'");
     expect(conditions).toHaveLength(1);
+    expect(params).toHaveLength(0);
   });
 
   it("includes user scope when includeUser=true and agent has userId", () => {
-    const conditions = buildScopeFilter(makeAgent({ userId: USER_ID }), {
+    const { conditions, params } = buildScopeFilter(makeAgent({ userId: USER_ID }), {
       includeUser: true,
       includePrivate: false,
     });
     expect(conditions).toHaveLength(2);
     expect(conditions[1]).toContain("me.memory_scope = 'user'");
-    expect(conditions[1]).toContain(USER_ID);
+    expect(params).toContain(USER_ID);
   });
 
   it("does NOT include user scope when agent has no userId", () => {
-    const conditions = buildScopeFilter(makeAgent({ userId: null }), {
+    const { conditions, params } = buildScopeFilter(makeAgent({ userId: null }), {
       includeUser: true,
       includePrivate: false,
     });
     expect(conditions).toHaveLength(1);
+    expect(params).toHaveLength(0);
   });
 
   it("includes private scope when includePrivate=true", () => {
-    const conditions = buildScopeFilter(makeAgent(), {
+    const { conditions, params } = buildScopeFilter(makeAgent(), {
       includeUser: false,
       includePrivate: true,
     });
     expect(conditions).toHaveLength(2);
     expect(conditions[1]).toContain("me.memory_scope = 'private'");
-    expect(conditions[1]).toContain(AGENT_ID);
+    expect(params).toContain(AGENT_ID);
   });
 
   it("includes all scopes when both flags set and agent has userId", () => {
-    const conditions = buildScopeFilter(makeAgent({ userId: USER_ID }), {
+    const { conditions, params } = buildScopeFilter(makeAgent({ userId: USER_ID }), {
       includeUser: true,
       includePrivate: true,
     });
     expect(conditions).toHaveLength(3);
+    expect(params).toHaveLength(2);
+  });
+
+  it("respects paramOffset for placeholder numbering", () => {
+    const { conditions, params } = buildScopeFilter(makeAgent({ userId: USER_ID }), {
+      includeUser: true,
+      includePrivate: true,
+    }, 3);
+    // With offset 3, first param should be $4, second $5
+    expect(conditions[1]).toContain("$4");
+    expect(conditions[2]).toContain("$5");
+    expect(params).toHaveLength(2);
   });
 });
 

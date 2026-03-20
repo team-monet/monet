@@ -262,16 +262,14 @@ async function findRelatedMemoryIds(
 ): Promise<string[]> {
   return withTenantScope(sql, schemaName, async (txSql) => {
     const tx = txSql as unknown as postgres.Sql;
-    const vectorLiteral = escapeLiteral(toVectorLiteral(embedding));
-    const safeEntryId = escapeLiteral(entryId);
     const rows = await tx.unsafe(`
       SELECT id
       FROM memory_entries
-      WHERE id <> ${safeEntryId}::uuid
+      WHERE id <> $1::uuid
         AND embedding IS NOT NULL
-      ORDER BY embedding <=> ${vectorLiteral}::vector
-      LIMIT ${RELATED_MEMORY_LIMIT}
-    `);
+      ORDER BY embedding <=> $2::vector
+      LIMIT $3
+    `, [entryId, toVectorLiteral(embedding), RELATED_MEMORY_LIMIT]);
 
     return (rows as Array<Record<string, unknown>>).map((row) => row.id as string);
   });
@@ -284,10 +282,6 @@ function toVectorLiteral(embedding: number[]): string {
     }
     return Number(value).toString();
   }).join(",")}]`;
-}
-
-function escapeLiteral(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
