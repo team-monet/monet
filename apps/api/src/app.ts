@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { secureHeaders } from "hono/secure-headers";
 import type { Database } from "@monet/db";
 import type postgres from "postgres";
 import { health } from "./routes/health";
@@ -23,6 +24,9 @@ export function createApp(
   sessionStore: SessionStore | null = null,
 ) {
   const app = new Hono<AppEnv>();
+
+  // Security headers (X-Content-Type-Options, X-Frame-Options, etc.)
+  app.use("*", secureHeaders());
 
   // Structured logging middleware with per-request correlation IDs.
   app.use("*", structuredLogger);
