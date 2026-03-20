@@ -1,4 +1,4 @@
-import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes, createHash, scryptSync, timingSafeEqual } from "node:crypto";
 
 const KEY_PREFIX = "mnt_";
 
@@ -48,26 +48,32 @@ export function parseApiKey(rawKey: string): ParsedApiKey | null {
   }
 }
 
+const SCRYPT_PREFIX = "scrypt:";
+const SCRYPT_KEYLEN = 64;
+
 /**
- * Hash an API key with a random salt using SHA-256.
+ * Hash an API key with a random salt using scrypt (slow hash).
  * Used when storing a new key.
  */
 export function hashApiKey(rawKey: string): HashedApiKey {
   const salt = randomBytes(16).toString("hex");
-  const hash = createHash("sha256")
-    .update(salt + rawKey)
-    .digest("hex");
-  return { hash, salt };
+  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN).toString("hex");
+  return { hash: `${SCRYPT_PREFIX}${derived}`, salt };
 }
 
 /**
  * Hash an API key with a known salt.
- * Used when validating an incoming key against a stored hash.
+ * Detects hash format: scrypt-prefixed hashes use scrypt, others use legacy SHA-256.
  */
-export function hashApiKeyWithSalt(rawKey: string, salt: string): string {
-  return createHash("sha256")
-    .update(salt + rawKey)
-    .digest("hex");
+export function hashApiKeyWithSalt(rawKey: string, salt: string, storedHash?: string): string {
+  if (storedHash && !storedHash.startsWith(SCRYPT_PREFIX)) {
+    // Legacy SHA-256 path for existing keys
+    return createHash("sha256")
+      .update(salt + rawKey)
+      .digest("hex");
+  }
+  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN).toString("hex");
+  return `${SCRYPT_PREFIX}${derived}`;
 }
 
 /**
@@ -89,6 +95,6 @@ export function validateApiKey(
   storedHash: string,
   storedSalt: string,
 ): boolean {
-  const computedHash = hashApiKeyWithSalt(rawKey, storedSalt);
+  const computedHash = hashApiKeyWithSalt(rawKey, storedSalt, storedHash);
   return constantTimeCompare(computedHash, storedHash);
 }

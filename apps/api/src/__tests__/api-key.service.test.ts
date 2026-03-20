@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { describe, it, expect } from "vitest";
 import {
   generateApiKey,
@@ -65,12 +66,12 @@ describe("api-key.service", () => {
   });
 
   describe("hashApiKey", () => {
-    it("produces a hash and salt", () => {
+    it("produces a scrypt hash and salt", () => {
       const key = generateApiKey("agent-1");
       const { hash, salt } = hashApiKey(key);
       expect(hash).toBeTruthy();
       expect(salt).toBeTruthy();
-      expect(hash).toHaveLength(64); // SHA-256 hex
+      expect(hash).toMatch(/^scrypt:/);
       expect(salt).toHaveLength(32); // 16 bytes hex
     });
 
@@ -86,10 +87,31 @@ describe("api-key.service", () => {
   describe("hashApiKeyWithSalt", () => {
     it("produces a deterministic hash for the same key and salt", () => {
       const key = generateApiKey("agent-1");
-      const { salt } = hashApiKey(key);
-      const h1 = hashApiKeyWithSalt(key, salt);
-      const h2 = hashApiKeyWithSalt(key, salt);
+      const { hash, salt } = hashApiKey(key);
+      const h1 = hashApiKeyWithSalt(key, salt, hash);
+      const h2 = hashApiKeyWithSalt(key, salt, hash);
       expect(h1).toBe(h2);
+    });
+  });
+
+  describe("legacy SHA-256 compatibility", () => {
+    it("validates keys hashed with legacy SHA-256", () => {
+      const key = generateApiKey("agent-1");
+      const salt = randomBytes(16).toString("hex");
+      const legacyHash = createHash("sha256")
+        .update(salt + key)
+        .digest("hex");
+      expect(validateApiKey(key, legacyHash, salt)).toBe(true);
+    });
+
+    it("rejects wrong key against legacy hash", () => {
+      const key = generateApiKey("agent-1");
+      const wrongKey = generateApiKey("agent-1");
+      const salt = randomBytes(16).toString("hex");
+      const legacyHash = createHash("sha256")
+        .update(salt + key)
+        .digest("hex");
+      expect(validateApiKey(wrongKey, legacyHash, salt)).toBe(false);
     });
   });
 
