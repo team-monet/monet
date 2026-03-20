@@ -50,7 +50,7 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
     const canManageRuleSets = Boolean(agent) && (isAdmin || (agent.userId != null && agent.userId === sessionUser.id));
     if (canManageRuleSets) {
       sharedRuleSets = (await client.listRuleSets()).ruleSets;
-      if (agent.userId === sessionUser.id) {
+      if (agent.userId != null && agent.userId === sessionUser.id) {
         personalRuleSets = (await client.listPersonalRuleSets()).ruleSets;
       }
     }
