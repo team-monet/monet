@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "crypto";
+import { createHash, scryptSync, timingSafeEqual } from "crypto";
 import { cookies } from "next/headers";
 import { desc, eq, gt } from "drizzle-orm";
 import {
@@ -31,7 +31,13 @@ function getBootstrapApiUrl() {
   return process.env.INTERNAL_API_URL || "http://localhost:3001";
 }
 
-function hashTokenWithSalt(rawToken: string, salt: string) {
+const SCRYPT_PREFIX = "scrypt:";
+const SCRYPT_KEYLEN = 64;
+
+function hashTokenWithSalt(rawToken: string, salt: string, storedHash: string) {
+  if (storedHash.startsWith(SCRYPT_PREFIX)) {
+    return SCRYPT_PREFIX + scryptSync(rawToken, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 }).toString("hex");
+  }
   return createHash("sha256").update(salt + rawToken).digest("hex");
 }
 
@@ -45,7 +51,7 @@ function validateStoredToken(
   storedHash: string,
   storedSalt: string,
 ) {
-  return constantTimeCompare(hashTokenWithSalt(rawToken, storedSalt), storedHash);
+  return constantTimeCompare(hashTokenWithSalt(rawToken, storedSalt, storedHash), storedHash);
 }
 
 function normalizeEmail(email: string) {
