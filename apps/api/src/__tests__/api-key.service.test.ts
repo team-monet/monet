@@ -1,5 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
-import { describe, it, expect } from "vitest";
+import * as crypto from "node:crypto";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   generateApiKey,
   parseApiKey,
@@ -7,9 +7,20 @@ import {
   hashApiKeyWithSalt,
   validateApiKey,
   constantTimeCompare,
+  getApiKeyValidationCacheSize,
+  resetApiKeyValidationCache,
 } from "../services/api-key.service";
 
 describe("api-key.service", () => {
+  beforeEach(() => {
+    resetApiKeyValidationCache();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetApiKeyValidationCache();
+  });
+
   describe("generateApiKey", () => {
     it("generates keys with the mnt_ prefix", () => {
       const key = generateApiKey("agent-1");
@@ -97,8 +108,8 @@ describe("api-key.service", () => {
   describe("legacy SHA-256 compatibility", () => {
     it("validates keys hashed with legacy SHA-256", () => {
       const key = generateApiKey("agent-1");
-      const salt = randomBytes(16).toString("hex");
-      const legacyHash = createHash("sha256")
+      const salt = crypto.randomBytes(16).toString("hex");
+      const legacyHash = crypto.createHash("sha256")
         .update(salt + key)
         .digest("hex");
       expect(validateApiKey(key, legacyHash, salt)).toBe(true);
@@ -107,8 +118,8 @@ describe("api-key.service", () => {
     it("rejects wrong key against legacy hash", () => {
       const key = generateApiKey("agent-1");
       const wrongKey = generateApiKey("agent-1");
-      const salt = randomBytes(16).toString("hex");
-      const legacyHash = createHash("sha256")
+      const salt = crypto.randomBytes(16).toString("hex");
+      const legacyHash = crypto.createHash("sha256")
         .update(salt + key)
         .digest("hex");
       expect(validateApiKey(wrongKey, legacyHash, salt)).toBe(false);
@@ -133,6 +144,37 @@ describe("api-key.service", () => {
       const key = generateApiKey("agent-1");
       const { hash } = hashApiKey(key);
       expect(validateApiKey(key, hash, "wrong-salt")).toBe(false);
+    });
+
+    it("reuses successful scrypt validations for the same key material", () => {
+      const key = generateApiKey("agent-1");
+      const { hash, salt } = hashApiKey(key);
+
+      expect(validateApiKey(key, hash, salt)).toBe(true);
+      expect(getApiKeyValidationCacheSize()).toBe(1);
+
+      expect(validateApiKey(key, hash, salt)).toBe(true);
+      expect(getApiKeyValidationCacheSize()).toBe(1);
+    });
+
+    it("does not reuse a cached success after the stored hash changes", () => {
+      const key = generateApiKey("agent-1");
+      const { hash, salt } = hashApiKey(key);
+      const other = hashApiKey(generateApiKey("agent-1"));
+
+      expect(validateApiKey(key, hash, salt)).toBe(true);
+      expect(getApiKeyValidationCacheSize()).toBe(1);
+
+      expect(validateApiKey(key, other.hash, other.salt)).toBe(false);
+      expect(getApiKeyValidationCacheSize()).toBe(1);
+    });
+
+    it("does not cache failed validations", () => {
+      const key = generateApiKey("agent-1");
+      const { hash, salt } = hashApiKey(generateApiKey("agent-1"));
+
+      expect(validateApiKey(key, hash, salt)).toBe(false);
+      expect(getApiKeyValidationCacheSize()).toBe(0);
     });
   });
 

@@ -1,4 +1,4 @@
-import { randomBytes, createHash, scryptSync, timingSafeEqual } from "node:crypto";
+import * as crypto from "node:crypto";
 
 const KEY_PREFIX = "mnt_";
 
@@ -19,7 +19,7 @@ export interface HashedApiKey {
  */
 export function generateApiKey(agentId: string): string {
   const agentPart = Buffer.from(agentId).toString("base64url");
-  const secretPart = randomBytes(32).toString("base64url");
+  const secretPart = crypto.randomBytes(32).toString("base64url");
   return `${KEY_PREFIX}${agentPart}.${secretPart}`;
 }
 
@@ -50,14 +50,19 @@ export function parseApiKey(rawKey: string): ParsedApiKey | null {
 
 const SCRYPT_PREFIX = "scrypt:";
 const SCRYPT_KEYLEN = 64;
+const VALIDATION_CACHE_TTL_MS = 5 * 60 * 1000;
+const VALIDATION_CACHE_MAX_ENTRIES = 1024;
+const validationCache = new Map<string, number>();
 
 /**
  * Hash an API key with a random salt using scrypt (slow hash).
  * Used when storing a new key.
  */
 export function hashApiKey(rawKey: string): HashedApiKey {
-  const salt = randomBytes(16).toString("hex");
-  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 }).toString("hex");
+  const salt = crypto.randomBytes(16).toString("hex");
+  const derived = crypto
+    .scryptSync(rawKey, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 })
+    .toString("hex");
   return { hash: `${SCRYPT_PREFIX}${derived}`, salt };
 }
 
@@ -68,11 +73,13 @@ export function hashApiKey(rawKey: string): HashedApiKey {
 export function hashApiKeyWithSalt(rawKey: string, salt: string, storedHash?: string): string {
   if (storedHash && !storedHash.startsWith(SCRYPT_PREFIX)) {
     // Legacy SHA-256 path for existing keys
-    return createHash("sha256")
+    return crypto.createHash("sha256")
       .update(salt + rawKey)
       .digest("hex");
   }
-  const derived = scryptSync(rawKey, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 }).toString("hex");
+  const derived = crypto
+    .scryptSync(rawKey, salt, SCRYPT_KEYLEN, { N: 16384, r: 8, p: 1 })
+    .toString("hex");
   return `${SCRYPT_PREFIX}${derived}`;
 }
 
@@ -84,7 +91,7 @@ export function constantTimeCompare(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   const bufA = Buffer.from(a, "utf-8");
   const bufB = Buffer.from(b, "utf-8");
-  return timingSafeEqual(bufA, bufB);
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**
@@ -95,6 +102,70 @@ export function validateApiKey(
   storedHash: string,
   storedSalt: string,
 ): boolean {
+  const cacheKey = buildValidationCacheKey(rawKey, storedHash, storedSalt);
+  const cachedResult = readValidationCache(cacheKey);
+  if (cachedResult) {
+    return true;
+  }
+
   const computedHash = hashApiKeyWithSalt(rawKey, storedSalt, storedHash);
-  return constantTimeCompare(computedHash, storedHash);
+  const isValid = constantTimeCompare(computedHash, storedHash);
+  if (isValid) {
+    writeValidationCache(cacheKey);
+  }
+  return isValid;
+}
+
+export function resetApiKeyValidationCache() {
+  validationCache.clear();
+}
+
+export function getApiKeyValidationCacheSize() {
+  return validationCache.size;
+}
+
+function buildValidationCacheKey(rawKey: string, storedHash: string, storedSalt: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(storedHash)
+    .update("\0")
+    .update(storedSalt)
+    .update("\0")
+    .update(rawKey)
+    .digest("hex");
+}
+
+function readValidationCache(cacheKey: string): boolean {
+  const now = Date.now();
+  const expiresAt = validationCache.get(cacheKey);
+  if (!expiresAt) {
+    return false;
+  }
+
+  if (expiresAt <= now) {
+    validationCache.delete(cacheKey);
+    return false;
+  }
+
+  validationCache.delete(cacheKey);
+  validationCache.set(cacheKey, expiresAt);
+  return true;
+}
+
+function writeValidationCache(cacheKey: string) {
+  validationCache.set(cacheKey, Date.now() + VALIDATION_CACHE_TTL_MS);
+
+  if (validationCache.size <= VALIDATION_CACHE_MAX_ENTRIES) {
+    return;
+  }
+
+  const now = Date.now();
+  for (const [key, expiresAt] of validationCache) {
+    if (expiresAt <= now || validationCache.size > VALIDATION_CACHE_MAX_ENTRIES) {
+      validationCache.delete(key);
+    }
+    if (validationCache.size <= VALIDATION_CACHE_MAX_ENTRIES) {
+      break;
+    }
+  }
 }
