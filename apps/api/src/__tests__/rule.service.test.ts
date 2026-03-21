@@ -55,7 +55,7 @@ describe("rule service", () => {
   });
 
   it("updateRule returns not_found for unknown rule id", async () => {
-    const tx = makeSqlMock([[]]);
+    const tx = makeSqlMock([[], []]);
     withTenantScopeMock.mockImplementation(async (_sql, _schemaName, fn) => fn(tx));
 
     const result = await updateRule(
@@ -71,7 +71,7 @@ describe("rule service", () => {
   });
 
   it("deleteRule attempts deletion; cascade is handled by database FK", async () => {
-    const tx = makeSqlMock([[{ id: "rule-1" }]]);
+    const tx = makeSqlMock([[{ id: "rule-1", name: "Test Rule" }]]);
     withTenantScopeMock.mockImplementation(async (_sql, _schemaName, fn) => fn(tx));
 
     const result = await deleteRule({} as never, "tenant-1", "tenant_schema", actor, "rule-1");

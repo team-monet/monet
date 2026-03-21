@@ -5,7 +5,7 @@ import { createRuleAction, createRuleSetAction, deleteRuleSetAction, updateRuleA
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Plus, Scale, Settings2, Calendar, AlertTriangle, Layers, Trash2, ArrowRight } from "lucide-react";
+import { Plus, Scale, Settings2, Calendar, AlertTriangle, Layers, Trash2, ArrowRight, Building2, User } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { 
   Dialog, 
@@ -21,6 +21,7 @@ import { Input } from "@/components/ui/input";
 import { SubmitButton } from "@/components/ui/submit-button";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Badge } from "@/components/ui/badge";
 import Link from "next/link";
 
 interface PageProps {
@@ -197,6 +198,8 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                     <TableRow>
                       <TableHead className="w-[260px]">Rule Name</TableHead>
                       <TableHead>Description</TableHead>
+                      <TableHead className="w-[100px]">Scope</TableHead>
+                      <TableHead className="w-[140px]">Created</TableHead>
                       <TableHead className="w-[140px]">Updated</TableHead>
                       <TableHead className="w-[80px] text-right"></TableHead>
                     </TableRow>
@@ -204,7 +207,7 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                   <TableBody>
                     {rules.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={4} className="h-24 text-center text-muted-foreground">
+                        <TableCell colSpan={6} className="h-24 text-center text-muted-foreground">
                           No rules defined yet.
                         </TableCell>
                       </TableRow>
@@ -225,6 +228,25 @@ export default async function AdminRulesPage({ searchParams }: PageProps) {
                             <span className="block break-words text-sm leading-6 text-muted-foreground line-clamp-3">
                               {r.description}
                             </span>
+                          </TableCell>
+                          <TableCell className="align-top py-3">
+                            {r.ownerUserId ? (
+                              <Badge variant="outline" className="gap-1 text-xs">
+                                <User className="h-3 w-3" />
+                                Personal
+                              </Badge>
+                            ) : (
+                              <Badge variant="secondary" className="gap-1 text-xs">
+                                <Building2 className="h-3 w-3" />
+                                Shared
+                              </Badge>
+                            )}
+                          </TableCell>
+                          <TableCell className="align-top py-3">
+                            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                              <Calendar className="h-3 w-3" />
+                              {new Date(r.createdAt).toLocaleDateString()}
+                            </div>
                           </TableCell>
                           <TableCell className="align-top py-3">
                             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">

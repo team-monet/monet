@@ -131,6 +131,7 @@ export async function createRule(
     action: "rule.create",
     targetId: created.id,
     outcome: "success",
+    metadata: { name: created.name, description: created.description, scope: scope.ownerUserId ? "personal" : "shared" },
   });
 
   return created;
@@ -145,8 +146,15 @@ export async function updateRule(
   input: UpdateRuleInput,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<RuleRecord | { error: "not_found" }> {
-  const updated = await withTenantScope(sql, schemaName, async (txSql) => {
+  const { updated, previous } = await withTenantScope(sql, schemaName, async (txSql) => {
     const tx = txSql as unknown as postgres.Sql;
+
+    // Fetch current values for audit diff
+    const [existing] = scope.ownerUserId === null
+      ? await tx`SELECT name, description FROM rules WHERE id = ${ruleId} AND owner_user_id IS NULL`
+      : await tx`SELECT name, description FROM rules WHERE id = ${ruleId} AND owner_user_id = ${scope.ownerUserId}`;
+    const prev = existing ? { name: existing.name as string, description: existing.description as string } : null;
+
     const [rule] = scope.ownerUserId === null
       ? await tx`
           UPDATE rules
@@ -168,7 +176,7 @@ export async function updateRule(
             AND owner_user_id = ${scope.ownerUserId}
           RETURNING id, name, description, owner_user_id, updated_at, created_at
         `;
-    return rule ? mapRule(rule as Record<string, unknown>) : null;
+    return { updated: rule ? mapRule(rule as Record<string, unknown>) : null, previous: prev };
   });
 
   if (!updated) {
@@ -184,6 +192,14 @@ export async function updateRule(
     return { error: "not_found" };
   }
 
+  const changes: Record<string, { from: string; to: string }> = {};
+  if (previous && updated.name !== previous.name) {
+    changes.name = { from: previous.name, to: updated.name };
+  }
+  if (previous && updated.description !== previous.description) {
+    changes.description = { from: previous.description, to: updated.description };
+  }
+
   await logAuditEvent(sql, schemaName, {
     tenantId,
     actorId: actor.actorId,
@@ -191,6 +207,7 @@ export async function updateRule(
     action: "rule.update",
     targetId: updated.id,
     outcome: "success",
+    metadata: { changes, scope: scope.ownerUserId ? "personal" : "shared" },
   });
 
   return updated;
@@ -211,15 +228,15 @@ export async function deleteRule(
           DELETE FROM rules
           WHERE id = ${ruleId}
             AND owner_user_id IS NULL
-          RETURNING id
+          RETURNING id, name
         `
       : await tx`
           DELETE FROM rules
           WHERE id = ${ruleId}
             AND owner_user_id = ${scope.ownerUserId}
-          RETURNING id
+          RETURNING id, name
         `;
-    return row ? (row.id as string) : null;
+    return row ? { id: row.id as string, name: row.name as string } : null;
   });
 
   if (!deleted) {
@@ -240,8 +257,9 @@ export async function deleteRule(
     actorId: actor.actorId,
     actorType: actor.actorType,
     action: "rule.delete",
-    targetId: deleted,
+    targetId: deleted.id,
     outcome: "success",
+    metadata: { name: deleted.name, scope: scope.ownerUserId ? "personal" : "shared" },
   });
 
   return { success: true };
@@ -322,6 +340,7 @@ export async function createRuleSet(
     action: "rule_set.create",
     targetId: created.id,
     outcome: "success",
+    metadata: { name: created.name, scope: scope.ownerUserId ? "personal" : "shared" },
   });
 
   return created;
@@ -418,15 +437,15 @@ export async function deleteRuleSet(
           DELETE FROM rule_sets
           WHERE id = ${ruleSetId}
             AND owner_user_id IS NULL
-          RETURNING id
+          RETURNING id, name
         `
       : await tx`
           DELETE FROM rule_sets
           WHERE id = ${ruleSetId}
             AND owner_user_id = ${scope.ownerUserId}
-          RETURNING id
+          RETURNING id, name
         `;
-    return row ? (row.id as string) : null;
+    return row ? { id: row.id as string, name: row.name as string } : null;
   });
 
   if (!deleted) {
@@ -447,8 +466,9 @@ export async function deleteRuleSet(
     actorId: actor.actorId,
     actorType: actor.actorType,
     action: "rule_set.delete",
-    targetId: deleted,
+    targetId: deleted.id,
     outcome: "success",
+    metadata: { name: deleted.name, scope: scope.ownerUserId ? "personal" : "shared" },
   });
 
   return { success: true };
@@ -515,6 +535,7 @@ export async function addRuleToSet(
     targetId: `${ruleSetId}:${ruleId}`,
     outcome: "error" in result ? "failure" : "success",
     reason: "error" in result ? result.error : undefined,
+    metadata: { ruleSetId, ruleId },
   });
 
   return result;
@@ -561,6 +582,7 @@ export async function removeRuleFromSet(
     targetId: `${ruleSetId}:${ruleId}`,
     outcome: removed ? "success" : "failure",
     reason: removed ? undefined : "not_found",
+    metadata: { ruleSetId, ruleId },
   });
 
   return removed ? { success: true } : { error: "not_found" };
@@ -617,6 +639,7 @@ export async function associateRuleSetWithAgent(
     targetId: `${agentId}:${ruleSetId}`,
     outcome: "error" in result ? "failure" : "success",
     reason: "error" in result ? result.error : undefined,
+    metadata: { agentId, ruleSetId },
   });
 
   return result;
@@ -648,6 +671,7 @@ export async function dissociateRuleSetFromAgent(
     targetId: `${agentId}:${ruleSetId}`,
     outcome: removed ? "success" : "failure",
     reason: removed ? undefined : "not_found",
+    metadata: { agentId, ruleSetId },
   });
 
   return removed ? { success: true } : { error: "not_found" };
