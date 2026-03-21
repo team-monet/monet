@@ -129,7 +129,7 @@ describe("validateTenantAction", () => {
   describe("dev bypass for test-org (#29)", () => {
     it("returns dev-bypass provider when DEV_BYPASS_AUTH is enabled in development", async () => {
       vi.stubEnv("NODE_ENV", "development");
-      // DEV_BYPASS_AUTH is not set to "false", so bypass is enabled by default
+      vi.stubEnv("DEV_BYPASS_AUTH", "true");
 
       const result = await validateTenantAction("test-org");
       expect(result).toEqual({
@@ -142,6 +142,7 @@ describe("validateTenantAction", () => {
 
     it("returns dev-bypass when DASHBOARD_LOCAL_AUTH is true even outside development", async () => {
       vi.stubEnv("NODE_ENV", "production");
+      vi.stubEnv("DEV_BYPASS_AUTH", "true");
       vi.stubEnv("DASHBOARD_LOCAL_AUTH", "true");
 
       const result = await validateTenantAction("test-org");
@@ -153,9 +154,9 @@ describe("validateTenantAction", () => {
       });
     });
 
-    it("does not bypass when DEV_BYPASS_AUTH is explicitly false", async () => {
+    it("does not bypass when DEV_BYPASS_AUTH is not set", async () => {
       vi.stubEnv("NODE_ENV", "development");
-      vi.stubEnv("DEV_BYPASS_AUTH", "false");
+      // DEV_BYPASS_AUTH is not set — bypass should be disabled by default
       setupDbMocks([{ id: "tenant-uuid-test" }], [{ id: "oauth-uuid" }]);
 
       const result = await validateTenantAction("test-org");

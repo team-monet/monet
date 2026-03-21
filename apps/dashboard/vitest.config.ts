@@ -10,6 +10,8 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "@monet/types": path.resolve(__dirname, "../../packages/types/src/index.ts"),
+      "@monet/db": path.resolve(__dirname, "../../packages/db/src/index.ts"),
     },
   },
 });
