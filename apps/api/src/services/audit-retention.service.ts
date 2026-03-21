@@ -59,6 +59,11 @@ export async function purgeExpiredAuditEntriesAcrossTenants(
     }
 
     const purged = await purgeExpiredAuditEntries(sql, schemaName, retentionDays);
+    if (purged > 0) {
+      console.log(
+        `[audit-retention] Purged ${purged} entries from schema ${schemaName}`,
+      );
+    }
     totalPurged += purged;
   }
 
@@ -69,6 +74,13 @@ export function startAuditRetentionJob(
   sql: postgres.Sql,
   retentionDays = currentAuditRetentionDays(),
 ): void {
+  if (process.env.AUDIT_PURGE_ENABLED !== "true") {
+    console.log(
+      "[audit-retention] Purge disabled (set AUDIT_PURGE_ENABLED=true to enable)",
+    );
+    return;
+  }
+
   // Run once on startup.
   void purgeExpiredAuditEntriesAcrossTenants(sql, retentionDays)
     .then((count) => {
