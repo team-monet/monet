@@ -10,6 +10,7 @@ export const AuditLog = z.object({
   target_id: z.string().nullable().optional(),
   outcome: z.string(),
   reason: z.string().nullable().optional(),
+  metadata: z.record(z.unknown()).nullable().optional(),
   created_at: z.string(),
 });
 export type AuditLog = z.infer<typeof AuditLog>;

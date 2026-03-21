@@ -1,7 +1,6 @@
 import Link from "next/link";
-import { redirect } from "next/navigation";
 import { getApiClient } from "@/lib/api-client";
-import { requireAuth } from "@/lib/auth";
+import { requireAdmin } from "@/lib/auth";
 import type { Agent, AgentGroup, AuditLog, Rule, RuleSet } from "@monet/types";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -28,11 +27,7 @@ function formatAction(action: string) {
 }
 
 export default async function AdminOverviewPage() {
-  const session = await requireAuth();
-  const sessionUser = session.user as { role?: string | null };
-  if (sessionUser.role !== "tenant_admin") {
-    redirect("/");
-  }
+  await requireAdmin();
 
   let rules: Rule[] = [];
   let ruleSets: RuleSet[] = [];
