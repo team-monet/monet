@@ -189,6 +189,7 @@ Optional:
 - `EMBEDDING_DIMENSIONS` - dimensionality of embedding vectors (default `1024`). Set this to match your chosen embedding model (e.g. `1536` for OpenAI `text-embedding-3-small`, `1024` for Ollama `qwen3-embedding` or ONNX `Snowflake/snowflake-arctic-embed-l-v2.0`). Must be set **before** running the first migration, as it defines the database column width.
 - `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` (defaults `100` per `60000ms`).
 - `AUDIT_RETENTION_DAYS` (default `90`).
+- `AUDIT_PURGE_ENABLED` - set to `true` to enable audit retention deletes. Purge is disabled by default.
 - `AUDIT_PURGE_DATABASE_URL` (separate DB role for retention deletes).
 
 Provider-specific:
@@ -374,7 +375,8 @@ Recommended checks:
 ## Audit Retention
 
 - Default retention is `90` days (`AUDIT_RETENTION_DAYS`).
-- Purge runs at startup and every 24h.
+- Purge is disabled by default. Set `AUDIT_PURGE_ENABLED=true` to enable it.
+- When enabled, purge runs at startup and every 24h.
 - In production, use `AUDIT_PURGE_DATABASE_URL` with a restricted purge role.
 
 Manual check per tenant schema:
