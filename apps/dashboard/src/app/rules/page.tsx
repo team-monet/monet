@@ -224,6 +224,7 @@ export default async function PersonalRulesPage({ searchParams }: PageProps) {
                     <TableRow>
                       <TableHead className="w-[260px]">Rule Name</TableHead>
                       <TableHead>Description</TableHead>
+                      <TableHead className="w-[140px]">Created</TableHead>
                       <TableHead className="w-[140px]">Updated</TableHead>
                       <TableHead className="w-[120px] text-right" />
                     </TableRow>
@@ -231,7 +232,7 @@ export default async function PersonalRulesPage({ searchParams }: PageProps) {
                   <TableBody>
                     {rules.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={4} className="h-24 text-center text-muted-foreground">
+                        <TableCell colSpan={5} className="h-24 text-center text-muted-foreground">
                           No personal rules yet.
                         </TableCell>
                       </TableRow>
@@ -252,6 +253,12 @@ export default async function PersonalRulesPage({ searchParams }: PageProps) {
                             <span className="block break-words text-sm leading-6 text-muted-foreground line-clamp-3">
                               {rule.description}
                             </span>
+                          </TableCell>
+                          <TableCell className="align-top py-3">
+                            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                              <Calendar className="h-3 w-3" />
+                              {new Date(rule.createdAt).toLocaleDateString()}
+                            </div>
                           </TableCell>
                           <TableCell className="align-top py-3">
                             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
