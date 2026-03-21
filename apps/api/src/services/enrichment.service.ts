@@ -17,6 +17,11 @@ let cachedProvider: EnrichmentProvider | null | undefined;
 let activeJobs = 0;
 const queue: EnrichmentJob[] = [];
 const drainWaiters = new Set<() => void>();
+let shuttingDown = false;
+
+export function markShuttingDown() {
+  shuttingDown = true;
+}
 
 export function setEnrichmentProviderForTests(
   provider: EnrichmentProvider | null | undefined,
@@ -30,6 +35,7 @@ export function resetEnrichmentStateForTests() {
   cachedProvider = undefined;
   activeJobs = 0;
   queue.length = 0;
+  shuttingDown = false;
   for (const resolve of drainWaiters) {
     resolve();
   }
@@ -81,6 +87,7 @@ export function enqueueEnrichment(
   schemaName: string,
   entryId: string,
 ) {
+  if (shuttingDown) return;
   queue.push({ schemaName, entryId });
   drainQueue(sql);
 }
