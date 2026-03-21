@@ -31,7 +31,7 @@ function isMissingRelationError(error: unknown) {
 }
 
 function isDevBypassEnabled() {
-  const bypassEnabled = process.env.DEV_BYPASS_AUTH !== "false";
+  const bypassEnabled = process.env.DEV_BYPASS_AUTH === "true";
   const allowInProduction = process.env.DASHBOARD_LOCAL_AUTH === "true";
   return bypassEnabled && (process.env.NODE_ENV === "development" || allowInProduction);
 }
