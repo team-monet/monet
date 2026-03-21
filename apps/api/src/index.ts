@@ -11,6 +11,7 @@ import { ensureTenantSchemasCurrent } from "./services/tenant.service";
 import {
   getActiveEnrichmentCount,
   getQueuedEnrichmentCount,
+  markShuttingDown,
   recoverPendingEnrichments,
   waitForEnrichmentDrain,
 } from "./services/enrichment.service";
@@ -128,6 +129,7 @@ let shuttingDown = false;
 async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
+  markShuttingDown();
 
   console.log(`Received ${signal}, shutting down`);
   let exitCode = 0;

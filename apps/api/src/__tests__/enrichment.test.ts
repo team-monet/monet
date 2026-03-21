@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createEnrichmentProvider } from "../providers/index";
 import {
   computeQueryEmbedding,
+  enqueueEnrichment,
+  getActiveEnrichmentCount,
+  getQueuedEnrichmentCount,
+  markShuttingDown,
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
 } from "../services/enrichment.service";
@@ -62,5 +66,45 @@ describe("computeQueryEmbedding", () => {
     });
 
     await expect(computeQueryEmbedding("test")).resolves.toBeNull();
+  });
+});
+
+describe("shutdown drain semantics", () => {
+  afterEach(() => {
+    resetEnrichmentStateForTests();
+  });
+
+  it("enqueueEnrichment is a no-op after markShuttingDown", () => {
+    // Set a provider that would throw if any enrichment work ran —
+    // this proves the job never reaches drainQueue.
+    let providerCalled = false;
+    setEnrichmentProviderForTests({
+      generateSummary: async () => { providerCalled = true; return "s"; },
+      computeEmbedding: async () => { providerCalled = true; return [1]; },
+      extractTags: async () => { providerCalled = true; return []; },
+    });
+
+    const fakeSql = {} as Parameters<typeof enqueueEnrichment>[0];
+
+    markShuttingDown();
+    enqueueEnrichment(fakeSql, "tenant_a", "entry-1");
+
+    // Queue stays empty because the job was rejected before entering it
+    expect(getQueuedEnrichmentCount()).toBe(0);
+    expect(getActiveEnrichmentCount()).toBe(0);
+    expect(providerCalled).toBe(false);
+  });
+
+  it("markShuttingDown prevents all subsequent enqueues", () => {
+    setEnrichmentProviderForTests(null);
+    const fakeSql = {} as Parameters<typeof enqueueEnrichment>[0];
+
+    markShuttingDown();
+
+    enqueueEnrichment(fakeSql, "tenant_b", "entry-2");
+    enqueueEnrichment(fakeSql, "tenant_b", "entry-3");
+
+    expect(getQueuedEnrichmentCount()).toBe(0);
+    expect(getActiveEnrichmentCount()).toBe(0);
   });
 });
