@@ -1,6 +1,14 @@
 import { randomUUID } from "node:crypto";
-import type postgres from "postgres";
+import {
+  agents,
+  asDrizzleSqlClient,
+  type SqlClient,
+  type TransactionClient,
+} from "@monet/db";
+import { drizzle } from "drizzle-orm/postgres-js";
 import { generateApiKey, hashApiKey } from "./api-key.service";
+
+type AgentSqlClient = SqlClient | TransactionClient;
 
 type ProvisionAgentInput = {
   externalId: string;
@@ -23,36 +31,29 @@ export type ProvisionAgentResult = {
 };
 
 export async function provisionAgentWithApiKey(
-  sql: postgres.Sql,
+  sql: AgentSqlClient,
   input: ProvisionAgentInput,
 ): Promise<ProvisionAgentResult> {
   const agentId = randomUUID();
   const rawApiKey = generateApiKey(agentId);
   const { hash, salt } = hashApiKey(rawApiKey);
+  const db = drizzle(asDrizzleSqlClient(sql));
 
-  const [agent] = await sql`
-    INSERT INTO agents (
-      id,
-      external_id,
-      tenant_id,
-      user_id,
-      role,
-      api_key_hash,
-      api_key_salt,
-      is_autonomous
-    )
-    VALUES (
-      ${agentId},
-      ${input.externalId},
-      ${input.tenantId},
-      ${input.userId ?? null},
-      ${input.role ?? null},
-      ${hash},
-      ${salt},
-      ${input.isAutonomous ?? false}
-    )
-    RETURNING id, external_id, user_id, role, is_autonomous, created_at
-  `;
+  const [agent] = await db
+    .insert(agents)
+    .values({
+      id: agentId,
+      externalId: input.externalId,
+      tenantId: input.tenantId,
+      userId: input.userId ?? null,
+      role: input.role ?? null,
+      apiKeyHash: hash,
+      apiKeySalt: salt,
+      isAutonomous: input.isAutonomous ?? false,
+    })
+    .returning({
+      createdAt: agents.createdAt,
+    });
 
   return {
     agent: {
@@ -61,7 +62,7 @@ export async function provisionAgentWithApiKey(
       userId: input.userId ?? null,
       role: input.role ?? null,
       isAutonomous: input.isAutonomous ?? false,
-      createdAt: agent.created_at as Date,
+      createdAt: agent.createdAt,
     },
     rawApiKey,
   };

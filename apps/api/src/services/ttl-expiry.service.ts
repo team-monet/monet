@@ -1,37 +1,64 @@
-import postgres from "postgres";
+import { memoryEntries, withTenantDrizzleScope } from "@monet/db";
+import { and, isNotNull, lt, sql as drizzleSql } from "drizzle-orm";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
 
 const EXPIRY_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
+const SCHEMA_NAME_REGEX = /^tenant_[a-f0-9_]{36}$/;
+const inflightPurges = new Set<Promise<number>>();
+
+function trackPurge(purgePromise: Promise<number>): Promise<number> {
+  inflightPurges.add(purgePromise);
+  return purgePromise.finally(() => {
+    inflightPurges.delete(purgePromise);
+  });
+}
 
 /**
  * Delete expired memory entries across all tenant schemas.
  * Runs inside each tenant schema using SET LOCAL search_path.
  */
-async function purgeExpiredEntries(sql: postgres.Sql): Promise<number> {
-  // Find all tenant schemas
+export async function purgeExpiredEntriesInSchema(
+  sql: SqlClient,
+  schemaName: string,
+): Promise<number> {
+  if (!SCHEMA_NAME_REGEX.test(schemaName)) {
+    throw new Error(`Invalid tenant schema name: ${schemaName}`);
+  }
+
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const result = await db
+      .delete(memoryEntries)
+      .where(
+        and(
+          isNotNull(memoryEntries.expiresAt),
+          lt(memoryEntries.expiresAt, drizzleSql`NOW()`),
+        ),
+      );
+
+    return Number(result.count);
+  });
+}
+
+export async function purgeExpiredEntriesAcrossTenants(sql: SqlClient): Promise<number> {
   const schemas = await sql`
-    SELECT schema_name FROM information_schema.schemata
-    WHERE schema_name LIKE 'tenant_%'
+    SELECT schema_name
+    FROM information_schema.schemata
+    WHERE schema_name LIKE 'tenant\_%' ESCAPE '\'
+    ORDER BY schema_name ASC
   `;
 
   let totalDeleted = 0;
 
   for (const row of schemas) {
     const schemaName = row.schema_name as string;
+    if (!SCHEMA_NAME_REGEX.test(schemaName)) continue;
 
-    // Validate schema name to prevent injection
-    if (!/^tenant_[a-f0-9_]{36}$/.test(schemaName)) continue;
-
-    const deleted = await sql.begin(async (txSql) => {
-      const tx = txSql as unknown as postgres.Sql;
-      await tx.unsafe(`SET LOCAL search_path TO "${schemaName}"`);
-      const result = await tx`
-        DELETE FROM memory_entries
-        WHERE expires_at IS NOT NULL AND expires_at < NOW()
-      `;
-      return result.count;
-    });
-
-    totalDeleted += deleted;
+    try {
+      const deleted = await purgeExpiredEntriesInSchema(sql, schemaName);
+      totalDeleted += deleted;
+    } catch (error) {
+      console.error(`[ttl-expiry] Failed to purge ${schemaName}:`, error);
+    }
   }
 
   return totalDeleted;
@@ -43,9 +70,14 @@ let intervalHandle: ReturnType<typeof setInterval> | null = null;
  * Start the TTL expiry background job.
  * Runs immediately on startup, then every 60 minutes.
  */
-export function startTtlExpiryJob(sql: postgres.Sql): void {
+export function startTtlExpiryJob(sql: SqlClient): void {
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+  }
+
   // Run immediately on startup
-  purgeExpiredEntries(sql).then((count) => {
+  void trackPurge(purgeExpiredEntriesAcrossTenants(sql)).then((count) => {
     if (count > 0) {
       console.log(`[ttl-expiry] Purged ${count} expired entries on startup`);
     }
@@ -55,7 +87,7 @@ export function startTtlExpiryJob(sql: postgres.Sql): void {
 
   // Schedule recurring job
   intervalHandle = setInterval(() => {
-    purgeExpiredEntries(sql).then((count) => {
+    void trackPurge(purgeExpiredEntriesAcrossTenants(sql)).then((count) => {
       if (count > 0) {
         console.log(`[ttl-expiry] Purged ${count} expired entries`);
       }
@@ -68,9 +100,13 @@ export function startTtlExpiryJob(sql: postgres.Sql): void {
 /**
  * Stop the TTL expiry background job.
  */
-export function stopTtlExpiryJob(): void {
+export async function stopTtlExpiryJob(): Promise<void> {
   if (intervalHandle) {
     clearInterval(intervalHandle);
     intervalHandle = null;
+  }
+
+  if (inflightPurges.size > 0) {
+    await Promise.allSettled([...inflightPurges]);
   }
 }

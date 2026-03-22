@@ -1,5 +1,18 @@
-import type postgres from "postgres";
+import {
+  agentGroupMembers,
+  agentGroups,
+  agents,
+  asDrizzleSqlClient,
+  tenantUsers,
+  type SqlClient,
+  type TransactionClient,
+} from "@monet/db";
+import { and, asc, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 import type { AgentContext } from "../middleware/context";
+
+type GroupSqlClient = SqlClient | TransactionClient;
+type GroupDrizzleOptions = NonNullable<SqlClient["options"]>;
 
 // ---------- Role helpers ----------
 
@@ -9,7 +22,7 @@ import type { AgentContext } from "../middleware/context";
  * Roles are always resolved from the database, never from request claims (threat model E1).
  */
 export async function resolveAgentRole(
-  sql: postgres.Sql,
+  sql: SqlClient,
   agent: AgentContext,
 ): Promise<string | null> {
   // Agent has a direct role (e.g., provisioning admin)
@@ -17,10 +30,13 @@ export async function resolveAgentRole(
 
   // Fall back to the linked user's role
   if (agent.userId) {
-    const [user] = await sql`
-      SELECT role FROM users WHERE id = ${agent.userId}
-    `;
-    if (user) return user.role as string;
+    const db = createGroupDb(sql);
+    const [user] = await db
+      .select({ role: tenantUsers.role })
+      .from(tenantUsers)
+      .where(eq(tenantUsers.id, agent.userId))
+      .limit(1);
+    if (user) return user.role;
   }
 
   return null;
@@ -34,96 +50,151 @@ export function isGroupAdminOrAbove(role: string | null): boolean {
   return role === "tenant_admin" || role === "group_admin";
 }
 
-// ---------- Group CRUD ----------
+function formatTimestamp(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : String(value);
+}
 
-export async function createGroup(
-  sql: postgres.Sql,
-  tenantId: string,
-  input: { name: string; description?: string; memoryQuota?: number },
+function createGroupDb(
+  sql: GroupSqlClient,
+  options?: GroupDrizzleOptions,
 ) {
-  const [group] = await sql`
-    INSERT INTO agent_groups (tenant_id, name, description, memory_quota)
-    VALUES (${tenantId}, ${input.name}, ${input.description ?? ""}, ${input.memoryQuota ?? null})
-    RETURNING id, tenant_id, name, description, memory_quota, created_at
-  `;
+  return drizzle(asDrizzleSqlClient(sql, options));
+}
 
+function mapGroupRecord(group: {
+  id: string;
+  tenantId: string;
+  name: string;
+  description: string | null;
+  memoryQuota: number | null;
+  createdAt: Date | string;
+}) {
   return {
-    id: group.id as string,
-    tenantId: group.tenant_id as string,
-    name: group.name as string,
-    description: group.description as string,
-    memoryQuota: (group.memory_quota as number) ?? null,
-    createdAt: group.created_at as string,
+    id: group.id,
+    tenantId: group.tenantId,
+    name: group.name,
+    description: group.description ?? "",
+    memoryQuota: group.memoryQuota ?? null,
+    createdAt: formatTimestamp(group.createdAt),
   };
 }
 
+// ---------- Group CRUD ----------
+
+export async function createGroup(
+  sql: SqlClient,
+  tenantId: string,
+  input: { name: string; description?: string; memoryQuota?: number },
+) {
+  const db = drizzle(sql);
+  const [group] = await db
+    .insert(agentGroups)
+    .values({
+      tenantId,
+      name: input.name,
+      description: input.description ?? "",
+      memoryQuota: input.memoryQuota ?? null,
+    })
+    .returning();
+
+  return mapGroupRecord(group);
+}
+
 export async function updateGroup(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   groupId: string,
   input: { name?: string; description?: string; memoryQuota?: number },
 ) {
-  // Verify group belongs to this tenant
-  const [existing] = await sql`
-    SELECT id FROM agent_groups WHERE id = ${groupId} AND tenant_id = ${tenantId}
-  `;
+  const db = drizzle(sql);
+  const [existing] = await db
+    .select()
+    .from(agentGroups)
+    .where(
+      and(
+        eq(agentGroups.id, groupId),
+        eq(agentGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
+
   if (!existing) {
     return { error: "not_found" as const, message: "Group not found" };
   }
 
-  const [group] = await sql`
-    UPDATE agent_groups
-    SET
-      name = ${input.name ?? sql`name`},
-      description = ${input.description ?? sql`description`},
-      memory_quota = ${input.memoryQuota !== undefined ? input.memoryQuota : sql`memory_quota`}
-    WHERE id = ${groupId} AND tenant_id = ${tenantId}
-    RETURNING id, tenant_id, name, description, memory_quota, created_at
-  `;
+  const [group] = await db
+    .update(agentGroups)
+    .set({
+      name: input.name ?? existing.name,
+      description: input.description ?? existing.description ?? "",
+      memoryQuota:
+        input.memoryQuota !== undefined
+          ? input.memoryQuota
+          : existing.memoryQuota,
+    })
+    .where(
+      and(
+        eq(agentGroups.id, groupId),
+        eq(agentGroups.tenantId, tenantId),
+      ),
+    )
+    .returning();
 
-  return {
-    id: group.id as string,
-    tenantId: group.tenant_id as string,
-    name: group.name as string,
-    description: group.description as string,
-    memoryQuota: (group.memory_quota as number) ?? null,
-    createdAt: group.created_at as string,
-  };
+  return mapGroupRecord(group);
 }
 
 export async function addMember(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   groupId: string,
   agentId: string,
 ) {
   return sql.begin(async (tx) => {
-    const scopedSql = tx as unknown as postgres.Sql;
+    const db = createGroupDb(tx, sql.options);
 
     // Verify group belongs to this tenant.
-    const [group] = await scopedSql`
-      SELECT id FROM agent_groups WHERE id = ${groupId} AND tenant_id = ${tenantId}
-    `;
+    const [group] = await db
+      .select({ id: agentGroups.id })
+      .from(agentGroups)
+      .where(
+        and(
+          eq(agentGroups.id, groupId),
+          eq(agentGroups.tenantId, tenantId),
+        ),
+      )
+      .limit(1);
+
     if (!group) {
       return { error: "not_found" as const, message: "Group not found" };
     }
 
     // Verify agent belongs to this tenant.
-    const [agent] = await scopedSql`
-      SELECT id FROM agents WHERE id = ${agentId} AND tenant_id = ${tenantId}
-    `;
+    const [agent] = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.id, agentId),
+          eq(agents.tenantId, tenantId),
+        ),
+      )
+      .limit(1);
+
     if (!agent) {
       return { error: "not_found" as const, message: "Agent not found" };
     }
 
-    const existingMemberships = (await scopedSql`
-      SELECT group_id FROM agent_group_members
-      WHERE agent_id = ${agentId}
-      ORDER BY joined_at ASC, group_id ASC
-    `) as Array<{ group_id: string }>;
+    const existingMemberships = await db
+      .select({ groupId: agentGroupMembers.groupId })
+      .from(agentGroupMembers)
+      .where(eq(agentGroupMembers.agentId, agentId))
+      .orderBy(
+        asc(agentGroupMembers.joinedAt),
+        asc(agentGroupMembers.groupId),
+      );
 
     const alreadyInTargetGroup = existingMemberships.some(
-      (membership) => membership.group_id === groupId,
+      (membership) => membership.groupId === groupId,
     );
 
     if (alreadyInTargetGroup && existingMemberships.length === 1) {
@@ -131,17 +202,15 @@ export async function addMember(
     }
 
     if (existingMemberships.length > 0) {
-      await scopedSql`
-        DELETE FROM agent_group_members
-        WHERE agent_id = ${agentId}
-      `;
+      await db
+        .delete(agentGroupMembers)
+        .where(eq(agentGroupMembers.agentId, agentId));
     }
 
     if (!alreadyInTargetGroup || existingMemberships.length > 1) {
-      await scopedSql`
-        INSERT INTO agent_group_members (agent_id, group_id)
-        VALUES (${agentId}, ${groupId})
-      `;
+      await db
+        .insert(agentGroupMembers)
+        .values({ agentId, groupId });
     }
 
     return {
@@ -155,32 +224,49 @@ export async function addMember(
 }
 
 export async function removeMember(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   groupId: string,
   agentId: string,
 ) {
+  const db = createGroupDb(sql);
+
   // Verify group belongs to this tenant
-  const [group] = await sql`
-    SELECT id FROM agent_groups WHERE id = ${groupId} AND tenant_id = ${tenantId}
-  `;
+  const [group] = await db
+    .select({ id: agentGroups.id })
+    .from(agentGroups)
+    .where(
+      and(
+        eq(agentGroups.id, groupId),
+        eq(agentGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
+
   if (!group) {
     return { error: "not_found" as const, message: "Group not found" };
   }
 
   // Check membership exists
-  const [membership] = await sql`
-    SELECT agent_id FROM agent_group_members
-    WHERE agent_id = ${agentId} AND group_id = ${groupId}
-  `;
+  const [membership] = await db
+    .select({ agentId: agentGroupMembers.agentId })
+    .from(agentGroupMembers)
+    .where(
+      and(
+        eq(agentGroupMembers.agentId, agentId),
+        eq(agentGroupMembers.groupId, groupId),
+      ),
+    )
+    .limit(1);
+
   if (!membership) {
     return { error: "not_found" as const, message: "Agent is not a member of this group" };
   }
 
-  const memberships = await sql`
-    SELECT group_id FROM agent_group_members
-    WHERE agent_id = ${agentId}
-  `;
+  const memberships = await db
+    .select({ groupId: agentGroupMembers.groupId })
+    .from(agentGroupMembers)
+    .where(eq(agentGroupMembers.agentId, agentId));
 
   if (memberships.length <= 1) {
     return {
@@ -190,101 +276,108 @@ export async function removeMember(
   }
 
   // Remove membership only — authored entries are retained (M2 spec)
-  await sql`
-    DELETE FROM agent_group_members
-    WHERE agent_id = ${agentId} AND group_id = ${groupId}
-  `;
+  await db
+    .delete(agentGroupMembers)
+    .where(
+      and(
+        eq(agentGroupMembers.agentId, agentId),
+        eq(agentGroupMembers.groupId, groupId),
+      ),
+    );
 
   return { success: true };
 }
 
 export async function listGroups(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
 ) {
-  const groups = await sql`
-    SELECT id, tenant_id, name, description, memory_quota, created_at
-    FROM agent_groups
-    WHERE tenant_id = ${tenantId}
-    ORDER BY created_at ASC
-  `;
+  const db = drizzle(sql);
+  const groups = await db
+    .select()
+    .from(agentGroups)
+    .where(eq(agentGroups.tenantId, tenantId))
+    .orderBy(asc(agentGroups.createdAt));
 
-  return (groups as Record<string, unknown>[]).map((g) => ({
-    id: g.id as string,
-    tenantId: g.tenant_id as string,
-    name: g.name as string,
-    description: g.description as string,
-    memoryQuota: (g.memory_quota as number) ?? null,
-    createdAt: g.created_at as string,
-  }));
+  return groups.map(mapGroupRecord);
 }
 
 export async function listGroupMembers(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   groupId: string,
 ) {
+  const db = createGroupDb(sql);
+
   // Verify group belongs to tenant
-  const [group] = await sql`
-    SELECT id FROM agent_groups WHERE id = ${groupId} AND tenant_id = ${tenantId}
-  `;
+  const [group] = await db
+    .select({ id: agentGroups.id })
+    .from(agentGroups)
+    .where(
+      and(
+        eq(agentGroups.id, groupId),
+        eq(agentGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
+
   if (!group) {
     return { error: "not_found" as const };
   }
 
-  const members = await sql`
-    SELECT
-      a.id,
-      a.external_id,
-      a.tenant_id,
-      a.user_id,
-      a.role,
-      a.is_autonomous,
-      a.revoked_at,
-      a.created_at,
-      u.id AS owner_id,
-      u.external_id AS owner_external_id,
-      u.display_name AS owner_display_name,
-      u.email AS owner_email
-    FROM agents a
-    JOIN agent_group_members m ON m.agent_id = a.id
-    LEFT JOIN users u ON u.id = a.user_id
-    WHERE m.group_id = ${groupId}
-    ORDER BY m.joined_at ASC
-  `;
+  const members = await db
+    .select({
+      id: agents.id,
+      externalId: agents.externalId,
+      tenantId: agents.tenantId,
+      userId: agents.userId,
+      role: agents.role,
+      isAutonomous: agents.isAutonomous,
+      revokedAt: agents.revokedAt,
+      createdAt: agents.createdAt,
+      ownerId: tenantUsers.id,
+      ownerExternalId: tenantUsers.externalId,
+      ownerDisplayName: tenantUsers.displayName,
+      ownerEmail: tenantUsers.email,
+    })
+    .from(agentGroupMembers)
+    .innerJoin(agents, eq(agents.id, agentGroupMembers.agentId))
+    .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+    .where(eq(agentGroupMembers.groupId, groupId))
+    .orderBy(asc(agentGroupMembers.joinedAt));
 
   return {
-    members: (members as Record<string, unknown>[]).map((m) => {
+    members: members.map((member) => {
       const ownerLabel =
-        (m.owner_display_name as string | null) ??
-        (m.owner_email as string | null) ??
-        (m.owner_external_id as string | null) ??
+        member.ownerDisplayName ??
+        member.ownerEmail ??
+        member.ownerExternalId ??
         null;
 
       return {
-        id: m.id as string,
-        externalId: m.external_id as string,
-        tenantId: m.tenant_id as string,
-        userId: (m.user_id as string | null) ?? null,
-        isAutonomous: m.is_autonomous as boolean,
-        role: (m.role as "user" | "group_admin" | "tenant_admin" | null) ?? null,
-        revokedAt: (m.revoked_at as string | Date | null) ?? null,
-        displayName: m.is_autonomous
-          ? `${m.external_id as string} (Autonomous)`
+        id: member.id,
+        externalId: member.externalId,
+        tenantId: member.tenantId,
+        userId: member.userId ?? null,
+        isAutonomous: member.isAutonomous,
+        role: member.role ?? null,
+        revokedAt: member.revokedAt ?? null,
+        displayName: member.isAutonomous
+          ? `${member.externalId} (Autonomous)`
           : ownerLabel
-            ? `${m.external_id as string} · ${ownerLabel}`
-            : (m.external_id as string),
+            ? `${member.externalId} · ${ownerLabel}`
+            : member.externalId,
         owner:
-          m.owner_id && ownerLabel
+          member.ownerId && ownerLabel
             ? {
-                id: m.owner_id as string,
-                externalId: (m.owner_external_id as string | null) ?? ownerLabel,
-                displayName: (m.owner_display_name as string | null) ?? null,
-                email: (m.owner_email as string | null) ?? null,
+                id: member.ownerId,
+                externalId: member.ownerExternalId ?? ownerLabel,
+                displayName: member.ownerDisplayName ?? null,
+                email: member.ownerEmail ?? null,
                 label: ownerLabel,
               }
             : null,
-        createdAt: m.created_at as string,
+        createdAt: formatTimestamp(member.createdAt),
       };
     }),
   };

@@ -6,10 +6,14 @@ import {
   resetAuditCounters,
 } from "../services/audit.service";
 
-const withTenantScopeMock = vi.fn();
+const { withTenantDrizzleScopeMock, auditLogMock } = vi.hoisted(() => ({
+  withTenantDrizzleScopeMock: vi.fn(),
+  auditLogMock: { __name: "auditLog" },
+}));
 
 vi.mock("@monet/db", () => ({
-  withTenantScope: (...args: unknown[]) => withTenantScopeMock(...args),
+  auditLog: auditLogMock,
+  withTenantDrizzleScope: (...args: unknown[]) => withTenantDrizzleScopeMock(...args),
 }));
 
 const ENTRY = {
@@ -21,11 +25,16 @@ const ENTRY = {
 };
 
 function mockSuccess() {
-  const txMock = vi.fn().mockResolvedValue([]);
-  withTenantScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
-    fn(txMock),
+  const valuesMock = vi.fn().mockResolvedValue([]);
+  const insertMock = vi.fn(() => ({
+    values: valuesMock,
+  }));
+  withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
+    fn({
+      insert: insertMock,
+    }),
   );
-  return txMock;
+  return { insertMock, valuesMock };
 }
 
 describe("audit service", () => {
@@ -35,7 +44,7 @@ describe("audit service", () => {
   });
 
   it("inserts an audit log record and returns success", async () => {
-    const txMock = mockSuccess();
+    const { insertMock, valuesMock } = mockSuccess();
 
     const result = await logAuditEvent({} as never, "tenant_test", {
       ...ENTRY,
@@ -44,14 +53,24 @@ describe("audit service", () => {
     });
 
     expect(result).toEqual({ success: true });
-    expect(withTenantScopeMock).toHaveBeenCalledTimes(1);
-    expect(txMock).toHaveBeenCalledTimes(1);
+    expect(withTenantDrizzleScopeMock).toHaveBeenCalledTimes(1);
+    expect(insertMock).toHaveBeenCalledWith(auditLogMock);
+    expect(valuesMock).toHaveBeenCalledWith({
+      tenantId: ENTRY.tenantId,
+      actorId: ENTRY.actorId,
+      actorType: ENTRY.actorType,
+      action: ENTRY.action,
+      targetId: "00000000-0000-0000-0000-000000000003",
+      outcome: ENTRY.outcome,
+      reason: "ok",
+      metadata: null,
+    });
     expect(getConsecutiveAuditFailureCount()).toBe(0);
   });
 
   it("returns failure result when audit write fails", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    withTenantScopeMock.mockRejectedValueOnce(new Error("db down"));
+    withTenantDrizzleScopeMock.mockRejectedValueOnce(new Error("db down"));
 
     const result = await logAuditEvent({} as never, "tenant_test", ENTRY);
 
@@ -72,7 +91,7 @@ describe("audit service", () => {
 
   it("reports degraded status after a failure", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    withTenantScopeMock.mockRejectedValueOnce(new Error("db down"));
+    withTenantDrizzleScopeMock.mockRejectedValueOnce(new Error("db down"));
 
     await logAuditEvent({} as never, "tenant_test", ENTRY);
 
@@ -87,7 +106,7 @@ describe("audit service", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     // trigger failure
-    withTenantScopeMock.mockRejectedValueOnce(new Error("db down"));
+    withTenantDrizzleScopeMock.mockRejectedValueOnce(new Error("db down"));
     await logAuditEvent({} as never, "tenant_test", ENTRY);
     expect(getAuditHealth().consecutiveFailures).toBe(1);
     expect(getAuditHealth().totalFailures).toBe(1);

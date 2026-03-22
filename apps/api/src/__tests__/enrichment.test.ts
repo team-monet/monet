@@ -1,11 +1,32 @@
-import { afterEach, describe, expect, it } from "vitest";
+import type { SqlClient } from "@monet/db";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createEnrichmentProvider } from "../providers/index";
+
+const { drizzleMock, withTenantDrizzleScopeMock } = vi.hoisted(() => ({
+  drizzleMock: vi.fn(),
+  withTenantDrizzleScopeMock: vi.fn(),
+}));
+
+vi.mock("drizzle-orm/postgres-js", () => ({
+  drizzle: (...args: unknown[]) => drizzleMock(...args),
+}));
+
+vi.mock("@monet/db", async () => {
+  const actual = await vi.importActual<typeof import("@monet/db")>("@monet/db");
+  return {
+    ...actual,
+    withTenantDrizzleScope: (...args: unknown[]) =>
+      withTenantDrizzleScopeMock(...args),
+  };
+});
+
 import {
   computeQueryEmbedding,
   enqueueEnrichment,
   getActiveEnrichmentCount,
   getQueuedEnrichmentCount,
   markShuttingDown,
+  recoverPendingEnrichments,
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
 } from "../services/enrichment.service";
@@ -42,6 +63,10 @@ describe("createEnrichmentProvider", () => {
 });
 
 describe("computeQueryEmbedding", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   afterEach(() => {
     resetEnrichmentStateForTests();
   });
@@ -106,5 +131,62 @@ describe("shutdown drain semantics", () => {
 
     expect(getQueuedEnrichmentCount()).toBe(0);
     expect(getActiveEnrichmentCount()).toBe(0);
+  });
+});
+
+describe("recoverPendingEnrichments", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    resetEnrichmentStateForTests();
+  });
+
+  it("reads tenant schemas via Drizzle and derives schema names from tenant ids", async () => {
+    setEnrichmentProviderForTests({
+      generateSummary: async () => "summary",
+      computeEmbedding: async () => [1, 2, 3],
+      extractTags: async () => ["ops"],
+    });
+
+    const orderByMock = vi.fn().mockResolvedValue([
+      { id: "00000000-0000-0000-0000-000000000010" },
+    ]);
+    const fromMock = vi.fn(() => ({
+      orderBy: orderByMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: fromMock,
+    }));
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    const tenantEntryOrderByMock = vi.fn().mockResolvedValue([]);
+    const tenantEntryWhereMock = vi.fn(() => ({
+      orderBy: tenantEntryOrderByMock,
+    }));
+    const tenantEntryFromMock = vi.fn(() => ({
+      where: tenantEntryWhereMock,
+    }));
+    const tenantEntrySelectMock = vi.fn(() => ({
+      from: tenantEntryFromMock,
+    }));
+
+    withTenantDrizzleScopeMock.mockImplementation(
+      async (_sql, _schemaName, fn) => fn({ select: tenantEntrySelectMock }),
+    );
+
+    const sql = {} as SqlClient;
+    await recoverPendingEnrichments(sql);
+
+    expect(drizzleMock).toHaveBeenCalledWith(sql);
+    expect(selectMock).toHaveBeenCalled();
+    expect(withTenantDrizzleScopeMock).toHaveBeenCalledWith(
+      sql,
+      "tenant_00000000_0000_0000_0000_000000000010",
+      expect.any(Function),
+    );
   });
 });

@@ -1,7 +1,11 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import postgres from "postgres";
-import { createClient, withTenantScope } from "@monet/db";
+import {
+  createClient,
+  createSqlClient,
+  type SqlClient,
+  withTenantScope,
+} from "@monet/db";
 import { provisionTenant } from "../../src/services/tenant.service";
 import { EMBEDDING_DIMENSIONS } from "../../src/providers/enrichment";
 
@@ -74,7 +78,7 @@ async function main() {
 
   const tenantName = `load-test-${Date.now()}`;
   const { db, sql: platformSql } = createClient(databaseUrl);
-  const sql = postgres(databaseUrl);
+  const sql = createSqlClient(databaseUrl);
 
   try {
     const tenantResult = await provisionTenant(db, platformSql, { name: tenantName });
@@ -161,7 +165,7 @@ async function main() {
       const vector = embeddingLiteral(groupIndex % 2 === 0 ? 0.15 : 0.85);
 
       await withTenantScope(sql, schemaName, async (txSql) => {
-        const tx = txSql as unknown as postgres.Sql;
+        const tx = txSql as unknown as SqlClient;
 
         for (let i = 0; i < memoriesPerGroup; i += 1) {
           const authorId = agentIds[(groupIndex + i) % agentIds.length];

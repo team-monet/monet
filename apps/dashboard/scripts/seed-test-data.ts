@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { 
+import {
   createClient, 
   createTenantSchema, 
   tenantSchemaNameFromId,
@@ -17,7 +17,6 @@ import {
 } from "@monet/db";
 import { eq } from "drizzle-orm";
 import { randomBytes, createHash, randomUUID } from "node:crypto";
-import postgres from "postgres";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

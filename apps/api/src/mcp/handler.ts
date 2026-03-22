@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { performance } from "node:perf_hooks";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type postgres from "postgres";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
 import type { Database } from "@monet/db";
 import { checkRateLimit } from "../middleware/rate-limit";
 import { tenantSchemaName } from "../middleware/tenant";
@@ -16,7 +16,7 @@ import type { SessionStore } from "./session-store";
 
 interface McpHandlerDeps {
   db: Database;
-  sql: postgres.Sql;
+  sql: SqlClient;
   sessionStore: SessionStore;
 }
 

@@ -1,4 +1,4 @@
-import postgres from "postgres";
+import { createSqlClient } from "@monet/db";
 
 const databaseUrl =
   process.env.DATABASE_URL ??
@@ -14,7 +14,7 @@ function sleep(ms) {
 let lastError = null;
 
 for (let attempt = 1; attempt <= retries; attempt += 1) {
-  const sql = postgres(databaseUrl, {
+  const sql = createSqlClient(databaseUrl, {
     max: 1,
     connect_timeout: 5,
     idle_timeout: 1,

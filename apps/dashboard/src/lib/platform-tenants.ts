@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type postgres from "postgres";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
 import {
   createTenantSchema,
   tenantUsers,
@@ -229,7 +229,7 @@ export async function createPlatformTenant(
 
   try {
     const result = await getSqlClient().begin(async (txSql) => {
-      const tx = txSql as unknown as postgres.Sql;
+      const tx = txSql as unknown as SqlClient;
 
       const [tenant] = await tx`
         INSERT INTO tenants (name, slug, isolation_mode)

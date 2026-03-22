@@ -1,5 +1,6 @@
-import { withTenantScope } from "@monet/db";
-import type postgres from "postgres";
+import { auditLog, withTenantDrizzleScope } from "@monet/db";
+import type { Database } from "@monet/db";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
 
 export interface AuditEntry {
   tenantId: string;
@@ -43,26 +44,22 @@ export function getAuditHealth(): AuditHealth {
 }
 
 export async function logAuditEvent(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   entry: AuditEntry,
 ): Promise<AuditResult> {
   try {
-    await withTenantScope(sql, schemaName, async (txSql) => {
-      const tx = txSql as unknown as postgres.Sql;
-      await tx`
-        INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, target_id, outcome, reason, metadata)
-        VALUES (
-          ${entry.tenantId},
-          ${entry.actorId},
-          ${entry.actorType},
-          ${entry.action},
-          ${entry.targetId ?? null},
-          ${entry.outcome},
-          ${entry.reason ?? null},
-          ${entry.metadata ? JSON.stringify(entry.metadata) : null}
-        )
-      `;
+    await withTenantDrizzleScope(sql, schemaName, async (db: Database) => {
+      await db.insert(auditLog).values({
+        tenantId: entry.tenantId,
+        actorId: entry.actorId,
+        actorType: entry.actorType,
+        action: entry.action,
+        targetId: entry.targetId ?? null,
+        outcome: entry.outcome,
+        reason: entry.reason ?? null,
+        metadata: entry.metadata ?? null,
+      });
     });
     consecutiveAuditFailures = 0;
     return { success: true };

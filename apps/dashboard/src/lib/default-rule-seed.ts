@@ -1,7 +1,14 @@
-import type postgres from "postgres";
+import {
+  groupRuleSets,
+  rules,
+  ruleSetRules,
+  ruleSets,
+  type SqlClient,
+  withTenantDrizzleScope,
+} from "@monet/db";
 
 export async function seedDefaultGeneralGuidance(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   groupId: string,
 ): Promise<void> {
@@ -53,30 +60,30 @@ export async function seedDefaultGeneralGuidance(
     },
   ] as const;
 
-  const ruleIds: string[] = [];
+  await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const createdRules = await db
+      .insert(rules)
+      .values(defaultRules.map((rule) => ({
+        name: rule.name,
+        description: rule.description,
+      })))
+      .returning({ id: rules.id });
 
-  for (const rule of defaultRules) {
-    const [createdRule] = await sql.unsafe(
-      `INSERT INTO "${schemaName}".rules (name, description) VALUES ($1, $2) RETURNING id`,
-      [rule.name, rule.description],
+    const [ruleSet] = await db
+      .insert(ruleSets)
+      .values({ name: "Default General Guidance" })
+      .returning({ id: ruleSets.id });
+
+    await db.insert(ruleSetRules).values(
+      createdRules.map((rule) => ({
+        ruleSetId: ruleSet.id,
+        ruleId: rule.id,
+      })),
     );
-    ruleIds.push(createdRule.id as string);
-  }
 
-  const [ruleSet] = await sql.unsafe(
-    `INSERT INTO "${schemaName}".rule_sets (name) VALUES ($1) RETURNING id`,
-    ["Default General Guidance"],
-  );
-
-  for (const ruleId of ruleIds) {
-    await sql.unsafe(
-      `INSERT INTO "${schemaName}".rule_set_rules (rule_set_id, rule_id) VALUES ($1, $2)`,
-      [ruleSet.id as string, ruleId],
-    );
-  }
-
-  await sql.unsafe(
-    `INSERT INTO "${schemaName}".group_rule_sets (group_id, rule_set_id) VALUES ($1, $2)`,
-    [groupId, ruleSet.id as string],
-  );
+    await db.insert(groupRuleSets).values({
+      groupId,
+      ruleSetId: ruleSet.id,
+    });
+  });
 }

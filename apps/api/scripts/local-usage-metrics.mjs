@@ -3,7 +3,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import postgres from "postgres";
+import { createSqlClient } from "@monet/db";
 
 function buildDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
@@ -31,7 +31,7 @@ async function main() {
     ? configuredOutput
     : path.resolve(repoRoot, configuredOutput);
 
-  const sql = postgres(buildDatabaseUrl(), { max: 1 });
+  const sql = createSqlClient(buildDatabaseUrl(), { max: 1 });
   try {
     let tenantId = providedTenantId;
     if (!tenantId) {

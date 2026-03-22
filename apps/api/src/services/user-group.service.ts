@@ -1,4 +1,15 @@
-import type postgres from "postgres";
+import {
+  agentGroups,
+  asDrizzleSqlClient,
+  tenantUsers,
+  userGroupAgentGroupPermissions,
+  userGroupMembers,
+  userGroups,
+  type SqlClient,
+  type TransactionClient,
+} from "@monet/db";
+import { and, asc, eq, inArray, sql as drizzleSql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 
 type UserGroupRecord = {
   id: string;
@@ -37,39 +48,82 @@ export type UserGroupDetail = {
   allowedAgentGroupIds: string[];
 };
 
+type UserGroupSqlClient = SqlClient | TransactionClient;
+type UserGroupDrizzleOptions = NonNullable<SqlClient["options"]>;
+
+function createUserGroupDb(
+  sql: UserGroupSqlClient,
+  options?: UserGroupDrizzleOptions,
+) {
+  return drizzle(asDrizzleSqlClient(sql, options));
+}
+
+function mapUserGroupRecord(group: {
+  id: string;
+  name: string;
+  description: string | null;
+  createdAt: Date;
+}): UserGroupRecord {
+  return {
+    id: group.id,
+    name: group.name,
+    description: group.description ?? "",
+    createdAt: group.createdAt,
+  };
+}
+
+function userSortExpression() {
+  return drizzleSql`COALESCE(${tenantUsers.displayName}, ${tenantUsers.email}, ${tenantUsers.externalId}) ASC NULLS LAST`;
+}
+
 export async function listAllowedAgentGroupIdsForUser(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   userId: string,
 ): Promise<string[]> {
-  const rows = await sql`
-    SELECT DISTINCT ag.id
-    FROM user_group_members hgm
-    JOIN user_groups hg ON hg.id = hgm.user_group_id
-    JOIN user_group_agent_group_permissions hgagp
-      ON hgagp.user_group_id = hgm.user_group_id
-    JOIN agent_groups ag ON ag.id = hgagp.agent_group_id
-    WHERE hgm.user_id = ${userId}
-      AND hg.tenant_id = ${tenantId}
-      AND ag.tenant_id = ${tenantId}
-  `;
+  const db = createUserGroupDb(sql);
+  const rows = await db
+    .selectDistinct({
+      id: agentGroups.id,
+    })
+    .from(userGroupMembers)
+    .innerJoin(userGroups, eq(userGroups.id, userGroupMembers.userGroupId))
+    .innerJoin(
+      userGroupAgentGroupPermissions,
+      eq(userGroupAgentGroupPermissions.userGroupId, userGroupMembers.userGroupId),
+    )
+    .innerJoin(
+      agentGroups,
+      eq(agentGroups.id, userGroupAgentGroupPermissions.agentGroupId),
+    )
+    .where(
+      and(
+        eq(userGroupMembers.userId, userId),
+        eq(userGroups.tenantId, tenantId),
+        eq(agentGroups.tenantId, tenantId),
+      ),
+    );
 
-  return (rows as unknown as Array<{ id: string }>).map((row) => row.id);
+  return rows.map((row) => row.id);
 }
 
 export async function userCanSelectAgentGroup(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   userId: string,
   groupId: string,
 ): Promise<boolean> {
-  const [group] = await sql`
-    SELECT id
-    FROM agent_groups
-    WHERE id = ${groupId}
-      AND tenant_id = ${tenantId}
-    LIMIT 1
-  `;
+  const db = createUserGroupDb(sql);
+  const [group] = await db
+    .select({ id: agentGroups.id })
+    .from(agentGroups)
+    .where(
+      and(
+        eq(agentGroups.id, groupId),
+        eq(agentGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
 
   if (!group) {
     return false;
@@ -85,283 +139,318 @@ export async function userCanSelectAgentGroup(
 }
 
 export async function listUserGroups(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
 ): Promise<UserGroupSummary[]> {
-  const rows = await sql`
-    SELECT
-      hg.id,
-      hg.name,
-      hg.description,
-      hg.created_at,
-      COALESCE(member_counts.count, 0)::int AS member_count,
-      COALESCE(permission_counts.count, 0)::int AS allowed_agent_group_count
-    FROM user_groups hg
-    LEFT JOIN (
-      SELECT user_group_id, COUNT(*)::int AS count
-      FROM user_group_members
-      GROUP BY user_group_id
-    ) member_counts ON member_counts.user_group_id = hg.id
-    LEFT JOIN (
-      SELECT user_group_id, COUNT(*)::int AS count
-      FROM user_group_agent_group_permissions
-      GROUP BY user_group_id
-    ) permission_counts ON permission_counts.user_group_id = hg.id
-    WHERE hg.tenant_id = ${tenantId}
-    ORDER BY hg.name ASC
-  `;
+  const db = createUserGroupDb(sql);
 
-  return (rows as Array<Record<string, unknown>>).map((row) => ({
-    id: row.id as string,
-    name: row.name as string,
-    description: row.description as string,
-    createdAt: row.created_at as Date,
-    memberCount: Number(row.member_count ?? 0),
-    allowedAgentGroupCount: Number(row.allowed_agent_group_count ?? 0),
+  const [groups, memberCounts, permissionCounts] = await Promise.all([
+    db
+      .select()
+      .from(userGroups)
+      .where(eq(userGroups.tenantId, tenantId))
+      .orderBy(asc(userGroups.name)),
+    db
+      .select({
+        userGroupId: userGroupMembers.userGroupId,
+        count: drizzleSql<number>`COUNT(*)::int`,
+      })
+      .from(userGroupMembers)
+      .groupBy(userGroupMembers.userGroupId),
+    db
+      .select({
+        userGroupId: userGroupAgentGroupPermissions.userGroupId,
+        count: drizzleSql<number>`COUNT(*)::int`,
+      })
+      .from(userGroupAgentGroupPermissions)
+      .groupBy(userGroupAgentGroupPermissions.userGroupId),
+  ]);
+
+  const memberCountByGroupId = new Map(
+    memberCounts.map((row) => [row.userGroupId, Number(row.count ?? 0)]),
+  );
+  const permissionCountByGroupId = new Map(
+    permissionCounts.map((row) => [row.userGroupId, Number(row.count ?? 0)]),
+  );
+
+  return groups.map((group) => ({
+    ...mapUserGroupRecord(group),
+    memberCount: memberCountByGroupId.get(group.id) ?? 0,
+    allowedAgentGroupCount: permissionCountByGroupId.get(group.id) ?? 0,
   }));
 }
 
 export async function getUserGroupDetail(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   userGroupId: string,
 ): Promise<UserGroupDetail | null> {
-  const [group] = await sql`
-    SELECT id, name, description, created_at
-    FROM user_groups
-    WHERE id = ${userGroupId}
-      AND tenant_id = ${tenantId}
-    LIMIT 1
-  `;
+  const db = createUserGroupDb(sql);
+  const [group] = await db
+    .select({
+      id: userGroups.id,
+      name: userGroups.name,
+      description: userGroups.description,
+      createdAt: userGroups.createdAt,
+    })
+    .from(userGroups)
+    .where(
+      and(
+        eq(userGroups.id, userGroupId),
+        eq(userGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
 
   if (!group) {
     return null;
   }
 
-  const [members, tenantUsers, tenantAgentGroups, permissions] = await Promise.all([
-    sql`
-      SELECT
-        u.id,
-        u.external_id,
-        u.display_name,
-        u.email,
-        u.role,
-        hgm.joined_at
-      FROM user_group_members hgm
-      JOIN users u ON u.id = hgm.user_id
-      WHERE hgm.user_group_id = ${userGroupId}
-      ORDER BY COALESCE(u.display_name, u.email, u.external_id) ASC NULLS LAST, u.external_id ASC
-    `,
-    sql`
-      SELECT
-        id,
-        external_id,
-        display_name,
-        email,
-        role
-      FROM users
-      WHERE tenant_id = ${tenantId}
-      ORDER BY COALESCE(display_name, email, external_id) ASC NULLS LAST, external_id ASC
-    `,
-    sql`
-      SELECT
-        id,
-        name,
-        description
-      FROM agent_groups
-      WHERE tenant_id = ${tenantId}
-      ORDER BY name ASC
-    `,
-    sql`
-      SELECT agent_group_id
-      FROM user_group_agent_group_permissions
-      WHERE user_group_id = ${userGroupId}
-    `,
+  const [members, tenantUserRows, tenantAgentGroups, permissions] = await Promise.all([
+    db
+      .select({
+        id: tenantUsers.id,
+        externalId: tenantUsers.externalId,
+        displayName: tenantUsers.displayName,
+        email: tenantUsers.email,
+        role: tenantUsers.role,
+        joinedAt: userGroupMembers.joinedAt,
+      })
+      .from(userGroupMembers)
+      .innerJoin(tenantUsers, eq(tenantUsers.id, userGroupMembers.userId))
+      .where(eq(userGroupMembers.userGroupId, userGroupId))
+      .orderBy(userSortExpression(), asc(tenantUsers.externalId)),
+    db
+      .select({
+        id: tenantUsers.id,
+        externalId: tenantUsers.externalId,
+        displayName: tenantUsers.displayName,
+        email: tenantUsers.email,
+        role: tenantUsers.role,
+      })
+      .from(tenantUsers)
+      .where(eq(tenantUsers.tenantId, tenantId))
+      .orderBy(userSortExpression(), asc(tenantUsers.externalId)),
+    db
+      .select({
+        id: agentGroups.id,
+        name: agentGroups.name,
+        description: agentGroups.description,
+      })
+      .from(agentGroups)
+      .where(eq(agentGroups.tenantId, tenantId))
+      .orderBy(asc(agentGroups.name)),
+    db
+      .select({
+        agentGroupId: userGroupAgentGroupPermissions.agentGroupId,
+      })
+      .from(userGroupAgentGroupPermissions)
+      .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId)),
   ]);
 
   return {
-    group: {
-      id: group.id as string,
-      name: group.name as string,
-      description: group.description as string,
-      createdAt: group.created_at as Date,
-    },
-    members: (members as Array<Record<string, unknown>>).map((row) => ({
-      id: row.id as string,
-      externalId: row.external_id as string,
-      displayName: (row.display_name as string | null) ?? null,
-      email: (row.email as string | null) ?? null,
-      role: row.role as "user" | "group_admin" | "tenant_admin",
-      joinedAt: row.joined_at as Date,
+    group: mapUserGroupRecord(group),
+    members: members.map((row) => ({
+      id: row.id,
+      externalId: row.externalId,
+      displayName: row.displayName ?? null,
+      email: row.email ?? null,
+      role: row.role,
+      joinedAt: row.joinedAt,
     })),
-    tenantUsers: (tenantUsers as Array<Record<string, unknown>>).map((row) => ({
-      id: row.id as string,
-      externalId: row.external_id as string,
-      displayName: (row.display_name as string | null) ?? null,
-      email: (row.email as string | null) ?? null,
-      role: row.role as "user" | "group_admin" | "tenant_admin",
+    tenantUsers: tenantUserRows.map((row) => ({
+      id: row.id,
+      externalId: row.externalId,
+      displayName: row.displayName ?? null,
+      email: row.email ?? null,
+      role: row.role,
     })),
-    tenantAgentGroups: (tenantAgentGroups as Array<Record<string, unknown>>).map((row) => ({
-      id: row.id as string,
-      name: row.name as string,
-      description: (row.description as string | null) ?? "",
+    tenantAgentGroups: tenantAgentGroups.map((row) => ({
+      id: row.id,
+      name: row.name,
+      description: row.description ?? "",
     })),
-    allowedAgentGroupIds: (permissions as Array<Record<string, unknown>>).map(
-      (row) => row.agent_group_id as string,
-    ),
+    allowedAgentGroupIds: permissions.map((row) => row.agentGroupId),
   };
 }
 
 export async function createUserGroup(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   input: { name: string; description?: string },
 ) {
-  const [group] = await sql`
-    INSERT INTO user_groups (tenant_id, name, description)
-    VALUES (${tenantId}, ${input.name}, ${input.description ?? ""})
-    RETURNING id, name, description, created_at
-  `;
+  const db = createUserGroupDb(sql);
+  const [group] = await db
+    .insert(userGroups)
+    .values({
+      tenantId,
+      name: input.name,
+      description: input.description ?? "",
+    })
+    .returning({
+      id: userGroups.id,
+      name: userGroups.name,
+      description: userGroups.description,
+      createdAt: userGroups.createdAt,
+    });
 
-  return {
-    id: group.id as string,
-    name: group.name as string,
-    description: group.description as string,
-    createdAt: group.created_at as Date,
-  };
+  return mapUserGroupRecord(group);
 }
 
 export async function updateUserGroup(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   userGroupId: string,
   input: { name?: string; description?: string },
 ) {
-  const [existing] = await sql`
-    SELECT id
-    FROM user_groups
-    WHERE id = ${userGroupId}
-      AND tenant_id = ${tenantId}
-    LIMIT 1
-  `;
+  const db = createUserGroupDb(sql);
+  const [existing] = await db
+    .select()
+    .from(userGroups)
+    .where(
+      and(
+        eq(userGroups.id, userGroupId),
+        eq(userGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
 
   if (!existing) {
     return { error: "not_found" as const, message: "User group not found" };
   }
 
-  const [group] = await sql`
-    UPDATE user_groups
-    SET
-      name = ${input.name ?? sql`name`},
-      description = ${input.description ?? sql`description`}
-    WHERE id = ${userGroupId}
-      AND tenant_id = ${tenantId}
-    RETURNING id, name, description, created_at
-  `;
+  const [group] = await db
+    .update(userGroups)
+    .set({
+      name: input.name ?? existing.name,
+      description: input.description ?? existing.description,
+    })
+    .where(
+      and(
+        eq(userGroups.id, userGroupId),
+        eq(userGroups.tenantId, tenantId),
+      ),
+    )
+    .returning({
+      id: userGroups.id,
+      name: userGroups.name,
+      description: userGroups.description,
+      createdAt: userGroups.createdAt,
+    });
 
-  return {
-    id: group.id as string,
-    name: group.name as string,
-    description: group.description as string,
-    createdAt: group.created_at as Date,
-  };
+  return mapUserGroupRecord(group);
 }
 
 export async function addUserGroupMember(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   userGroupId: string,
   userId: string,
 ) {
+  const db = createUserGroupDb(sql);
   const [[group], [user]] = await Promise.all([
-    sql`
-      SELECT id
-      FROM user_groups
-      WHERE id = ${userGroupId}
-        AND tenant_id = ${tenantId}
-      LIMIT 1
-    `,
-    sql`
-      SELECT id
-      FROM users
-      WHERE id = ${userId}
-        AND tenant_id = ${tenantId}
-      LIMIT 1
-    `,
+    db
+      .select({ id: userGroups.id })
+      .from(userGroups)
+      .where(
+        and(
+          eq(userGroups.id, userGroupId),
+          eq(userGroups.tenantId, tenantId),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: tenantUsers.id })
+      .from(tenantUsers)
+      .where(
+        and(
+          eq(tenantUsers.id, userId),
+          eq(tenantUsers.tenantId, tenantId),
+        ),
+      )
+      .limit(1),
   ]);
 
   if (!group || !user) {
     return { error: "not_found" as const, message: "User group or user not found" };
   }
 
-  await sql`
-    INSERT INTO user_group_members (user_group_id, user_id)
-    VALUES (${userGroupId}, ${userId})
-    ON CONFLICT DO NOTHING
-  `;
+  await db
+    .insert(userGroupMembers)
+    .values({ userGroupId, userId })
+    .onConflictDoNothing();
 
   return { success: true };
 }
 
 export async function removeUserGroupMember(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   userGroupId: string,
   userId: string,
 ) {
-  const [group] = await sql`
-    SELECT id
-    FROM user_groups
-    WHERE id = ${userGroupId}
-      AND tenant_id = ${tenantId}
-    LIMIT 1
-  `;
+  const db = createUserGroupDb(sql);
+  const [group] = await db
+    .select({ id: userGroups.id })
+    .from(userGroups)
+    .where(
+      and(
+        eq(userGroups.id, userGroupId),
+        eq(userGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
 
   if (!group) {
     return { error: "not_found" as const, message: "User group not found" };
   }
 
-  await sql`
-    DELETE FROM user_group_members
-    WHERE user_group_id = ${userGroupId}
-      AND user_id = ${userId}
-  `;
+  await db
+    .delete(userGroupMembers)
+    .where(
+      and(
+        eq(userGroupMembers.userGroupId, userGroupId),
+        eq(userGroupMembers.userId, userId),
+      ),
+    );
 
   return { success: true };
 }
 
 export async function saveUserGroupAgentGroupPermissions(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   userGroupId: string,
   agentGroupIds: string[],
 ) {
-  const [group] = await sql`
-    SELECT id
-    FROM user_groups
-    WHERE id = ${userGroupId}
-      AND tenant_id = ${tenantId}
-    LIMIT 1
-  `;
+  const db = createUserGroupDb(sql);
+  const [group] = await db
+    .select({ id: userGroups.id })
+    .from(userGroups)
+    .where(
+      and(
+        eq(userGroups.id, userGroupId),
+        eq(userGroups.tenantId, tenantId),
+      ),
+    )
+    .limit(1);
 
   if (!group) {
     return { error: "not_found" as const, message: "User group not found" };
   }
 
   if (agentGroupIds.length > 0) {
-    const validGroups = await Promise.all(
-      agentGroupIds.map((agentGroupId) =>
-        sql`
-          SELECT id
-          FROM agent_groups
-          WHERE tenant_id = ${tenantId}
-            AND id = ${agentGroupId}
-          LIMIT 1
-        `,
-      ),
-    );
+    const validGroups = await db
+      .select({ id: agentGroups.id })
+      .from(agentGroups)
+      .where(
+        and(
+          eq(agentGroups.tenantId, tenantId),
+          inArray(agentGroups.id, agentGroupIds),
+        ),
+      );
 
-    if (validGroups.some((rows) => rows.length === 0)) {
+    if (validGroups.length !== agentGroupIds.length) {
       return {
         error: "validation" as const,
         message: "One or more agent groups were invalid",
@@ -370,20 +459,21 @@ export async function saveUserGroupAgentGroupPermissions(
   }
 
   await sql.begin(async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
+    const tx = createUserGroupDb(txSql, sql.options);
 
-    await tx`
-      DELETE FROM user_group_agent_group_permissions
-      WHERE user_group_id = ${userGroupId}
-    `;
+    await tx
+      .delete(userGroupAgentGroupPermissions)
+      .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId));
 
     if (agentGroupIds.length > 0) {
-      for (const agentGroupId of agentGroupIds) {
-        await tx`
-          INSERT INTO user_group_agent_group_permissions (user_group_id, agent_group_id)
-          VALUES (${userGroupId}, ${agentGroupId})
-        `;
-      }
+      await tx
+        .insert(userGroupAgentGroupPermissions)
+        .values(
+          agentGroupIds.map((agentGroupId) => ({
+            userGroupId,
+            agentGroupId,
+          })),
+        );
     }
   });
 

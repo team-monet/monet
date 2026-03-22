@@ -1,6 +1,16 @@
-import { withTenantScope } from "@monet/db";
+import {
+  agents,
+  agentGroupMembers,
+  agentRuleSets,
+  groupRuleSets,
+  ruleSetRules as ruleSetRuleTable,
+  ruleSets as ruleSetTable,
+  rules as ruleTable,
+  withTenantDrizzleScope,
+} from "@monet/db";
+import { and, asc, eq, inArray, isNull, sql as drizzleSql } from "drizzle-orm";
 import type { CreateRuleInput, CreateRuleSetInput, UpdateRuleInput } from "@monet/types";
-import type postgres from "postgres";
+import type { SqlClient } from "@monet/db";
 import { logAuditEvent, type AuditEntry } from "./audit.service";
 
 interface RuleMutationActor {
@@ -32,96 +42,149 @@ export interface RuleSetWithRulesRecord extends RuleSetRecord {
   ruleIds: string[];
 }
 
-function mapRule(row: Record<string, unknown>): RuleRecord {
+function dedupeStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function normalizeTimestamp(value: unknown): string {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (typeof value === "string" || typeof value === "number") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  throw new TypeError(`Unexpected timestamp value: ${String(value)}`);
+}
+
+type RuleRowLike = {
+  id: string;
+  name: string;
+  description: string;
+  ownerUserId: string | null;
+  updatedAt: Date | string;
+  createdAt: Date | string;
+};
+
+function mapRuleRow(row: RuleRowLike): RuleRecord {
   return {
-    id: row.id as string,
-    name: row.name as string,
-    description: row.description as string,
-    ownerUserId: (row.owner_user_id as string | null) ?? null,
-    updatedAt: row.updated_at as string,
-    createdAt: row.created_at as string,
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    ownerUserId: row.ownerUserId,
+    updatedAt: normalizeTimestamp(row.updatedAt),
+    createdAt: normalizeTimestamp(row.createdAt),
   };
 }
 
-function mapRuleSet(row: Record<string, unknown>): RuleSetRecord {
+function ownerScopeCondition(ownerUserId: string | null) {
+  return ownerUserId === null
+    ? isNull(ruleTable.ownerUserId)
+    : eq(ruleTable.ownerUserId, ownerUserId);
+}
+
+function ruleSetOwnerScopeCondition(ownerUserId: string | null) {
+  return ownerUserId === null
+    ? isNull(ruleSetTable.ownerUserId)
+    : eq(ruleSetTable.ownerUserId, ownerUserId);
+}
+
+type RuleSetRowLike = {
+  id: string;
+  name: string;
+  ownerUserId: string | null;
+  createdAt: Date | string;
+};
+
+function mapRuleSetRow(row: RuleSetRowLike): RuleSetRecord {
   return {
-    id: row.id as string,
-    name: row.name as string,
-    ownerUserId: (row.owner_user_id as string | null) ?? null,
-    createdAt: row.created_at as string,
+    id: row.id,
+    name: row.name,
+    ownerUserId: row.ownerUserId,
+    createdAt: normalizeTimestamp(row.createdAt),
   };
 }
 
-function mapRuleSetWithRules(row: Record<string, unknown>): RuleSetWithRulesRecord {
+type RuleSetWithRulesRowLike = RuleSetRowLike & {
+  ruleIds: string[] | null;
+};
+
+function mapRuleSetWithRulesRow(row: RuleSetWithRulesRowLike): RuleSetWithRulesRecord {
   return {
-    ...mapRuleSet(row),
-    ruleIds: Array.isArray(row.rule_ids) ? (row.rule_ids as string[]) : [],
+    ...mapRuleSetRow(row),
+    ruleIds: row.ruleIds ?? [],
   };
+}
+
+function ruleIdsSelection() {
+  return drizzleSql<string[]>`
+    COALESCE(
+      ARRAY_AGG(${ruleSetRuleTable.ruleId} ORDER BY ${ruleSetRuleTable.ruleId})
+        FILTER (WHERE ${ruleSetRuleTable.ruleId} IS NOT NULL),
+      ARRAY[]::uuid[]
+    )
+  `;
 }
 
 async function listRuleSetsByOwner(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   ownerUserId: string | null,
 ): Promise<RuleSetWithRulesRecord[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = ownerUserId === null
-      ? await tx`
-          SELECT
-            rs.id,
-            rs.name,
-            rs.owner_user_id,
-            rs.created_at,
-            COALESCE(
-              ARRAY_AGG(rsr.rule_id ORDER BY rsr.rule_id)
-                FILTER (WHERE rsr.rule_id IS NOT NULL),
-              ARRAY[]::uuid[]
-            ) AS rule_ids
-          FROM rule_sets rs
-          LEFT JOIN rule_set_rules rsr ON rsr.rule_set_id = rs.id
-          WHERE rs.owner_user_id IS NULL
-          GROUP BY rs.id, rs.name, rs.owner_user_id, rs.created_at
-          ORDER BY rs.created_at ASC, rs.id ASC
-        `
-      : await tx`
-          SELECT
-            rs.id,
-            rs.name,
-            rs.owner_user_id,
-            rs.created_at,
-            COALESCE(
-              ARRAY_AGG(rsr.rule_id ORDER BY rsr.rule_id)
-                FILTER (WHERE rsr.rule_id IS NOT NULL),
-              ARRAY[]::uuid[]
-            ) AS rule_ids
-          FROM rule_sets rs
-          LEFT JOIN rule_set_rules rsr ON rsr.rule_set_id = rs.id
-          WHERE rs.owner_user_id = ${ownerUserId}
-          GROUP BY rs.id, rs.name, rs.owner_user_id, rs.created_at
-          ORDER BY rs.created_at ASC, rs.id ASC
-        `;
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .select({
+        id: ruleSetTable.id,
+        name: ruleSetTable.name,
+        ownerUserId: ruleSetTable.ownerUserId,
+        createdAt: ruleSetTable.createdAt,
+        ruleIds: ruleIdsSelection(),
+      })
+      .from(ruleSetTable)
+      .leftJoin(ruleSetRuleTable, eq(ruleSetRuleTable.ruleSetId, ruleSetTable.id))
+      .where(ruleSetOwnerScopeCondition(ownerUserId))
+      .groupBy(
+        ruleSetTable.id,
+        ruleSetTable.name,
+        ruleSetTable.ownerUserId,
+        ruleSetTable.createdAt,
+      )
+      .orderBy(asc(ruleSetTable.createdAt), asc(ruleSetTable.id));
 
-    return (rows as Record<string, unknown>[]).map(mapRuleSetWithRules);
+    return rows.map(mapRuleSetWithRulesRow);
   });
 }
 
 export async function createRule(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
   input: CreateRuleInput,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<RuleRecord> {
-  const created = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [rule] = await tx`
-      INSERT INTO rules (name, description, owner_user_id)
-      VALUES (${input.name}, ${input.description}, ${scope.ownerUserId})
-      RETURNING id, name, description, owner_user_id, updated_at, created_at
-    `;
-    return mapRule(rule as Record<string, unknown>);
+  const created = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [rule] = await db
+      .insert(ruleTable)
+      .values({
+        name: input.name,
+        description: input.description,
+        ownerUserId: scope.ownerUserId,
+      })
+      .returning({
+        id: ruleTable.id,
+        name: ruleTable.name,
+        description: ruleTable.description,
+        ownerUserId: ruleTable.ownerUserId,
+        updatedAt: ruleTable.updatedAt,
+        createdAt: ruleTable.createdAt,
+      });
+
+    return mapRuleRow(rule);
   });
 
   await logAuditEvent(sql, schemaName, {
@@ -138,7 +201,7 @@ export async function createRule(
 }
 
 export async function updateRule(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
@@ -146,37 +209,58 @@ export async function updateRule(
   input: UpdateRuleInput,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<RuleRecord | { error: "not_found" }> {
-  const { updated, previous } = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
+  const { updated, previous } = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [existing] = await db
+      .select({
+        name: ruleTable.name,
+        description: ruleTable.description,
+      })
+      .from(ruleTable)
+      .where(
+        and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)),
+      )
+      .limit(1);
 
-    // Fetch current values for audit diff
-    const [existing] = scope.ownerUserId === null
-      ? await tx`SELECT name, description FROM rules WHERE id = ${ruleId} AND owner_user_id IS NULL`
-      : await tx`SELECT name, description FROM rules WHERE id = ${ruleId} AND owner_user_id = ${scope.ownerUserId}`;
-    const prev = existing ? { name: existing.name as string, description: existing.description as string } : null;
+    if (!existing) {
+      return { updated: null, previous: null };
+    }
 
-    const [rule] = scope.ownerUserId === null
-      ? await tx`
-          UPDATE rules
-          SET
-            name = COALESCE(${input.name ?? null}, name),
-            description = COALESCE(${input.description ?? null}, description),
-            updated_at = NOW()
-          WHERE id = ${ruleId}
-            AND owner_user_id IS NULL
-          RETURNING id, name, description, owner_user_id, updated_at, created_at
-        `
-      : await tx`
-          UPDATE rules
-          SET
-            name = COALESCE(${input.name ?? null}, name),
-            description = COALESCE(${input.description ?? null}, description),
-            updated_at = NOW()
-          WHERE id = ${ruleId}
-            AND owner_user_id = ${scope.ownerUserId}
-          RETURNING id, name, description, owner_user_id, updated_at, created_at
-        `;
-    return { updated: rule ? mapRule(rule as Record<string, unknown>) : null, previous: prev };
+    const previous = {
+      name: existing.name,
+      description: existing.description,
+    };
+
+    const updateValues: {
+      name?: string;
+      description?: string;
+      updatedAt: ReturnType<typeof drizzleSql>;
+    } = {
+      updatedAt: drizzleSql`NOW()`,
+    };
+
+    if (input.name !== undefined) {
+      updateValues.name = input.name;
+    }
+    if (input.description !== undefined) {
+      updateValues.description = input.description;
+    }
+
+    const [rule] = await db
+      .update(ruleTable)
+      .set(updateValues)
+      .where(
+        and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)),
+      )
+      .returning({
+        id: ruleTable.id,
+        name: ruleTable.name,
+        description: ruleTable.description,
+        ownerUserId: ruleTable.ownerUserId,
+        updatedAt: ruleTable.updatedAt,
+        createdAt: ruleTable.createdAt,
+      });
+
+    return { updated: rule ? mapRuleRow(rule) : null, previous };
   });
 
   if (!updated) {
@@ -214,29 +298,25 @@ export async function updateRule(
 }
 
 export async function deleteRule(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
   ruleId: string,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<{ success: true } | { error: "not_found" }> {
-  const deleted = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [row] = scope.ownerUserId === null
-      ? await tx`
-          DELETE FROM rules
-          WHERE id = ${ruleId}
-            AND owner_user_id IS NULL
-          RETURNING id, name
-        `
-      : await tx`
-          DELETE FROM rules
-          WHERE id = ${ruleId}
-            AND owner_user_id = ${scope.ownerUserId}
-          RETURNING id, name
-        `;
-    return row ? { id: row.id as string, name: row.name as string } : null;
+  const deleted = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [row] = await db
+      .delete(ruleTable)
+      .where(
+        and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)),
+      )
+      .returning({
+        id: ruleTable.id,
+        name: ruleTable.name,
+      });
+
+    return row ?? null;
   });
 
   if (!deleted) {
@@ -266,71 +346,98 @@ export async function deleteRule(
 }
 
 export async function listRules(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
 ): Promise<RuleRecord[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx`
-      SELECT id, name, description, owner_user_id, updated_at, created_at
-      FROM rules
-      WHERE owner_user_id IS NULL
-      ORDER BY created_at ASC, id ASC
-    `;
-    return (rows as Record<string, unknown>[]).map(mapRule);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .select({
+        id: ruleTable.id,
+        name: ruleTable.name,
+        description: ruleTable.description,
+        ownerUserId: ruleTable.ownerUserId,
+        updatedAt: ruleTable.updatedAt,
+        createdAt: ruleTable.createdAt,
+      })
+      .from(ruleTable)
+      .where(isNull(ruleTable.ownerUserId))
+      .orderBy(asc(ruleTable.createdAt), asc(ruleTable.id));
+
+    return rows.map(mapRuleRow);
   });
 }
 
 export async function listPersonalRulesForUser(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   ownerUserId: string,
 ): Promise<RuleRecord[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx`
-      SELECT id, name, description, owner_user_id, updated_at, created_at
-      FROM rules
-      WHERE owner_user_id = ${ownerUserId}
-      ORDER BY created_at ASC, id ASC
-    `;
-    return (rows as Record<string, unknown>[]).map(mapRule);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .select({
+        id: ruleTable.id,
+        name: ruleTable.name,
+        description: ruleTable.description,
+        ownerUserId: ruleTable.ownerUserId,
+        updatedAt: ruleTable.updatedAt,
+        createdAt: ruleTable.createdAt,
+      })
+      .from(ruleTable)
+      .where(eq(ruleTable.ownerUserId, ownerUserId))
+      .orderBy(asc(ruleTable.createdAt), asc(ruleTable.id));
+
+    return rows.map(mapRuleRow);
   });
 }
 
 export async function getRule(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   ruleId: string,
 ): Promise<RuleRecord | null> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [row] = await tx`
-      SELECT id, name, description, owner_user_id, updated_at, created_at
-      FROM rules
-      WHERE id = ${ruleId}
-        AND owner_user_id IS NULL
-    `;
-    return row ? mapRule(row as Record<string, unknown>) : null;
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [row] = await db
+      .select({
+        id: ruleTable.id,
+        name: ruleTable.name,
+        description: ruleTable.description,
+        ownerUserId: ruleTable.ownerUserId,
+        updatedAt: ruleTable.updatedAt,
+        createdAt: ruleTable.createdAt,
+      })
+      .from(ruleTable)
+      .where(
+        and(eq(ruleTable.id, ruleId), isNull(ruleTable.ownerUserId)),
+      )
+      .limit(1);
+
+    return row ? mapRuleRow(row) : null;
   });
 }
 
 export async function createRuleSet(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
   input: CreateRuleSetInput,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<RuleSetRecord> {
-  const created = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [row] = await tx`
-      INSERT INTO rule_sets (name, owner_user_id)
-      VALUES (${input.name}, ${scope.ownerUserId})
-      RETURNING id, name, owner_user_id, created_at
-    `;
-    return mapRuleSet(row as Record<string, unknown>);
+  const created = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [row] = await db
+      .insert(ruleSetTable)
+      .values({
+        name: input.name,
+        ownerUserId: scope.ownerUserId,
+      })
+      .returning({
+        id: ruleSetTable.id,
+        name: ruleSetTable.name,
+        ownerUserId: ruleSetTable.ownerUserId,
+        createdAt: ruleSetTable.createdAt,
+      });
+
+    return mapRuleSetRow(row);
   });
 
   await logAuditEvent(sql, schemaName, {
@@ -347,14 +454,14 @@ export async function createRuleSet(
 }
 
 export async function listRuleSets(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
 ): Promise<RuleSetWithRulesRecord[]> {
   return listRuleSetsByOwner(sql, schemaName, null);
 }
 
 export async function listPersonalRuleSetsForUser(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   ownerUserId: string,
 ): Promise<RuleSetWithRulesRecord[]> {
@@ -362,90 +469,85 @@ export async function listPersonalRuleSetsForUser(
 }
 
 export async function listRuleSetsForAgent(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   agentId: string,
 ): Promise<RuleSetWithRulesRecord[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx`
-      SELECT
-        rs.id,
-        rs.name,
-        rs.owner_user_id,
-        rs.created_at,
-        COALESCE(
-          ARRAY_AGG(rsr.rule_id ORDER BY rsr.rule_id)
-            FILTER (WHERE rsr.rule_id IS NOT NULL),
-          ARRAY[]::uuid[]
-        ) AS rule_ids
-      FROM agent_rule_sets ars
-      JOIN rule_sets rs ON rs.id = ars.rule_set_id
-      LEFT JOIN rule_set_rules rsr ON rsr.rule_set_id = rs.id
-      WHERE ars.agent_id = ${agentId}
-      GROUP BY rs.id, rs.name, rs.owner_user_id, rs.created_at
-      ORDER BY rs.created_at ASC, rs.id ASC
-    `;
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .select({
+        id: ruleSetTable.id,
+        name: ruleSetTable.name,
+        ownerUserId: ruleSetTable.ownerUserId,
+        createdAt: ruleSetTable.createdAt,
+        ruleIds: ruleIdsSelection(),
+      })
+      .from(agentRuleSets)
+      .innerJoin(ruleSetTable, eq(ruleSetTable.id, agentRuleSets.ruleSetId))
+      .leftJoin(ruleSetRuleTable, eq(ruleSetRuleTable.ruleSetId, ruleSetTable.id))
+      .where(eq(agentRuleSets.agentId, agentId))
+      .groupBy(
+        ruleSetTable.id,
+        ruleSetTable.name,
+        ruleSetTable.ownerUserId,
+        ruleSetTable.createdAt,
+      )
+      .orderBy(asc(ruleSetTable.createdAt), asc(ruleSetTable.id));
 
-    return (rows as Record<string, unknown>[]).map(mapRuleSetWithRules);
+    return rows.map(mapRuleSetWithRulesRow);
   });
 }
 
 export async function listRuleSetsForGroup(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   groupId: string,
 ): Promise<RuleSetWithRulesRecord[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx`
-      SELECT
-        rs.id,
-        rs.name,
-        rs.owner_user_id,
-        rs.created_at,
-        COALESCE(
-          ARRAY_AGG(rsr.rule_id ORDER BY rsr.rule_id)
-            FILTER (WHERE rsr.rule_id IS NOT NULL),
-          ARRAY[]::uuid[]
-        ) AS rule_ids
-      FROM group_rule_sets grs
-      JOIN rule_sets rs ON rs.id = grs.rule_set_id
-      LEFT JOIN rule_set_rules rsr ON rsr.rule_set_id = rs.id
-      WHERE grs.group_id = ${groupId}
-        AND rs.owner_user_id IS NULL
-      GROUP BY rs.id, rs.name, rs.owner_user_id, rs.created_at
-      ORDER BY rs.created_at ASC, rs.id ASC
-    `;
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .select({
+        id: ruleSetTable.id,
+        name: ruleSetTable.name,
+        ownerUserId: ruleSetTable.ownerUserId,
+        createdAt: ruleSetTable.createdAt,
+        ruleIds: ruleIdsSelection(),
+      })
+      .from(groupRuleSets)
+      .innerJoin(ruleSetTable, eq(ruleSetTable.id, groupRuleSets.ruleSetId))
+      .leftJoin(ruleSetRuleTable, eq(ruleSetRuleTable.ruleSetId, ruleSetTable.id))
+      .where(and(eq(groupRuleSets.groupId, groupId), isNull(ruleSetTable.ownerUserId)))
+      .groupBy(
+        ruleSetTable.id,
+        ruleSetTable.name,
+        ruleSetTable.ownerUserId,
+        ruleSetTable.createdAt,
+      )
+      .orderBy(asc(ruleSetTable.createdAt), asc(ruleSetTable.id));
 
-    return (rows as Record<string, unknown>[]).map(mapRuleSetWithRules);
+    return rows.map(mapRuleSetWithRulesRow);
   });
 }
 
 export async function deleteRuleSet(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
   ruleSetId: string,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<{ success: true } | { error: "not_found" }> {
-  const deleted = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [row] = scope.ownerUserId === null
-      ? await tx`
-          DELETE FROM rule_sets
-          WHERE id = ${ruleSetId}
-            AND owner_user_id IS NULL
-          RETURNING id, name
-        `
-      : await tx`
-          DELETE FROM rule_sets
-          WHERE id = ${ruleSetId}
-            AND owner_user_id = ${scope.ownerUserId}
-          RETURNING id, name
-        `;
-    return row ? { id: row.id as string, name: row.name as string } : null;
+  const deleted = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [row] = await db
+      .delete(ruleSetTable)
+      .where(
+        and(eq(ruleSetTable.id, ruleSetId), ruleSetOwnerScopeCondition(scope.ownerUserId)),
+      )
+      .returning({
+        id: ruleSetTable.id,
+        name: ruleSetTable.name,
+      });
+
+    return row ?? null;
   });
 
   if (!deleted) {
@@ -475,7 +577,7 @@ export async function deleteRuleSet(
 }
 
 export async function addRuleToSet(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
@@ -483,44 +585,37 @@ export async function addRuleToSet(
   ruleId: string,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<{ success: true } | { error: "not_found" | "conflict" }> {
-  const result = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [ruleSetExists] = scope.ownerUserId === null
-      ? await tx`
-          SELECT id
-          FROM rule_sets
-          WHERE id = ${ruleSetId}
-            AND owner_user_id IS NULL
-        `
-      : await tx`
-          SELECT id
-          FROM rule_sets
-          WHERE id = ${ruleSetId}
-            AND owner_user_id = ${scope.ownerUserId}
-        `;
+  const result = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [ruleSetExists] = await db
+      .select({
+        id: ruleSetTable.id,
+      })
+      .from(ruleSetTable)
+      .where(
+        and(eq(ruleSetTable.id, ruleSetId), ruleSetOwnerScopeCondition(scope.ownerUserId)),
+      )
+      .limit(1);
     if (!ruleSetExists) return { error: "not_found" as const };
 
-    const [ruleExists] = scope.ownerUserId === null
-      ? await tx`
-          SELECT id
-          FROM rules
-          WHERE id = ${ruleId}
-            AND owner_user_id IS NULL
-        `
-      : await tx`
-          SELECT id
-          FROM rules
-          WHERE id = ${ruleId}
-            AND owner_user_id = ${scope.ownerUserId}
-        `;
+    const [ruleExists] = await db
+      .select({
+        id: ruleTable.id,
+      })
+      .from(ruleTable)
+      .where(and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)))
+      .limit(1);
     if (!ruleExists) return { error: "not_found" as const };
 
-    const [inserted] = await tx`
-      INSERT INTO rule_set_rules (rule_set_id, rule_id)
-      VALUES (${ruleSetId}, ${ruleId})
-      ON CONFLICT DO NOTHING
-      RETURNING rule_set_id
-    `;
+    const [inserted] = await db
+      .insert(ruleSetRuleTable)
+      .values({
+        ruleSetId,
+        ruleId,
+      })
+      .onConflictDoNothing()
+      .returning({
+        ruleSetId: ruleSetRuleTable.ruleSetId,
+      });
 
     if (!inserted) return { error: "conflict" as const };
 
@@ -542,7 +637,7 @@ export async function addRuleToSet(
 }
 
 export async function removeRuleFromSet(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
@@ -550,27 +645,30 @@ export async function removeRuleFromSet(
   ruleId: string,
   scope: RuleOwnerScope = { ownerUserId: null },
 ): Promise<{ success: true } | { error: "not_found" }> {
-  const removed = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [row] = scope.ownerUserId === null
-      ? await tx`
-          DELETE FROM rule_set_rules rsr
-          USING rule_sets rs
-          WHERE rsr.rule_set_id = rs.id
-            AND rs.id = ${ruleSetId}
-            AND rsr.rule_id = ${ruleId}
-            AND rs.owner_user_id IS NULL
-          RETURNING rsr.rule_set_id
-        `
-      : await tx`
-          DELETE FROM rule_set_rules rsr
-          USING rule_sets rs
-          WHERE rsr.rule_set_id = rs.id
-            AND rs.id = ${ruleSetId}
-            AND rsr.rule_id = ${ruleId}
-            AND rs.owner_user_id = ${scope.ownerUserId}
-          RETURNING rsr.rule_set_id
-        `;
+  const removed = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [ruleSetExists] = await db
+      .select({
+        id: ruleSetTable.id,
+      })
+      .from(ruleSetTable)
+      .where(
+        and(eq(ruleSetTable.id, ruleSetId), ruleSetOwnerScopeCondition(scope.ownerUserId)),
+      )
+      .limit(1);
+    if (!ruleSetExists) return false;
+
+    const [row] = await db
+      .delete(ruleSetRuleTable)
+      .where(
+        and(
+          eq(ruleSetRuleTable.ruleSetId, ruleSetId),
+          eq(ruleSetRuleTable.ruleId, ruleId),
+        ),
+      )
+      .returning({
+        ruleSetId: ruleSetRuleTable.ruleSetId,
+      });
+
     return Boolean(row);
   });
 
@@ -589,43 +687,48 @@ export async function removeRuleFromSet(
 }
 
 export async function associateRuleSetWithAgent(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
   agentId: string,
   ruleSetId: string,
 ): Promise<{ success: true } | { error: "not_found" | "conflict" | "forbidden" }> {
-  const result = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-
-    // Validate agent exists and belongs to this tenant (use tx for transactional consistency)
-    const [agent] = await tx`
-      SELECT user_id FROM public.agents
-      WHERE id = ${agentId} AND tenant_id = ${tenantId}
-    `;
+  const result = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [agent] = await db
+      .select({
+        userId: agents.userId,
+      })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)))
+      .limit(1);
     if (!agent) return { error: "not_found" as const };
 
-    const agentOwnerUserId = (agent.user_id as string | null) ?? null;
+    const agentOwnerUserId = agent.userId ?? null;
 
-    const [ruleSet] = await tx`
-      SELECT owner_user_id
-      FROM rule_sets
-      WHERE id = ${ruleSetId}
-    `;
+    const [ruleSet] = await db
+      .select({
+        ownerUserId: ruleSetTable.ownerUserId,
+      })
+      .from(ruleSetTable)
+      .where(eq(ruleSetTable.id, ruleSetId))
+      .limit(1);
     if (!ruleSet) return { error: "not_found" as const };
 
-    const ownerUserId = (ruleSet.owner_user_id as string | null) ?? null;
-    if (ownerUserId && ownerUserId !== agentOwnerUserId) {
+    if (ruleSet.ownerUserId && ruleSet.ownerUserId !== agentOwnerUserId) {
       return { error: "forbidden" as const };
     }
 
-    const [inserted] = await tx`
-      INSERT INTO agent_rule_sets (agent_id, rule_set_id)
-      VALUES (${agentId}, ${ruleSetId})
-      ON CONFLICT DO NOTHING
-      RETURNING agent_id
-    `;
+    const [inserted] = await db
+      .insert(agentRuleSets)
+      .values({
+        agentId,
+        ruleSetId,
+      })
+      .onConflictDoNothing()
+      .returning({
+        agentId: agentRuleSets.agentId,
+      });
 
     if (!inserted) return { error: "conflict" as const };
     return { success: true as const };
@@ -646,20 +749,26 @@ export async function associateRuleSetWithAgent(
 }
 
 export async function dissociateRuleSetFromAgent(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   schemaName: string,
   actor: RuleMutationActor,
   agentId: string,
   ruleSetId: string,
 ): Promise<{ success: true } | { error: "not_found" }> {
-  const removed = await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const [row] = await tx`
-      DELETE FROM agent_rule_sets
-      WHERE agent_id = ${agentId} AND rule_set_id = ${ruleSetId}
-      RETURNING agent_id
-    `;
+  const removed = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [row] = await db
+      .delete(agentRuleSets)
+      .where(
+        and(
+          eq(agentRuleSets.agentId, agentId),
+          eq(agentRuleSets.ruleSetId, ruleSetId),
+        ),
+      )
+      .returning({
+        agentId: agentRuleSets.agentId,
+      });
+
     return Boolean(row);
   });
 
@@ -678,80 +787,110 @@ export async function dissociateRuleSetFromAgent(
 }
 
 export async function getActiveRulesForAgent(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   agentId: string,
 ): Promise<RuleRecord[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx`
-      WITH effective_rule_sets AS (
-        SELECT rule_set_id
-        FROM agent_rule_sets
-        WHERE agent_id = ${agentId}
-        UNION
-        SELECT grs.rule_set_id
-        FROM agent_group_members agm
-        JOIN group_rule_sets grs ON grs.group_id = agm.group_id
-        WHERE agm.agent_id = ${agentId}
-      )
-      SELECT DISTINCT r.id, r.name, r.description, r.owner_user_id, r.updated_at, r.created_at
-      FROM effective_rule_sets ers
-      JOIN rule_set_rules rsr ON rsr.rule_set_id = ers.rule_set_id
-      JOIN rules r ON r.id = rsr.rule_id
-      ORDER BY r.created_at ASC, r.id ASC
-    `;
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [directRuleSetRows, groupRuleSetRows] = await Promise.all([
+      db
+        .select({
+          ruleSetId: agentRuleSets.ruleSetId,
+        })
+        .from(agentRuleSets)
+        .where(eq(agentRuleSets.agentId, agentId)),
+      db
+        .select({
+          ruleSetId: groupRuleSets.ruleSetId,
+        })
+        .from(agentGroupMembers)
+        .innerJoin(groupRuleSets, eq(groupRuleSets.groupId, agentGroupMembers.groupId))
+        .where(eq(agentGroupMembers.agentId, agentId)),
+    ]);
 
-    return (rows as Record<string, unknown>[]).map(mapRule);
+    const ruleSetIds = dedupeStrings([
+      ...directRuleSetRows.map((row) => row.ruleSetId),
+      ...groupRuleSetRows.map((row) => row.ruleSetId),
+    ]);
+
+    if (ruleSetIds.length === 0) {
+      return [];
+    }
+
+    const rows = await db
+      .selectDistinct({
+        id: ruleTable.id,
+        name: ruleTable.name,
+        description: ruleTable.description,
+        ownerUserId: ruleTable.ownerUserId,
+        updatedAt: ruleTable.updatedAt,
+        createdAt: ruleTable.createdAt,
+      })
+      .from(ruleSetRuleTable)
+      .innerJoin(ruleTable, eq(ruleTable.id, ruleSetRuleTable.ruleId))
+      .where(inArray(ruleSetRuleTable.ruleSetId, ruleSetIds))
+      .orderBy(asc(ruleTable.createdAt), asc(ruleTable.id));
+
+    return rows.map(mapRuleRow);
   });
 }
 
 export async function getAgentIdsForRuleSet(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   ruleSetId: string,
 ): Promise<string[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx`
-      SELECT DISTINCT agent_id
-      FROM (
-        SELECT agent_id
-        FROM agent_rule_sets
-        WHERE rule_set_id = ${ruleSetId}
-        UNION
-        SELECT agm.agent_id
-        FROM group_rule_sets grs
-        JOIN agent_group_members agm ON agm.group_id = grs.group_id
-        WHERE grs.rule_set_id = ${ruleSetId}
-      ) AS effective_agents
-    `;
-    return (rows as Record<string, unknown>[]).map((row) => row.agent_id as string);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [directAgentRows, groupAgentRows] = await Promise.all([
+      db
+        .select({
+          agentId: agentRuleSets.agentId,
+        })
+        .from(agentRuleSets)
+        .where(eq(agentRuleSets.ruleSetId, ruleSetId)),
+      db
+        .select({
+          agentId: agentGroupMembers.agentId,
+        })
+        .from(groupRuleSets)
+        .innerJoin(agentGroupMembers, eq(agentGroupMembers.groupId, groupRuleSets.groupId))
+        .where(eq(groupRuleSets.ruleSetId, ruleSetId)),
+    ]);
+
+    return dedupeStrings([
+      ...directAgentRows.map((row) => row.agentId),
+      ...groupAgentRows.map((row) => row.agentId),
+    ]);
   });
 }
 
 export async function getAgentIdsForRule(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   ruleId: string,
 ): Promise<string[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx`
-      SELECT DISTINCT agent_id
-      FROM (
-        SELECT ars.agent_id
-        FROM agent_rule_sets ars
-        JOIN rule_set_rules rsr ON rsr.rule_set_id = ars.rule_set_id
-        WHERE rsr.rule_id = ${ruleId}
-        UNION
-        SELECT agm.agent_id
-        FROM group_rule_sets grs
-        JOIN rule_set_rules rsr ON rsr.rule_set_id = grs.rule_set_id
-        JOIN agent_group_members agm ON agm.group_id = grs.group_id
-        WHERE rsr.rule_id = ${ruleId}
-      ) AS effective_agents
-    `;
-    return (rows as Record<string, unknown>[]).map((row) => row.agent_id as string);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [directAgentRows, groupAgentRows] = await Promise.all([
+      db
+        .select({
+          agentId: agentRuleSets.agentId,
+        })
+        .from(agentRuleSets)
+        .innerJoin(ruleSetRuleTable, eq(ruleSetRuleTable.ruleSetId, agentRuleSets.ruleSetId))
+        .where(eq(ruleSetRuleTable.ruleId, ruleId)),
+      db
+        .select({
+          agentId: agentGroupMembers.agentId,
+        })
+        .from(groupRuleSets)
+        .innerJoin(ruleSetRuleTable, eq(ruleSetRuleTable.ruleSetId, groupRuleSets.ruleSetId))
+        .innerJoin(agentGroupMembers, eq(agentGroupMembers.groupId, groupRuleSets.groupId))
+        .where(eq(ruleSetRuleTable.ruleId, ruleId)),
+    ]);
+
+    return dedupeStrings([
+      ...directAgentRows.map((row) => row.agentId),
+      ...groupAgentRows.map((row) => row.agentId),
+    ]);
   });
 }

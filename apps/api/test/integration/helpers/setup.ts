@@ -1,7 +1,7 @@
-import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import * as platformSchema from "@monet/db/schema";
+import { createSqlClient, type SqlClient } from "@monet/db";
 import { createApp } from "../../../src/app";
 import { provisionTenant } from "../../../src/services/tenant.service";
 import path from "node:path";
@@ -10,11 +10,11 @@ const TEST_DB_URL =
   process.env.DATABASE_URL ??
   "postgresql://postgres:postgres@localhost:5432/monet_test";
 
-let sql: ReturnType<typeof postgres>;
+let sql: SqlClient | null = null;
 let db: ReturnType<typeof drizzle>;
 let schemaReadyPromise: Promise<void> | null = null;
 
-async function applyPreparedSchemaUpgrades(s: ReturnType<typeof postgres>) {
+async function applyPreparedSchemaUpgrades(s: SqlClient) {
   await s.unsafe(`
     CREATE TABLE IF NOT EXISTS "platform_installations" (
       "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
@@ -375,7 +375,7 @@ export function getTestSql() {
     // Disable prepared statement caching so that dropping & recreating
     // tenant schemas (which carry per-schema enum types) between tests
     // does not cause stale type-OID errors (XX000 / getTypeInputInfo).
-    sql = postgres(TEST_DB_URL, {
+    sql = createSqlClient(TEST_DB_URL, {
       prepare: false,
       // Integration cleanup drops tenant schemas between tests, which emits
       // expected NOTICE messages from Postgres. Suppress them to keep test

@@ -15,99 +15,65 @@ import { generateApiKey, hashApiKey } from "../services/api-key.service";
 import type { AuditEntry } from "../services/audit.service";
 import { logAuditEvent } from "../services/audit.service";
 import { rateLimitMiddleware } from "../middleware/rate-limit";
+import {
+  deletePlatformAgent,
+  listPlatformAgentGroups,
+  listPlatformAgents,
+  loadPlatformAgentRecord,
+  loadPlatformUserOwner,
+  revokePlatformAgent,
+  rotatePlatformAgentToken,
+  type PlatformAgentRecord,
+  unrevokePlatformAgent,
+} from "../services/platform-agent.service";
 
 export const agentsRouter = new Hono<AppEnv>();
-const DASHBOARD_AGENT_PREFIX = "dashboard:";
 
-type AgentRow = {
-  id: string;
-  external_id: string;
-  tenant_id: string;
-  user_id: string | null;
-  role: "user" | "group_admin" | "tenant_admin" | null;
-  is_autonomous: boolean;
-  revoked_at: Date | null;
-  created_at: Date;
-  owner_id: string | null;
-  owner_external_id: string | null;
-  owner_display_name: string | null;
-  owner_email: string | null;
-};
-
-function ownerLabel(row: AgentRow) {
-  return row.owner_display_name ?? row.owner_email ?? row.owner_external_id ?? null;
+function ownerLabel(row: PlatformAgentRecord) {
+  return row.ownerDisplayName ?? row.ownerEmail ?? row.ownerExternalId ?? null;
 }
 
-function displayName(row: AgentRow) {
-  if (row.is_autonomous) {
-    return `${row.external_id} (Autonomous)`;
+function displayName(row: PlatformAgentRecord) {
+  if (row.isAutonomous) {
+    return `${row.externalId} (Autonomous)`;
   }
 
   const label = ownerLabel(row);
-  return label ? `${row.external_id} · ${label}` : row.external_id;
+  return label ? `${row.externalId} · ${label}` : row.externalId;
 }
 
-function mapAgent(row: AgentRow) {
+function mapAgent(row: PlatformAgentRecord) {
   const label = ownerLabel(row);
 
   return {
     id: row.id,
-    externalId: row.external_id,
-    tenantId: row.tenant_id,
-    userId: row.user_id,
-    isAutonomous: row.is_autonomous,
+    externalId: row.externalId,
+    tenantId: row.tenantId,
+    userId: row.userId,
+    isAutonomous: row.isAutonomous,
     role: row.role,
-    revokedAt: row.revoked_at,
+    revokedAt: row.revokedAt,
     displayName: displayName(row),
     owner:
-      row.owner_id && label
+      row.ownerId && label
         ? {
-            id: row.owner_id,
-            externalId: row.owner_external_id ?? label,
-            displayName: row.owner_display_name,
-            email: row.owner_email,
+            id: row.ownerId,
+            externalId: row.ownerExternalId ?? label,
+            displayName: row.ownerDisplayName,
+            email: row.ownerEmail,
             label,
           }
         : null,
-    createdAt: row.created_at,
+    createdAt: row.createdAt,
   };
-}
-
-async function loadAgentRow(
-  sql: AppEnv["Variables"]["sql"],
-  tenantId: string,
-  agentId: string,
-): Promise<AgentRow | null> {
-  const [row] = await sql`
-    SELECT
-      a.id,
-      a.external_id,
-      a.tenant_id,
-      a.user_id,
-      a.role,
-      a.is_autonomous,
-      a.revoked_at,
-      a.created_at,
-      u.id AS owner_id,
-      u.external_id AS owner_external_id,
-      u.display_name AS owner_display_name,
-      u.email AS owner_email
-    FROM agents a
-    LEFT JOIN users u ON u.id = a.user_id
-    WHERE a.id = ${agentId}
-      AND a.tenant_id = ${tenantId}
-      AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
-    LIMIT 1
-  `;
-
-  return (row as AgentRow | undefined) ?? null;
 }
 
 async function loadAccessibleAgentRow(
   c: Context<AppEnv>,
   agentId: string,
-): Promise<{ row: AgentRow; isAdmin: boolean } | { response: Response }> {
+): Promise<{ row: PlatformAgentRecord; isAdmin: boolean } | { response: Response }> {
   const requester = c.get("agent");
+  const db = c.get("db");
   const sql = c.get("sql");
   const role = await resolveAgentRole(sql, requester);
   const admin = isTenantAdmin(role);
@@ -118,7 +84,7 @@ async function loadAccessibleAgentRow(
     };
   }
 
-  const row = await loadAgentRow(sql, requester.tenantId, agentId);
+  const row = await loadPlatformAgentRecord(db, requester.tenantId, agentId);
 
   if (!row) {
     return {
@@ -126,7 +92,7 @@ async function loadAccessibleAgentRow(
     };
   }
 
-  if (!admin && (!requester.userId || row.user_id !== requester.userId)) {
+  if (!admin && (!requester.userId || row.userId !== requester.userId)) {
     return {
       response: c.json({ error: "not_found", message: "Agent not found" }, 404),
     };
@@ -179,6 +145,7 @@ function parseAgentRuleSetAssociationInput(
  */
 agentsRouter.post("/register", async (c) => {
   const agent = c.get("agent");
+  const db = c.get("db");
   const sql = c.get("sql");
   const role = await resolveAgentRole(sql, agent);
   const admin = isTenantAdmin(role);
@@ -262,24 +229,20 @@ agentsRouter.post("/register", async (c) => {
     label: string;
   } | null = null;
   if (userId) {
-    const [user] = await sql`
-      SELECT id, external_id, display_name, email
-      FROM users
-      WHERE id = ${userId} AND tenant_id = ${agent.tenantId}
-    `;
+    const user = await loadPlatformUserOwner(db, agent.tenantId, userId);
     if (!user) {
       return c.json({ error: "not_found", message: "User not found" }, 404);
     }
 
     const label =
-      (user.display_name as string | null) ??
-      (user.email as string | null) ??
-      (user.external_id as string);
+      user.displayName ??
+      user.email ??
+      user.externalId;
     owner = {
-      id: user.id as string,
-      externalId: user.external_id as string,
-      displayName: (user.display_name as string | null) ?? null,
-      email: (user.email as string | null) ?? null,
+      id: user.id,
+      externalId: user.externalId,
+      displayName: user.displayName ?? null,
+      email: user.email ?? null,
       label,
     };
   }
@@ -300,7 +263,7 @@ agentsRouter.post("/register", async (c) => {
   );
 
   if ("error" in membershipResult) {
-    await sql`DELETE FROM agents WHERE id = ${newAgent.id}`;
+    await deletePlatformAgent(db, agent.tenantId, newAgent.id);
     if (membershipResult.error === "not_found") {
       return c.json({ error: "not_found", message: membershipResult.message }, 404);
     }
@@ -335,6 +298,7 @@ agentsRouter.post("/register", async (c) => {
  * POST /api/agents/:id/regenerate-token — rotate an agent API key and return the raw key once.
  */
 agentsRouter.post("/:id/regenerate-token", rateLimitMiddleware, async (c) => {
+  const db = c.get("db");
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
   const schemaName = c.get("tenantSchemaName");
@@ -349,13 +313,7 @@ agentsRouter.post("/:id/regenerate-token", rateLimitMiddleware, async (c) => {
   const rawApiKey = generateApiKey(access.row.id);
   const { hash, salt } = hashApiKey(rawApiKey);
 
-  await sql`
-    UPDATE agents
-    SET api_key_hash = ${hash},
-        api_key_salt = ${salt}
-    WHERE id = ${targetId}
-      AND tenant_id = ${access.row.tenant_id}
-  `;
+  await rotatePlatformAgentToken(db, access.row.tenantId, targetId, hash, salt);
 
   await closeAgentSessionsIfPresent(sessionStore, targetId);
   await logAuditEvent(sql, schemaName, {
@@ -376,24 +334,19 @@ agentsRouter.post("/:id/revoke", rateLimitMiddleware, async (c) => {
   const forbidden = await requireTenantAdmin(c);
   if (forbidden) return forbidden;
 
+  const db = c.get("db");
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
   const schemaName = c.get("tenantSchemaName");
   const requester = c.get("agent");
   const targetId = c.req.param("id");
-  const row = await loadAgentRow(sql, requester.tenantId, targetId);
+  const row = await loadPlatformAgentRecord(db, requester.tenantId, targetId);
 
   if (!row) {
     return c.json({ error: "not_found", message: "Agent not found" }, 404);
   }
 
-  const [updated] = await sql`
-    UPDATE agents
-    SET revoked_at = COALESCE(revoked_at, now())
-    WHERE id = ${targetId}
-      AND tenant_id = ${requester.tenantId}
-    RETURNING revoked_at
-  `;
+  const revokedAt = await revokePlatformAgent(db, requester.tenantId, targetId);
 
   await closeAgentSessionsIfPresent(sessionStore, targetId);
   await logAuditEvent(sql, schemaName, {
@@ -406,7 +359,7 @@ agentsRouter.post("/:id/revoke", rateLimitMiddleware, async (c) => {
 
   return c.json({
     success: true,
-    revokedAt: (updated?.revoked_at as Date | null | undefined) ?? row.revoked_at,
+    revokedAt: revokedAt ?? row.revokedAt,
   });
 });
 
@@ -417,22 +370,18 @@ agentsRouter.post("/:id/unrevoke", rateLimitMiddleware, async (c) => {
   const forbidden = await requireTenantAdmin(c);
   if (forbidden) return forbidden;
 
+  const db = c.get("db");
   const sql = c.get("sql");
   const schemaName = c.get("tenantSchemaName");
   const requester = c.get("agent");
   const targetId = c.req.param("id");
-  const row = await loadAgentRow(sql, requester.tenantId, targetId);
+  const row = await loadPlatformAgentRecord(db, requester.tenantId, targetId);
 
   if (!row) {
     return c.json({ error: "not_found", message: "Agent not found" }, 404);
   }
 
-  await sql`
-    UPDATE agents
-    SET revoked_at = NULL
-    WHERE id = ${targetId}
-      AND tenant_id = ${requester.tenantId}
-  `;
+  await unrevokePlatformAgent(db, requester.tenantId, targetId);
   await logAuditEvent(sql, schemaName, {
     tenantId: requester.tenantId,
     ...auditActor(requester),
@@ -535,37 +484,28 @@ agentsRouter.get("/:id/rules", async (c) => {
  */
 agentsRouter.get("/", async (c) => {
   const agent = c.get("agent");
+  const db = c.get("db");
   const sql = c.get("sql");
   const role = await resolveAgentRole(sql, agent);
   const admin = isTenantAdmin(role);
 
-  if (!admin && !agent.userId) {
-    return c.json([]);
+  let rows;
+  if (admin) {
+    rows = await listPlatformAgents(db, agent.tenantId, {
+      isAdmin: true,
+    });
+  } else {
+    if (!agent.userId) {
+      return c.json([]);
+    }
+
+    rows = await listPlatformAgents(db, agent.tenantId, {
+      isAdmin: false,
+      requesterUserId: agent.userId,
+    });
   }
 
-  const rows = await sql`
-    SELECT
-      a.id,
-      a.external_id,
-      a.tenant_id,
-      a.user_id,
-      a.role,
-      a.is_autonomous,
-      a.revoked_at,
-      a.created_at,
-      u.id AS owner_id,
-      u.external_id AS owner_external_id,
-      u.display_name AS owner_display_name,
-      u.email AS owner_email
-    FROM agents a
-    LEFT JOIN users u ON u.id = a.user_id
-    WHERE a.tenant_id = ${agent.tenantId}
-      AND a.external_id NOT LIKE ${`${DASHBOARD_AGENT_PREFIX}%`}
-      AND (${admin} OR a.user_id = ${agent.userId})
-    ORDER BY a.created_at DESC
-  `;
-
-  return c.json((rows as unknown as AgentRow[]).map(mapAgent));
+  return c.json(rows.map(mapAgent));
 });
 
 /**
@@ -598,7 +538,7 @@ agentsRouter.get("/:id/status", async (c) => {
 
   return c.json({
     activeSessions,
-    revoked: Boolean(access.row.revoked_at),
+    revoked: Boolean(access.row.revokedAt),
   });
 });
 
@@ -606,6 +546,7 @@ agentsRouter.get("/:id/status", async (c) => {
  * GET /api/agents/:id — get an agent detail record.
  */
 agentsRouter.get("/:id", async (c) => {
+  const db = c.get("db");
   const sql = c.get("sql");
   const schemaName = c.get("tenantSchemaName");
   const targetId = c.req.param("id");
@@ -616,29 +557,18 @@ agentsRouter.get("/:id", async (c) => {
   }
 
   const [groups, ruleSets] = await Promise.all([
-    sql`
-      SELECT
-        g.id,
-        g.name,
-        g.description,
-        g.memory_quota,
-        g.created_at
-      FROM agent_group_members gm
-      JOIN agent_groups g ON g.id = gm.group_id
-      WHERE gm.agent_id = ${targetId}
-      ORDER BY g.name ASC, g.created_at ASC
-    `,
+    listPlatformAgentGroups(db, targetId),
     listRuleSetsForAgent(sql, schemaName, targetId),
   ]);
 
   return c.json({
     ...mapAgent(access.row),
-    groups: (groups as Record<string, unknown>[]).map((group) => ({
-      id: group.id as string,
-      name: group.name as string,
-      description: (group.description as string) ?? "",
-      memoryQuota: (group.memory_quota as number | null) ?? null,
-      createdAt: group.created_at as Date,
+    groups: groups.map((group) => ({
+      id: group.id,
+      name: group.name,
+      description: group.description ?? "",
+      memoryQuota: group.memoryQuota ?? null,
+      createdAt: group.createdAt,
     })),
     ruleSets,
   });

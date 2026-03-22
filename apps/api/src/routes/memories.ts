@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { withTenantScope } from "@monet/db";
+import { withTenantScope, type SqlClient } from "@monet/db";
 import { CreateMemoryEntryInput, UpdateMemoryEntryInput, MemoryScope } from "@monet/types";
 import type { AppEnv } from "../middleware/context";
 import {
@@ -111,7 +111,7 @@ memoriesRouter.get("/", async (c) => {
   const result = await withTenantScope(sql, schemaName, async (txSql) => {
     const searchResult = await searchMemories(txSql, agent, query, queryEmbedding);
     await writeAuditLog(
-      txSql as unknown as import("postgres").Sql,
+      txSql as unknown as SqlClient,
       agent.tenantId,
       agent.id,
       "memory.search",
@@ -161,7 +161,7 @@ memoriesRouter.get("/:id", async (c) => {
     const fetchResult = await fetchMemory(txSql, agent, id);
     if (!("error" in fetchResult)) {
       await writeAuditLog(
-        txSql as unknown as import("postgres").Sql,
+        txSql as unknown as SqlClient,
         agent.tenantId,
         agent.id,
         "memory.get",

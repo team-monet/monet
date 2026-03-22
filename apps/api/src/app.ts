@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { secureHeaders } from "hono/secure-headers";
-import type { Database } from "@monet/db";
-import type postgres from "postgres";
+import type { Database, SqlClient } from "@monet/db";
 import { health } from "./routes/health";
 import { bootstrapRouter } from "./routes/bootstrap";
 import { agentsRouter } from "./routes/agents";
@@ -20,7 +19,7 @@ import type { SessionStore } from "./mcp/session-store";
 
 export function createApp(
   db: Database | null,
-  sql: postgres.Sql | null,
+  sql: SqlClient | null,
   sessionStore: SessionStore | null = null,
 ) {
   const app = new Hono<AppEnv>();

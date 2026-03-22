@@ -20,6 +20,28 @@ const listRuleSetsForAgentMock = vi.fn();
 const associateRuleSetWithAgentMock = vi.fn();
 const dissociateRuleSetFromAgentMock = vi.fn();
 const getActiveRulesForAgentMock = vi.fn();
+const loadPlatformAgentRecordMock = vi.fn();
+const loadPlatformUserOwnerMock = vi.fn();
+const deletePlatformAgentMock = vi.fn();
+const rotatePlatformAgentTokenMock = vi.fn();
+const revokePlatformAgentMock = vi.fn();
+const unrevokePlatformAgentMock = vi.fn();
+const listPlatformAgentsMock = vi.fn();
+const listPlatformAgentGroupsMock = vi.fn();
+const drizzleMock = vi.fn();
+const insertMock = vi.fn();
+const valuesMock = vi.fn();
+const returningMock = vi.fn();
+const sqlClientMock = Object.assign(sqlMock, {
+  options: {
+    parsers: {},
+    serializers: {},
+  },
+});
+
+vi.mock("drizzle-orm/postgres-js", () => ({
+  drizzle: (...args: unknown[]) => drizzleMock(...args),
+}));
 
 vi.mock("../services/group.service.js", () => ({
   addMember: (...args: unknown[]) => addMemberMock(...args),
@@ -42,6 +64,17 @@ vi.mock("../services/rule.service.js", () => ({
   listRuleSetsForAgent: (...args: unknown[]) => listRuleSetsForAgentMock(...args),
 }));
 
+vi.mock("../services/platform-agent.service.js", () => ({
+  loadPlatformAgentRecord: (...args: unknown[]) => loadPlatformAgentRecordMock(...args),
+  loadPlatformUserOwner: (...args: unknown[]) => loadPlatformUserOwnerMock(...args),
+  deletePlatformAgent: (...args: unknown[]) => deletePlatformAgentMock(...args),
+  rotatePlatformAgentToken: (...args: unknown[]) => rotatePlatformAgentTokenMock(...args),
+  revokePlatformAgent: (...args: unknown[]) => revokePlatformAgentMock(...args),
+  unrevokePlatformAgent: (...args: unknown[]) => unrevokePlatformAgentMock(...args),
+  listPlatformAgents: (...args: unknown[]) => listPlatformAgentsMock(...args),
+  listPlatformAgentGroups: (...args: unknown[]) => listPlatformAgentGroupsMock(...args),
+}));
+
 function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
   return {
     id: "00000000-0000-0000-0000-000000000001",
@@ -50,6 +83,24 @@ function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
     isAutonomous: false,
     userId: null,
     role: "tenant_admin",
+    ...overrides,
+  };
+}
+
+function makePlatformAgentRow(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: AGENT_ID,
+    externalId: "worker",
+    tenantId: TENANT_ID,
+    userId: null,
+    role: null,
+    isAutonomous: true,
+    revokedAt: null,
+    createdAt: new Date("2026-03-03T00:00:00.000Z"),
+    ownerId: null,
+    ownerExternalId: null,
+    ownerDisplayName: null,
+    ownerEmail: null,
     ...overrides,
   };
 }
@@ -65,7 +116,8 @@ function createTestApp(
 
   app.use("*", async (c, next) => {
     c.set("agent", makeAgent(agentOverrides));
-    c.set("sql", sqlMock as unknown as AppEnv["Variables"]["sql"]);
+    c.set("db", {} as AppEnv["Variables"]["db"]);
+    c.set("sql", sqlClientMock as unknown as AppEnv["Variables"]["sql"]);
     c.set("tenantId", TENANT_ID);
     c.set("tenantSchemaName", `tenant_${TENANT_ID.replace(/-/g, "_")}`);
     if (sessionStore) {
@@ -92,6 +144,28 @@ describe("agents route", () => {
     associateRuleSetWithAgentMock.mockResolvedValue({ success: true });
     dissociateRuleSetFromAgentMock.mockResolvedValue({ success: true });
     getActiveRulesForAgentMock.mockResolvedValue([]);
+    loadPlatformAgentRecordMock.mockResolvedValue(null);
+    loadPlatformUserOwnerMock.mockResolvedValue(null);
+    deletePlatformAgentMock.mockResolvedValue(undefined);
+    rotatePlatformAgentTokenMock.mockResolvedValue(undefined);
+    revokePlatformAgentMock.mockResolvedValue(null);
+    unrevokePlatformAgentMock.mockResolvedValue(undefined);
+    listPlatformAgentsMock.mockResolvedValue([]);
+    listPlatformAgentGroupsMock.mockResolvedValue([]);
+    returningMock.mockResolvedValue([
+      {
+        createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      },
+    ]);
+    valuesMock.mockReturnValue({
+      returning: returningMock,
+    });
+    insertMock.mockReturnValue({
+      values: valuesMock,
+    });
+    drizzleMock.mockReturnValue({
+      insert: insertMock,
+    });
     sqlMock.mockReset();
   });
 
@@ -121,8 +195,13 @@ describe("agents route", () => {
   });
 
   it("registers with userId after validating tenant ownership", async () => {
+    loadPlatformUserOwnerMock.mockResolvedValueOnce({
+      id: USER_ID,
+      externalId: "bound-user",
+      displayName: null,
+      email: "bound@example.com",
+    });
     sqlMock
-      .mockResolvedValueOnce([{ id: USER_ID, external_id: "bound-user", email: "bound@example.com" }])
       .mockResolvedValueOnce([
         {
           id: "00000000-0000-0000-0000-000000000002",
@@ -146,8 +225,13 @@ describe("agents route", () => {
   });
 
   it("forces normal-user registrations to bind to the requester", async () => {
+    loadPlatformUserOwnerMock.mockResolvedValueOnce({
+      id: USER_ID,
+      externalId: "test-user",
+      displayName: null,
+      email: "test@example.com",
+    });
     sqlMock
-      .mockResolvedValueOnce([{ id: USER_ID, external_id: "test-user", email: "test@example.com" }])
       .mockResolvedValueOnce([
         {
           id: "00000000-0000-0000-0000-000000000002",
@@ -247,25 +331,109 @@ describe("agents route", () => {
     expect(res.status).toBe(400);
   });
 
+  it("cleans up the provisioned agent when group assignment fails", async () => {
+    addMemberMock.mockResolvedValueOnce({
+      error: "not_found",
+      message: "Group not found",
+    });
+    sqlMock.mockResolvedValueOnce([
+      {
+        id: AGENT_ID,
+        external_id: "worker",
+        user_id: null,
+        is_autonomous: true,
+        created_at: "2026-03-03T00:00:00.000Z",
+      },
+    ]);
+
+    const app = createTestApp();
+    const res = await app.request("/agents/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ externalId: "worker", isAutonomous: true, groupId: GROUP_ID }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(deletePlatformAgentMock).toHaveBeenCalledWith(
+      expect.anything(),
+      TENANT_ID,
+      expect.stringMatching(UUID_RE),
+    );
+  });
+
+  it("lists all tenant agents for admins", async () => {
+    listPlatformAgentsMock.mockResolvedValueOnce([
+      makePlatformAgentRow(),
+    ]);
+
+    const app = createTestApp();
+    const res = await app.request("/agents");
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual([
+      expect.objectContaining({
+        id: AGENT_ID,
+        externalId: "worker",
+      }),
+    ]);
+    expect(listPlatformAgentsMock).toHaveBeenCalledWith(expect.anything(), TENANT_ID, {
+      isAdmin: true,
+    });
+  });
+
+  it("lists only user-bound agents for non-admin callers", async () => {
+    listPlatformAgentsMock.mockResolvedValueOnce([
+      makePlatformAgentRow({
+        userId: USER_ID,
+        externalId: "self-bound",
+        isAutonomous: false,
+        ownerId: USER_ID,
+        ownerExternalId: "bound-user",
+        ownerEmail: "bound@example.com",
+      }),
+    ]);
+
+    const app = createTestApp({ role: "user", userId: USER_ID });
+    const res = await app.request("/agents");
+
+    expect(res.status).toBe(200);
+    expect(listPlatformAgentsMock).toHaveBeenCalledWith(expect.anything(), TENANT_ID, {
+      isAdmin: false,
+      requesterUserId: USER_ID,
+    });
+    await expect(res.json()).resolves.toEqual([
+      expect.objectContaining({
+        userId: USER_ID,
+        externalId: "self-bound",
+      }),
+    ]);
+  });
+
+  it("returns an empty list for non-admin callers without a user binding", async () => {
+    const app = createTestApp({ role: "user", userId: null, isAutonomous: true });
+    const res = await app.request("/agents");
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual([]);
+    expect(listPlatformAgentsMock).not.toHaveBeenCalled();
+  });
+
   it("allows an owning user to regenerate an agent token", async () => {
     const closeSessionsForAgent = vi.fn().mockResolvedValue(1);
-    sqlMock
-      .mockResolvedValueOnce([
-        {
-          id: AGENT_ID,
-          external_id: "self-bound",
-          tenant_id: TENANT_ID,
-          user_id: USER_ID,
-          role: "user",
-          is_autonomous: false,
-          revoked_at: null,
-          created_at: "2026-03-03T00:00:00.000Z",
-          owner_id: USER_ID,
-          owner_external_id: "bound-user",
-          owner_email: "bound@example.com",
-        },
-      ])
-      .mockResolvedValueOnce([]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "self-bound",
+      tenantId: TENANT_ID,
+      userId: USER_ID,
+      role: "user",
+      isAutonomous: false,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: USER_ID,
+      ownerExternalId: "bound-user",
+      ownerDisplayName: null,
+      ownerEmail: "bound@example.com",
+    });
 
     const app = createTestApp(
       { role: "user", userId: USER_ID },
@@ -280,6 +448,13 @@ describe("agents route", () => {
     expect(body.apiKey).toMatch(/^mnt_/);
     expect(parseApiKey(body.apiKey)?.agentId).toBe(AGENT_ID);
     expect(closeSessionsForAgent).toHaveBeenCalledWith(AGENT_ID);
+    expect(rotatePlatformAgentTokenMock).toHaveBeenCalledWith(
+      expect.anything(),
+      TENANT_ID,
+      AGENT_ID,
+      expect.any(String),
+      expect.any(String),
+    );
     expect(logAuditEventMock).toHaveBeenCalledWith(
       sqlMock,
       `tenant_${TENANT_ID.replace(/-/g, "_")}`,
@@ -294,21 +469,20 @@ describe("agents route", () => {
   });
 
   it("hides regenerate token for agents owned by another user", async () => {
-    sqlMock.mockResolvedValueOnce([
-      {
-        id: AGENT_ID,
-        external_id: "other-user-agent",
-        tenant_id: TENANT_ID,
-        user_id: "00000000-0000-0000-0000-000000000123",
-        role: "user",
-        is_autonomous: false,
-        revoked_at: null,
-        created_at: "2026-03-03T00:00:00.000Z",
-        owner_id: "00000000-0000-0000-0000-000000000123",
-        owner_external_id: "other-user",
-        owner_email: "other@example.com",
-      },
-    ]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "other-user-agent",
+      tenantId: TENANT_ID,
+      userId: "00000000-0000-0000-0000-000000000123",
+      role: "user",
+      isAutonomous: false,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: "00000000-0000-0000-0000-000000000123",
+      ownerExternalId: "other-user",
+      ownerDisplayName: null,
+      ownerEmail: "other@example.com",
+    });
 
     const app = createTestApp({ role: "user", userId: USER_ID });
     const res = await app.request(`/agents/${AGENT_ID}/regenerate-token`, {
@@ -336,23 +510,20 @@ describe("agents route", () => {
     process.env.RATE_LIMIT_MAX = "1";
     process.env.RATE_LIMIT_WINDOW_MS = "60000";
 
-    sqlMock
-      .mockResolvedValueOnce([
-        {
-          id: AGENT_ID,
-          external_id: "self-bound",
-          tenant_id: TENANT_ID,
-          user_id: USER_ID,
-          role: "user",
-          is_autonomous: false,
-          revoked_at: null,
-          created_at: "2026-03-03T00:00:00.000Z",
-          owner_id: USER_ID,
-          owner_external_id: "bound-user",
-          owner_email: "bound@example.com",
-        },
-      ])
-      .mockResolvedValueOnce([]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "self-bound",
+      tenantId: TENANT_ID,
+      userId: USER_ID,
+      role: "user",
+      isAutonomous: false,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: USER_ID,
+      ownerExternalId: "bound-user",
+      ownerDisplayName: null,
+      ownerEmail: "bound@example.com",
+    });
 
     const app = createTestApp({ role: "user", userId: USER_ID });
 
@@ -370,23 +541,21 @@ describe("agents route", () => {
   it("allows a tenant admin to revoke an agent and terminate sessions", async () => {
     const closeSessionsForAgent = vi.fn().mockResolvedValue(2);
     const revokedAt = "2026-03-09T10:00:00.000Z";
-    sqlMock
-      .mockResolvedValueOnce([
-        {
-          id: AGENT_ID,
-          external_id: "worker",
-          tenant_id: TENANT_ID,
-          user_id: null,
-          role: null,
-          is_autonomous: true,
-          revoked_at: null,
-          created_at: "2026-03-03T00:00:00.000Z",
-          owner_id: null,
-          owner_external_id: null,
-          owner_email: null,
-        },
-      ])
-      .mockResolvedValueOnce([{ revoked_at: revokedAt }]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "worker",
+      tenantId: TENANT_ID,
+      userId: null,
+      role: null,
+      isAutonomous: true,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: null,
+      ownerExternalId: null,
+      ownerDisplayName: null,
+      ownerEmail: null,
+    });
+    revokePlatformAgentMock.mockResolvedValueOnce(revokedAt);
 
     const app = createTestApp({}, { closeSessionsForAgent });
     const res = await app.request(`/agents/${AGENT_ID}/revoke`, {
@@ -423,23 +592,21 @@ describe("agents route", () => {
     process.env.RATE_LIMIT_MAX = "1";
     process.env.RATE_LIMIT_WINDOW_MS = "60000";
 
-    sqlMock
-      .mockResolvedValueOnce([
-        {
-          id: AGENT_ID,
-          external_id: "worker",
-          tenant_id: TENANT_ID,
-          user_id: null,
-          role: null,
-          is_autonomous: true,
-          revoked_at: null,
-          created_at: "2026-03-03T00:00:00.000Z",
-          owner_id: null,
-          owner_external_id: null,
-          owner_email: null,
-        },
-      ])
-      .mockResolvedValueOnce([{ revoked_at: "2026-03-09T10:00:00.000Z" }]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "worker",
+      tenantId: TENANT_ID,
+      userId: null,
+      role: null,
+      isAutonomous: true,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: null,
+      ownerExternalId: null,
+      ownerDisplayName: null,
+      ownerEmail: null,
+    });
+    revokePlatformAgentMock.mockResolvedValueOnce("2026-03-09T10:00:00.000Z");
 
     const app = createTestApp();
     const firstRes = await app.request(`/agents/${AGENT_ID}/revoke`, {
@@ -454,23 +621,20 @@ describe("agents route", () => {
   });
 
   it("allows a tenant admin to unrevoke an agent", async () => {
-    sqlMock
-      .mockResolvedValueOnce([
-        {
-          id: AGENT_ID,
-          external_id: "worker",
-          tenant_id: TENANT_ID,
-          user_id: null,
-          role: null,
-          is_autonomous: true,
-          revoked_at: "2026-03-08T10:00:00.000Z",
-          created_at: "2026-03-03T00:00:00.000Z",
-          owner_id: null,
-          owner_external_id: null,
-          owner_email: null,
-        },
-      ])
-      .mockResolvedValueOnce([]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "worker",
+      tenantId: TENANT_ID,
+      userId: null,
+      role: null,
+      isAutonomous: true,
+      revokedAt: new Date("2026-03-08T10:00:00.000Z"),
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: null,
+      ownerExternalId: null,
+      ownerDisplayName: null,
+      ownerEmail: null,
+    });
 
     const app = createTestApp();
     const res = await app.request(`/agents/${AGENT_ID}/unrevoke`, {
@@ -496,23 +660,20 @@ describe("agents route", () => {
     process.env.RATE_LIMIT_MAX = "1";
     process.env.RATE_LIMIT_WINDOW_MS = "60000";
 
-    sqlMock
-      .mockResolvedValueOnce([
-        {
-          id: AGENT_ID,
-          external_id: "worker",
-          tenant_id: TENANT_ID,
-          user_id: null,
-          role: null,
-          is_autonomous: true,
-          revoked_at: "2026-03-08T10:00:00.000Z",
-          created_at: "2026-03-03T00:00:00.000Z",
-          owner_id: null,
-          owner_external_id: null,
-          owner_email: null,
-        },
-      ])
-      .mockResolvedValueOnce([]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "worker",
+      tenantId: TENANT_ID,
+      userId: null,
+      role: null,
+      isAutonomous: true,
+      revokedAt: new Date("2026-03-08T10:00:00.000Z"),
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: null,
+      ownerExternalId: null,
+      ownerDisplayName: null,
+      ownerEmail: null,
+    });
 
     const app = createTestApp();
     const firstRes = await app.request(`/agents/${AGENT_ID}/unrevoke`, {
@@ -535,31 +696,29 @@ describe("agents route", () => {
         createdAt: "2026-03-03T00:00:00.000Z",
       },
     ]);
-    sqlMock
-      .mockResolvedValueOnce([
-        {
-          id: AGENT_ID,
-          external_id: "self-bound",
-          tenant_id: TENANT_ID,
-          user_id: USER_ID,
-          role: "user",
-          is_autonomous: false,
-          revoked_at: null,
-          created_at: "2026-03-03T00:00:00.000Z",
-          owner_id: USER_ID,
-          owner_external_id: "bound-user",
-          owner_email: "bound@example.com",
-        },
-      ])
-      .mockResolvedValueOnce([
-        {
-          id: GROUP_ID,
-          name: "General",
-          description: "",
-          memory_quota: null,
-          created_at: "2026-03-01T00:00:00.000Z",
-        },
-      ]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "self-bound",
+      tenantId: TENANT_ID,
+      userId: USER_ID,
+      role: "user",
+      isAutonomous: false,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: USER_ID,
+      ownerExternalId: "bound-user",
+      ownerDisplayName: null,
+      ownerEmail: "bound@example.com",
+    });
+    listPlatformAgentGroupsMock.mockResolvedValueOnce([
+      {
+        id: GROUP_ID,
+        name: "General",
+        description: "",
+        memoryQuota: null,
+        createdAt: new Date("2026-03-01T00:00:00.000Z"),
+      },
+    ]);
 
     const app = createTestApp({ role: "user", userId: USER_ID });
     const res = await app.request(`/agents/${AGENT_ID}`, {
@@ -579,21 +738,20 @@ describe("agents route", () => {
 
   it("allows an owning user to attach a rule set to their agent", async () => {
     const sessionStore = { getByAgentId: vi.fn().mockReturnValue([]) };
-    sqlMock.mockResolvedValueOnce([
-      {
-        id: AGENT_ID,
-        external_id: "self-bound",
-        tenant_id: TENANT_ID,
-        user_id: USER_ID,
-        role: "user",
-        is_autonomous: false,
-        revoked_at: null,
-        created_at: "2026-03-03T00:00:00.000Z",
-        owner_id: USER_ID,
-        owner_external_id: "bound-user",
-        owner_email: "bound@example.com",
-      },
-    ]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "self-bound",
+      tenantId: TENANT_ID,
+      userId: USER_ID,
+      role: "user",
+      isAutonomous: false,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: USER_ID,
+      ownerExternalId: "bound-user",
+      ownerDisplayName: null,
+      ownerEmail: "bound@example.com",
+    });
 
     const app = createTestApp({ role: "user", userId: USER_ID }, sessionStore);
     const res = await app.request(`/agents/${AGENT_ID}/rule-sets`, {
@@ -618,21 +776,20 @@ describe("agents route", () => {
 
   it("returns forbidden when a personal rule set does not belong to the target agent owner", async () => {
     const sessionStore = { getByAgentId: vi.fn().mockReturnValue([]) };
-    sqlMock.mockResolvedValueOnce([
-      {
-        id: AGENT_ID,
-        external_id: "self-bound",
-        tenant_id: TENANT_ID,
-        user_id: USER_ID,
-        role: "user",
-        is_autonomous: false,
-        revoked_at: null,
-        created_at: "2026-03-03T00:00:00.000Z",
-        owner_id: USER_ID,
-        owner_external_id: "bound-user",
-        owner_email: "bound@example.com",
-      },
-    ]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "self-bound",
+      tenantId: TENANT_ID,
+      userId: USER_ID,
+      role: "user",
+      isAutonomous: false,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: USER_ID,
+      ownerExternalId: "bound-user",
+      ownerDisplayName: null,
+      ownerEmail: "bound@example.com",
+    });
     associateRuleSetWithAgentMock.mockResolvedValueOnce({ error: "forbidden" });
 
     const app = createTestApp({ role: "user", userId: USER_ID }, sessionStore);
@@ -655,21 +812,20 @@ describe("agents route", () => {
         updatedAt: "2026-03-03T00:00:00.000Z",
       },
     ]);
-    sqlMock.mockResolvedValueOnce([
-      {
-        id: AGENT_ID,
-        external_id: "self-bound",
-        tenant_id: TENANT_ID,
-        user_id: USER_ID,
-        role: "user",
-        is_autonomous: false,
-        revoked_at: null,
-        created_at: "2026-03-03T00:00:00.000Z",
-        owner_id: USER_ID,
-        owner_external_id: "bound-user",
-        owner_email: "bound@example.com",
-      },
-    ]);
+    loadPlatformAgentRecordMock.mockResolvedValueOnce({
+      id: AGENT_ID,
+      externalId: "self-bound",
+      tenantId: TENANT_ID,
+      userId: USER_ID,
+      role: "user",
+      isAutonomous: false,
+      revokedAt: null,
+      createdAt: new Date("2026-03-03T00:00:00.000Z"),
+      ownerId: USER_ID,
+      ownerExternalId: "bound-user",
+      ownerDisplayName: null,
+      ownerEmail: "bound@example.com",
+    });
 
     const app = createTestApp({ role: "user", userId: USER_ID });
     const res = await app.request(`/agents/${AGENT_ID}/rules`, {

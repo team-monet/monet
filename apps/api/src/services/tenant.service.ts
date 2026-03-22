@@ -1,6 +1,18 @@
-import postgres from "postgres";
-import type { Database } from "@monet/db";
-import { createTenantSchema, tenantOauthConfigs } from "@monet/db";
+import {
+  agentGroupMembers,
+  agentGroups,
+  asDrizzleSqlClient,
+  createTenantSchema,
+  type Database,
+  type SqlClient,
+  tenants,
+  tenantOauthConfigs,
+  type TransactionClient,
+  userGroupAgentGroupPermissions,
+  userGroups,
+} from "@monet/db";
+import { asc } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 import {
   DEFAULT_AGENT_GROUP_DESCRIPTION,
   DEFAULT_AGENT_GROUP_NAME,
@@ -11,6 +23,16 @@ import {
 import { encrypt } from "../lib/crypto";
 import { seedDefaultGeneralGuidance } from "./default-rule-seed.service";
 import { provisionAgentWithApiKey } from "./agent-provisioning.service";
+
+type TenantSqlClient = SqlClient | TransactionClient;
+type TenantDrizzleOptions = NonNullable<SqlClient["options"]>;
+
+function createTenantDb(
+  sql: TenantSqlClient,
+  options?: TenantDrizzleOptions,
+) {
+  return drizzle(asDrizzleSqlClient(sql, options));
+}
 
 export interface ProvisionTenantResult {
   tenant: {
@@ -58,18 +80,18 @@ export async function configureTenantOauth(
   return result;
 }
 
-export async function ensureTenantSchemasCurrent(sql: postgres.Sql): Promise<number> {
-  const tenants = await sql`
-    SELECT id
-    FROM tenants
-    ORDER BY created_at ASC, id ASC
-  `;
+export async function ensureTenantSchemasCurrent(sql: SqlClient): Promise<number> {
+  const db = createTenantDb(sql);
+  const tenantRows = await db
+    .select({ id: tenants.id })
+    .from(tenants)
+    .orderBy(asc(tenants.createdAt), asc(tenants.id));
 
-  for (const tenant of tenants as unknown as Array<{ id: string }>) {
+  for (const tenant of tenantRows) {
     await createTenantSchema(sql, tenant.id);
   }
 
-  return tenants.length;
+  return tenantRows.length;
 }
 
 /**
@@ -77,8 +99,8 @@ export async function ensureTenantSchemasCurrent(sql: postgres.Sql): Promise<num
  * All operations are atomic — if any step fails, the entire operation rolls back.
  */
 export async function provisionTenant(
-  db: Database,
-  sql: postgres.Sql,
+  _db: Database,
+  sql: SqlClient,
   input: { name: string; slug?: string; isolationMode?: "logical" | "physical" },
 ): Promise<ProvisionTenantResult> {
   const tenantSlug = input.slug?.trim() || slugifyTenantName(input.name);
@@ -87,70 +109,75 @@ export async function provisionTenant(
 
   // Use a transaction for atomicity of tenant + agent creation
   const result = await sql.begin(async (txSql) => {
-    // Cast to Sql for tagged template usage (TransactionSql drops call signatures via Omit)
-    const tx = txSql as unknown as postgres.Sql;
+    const txDb = createTenantDb(txSql, sql.options);
 
-    // Insert tenant
-    const [tenant] = await tx`
-      INSERT INTO tenants (name, slug, isolation_mode)
-      VALUES (${input.name}, ${tenantSlug}, ${isolationMode})
-      RETURNING id, name, slug, isolation_mode, created_at
-    `;
+    const [tenant] = await txDb
+      .insert(tenants)
+      .values({
+        name: input.name,
+        slug: tenantSlug,
+        isolationMode,
+      })
+      .returning({
+        id: tenants.id,
+        name: tenants.name,
+        slug: tenants.slug,
+        isolationMode: tenants.isolationMode,
+        createdAt: tenants.createdAt,
+      });
 
     // Create the tenant schema with all DDL
     const tenantSchemaName = await createTenantSchema(txSql, tenant.id);
 
-    const [defaultUserGroup] = await tx`
-      INSERT INTO user_groups (tenant_id, name, description)
-      VALUES (
-        ${tenant.id},
-        ${DEFAULT_USER_GROUP_NAME},
-        ${DEFAULT_USER_GROUP_DESCRIPTION}
-      )
-      RETURNING id
-    `;
+    const [defaultUserGroup] = await txDb
+      .insert(userGroups)
+      .values({
+        tenantId: tenant.id,
+        name: DEFAULT_USER_GROUP_NAME,
+        description: DEFAULT_USER_GROUP_DESCRIPTION,
+      })
+      .returning({ id: userGroups.id });
 
-    const [defaultAgentGroup] = await tx`
-      INSERT INTO agent_groups (tenant_id, name, description)
-      VALUES (
-        ${tenant.id},
-        ${DEFAULT_AGENT_GROUP_NAME},
-        ${DEFAULT_AGENT_GROUP_DESCRIPTION}
-      )
-      RETURNING id
-    `;
+    const [defaultAgentGroup] = await txDb
+      .insert(agentGroups)
+      .values({
+        tenantId: tenant.id,
+        name: DEFAULT_AGENT_GROUP_NAME,
+        description: DEFAULT_AGENT_GROUP_DESCRIPTION,
+      })
+      .returning({ id: agentGroups.id });
 
     // Create the first admin agent with tenant_admin role
-    const adminAgent = await provisionAgentWithApiKey(tx, {
+    const adminAgent = await provisionAgentWithApiKey(txSql, {
       externalId: adminExternalId,
-      tenantId: tenant.id as string,
+      tenantId: tenant.id,
       isAutonomous: false,
       role: "tenant_admin",
     });
 
-    await tx`
-      INSERT INTO agent_group_members (agent_id, group_id)
-      VALUES (${adminAgent.agent.id}, ${defaultAgentGroup.id})
-    `;
+    await txDb.insert(agentGroupMembers).values({
+      agentId: adminAgent.agent.id,
+      groupId: defaultAgentGroup.id,
+    });
 
-    await tx`
-      INSERT INTO user_group_agent_group_permissions (user_group_id, agent_group_id)
-      VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
-    `;
+    await txDb.insert(userGroupAgentGroupPermissions).values({
+      userGroupId: defaultUserGroup.id,
+      agentGroupId: defaultAgentGroup.id,
+    });
 
     await seedDefaultGeneralGuidance(
-      tx,
+      txSql,
       tenantSchemaName,
-      defaultAgentGroup.id as string,
+      defaultAgentGroup.id,
     );
 
     return {
       tenant: {
-        id: tenant.id as string,
-        name: tenant.name as string,
-        slug: tenant.slug as string,
-        isolationMode: tenant.isolation_mode as string,
-        createdAt: tenant.created_at as Date,
+        id: tenant.id,
+        name: tenant.name,
+        slug: tenant.slug,
+        isolationMode: tenant.isolationMode,
+        createdAt: tenant.createdAt,
       },
       agent: {
         id: adminAgent.agent.id,

@@ -5,27 +5,178 @@ import {
   getHealthMetrics,
 } from "../services/metrics.service";
 
-const withTenantScopeMock = vi.fn();
+const withTenantDrizzleScopeMock = vi.fn();
 
 vi.mock("@monet/db", async () => {
   const actual = await vi.importActual("@monet/db");
   return {
     ...actual,
-    withTenantScope: (...args: unknown[]) => withTenantScopeMock(...args),
+    withTenantDrizzleScope: (...args: unknown[]) => withTenantDrizzleScopeMock(...args),
   };
 });
 
-function setupMock(unsafeResults: unknown[][]) {
-  let callIndex = 0;
-  const unsafeMock = vi.fn().mockImplementation(() => {
-    const result = unsafeResults[callIndex] ?? [];
-    callIndex++;
-    return Promise.resolve(result);
-  });
-  withTenantScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
-    fn({ unsafe: unsafeMock }),
+function setupUsageMetricsMock({
+  frequencyRows,
+  activeAgentRows,
+  totalAgentRows,
+  enrichmentRows,
+  searchHitRows,
+  semanticRows,
+}: {
+  frequencyRows: unknown[];
+  activeAgentRows: unknown[];
+  totalAgentRows: unknown[];
+  enrichmentRows: unknown[];
+  searchHitRows: unknown[];
+  semanticRows: unknown[];
+}) {
+  const executeMock = vi.fn().mockResolvedValue(frequencyRows);
+  const selectMock = vi.fn()
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        innerJoin: vi.fn(() => ({
+          where: vi.fn().mockResolvedValue(activeAgentRows),
+        })),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue(totalAgentRows),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue(enrichmentRows),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue(searchHitRows),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue(semanticRows),
+      })),
+    });
+
+  withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
+    fn({ execute: executeMock, select: selectMock }),
   );
-  return unsafeMock;
+
+  return { executeMock, select: selectMock };
+}
+
+function setupHealthMetricsMock({
+  liveLifecycleRows,
+  allEntryLifecycleRows,
+  groupRows,
+  groupCurrentRows,
+  groupMemberRows,
+}: {
+  liveLifecycleRows: unknown[];
+  allEntryLifecycleRows: unknown[];
+  groupRows: unknown[];
+  groupCurrentRows: unknown[];
+  groupMemberRows: unknown[];
+}) {
+  const selectMock = vi.fn()
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue(liveLifecycleRows),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn().mockResolvedValue(allEntryLifecycleRows),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          orderBy: vi.fn().mockResolvedValue(groupRows),
+        })),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          groupBy: vi.fn().mockResolvedValue(groupCurrentRows),
+        })),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        innerJoin: vi.fn(() => ({
+          leftJoin: vi.fn(() => ({
+            where: vi.fn(() => ({
+              groupBy: vi.fn().mockResolvedValue(groupMemberRows),
+            })),
+          })),
+        })),
+      })),
+    });
+
+  withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
+    fn({ select: selectMock }),
+  );
+
+  return { selectMock };
+}
+
+function setupBenefitMetricsMock({
+  usefulnessRows,
+  reuseRows,
+  tagDiversityRows,
+  enrichmentQualityRows,
+  crossAgentTotalRows,
+  crossAgentPairRows,
+}: {
+  usefulnessRows: unknown[];
+  reuseRows: unknown[];
+  tagDiversityRows: unknown[];
+  enrichmentQualityRows: unknown[];
+  crossAgentTotalRows: unknown[];
+  crossAgentPairRows: unknown[];
+}) {
+  const executeMock = vi.fn()
+    .mockResolvedValueOnce(usefulnessRows)
+    .mockResolvedValueOnce(reuseRows)
+    .mockResolvedValueOnce(tagDiversityRows)
+    .mockResolvedValueOnce(enrichmentQualityRows);
+  const selectMock = vi.fn()
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        innerJoin: vi.fn(() => ({
+          innerJoin: vi.fn(() => ({
+            innerJoin: vi.fn(() => ({
+              where: vi.fn().mockResolvedValue(crossAgentTotalRows),
+            })),
+          })),
+        })),
+      })),
+    })
+    .mockReturnValueOnce({
+      from: vi.fn(() => ({
+        innerJoin: vi.fn(() => ({
+          innerJoin: vi.fn(() => ({
+            innerJoin: vi.fn(() => ({
+              where: vi.fn(() => ({
+                groupBy: vi.fn(() => ({
+                  orderBy: vi.fn(() => ({
+                    limit: vi.fn().mockResolvedValue(crossAgentPairRows),
+                  })),
+                })),
+              })),
+            })),
+          })),
+        })),
+      })),
+    });
+
+  withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) =>
+    fn({ execute: executeMock, select: selectMock }),
+  );
+
+  return { execute: executeMock, select: selectMock };
 }
 
 const TENANT_ID = "00000000-0000-0000-0000-000000000001";
@@ -48,13 +199,14 @@ describe("metrics service", () => {
         };
       });
 
-      setupMock([
-        days, // frequency query
-        [{ period_7d: 5, period_30d: 12, total: 20 }], // active agents
-        [{ pending: 3, processing: 1, completed: 50, failed: 2 }], // enrichment
-        [{ total: 10, with_results: 8 }], // search hit rate
-        [{ total: 10, vector_count: 4 }], // semantic search
-      ]);
+      setupUsageMetricsMock({
+        frequencyRows: days,
+        activeAgentRows: [{ period7d: 5, period30d: 12 }],
+        totalAgentRows: [{ total: 20 }],
+        enrichmentRows: [{ pending: 3, processing: 1, completed: 50, failed: 2 }],
+        searchHitRows: [{ total: 10, withResults: 8 }],
+        semanticRows: [{ total: 10, vectorCount: 4 }],
+      });
 
       const result = await getUsageMetrics({} as never, TENANT_ID);
 
@@ -85,13 +237,14 @@ describe("metrics service", () => {
         return { date: d, reads: 0, writes: 0, searches: 0 };
       });
 
-      setupMock([
-        emptyDays,
-        [{ period_7d: 0, period_30d: 0, total: 0 }],
-        [{ pending: 0, processing: 0, completed: 0, failed: 0 }],
-        [{ total: 0, with_results: 0 }],
-        [{ total: 0, vector_count: 0 }],
-      ]);
+      setupUsageMetricsMock({
+        frequencyRows: emptyDays,
+        activeAgentRows: [{ period7d: 0, period30d: 0 }],
+        totalAgentRows: [{ total: 0 }],
+        enrichmentRows: [{ pending: 0, processing: 0, completed: 0, failed: 0 }],
+        searchHitRows: [{ total: 0, withResults: 0 }],
+        semanticRows: [{ total: 0, vectorCount: 0 }],
+      });
 
       const result = await getUsageMetrics({} as never, TENANT_ID);
 
@@ -109,51 +262,43 @@ describe("metrics service", () => {
 
   describe("getBenefitMetrics", () => {
     it("returns bucketed usefulness scores and reuse rates", async () => {
-      setupMock([
-        // usefulness distribution
-        [
-          { bucket: "0", count: 10 },
-          { bucket: "1", count: 5 },
-          { bucket: "2-3", count: 8 },
-          { bucket: "4-6", count: 3 },
+      setupBenefitMetricsMock({
+        usefulnessRows: [
+          { bucket: "0", count: 1 },
+          { bucket: "1", count: 1 },
+          { bucket: "2-3", count: 1 },
+          { bucket: "4-6", count: 1 },
           { bucket: "7+", count: 1 },
         ],
-        // reuse rate
-        [
-          { bucket: "Never accessed", count: 10 },
-          { bucket: "1-3 times", count: 12 },
-          { bucket: "4-10 times", count: 3 },
+        reuseRows: [
+          { bucket: "Never accessed", count: 1 },
+          { bucket: "1-3 times", count: 2 },
+          { bucket: "4-10 times", count: 1 },
           { bucket: "10+ times", count: 1 },
         ],
-        // tag diversity
-        [
-          {
-            group_id: "g1",
-            group_name: "Team A",
-            tag_count: 15,
-            top_tags: ["api", "auth", "db"],
-          },
+        tagDiversityRows: [
+          { groupId: "g1", groupName: "Team A", tagCount: 3, topTags: ["api", "auth", "db"] },
         ],
-        // enrichment quality
-        [{ with_summary: 40, with_embedding: 35, with_auto_tags: 30, total: 50 }],
-        // cross-agent sharing: total count
-        [{ total: 5 }],
-        // cross-agent sharing: top pairs
-        [{ writer_agent_id: "a1", reader_agent_id: "a2", count: 5 }],
-      ]);
+        enrichmentQualityRows: [
+          { withSummary: 4, withEmbedding: 2, withAutoTags: 3, total: 5 },
+        ],
+        crossAgentTotalRows: [{ total: 5 }],
+        crossAgentPairRows: [{ writerAgentId: "a1", readerAgentId: "a2", count: 5 }],
+      });
 
       const result = await getBenefitMetrics({} as never, TENANT_ID);
 
       expect(result.usefulnessDistribution).toHaveLength(5);
-      expect(result.usefulnessDistribution[0]).toEqual({ bucket: "0", count: 10 });
+      expect(result.usefulnessDistribution[0]).toEqual({ bucket: "0", count: 1 });
       expect(result.memoryReuseRate).toHaveLength(4);
       expect(result.tagDiversityByGroup).toHaveLength(1);
+      expect(result.tagDiversityByGroup[0].tagCount).toBe(3);
       expect(result.tagDiversityByGroup[0].topTags).toEqual(["api", "auth", "db"]);
       expect(result.enrichmentQuality).toEqual({
-        withSummary: 40,
-        withEmbedding: 35,
-        withAutoTags: 30,
-        total: 50,
+        withSummary: 4,
+        withEmbedding: 2,
+        withAutoTags: 3,
+        total: 5,
       });
       expect(result.crossAgentSharing).toEqual({
         totalShared: 5,
@@ -162,14 +307,14 @@ describe("metrics service", () => {
     });
 
     it("handles empty data gracefully", async () => {
-      setupMock([
-        [], // usefulness
-        [], // reuse
-        [], // tag diversity
-        [{ with_summary: 0, with_embedding: 0, with_auto_tags: 0, total: 0 }],
-        [{ total: 0 }], // cross-agent sharing: total count
-        [], // cross-agent sharing: top pairs
-      ]);
+      setupBenefitMetricsMock({
+        usefulnessRows: [],
+        reuseRows: [],
+        tagDiversityRows: [],
+        enrichmentQualityRows: [{ withSummary: 0, withEmbedding: 0, withAutoTags: 0, total: 0 }],
+        crossAgentTotalRows: [{ total: 0 }],
+        crossAgentPairRows: [],
+      });
 
       const result = await getBenefitMetrics({} as never, TENANT_ID);
 
@@ -183,15 +328,23 @@ describe("metrics service", () => {
 
   describe("getHealthMetrics", () => {
     it("calculates lifecycle stats and quota utilization", async () => {
-      setupMock([
-        // lifecycle
-        [{ avg_age_days: 7.5432, outdated_pct: 12.345, expiry_rate: 3.678 }],
-        // quota utilization
-        [
-          { group_id: "g1", group_name: "Team A", current: 150, quota: 1000, max_agent_current: 80 },
-          { group_id: "g2", group_name: "Team B", current: 900, quota: 1000, max_agent_current: 500 },
+      setupHealthMetricsMock({
+        liveLifecycleRows: [{ avgAgeDays: 7.5432, outdatedPct: 12.345 }],
+        allEntryLifecycleRows: [{ expiryRate: 3.678 }],
+        groupRows: [
+          { groupId: "g1", groupName: "Team A", quota: 1000 },
+          { groupId: "g2", groupName: "Team B", quota: 1000 },
         ],
-      ]);
+        groupCurrentRows: [
+          { groupId: "g1", current: 150 },
+          { groupId: "g2", current: 900 },
+        ],
+        groupMemberRows: [
+          { groupId: "g1", agentId: "a1", agentCount: 80 },
+          { groupId: "g1", agentId: "a2", agentCount: 25 },
+          { groupId: "g2", agentId: "a3", agentCount: 500 },
+        ],
+      });
 
       const result = await getHealthMetrics({} as never, TENANT_ID);
 
@@ -210,10 +363,13 @@ describe("metrics service", () => {
     });
 
     it("handles no data with zero values", async () => {
-      setupMock([
-        [{ avg_age_days: 0, outdated_pct: 0, expiry_rate: 0 }],
-        [],
-      ]);
+      setupHealthMetricsMock({
+        liveLifecycleRows: [{ avgAgeDays: 0, outdatedPct: 0 }],
+        allEntryLifecycleRows: [{ expiryRate: 0 }],
+        groupRows: [],
+        groupCurrentRows: [],
+        groupMemberRows: [],
+      });
 
       const result = await getHealthMetrics({} as never, TENANT_ID);
 

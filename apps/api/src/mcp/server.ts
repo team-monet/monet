@@ -5,7 +5,7 @@ import {
   registerAllTools,
   type McpToolHandlers,
 } from "@monet/mcp-tools";
-import type postgres from "postgres";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
 import type { AgentContext } from "../middleware/context";
 import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service";
 import {
@@ -150,7 +150,7 @@ function formatActiveRulesInstructions(activeRules: RuleRecord[]): string | unde
 export function createMcpServer(
   agentContext: AgentContext,
   tenantSchemaName: string,
-  sql: postgres.Sql,
+  sql: SqlClient,
   options: CreateMcpServerOptions = {},
 ) {
   const instructions = formatActiveRulesInstructions(options.activeRules ?? []);
@@ -190,7 +190,7 @@ export function createMcpServer(
         const result = await withTenantScope(sql, tenantSchemaName, async (txSql) => {
           const searchResult = await searchMemories(txSql, agentContext, args, queryEmbedding);
           await writeAuditLog(
-            txSql as unknown as import("postgres").Sql,
+            txSql as unknown as SqlClient,
             agentContext.tenantId,
             agentContext.id,
             "memory.search",
@@ -214,7 +214,7 @@ export function createMcpServer(
           const fetchResult = await fetchMemory(txSql, agentContext, args.id);
           if (!hasError(fetchResult)) {
             await writeAuditLog(
-              txSql as unknown as import("postgres").Sql,
+              txSql as unknown as SqlClient,
               agentContext.tenantId,
               agentContext.id,
               "memory.get",

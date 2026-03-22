@@ -1,5 +1,14 @@
-import type postgres from "postgres";
-import { tenantSchemaNameFromId, withTenantScope } from "@monet/db";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import {
+  agents,
+  agentGroupMembers,
+  agentGroups,
+  auditLog,
+  memoryEntries,
+  tenantSchemaNameFromId,
+  withTenantDrizzleScope,
+} from "@monet/db";
+import { aliasedTable, and, eq, inArray, isNotNull, notLike, sql as drizzleSql } from "drizzle-orm";
 import type {
   UsageMetrics,
   BenefitMetrics,
@@ -9,115 +18,148 @@ import type {
 // Must match DEFAULT_MEMORY_QUOTA in memory.service.ts (enforcement fallback)
 const DEFAULT_MEMORY_QUOTA = 10000;
 
+function formatDateOnly(value: Date | string): string {
+  return (value instanceof Date ? value.toISOString() : String(value)).split("T")[0];
+}
+
+function toNumber(value: unknown): number {
+  if (typeof value === "number") {
+    return value;
+  }
+
+  return Number(value ?? 0);
+}
+
 // ---------- Usage metrics ----------
 
 export async function getUsageMetrics(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
 ): Promise<UsageMetrics> {
   const schemaName = tenantSchemaNameFromId(tenantId);
 
-  return withTenantScope(sql, schemaName, async (tx) => {
-    // 14-day read/write/search frequency from audit_log
-    const frequencyRows = await tx.unsafe(`
-      SELECT
-        d::date AS date,
-        COALESCE(SUM(CASE WHEN al.action = 'memory.create' THEN 1 ELSE 0 END), 0)::int AS writes,
-        COALESCE(SUM(CASE WHEN al.action = 'memory.get' THEN 1 ELSE 0 END), 0)::int AS reads,
-        COALESCE(SUM(CASE WHEN al.action = 'memory.search' THEN 1 ELSE 0 END), 0)::int AS searches
-      FROM generate_series(
-        (CURRENT_DATE - INTERVAL '13 days')::date,
-        CURRENT_DATE::date,
-        '1 day'::interval
-      ) AS d
-      LEFT JOIN audit_log al
-        ON al.created_at::date = d::date
-        AND al.action IN ('memory.create', 'memory.get', 'memory.search')
-      GROUP BY d::date
-      ORDER BY d::date ASC
-    `);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const liveMemoryCondition = drizzleSql`${memoryEntries.expiresAt} IS NULL OR ${memoryEntries.expiresAt} > NOW()`;
 
-    // Active agents (7d / 30d) from audit_log, excluding dashboard agents + total from platform
-    const [activeAgents] = await tx.unsafe(
-      `
-      SELECT
-        COUNT(DISTINCT CASE WHEN al.created_at > NOW() - INTERVAL '7 days' THEN al.actor_id END)::int AS period_7d,
-        COUNT(DISTINCT CASE WHEN al.created_at > NOW() - INTERVAL '30 days' THEN al.actor_id END)::int AS period_30d,
-        (SELECT COUNT(*)::int FROM public.agents WHERE tenant_id = $1 AND external_id NOT LIKE 'dashboard:%') AS total
-      FROM audit_log al
-      JOIN public.agents a ON a.id = al.actor_id
-      WHERE al.created_at > NOW() - INTERVAL '30 days'
-        AND al.actor_type = 'agent'
-        AND a.external_id NOT LIKE 'dashboard:%'
-    `,
-      [tenantId],
-    );
+    const [
+      frequencyRows,
+      activeAgentRows,
+      totalAgentRows,
+      enrichmentRows,
+      searchHitRows,
+      semanticRows,
+    ] = await Promise.all([
+      db.execute<{
+        date: Date | string;
+        writes: number | string;
+        reads: number | string;
+        searches: number | string;
+      }>(drizzleSql`
+        SELECT
+          d::date AS date,
+          COALESCE(SUM(CASE WHEN al.action = 'memory.create' THEN 1 ELSE 0 END), 0)::int AS writes,
+          COALESCE(SUM(CASE WHEN al.action = 'memory.get' THEN 1 ELSE 0 END), 0)::int AS reads,
+          COALESCE(SUM(CASE WHEN al.action = 'memory.search' THEN 1 ELSE 0 END), 0)::int AS searches
+        FROM generate_series(
+          (CURRENT_DATE - INTERVAL '13 days')::date,
+          CURRENT_DATE::date,
+          '1 day'::interval
+        ) AS d
+        LEFT JOIN audit_log al
+          ON DATE(al.created_at) = d::date
+          AND al.action IN ('memory.create', 'memory.get', 'memory.search')
+        GROUP BY d::date
+        ORDER BY d::date ASC
+      `),
+      db
+        .select({
+          period7d: drizzleSql<number>`COUNT(DISTINCT CASE WHEN ${auditLog.createdAt} > NOW() - INTERVAL '7 days' THEN ${auditLog.actorId} END)::int`,
+          period30d: drizzleSql<number>`COUNT(DISTINCT CASE WHEN ${auditLog.createdAt} > NOW() - INTERVAL '30 days' THEN ${auditLog.actorId} END)::int`,
+        })
+        .from(auditLog)
+        .innerJoin(agents, eq(agents.id, auditLog.actorId))
+        .where(
+          and(
+            drizzleSql`${auditLog.createdAt} > NOW() - INTERVAL '30 days'`,
+            eq(auditLog.actorType, "agent"),
+            notLike(agents.externalId, "dashboard:%"),
+          ),
+        ),
+      db
+        .select({
+          total: drizzleSql<number>`COUNT(*)::int`,
+        })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.tenantId, tenantId),
+            notLike(agents.externalId, "dashboard:%"),
+          ),
+        ),
+      db
+        .select({
+          pending: drizzleSql<number>`COUNT(*) FILTER (WHERE ${memoryEntries.enrichmentStatus} = 'pending')::int`,
+          processing: drizzleSql<number>`COUNT(*) FILTER (WHERE ${memoryEntries.enrichmentStatus} = 'processing')::int`,
+          completed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${memoryEntries.enrichmentStatus} = 'completed')::int`,
+          failed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${memoryEntries.enrichmentStatus} = 'failed')::int`,
+        })
+        .from(memoryEntries)
+        .where(liveMemoryCondition),
+      db
+        .select({
+          total: drizzleSql<number>`COUNT(*)::int`,
+          withResults: drizzleSql<number>`COUNT(*) FILTER (WHERE (${auditLog.metadata}->>'resultCount')::int > 0)::int`,
+        })
+        .from(auditLog)
+        .where(
+          and(
+            eq(auditLog.action, "memory.search"),
+            drizzleSql`${auditLog.metadata} IS NOT NULL`,
+            drizzleSql`${auditLog.metadata} ? 'resultCount'`,
+          ),
+        ),
+      db
+        .select({
+          total: drizzleSql<number>`COUNT(*)::int`,
+          vectorCount: drizzleSql<number>`COUNT(*) FILTER (WHERE ${auditLog.metadata}->>'searchType' = 'vector')::int`,
+        })
+        .from(auditLog)
+        .where(
+          and(
+            eq(auditLog.action, "memory.search"),
+            drizzleSql`${auditLog.metadata} IS NOT NULL`,
+            drizzleSql`${auditLog.metadata} ? 'searchType'`,
+          ),
+        ),
+    ]);
 
-    // Enrichment throughput from memory_entries
-    const [enrichment] = await tx.unsafe(`
-      SELECT
-        COUNT(*) FILTER (WHERE enrichment_status = 'pending')::int AS pending,
-        COUNT(*) FILTER (WHERE enrichment_status = 'processing')::int AS processing,
-        COUNT(*) FILTER (WHERE enrichment_status = 'completed')::int AS completed,
-        COUNT(*) FILTER (WHERE enrichment_status = 'failed')::int AS failed
-      FROM memory_entries
-      WHERE expires_at IS NULL OR expires_at > NOW()
-    `);
-
-    // Tier 2: Search hit rate (from metadata JSONB)
-    const searchHitRows = await tx.unsafe(`
-      SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE (metadata->>'resultCount')::int > 0)::int AS with_results
-      FROM audit_log
-      WHERE action = 'memory.search'
-        AND metadata IS NOT NULL
-        AND metadata ? 'resultCount'
-    `);
-    const searchHitData = searchHitRows[0] as Record<string, unknown> | undefined;
-    const searchTotal = (searchHitData?.total as number) ?? 0;
-    const searchWithResults = (searchHitData?.with_results as number) ?? 0;
-
-    // Tier 2: Semantic search percentage
-    const semanticRows = await tx.unsafe(`
-      SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE metadata->>'searchType' = 'vector')::int AS vector_count
-      FROM audit_log
-      WHERE action = 'memory.search'
-        AND metadata IS NOT NULL
-        AND metadata ? 'searchType'
-    `);
-    const semanticData = semanticRows[0] as Record<string, unknown> | undefined;
-    const semanticTotal = (semanticData?.total as number) ?? 0;
-    const vectorCount = (semanticData?.vector_count as number) ?? 0;
+    const [activeAgents = { period7d: 0, period30d: 0 }] = activeAgentRows;
+    const [totalAgents = { total: 0 }] = totalAgentRows;
+    const [enrichment = { pending: 0, processing: 0, completed: 0, failed: 0 }] = enrichmentRows;
+    const [searchHitData = { total: 0, withResults: 0 }] = searchHitRows;
+    const [semanticData = { total: 0, vectorCount: 0 }] = semanticRows;
+    const searchTotal = toNumber(searchHitData.total);
+    const searchWithResults = toNumber(searchHitData.withResults);
+    const semanticTotal = toNumber(semanticData.total);
+    const vectorCount = toNumber(semanticData.vectorCount);
 
     return {
-      readWriteFrequency: (frequencyRows as Record<string, unknown>[]).map(
-        (r) => {
-          const raw = r.date;
-          const dateStr =
-            raw instanceof Date
-              ? raw.toISOString().split("T")[0]
-              : String(raw).split("T")[0];
-          return {
-            date: dateStr,
-            reads: r.reads as number,
-            writes: r.writes as number,
-            searches: r.searches as number,
-          };
-        },
-      ),
+      readWriteFrequency: frequencyRows.map((row) => ({
+        date: formatDateOnly(row.date),
+        reads: toNumber(row.reads),
+        writes: toNumber(row.writes),
+        searches: toNumber(row.searches),
+      })),
       activeAgents: {
-        period7d: activeAgents.period_7d as number,
-        period30d: activeAgents.period_30d as number,
-        total: activeAgents.total as number,
+        period7d: toNumber(activeAgents.period7d),
+        period30d: toNumber(activeAgents.period30d),
+        total: toNumber(totalAgents.total),
       },
       enrichmentThroughput: {
-        pending: enrichment.pending as number,
-        processing: enrichment.processing as number,
-        completed: enrichment.completed as number,
-        failed: enrichment.failed as number,
+        pending: toNumber(enrichment.pending),
+        processing: toNumber(enrichment.processing),
+        completed: toNumber(enrichment.completed),
+        failed: toNumber(enrichment.failed),
       },
       searchHitRate: searchTotal > 0
         ? {
@@ -136,155 +178,191 @@ export async function getUsageMetrics(
 // ---------- Benefit metrics ----------
 
 export async function getBenefitMetrics(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
 ): Promise<BenefitMetrics> {
   const schemaName = tenantSchemaNameFromId(tenantId);
 
-  return withTenantScope(sql, schemaName, async (tx) => {
-    // Usefulness score distribution (bucketed)
-    const usefulnessRows = await tx.unsafe(`
-      SELECT
-        CASE
-          WHEN usefulness_score = 0 THEN '0'
-          WHEN usefulness_score = 1 THEN '1'
-          WHEN usefulness_score BETWEEN 2 AND 3 THEN '2-3'
-          WHEN usefulness_score BETWEEN 4 AND 6 THEN '4-6'
-          ELSE '7+'
-        END AS bucket,
-        COUNT(*)::int AS count
-      FROM memory_entries
-      WHERE expires_at IS NULL OR expires_at > NOW()
-      GROUP BY bucket
-      ORDER BY MIN(usefulness_score) ASC
-    `);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const liveMemoryCondition = drizzleSql`${memoryEntries.expiresAt} IS NULL OR ${memoryEntries.expiresAt} > NOW()`;
+    const readerAgents = aliasedTable(agents, "reader_agents");
+    const writerAgents = aliasedTable(agents, "writer_agents");
 
-    // Memory reuse rate (bucketed by usefulness_score as access proxy)
-    const reuseRows = await tx.unsafe(`
-      SELECT
-        CASE
-          WHEN usefulness_score = 0 THEN 'Never accessed'
-          WHEN usefulness_score BETWEEN 1 AND 3 THEN '1-3 times'
-          WHEN usefulness_score BETWEEN 4 AND 10 THEN '4-10 times'
-          ELSE '10+ times'
-        END AS bucket,
-        COUNT(*)::int AS count
-      FROM memory_entries
-      WHERE expires_at IS NULL OR expires_at > NOW()
-      GROUP BY bucket
-      ORDER BY MIN(usefulness_score) ASC
-    `);
-
-    // Tag diversity per group
-    const tagDiversityRows = await tx.unsafe(
-      `
-      SELECT
-        me.group_id,
-        ag.name AS group_name,
-        COUNT(DISTINCT t.tag)::int AS tag_count,
-        COALESCE(
-          (SELECT array_agg(top_tag ORDER BY top_cnt DESC)
-           FROM (
-             SELECT unnest(me2.tags) AS top_tag, COUNT(*) AS top_cnt
-             FROM memory_entries me2
-             WHERE me2.group_id = me.group_id
-               AND (me2.expires_at IS NULL OR me2.expires_at > NOW())
-             GROUP BY top_tag
-             ORDER BY top_cnt DESC
-             LIMIT 5
-           ) sub),
-          '{}'::text[]
-        ) AS top_tags
-      FROM memory_entries me
-      CROSS JOIN LATERAL unnest(me.tags) AS t(tag)
-      JOIN public.agent_groups ag ON ag.id = me.group_id
-      WHERE me.group_id IS NOT NULL
-        AND (me.expires_at IS NULL OR me.expires_at > NOW())
-      GROUP BY me.group_id, ag.name
-      ORDER BY tag_count DESC
-    `,
-    );
-
-    // Enrichment quality
-    const [quality] = await tx.unsafe(`
-      SELECT
-        COUNT(*) FILTER (WHERE summary IS NOT NULL AND summary != '')::int AS with_summary,
-        COUNT(*) FILTER (WHERE embedding IS NOT NULL)::int AS with_embedding,
-        COUNT(*) FILTER (WHERE array_length(auto_tags, 1) > 0)::int AS with_auto_tags,
-        COUNT(*)::int AS total
-      FROM memory_entries
-      WHERE expires_at IS NULL OR expires_at > NOW()
-    `);
-
-    // Tier 2: Cross-agent sharing — memories written by one agent, read by another
-    // Exclude dashboard agents from both reader and writer sides
-    const [[crossAgentTotal], crossAgentRows] = await Promise.all([
-      tx.unsafe(`
-        SELECT COUNT(*)::int AS total
-        FROM audit_log al
-        JOIN memory_entries me ON me.id = al.target_id::uuid
-        JOIN public.agents reader ON reader.id = al.actor_id
-        JOIN public.agents writer ON writer.id = me.author_agent_id
-        WHERE al.action = 'memory.get'
-          AND al.actor_id != me.author_agent_id
-          AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-          AND reader.external_id NOT LIKE 'dashboard:%'
-          AND writer.external_id NOT LIKE 'dashboard:%'
-      `),
-      tx.unsafe(`
+    const [
+      usefulnessRows,
+      reuseRows,
+      tagDiversityRows,
+      enrichmentQualityRows,
+      crossAgentTotalRows,
+      crossAgentPairRows,
+    ] = await Promise.all([
+      db.execute<{
+        bucket: string;
+        count: number | string;
+      }>(drizzleSql`
         SELECT
-          me.author_agent_id AS writer_agent_id,
-          al.actor_id AS reader_agent_id,
+          CASE
+            WHEN ${memoryEntries.usefulnessScore} = 0 THEN '0'
+            WHEN ${memoryEntries.usefulnessScore} = 1 THEN '1'
+            WHEN ${memoryEntries.usefulnessScore} BETWEEN 2 AND 3 THEN '2-3'
+            WHEN ${memoryEntries.usefulnessScore} BETWEEN 4 AND 6 THEN '4-6'
+            ELSE '7+'
+          END AS bucket,
           COUNT(*)::int AS count
-        FROM audit_log al
-        JOIN memory_entries me ON me.id = al.target_id::uuid
-        JOIN public.agents reader ON reader.id = al.actor_id
-        JOIN public.agents writer ON writer.id = me.author_agent_id
-        WHERE al.action = 'memory.get'
-          AND al.actor_id != me.author_agent_id
-          AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-          AND reader.external_id NOT LIKE 'dashboard:%'
-          AND writer.external_id NOT LIKE 'dashboard:%'
-        GROUP BY me.author_agent_id, al.actor_id
-        ORDER BY count DESC
-        LIMIT 10
+        FROM ${memoryEntries}
+        WHERE ${liveMemoryCondition}
+        GROUP BY 1
+        ORDER BY MIN(${memoryEntries.usefulnessScore}) ASC
       `),
+      db.execute<{
+        bucket: string;
+        count: number | string;
+      }>(drizzleSql`
+        SELECT
+          CASE
+            WHEN ${memoryEntries.usefulnessScore} = 0 THEN 'Never accessed'
+            WHEN ${memoryEntries.usefulnessScore} BETWEEN 1 AND 3 THEN '1-3 times'
+            WHEN ${memoryEntries.usefulnessScore} BETWEEN 4 AND 10 THEN '4-10 times'
+            ELSE '10+ times'
+          END AS bucket,
+          COUNT(*)::int AS count
+        FROM ${memoryEntries}
+        WHERE ${liveMemoryCondition}
+        GROUP BY 1
+        ORDER BY MIN(${memoryEntries.usefulnessScore}) ASC
+      `),
+      db.execute<{
+        groupId: string;
+        groupName: string;
+        tagCount: number | string;
+        topTags: string[] | null;
+      }>(drizzleSql`
+        SELECT
+          me.group_id AS "groupId",
+          ag.name AS "groupName",
+          COUNT(DISTINCT t.tag)::int AS "tagCount",
+          COALESCE(
+            (
+              SELECT array_agg(top_tag ORDER BY top_cnt DESC, top_tag ASC)
+              FROM (
+                SELECT unnest(me2.tags) AS top_tag, COUNT(*) AS top_cnt
+                FROM ${memoryEntries} me2
+                WHERE me2.group_id = me.group_id
+                  AND (me2.expires_at IS NULL OR me2.expires_at > NOW())
+                GROUP BY top_tag
+                ORDER BY top_cnt DESC, top_tag ASC
+                LIMIT 5
+              ) sub
+            ),
+            '{}'::text[]
+          ) AS "topTags"
+        FROM ${memoryEntries} me
+        CROSS JOIN LATERAL unnest(me.tags) AS t(tag)
+        JOIN ${agentGroups} ag ON ag.id = me.group_id
+        WHERE me.group_id IS NOT NULL
+          AND (me.expires_at IS NULL OR me.expires_at > NOW())
+        GROUP BY me.group_id, ag.name
+        ORDER BY "tagCount" DESC, ag.name ASC
+      `),
+      db.execute<{
+        withSummary: number | string;
+        withEmbedding: number | string;
+        withAutoTags: number | string;
+        total: number | string;
+      }>(drizzleSql`
+        SELECT
+          COUNT(*) FILTER (WHERE ${memoryEntries.summary} IS NOT NULL AND ${memoryEntries.summary} != '')::int AS "withSummary",
+          COUNT(*) FILTER (WHERE ${memoryEntries.embedding} IS NOT NULL)::int AS "withEmbedding",
+          COUNT(*) FILTER (WHERE array_length(${memoryEntries.autoTags}, 1) > 0)::int AS "withAutoTags",
+          COUNT(*)::int AS total
+        FROM ${memoryEntries}
+        WHERE ${liveMemoryCondition}
+      `),
+      db
+        .select({
+          total: drizzleSql<number>`COUNT(*)::int`,
+        })
+        .from(auditLog)
+        .innerJoin(
+          memoryEntries,
+          drizzleSql`${memoryEntries.id}::text = ${auditLog.targetId}`,
+        )
+        .innerJoin(readerAgents, eq(readerAgents.id, auditLog.actorId))
+        .innerJoin(writerAgents, eq(writerAgents.id, memoryEntries.authorAgentId))
+        .where(
+          and(
+            eq(auditLog.action, "memory.get"),
+            drizzleSql`${auditLog.actorId} != ${memoryEntries.authorAgentId}`,
+            notLike(readerAgents.externalId, "dashboard:%"),
+            notLike(writerAgents.externalId, "dashboard:%"),
+          ),
+        ),
+      db
+        .select({
+          writerAgentId: memoryEntries.authorAgentId,
+          readerAgentId: auditLog.actorId,
+          count: drizzleSql<number>`COUNT(*)::int`,
+        })
+        .from(auditLog)
+        .innerJoin(
+          memoryEntries,
+          drizzleSql`${memoryEntries.id}::text = ${auditLog.targetId}`,
+        )
+        .innerJoin(readerAgents, eq(readerAgents.id, auditLog.actorId))
+        .innerJoin(writerAgents, eq(writerAgents.id, memoryEntries.authorAgentId))
+        .where(
+          and(
+            eq(auditLog.action, "memory.get"),
+            drizzleSql`${auditLog.actorId} != ${memoryEntries.authorAgentId}`,
+            notLike(readerAgents.externalId, "dashboard:%"),
+            notLike(writerAgents.externalId, "dashboard:%"),
+          ),
+        )
+        .groupBy(memoryEntries.authorAgentId, auditLog.actorId)
+        .orderBy(
+          drizzleSql`COUNT(*) DESC`,
+          memoryEntries.authorAgentId,
+          auditLog.actorId,
+        )
+        .limit(10),
     ]);
-    const crossAgentPairs = crossAgentRows as Record<string, unknown>[];
-    const totalShared = (crossAgentTotal?.total as number) ?? 0;
+    const usefulnessDistribution = usefulnessRows.map((row) => ({
+      bucket: row.bucket,
+      count: toNumber(row.count),
+    }));
+    const memoryReuseRate = reuseRows.map((row) => ({
+      bucket: row.bucket,
+      count: toNumber(row.count),
+    }));
+    const tagDiversityByGroup = tagDiversityRows.map((row) => ({
+      groupId: row.groupId,
+      groupName: row.groupName,
+      tagCount: toNumber(row.tagCount),
+      topTags: row.topTags ?? [],
+    }));
+    const [quality = { withSummary: 0, withEmbedding: 0, withAutoTags: 0, total: 0 }] = enrichmentQualityRows;
+    const enrichmentQuality = {
+      withSummary: toNumber(quality.withSummary),
+      withEmbedding: toNumber(quality.withEmbedding),
+      withAutoTags: toNumber(quality.withAutoTags),
+      total: toNumber(quality.total),
+    };
+
+    const [crossAgentTotal = { total: 0 }] = crossAgentTotalRows;
+    const totalShared = toNumber(crossAgentTotal.total);
 
     return {
-      usefulnessDistribution: (
-        usefulnessRows as Record<string, unknown>[]
-      ).map((r) => ({
-        bucket: r.bucket as string,
-        count: r.count as number,
-      })),
-      memoryReuseRate: (reuseRows as Record<string, unknown>[]).map((r) => ({
-        bucket: r.bucket as string,
-        count: r.count as number,
-      })),
-      tagDiversityByGroup: (
-        tagDiversityRows as Record<string, unknown>[]
-      ).map((r) => ({
-        groupId: r.group_id as string,
-        groupName: r.group_name as string,
-        tagCount: r.tag_count as number,
-        topTags: (r.top_tags as string[]) ?? [],
-      })),
-      enrichmentQuality: {
-        withSummary: quality.with_summary as number,
-        withEmbedding: quality.with_embedding as number,
-        withAutoTags: quality.with_auto_tags as number,
-        total: quality.total as number,
-      },
+      usefulnessDistribution,
+      memoryReuseRate,
+      tagDiversityByGroup,
+      enrichmentQuality,
       crossAgentSharing: totalShared > 0
         ? {
             totalShared,
-            topPairs: crossAgentPairs.map((r) => ({
-              writerAgentId: r.writer_agent_id as string,
-              readerAgentId: r.reader_agent_id as string,
-              count: r.count as number,
+            topPairs: crossAgentPairRows.map((row) => ({
+              writerAgentId: row.writerAgentId,
+              readerAgentId: row.readerAgentId,
+              count: toNumber(row.count),
             })),
           }
         : null,
@@ -295,86 +373,104 @@ export async function getBenefitMetrics(
 // ---------- Health metrics ----------
 
 export async function getHealthMetrics(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
 ): Promise<HealthMetrics> {
   const schemaName = tenantSchemaNameFromId(tenantId);
 
-  return withTenantScope(sql, schemaName, async (tx) => {
-    // Memory lifecycle stats
-    // avg age & outdated: only live entries; expiry rate: all entries (expired ones are the numerator)
-    const [lifecycle] = await tx.unsafe(`
-      SELECT
-        COALESCE(live.avg_age_days, 0)::float AS avg_age_days,
-        COALESCE(live.outdated_pct, 0)::float AS outdated_pct,
-        COALESCE(all_entries.expiry_rate, 0)::float AS expiry_rate
-      FROM (
-        SELECT
-          AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400) AS avg_age_days,
-          CASE WHEN COUNT(*) = 0 THEN 0
-            ELSE (COUNT(*) FILTER (WHERE outdated = true)::float / COUNT(*)::float * 100)
-          END AS outdated_pct
-        FROM memory_entries
-        WHERE expires_at IS NULL OR expires_at > NOW()
-      ) live,
-      (
-        SELECT
-          CASE WHEN COUNT(*) = 0 THEN 0
-            ELSE (COUNT(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at <= NOW())::float / COUNT(*)::float * 100)
-          END AS expiry_rate
-        FROM memory_entries
-      ) all_entries
-    `);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const liveMemoryCondition = drizzleSql`${memoryEntries.expiresAt} IS NULL OR ${memoryEntries.expiresAt} > NOW()`;
 
-    // Quota utilization per group
-    // current = total group entries, max_agent_current = highest per-agent entry count
-    // among current group members (via agent_group_members), matching enforcement semantics
-    const quotaRows = await tx.unsafe(
-      `
-      SELECT
-        ag.id AS group_id,
-        ag.name AS group_name,
-        COUNT(DISTINCT me.id)::int AS current,
-        ag.memory_quota::int AS quota,
-        COALESCE(MAX(member_counts.agent_count), 0)::int AS max_agent_current
-      FROM public.agent_groups ag
-      LEFT JOIN memory_entries me
-        ON me.group_id = ag.id
-        AND (me.expires_at IS NULL OR me.expires_at > NOW())
-      LEFT JOIN (
-        SELECT agm.group_id, agm.agent_id, COUNT(me2.id)::int AS agent_count
-        FROM public.agent_group_members agm
-        JOIN memory_entries me2 ON me2.author_agent_id = agm.agent_id
-          AND (me2.expires_at IS NULL OR me2.expires_at > NOW())
-        GROUP BY agm.group_id, agm.agent_id
-      ) member_counts ON member_counts.group_id = ag.id
-      WHERE ag.tenant_id = $1
-      GROUP BY ag.id, ag.name, ag.memory_quota
-      ORDER BY ag.name ASC
-    `,
-      [tenantId],
+    const [
+      liveLifecycleRows,
+      allEntryLifecycleRows,
+      groupRows,
+      groupCurrentRows,
+      groupMemberRows,
+    ] = await Promise.all([
+      db
+        .select({
+          avgAgeDays: drizzleSql<number>`COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - ${memoryEntries.createdAt})) / 86400), 0)::float`,
+          outdatedPct: drizzleSql<number>`CASE WHEN COUNT(*) = 0 THEN 0 ELSE (COUNT(*) FILTER (WHERE ${memoryEntries.outdated} = true)::float / COUNT(*)::float * 100) END`,
+        })
+        .from(memoryEntries)
+        .where(liveMemoryCondition),
+      db
+        .select({
+          expiryRate: drizzleSql<number>`CASE WHEN COUNT(*) = 0 THEN 0 ELSE (COUNT(*) FILTER (WHERE ${memoryEntries.expiresAt} IS NOT NULL AND ${memoryEntries.expiresAt} <= NOW())::float / COUNT(*)::float * 100) END`,
+        })
+        .from(memoryEntries),
+      db
+        .select({
+          groupId: agentGroups.id,
+          groupName: agentGroups.name,
+          quota: agentGroups.memoryQuota,
+        })
+        .from(agentGroups)
+        .where(eq(agentGroups.tenantId, tenantId))
+        .orderBy(agentGroups.name),
+      db
+        .select({
+          groupId: memoryEntries.groupId,
+          current: drizzleSql<number>`COUNT(*)::int`,
+        })
+        .from(memoryEntries)
+        .where(and(isNotNull(memoryEntries.groupId), liveMemoryCondition))
+        .groupBy(memoryEntries.groupId),
+      db
+        .select({
+          groupId: agentGroupMembers.groupId,
+          agentId: agentGroupMembers.agentId,
+          agentCount: drizzleSql<number>`COUNT(${memoryEntries.id})::int`,
+        })
+        .from(agentGroupMembers)
+        .innerJoin(agentGroups, eq(agentGroups.id, agentGroupMembers.groupId))
+        .leftJoin(
+          memoryEntries,
+          and(
+            eq(memoryEntries.authorAgentId, agentGroupMembers.agentId),
+            liveMemoryCondition,
+          ),
+        )
+        .where(eq(agentGroups.tenantId, tenantId))
+        .groupBy(agentGroupMembers.groupId, agentGroupMembers.agentId),
+    ]);
+
+    const [liveLifecycle = { avgAgeDays: 0, outdatedPct: 0 }] = liveLifecycleRows;
+    const [allEntryLifecycle = { expiryRate: 0 }] = allEntryLifecycleRows;
+    const currentByGroupId = new Map(
+      groupCurrentRows.map((row) => [row.groupId, toNumber(row.current)]),
     );
+    const maxAgentCurrentByGroupId = new Map<string, number>();
+
+    for (const row of groupMemberRows) {
+      const previous = maxAgentCurrentByGroupId.get(row.groupId) ?? 0;
+      maxAgentCurrentByGroupId.set(
+        row.groupId,
+        Math.max(previous, toNumber(row.agentCount)),
+      );
+    }
 
     return {
       memoryLifecycle: {
-        avgAgeDays: Math.round((lifecycle.avg_age_days as number) * 10) / 10,
-        outdatedPct:
-          Math.round((lifecycle.outdated_pct as number) * 10) / 10,
-        expiryRate:
-          Math.round((lifecycle.expiry_rate as number) * 10) / 10,
+        avgAgeDays: Math.round(toNumber(liveLifecycle.avgAgeDays) * 10) / 10,
+        outdatedPct: Math.round(toNumber(liveLifecycle.outdatedPct) * 10) / 10,
+        expiryRate: Math.round(toNumber(allEntryLifecycle.expiryRate) * 10) / 10,
       },
-      quotaUtilization: (quotaRows as Record<string, unknown>[]).map(
-        (r) => ({
-          groupId: r.group_id as string,
-          groupName: r.group_name as string,
-          current: r.current as number,
-          quota: (r.quota as number | null) ?? null,
-          effectiveQuotaPerAgent: ((r.quota as number | null) ?? null) !== null && (r.quota as number) > 0
-            ? (r.quota as number)
-            : DEFAULT_MEMORY_QUOTA,
-          maxAgentCurrent: r.max_agent_current as number,
+      quotaUtilization: groupRows.map((row) => {
+          const quota = row.quota ?? null;
+
+          return {
+            groupId: row.groupId,
+            groupName: row.groupName,
+            current: currentByGroupId.get(row.groupId) ?? 0,
+            quota,
+            effectiveQuotaPerAgent: quota !== null && quota > 0
+              ? quota
+              : DEFAULT_MEMORY_QUOTA,
+            maxAgentCurrent: maxAgentCurrentByGroupId.get(row.groupId) ?? 0,
+          };
         }),
-      ),
     };
   });
 }

@@ -1,4 +1,12 @@
-import type postgres from "postgres";
+import {
+  groupRuleSets,
+  rules,
+  ruleSetRules,
+  ruleSets,
+  type SqlClient,
+  type TransactionClient,
+  withTenantDrizzleScope,
+} from "@monet/db";
 
 export const DEFAULT_GENERAL_GUIDANCE_RULE_SET_NAME = "Default General Guidance";
 
@@ -51,39 +59,39 @@ export const DEFAULT_GENERAL_GUIDANCE_RULES = [
 ] as const;
 
 export async function seedDefaultGeneralGuidance(
-  sql: postgres.Sql,
+  sql: SqlClient | TransactionClient,
   schemaName: string,
   groupId: string,
 ): Promise<{ ruleSetId: string; ruleCount: number }> {
-  const ruleIds: string[] = [];
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const createdRules = await db
+      .insert(rules)
+      .values(DEFAULT_GENERAL_GUIDANCE_RULES.map((rule) => ({
+        name: rule.name,
+        description: rule.description,
+      })))
+      .returning({ id: rules.id });
 
-  for (const rule of DEFAULT_GENERAL_GUIDANCE_RULES) {
-    const [createdRule] = await sql.unsafe(
-      `INSERT INTO "${schemaName}".rules (name, description) VALUES ($1, $2) RETURNING id`,
-      [rule.name, rule.description],
+    const [ruleSet] = await db
+      .insert(ruleSets)
+      .values({ name: DEFAULT_GENERAL_GUIDANCE_RULE_SET_NAME })
+      .returning({ id: ruleSets.id });
+
+    await db.insert(ruleSetRules).values(
+      createdRules.map((rule) => ({
+        ruleSetId: ruleSet.id,
+        ruleId: rule.id,
+      })),
     );
-    ruleIds.push(createdRule.id as string);
-  }
 
-  const [ruleSet] = await sql.unsafe(
-    `INSERT INTO "${schemaName}".rule_sets (name) VALUES ($1) RETURNING id`,
-    [DEFAULT_GENERAL_GUIDANCE_RULE_SET_NAME],
-  );
+    await db.insert(groupRuleSets).values({
+      groupId,
+      ruleSetId: ruleSet.id,
+    });
 
-  for (const ruleId of ruleIds) {
-    await sql.unsafe(
-      `INSERT INTO "${schemaName}".rule_set_rules (rule_set_id, rule_id) VALUES ($1, $2)`,
-      [ruleSet.id as string, ruleId],
-    );
-  }
-
-  await sql.unsafe(
-    `INSERT INTO "${schemaName}".group_rule_sets (group_id, rule_set_id) VALUES ($1, $2)`,
-    [groupId, ruleSet.id as string],
-  );
-
-  return {
-    ruleSetId: ruleSet.id as string,
-    ruleCount: ruleIds.length,
-  };
+    return {
+      ruleSetId: ruleSet.id,
+      ruleCount: createdRules.length,
+    };
+  });
 }

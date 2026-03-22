@@ -1,11 +1,35 @@
-import { describe, it, expect } from "vitest";
+import {
+  agentGroupMembers,
+  agentGroups,
+  auditLog,
+  memoryEntries,
+  memoryVersions,
+  type SqlClient,
+  type TransactionClient,
+} from "@monet/db";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CreateMemoryEntryInput } from "@monet/types";
+
+const { drizzleMock } = vi.hoisted(() => ({
+  drizzleMock: vi.fn(),
+}));
+
+vi.mock("drizzle-orm/postgres-js", () => ({
+  drizzle: (...args: unknown[]) => drizzleMock(...args),
+}));
+
 import {
   encodeCursor,
   decodeCursor,
-  buildScopeFilter,
   createMemory,
+  deleteMemory,
+  fetchMemory,
   buildSummary,
+  listAgentMemories,
+  listTags,
+  resolveMemoryWritePreflight,
+  searchMemories,
+  updateMemory,
 } from "../services/memory.service";
 import type { AgentContext } from "../middleware/context";
 
@@ -24,6 +48,14 @@ function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
   };
 }
 
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe("encodeCursor / decodeCursor", () => {
   it("round-trips correctly", () => {
     const createdAt = "2025-01-01T00:00:00.000Z";
@@ -38,67 +70,6 @@ describe("encodeCursor / decodeCursor", () => {
   it("produces a URL-safe base64 string", () => {
     const cursor = encodeCursor("2025-01-01T00:00:00.000Z", "some-id");
     expect(cursor).not.toMatch(/[+/=]/);
-  });
-});
-
-describe("buildScopeFilter", () => {
-  it("always includes group scope", () => {
-    const { conditions, params } = buildScopeFilter(makeAgent(), {
-      includeUser: false,
-      includePrivate: false,
-    });
-    expect(conditions).toContain("me.memory_scope = 'group'");
-    expect(conditions).toHaveLength(1);
-    expect(params).toHaveLength(0);
-  });
-
-  it("includes user scope when includeUser=true and agent has userId", () => {
-    const { conditions, params } = buildScopeFilter(makeAgent({ userId: USER_ID }), {
-      includeUser: true,
-      includePrivate: false,
-    });
-    expect(conditions).toHaveLength(2);
-    expect(conditions[1]).toContain("me.memory_scope = 'user'");
-    expect(params).toContain(USER_ID);
-  });
-
-  it("does NOT include user scope when agent has no userId", () => {
-    const { conditions, params } = buildScopeFilter(makeAgent({ userId: null }), {
-      includeUser: true,
-      includePrivate: false,
-    });
-    expect(conditions).toHaveLength(1);
-    expect(params).toHaveLength(0);
-  });
-
-  it("includes private scope when includePrivate=true", () => {
-    const { conditions, params } = buildScopeFilter(makeAgent(), {
-      includeUser: false,
-      includePrivate: true,
-    });
-    expect(conditions).toHaveLength(2);
-    expect(conditions[1]).toContain("me.memory_scope = 'private'");
-    expect(params).toContain(AGENT_ID);
-  });
-
-  it("includes all scopes when both flags set and agent has userId", () => {
-    const { conditions, params } = buildScopeFilter(makeAgent({ userId: USER_ID }), {
-      includeUser: true,
-      includePrivate: true,
-    });
-    expect(conditions).toHaveLength(3);
-    expect(params).toHaveLength(2);
-  });
-
-  it("respects paramOffset for placeholder numbering", () => {
-    const { conditions, params } = buildScopeFilter(makeAgent({ userId: USER_ID }), {
-      includeUser: true,
-      includePrivate: true,
-    }, 3);
-    // With offset 3, first param should be $4, second $5
-    expect(conditions[1]).toContain("$4");
-    expect(conditions[2]).toContain("$5");
-    expect(params).toHaveLength(2);
   });
 });
 
@@ -144,10 +115,10 @@ describe("createMemory", () => {
   it("rejects autonomous agents storing user-scoped memories", async () => {
     const sql = (() => {
       throw new Error("should not query");
-    }) as unknown as import("postgres").Sql;
+    }) as unknown as SqlClient;
 
     const result = await createMemory(
-      sql as unknown as import("postgres").TransactionSql,
+      sql as unknown as TransactionClient,
       makeAgent({ isAutonomous: true }),
       {
         content: "test",
@@ -161,6 +132,791 @@ describe("createMemory", () => {
       error: "validation",
       message: "Autonomous agents cannot store user-scoped memories",
     });
+  });
+
+  it("creates a memory, version snapshot, and audit log through Drizzle", async () => {
+    const countWhereMock = vi.fn().mockResolvedValue([{ count: 1 }]);
+    const countFromMock = vi.fn(() => ({
+      where: countWhereMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: countFromMock,
+    }));
+
+    const memoryReturningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000200",
+        content: "hello world",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T01:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T01:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: "00000000-0000-0000-0000-000000000300",
+        user_id: USER_ID,
+        version: 0,
+      },
+    ]);
+    const memoryValuesMock = vi.fn(() => ({
+      returning: memoryReturningMock,
+    }));
+    const versionValuesMock = vi.fn().mockResolvedValue(undefined);
+    const auditValuesMock = vi.fn().mockResolvedValue(undefined);
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: memoryValuesMock })
+      .mockReturnValueOnce({ values: versionValuesMock })
+      .mockReturnValueOnce({ values: auditValuesMock });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      insert: insertMock,
+    });
+
+    const result = await createMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        content: "hello world",
+        memoryType: "fact",
+        memoryScope: "group",
+        tags: ["ops"],
+      },
+      {
+        hasGroupMembership: true,
+        memoryQuota: 10,
+        groupId: "00000000-0000-0000-0000-000000000300",
+      },
+    );
+
+    expect(insertMock).toHaveBeenNthCalledWith(1, memoryEntries);
+    expect(memoryValuesMock).toHaveBeenCalledWith({
+      content: "hello world",
+      memoryType: "fact",
+      memoryScope: "group",
+      tags: ["ops"],
+      ttlSeconds: null,
+      expiresAt: null,
+      authorAgentId: AGENT_ID,
+      userId: USER_ID,
+      groupId: "00000000-0000-0000-0000-000000000300",
+      version: 0,
+    });
+    expect(insertMock).toHaveBeenNthCalledWith(2, memoryVersions);
+    expect(versionValuesMock).toHaveBeenCalledWith({
+      memoryEntryId: "00000000-0000-0000-0000-000000000200",
+      content: "hello world",
+      version: 0,
+      authorAgentId: AGENT_ID,
+    });
+    expect(insertMock).toHaveBeenNthCalledWith(3, auditLog);
+    expect(auditValuesMock).toHaveBeenCalledWith({
+      tenantId: "00000000-0000-0000-0000-000000000010",
+      actorId: AGENT_ID,
+      actorType: "agent",
+      action: "memory.create",
+      targetId: "00000000-0000-0000-0000-000000000200",
+      outcome: "success",
+      metadata: null,
+    });
+    expect(result).toEqual({
+      id: "00000000-0000-0000-0000-000000000200",
+      content: "hello world",
+      summary: null,
+      memoryType: "fact",
+      memoryScope: "group",
+      tags: ["ops"],
+      autoTags: [],
+      relatedMemoryIds: [],
+      usefulnessScore: 0,
+      outdated: false,
+      ttlSeconds: null,
+      expiresAt: null,
+      createdAt: "2026-03-22T01:00:00.000Z",
+      lastAccessedAt: "2026-03-22T01:00:00.000Z",
+      authorAgentId: AGENT_ID,
+      authorAgentDisplayName: null,
+      groupId: "00000000-0000-0000-0000-000000000300",
+      userId: USER_ID,
+      version: 0,
+    });
+  });
+});
+
+describe("resolveMemoryWritePreflight", () => {
+  it("returns the first matching group membership and quota through Drizzle", async () => {
+    const limitMock = vi.fn().mockResolvedValue([
+      {
+        memoryQuota: 250,
+        groupId: "00000000-0000-0000-0000-000000000222",
+      },
+    ]);
+    const whereMock = vi.fn(() => ({
+      limit: limitMock,
+    }));
+    const innerJoinMock = vi.fn(() => ({
+      where: whereMock,
+    }));
+    const fromMock = vi.fn(() => ({
+      innerJoin: innerJoinMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: fromMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    const result = await resolveMemoryWritePreflight(
+      {} as SqlClient,
+      makeAgent(),
+    );
+
+    expect(selectMock).toHaveBeenCalledWith({
+      memoryQuota: agentGroups.memoryQuota,
+      groupId: agentGroups.id,
+    });
+    expect(fromMock).toHaveBeenCalledWith(agentGroupMembers);
+    expect(result).toEqual({
+      hasGroupMembership: true,
+      memoryQuota: 250,
+      groupId: "00000000-0000-0000-0000-000000000222",
+    });
+  });
+});
+
+describe("fetchMemory", () => {
+  it("loads the entry with versions and bumps usefulness through Drizzle", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000401",
+        content: "remember this",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 5,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T01:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T01:10:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent · owner@example.com",
+        group_id: null,
+        user_id: USER_ID,
+        version: 2,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({
+      limit: entryLimitMock,
+    }));
+    const secondLeftJoinMock = vi.fn(() => ({
+      where: entryWhereMock,
+    }));
+    const firstLeftJoinMock = vi.fn(() => ({
+      leftJoin: secondLeftJoinMock,
+    }));
+    const entryFromMock = vi.fn(() => ({
+      leftJoin: firstLeftJoinMock,
+    }));
+
+    const versionsOrderByMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000402",
+        memory_entry_id: "00000000-0000-0000-0000-000000000401",
+        content: "remember this",
+        version: 0,
+        author_agent_id: AGENT_ID,
+        created_at: new Date("2026-03-22T01:00:00.000Z"),
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000403",
+        memory_entry_id: "00000000-0000-0000-0000-000000000401",
+        content: "remember this, updated",
+        version: 2,
+        author_agent_id: AGENT_ID,
+        created_at: new Date("2026-03-22T01:15:00.000Z"),
+      },
+    ]);
+    const versionsWhereMock = vi.fn(() => ({
+      orderBy: versionsOrderByMock,
+    }));
+    const versionsFromMock = vi.fn(() => ({
+      where: versionsWhereMock,
+    }));
+
+    const selectMock = vi
+      .fn()
+      .mockReturnValueOnce({
+        from: entryFromMock,
+      })
+      .mockReturnValueOnce({
+        from: versionsFromMock,
+      });
+
+    const updateWhereMock = vi.fn().mockResolvedValue(undefined);
+    const updateSetMock = vi.fn(() => ({
+      where: updateWhereMock,
+    }));
+    const updateMock = vi.fn(() => ({
+      set: updateSetMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+    });
+
+    const result = await fetchMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      "00000000-0000-0000-0000-000000000401",
+    );
+
+    expect(updateMock).toHaveBeenCalledWith(memoryEntries);
+    expect(result).toEqual({
+      entry: {
+        id: "00000000-0000-0000-0000-000000000401",
+        content: "remember this",
+        summary: null,
+        memoryType: "fact",
+        memoryScope: "group",
+        tags: ["ops"],
+        autoTags: [],
+        relatedMemoryIds: [],
+        usefulnessScore: 5,
+        outdated: false,
+        ttlSeconds: null,
+        expiresAt: null,
+        createdAt: "2026-03-22T01:00:00.000Z",
+        lastAccessedAt: "2026-03-22T01:10:00.000Z",
+        authorAgentId: AGENT_ID,
+        authorAgentDisplayName: "test-agent · owner@example.com",
+        groupId: null,
+        userId: USER_ID,
+        version: 2,
+      },
+      versions: [
+        {
+          id: "00000000-0000-0000-0000-000000000402",
+          memoryEntryId: "00000000-0000-0000-0000-000000000401",
+          content: "remember this",
+          version: 0,
+          authorAgentId: AGENT_ID,
+          createdAt: "2026-03-22T01:00:00.000Z",
+        },
+        {
+          id: "00000000-0000-0000-0000-000000000403",
+          memoryEntryId: "00000000-0000-0000-0000-000000000401",
+          content: "remember this, updated",
+          version: 2,
+          authorAgentId: AGENT_ID,
+          createdAt: "2026-03-22T01:15:00.000Z",
+        },
+      ],
+    });
+  });
+});
+
+describe("updateMemory", () => {
+  it("returns a conflict with the current version when optimistic locking fails", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000501",
+        content: "draft",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({
+      limit: entryLimitMock,
+    }));
+    const entryFromMock = vi.fn(() => ({
+      where: entryWhereMock,
+    }));
+    const versionLimitMock = vi.fn().mockResolvedValue([{ version: 4 }]);
+    const versionWhereMock = vi.fn(() => ({
+      limit: versionLimitMock,
+    }));
+    const versionFromMock = vi.fn(() => ({
+      where: versionWhereMock,
+    }));
+    const selectMock = vi
+      .fn()
+      .mockReturnValueOnce({
+        from: entryFromMock,
+      })
+      .mockReturnValueOnce({
+        from: versionFromMock,
+      });
+
+    const returningMock = vi.fn().mockResolvedValue([]);
+    const updateWhereMock = vi.fn(() => ({
+      returning: returningMock,
+    }));
+    const updateSetMock = vi.fn(() => ({
+      where: updateWhereMock,
+    }));
+    const updateMock = vi.fn(() => ({
+      set: updateSetMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+    });
+
+    const result = await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000501",
+      {
+        content: "new draft",
+        expectedVersion: 2,
+      },
+    );
+
+    expect(result).toEqual({
+      error: "conflict",
+      currentVersion: 4,
+    });
+  });
+});
+
+describe("deleteMemory", () => {
+  it("deletes author-owned entries and writes an audit record", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000601",
+        content: "cleanup",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: [],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T03:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T03:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 0,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({
+      limit: entryLimitMock,
+    }));
+    const entryFromMock = vi.fn(() => ({
+      where: entryWhereMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: entryFromMock,
+    }));
+
+    const deleteWhereMock = vi.fn().mockResolvedValue(undefined);
+    const deleteMock = vi.fn(() => ({
+      where: deleteWhereMock,
+    }));
+    const auditValuesMock = vi.fn().mockResolvedValue(undefined);
+    const insertMock = vi.fn(() => ({
+      values: auditValuesMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      delete: deleteMock,
+      insert: insertMock,
+    });
+
+    const result = await deleteMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000601",
+    );
+
+    expect(deleteMock).toHaveBeenCalledWith(memoryEntries);
+    expect(insertMock).toHaveBeenCalledWith(auditLog);
+    expect(result).toEqual({ success: true });
+  });
+});
+
+describe("listAgentMemories", () => {
+  it("returns paginated group memories with author display names", async () => {
+    const limitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000701",
+        content: "alpha memory",
+        summary: "alpha",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 2,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T04:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T04:05:00.000Z"),
+        author_agent_id: "00000000-0000-0000-0000-000000000777",
+        author_agent_display_name: "worker-1 · owner@example.com",
+        group_id: null,
+        user_id: null,
+        version: 0,
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000702",
+        content: "beta memory",
+        summary: null,
+        memory_type: "pattern",
+        memory_scope: "group",
+        tags: ["docs"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 3,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T03:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T03:05:00.000Z"),
+        author_agent_id: "00000000-0000-0000-0000-000000000777",
+        author_agent_display_name: "worker-1 · owner@example.com",
+        group_id: null,
+        user_id: null,
+        version: 1,
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000703",
+        content: "gamma memory",
+        summary: null,
+        memory_type: "procedure",
+        memory_scope: "group",
+        tags: ["runbook"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 1,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:05:00.000Z"),
+        author_agent_id: "00000000-0000-0000-0000-000000000777",
+        author_agent_display_name: "worker-1 · owner@example.com",
+        group_id: null,
+        user_id: null,
+        version: 2,
+      },
+    ]);
+    const orderByMock = vi.fn(() => ({
+      limit: limitMock,
+    }));
+    const whereMock = vi.fn(() => ({
+      orderBy: orderByMock,
+    }));
+    const secondLeftJoinMock = vi.fn(() => ({
+      where: whereMock,
+    }));
+    const firstLeftJoinMock = vi.fn(() => ({
+      leftJoin: secondLeftJoinMock,
+    }));
+    const fromMock = vi.fn(() => ({
+      leftJoin: firstLeftJoinMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: fromMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    const result = await listAgentMemories(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000777",
+      { limit: 2 },
+    );
+
+    expect(fromMock).toHaveBeenCalledWith(memoryEntries);
+    expect(limitMock).toHaveBeenCalledWith(3);
+    expect(result.items).toEqual([
+      {
+        id: "00000000-0000-0000-0000-000000000701",
+        summary: "alpha",
+        memoryType: "fact",
+        memoryScope: "group",
+        tags: ["ops"],
+        autoTags: [],
+        usefulnessScore: 2,
+        outdated: false,
+        createdAt: new Date("2026-03-22T04:00:00.000Z"),
+        authorAgentId: "00000000-0000-0000-0000-000000000777",
+        authorAgentDisplayName: "worker-1 · owner@example.com",
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000702",
+        summary: "beta memory",
+        memoryType: "pattern",
+        memoryScope: "group",
+        tags: ["docs"],
+        autoTags: [],
+        usefulnessScore: 3,
+        outdated: false,
+        createdAt: new Date("2026-03-22T03:00:00.000Z"),
+        authorAgentId: "00000000-0000-0000-0000-000000000777",
+        authorAgentDisplayName: "worker-1 · owner@example.com",
+      },
+    ]);
+    expect(decodeCursor(result.nextCursor!)).toEqual({
+      createdAt: "2026-03-22T03:00:00.000Z",
+      id: "00000000-0000-0000-0000-000000000702",
+    });
+  });
+});
+
+describe("listTags", () => {
+  it("returns distinct visible tags through Drizzle", async () => {
+    const orderByMock = vi.fn().mockResolvedValue([
+      { tag: "docs" },
+      { tag: "ops" },
+      { tag: "runbook" },
+    ]);
+    const whereMock = vi.fn(() => ({
+      orderBy: orderByMock,
+    }));
+    const fromMock = vi.fn(() => ({
+      where: whereMock,
+    }));
+    const selectDistinctMock = vi.fn(() => ({
+      from: fromMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      selectDistinct: selectDistinctMock,
+    });
+
+    const result = await listTags(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      { includeUser: true, includePrivate: true },
+    );
+
+    expect(selectDistinctMock).toHaveBeenCalledWith({
+      tag: expect.any(Object),
+    });
+    expect(fromMock).toHaveBeenCalledWith(memoryEntries);
+    expect(result).toEqual(["docs", "ops", "runbook"]);
+  });
+});
+
+describe("searchMemories", () => {
+  it("returns ranked paginated memories through Drizzle for text search", async () => {
+    const limitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000801",
+        content: "alpha runbook",
+        summary: "alpha summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: [],
+        usefulness_score: 5,
+        outdated: false,
+        created_at: new Date("2026-03-22T05:00:00.000Z"),
+        author_agent_id: "00000000-0000-0000-0000-000000000888",
+        author_agent_display_name: "worker-2 · owner@example.com",
+        search_rank: 5,
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000802",
+        content: "beta notes",
+        summary: null,
+        memory_type: "pattern",
+        memory_scope: "user",
+        tags: ["docs"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 3,
+        outdated: false,
+        created_at: new Date("2026-03-22T04:00:00.000Z"),
+        author_agent_id: "00000000-0000-0000-0000-000000000888",
+        author_agent_display_name: "worker-2 · owner@example.com",
+        search_rank: 3,
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000803",
+        content: "gamma draft",
+        summary: null,
+        memory_type: "procedure",
+        memory_scope: "private",
+        tags: ["runbook"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 1,
+        outdated: true,
+        created_at: new Date("2026-03-22T03:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.5,
+      },
+    ]);
+    const orderByMock = vi.fn(() => ({
+      limit: limitMock,
+    }));
+    const whereMock = vi.fn(() => ({
+      orderBy: orderByMock,
+    }));
+    const secondLeftJoinMock = vi.fn(() => ({
+      where: whereMock,
+    }));
+    const firstLeftJoinMock = vi.fn(() => ({
+      leftJoin: secondLeftJoinMock,
+    }));
+    const fromMock = vi.fn(() => ({
+      leftJoin: firstLeftJoinMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: fromMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    const result = await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        query: "notes",
+        includeUser: true,
+        includePrivate: true,
+        limit: 2,
+      },
+      null,
+    );
+
+    expect(fromMock).toHaveBeenCalledWith(memoryEntries);
+    expect(limitMock).toHaveBeenCalledWith(3);
+    expect(result.items).toEqual([
+      {
+        id: "00000000-0000-0000-0000-000000000801",
+        summary: "alpha summary",
+        memoryType: "fact",
+        memoryScope: "group",
+        tags: ["ops"],
+        autoTags: ["guide"],
+        usefulnessScore: 5,
+        outdated: false,
+        createdAt: new Date("2026-03-22T05:00:00.000Z"),
+        authorAgentId: "00000000-0000-0000-0000-000000000888",
+        authorAgentDisplayName: "worker-2 · owner@example.com",
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000802",
+        summary: "beta notes",
+        memoryType: "pattern",
+        memoryScope: "user",
+        tags: ["docs"],
+        autoTags: [],
+        usefulnessScore: 3,
+        outdated: false,
+        createdAt: new Date("2026-03-22T04:00:00.000Z"),
+        authorAgentId: "00000000-0000-0000-0000-000000000888",
+        authorAgentDisplayName: "worker-2 · owner@example.com",
+      },
+    ]);
+    expect(decodeCursor(result.nextCursor!)).toEqual({
+      createdAt: "2026-03-22T04:00:00.000Z",
+      id: "00000000-0000-0000-0000-000000000802",
+      rank: 3,
+    });
+  });
+
+  it("ignores invalid cursors and keeps semantic rank values", async () => {
+    const limitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000804",
+        content: "vector hit",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["semantic"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 4,
+        outdated: false,
+        created_at: new Date("2026-03-22T06:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.87,
+      },
+    ]);
+    const orderByMock = vi.fn(() => ({
+      limit: limitMock,
+    }));
+    const whereMock = vi.fn(() => ({
+      orderBy: orderByMock,
+    }));
+    const secondLeftJoinMock = vi.fn(() => ({
+      where: whereMock,
+    }));
+    const firstLeftJoinMock = vi.fn(() => ({
+      leftJoin: secondLeftJoinMock,
+    }));
+    const fromMock = vi.fn(() => ({
+      leftJoin: firstLeftJoinMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: fromMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    const result = await searchMemories(
+      {} as TransactionClient,
+      makeAgent(),
+      {
+        query: "vector",
+        cursor: "not-a-real-cursor",
+      },
+      [0.1, 0.2, 0.3],
+    );
+
+    expect(result.items).toHaveLength(1);
+    expect(result.nextCursor).toBeNull();
   });
 });
 

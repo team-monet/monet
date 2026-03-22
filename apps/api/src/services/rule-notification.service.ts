@@ -1,11 +1,11 @@
-import type postgres from "postgres";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
 import type { SessionStore } from "../mcp/session-store";
 import { getActiveRulesForAgent } from "./rule.service";
 
 export async function pushRulesToAgent(
   agentId: string,
   sessionStore: SessionStore,
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
 ): Promise<void> {
   const sessions = sessionStore.getByAgentId(agentId);

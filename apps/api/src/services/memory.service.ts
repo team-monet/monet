@@ -1,4 +1,28 @@
-import type postgres from "postgres";
+import {
+  agentGroupMembers,
+  agentGroups,
+  agents,
+  asDrizzleSqlClient,
+  auditLog,
+  memoryEntries,
+  memoryVersions,
+  type SqlClient,
+  type TransactionClient,
+  tenantUsers,
+} from "@monet/db";
+import {
+  and,
+  arrayOverlaps,
+  asc,
+  desc,
+  eq,
+  ilike,
+  lt,
+  or,
+  sql as drizzleSql,
+  type SQL,
+} from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 import { z } from "zod";
 import type { AgentContext } from "../middleware/context";
 import type {
@@ -6,6 +30,59 @@ import type {
   MemoryEntryTier1,
   UpdateMemoryEntryInput,
 } from "@monet/types";
+
+type MemorySqlClient = SqlClient | TransactionClient;
+type MemoryDrizzleOptions = NonNullable<SqlClient["options"]>;
+
+function createMemoryDb(
+  sql: MemorySqlClient,
+  options?: MemoryDrizzleOptions,
+) {
+  return drizzle(asDrizzleSqlClient(sql, options));
+}
+
+const MEMORY_ENTRY_RETURNING = {
+  id: memoryEntries.id,
+  content: memoryEntries.content,
+  summary: memoryEntries.summary,
+  memory_type: memoryEntries.memoryType,
+  memory_scope: memoryEntries.memoryScope,
+  tags: memoryEntries.tags,
+  auto_tags: memoryEntries.autoTags,
+  related_memory_ids: memoryEntries.relatedMemoryIds,
+  usefulness_score: memoryEntries.usefulnessScore,
+  outdated: memoryEntries.outdated,
+  ttl_seconds: memoryEntries.ttlSeconds,
+  expires_at: memoryEntries.expiresAt,
+  created_at: memoryEntries.createdAt,
+  last_accessed_at: memoryEntries.lastAccessedAt,
+  author_agent_id: memoryEntries.authorAgentId,
+  group_id: memoryEntries.groupId,
+  user_id: memoryEntries.userId,
+  version: memoryEntries.version,
+};
+
+const MEMORY_ENTRY_WITH_AUTHOR_SELECT = {
+  ...MEMORY_ENTRY_RETURNING,
+  author_agent_display_name: drizzleSql<string | null>`
+    CASE
+      WHEN ${agents.id} IS NULL THEN NULL
+      WHEN ${agents.isAutonomous} THEN ${agents.externalId} || ' (Autonomous)'
+      WHEN ${tenantUsers.email} IS NOT NULL THEN ${agents.externalId} || ' · ' || ${tenantUsers.email}
+      WHEN ${tenantUsers.externalId} IS NOT NULL THEN ${agents.externalId} || ' · ' || ${tenantUsers.externalId}
+      ELSE ${agents.externalId}
+    END
+  `,
+};
+
+const MEMORY_VERSION_RETURNING = {
+  id: memoryVersions.id,
+  memory_entry_id: memoryVersions.memoryEntryId,
+  content: memoryVersions.content,
+  version: memoryVersions.version,
+  author_agent_id: memoryVersions.authorAgentId,
+  created_at: memoryVersions.createdAt,
+};
 
 // ---------- Cursor helpers ----------
 
@@ -49,9 +126,9 @@ function mapRow(row: Record<string, unknown>) {
     usefulnessScore: row.usefulness_score as number,
     outdated: row.outdated as boolean,
     ttlSeconds: (row.ttl_seconds as number) ?? null,
-    expiresAt: (row.expires_at as string) ?? null,
-    createdAt: row.created_at as string,
-    lastAccessedAt: row.last_accessed_at as string,
+    expiresAt: row.expires_at ? asTimestamp(row.expires_at) : null,
+    createdAt: asTimestamp(row.created_at),
+    lastAccessedAt: asTimestamp(row.last_accessed_at),
     authorAgentId: row.author_agent_id as string,
     authorAgentDisplayName: (row.author_agent_display_name as string | null) ?? null,
     groupId: (row.group_id as string) ?? null,
@@ -67,7 +144,7 @@ function mapVersion(row: Record<string, unknown>) {
     content: row.content as string,
     version: row.version as number,
     authorAgentId: row.author_agent_id as string,
-    createdAt: row.created_at as string,
+    createdAt: asTimestamp(row.created_at),
   };
 }
 
@@ -87,35 +164,10 @@ function mapTier1Row(row: Record<string, unknown>): MemoryEntryTier1 {
   };
 }
 
-const MEMORY_AUTHOR_DISPLAY_SELECT = `
-  CASE
-    WHEN author_agent.id IS NULL THEN NULL
-    WHEN author_agent.is_autonomous THEN author_agent.external_id || ' (Autonomous)'
-    WHEN author_owner.email IS NOT NULL THEN author_agent.external_id || ' · ' || author_owner.email
-    WHEN author_owner.external_id IS NOT NULL THEN author_agent.external_id || ' · ' || author_owner.external_id
-    ELSE author_agent.external_id
-  END AS author_agent_display_name
-`;
-
-function buildMemoryEntrySelect(rankExpression?: string) {
-  const rankSelect = rankExpression
-    ? `${rankExpression} AS search_rank,\n    `
-    : "";
-
-  return `
-    SELECT
-      me.*,
-      ${rankSelect}${MEMORY_AUTHOR_DISPLAY_SELECT}
-    FROM memory_entries me
-    LEFT JOIN public.agents author_agent ON author_agent.id = me.author_agent_id
-    LEFT JOIN public.users author_owner ON author_owner.id = author_agent.user_id
-  `;
-}
-
 // ---------- Audit log ----------
 
 export async function writeAuditLog(
-  tx: postgres.Sql,
+  tx: MemorySqlClient,
   tenantId: string,
   agentId: string,
   action: string,
@@ -123,10 +175,16 @@ export async function writeAuditLog(
   outcome: string,
   metadata?: Record<string, unknown>,
 ) {
-  await tx`
-    INSERT INTO audit_log (tenant_id, actor_id, actor_type, action, target_id, outcome, metadata)
-    VALUES (${tenantId}, ${agentId}, ${"agent"}, ${action}, ${targetId}, ${outcome}, ${metadata ? JSON.stringify(metadata) : null})
-  `;
+  const db = createMemoryDb(tx);
+  await db.insert(auditLog).values({
+    tenantId,
+    actorId: agentId,
+    actorType: "agent",
+    action,
+    targetId,
+    outcome,
+    metadata: metadata ?? null,
+  });
 }
 
 // ---------- Scope filter ----------
@@ -142,39 +200,83 @@ export interface MemoryWritePreflight {
   groupId: string | null;
 }
 
-/**
- * Build scope visibility filter fragments.
- * Returns an array of SQL conditions (with `$N` placeholders) and a matching
- * params array that should be OR'd together.
- *
- * - group: always visible
- * - user: visible when includeUser=true AND agent shares same userId
- * - private: visible when includePrivate=true AND agent is the author
- *
- * @param paramOffset - the number of params already accumulated by the caller
- *   so that placeholder indices continue correctly (e.g. pass `params.length`).
- */
-export function buildScopeFilter(
+function buildScopeFilterCondition(
   agent: AgentContext,
   opts: ScopeFilterOpts,
-  paramOffset = 0,
-): { conditions: string[]; params: postgres.ParameterOrJSON<never>[] } {
-  const conditions: string[] = ["me.memory_scope = 'group'"];
-  const params: postgres.ParameterOrJSON<never>[] = [];
+): SQL<unknown> {
+  const conditions: SQL<unknown>[] = [eq(memoryEntries.memoryScope, "group")];
 
   if (opts.includeUser && agent.userId) {
-    params.push(agent.userId);
-    conditions.push(`(me.memory_scope = 'user' AND me.user_id = $${paramOffset + params.length})`);
-  }
-
-  if (opts.includePrivate) {
-    params.push(agent.id);
     conditions.push(
-      `(me.memory_scope = 'private' AND me.author_agent_id = $${paramOffset + params.length})`,
+      and(
+        eq(memoryEntries.memoryScope, "user"),
+        eq(memoryEntries.userId, agent.userId),
+      )!,
     );
   }
 
-  return { conditions, params };
+  if (opts.includePrivate) {
+    conditions.push(
+      and(
+        eq(memoryEntries.memoryScope, "private"),
+        eq(memoryEntries.authorAgentId, agent.id),
+      )!,
+    );
+  }
+
+  return conditions.length === 1 ? conditions[0] : or(...conditions)!;
+}
+
+function buildNonExpiredCondition(): SQL<unknown> {
+  return or(
+    drizzleSql`${memoryEntries.expiresAt} IS NULL`,
+    drizzleSql`${memoryEntries.expiresAt} > NOW()`,
+  )!;
+}
+
+function buildCreatedAtCursorCondition(cursor: SearchCursorPayload): SQL<unknown> {
+  return or(
+    drizzleSql`${memoryEntries.createdAt} < ${cursor.createdAt}::timestamptz`,
+    and(
+      drizzleSql`${memoryEntries.createdAt} = ${cursor.createdAt}::timestamptz`,
+      lt(memoryEntries.id, cursor.id),
+    )!,
+  )!;
+}
+
+function buildSearchRankExpression(
+  queryEmbedding: number[] | null,
+): SQL<number | null> {
+  const usefulnessWeight = drizzleSql`GREATEST(${memoryEntries.usefulnessScore}, 1)`;
+  const outdatedWeight = drizzleSql`CASE WHEN ${memoryEntries.outdated} THEN 0.5 ELSE 1.0 END`;
+
+  if (!queryEmbedding) {
+    return drizzleSql<number>`(${usefulnessWeight} * ${outdatedWeight})`;
+  }
+
+  const vectorLiteral = toVectorLiteral(queryEmbedding);
+  return drizzleSql<number | null>`
+    CASE
+      WHEN ${memoryEntries.embedding} IS NULL THEN NULL
+      ELSE ((1 - (${memoryEntries.embedding} <=> ${vectorLiteral}::vector)) * ${usefulnessWeight} * ${outdatedWeight})
+    END
+  `;
+}
+
+function buildSearchCursorCondition(
+  rankExpression: SQL<number | null>,
+  cursor: SearchCursorPayload,
+): SQL<unknown> {
+  const createdAtCursorCondition = buildCreatedAtCursorCondition(cursor);
+
+  if (cursor.rank === undefined) {
+    return createdAtCursorCondition;
+  }
+
+  return or(
+    lt(rankExpression, cursor.rank),
+    and(eq(rankExpression, cursor.rank), createdAtCursorCondition)!,
+  )!;
 }
 
 // ---------- Quota ----------
@@ -182,20 +284,23 @@ export function buildScopeFilter(
 const DEFAULT_MEMORY_QUOTA = 10000;
 
 export async function resolveMemoryWritePreflight(
-  platformSql: postgres.Sql | null,
+  platformSql: SqlClient | null,
   agent: AgentContext,
 ): Promise<MemoryWritePreflight | null> {
   if (!platformSql) {
     return null;
   }
 
-  const rows = await platformSql`
-    SELECT ag.memory_quota, ag.id AS group_id
-    FROM agent_group_members agm
-    JOIN agent_groups ag ON ag.id = agm.group_id
-    WHERE agm.agent_id = ${agent.id}
-    LIMIT 1
-  `;
+  const db = createMemoryDb(platformSql);
+  const rows = await db
+    .select({
+      memoryQuota: agentGroups.memoryQuota,
+      groupId: agentGroups.id,
+    })
+    .from(agentGroupMembers)
+    .innerJoin(agentGroups, eq(agentGroups.id, agentGroupMembers.groupId))
+    .where(eq(agentGroupMembers.agentId, agent.id))
+    .limit(1);
 
   if (rows.length === 0) {
     return {
@@ -207,8 +312,8 @@ export async function resolveMemoryWritePreflight(
 
   return {
     hasGroupMembership: true,
-    memoryQuota: (rows[0].memory_quota as number | null) ?? null,
-    groupId: (rows[0].group_id as string) ?? null,
+    memoryQuota: rows[0].memoryQuota ?? null,
+    groupId: rows[0].groupId ?? null,
   };
 }
 
@@ -217,17 +322,20 @@ export async function resolveMemoryWritePreflight(
  * Quota is resolved from the agent's group (memory_quota column) or falls back to a default.
  */
 export async function checkQuota(
-  tx: postgres.Sql,
+  tx: MemorySqlClient,
   agent: AgentContext,
   quotaOverride: number | null = null,
 ): Promise<{ error: "quota_exceeded"; limit: number; current: number } | null> {
   const quota = quotaOverride && quotaOverride > 0 ? quotaOverride : DEFAULT_MEMORY_QUOTA;
 
-  // Count current entries by this agent in the tenant schema
-  const [result] = await tx`
-    SELECT COUNT(*)::int AS count FROM memory_entries WHERE author_agent_id = ${agent.id}
-  `;
-  const current = (result.count as number) ?? 0;
+  const db = createMemoryDb(tx);
+  const [result] = await db
+    .select({
+      count: drizzleSql<number>`count(*)`.mapWith(Number),
+    })
+    .from(memoryEntries)
+    .where(eq(memoryEntries.authorAgentId, agent.id));
+  const current = result?.count ?? 0;
 
   if (current >= quota) {
     return { error: "quota_exceeded", limit: quota, current };
@@ -239,12 +347,12 @@ export async function checkQuota(
 // ---------- Core CRUD ----------
 
 export async function createMemory(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   input: CreateMemoryEntryInput,
   preflight: MemoryWritePreflight | null = null,
 ) {
-  const tx = txSql as unknown as postgres.Sql;
+  const db = createMemoryDb(txSql);
 
   // Autonomous agents cannot store user-scoped entries (they have no user binding)
   if (agent.isAutonomous && input.memoryScope === "user") {
@@ -257,46 +365,47 @@ export async function createMemory(
   }
 
   // Quota enforcement
-  const quotaErr = await checkQuota(tx, agent, preflight?.memoryQuota ?? null);
+  const quotaErr = await checkQuota(txSql, agent, preflight?.memoryQuota ?? null);
   if (quotaErr) return quotaErr;
 
   const expiresAt = input.ttlSeconds
-    ? new Date(Date.now() + input.ttlSeconds * 1000).toISOString()
+    ? new Date(Date.now() + input.ttlSeconds * 1000)
     : null;
 
   const groupId = preflight?.groupId ?? null;
 
-  const [entry] = await tx`
-    INSERT INTO memory_entries (content, memory_type, memory_scope, tags, ttl_seconds, expires_at, author_agent_id, user_id, group_id, version)
-    VALUES (
-      ${input.content},
-      ${input.memoryType},
-      ${input.memoryScope},
-      ${input.tags},
-      ${input.ttlSeconds ?? null},
-      ${expiresAt},
-      ${agent.id},
-      ${agent.userId},
-      ${groupId},
-      ${0}
-    )
-    RETURNING *
-  `;
+  const [entry] = await db
+    .insert(memoryEntries)
+    .values({
+      content: input.content,
+      memoryType: input.memoryType,
+      memoryScope: input.memoryScope,
+      tags: input.tags,
+      ttlSeconds: input.ttlSeconds ?? null,
+      expiresAt,
+      authorAgentId: agent.id,
+      userId: agent.userId,
+      groupId,
+      version: 0,
+    })
+    .returning(MEMORY_ENTRY_RETURNING);
 
   // Insert initial version snapshot (v0)
-  await tx`
-    INSERT INTO memory_versions (memory_entry_id, content, version, author_agent_id)
-    VALUES (${entry.id}, ${input.content}, ${0}, ${agent.id})
-  `;
+  await db.insert(memoryVersions).values({
+    memoryEntryId: entry.id,
+    content: input.content,
+    version: 0,
+    authorAgentId: agent.id,
+  });
 
   // Audit log
-  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.create", entry.id as string, "success");
+  await writeAuditLog(txSql, agent.tenantId, agent.id, "memory.create", entry.id, "success");
 
   return mapRow(entry as Record<string, unknown>);
 }
 
 export async function searchMemories(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   query: {
     query?: string;
@@ -313,114 +422,74 @@ export async function searchMemories(
   },
   queryEmbedding: number[] | null = null,
 ) {
-  const tx = txSql as unknown as postgres.Sql;
+  const db = createMemoryDb(txSql);
   const limit = query.limit ?? 20;
+  const rankExpression = buildSearchRankExpression(queryEmbedding);
+  const conditions: SQL<unknown>[] = [
+    buildScopeFilterCondition(agent, {
+      includeUser: query.includeUser ?? false,
+      includePrivate: query.includePrivate ?? false,
+    }),
+    buildNonExpiredCondition(),
+  ];
 
-  // Build WHERE clauses with parameterized values
-  const params: postgres.ParameterOrJSON<never>[] = [];
-  const conditions: string[] = [];
-
-  // Scope filter
-  const scopeFilter = buildScopeFilter(agent, {
-    includeUser: query.includeUser ?? false,
-    includePrivate: query.includePrivate ?? false,
-  }, params.length);
-  params.push(...scopeFilter.params);
-  conditions.push(`(${scopeFilter.conditions.join(" OR ")})`);
-
-  // Exclude expired
-  conditions.push(
-    `(me.expires_at IS NULL OR me.expires_at > NOW())`,
-  );
-
-  // Text search
   if (query.query && !queryEmbedding) {
-    params.push(query.query);
-    conditions.push(`me.content ILIKE '%' || $${params.length} || '%'`);
+    conditions.push(ilike(memoryEntries.content, `%${query.query}%`));
   }
 
-  // Tag overlap
   if (query.tags && query.tags.length > 0) {
-    params.push(query.tags);
-    conditions.push(`me.tags && $${params.length}::text[]`);
+    conditions.push(arrayOverlaps(memoryEntries.tags, query.tags));
   }
 
-  // Memory type
   if (query.memoryType) {
-    params.push(query.memoryType);
-    conditions.push(`me.memory_type = $${params.length}::memory_type`);
+    conditions.push(
+      drizzleSql`${memoryEntries.memoryType} = ${query.memoryType}::memory_type`,
+    );
   }
 
-  // Date range
   if (query.createdAfter) {
-    params.push(query.createdAfter);
-    conditions.push(`me.created_at >= $${params.length}::timestamptz`);
+    conditions.push(
+      drizzleSql`${memoryEntries.createdAt} >= ${query.createdAfter}::timestamptz`,
+    );
   }
   if (query.createdBefore) {
-    params.push(query.createdBefore);
-    conditions.push(`me.created_at <= $${params.length}::timestamptz`);
+    conditions.push(
+      drizzleSql`${memoryEntries.createdAt} <= ${query.createdBefore}::timestamptz`,
+    );
   }
   if (query.accessedAfter) {
-    params.push(query.accessedAfter);
-    conditions.push(`me.last_accessed_at >= $${params.length}::timestamptz`);
+    conditions.push(
+      drizzleSql`${memoryEntries.lastAccessedAt} >= ${query.accessedAfter}::timestamptz`,
+    );
   }
   if (query.accessedBefore) {
-    params.push(query.accessedBefore);
-    conditions.push(`me.last_accessed_at <= $${params.length}::timestamptz`);
+    conditions.push(
+      drizzleSql`${memoryEntries.lastAccessedAt} <= ${query.accessedBefore}::timestamptz`,
+    );
   }
 
-  // Cursor pagination (created_at, id)
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
-    if (!decoded) {
-      // Invalid cursor — ignore and return results from the start
-    } else if (decoded.rank !== undefined) {
-      params.push(decoded.rank);
-      const cursorRankIdx = params.length;
-      // Only guard with "embedding IS NULL → NULL" when doing semantic search;
-      // for plain browsing the rank expression doesn't reference me.embedding.
-      // INVARIANT: must produce the same SQL as the search_rank alias in buildMemoryEntrySelect().
-      const cursorRankParams: postgres.ParameterOrJSON<never>[] = [];
-      const cursorRankExprRaw = buildRankExpression(queryEmbedding, cursorRankParams, params.length);
-      params.push(...cursorRankParams);
-      const rankExpr = queryEmbedding
-        ? `(CASE WHEN me.embedding IS NULL THEN NULL ELSE ${cursorRankExprRaw} END)`
-        : cursorRankExprRaw;
-      params.push(decoded.createdAt);
-      const createdAtIdx = params.length;
-      params.push(decoded.id);
-      const idIdx = params.length;
-      conditions.push(
-        `((${rankExpr} < $${cursorRankIdx}) OR (${rankExpr} = $${cursorRankIdx} AND (me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)))`,
-      );
-    } else {
-      params.push(decoded.createdAt);
-      const createdAtIdx = params.length;
-      params.push(decoded.id);
-      const idIdx = params.length;
-      conditions.push(
-        `(me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`,
-      );
+    if (decoded) {
+      conditions.push(buildSearchCursorCondition(rankExpression, decoded));
     }
   }
 
-  // Build the rank expression for the SELECT clause
-  const selectRankParams: postgres.ParameterOrJSON<never>[] = [];
-  const rankExpression = buildRankExpression(queryEmbedding, selectRankParams, params.length);
-  params.push(...selectRankParams);
-
-  const where = conditions.join(" AND ");
-  const orderBy = `ORDER BY search_rank DESC NULLS LAST, me.created_at DESC, me.id DESC`;
-  params.push(limit + 1);
-  const limitIdx = params.length;
-  const sql = `
-    ${buildMemoryEntrySelect(rankExpression)}
-    WHERE ${where}
-    ${orderBy}
-    LIMIT $${limitIdx}
-  `;
-
-  const rows = await tx.unsafe(sql, params);
+  const rows = await db
+    .select({
+      ...MEMORY_ENTRY_WITH_AUTHOR_SELECT,
+      search_rank: rankExpression,
+    })
+    .from(memoryEntries)
+    .leftJoin(agents, eq(agents.id, memoryEntries.authorAgentId))
+    .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+    .where(and(...conditions))
+    .orderBy(
+      drizzleSql`${rankExpression} DESC NULLS LAST`,
+      desc(memoryEntries.createdAt),
+      desc(memoryEntries.id),
+    )
+    .limit(limit + 1);
 
   const hasMore = rows.length > limit;
   const items = (rows.slice(0, limit) as Record<string, unknown>[]).map(mapTier1Row);
@@ -439,7 +508,7 @@ export async function searchMemories(
 }
 
 export async function listAgentMemories(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   targetAgentId: string,
   query: {
@@ -447,52 +516,42 @@ export async function listAgentMemories(
     limit?: number;
   },
 ) {
-  const tx = txSql as unknown as postgres.Sql;
+  const db = createMemoryDb(txSql);
   const limit = query.limit ?? 20;
-  const params: postgres.ParameterOrJSON<never>[] = [];
-
-  params.push(targetAgentId);
-  const conditions = [
-    `me.author_agent_id = $${params.length}`,
-    `me.memory_scope = 'group'`,
-    `(me.expires_at IS NULL OR me.expires_at > NOW())`,
+  const conditions: SQL<unknown>[] = [
+    eq(memoryEntries.authorAgentId, targetAgentId),
+    eq(memoryEntries.memoryScope, "group"),
+    buildNonExpiredCondition(),
   ];
 
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
     if (decoded) {
-      params.push(decoded.createdAt);
-      const createdAtIdx = params.length;
-      params.push(decoded.id);
-      const idIdx = params.length;
-      conditions.push(
-        `(me.created_at, me.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`,
-      );
+      conditions.push(buildCreatedAtCursorCondition(decoded));
     }
   }
 
-  params.push(limit + 1);
-  const limitIdx = params.length;
-
   // Group memories are visible to all group members. The current codebase treats
   // group scope as globally visible within the tenant schema, so match that here.
-  const rows = await tx.unsafe(
-    `
-      ${buildMemoryEntrySelect()}
-      WHERE ${conditions.join(" AND ")}
-      ORDER BY me.created_at DESC, me.id DESC
-      LIMIT $${limitIdx}
-    `,
-    params,
-  );
+  const rows = await db
+    .select(MEMORY_ENTRY_WITH_AUTHOR_SELECT)
+    .from(memoryEntries)
+    .leftJoin(agents, eq(agents.id, memoryEntries.authorAgentId))
+    .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+    .where(and(...conditions))
+    .orderBy(desc(memoryEntries.createdAt), desc(memoryEntries.id))
+    .limit(limit + 1);
 
   const hasMore = rows.length > limit;
   const items = (rows.slice(0, limit) as Record<string, unknown>[]).map(mapTier1Row);
 
   let nextCursor: string | null = null;
   if (hasMore && items.length > 0) {
-    const last = items[items.length - 1];
-    nextCursor = encodeCursor(last.createdAt.toISOString(), last.id);
+    const last = rows[Math.min(limit - 1, rows.length - 1)] as Record<string, unknown>;
+    nextCursor = encodeCursor(
+      asTimestamp(last.created_at),
+      last.id as string,
+    );
   }
 
   void agent;
@@ -501,20 +560,18 @@ export async function listAgentMemories(
 }
 
 export async function fetchMemory(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   id: string,
 ) {
-  const tx = txSql as unknown as postgres.Sql;
-
-  const [entry] = await tx.unsafe(
-    `
-      ${buildMemoryEntrySelect()}
-      WHERE me.id = $1::uuid
-      LIMIT 1
-    `,
-    [id],
-  );
+  const db = createMemoryDb(txSql);
+  const [entry] = await db
+    .select(MEMORY_ENTRY_WITH_AUTHOR_SELECT)
+    .from(memoryEntries)
+    .leftJoin(agents, eq(agents.id, memoryEntries.authorAgentId))
+    .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+    .where(eq(memoryEntries.id, id))
+    .limit(1);
 
   if (!entry) {
     return { error: "not_found" as const };
@@ -525,18 +582,20 @@ export async function fetchMemory(
   if (scopeErr) return scopeErr;
 
   // Increment usefulness score and update last_accessed_at
-  await tx`
-    UPDATE memory_entries
-    SET usefulness_score = usefulness_score + 1, last_accessed_at = NOW()
-    WHERE id = ${id}
-  `;
+  await db
+    .update(memoryEntries)
+    .set({
+      usefulnessScore: drizzleSql`${memoryEntries.usefulnessScore} + 1`,
+      lastAccessedAt: drizzleSql`NOW()`,
+    })
+    .where(eq(memoryEntries.id, id));
 
   // Fetch versions
-  const versions = await tx`
-    SELECT * FROM memory_versions
-    WHERE memory_entry_id = ${id}
-    ORDER BY version ASC
-  `;
+  const versions = await db
+    .select(MEMORY_VERSION_RETURNING)
+    .from(memoryVersions)
+    .where(eq(memoryVersions.memoryEntryId, id))
+    .orderBy(asc(memoryVersions.version));
 
   return {
     entry: mapRow(entry as Record<string, unknown>),
@@ -545,16 +604,17 @@ export async function fetchMemory(
 }
 
 export async function updateMemory(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   id: string,
   input: UpdateMemoryEntryInput,
 ) {
-  const tx = txSql as unknown as postgres.Sql;
-
-  const [entry] = await tx`
-    SELECT * FROM memory_entries WHERE id = ${id}
-  `;
+  const db = createMemoryDb(txSql);
+  const [entry] = await db
+    .select(MEMORY_ENTRY_RETURNING)
+    .from(memoryEntries)
+    .where(eq(memoryEntries.id, id))
+    .limit(1);
 
   if (!entry) {
     return { error: "not_found" as const };
@@ -567,52 +627,58 @@ export async function updateMemory(
   const newVersion = (entry.version as number) + 1;
   const newContent = input.content ?? (entry.content as string);
   const newTags = input.tags ?? (entry.tags as string[]);
-  const [updated] = await tx`
-    WITH updated AS (
-      UPDATE memory_entries
-      SET
-        content = ${newContent},
-        tags = ${newTags},
-        version = ${newVersion},
-        last_accessed_at = NOW()
-      WHERE id = ${id} AND version = ${input.expectedVersion}
-      RETURNING *
-    ),
-    inserted_version AS (
-      INSERT INTO memory_versions (memory_entry_id, content, version, author_agent_id)
-      SELECT id, content, version, ${agent.id}
-      FROM updated
-      RETURNING id
+  const [updated] = await db
+    .update(memoryEntries)
+    .set({
+      content: newContent,
+      tags: newTags,
+      version: newVersion,
+      lastAccessedAt: drizzleSql`NOW()`,
+    })
+    .where(
+      and(
+        eq(memoryEntries.id, id),
+        eq(memoryEntries.version, input.expectedVersion),
+      ),
     )
-    SELECT * FROM updated
-  `;
+    .returning(MEMORY_ENTRY_RETURNING);
 
   if (!updated) {
-    const [current] = await tx`
-      SELECT version FROM memory_entries WHERE id = ${id}
-    `;
+    const [current] = await db
+      .select({ version: memoryEntries.version })
+      .from(memoryEntries)
+      .where(eq(memoryEntries.id, id))
+      .limit(1);
     return {
       error: "conflict" as const,
-      currentVersion: (current?.version as number) ?? input.expectedVersion,
+      currentVersion: current?.version ?? input.expectedVersion,
     };
   }
 
+  await db.insert(memoryVersions).values({
+    memoryEntryId: updated.id,
+    content: newContent,
+    version: newVersion,
+    authorAgentId: agent.id,
+  });
+
   // Audit log
-  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.update", id, "success");
+  await writeAuditLog(txSql, agent.tenantId, agent.id, "memory.update", id, "success");
 
   return { entry: mapRow(updated as Record<string, unknown>) };
 }
 
 export async function deleteMemory(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   id: string,
 ) {
-  const tx = txSql as unknown as postgres.Sql;
-
-  const [entry] = await tx`
-    SELECT * FROM memory_entries WHERE id = ${id}
-  `;
+  const db = createMemoryDb(txSql);
+  const [entry] = await db
+    .select(MEMORY_ENTRY_RETURNING)
+    .from(memoryEntries)
+    .where(eq(memoryEntries.id, id))
+    .limit(1);
 
   if (!entry) {
     return { error: "not_found" as const };
@@ -623,24 +689,25 @@ export async function deleteMemory(
     return { error: "forbidden" as const };
   }
 
-  await tx`DELETE FROM memory_entries WHERE id = ${id}`;
+  await db.delete(memoryEntries).where(eq(memoryEntries.id, id));
 
   // Audit log
-  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.delete", id, "success");
+  await writeAuditLog(txSql, agent.tenantId, agent.id, "memory.delete", id, "success");
 
   return { success: true };
 }
 
 export async function markOutdated(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   id: string,
 ) {
-  const tx = txSql as unknown as postgres.Sql;
-
-  const [entry] = await tx`
-    SELECT * FROM memory_entries WHERE id = ${id}
-  `;
+  const db = createMemoryDb(txSql);
+  const [entry] = await db
+    .select(MEMORY_ENTRY_RETURNING)
+    .from(memoryEntries)
+    .where(eq(memoryEntries.id, id))
+    .limit(1);
 
   if (!entry) {
     return { error: "not_found" as const };
@@ -650,11 +717,19 @@ export async function markOutdated(
   const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent);
   if (scopeErr) return scopeErr;
 
-  await tx`
-    UPDATE memory_entries SET outdated = true WHERE id = ${id}
-  `;
+  await db
+    .update(memoryEntries)
+    .set({ outdated: true })
+    .where(eq(memoryEntries.id, id));
 
-  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.mark_outdated", id, "success");
+  await writeAuditLog(
+    txSql,
+    agent.tenantId,
+    agent.id,
+    "memory.mark_outdated",
+    id,
+    "success",
+  );
 
   return { success: true };
 }
@@ -662,16 +737,17 @@ export async function markOutdated(
 const SCOPE_ORDER: Record<string, number> = { private: 0, user: 1, group: 2 };
 
 export async function promoteScope(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   id: string,
   newScope: string,
 ) {
-  const tx = txSql as unknown as postgres.Sql;
-
-  const [entry] = await tx`
-    SELECT * FROM memory_entries WHERE id = ${id}
-  `;
+  const db = createMemoryDb(txSql);
+  const [entry] = await db
+    .select(MEMORY_ENTRY_RETURNING)
+    .from(memoryEntries)
+    .where(eq(memoryEntries.id, id))
+    .limit(1);
 
   if (!entry) {
     return { error: "not_found" as const };
@@ -697,34 +773,48 @@ export async function promoteScope(
     return { error: "no_change" as const };
   }
 
-  await tx`
-    UPDATE memory_entries SET memory_scope = ${newScope} WHERE id = ${id}
-  `;
+  await db
+    .update(memoryEntries)
+    .set({
+      memoryScope: newScope as "group" | "user" | "private",
+    })
+    .where(eq(memoryEntries.id, id));
 
   // Audit log
-  await writeAuditLog(tx, agent.tenantId, agent.id, "memory.scope_change", id, "success");
+  await writeAuditLog(
+    txSql,
+    agent.tenantId,
+    agent.id,
+    "memory.scope_change",
+    id,
+    "success",
+  );
 
   return { success: true, scope: newScope };
 }
 
 export async function listTags(
-  txSql: postgres.TransactionSql,
+  txSql: TransactionClient,
   agent: AgentContext,
   opts: ScopeFilterOpts = { includeUser: false, includePrivate: false },
 ) {
-  const tx = txSql as unknown as postgres.Sql;
+  const db = createMemoryDb(txSql);
+  const tagExpression = drizzleSql<string>`unnest(${memoryEntries.tags})`;
 
-  const params: postgres.ParameterOrJSON<never>[] = [];
-  const scopeFilter = buildScopeFilter(agent, opts, params.length);
-  params.push(...scopeFilter.params);
-  const where = scopeFilter.conditions.join(" OR ");
+  const rows = await db
+    .selectDistinct({ tag: tagExpression })
+    .from(memoryEntries)
+    .where(
+      and(
+        buildScopeFilterCondition(agent, opts),
+        buildNonExpiredCondition(),
+      ),
+    )
+    .orderBy(tagExpression);
 
-  const rows = await tx.unsafe(
-    `SELECT DISTINCT unnest(me.tags) AS tag FROM memory_entries me WHERE (${where}) AND (me.expires_at IS NULL OR me.expires_at > NOW()) ORDER BY tag`,
-    params,
-  );
-
-  return (rows as Record<string, unknown>[]).map((r) => r.tag as string);
+  return rows
+    .map((row) => row.tag)
+    .filter((tag): tag is string => typeof tag === "string" && tag.length > 0);
 }
 
 // ---------- Internal helpers ----------
@@ -781,19 +871,4 @@ function asTimestamp(value: unknown): string {
     return value.toISOString();
   }
   return String(value);
-}
-
-function buildRankExpression(
-  queryEmbedding: number[] | null,
-  params: postgres.ParameterOrJSON<never>[],
-  paramOffset = 0,
-): string {
-  const usefulnessWeight = "GREATEST(me.usefulness_score, 1)";
-  const outdatedWeight = "CASE WHEN me.outdated THEN 0.5 ELSE 1.0 END";
-  if (!queryEmbedding) {
-    return `(${usefulnessWeight} * ${outdatedWeight})`;
-  }
-
-  params.push(toVectorLiteral(queryEmbedding));
-  return `((1 - (me.embedding <=> $${paramOffset + params.length}::vector)) * ${usefulnessWeight} * ${outdatedWeight})`;
 }

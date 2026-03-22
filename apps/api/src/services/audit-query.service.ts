@@ -1,6 +1,20 @@
-import postgres from "postgres";
+import { alias } from "drizzle-orm/pg-core";
 import { z } from "zod";
-import { tenantSchemaNameFromId, withTenantScope } from "@monet/db";
+import {
+  and,
+  desc,
+  eq,
+  sql as drizzleSql,
+  type SQL,
+} from "drizzle-orm";
+import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import {
+  agents,
+  auditLog,
+  tenantSchemaNameFromId,
+  tenantUsers,
+  withTenantDrizzleScope,
+} from "@monet/db";
 
 export interface AuditQueryOptions {
   actorId?: string;
@@ -21,8 +35,8 @@ export function encodeAuditCursor(createdAt: string, id: string): string {
 }
 
 const AuditCursorSchema = z.object({
-  createdAt: z.string(),
-  id: z.string(),
+  createdAt: z.string().datetime({ offset: true }),
+  id: z.string().uuid(),
 });
 
 export function decodeAuditCursor(cursor: string): AuditCursorPayload | null {
@@ -39,74 +53,93 @@ export function decodeAuditCursor(cursor: string): AuditCursorPayload | null {
  * Uses withTenantScope to ensure the correct schema is used.
  */
 export async function queryAuditLogs(
-  sql: postgres.Sql,
+  sql: SqlClient,
   tenantId: string,
   options: AuditQueryOptions = {},
 ) {
   const schemaName = tenantSchemaNameFromId(tenantId);
-  const limit = options.limit || 100;
+  const limit = options.limit ?? 100;
+  const actorAgent = alias(agents, "actor_agent");
+  const actorAgentOwner = alias(tenantUsers, "actor_agent_owner");
+  const actorUser = alias(tenantUsers, "actor_user");
 
-  return withTenantScope(sql, schemaName, async (tx) => {
-    // Start building the query
-    let queryText = `
-      SELECT
-        al.*,
-        CASE
-          WHEN al.actor_type = 'agent' AND actor_agent.id IS NOT NULL THEN
-            CASE
-              WHEN actor_agent.is_autonomous THEN actor_agent.external_id || ' (Autonomous)'
-              WHEN actor_agent_owner.display_name IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.display_name
-              WHEN actor_agent_owner.email IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.email
-              WHEN actor_agent_owner.external_id IS NOT NULL THEN actor_agent.external_id || ' · ' || actor_agent_owner.external_id
-              ELSE actor_agent.external_id
-            END
-          WHEN al.actor_type = 'user' THEN COALESCE(actor_user.display_name, actor_user.email, actor_user.external_id)
-          WHEN al.actor_type = 'system' THEN 'System'
-          ELSE NULL
-        END AS actor_display_name
-      FROM audit_log al
-      LEFT JOIN public.agents actor_agent
-        ON al.actor_type = 'agent' AND actor_agent.id = al.actor_id
-      LEFT JOIN public.users actor_agent_owner
-        ON actor_agent_owner.id = actor_agent.user_id
-      LEFT JOIN public.users actor_user
-        ON al.actor_type = 'user' AND actor_user.id = al.actor_id
-      WHERE 1=1
-    `;
-    const queryParams: postgres.ParameterOrJSON<never>[] = [];
+  const conditions: SQL[] = [];
 
-    if (options.actorId) {
-      queryParams.push(options.actorId);
-      queryText += ` AND al.actor_id = $${queryParams.length}`;
-    }
-    if (options.action) {
-      queryParams.push(options.action);
-      queryText += ` AND al.action = $${queryParams.length}`;
-    }
-    if (options.startDate) {
-      queryParams.push(options.startDate);
-      queryText += ` AND al.created_at >= $${queryParams.length}`;
-    }
-    if (options.endDate) {
-      queryParams.push(options.endDate);
-      queryText += ` AND al.created_at <= $${queryParams.length}`;
-    }
+  if (options.actorId) {
+    conditions.push(eq(auditLog.actorId, options.actorId));
+  }
+  if (options.action) {
+    conditions.push(eq(auditLog.action, options.action));
+  }
+  if (options.startDate) {
+    conditions.push(
+      drizzleSql`${auditLog.createdAt} >= ${options.startDate}::timestamptz`,
+    );
+  }
+  if (options.endDate) {
+    conditions.push(
+      drizzleSql`${auditLog.createdAt} <= ${options.endDate}::timestamptz`,
+    );
+  }
 
-    // Cursor pagination (created_at, id)
-    if (options.cursor) {
-      const decoded = decodeAuditCursor(options.cursor);
-      if (decoded) {
-        queryParams.push(decoded.createdAt);
-        const createdAtIdx = queryParams.length;
-        queryParams.push(decoded.id);
-        const idIdx = queryParams.length;
-        queryText += ` AND (al.created_at, al.id) < ($${createdAtIdx}::timestamptz, $${idIdx}::uuid)`;
-      }
+  if (options.cursor) {
+    const decoded = decodeAuditCursor(options.cursor);
+    if (decoded) {
+      conditions.push(
+        drizzleSql`(${auditLog.createdAt}, ${auditLog.id}) < (${decoded.createdAt}::timestamptz, ${decoded.id}::uuid)`,
+      );
     }
+  }
 
-    queryText += ` ORDER BY al.created_at DESC, al.id DESC LIMIT ${limit + 1}`;
-
-    const rows = await tx.unsafe(queryText, queryParams);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    // NOTE: search_path is tenant schema first, then public; platform tables resolve from public today.
+    const rows = await db
+      .select({
+        id: auditLog.id,
+        tenant_id: auditLog.tenantId,
+        actor_id: auditLog.actorId,
+        actor_type: auditLog.actorType,
+        action: auditLog.action,
+        target_id: auditLog.targetId,
+        outcome: auditLog.outcome,
+        reason: auditLog.reason,
+        metadata: auditLog.metadata,
+        created_at: auditLog.createdAt,
+        actor_display_name: drizzleSql<string | null>`
+          CASE
+            WHEN ${auditLog.actorType} = 'agent' AND ${actorAgent.id} IS NOT NULL THEN
+              CASE
+                WHEN ${actorAgent.isAutonomous} THEN ${actorAgent.externalId} || ' (Autonomous)'
+                WHEN ${actorAgentOwner.displayName} IS NOT NULL THEN ${actorAgent.externalId} || ' · ' || ${actorAgentOwner.displayName}
+                WHEN ${actorAgentOwner.email} IS NOT NULL THEN ${actorAgent.externalId} || ' · ' || ${actorAgentOwner.email}
+                WHEN ${actorAgentOwner.externalId} IS NOT NULL THEN ${actorAgent.externalId} || ' · ' || ${actorAgentOwner.externalId}
+                ELSE ${actorAgent.externalId}
+              END
+            WHEN ${auditLog.actorType} = 'user' THEN COALESCE(${actorUser.displayName}, ${actorUser.email}, ${actorUser.externalId})
+            WHEN ${auditLog.actorType} = 'system' THEN 'System'
+            ELSE NULL
+          END
+        `,
+      })
+      .from(auditLog)
+      .leftJoin(
+        actorAgent,
+        and(
+          eq(auditLog.actorType, "agent"),
+          eq(actorAgent.id, auditLog.actorId),
+        ),
+      )
+      .leftJoin(actorAgentOwner, eq(actorAgentOwner.id, actorAgent.userId))
+      .leftJoin(
+        actorUser,
+        and(
+          eq(auditLog.actorType, "user"),
+          eq(actorUser.id, auditLog.actorId),
+        ),
+      )
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(auditLog.createdAt), desc(auditLog.id))
+      .limit(limit + 1);
 
     const hasMore = rows.length > limit;
     const items = rows.slice(0, limit);

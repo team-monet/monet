@@ -1,9 +1,18 @@
-import { withTenantScope } from "@monet/db";
-import type postgres from "postgres";
+import { auditLog, withTenantDrizzleScope } from "@monet/db";
+import { lt, sql as drizzleSql } from "drizzle-orm";
+import type { SqlClient } from "@monet/db";
 
 const AUDIT_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const DEFAULT_AUDIT_RETENTION_DAYS = 90;
 const SCHEMA_NAME_REGEX = /^tenant_[a-f0-9_]{36}$/;
+const inflightPurges = new Set<Promise<number>>();
+
+function trackPurge(purgePromise: Promise<number>): Promise<number> {
+  inflightPurges.add(purgePromise);
+  return purgePromise.finally(() => {
+    inflightPurges.delete(purgePromise);
+  });
+}
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -20,7 +29,7 @@ export function currentAuditRetentionDays(): number {
 }
 
 export async function purgeExpiredAuditEntries(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   retentionDays: number,
 ): Promise<number> {
@@ -30,18 +39,22 @@ export async function purgeExpiredAuditEntries(
 
   const safeRetentionDays = Math.max(1, Math.floor(retentionDays));
 
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const result = await tx`
-      DELETE FROM audit_log
-      WHERE created_at < NOW() - (${safeRetentionDays} * INTERVAL '1 day')
-    `;
-    return result.count;
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const result = await db
+      .delete(auditLog)
+      .where(
+        lt(
+          auditLog.createdAt,
+          drizzleSql`NOW() - (${safeRetentionDays} * INTERVAL '1 day')`,
+        ),
+      );
+
+    return Number(result.count);
   });
 }
 
 export async function purgeExpiredAuditEntriesAcrossTenants(
-  sql: postgres.Sql,
+  sql: SqlClient,
   retentionDays = currentAuditRetentionDays(),
 ): Promise<number> {
   const schemas = await sql`
@@ -58,22 +71,35 @@ export async function purgeExpiredAuditEntriesAcrossTenants(
       continue;
     }
 
-    const purged = await purgeExpiredAuditEntries(sql, schemaName, retentionDays);
-    if (purged > 0) {
-      console.log(
-        `[audit-retention] Purged ${purged} entries from schema ${schemaName}`,
-      );
+    try {
+      const purged = await purgeExpiredAuditEntries(sql, schemaName, retentionDays);
+      if (purged > 0) {
+        console.log(
+          `[audit-retention] Purged ${purged} entries from schema ${schemaName}`,
+        );
+      }
+      totalPurged += purged;
+    } catch (error) {
+      console.error(`[audit-retention] Failed to purge ${schemaName}:`, error);
     }
-    totalPurged += purged;
   }
 
   return totalPurged;
 }
 
+function resolveAuditRetentionDays(retentionDays?: number): number {
+  return retentionDays ?? currentAuditRetentionDays();
+}
+
 export function startAuditRetentionJob(
-  sql: postgres.Sql,
-  retentionDays = currentAuditRetentionDays(),
+  sql: SqlClient,
+  retentionDays?: number,
 ): void {
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+  }
+
   if (process.env.AUDIT_PURGE_ENABLED !== "true") {
     console.log(
       "[audit-retention] Purge disabled (set AUDIT_PURGE_ENABLED=true to enable)",
@@ -82,7 +108,9 @@ export function startAuditRetentionJob(
   }
 
   // Run once on startup.
-  void purgeExpiredAuditEntriesAcrossTenants(sql, retentionDays)
+  void trackPurge(
+    purgeExpiredAuditEntriesAcrossTenants(sql, resolveAuditRetentionDays(retentionDays)),
+  )
     .then((count) => {
       if (count > 0) {
         console.log(`[audit-retention] Purged ${count} audit rows on startup`);
@@ -93,7 +121,9 @@ export function startAuditRetentionJob(
     });
 
   intervalHandle = setInterval(() => {
-    void purgeExpiredAuditEntriesAcrossTenants(sql, retentionDays)
+    void trackPurge(
+      purgeExpiredAuditEntriesAcrossTenants(sql, resolveAuditRetentionDays(retentionDays)),
+    )
       .then((count) => {
         if (count > 0) {
           console.log(`[audit-retention] Purged ${count} audit rows`);
@@ -105,8 +135,13 @@ export function startAuditRetentionJob(
   }, AUDIT_RETENTION_INTERVAL_MS);
 }
 
-export function stopAuditRetentionJob(): void {
-  if (!intervalHandle) return;
-  clearInterval(intervalHandle);
-  intervalHandle = null;
+export async function stopAuditRetentionJob(): Promise<void> {
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+  }
+
+  if (inflightPurges.size > 0) {
+    await Promise.allSettled([...inflightPurges]);
+  }
 }

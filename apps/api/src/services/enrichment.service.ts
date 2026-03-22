@@ -1,5 +1,12 @@
-import { withTenantScope } from "@monet/db";
-import type postgres from "postgres";
+import {
+  memoryEntries,
+  tenantSchemaNameFromId,
+  tenants,
+  withTenantDrizzleScope,
+  type SqlClient,
+} from "@monet/db";
+import { and, asc, eq, inArray, isNotNull, ne, sql as drizzleSql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 import { createEnrichmentProvider } from "../providers/index";
 import type { EnrichmentProvider } from "../providers/enrichment";
 
@@ -83,7 +90,7 @@ export async function waitForEnrichmentDrain(timeoutMs: number): Promise<void> {
 }
 
 export function enqueueEnrichment(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   entryId: string,
 ) {
@@ -92,33 +99,36 @@ export function enqueueEnrichment(
   drainQueue(sql);
 }
 
-export async function recoverPendingEnrichments(sql: postgres.Sql) {
+export async function recoverPendingEnrichments(sql: SqlClient) {
   const provider = getProvider({ logFailures: true });
   if (!provider) {
     return;
   }
 
-  const schemas = await sql`
-    SELECT schema_name
-    FROM information_schema.schemata
-    WHERE schema_name LIKE 'tenant\_%' ESCAPE '\'
-    ORDER BY schema_name ASC
-  `;
+  const db = drizzle(sql);
+  const tenantRows = await db
+    .select({ id: tenants.id })
+    .from(tenants)
+    .orderBy(asc(tenants.createdAt), asc(tenants.id));
 
-  for (const row of schemas) {
-    const schemaName = row.schema_name as string;
-    const entries = await withTenantScope(sql, schemaName, async (txSql) => {
-      const tx = txSql as unknown as postgres.Sql;
-      return tx`
-        SELECT id
-        FROM memory_entries
-        WHERE enrichment_status IN ('pending', 'processing', 'failed')
-        ORDER BY created_at ASC
-      `;
+  for (const row of tenantRows) {
+    const schemaName = tenantSchemaNameFromId(row.id);
+    const entries = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+      return db
+        .select({ id: memoryEntries.id })
+        .from(memoryEntries)
+        .where(
+          inArray(memoryEntries.enrichmentStatus, [
+            "pending",
+            "processing",
+            "failed",
+          ]),
+        )
+        .orderBy(asc(memoryEntries.createdAt));
     });
 
     for (const entry of entries) {
-      queue.push({ schemaName, entryId: entry.id as string });
+      queue.push({ schemaName, entryId: entry.id });
     }
   }
 
@@ -166,7 +176,7 @@ function getProvider(opts: { logFailures: boolean }): EnrichmentProvider | null 
   }
 }
 
-function drainQueue(sql: postgres.Sql) {
+function drainQueue(sql: SqlClient) {
   while (activeJobs < MAX_CONCURRENT_ENRICHMENTS && queue.length > 0) {
     const job = queue.shift();
     if (!job) {
@@ -183,34 +193,48 @@ function drainQueue(sql: postgres.Sql) {
   notifyDrainWaiters();
 }
 
-async function runJob(sql: postgres.Sql, job: EnrichmentJob) {
+async function runJob(sql: SqlClient, job: EnrichmentJob) {
   const provider = getProvider({ logFailures: true });
   if (!provider) {
     return;
   }
 
   try {
-    const entry = await withTenantScope(sql, job.schemaName, async (txSql) => {
-      const tx = txSql as unknown as postgres.Sql;
-      const [row] = await tx`
-        UPDATE memory_entries
-        SET enrichment_status = 'processing'
-        WHERE id = ${job.entryId}
-          AND enrichment_status IN ('pending', 'failed')
-        RETURNING id, content, tags
-      `;
+    const entry = await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
+      const [row] = await db
+        .update(memoryEntries)
+        .set({ enrichmentStatus: "processing" })
+        .where(
+          and(
+            eq(memoryEntries.id, job.entryId),
+            inArray(memoryEntries.enrichmentStatus, ["pending", "failed"]),
+          ),
+        )
+        .returning({
+          id: memoryEntries.id,
+          content: memoryEntries.content,
+          tags: memoryEntries.tags,
+        });
 
       if (row) {
-        return row as { id: string; content: string; tags: string[] } | undefined;
+        return row;
       }
 
-      const [processingRow] = await tx`
-        SELECT id, content, tags
-        FROM memory_entries
-        WHERE id = ${job.entryId}
-          AND enrichment_status = 'processing'
-      `;
-      return processingRow as { id: string; content: string; tags: string[] } | undefined;
+      const [processingRow] = await db
+        .select({
+          id: memoryEntries.id,
+          content: memoryEntries.content,
+          tags: memoryEntries.tags,
+        })
+        .from(memoryEntries)
+        .where(
+          and(
+            eq(memoryEntries.id, job.entryId),
+            eq(memoryEntries.enrichmentStatus, "processing"),
+          ),
+        )
+        .limit(1);
+      return processingRow;
     });
 
     if (!entry) {
@@ -226,17 +250,17 @@ async function runJob(sql: postgres.Sql, job: EnrichmentJob) {
     const mergedTags = [...new Set([...(entry.tags ?? []), ...extractedTags])].slice(0, 16);
     const relatedMemoryIds = await findRelatedMemoryIds(sql, job.schemaName, job.entryId, embedding);
 
-    await withTenantScope(sql, job.schemaName, async (txSql) => {
-      const tx = txSql as unknown as postgres.Sql;
-      await tx`
-        UPDATE memory_entries
-        SET summary = ${summary},
-            embedding = ${toVectorLiteral(embedding)}::vector,
-            auto_tags = ${mergedTags},
-            related_memory_ids = ${relatedMemoryIds},
-            enrichment_status = 'completed'
-        WHERE id = ${job.entryId}
-      `;
+    await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
+      await db
+        .update(memoryEntries)
+        .set({
+          summary,
+          embedding: drizzleSql`${toVectorLiteral(embedding)}::vector`,
+          autoTags: mergedTags,
+          relatedMemoryIds,
+          enrichmentStatus: "completed",
+        })
+        .where(eq(memoryEntries.id, job.entryId));
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -246,39 +270,45 @@ async function runJob(sql: postgres.Sql, job: EnrichmentJob) {
 }
 
 async function markEnrichmentFailed(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   entryId: string,
 ) {
-  await withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    await tx`
-      UPDATE memory_entries
-      SET enrichment_status = 'failed'
-      WHERE id = ${entryId}
-        AND enrichment_status = 'processing'
-    `;
+  await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    await db
+      .update(memoryEntries)
+      .set({ enrichmentStatus: "failed" })
+      .where(
+        and(
+          eq(memoryEntries.id, entryId),
+          eq(memoryEntries.enrichmentStatus, "processing"),
+        ),
+      );
   });
 }
 
 async function findRelatedMemoryIds(
-  sql: postgres.Sql,
+  sql: SqlClient,
   schemaName: string,
   entryId: string,
   embedding: number[],
 ): Promise<string[]> {
-  return withTenantScope(sql, schemaName, async (txSql) => {
-    const tx = txSql as unknown as postgres.Sql;
-    const rows = await tx.unsafe(`
-      SELECT id
-      FROM memory_entries
-      WHERE id <> $1::uuid
-        AND embedding IS NOT NULL
-      ORDER BY embedding <=> $2::vector
-      LIMIT $3
-    `, [entryId, toVectorLiteral(embedding), RELATED_MEMORY_LIMIT]);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .select({ id: memoryEntries.id })
+      .from(memoryEntries)
+      .where(
+        and(
+          ne(memoryEntries.id, entryId),
+          isNotNull(memoryEntries.embedding),
+        ),
+      )
+      .orderBy(
+        drizzleSql`${memoryEntries.embedding} <=> ${toVectorLiteral(embedding)}::vector`,
+      )
+      .limit(RELATED_MEMORY_LIMIT);
 
-    return (rows as Array<Record<string, unknown>>).map((row) => row.id as string);
+    return rows.map((row) => row.id);
   });
 }
 

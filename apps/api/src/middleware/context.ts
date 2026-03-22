@@ -1,6 +1,5 @@
 import type { Env } from "hono";
-import type { Database } from "@monet/db";
-import type postgres from "postgres";
+import type { Database, SqlClient } from "@monet/db";
 import type { SessionStore } from "../mcp/session-store";
 
 export interface AgentContext {
@@ -19,7 +18,7 @@ export interface AppEnv extends Env {
     tenantId: string;
     tenantSchemaName: string;
     db: Database;
-    sql: postgres.Sql;
+    sql: SqlClient;
     sessionStore: SessionStore;
   };
 }
