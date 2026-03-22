@@ -112,6 +112,10 @@ describe("validateStartupConfig", () => {
     const result = validateStartupConfig({
       ...createBaseEnv(),
       NODE_ENV: "production",
+      NEXTAUTH_URL: "https://monet.example.com",
+      PUBLIC_API_URL: "https://api.monet.example.com",
+      MCP_PUBLIC_URL: "https://api.monet.example.com/mcp",
+      PUBLIC_OIDC_BASE_URL: "https://auth.monet.example.com",
       DEV_BYPASS_AUTH: "true",
       DASHBOARD_LOCAL_AUTH: "true",
     });
@@ -120,6 +124,76 @@ describe("validateStartupConfig", () => {
       "DEV_BYPASS_AUTH=true in production allows local auth bypass.",
       "DASHBOARD_LOCAL_AUTH=true in production enables dashboard local auth.",
     ]);
+  });
+
+  it("fails in production when public URLs are not https", () => {
+    try {
+      validateStartupConfig({
+        ...createBaseEnv(),
+        NODE_ENV: "production",
+        NEXTAUTH_URL: "http://monet.example.com",
+        PUBLIC_API_URL: "http://api.monet.example.com",
+        MCP_PUBLIC_URL: "http://api.monet.example.com/mcp",
+        PUBLIC_OIDC_BASE_URL: "http://auth.monet.example.com",
+      });
+      throw new Error("Expected validateStartupConfig to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(StartupValidationError);
+      expect((error as StartupValidationError).errors).toContain(
+        "NEXTAUTH_URL must use https:// in production.",
+      );
+      expect((error as StartupValidationError).errors).toContain(
+        "PUBLIC_API_URL must use https:// in production.",
+      );
+      expect((error as StartupValidationError).errors).toContain(
+        "MCP_PUBLIC_URL must use https:// in production.",
+      );
+      expect((error as StartupValidationError).errors).toContain(
+        "PUBLIC_OIDC_BASE_URL must use https:// in production.",
+      );
+    }
+  });
+
+  it("allows loopback http URLs in production for local runtime evaluation", () => {
+    const result = validateStartupConfig({
+      ...createBaseEnv(),
+      NODE_ENV: "production",
+      NEXTAUTH_URL: "http://localhost:4310",
+      PUBLIC_API_URL: "http://127.0.0.1:4301",
+      MCP_PUBLIC_URL: "http://localhost:4301/mcp",
+      PUBLIC_OIDC_BASE_URL: "http://keycloak.localhost:4400",
+    });
+
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("warns when production public URLs are missing", () => {
+    const result = validateStartupConfig({
+      ...createBaseEnv(),
+      NODE_ENV: "production",
+    });
+
+    expect(result.warnings).toEqual([
+      "NEXTAUTH_URL is not configured; production TLS verification cannot confirm the dashboard public origin.",
+      "PUBLIC_API_URL is not configured; production TLS verification cannot confirm the API public origin.",
+      "MCP_PUBLIC_URL is not configured; ensure the public MCP endpoint is published over https:// and ends with /mcp.",
+      "PUBLIC_OIDC_BASE_URL is not configured; production TLS verification cannot confirm the public OIDC issuer origin.",
+    ]);
+  });
+
+  it("warns when MCP_PUBLIC_URL does not end with /mcp in production", () => {
+    const result = validateStartupConfig({
+      ...createBaseEnv(),
+      NODE_ENV: "production",
+      NEXTAUTH_URL: "https://monet.example.com",
+      PUBLIC_API_URL: "https://api.monet.example.com",
+      MCP_PUBLIC_URL: "https://api.monet.example.com/tools",
+      PUBLIC_OIDC_BASE_URL: "https://auth.monet.example.com",
+    });
+
+    expect(result.warnings).toContain(
+      "MCP_PUBLIC_URL should usually end with /mcp in production deployments.",
+    );
   });
 
   it("requires anthropic credentials when anthropic enrichment is enabled", () => {

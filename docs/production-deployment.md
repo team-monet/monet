@@ -94,6 +94,15 @@ Set these public URLs in `.env.runtime`:
 
 Keep `KEYCLOAK_BASE_URL` and `LOCAL_OIDC_BASE_URL` on a URL the host and dashboard can actually reach during runtime and Keycloak bootstrap. In the simplest deployment, that can be the same Keycloak hostname if the host can resolve and reach it itself.
 
+For the runtime API container, startup validation also checks the public URL
+settings passed through the runtime env file. In production, these public URLs
+must use `https://`:
+
+- `NEXTAUTH_URL`
+- `PUBLIC_API_URL`
+- `MCP_PUBLIC_URL`
+- `PUBLIC_OIDC_BASE_URL`
+
 ## Environment File
 
 Create the runtime env file:
@@ -136,6 +145,8 @@ Important env notes:
 - `ENRICHMENT_PROVIDER` is still accepted as legacy shorthand, but do not use it for new production configs.
 - `EMBEDDING_DIMENSIONS` must match your embedding model before the first migration.
 - `AUDIT_PURGE_DATABASE_URL` is optional but recommended when audit retention deletes should run under a restricted DB role.
+- in production, set `NEXTAUTH_URL`, `PUBLIC_API_URL`, `MCP_PUBLIC_URL`, and `PUBLIC_OIDC_BASE_URL` to `https://` public origins
+- rotate the example `ENCRYPTION_KEY`; do not use the template value in production
 
 The full template is in [`../.env.runtime.example`](../.env.runtime.example).
 
@@ -207,6 +218,48 @@ Operational checks:
 - confirm platform migrations are current
 - confirm the dashboard can complete OIDC login
 - if semantic search is enabled, store a memory and verify search works
+
+## Security Verification
+
+Transport security checks:
+
+- confirm the public dashboard URL loads over `https://`
+- confirm the public API URL responds over `https://`
+- confirm the public OIDC issuer is served over `https://`
+- confirm `MCP_PUBLIC_URL` uses `https://` and ends with `/mcp`
+- keep raw host ports `4301`, `4310`, and `4400` private behind the reverse proxy unless you are intentionally using break-glass access
+
+Example checks:
+
+```bash
+curl -I https://monet.example.com/login
+curl -I https://api.monet.example.com/healthz
+curl -I https://auth.monet.example.com/realms/monet/.well-known/openid-configuration
+```
+
+At-rest encryption checks:
+
+- Monet application-level encryption currently protects stored secrets, not every database field
+- encrypted-at-rest application secrets include:
+  - `tenant_oauth_configs.client_secret_encrypted`
+  - `platform_oauth_configs.client_secret_encrypted`
+  - `users.dashboard_api_key_encrypted`
+- tenant memory content and audit rows are not application-encrypted; rely on your PostgreSQL/storage-layer encryption controls if you need full database-at-rest coverage
+
+Example verification from the runtime database:
+
+```bash
+docker compose \
+  --project-name monet-runtime \
+  --env-file .env.runtime \
+  -f docker-compose.runtime.yml \
+  exec postgres \
+  psql -U postgres -d monet_runtime \
+  -c "SELECT left(client_secret_encrypted, 24) AS tenant_secret_sample FROM tenant_oauth_configs LIMIT 3;"
+```
+
+Encrypted values should appear as opaque ciphertext, not raw OIDC client secrets
+or dashboard API keys.
 
 ## Useful Runtime Commands
 

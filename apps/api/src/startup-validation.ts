@@ -151,6 +151,7 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): ValidatedStartupC
   );
 
   validateEncryptionKey(env.ENCRYPTION_KEY, errors);
+  validateTransportSecurityConfig(env, nodeEnv, errors, warnings);
 
   const devBypassAuth = parseOptionalBooleanEnv("DEV_BYPASS_AUTH", env.DEV_BYPASS_AUTH, errors) ?? false;
   const dashboardLocalAuth =
@@ -623,19 +624,97 @@ function validatePostgresUrl(name: string, value: string, errors: string[]): str
 }
 
 function validateHttpUrl(name: string, value: string | undefined, errors: string[]) {
+  parseOptionalHttpUrl(name, value, errors);
+}
+
+function parseOptionalHttpUrl(name: string, value: string | undefined, errors: string[]): URL | null {
   const trimmed = value?.trim();
   if (!trimmed) {
-    return;
+    return null;
   }
 
   try {
     const url = new URL(trimmed);
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       errors.push(`${name} must use an http:// or https:// URL.`);
+      return null;
     }
+    return url;
   } catch {
     errors.push(`${name} must be a valid URL.`);
+    return null;
   }
+}
+
+function validateTransportSecurityConfig(
+  env: NodeJS.ProcessEnv,
+  nodeEnv: string,
+  errors: string[],
+  warnings: string[],
+) {
+  const nextauthUrl = parseOptionalHttpUrl("NEXTAUTH_URL", env.NEXTAUTH_URL, errors);
+  const publicApiUrl = parseOptionalHttpUrl("PUBLIC_API_URL", env.PUBLIC_API_URL, errors);
+  const mcpPublicUrl = parseOptionalHttpUrl("MCP_PUBLIC_URL", env.MCP_PUBLIC_URL, errors);
+  const publicOidcBaseUrl = parseOptionalHttpUrl(
+    "PUBLIC_OIDC_BASE_URL",
+    env.PUBLIC_OIDC_BASE_URL,
+    errors,
+  );
+
+  if (nodeEnv !== "production") {
+    return;
+  }
+
+  requireHttpsUrl("NEXTAUTH_URL", nextauthUrl, errors);
+  requireHttpsUrl("PUBLIC_API_URL", publicApiUrl, errors);
+  requireHttpsUrl("MCP_PUBLIC_URL", mcpPublicUrl, errors);
+  requireHttpsUrl("PUBLIC_OIDC_BASE_URL", publicOidcBaseUrl, errors);
+
+  if (!nextauthUrl) {
+    warnings.push(
+      "NEXTAUTH_URL is not configured; production TLS verification cannot confirm the dashboard public origin.",
+    );
+  }
+
+  if (!publicApiUrl) {
+    warnings.push(
+      "PUBLIC_API_URL is not configured; production TLS verification cannot confirm the API public origin.",
+    );
+  }
+
+  if (!mcpPublicUrl) {
+    warnings.push(
+      "MCP_PUBLIC_URL is not configured; ensure the public MCP endpoint is published over https:// and ends with /mcp.",
+    );
+  } else if (mcpPublicUrl.pathname !== "/mcp") {
+    warnings.push("MCP_PUBLIC_URL should usually end with /mcp in production deployments.");
+  }
+
+  if (!publicOidcBaseUrl) {
+    warnings.push(
+      "PUBLIC_OIDC_BASE_URL is not configured; production TLS verification cannot confirm the public OIDC issuer origin.",
+    );
+  }
+}
+
+function requireHttpsUrl(name: string, url: URL | null, errors: string[]) {
+  if (!url) {
+    return;
+  }
+
+  if (url.protocol !== "https:" && !isLoopbackTlsException(url)) {
+    errors.push(`${name} must use https:// in production.`);
+  }
+}
+
+function isLoopbackTlsException(url: URL) {
+  const hostname = url.hostname.toLowerCase();
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname.endsWith(".localhost")
+  );
 }
 
 function requireNonEmptyString(
