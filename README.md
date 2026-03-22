@@ -17,6 +17,7 @@ It provides:
 
 ## Documentation
 
+- [Production Deployment Guide](docs/production-deployment.md)
 - [User and Agent Group Model](docs/user-and-agent-group-model.md)
 
 ## Prerequisites
@@ -261,6 +262,8 @@ This builds the `api`, `dashboard`, and `migrate` targets from `docker/monet.Doc
 ## Runtime Stack
 
 The runtime stack is image-only and isolated from the host-run local dev workflow.
+For the single recommended production path, use the Docker Compose runtime guide at
+[docs/production-deployment.md](docs/production-deployment.md).
 
 1. Create runtime config:
 
