@@ -1,10 +1,11 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
-import { X } from "lucide-react";
+import { Loader2, X } from "lucide-react";
 
 interface AuditFiltersProps {
   initialAction?: string;
@@ -28,11 +29,18 @@ const ACTION_OPTIONS = [
 ];
 
 export function AuditFilters({ initialAction }: AuditFiltersProps) {
+  const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
+  const [isUpdating, setIsUpdating] = useState(false);
+  const currentQuery = searchParams.toString();
+
+  useEffect(() => {
+    setIsUpdating(false);
+  }, [currentQuery]);
 
   const updateAction = (value: string) => {
-    const params = new URLSearchParams(searchParams.toString());
+    const params = new URLSearchParams(currentQuery);
     if (value === "all") {
       params.delete("action");
     } else {
@@ -41,15 +49,30 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
     params.delete("cursor");
 
     const query = params.toString();
-    router.push(query ? `/admin/audit?${query}` : "/admin/audit");
+    const nextUrl = query ? `/admin/audit?${query}` : "/admin/audit";
+    const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+    if (nextUrl === currentUrl) {
+      return;
+    }
+
+    setIsUpdating(true);
+    router.replace(nextUrl);
   };
 
   return (
     <div className="p-4 grid gap-4 md:grid-cols-[minmax(220px,280px)_1fr] items-end">
       <div className="grid gap-2">
-        <Label className="text-xs uppercase text-muted-foreground font-semibold">Action Type</Label>
-        <Select value={initialAction ?? "all"} onValueChange={updateAction}>
-          <SelectTrigger>
+        <div className="flex items-center justify-between gap-3">
+          <Label className="text-xs uppercase text-muted-foreground font-semibold">Action Type</Label>
+          {isUpdating ? (
+            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Updating...
+            </span>
+          ) : null}
+        </div>
+        <Select value={initialAction ?? "all"} onValueChange={updateAction} disabled={isUpdating}>
+          <SelectTrigger aria-busy={isUpdating}>
             <SelectValue placeholder="All Actions" />
           </SelectTrigger>
           <SelectContent>
@@ -70,10 +93,15 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
+            disabled={isUpdating}
             onClick={() => updateAction("all")}
           >
-            <X className="mr-2 h-4 w-4" />
-            Clear Filter
+            {isUpdating ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <X className="mr-2 h-4 w-4" />
+            )}
+            {isUpdating ? "Updating..." : "Clear Filter"}
           </Button>
         )}
       </div>

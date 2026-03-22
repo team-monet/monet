@@ -128,13 +128,6 @@ function LoginFormInner() {
                 onChange={(e) => setTenant(e.target.value)}
                 disabled={loading}
               />
-              <p className="text-[11px] text-muted-foreground">
-                Hint: Use{" "}
-                <code className="rounded bg-muted px-1 font-mono text-xs font-bold">
-                  test-org
-                </code>{" "}
-                for development.
-              </p>
             </div>
 
             {error ? (

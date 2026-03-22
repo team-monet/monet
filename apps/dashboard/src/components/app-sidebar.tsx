@@ -98,7 +98,7 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       isActive: pathname.startsWith("/admin/user-groups"),
     },
     {
-      title: "Groups",
+      title: "Agent Groups",
       url: "/admin/groups",
       icon: Users,
       isActive: pathname.startsWith("/admin/groups"),
