@@ -1,4 +1,4 @@
-import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import type { SqlClient } from "@monet/db";
 import type { SessionStore } from "../mcp/session-store";
 import { getActiveRulesForAgent } from "./rule.service";
 

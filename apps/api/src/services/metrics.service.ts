@@ -1,4 +1,4 @@
-import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import type { SqlClient } from "@monet/db";
 import {
   agents,
   agentGroupMembers,
@@ -8,7 +8,7 @@ import {
   tenantSchemaNameFromId,
   withTenantDrizzleScope,
 } from "@monet/db";
-import { aliasedTable, and, eq, inArray, isNotNull, notLike, sql as drizzleSql } from "drizzle-orm";
+import { aliasedTable, and, eq, isNotNull, notLike, sql as drizzleSql } from "drizzle-orm";
 import type {
   UsageMetrics,
   BenefitMetrics,

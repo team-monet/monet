@@ -1,6 +1,6 @@
 import { memoryEntries, withTenantDrizzleScope } from "@monet/db";
 import { and, isNotNull, lt, sql as drizzleSql } from "drizzle-orm";
-import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import type { SqlClient } from "@monet/db";
 
 const EXPIRY_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
 const SCHEMA_NAME_REGEX = /^tenant_[a-f0-9_]{36}$/;

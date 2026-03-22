@@ -1,7 +1,6 @@
 import {
   agentGroupMembers,
   agentGroups,
-  agents,
   tenantUsers,
   type SqlClient,
 } from "@monet/db";

@@ -1,6 +1,5 @@
 import { auditLog, withTenantDrizzleScope } from "@monet/db";
-import type { Database } from "@monet/db";
-import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import type { Database, SqlClient } from "@monet/db";
 
 export interface AuditEntry {
   tenantId: string;

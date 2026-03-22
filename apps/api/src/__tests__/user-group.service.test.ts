@@ -1,6 +1,5 @@
 import {
   agentGroups,
-  tenantUsers,
   userGroupAgentGroupPermissions,
   userGroupMembers,
   userGroups,

@@ -5,7 +5,7 @@ import {
   registerAllTools,
   type McpToolHandlers,
 } from "@monet/mcp-tools";
-import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import type { SqlClient } from "@monet/db";
 import type { AgentContext } from "../middleware/context";
 import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service";
 import {
