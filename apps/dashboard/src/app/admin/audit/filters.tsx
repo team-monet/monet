@@ -32,12 +32,28 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [isUpdating, setIsUpdating] = useState(false);
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const currentQuery = searchParams.toString();
+  const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+  const isUpdating = pendingUrl !== null;
 
   useEffect(() => {
-    setIsUpdating(false);
-  }, [currentQuery]);
+    if (pendingUrl && currentUrl === pendingUrl) {
+      setPendingUrl(null);
+    }
+  }, [currentUrl, pendingUrl]);
+
+  useEffect(() => {
+    if (!pendingUrl) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setPendingUrl(null);
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [pendingUrl]);
 
   const updateAction = (value: string) => {
     const params = new URLSearchParams(currentQuery);
@@ -50,12 +66,11 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
 
     const query = params.toString();
     const nextUrl = query ? `/admin/audit?${query}` : "/admin/audit";
-    const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
     if (nextUrl === currentUrl) {
       return;
     }
 
-    setIsUpdating(true);
+    setPendingUrl(nextUrl);
     router.replace(nextUrl);
   };
 

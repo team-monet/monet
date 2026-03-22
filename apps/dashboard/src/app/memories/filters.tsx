@@ -34,15 +34,29 @@ export function MemoryFilters({
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const [isUpdating, setIsUpdating] = useState(false);
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const currentQuery = searchParams.toString();
+  const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+  const isUpdating = pendingUrl !== null;
   const isSessionExpired = errorMessage === SESSION_EXPIRED_ERROR_MESSAGE;
 
   useEffect(() => {
-    setIsUpdating(false);
-  }, [currentQuery]);
+    if (pendingUrl && currentUrl === pendingUrl) {
+      setPendingUrl(null);
+    }
+  }, [currentUrl, pendingUrl]);
 
-  const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+  useEffect(() => {
+    if (!pendingUrl) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setPendingUrl(null);
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [pendingUrl]);
 
   const updateUrl = (updates: Record<string, string | boolean | undefined>) => {
     const params = new URLSearchParams(currentQuery);
@@ -60,7 +74,7 @@ export function MemoryFilters({
       return;
     }
 
-    setIsUpdating(true);
+    setPendingUrl(nextUrl);
     router.replace(nextUrl);
   };
 
@@ -130,7 +144,7 @@ export function MemoryFilters({
                 if (currentUrl === "/memories") {
                   return;
                 }
-                setIsUpdating(true);
+                setPendingUrl("/memories");
                 router.replace("/memories");
               }}
             >
