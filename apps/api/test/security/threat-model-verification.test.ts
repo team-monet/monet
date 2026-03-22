@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupTestData,
   closeTestDb,
@@ -23,10 +23,6 @@ function sleep(ms: number): Promise<void> {
 describe("threat model verification", () => {
   const app = getTestApp();
   const sql = getTestSql();
-
-  beforeAll(() => {
-    process.env.ENRICHMENT_PROVIDER = "ollama";
-  });
 
   beforeEach(async () => {
     resetEnrichmentStateForTests();

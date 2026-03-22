@@ -3,6 +3,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import * as platformSchema from "@monet/db/schema";
 import { createSqlClient, type SqlClient } from "@monet/db";
 import { createApp } from "../../../src/app";
+import { waitForEnrichmentDrain } from "../../../src/services/enrichment.service";
 import { provisionTenant } from "../../../src/services/tenant.service";
 import path from "node:path";
 
@@ -431,6 +432,8 @@ export async function provisionTestTenant(
 }
 
 export async function cleanupTestData() {
+  // Give background enrichment jobs a chance to finish before dropping schemas.
+  await waitForEnrichmentDrain(5_000);
   await ensurePlatformSchemaReady();
 
   const s = getTestSql();
