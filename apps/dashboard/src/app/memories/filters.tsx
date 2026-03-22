@@ -3,7 +3,7 @@
 import { MemoryType } from "@monet/types";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 import { 
   Select as ShadSelect, 
   SelectContent as ShadSelectContent, 
@@ -20,23 +20,40 @@ import { SESSION_EXPIRED_ERROR_MESSAGE } from "@/lib/session-errors";
 
 interface MemoryFiltersProps {
   initialType?: MemoryType;
+  initialTag?: string;
   initialIncludeUser: boolean;
   initialIncludePrivate: boolean;
   errorMessage?: string;
+  stateKey: string;
 }
 
 export function MemoryFilters({
   initialType,
+  initialTag,
   initialIncludeUser,
   initialIncludePrivate,
   errorMessage,
+  stateKey,
 }: MemoryFiltersProps) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const [isPending, startTransition] = useTransition();
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [, startTransition] = useTransition();
   const currentQuery = searchParams.toString();
   const isSessionExpired = errorMessage === SESSION_EXPIRED_ERROR_MESSAGE;
+
+  // Clear loading state when the server-rendered page state updates.
+  useEffect(() => {
+    setIsUpdating(false);
+  }, [stateKey]);
+
+  // Safety timeout to ensure the UI doesn't stay stuck forever
+  useEffect(() => {
+    if (!isUpdating) return;
+    const timer = setTimeout(() => setIsUpdating(false), 5000);
+    return () => clearTimeout(timer);
+  }, [isUpdating]);
 
   const updateUrl = (updates: Record<string, string | boolean | undefined>) => {
     const params = new URLSearchParams(currentQuery);
@@ -48,9 +65,15 @@ export function MemoryFilters({
       }
     });
     params.delete("cursor");
-    const query = params.toString();
-    const nextUrl = query ? `${pathname}?${query}` : pathname;
     
+    const nextQuery = params.toString();
+    if (nextQuery === currentQuery) {
+      return;
+    }
+
+    const nextUrl = nextQuery ? `${pathname}?${nextQuery}` : pathname;
+    
+    setIsUpdating(true);
     startTransition(() => {
       router.replace(nextUrl);
     });
@@ -58,7 +81,7 @@ export function MemoryFilters({
 
   return (
     <div className="relative mb-6 rounded-lg border bg-card p-4 shadow-sm">
-      {isPending && (
+      {isUpdating && (
         <div className="absolute inset-0 bg-background/50 flex items-center justify-center z-10 rounded-lg">
           <div className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm font-medium shadow-sm">
             <Loader2 className="h-4 w-4 animate-spin text-primary" />
@@ -71,10 +94,10 @@ export function MemoryFilters({
           <Label className="text-xs uppercase text-muted-foreground font-semibold">Memory Type</Label>
           <ShadSelect 
             value={initialType || "all"} 
-            disabled={isPending}
+            disabled={isUpdating}
             onValueChange={(val) => updateUrl({ memoryType: val === "all" ? "" : val })}
           >
-            <ShadSelectTrigger aria-busy={isPending}>
+            <ShadSelectTrigger aria-busy={isUpdating}>
               <ShadSelectValue placeholder="Select type" />
             </ShadSelectTrigger>
             <ShadSelectContent>
@@ -94,7 +117,7 @@ export function MemoryFilters({
             <Checkbox 
               id="includeUser" 
               checked={initialIncludeUser} 
-              disabled={isPending}
+              disabled={isUpdating}
               onCheckedChange={(checked) => updateUrl({ includeUser: !!checked })}
             />
             <Label htmlFor="includeUser" className="text-sm cursor-pointer">Include User</Label>
@@ -103,7 +126,7 @@ export function MemoryFilters({
             <Checkbox 
               id="includePrivate" 
               checked={initialIncludePrivate} 
-              disabled={isPending}
+              disabled={isUpdating}
               onCheckedChange={(checked) => updateUrl({ includePrivate: !!checked })}
             />
             <Label htmlFor="includePrivate" className="text-sm cursor-pointer">Include Private</Label>
@@ -111,25 +134,26 @@ export function MemoryFilters({
         </div>
 
         <div className="ml-auto">
-          {(initialType || initialIncludeUser || initialIncludePrivate) && (
+          {(initialType || initialTag || initialIncludeUser || initialIncludePrivate) && (
             <Button
               type="button"
               variant="ghost"
               size="sm"
               className="text-muted-foreground"
-              disabled={isPending}
+              disabled={isUpdating}
               onClick={() => {
+                setIsUpdating(true);
                 startTransition(() => {
                   router.replace(pathname);
                 });
               }}
             >
-              {isPending ? (
+              {isUpdating ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               ) : (
                 <X className="mr-2 h-4 w-4" />
               )}
-              {isPending ? "Loading..." : "Clear Filters"}
+              {isUpdating ? "Loading..." : "Clear Filters"}
             </Button>
           )}
         </div>

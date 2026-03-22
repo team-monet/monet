@@ -48,6 +48,13 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
   const includePrivate = params.includePrivate === "true";
   const cursor = params.cursor as string;
   const limit = 20;
+  const filterStateKey = JSON.stringify({
+    memoryType: type ?? null,
+    tag: tag ?? null,
+    includeUser,
+    includePrivate,
+    cursor: cursor ?? null,
+  });
 
   let memories: MemoryEntryTier1[] = [];
   let nextCursor: string | null = null;
@@ -105,9 +112,11 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
 
       <MemoryFilters 
         initialType={type} 
+        initialTag={tag}
         initialIncludeUser={includeUser} 
         initialIncludePrivate={includePrivate}
         errorMessage={error}
+        stateKey={filterStateKey}
       />
 
       {error ? null : (

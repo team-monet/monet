@@ -45,6 +45,13 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
   const startDate = getSingleParam(params.startDate);
   const endDate = getSingleParam(params.endDate);
   const cursor = getSingleParam(params.cursor);
+  const filterStateKey = JSON.stringify({
+    action: action ?? null,
+    actorId: actorId ?? null,
+    startDate: startDate ?? null,
+    endDate: endDate ?? null,
+    cursor: cursor ?? null,
+  });
 
   let logs: AuditLog[] = [];
   let nextCursor: string | null = null;
@@ -77,7 +84,7 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
 
       <Card className="shadow-sm">
         <CardContent className="p-0">
-          <AuditFilters initialAction={action} />
+          <AuditFilters initialAction={action} stateKey={filterStateKey} />
         </CardContent>
       </Card>
 

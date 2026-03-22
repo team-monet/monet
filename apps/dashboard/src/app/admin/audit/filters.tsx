@@ -1,6 +1,6 @@
 "use client";
 
-import { useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
@@ -9,6 +9,7 @@ import { Loader2, X } from "lucide-react";
 
 interface AuditFiltersProps {
   initialAction?: string;
+  stateKey: string;
 }
 
 const ACTION_OPTIONS = [
@@ -28,12 +29,25 @@ const ACTION_OPTIONS = [
   { value: "agent_rule_set.dissociate", label: "Agent Rule Set Dissociate" },
 ];
 
-export function AuditFilters({ initialAction }: AuditFiltersProps) {
+export function AuditFilters({ initialAction, stateKey }: AuditFiltersProps) {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [isPending, startTransition] = useTransition();
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [, startTransition] = useTransition();
   const currentQuery = searchParams.toString();
+
+  // Clear loading state when the server-rendered page state updates.
+  useEffect(() => {
+    setIsUpdating(false);
+  }, [stateKey]);
+
+  // Safety timeout
+  useEffect(() => {
+    if (!isUpdating) return;
+    const timer = setTimeout(() => setIsUpdating(false), 5000);
+    return () => clearTimeout(timer);
+  }, [isUpdating]);
 
   const updateAction = (value: string) => {
     const params = new URLSearchParams(currentQuery);
@@ -44,9 +58,14 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
     }
     params.delete("cursor");
 
-    const query = params.toString();
-    const nextUrl = query ? `${pathname}?${query}` : pathname;
+    const nextQuery = params.toString();
+    if (nextQuery === currentQuery) {
+      return;
+    }
+
+    const nextUrl = nextQuery ? `${pathname}?${nextQuery}` : pathname;
     
+    setIsUpdating(true);
     startTransition(() => {
       router.replace(nextUrl);
     });
@@ -57,15 +76,15 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
       <div className="grid gap-2">
         <div className="flex items-center justify-between gap-3">
           <Label className="text-xs uppercase text-muted-foreground font-semibold">Action Type</Label>
-          {isPending ? (
+          {isUpdating ? (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
               Loading...
             </span>
           ) : null}
         </div>
-        <Select value={initialAction ?? "all"} onValueChange={updateAction} disabled={isPending}>
-          <SelectTrigger aria-busy={isPending}>
+        <Select value={initialAction ?? "all"} onValueChange={updateAction} disabled={isUpdating}>
+          <SelectTrigger aria-busy={isUpdating}>
             <SelectValue placeholder="All Actions" />
           </SelectTrigger>
           <SelectContent>
@@ -86,15 +105,15 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            disabled={isPending}
+            disabled={isUpdating}
             onClick={() => updateAction("all")}
           >
-            {isPending ? (
+            {isUpdating ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             ) : (
               <X className="mr-2 h-4 w-4" />
             )}
-            {isPending ? "Loading..." : "Clear Filter"}
+            {isUpdating ? "Loading..." : "Clear Filter"}
           </Button>
         )}
       </div>
