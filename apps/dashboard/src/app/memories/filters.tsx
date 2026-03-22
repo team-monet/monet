@@ -84,7 +84,7 @@ export function MemoryFilters({
         <div className="absolute inset-0 bg-background/50 flex items-center justify-center z-10 rounded-lg">
           <div className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm font-medium shadow-sm">
             <Loader2 className="h-4 w-4 animate-spin text-primary" />
-            Updating memories...
+            Loading memories...
           </div>
         </div>
       )}
@@ -153,7 +153,7 @@ export function MemoryFilters({
               ) : (
                 <X className="mr-2 h-4 w-4" />
               )}
-              {isUpdating ? "Updating..." : "Clear Filters"}
+              {isUpdating ? "Loading..." : "Clear Filters"}
             </Button>
           )}
         </div>

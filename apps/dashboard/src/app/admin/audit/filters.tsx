@@ -82,7 +82,7 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
           {isUpdating ? (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
-              Updating...
+              Loading...
             </span>
           ) : null}
         </div>
@@ -116,7 +116,7 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
             ) : (
               <X className="mr-2 h-4 w-4" />
             )}
-            {isUpdating ? "Updating..." : "Clear Filter"}
+            {isUpdating ? "Loading..." : "Clear Filter"}
           </Button>
         )}
       </div>
