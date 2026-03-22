@@ -3,7 +3,7 @@
 import { MemoryType } from "@monet/types";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useTransition } from "react";
 import { 
   Select as ShadSelect, 
   SelectContent as ShadSelectContent, 
@@ -34,33 +34,9 @@ export function MemoryFilters({
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
   const currentQuery = searchParams.toString();
-  const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
-  const isUpdating = pendingUrl !== null;
   const isSessionExpired = errorMessage === SESSION_EXPIRED_ERROR_MESSAGE;
-
-  useEffect(() => {
-    setPendingUrl(null);
-  }, [initialType, initialIncludeUser, initialIncludePrivate, errorMessage]);
-
-  useEffect(() => {
-    if (!pendingUrl) {
-      return;
-    }
-
-    const timer = window.setTimeout(() => {
-      setPendingUrl(null);
-    }, 5000);
-
-    return () => window.clearTimeout(timer);
-  }, [pendingUrl]);
-
-  useEffect(() => {
-    if (pendingUrl && currentUrl === pendingUrl) {
-      setPendingUrl(null);
-    }
-  }, [currentUrl, pendingUrl]);
 
   const updateUrl = (updates: Record<string, string | boolean | undefined>) => {
     const params = new URLSearchParams(currentQuery);
@@ -73,18 +49,16 @@ export function MemoryFilters({
     });
     params.delete("cursor");
     const query = params.toString();
-    const nextUrl = query ? `/memories?${query}` : "/memories";
-    if (nextUrl === currentUrl) {
-      return;
-    }
-
-    setPendingUrl(nextUrl);
-    router.replace(nextUrl);
+    const nextUrl = query ? `${pathname}?${query}` : pathname;
+    
+    startTransition(() => {
+      router.replace(nextUrl);
+    });
   };
 
   return (
     <div className="relative mb-6 rounded-lg border bg-card p-4 shadow-sm">
-      {isUpdating && (
+      {isPending && (
         <div className="absolute inset-0 bg-background/50 flex items-center justify-center z-10 rounded-lg">
           <div className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm font-medium shadow-sm">
             <Loader2 className="h-4 w-4 animate-spin text-primary" />
@@ -97,10 +71,10 @@ export function MemoryFilters({
           <Label className="text-xs uppercase text-muted-foreground font-semibold">Memory Type</Label>
           <ShadSelect 
             value={initialType || "all"} 
-            disabled={isUpdating}
+            disabled={isPending}
             onValueChange={(val) => updateUrl({ memoryType: val === "all" ? "" : val })}
           >
-            <ShadSelectTrigger aria-busy={isUpdating}>
+            <ShadSelectTrigger aria-busy={isPending}>
               <ShadSelectValue placeholder="Select type" />
             </ShadSelectTrigger>
             <ShadSelectContent>
@@ -120,7 +94,7 @@ export function MemoryFilters({
             <Checkbox 
               id="includeUser" 
               checked={initialIncludeUser} 
-              disabled={isUpdating}
+              disabled={isPending}
               onCheckedChange={(checked) => updateUrl({ includeUser: !!checked })}
             />
             <Label htmlFor="includeUser" className="text-sm cursor-pointer">Include User</Label>
@@ -129,7 +103,7 @@ export function MemoryFilters({
             <Checkbox 
               id="includePrivate" 
               checked={initialIncludePrivate} 
-              disabled={isUpdating}
+              disabled={isPending}
               onCheckedChange={(checked) => updateUrl({ includePrivate: !!checked })}
             />
             <Label htmlFor="includePrivate" className="text-sm cursor-pointer">Include Private</Label>
@@ -143,21 +117,19 @@ export function MemoryFilters({
               variant="ghost"
               size="sm"
               className="text-muted-foreground"
-              disabled={isUpdating}
+              disabled={isPending}
               onClick={() => {
-                if (currentUrl === "/memories") {
-                  return;
-                }
-                setPendingUrl("/memories");
-                router.replace("/memories");
+                startTransition(() => {
+                  router.replace(pathname);
+                });
               }}
             >
-              {isUpdating ? (
+              {isPending ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               ) : (
                 <X className="mr-2 h-4 w-4" />
               )}
-              {isUpdating ? "Loading..." : "Clear Filters"}
+              {isPending ? "Loading..." : "Clear Filters"}
             </Button>
           )}
         </div>

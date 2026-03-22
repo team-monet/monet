@@ -58,6 +58,7 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
       startDate,
       endDate,
       cursor,
+      limit: 20,
     });
     logs = result.items;
     nextCursor = result.nextCursor;
