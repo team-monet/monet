@@ -38,10 +38,8 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
   const isUpdating = pendingUrl !== null;
 
   useEffect(() => {
-    if (pendingUrl && currentUrl === pendingUrl) {
-      setPendingUrl(null);
-    }
-  }, [currentUrl, pendingUrl]);
+    setPendingUrl(null);
+  }, [initialAction]);
 
   useEffect(() => {
     if (!pendingUrl) {
@@ -54,6 +52,12 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
 
     return () => window.clearTimeout(timer);
   }, [pendingUrl]);
+
+  useEffect(() => {
+    if (pendingUrl && currentUrl === pendingUrl) {
+      setPendingUrl(null);
+    }
+  }, [currentUrl, pendingUrl]);
 
   const updateAction = (value: string) => {
     const params = new URLSearchParams(currentQuery);

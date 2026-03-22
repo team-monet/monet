@@ -41,10 +41,8 @@ export function MemoryFilters({
   const isSessionExpired = errorMessage === SESSION_EXPIRED_ERROR_MESSAGE;
 
   useEffect(() => {
-    if (pendingUrl && currentUrl === pendingUrl) {
-      setPendingUrl(null);
-    }
-  }, [currentUrl, pendingUrl]);
+    setPendingUrl(null);
+  }, [initialType, initialIncludeUser, initialIncludePrivate, errorMessage]);
 
   useEffect(() => {
     if (!pendingUrl) {
@@ -57,6 +55,12 @@ export function MemoryFilters({
 
     return () => window.clearTimeout(timer);
   }, [pendingUrl]);
+
+  useEffect(() => {
+    if (pendingUrl && currentUrl === pendingUrl) {
+      setPendingUrl(null);
+    }
+  }, [currentUrl, pendingUrl]);
 
   const updateUrl = (updates: Record<string, string | boolean | undefined>) => {
     const params = new URLSearchParams(currentQuery);
