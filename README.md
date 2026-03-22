@@ -17,6 +17,7 @@ It provides:
 
 ## Documentation
 
+- [Migration and Upgrade Guide](docs/migration-upgrade.md)
 - [Observability Guide](docs/observability.md)
 - [Production Deployment Guide](docs/production-deployment.md)
 - [User and Agent Group Model](docs/user-and-agent-group-model.md)

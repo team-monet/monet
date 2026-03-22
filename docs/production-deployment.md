@@ -14,6 +14,9 @@ This guide is intentionally opinionated. It optimizes for a setup that is fast t
 understand, repeatable to operate, and aligned with the repo's existing runtime
 scripts.
 
+For version changes after initial deployment, follow the
+[Migration And Upgrade Guide](migration-upgrade.md).
+
 ## Recommended Topology
 
 Use one Linux host with:
