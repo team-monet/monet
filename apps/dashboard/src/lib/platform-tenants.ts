@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { SqlClient, TransactionClient, SqlParameter } from "@monet/db";
+import type { SqlClient } from "@monet/db";
 import {
   createTenantSchema,
   tenantUsers,
