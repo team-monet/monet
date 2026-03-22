@@ -13,7 +13,8 @@ function createBaseEnv(): NodeJS.ProcessEnv {
   return {
     DATABASE_URL: "postgresql://postgres:secret@db.internal:5432/monet",
     ENCRYPTION_KEY: VALID_ENCRYPTION_KEY,
-    ENRICHMENT_PROVIDER: "ollama",
+    ENRICHMENT_CHAT_PROVIDER: "ollama",
+    ENRICHMENT_EMBEDDING_PROVIDER: "ollama",
   };
 }
 
@@ -54,30 +55,41 @@ describe("validateStartupConfig", () => {
 
     expect(result.apiPort).toBe(3001);
     expect(result.summary.database.primary).toBe("postgresql://db.internal:5432/monet");
-    expect(result.summary.enrichment.provider).toBe("ollama");
+    expect(result.summary.enrichment.chatProvider).toBe("ollama");
+    expect(result.summary.enrichment.embeddingProvider).toBe("ollama");
     expect(result.warnings).toEqual([]);
   });
 
-  it("allows startup without enrichment provider and records degraded mode", () => {
+  it("allows startup without enrichment providers and records degraded mode", () => {
     const env = createBaseEnv();
-    delete env.ENRICHMENT_PROVIDER;
+    delete env.ENRICHMENT_CHAT_PROVIDER;
+    delete env.ENRICHMENT_EMBEDDING_PROVIDER;
 
     const result = validateStartupConfig(env);
 
-    expect(result.summary.enrichment.provider).toBeNull();
+    expect(result.summary.enrichment.chatProvider).toBeNull();
+    expect(result.summary.enrichment.embeddingProvider).toBeNull();
     expect(result.summary.enrichment.details).toEqual({
       configured: false,
-      mode: "degraded",
+      backgroundEnrichment: false,
+      semanticSearch: false,
+      legacyProvider: null,
+      chat: {
+        configured: false,
+      },
+      embedding: {
+        configured: false,
+      },
     });
     expect(result.warnings).toContain(
-      "ENRICHMENT_PROVIDER is not configured; enrichment and semantic search will run in degraded mode.",
+      "ENRICHMENT_CHAT_PROVIDER and ENRICHMENT_EMBEDDING_PROVIDER are not configured; memory enrichment and semantic search will run in degraded mode.",
     );
   });
 
   it("fails when required config is missing or malformed", () => {
     expect(() =>
       validateStartupConfig({
-        ENRICHMENT_PROVIDER: "anthropic",
+        ENRICHMENT_CHAT_PROVIDER: "anthropic",
         API_PORT: "abc",
         RATE_LIMIT_MAX: "0",
         ENCRYPTION_KEY: "too-short",
@@ -103,10 +115,61 @@ describe("validateStartupConfig", () => {
     expect(() =>
       validateStartupConfig({
         ...createBaseEnv(),
-        ENRICHMENT_PROVIDER: "anthropic",
+        ENRICHMENT_CHAT_PROVIDER: "anthropic",
         ENRICHMENT_API_KEY: "",
       }),
-    ).toThrow("ENRICHMENT_API_KEY is required when ENRICHMENT_PROVIDER=anthropic.");
+    ).toThrow(
+      "ENRICHMENT_CHAT_API_KEY is required when ENRICHMENT_CHAT_PROVIDER=anthropic",
+    );
+  });
+
+  it("accepts canonical chat api key for anthropic chat", () => {
+    const result = validateStartupConfig({
+      ...createBaseEnv(),
+      ENRICHMENT_CHAT_PROVIDER: "anthropic",
+      ENRICHMENT_EMBEDDING_PROVIDER: "onnx",
+      ENRICHMENT_CHAT_API_KEY: "anthropic-key",
+      ENRICHMENT_API_KEY: "",
+    });
+
+    expect(result.summary.enrichment.chatProvider).toBe("anthropic");
+    expect(result.summary.enrichment.embeddingProvider).toBe("onnx");
+  });
+
+  it("maps legacy onnx shorthand to ollama chat plus onnx embeddings", () => {
+    const env = createBaseEnv();
+    delete env.ENRICHMENT_CHAT_PROVIDER;
+    delete env.ENRICHMENT_EMBEDDING_PROVIDER;
+    env.ENRICHMENT_PROVIDER = "onnx";
+
+    const result = validateStartupConfig(env);
+
+    expect(result.summary.enrichment.chatProvider).toBe("ollama");
+    expect(result.summary.enrichment.embeddingProvider).toBe("onnx");
+    expect(result.warnings).toContain(
+      "ENRICHMENT_PROVIDER is legacy shorthand. Prefer ENRICHMENT_CHAT_PROVIDER and ENRICHMENT_EMBEDDING_PROVIDER.",
+    );
+  });
+
+  it("does not treat legacy anthropic chat key as an embedding credential", () => {
+    const env = createBaseEnv();
+    delete env.ENRICHMENT_CHAT_PROVIDER;
+    delete env.ENRICHMENT_EMBEDDING_PROVIDER;
+    env.ENRICHMENT_PROVIDER = "anthropic";
+    env.ENRICHMENT_API_KEY = "anthropic-key";
+    delete env.OPENAI_API_KEY;
+    delete env.OPENAI_EMBEDDING_API_KEY;
+    delete env.ENRICHMENT_EMBEDDING_API_KEY;
+    delete env.EMBEDDING_API_KEY;
+
+    const result = validateStartupConfig(env);
+
+    expect(result.summary.enrichment.details).toMatchObject({
+      embedding: {
+        provider: "openai",
+        apiKeyConfigured: false,
+      },
+    });
   });
 });
 

@@ -1,6 +1,14 @@
-export interface EnrichmentProvider {
+export interface ChatEnrichmentProvider {
   generateSummary(content: string): Promise<string>;
+  extractTags(content: string): Promise<string[]>;
+}
+
+export interface EmbeddingEnrichmentProvider {
   computeEmbedding(content: string): Promise<number[]>;
+}
+
+export interface EnrichmentProvider
+  extends ChatEnrichmentProvider, EmbeddingEnrichmentProvider {
   extractTags(content: string): Promise<string[]>;
 }
 

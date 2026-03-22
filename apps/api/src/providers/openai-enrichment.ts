@@ -22,25 +22,39 @@ export class OpenAICompatibleEnrichmentProvider implements EnrichmentProvider {
   private readonly embeddingDimensions: number;
 
   constructor(config: EnrichmentConfig = {}) {
+    const genericApiKey = config.openaiApiKey || process.env.OPENAI_API_KEY || "";
     const baseUrl = (
       config.openaiBaseUrl || process.env.OPENAI_BASE_URL || DEFAULT_BASE_URL
     ).replace(/\/+$/, "");
-    const apiKey = config.openaiApiKey || process.env.OPENAI_API_KEY || "";
 
     this.chatBaseUrl = (
       config.openaiChatBaseUrl || process.env.OPENAI_CHAT_BASE_URL || baseUrl
     ).replace(/\/+$/, "");
-    this.chatApiKey = config.openaiChatApiKey || process.env.OPENAI_CHAT_API_KEY || apiKey;
+    this.chatApiKey =
+      config.openaiChatApiKey ||
+      process.env.OPENAI_CHAT_API_KEY ||
+      process.env.ENRICHMENT_CHAT_API_KEY ||
+      genericApiKey;
     this.chatModel =
       config.openaiChatModel || process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL;
 
     this.embeddingBaseUrl = (
-      config.openaiEmbeddingBaseUrl || process.env.OPENAI_EMBEDDING_BASE_URL || baseUrl
+      config.openaiEmbeddingBaseUrl ||
+      process.env.OPENAI_EMBEDDING_BASE_URL ||
+      process.env.EMBEDDING_BASE_URL ||
+      baseUrl
     ).replace(/\/+$/, "");
     this.embeddingApiKey =
-      config.openaiEmbeddingApiKey || process.env.OPENAI_EMBEDDING_API_KEY || apiKey;
+      config.openaiEmbeddingApiKey ||
+      process.env.OPENAI_EMBEDDING_API_KEY ||
+      process.env.ENRICHMENT_EMBEDDING_API_KEY ||
+      process.env.EMBEDDING_API_KEY ||
+      genericApiKey;
     this.embeddingModel =
-      config.openaiEmbeddingModel || process.env.OPENAI_EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL;
+      config.openaiEmbeddingModel ||
+      process.env.OPENAI_EMBEDDING_MODEL ||
+      process.env.EMBEDDING_MODEL ||
+      DEFAULT_EMBEDDING_MODEL;
     this.embeddingDimensions = EMBEDDING_DIMENSIONS;
   }
 
@@ -131,4 +145,3 @@ export class OpenAICompatibleEnrichmentProvider implements EnrichmentProvider {
 function normalizeTags(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].slice(0, 8);
 }
-

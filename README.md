@@ -186,7 +186,9 @@ Required:
 
 Optional:
 
-- `ENRICHMENT_PROVIDER` - `anthropic`, `ollama`, `onnx`, or `openai`. If omitted, the API starts in degraded mode without enrichment or semantic search.
+- `ENRICHMENT_CHAT_PROVIDER` - `anthropic`, `ollama`, or `openai`. Controls summary/tag generation for memory enrichment jobs.
+- `ENRICHMENT_EMBEDDING_PROVIDER` - `ollama`, `onnx`, or `openai`. Controls semantic search embeddings and related-memory vectors.
+- `ENRICHMENT_PROVIDER` - legacy shorthand fallback. Mappings: `anthropic -> chat=anthropic, embedding=openai`, `onnx -> chat=ollama, embedding=onnx`, `openai -> both openai`, `ollama -> both ollama`.
 - `EMBEDDING_DIMENSIONS` - dimensionality of embedding vectors (default `1024`). Set this to match your chosen embedding model (e.g. `1536` for OpenAI `text-embedding-3-small`, `1024` for Ollama `qwen3-embedding` or ONNX `Snowflake/snowflake-arctic-embed-l-v2.0`). Must be set **before** running the first migration, as it defines the database column width.
 - `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` (defaults `100` per `60000ms`).
 - `AUDIT_RETENTION_DAYS` (default `90`).
@@ -195,10 +197,12 @@ Optional:
 
 Provider-specific:
 
-- Anthropic: `ENRICHMENT_API_KEY`, `EMBEDDING_API_KEY`, `ANTHROPIC_MODEL`, `EMBEDDING_MODEL`.
-- ONNX: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `ONNX_EMBEDDING_MODEL`, `ONNX_QUANTIZED`. Uses Ollama for chat and defaults to `Snowflake/snowflake-arctic-embed-l-v2.0` for 1024-dimensional embeddings.
-- OpenAI-compatible: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL`, `OPENAI_EMBEDDING_MODEL`. Supports split chat/embedding providers via `OPENAI_CHAT_*` and `OPENAI_EMBEDDING_*` overrides.
-- Ollama: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `OLLAMA_EMBEDDING_MODEL`, `OLLAMA_MODELS_DIR`.
+- Canonical split keys: `ENRICHMENT_CHAT_API_KEY` and `ENRICHMENT_EMBEDDING_API_KEY`.
+- Anthropic chat: `ENRICHMENT_CHAT_API_KEY` or legacy `ENRICHMENT_API_KEY`, plus `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`.
+- OpenAI-compatible chat/embeddings: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL`, `OPENAI_EMBEDDING_MODEL`. Supports split overrides via `OPENAI_CHAT_*` and `OPENAI_EMBEDDING_*`, and also respects `ENRICHMENT_CHAT_API_KEY` / `ENRICHMENT_EMBEDDING_API_KEY`.
+- Legacy embedding fallbacks for OpenAI-compatible embeddings: `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`.
+- ONNX embeddings: `ONNX_EMBEDDING_MODEL`, `ONNX_QUANTIZED`. This is embedding-only; it does not imply a chat provider. If you still use legacy `ENRICHMENT_PROVIDER=onnx`, chat falls back to Ollama.
+- Ollama chat/embeddings: `OLLAMA_BASE_URL`, `OLLAMA_CHAT_MODEL`, `OLLAMA_EMBEDDING_MODEL`, `OLLAMA_MODELS_DIR`.
 
 ## API Startup
 
@@ -316,7 +320,15 @@ for the runtime containers.
 
 ## Enrichment Provider Swap
 
-Set `ENRICHMENT_PROVIDER` to `anthropic`, `ollama`, `onnx`, or `openai`, configure provider vars and `EMBEDDING_DIMENSIONS` to match your embedding model, then restart API.
+Set `ENRICHMENT_CHAT_PROVIDER` and `ENRICHMENT_EMBEDDING_PROVIDER`, configure the matching provider vars, and keep `EMBEDDING_DIMENSIONS` aligned with your embedding model before restarting the API.
+
+Examples:
+
+- `ENRICHMENT_CHAT_PROVIDER=anthropic` with `ENRICHMENT_EMBEDDING_PROVIDER=openai`
+- `ENRICHMENT_CHAT_PROVIDER=ollama` with `ENRICHMENT_EMBEDDING_PROVIDER=onnx`
+- `ENRICHMENT_CHAT_PROVIDER=openai` with `ENRICHMENT_EMBEDDING_PROVIDER=ollama`
+
+Legacy `ENRICHMENT_PROVIDER` still works, but it is now just shorthand for those explicit pairings.
 
 Pending enrichment jobs are recovered on startup.
 
@@ -357,7 +369,7 @@ Health endpoints:
 - `GET /healthz`
 - `GET /health/ready`
 
-Readiness returns `200` only when the API can reach PostgreSQL, the platform migrations are current, and the MCP session subsystem is available. Enrichment configuration is reported as a component state, but a missing provider only degrades semantic search and does not make the API unready.
+Readiness returns `200` only when the API can reach PostgreSQL, the platform migrations are current, and the MCP session subsystem is available. Enrichment configuration is reported as a component state, but missing chat or embedding providers only degrade enrichment features and do not make the API unready.
 
 Runtime Docker Compose already uses readiness for the API container:
 

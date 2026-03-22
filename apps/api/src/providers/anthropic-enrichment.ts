@@ -1,38 +1,28 @@
-import type { EnrichmentConfig, EnrichmentProvider } from "./enrichment";
-import { EMBEDDING_DIMENSIONS } from "./enrichment";
+import type { ChatEnrichmentProvider, EnrichmentConfig } from "./enrichment";
 
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
 const DEFAULT_ANTHROPIC_MODEL = "claude-3-5-haiku-latest";
-const DEFAULT_EMBEDDING_BASE_URL = "https://api.openai.com/v1";
-const DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small";
 
-export class AnthropicEnrichmentProvider implements EnrichmentProvider {
+export class AnthropicEnrichmentProvider implements ChatEnrichmentProvider {
   private readonly anthropicApiKey: string;
   private readonly anthropicBaseUrl: string;
   private readonly anthropicModel: string;
-  private readonly embeddingApiKey: string;
-  private readonly embeddingBaseUrl: string;
-  private readonly embeddingModel: string;
 
   constructor(config: EnrichmentConfig = {}) {
     this.anthropicApiKey =
-      config.anthropicApiKey ?? process.env.ENRICHMENT_API_KEY ?? "";
+      config.anthropicApiKey ??
+      process.env.ENRICHMENT_CHAT_API_KEY ??
+      process.env.ENRICHMENT_API_KEY ??
+      "";
     this.anthropicBaseUrl =
       config.anthropicBaseUrl ?? process.env.ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL;
     this.anthropicModel =
       config.anthropicModel ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_ANTHROPIC_MODEL;
-    this.embeddingApiKey =
-      config.embeddingApiKey ?? process.env.EMBEDDING_API_KEY ?? this.anthropicApiKey;
-    this.embeddingBaseUrl =
-      config.embeddingBaseUrl ?? process.env.EMBEDDING_BASE_URL ?? DEFAULT_EMBEDDING_BASE_URL;
-    this.embeddingModel =
-      config.embeddingModel ?? process.env.EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL;
 
     if (!this.anthropicApiKey) {
-      throw new Error("ENRICHMENT_API_KEY is required for anthropic enrichment");
-    }
-    if (!this.embeddingApiKey) {
-      throw new Error("EMBEDDING_API_KEY is required for embeddings (defaults to ENRICHMENT_API_KEY)");
+      throw new Error(
+        "ENRICHMENT_CHAT_API_KEY is required for anthropic chat (or use legacy ENRICHMENT_API_KEY)",
+      );
     }
   }
 
@@ -42,38 +32,6 @@ export class AnthropicEnrichmentProvider implements EnrichmentProvider {
       content,
     );
     return text.trim().slice(0, 200);
-  }
-
-  async computeEmbedding(content: string): Promise<number[]> {
-    const response = await fetch(`${this.embeddingBaseUrl}/embeddings`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.embeddingApiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.embeddingModel,
-        input: content,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Embedding request failed: ${response.status}`);
-    }
-
-    const body = (await response.json()) as {
-      data?: Array<{ embedding?: number[] }>;
-    };
-    const embedding = body.data?.[0]?.embedding;
-
-    if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIMENSIONS) {
-      throw new Error(
-        `Embedding response was not a ${EMBEDDING_DIMENSIONS}-dimensional vector` +
-          (Array.isArray(embedding) ? ` (got ${embedding.length})` : ""),
-      );
-    }
-
-    return embedding;
   }
 
   async extractTags(content: string): Promise<string[]> {

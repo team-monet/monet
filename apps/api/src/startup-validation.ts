@@ -1,4 +1,12 @@
 import type { SqlClient } from "@monet/db";
+import {
+  CHAT_PROVIDERS,
+  EMBEDDING_PROVIDERS,
+  LEGACY_ENRICHMENT_PROVIDERS,
+  type ChatProviderName,
+  type EmbeddingProviderName,
+  type LegacyEnrichmentProviderName,
+} from "./providers/index";
 import migrationJournal from "../../../packages/db/drizzle/meta/_journal.json";
 
 const DEFAULT_API_HOST = "0.0.0.0";
@@ -17,9 +25,6 @@ const DEFAULT_OLLAMA_CHAT_MODEL = "llama3.1:8b";
 const DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text";
 const DEFAULT_ONNX_EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-l-v2.0";
 const DEFAULT_EXAMPLE_ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
-const ALLOWED_ENRICHMENT_PROVIDERS = ["anthropic", "ollama", "onnx", "openai"] as const;
-
-type EnrichmentProvider = (typeof ALLOWED_ENRICHMENT_PROVIDERS)[number];
 
 type MigrationJournal = {
   entries: Array<{
@@ -47,7 +52,8 @@ export interface StartupConfigSummary {
     auditPurge: string;
   };
   enrichment: {
-    provider: EnrichmentProvider | null;
+    chatProvider: ChatProviderName | null;
+    embeddingProvider: EmbeddingProviderName | null;
     details: { [key: string]: StartupSummaryValue };
   };
   security: {
@@ -253,100 +259,248 @@ function validateEnrichmentConfig(
   errors: string[],
   warnings: string[],
 ): StartupConfigSummary["enrichment"] {
-  const provider = env.ENRICHMENT_PROVIDER?.trim() as EnrichmentProvider | undefined;
+  const explicitChatProvider = parseChatProviderEnv(env.ENRICHMENT_CHAT_PROVIDER, errors);
+  const explicitEmbeddingProvider = parseEmbeddingProviderEnv(
+    env.ENRICHMENT_EMBEDDING_PROVIDER,
+    errors,
+  );
+  const legacyProvider = parseLegacyEnrichmentProviderEnv(env.ENRICHMENT_PROVIDER, errors);
+  const chatProvider = explicitChatProvider ?? resolveLegacyChatProvider(legacyProvider);
+  const embeddingProvider =
+    explicitEmbeddingProvider ?? resolveLegacyEmbeddingProvider(legacyProvider);
 
-  if (!provider) {
+  if (legacyProvider && !explicitChatProvider && !explicitEmbeddingProvider) {
     warnings.push(
-      "ENRICHMENT_PROVIDER is not configured; enrichment and semantic search will run in degraded mode.",
+      "ENRICHMENT_PROVIDER is legacy shorthand. Prefer ENRICHMENT_CHAT_PROVIDER and ENRICHMENT_EMBEDDING_PROVIDER.",
     );
-    return {
-      provider: null,
-      details: {
-        configured: false,
-        mode: "degraded",
-      },
-    };
   }
 
-  if (!ALLOWED_ENRICHMENT_PROVIDERS.includes(provider)) {
-    errors.push(
-      `Unknown ENRICHMENT_PROVIDER: ${provider}. Expected one of ${ALLOWED_ENRICHMENT_PROVIDERS.join(", ")}.`,
+  if (!chatProvider && !embeddingProvider) {
+    warnings.push(
+      "ENRICHMENT_CHAT_PROVIDER and ENRICHMENT_EMBEDDING_PROVIDER are not configured; memory enrichment and semantic search will run in degraded mode.",
     );
-    return {
-      provider: "ollama",
-      details: {},
-    };
+  } else {
+    if (!chatProvider) {
+      warnings.push(
+        "ENRICHMENT_CHAT_PROVIDER is not configured; summary and tag enrichment will run in degraded mode.",
+      );
+    }
+    if (!embeddingProvider) {
+      warnings.push(
+        "ENRICHMENT_EMBEDDING_PROVIDER is not configured; semantic search and related-memory enrichment will run in degraded mode.",
+      );
+    }
   }
 
+  return {
+    chatProvider,
+    embeddingProvider,
+    details: {
+      configured: Boolean(chatProvider && embeddingProvider),
+      backgroundEnrichment: Boolean(chatProvider && embeddingProvider),
+      semanticSearch: Boolean(embeddingProvider),
+      legacyProvider,
+      chat: chatProvider
+        ? validateChatProviderConfig(env, chatProvider, errors)
+        : { configured: false },
+      embedding: embeddingProvider
+        ? validateEmbeddingProviderConfig(env, embeddingProvider, errors)
+        : { configured: false },
+    },
+  };
+}
+
+function validateChatProviderConfig(
+  env: NodeJS.ProcessEnv,
+  provider: ChatProviderName,
+  errors: string[],
+): StartupSummaryValue {
   if (provider === "anthropic") {
-    if (!env.ENRICHMENT_API_KEY?.trim()) {
-      errors.push("ENRICHMENT_API_KEY is required when ENRICHMENT_PROVIDER=anthropic.");
+    if (!env.ENRICHMENT_CHAT_API_KEY?.trim() && !env.ENRICHMENT_API_KEY?.trim()) {
+      errors.push(
+        "ENRICHMENT_CHAT_API_KEY is required when ENRICHMENT_CHAT_PROVIDER=anthropic (or use legacy ENRICHMENT_API_KEY).",
+      );
     }
 
     validateHttpUrl("ANTHROPIC_BASE_URL", env.ANTHROPIC_BASE_URL, errors);
-    validateHttpUrl("EMBEDDING_BASE_URL", env.EMBEDDING_BASE_URL, errors);
 
     return {
+      configured: true,
       provider,
-      details: {
-        anthropicBaseUrl: env.ANTHROPIC_BASE_URL?.trim() || DEFAULT_ANTHROPIC_BASE_URL,
-        anthropicModel: env.ANTHROPIC_MODEL?.trim() || DEFAULT_ANTHROPIC_MODEL,
-        embeddingBaseUrl: env.EMBEDDING_BASE_URL?.trim() || DEFAULT_OPENAI_BASE_URL,
-        embeddingModel: env.EMBEDDING_MODEL?.trim() || DEFAULT_OPENAI_EMBEDDING_MODEL,
-        anthropicApiKeyConfigured: Boolean(env.ENRICHMENT_API_KEY?.trim()),
-        embeddingApiKeyConfigured: Boolean(
-          env.EMBEDDING_API_KEY?.trim() || env.ENRICHMENT_API_KEY?.trim(),
-        ),
-      },
+      baseUrl: env.ANTHROPIC_BASE_URL?.trim() || DEFAULT_ANTHROPIC_BASE_URL,
+      model: env.ANTHROPIC_MODEL?.trim() || DEFAULT_ANTHROPIC_MODEL,
+      apiKeyConfigured: Boolean(
+        env.ENRICHMENT_CHAT_API_KEY?.trim() || env.ENRICHMENT_API_KEY?.trim(),
+      ),
     };
   }
 
   if (provider === "openai") {
     validateHttpUrl("OPENAI_BASE_URL", env.OPENAI_BASE_URL, errors);
     validateHttpUrl("OPENAI_CHAT_BASE_URL", env.OPENAI_CHAT_BASE_URL, errors);
-    validateHttpUrl("OPENAI_EMBEDDING_BASE_URL", env.OPENAI_EMBEDDING_BASE_URL, errors);
 
     return {
+      configured: true,
       provider,
-      details: {
-        chatBaseUrl: env.OPENAI_CHAT_BASE_URL?.trim() || env.OPENAI_BASE_URL?.trim() || DEFAULT_OPENAI_BASE_URL,
-        chatModel: env.OPENAI_CHAT_MODEL?.trim() || DEFAULT_OPENAI_CHAT_MODEL,
-        embeddingBaseUrl:
-          env.OPENAI_EMBEDDING_BASE_URL?.trim() || env.OPENAI_BASE_URL?.trim() || DEFAULT_OPENAI_BASE_URL,
-        embeddingModel: env.OPENAI_EMBEDDING_MODEL?.trim() || DEFAULT_OPENAI_EMBEDDING_MODEL,
-        chatApiKeyConfigured: Boolean(env.OPENAI_CHAT_API_KEY?.trim() || env.OPENAI_API_KEY?.trim()),
-        embeddingApiKeyConfigured: Boolean(
-          env.OPENAI_EMBEDDING_API_KEY?.trim() || env.OPENAI_API_KEY?.trim(),
-        ),
-      },
-    };
-  }
-
-  if (provider === "onnx") {
-    validateHttpUrl("OLLAMA_BASE_URL", env.OLLAMA_BASE_URL, errors);
-    const quantized = parseOptionalBooleanEnv("ONNX_QUANTIZED", env.ONNX_QUANTIZED, errors);
-
-    return {
-      provider,
-      details: {
-        baseUrl: env.OLLAMA_BASE_URL?.trim() || DEFAULT_OLLAMA_BASE_URL,
-        chatModel: env.OLLAMA_CHAT_MODEL?.trim() || DEFAULT_OLLAMA_CHAT_MODEL,
-        embeddingModel: env.ONNX_EMBEDDING_MODEL?.trim() || DEFAULT_ONNX_EMBEDDING_MODEL,
-        quantized: quantized ?? true,
-      },
+      baseUrl: env.OPENAI_CHAT_BASE_URL?.trim() || env.OPENAI_BASE_URL?.trim() || DEFAULT_OPENAI_BASE_URL,
+      model: env.OPENAI_CHAT_MODEL?.trim() || DEFAULT_OPENAI_CHAT_MODEL,
+      apiKeyConfigured: Boolean(
+        env.OPENAI_CHAT_API_KEY?.trim() ||
+          env.ENRICHMENT_CHAT_API_KEY?.trim() ||
+          env.OPENAI_API_KEY?.trim(),
+      ),
     };
   }
 
   validateHttpUrl("OLLAMA_BASE_URL", env.OLLAMA_BASE_URL, errors);
 
   return {
+    configured: true,
     provider,
-    details: {
-      baseUrl: env.OLLAMA_BASE_URL?.trim() || DEFAULT_OLLAMA_BASE_URL,
-      chatModel: env.OLLAMA_CHAT_MODEL?.trim() || DEFAULT_OLLAMA_CHAT_MODEL,
-      embeddingModel: env.OLLAMA_EMBEDDING_MODEL?.trim() || DEFAULT_OLLAMA_EMBEDDING_MODEL,
-    },
+    baseUrl: env.OLLAMA_BASE_URL?.trim() || DEFAULT_OLLAMA_BASE_URL,
+    model: env.OLLAMA_CHAT_MODEL?.trim() || DEFAULT_OLLAMA_CHAT_MODEL,
   };
+}
+
+function validateEmbeddingProviderConfig(
+  env: NodeJS.ProcessEnv,
+  provider: EmbeddingProviderName,
+  errors: string[],
+): StartupSummaryValue {
+  if (provider === "openai") {
+    validateHttpUrl("OPENAI_BASE_URL", env.OPENAI_BASE_URL, errors);
+    validateHttpUrl("OPENAI_EMBEDDING_BASE_URL", env.OPENAI_EMBEDDING_BASE_URL, errors);
+    validateHttpUrl("EMBEDDING_BASE_URL", env.EMBEDDING_BASE_URL, errors);
+
+    return {
+      configured: true,
+      provider,
+      baseUrl:
+        env.OPENAI_EMBEDDING_BASE_URL?.trim() ||
+        env.EMBEDDING_BASE_URL?.trim() ||
+        env.OPENAI_BASE_URL?.trim() ||
+        DEFAULT_OPENAI_BASE_URL,
+      model:
+        env.OPENAI_EMBEDDING_MODEL?.trim() ||
+        env.EMBEDDING_MODEL?.trim() ||
+        DEFAULT_OPENAI_EMBEDDING_MODEL,
+      apiKeyConfigured: Boolean(
+        env.OPENAI_EMBEDDING_API_KEY?.trim() ||
+          env.ENRICHMENT_EMBEDDING_API_KEY?.trim() ||
+          env.EMBEDDING_API_KEY?.trim() ||
+          env.OPENAI_API_KEY?.trim(),
+      ),
+    };
+  }
+
+  if (provider === "onnx") {
+    const quantized = parseOptionalBooleanEnv("ONNX_QUANTIZED", env.ONNX_QUANTIZED, errors);
+
+    return {
+      configured: true,
+      provider,
+      model: env.ONNX_EMBEDDING_MODEL?.trim() || DEFAULT_ONNX_EMBEDDING_MODEL,
+      quantized: quantized ?? true,
+    };
+  }
+
+  validateHttpUrl("OLLAMA_BASE_URL", env.OLLAMA_BASE_URL, errors);
+
+  return {
+    configured: true,
+    provider,
+    baseUrl: env.OLLAMA_BASE_URL?.trim() || DEFAULT_OLLAMA_BASE_URL,
+    model: env.OLLAMA_EMBEDDING_MODEL?.trim() || DEFAULT_OLLAMA_EMBEDDING_MODEL,
+  };
+}
+
+function parseChatProviderEnv(
+  value: string | undefined,
+  errors: string[],
+): ChatProviderName | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if ((CHAT_PROVIDERS as readonly string[]).includes(trimmed)) {
+    return trimmed as ChatProviderName;
+  }
+
+  errors.push(
+    `Unknown ENRICHMENT_CHAT_PROVIDER: ${trimmed}. Expected one of ${CHAT_PROVIDERS.join(", ")}.`,
+  );
+  return null;
+}
+
+function parseEmbeddingProviderEnv(
+  value: string | undefined,
+  errors: string[],
+): EmbeddingProviderName | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if ((EMBEDDING_PROVIDERS as readonly string[]).includes(trimmed)) {
+    return trimmed as EmbeddingProviderName;
+  }
+
+  errors.push(
+    `Unknown ENRICHMENT_EMBEDDING_PROVIDER: ${trimmed}. Expected one of ${EMBEDDING_PROVIDERS.join(", ")}.`,
+  );
+  return null;
+}
+
+function parseLegacyEnrichmentProviderEnv(
+  value: string | undefined,
+  errors: string[],
+): LegacyEnrichmentProviderName | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if ((LEGACY_ENRICHMENT_PROVIDERS as readonly string[]).includes(trimmed)) {
+    return trimmed as LegacyEnrichmentProviderName;
+  }
+
+  errors.push(
+    `Unknown ENRICHMENT_PROVIDER: ${trimmed}. Expected one of ${LEGACY_ENRICHMENT_PROVIDERS.join(", ")}.`,
+  );
+  return null;
+}
+
+function resolveLegacyChatProvider(
+  provider: LegacyEnrichmentProviderName | null,
+): ChatProviderName | null {
+  switch (provider) {
+    case "anthropic":
+      return "anthropic";
+    case "onnx":
+    case "ollama":
+      return "ollama";
+    case "openai":
+      return "openai";
+    default:
+      return null;
+  }
+}
+
+function resolveLegacyEmbeddingProvider(
+  provider: LegacyEnrichmentProviderName | null,
+): EmbeddingProviderName | null {
+  switch (provider) {
+    case "anthropic":
+    case "openai":
+      return "openai";
+    case "onnx":
+      return "onnx";
+    case "ollama":
+      return "ollama";
+    default:
+      return null;
+  }
 }
 
 async function probeDatabase(label: string, sql: SqlClient) {

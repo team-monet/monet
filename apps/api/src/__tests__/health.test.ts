@@ -37,21 +37,37 @@ function createSqlMock(options?: {
 }
 
 describe("health endpoints", () => {
-  const originalProvider = process.env.ENRICHMENT_PROVIDER;
+  const originalChatProvider = process.env.ENRICHMENT_CHAT_PROVIDER;
+  const originalEmbeddingProvider = process.env.ENRICHMENT_EMBEDDING_PROVIDER;
+  const originalLegacyProvider = process.env.ENRICHMENT_PROVIDER;
   const sessionStore = {
     count: vi.fn(() => 0),
   };
 
   beforeEach(() => {
-    process.env.ENRICHMENT_PROVIDER = "ollama";
+    process.env.ENRICHMENT_CHAT_PROVIDER = "ollama";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "ollama";
+    delete process.env.ENRICHMENT_PROVIDER;
     sessionStore.count.mockClear();
   });
 
   afterEach(() => {
-    if (originalProvider === undefined) {
+    if (originalChatProvider === undefined) {
+      delete process.env.ENRICHMENT_CHAT_PROVIDER;
+    } else {
+      process.env.ENRICHMENT_CHAT_PROVIDER = originalChatProvider;
+    }
+
+    if (originalEmbeddingProvider === undefined) {
+      delete process.env.ENRICHMENT_EMBEDDING_PROVIDER;
+    } else {
+      process.env.ENRICHMENT_EMBEDDING_PROVIDER = originalEmbeddingProvider;
+    }
+
+    if (originalLegacyProvider === undefined) {
       delete process.env.ENRICHMENT_PROVIDER;
     } else {
-      process.env.ENRICHMENT_PROVIDER = originalProvider;
+      process.env.ENRICHMENT_PROVIDER = originalLegacyProvider;
     }
   });
 
@@ -102,7 +118,14 @@ describe("health endpoints", () => {
         },
         enrichment: {
           status: "configured",
-          provider: "ollama",
+          configured: true,
+          chatProvider: "ollama",
+          embeddingProvider: "ollama",
+          features: {
+            backgroundEnrichment: true,
+            semanticSearch: true,
+          },
+          reasons: [],
         },
         audit: {
           status: "healthy",
@@ -136,8 +159,9 @@ describe("health endpoints", () => {
     });
   });
 
-  it("GET /health/ready stays ready when enrichment provider is not configured", async () => {
-    delete process.env.ENRICHMENT_PROVIDER;
+  it("GET /health/ready stays ready when only the embedding provider is configured", async () => {
+    delete process.env.ENRICHMENT_CHAT_PROVIDER;
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
     const sql = createSqlMock();
     const app = createApp(null, sql as never, sessionStore as never);
     const res = await app.request("/health/ready");
@@ -147,7 +171,13 @@ describe("health endpoints", () => {
       components: {
         enrichment: {
           status: "degraded",
-          provider: null,
+          configured: false,
+          chatProvider: null,
+          embeddingProvider: "onnx",
+          features: {
+            backgroundEnrichment: false,
+            semanticSearch: true,
+          },
         },
       },
     });

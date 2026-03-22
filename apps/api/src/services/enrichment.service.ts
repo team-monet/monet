@@ -7,8 +7,15 @@ import {
 } from "@monet/db";
 import { and, asc, eq, inArray, isNotNull, ne, sql as drizzleSql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
-import { createEnrichmentProvider } from "../providers/index";
-import type { EnrichmentProvider } from "../providers/enrichment";
+import {
+  createChatEnrichmentProvider,
+  createEmbeddingEnrichmentProvider,
+} from "../providers/index";
+import type {
+  ChatEnrichmentProvider,
+  EmbeddingEnrichmentProvider,
+  EnrichmentProvider,
+} from "../providers/enrichment";
 
 const MAX_CONCURRENT_ENRICHMENTS = 5;
 const QUERY_EMBEDDING_TIMEOUT_MS = 3000;
@@ -20,7 +27,8 @@ interface EnrichmentJob {
 }
 
 let providerOverride: EnrichmentProvider | null | undefined;
-let cachedProvider: EnrichmentProvider | null | undefined;
+let cachedChatProvider: ChatEnrichmentProvider | null | undefined;
+let cachedEmbeddingProvider: EmbeddingEnrichmentProvider | null | undefined;
 let activeJobs = 0;
 const queue: EnrichmentJob[] = [];
 const drainWaiters = new Set<() => void>();
@@ -34,12 +42,14 @@ export function setEnrichmentProviderForTests(
   provider: EnrichmentProvider | null | undefined,
 ) {
   providerOverride = provider;
-  cachedProvider = undefined;
+  cachedChatProvider = undefined;
+  cachedEmbeddingProvider = undefined;
 }
 
 export function resetEnrichmentStateForTests() {
   providerOverride = undefined;
-  cachedProvider = undefined;
+  cachedChatProvider = undefined;
+  cachedEmbeddingProvider = undefined;
   activeJobs = 0;
   queue.length = 0;
   shuttingDown = false;
@@ -139,14 +149,14 @@ export async function recoverPendingEnrichments(sql: SqlClient) {
 }
 
 export async function computeQueryEmbedding(query: string): Promise<number[] | null> {
-  const provider = getProvider({ logFailures: false });
-  if (!provider) {
-    console.warn("Falling back to text search because no enrichment provider is configured");
+  const embeddingProvider = getEmbeddingProvider({ logFailures: false });
+  if (!embeddingProvider) {
+    console.warn("Falling back to text search because no embedding provider is configured");
     return null;
   }
 
   try {
-    return await withTimeout(provider.computeEmbedding(query), QUERY_EMBEDDING_TIMEOUT_MS);
+    return await withTimeout(embeddingProvider.computeEmbedding(query), QUERY_EMBEDDING_TIMEOUT_MS);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`Falling back to text search because query embedding failed: ${message}`);
@@ -155,22 +165,59 @@ export async function computeQueryEmbedding(query: string): Promise<number[] | n
 }
 
 function getProvider(opts: { logFailures: boolean }): EnrichmentProvider | null {
+  const chatProvider = getChatProvider(opts);
+  const embeddingProvider = getEmbeddingProvider(opts);
+
+  if (!chatProvider || !embeddingProvider) {
+    return null;
+  }
+
+  return {
+    generateSummary: (content: string) => chatProvider.generateSummary(content),
+    extractTags: (content: string) => chatProvider.extractTags(content),
+    computeEmbedding: (content: string) => embeddingProvider.computeEmbedding(content),
+  };
+}
+
+function getChatProvider(opts: { logFailures: boolean }): ChatEnrichmentProvider | null {
   if (providerOverride !== undefined) {
     return providerOverride;
   }
 
-  if (cachedProvider !== undefined) {
-    return cachedProvider;
+  if (cachedChatProvider !== undefined) {
+    return cachedChatProvider;
   }
 
   try {
-    cachedProvider = createEnrichmentProvider();
-    return cachedProvider;
+    cachedChatProvider = createChatEnrichmentProvider();
+    return cachedChatProvider;
   } catch (error) {
-    cachedProvider = null;
+    cachedChatProvider = null;
     if (opts.logFailures) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`Enrichment provider unavailable: ${message}`);
+      console.warn(`Chat enrichment unavailable: ${message}`);
+    }
+    return null;
+  }
+}
+
+function getEmbeddingProvider(opts: { logFailures: boolean }): EmbeddingEnrichmentProvider | null {
+  if (providerOverride !== undefined) {
+    return providerOverride;
+  }
+
+  if (cachedEmbeddingProvider !== undefined) {
+    return cachedEmbeddingProvider;
+  }
+
+  try {
+    cachedEmbeddingProvider = createEmbeddingEnrichmentProvider();
+    return cachedEmbeddingProvider;
+  } catch (error) {
+    cachedEmbeddingProvider = null;
+    if (opts.logFailures) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Embedding provider unavailable: ${message}`);
     }
     return null;
   }

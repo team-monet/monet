@@ -77,11 +77,7 @@ health.get("/health/ready", async (c) => {
   }
 
   const enrichmentConfig = getEnrichmentProviderConfigStatus();
-  const enrichment = {
-    status: enrichmentConfig.configured ? "configured" : "degraded",
-    provider: enrichmentConfig.provider,
-    ...(enrichmentConfig.reason ? { reason: enrichmentConfig.reason } : {}),
-  };
+  const enrichment = enrichmentConfig;
 
   const audit = getAuditHealth();
   const mcp = {

@@ -1,6 +1,12 @@
 import type { SqlClient } from "@monet/db";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createEnrichmentProvider } from "../providers/index";
+import {
+  createChatEnrichmentProvider,
+  createEmbeddingEnrichmentProvider,
+  createEnrichmentProvider,
+  getEnrichmentProviderConfigStatus,
+  resolveConfiguredProviders,
+} from "../providers/index";
 
 const { drizzleMock, withTenantDrizzleScopeMock } = vi.hoisted(() => ({
   drizzleMock: vi.fn(),
@@ -34,31 +40,85 @@ import {
 describe("createEnrichmentProvider", () => {
   afterEach(() => {
     delete process.env.ENRICHMENT_PROVIDER;
+    delete process.env.ENRICHMENT_CHAT_PROVIDER;
+    delete process.env.ENRICHMENT_EMBEDDING_PROVIDER;
     delete process.env.ENRICHMENT_API_KEY;
     resetEnrichmentStateForTests();
   });
 
-  it("creates an ollama provider from env", () => {
-    process.env.ENRICHMENT_PROVIDER = "ollama";
+  it("creates split providers from explicit env", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
     const provider = createEnrichmentProvider();
+
     expect(provider).toBeDefined();
+    expect(resolveConfiguredProviders()).toEqual({
+      chatProvider: "openai",
+      embeddingProvider: "onnx",
+    });
   });
 
-  it("creates an openai provider from env", () => {
-    process.env.ENRICHMENT_PROVIDER = "openai";
-    const provider = createEnrichmentProvider();
-    expect(provider).toBeDefined();
-  });
-
-  it("creates an onnx provider from env", () => {
+  it("maps legacy onnx config to ollama chat plus onnx embeddings", () => {
     process.env.ENRICHMENT_PROVIDER = "onnx";
-    const provider = createEnrichmentProvider();
-    expect(provider).toBeDefined();
+
+    const chatProvider = createChatEnrichmentProvider();
+    const embeddingProvider = createEmbeddingEnrichmentProvider();
+
+    expect(chatProvider).toBeDefined();
+    expect(embeddingProvider).toBeDefined();
+    expect(resolveConfiguredProviders()).toEqual({
+      chatProvider: "ollama",
+      embeddingProvider: "onnx",
+    });
   });
 
-  it("throws for an unknown provider", () => {
-    process.env.ENRICHMENT_PROVIDER = "unknown";
-    expect(() => createEnrichmentProvider()).toThrow("Unknown ENRICHMENT_PROVIDER");
+  it("creates anthropic chat from canonical split api key", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "anthropic";
+    process.env.ENRICHMENT_CHAT_API_KEY = "anthropic-key";
+
+    const chatProvider = createChatEnrichmentProvider();
+
+    expect(chatProvider).toBeDefined();
+  });
+
+  it("honors an explicit env object instead of relying on process.env", () => {
+    const chatProvider = createChatEnrichmentProvider({
+      ENRICHMENT_CHAT_PROVIDER: "anthropic",
+      ENRICHMENT_CHAT_API_KEY: "anthropic-key",
+    });
+
+    expect(chatProvider).toBeDefined();
+  });
+
+  it("allows embedding-only configuration for semantic search", () => {
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
+    const embeddingProvider = createEmbeddingEnrichmentProvider();
+
+    expect(embeddingProvider).toBeDefined();
+    expect(resolveConfiguredProviders()).toEqual({
+      chatProvider: null,
+      embeddingProvider: "onnx",
+    });
+  });
+
+  it("throws for an unknown explicit provider", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "unknown";
+    expect(() => createChatEnrichmentProvider()).toThrow("Unknown ENRICHMENT_CHAT_PROVIDER");
+  });
+
+  it("reports invalid explicit config as degraded instead of throwing", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "unknown";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
+    expect(getEnrichmentProviderConfigStatus()).toMatchObject({
+      status: "degraded",
+      chatProvider: null,
+      reasons: expect.arrayContaining([
+        expect.stringContaining("Unknown ENRICHMENT_CHAT_PROVIDER"),
+      ]),
+    });
   });
 });
 
