@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import type { SqlClient } from "@monet/db";
 import {
   CHAT_PROVIDERS,
@@ -61,6 +62,7 @@ export interface StartupConfigSummary {
     encryptionKeyConfigured: boolean;
     devBypassAuth: boolean;
     dashboardLocalAuth: boolean;
+    allowInsecurePrivateHttpOrigins: boolean;
   };
   logging: {
     level: "info" | "warn" | "error";
@@ -149,9 +151,21 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): ValidatedStartupC
     { min: 1 },
     errors,
   );
+  const allowInsecurePrivateHttpOrigins =
+    parseOptionalBooleanEnv(
+      "ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS",
+      env.ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS,
+      errors,
+    ) ?? false;
 
   validateEncryptionKey(env.ENCRYPTION_KEY, errors);
-  validateTransportSecurityConfig(env, nodeEnv, errors, warnings);
+  validateTransportSecurityConfig(
+    env,
+    nodeEnv,
+    { allowInsecurePrivateHttpOrigins },
+    errors,
+    warnings,
+  );
 
   const devBypassAuth = parseOptionalBooleanEnv("DEV_BYPASS_AUTH", env.DEV_BYPASS_AUTH, errors) ?? false;
   const dashboardLocalAuth =
@@ -204,6 +218,7 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): ValidatedStartupC
         encryptionKeyConfigured: true,
         devBypassAuth,
         dashboardLocalAuth,
+        allowInsecurePrivateHttpOrigins,
       },
       logging: {
         level: logLevel,
@@ -649,6 +664,9 @@ function parseOptionalHttpUrl(name: string, value: string | undefined, errors: s
 function validateTransportSecurityConfig(
   env: NodeJS.ProcessEnv,
   nodeEnv: string,
+  options: {
+    allowInsecurePrivateHttpOrigins: boolean;
+  },
   errors: string[],
   warnings: string[],
 ) {
@@ -665,10 +683,16 @@ function validateTransportSecurityConfig(
     return;
   }
 
-  requireHttpsUrl("NEXTAUTH_URL", nextauthUrl, errors);
-  requireHttpsUrl("PUBLIC_API_URL", publicApiUrl, errors);
-  requireHttpsUrl("MCP_PUBLIC_URL", mcpPublicUrl, errors);
-  requireHttpsUrl("PUBLIC_OIDC_BASE_URL", publicOidcBaseUrl, errors);
+  if (options.allowInsecurePrivateHttpOrigins) {
+    warnings.push(
+      "ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true allows http:// public URLs on loopback or private-network addresses. Use this only for internal evaluation and remove it before broader rollout.",
+    );
+  }
+
+  requireHttpsUrl("NEXTAUTH_URL", nextauthUrl, options, errors, warnings);
+  requireHttpsUrl("PUBLIC_API_URL", publicApiUrl, options, errors, warnings);
+  requireHttpsUrl("MCP_PUBLIC_URL", mcpPublicUrl, options, errors, warnings);
+  requireHttpsUrl("PUBLIC_OIDC_BASE_URL", publicOidcBaseUrl, options, errors, warnings);
 
   if (!nextauthUrl) {
     warnings.push(
@@ -697,12 +721,31 @@ function validateTransportSecurityConfig(
   }
 }
 
-function requireHttpsUrl(name: string, url: URL | null, errors: string[]) {
+function requireHttpsUrl(
+  name: string,
+  url: URL | null,
+  options: {
+    allowInsecurePrivateHttpOrigins: boolean;
+  },
+  errors: string[],
+  warnings: string[],
+) {
   if (!url) {
     return;
   }
 
-  if (url.protocol !== "https:" && !isLoopbackTlsException(url)) {
+  if (url.protocol === "https:" || isLoopbackTlsException(url)) {
+    return;
+  }
+
+  if (options.allowInsecurePrivateHttpOrigins && isPrivateNetworkTlsException(url)) {
+    warnings.push(
+      `${name} uses http:// on a private-network address because ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true. Browsers will treat this as an insecure origin; use TLS before broader rollout.`,
+    );
+    return;
+  }
+
+  if (url.protocol !== "https:") {
     errors.push(`${name} must use https:// in production.`);
   }
 }
@@ -715,6 +758,39 @@ function isLoopbackTlsException(url: URL) {
     hostname === "::1" ||
     hostname.endsWith(".localhost")
   );
+}
+
+function isPrivateNetworkTlsException(url: URL) {
+  const hostname = url.hostname.toLowerCase();
+  const ipVersion = isIP(hostname);
+
+  if (ipVersion === 4) {
+    const octets = hostname.split(".").map((octet) => Number.parseInt(octet, 10));
+    if (octets.length !== 4 || octets.some((octet) => Number.isNaN(octet))) {
+      return false;
+    }
+
+    const [first, second] = octets;
+    return (
+      first === 10 ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168) ||
+      (first === 169 && second === 254)
+    );
+  }
+
+  if (ipVersion === 6) {
+    return (
+      hostname.startsWith("fc") ||
+      hostname.startsWith("fd") ||
+      hostname.startsWith("fe8") ||
+      hostname.startsWith("fe9") ||
+      hostname.startsWith("fea") ||
+      hostname.startsWith("feb")
+    );
+  }
+
+  return false;
 }
 
 function requireNonEmptyString(

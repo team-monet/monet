@@ -61,6 +61,12 @@ describe("validateStartupConfig", () => {
       level: "info",
       requestLogging: true,
     });
+    expect(result.summary.security).toEqual({
+      encryptionKeyConfigured: true,
+      devBypassAuth: false,
+      dashboardLocalAuth: false,
+      allowInsecurePrivateHttpOrigins: false,
+    });
     expect(result.warnings).toEqual([]);
   });
 
@@ -165,6 +171,49 @@ describe("validateStartupConfig", () => {
     });
 
     expect(result.warnings).toEqual([]);
+  });
+
+  it("allows private-network http URLs in production when the explicit opt-in is enabled", () => {
+    const result = validateStartupConfig({
+      ...createBaseEnv(),
+      NODE_ENV: "production",
+      ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS: "true",
+      NEXTAUTH_URL: "http://192.168.0.73:4310",
+      PUBLIC_API_URL: "http://192.168.0.73:4301",
+      MCP_PUBLIC_URL: "http://192.168.0.73:4301/mcp",
+      PUBLIC_OIDC_BASE_URL: "http://192.168.0.73:4400",
+    });
+
+    expect(result.summary.security.allowInsecurePrivateHttpOrigins).toBe(true);
+    expect(result.warnings).toContain(
+      "ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true allows http:// public URLs on loopback or private-network addresses. Use this only for internal evaluation and remove it before broader rollout.",
+    );
+    expect(result.warnings).toContain(
+      "NEXTAUTH_URL uses http:// on a private-network address because ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true. Browsers will treat this as an insecure origin; use TLS before broader rollout.",
+    );
+    expect(result.warnings).toContain(
+      "PUBLIC_API_URL uses http:// on a private-network address because ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true. Browsers will treat this as an insecure origin; use TLS before broader rollout.",
+    );
+    expect(result.warnings).toContain(
+      "MCP_PUBLIC_URL uses http:// on a private-network address because ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true. Browsers will treat this as an insecure origin; use TLS before broader rollout.",
+    );
+    expect(result.warnings).toContain(
+      "PUBLIC_OIDC_BASE_URL uses http:// on a private-network address because ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true. Browsers will treat this as an insecure origin; use TLS before broader rollout.",
+    );
+  });
+
+  it("still rejects public http URLs in production when the private-network opt-in is enabled", () => {
+    expect(() =>
+      validateStartupConfig({
+        ...createBaseEnv(),
+        NODE_ENV: "production",
+        ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS: "true",
+        NEXTAUTH_URL: "http://monet.example.com",
+        PUBLIC_API_URL: "http://api.monet.example.com",
+        MCP_PUBLIC_URL: "http://api.monet.example.com/mcp",
+        PUBLIC_OIDC_BASE_URL: "http://auth.monet.example.com",
+      }),
+    ).toThrow("NEXTAUTH_URL must use https:// in production.");
   });
 
   it("warns when production public URLs are missing", () => {

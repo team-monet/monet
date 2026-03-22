@@ -103,6 +103,12 @@ must use `https://`:
 - `MCP_PUBLIC_URL`
 - `PUBLIC_OIDC_BASE_URL`
 
+For a first internal trial on raw LAN ports, you can opt into insecure private
+network HTTP origins by setting `ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true` and
+using `http://` URLs on RFC1918/private-network IPs such as `192.168.x.x`.
+Keep this mode private to your LAN, expect browser security limitations, and
+remove the flag before broader rollout.
+
 ## Environment File
 
 Create the runtime env file:
@@ -122,6 +128,7 @@ At minimum, set:
 - `PUBLIC_API_URL`
 - `MCP_PUBLIC_URL`
 - `PUBLIC_OIDC_BASE_URL`
+- `ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS` only if you are deliberately running an internal HTTP-only trial on private-network IPs
 - `KEYCLOAK_BASE_URL`
 - `LOCAL_OIDC_BASE_URL`
 - `KEYCLOAK_ADMIN`
@@ -146,6 +153,7 @@ Important env notes:
 - `EMBEDDING_DIMENSIONS` must match your embedding model before the first migration.
 - `AUDIT_PURGE_DATABASE_URL` is optional but recommended when audit retention deletes should run under a restricted DB role.
 - in production, set `NEXTAUTH_URL`, `PUBLIC_API_URL`, `MCP_PUBLIC_URL`, and `PUBLIC_OIDC_BASE_URL` to `https://` public origins
+- `ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true` is an internal-trial escape hatch for raw private-network `http://` origins only; do not use it for internet-facing deployments
 - rotate the example `ENCRYPTION_KEY`; do not use the template value in production
 
 The full template is in [`../.env.runtime.example`](../.env.runtime.example).
