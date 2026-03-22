@@ -58,6 +58,22 @@ describe("validateStartupConfig", () => {
     expect(result.warnings).toEqual([]);
   });
 
+  it("allows startup without enrichment provider and records degraded mode", () => {
+    const env = createBaseEnv();
+    delete env.ENRICHMENT_PROVIDER;
+
+    const result = validateStartupConfig(env);
+
+    expect(result.summary.enrichment.provider).toBeNull();
+    expect(result.summary.enrichment.details).toEqual({
+      configured: false,
+      mode: "degraded",
+    });
+    expect(result.warnings).toContain(
+      "ENRICHMENT_PROVIDER is not configured; enrichment and semantic search will run in degraded mode.",
+    );
+  });
+
   it("fails when required config is missing or malformed", () => {
     expect(() =>
       validateStartupConfig({

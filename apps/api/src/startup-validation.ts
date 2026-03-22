@@ -47,7 +47,7 @@ export interface StartupConfigSummary {
     auditPurge: string;
   };
   enrichment: {
-    provider: EnrichmentProvider;
+    provider: EnrichmentProvider | null;
     details: { [key: string]: StartupSummaryValue };
   };
   security: {
@@ -144,7 +144,7 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): ValidatedStartupC
   const devBypassAuth = parseOptionalBooleanEnv("DEV_BYPASS_AUTH", env.DEV_BYPASS_AUTH, errors) ?? false;
   const dashboardLocalAuth =
     parseOptionalBooleanEnv("DASHBOARD_LOCAL_AUTH", env.DASHBOARD_LOCAL_AUTH, errors) ?? false;
-  const enrichment = validateEnrichmentConfig(env, errors);
+  const enrichment = validateEnrichmentConfig(env, errors, warnings);
 
   if (nodeEnv === "production" && devBypassAuth) {
     warnings.push("DEV_BYPASS_AUTH=true in production allows local auth bypass.");
@@ -251,14 +251,20 @@ export function formatStartupFailure(error: unknown): string {
 function validateEnrichmentConfig(
   env: NodeJS.ProcessEnv,
   errors: string[],
+  warnings: string[],
 ): StartupConfigSummary["enrichment"] {
   const provider = env.ENRICHMENT_PROVIDER?.trim() as EnrichmentProvider | undefined;
 
   if (!provider) {
-    errors.push("ENRICHMENT_PROVIDER is required (anthropic | ollama | onnx | openai).");
+    warnings.push(
+      "ENRICHMENT_PROVIDER is not configured; enrichment and semantic search will run in degraded mode.",
+    );
     return {
-      provider: "ollama",
-      details: {},
+      provider: null,
+      details: {
+        configured: false,
+        mode: "degraded",
+      },
     };
   }
 

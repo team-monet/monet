@@ -31,6 +31,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/monet_test
+      ENCRYPTION_KEY: ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=
       PLATFORM_ADMIN_SECRET: ci-test-secret
       TURBO_TELEMETRY_DISABLED: 1
       RUN_PERF: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && (contains(github.event.pull_request.title, '[perf]') || contains(join(github.event.pull_request.labels.*.name, ','), 'perf'))) }}
