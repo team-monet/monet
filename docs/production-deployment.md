@@ -16,6 +16,8 @@ scripts.
 
 For version changes after initial deployment, follow the
 [Migration And Upgrade Guide](migration-upgrade.md).
+For durability planning and recovery procedures, follow the
+[Backup And Restore Guide](backup-restore.md).
 
 ## Recommended Topology
 

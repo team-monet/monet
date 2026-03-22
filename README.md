@@ -17,6 +17,7 @@ It provides:
 
 ## Documentation
 
+- [Backup and Restore Guide](docs/backup-restore.md)
 - [Migration and Upgrade Guide](docs/migration-upgrade.md)
 - [Observability Guide](docs/observability.md)
 - [Production Deployment Guide](docs/production-deployment.md)
@@ -355,13 +356,15 @@ HOST_OLLAMA_BASE_URL=http://127.0.0.1:11434
 
 ## Backup and Restore
 
-Backup:
+For production guidance, use the [Backup and Restore Guide](docs/backup-restore.md).
+
+For a quick local snapshot:
 
 ```bash
 pg_dump "$DATABASE_URL" > monet_backup.sql
 ```
 
-Restore:
+For a quick local restore:
 
 ```bash
 psql "$DATABASE_URL" < monet_backup.sql
