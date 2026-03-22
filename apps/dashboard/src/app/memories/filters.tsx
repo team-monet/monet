@@ -3,7 +3,7 @@
 import { MemoryType } from "@monet/types";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useState } from "react";
 import { 
   Select as ShadSelect, 
   SelectContent as ShadSelectContent, 
@@ -20,40 +20,47 @@ import { SESSION_EXPIRED_ERROR_MESSAGE } from "@/lib/session-errors";
 
 interface MemoryFiltersProps {
   initialType?: MemoryType;
-  initialTag?: string;
   initialIncludeUser: boolean;
   initialIncludePrivate: boolean;
   errorMessage?: string;
-  stateKey: string;
 }
 
 export function MemoryFilters({
   initialType,
-  initialTag,
   initialIncludeUser,
   initialIncludePrivate,
   errorMessage,
-  stateKey,
 }: MemoryFiltersProps) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const [isUpdating, setIsUpdating] = useState(false);
-  const [, startTransition] = useTransition();
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const currentQuery = searchParams.toString();
+  const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+  const isUpdating = pendingUrl !== null;
   const isSessionExpired = errorMessage === SESSION_EXPIRED_ERROR_MESSAGE;
 
-  // Clear loading state when the server-rendered page state updates.
   useEffect(() => {
-    setIsUpdating(false);
-  }, [stateKey]);
+    setPendingUrl(null);
+  }, [initialType, initialIncludeUser, initialIncludePrivate, errorMessage]);
 
-  // Safety timeout to ensure the UI doesn't stay stuck forever
   useEffect(() => {
-    if (!isUpdating) return;
-    const timer = setTimeout(() => setIsUpdating(false), 5000);
-    return () => clearTimeout(timer);
-  }, [isUpdating]);
+    if (!pendingUrl) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setPendingUrl(null);
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [pendingUrl]);
+
+  useEffect(() => {
+    if (pendingUrl && currentUrl === pendingUrl) {
+      setPendingUrl(null);
+    }
+  }, [currentUrl, pendingUrl]);
 
   const updateUrl = (updates: Record<string, string | boolean | undefined>) => {
     const params = new URLSearchParams(currentQuery);
@@ -65,18 +72,14 @@ export function MemoryFilters({
       }
     });
     params.delete("cursor");
-    
-    const nextQuery = params.toString();
-    if (nextQuery === currentQuery) {
+    const query = params.toString();
+    const nextUrl = query ? `/memories?${query}` : "/memories";
+    if (nextUrl === currentUrl) {
       return;
     }
 
-    const nextUrl = nextQuery ? `${pathname}?${nextQuery}` : pathname;
-    
-    setIsUpdating(true);
-    startTransition(() => {
-      router.replace(nextUrl);
-    });
+    setPendingUrl(nextUrl);
+    router.replace(nextUrl);
   };
 
   return (
@@ -134,7 +137,7 @@ export function MemoryFilters({
         </div>
 
         <div className="ml-auto">
-          {(initialType || initialTag || initialIncludeUser || initialIncludePrivate) && (
+          {(initialType || initialIncludeUser || initialIncludePrivate) && (
             <Button
               type="button"
               variant="ghost"
@@ -142,10 +145,11 @@ export function MemoryFilters({
               className="text-muted-foreground"
               disabled={isUpdating}
               onClick={() => {
-                setIsUpdating(true);
-                startTransition(() => {
-                  router.replace(pathname);
-                });
+                if (currentUrl === "/memories") {
+                  return;
+                }
+                setPendingUrl("/memories");
+                router.replace("/memories");
               }}
             >
               {isUpdating ? (

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
@@ -9,7 +9,6 @@ import { Loader2, X } from "lucide-react";
 
 interface AuditFiltersProps {
   initialAction?: string;
-  stateKey: string;
 }
 
 const ACTION_OPTIONS = [
@@ -29,25 +28,36 @@ const ACTION_OPTIONS = [
   { value: "agent_rule_set.dissociate", label: "Agent Rule Set Dissociate" },
 ];
 
-export function AuditFilters({ initialAction, stateKey }: AuditFiltersProps) {
+export function AuditFilters({ initialAction }: AuditFiltersProps) {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [isUpdating, setIsUpdating] = useState(false);
-  const [, startTransition] = useTransition();
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const currentQuery = searchParams.toString();
+  const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
+  const isUpdating = pendingUrl !== null;
 
-  // Clear loading state when the server-rendered page state updates.
   useEffect(() => {
-    setIsUpdating(false);
-  }, [stateKey]);
+    setPendingUrl(null);
+  }, [initialAction]);
 
-  // Safety timeout
   useEffect(() => {
-    if (!isUpdating) return;
-    const timer = setTimeout(() => setIsUpdating(false), 5000);
-    return () => clearTimeout(timer);
-  }, [isUpdating]);
+    if (!pendingUrl) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setPendingUrl(null);
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [pendingUrl]);
+
+  useEffect(() => {
+    if (pendingUrl && currentUrl === pendingUrl) {
+      setPendingUrl(null);
+    }
+  }, [currentUrl, pendingUrl]);
 
   const updateAction = (value: string) => {
     const params = new URLSearchParams(currentQuery);
@@ -58,17 +68,14 @@ export function AuditFilters({ initialAction, stateKey }: AuditFiltersProps) {
     }
     params.delete("cursor");
 
-    const nextQuery = params.toString();
-    if (nextQuery === currentQuery) {
+    const query = params.toString();
+    const nextUrl = query ? `/admin/audit?${query}` : "/admin/audit";
+    if (nextUrl === currentUrl) {
       return;
     }
 
-    const nextUrl = nextQuery ? `${pathname}?${nextQuery}` : pathname;
-    
-    setIsUpdating(true);
-    startTransition(() => {
-      router.replace(nextUrl);
-    });
+    setPendingUrl(nextUrl);
+    router.replace(nextUrl);
   };
 
   return (
