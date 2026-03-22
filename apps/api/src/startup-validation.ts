@@ -18,6 +18,7 @@ const DEFAULT_EMBEDDING_DIMENSIONS = 1024;
 const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
+const DEFAULT_LOG_LEVEL = "info";
 const DEFAULT_ANTHROPIC_MODEL = "claude-3-5-haiku-latest";
 const DEFAULT_OPENAI_CHAT_MODEL = "gpt-4o-mini";
 const DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small";
@@ -60,6 +61,10 @@ export interface StartupConfigSummary {
     encryptionKeyConfigured: boolean;
     devBypassAuth: boolean;
     dashboardLocalAuth: boolean;
+  };
+  logging: {
+    level: "info" | "warn" | "error";
+    requestLogging: boolean;
   };
   rateLimit: {
     max: number;
@@ -150,6 +155,8 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): ValidatedStartupC
   const devBypassAuth = parseOptionalBooleanEnv("DEV_BYPASS_AUTH", env.DEV_BYPASS_AUTH, errors) ?? false;
   const dashboardLocalAuth =
     parseOptionalBooleanEnv("DASHBOARD_LOCAL_AUTH", env.DASHBOARD_LOCAL_AUTH, errors) ?? false;
+  const logLevel = parseLogLevelEnv("LOG_LEVEL", env.LOG_LEVEL, DEFAULT_LOG_LEVEL, errors);
+  const requestLogging = parseOptionalBooleanEnv("LOG_REQUESTS", env.LOG_REQUESTS, errors) ?? true;
   const enrichment = validateEnrichmentConfig(env, errors, warnings);
 
   if (nodeEnv === "production" && devBypassAuth) {
@@ -196,6 +203,10 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): ValidatedStartupC
         encryptionKeyConfigured: true,
         devBypassAuth,
         dashboardLocalAuth,
+      },
+      logging: {
+        level: logLevel,
+        requestLogging,
       },
       rateLimit: {
         max: rateLimitMax,
@@ -703,6 +714,27 @@ function parseOptionalBooleanEnv(
     default:
       errors.push(`${name} must be a boolean-like value (true/false, 1/0, yes/no, on/off).`);
       return undefined;
+  }
+}
+
+function parseLogLevelEnv(
+  name: string,
+  value: string | undefined,
+  fallback: "info" | "warn" | "error",
+  errors: string[],
+): "info" | "warn" | "error" {
+  if (value === undefined || value.trim() === "") {
+    return fallback;
+  }
+
+  switch (value.trim().toLowerCase()) {
+    case "info":
+    case "warn":
+    case "error":
+      return value.trim().toLowerCase() as "info" | "warn" | "error";
+    default:
+      errors.push(`${name} must be one of: info, warn, error.`);
+      return fallback;
   }
 }
 

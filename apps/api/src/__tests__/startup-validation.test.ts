@@ -57,6 +57,10 @@ describe("validateStartupConfig", () => {
     expect(result.summary.database.primary).toBe("postgresql://db.internal:5432/monet");
     expect(result.summary.enrichment.chatProvider).toBe("ollama");
     expect(result.summary.enrichment.embeddingProvider).toBe("ollama");
+    expect(result.summary.logging).toEqual({
+      level: "info",
+      requestLogging: true,
+    });
     expect(result.warnings).toEqual([]);
   });
 
@@ -87,14 +91,21 @@ describe("validateStartupConfig", () => {
   });
 
   it("fails when required config is missing or malformed", () => {
-    expect(() =>
+    try {
       validateStartupConfig({
         ENRICHMENT_CHAT_PROVIDER: "anthropic",
         API_PORT: "abc",
         RATE_LIMIT_MAX: "0",
+        LOG_LEVEL: "debug",
         ENCRYPTION_KEY: "too-short",
-      }),
-    ).toThrowError(StartupValidationError);
+      });
+      throw new Error("Expected validateStartupConfig to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(StartupValidationError);
+      expect((error as StartupValidationError).errors).toContain(
+        "LOG_LEVEL must be one of: info, warn, error.",
+      );
+    }
   });
 
   it("adds production warnings for insecure shared auth defaults", () => {
@@ -170,6 +181,33 @@ describe("validateStartupConfig", () => {
         apiKeyConfigured: false,
       },
     });
+  });
+
+  it("records LOG_REQUESTS=false in the startup summary", () => {
+    const result = validateStartupConfig({
+      ...createBaseEnv(),
+      LOG_REQUESTS: "false",
+    });
+
+    expect(result.summary.logging).toEqual({
+      level: "info",
+      requestLogging: false,
+    });
+  });
+
+  it("fails when LOG_REQUESTS is not a boolean", () => {
+    try {
+      validateStartupConfig({
+        ...createBaseEnv(),
+        LOG_REQUESTS: "maybe",
+      });
+      throw new Error("Expected validateStartupConfig to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(StartupValidationError);
+      expect((error as StartupValidationError).errors).toContain(
+        "LOG_REQUESTS must be a boolean-like value (true/false, 1/0, yes/no, on/off).",
+      );
+    }
   });
 });
 

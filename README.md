@@ -17,6 +17,7 @@ It provides:
 
 ## Documentation
 
+- [Observability Guide](docs/observability.md)
 - [Production Deployment Guide](docs/production-deployment.md)
 - [User and Agent Group Model](docs/user-and-agent-group-model.md)
 
@@ -191,6 +192,8 @@ Optional:
 - `ENRICHMENT_EMBEDDING_PROVIDER` - `ollama`, `onnx`, or `openai`. Controls semantic search embeddings and related-memory vectors.
 - `ENRICHMENT_PROVIDER` - legacy shorthand fallback. Mappings: `anthropic -> chat=anthropic, embedding=openai`, `onnx -> chat=ollama, embedding=onnx`, `openai -> both openai`, `ollama -> both ollama`.
 - `EMBEDDING_DIMENSIONS` - dimensionality of embedding vectors (default `1024`). Set this to match your chosen embedding model (e.g. `1536` for OpenAI `text-embedding-3-small`, `1024` for Ollama `qwen3-embedding` or ONNX `Snowflake/snowflake-arctic-embed-l-v2.0`). Must be set **before** running the first migration, as it defines the database column width.
+- `LOG_LEVEL` - structured log threshold: `info`, `warn`, or `error` (default `info`).
+- `LOG_REQUESTS` - set to `false` to suppress structured request logs.
 - `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` (defaults `100` per `60000ms`).
 - `AUDIT_RETENTION_DAYS` (default `90`).
 - `AUDIT_PURGE_ENABLED` - set to `true` to enable audit retention deletes. Purge is disabled by default.

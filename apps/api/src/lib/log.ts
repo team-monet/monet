@@ -1,5 +1,11 @@
 export type LogLevel = "info" | "warn" | "error";
 
+const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
+  info: 20,
+  warn: 30,
+  error: 40,
+};
+
 export interface StructuredLogEntry {
   timestamp: string;
   level: LogLevel;
@@ -27,7 +33,23 @@ export function formatLogEntry(input: StructuredLogInput): string {
 }
 
 export function writeStructuredLog(input: StructuredLogInput): void {
-  console.log(formatLogEntry(input));
+  const level = input.level as LogLevel;
+
+  if (!shouldLogLevel(level)) {
+    return;
+  }
+
+  const rendered = formatLogEntry(input);
+  switch (level) {
+    case "error":
+      console.error(rendered);
+      return;
+    case "warn":
+      console.warn(rendered);
+      return;
+    default:
+      console.log(rendered);
+  }
 }
 
 export function logRequest(input: {
@@ -67,4 +89,20 @@ function isRequestLoggingEnabled(): boolean {
   }
 
   return true;
+}
+
+function shouldLogLevel(level: LogLevel): boolean {
+  return LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[getConfiguredLogLevel()];
+}
+
+function getConfiguredLogLevel(): LogLevel {
+  const raw = process.env.LOG_LEVEL?.trim().toLowerCase();
+  switch (raw) {
+    case "warn":
+      return "warn";
+    case "error":
+      return "error";
+    default:
+      return "info";
+  }
 }
