@@ -359,7 +359,9 @@ async function probeDatabase(label: string, sql: SqlClient) {
   }
 }
 
-async function verifyPlatformMigrations(sql: SqlClient): Promise<StartupDependencyStatus["migrations"]> {
+export async function verifyPlatformMigrations(
+  sql: SqlClient,
+): Promise<StartupDependencyStatus["migrations"]> {
   const latestExpected = LATEST_PLATFORM_MIGRATION;
 
   if (!latestExpected) {

@@ -181,11 +181,12 @@ pnpm test:integration
 Required:
 
 - `DATABASE_URL` - PostgreSQL connection string.
+- `ENCRYPTION_KEY` - base64-encoded 32-byte key for secret encryption.
 - `API_PORT` - API bind port (default `3001`).
-- `ENRICHMENT_PROVIDER` - `anthropic`, `ollama`, `onnx`, or `openai`.
 
 Optional:
 
+- `ENRICHMENT_PROVIDER` - `anthropic`, `ollama`, `onnx`, or `openai`. If omitted, the API starts in degraded mode without enrichment or semantic search.
 - `EMBEDDING_DIMENSIONS` - dimensionality of embedding vectors (default `1024`). Set this to match your chosen embedding model (e.g. `1536` for OpenAI `text-embedding-3-small`, `1024` for Ollama `qwen3-embedding` or ONNX `Snowflake/snowflake-arctic-embed-l-v2.0`). Must be set **before** running the first migration, as it defines the database column width.
 - `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` (defaults `100` per `60000ms`).
 - `AUDIT_RETENTION_DAYS` (default `90`).
@@ -353,7 +354,38 @@ Health endpoints:
 
 - `GET /health`
 - `GET /health/live`
+- `GET /healthz`
 - `GET /health/ready`
+
+Readiness returns `200` only when the API can reach PostgreSQL, the platform migrations are current, and the MCP session subsystem is available. Enrichment configuration is reported as a component state, but a missing provider only degrades semantic search and does not make the API unready.
+
+Runtime Docker Compose already uses readiness for the API container:
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${API_PORT:-4301}/health/ready >/dev/null || exit 1"]
+  interval: 10s
+  timeout: 5s
+  retries: 6
+```
+
+Recommended Kubernetes probes:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 3001
+  periodSeconds: 10
+  timeoutSeconds: 5
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 3001
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 6
+```
 
 Request logs are structured JSON and should not include secrets or token values.
 
@@ -364,13 +396,14 @@ Common failures:
 - `401 unauthorized` - invalid or missing API key.
 - `403 forbidden` - role mismatch.
 - `409 conflict` - optimistic lock conflict or quota exceeded.
-- readiness `503` - DB or enrichment provider config issue.
+- readiness `503` - DB connectivity, pending migrations, or MCP availability issue.
 
 Recommended checks:
 
 - inspect logs by `requestId`
 - verify DB connectivity (`SELECT 1`)
-- verify enrichment env vars
+- verify `drizzle.__drizzle_migrations` is current
+- verify the API booted with MCP enabled
 
 ## Audit Retention
 
