@@ -4,9 +4,9 @@ import {
   asDrizzleSqlClient,
   resolveSqlClientOptions,
   type Database,
-} from "./client";
-import * as platformSchema from "./schema/platform";
-import * as tenantSchema from "./schema/tenant";
+} from "./client.js";
+import * as platformSchema from "./schema/platform.js";
+import * as tenantSchema from "./schema/tenant.js";
 
 const SCHEMA_NAME_REGEX = /^tenant_[a-f0-9_]{36}$/;
 const databaseSchema = {

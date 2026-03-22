@@ -1,2 +1,2 @@
-export * from "./platform";
-export * from "./tenant";
+export * from "./platform.js";
+export * from "./tenant.js";

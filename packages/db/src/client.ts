@@ -1,7 +1,7 @@
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
-import * as platformSchema from "./schema/platform";
-import * as tenantSchema from "./schema/tenant";
+import * as platformSchema from "./schema/platform.js";
+import * as tenantSchema from "./schema/tenant.js";
 
 export type SqlClient = postgres.Sql;
 export type TransactionClient = postgres.TransactionSql;

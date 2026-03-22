@@ -9,10 +9,10 @@ export {
   type SqlClientOptions,
   type SqlParameter,
   type TransactionClient,
-} from "./client";
-export * from "./schema/index";
+} from "./client.js";
+export * from "./schema/index.js";
 export {
   createTenantSchema,
   tenantSchemaNameFromId,
-} from "./tenant-schema-manager";
-export { withTenantDrizzleScope, withTenantScope } from "./scoped-client";
+} from "./tenant-schema-manager.js";
+export { withTenantDrizzleScope, withTenantScope } from "./scoped-client.js";
