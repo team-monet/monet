@@ -84,7 +84,7 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
       </div>
 
       <div className="flex justify-start md:justify-end">
-        {(initialAction || currentQuery) && (
+        {initialAction && (
           <Button
             type="button"
             variant="ghost"

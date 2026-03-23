@@ -8,9 +8,7 @@ export interface EmbeddingEnrichmentProvider {
 }
 
 export interface EnrichmentProvider
-  extends ChatEnrichmentProvider, EmbeddingEnrichmentProvider {
-  extractTags(content: string): Promise<string[]>;
-}
+  extends ChatEnrichmentProvider, EmbeddingEnrichmentProvider {}
 
 export interface EnrichmentConfig {
   anthropicApiKey?: string;

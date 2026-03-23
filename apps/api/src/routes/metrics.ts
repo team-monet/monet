@@ -29,9 +29,17 @@ metricsRouter.get("/", async (c) => {
     );
   }
 
+  const timezone = c.req.query("timezone") || "UTC";
+
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: timezone });
+  } catch {
+    return c.json({ error: "bad_request", message: "Invalid timezone" }, 400);
+  }
+
   try {
     const [usage, benefit, health] = await Promise.all([
-      getUsageMetrics(sql, agent.tenantId),
+      getUsageMetrics(sql, agent.tenantId, timezone),
       getBenefitMetrics(sql, agent.tenantId),
       getHealthMetrics(sql, agent.tenantId),
     ]);

@@ -14,7 +14,12 @@ import { redirect } from "next/navigation";
 import { db } from "./db";
 import { decrypt } from "./crypto";
 import { finalizePlatformInitialization } from "./bootstrap";
-import { fetchOidcDiscoveryDocument, resolveOidcProviderConfig } from "./oidc";
+import {
+  fetchOidcDiscoveryDocument,
+  resolveOidcProviderConfig,
+  resolveOidcIssuerForServer,
+  replaceUrlOrigin,
+} from "./oidc";
 import { upsertTenantUserFromLogin } from "./tenant-user-binding";
 
 interface ExtendedUser extends User {
@@ -96,11 +101,16 @@ async function refreshAccessToken(token: ExtendedJWT) {
     }
 
     const discovery = await fetchOidcDiscoveryDocument(config.issuer);
-    const tokenEndpoint = discovery.token_endpoint;
 
-    if (!tokenEndpoint) {
+    if (!discovery.token_endpoint) {
       throw new Error("OIDC discovery document is missing token_endpoint");
     }
+
+    const serverIssuer = resolveOidcIssuerForServer(config.issuer);
+    const tokenEndpoint = replaceUrlOrigin(
+      discovery.token_endpoint,
+      serverIssuer,
+    );
 
     const response = await fetch(tokenEndpoint, {
       method: "POST",
@@ -121,7 +131,8 @@ async function refreshAccessToken(token: ExtendedJWT) {
     return {
       ...token,
       accessToken: refreshedTokens.access_token,
-      expiresAt: Math.floor(Date.now() / 1000) + refreshedTokens.expires_in,
+      expiresAt:
+        Math.floor(Date.now() / 1000) + (refreshedTokens.expires_in ?? 3600),
       refreshToken: refreshedTokens.refresh_token ?? token.refreshToken,
     };
   } catch (error) {
@@ -190,8 +201,9 @@ export const authConfig: NextAuthConfig = {
             refreshToken:
               account.refresh_token || "platform-oauth-refresh-token",
             expiresAt:
+              (account.expires_at as number) ??
               Math.floor(Date.now() / 1000) +
-              ((account.expires_in as number) ?? 3600),
+                ((account.expires_in as number) ?? 3600),
           } as ExtendedJWT;
         }
 
@@ -218,13 +230,15 @@ export const authConfig: NextAuthConfig = {
           accessToken: account.access_token || "dev-bypass-token",
           refreshToken: account.refresh_token || "dev-bypass-refresh-token",
           expiresAt:
+            (account.expires_at as number) ??
             Math.floor(Date.now() / 1000) +
-            ((account.expires_in as number) ?? 3600),
+              ((account.expires_in as number) ?? 3600),
         } as ExtendedJWT;
       }
 
       const extendedToken = token as unknown as ExtendedJWT;
-      if (Date.now() < extendedToken.expiresAt * 1000) {
+      // Refresh token 60 seconds before it expires
+      if (Date.now() < (extendedToken.expiresAt - 60) * 1000) {
         return token;
       }
 

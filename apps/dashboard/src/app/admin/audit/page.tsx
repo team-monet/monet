@@ -15,6 +15,7 @@ import { AlertTriangle, Calendar, User, Bot, ShieldCheck } from "lucide-react";
 import { AuditFilters } from "./filters";
 import { Suspense } from "react";
 import { AuditTableSkeleton } from "./loading";
+import { LocalizedDateTime } from "@/components/localized-date-time";
 
 interface PageProps {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
@@ -37,6 +38,7 @@ function actorTypeLabel(actorType: string) {
   return actorType;
 }
 
+// Auth: relies on requireAdmin() in the parent AdminAuditPage — do not render outside that guard.
 async function AuditTable({ searchParams }: { searchParams: Promise<{ [key: string]: string | string[] | undefined }> }) {
   const params = await searchParams;
   
@@ -104,7 +106,7 @@ async function AuditTable({ searchParams }: { searchParams: Promise<{ [key: stri
                     <TableCell className="text-muted-foreground">
                       <div className="flex items-center gap-2">
                         <Calendar className="h-3.5 w-3.5" />
-                        {new Date(log.created_at).toLocaleString()}
+                        <LocalizedDateTime date={log.created_at} />
                       </div>
                     </TableCell>
                     <TableCell>

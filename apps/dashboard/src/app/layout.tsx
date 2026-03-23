@@ -36,6 +36,17 @@ export default async function RootLayout({
             } catch (_) {}
           `}
         </Script>
+        <Script id="timezone-init" strategy="beforeInteractive">
+          {`
+            try {
+              var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+              if (tz) {
+                var secure = location.protocol === "https:" ? "; Secure" : "";
+                document.cookie = "x-timezone=" + encodeURIComponent(tz) + "; path=/; max-age=31536000; SameSite=Lax" + secure;
+              }
+            } catch (_) {}
+          `}
+        </Script>
         <AppShell hasSession={Boolean(session)} user={user}>
           {children}
         </AppShell>
