@@ -17,6 +17,8 @@ import {
 import { formatMemoryAuthor } from "@/lib/memory-display";
 import { ClickableRow } from "./clickable-row";
 import { isSessionExpiredError } from "@/lib/session-errors";
+import { Suspense } from "react";
+import { MemoriesTableSkeleton } from "./loading";
 
 interface PageProps {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
@@ -40,7 +42,7 @@ function getScopeColor(scope: string) {
   }
 }
 
-export default async function MemoriesPage({ searchParams }: PageProps) {
+async function MemoriesTable({ searchParams }: { searchParams: Promise<{ [key: string]: string | string[] | undefined }> }) {
   const params = await searchParams;
   const type = params.memoryType as MemoryType;
   const tag = params.tag as string;
@@ -86,6 +88,115 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
     nextPageHref = `/memories?${nextParams.toString()}`;
   }
 
+  if (error) {
+    return (
+      <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-4 text-destructive">
+        {error}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <Card className="shadow-sm">
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-[120px]">Type</TableHead>
+                <TableHead className="w-[100px]">Scope</TableHead>
+                <TableHead>Summary</TableHead>
+                <TableHead className="w-[180px]">Metadata</TableHead>
+                <TableHead className="w-[80px]"></TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {memories.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={5} className="h-24 text-center text-muted-foreground">
+                    No memories found.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                memories.map((m) => (
+                  <ClickableRow key={m.id} href={`/memories/${m.id}`} className="group">
+                    <TableCell>
+                      <div className="flex flex-col gap-1.5">
+                        <Badge variant={getMemoryTypeVariant(m.memoryType)} className="w-fit uppercase text-[10px]">
+                          {m.memoryType}
+                        </Badge>
+                        {m.outdated && (
+                          <Badge variant="destructive" className="w-fit text-[9px] h-4 px-1.5 uppercase">
+                            Outdated
+                          </Badge>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${getScopeColor(m.memoryScope)}`}>
+                        {m.memoryScope}
+                      </span>
+                    </TableCell>
+                    <TableCell className="max-w-md">
+                      <div className="flex flex-col gap-1">
+                        <span className="font-medium text-sm line-clamp-2">{m.summary}</span>
+                        <div className="flex flex-wrap gap-1">
+                          {m.tags.slice(0, 3).map(tag => (
+                            <span key={tag} className="text-[10px] text-muted-foreground">#{tag}</span>
+                          ))}
+                          {m.tags.length > 3 && <span className="text-[10px] text-muted-foreground">+{m.tags.length - 3}</span>}
+                        </div>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+                        <div className="flex items-center gap-1.5">
+                          <Calendar className="h-3 w-3" />
+                          {new Date(m.createdAt).toLocaleDateString()}
+                        </div>
+                        <div className="flex items-center gap-1.5 truncate max-w-[150px]">
+                          <Bot className="h-3 w-3 shrink-0" />
+                          <span className="truncate">{formatMemoryAuthor(m)}</span>
+                        </div>
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Button variant="ghost" size="icon" asChild className="opacity-0 group-hover:opacity-100 transition-opacity">
+                        <Link href={`/memories/${m.id}`}>
+                          <ChevronRight className="h-4 w-4" />
+                          <span className="sr-only">View</span>
+                        </Link>
+                      </Button>
+                    </TableCell>
+                  </ClickableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+
+      {nextPageHref && (
+        <div className="flex justify-center mt-4">
+          <Pagination>
+            <PaginationContent>
+              <PaginationItem>
+                <PaginationNext href={nextPageHref} />
+              </PaginationItem>
+            </PaginationContent>
+          </Pagination>
+        </div>
+      )}
+    </>
+  );
+}
+
+export default async function MemoriesPage({ searchParams }: PageProps) {
+  const params = await searchParams;
+  const type = params.memoryType as MemoryType;
+  const includeUser = params.includeUser === "true";
+  const includePrivate = params.includePrivate === "true";
+
   return (
     <div className="flex flex-col gap-6 p-4">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -107,102 +218,11 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
         initialType={type} 
         initialIncludeUser={includeUser} 
         initialIncludePrivate={includePrivate}
-        errorMessage={error}
       />
 
-      {error ? null : (
-        <>
-          <Card className="shadow-sm">
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-[120px]">Type</TableHead>
-                    <TableHead className="w-[100px]">Scope</TableHead>
-                    <TableHead>Summary</TableHead>
-                    <TableHead className="w-[180px]">Metadata</TableHead>
-                    <TableHead className="w-[80px]"></TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {memories.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={5} className="h-24 text-center text-muted-foreground">
-                        No memories found.
-                      </TableCell>
-                    </TableRow>
-                  ) : (
-                    memories.map((m) => (
-                      <ClickableRow key={m.id} href={`/memories/${m.id}`} className="group">
-                        <TableCell>
-                          <div className="flex flex-col gap-1.5">
-                            <Badge variant={getMemoryTypeVariant(m.memoryType)} className="w-fit uppercase text-[10px]">
-                              {m.memoryType}
-                            </Badge>
-                            {m.outdated && (
-                              <Badge variant="destructive" className="w-fit text-[9px] h-4 px-1.5 uppercase">
-                                Outdated
-                              </Badge>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${getScopeColor(m.memoryScope)}`}>
-                            {m.memoryScope}
-                          </span>
-                        </TableCell>
-                        <TableCell className="max-w-md">
-                          <div className="flex flex-col gap-1">
-                            <span className="font-medium text-sm line-clamp-2">{m.summary}</span>
-                            <div className="flex flex-wrap gap-1">
-                              {m.tags.slice(0, 3).map(tag => (
-                                <span key={tag} className="text-[10px] text-muted-foreground">#{tag}</span>
-                              ))}
-                              {m.tags.length > 3 && <span className="text-[10px] text-muted-foreground">+{m.tags.length - 3}</span>}
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex flex-col gap-1 text-[11px] text-muted-foreground">
-                            <div className="flex items-center gap-1.5">
-                              <Calendar className="h-3 w-3" />
-                              {new Date(m.createdAt).toLocaleDateString()}
-                            </div>
-                            <div className="flex items-center gap-1.5 truncate max-w-[150px]">
-                              <Bot className="h-3 w-3 shrink-0" />
-                              <span className="truncate">{formatMemoryAuthor(m)}</span>
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-right">
-                          <Button variant="ghost" size="icon" asChild className="opacity-0 group-hover:opacity-100 transition-opacity">
-                            <Link href={`/memories/${m.id}`}>
-                              <ChevronRight className="h-4 w-4" />
-                              <span className="sr-only">View</span>
-                            </Link>
-                          </Button>
-                        </TableCell>
-                      </ClickableRow>
-                    ))
-                  )}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-
-          {nextPageHref && (
-            <div className="flex justify-center mt-4">
-              <Pagination>
-                <PaginationContent>
-                  <PaginationItem>
-                    <PaginationNext href={nextPageHref} />
-                  </PaginationItem>
-                </PaginationContent>
-              </Pagination>
-            </div>
-          )}
-        </>
-      )}
+      <Suspense fallback={<MemoriesTableSkeleton />}>
+        <MemoriesTable searchParams={searchParams} />
+      </Suspense>
     </div>
   );
 }

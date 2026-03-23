@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
@@ -32,32 +32,8 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
   const currentQuery = searchParams.toString();
-  const currentUrl = currentQuery ? `${pathname}?${currentQuery}` : pathname;
-  const isUpdating = pendingUrl !== null;
-
-  useEffect(() => {
-    setPendingUrl(null);
-  }, [initialAction]);
-
-  useEffect(() => {
-    if (!pendingUrl) {
-      return;
-    }
-
-    const timer = window.setTimeout(() => {
-      setPendingUrl(null);
-    }, 5000);
-
-    return () => window.clearTimeout(timer);
-  }, [pendingUrl]);
-
-  useEffect(() => {
-    if (pendingUrl && currentUrl === pendingUrl) {
-      setPendingUrl(null);
-    }
-  }, [currentUrl, pendingUrl]);
 
   const updateAction = (value: string) => {
     const params = new URLSearchParams(currentQuery);
@@ -69,13 +45,15 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
     params.delete("cursor");
 
     const query = params.toString();
-    const nextUrl = query ? `/admin/audit?${query}` : "/admin/audit";
-    if (nextUrl === currentUrl) {
+    const nextUrl = query ? `${pathname}?${query}` : pathname;
+    
+    if (nextUrl === (currentQuery ? `${pathname}?${currentQuery}` : pathname)) {
       return;
     }
 
-    setPendingUrl(nextUrl);
-    router.replace(nextUrl);
+    startTransition(() => {
+      router.replace(nextUrl);
+    });
   };
 
   return (
@@ -83,15 +61,15 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
       <div className="grid gap-2">
         <div className="flex items-center justify-between gap-3">
           <Label className="text-xs uppercase text-muted-foreground font-semibold">Action Type</Label>
-          {isUpdating ? (
+          {isPending ? (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
               Loading...
             </span>
           ) : null}
         </div>
-        <Select value={initialAction ?? "all"} onValueChange={updateAction} disabled={isUpdating}>
-          <SelectTrigger aria-busy={isUpdating}>
+        <Select value={initialAction ?? "all"} onValueChange={updateAction}>
+          <SelectTrigger>
             <SelectValue placeholder="All Actions" />
           </SelectTrigger>
           <SelectContent>
@@ -106,21 +84,25 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
       </div>
 
       <div className="flex justify-start md:justify-end">
-        {initialAction && (
+        {(initialAction || currentQuery) && (
           <Button
             type="button"
             variant="ghost"
             size="sm"
             className="text-muted-foreground"
-            disabled={isUpdating}
-            onClick={() => updateAction("all")}
+            onClick={() => {
+              if (!currentQuery) return;
+              startTransition(() => {
+                router.replace(pathname);
+              });
+            }}
           >
-            {isUpdating ? (
+            {isPending ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             ) : (
               <X className="mr-2 h-4 w-4" />
             )}
-            {isUpdating ? "Loading..." : "Clear Filter"}
+            {isPending ? "Loading..." : "Clear Filter"}
           </Button>
         )}
       </div>
