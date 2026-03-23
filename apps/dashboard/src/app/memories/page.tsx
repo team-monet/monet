@@ -195,8 +195,13 @@ async function MemoriesTable({ searchParams }: { searchParams: Promise<{ [key: s
 export default async function MemoriesPage({ searchParams }: PageProps) {
   const params = await searchParams;
   const type = params.memoryType as MemoryType;
+  const tag = params.tag as string;
   const includeUser = params.includeUser === "true";
   const includePrivate = params.includePrivate === "true";
+  const cursor = params.cursor as string;
+
+  // Key forces Suspense to remount (and show skeleton) when filters change
+  const suspenseKey = [type, tag, includeUser, includePrivate, cursor].filter(Boolean).join("|") || "default";
 
   return (
     <div className="flex flex-col gap-6 p-4">
@@ -215,13 +220,13 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
         </Button>
       </div>
 
-      <MemoryFilters 
-        initialType={type} 
-        initialIncludeUser={includeUser} 
+      <MemoryFilters
+        initialType={type}
+        initialIncludeUser={includeUser}
         initialIncludePrivate={includePrivate}
       />
 
-      <Suspense fallback={<MemoriesTableSkeleton />}>
+      <Suspense key={suspenseKey} fallback={<MemoriesTableSkeleton />}>
         <MemoriesTable searchParams={searchParams} />
       </Suspense>
     </div>

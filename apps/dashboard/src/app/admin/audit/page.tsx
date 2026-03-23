@@ -187,6 +187,10 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
   const params = await searchParams;
   const rawAction = getSingleParam(params.action);
   const action = rawAction && rawAction !== "all" ? rawAction : undefined;
+  const cursor = getSingleParam(params.cursor);
+
+  // Key forces Suspense to remount (and show skeleton) when filters change
+  const suspenseKey = [action, cursor].filter(Boolean).join("|") || "default";
 
   return (
     <div className="flex flex-col gap-6 p-4">
@@ -203,7 +207,7 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
         </CardContent>
       </Card>
 
-      <Suspense fallback={<AuditTableSkeleton />}>
+      <Suspense key={suspenseKey} fallback={<AuditTableSkeleton />}>
         <AuditTable searchParams={searchParams} />
       </Suspense>
     </div>
