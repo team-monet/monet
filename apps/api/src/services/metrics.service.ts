@@ -35,6 +35,7 @@ function toNumber(value: unknown): number {
 export async function getUsageMetrics(
   sql: SqlClient,
   tenantId: string,
+  timezone: string = "UTC",
 ): Promise<UsageMetrics> {
   const schemaName = tenantSchemaNameFromId(tenantId);
 
@@ -61,12 +62,12 @@ export async function getUsageMetrics(
           COALESCE(SUM(CASE WHEN al.action = 'memory.get' THEN 1 ELSE 0 END), 0)::int AS reads,
           COALESCE(SUM(CASE WHEN al.action = 'memory.search' THEN 1 ELSE 0 END), 0)::int AS searches
         FROM generate_series(
-          (CURRENT_DATE - INTERVAL '13 days')::date,
-          CURRENT_DATE::date,
+          (NOW() AT TIME ZONE 'UTC' AT TIME ZONE ${timezone})::date - INTERVAL '13 days',
+          (NOW() AT TIME ZONE 'UTC' AT TIME ZONE ${timezone})::date,
           '1 day'::interval
         ) AS d
         LEFT JOIN audit_log al
-          ON DATE(al.created_at) = d::date
+          ON DATE(al.created_at AT TIME ZONE 'UTC' AT TIME ZONE ${timezone}) = d::date
           AND al.action IN ('memory.create', 'memory.get', 'memory.search')
         GROUP BY d::date
         ORDER BY d::date ASC

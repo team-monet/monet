@@ -361,8 +361,10 @@ export class MonetApiClient {
   }
 
   // Metrics
-  async getMetrics(): Promise<MetricsResponse> {
-    return this.fetch<MetricsResponse>("/api/metrics");
+  async getMetrics(timezone?: string): Promise<MetricsResponse> {
+    const query = new URLSearchParams();
+    if (timezone) query.set("timezone", timezone);
+    return this.fetch<MetricsResponse>(`/api/metrics?${query.toString()}`);
   }
 
   // Audit (Step 10)

@@ -140,7 +140,7 @@ function LoginFormInner() {
               </Alert>
             ) : null}
           </CardContent>
-          <CardFooter>
+          <CardFooter className="pt-4">
             <Button type="submit" className="w-full" disabled={loading}>
               {loading ? (
                 <>

@@ -40,7 +40,7 @@ function getDashboardBaseUrl() {
   return trimTrailingSlash(configured);
 }
 
-function replaceUrlOrigin(value: string, base: string) {
+export function replaceUrlOrigin(value: string, base: string) {
   try {
     const valueUrl = new URL(value);
     const baseUrl = new URL(base);

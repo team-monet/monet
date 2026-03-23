@@ -13,6 +13,7 @@ import {
   EnrichmentThroughputChart,
   EnrichmentQualityBars,
 } from "./metrics-charts";
+import { cookies } from "next/headers";
 
 export default async function MetricsPage() {
   await requireAdmin();
@@ -21,8 +22,10 @@ export default async function MetricsPage() {
   let error = "";
 
   try {
+    const cookieStore = await cookies();
+    const timezone = cookieStore.get("x-timezone")?.value;
     const client = await getApiClient();
-    metrics = await client.getMetrics();
+    metrics = await client.getMetrics(timezone);
   } catch (err: unknown) {
     error = err instanceof Error ? err.message : "An unexpected error occurred";
   }

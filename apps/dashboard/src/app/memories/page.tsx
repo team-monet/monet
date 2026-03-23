@@ -19,6 +19,7 @@ import { ClickableRow } from "./clickable-row";
 import { isSessionExpiredError } from "@/lib/session-errors";
 import { Suspense } from "react";
 import { MemoriesTableSkeleton } from "./loading";
+import { LocalizedDateTime } from "@/components/localized-date-time";
 
 interface PageProps {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
@@ -152,7 +153,7 @@ async function MemoriesTable({ searchParams }: { searchParams: Promise<{ [key: s
                       <div className="flex flex-col gap-1 text-[11px] text-muted-foreground">
                         <div className="flex items-center gap-1.5">
                           <Calendar className="h-3 w-3" />
-                          {new Date(m.createdAt).toLocaleDateString()}
+                          <LocalizedDateTime date={m.createdAt} dateOnly />
                         </div>
                         <div className="flex items-center gap-1.5 truncate max-w-[150px]">
                           <Bot className="h-3 w-3 shrink-0" />
