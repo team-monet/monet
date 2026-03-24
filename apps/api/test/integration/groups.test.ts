@@ -211,15 +211,15 @@ describe("groups integration", () => {
     const group = await createRes.json();
     expect(group.memoryQuota).toBe(500);
 
-    // Clear quota to unlimited via null
+    // Clear quota to unlimited via 0
     const clearRes = await app.request(`/api/groups/${group.id}`, {
       method: "PATCH",
       headers: authHeaders(),
-      body: JSON.stringify({ memoryQuota: null }),
+      body: JSON.stringify({ memoryQuota: 0 }),
     });
     expect(clearRes.status).toBe(200);
     const cleared = await clearRes.json();
-    expect(cleared.memoryQuota).toBeNull();
+    expect(cleared.memoryQuota).toBe(0);
 
     // Set it back to a value
     const setRes = await app.request(`/api/groups/${group.id}`, {

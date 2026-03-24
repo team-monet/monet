@@ -103,7 +103,9 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                         <span className="font-medium">
                           {group.memoryQuota === null
                             ? "Default (10,000 per agent)"
-                            : `${group.memoryQuota} Entries`}
+                            : group.memoryQuota === 0
+                              ? "Unlimited"
+                              : `${group.memoryQuota.toLocaleString()} Entries`}
                         </span>
                       </div>
                       {(() => {
@@ -139,8 +141,8 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                             min={1}
                             step={1}
                             required
-                            defaultValue={group.memoryQuota ?? ""}
-                            placeholder={group.memoryQuota === null ? "e.g. 1000" : "Enter a new quota"}
+                            defaultValue={group.memoryQuota || ""}
+                            placeholder={group.memoryQuota ? "Enter a new quota" : "e.g. 1000"}
                             className="h-9"
                           />
                           <SubmitButton size="sm" type="submit" className="h-9 px-3">
@@ -150,7 +152,7 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                         </div>
                       </div>
                     </form>
-                    {group.memoryQuota !== null && (
+                    {group.memoryQuota !== null && group.memoryQuota !== 0 && (
                       <form action={clearGroupQuotaAction} className="pt-1">
                         <input type="hidden" name="groupId" value={group.id} />
                         <SubmitButton

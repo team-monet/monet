@@ -43,7 +43,7 @@ export async function clearGroupQuotaAction(formData: FormData) {
 
   try {
     const client = await getApiClient();
-    await client.updateGroup(groupId, { memoryQuota: null });
+    await client.updateGroup(groupId, { memoryQuota: 0 });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to clear quota";
     redirect(`/admin/quotas?updateError=${encodeURIComponent(message)}`);

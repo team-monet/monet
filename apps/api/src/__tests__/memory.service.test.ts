@@ -25,6 +25,7 @@ import {
   deleteMemory,
   fetchMemory,
   buildSummary,
+  checkQuota,
   listAgentMemories,
   listTags,
   resolveMemoryWritePreflight,
@@ -917,6 +918,51 @@ describe("searchMemories", () => {
 
     expect(result.items).toHaveLength(1);
     expect(result.nextCursor).toBeNull();
+  });
+});
+
+describe("checkQuota", () => {
+  it("skips quota check when quotaOverride is 0 (unlimited)", async () => {
+    // 0 = explicitly unlimited — should return null (no error) without querying
+    const result = await checkQuota({} as TransactionClient, makeAgent(), 0);
+    expect(result).toBeNull();
+    expect(drizzleMock).not.toHaveBeenCalled();
+  });
+
+  it("enforces default quota when quotaOverride is null", async () => {
+    const selectMock = vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue([{ count: 10001 }]),
+      })),
+    }));
+    drizzleMock.mockReturnValue({ select: selectMock });
+
+    const result = await checkQuota({} as TransactionClient, makeAgent(), null);
+    expect(result).toEqual({ error: "quota_exceeded", limit: 10000, current: 10001 });
+  });
+
+  it("enforces custom quota when quotaOverride is a positive number", async () => {
+    const selectMock = vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue([{ count: 500 }]),
+      })),
+    }));
+    drizzleMock.mockReturnValue({ select: selectMock });
+
+    const result = await checkQuota({} as TransactionClient, makeAgent(), 500);
+    expect(result).toEqual({ error: "quota_exceeded", limit: 500, current: 500 });
+  });
+
+  it("passes when under quota", async () => {
+    const selectMock = vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn().mockResolvedValue([{ count: 99 }]),
+      })),
+    }));
+    drizzleMock.mockReturnValue({ select: selectMock });
+
+    const result = await checkQuota({} as TransactionClient, makeAgent(), 500);
+    expect(result).toBeNull();
   });
 });
 

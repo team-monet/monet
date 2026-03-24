@@ -326,6 +326,8 @@ export async function checkQuota(
   agent: AgentContext,
   quotaOverride: number | null = null,
 ): Promise<{ error: "quota_exceeded"; limit: number; current: number } | null> {
+  // 0 = explicitly unlimited (admin cleared the quota), skip check entirely
+  if (quotaOverride === 0) return null;
   const quota = quotaOverride && quotaOverride > 0 ? quotaOverride : DEFAULT_MEMORY_QUOTA;
 
   const db = createMemoryDb(tx);

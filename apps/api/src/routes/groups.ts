@@ -68,8 +68,8 @@ function parseUpdateGroupInput(body: unknown): { data: { name?: string; descript
     return { error: "Invalid request body" };
   }
   const b = body as Record<string, unknown>;
-  if (b.memoryQuota !== undefined && b.memoryQuota !== null && (!Number.isInteger(b.memoryQuota) || Number(b.memoryQuota) <= 0)) {
-    return { error: "memoryQuota must be a positive integer or null" };
+  if (b.memoryQuota !== undefined && b.memoryQuota !== null && (!Number.isInteger(b.memoryQuota) || Number(b.memoryQuota) < 0)) {
+    return { error: "memoryQuota must be a non-negative integer (0 = unlimited)" };
   }
   return {
     data: {
