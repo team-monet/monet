@@ -948,6 +948,16 @@ export async function getAgentIdsForRuleSet(
   });
 }
 
+export async function getAgentIdsForGroup(
+  sql: SqlClient,
+  groupId: string,
+): Promise<string[]> {
+  const rows = await sql`
+    SELECT agent_id FROM agent_group_members WHERE group_id = ${groupId}
+  `;
+  return rows.map((row) => row.agent_id as string);
+}
+
 export async function getAgentIdsForRule(
   sql: SqlClient,
   schemaName: string,

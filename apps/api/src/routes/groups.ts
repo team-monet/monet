@@ -15,7 +15,7 @@ import {
   listRuleSetsForGroup,
   associateRuleSetWithGroup,
   dissociateRuleSetFromGroup,
-  getAgentIdsForRuleSet,
+  getAgentIdsForGroup,
 } from "../services/rule.service";
 import { pushRulesToAgent } from "../services/rule-notification.service";
 
@@ -211,7 +211,7 @@ groupsRouter.post("/:id/rule-sets", async (c) => {
     return c.json({ error: "conflict", message: "Rule set is already associated with this group" }, 409);
   }
 
-  const affectedAgentIds = await getAgentIdsForRuleSet(sql, schemaName, parsed.data.ruleSetId);
+  const affectedAgentIds = await getAgentIdsForGroup(sql, groupId);
   if (sessionStore) {
     await Promise.all(affectedAgentIds.map((id) => pushRulesToAgent(id, sessionStore, sql, schemaName)));
   }
@@ -233,8 +233,8 @@ groupsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
     return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
   }
 
-  // Collect affected agents before dissociation
-  const affectedAgentIds = await getAgentIdsForRuleSet(sql, schemaName, ruleSetId);
+  // Collect affected agents before dissociation (only agents in this group)
+  const affectedAgentIds = await getAgentIdsForGroup(sql, groupId);
 
   const result = await dissociateRuleSetFromGroup(
     sql,

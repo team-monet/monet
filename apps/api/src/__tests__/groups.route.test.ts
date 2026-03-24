@@ -49,7 +49,7 @@ vi.mock("../services/rule.service.js", () => ({
   ]),
   associateRuleSetWithGroup: vi.fn(async () => ({ success: true })),
   dissociateRuleSetFromGroup: vi.fn(async () => ({ success: true })),
-  getAgentIdsForRuleSet: vi.fn(async () => []),
+  getAgentIdsForGroup: vi.fn(async () => []),
 }));
 
 vi.mock("../services/rule-notification.service.js", () => ({
