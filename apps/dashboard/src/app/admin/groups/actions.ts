@@ -80,6 +80,50 @@ export async function updateGroupAction(formData: FormData) {
   redirect("/admin/groups?updated=1");
 }
 
+export async function addGroupRuleSetAction(formData: FormData) {
+  const groupId = toSingle(formData.get("groupId"));
+  const ruleSetId = toSingle(formData.get("ruleSetId"));
+  const redirectPath = groupId ? groupDetailPath(groupId) : "/admin/groups";
+
+  if (!groupId || !ruleSetId) {
+    redirect(`${redirectPath}?ruleSetError=Group%20and%20rule%20set%20are%20required`);
+  }
+
+  try {
+    const client = await getApiClient();
+    await client.addGroupRuleSet(groupId, ruleSetId);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to add rule set";
+    redirect(`${redirectPath}?ruleSetError=${encodeURIComponent(message)}`);
+  }
+
+  revalidatePath("/admin/groups");
+  revalidatePath(groupDetailPath(groupId));
+  redirect(`${groupDetailPath(groupId)}?ruleSetAdded=1`);
+}
+
+export async function removeGroupRuleSetAction(formData: FormData) {
+  const groupId = toSingle(formData.get("groupId"));
+  const ruleSetId = toSingle(formData.get("ruleSetId"));
+  const redirectPath = groupId ? groupDetailPath(groupId) : "/admin/groups";
+
+  if (!groupId || !ruleSetId) {
+    redirect(`${redirectPath}?ruleSetError=Group%20and%20rule%20set%20are%20required`);
+  }
+
+  try {
+    const client = await getApiClient();
+    await client.removeGroupRuleSet(groupId, ruleSetId);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to remove rule set";
+    redirect(`${redirectPath}?ruleSetError=${encodeURIComponent(message)}`);
+  }
+
+  revalidatePath("/admin/groups");
+  revalidatePath(groupDetailPath(groupId));
+  redirect(`${groupDetailPath(groupId)}?ruleSetRemoved=1`);
+}
+
 export async function addGroupMemberAction(formData: FormData) {
   const groupId = toSingle(formData.get("groupId"));
   const agentId = toSingle(formData.get("agentId"));

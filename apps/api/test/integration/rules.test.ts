@@ -611,6 +611,156 @@ describe("Rules integration", () => {
     expect(active.rules).toEqual([]);
   });
 
+  it("Tenant_Admin associates a rule set with a group and agents inherit it", async () => {
+    // Create a fresh group and move an agent into it
+    const createGroupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Group Rules Test", description: "Test group" }),
+    });
+    const group = await createGroupRes.json() as { id: string };
+
+    const agent = await registerAgent("worker-group-rules");
+    await app.request(`/api/groups/${group.id}/members`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: agent.id }),
+    });
+
+    // Create a rule and rule set
+    const ruleRes = await app.request("/api/rules", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Group Rule", description: "Inherited via group" }),
+    });
+    const rule = await ruleRes.json() as { id: string };
+
+    const setRes = await app.request("/api/rule-sets", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Group Set" }),
+    });
+    const ruleSet = await setRes.json() as { id: string };
+
+    await app.request(`/api/rule-sets/${ruleSet.id}/rules`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleId: rule.id }),
+    });
+
+    // Associate rule set with the group
+    const assocRes = await app.request(`/api/groups/${group.id}/rule-sets`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleSetId: ruleSet.id }),
+    });
+    expect(assocRes.status).toBe(201);
+
+    // Agent should now inherit the rule
+    const activeRes = await app.request(`/api/agents/${agent.id}/rules`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${adminApiKey}` },
+    });
+    expect(activeRes.status).toBe(200);
+    const active = await activeRes.json() as { rules: Array<{ id: string }> };
+    expect(active.rules.map((r) => r.id)).toContain(rule.id);
+
+    // Duplicate association returns 409
+    const dupRes = await app.request(`/api/groups/${group.id}/rule-sets`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleSetId: ruleSet.id }),
+    });
+    expect(dupRes.status).toBe(409);
+  });
+
+  it("Dissociating a rule set from a group removes inherited rules and pushes MCP update", async () => {
+    const createGroupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Group Dissoc Test" }),
+    });
+    const group = await createGroupRes.json() as { id: string };
+
+    const agent = await registerAgent("worker-group-dissoc");
+    const { notify } = addMockSession(agent.id);
+    await app.request(`/api/groups/${group.id}/members`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: agent.id }),
+    });
+
+    // Create rule + set and associate with group
+    const ruleRes = await app.request("/api/rules", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Dissoc Rule", description: "Will be removed" }),
+    });
+    const rule = await ruleRes.json() as { id: string };
+
+    const setRes = await app.request("/api/rule-sets", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Dissoc Set" }),
+    });
+    const ruleSet = await setRes.json() as { id: string };
+
+    await app.request(`/api/rule-sets/${ruleSet.id}/rules`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleId: rule.id }),
+    });
+
+    await app.request(`/api/groups/${group.id}/rule-sets`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleSetId: ruleSet.id }),
+    });
+
+    notify.mockClear();
+
+    // Dissociate rule set from group
+    const dissocRes = await app.request(`/api/groups/${group.id}/rule-sets/${ruleSet.id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${adminApiKey}` },
+    });
+    expect(dissocRes.status).toBe(200);
+
+    // MCP push should have fired
+    expect(notify).toHaveBeenCalledTimes(1);
+    const notification = notify.mock.calls[0]?.[0] as {
+      method: string;
+      params: { rules: Array<{ id: string }> };
+    };
+    expect(notification.method).toBe("notifications/rules/updated");
+    expect(notification.params.rules.map((r) => r.id)).not.toContain(rule.id);
+
+    // Agent should no longer inherit the rule
+    const activeRes = await app.request(`/api/agents/${agent.id}/rules`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${adminApiKey}` },
+    });
+    const active = await activeRes.json() as { rules: Array<{ id: string }> };
+    expect(active.rules.map((r) => r.id)).not.toContain(rule.id);
+  });
+
+  it("Non-admin cannot associate or dissociate group rule sets", async () => {
+    const nonAdmin = await registerAgent("worker-no-group-rules");
+
+    const assocRes = await app.request(`/api/groups/${defaultGroupId}/rule-sets`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${nonAdmin.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000000" }),
+    });
+    expect(assocRes.status).toBe(403);
+
+    const dissocRes = await app.request(`/api/groups/${defaultGroupId}/rule-sets/00000000-0000-0000-0000-000000000000`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${nonAdmin.apiKey}` },
+    });
+    expect(dissocRes.status).toBe(403);
+  });
+
   it("Audit log contains entries for rule mutations", async () => {
     const createRuleRes = await app.request("/api/rules", {
       method: "POST",
