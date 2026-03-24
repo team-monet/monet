@@ -200,6 +200,38 @@ describe("groups integration", () => {
     expect(body.role).toBe("group_admin");
   });
 
+  it("tenant admin can set and clear memoryQuota to unlimited", async () => {
+    // Create group with a quota
+    const createRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ name: "quota-test", memoryQuota: 500 }),
+    });
+    expect(createRes.status).toBe(201);
+    const group = await createRes.json();
+    expect(group.memoryQuota).toBe(500);
+
+    // Clear quota to unlimited via null
+    const clearRes = await app.request(`/api/groups/${group.id}`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ memoryQuota: null }),
+    });
+    expect(clearRes.status).toBe(200);
+    const cleared = await clearRes.json();
+    expect(cleared.memoryQuota).toBeNull();
+
+    // Set it back to a value
+    const setRes = await app.request(`/api/groups/${group.id}`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ memoryQuota: 1000 }),
+    });
+    expect(setRes.status).toBe(200);
+    const updated = await setRes.json();
+    expect(updated.memoryQuota).toBe(1000);
+  });
+
   it("non-admin cannot promote a user", async () => {
     const sql = getTestSql();
     const [user] = await sql`

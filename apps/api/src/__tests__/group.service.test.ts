@@ -168,6 +168,67 @@ describe("group CRUD", () => {
     });
   });
 
+  it("clears memoryQuota to null when explicitly set", async () => {
+    const existingGroup = {
+      id: GROUP_ID,
+      tenantId: TENANT_ID,
+      name: "General",
+      description: "Existing description",
+      memoryQuota: 100,
+      createdAt: new Date("2026-03-20T00:00:00.000Z"),
+    };
+    const updatedGroup = {
+      ...existingGroup,
+      memoryQuota: null,
+      createdAt: new Date("2026-03-22T00:00:00.000Z"),
+    };
+
+    const limitMock = vi.fn().mockResolvedValue([existingGroup]);
+    const whereSelectMock = vi.fn(() => ({
+      limit: limitMock,
+    }));
+    const fromMock = vi.fn(() => ({
+      where: whereSelectMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: fromMock,
+    }));
+
+    const returningMock = vi.fn().mockResolvedValue([updatedGroup]);
+    const whereUpdateMock = vi.fn(() => ({
+      returning: returningMock,
+    }));
+    const setMock = vi.fn(() => ({
+      where: whereUpdateMock,
+    }));
+    const updateMock = vi.fn(() => ({
+      set: setMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+    });
+
+    const result = await updateGroup(makeSqlClient(), TENANT_ID, GROUP_ID, {
+      memoryQuota: null,
+    });
+
+    expect(setMock).toHaveBeenCalledWith({
+      name: "General",
+      description: "Existing description",
+      memoryQuota: null,
+    });
+    expect(result).toEqual({
+      id: GROUP_ID,
+      tenantId: TENANT_ID,
+      name: "General",
+      description: "Existing description",
+      memoryQuota: null,
+      createdAt: "2026-03-22T00:00:00.000Z",
+    });
+  });
+
   it("lists groups in creation order with normalized fields", async () => {
     const orderByMock = vi.fn().mockResolvedValue([
       {

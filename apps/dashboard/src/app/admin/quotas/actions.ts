@@ -33,3 +33,23 @@ export async function updateGroupQuotaAction(formData: FormData) {
   revalidatePath("/admin/groups");
   redirect("/admin/quotas?updated=1");
 }
+
+export async function clearGroupQuotaAction(formData: FormData) {
+  const groupId = toSingle(formData.get("groupId"));
+
+  if (!groupId) {
+    redirect("/admin/quotas?updateError=Group%20ID%20is%20required");
+  }
+
+  try {
+    const client = await getApiClient();
+    await client.updateGroup(groupId, { memoryQuota: null });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to clear quota";
+    redirect(`/admin/quotas?updateError=${encodeURIComponent(message)}`);
+  }
+
+  revalidatePath("/admin/quotas");
+  revalidatePath("/admin/groups");
+  redirect("/admin/quotas?updated=1");
+}

@@ -63,19 +63,19 @@ function parseGroupRuleSetInput(body: unknown): { data: { ruleSetId: string } } 
   return { data: { ruleSetId: b.ruleSetId } };
 }
 
-function parseUpdateGroupInput(body: unknown): { data: { name?: string; description?: string; memoryQuota?: number } } | { error: string } {
+function parseUpdateGroupInput(body: unknown): { data: { name?: string; description?: string; memoryQuota?: number | null } } | { error: string } {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { error: "Invalid request body" };
   }
   const b = body as Record<string, unknown>;
   if (b.memoryQuota !== undefined && b.memoryQuota !== null && (!Number.isInteger(b.memoryQuota) || Number(b.memoryQuota) <= 0)) {
-    return { error: "memoryQuota must be a positive integer" };
+    return { error: "memoryQuota must be a positive integer or null" };
   }
   return {
     data: {
       name: typeof b.name === "string" ? b.name : undefined,
       description: typeof b.description === "string" ? b.description : undefined,
-      memoryQuota: typeof b.memoryQuota === "number" ? b.memoryQuota : undefined,
+      memoryQuota: b.memoryQuota === null ? null : typeof b.memoryQuota === "number" ? b.memoryQuota : undefined,
     },
   };
 }

@@ -1,7 +1,7 @@
 import { getApiClient } from "@/lib/api-client";
 import { requireAdmin } from "@/lib/auth";
 import { AgentGroup, QuotaUtilization } from "@monet/types";
-import { updateGroupQuotaAction } from "./actions";
+import { updateGroupQuotaAction, clearGroupQuotaAction } from "./actions";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { SubmitButton } from "@/components/ui/submit-button";
 import { Input } from "@/components/ui/input";
@@ -50,7 +50,7 @@ export default async function QuotasPage({ searchParams }: PageProps) {
           Manage memory storage limits for agent groups.
         </p>
         <p className="text-xs text-muted-foreground">
-          Setting a quota back to unlimited is not supported yet.
+          Set a quota to limit memory entries per agent, or clear it to allow unlimited storage.
         </p>
       </div>
 
@@ -125,9 +125,6 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                           </p>
                         );
                       })()}
-                      <p className="text-[11px] text-muted-foreground">
-                        Use a positive integer. Clearing quota to unlimited is not available yet.
-                      </p>
                     </div>
 
                     <form action={updateGroupQuotaAction} className="space-y-3 pt-2">
@@ -153,6 +150,18 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                         </div>
                       </div>
                     </form>
+                    {group.memoryQuota !== null && (
+                      <form action={clearGroupQuotaAction} className="pt-1">
+                        <input type="hidden" name="groupId" value={group.id} />
+                        <SubmitButton
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 text-xs text-muted-foreground"
+                          label="Clear quota (unlimited)"
+                          pendingLabel="Clearing..."
+                        />
+                      </form>
+                    )}
                   </CardContent>
                   <CardFooter className="bg-muted/30 border-t py-3 flex justify-between">
                     <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
