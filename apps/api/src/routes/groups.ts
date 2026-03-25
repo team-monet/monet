@@ -215,7 +215,7 @@ groupsRouter.post("/:id/rule-sets", async (c) => {
     return c.json({ error: "conflict", message: "Rule set is already associated with this group" }, 409);
   }
 
-  const affectedAgentIds = await getAgentIdsForGroup(sql, groupId);
+  const affectedAgentIds = await getAgentIdsForGroup(sql, schemaName, groupId);
   if (sessionStore) {
     await Promise.all(affectedAgentIds.map((id) => pushRulesToAgent(id, sessionStore, sql, schemaName)));
   }
@@ -255,7 +255,7 @@ groupsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
   }
 
   // Fetch affected agents after successful dissociation to avoid race with concurrent member additions
-  const affectedAgentIds = await getAgentIdsForGroup(sql, groupId);
+  const affectedAgentIds = await getAgentIdsForGroup(sql, schemaName, groupId);
   if (sessionStore) {
     await Promise.all(affectedAgentIds.map((id) => pushRulesToAgent(id, sessionStore, sql, schemaName)));
   }

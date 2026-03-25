@@ -950,12 +950,16 @@ export async function getAgentIdsForRuleSet(
 
 export async function getAgentIdsForGroup(
   sql: SqlClient,
+  schemaName: string,
   groupId: string,
 ): Promise<string[]> {
-  const rows = await sql`
-    SELECT DISTINCT agent_id FROM agent_group_members WHERE group_id = ${groupId}
-  `;
-  return rows.map((row) => row.agent_id as string);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .selectDistinct({ agentId: agentGroupMembers.agentId })
+      .from(agentGroupMembers)
+      .where(eq(agentGroupMembers.groupId, groupId));
+    return rows.map((row) => row.agentId);
+  });
 }
 
 export async function getAgentIdsForRule(
