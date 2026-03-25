@@ -241,9 +241,6 @@ groupsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
     return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
   }
 
-  // Collect affected agents before dissociation (only agents in this group)
-  const affectedAgentIds = await getAgentIdsForGroup(sql, groupId);
-
   const result = await dissociateRuleSetFromGroup(
     sql,
     agent.tenantId,
@@ -257,6 +254,8 @@ groupsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
     return c.json({ error: "not_found", message: "Group/rule-set association not found" }, 404);
   }
 
+  // Fetch affected agents after successful dissociation to avoid race with concurrent member additions
+  const affectedAgentIds = await getAgentIdsForGroup(sql, groupId);
   if (sessionStore) {
     await Promise.all(affectedAgentIds.map((id) => pushRulesToAgent(id, sessionStore, sql, schemaName)));
   }
