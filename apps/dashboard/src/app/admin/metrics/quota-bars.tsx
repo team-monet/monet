@@ -39,21 +39,26 @@ export function QuotaBars({ data }: QuotaBarsProps) {
       </CardHeader>
       <CardContent className="space-y-4">
         {data.map((group) => {
-          const agentPct = group.effectiveQuotaPerAgent > 0
+          const unlimited = group.effectiveQuotaPerAgent === 0;
+          const agentPct = !unlimited && group.effectiveQuotaPerAgent > 0
             ? Math.round((group.maxAgentCurrent / group.effectiveQuotaPerAgent) * 100)
             : 0;
           return (
             <div key={group.groupId} className="space-y-1.5">
               <div className="flex justify-between text-sm">
                 <span className="font-medium">{group.groupName}</span>
-                <span className={quotaColor(agentPct)}>
-                  {group.maxAgentCurrent.toLocaleString()} / {group.effectiveQuotaPerAgent.toLocaleString()} ({agentPct}%)
+                <span className={unlimited ? "text-muted-foreground" : quotaColor(agentPct)}>
+                  {unlimited
+                    ? `${group.maxAgentCurrent.toLocaleString()} entries (unlimited)`
+                    : `${group.maxAgentCurrent.toLocaleString()} / ${group.effectiveQuotaPerAgent.toLocaleString()} (${agentPct}%)`}
                 </span>
               </div>
-              <Progress value={Math.min(agentPct, 100)} className={progressColor(agentPct)} />
+              {!unlimited && (
+                <Progress value={Math.min(agentPct, 100)} className={progressColor(agentPct)} />
+              )}
               <p className="text-[11px] text-muted-foreground">
                 Busiest agent — {group.current.toLocaleString()} total entries across group
-                {group.quota === null ? " (no group quota)" : ` (group quota: ${group.quota.toLocaleString()})`}
+                {group.quota === null ? " (default quota)" : group.quota === 0 ? " (unlimited)" : ` (group quota: ${group.quota.toLocaleString()})`}
               </p>
             </div>
           );
