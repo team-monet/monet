@@ -227,7 +227,7 @@ describe("groups route", () => {
   describe("POST /:id/rule-sets", () => {
     it("returns 201 for tenant admin", async () => {
       const app = createTestApp(makeAgent());
-      const res = await app.request("/groups/group-1/rule-sets", {
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
@@ -237,7 +237,7 @@ describe("groups route", () => {
 
     it("returns 403 for non-admin", async () => {
       const app = createTestApp(makeAgent({ role: null }));
-      const res = await app.request("/groups/group-1/rule-sets", {
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
@@ -247,7 +247,7 @@ describe("groups route", () => {
 
     it("returns 403 for group admin", async () => {
       const app = createTestApp(makeAgent({ role: "group_admin" }));
-      const res = await app.request("/groups/group-1/rule-sets", {
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
@@ -255,9 +255,19 @@ describe("groups route", () => {
       expect(res.status).toBe(403);
     });
 
+    it("returns 400 for non-UUID groupId", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/not-a-uuid/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
+      });
+      expect(res.status).toBe(400);
+    });
+
     it("returns 400 for invalid ruleSetId", async () => {
       const app = createTestApp(makeAgent());
-      const res = await app.request("/groups/group-1/rule-sets", {
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ruleSetId: "not-a-uuid" }),
@@ -272,7 +282,7 @@ describe("groups route", () => {
       });
 
       const app = createTestApp(makeAgent());
-      const res = await app.request("/groups/group-1/rule-sets", {
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
@@ -287,7 +297,7 @@ describe("groups route", () => {
       });
 
       const app = createTestApp(makeAgent());
-      const res = await app.request("/groups/group-1/rule-sets", {
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),

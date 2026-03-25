@@ -184,6 +184,10 @@ groupsRouter.post("/:id/rule-sets", async (c) => {
   const schemaName = c.get("tenantSchemaName");
   const groupId = c.req.param("id");
 
+  if (!UUID_RE.test(groupId)) {
+    return c.json({ error: "validation_error", message: "Invalid group UUID" }, 400);
+  }
+
   const role = await resolveAgentRole(sql, agent);
   if (!isTenantAdmin(role)) {
     return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
