@@ -3,7 +3,12 @@ import { getApiClient } from "@/lib/api-client";
 import { requireAdmin } from "@/lib/auth";
 import type { Agent, AgentGroup, RuleSet } from "@monet/types";
 import { formatAgentDisplayName } from "@/lib/agent-display";
-import { addGroupMemberAction, removeGroupMemberAction } from "../actions";
+import {
+  addGroupMemberAction,
+  removeGroupMemberAction,
+  addGroupRuleSetAction,
+  removeGroupRuleSetAction,
+} from "../actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,11 +33,15 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
   const memberAdded = getSingleParam(query.memberAdded) === "1";
   const memberRemoved = getSingleParam(query.memberRemoved) === "1";
   const memberError = getSingleParam(query.memberError);
+  const ruleSetAdded = getSingleParam(query.ruleSetAdded) === "1";
+  const ruleSetRemoved = getSingleParam(query.ruleSetRemoved) === "1";
+  const ruleSetError = getSingleParam(query.ruleSetError);
 
   let group: AgentGroup | undefined;
   let members: Agent[] = [];
   let availableAgents: Agent[] = [];
   let appliedRuleSets: RuleSet[] = [];
+  let availableRuleSets: RuleSet[] = [];
   let error = "";
 
   try {
@@ -46,12 +55,15 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
     if (!group) {
       error = "Group not found.";
     } else {
-      const [membersResult, ruleSetsResult] = await Promise.all([
+      const [membersResult, groupRuleSetsResult, allRuleSetsResult] = await Promise.all([
         client.listGroupMembers(groupId),
         client.listGroupRuleSets(groupId),
+        client.listRuleSets(),
       ]);
       members = membersResult.members;
-      appliedRuleSets = ruleSetsResult.ruleSets;
+      appliedRuleSets = groupRuleSetsResult.ruleSets;
+      const appliedIds = new Set(appliedRuleSets.map((rs) => rs.id));
+      availableRuleSets = allRuleSetsResult.ruleSets.filter((rs) => !appliedIds.has(rs.id));
       const memberIds = new Set(members.map((m) => m.id));
       availableAgents = agentsResult.filter((agent) => !memberIds.has(agent.id));
     }
@@ -95,6 +107,28 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Member update failed</AlertTitle>
           <AlertDescription>{memberError}</AlertDescription>
+        </Alert>
+      )}
+
+      {ruleSetAdded && (
+        <Alert>
+          <AlertTitle>Rule set added</AlertTitle>
+          <AlertDescription>The rule set was applied to this group.</AlertDescription>
+        </Alert>
+      )}
+
+      {ruleSetRemoved && (
+        <Alert>
+          <AlertTitle>Rule set removed</AlertTitle>
+          <AlertDescription>The rule set was removed from this group.</AlertDescription>
+        </Alert>
+      )}
+
+      {ruleSetError && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Rule set update failed</AlertTitle>
+          <AlertDescription>{ruleSetError}</AlertDescription>
         </Alert>
       )}
 
@@ -152,15 +186,49 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
                   <p className="text-sm text-muted-foreground">No rule sets are attached to this group.</p>
                 ) : (
                   appliedRuleSets.map((ruleSet) => (
-                    <div key={ruleSet.id} className="rounded-md border p-3">
-                      <Link href={`/admin/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
-                        {ruleSet.name}
-                      </Link>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {ruleSet.ruleIds.length} {ruleSet.ruleIds.length === 1 ? "rule" : "rules"}
-                      </p>
+                    <div key={ruleSet.id} className="flex items-center justify-between rounded-md border p-3">
+                      <div>
+                        <Link href={`/admin/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
+                          {ruleSet.name}
+                        </Link>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {ruleSet.ruleIds.length} {ruleSet.ruleIds.length === 1 ? "rule" : "rules"}
+                        </p>
+                      </div>
+                      <form action={removeGroupRuleSetAction}>
+                        <input type="hidden" name="groupId" value={groupId} />
+                        <input type="hidden" name="ruleSetId" value={ruleSet.id} />
+                        <SubmitButton label="Remove" pendingLabel="Removing..." variant="outline" size="sm" />
+                      </form>
                     </div>
                   ))
+                )}
+                {availableRuleSets.length > 0 && (
+                  <form action={addGroupRuleSetAction} className="flex flex-col gap-2 pt-2 border-t">
+                    <input type="hidden" name="groupId" value={groupId} />
+                    <label htmlFor="ruleSetId" className="text-xs font-medium text-muted-foreground">
+                      Add a rule set
+                    </label>
+                    <div className="flex gap-2">
+                      <select
+                        id="ruleSetId"
+                        name="ruleSetId"
+                        required
+                        className="h-9 flex-1 rounded-md border border-input bg-background px-3 py-1 text-sm"
+                        defaultValue=""
+                      >
+                        <option value="" disabled>
+                          Select a rule set
+                        </option>
+                        {availableRuleSets.map((rs) => (
+                          <option key={rs.id} value={rs.id}>
+                            {rs.name}
+                          </option>
+                        ))}
+                      </select>
+                      <SubmitButton label="Add" pendingLabel="Adding..." size="sm" />
+                    </div>
+                  </form>
                 )}
               </CardContent>
             </Card>

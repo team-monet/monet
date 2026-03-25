@@ -11,7 +11,12 @@ import {
   listGroups,
   listGroupMembers,
 } from "../services/group.service";
-import { listRuleSetsForGroup } from "../services/rule.service";
+import {
+  listRuleSetsForGroup,
+  associateRuleSetWithGroup,
+  dissociateRuleSetFromGroup,
+  getAgentIdsForGroup,
+} from "../services/rule.service";
 import { pushRulesToAgent } from "../services/rule-notification.service";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -48,6 +53,14 @@ function parsePromoteUserInput(body: unknown): { data: { role: "group_admin" | "
     return { error: "Role must be one of: group_admin, user" };
   }
   return { data: { role: b.role as "group_admin" | "user" } };
+}
+
+function parseGroupRuleSetInput(body: unknown): { data: { ruleSetId: string } } | { error: string } {
+  const b = body as Record<string, unknown>;
+  if (!b || typeof b.ruleSetId !== "string" || !UUID_RE.test(b.ruleSetId)) {
+    return { error: "Valid ruleSetId (UUID) is required" };
+  }
+  return { data: { ruleSetId: b.ruleSetId } };
 }
 
 function parseUpdateGroupInput(body: unknown): { data: { name?: string; description?: string; memoryQuota?: number } } | { error: string } {
@@ -161,6 +174,93 @@ groupsRouter.get("/:id/rule-sets", async (c) => {
 
   const ruleSets = await listRuleSetsForGroup(sql, schemaName, groupId);
   return c.json({ ruleSets });
+});
+
+// POST /:id/rule-sets — associate a rule set with a group (Tenant_Admin only)
+groupsRouter.post("/:id/rule-sets", async (c) => {
+  const agent = c.get("agent");
+  const sql = c.get("sql");
+  const sessionStore = c.get("sessionStore");
+  const schemaName = c.get("tenantSchemaName");
+  const groupId = c.req.param("id");
+
+  if (!UUID_RE.test(groupId)) {
+    return c.json({ error: "validation_error", message: "Invalid group UUID" }, 400);
+  }
+
+  const role = await resolveAgentRole(sql, agent);
+  if (!isTenantAdmin(role)) {
+    return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
+  }
+
+  const body = await c.req.json();
+  const parsed = parseGroupRuleSetInput(body);
+  if ("error" in parsed) {
+    return c.json({ error: "validation_error", message: parsed.error }, 400);
+  }
+
+  const result = await associateRuleSetWithGroup(
+    sql,
+    agent.tenantId,
+    schemaName,
+    { actorId: agent.userId ?? agent.id, actorType: agent.userId ? "user" : "agent" },
+    groupId,
+    parsed.data.ruleSetId,
+  );
+
+  if ("error" in result) {
+    if (result.error === "not_found") {
+      return c.json({ error: "not_found", message: "Group or rule set not found" }, 404);
+    }
+    return c.json({ error: "conflict", message: "Rule set is already associated with this group" }, 409);
+  }
+
+  const affectedAgentIds = await getAgentIdsForGroup(sql, schemaName, groupId);
+  if (sessionStore) {
+    await Promise.all(affectedAgentIds.map((id) => pushRulesToAgent(id, sessionStore, sql, schemaName)));
+  }
+
+  return c.json({ success: true }, 201);
+});
+
+// DELETE /:id/rule-sets/:ruleSetId — dissociate a rule set from a group (Tenant_Admin only)
+groupsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
+  const agent = c.get("agent");
+  const sql = c.get("sql");
+  const sessionStore = c.get("sessionStore");
+  const schemaName = c.get("tenantSchemaName");
+  const groupId = c.req.param("id");
+  const ruleSetId = c.req.param("ruleSetId");
+
+  if (!UUID_RE.test(groupId) || !UUID_RE.test(ruleSetId)) {
+    return c.json({ error: "validation_error", message: "Invalid UUID in path" }, 400);
+  }
+
+  const role = await resolveAgentRole(sql, agent);
+  if (!isTenantAdmin(role)) {
+    return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);
+  }
+
+  const result = await dissociateRuleSetFromGroup(
+    sql,
+    agent.tenantId,
+    schemaName,
+    { actorId: agent.userId ?? agent.id, actorType: agent.userId ? "user" : "agent" },
+    groupId,
+    ruleSetId,
+  );
+
+  if ("error" in result) {
+    return c.json({ error: "not_found", message: "Group/rule-set association not found" }, 404);
+  }
+
+  // Fetch affected agents after successful dissociation to avoid race with concurrent member additions
+  const affectedAgentIds = await getAgentIdsForGroup(sql, schemaName, groupId);
+  if (sessionStore) {
+    await Promise.all(affectedAgentIds.map((id) => pushRulesToAgent(id, sessionStore, sql, schemaName)));
+  }
+
+  return c.json({ success: true });
 });
 
 // POST /:id/members — add agent to group (Group_Admin or Tenant_Admin)

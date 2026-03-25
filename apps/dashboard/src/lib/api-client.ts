@@ -228,6 +228,19 @@ export class MonetApiClient {
     return this.fetch<{ ruleSets: RuleSet[] }>(`/api/groups/${id}/rule-sets`);
   }
 
+  async addGroupRuleSet(id: string, ruleSetId: string): Promise<void> {
+    return this.fetch<void>(`/api/groups/${id}/rule-sets`, {
+      method: "POST",
+      body: JSON.stringify({ ruleSetId }),
+    });
+  }
+
+  async removeGroupRuleSet(id: string, ruleSetId: string): Promise<void> {
+    return this.fetch<void>(`/api/groups/${id}/rule-sets/${ruleSetId}`, {
+      method: "DELETE",
+    });
+  }
+
   async addGroupMember(id: string, agentId: string): Promise<void> {
     return this.fetch<void>(`/api/groups/${id}/members`, {
       method: "POST",

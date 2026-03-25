@@ -47,6 +47,13 @@ vi.mock("../services/rule.service.js", () => ({
       ruleIds: ["00000000-0000-0000-0000-000000000111"],
     },
   ]),
+  associateRuleSetWithGroup: vi.fn(async () => ({ success: true })),
+  dissociateRuleSetFromGroup: vi.fn(async () => ({ success: true })),
+  getAgentIdsForGroup: vi.fn(async () => []),
+}));
+
+vi.mock("../services/rule-notification.service.js", () => ({
+  pushRulesToAgent: vi.fn(async () => {}),
 }));
 
 function createTestApp(agent: AgentContext) {
@@ -56,6 +63,8 @@ function createTestApp(agent: AgentContext) {
     c.set("agent", agent);
     c.set("sql", {} as AppEnv["Variables"]["sql"]);
     c.set("tenantSchemaName", `tenant_${TENANT_ID.replace(/-/g, "_")}`);
+    c.set("tenantId", TENANT_ID);
+    c.set("sessionStore", {} as AppEnv["Variables"]["sessionStore"]);
     await next();
   });
 
@@ -212,6 +221,140 @@ describe("groups route", () => {
         { method: "DELETE" },
       );
       expect(res.status).toBe(409);
+    });
+  });
+
+  describe("POST /:id/rule-sets", () => {
+    it("returns 201 for tenant admin", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
+      });
+      expect(res.status).toBe(201);
+    });
+
+    it("returns 403 for non-admin", async () => {
+      const app = createTestApp(makeAgent({ role: null }));
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it("returns 403 for group admin", async () => {
+      const app = createTestApp(makeAgent({ role: "group_admin" }));
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it("returns 400 for non-UUID groupId", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/not-a-uuid/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 for invalid ruleSetId", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "not-a-uuid" }),
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 404 when group or rule set not found", async () => {
+      const ruleService = await import("../services/rule.service.js");
+      vi.mocked(ruleService.associateRuleSetWithGroup).mockResolvedValueOnce({
+        error: "not_found",
+      });
+
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
+      });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 409 when rule set already associated", async () => {
+      const ruleService = await import("../services/rule.service.js");
+      vi.mocked(ruleService.associateRuleSetWithGroup).mockResolvedValueOnce({
+        error: "conflict",
+      });
+
+      const app = createTestApp(makeAgent());
+      const res = await app.request("/groups/00000000-0000-0000-0000-000000000001/rule-sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ruleSetId: "00000000-0000-0000-0000-000000000111" }),
+      });
+      expect(res.status).toBe(409);
+    });
+  });
+
+  describe("DELETE /:id/rule-sets/:ruleSetId", () => {
+    it("returns 400 for non-UUID ruleSetId", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request(
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/not-a-uuid",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 200 for tenant admin", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request(
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it("returns 403 for non-admin", async () => {
+      const app = createTestApp(makeAgent({ role: null }));
+      const res = await app.request(
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(403);
+    });
+
+    it("returns 403 for group admin", async () => {
+      const app = createTestApp(makeAgent({ role: "group_admin" }));
+      const res = await app.request(
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(403);
+    });
+
+    it("returns 404 when association not found", async () => {
+      const ruleService = await import("../services/rule.service.js");
+      vi.mocked(ruleService.dissociateRuleSetFromGroup).mockResolvedValueOnce({
+        error: "not_found",
+      });
+
+      const app = createTestApp(makeAgent());
+      const res = await app.request(
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(404);
     });
   });
 

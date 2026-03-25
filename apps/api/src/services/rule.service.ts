@@ -1,5 +1,6 @@
 import {
   agents,
+  agentGroups,
   agentGroupMembers,
   agentRuleSets,
   groupRuleSets,
@@ -786,6 +787,89 @@ export async function dissociateRuleSetFromAgent(
   return removed ? { success: true } : { error: "not_found" };
 }
 
+export async function associateRuleSetWithGroup(
+  sql: SqlClient,
+  tenantId: string,
+  schemaName: string,
+  actor: RuleMutationActor,
+  groupId: string,
+  ruleSetId: string,
+): Promise<{ success: true } | { error: "not_found" | "conflict" }> {
+  const result = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [group] = await db
+      .select({ id: agentGroups.id })
+      .from(agentGroups)
+      .where(and(eq(agentGroups.id, groupId), eq(agentGroups.tenantId, tenantId)))
+      .limit(1);
+    if (!group) return { error: "not_found" as const };
+
+    const [ruleSet] = await db
+      .select({ id: ruleSetTable.id })
+      .from(ruleSetTable)
+      .where(and(eq(ruleSetTable.id, ruleSetId), isNull(ruleSetTable.ownerUserId)))
+      .limit(1);
+    if (!ruleSet) return { error: "not_found" as const };
+
+    const [inserted] = await db
+      .insert(groupRuleSets)
+      .values({ groupId, ruleSetId })
+      .onConflictDoNothing()
+      .returning({ groupId: groupRuleSets.groupId });
+
+    if (!inserted) return { error: "conflict" as const };
+    return { success: true as const };
+  });
+
+  await logAuditEvent(sql, schemaName, {
+    tenantId,
+    actorId: actor.actorId,
+    actorType: actor.actorType,
+    action: "group_rule_set.associate",
+    targetId: `${groupId}:${ruleSetId}`,
+    outcome: "error" in result ? "failure" : "success",
+    reason: "error" in result ? result.error : undefined,
+    metadata: { groupId, ruleSetId },
+  });
+
+  return result;
+}
+
+export async function dissociateRuleSetFromGroup(
+  sql: SqlClient,
+  tenantId: string,
+  schemaName: string,
+  actor: RuleMutationActor,
+  groupId: string,
+  ruleSetId: string,
+): Promise<{ success: true } | { error: "not_found" }> {
+  const removed = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [row] = await db
+      .delete(groupRuleSets)
+      .where(
+        and(
+          eq(groupRuleSets.groupId, groupId),
+          eq(groupRuleSets.ruleSetId, ruleSetId),
+        ),
+      )
+      .returning({ groupId: groupRuleSets.groupId });
+
+    return Boolean(row);
+  });
+
+  await logAuditEvent(sql, schemaName, {
+    tenantId,
+    actorId: actor.actorId,
+    actorType: actor.actorType,
+    action: "group_rule_set.dissociate",
+    targetId: `${groupId}:${ruleSetId}`,
+    outcome: removed ? "success" : "failure",
+    reason: removed ? undefined : "not_found",
+    metadata: { groupId, ruleSetId },
+  });
+
+  return removed ? { success: true } : { error: "not_found" };
+}
+
 export async function getActiveRulesForAgent(
   sql: SqlClient,
   schemaName: string,
@@ -861,6 +945,20 @@ export async function getAgentIdsForRuleSet(
       ...directAgentRows.map((row) => row.agentId),
       ...groupAgentRows.map((row) => row.agentId),
     ]);
+  });
+}
+
+export async function getAgentIdsForGroup(
+  sql: SqlClient,
+  schemaName: string,
+  groupId: string,
+): Promise<string[]> {
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const rows = await db
+      .selectDistinct({ agentId: agentGroupMembers.agentId })
+      .from(agentGroupMembers)
+      .where(eq(agentGroupMembers.groupId, groupId));
+    return rows.map((row) => row.agentId);
   });
 }
 
