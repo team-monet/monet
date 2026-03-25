@@ -145,8 +145,8 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                             min={1}
                             step={1}
                             required
-                            defaultValue={group.memoryQuota || ""}
-                            placeholder={group.memoryQuota ? "Enter a new quota" : "e.g. 1000"}
+                            defaultValue={group.memoryQuota ?? ""}
+                            placeholder={group.memoryQuota != null ? "Enter a new quota" : "e.g. 1000"}
                             className="h-9"
                           />
                           <SubmitButton size="sm" type="submit" className="h-9 px-3">

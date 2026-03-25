@@ -27,8 +27,8 @@ function parseCreateGroupInput(body: unknown): { data: { name: string; descripti
   if (!b || typeof b.name !== "string" || b.name.length === 0) {
     return { error: "Name is required" };
   }
-  if (b.memoryQuota !== undefined && (!Number.isInteger(b.memoryQuota) || Number(b.memoryQuota) <= 0)) {
-    return { error: "memoryQuota must be a positive integer" };
+  if (b.memoryQuota !== undefined && (!Number.isInteger(b.memoryQuota) || Number(b.memoryQuota) < 0)) {
+    return { error: "memoryQuota must be a non-negative integer (0 = unlimited)" };
   }
   return {
     data: {
