@@ -228,6 +228,10 @@ groupsRouter.delete("/:id/rule-sets/:ruleSetId", async (c) => {
   const groupId = c.req.param("id");
   const ruleSetId = c.req.param("ruleSetId");
 
+  if (!UUID_RE.test(groupId) || !UUID_RE.test(ruleSetId)) {
+    return c.json({ error: "validation_error", message: "Invalid UUID in path" }, 400);
+  }
+
   const role = await resolveAgentRole(sql, agent);
   if (!isTenantAdmin(role)) {
     return c.json({ error: "forbidden", message: "Tenant admin role required" }, 403);

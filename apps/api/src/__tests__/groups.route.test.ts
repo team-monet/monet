@@ -297,10 +297,19 @@ describe("groups route", () => {
   });
 
   describe("DELETE /:id/rule-sets/:ruleSetId", () => {
+    it("returns 400 for non-UUID ruleSetId", async () => {
+      const app = createTestApp(makeAgent());
+      const res = await app.request(
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/not-a-uuid",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(400);
+    });
+
     it("returns 200 for tenant admin", async () => {
       const app = createTestApp(makeAgent());
       const res = await app.request(
-        "/groups/group-1/rule-sets/00000000-0000-0000-0000-000000000111",
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
         { method: "DELETE" },
       );
       expect(res.status).toBe(200);
@@ -309,7 +318,7 @@ describe("groups route", () => {
     it("returns 403 for non-admin", async () => {
       const app = createTestApp(makeAgent({ role: null }));
       const res = await app.request(
-        "/groups/group-1/rule-sets/00000000-0000-0000-0000-000000000111",
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
         { method: "DELETE" },
       );
       expect(res.status).toBe(403);
@@ -318,7 +327,7 @@ describe("groups route", () => {
     it("returns 403 for group admin", async () => {
       const app = createTestApp(makeAgent({ role: "group_admin" }));
       const res = await app.request(
-        "/groups/group-1/rule-sets/00000000-0000-0000-0000-000000000111",
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
         { method: "DELETE" },
       );
       expect(res.status).toBe(403);
@@ -332,7 +341,7 @@ describe("groups route", () => {
 
       const app = createTestApp(makeAgent());
       const res = await app.request(
-        "/groups/group-1/rule-sets/00000000-0000-0000-0000-000000000111",
+        "/groups/00000000-0000-0000-0000-000000000001/rule-sets/00000000-0000-0000-0000-000000000111",
         { method: "DELETE" },
       );
       expect(res.status).toBe(404);

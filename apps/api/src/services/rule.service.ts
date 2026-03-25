@@ -953,7 +953,7 @@ export async function getAgentIdsForGroup(
   groupId: string,
 ): Promise<string[]> {
   const rows = await sql`
-    SELECT agent_id FROM agent_group_members WHERE group_id = ${groupId}
+    SELECT DISTINCT agent_id FROM agent_group_members WHERE group_id = ${groupId}
   `;
   return rows.map((row) => row.agent_id as string);
 }
