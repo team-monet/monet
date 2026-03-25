@@ -156,7 +156,7 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                         </div>
                       </div>
                     </form>
-                    {group.memoryQuota !== null && group.memoryQuota !== 0 && (
+                    {group.memoryQuota !== 0 && (
                       <form action={clearGroupQuotaAction} className="pt-1">
                         <input type="hidden" name="groupId" value={group.id} />
                         <SubmitButton
