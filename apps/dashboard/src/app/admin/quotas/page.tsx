@@ -111,12 +111,16 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                       {(() => {
                         const usage = quotaUsage.find((q) => q.groupId === group.id);
                         if (usage) {
-                          const agentPct = usage.effectiveQuotaPerAgent > 0
+                          const unlimited = usage.effectiveQuotaPerAgent === 0;
+                          const agentPct = !unlimited && usage.effectiveQuotaPerAgent > 0
                             ? Math.round((usage.maxAgentCurrent / usage.effectiveQuotaPerAgent) * 100)
                             : 0;
                           return (
                             <p className="text-[11px] text-muted-foreground">
-                              Busiest agent: <span className="font-medium">{usage.maxAgentCurrent.toLocaleString()}</span> / {usage.effectiveQuotaPerAgent.toLocaleString()} entries ({agentPct}%)
+                              Busiest agent: <span className="font-medium">{usage.maxAgentCurrent.toLocaleString()}</span>
+                              {unlimited
+                                ? " entries (unlimited)"
+                                : ` / ${usage.effectiveQuotaPerAgent.toLocaleString()} entries (${agentPct}%)`}
                               {" · "}{usage.current.toLocaleString()} total in group
                             </p>
                           );
