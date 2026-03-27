@@ -17,8 +17,8 @@ export async function updateGroupQuotaAction(formData: FormData) {
     redirect("/admin/quotas?updateError=Group%20ID%20is%20required");
   }
 
-  if (!quotaInput || !Number.isInteger(quota) || quota <= 0) {
-    redirect("/admin/quotas?updateError=Quota%20must%20be%20a%20positive%20integer");
+  if (!quotaInput || !Number.isInteger(quota) || quota < 0) {
+    redirect("/admin/quotas?updateError=Quota%20must%20be%20a%20non-negative%20integer%20(0%20%3D%20unlimited)");
   }
 
   try {

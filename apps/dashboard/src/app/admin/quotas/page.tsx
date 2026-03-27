@@ -145,7 +145,7 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                             min={1}
                             step={1}
                             required
-                            defaultValue={group.memoryQuota ?? ""}
+                            defaultValue={group.memoryQuota || ""}
                             placeholder={group.memoryQuota != null ? "Enter a new quota" : "e.g. 1000"}
                             className="h-9"
                           />
