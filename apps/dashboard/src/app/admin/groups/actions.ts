@@ -8,10 +8,10 @@ function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function parseOptionalPositiveInt(value: string): number | null {
+function parseOptionalNonNegativeInt(value: string): number | null {
   if (!value) return null;
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed <= 0) return Number.NaN;
+  if (!Number.isInteger(parsed) || parsed < 0) return Number.NaN;
   return parsed;
 }
 
@@ -23,13 +23,13 @@ export async function createGroupAction(formData: FormData) {
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
   const memoryQuotaInput = toSingle(formData.get("memoryQuota"));
-  const memoryQuota = parseOptionalPositiveInt(memoryQuotaInput);
+  const memoryQuota = parseOptionalNonNegativeInt(memoryQuotaInput);
 
   if (!name) {
     redirect("/admin/groups?createError=Group%20name%20is%20required");
   }
   if (Number.isNaN(memoryQuota)) {
-    redirect("/admin/groups?createError=Memory%20quota%20must%20be%20a%20positive%20integer");
+    redirect("/admin/groups?createError=Memory%20quota%20must%20be%20a%20non-negative%20integer%20(0%20%3D%20unlimited)");
   }
 
   try {
@@ -54,13 +54,13 @@ export async function updateGroupAction(formData: FormData) {
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
   const memoryQuotaInput = toSingle(formData.get("memoryQuota"));
-  const memoryQuota = parseOptionalPositiveInt(memoryQuotaInput);
+  const memoryQuota = parseOptionalNonNegativeInt(memoryQuotaInput);
 
   if (!groupId || !name) {
     redirect("/admin/groups?updateError=Group%20ID%20and%20name%20are%20required");
   }
   if (Number.isNaN(memoryQuota)) {
-    redirect("/admin/groups?updateError=Memory%20quota%20must%20be%20a%20positive%20integer");
+    redirect("/admin/groups?updateError=Memory%20quota%20must%20be%20a%20non-negative%20integer%20(0%20%3D%20unlimited)");
   }
 
   try {

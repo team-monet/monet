@@ -25,7 +25,7 @@ export const AgentGroup = z.object({
   id: z.string().uuid(),
   name: z.string(),
   description: z.string(),
-  memoryQuota: z.number().int().positive().nullable(),
+  memoryQuota: z.number().int().nonnegative().nullable(),
   createdAt: z.coerce.date(),
 });
 export type AgentGroup = z.infer<typeof AgentGroup>;

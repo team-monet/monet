@@ -200,6 +200,48 @@ describe("groups integration", () => {
     expect(body.role).toBe("group_admin");
   });
 
+  it("tenant admin can set and clear memoryQuota to unlimited", async () => {
+    // Create group with a quota
+    const createRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ name: "quota-test", memoryQuota: 500 }),
+    });
+    expect(createRes.status).toBe(201);
+    const group = await createRes.json();
+    expect(group.memoryQuota).toBe(500);
+
+    // Clear quota to unlimited via 0
+    const clearRes = await app.request(`/api/groups/${group.id}`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ memoryQuota: 0 }),
+    });
+    expect(clearRes.status).toBe(200);
+    const cleared = await clearRes.json();
+    expect(cleared.memoryQuota).toBe(0);
+
+    // Set it back to a value
+    const setRes = await app.request(`/api/groups/${group.id}`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ memoryQuota: 1000 }),
+    });
+    expect(setRes.status).toBe(200);
+    const updated = await setRes.json();
+    expect(updated.memoryQuota).toBe(1000);
+
+    // Sending null restores default (null in DB)
+    const nullRes = await app.request(`/api/groups/${group.id}`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ memoryQuota: null }),
+    });
+    expect(nullRes.status).toBe(200);
+    const nullCleared = await nullRes.json();
+    expect(nullCleared.memoryQuota).toBeNull();
+  });
+
   it("non-admin cannot promote a user", async () => {
     const sql = getTestSql();
     const [user] = await sql`

@@ -466,9 +466,11 @@ export async function getHealthMetrics(
             groupName: row.groupName,
             current: currentByGroupId.get(row.groupId) ?? 0,
             quota,
-            effectiveQuotaPerAgent: quota !== null && quota > 0
-              ? quota
-              : DEFAULT_MEMORY_QUOTA,
+            effectiveQuotaPerAgent: quota === 0
+              ? 0  // 0 = explicitly unlimited
+              : quota !== null && quota > 0
+                ? quota
+                : DEFAULT_MEMORY_QUOTA,
             maxAgentCurrent: maxAgentCurrentByGroupId.get(row.groupId) ?? 0,
           };
         }),

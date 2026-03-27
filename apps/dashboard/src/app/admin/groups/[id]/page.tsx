@@ -157,7 +157,7 @@ export default async function GroupMembersPage({ params, searchParams }: PagePro
                     Memory quota
                   </p>
                   <p className="text-sm font-medium">
-                    {group?.memoryQuota ? `${group.memoryQuota} entries` : "Unlimited"}
+                    {group?.memoryQuota ? `${group.memoryQuota} entries` : group?.memoryQuota === 0 ? "Unlimited" : "Default"}
                   </p>
                 </div>
                 <div className="space-y-1">

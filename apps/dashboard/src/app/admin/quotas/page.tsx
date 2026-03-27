@@ -1,7 +1,7 @@
 import { getApiClient } from "@/lib/api-client";
 import { requireAdmin } from "@/lib/auth";
 import { AgentGroup, QuotaUtilization } from "@monet/types";
-import { updateGroupQuotaAction } from "./actions";
+import { updateGroupQuotaAction, clearGroupQuotaAction } from "./actions";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { SubmitButton } from "@/components/ui/submit-button";
 import { Input } from "@/components/ui/input";
@@ -50,7 +50,7 @@ export default async function QuotasPage({ searchParams }: PageProps) {
           Manage memory storage limits for agent groups.
         </p>
         <p className="text-xs text-muted-foreground">
-          Setting a quota back to unlimited is not supported yet.
+          Set a quota to limit memory entries per agent, or clear it to allow unlimited storage.
         </p>
       </div>
 
@@ -103,18 +103,24 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                         <span className="font-medium">
                           {group.memoryQuota === null
                             ? "Default (10,000 per agent)"
-                            : `${group.memoryQuota} Entries`}
+                            : group.memoryQuota === 0
+                              ? "Unlimited"
+                              : `${group.memoryQuota.toLocaleString()} Entries`}
                         </span>
                       </div>
                       {(() => {
                         const usage = quotaUsage.find((q) => q.groupId === group.id);
                         if (usage) {
-                          const agentPct = usage.effectiveQuotaPerAgent > 0
+                          const unlimited = usage.effectiveQuotaPerAgent === 0;
+                          const agentPct = !unlimited && usage.effectiveQuotaPerAgent > 0
                             ? Math.round((usage.maxAgentCurrent / usage.effectiveQuotaPerAgent) * 100)
                             : 0;
                           return (
                             <p className="text-[11px] text-muted-foreground">
-                              Busiest agent: <span className="font-medium">{usage.maxAgentCurrent.toLocaleString()}</span> / {usage.effectiveQuotaPerAgent.toLocaleString()} entries ({agentPct}%)
+                              Busiest agent: <span className="font-medium">{usage.maxAgentCurrent.toLocaleString()}</span>
+                              {unlimited
+                                ? " entries (unlimited)"
+                                : ` / ${usage.effectiveQuotaPerAgent.toLocaleString()} entries (${agentPct}%)`}
                               {" · "}{usage.current.toLocaleString()} total in group
                             </p>
                           );
@@ -125,9 +131,6 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                           </p>
                         );
                       })()}
-                      <p className="text-[11px] text-muted-foreground">
-                        Use a positive integer. Clearing quota to unlimited is not available yet.
-                      </p>
                     </div>
 
                     <form action={updateGroupQuotaAction} className="space-y-3 pt-2">
@@ -142,8 +145,8 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                             min={1}
                             step={1}
                             required
-                            defaultValue={group.memoryQuota ?? ""}
-                            placeholder={group.memoryQuota === null ? "e.g. 1000" : "Enter a new quota"}
+                            defaultValue={group.memoryQuota || ""}
+                            placeholder={group.memoryQuota != null ? "Enter a new quota" : "e.g. 1000"}
                             className="h-9"
                           />
                           <SubmitButton size="sm" type="submit" className="h-9 px-3">
@@ -153,6 +156,18 @@ export default async function QuotasPage({ searchParams }: PageProps) {
                         </div>
                       </div>
                     </form>
+                    {group.memoryQuota !== 0 && (
+                      <form action={clearGroupQuotaAction} className="pt-1">
+                        <input type="hidden" name="groupId" value={group.id} />
+                        <SubmitButton
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 text-xs text-muted-foreground"
+                          label="Clear quota (unlimited)"
+                          pendingLabel="Clearing..."
+                        />
+                      </form>
+                    )}
                   </CardContent>
                   <CardFooter className="bg-muted/30 border-t py-3 flex justify-between">
                     <div className="flex items-center gap-1 text-[10px] text-muted-foreground">

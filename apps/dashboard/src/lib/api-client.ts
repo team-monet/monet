@@ -256,7 +256,7 @@ export class MonetApiClient {
 
   async updateGroup(
     id: string,
-    input: { name?: string; description?: string; memoryQuota?: number },
+    input: { name?: string; description?: string; memoryQuota?: number | null },
   ): Promise<AgentGroup> {
     return this.fetch<AgentGroup>(`/api/groups/${id}`, {
       method: "PATCH",

@@ -104,7 +104,7 @@ export async function updateGroup(
   sql: SqlClient,
   tenantId: string,
   groupId: string,
-  input: { name?: string; description?: string; memoryQuota?: number },
+  input: { name?: string; description?: string; memoryQuota?: number | null },
 ) {
   const db = drizzle(sql);
   const [existing] = await db
