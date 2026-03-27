@@ -75,7 +75,7 @@ function parseUpdateGroupInput(body: unknown): { data: { name?: string; descript
     data: {
       name: typeof b.name === "string" ? b.name : undefined,
       description: typeof b.description === "string" ? b.description : undefined,
-      memoryQuota: b.memoryQuota === null ? 0 : typeof b.memoryQuota === "number" ? b.memoryQuota : undefined,
+      memoryQuota: b.memoryQuota === null ? null : typeof b.memoryQuota === "number" ? b.memoryQuota : undefined,
     },
   };
 }

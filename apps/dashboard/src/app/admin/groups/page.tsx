@@ -169,7 +169,7 @@ export default async function AdminGroupsPage({ searchParams }: PageProps) {
                       </TableCell>
                       <TableCell>
                         <Badge variant="secondary" className="font-normal">
-                          {g.memoryQuota ? `${g.memoryQuota} entries` : "Unlimited"}
+                          {g.memoryQuota ? `${g.memoryQuota} entries` : g.memoryQuota === 0 ? "Unlimited" : "Default"}
                         </Badge>
                       </TableCell>
                       <TableCell>
@@ -210,13 +210,13 @@ export default async function AdminGroupsPage({ searchParams }: PageProps) {
                                     id={`edit-memoryQuota-${g.id}`}
                                     name="memoryQuota"
                                     type="number"
-                                    min={1}
+                                    min={0}
                                     step={1}
                                     defaultValue={g.memoryQuota ?? undefined}
-                                    placeholder="Leave blank to keep current quota"
+                                    placeholder="Leave blank for default · 0 = unlimited"
                                   />
                                   <p className="text-[11px] text-muted-foreground">
-                                    Clearing an existing quota to unlimited is not supported yet.
+                                    0 = unlimited · blank = keep current quota
                                   </p>
                                 </div>
                                 <DialogFooter>
