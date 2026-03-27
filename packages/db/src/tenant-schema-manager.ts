@@ -154,10 +154,11 @@ export async function createTenantSchema(
     CREATE INDEX IF NOT EXISTS idx_rules_owner_user
     ON "${schemaName}".rules (owner_user_id)
   `);
-  // Deduplicate existing rule names before adding unique constraint
+  // Deduplicate existing rule names before adding unique constraint.
+  // Truncate name to leave room for ' (uuid)' suffix (39 chars) within VARCHAR(255).
   await sql.unsafe(`
     UPDATE "${schemaName}".rules r
-    SET name = r.name || ' (' || r.id::text || ')'
+    SET name = LEFT(r.name, 216) || ' (' || r.id::text || ')'
     FROM (
       SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
       FROM "${schemaName}".rules
@@ -186,10 +187,11 @@ export async function createTenantSchema(
     CREATE INDEX IF NOT EXISTS idx_rule_sets_owner_user
     ON "${schemaName}".rule_sets (owner_user_id)
   `);
-  // Deduplicate existing rule set names before adding unique constraint
+  // Deduplicate existing rule set names before adding unique constraint.
+  // Truncate name to leave room for ' (uuid)' suffix (39 chars) within VARCHAR(255).
   await sql.unsafe(`
     UPDATE "${schemaName}".rule_sets rs
-    SET name = rs.name || ' (' || rs.id::text || ')'
+    SET name = LEFT(rs.name, 216) || ' (' || rs.id::text || ')'
     FROM (
       SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
       FROM "${schemaName}".rule_sets
