@@ -231,7 +231,7 @@ describe("groups integration", () => {
     const updated = await setRes.json();
     expect(updated.memoryQuota).toBe(1000);
 
-    // Sending null also clears to unlimited (mapped to 0)
+    // Sending null restores default (null in DB)
     const nullRes = await app.request(`/api/groups/${group.id}`, {
       method: "PATCH",
       headers: authHeaders(),
@@ -239,7 +239,7 @@ describe("groups integration", () => {
     });
     expect(nullRes.status).toBe(200);
     const nullCleared = await nullRes.json();
-    expect(nullCleared.memoryQuota).toBe(0);
+    expect(nullCleared.memoryQuota).toBeNull();
   });
 
   it("non-admin cannot promote a user", async () => {
