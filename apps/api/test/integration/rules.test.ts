@@ -797,4 +797,68 @@ describe("Rules integration", () => {
     expect(actions).toContain("rule.update");
     expect(actions).toContain("rule.delete");
   });
+
+  it("rejects duplicate rule name within the same owner scope", async () => {
+    const headers = { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" };
+
+    const first = await app.request("/api/rules", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Unique Rule", description: "First" }),
+    });
+    expect(first.status).toBe(201);
+
+    const second = await app.request("/api/rules", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Unique Rule", description: "Duplicate" }),
+    });
+    expect(second.status).toBe(409);
+    const body = await second.json();
+    expect(body.error).toBe("conflict");
+  });
+
+  it("rejects duplicate rule set name within the same owner scope", async () => {
+    const headers = { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" };
+
+    const first = await app.request("/api/rule-sets", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Unique Set" }),
+    });
+    expect(first.status).toBe(201);
+
+    const second = await app.request("/api/rule-sets", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Unique Set" }),
+    });
+    expect(second.status).toBe(409);
+    const body = await second.json();
+    expect(body.error).toBe("conflict");
+  });
+
+  it("rejects renaming a rule to an existing name", async () => {
+    const headers = { Authorization: `Bearer ${adminApiKey}`, "Content-Type": "application/json" };
+
+    await app.request("/api/rules", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Name A", description: "A" }),
+    });
+
+    const ruleB = await app.request("/api/rules", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Name B", description: "B" }),
+    });
+    const { id: ruleBId } = await ruleB.json() as { id: string };
+
+    const rename = await app.request(`/api/rules/${ruleBId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ name: "Name A" }),
+    });
+    expect(rename.status).toBe(409);
+  });
 });

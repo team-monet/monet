@@ -154,6 +154,10 @@ export async function createTenantSchema(
     CREATE INDEX IF NOT EXISTS idx_rules_owner_user
     ON "${schemaName}".rules (owner_user_id)
   `);
+  await sql.unsafe(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_name_owner
+    ON "${schemaName}".rules (name, owner_user_id) NULLS NOT DISTINCT
+  `);
 
   // Rule sets table
   await sql.unsafe(`
@@ -171,6 +175,10 @@ export async function createTenantSchema(
   await sql.unsafe(`
     CREATE INDEX IF NOT EXISTS idx_rule_sets_owner_user
     ON "${schemaName}".rule_sets (owner_user_id)
+  `);
+  await sql.unsafe(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_sets_name_owner
+    ON "${schemaName}".rule_sets (name, owner_user_id) NULLS NOT DISTINCT
   `);
 
   // Rule set rules join table

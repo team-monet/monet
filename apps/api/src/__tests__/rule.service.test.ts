@@ -240,7 +240,10 @@ describe("rule service", () => {
       description: "Desc A",
     });
 
-    expect(result.id).toBe("00000000-0000-0000-0000-000000000001");
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.id).toBe("00000000-0000-0000-0000-000000000001");
+    }
     expect(logAuditEventMock).toHaveBeenCalledTimes(1);
   });
 
