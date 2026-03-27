@@ -154,6 +154,16 @@ export async function createTenantSchema(
     CREATE INDEX IF NOT EXISTS idx_rules_owner_user
     ON "${schemaName}".rules (owner_user_id)
   `);
+  // Deduplicate existing rule names before adding unique constraint
+  await sql.unsafe(`
+    UPDATE "${schemaName}".rules r
+    SET name = r.name || ' (' || r.id::text || ')'
+    FROM (
+      SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
+      FROM "${schemaName}".rules
+    ) dups
+    WHERE r.id = dups.id AND dups.rn > 1
+  `);
   await sql.unsafe(`
     CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_name_owner
     ON "${schemaName}".rules (name, owner_user_id) NULLS NOT DISTINCT
@@ -175,6 +185,16 @@ export async function createTenantSchema(
   await sql.unsafe(`
     CREATE INDEX IF NOT EXISTS idx_rule_sets_owner_user
     ON "${schemaName}".rule_sets (owner_user_id)
+  `);
+  // Deduplicate existing rule set names before adding unique constraint
+  await sql.unsafe(`
+    UPDATE "${schemaName}".rule_sets rs
+    SET name = rs.name || ' (' || rs.id::text || ')'
+    FROM (
+      SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
+      FROM "${schemaName}".rule_sets
+    ) dups
+    WHERE rs.id = dups.id AND dups.rn > 1
   `);
   await sql.unsafe(`
     CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_sets_name_owner
