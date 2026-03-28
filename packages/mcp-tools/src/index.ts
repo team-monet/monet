@@ -72,42 +72,50 @@ export const MemoryListTagsInput = z.object({
 export const toolDefinitions = [
   {
     name: TOOL_MEMORY_STORE,
-    description: "Store a new memory entry. The entry will be searchable by tag and full-text immediately. Semantic search becomes available after enrichment completes.",
+    description:
+      "Store a new memory entry. Use this PROACTIVELY whenever you discover something worth remembering: decisions made, problems solved, patterns identified, user preferences learned, procedures followed, or important facts encountered. The entry will be searchable by tag and full-text immediately; semantic search becomes available after enrichment completes. Choose memoryType carefully (decision, pattern, issue, preference, fact, procedure) and always include descriptive tags for future retrieval.",
     inputSchema: MemoryStoreInput,
   },
   {
     name: TOOL_MEMORY_SEARCH,
-    description: "Search for memories. Returns lightweight summaries (Tier 1). Use memory_fetch to get full content for specific entries.",
+    description:
+      "Search for memories. Use this BEFORE starting any non-trivial task to check for relevant prior context — previous decisions, known issues, established patterns, or user preferences. Also use this when the user references something discussed in a prior session. Returns lightweight summaries (Tier 1); use memory_fetch to get full content for specific entries.",
     inputSchema: MemorySearchInput,
   },
   {
     name: TOOL_MEMORY_FETCH,
-    description: "Fetch the full content and version history of a specific memory entry (Tier 2). Increments the entry's usefulness score.",
+    description:
+      "Fetch the full content and version history of a specific memory entry (Tier 2). Use this after memory_search returns a relevant result and you need the complete details to act on it. Increments the entry's usefulness score.",
     inputSchema: MemoryFetchInput,
   },
   {
     name: TOOL_MEMORY_UPDATE,
-    description: "Update the content or tags of a memory entry using optimistic concurrency via expectedVersion.",
+    description:
+      "Update the content or tags of a memory entry using optimistic concurrency via expectedVersion. Use this when information has changed — a decision was revised, a procedure was updated, or a fact is now more complete. Always update rather than creating duplicates.",
     inputSchema: MemoryUpdateInput,
   },
   {
     name: TOOL_MEMORY_DELETE,
-    description: "Delete a memory entry you authored. Removes the entry and all its version history.",
+    description:
+      "Delete a memory entry you authored. Use this to remove entries that are completely wrong or no longer relevant. For information that is simply outdated but still useful as historical context, prefer memory_mark_outdated instead.",
     inputSchema: MemoryDeleteInput,
   },
   {
     name: TOOL_MEMORY_PROMOTE_SCOPE,
-    description: "Change a memory's visibility scope. Promotion supports sharing a memory with a wider audience.",
+    description:
+      "Change a memory's visibility scope (private, user, group). Promotion widens visibility to a broader audience; demotion (narrowing) is allowed only by the original author. Use this when a memory should be shared more widely or restricted after reconsideration.",
     inputSchema: MemoryPromoteScopeInput,
   },
   {
     name: TOOL_MEMORY_MARK_OUTDATED,
-    description: "Mark a memory entry as outdated. The entry remains searchable but is ranked lower in results.",
+    description:
+      "Mark a memory entry as outdated. Use this when information is no longer current but still has historical value. The entry remains searchable but is ranked lower in results. Prefer this over deletion when the old context might still be useful for understanding past decisions.",
     inputSchema: MemoryMarkOutdatedInput,
   },
   {
     name: TOOL_MEMORY_LIST_TAGS,
-    description: "List all unique tags across memories in your accessible scopes.",
+    description:
+      "List all unique tags across memories in your accessible scopes. Use this to discover the existing tag vocabulary before storing new memories, so you can reuse established tags and maintain consistency.",
     inputSchema: MemoryListTagsInput,
   },
 ] as const;
