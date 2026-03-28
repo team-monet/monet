@@ -101,6 +101,25 @@ describe("MCP server factory", () => {
     await Promise.all([client.close(), server.close()]);
   });
 
+  it("delivers base governance instructions even with no active rules", async () => {
+    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const instructions = client.getInstructions();
+    expect(instructions).toBeDefined();
+    expect(instructions).toContain("enterprise AI agent governance platform");
+    expect(instructions).toContain("COMPLY with all active rules provided by this server");
+    expect(instructions).not.toContain("Active rules");
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
   it("publishes active rules through MCP initialize instructions", async () => {
     const server = createMcpServer(AGENT, "tenant_test", {} as never, {
       activeRules: [...ACTIVE_RULES],
