@@ -10,6 +10,7 @@ import { userGroupsRouter } from "./routes/user-groups";
 import { rulesRouter } from "./routes/rules";
 import { auditRouter } from "./routes/audit";
 import { metricsRouter } from "./routes/metrics";
+import { settingsRouter } from "./routes/settings";
 import { authMiddleware } from "./middleware/auth";
 import { tenantMiddleware } from "./middleware/tenant";
 import { rateLimitMiddleware } from "./middleware/rate-limit";
@@ -53,6 +54,7 @@ export function createApp(
   authenticated.route("/user-groups", userGroupsRouter);
   authenticated.route("/audit", auditRouter);
   authenticated.route("/metrics", metricsRouter);
+  authenticated.route("/settings", settingsRouter);
   authenticated.route("/", rulesRouter);
 
   app.route("/api", authenticated);

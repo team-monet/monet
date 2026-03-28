@@ -8,6 +8,7 @@ import {
 import type { SqlClient } from "@monet/db";
 import type { AgentContext } from "../middleware/context";
 import { computeQueryEmbedding, enqueueEnrichment } from "../services/enrichment.service";
+import { getMonetGuidance } from "../services/settings.service";
 import {
   createMemory,
   deleteMemory,
@@ -170,6 +171,24 @@ export function createMcpServer(
     name: "monet",
     version: packageJson.version,
   }, { instructions });
+
+  server.registerPrompt("monet_guidance", {
+    title: "Monet Usage Guidance",
+    description: "Comprehensive guidance on how to use Monet effectively as an AI agent. Covers memory operations, scoping, tagging, rules compliance, and best practices.",
+  }, async () => {
+    const guidance = await getMonetGuidance(sql, tenantSchemaName);
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: guidance,
+          },
+        },
+      ],
+    };
+  });
 
   if (options.onInitialized) {
     server.server.oninitialized = () => {

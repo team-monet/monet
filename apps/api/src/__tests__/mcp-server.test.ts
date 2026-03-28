@@ -44,6 +44,12 @@ vi.mock("../services/enrichment.service.js", () => ({
   enqueueEnrichment: (...args: unknown[]) => enqueueEnrichment(...args),
 }));
 
+const getMonetGuidanceMock = vi.fn().mockResolvedValue("Custom tenant guidance text");
+
+vi.mock("../services/settings.service.js", () => ({
+  getMonetGuidance: (...args: unknown[]) => getMonetGuidanceMock(...args),
+}));
+
 const AGENT = {
   id: "00000000-0000-0000-0000-000000000001",
   externalId: "agent-1",
@@ -116,6 +122,28 @@ describe("MCP server factory", () => {
     expect(instructions).toContain("enterprise AI agent governance platform");
     expect(instructions).toContain("COMPLY with all active rules provided by this server");
     expect(instructions).not.toContain("Active rules");
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
+  it("serves monet_guidance prompt with tenant-specific guidance", async () => {
+    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const result = await client.getPrompt({ name: "monet_guidance" });
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[0].content).toEqual({
+      type: "text",
+      text: "Custom tenant guidance text",
+    });
+    expect(getMonetGuidanceMock).toHaveBeenCalledWith({}, "tenant_test");
 
     await Promise.all([client.close(), server.close()]);
   });

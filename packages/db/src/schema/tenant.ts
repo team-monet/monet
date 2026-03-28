@@ -174,3 +174,11 @@ export const groupRuleSets = pgTable(
     primaryKey({ columns: [table.groupId, table.ruleSetId] }),
   ],
 );
+
+export const tenantSettings = pgTable("tenant_settings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  monetGuidance: text("monet_guidance").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});

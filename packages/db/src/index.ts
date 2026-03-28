@@ -13,6 +13,7 @@ export {
 export * from "./schema/index.js";
 export {
   createTenantSchema,
+  DEFAULT_MONET_GUIDANCE,
   tenantSchemaNameFromId,
 } from "./tenant-schema-manager.js";
 export { withTenantDrizzleScope, withTenantScope } from "./scoped-client.js";
