@@ -94,6 +94,9 @@ rulesRouter.post("/rules", async (c) => {
   const schemaName = c.get("tenantSchemaName");
 
   const rule = await createRule(sql, tenantId, schemaName, ruleMutationActor(agent), parsed.data);
+  if ("error" in rule) {
+    return c.json({ error: rule.error, message: rule.message }, 409);
+  }
   return c.json(rule, 201);
 });
 
@@ -158,6 +161,9 @@ rulesRouter.patch("/rules/:id", async (c) => {
   );
 
   if ("error" in result) {
+    if (result.error === "conflict") {
+      return c.json({ error: "conflict", message: result.message }, 409);
+    }
     return c.json({ error: "not_found", message: "Rule not found" }, 404);
   }
 
@@ -212,6 +218,9 @@ rulesRouter.post("/rule-sets", async (c) => {
   const schemaName = c.get("tenantSchemaName");
 
   const ruleSet = await createRuleSet(sql, tenantId, schemaName, ruleMutationActor(agent), parsed.data);
+  if ("error" in ruleSet) {
+    return c.json({ error: ruleSet.error, message: ruleSet.message }, 409);
+  }
   return c.json(ruleSet, 201);
 });
 
@@ -346,6 +355,9 @@ rulesRouter.post("/me/rules", async (c) => {
     { ownerUserId: access.userId },
   );
 
+  if ("error" in rule) {
+    return c.json({ error: rule.error, message: rule.message }, 409);
+  }
   return c.json(rule, 201);
 });
 
@@ -385,6 +397,9 @@ rulesRouter.patch("/me/rules/:id", async (c) => {
   );
 
   if ("error" in result) {
+    if (result.error === "conflict") {
+      return c.json({ error: "conflict", message: result.message }, 409);
+    }
     return c.json({ error: "not_found", message: "Rule not found" }, 404);
   }
 
@@ -458,6 +473,9 @@ rulesRouter.post("/me/rule-sets", async (c) => {
     { ownerUserId: access.userId },
   );
 
+  if ("error" in ruleSet) {
+    return c.json({ error: ruleSet.error, message: ruleSet.message }, 409);
+  }
   return c.json(ruleSet, 201);
 });
 

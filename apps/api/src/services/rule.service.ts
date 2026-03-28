@@ -14,6 +14,10 @@ import type { CreateRuleInput, CreateRuleSetInput, UpdateRuleInput } from "@mone
 import type { SqlClient } from "@monet/db";
 import { logAuditEvent, type AuditEntry } from "./audit.service";
 
+function isDuplicateNameError(err: unknown): boolean {
+  return err instanceof Error && "code" in err && (err as { code: string }).code === "23505";
+}
+
 interface RuleMutationActor {
   actorId: string;
   actorType: AuditEntry["actorType"];
@@ -167,26 +171,34 @@ export async function createRule(
   actor: RuleMutationActor,
   input: CreateRuleInput,
   scope: RuleOwnerScope = { ownerUserId: null },
-): Promise<RuleRecord> {
-  const created = await withTenantDrizzleScope(sql, schemaName, async (db) => {
-    const [rule] = await db
-      .insert(ruleTable)
-      .values({
-        name: input.name,
-        description: input.description,
-        ownerUserId: scope.ownerUserId,
-      })
-      .returning({
-        id: ruleTable.id,
-        name: ruleTable.name,
-        description: ruleTable.description,
-        ownerUserId: ruleTable.ownerUserId,
-        updatedAt: ruleTable.updatedAt,
-        createdAt: ruleTable.createdAt,
-      });
+): Promise<RuleRecord | { error: "conflict"; message: string }> {
+  let created: RuleRecord;
+  try {
+    created = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+      const [rule] = await db
+        .insert(ruleTable)
+        .values({
+          name: input.name,
+          description: input.description,
+          ownerUserId: scope.ownerUserId,
+        })
+        .returning({
+          id: ruleTable.id,
+          name: ruleTable.name,
+          description: ruleTable.description,
+          ownerUserId: ruleTable.ownerUserId,
+          updatedAt: ruleTable.updatedAt,
+          createdAt: ruleTable.createdAt,
+        });
 
-    return mapRuleRow(rule);
-  });
+      return mapRuleRow(rule);
+    });
+  } catch (err: unknown) {
+    if (isDuplicateNameError(err)) {
+      return { error: "conflict", message: `A rule named "${input.name}" already exists` };
+    }
+    throw err;
+  }
 
   await logAuditEvent(sql, schemaName, {
     tenantId,
@@ -209,60 +221,70 @@ export async function updateRule(
   ruleId: string,
   input: UpdateRuleInput,
   scope: RuleOwnerScope = { ownerUserId: null },
-): Promise<RuleRecord | { error: "not_found" }> {
-  const { updated, previous } = await withTenantDrizzleScope(sql, schemaName, async (db) => {
-    const [existing] = await db
-      .select({
-        name: ruleTable.name,
-        description: ruleTable.description,
-      })
-      .from(ruleTable)
-      .where(
-        and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)),
-      )
-      .limit(1);
+): Promise<RuleRecord | { error: "not_found" } | { error: "conflict"; message: string }> {
+  let result: { updated: RuleRecord | null; previous: { name: string; description: string } | null };
+  try {
+    result = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+      const [existing] = await db
+        .select({
+          name: ruleTable.name,
+          description: ruleTable.description,
+        })
+        .from(ruleTable)
+        .where(
+          and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)),
+        )
+        .limit(1);
 
-    if (!existing) {
-      return { updated: null, previous: null };
+      if (!existing) {
+        return { updated: null, previous: null };
+      }
+
+      const previous = {
+        name: existing.name,
+        description: existing.description,
+      };
+
+      const updateValues: {
+        name?: string;
+        description?: string;
+        updatedAt: ReturnType<typeof drizzleSql>;
+      } = {
+        updatedAt: drizzleSql`NOW()`,
+      };
+
+      if (input.name !== undefined) {
+        updateValues.name = input.name;
+      }
+      if (input.description !== undefined) {
+        updateValues.description = input.description;
+      }
+
+      const [rule] = await db
+        .update(ruleTable)
+        .set(updateValues)
+        .where(
+          and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)),
+        )
+        .returning({
+          id: ruleTable.id,
+          name: ruleTable.name,
+          description: ruleTable.description,
+          ownerUserId: ruleTable.ownerUserId,
+          updatedAt: ruleTable.updatedAt,
+          createdAt: ruleTable.createdAt,
+        });
+
+      return { updated: rule ? mapRuleRow(rule) : null, previous };
+    });
+  } catch (err: unknown) {
+    if (isDuplicateNameError(err)) {
+      return { error: "conflict", message: `A rule named "${input.name}" already exists` };
     }
+    throw err;
+  }
 
-    const previous = {
-      name: existing.name,
-      description: existing.description,
-    };
-
-    const updateValues: {
-      name?: string;
-      description?: string;
-      updatedAt: ReturnType<typeof drizzleSql>;
-    } = {
-      updatedAt: drizzleSql`NOW()`,
-    };
-
-    if (input.name !== undefined) {
-      updateValues.name = input.name;
-    }
-    if (input.description !== undefined) {
-      updateValues.description = input.description;
-    }
-
-    const [rule] = await db
-      .update(ruleTable)
-      .set(updateValues)
-      .where(
-        and(eq(ruleTable.id, ruleId), ownerScopeCondition(scope.ownerUserId)),
-      )
-      .returning({
-        id: ruleTable.id,
-        name: ruleTable.name,
-        description: ruleTable.description,
-        ownerUserId: ruleTable.ownerUserId,
-        updatedAt: ruleTable.updatedAt,
-        createdAt: ruleTable.createdAt,
-      });
-
-    return { updated: rule ? mapRuleRow(rule) : null, previous };
-  });
+  const { updated, previous } = result;
 
   if (!updated) {
     await logAuditEvent(sql, schemaName, {
@@ -423,23 +445,31 @@ export async function createRuleSet(
   actor: RuleMutationActor,
   input: CreateRuleSetInput,
   scope: RuleOwnerScope = { ownerUserId: null },
-): Promise<RuleSetRecord> {
-  const created = await withTenantDrizzleScope(sql, schemaName, async (db) => {
-    const [row] = await db
-      .insert(ruleSetTable)
-      .values({
-        name: input.name,
-        ownerUserId: scope.ownerUserId,
-      })
-      .returning({
-        id: ruleSetTable.id,
-        name: ruleSetTable.name,
-        ownerUserId: ruleSetTable.ownerUserId,
-        createdAt: ruleSetTable.createdAt,
-      });
+): Promise<RuleSetRecord | { error: "conflict"; message: string }> {
+  let created: RuleSetRecord;
+  try {
+    created = await withTenantDrizzleScope(sql, schemaName, async (db) => {
+      const [row] = await db
+        .insert(ruleSetTable)
+        .values({
+          name: input.name,
+          ownerUserId: scope.ownerUserId,
+        })
+        .returning({
+          id: ruleSetTable.id,
+          name: ruleSetTable.name,
+          ownerUserId: ruleSetTable.ownerUserId,
+          createdAt: ruleSetTable.createdAt,
+        });
 
-    return mapRuleSetRow(row);
-  });
+      return mapRuleSetRow(row);
+    });
+  } catch (err: unknown) {
+    if (isDuplicateNameError(err)) {
+      return { error: "conflict", message: `A rule set named "${input.name}" already exists` };
+    }
+    throw err;
+  }
 
   await logAuditEvent(sql, schemaName, {
     tenantId,

@@ -9,6 +9,7 @@ import {
   pgEnum,
   vector,
   index,
+  uniqueIndex,
   primaryKey,
   jsonb,
 } from "drizzle-orm/pg-core";
@@ -118,6 +119,7 @@ export const rules = pgTable("rules", {
     .defaultNow(),
 }, (table) => [
   index("idx_rules_owner_user").on(table.ownerUserId),
+  uniqueIndex("uq_rules_name_owner").on(table.name, table.ownerUserId),
 ]);
 
 export const ruleSets = pgTable("rule_sets", {
@@ -129,6 +131,7 @@ export const ruleSets = pgTable("rule_sets", {
     .defaultNow(),
 }, (table) => [
   index("idx_rule_sets_owner_user").on(table.ownerUserId),
+  uniqueIndex("uq_rule_sets_name_owner").on(table.name, table.ownerUserId),
 ]);
 
 export const ruleSetRules = pgTable(
