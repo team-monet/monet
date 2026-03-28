@@ -72,7 +72,7 @@ interface CreateMcpServerOptions {
 const MAX_RULE_NAME_INSTRUCTIONS_CHARS = 120;
 const MAX_RULE_DESCRIPTION_INSTRUCTIONS_CHARS = 240;
 const MAX_RULES_IN_INSTRUCTIONS = 20;
-const MAX_INSTRUCTIONS_CHARS = 4000;
+const MAX_INSTRUCTIONS_CHARS = 5000;
 
 function normalizeInstructionText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
@@ -103,48 +103,60 @@ function summarizeRuleForInstructions(rule: RuleRecord, index: number): string {
   return `${index + 1}. ${name}: ${description}`;
 }
 
-function formatActiveRulesInstructions(activeRules: RuleRecord[]): string | undefined {
-  if (activeRules.length === 0) {
-    return undefined;
-  }
+const BASE_INSTRUCTIONS = `You are connected to Monet, an enterprise AI agent governance platform. Monet defines how you operate within this organization through rules, policies, and shared memory.
 
-  const header = `The following is a bounded summary of the ${activeRules.length} Monet tenant rule(s) active for this agent. Treat them as required guidance whenever you use this server.`;
-  const footer =
-    "Full active rules are also sent after initialization via notifications/rules/updated. If later updates arrive, replace this summary with the latest rules.";
-  const candidateRules = activeRules.slice(0, MAX_RULES_IN_INSTRUCTIONS);
-  const ruleLines: string[] = [];
-  let omittedCount = activeRules.length - candidateRules.length;
+Your responsibilities:
+- COMPLY with all active rules below. These are organizational policies that govern your behavior — treat them as mandatory, not advisory.
+- USE shared memory proactively. Before starting non-trivial tasks, search for relevant prior context (decisions, known issues, patterns, preferences). After completing meaningful work, store durable takeaways for future sessions.
+- MAINTAIN memory quality. Update outdated entries rather than creating duplicates. Use descriptive tags consistently (check memory_list_tags first). Choose the narrowest appropriate scope and promote later if needed.
+- RESPECT scope boundaries. Private memories are yours alone; user-scoped memories are visible to your operator; group-scoped memories are shared across all agents in your group.`;
 
-  for (const [index, rule] of candidateRules.entries()) {
-    const nextLine = summarizeRuleForInstructions(rule, index);
-    const nextInstructions = [
-      header,
-      "",
-      ...ruleLines,
-      nextLine,
-      "",
-      footer,
-    ].join("\n");
+function formatInstructions(activeRules: RuleRecord[]): string {
+  const sections: string[] = [BASE_INSTRUCTIONS];
 
-    if (nextInstructions.length > MAX_INSTRUCTIONS_CHARS) {
-      omittedCount += candidateRules.length - index;
-      break;
+  if (activeRules.length > 0) {
+    const header = `Active rules (${activeRules.length}):`;
+    const footer =
+      "Full active rules are also sent after initialization via notifications/rules/updated. If later updates arrive, replace this summary with the latest rules.";
+    const candidateRules = activeRules.slice(0, MAX_RULES_IN_INSTRUCTIONS);
+    const ruleLines: string[] = [];
+    let omittedCount = activeRules.length - candidateRules.length;
+
+    for (const [index, rule] of candidateRules.entries()) {
+      const nextLine = summarizeRuleForInstructions(rule, index);
+      const nextInstructions = [
+        ...sections,
+        "",
+        header,
+        "",
+        ...ruleLines,
+        nextLine,
+        "",
+        footer,
+      ].join("\n");
+
+      if (nextInstructions.length > MAX_INSTRUCTIONS_CHARS) {
+        omittedCount += candidateRules.length - index;
+        break;
+      }
+
+      ruleLines.push(nextLine);
     }
 
-    ruleLines.push(nextLine);
+    const rulesSection = [header, "", ...ruleLines];
+
+    if (omittedCount > 0) {
+      rulesSection.push(
+        "",
+        `Only ${ruleLines.length} of ${activeRules.length} rule(s) included here; ${omittedCount} omitted to keep initialization bounded.`,
+      );
+    }
+
+    rulesSection.push("", footer);
+    sections.push(rulesSection.join("\n"));
   }
 
-  const lines = [header, "", ...ruleLines];
-
-  if (omittedCount > 0) {
-    lines.push(
-      "",
-      `Only ${ruleLines.length} rule summary item(s) are included here; ${omittedCount} additional active rule(s) are omitted to keep MCP initialization bounded.`,
-    );
-  }
-
-  lines.push("", footer);
-  return lines.join("\n");
+  return sections.join("\n\n");
 }
 
 export function createMcpServer(
@@ -153,11 +165,11 @@ export function createMcpServer(
   sql: SqlClient,
   options: CreateMcpServerOptions = {},
 ) {
-  const instructions = formatActiveRulesInstructions(options.activeRules ?? []);
+  const instructions = formatInstructions(options.activeRules ?? []);
   const server = new McpServer({
     name: "monet",
     version: packageJson.version,
-  }, instructions ? { instructions } : undefined);
+  }, { instructions });
 
   if (options.onInitialized) {
     server.server.oninitialized = () => {

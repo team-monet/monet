@@ -113,8 +113,10 @@ describe("MCP server factory", () => {
       client.connect(clientTransport),
     ]);
 
-    expect(client.getInstructions()).toContain("Stay Within Tenant Scope");
-    expect(client.getInstructions()).toContain("Only use tenant-scoped data");
+    const instructions = client.getInstructions();
+    expect(instructions).toContain("enterprise AI agent governance platform");
+    expect(instructions).toContain("Stay Within Tenant Scope");
+    expect(instructions).toContain("Only use tenant-scoped data");
 
     await Promise.all([client.close(), server.close()]);
   });
@@ -142,9 +144,8 @@ describe("MCP server factory", () => {
 
     const instructions = client.getInstructions();
     expect(instructions).toBeDefined();
-    expect(instructions?.length).toBeLessThanOrEqual(4000);
-    expect(instructions).toContain("bounded summary");
-    expect(instructions).toContain("omitted to keep MCP initialization bounded");
+    expect(instructions?.length).toBeLessThanOrEqual(5000);
+    expect(instructions).toContain("omitted to keep initialization bounded");
     expect(instructions).toContain("notifications/rules/updated");
 
     await Promise.all([client.close(), server.close()]);
