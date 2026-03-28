@@ -21,6 +21,8 @@ import {
   replaceUrlOrigin,
 } from "./oidc";
 import { upsertTenantUserFromLogin } from "./tenant-user-binding";
+import { buildRefreshedToken } from "./auth-refresh";
+import { REFRESH_ACCESS_TOKEN_ERROR } from "./session-errors";
 
 interface ExtendedUser extends User {
   role?: string;
@@ -128,18 +130,12 @@ async function refreshAccessToken(token: ExtendedJWT) {
       throw refreshedTokens;
     }
 
-    return {
-      ...token,
-      accessToken: refreshedTokens.access_token,
-      expiresAt:
-        Math.floor(Date.now() / 1000) + (refreshedTokens.expires_in ?? 3600),
-      refreshToken: refreshedTokens.refresh_token ?? token.refreshToken,
-    };
+    return buildRefreshedToken(token, refreshedTokens);
   } catch (error) {
     console.error("RefreshAccessTokenError", error);
     return {
       ...token,
-      error: "RefreshAccessTokenError",
+      error: REFRESH_ACCESS_TOKEN_ERROR,
     };
   }
 }
