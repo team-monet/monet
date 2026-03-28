@@ -103,7 +103,7 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_PROMOTE_SCOPE,
     description:
-      "Change a memory's visibility scope (private → user → group). Use this when a memory created in a narrow scope turns out to be valuable to a wider audience — e.g., promoting a personal preference to the team or sharing a private finding with all agents.",
+      "Change a memory's visibility scope (private, user, group). Promotion widens visibility to a broader audience; demotion (narrowing) is allowed only by the original author. Use this when a memory should be shared more widely or restricted after reconsideration.",
     inputSchema: MemoryPromoteScopeInput,
   },
   {
