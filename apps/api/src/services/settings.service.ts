@@ -1,5 +1,4 @@
-import { tenantSettings, withTenantDrizzleScope, DEFAULT_MONET_GUIDANCE } from "@monet/db";
-import { eq } from "drizzle-orm";
+import { tenantSettings, withTenantDrizzleScope, DEFAULT_MONET_GUIDANCE, withTenantScope } from "@monet/db";
 import type { SqlClient } from "@monet/db";
 
 export async function getMonetGuidance(
@@ -17,15 +16,16 @@ export async function updateMonetGuidance(
   tenantSchemaName: string,
   guidance: string,
 ): Promise<void> {
-  await withTenantDrizzleScope(sql, tenantSchemaName, async (db) => {
-    const rows = await db.select({ id: tenantSettings.id }).from(tenantSettings).limit(1);
-    if (rows.length > 0) {
-      await db.update(tenantSettings).set({
-        monetGuidance: guidance,
-        updatedAt: new Date(),
-      }).where(eq(tenantSettings.id, rows[0].id));
-    } else {
-      await db.insert(tenantSettings).values({ monetGuidance: guidance });
+  await withTenantScope(sql, tenantSchemaName, async (txSql) => {
+    // Atomic upsert: update existing row, or insert if none exists.
+    const updated = await txSql.unsafe(`
+      UPDATE tenant_settings SET monet_guidance = $1, updated_at = now()
+      RETURNING id
+    `, [guidance]);
+    if (updated.length === 0) {
+      await txSql.unsafe(`
+        INSERT INTO tenant_settings (monet_guidance) VALUES ($1)
+      `, [guidance]);
     }
   });
 }
