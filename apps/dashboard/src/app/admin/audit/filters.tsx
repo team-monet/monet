@@ -46,7 +46,7 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
 
     const query = params.toString();
     const nextUrl = query ? `${pathname}?${query}` : pathname;
-    
+
     if (nextUrl === (currentQuery ? `${pathname}?${currentQuery}` : pathname)) {
       return;
     }
@@ -61,12 +61,6 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
       <div className="grid gap-2">
         <div className="flex items-center justify-between gap-3">
           <Label className="text-xs uppercase text-muted-foreground font-semibold">Action Type</Label>
-          {isPending ? (
-            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-              <Loader2 className="h-3 w-3 animate-spin" />
-              Loading...
-            </span>
-          ) : null}
         </div>
         <Select value={initialAction ?? "all"} onValueChange={updateAction}>
           <SelectTrigger>
@@ -98,11 +92,16 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
             }}
           >
             {isPending ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                "Loading..."
+              </>
             ) : (
-              <X className="mr-2 h-4 w-4" />
+              <>
+                <X className="mr-2 h-4 w-4" />
+                "Clear Filter"
+              </>
             )}
-            {isPending ? "Loading..." : "Clear Filter"}
           </Button>
         )}
       </div>

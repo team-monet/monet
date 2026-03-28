@@ -3,12 +3,12 @@
 import { MemoryType } from "@monet/types";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTransition } from "react";
-import { 
-  Select as ShadSelect, 
-  SelectContent as ShadSelectContent, 
-  SelectItem as ShadSelectItem, 
-  SelectTrigger as ShadSelectTrigger, 
-  SelectValue as ShadSelectValue 
+import {
+  Select as ShadSelect,
+  SelectContent as ShadSelectContent,
+  SelectItem as ShadSelectItem,
+  SelectTrigger as ShadSelectTrigger,
+  SelectValue as ShadSelectValue
 } from "@/components/ui/select";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
@@ -44,7 +44,7 @@ export function MemoryFilters({
     params.delete("cursor");
     const query = params.toString();
     const nextUrl = query ? `${pathname}?${query}` : pathname;
-    
+
     if (nextUrl === (currentQuery ? `${pathname}?${currentQuery}` : pathname)) {
       return;
     }
@@ -60,10 +60,9 @@ export function MemoryFilters({
         <div className="grid min-w-[180px] gap-2">
           <div className="flex items-center justify-between">
             <Label className="text-xs uppercase text-muted-foreground font-semibold">Memory Type</Label>
-            {isPending && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
           </div>
-          <ShadSelect 
-            value={initialType || "all"} 
+          <ShadSelect
+            value={initialType || "all"}
             onValueChange={(val) => updateUrl({ memoryType: val === "all" ? "" : val })}
           >
             <ShadSelectTrigger>
@@ -83,17 +82,17 @@ export function MemoryFilters({
 
         <div className="flex items-center gap-6 py-2">
           <div className="flex items-center space-x-2">
-            <Checkbox 
-              id="includeUser" 
-              checked={initialIncludeUser} 
+            <Checkbox
+              id="includeUser"
+              checked={initialIncludeUser}
               onCheckedChange={(checked) => updateUrl({ includeUser: !!checked })}
             />
             <Label htmlFor="includeUser" className="text-sm cursor-pointer">Include User</Label>
           </div>
           <div className="flex items-center space-x-2">
-            <Checkbox 
-              id="includePrivate" 
-              checked={initialIncludePrivate} 
+            <Checkbox
+              id="includePrivate"
+              checked={initialIncludePrivate}
               onCheckedChange={(checked) => updateUrl({ includePrivate: !!checked })}
             />
             <Label htmlFor="includePrivate" className="text-sm cursor-pointer">Include Private</Label>
@@ -115,11 +114,16 @@ export function MemoryFilters({
               }}
             >
               {isPending ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  "Loading..."
+                </>
               ) : (
-                <X className="mr-2 h-4 w-4" />
+                <>
+                  <X className="mr-2 h-4 w-4" />
+                  "Clear Filters"
+                </>
               )}
-              {isPending ? "Loading..." : "Clear Filters"}
             </Button>
           )}
         </div>
