@@ -154,22 +154,25 @@ export async function createTenantSchema(
     CREATE INDEX IF NOT EXISTS idx_rules_owner_user
     ON "${schemaName}".rules (owner_user_id)
   `);
-  // Deduplicate existing rule names before adding unique constraint.
-  // Use gen_random_uuid() for suffix to avoid collisions with pre-existing names.
-  // Truncate name to leave room for ' (uuid)' suffix (39 chars) within VARCHAR(255).
-  await sql.unsafe(`
-    UPDATE "${schemaName}".rules r
-    SET name = LEFT(r.name, 216) || ' (' || gen_random_uuid()::text || ')'
-    FROM (
-      SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
-      FROM "${schemaName}".rules
-    ) dups
-    WHERE r.id = dups.id AND dups.rn > 1
+  // Deduplicate existing rule names before adding unique constraint (only on first run).
+  const [rulesIdx] = await sql.unsafe(`
+    SELECT 1 FROM pg_indexes WHERE schemaname = '${schemaName}' AND indexname = 'uq_rules_name_owner'
   `);
-  await sql.unsafe(`
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_name_owner
-    ON "${schemaName}".rules (name, owner_user_id) NULLS NOT DISTINCT
-  `);
+  if (!rulesIdx) {
+    await sql.unsafe(`
+      UPDATE "${schemaName}".rules r
+      SET name = LEFT(r.name, 216) || ' (' || gen_random_uuid()::text || ')'
+      FROM (
+        SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
+        FROM "${schemaName}".rules
+      ) dups
+      WHERE r.id = dups.id AND dups.rn > 1
+    `);
+    await sql.unsafe(`
+      CREATE UNIQUE INDEX uq_rules_name_owner
+      ON "${schemaName}".rules (name, owner_user_id) NULLS NOT DISTINCT
+    `);
+  }
 
   // Rule sets table
   await sql.unsafe(`
@@ -188,22 +191,25 @@ export async function createTenantSchema(
     CREATE INDEX IF NOT EXISTS idx_rule_sets_owner_user
     ON "${schemaName}".rule_sets (owner_user_id)
   `);
-  // Deduplicate existing rule set names before adding unique constraint.
-  // Use gen_random_uuid() for suffix to avoid collisions with pre-existing names.
-  // Truncate name to leave room for ' (uuid)' suffix (39 chars) within VARCHAR(255).
-  await sql.unsafe(`
-    UPDATE "${schemaName}".rule_sets rs
-    SET name = LEFT(rs.name, 216) || ' (' || gen_random_uuid()::text || ')'
-    FROM (
-      SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
-      FROM "${schemaName}".rule_sets
-    ) dups
-    WHERE rs.id = dups.id AND dups.rn > 1
+  // Deduplicate existing rule set names before adding unique constraint (only on first run).
+  const [ruleSetsIdx] = await sql.unsafe(`
+    SELECT 1 FROM pg_indexes WHERE schemaname = '${schemaName}' AND indexname = 'uq_rule_sets_name_owner'
   `);
-  await sql.unsafe(`
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_sets_name_owner
-    ON "${schemaName}".rule_sets (name, owner_user_id) NULLS NOT DISTINCT
-  `);
+  if (!ruleSetsIdx) {
+    await sql.unsafe(`
+      UPDATE "${schemaName}".rule_sets rs
+      SET name = LEFT(rs.name, 216) || ' (' || gen_random_uuid()::text || ')'
+      FROM (
+        SELECT id, ROW_NUMBER() OVER (PARTITION BY name, owner_user_id ORDER BY created_at ASC, id ASC) AS rn
+        FROM "${schemaName}".rule_sets
+      ) dups
+      WHERE rs.id = dups.id AND dups.rn > 1
+    `);
+    await sql.unsafe(`
+      CREATE UNIQUE INDEX uq_rule_sets_name_owner
+      ON "${schemaName}".rule_sets (name, owner_user_id) NULLS NOT DISTINCT
+    `);
+  }
 
   // Rule set rules join table
   await sql.unsafe(`
