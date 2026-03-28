@@ -116,12 +116,12 @@ export function MemoryFilters({
               {isPending ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  "Loading..."
+                  Loading...
                 </>
               ) : (
                 <>
                   <X className="mr-2 h-4 w-4" />
-                  "Clear Filters"
+                  Clear Filters
                 </>
               )}
             </Button>

@@ -94,12 +94,12 @@ export function AuditFilters({ initialAction }: AuditFiltersProps) {
             {isPending ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                "Loading..."
+                Loading...
               </>
             ) : (
               <>
                 <X className="mr-2 h-4 w-4" />
-                "Clear Filter"
+                Clear Filter
               </>
             )}
           </Button>
