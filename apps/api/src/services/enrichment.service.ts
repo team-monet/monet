@@ -10,6 +10,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import {
   createChatEnrichmentProvider,
   createEmbeddingEnrichmentProvider,
+  resolveConfiguredProviders,
 } from "../providers/index";
 import type {
   ChatEnrichmentProvider,
@@ -17,7 +18,8 @@ import type {
   EnrichmentProvider,
 } from "../providers/enrichment";
 
-const MAX_CONCURRENT_ENRICHMENTS = 5;
+const DEFAULT_MAX_CONCURRENT_ENRICHMENTS = 5;
+const OLLAMA_MAX_CONCURRENT_ENRICHMENTS = 1;
 const QUERY_EMBEDDING_TIMEOUT_MS = 3000;
 const RELATED_MEMORY_LIMIT = 5;
 
@@ -65,6 +67,26 @@ export function getActiveEnrichmentCount(): number {
 
 export function getQueuedEnrichmentCount(): number {
   return queue.length;
+}
+
+export function resolveMaxConcurrentEnrichments(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const explicit = parsePositiveInteger(env.ENRICHMENT_MAX_CONCURRENT_JOBS);
+  if (explicit) {
+    return explicit;
+  }
+
+  try {
+    const { chatProvider, embeddingProvider } = resolveConfiguredProviders(env);
+    if (chatProvider === "ollama" || embeddingProvider === "ollama") {
+      return OLLAMA_MAX_CONCURRENT_ENRICHMENTS;
+    }
+  } catch {
+    // Fall back to the general default when provider config is invalid.
+  }
+
+  return DEFAULT_MAX_CONCURRENT_ENRICHMENTS;
 }
 
 export async function waitForEnrichmentDrain(timeoutMs: number): Promise<void> {
@@ -224,7 +246,9 @@ function getEmbeddingProvider(opts: { logFailures: boolean }): EmbeddingEnrichme
 }
 
 function drainQueue(sql: SqlClient) {
-  while (activeJobs < MAX_CONCURRENT_ENRICHMENTS && queue.length > 0) {
+  const maxConcurrentEnrichments = resolveMaxConcurrentEnrichments();
+
+  while (activeJobs < maxConcurrentEnrichments && queue.length > 0) {
     const job = queue.shift();
     if (!job) {
       return;
@@ -288,11 +312,11 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
       return;
     }
 
-    const [summary, embedding, extractedTags] = await Promise.all([
-      provider.generateSummary(entry.content),
-      provider.computeEmbedding(entry.content),
-      provider.extractTags(entry.content),
-    ]);
+    // Running these sequentially keeps local providers such as Ollama/ONNX
+    // from overcommitting memory during a single enrichment job.
+    const summary = await provider.generateSummary(entry.content);
+    const extractedTags = await provider.extractTags(entry.content);
+    const embedding = await provider.computeEmbedding(entry.content);
 
     const mergedTags = [...new Set([...(entry.tags ?? []), ...extractedTags])].slice(0, 16);
     const relatedMemoryIds = await findRelatedMemoryIds(sql, job.schemaName, job.entryId, embedding);
@@ -385,6 +409,20 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
       },
     );
   });
+}
+
+function parsePositiveInteger(value: string | undefined): number | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return null;
+  }
+
+  return parsed;
 }
 
 function isQueueDrained(): boolean {

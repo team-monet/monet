@@ -34,7 +34,9 @@ import {
   markShuttingDown,
   recoverPendingEnrichments,
   resetEnrichmentStateForTests,
+  resolveMaxConcurrentEnrichments,
   setEnrichmentProviderForTests,
+  waitForEnrichmentDrain,
 } from "../services/enrichment.service";
 
 describe("createEnrichmentProvider", () => {
@@ -154,6 +156,36 @@ describe("computeQueryEmbedding", () => {
   });
 });
 
+describe("resolveMaxConcurrentEnrichments", () => {
+  afterEach(() => {
+    delete process.env.ENRICHMENT_CHAT_PROVIDER;
+    delete process.env.ENRICHMENT_EMBEDDING_PROVIDER;
+    delete process.env.ENRICHMENT_MAX_CONCURRENT_JOBS;
+  });
+
+  it("uses a safer single-job limit when Ollama is configured", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "ollama";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
+    expect(resolveMaxConcurrentEnrichments()).toBe(1);
+  });
+
+  it("keeps the general default for non-Ollama providers", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
+    expect(resolveMaxConcurrentEnrichments()).toBe(5);
+  });
+
+  it("honors an explicit concurrency override", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "ollama";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "ollama";
+    process.env.ENRICHMENT_MAX_CONCURRENT_JOBS = "3";
+
+    expect(resolveMaxConcurrentEnrichments()).toBe(3);
+  });
+});
+
 describe("shutdown drain semantics", () => {
   afterEach(() => {
     resetEnrichmentStateForTests();
@@ -248,5 +280,84 @@ describe("recoverPendingEnrichments", () => {
       "tenant_00000000_0000_0000_0000_000000000010",
       expect.any(Function),
     );
+  });
+});
+
+describe("enqueueEnrichment", () => {
+  afterEach(() => {
+    resetEnrichmentStateForTests();
+  });
+
+  it("runs provider work sequentially within a single job", async () => {
+    let activeCalls = 0;
+    let maxConcurrentCalls = 0;
+
+    const trackCall = async <T>(result: T): Promise<T> => {
+      activeCalls += 1;
+      maxConcurrentCalls = Math.max(maxConcurrentCalls, activeCalls);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      activeCalls -= 1;
+      return result;
+    };
+
+    setEnrichmentProviderForTests({
+      generateSummary: async () => trackCall("summary"),
+      extractTags: async () => trackCall(["ops"]),
+      computeEmbedding: async () => trackCall([0.1, 0.2, 0.3]),
+    });
+
+    let scopeCallCount = 0;
+    withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) => {
+      scopeCallCount += 1;
+
+      if (scopeCallCount === 1) {
+        return fn({
+          update: () => ({
+            set: () => ({
+              where: () => ({
+                returning: async () => [
+                  {
+                    id: "entry-1",
+                    content: "sequential enrichment test",
+                    tags: ["existing"],
+                  },
+                ],
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 2) {
+        return fn({
+          select: () => ({
+            from: () => ({
+              where: () => ({
+                orderBy: () => ({
+                  limit: async () => [],
+                }),
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 3) {
+        return fn({
+          update: () => ({
+            set: () => ({
+              where: async () => undefined,
+            }),
+          }),
+        });
+      }
+
+      throw new Error(`Unexpected withTenantDrizzleScope call #${scopeCallCount}`);
+    });
+
+    enqueueEnrichment({} as SqlClient, "tenant_test", "entry-1");
+    await waitForEnrichmentDrain(1000);
+
+    expect(maxConcurrentCalls).toBe(1);
   });
 });
