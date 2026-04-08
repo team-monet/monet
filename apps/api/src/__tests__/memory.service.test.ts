@@ -864,8 +864,77 @@ describe("searchMemories", () => {
     });
   });
 
-  it("ignores invalid cursors and keeps semantic rank values", async () => {
-    const limitMock = vi.fn().mockResolvedValue([
+  it("runs hybrid search and fuses semantic plus lexical matches", async () => {
+    const semanticLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000804",
+        content: "vector hit",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["semantic"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 4,
+        outdated: false,
+        created_at: new Date("2026-03-22T06:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.87,
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000806",
+        content: "semantic only",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["semantic"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 2,
+        outdated: false,
+        created_at: new Date("2026-03-22T05:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.62,
+      },
+    ]);
+    const semanticOrderByMock = vi.fn(() => ({
+      limit: semanticLimitMock,
+    }));
+    const semanticWhereMock = vi.fn(() => ({
+      orderBy: semanticOrderByMock,
+    }));
+    const semanticSecondLeftJoinMock = vi.fn(() => ({
+      where: semanticWhereMock,
+    }));
+    const semanticFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: semanticSecondLeftJoinMock,
+    }));
+    const semanticFromMock = vi.fn(() => ({
+      leftJoin: semanticFirstLeftJoinMock,
+    }));
+    const semanticSelectMock = vi.fn(() => ({
+      from: semanticFromMock,
+    }));
+
+    const lexicalLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000805",
+        content: "lexical hit",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["keyword"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 3,
+        outdated: false,
+        created_at: new Date("2026-03-22T07:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.2,
+      },
       {
         id: "00000000-0000-0000-0000-000000000804",
         content: "vector hit",
@@ -883,27 +952,30 @@ describe("searchMemories", () => {
         search_rank: 0.87,
       },
     ]);
-    const orderByMock = vi.fn(() => ({
-      limit: limitMock,
+    const lexicalOrderByMock = vi.fn(() => ({
+      limit: lexicalLimitMock,
     }));
-    const whereMock = vi.fn(() => ({
-      orderBy: orderByMock,
+    const lexicalWhereMock = vi.fn(() => ({
+      orderBy: lexicalOrderByMock,
     }));
-    const secondLeftJoinMock = vi.fn(() => ({
-      where: whereMock,
+    const lexicalSecondLeftJoinMock = vi.fn(() => ({
+      where: lexicalWhereMock,
     }));
-    const firstLeftJoinMock = vi.fn(() => ({
-      leftJoin: secondLeftJoinMock,
+    const lexicalFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: lexicalSecondLeftJoinMock,
     }));
-    const fromMock = vi.fn(() => ({
-      leftJoin: firstLeftJoinMock,
+    const lexicalFromMock = vi.fn(() => ({
+      leftJoin: lexicalFirstLeftJoinMock,
     }));
-    const selectMock = vi.fn(() => ({
-      from: fromMock,
+    const lexicalSelectMock = vi.fn(() => ({
+      from: lexicalFromMock,
     }));
 
     drizzleMock.mockReturnValue({
-      select: selectMock,
+      select: vi
+        .fn()
+        .mockImplementationOnce(semanticSelectMock)
+        .mockImplementationOnce(lexicalSelectMock),
     });
 
     const result = await searchMemories(
@@ -911,13 +983,20 @@ describe("searchMemories", () => {
       makeAgent(),
       {
         query: "vector",
-        cursor: "not-a-real-cursor",
+        includePrivate: true,
+        limit: 2,
       },
       [0.1, 0.2, 0.3],
     );
 
-    expect(result.items).toHaveLength(1);
-    expect(result.nextCursor).toBeNull();
+    expect(result.items).toHaveLength(2);
+    expect(result.items.map((item) => item.id)).toEqual([
+      "00000000-0000-0000-0000-000000000804",
+      "00000000-0000-0000-0000-000000000805",
+    ]);
+    expect(decodeCursor(result.nextCursor!)).toMatchObject({
+      id: "00000000-0000-0000-0000-000000000805",
+    });
   });
 });
 
