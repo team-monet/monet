@@ -248,7 +248,7 @@ function buildCreatedAtCursorCondition(cursor: SearchCursorPayload): SQL<unknown
 function buildSearchRankExpression(
   queryEmbedding: number[] | null,
 ): SQL<number | null> {
-  const usefulnessWeight = drizzleSql`GREATEST(${memoryEntries.usefulnessScore}, 1)`;
+  const usefulnessWeight = drizzleSql`(1 + LN(1 + GREATEST(${memoryEntries.usefulnessScore}, 0)))`;
   const outdatedWeight = drizzleSql`CASE WHEN ${memoryEntries.outdated} THEN 0.5 ELSE 1.0 END`;
 
   if (!queryEmbedding) {
