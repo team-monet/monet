@@ -756,6 +756,9 @@ export async function updateMemory(
   const newVersion = (entry.version as number) + 1;
   const newContent = input.content ?? (entry.content as string);
   const newTags = input.tags ?? (entry.tags as string[]);
+  const contentChanged = input.content !== undefined && input.content !== (entry.content as string);
+  const tagsChanged = input.tags !== undefined && !stringArraysEqual(input.tags, entry.tags as string[]);
+  const needsEnrichment = contentChanged || tagsChanged;
   const [updated] = await db
     .update(memoryEntries)
     .set({
@@ -763,6 +766,15 @@ export async function updateMemory(
       tags: newTags,
       version: newVersion,
       lastAccessedAt: drizzleSql`NOW()`,
+      ...(needsEnrichment
+        ? {
+            summary: null,
+            autoTags: [],
+            embedding: null,
+            relatedMemoryIds: [],
+            enrichmentStatus: "pending" as const,
+          }
+        : {}),
     })
     .where(
       and(
@@ -794,7 +806,10 @@ export async function updateMemory(
   // Audit log
   await writeAuditLog(txSql, agent.tenantId, agent.id, "memory.update", id, "success");
 
-  return { entry: mapRow(updated as Record<string, unknown>) };
+  return {
+    entry: mapRow(updated as Record<string, unknown>),
+    needsEnrichment,
+  };
 }
 
 export async function deleteMemory(
@@ -1000,4 +1015,18 @@ function asTimestamp(value: unknown): string {
     return value.toISOString();
   }
   return String(value);
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+
+  return true;
 }

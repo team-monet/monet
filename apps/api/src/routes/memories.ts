@@ -225,7 +225,12 @@ memoriesRouter.patch("/:id", async (c) => {
     }
   }
 
-  return c.json((result as { entry: unknown }).entry);
+  const updated = result as { entry: unknown; needsEnrichment?: boolean };
+  if (updated.needsEnrichment) {
+    enqueueEnrichment(sql, schemaName, id);
+  }
+
+  return c.json(updated.entry);
 });
 
 // DELETE /:id — delete a memory
