@@ -1,4 +1,8 @@
-import type { EmbeddingEnrichmentProvider, EnrichmentConfig } from "./enrichment";
+import type {
+  EmbeddingEnrichmentProvider,
+  EmbeddingMode,
+  EnrichmentConfig,
+} from "./enrichment";
 import { EMBEDDING_DIMENSIONS } from "./enrichment";
 
 const DEFAULT_EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-l-v2.0";
@@ -11,7 +15,7 @@ type FeatureExtractionOutput = {
 type FeatureExtractionPipeline = (
   input: string,
   options?: {
-    pooling?: "mean";
+    pooling?: "mean" | "cls";
     normalize?: boolean;
   },
 ) => Promise<FeatureExtractionOutput>;
@@ -30,10 +34,14 @@ export class OnnxEnrichmentProvider implements EmbeddingEnrichmentProvider {
     this.quantized = config.onnxQuantized ?? parseBoolean(process.env.ONNX_QUANTIZED, DEFAULT_QUANTIZED);
   }
 
-  async computeEmbedding(content: string): Promise<number[]> {
+  async computeEmbedding(
+    content: string,
+    options?: { mode?: EmbeddingMode },
+  ): Promise<number[]> {
     const extractor = await getEmbeddingPipeline(this.embeddingModel, this.quantized);
-    const output = await extractor(content, {
-      pooling: "mean",
+    const input = options?.mode === "query" ? `query: ${content}` : content;
+    const output = await extractor(input, {
+      pooling: "cls",
       normalize: true,
     });
     const embedding = output.data ? Array.from(output.data) : null;

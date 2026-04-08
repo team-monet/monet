@@ -178,7 +178,10 @@ export async function computeQueryEmbedding(query: string): Promise<number[] | n
   }
 
   try {
-    return await withTimeout(embeddingProvider.computeEmbedding(query), QUERY_EMBEDDING_TIMEOUT_MS);
+    return await withTimeout(
+      embeddingProvider.computeEmbedding(query, { mode: "query" }),
+      QUERY_EMBEDDING_TIMEOUT_MS,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`Falling back to text search because query embedding failed: ${message}`);
@@ -197,7 +200,7 @@ function getProvider(opts: { logFailures: boolean }): EnrichmentProvider | null 
   return {
     generateSummary: (content: string) => chatProvider.generateSummary(content),
     extractTags: (content: string) => chatProvider.extractTags(content),
-    computeEmbedding: (content: string) => embeddingProvider.computeEmbedding(content),
+    computeEmbedding: (content: string, options) => embeddingProvider.computeEmbedding(content, options),
   };
 }
 

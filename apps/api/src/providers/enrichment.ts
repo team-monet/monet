@@ -3,8 +3,15 @@ export interface ChatEnrichmentProvider {
   extractTags(content: string): Promise<string[]>;
 }
 
+export type EmbeddingMode = "document" | "query";
+
 export interface EmbeddingEnrichmentProvider {
-  computeEmbedding(content: string): Promise<number[]>;
+  computeEmbedding(
+    content: string,
+    options?: {
+      mode?: EmbeddingMode;
+    },
+  ): Promise<number[]>;
 }
 
 export interface EnrichmentProvider

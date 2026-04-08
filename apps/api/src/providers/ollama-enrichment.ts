@@ -1,4 +1,8 @@
-import type { EnrichmentConfig, EnrichmentProvider } from "./enrichment";
+import type {
+  EmbeddingMode,
+  EnrichmentConfig,
+  EnrichmentProvider,
+} from "./enrichment";
 import { EMBEDDING_DIMENSIONS } from "./enrichment";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
@@ -25,7 +29,10 @@ export class OllamaEnrichmentProvider implements EnrichmentProvider {
     return text.trim().slice(0, 200);
   }
 
-  async computeEmbedding(content: string): Promise<number[]> {
+  async computeEmbedding(
+    content: string,
+    _options?: { mode?: EmbeddingMode },
+  ): Promise<number[]> {
     let response = await fetch(`${this.baseUrl}/api/embed`, {
       method: "POST",
       headers: { "content-type": "application/json" },
