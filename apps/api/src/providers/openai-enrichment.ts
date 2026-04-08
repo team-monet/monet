@@ -72,8 +72,9 @@ export class OpenAICompatibleEnrichmentProvider implements EnrichmentProvider {
 
   async computeEmbedding(
     content: string,
-    _options?: { mode?: EmbeddingMode },
+    options?: { mode?: EmbeddingMode },
   ): Promise<number[]> {
+    void options;
     const response = await fetch(`${this.embeddingBaseUrl}/embeddings`, {
       method: "POST",
       headers: this.buildHeaders(this.embeddingApiKey),

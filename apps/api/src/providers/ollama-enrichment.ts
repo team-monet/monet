@@ -31,8 +31,9 @@ export class OllamaEnrichmentProvider implements EnrichmentProvider {
 
   async computeEmbedding(
     content: string,
-    _options?: { mode?: EmbeddingMode },
+    options?: { mode?: EmbeddingMode },
   ): Promise<number[]> {
+    void options;
     let response = await fetch(`${this.baseUrl}/api/embed`, {
       method: "POST",
       headers: { "content-type": "application/json" },
