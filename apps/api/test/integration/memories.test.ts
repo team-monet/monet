@@ -381,11 +381,13 @@ describe("memories integration", () => {
 
   it("returns 409 when group quota is exceeded", async () => {
     const sql = getTestSql();
-    await sql`
-      UPDATE agent_groups
-      SET memory_quota = 2
-      WHERE tenant_id = ${tenantId}
-    `;
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`
+        UPDATE agent_groups
+        SET memory_quota = 2
+        WHERE tenant_id = ${tenantId}
+      `;
+    });
 
     const first = await storeMemory({
       content: "mem-1",

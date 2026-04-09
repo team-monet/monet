@@ -210,13 +210,17 @@ describe("metrics integration", () => {
   it("returns 403 for non-admin agents", async () => {
     // Downgrade the provisioned agent to 'user' role
     const sql = getTestSql();
-    await sql`UPDATE agents SET role = 'user' WHERE id = ${agentId}`;
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`UPDATE agents SET role = 'user' WHERE id = ${agentId}`;
+    });
 
     const res = await app.request("/api/metrics", { headers: authHeaders() });
     expect(res.status).toBe(403);
 
     // Restore role for other tests
-    await sql`UPDATE agents SET role = 'tenant_admin' WHERE id = ${agentId}`;
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`UPDATE agents SET role = 'tenant_admin' WHERE id = ${agentId}`;
+    });
   });
 
   it("handles tenant with no data gracefully", async () => {

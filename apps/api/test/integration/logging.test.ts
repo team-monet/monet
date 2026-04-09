@@ -9,11 +9,13 @@ import {
 describe("logging integration", () => {
   const app = getTestApp();
   let apiKey: string;
+  let tenantSlug: string;
 
   beforeEach(async () => {
     await cleanupTestData();
     const { body } = await provisionTestTenant({ name: "logging-test" });
     apiKey = body.apiKey as string;
+    tenantSlug = (body.tenant as { slug: string }).slug;
   });
 
   afterAll(async () => {
@@ -26,7 +28,8 @@ describe("logging integration", () => {
     process.env.FORCE_REQUEST_LOGS = "true";
     const spy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    const res = await app.request("/api/agents/me", {
+    const requestPath = `/api/tenants/${tenantSlug}/agents/me`;
+    const res = await app.request(requestPath, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
 
@@ -37,7 +40,7 @@ describe("logging integration", () => {
 
     const requestLogLine = output
       .split("\n")
-      .find((line) => line.includes("\"path\":\"/api/agents/me\""));
+      .find((line) => line.includes(`\"path\":\"${requestPath}\"`));
     expect(requestLogLine).toBeDefined();
 
     const parsed = JSON.parse(requestLogLine ?? "{}") as Record<string, unknown>;
@@ -45,7 +48,7 @@ describe("logging integration", () => {
       level: "info",
       message: "http_request",
       method: "GET",
-      path: "/api/agents/me",
+      path: requestPath,
       statusCode: 200,
     });
     expect(typeof parsed.requestId).toBe("string");

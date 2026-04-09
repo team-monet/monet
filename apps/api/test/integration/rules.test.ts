@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { getRequestListener } from "@hono/node-server";
+import { withTenantScope } from "@monet/db";
 import { createApp } from "../../src/app";
 import { createMcpHandler } from "../../src/mcp/handler";
 import { SessionStore } from "../../src/mcp/session-store";
@@ -109,11 +110,11 @@ describe("Rules integration", () => {
   }
 
   async function createUser(externalId: string, email: string) {
-    const [user] = await sql`
+    const [user] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
       INSERT INTO users (external_id, tenant_id, role, email)
       VALUES (${externalId}, ${tenantId}, 'user', ${email})
       RETURNING id
-    `;
+    `);
     return user.id as string;
   }
 

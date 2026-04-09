@@ -4,8 +4,7 @@ import type { AddressInfo } from "node:net";
 import { getRequestListener } from "@hono/node-server";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { eq } from "drizzle-orm";
-import { agents } from "@monet/db/schema";
+import { withTenantScope } from "@monet/db";
 import { createApp } from "../../src/app";
 import { createMcpHandler } from "../../src/mcp/handler";
 import { SessionStore } from "../../src/mcp/session-store";
@@ -69,6 +68,8 @@ describe("MCP integration", () => {
   let baseUrl: URL;
   let apiKey: string;
   let agentId: string;
+  let tenantId: string;
+  let schemaName: string;
   let groupId: string;
   let tenantSlug: string;
 
@@ -97,6 +98,8 @@ describe("MCP integration", () => {
     const { body } = await provisionTestTenant({ name: "mcp-test" });
     apiKey = body.apiKey as string;
     agentId = (body.agent as { id: string }).id;
+    tenantId = (body.tenant as { id: string }).id;
+    schemaName = `tenant_${tenantId.replace(/-/g, "_")}`;
     tenantSlug = (body.tenant as { slug: string }).slug;
 
     const groupRes = await app.request("/api/groups", {
@@ -333,7 +336,7 @@ describe("MCP integration", () => {
     await first.transport.terminateSession();
     expect(sessionStore.count()).toBeGreaterThanOrEqual(1);
 
-    await second.client.close();
+    await Promise.all([first.client.close(), second.client.close()]);
   });
 
   it("rejects the next request when an API key is revoked mid-session", async () => {
@@ -342,10 +345,13 @@ describe("MCP integration", () => {
     const initialTools = await client.listTools();
     expect(initialTools.tools).toHaveLength(8);
 
-    await db
-      .update(agents)
-      .set({ revokedAt: new Date() })
-      .where(eq(agents.id, agentId));
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`
+        UPDATE agents
+        SET revoked_at = NOW()
+        WHERE id = ${agentId}
+      `;
+    });
 
     await expect(client.listTools()).rejects.toThrow();
 
