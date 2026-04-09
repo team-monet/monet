@@ -555,6 +555,7 @@ export async function searchMemories(
     >();
 
     const RRF_K = 60;
+    const OVERLAP_BOOST = 1 / RRF_K;
     const addRows = (rows: Record<string, unknown>[], source: "semantic" | "lexical") => {
       rows.forEach((row, index) => {
         const id = row.id as string;
@@ -586,7 +587,7 @@ export async function searchMemories(
     const fusedRows = Array.from(fusedById.values())
       .map((entry) => ({
         ...entry,
-        score: entry.score + (entry.seenSemantic && entry.seenLexical ? 0.1 : 0),
+        score: entry.score + (entry.seenSemantic && entry.seenLexical ? OVERLAP_BOOST : 0),
       }))
       .sort((a, b) => {
         if (b.score !== a.score) {
