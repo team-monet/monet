@@ -288,6 +288,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           id: memoryEntries.id,
           content: memoryEntries.content,
           tags: memoryEntries.tags,
+          version: memoryEntries.version,
         });
 
       if (row) {
@@ -299,6 +300,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           id: memoryEntries.id,
           content: memoryEntries.content,
           tags: memoryEntries.tags,
+          version: memoryEntries.version,
         })
         .from(memoryEntries)
         .where(
@@ -325,7 +327,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
     const relatedMemoryIds = await findRelatedMemoryIds(sql, job.schemaName, job.entryId, embedding);
 
     await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
-      await db
+      const [updated] = await db
         .update(memoryEntries)
         .set({
           summary,
@@ -334,7 +336,17 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           relatedMemoryIds,
           enrichmentStatus: "completed",
         })
-        .where(eq(memoryEntries.id, job.entryId));
+        .where(
+          and(
+            eq(memoryEntries.id, job.entryId),
+            eq(memoryEntries.version, entry.version),
+          ),
+        )
+        .returning({ id: memoryEntries.id });
+
+      // If no rows were updated, content/tags changed while this job was running.
+      // A newer enrichment job will write the current results.
+      void updated;
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
