@@ -39,9 +39,12 @@ export class OnnxEnrichmentProvider implements EmbeddingEnrichmentProvider {
     options?: { mode?: EmbeddingMode },
   ): Promise<number[]> {
     const extractor = await getEmbeddingPipeline(this.embeddingModel, this.quantized);
-    const input = options?.mode === "query" ? `query: ${content}` : content;
+    const isArcticModel = this.embeddingModel.toLowerCase().includes("arctic");
+    const input = isArcticModel && options?.mode === "query"
+      ? `query: ${content}`
+      : content;
     const output = await extractor(input, {
-      pooling: "cls",
+      pooling: isArcticModel ? "cls" : "mean",
       normalize: true,
     });
     const embedding = output.data ? Array.from(output.data) : null;
