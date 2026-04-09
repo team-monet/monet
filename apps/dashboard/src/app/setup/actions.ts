@@ -1,12 +1,24 @@
 "use server";
 
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import {
   exchangeBootstrapToken,
   savePlatformSetup,
   SETUP_SESSION_COOKIE_NAME,
 } from "@/lib/bootstrap";
+
+function isSecureConnection(requestHeaders: Headers): boolean {
+  const forwardedProto = requestHeaders.get("x-forwarded-proto");
+  if (forwardedProto) {
+    return forwardedProto
+      .split(",")
+      .map((value) => value.trim().toLowerCase())
+      .includes("https");
+  }
+
+  return process.env.NEXTAUTH_URL?.startsWith("https://") ?? false;
+}
 
 export async function exchangeBootstrapTokenAction(formData: FormData) {
   const token = formData.get("token");
@@ -17,10 +29,11 @@ export async function exchangeBootstrapTokenAction(formData: FormData) {
   try {
     const result = await exchangeBootstrapToken(token);
     const cookieStore = await cookies();
+    const requestHeaders = await headers();
     cookieStore.set(SETUP_SESSION_COOKIE_NAME, result.setupSessionToken, {
       httpOnly: true,
       sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
+      secure: isSecureConnection(requestHeaders),
       expires: new Date(result.expiresAt),
       path: "/",
     });
