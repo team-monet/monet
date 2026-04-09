@@ -566,27 +566,36 @@ export async function cleanupTestData() {
     await s.unsafe(`DROP SCHEMA IF EXISTS "${row.schema_name}" CASCADE`);
   }
 
-  await s.unsafe(`
-    DO $$ BEGIN
-      TRUNCATE TABLE
-        tenant_admin_nominations,
-        platform_oauth_configs,
-        platform_admins,
-        platform_setup_sessions,
-        platform_bootstrap_tokens,
-        platform_installations,
-        user_group_agent_group_permissions,
-        user_group_members,
-        user_groups,
-        agent_group_members,
-        agent_groups,
-        agents,
-        users,
-        tenants
-      CASCADE;
-    EXCEPTION WHEN undefined_table THEN NULL;
-    END $$
-  `);
+  const candidatePublicTables = [
+    "tenant_admin_nominations",
+    "platform_oauth_configs",
+    "platform_admins",
+    "platform_setup_sessions",
+    "platform_bootstrap_tokens",
+    "platform_installations",
+    "user_group_agent_group_permissions",
+    "user_group_members",
+    "user_groups",
+    "agent_group_members",
+    "agent_groups",
+    "agents",
+    "users",
+    "tenants",
+  ];
+
+  const existingPublicTables = await s<{ table_name: string }[]>`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name = ANY(${candidatePublicTables}::text[])
+  `;
+
+  if (existingPublicTables.length > 0) {
+    const quotedTableList = existingPublicTables
+      .map((row) => `"${row.table_name}"`)
+      .join(", ");
+    await s.unsafe(`TRUNCATE TABLE ${quotedTableList} CASCADE`);
+  }
 }
 
 export async function closeTestDb() {
