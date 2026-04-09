@@ -48,6 +48,39 @@ export async function createTenantSchema(
     )
   `);
 
+  const [legacyUsersTableState] = await sql.unsafe(
+    `SELECT to_regclass('public.users') IS NOT NULL AS exists`,
+  );
+
+  if (legacyUsersTableState?.exists) {
+    await sql.unsafe(`
+      INSERT INTO "${schemaName}".users (
+        id,
+        external_id,
+        tenant_id,
+        display_name,
+        email,
+        role,
+        dashboard_api_key_encrypted,
+        last_login_at,
+        created_at
+      )
+      SELECT
+        id,
+        external_id,
+        tenant_id,
+        display_name,
+        email,
+        role,
+        dashboard_api_key_encrypted,
+        last_login_at,
+        created_at
+      FROM public.users
+      WHERE tenant_id = '${tenantId}'
+      ON CONFLICT (id) DO NOTHING
+    `);
+  }
+
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "${schemaName}".agents (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -62,6 +95,41 @@ export async function createTenantSchema(
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
+
+  const [legacyAgentsTableState] = await sql.unsafe(
+    `SELECT to_regclass('public.agents') IS NOT NULL AS exists`,
+  );
+
+  if (legacyAgentsTableState?.exists) {
+    await sql.unsafe(`
+      INSERT INTO "${schemaName}".agents (
+        id,
+        external_id,
+        tenant_id,
+        user_id,
+        role,
+        api_key_hash,
+        api_key_salt,
+        is_autonomous,
+        revoked_at,
+        created_at
+      )
+      SELECT
+        legacy.id,
+        legacy.external_id,
+        legacy.tenant_id,
+        legacy.user_id,
+        legacy.role,
+        legacy.api_key_hash,
+        legacy.api_key_salt,
+        legacy.is_autonomous,
+        legacy.revoked_at,
+        legacy.created_at
+      FROM public.agents legacy
+      WHERE legacy.tenant_id = '${tenantId}'
+      ON CONFLICT (id) DO NOTHING
+    `);
+  }
 
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "${schemaName}".agent_groups (
