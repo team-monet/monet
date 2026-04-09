@@ -37,8 +37,10 @@ export function asDrizzleSqlClient(
   fallback?: DrizzleSqlClientOptions,
 ): SqlClient {
   const options = resolveSqlClientOptions(sql, fallback);
+  const sqlObj = sql as unknown as Record<string, unknown>;
+  const isTransaction = typeof sqlObj.begin !== "function" && typeof sqlObj.savepoint === "function";
 
-  if ((sql as { options?: DrizzleSqlClientOptions }).options === options) {
+  if (!isTransaction && (sql as { options?: DrizzleSqlClientOptions }).options === options) {
     return sql as SqlClient;
   }
 
@@ -46,6 +48,10 @@ export function asDrizzleSqlClient(
     get(target, prop, receiver) {
       if (prop === "options") {
         return options;
+      }
+      if (prop === "begin" && isTransaction) {
+        const targetObj = target as unknown as Record<string, unknown>;
+        return typeof targetObj.savepoint === "function" ? targetObj.savepoint.bind(target) : undefined;
       }
 
       const value = Reflect.get(target, prop, receiver);
