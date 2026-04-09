@@ -1,15 +1,14 @@
 import {
   agentGroups,
-  asDrizzleSqlClient,
+  tenantSchemaNameFromId,
   tenantUsers,
   userGroupAgentGroupPermissions,
   userGroupMembers,
   userGroups,
   type SqlClient,
-  type TransactionClient,
+  withTenantDrizzleScope,
 } from "@monet/db";
 import { and, asc, eq, inArray, sql as drizzleSql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/postgres-js";
 
 type UserGroupRecord = {
   id: string;
@@ -48,16 +47,6 @@ export type UserGroupDetail = {
   allowedAgentGroupIds: string[];
 };
 
-type UserGroupSqlClient = SqlClient | TransactionClient;
-type UserGroupDrizzleOptions = NonNullable<SqlClient["options"]>;
-
-function createUserGroupDb(
-  sql: UserGroupSqlClient,
-  options?: UserGroupDrizzleOptions,
-) {
-  return drizzle(asDrizzleSqlClient(sql, options));
-}
-
 function mapUserGroupRecord(group: {
   id: string;
   name: string;
@@ -81,8 +70,8 @@ export async function listAllowedAgentGroupIdsForUser(
   tenantId: string,
   userId: string,
 ): Promise<string[]> {
-  const db = createUserGroupDb(sql);
-  const rows = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const rows = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .selectDistinct({
       id: agentGroups.id,
     })
@@ -102,7 +91,7 @@ export async function listAllowedAgentGroupIdsForUser(
         eq(userGroups.tenantId, tenantId),
         eq(agentGroups.tenantId, tenantId),
       ),
-    );
+    ));
 
   return rows.map((row) => row.id);
 }
@@ -113,8 +102,8 @@ export async function userCanSelectAgentGroup(
   userId: string,
   groupId: string,
 ): Promise<boolean> {
-  const db = createUserGroupDb(sql);
-  const [group] = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const [group] = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .select({ id: agentGroups.id })
     .from(agentGroups)
     .where(
@@ -123,7 +112,7 @@ export async function userCanSelectAgentGroup(
         eq(agentGroups.tenantId, tenantId),
       ),
     )
-    .limit(1);
+    .limit(1));
 
   if (!group) {
     return false;
@@ -142,9 +131,9 @@ export async function listUserGroups(
   sql: SqlClient,
   tenantId: string,
 ): Promise<UserGroupSummary[]> {
-  const db = createUserGroupDb(sql);
+  const schemaName = tenantSchemaNameFromId(tenantId);
 
-  const [groups, memberCounts, permissionCounts] = await Promise.all([
+  const [groups, memberCounts, permissionCounts] = await withTenantDrizzleScope(sql, schemaName, async (db) => Promise.all([
     db
       .select()
       .from(userGroups)
@@ -164,7 +153,7 @@ export async function listUserGroups(
       })
       .from(userGroupAgentGroupPermissions)
       .groupBy(userGroupAgentGroupPermissions.userGroupId),
-  ]);
+  ]));
 
   const memberCountByGroupId = new Map(
     memberCounts.map((row) => [row.userGroupId, Number(row.count ?? 0)]),
@@ -185,8 +174,9 @@ export async function getUserGroupDetail(
   tenantId: string,
   userGroupId: string,
 ): Promise<UserGroupDetail | null> {
-  const db = createUserGroupDb(sql);
-  const [group] = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [group] = await db
     .select({
       id: userGroups.id,
       name: userGroups.name,
@@ -202,12 +192,12 @@ export async function getUserGroupDetail(
     )
     .limit(1);
 
-  if (!group) {
-    return null;
-  }
+    if (!group) {
+      return null;
+    }
 
-  const [members, tenantUserRows, tenantAgentGroups, permissions] = await Promise.all([
-    db
+    const [members, tenantUserRows, tenantAgentGroups, permissions] = await Promise.all([
+      db
       .select({
         id: tenantUsers.id,
         externalId: tenantUsers.externalId,
@@ -248,9 +238,9 @@ export async function getUserGroupDetail(
       .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId)),
   ]);
 
-  return {
-    group: mapUserGroupRecord(group),
-    members: members.map((row) => ({
+    return {
+      group: mapUserGroupRecord(group),
+      members: members.map((row) => ({
       id: row.id,
       externalId: row.externalId,
       displayName: row.displayName ?? null,
@@ -270,8 +260,9 @@ export async function getUserGroupDetail(
       name: row.name,
       description: row.description ?? "",
     })),
-    allowedAgentGroupIds: permissions.map((row) => row.agentGroupId),
-  };
+      allowedAgentGroupIds: permissions.map((row) => row.agentGroupId),
+    };
+  });
 }
 
 export async function createUserGroup(
@@ -279,8 +270,8 @@ export async function createUserGroup(
   tenantId: string,
   input: { name: string; description?: string },
 ) {
-  const db = createUserGroupDb(sql);
-  const [group] = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const [group] = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .insert(userGroups)
     .values({
       tenantId,
@@ -292,7 +283,7 @@ export async function createUserGroup(
       name: userGroups.name,
       description: userGroups.description,
       createdAt: userGroups.createdAt,
-    });
+    }));
 
   return mapUserGroupRecord(group);
 }
@@ -303,8 +294,9 @@ export async function updateUserGroup(
   userGroupId: string,
   input: { name?: string; description?: string },
 ) {
-  const db = createUserGroupDb(sql);
-  const [existing] = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [existing] = await db
     .select()
     .from(userGroups)
     .where(
@@ -315,30 +307,31 @@ export async function updateUserGroup(
     )
     .limit(1);
 
-  if (!existing) {
-    return { error: "not_found" as const, message: "User group not found" };
-  }
+    if (!existing) {
+      return { error: "not_found" as const, message: "User group not found" };
+    }
 
-  const [group] = await db
-    .update(userGroups)
-    .set({
-      name: input.name ?? existing.name,
-      description: input.description ?? existing.description,
-    })
-    .where(
-      and(
-        eq(userGroups.id, userGroupId),
-        eq(userGroups.tenantId, tenantId),
-      ),
-    )
-    .returning({
-      id: userGroups.id,
-      name: userGroups.name,
-      description: userGroups.description,
-      createdAt: userGroups.createdAt,
-    });
+    const [group] = await db
+      .update(userGroups)
+      .set({
+        name: input.name ?? existing.name,
+        description: input.description ?? existing.description,
+      })
+      .where(
+        and(
+          eq(userGroups.id, userGroupId),
+          eq(userGroups.tenantId, tenantId),
+        ),
+      )
+      .returning({
+        id: userGroups.id,
+        name: userGroups.name,
+        description: userGroups.description,
+        createdAt: userGroups.createdAt,
+      });
 
-  return mapUserGroupRecord(group);
+    return mapUserGroupRecord(group);
+  });
 }
 
 export async function addUserGroupMember(
@@ -347,9 +340,10 @@ export async function addUserGroupMember(
   userGroupId: string,
   userId: string,
 ) {
-  const db = createUserGroupDb(sql);
-  const [[group], [user]] = await Promise.all([
-    db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [[group], [user]] = await Promise.all([
+      db
       .select({ id: userGroups.id })
       .from(userGroups)
       .where(
@@ -371,16 +365,17 @@ export async function addUserGroupMember(
       .limit(1),
   ]);
 
-  if (!group || !user) {
-    return { error: "not_found" as const, message: "User group or user not found" };
-  }
+    if (!group || !user) {
+      return { error: "not_found" as const, message: "User group or user not found" };
+    }
 
-  await db
-    .insert(userGroupMembers)
-    .values({ userGroupId, userId })
-    .onConflictDoNothing();
+    await db
+      .insert(userGroupMembers)
+      .values({ userGroupId, userId })
+      .onConflictDoNothing();
 
-  return { success: true };
+    return { success: true };
+  });
 }
 
 export async function removeUserGroupMember(
@@ -389,8 +384,9 @@ export async function removeUserGroupMember(
   userGroupId: string,
   userId: string,
 ) {
-  const db = createUserGroupDb(sql);
-  const [group] = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [group] = await db
     .select({ id: userGroups.id })
     .from(userGroups)
     .where(
@@ -401,20 +397,21 @@ export async function removeUserGroupMember(
     )
     .limit(1);
 
-  if (!group) {
-    return { error: "not_found" as const, message: "User group not found" };
-  }
+    if (!group) {
+      return { error: "not_found" as const, message: "User group not found" };
+    }
 
-  await db
-    .delete(userGroupMembers)
-    .where(
-      and(
-        eq(userGroupMembers.userGroupId, userGroupId),
-        eq(userGroupMembers.userId, userId),
-      ),
-    );
+    await db
+      .delete(userGroupMembers)
+      .where(
+        and(
+          eq(userGroupMembers.userGroupId, userGroupId),
+          eq(userGroupMembers.userId, userId),
+        ),
+      );
 
-  return { success: true };
+    return { success: true };
+  });
 }
 
 export async function saveUserGroupAgentGroupPermissions(
@@ -423,50 +420,48 @@ export async function saveUserGroupAgentGroupPermissions(
   userGroupId: string,
   agentGroupIds: string[],
 ) {
-  const db = createUserGroupDb(sql);
-  const [group] = await db
-    .select({ id: userGroups.id })
-    .from(userGroups)
-    .where(
-      and(
-        eq(userGroups.id, userGroupId),
-        eq(userGroups.tenantId, tenantId),
-      ),
-    )
-    .limit(1);
-
-  if (!group) {
-    return { error: "not_found" as const, message: "User group not found" };
-  }
-
-  if (agentGroupIds.length > 0) {
-    const validGroups = await db
-      .select({ id: agentGroups.id })
-      .from(agentGroups)
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [group] = await db
+      .select({ id: userGroups.id })
+      .from(userGroups)
       .where(
         and(
-          eq(agentGroups.tenantId, tenantId),
-          inArray(agentGroups.id, agentGroupIds),
+          eq(userGroups.id, userGroupId),
+          eq(userGroups.tenantId, tenantId),
         ),
-      );
+      )
+      .limit(1);
 
-    if (validGroups.length !== agentGroupIds.length) {
-      return {
-        error: "validation" as const,
-        message: "One or more agent groups were invalid",
-      };
+    if (!group) {
+      return { error: "not_found" as const, message: "User group not found" };
     }
-  }
 
-  await sql.begin(async (txSql) => {
-    const tx = createUserGroupDb(txSql, sql.options);
+    if (agentGroupIds.length > 0) {
+      const validGroups = await db
+        .select({ id: agentGroups.id })
+        .from(agentGroups)
+        .where(
+          and(
+            eq(agentGroups.tenantId, tenantId),
+            inArray(agentGroups.id, agentGroupIds),
+          ),
+        );
 
-    await tx
+      if (validGroups.length !== agentGroupIds.length) {
+        return {
+          error: "validation" as const,
+          message: "One or more agent groups were invalid",
+        };
+      }
+    }
+
+    await db
       .delete(userGroupAgentGroupPermissions)
       .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId));
 
     if (agentGroupIds.length > 0) {
-      await tx
+      await db
         .insert(userGroupAgentGroupPermissions)
         .values(
           agentGroupIds.map((agentGroupId) => ({
@@ -475,7 +470,7 @@ export async function saveUserGroupAgentGroupPermissions(
           })),
         );
     }
-  });
 
-  return { success: true };
+    return { success: true };
+  });
 }

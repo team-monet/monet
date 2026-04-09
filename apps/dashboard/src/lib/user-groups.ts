@@ -7,12 +7,23 @@ import {
 } from "@monet/types";
 import {
   agentGroups,
+  tenantSchemaNameFromId,
   userGroupAgentGroupPermissions,
   userGroupMembers,
   userGroups,
   tenantUsers,
+  withTenantDrizzleScope,
+  type Database,
+  type TransactionClient,
 } from "@monet/db";
-import { db } from "./db";
+import { getSqlClient } from "./db";
+
+async function withTenantDb<T>(
+  tenantId: string,
+  fn: (db: Database, sql: TransactionClient) => Promise<T>,
+): Promise<T> {
+  return withTenantDrizzleScope(getSqlClient(), tenantSchemaNameFromId(tenantId), fn);
+}
 
 export type UserGroupSummary = {
   id: string;
@@ -26,7 +37,7 @@ export type UserGroupSummary = {
 export async function listUserGroupsForTenant(
   tenantId: string,
 ): Promise<UserGroupSummary[]> {
-  const groups = await db
+  const groups = await withTenantDb(tenantId, async (db) => db
     .select({
       id: userGroups.id,
       name: userGroups.name,
@@ -35,14 +46,14 @@ export async function listUserGroupsForTenant(
     })
     .from(userGroups)
     .where(eq(userGroups.tenantId, tenantId))
-    .orderBy(asc(userGroups.name));
+    .orderBy(asc(userGroups.name)));
 
   if (groups.length === 0) {
     return [];
   }
 
   const groupIds = groups.map((group) => group.id);
-  const [memberCounts, permissionCounts] = await Promise.all([
+  const [memberCounts, permissionCounts] = await withTenantDb(tenantId, async (db) => Promise.all([
     db
       .select({
         userGroupId: userGroupMembers.userGroupId,
@@ -59,7 +70,7 @@ export async function listUserGroupsForTenant(
       .from(userGroupAgentGroupPermissions)
       .where(inArray(userGroupAgentGroupPermissions.userGroupId, groupIds))
       .groupBy(userGroupAgentGroupPermissions.userGroupId),
-  ]);
+  ]));
 
   const memberCountMap = new Map(
     memberCounts.map((row) => [row.userGroupId, Number(row.count)]),
@@ -76,7 +87,8 @@ export async function listUserGroupsForTenant(
 }
 
 export async function getUserGroupDetail(tenantId: string, userGroupId: string) {
-  const [group] = await db
+  return withTenantDb(tenantId, async (db) => {
+    const [group] = await db
     .select({
       id: userGroups.id,
       name: userGroups.name,
@@ -89,14 +101,14 @@ export async function getUserGroupDetail(tenantId: string, userGroupId: string) 
     )
     .limit(1);
 
-  if (!group) {
-    return null;
-  }
+    if (!group) {
+      return null;
+    }
 
   const userSortOrder = sql`coalesce(${tenantUsers.displayName}, ${tenantUsers.email}, ${tenantUsers.externalId})`;
 
-  const [members, tenantUserRows, tenantAgentGroups, permissionRows] = await Promise.all([
-    db
+    const [members, tenantUserRows, tenantAgentGroups, permissionRows] = await Promise.all([
+      db
       .select({
         id: tenantUsers.id,
         externalId: tenantUsers.externalId,
@@ -137,22 +149,23 @@ export async function getUserGroupDetail(tenantId: string, userGroupId: string) 
       .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId)),
   ]);
 
-  return {
-    group,
-    members,
-    tenantUsers: tenantUserRows,
-    tenantAgentGroups,
-    allowedAgentGroupIds: new Set(
-      permissionRows.map((row) => row.agentGroupId),
-    ),
-  };
+    return {
+      group,
+      members,
+      tenantUsers: tenantUserRows,
+      tenantAgentGroups,
+      allowedAgentGroupIds: new Set(
+        permissionRows.map((row) => row.agentGroupId),
+      ),
+    };
+  });
 }
 
 export async function ensureDefaultUserGroupMembership(
   tenantId: string,
   userId: string,
 ) {
-  const existingMemberships = await db
+  const existingMemberships = await withTenantDb(tenantId, async (db) => db
     .select({ userGroupId: userGroupMembers.userGroupId })
     .from(userGroupMembers)
     .innerJoin(userGroups, eq(userGroups.id, userGroupMembers.userGroupId))
@@ -162,13 +175,13 @@ export async function ensureDefaultUserGroupMembership(
         eq(userGroups.tenantId, tenantId),
       ),
     )
-    .limit(1);
+    .limit(1));
 
   if (existingMemberships.length > 0) {
     return;
   }
 
-  await db.transaction(async (tx) => {
+  await withTenantDb(tenantId, async (db) => db.transaction(async (tx) => {
     let [defaultGroup] = await tx
       .select({ id: userGroups.id })
       .from(userGroups)
@@ -241,5 +254,5 @@ export async function ensureDefaultUserGroupMembership(
         userId,
       })
       .onConflictDoNothing();
-  });
+  }));
 }

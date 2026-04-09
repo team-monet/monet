@@ -73,7 +73,6 @@ async function loadAccessibleAgentRow(
   agentId: string,
 ): Promise<{ row: PlatformAgentRecord; isAdmin: boolean } | { response: Response }> {
   const requester = c.get("agent");
-  const db = c.get("db");
   const sql = c.get("sql");
   const role = await resolveAgentRole(sql, requester);
   const admin = isTenantAdmin(role);
@@ -84,7 +83,7 @@ async function loadAccessibleAgentRow(
     };
   }
 
-  const row = await loadPlatformAgentRecord(db, requester.tenantId, agentId);
+  const row = await loadPlatformAgentRecord(sql, requester.tenantId, agentId);
 
   if (!row) {
     return {
@@ -145,7 +144,6 @@ function parseAgentRuleSetAssociationInput(
  */
 agentsRouter.post("/register", async (c) => {
   const agent = c.get("agent");
-  const db = c.get("db");
   const sql = c.get("sql");
   const role = await resolveAgentRole(sql, agent);
   const admin = isTenantAdmin(role);
@@ -229,7 +227,7 @@ agentsRouter.post("/register", async (c) => {
     label: string;
   } | null = null;
   if (userId) {
-    const user = await loadPlatformUserOwner(db, agent.tenantId, userId);
+    const user = await loadPlatformUserOwner(sql, agent.tenantId, userId);
     if (!user) {
       return c.json({ error: "not_found", message: "User not found" }, 404);
     }
@@ -263,7 +261,7 @@ agentsRouter.post("/register", async (c) => {
   );
 
   if ("error" in membershipResult) {
-    await deletePlatformAgent(db, agent.tenantId, newAgent.id);
+    await deletePlatformAgent(sql, agent.tenantId, newAgent.id);
     if (membershipResult.error === "not_found") {
       return c.json({ error: "not_found", message: membershipResult.message }, 404);
     }
@@ -298,7 +296,6 @@ agentsRouter.post("/register", async (c) => {
  * POST /api/agents/:id/regenerate-token — rotate an agent API key and return the raw key once.
  */
 agentsRouter.post("/:id/regenerate-token", rateLimitMiddleware, async (c) => {
-  const db = c.get("db");
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
   const schemaName = c.get("tenantSchemaName");
@@ -313,7 +310,7 @@ agentsRouter.post("/:id/regenerate-token", rateLimitMiddleware, async (c) => {
   const rawApiKey = generateApiKey(access.row.id);
   const { hash, salt } = hashApiKey(rawApiKey);
 
-  await rotatePlatformAgentToken(db, access.row.tenantId, targetId, hash, salt);
+  await rotatePlatformAgentToken(sql, requester.tenantId, targetId, hash, salt);
 
   await closeAgentSessionsIfPresent(sessionStore, targetId);
   await logAuditEvent(sql, schemaName, {
@@ -334,19 +331,18 @@ agentsRouter.post("/:id/revoke", rateLimitMiddleware, async (c) => {
   const forbidden = await requireTenantAdmin(c);
   if (forbidden) return forbidden;
 
-  const db = c.get("db");
   const sql = c.get("sql");
   const sessionStore = c.get("sessionStore");
   const schemaName = c.get("tenantSchemaName");
   const requester = c.get("agent");
   const targetId = c.req.param("id");
-  const row = await loadPlatformAgentRecord(db, requester.tenantId, targetId);
+  const row = await loadPlatformAgentRecord(sql, requester.tenantId, targetId);
 
   if (!row) {
     return c.json({ error: "not_found", message: "Agent not found" }, 404);
   }
 
-  const revokedAt = await revokePlatformAgent(db, requester.tenantId, targetId);
+  const revokedAt = await revokePlatformAgent(sql, requester.tenantId, targetId);
 
   await closeAgentSessionsIfPresent(sessionStore, targetId);
   await logAuditEvent(sql, schemaName, {
@@ -370,18 +366,17 @@ agentsRouter.post("/:id/unrevoke", rateLimitMiddleware, async (c) => {
   const forbidden = await requireTenantAdmin(c);
   if (forbidden) return forbidden;
 
-  const db = c.get("db");
   const sql = c.get("sql");
   const schemaName = c.get("tenantSchemaName");
   const requester = c.get("agent");
   const targetId = c.req.param("id");
-  const row = await loadPlatformAgentRecord(db, requester.tenantId, targetId);
+  const row = await loadPlatformAgentRecord(sql, requester.tenantId, targetId);
 
   if (!row) {
     return c.json({ error: "not_found", message: "Agent not found" }, 404);
   }
 
-  await unrevokePlatformAgent(db, requester.tenantId, targetId);
+  await unrevokePlatformAgent(sql, requester.tenantId, targetId);
   await logAuditEvent(sql, schemaName, {
     tenantId: requester.tenantId,
     ...auditActor(requester),
@@ -484,14 +479,13 @@ agentsRouter.get("/:id/rules", async (c) => {
  */
 agentsRouter.get("/", async (c) => {
   const agent = c.get("agent");
-  const db = c.get("db");
   const sql = c.get("sql");
   const role = await resolveAgentRole(sql, agent);
   const admin = isTenantAdmin(role);
 
   let rows;
   if (admin) {
-    rows = await listPlatformAgents(db, agent.tenantId, {
+    rows = await listPlatformAgents(sql, agent.tenantId, {
       isAdmin: true,
     });
   } else {
@@ -499,7 +493,7 @@ agentsRouter.get("/", async (c) => {
       return c.json([]);
     }
 
-    rows = await listPlatformAgents(db, agent.tenantId, {
+    rows = await listPlatformAgents(sql, agent.tenantId, {
       isAdmin: false,
       requesterUserId: agent.userId,
     });
@@ -546,9 +540,9 @@ agentsRouter.get("/:id/status", async (c) => {
  * GET /api/agents/:id — get an agent detail record.
  */
 agentsRouter.get("/:id", async (c) => {
-  const db = c.get("db");
   const sql = c.get("sql");
   const schemaName = c.get("tenantSchemaName");
+  const requester = c.get("agent");
   const targetId = c.req.param("id");
   const access = await loadAccessibleAgentRow(c, targetId);
 
@@ -557,7 +551,7 @@ agentsRouter.get("/:id", async (c) => {
   }
 
   const [groups, ruleSets] = await Promise.all([
-    listPlatformAgentGroups(db, targetId),
+    listPlatformAgentGroups(sql, requester.tenantId, targetId),
     listRuleSetsForAgent(sql, schemaName, targetId),
   ]);
 

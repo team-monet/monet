@@ -55,6 +55,13 @@ describe("MCP integration", () => {
   const db = getTestDb();
   const sql = getTestSql();
   const app = createApp(db as unknown as Parameters<typeof createApp>[0], sql);
+  const appRequest = app.request.bind(app);
+  app.request = ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (typeof input === "string" && tenantSlug && input.startsWith("/api/") && !input.startsWith("/api/tenants/")) {
+      return appRequest(`/api/tenants/${tenantSlug}${input.slice(4)}`, init);
+    }
+    return appRequest(input, init);
+  }) as typeof app.request;
   const sessionStore = new SessionStore();
   const mcpHandler = createMcpHandler({ db, sql, sessionStore });
   const honoListener = getRequestListener(app.fetch);
@@ -63,6 +70,7 @@ describe("MCP integration", () => {
   let apiKey: string;
   let agentId: string;
   let groupId: string;
+  let tenantSlug: string;
 
   beforeAll(async () => {
     server = createServer((req, res) => {
@@ -78,7 +86,7 @@ describe("MCP integration", () => {
     });
 
     const address = server.address() as AddressInfo;
-    baseUrl = new URL(`http://127.0.0.1:${address.port}/mcp`);
+    baseUrl = new URL(`http://127.0.0.1:${address.port}`);
   });
 
   beforeEach(async () => {
@@ -89,6 +97,7 @@ describe("MCP integration", () => {
     const { body } = await provisionTestTenant({ name: "mcp-test" });
     apiKey = body.apiKey as string;
     agentId = (body.agent as { id: string }).id;
+    tenantSlug = (body.tenant as { slug: string }).slug;
 
     const groupRes = await app.request("/api/groups", {
       method: "POST",
@@ -119,7 +128,7 @@ describe("MCP integration", () => {
 
   async function connectClient(key = apiKey) {
     const client = new Client({ name: "mcp-test-client", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(baseUrl, {
+    const transport = new StreamableHTTPClientTransport(new URL(`/mcp/${tenantSlug}`, baseUrl), {
       requestInit: {
         headers: {
           Authorization: `Bearer ${key}`,
@@ -151,7 +160,7 @@ describe("MCP integration", () => {
 
   it("rejects connection with an invalid API key", async () => {
     const client = new Client({ name: "mcp-test-client", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(baseUrl, {
+    const transport = new StreamableHTTPClientTransport(new URL(`/mcp/${tenantSlug}`, baseUrl), {
       requestInit: {
         headers: {
           Authorization: "Bearer mnt_invalid.invalid",

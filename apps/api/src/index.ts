@@ -78,7 +78,7 @@ async function main() {
       res.once("finish", releaseRequest);
       res.once("close", releaseRequest);
 
-      if (req.url?.startsWith("/mcp")) {
+      if (req.url?.startsWith("/mcp/")) {
         void mcpHandler.handle(req, res);
         return;
       }

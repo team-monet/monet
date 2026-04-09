@@ -42,10 +42,10 @@ export function createApp(
   app.route("/", health);
   app.route("/api/bootstrap", bootstrapRouter);
 
-  // Authenticated API sub-app with middleware chain: auth → tenant → rate-limit
+  // Authenticated tenant API sub-app with middleware chain: tenant → auth → rate-limit
   const authenticated = new Hono<AppEnv>();
-  authenticated.use("*", authMiddleware);
   authenticated.use("*", tenantMiddleware);
+  authenticated.use("*", authMiddleware);
   authenticated.use("*", rateLimitMiddleware);
   authenticated.route("/agents", agentsRouter);
   authenticated.route("/memories", memoriesRouter);
@@ -55,7 +55,7 @@ export function createApp(
   authenticated.route("/metrics", metricsRouter);
   authenticated.route("/", rulesRouter);
 
-  app.route("/api", authenticated);
+  app.route("/api/tenants/:tenantSlug", authenticated);
 
   return app;
 }

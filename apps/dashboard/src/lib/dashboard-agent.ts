@@ -4,22 +4,35 @@ import {
   agentGroupMembers,
   agentGroups,
   agents,
+  tenantSchemaNameFromId,
   userGroupAgentGroupPermissions,
   userGroupMembers,
   userGroups,
   tenantUsers,
+  withTenantDrizzleScope,
+  type Database,
+  type TransactionClient,
 } from "@monet/db";
 import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import { encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
+import { getSqlClient } from "./db";
+
+async function withTenantDb<T>(
+  tenantId: string,
+  fn: (db: Database, sql: TransactionClient) => Promise<T>,
+): Promise<T> {
+  return withTenantDrizzleScope(getSqlClient(), tenantSchemaNameFromId(tenantId), fn);
+}
 
 export async function ensureDashboardAgent(
   userId: string,
   _externalId: string, // Unused now that we have a standard format
   tenantId: string,
 ) {
+  return withTenantDb(tenantId, async (tenantDb) => {
   // 1. Load user and existing dashboard agent metadata.
-  const userRows = await db
+  const userRows = await tenantDb
     .select({ 
       id: tenantUsers.id,
       role: tenantUsers.role,
@@ -37,7 +50,7 @@ export async function ensureDashboardAgent(
   const dashboardExternalId = `dashboard:${userId}`;
   const desiredRole = user.role ?? "user";
 
-  const [existingAgent] = await db
+  const [existingAgent] = await tenantDb
     .select({ id: agents.id, role: agents.role })
     .from(agents)
     .where(and(eq(agents.userId, userId), eq(agents.externalId, dashboardExternalId)))
@@ -49,7 +62,7 @@ export async function ensureDashboardAgent(
   if (existingAgent) {
     dashboardAgentId = existingAgent.id;
     if (existingAgent.role !== desiredRole) {
-      await db
+      await tenantDb
         .update(agents)
         .set({ role: desiredRole })
         .where(eq(agents.id, existingAgent.id));
@@ -62,7 +75,7 @@ export async function ensureDashboardAgent(
     const apiKey = generateApiKey(targetAgentId);
     const { hash, salt } = hashApiKey(apiKey);
 
-    encryptedApiKey = await db.transaction(async (tx) => {
+    encryptedApiKey = await tenantDb.transaction(async (tx) => {
       if (!dashboardAgentId) {
         const [newAgent] = await tx
           .insert(agents)
@@ -102,44 +115,48 @@ export async function ensureDashboardAgent(
 
   // 3. Sync group memberships
   if (dashboardAgentId) {
-    await syncAgentGroups(userId, dashboardAgentId, tenantId);
+    await syncAgentGroups(tenantDb, userId, dashboardAgentId, tenantId);
   }
 
   return encryptedApiKey!;
+  });
 }
 
 /**
  * Lightweight 1-query role sync for the hot path.  Only updates when the
  * dashboard agent's role diverges from the user's current role.
  */
-export async function syncDashboardAgentRole(userId: string) {
-  const dashboardExternalId = `dashboard:${userId}`;
-  const rows = await db
-    .select({
-      agentId: agents.id,
-      agentRole: agents.role,
-      userRole: tenantUsers.role,
-    })
-    .from(agents)
-    .innerJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
-    .where(and(eq(agents.userId, userId), eq(agents.externalId, dashboardExternalId)))
-    .limit(1);
+export async function syncDashboardAgentRole(userId: string, tenantId: string) {
+  return withTenantDb(tenantId, async (tenantDb) => {
+    const dashboardExternalId = `dashboard:${userId}`;
+    const rows = await tenantDb
+      .select({
+        agentId: agents.id,
+        agentRole: agents.role,
+        userRole: tenantUsers.role,
+      })
+      .from(agents)
+      .innerJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+      .where(and(eq(agents.userId, userId), eq(agents.externalId, dashboardExternalId)))
+      .limit(1);
 
-  if (rows.length === 1 && rows[0].agentRole !== (rows[0].userRole ?? "user")) {
-    await db
-      .update(agents)
-      .set({ role: rows[0].userRole ?? "user" })
-      .where(eq(agents.id, rows[0].agentId));
-  }
+    if (rows.length === 1 && rows[0].agentRole !== (rows[0].userRole ?? "user")) {
+      await tenantDb
+        .update(agents)
+        .set({ role: rows[0].userRole ?? "user" })
+        .where(eq(agents.id, rows[0].agentId));
+    }
+  });
 }
 
 async function syncAgentGroups(
+  tenantDb: typeof db,
   userId: string,
   dashboardAgentId: string,
   tenantId: string,
 ) {
   // Find the preferred group from the user's other agents first.
-  const userAgents = await db
+  const userAgents = await tenantDb
     .select({ id: agents.id })
     .from(agents)
     .where(and(eq(agents.userId, userId), ne(agents.id, dashboardAgentId)));
@@ -147,7 +164,7 @@ async function syncAgentGroups(
   let preferredGroupId: string | null = null;
   if (userAgents.length > 0) {
     const agentIds = userAgents.map((a) => a.id);
-    const memberships = await db
+    const memberships = await tenantDb
       .select({
         groupId: agentGroupMembers.groupId,
         joinedAt: agentGroupMembers.joinedAt,
@@ -162,7 +179,7 @@ async function syncAgentGroups(
 
   // Fall back to the first agent group the user's user-group memberships allow.
   if (!preferredGroupId) {
-    const allowedGroups = await db
+    const allowedGroups = await tenantDb
       .selectDistinct({
         id: agentGroups.id,
         name: agentGroups.name,
@@ -196,14 +213,14 @@ async function syncAgentGroups(
   }
 
   // Current memberships for dashboard agent
-  const currentMemberships = await db
+  const currentMemberships = await tenantDb
     .select({ groupId: agentGroupMembers.groupId })
     .from(agentGroupMembers)
     .where(eq(agentGroupMembers.agentId, dashboardAgentId));
 
   if (!preferredGroupId) {
     if (currentMemberships.length > 0) {
-      await db
+      await tenantDb
         .delete(agentGroupMembers)
         .where(eq(agentGroupMembers.agentId, dashboardAgentId));
     }
@@ -217,7 +234,7 @@ async function syncAgentGroups(
     return;
   }
 
-  await db.transaction(async (tx) => {
+  await tenantDb.transaction(async (tx) => {
     await tx
       .delete(agentGroupMembers)
       .where(eq(agentGroupMembers.agentId, dashboardAgentId));

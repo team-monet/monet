@@ -1,9 +1,11 @@
 import { and, eq, isNull } from "drizzle-orm";
 import {
+  tenantSchemaNameFromId,
   tenantUsers,
   tenantAdminNominations,
+  withTenantDrizzleScope,
 } from "@monet/db";
-import { db } from "./db";
+import { db, getSqlClient } from "./db";
 import { ensureDashboardAgent } from "./dashboard-agent";
 import { ensureDefaultUserGroupMembership } from "./user-groups";
 
@@ -27,11 +29,12 @@ type UpsertTenantUserFromLoginInput = {
 export async function upsertTenantUserFromLogin(
   input: UpsertTenantUserFromLoginInput,
 ) {
+  const schemaName = tenantSchemaNameFromId(input.tenantId);
   const normalizedEmail = normalizeEmail(input.email);
   const normalizedDisplayName = normalizeOptionalText(input.displayName);
   const now = new Date();
 
-  let [dbUser] = await db
+  let [dbUser] = await withTenantDrizzleScope(getSqlClient(), schemaName, async (tenantDb) => tenantDb
     .select()
     .from(tenantUsers)
     .where(
@@ -40,7 +43,7 @@ export async function upsertTenantUserFromLogin(
         eq(tenantUsers.externalId, input.externalId),
       ),
     )
-    .limit(1);
+    .limit(1));
 
   const [nomination] = normalizedEmail
     ? await db
@@ -61,20 +64,20 @@ export async function upsertTenantUserFromLogin(
   // existing tenant user record instead of creating duplicates and losing role state.
   if (!dbUser && normalizedEmail && input.emailVerified) {
     if (nomination?.claimedByUserId) {
-      [dbUser] = await db
+      [dbUser] = await withTenantDrizzleScope(getSqlClient(), schemaName, async (tenantDb) => tenantDb
         .select()
         .from(tenantUsers)
         .where(
           and(
             eq(tenantUsers.tenantId, input.tenantId),
-            eq(tenantUsers.id, nomination.claimedByUserId),
+            eq(tenantUsers.id, nomination.claimedByUserId!),
           ),
         )
-        .limit(1);
+        .limit(1));
     }
 
     if (!dbUser) {
-      [dbUser] = await db
+      [dbUser] = await withTenantDrizzleScope(getSqlClient(), schemaName, async (tenantDb) => tenantDb
         .select()
         .from(tenantUsers)
         .where(
@@ -83,7 +86,7 @@ export async function upsertTenantUserFromLogin(
             eq(tenantUsers.email, normalizedEmail),
           ),
         )
-        .limit(1);
+        .limit(1));
     }
   }
 
@@ -94,7 +97,7 @@ export async function upsertTenantUserFromLogin(
       nomination!.claimedByUserId === dbUser?.id);
 
   if (!dbUser) {
-    const [newUser] = await db
+    const [newUser] = await withTenantDrizzleScope(getSqlClient(), schemaName, async (tenantDb) => tenantDb
       .insert(tenantUsers)
       .values({
         externalId: input.externalId,
@@ -104,7 +107,7 @@ export async function upsertTenantUserFromLogin(
         role: canClaimNomination ? "tenant_admin" : "user",
         lastLoginAt: now,
       })
-      .returning();
+      .returning());
     dbUser = newUser;
   } else {
     const desiredRole =
@@ -112,7 +115,7 @@ export async function upsertTenantUserFromLogin(
         ? "tenant_admin"
         : dbUser.role;
 
-    const [updatedUser] = await db
+    const [updatedUser] = await withTenantDrizzleScope(getSqlClient(), schemaName, async (tenantDb) => tenantDb
       .update(tenantUsers)
       .set({
         externalId: input.externalId,
@@ -122,7 +125,7 @@ export async function upsertTenantUserFromLogin(
         lastLoginAt: now,
       })
       .where(eq(tenantUsers.id, dbUser.id))
-      .returning();
+      .returning());
     dbUser = updatedUser;
   }
 

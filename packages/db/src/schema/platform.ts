@@ -2,11 +2,8 @@ import {
   pgTable,
   uuid,
   varchar,
-  boolean,
   timestamp,
   pgEnum,
-  integer,
-  primaryKey,
   unique,
 } from "drizzle-orm/pg-core";
 
@@ -32,33 +29,6 @@ export const tenants = pgTable("tenants", {
     .notNull()
     .defaultNow(),
 });
-
-export const tenantUsers = pgTable(
-  "users",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    externalId: varchar("external_id", { length: 255 }).notNull(),
-    tenantId: uuid("tenant_id")
-      .notNull()
-      .references(() => tenants.id),
-    displayName: varchar("display_name", { length: 255 }),
-    email: varchar("email", { length: 255 }),
-    role: userRoleEnum("role").notNull().default("user"),
-    dashboardApiKeyEncrypted: varchar("dashboard_api_key_encrypted", {
-      length: 1024,
-    }),
-    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-  },
-  (table) => ({
-    tenantExternalIdUnique: unique("users_tenant_id_external_id_unique").on(
-      table.tenantId,
-      table.externalId,
-    ),
-  }),
-);
 
 export const tenantOauthConfigs = pgTable("tenant_oauth_configs", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -142,9 +112,7 @@ export const tenantAdminNominations = pgTable(
       .notNull()
       .references(() => tenants.id),
     email: varchar("email", { length: 255 }).notNull(),
-    claimedByUserId: uuid("claimed_by_user_id").references(
-      () => tenantUsers.id,
-    ),
+    claimedByUserId: uuid("claimed_by_user_id"),
     createdByPlatformAdminId: uuid("created_by_platform_admin_id")
       .notNull()
       .references(() => platformAdmins.id),
@@ -159,101 +127,5 @@ export const tenantAdminNominations = pgTable(
       table.tenantId,
       table.email,
     ),
-  }),
-);
-
-export const userGroups = pgTable(
-  "user_groups",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    tenantId: uuid("tenant_id")
-      .notNull()
-      .references(() => tenants.id),
-    name: varchar("name", { length: 255 }).notNull(),
-    description: varchar("description", { length: 1024 }).notNull().default(""),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-  },
-  (table) => ({
-    tenantNameUnique: unique("user_groups_tenant_id_name_unique").on(
-      table.tenantId,
-      table.name,
-    ),
-  }),
-);
-
-export const userGroupMembers = pgTable(
-  "user_group_members",
-  {
-    userGroupId: uuid("user_group_id")
-      .notNull()
-      .references(() => userGroups.id),
-    userId: uuid("user_id")
-      .notNull()
-      .references(() => tenantUsers.id),
-    joinedAt: timestamp("joined_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-  },
-  (table) => ({
-    pk: primaryKey({ columns: [table.userGroupId, table.userId] }),
-  }),
-);
-
-export const agents = pgTable("agents", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  externalId: varchar("external_id", { length: 255 }).notNull(),
-  tenantId: uuid("tenant_id")
-    .notNull()
-    .references(() => tenants.id),
-  userId: uuid("user_id").references(() => tenantUsers.id),
-  role: userRoleEnum("role"),
-  apiKeyHash: varchar("api_key_hash", { length: 255 }).notNull(),
-  apiKeySalt: varchar("api_key_salt", { length: 255 }).notNull(),
-  isAutonomous: boolean("is_autonomous").notNull().default(false),
-  revokedAt: timestamp("revoked_at", { withTimezone: true }),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
-
-export const agentGroups = pgTable("agent_groups", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  tenantId: uuid("tenant_id")
-    .notNull()
-    .references(() => tenants.id),
-  name: varchar("name", { length: 255 }).notNull(),
-  description: varchar("description", { length: 1024 }).default(""),
-  memoryQuota: integer("memory_quota"),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
-
-export const agentGroupMembers = pgTable("agent_group_members", {
-  agentId: uuid("agent_id")
-    .notNull()
-    .references(() => agents.id),
-  groupId: uuid("group_id")
-    .notNull()
-    .references(() => agentGroups.id),
-  joinedAt: timestamp("joined_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
-
-export const userGroupAgentGroupPermissions = pgTable(
-  "user_group_agent_group_permissions",
-  {
-    userGroupId: uuid("user_group_id")
-      .notNull()
-      .references(() => userGroups.id),
-    agentGroupId: uuid("agent_group_id")
-      .notNull()
-      .references(() => agentGroups.id),
-  },
-  (table) => ({
-    pk: primaryKey({ columns: [table.userGroupId, table.agentGroupId] }),
   }),
 );

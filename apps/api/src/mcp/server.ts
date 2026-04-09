@@ -180,7 +180,7 @@ export function createMcpServer(
   const handlers: McpToolHandlers = {
     memoryStore: async (args) => {
       try {
-        const preflight = await resolveMemoryWritePreflight(sql, agentContext);
+        const preflight = await resolveMemoryWritePreflight(sql, tenantSchemaName, agentContext);
         const result = await withTenantScope(sql, tenantSchemaName, (txSql) =>
           createMemory(txSql, agentContext, args, preflight),
         );

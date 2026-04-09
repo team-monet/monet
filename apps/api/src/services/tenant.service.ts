@@ -7,6 +7,7 @@ import {
   type SqlClient,
   tenants,
   tenantOauthConfigs,
+  withTenantDrizzleScope,
   type TransactionClient,
   userGroupAgentGroupPermissions,
   userGroups,
@@ -129,23 +130,34 @@ export async function provisionTenant(
     // Create the tenant schema with all DDL
     const tenantSchemaName = await createTenantSchema(txSql, tenant.id);
 
-    const [defaultUserGroup] = await txDb
-      .insert(userGroups)
-      .values({
-        tenantId: tenant.id,
-        name: DEFAULT_USER_GROUP_NAME,
-        description: DEFAULT_USER_GROUP_DESCRIPTION,
-      })
-      .returning({ id: userGroups.id });
+    const { defaultUserGroup, defaultAgentGroup } = await withTenantDrizzleScope(
+      txSql,
+      tenantSchemaName,
+      async (tenantDb) => {
+        const [createdUserGroup] = await tenantDb
+          .insert(userGroups)
+          .values({
+            tenantId: tenant.id,
+            name: DEFAULT_USER_GROUP_NAME,
+            description: DEFAULT_USER_GROUP_DESCRIPTION,
+          })
+          .returning({ id: userGroups.id });
 
-    const [defaultAgentGroup] = await txDb
-      .insert(agentGroups)
-      .values({
-        tenantId: tenant.id,
-        name: DEFAULT_AGENT_GROUP_NAME,
-        description: DEFAULT_AGENT_GROUP_DESCRIPTION,
-      })
-      .returning({ id: agentGroups.id });
+        const [createdAgentGroup] = await tenantDb
+          .insert(agentGroups)
+          .values({
+            tenantId: tenant.id,
+            name: DEFAULT_AGENT_GROUP_NAME,
+            description: DEFAULT_AGENT_GROUP_DESCRIPTION,
+          })
+          .returning({ id: agentGroups.id });
+
+        return {
+          defaultUserGroup: createdUserGroup,
+          defaultAgentGroup: createdAgentGroup,
+        };
+      },
+    );
 
     // Create the first admin agent with tenant_admin role
     const adminAgent = await provisionAgentWithApiKey(txSql, {
@@ -155,14 +167,16 @@ export async function provisionTenant(
       role: "tenant_admin",
     });
 
-    await txDb.insert(agentGroupMembers).values({
-      agentId: adminAgent.agent.id,
-      groupId: defaultAgentGroup.id,
-    });
+    await withTenantDrizzleScope(txSql, tenantSchemaName, async (tenantDb) => {
+      await tenantDb.insert(agentGroupMembers).values({
+        agentId: adminAgent.agent.id,
+        groupId: defaultAgentGroup.id,
+      });
 
-    await txDb.insert(userGroupAgentGroupPermissions).values({
-      userGroupId: defaultUserGroup.id,
-      agentGroupId: defaultAgentGroup.id,
+      await tenantDb.insert(userGroupAgentGroupPermissions).values({
+        userGroupId: defaultUserGroup.id,
+        agentGroupId: defaultAgentGroup.id,
+      });
     });
 
     await seedDefaultGeneralGuidance(

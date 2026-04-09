@@ -3,15 +3,17 @@ import type { NextAuthConfig, User, Profile } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import { desc, eq } from "drizzle-orm";
 import {
+  tenantSchemaNameFromId,
   tenantUsers,
   platformAdmins,
   platformOauthConfigs,
   tenantOauthConfigs,
   tenants,
+  withTenantDrizzleScope,
 } from "@monet/db";
 import { normalizeTenantSlug } from "@monet/types";
 import { redirect } from "next/navigation";
-import { db } from "./db";
+import { db, getSqlClient } from "./db";
 import { decrypt } from "./crypto";
 import { finalizePlatformInitialization } from "./bootstrap";
 import {
@@ -300,11 +302,15 @@ const result = NextAuth(async (req) => {
             .limit(1);
           if (!tenant) return null;
 
-          const [user] = await db
-            .select()
-            .from(tenantUsers)
-            .where(eq(tenantUsers.tenantId, tenant.id))
-            .limit(1);
+          const [user] = await withTenantDrizzleScope(
+            getSqlClient(),
+            tenantSchemaNameFromId(tenant.id),
+            async (tenantDb) => tenantDb
+              .select()
+              .from(tenantUsers)
+              .where(eq(tenantUsers.tenantId, tenant.id))
+              .limit(1),
+          );
           if (!user) return null;
 
           return {

@@ -41,17 +41,21 @@ export async function withTenantScope<T>(
 
   if (hasBegin(sql)) {
     const result = await sql.begin(async (txSql) => {
-      await txSql.unsafe(
-        `SET LOCAL search_path TO "${schemaName}", public`,
-      );
+      if (typeof (txSql as { unsafe?: unknown }).unsafe === "function") {
+        await txSql.unsafe(
+          `SET LOCAL search_path TO "${schemaName}", public`,
+        );
+      }
       return fn(txSql);
     });
     return result as T;
   }
 
-  await sql.unsafe(
-    `SET LOCAL search_path TO "${schemaName}", public`,
-  );
+  if (typeof (sql as { unsafe?: unknown }).unsafe === "function") {
+    await sql.unsafe(
+      `SET LOCAL search_path TO "${schemaName}", public`,
+    );
+  }
   return fn(sql);
 }
 

@@ -3,6 +3,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import * as platformSchema from "@monet/db/schema";
 import { createSqlClient, type SqlClient } from "@monet/db";
 import { createApp } from "../../../src/app";
+import { parseApiKey } from "../../../src/services/api-key.service";
 import { waitForEnrichmentDrain } from "../../../src/services/enrichment.service";
 import { provisionTenant } from "../../../src/services/tenant.service";
 import path from "node:path";
@@ -14,6 +15,68 @@ const TEST_DB_URL =
 let sql: SqlClient | null = null;
 let db: ReturnType<typeof drizzle>;
 let schemaReadyPromise: Promise<void> | null = null;
+const apiKeyTenantSlug = new Map<string, string>();
+const agentIdTenantSlug = new Map<string, string>();
+let lastKnownTenantSlug: string | null = null;
+
+function rememberTenantBinding(tenantSlug: string, apiKey?: string, agentId?: string) {
+  lastKnownTenantSlug = tenantSlug;
+  if (apiKey) apiKeyTenantSlug.set(apiKey, tenantSlug);
+  if (agentId) agentIdTenantSlug.set(agentId, tenantSlug);
+}
+
+function getHeader(headers: HeadersInit | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+
+  if (headers instanceof Headers) {
+    return headers.get(name) ?? undefined;
+  }
+
+  if (Array.isArray(headers)) {
+    const found = headers.find(([key]) => key.toLowerCase() === name.toLowerCase());
+    return found?.[1];
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name.toLowerCase()) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function resolveTenantSlugFromAuthHeader(authHeader: string | undefined): string | undefined {
+  if (!authHeader?.startsWith("Bearer ")) {
+    return undefined;
+  }
+
+  const token = authHeader.slice("Bearer ".length);
+  const mappedByToken = apiKeyTenantSlug.get(token);
+  if (mappedByToken) {
+    return mappedByToken;
+  }
+
+  const parsed = parseApiKey(token);
+  if (!parsed) {
+    return undefined;
+  }
+
+  return agentIdTenantSlug.get(parsed.agentId);
+}
+
+function resolveSingleKnownTenantSlug(): string | undefined {
+  const slugs = new Set<string>([
+    ...apiKeyTenantSlug.values(),
+    ...agentIdTenantSlug.values(),
+  ]);
+
+  if (slugs.size === 1) {
+    return [...slugs][0];
+  }
+
+  return lastKnownTenantSlug ?? undefined;
+}
 
 async function applyPreparedSchemaUpgrades(s: SqlClient) {
   await s.unsafe(`
@@ -395,7 +458,58 @@ export function getTestDb() {
 }
 
 export function getTestApp() {
-  return createApp(getTestDb() as unknown as Parameters<typeof createApp>[0], getTestSql());
+  const app = createApp(getTestDb() as unknown as Parameters<typeof createApp>[0], getTestSql());
+  const request = async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (typeof input !== "string") {
+      return app.request(input, init);
+    }
+
+    let path = input;
+
+    if (path.startsWith("/api/") && !path.startsWith("/api/tenants/") && !path.startsWith("/api/bootstrap")) {
+      const slug =
+        resolveTenantSlugFromAuthHeader(getHeader(init?.headers, "authorization"))
+        ?? resolveSingleKnownTenantSlug();
+      if (slug) {
+        path = `/api/tenants/${slug}${path.slice(4)}`;
+      }
+    }
+
+    if (path === "/mcp" || path.startsWith("/mcp?")) {
+      const slug =
+        resolveTenantSlugFromAuthHeader(getHeader(init?.headers, "authorization"))
+        ?? resolveSingleKnownTenantSlug();
+      if (slug) {
+        path = `/mcp/${slug}${path.slice(4)}`;
+      }
+    }
+
+    const response = await app.request(path, init);
+
+    const registerMatch = path.match(/^\/api\/tenants\/([^/]+)\/agents\/register(?:\?.*)?$/);
+    if (registerMatch && response.status === 201) {
+      try {
+        const payload = await response.clone().json() as {
+          apiKey?: string;
+          agent?: { id?: string };
+        };
+        rememberTenantBinding(registerMatch[1], payload.apiKey, payload.agent?.id);
+      } catch {
+        // ignore non-JSON payloads in tests
+      }
+    }
+
+    return response;
+  };
+
+  return new Proxy(app, {
+    get(target, prop, receiver) {
+      if (prop === "request") {
+        return request;
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
 }
 
 export async function provisionTestTenant(
@@ -408,19 +522,22 @@ export async function provisionTestTenant(
   await ensurePlatformSchemaReady();
 
   const result = await provisionTenant(getTestDb(), getTestSql(), input);
-  const [defaultMembership] = await getTestSql()`
-    SELECT group_id
-    FROM agent_group_members
-    WHERE agent_id = ${result.agent.id}
-    ORDER BY joined_at ASC, group_id ASC
-    LIMIT 1
-  `;
+  const schemaName = `tenant_${result.tenant.id.replace(/-/g, "_")}`;
+  const [defaultMembership] = await getTestSql().unsafe(
+    `SELECT group_id
+     FROM "${schemaName}".agent_group_members
+     WHERE agent_id = $1
+     ORDER BY joined_at ASC, group_id ASC
+     LIMIT 1`,
+    [result.agent.id],
+  );
   const body = {
     tenant: result.tenant,
     agent: result.agent,
     apiKey: result.rawApiKey,
     defaultGroupId: defaultMembership?.group_id as string | undefined,
   };
+  rememberTenantBinding(result.tenant.slug, result.rawApiKey, result.agent.id);
   const res = new Response(JSON.stringify(body), {
     status: 201,
     headers: {
@@ -435,6 +552,9 @@ export async function cleanupTestData() {
   // Give background enrichment jobs a chance to finish before dropping schemas.
   await waitForEnrichmentDrain(5_000);
   await ensurePlatformSchemaReady();
+  apiKeyTenantSlug.clear();
+  agentIdTenantSlug.clear();
+  lastKnownTenantSlug = null;
 
   const s = getTestSql();
 

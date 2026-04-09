@@ -2,17 +2,13 @@ import {
   agentGroupMembers,
   agentGroups,
   agents,
-  asDrizzleSqlClient,
+  tenantSchemaNameFromId,
   tenantUsers,
   type SqlClient,
-  type TransactionClient,
+  withTenantDrizzleScope,
 } from "@monet/db";
 import { and, asc, eq } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/postgres-js";
 import type { AgentContext } from "../middleware/context";
-
-type GroupSqlClient = SqlClient | TransactionClient;
-type GroupDrizzleOptions = NonNullable<SqlClient["options"]>;
 
 // ---------- Role helpers ----------
 
@@ -30,12 +26,12 @@ export async function resolveAgentRole(
 
   // Fall back to the linked user's role
   if (agent.userId) {
-    const db = createGroupDb(sql);
-    const [user] = await db
+    const schemaName = tenantSchemaNameFromId(agent.tenantId);
+    const [user] = await withTenantDrizzleScope(sql, schemaName, async (db) => db
       .select({ role: tenantUsers.role })
       .from(tenantUsers)
-      .where(eq(tenantUsers.id, agent.userId))
-      .limit(1);
+      .where(eq(tenantUsers.id, agent.userId!))
+      .limit(1));
     if (user) return user.role;
   }
 
@@ -52,13 +48,6 @@ export function isGroupAdminOrAbove(role: string | null): boolean {
 
 function formatTimestamp(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : String(value);
-}
-
-function createGroupDb(
-  sql: GroupSqlClient,
-  options?: GroupDrizzleOptions,
-) {
-  return drizzle(asDrizzleSqlClient(sql, options));
 }
 
 function mapGroupRecord(group: {
@@ -86,8 +75,8 @@ export async function createGroup(
   tenantId: string,
   input: { name: string; description?: string; memoryQuota?: number },
 ) {
-  const db = drizzle(sql);
-  const [group] = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const [group] = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .insert(agentGroups)
     .values({
       tenantId,
@@ -95,7 +84,7 @@ export async function createGroup(
       description: input.description ?? "",
       memoryQuota: input.memoryQuota ?? null,
     })
-    .returning();
+    .returning());
 
   return mapGroupRecord(group);
 }
@@ -106,41 +95,43 @@ export async function updateGroup(
   groupId: string,
   input: { name?: string; description?: string; memoryQuota?: number | null },
 ) {
-  const db = drizzle(sql);
-  const [existing] = await db
-    .select()
-    .from(agentGroups)
-    .where(
-      and(
-        eq(agentGroups.id, groupId),
-        eq(agentGroups.tenantId, tenantId),
-      ),
-    )
-    .limit(1);
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const [existing] = await db
+      .select()
+      .from(agentGroups)
+      .where(
+        and(
+          eq(agentGroups.id, groupId),
+          eq(agentGroups.tenantId, tenantId),
+        ),
+      )
+      .limit(1);
 
-  if (!existing) {
-    return { error: "not_found" as const, message: "Group not found" };
-  }
+    if (!existing) {
+      return { error: "not_found" as const, message: "Group not found" };
+    }
 
-  const [group] = await db
-    .update(agentGroups)
-    .set({
-      name: input.name ?? existing.name,
-      description: input.description ?? existing.description ?? "",
-      memoryQuota:
-        input.memoryQuota !== undefined
-          ? input.memoryQuota
-          : existing.memoryQuota,
-    })
-    .where(
-      and(
-        eq(agentGroups.id, groupId),
-        eq(agentGroups.tenantId, tenantId),
-      ),
-    )
-    .returning();
+    const [group] = await db
+      .update(agentGroups)
+      .set({
+        name: input.name ?? existing.name,
+        description: input.description ?? existing.description ?? "",
+        memoryQuota:
+          input.memoryQuota !== undefined
+            ? input.memoryQuota
+            : existing.memoryQuota,
+      })
+      .where(
+        and(
+          eq(agentGroups.id, groupId),
+          eq(agentGroups.tenantId, tenantId),
+        ),
+      )
+      .returning();
 
-  return mapGroupRecord(group);
+    return mapGroupRecord(group);
+  });
 }
 
 export async function addMember(
@@ -149,8 +140,8 @@ export async function addMember(
   groupId: string,
   agentId: string,
 ) {
-  return sql.begin(async (tx) => {
-    const db = createGroupDb(tx, sql.options);
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
 
     // Verify group belongs to this tenant.
     const [group] = await db
@@ -229,7 +220,8 @@ export async function removeMember(
   groupId: string,
   agentId: string,
 ) {
-  const db = createGroupDb(sql);
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
 
   // Verify group belongs to this tenant
   const [group] = await db
@@ -285,19 +277,20 @@ export async function removeMember(
       ),
     );
 
-  return { success: true };
+    return { success: true };
+  });
 }
 
 export async function listGroups(
   sql: SqlClient,
   tenantId: string,
 ) {
-  const db = drizzle(sql);
-  const groups = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const groups = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .select()
     .from(agentGroups)
     .where(eq(agentGroups.tenantId, tenantId))
-    .orderBy(asc(agentGroups.createdAt));
+    .orderBy(asc(agentGroups.createdAt)));
 
   return groups.map(mapGroupRecord);
 }
@@ -307,7 +300,8 @@ export async function listGroupMembers(
   tenantId: string,
   groupId: string,
 ) {
-  const db = createGroupDb(sql);
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => {
 
   // Verify group belongs to tenant
   const [group] = await db
@@ -346,8 +340,8 @@ export async function listGroupMembers(
     .where(eq(agentGroupMembers.groupId, groupId))
     .orderBy(asc(agentGroupMembers.joinedAt));
 
-  return {
-    members: members.map((member) => {
+    return {
+      members: members.map((member) => {
       const ownerLabel =
         member.ownerDisplayName ??
         member.ownerEmail ??
@@ -379,6 +373,7 @@ export async function listGroupMembers(
             : null,
         createdAt: formatTimestamp(member.createdAt),
       };
-    }),
-  };
+      }),
+    };
+  });
 }

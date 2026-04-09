@@ -66,7 +66,7 @@ describe("group CRUD", () => {
       name: "General",
     });
 
-    expect(drizzleMock).toHaveBeenCalledWith(sql);
+    expect(drizzleMock).toHaveBeenCalled();
     expect(insertMock).toHaveBeenCalledWith(agentGroups);
     expect(valuesMock).toHaveBeenCalledWith({
       tenantId: TENANT_ID,

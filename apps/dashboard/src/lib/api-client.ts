@@ -15,8 +15,9 @@ import {
   MetricsResponse,
 } from "@monet/types";
 import { auth } from "./auth";
-import { db } from "./db";
-import { tenantUsers } from "@monet/db";
+import { db, getSqlClient } from "./db";
+import { tenantSchemaNameFromId, tenantUsers, withTenantDrizzleScope } from "@monet/db";
+import { tenants } from "@monet/db";
 import { eq } from "drizzle-orm";
 import { decrypt } from "./crypto";
 import { ensureDashboardAgent, syncDashboardAgentRole } from "./dashboard-agent";
@@ -28,19 +29,29 @@ import {
 export interface ApiClientOptions {
   baseUrl: string;
   apiKey: string;
+  tenantSlug: string;
 }
 
 export class MonetApiClient {
   private baseUrl: string;
   private apiKey: string;
+  private tenantSlug: string;
 
   constructor(options: ApiClientOptions) {
     this.baseUrl = options.baseUrl;
     this.apiKey = options.apiKey;
+    this.tenantSlug = options.tenantSlug;
+  }
+
+  getTenantSlug() {
+    return this.tenantSlug;
   }
 
   private async fetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
+    const normalizedPath = path.startsWith("/api/")
+      ? `/api/tenants/${this.tenantSlug}/${path.slice(5)}`
+      : path;
+    const url = `${this.baseUrl}${normalizedPath}`;
     const response = await fetch(url, {
       ...options,
       headers: {
@@ -424,28 +435,32 @@ export async function getApiClient() {
   if (!sessionUser.tenantId) {
     throw new Error("Tenant ID not found in session");
   }
+  const userId = sessionUser.id;
+  const tenantId = sessionUser.tenantId;
+
+  const tenantSchemaName = tenantSchemaNameFromId(tenantId);
 
   // Fetch the user record to get the encrypted dashboard API key.
-  let userRows = await db
+  let userRows = await withTenantDrizzleScope(getSqlClient(), tenantSchemaName, async (tenantDb) => tenantDb
     .select({ dashboardApiKeyEncrypted: tenantUsers.dashboardApiKeyEncrypted })
     .from(tenantUsers)
-    .where(eq(tenantUsers.id, sessionUser.id))
-    .limit(1);
+    .where(eq(tenantUsers.id, userId))
+    .limit(1));
 
   // Only run the full ensureDashboardAgent setup when the key is missing (first
   // visit or after a credential reset).  This avoids 5+ DB queries on every
   // single API call just to confirm nothing changed.  A lightweight 1-query
   // role sync always runs to keep RBAC current.
   if (userRows.length === 0 || !userRows[0].dashboardApiKeyEncrypted) {
-    await ensureDashboardAgent(sessionUser.id, sessionUser.id, sessionUser.tenantId);
-    userRows = await db
+    await ensureDashboardAgent(userId, userId, tenantId);
+    userRows = await withTenantDrizzleScope(getSqlClient(), tenantSchemaName, async (tenantDb) => tenantDb
       .select({ dashboardApiKeyEncrypted: tenantUsers.dashboardApiKeyEncrypted })
       .from(tenantUsers)
-      .where(eq(tenantUsers.id, sessionUser.id))
-      .limit(1);
+      .where(eq(tenantUsers.id, userId))
+      .limit(1));
   } else {
     // Hot path: 1-query role sync keeps RBAC current without the full setup cost.
-    await syncDashboardAgentRole(sessionUser.id);
+    await syncDashboardAgentRole(userId, tenantId);
   }
 
   if (userRows.length === 0 || !userRows[0].dashboardApiKeyEncrypted) {
@@ -454,9 +469,19 @@ export async function getApiClient() {
 
   const apiKey = decrypt(userRows[0].dashboardApiKeyEncrypted);
   const apiUrl = process.env.INTERNAL_API_URL || "http://localhost:3001";
+  const tenantRows = await db
+    .select({ slug: tenants.slug })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+
+  if (tenantRows.length === 0) {
+    throw new Error("Tenant not found");
+  }
 
   return new MonetApiClient({
     baseUrl: apiUrl,
     apiKey,
+    tenantSlug: tenantRows[0].slug,
   });
 }
