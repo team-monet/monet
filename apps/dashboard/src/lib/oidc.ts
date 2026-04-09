@@ -96,26 +96,18 @@ export function resolveOidcIssuerForBrowser(issuer: string) {
 export async function fetchOidcDiscoveryDocument(
   issuer: string,
 ): Promise<OidcDiscoveryDocument> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  const response = await fetch(
+    `${resolveOidcIssuerForServer(issuer)}/.well-known/openid-configuration`,
+    {
+      cache: "no-store",
+    },
+  );
 
-  try {
-    const response = await fetch(
-      `${resolveOidcIssuerForServer(issuer)}/.well-known/openid-configuration`,
-      {
-        cache: "no-store",
-        signal: controller.signal,
-      },
-    );
-
-    if (!response.ok) {
-      throw new Error(`OIDC discovery failed with ${response.status}`);
-    }
-
-    return await response.json() as OidcDiscoveryDocument;
-  } finally {
-    clearTimeout(timeout);
+  if (!response.ok) {
+    throw new Error(`OIDC discovery failed with ${response.status}`);
   }
+
+  return response.json() as Promise<OidcDiscoveryDocument>;
 }
 
 export function getOidcExampleIssuer(realm: string) {
@@ -185,26 +177,17 @@ export async function validateOidcClientConfig(
     throw new Error("OIDC discovery document is missing token_endpoint");
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-
-  let response;
-  try {
-    response = await fetch(tokenEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: input.clientId,
-        client_secret: input.clientSecret,
-        grant_type: "authorization_code",
-        code: "monet-client-config-validation",
-        redirect_uri: `${getDashboardBaseUrl()}${input.callbackPath}`,
-      }),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
+  const response = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: input.clientId,
+      client_secret: input.clientSecret,
+      grant_type: "authorization_code",
+      code: "monet-client-config-validation",
+      redirect_uri: `${getDashboardBaseUrl()}${input.callbackPath}`,
+    }),
+  });
 
   const payload = (await response.json().catch(() => null)) as
     | { error?: string; error_description?: string }

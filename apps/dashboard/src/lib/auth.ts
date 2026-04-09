@@ -270,25 +270,6 @@ const authSecret =
   process.env.AUTH_SECRET ??
   process.env.NEXTAUTH_SECRET;
 
-const PROVIDER_CONFIG_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const providerConfigCache = new Map<
-  string,
-  { data: Awaited<ReturnType<typeof resolveOidcProviderConfig>>; expiresAt: number }
->();
-
-async function getCachedProviderConfig(issuer: string) {
-  const cached = providerConfigCache.get(issuer);
-  if (cached && Date.now() < cached.expiresAt) {
-    return cached.data;
-  }
-  const config = await resolveOidcProviderConfig(issuer);
-  providerConfigCache.set(issuer, {
-    data: config,
-    expiresAt: Date.now() + PROVIDER_CONFIG_CACHE_TTL,
-  });
-  return config;
-}
-
 const result = NextAuth(async (req) => {
   if (!authSecret) {
     throw new Error(
@@ -359,7 +340,7 @@ const result = NextAuth(async (req) => {
   }
 
   if (platformConfig) {
-    const platformOidc = await getCachedProviderConfig(platformConfig.issuer);
+    const platformOidc = await resolveOidcProviderConfig(platformConfig.issuer);
     providers.push({
       id: "platform-oauth",
       name: "Monet Platform",
@@ -416,7 +397,7 @@ const result = NextAuth(async (req) => {
       }
 
       if (config) {
-        const tenantOidc = await getCachedProviderConfig(config.issuer);
+        const tenantOidc = await resolveOidcProviderConfig(config.issuer);
         providers.push({
           id: "tenant-oauth",
           name: tenant.name,

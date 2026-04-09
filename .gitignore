@@ -15,3 +15,4 @@ apps/api/.local-dev/
 *.log
 .omc
 .env.runtime
+.claude
