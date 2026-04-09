@@ -17,7 +17,6 @@ import {
   desc,
   eq,
   isNotNull,
-  ilike,
   lt,
   or,
   sql as drizzleSql,
@@ -91,16 +90,23 @@ interface SearchCursorPayload {
   createdAt: string;
   id: string;
   rank?: number;
+  offset?: number;
 }
 
-export function encodeCursor(createdAt: string, id: string, rank?: number): string {
-  return Buffer.from(JSON.stringify({ createdAt, id, rank })).toString("base64url");
+export function encodeCursor(
+  createdAt: string,
+  id: string,
+  rank?: number,
+  offset?: number,
+): string {
+  return Buffer.from(JSON.stringify({ createdAt, id, rank, offset })).toString("base64url");
 }
 
 const SearchCursorSchema = z.object({
   createdAt: z.string(),
   id: z.string(),
   rank: z.number().optional(),
+  offset: z.number().int().nonnegative().optional(),
 });
 
 export function decodeCursor(cursor: string): SearchCursorPayload | null {
@@ -265,13 +271,23 @@ function buildSearchRankExpression(
 }
 
 function buildLexicalQueryCondition(queryText: string): SQL<unknown> {
-  const likePattern = `%${queryText}%`;
-  return or(
-    ilike(memoryEntries.content, likePattern),
-    ilike(memoryEntries.summary, likePattern),
-    drizzleSql`array_to_string(${memoryEntries.tags}, ' ') ILIKE ${likePattern}`,
-    drizzleSql`array_to_string(${memoryEntries.autoTags}, ' ') ILIKE ${likePattern}`,
-  )!;
+  const lexicalRankExpression = buildLexicalMatchCountExpression(queryText);
+  return drizzleSql`${lexicalRankExpression} > 0`;
+}
+
+function buildLexicalMatchCountExpression(queryText: string): SQL<number> {
+  const likePattern = `%${escapeLike(queryText)}%`;
+
+  return drizzleSql<number>`(
+    CASE WHEN ${memoryEntries.content} ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END +
+    CASE WHEN ${memoryEntries.summary} ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END +
+    CASE WHEN COALESCE(array_to_string(${memoryEntries.tags}, ' '), '') ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END +
+    CASE WHEN COALESCE(array_to_string(${memoryEntries.autoTags}, ' '), '') ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END
+  )`;
+}
+
+function escapeLike(text: string): string {
+  return text.replace(/[%_\\]/g, "\\$&");
 }
 
 function buildSearchCursorCondition(
@@ -438,6 +454,10 @@ export async function searchMemories(
   const db = createMemoryDb(txSql);
   const limit = query.limit ?? 20;
   const rankExpression = buildSearchRankExpression(queryEmbedding);
+  const lexicalRankExpression = query.query
+    ? buildLexicalMatchCountExpression(query.query)
+    : null;
+  const hybridSearch = Boolean(queryEmbedding && lexicalRankExpression);
   const baseConditions: SQL<unknown>[] = [
     buildScopeFilterCondition(agent, {
       includeUser: query.includeUser ?? false,
@@ -482,15 +502,15 @@ export async function searchMemories(
   }
 
   const decodedCursor = query.cursor ? decodeCursor(query.cursor) : null;
-  if (decodedCursor) {
-    const cursorCondition = queryEmbedding && lexicalCondition
-      ? buildCreatedAtCursorCondition(decodedCursor)
-      : buildSearchCursorCondition(rankExpression, decodedCursor);
+  if (decodedCursor && !hybridSearch) {
+    const cursorCondition = buildSearchCursorCondition(rankExpression, decodedCursor);
     baseConditions.push(cursorCondition);
   }
 
-  if (queryEmbedding && lexicalCondition) {
-    const candidateLimit = Math.max(limit + 1, Math.min((limit + 1) * 3, 300));
+  if (hybridSearch && lexicalCondition && lexicalRankExpression) {
+    const pageOffset = decodedCursor?.offset ?? 0;
+    const pageWindow = pageOffset + limit + 1;
+    const candidateLimit = Math.max(pageWindow, Math.min(pageWindow * 3, 3000));
 
     const semanticRows = await db
       .select({
@@ -511,14 +531,14 @@ export async function searchMemories(
     const lexicalRows = await db
       .select({
         ...MEMORY_ENTRY_WITH_AUTHOR_SELECT,
-        search_rank: rankExpression,
+        search_rank: lexicalRankExpression,
       })
       .from(memoryEntries)
       .leftJoin(agents, eq(agents.id, memoryEntries.authorAgentId))
       .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
       .where(and(...baseConditions, lexicalCondition))
       .orderBy(
-        drizzleSql`${rankExpression} DESC NULLS LAST`,
+        drizzleSql`${lexicalRankExpression} DESC NULLS LAST`,
         desc(memoryEntries.createdAt),
         desc(memoryEntries.id),
       )
@@ -582,7 +602,7 @@ export async function searchMemories(
         return (b.row.id as string).localeCompare(a.row.id as string);
       });
 
-    const pageRows = fusedRows.slice(0, limit + 1);
+    const pageRows = fusedRows.slice(pageOffset, pageOffset + limit + 1);
     const hasMore = pageRows.length > limit;
     const items = pageRows.slice(0, limit).map((entry) => mapTier1Row(entry.row));
 
@@ -592,7 +612,8 @@ export async function searchMemories(
       nextCursor = encodeCursor(
         asTimestamp(last.row.created_at),
         last.row.id as string,
-        last.score,
+        undefined,
+        pageOffset + limit,
       );
     }
 
@@ -759,6 +780,20 @@ export async function updateMemory(
   const contentChanged = input.content !== undefined && input.content !== (entry.content as string);
   const tagsChanged = input.tags !== undefined && !stringArraysEqual(input.tags, entry.tags as string[]);
   const needsEnrichment = contentChanged || tagsChanged;
+  const enrichmentReset = contentChanged
+    ? {
+        summary: null,
+        autoTags: [],
+        embedding: null,
+        relatedMemoryIds: [],
+        enrichmentStatus: "pending" as const,
+      }
+    : tagsChanged
+      ? {
+          autoTags: [],
+          enrichmentStatus: "pending" as const,
+        }
+      : {};
   const [updated] = await db
     .update(memoryEntries)
     .set({
@@ -766,15 +801,7 @@ export async function updateMemory(
       tags: newTags,
       version: newVersion,
       lastAccessedAt: drizzleSql`NOW()`,
-      ...(needsEnrichment
-        ? {
-            summary: null,
-            autoTags: [],
-            embedding: null,
-            relatedMemoryIds: [],
-            enrichmentStatus: "pending" as const,
-          }
-        : {}),
+      ...(needsEnrichment ? enrichmentReset : {}),
     })
     .where(
       and(
@@ -1018,12 +1045,15 @@ function asTimestamp(value: unknown): string {
 }
 
 function stringArraysEqual(left: string[], right: string[]): boolean {
-  if (left.length !== right.length) {
+  const leftNormalized = [...new Set(left)].sort();
+  const rightNormalized = [...new Set(right)].sort();
+
+  if (leftNormalized.length !== rightNormalized.length) {
     return false;
   }
 
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) {
+  for (let index = 0; index < leftNormalized.length; index += 1) {
+    if (leftNormalized[index] !== rightNormalized[index]) {
       return false;
     }
   }

@@ -508,6 +508,205 @@ describe("updateMemory", () => {
       currentVersion: 4,
     });
   });
+
+  it("does not trigger enrichment for tag reordering only", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000510",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops", "docs"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({
+      limit: entryLimitMock,
+    }));
+    const entryFromMock = vi.fn(() => ({
+      where: entryWhereMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: entryFromMock,
+    }));
+
+    const returningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000510",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["docs", "ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 4,
+      },
+    ]);
+    const updateWhereMock = vi.fn(() => ({
+      returning: returningMock,
+    }));
+    const updateSetMock = vi.fn(() => ({
+      where: updateWhereMock,
+    }));
+    const updateMock = vi.fn(() => ({
+      set: updateSetMock,
+    }));
+
+    const memoryVersionInsertMock = vi.fn().mockResolvedValue(undefined);
+    const auditInsertMock = vi.fn().mockResolvedValue(undefined);
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: memoryVersionInsertMock })
+      .mockReturnValueOnce({ values: auditInsertMock });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+      insert: insertMock,
+    });
+
+    const result = await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000510",
+      {
+        tags: ["docs", "ops"],
+        expectedVersion: 3,
+      },
+    );
+
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        enrichmentStatus: "pending",
+      }),
+    );
+    expect(result).toMatchObject({ needsEnrichment: false });
+  });
+
+  it("keeps summary and embedding for tag-only updates", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000511",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({
+      limit: entryLimitMock,
+    }));
+    const entryFromMock = vi.fn(() => ({
+      where: entryWhereMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: entryFromMock,
+    }));
+
+    const returningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000511",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops", "new"],
+        auto_tags: [],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 4,
+      },
+    ]);
+    const updateWhereMock = vi.fn(() => ({
+      returning: returningMock,
+    }));
+    const updateSetMock = vi.fn(() => ({
+      where: updateWhereMock,
+    }));
+    const updateMock = vi.fn(() => ({
+      set: updateSetMock,
+    }));
+
+    const memoryVersionInsertMock = vi.fn().mockResolvedValue(undefined);
+    const auditInsertMock = vi.fn().mockResolvedValue(undefined);
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: memoryVersionInsertMock })
+      .mockReturnValueOnce({ values: auditInsertMock });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+      insert: insertMock,
+    });
+
+    const result = await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000511",
+      {
+        tags: ["ops", "new"],
+        expectedVersion: 3,
+      },
+    );
+
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        autoTags: [],
+        enrichmentStatus: "pending",
+      }),
+    );
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        summary: null,
+        embedding: null,
+      }),
+    );
+    expect(result).toMatchObject({ needsEnrichment: true });
+  });
 });
 
 describe("deleteMemory", () => {
@@ -996,6 +1195,7 @@ describe("searchMemories", () => {
     ]);
     expect(decodeCursor(result.nextCursor!)).toMatchObject({
       id: "00000000-0000-0000-0000-000000000805",
+      offset: 2,
     });
   });
 });
