@@ -7,6 +7,13 @@ ENV TURBO_TELEMETRY_DISABLED=1
 RUN corepack enable
 WORKDIR /app
 
+FROM node:22-bookworm-slim AS api-base
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+ENV TURBO_TELEMETRY_DISABLED=1
+RUN corepack enable
+WORKDIR /app
+
 FROM base AS workspace-manifests
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json ./
 COPY apps/api/package.json apps/api/package.json
@@ -30,7 +37,7 @@ FROM workspace-deps AS migrate-build
 COPY . .
 RUN pnpm turbo build --filter=@monet/db
 
-FROM base AS api-prod-deps
+FROM api-base AS api-prod-deps
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/api/package.json apps/api/package.json
 COPY packages/db/package.json packages/db/package.json
@@ -44,7 +51,7 @@ COPY packages/db/package.json packages/db/package.json
 COPY packages/types/package.json packages/types/package.json
 RUN pnpm install --frozen-lockfile --prod --filter @monet/db...
 
-FROM node:22-alpine AS api-runtime
+FROM node:22-bookworm-slim AS api-runtime
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=api-prod-deps /app/node_modules /app/node_modules

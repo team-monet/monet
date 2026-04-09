@@ -29,7 +29,7 @@ x-monet-api-env: &monet_api_env
   EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
   EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
   OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama-shared:11434}
-  OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:7b}
+  OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:3b}
   OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:4b}
   ONNX_EMBEDDING_MODEL: ${ONNX_EMBEDDING_MODEL:-Snowflake/snowflake-arctic-embed-l-v2.0}
   ONNX_QUANTIZED: ${ONNX_QUANTIZED:-}
@@ -97,7 +97,7 @@ services:
     ports:
       - "${API_PORT:-4301}:${API_PORT:-4301}"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${API_PORT:-4301}/health/ready >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:' + (process.env.API_PORT || '4301') + '/health/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -156,7 +156,7 @@ services:
     ports:
       - "${DASHBOARD_PORT:-4310}:3000"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/login >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/login').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 10s
       timeout: 5s
       retries: 6
