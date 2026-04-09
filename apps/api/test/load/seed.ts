@@ -55,8 +55,24 @@ async function requestJson<T>(
   init: RequestInit,
 ): Promise<{ status: number; body: T }> {
   const res = await fetch(url, init);
-  const body = (await res.json()) as T;
-  return { status: res.status, body };
+  
+  // Get response text first to handle non-JSON gracefully
+  const responseText = await res.text();
+  
+  try {
+    const body = JSON.parse(responseText) as T;
+    return { status: res.status, body };
+  } catch (parseError) {
+    // Provide detailed error context when JSON parsing fails
+    const truncatedText = responseText.length > 500 
+      ? `${responseText.slice(0, 500)}... [truncated]` 
+      : responseText;
+    throw new Error(
+      `Failed to parse JSON response from ${url}: ${parseError instanceof Error ? parseError.message : String(parseError)}\n` +
+      `HTTP ${res.status} ${res.statusText}\n` +
+      `Response body: ${truncatedText || '(empty)'}`
+    );
+  }
 }
 
 function tenantSchemaName(tenantId: string): string {
@@ -83,6 +99,7 @@ async function main() {
   try {
     const tenantResult = await provisionTenant(db, platformSql, { name: tenantName });
     const tenantId = tenantResult.tenant.id;
+    const tenantSlug = tenantResult.tenant.slug;
     const bootstrapApiKey = tenantResult.rawApiKey;
     const bootstrapAgentId = tenantResult.agent.id;
     const groupIds: string[] = [];
