@@ -18,6 +18,8 @@ export interface McpSession {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   agentContext: AgentContext;
+  tenantId?: string;
+  tenantSlug?: string;
   tenantSchemaName: string;
   connectedAt: Date;
   lastActivityAt: Date;

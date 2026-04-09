@@ -1,4 +1,6 @@
 import { Hono } from "hono";
+import { eq } from "drizzle-orm";
+import { tenantUsers, withTenantDrizzleScope } from "@monet/db";
 import type { AppEnv } from "../middleware/context";
 import {
   resolveAgentRole,
@@ -304,6 +306,7 @@ groupsRouter.post("/:id/members", async (c) => {
 groupsRouter.post("/users/:userId/admin", async (c) => {
   const agent = c.get("agent");
   const sql = c.get("sql");
+  const schemaName = c.get("tenantSchemaName");
   const userId = c.req.param("userId");
 
   const role = await resolveAgentRole(sql, agent);
@@ -318,16 +321,21 @@ groupsRouter.post("/users/:userId/admin", async (c) => {
   }
 
   // Verify user belongs to this tenant
-  const [user] = await sql`
-    SELECT id, role FROM users WHERE id = ${userId} AND tenant_id = ${agent.tenantId}
-  `;
+  const [user] = await withTenantDrizzleScope(sql, schemaName, async (db) => db
+    .select({ id: tenantUsers.id, role: tenantUsers.role })
+    .from(tenantUsers)
+    .where(eq(tenantUsers.id, userId))
+    .limit(1));
   if (!user) {
     return c.json({ error: "not_found", message: "User not found" }, 404);
   }
 
-  await sql`
-    UPDATE users SET role = ${parsed.data.role} WHERE id = ${userId}
-  `;
+  await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    await db
+      .update(tenantUsers)
+      .set({ role: parsed.data.role })
+      .where(eq(tenantUsers.id, userId));
+  });
 
   return c.json({ success: true, userId, role: parsed.data.role });
 });

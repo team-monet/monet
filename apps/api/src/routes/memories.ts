@@ -38,7 +38,7 @@ memoriesRouter.post("/", async (c) => {
     );
   }
 
-  const preflight = await resolveMemoryWritePreflight(sql, agent);
+  const preflight = await resolveMemoryWritePreflight(sql, schemaName, agent);
 
   const result = await withTenantScope(sql, schemaName, (txSql) =>
     createMemory(txSql, agent, parsed.data, preflight),

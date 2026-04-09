@@ -1,7 +1,36 @@
 import { z } from "zod";
 
 export const TENANT_SLUG_MAX_LENGTH = 63;
-export const tenantSlugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+export const TENANT_SLUG_MIN_LENGTH = 3;
+export const tenantSlugPattern = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
+export const RESERVED_TENANT_SLUGS = new Set([
+  "api",
+  "mcp",
+  "health",
+  "setup",
+  "admin",
+  "platform",
+]);
+
+export const TENANT_SLUG_FORMAT_MESSAGE =
+  "Slug must be 3-63 lowercase letters, numbers, and hyphens, starting with a letter";
+
+export function validateTenantSlug(value: string) {
+  const slug = value.trim();
+  if (slug.length < TENANT_SLUG_MIN_LENGTH || slug.length > TENANT_SLUG_MAX_LENGTH) {
+    return TENANT_SLUG_FORMAT_MESSAGE;
+  }
+  if (!tenantSlugPattern.test(slug)) {
+    return TENANT_SLUG_FORMAT_MESSAGE;
+  }
+  if (slug.includes("--")) {
+    return "Slug cannot contain consecutive hyphens";
+  }
+  if (RESERVED_TENANT_SLUGS.has(slug)) {
+    return "Slug is reserved. Choose another slug";
+  }
+  return null;
+}
 
 export function normalizeTenantSlug(value: string) {
   return value
@@ -22,12 +51,15 @@ export function slugifyTenantName(name: string) {
 export const TenantSlug = z
   .string()
   .trim()
-  .min(2, "Tenant slug is required")
+  .min(TENANT_SLUG_MIN_LENGTH, TENANT_SLUG_FORMAT_MESSAGE)
   .max(TENANT_SLUG_MAX_LENGTH, `Tenant slug must be ${TENANT_SLUG_MAX_LENGTH} characters or fewer`)
-  .regex(
-    tenantSlugPattern,
-    "Tenant slug must use lowercase letters, numbers, and hyphens only",
-  );
+  .regex(tenantSlugPattern, TENANT_SLUG_FORMAT_MESSAGE)
+  .refine((slug) => !slug.includes("--"), {
+    message: "Slug cannot contain consecutive hyphens",
+  })
+  .refine((slug) => !RESERVED_TENANT_SLUGS.has(slug), {
+    message: "Slug is reserved. Choose another slug",
+  });
 
 export const CreateTenantInput = z.object({
   name: z.string().min(1, "Tenant name is required").max(255),

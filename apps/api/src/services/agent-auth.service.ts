@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
-import type { Database } from "@monet/db";
-import { agents } from "@monet/db/schema";
+import type { SqlClient } from "@monet/db";
+import { agents, withTenantDrizzleScope } from "@monet/db";
 import type { AgentContext } from "../middleware/context";
 import { parseApiKey, validateApiKey } from "./api-key.service";
 
@@ -36,8 +36,9 @@ export function extractBearerToken(
 }
 
 export async function authenticateAgentFromBearerToken(
-  db: Database,
+  sql: SqlClient,
   authHeader: string | undefined,
+  tenant?: { tenantId: string; tenantSchemaName: string },
 ): Promise<AuthenticationResult> {
   const token = extractBearerToken(authHeader);
   if (!token.ok) {
@@ -63,11 +64,25 @@ export async function authenticateAgentFromBearerToken(
     };
   }
 
-  const agentRows = await db
-    .select()
-    .from(agents)
-    .where(eq(agents.id, parsed.agentId))
-    .limit(1);
+  if (!tenant) {
+    return {
+      ok: false,
+      status: 401,
+      error: "unauthorized",
+      message: "Tenant context is required",
+    };
+  }
+
+  const agentRows = await withTenantDrizzleScope(
+    sql,
+    tenant.tenantSchemaName,
+    async (tenantDb) =>
+      tenantDb
+        .select()
+        .from(agents)
+        .where(eq(agents.id, parsed.agentId))
+        .limit(1),
+  );
 
   if (agentRows.length === 0) {
     return {
@@ -105,7 +120,7 @@ export async function authenticateAgentFromBearerToken(
     agent: {
       id: agent.id,
       externalId: agent.externalId,
-      tenantId: agent.tenantId,
+      tenantId: tenant?.tenantId ?? agent.tenantId,
       isAutonomous: agent.isAutonomous,
       userId: agent.userId ?? null,
       role: agent.role ?? null,

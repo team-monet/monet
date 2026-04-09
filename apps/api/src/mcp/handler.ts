@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { performance } from "node:perf_hooks";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { Database, SqlClient } from "@monet/db";
+import { tenantSchemaNameFromId, type Database, type SqlClient } from "@monet/db";
 import { checkRateLimit } from "../middleware/rate-limit";
-import { tenantSchemaName } from "../middleware/tenant";
+import { resolveTenantBySlug } from "../middleware/tenant";
 import { authenticateAgentFromBearerToken } from "../services/agent-auth.service";
 import { pushRulesToAgent } from "../services/rule-notification.service";
 import { getActiveRulesForAgent } from "../services/rule.service";
@@ -31,6 +31,11 @@ function requestPath(req: IncomingMessage): string {
   } catch {
     return "/mcp";
   }
+}
+
+function tenantSlugFromPath(path: string): string | null {
+  const match = path.match(/^\/mcp\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 function writeJson(
@@ -70,10 +75,21 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
       }
 
       try {
+        const requestedTenantSlug = tenantSlugFromPath(path);
+        const tenant = requestedTenantSlug
+          ? await resolveTenantBySlug(db, requestedTenantSlug)
+          : null;
+        if (requestedTenantSlug && !tenant) {
+          writeJson(res, 404, { error: "not_found", message: "Tenant not found" });
+          return;
+        }
+        tenantId = tenant?.tenantId;
+
         if (method === "POST") {
           const auth = await authenticateAgentFromBearerToken(
-            db,
+            sql,
             headerValue(req.headers.authorization),
+            tenant ?? undefined,
           );
           if (!auth.ok) {
             writeJson(res, auth.status, {
@@ -83,7 +99,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             return;
           }
           agentId = auth.agent.id;
-          tenantId = auth.agent.tenantId;
+          tenantId = tenantId ?? auth.agent.tenantId;
 
           const limit = checkRateLimit(auth.agent.id);
           if (!limit.allowed) {
@@ -100,7 +116,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           if (!sessionId) {
             const newSessionId = randomUUID();
-            const schemaName = tenantSchemaName(auth.agent.tenantId);
+            const schemaName = tenant?.tenantSchemaName ?? tenantSchemaNameFromId(auth.agent.tenantId);
             const activeRules = await getActiveRulesForAgent(sql, schemaName, auth.agent.id);
             const transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => newSessionId,
@@ -129,6 +145,8 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
                 transport,
                 server,
                 agentContext: auth.agent,
+                tenantId: tenant?.tenantId ?? auth.agent.tenantId,
+                tenantSlug: requestedTenantSlug ?? undefined,
                 tenantSchemaName: schemaName,
                 connectedAt: new Date(),
                 lastActivityAt: new Date(),
@@ -177,6 +195,14 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             return;
           }
 
+          const sessionTenantMatches = session.tenantSlug
+            ? session.tenantSlug === requestedTenantSlug
+            : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
+          if (requestedTenantSlug && !sessionTenantMatches) {
+            writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
+            return;
+          }
+
           sessionStore.touch(sessionId);
           try {
             await session.transport.handleRequest(req, res);
@@ -198,8 +224,9 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
           }
 
           const auth = await authenticateAgentFromBearerToken(
-            db,
+            sql,
             headerValue(req.headers.authorization),
+            tenant ?? undefined,
           );
           if (!auth.ok) {
             writeJson(res, auth.status, {
@@ -209,7 +236,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             return;
           }
           agentId = auth.agent.id;
-          tenantId = auth.agent.tenantId;
+          tenantId = tenantId ?? auth.agent.tenantId;
 
           const session = sessionStore.get(sessionId);
           if (!session) {
@@ -219,6 +246,14 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           if (session.agentContext.id !== auth.agent.id) {
             writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
+            return;
+          }
+
+          const sessionTenantMatches = session.tenantSlug
+            ? session.tenantSlug === requestedTenantSlug
+            : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
+          if (requestedTenantSlug && !sessionTenantMatches) {
+            writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
             return;
           }
 
@@ -243,8 +278,9 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
           }
 
           const auth = await authenticateAgentFromBearerToken(
-            db,
+            sql,
             headerValue(req.headers.authorization),
+            tenant ?? undefined,
           );
           if (!auth.ok) {
             writeJson(res, auth.status, {
@@ -254,7 +290,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             return;
           }
           agentId = auth.agent.id;
-          tenantId = auth.agent.tenantId;
+          tenantId = tenantId ?? auth.agent.tenantId;
 
           const limit = checkRateLimit(auth.agent.id);
           if (!limit.allowed) {
@@ -276,6 +312,14 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           if (session.agentContext.id !== auth.agent.id) {
             writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
+            return;
+          }
+
+          const sessionTenantMatches = session.tenantSlug
+            ? session.tenantSlug === requestedTenantSlug
+            : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
+          if (requestedTenantSlug && !sessionTenantMatches) {
+            writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
             return;
           }
 

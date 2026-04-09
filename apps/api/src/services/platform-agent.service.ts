@@ -1,9 +1,11 @@
-import type { Database } from "@monet/db";
 import {
   agentGroupMembers,
   agentGroups,
   agents,
   tenantUsers,
+  tenantSchemaNameFromId,
+  type SqlClient,
+  withTenantDrizzleScope,
 } from "@monet/db";
 import { and, asc, desc, eq, notLike, sql as drizzleSql } from "drizzle-orm";
 
@@ -66,32 +68,33 @@ function agentRecordSelection() {
 }
 
 export async function loadPlatformAgentRecord(
-  db: Database,
+  sql: SqlClient,
   tenantId: string,
   agentId: string,
 ): Promise<PlatformAgentRecord | null> {
-  const rows = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const rows = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .select(agentRecordSelection())
     .from(agents)
     .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
     .where(
       and(
         eq(agents.id, agentId),
-        eq(agents.tenantId, tenantId),
         notLike(agents.externalId, `${DASHBOARD_AGENT_PREFIX}%`),
       ),
     )
-    .limit(1);
+    .limit(1));
 
   return rows[0] ?? null;
 }
 
 export async function loadPlatformUserOwner(
-  db: Database,
+  sql: SqlClient,
   tenantId: string,
   userId: string,
 ): Promise<PlatformAgentOwner | null> {
-  const rows = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const rows = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .select({
       id: tenantUsers.id,
       externalId: tenantUsers.externalId,
@@ -99,67 +102,77 @@ export async function loadPlatformUserOwner(
       email: tenantUsers.email,
     })
     .from(tenantUsers)
-    .where(and(eq(tenantUsers.id, userId), eq(tenantUsers.tenantId, tenantId)))
-    .limit(1);
+    .where(eq(tenantUsers.id, userId))
+    .limit(1));
 
   return rows[0] ?? null;
 }
 
 export async function deletePlatformAgent(
-  db: Database,
+  sql: SqlClient,
   tenantId: string,
   agentId: string,
 ): Promise<void> {
-  await db.delete(agents).where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    await db.delete(agents).where(eq(agents.id, agentId));
+  });
 }
 
 export async function rotatePlatformAgentToken(
-  db: Database,
+  sql: SqlClient,
   tenantId: string,
   agentId: string,
   hash: string,
   salt: string,
 ): Promise<void> {
-  await db
-    .update(agents)
-    .set({
-      apiKeyHash: hash,
-      apiKeySalt: salt,
-    })
-    .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    await db
+      .update(agents)
+      .set({
+        apiKeyHash: hash,
+        apiKeySalt: salt,
+      })
+      .where(eq(agents.id, agentId));
+  });
 }
 
 export async function revokePlatformAgent(
-  db: Database,
+  sql: SqlClient,
   tenantId: string,
   agentId: string,
 ): Promise<Date | null> {
-  const [updated] = await db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  const [updated] = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .update(agents)
     .set({
       revokedAt: drizzleSql`COALESCE(${agents.revokedAt}, now())`,
     })
-    .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)))
+    .where(eq(agents.id, agentId))
     .returning({
       revokedAt: agents.revokedAt,
-    });
+    }));
 
   return updated?.revokedAt ?? null;
 }
 
 export async function unrevokePlatformAgent(
-  db: Database,
+  sql: SqlClient,
   tenantId: string,
   agentId: string,
 ): Promise<void> {
-  await db
-    .update(agents)
-    .set({ revokedAt: null })
-    .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  await withTenantDrizzleScope(sql, schemaName, async (db) => {
+    await db
+      .update(agents)
+      .set({ revokedAt: null })
+      .where(eq(agents.id, agentId));
+  });
 }
 
 export async function listPlatformAgents(
-  db: Database,
+  sql: SqlClient,
   tenantId: string,
   options: ListPlatformAgentsOptions,
 ): Promise<PlatformAgentRecord[]> {
@@ -168,7 +181,6 @@ export async function listPlatformAgents(
   }
 
   const baseWhere = [
-    eq(agents.tenantId, tenantId),
     notLike(agents.externalId, `${DASHBOARD_AGENT_PREFIX}%`),
   ];
 
@@ -176,19 +188,22 @@ export async function listPlatformAgents(
     ? and(...baseWhere)
     : and(...baseWhere, eq(agents.userId, options.requesterUserId));
 
-  return db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => db
     .select(agentRecordSelection())
     .from(agents)
     .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
     .where(whereClause)
-    .orderBy(desc(agents.createdAt));
+    .orderBy(desc(agents.createdAt)));
 }
 
 export async function listPlatformAgentGroups(
-  db: Database,
+  sql: SqlClient,
+  tenantId: string,
   agentId: string,
 ): Promise<PlatformAgentGroup[]> {
-  return db
+  const schemaName = tenantSchemaNameFromId(tenantId);
+  return withTenantDrizzleScope(sql, schemaName, async (db) => db
     .select({
       id: agentGroups.id,
       name: agentGroups.name,
@@ -199,5 +214,5 @@ export async function listPlatformAgentGroups(
     .from(agentGroupMembers)
     .innerJoin(agentGroups, eq(agentGroups.id, agentGroupMembers.groupId))
     .where(eq(agentGroupMembers.agentId, agentId))
-    .orderBy(asc(agentGroups.name), asc(agentGroups.createdAt));
+    .orderBy(asc(agentGroups.name), asc(agentGroups.createdAt)));
 }

@@ -83,14 +83,20 @@ describe("auth flow integration", () => {
   });
 
   it("returns 401 for an invalid API key", async () => {
-    const res = await app.request("/api/agents/me", {
+    const { body } = await provisionTestTenant({ name: "invalid-key-tenant" });
+    const tenantSlug = (body.tenant as { slug: string }).slug;
+
+    const res = await app.request(`/api/tenants/${tenantSlug}/agents/me`, {
       headers: { Authorization: "Bearer mnt_invalid.key" },
     });
     expect(res.status).toBe(401);
   });
 
   it("returns 401 for missing Authorization header", async () => {
-    const res = await app.request("/api/agents/me");
+    const { body } = await provisionTestTenant({ name: "missing-auth-tenant" });
+    const tenantSlug = (body.tenant as { slug: string }).slug;
+
+    const res = await app.request(`/api/tenants/${tenantSlug}/agents/me`);
     expect(res.status).toBe(401);
   });
 

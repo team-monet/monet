@@ -6,6 +6,7 @@ import {
   auditLog,
   memoryEntries,
   memoryVersions,
+  withTenantDrizzleScope,
   type SqlClient,
   type TransactionClient,
   tenantUsers,
@@ -314,14 +315,23 @@ const DEFAULT_MEMORY_QUOTA = 10000;
 
 export async function resolveMemoryWritePreflight(
   platformSql: SqlClient | null,
-  agent: AgentContext,
+  schemaNameOrAgent: string | AgentContext,
+  maybeAgent?: AgentContext,
 ): Promise<MemoryWritePreflight | null> {
   if (!platformSql) {
     return null;
   }
 
-  const db = createMemoryDb(platformSql);
-  const rows = await db
+  const agent = typeof schemaNameOrAgent === "string" ? maybeAgent : schemaNameOrAgent;
+  const schemaName = typeof schemaNameOrAgent === "string"
+    ? schemaNameOrAgent
+    : `tenant_${schemaNameOrAgent.tenantId.replace(/-/g, "_")}`;
+
+  if (!agent) {
+    return null;
+  }
+
+  const rows = await withTenantDrizzleScope(platformSql, schemaName, async (db) => db
     .select({
       memoryQuota: agentGroups.memoryQuota,
       groupId: agentGroups.id,
@@ -329,7 +339,7 @@ export async function resolveMemoryWritePreflight(
     .from(agentGroupMembers)
     .innerJoin(agentGroups, eq(agentGroups.id, agentGroupMembers.groupId))
     .where(eq(agentGroupMembers.agentId, agent.id))
-    .limit(1);
+    .limit(1));
 
   if (rows.length === 0) {
     return {

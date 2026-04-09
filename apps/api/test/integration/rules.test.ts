@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { getRequestListener } from "@hono/node-server";
+import { withTenantScope } from "@monet/db";
 import { createApp } from "../../src/app";
 import { createMcpHandler } from "../../src/mcp/handler";
 import { SessionStore } from "../../src/mcp/session-store";
@@ -23,6 +24,13 @@ describe("Rules integration", () => {
   const sql = getTestSql();
   const sessionStore = new SessionStore();
   const app = createApp(db as never, sql, sessionStore);
+  const appRequest = app.request.bind(app);
+  app.request = ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (typeof input === "string" && tenantSlug && input.startsWith("/api/") && !input.startsWith("/api/tenants/")) {
+      return appRequest(`/api/tenants/${tenantSlug}${input.slice(4)}`, init);
+    }
+    return appRequest(input, init);
+  }) as typeof app.request;
   const mcpHandler = createMcpHandler({ db, sql, sessionStore });
   const honoListener = getRequestListener(app.fetch);
 
@@ -32,6 +40,7 @@ describe("Rules integration", () => {
   let adminApiKey: string;
   let adminAgentId: string;
   let defaultGroupId: string;
+  let tenantSlug: string;
   const defaultRuleNames = DEFAULT_GENERAL_GUIDANCE_RULES.map((rule) => rule.name).sort();
 
   beforeAll(async () => {
@@ -58,6 +67,7 @@ describe("Rules integration", () => {
 
     const { body } = await provisionTestTenant({ name: "rules-integration" });
     tenantId = (body.tenant as { id: string }).id;
+    tenantSlug = (body.tenant as { slug: string }).slug;
     schemaName = `tenant_${tenantId.replace(/-/g, "_")}`;
     adminApiKey = body.apiKey as string;
     adminAgentId = (body.agent as { id: string }).id;
@@ -100,11 +110,11 @@ describe("Rules integration", () => {
   }
 
   async function createUser(externalId: string, email: string) {
-    const [user] = await sql`
+    const [user] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
       INSERT INTO users (external_id, tenant_id, role, email)
       VALUES (${externalId}, ${tenantId}, 'user', ${email})
       RETURNING id
-    `;
+    `);
     return user.id as string;
   }
 

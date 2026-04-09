@@ -1,30 +1,53 @@
 import { createMiddleware } from "hono/factory";
+import { eq } from "drizzle-orm";
+import { tenantSchemaNameFromId, tenants, type Database } from "@monet/db";
 import type { AppEnv } from "./context";
 
 const SCHEMA_NAME_REGEX = /^tenant_[a-f0-9_]{36}$/;
 
-/**
- * Derives the tenant schema name from the authenticated agent's tenantId.
- * Never uses request input — always derived from the agent context set by auth middleware.
- */
 export function tenantSchemaName(tenantId: string): string {
-  return `tenant_${tenantId.replace(/-/g, "_")}`;
+  return tenantSchemaNameFromId(tenantId);
+}
+
+export async function resolveTenantBySlug(
+  db: Database,
+  tenantSlug: string,
+): Promise<{ tenantId: string; tenantSchemaName: string } | null> {
+  const rows = await db
+    .select({ id: tenants.id })
+    .from(tenants)
+    .where(eq(tenants.slug, tenantSlug))
+    .limit(1);
+
+  if (rows.length === 0) {
+    return null;
+  }
+
+  const tenantId = rows[0].id;
+  return {
+    tenantId,
+    tenantSchemaName: tenantSchemaName(tenantId),
+  };
 }
 
 export const tenantMiddleware = createMiddleware<AppEnv>(async (c, next) => {
-  const agent = c.get("agent");
-  if (!agent) {
-    return c.json({ error: "unauthorized", message: "Authentication required" }, 401);
+  const db = c.get("db");
+  const tenantSlug = c.req.param("tenantSlug");
+  if (!tenantSlug) {
+    return c.json({ error: "not_found", message: "Tenant not found" }, 404);
   }
 
-  const schemaName = tenantSchemaName(agent.tenantId);
+  const tenant = await resolveTenantBySlug(db, tenantSlug);
+  if (!tenant) {
+    return c.json({ error: "not_found", message: "Tenant not found" }, 404);
+  }
 
-  if (!SCHEMA_NAME_REGEX.test(schemaName)) {
+  if (!SCHEMA_NAME_REGEX.test(tenant.tenantSchemaName)) {
     return c.json({ error: "internal", message: "Invalid tenant schema derivation" }, 500);
   }
 
-  c.set("tenantId", agent.tenantId);
-  c.set("tenantSchemaName", schemaName);
+  c.set("tenantId", tenant.tenantId);
+  c.set("tenantSchemaName", tenant.tenantSchemaName);
 
   await next();
 });

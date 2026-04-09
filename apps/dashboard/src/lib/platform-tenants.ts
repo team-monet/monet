@@ -2,10 +2,13 @@ import { randomUUID } from "node:crypto";
 import type { SqlClient } from "@monet/db";
 import {
   createTenantSchema,
+  tenantSchemaNameFromId,
   tenantUsers,
   tenantAdminNominations,
   tenantOauthConfigs,
   tenants,
+  withTenantDrizzleScope,
+  withTenantScope,
 } from "@monet/db";
 import type { CreateTenantInput } from "@monet/types";
 import {
@@ -14,8 +17,9 @@ import {
   DEFAULT_USER_GROUP_DESCRIPTION,
   DEFAULT_USER_GROUP_NAME,
   slugifyTenantName,
+  validateTenantSlug,
 } from "@monet/types";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql as drizzleSql } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
 import { decrypt, encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
@@ -108,6 +112,11 @@ function normalizeTenantInput(input: CreateTenantInput) {
     throw new Error("Tenant slug is required.");
   }
 
+  const slugValidationError = validateTenantSlug(slug);
+  if (slugValidationError) {
+    throw new Error(slugValidationError);
+  }
+
   return {
     name,
     slug,
@@ -170,15 +179,8 @@ export async function getPlatformTenant(tenantId: string) {
       claimedAt: tenantAdminNominations.claimedAt,
       createdAt: tenantAdminNominations.createdAt,
       claimedByUserId: tenantAdminNominations.claimedByUserId,
-      claimedByDisplayName: tenantUsers.displayName,
-      claimedByEmail: tenantUsers.email,
-      claimedByExternalId: tenantUsers.externalId,
     })
     .from(tenantAdminNominations)
-    .leftJoin(
-      tenantUsers,
-      eq(tenantUsers.id, tenantAdminNominations.claimedByUserId),
-    )
     .where(
       and(
         eq(tenantAdminNominations.tenantId, tenantId),
@@ -186,6 +188,26 @@ export async function getPlatformTenant(tenantId: string) {
       ),
     )
     .orderBy(desc(tenantAdminNominations.createdAt));
+
+  const claimedByUserIds = adminNominations
+    .map((nomination) => nomination.claimedByUserId)
+    .filter((value): value is string => Boolean(value));
+
+  const claimedByUserMap = claimedByUserIds.length > 0
+    ? new Map((await withTenantDrizzleScope(
+      getSqlClient(),
+      tenantSchemaNameFromId(tenantId),
+      async (tenantDb) => tenantDb
+        .select({
+          id: tenantUsers.id,
+          displayName: tenantUsers.displayName,
+          email: tenantUsers.email,
+          externalId: tenantUsers.externalId,
+        })
+        .from(tenantUsers)
+        .where(drizzleSql`${tenantUsers.id} = ANY(${claimedByUserIds}::uuid[])`),
+    )).map((user) => [user.id, user]))
+    : new Map<string, { id: string; displayName: string | null; email: string | null; externalId: string }>();
 
   return {
     tenant: {
@@ -205,15 +227,20 @@ export async function getPlatformTenant(tenantId: string) {
         }
       : null,
     adminNominations: adminNominations.map((nomination) => ({
+      claimedBy: nomination.claimedByUserId
+        ? claimedByUserMap.get(nomination.claimedByUserId)
+        : null,
       id: nomination.id,
       email: nomination.email,
       claimedAt: nomination.claimedAt,
       createdAt: nomination.createdAt,
       claimedByUserId: nomination.claimedByUserId,
       claimedByLabel:
-        nomination.claimedByDisplayName ??
-        nomination.claimedByEmail ??
-        nomination.claimedByExternalId,
+        (nomination.claimedByUserId
+          ? claimedByUserMap.get(nomination.claimedByUserId)?.displayName ??
+            claimedByUserMap.get(nomination.claimedByUserId)?.email ??
+            claimedByUserMap.get(nomination.claimedByUserId)?.externalId
+          : null) ?? null,
     })),
   };
 }
@@ -222,6 +249,16 @@ export async function createPlatformTenant(
   input: CreateTenantInput,
 ): Promise<CreatePlatformTenantResult> {
   const tenantInput = normalizeTenantInput(input);
+
+  const [existingTenantWithSlug] = await db
+    .select({ id: tenants.id })
+    .from(tenants)
+    .where(eq(tenants.slug, tenantInput.slug))
+    .limit(1);
+  if (existingTenantWithSlug) {
+    throw new Error("Tenant slug already exists.");
+  }
+
   const adminExternalId = `admin@${tenantInput.slug}`;
   const adminAgentId = randomUUID();
   const rawApiKey = generateApiKey(adminAgentId);
@@ -239,7 +276,7 @@ export async function createPlatformTenant(
 
       const tenantSchemaName = await createTenantSchema(txSql, tenant.id);
 
-      const [defaultUserGroup] = await tx`
+      const [defaultUserGroup] = await withTenantScope(tx, tenantSchemaName, (tenantSql) => (tenantSql as unknown as SqlClient)`
         INSERT INTO user_groups (tenant_id, name, description)
         VALUES (
           ${tenant.id},
@@ -247,9 +284,9 @@ export async function createPlatformTenant(
           ${DEFAULT_USER_GROUP_DESCRIPTION}
         )
         RETURNING id
-      `;
+      `) as Array<{ id: string }>;
 
-      const [defaultAgentGroup] = await tx`
+      const [defaultAgentGroup] = await withTenantScope(tx, tenantSchemaName, (tenantSql) => (tenantSql as unknown as SqlClient)`
         INSERT INTO agent_groups (tenant_id, name, description)
         VALUES (
           ${tenant.id},
@@ -257,9 +294,9 @@ export async function createPlatformTenant(
           ${DEFAULT_AGENT_GROUP_DESCRIPTION}
         )
         RETURNING id
-      `;
+      `) as Array<{ id: string }>;
 
-      const [agent] = await tx`
+      const [agent] = await withTenantScope(tx, tenantSchemaName, (tenantSql) => (tenantSql as unknown as SqlClient)`
         INSERT INTO agents (
           id,
           external_id,
@@ -279,17 +316,17 @@ export async function createPlatformTenant(
           ${"tenant_admin"}
         )
         RETURNING id, external_id
-      `;
+      `) as Array<{ id: string; external_id: string }>;
 
-      await tx`
+      await withTenantScope(tx, tenantSchemaName, (tenantSql) => (tenantSql as unknown as SqlClient)`
         INSERT INTO agent_group_members (agent_id, group_id)
         VALUES (${agent.id}, ${defaultAgentGroup.id})
-      `;
+      `);
 
-      await tx`
+      await withTenantScope(tx, tenantSchemaName, (tenantSql) => (tenantSql as unknown as SqlClient)`
         INSERT INTO user_group_agent_group_permissions (user_group_id, agent_group_id)
         VALUES (${defaultUserGroup.id}, ${defaultAgentGroup.id})
-      `;
+      `);
 
       await seedDefaultGeneralGuidance(
         tx,

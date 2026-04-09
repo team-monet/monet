@@ -36,7 +36,7 @@ async function resolveRequestDerivedApiBaseUrl() {
   }
 }
 
-export async function resolvePublicMcpUrl() {
+export async function resolvePublicMcpUrl(tenantSlug: string) {
   const baseUrl =
     process.env.MCP_PUBLIC_URL ||
     process.env.PUBLIC_API_URL ||
@@ -45,9 +45,9 @@ export async function resolvePublicMcpUrl() {
     `http://localhost:${process.env.API_PORT || "3001"}`;
 
   try {
-    return new URL("/mcp", baseUrl).toString();
+    return new URL(`/mcp/${tenantSlug}`, baseUrl).toString();
   } catch {
-    return `${baseUrl.replace(/\/$/, "")}/mcp`;
+    return `${baseUrl.replace(/\/$/, "")}/mcp/${tenantSlug}`;
   }
 }
 

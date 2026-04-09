@@ -4,8 +4,7 @@ import type { AddressInfo } from "node:net";
 import { getRequestListener } from "@hono/node-server";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { eq } from "drizzle-orm";
-import { agents } from "@monet/db/schema";
+import { withTenantScope } from "@monet/db";
 import { createApp } from "../../src/app";
 import { createMcpHandler } from "../../src/mcp/handler";
 import { SessionStore } from "../../src/mcp/session-store";
@@ -55,6 +54,13 @@ describe("MCP integration", () => {
   const db = getTestDb();
   const sql = getTestSql();
   const app = createApp(db as unknown as Parameters<typeof createApp>[0], sql);
+  const appRequest = app.request.bind(app);
+  app.request = ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (typeof input === "string" && tenantSlug && input.startsWith("/api/") && !input.startsWith("/api/tenants/")) {
+      return appRequest(`/api/tenants/${tenantSlug}${input.slice(4)}`, init);
+    }
+    return appRequest(input, init);
+  }) as typeof app.request;
   const sessionStore = new SessionStore();
   const mcpHandler = createMcpHandler({ db, sql, sessionStore });
   const honoListener = getRequestListener(app.fetch);
@@ -62,7 +68,10 @@ describe("MCP integration", () => {
   let baseUrl: URL;
   let apiKey: string;
   let agentId: string;
+  let tenantId: string;
+  let schemaName: string;
   let groupId: string;
+  let tenantSlug: string;
 
   beforeAll(async () => {
     server = createServer((req, res) => {
@@ -78,7 +87,7 @@ describe("MCP integration", () => {
     });
 
     const address = server.address() as AddressInfo;
-    baseUrl = new URL(`http://127.0.0.1:${address.port}/mcp`);
+    baseUrl = new URL(`http://127.0.0.1:${address.port}`);
   });
 
   beforeEach(async () => {
@@ -89,6 +98,9 @@ describe("MCP integration", () => {
     const { body } = await provisionTestTenant({ name: "mcp-test" });
     apiKey = body.apiKey as string;
     agentId = (body.agent as { id: string }).id;
+    tenantId = (body.tenant as { id: string }).id;
+    schemaName = `tenant_${tenantId.replace(/-/g, "_")}`;
+    tenantSlug = (body.tenant as { slug: string }).slug;
 
     const groupRes = await app.request("/api/groups", {
       method: "POST",
@@ -119,7 +131,7 @@ describe("MCP integration", () => {
 
   async function connectClient(key = apiKey) {
     const client = new Client({ name: "mcp-test-client", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(baseUrl, {
+    const transport = new StreamableHTTPClientTransport(new URL(`/mcp/${tenantSlug}`, baseUrl), {
       requestInit: {
         headers: {
           Authorization: `Bearer ${key}`,
@@ -151,7 +163,7 @@ describe("MCP integration", () => {
 
   it("rejects connection with an invalid API key", async () => {
     const client = new Client({ name: "mcp-test-client", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(baseUrl, {
+    const transport = new StreamableHTTPClientTransport(new URL(`/mcp/${tenantSlug}`, baseUrl), {
       requestInit: {
         headers: {
           Authorization: "Bearer mnt_invalid.invalid",
@@ -324,7 +336,7 @@ describe("MCP integration", () => {
     await first.transport.terminateSession();
     expect(sessionStore.count()).toBeGreaterThanOrEqual(1);
 
-    await second.client.close();
+    await Promise.all([first.client.close(), second.client.close()]);
   });
 
   it("rejects the next request when an API key is revoked mid-session", async () => {
@@ -333,10 +345,13 @@ describe("MCP integration", () => {
     const initialTools = await client.listTools();
     expect(initialTools.tools).toHaveLength(8);
 
-    await db
-      .update(agents)
-      .set({ revokedAt: new Date() })
-      .where(eq(agents.id, agentId));
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`
+        UPDATE agents
+        SET revoked_at = NOW()
+        WHERE id = ${agentId}
+      `;
+    });
 
     await expect(client.listTools()).rejects.toThrow();
 

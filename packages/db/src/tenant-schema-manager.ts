@@ -11,8 +11,9 @@ export function tenantSchemaNameFromId(tenantId: string): string {
 
 /**
  * Create a new tenant schema with all required tables, indexes, and security constraints.
- * The schema contains: memory_entries, memory_versions, audit_log, rules, rule_sets,
- * rule_set_rules, agent_rule_sets, group_rule_sets.
+ * The schema contains: users, agents, agent_groups, agent_group_members, user_groups,
+ * user_group_members, user_group_agent_group_permissions, memory_entries, memory_versions,
+ * audit_log, rules, rule_sets, rule_set_rules, agent_rule_sets, group_rule_sets.
  *
  * Audit log has UPDATE and DELETE revoked to ensure append-only behavior.
  */
@@ -21,6 +22,7 @@ export async function createTenantSchema(
   tenantId: string,
 ): Promise<string> {
   const schemaName = tenantSchemaNameFromId(tenantId);
+  const embeddingDimensions = parseInt(process.env.EMBEDDING_DIMENSIONS || "1024", 10);
 
   if (!SCHEMA_NAME_REGEX.test(schemaName)) {
     throw new Error(`Invalid tenant schema name: ${schemaName}`);
@@ -30,6 +32,94 @@ export async function createTenantSchema(
   await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS vector`);
 
   await sql.unsafe(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
+
+  // Tenant-owned identity/access tables
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      external_id VARCHAR(255) NOT NULL,
+      tenant_id UUID NOT NULL,
+      display_name VARCHAR(255),
+      email VARCHAR(255),
+      role public.user_role NOT NULL DEFAULT 'user',
+      dashboard_api_key_encrypted VARCHAR(1024),
+      last_login_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CONSTRAINT users_tenant_id_external_id_unique UNIQUE (tenant_id, external_id)
+    )
+  `);
+
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".agents (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      external_id VARCHAR(255) NOT NULL,
+      tenant_id UUID NOT NULL,
+      user_id UUID REFERENCES "${schemaName}".users(id),
+      role public.user_role,
+      api_key_hash VARCHAR(255) NOT NULL,
+      api_key_salt VARCHAR(255) NOT NULL,
+      is_autonomous BOOLEAN NOT NULL DEFAULT false,
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".agent_groups (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      description VARCHAR(1024) DEFAULT '',
+      memory_quota INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".agent_group_members (
+      agent_id UUID NOT NULL REFERENCES "${schemaName}".agents(id),
+      group_id UUID NOT NULL REFERENCES "${schemaName}".agent_groups(id),
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".user_groups (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      description VARCHAR(1024) NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CONSTRAINT user_groups_tenant_id_name_unique UNIQUE (tenant_id, name)
+    )
+  `);
+
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".user_group_members (
+      user_group_id UUID NOT NULL REFERENCES "${schemaName}".user_groups(id),
+      user_id UUID NOT NULL REFERENCES "${schemaName}".users(id),
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_group_id, user_id)
+    )
+  `);
+
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".user_group_agent_group_permissions (
+      user_group_id UUID NOT NULL REFERENCES "${schemaName}".user_groups(id),
+      agent_group_id UUID NOT NULL REFERENCES "${schemaName}".agent_groups(id),
+      PRIMARY KEY (user_group_id, agent_group_id)
+    )
+  `);
+
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON "${schemaName}".users (tenant_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_agents_tenant_id ON "${schemaName}".agents (tenant_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_agents_user_id ON "${schemaName}".agents (user_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_agent_groups_tenant_id ON "${schemaName}".agent_groups (tenant_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_agent_group_members_agent_id ON "${schemaName}".agent_group_members (agent_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_agent_group_members_group_id ON "${schemaName}".agent_group_members (group_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_user_groups_tenant_id ON "${schemaName}".user_groups (tenant_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_user_group_members_user_id ON "${schemaName}".user_group_members (user_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_user_group_agent_permissions_agent_group_id ON "${schemaName}".user_group_agent_group_permissions (agent_group_id)`);
 
   // Create enum types in the tenant schema
   await sql.unsafe(`
@@ -64,7 +154,7 @@ export async function createTenantSchema(
       memory_scope "${schemaName}".memory_scope NOT NULL DEFAULT 'group',
       tags TEXT[] NOT NULL DEFAULT '{}',
       auto_tags TEXT[] NOT NULL DEFAULT '{}',
-      embedding vector(1024),
+      embedding vector(${embeddingDimensions}),
       related_memory_ids UUID[] NOT NULL DEFAULT '{}',
       usefulness_score INTEGER NOT NULL DEFAULT 0,
       outdated BOOLEAN NOT NULL DEFAULT false,

@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import {
   agents,
-  asDrizzleSqlClient,
+  tenantSchemaNameFromId,
   type SqlClient,
   type TransactionClient,
+  withTenantDrizzleScope,
 } from "@monet/db";
-import { drizzle } from "drizzle-orm/postgres-js";
 import { generateApiKey, hashApiKey } from "./api-key.service";
 
 type AgentSqlClient = SqlClient | TransactionClient;
@@ -37,9 +37,9 @@ export async function provisionAgentWithApiKey(
   const agentId = randomUUID();
   const rawApiKey = generateApiKey(agentId);
   const { hash, salt } = hashApiKey(rawApiKey);
-  const db = drizzle(asDrizzleSqlClient(sql));
+  const schemaName = tenantSchemaNameFromId(input.tenantId);
 
-  const [agent] = await db
+  const [agent] = await withTenantDrizzleScope(sql, schemaName, async (db) => db
     .insert(agents)
     .values({
       id: agentId,
@@ -53,7 +53,7 @@ export async function provisionAgentWithApiKey(
     })
     .returning({
       createdAt: agents.createdAt,
-    });
+    }));
 
   return {
     agent: {

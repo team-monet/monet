@@ -6,11 +6,13 @@ import {
   cleanupTestData,
   closeTestDb,
 } from "./helpers/setup";
+import { withTenantScope } from "@monet/db";
 
 describe("groups integration", () => {
   const app = getTestApp();
   let adminKey: string;
   let tenantId: string;
+  let schemaName: string;
   let defaultGroupId: string;
 
   beforeEach(async () => {
@@ -18,6 +20,7 @@ describe("groups integration", () => {
     const { body } = await provisionTestTenant({ name: "group-test" });
     adminKey = body.apiKey as string;
     tenantId = (body.tenant as { id: string }).id;
+    schemaName = `tenant_${tenantId.replace(/-/g, "_")}`;
     defaultGroupId = body.defaultGroupId as string;
   });
 
@@ -184,11 +187,11 @@ describe("groups integration", () => {
 
   it("tenant admin can promote a user to group_admin", async () => {
     const sql = getTestSql();
-    const [user] = await sql`
+    const [user] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
       INSERT INTO users (external_id, tenant_id, role)
       VALUES ('user-promote', ${tenantId}, 'user')
       RETURNING id
-    `;
+    `);
 
     const res = await app.request(`/api/groups/users/${user.id}/admin`, {
       method: "POST",
@@ -244,11 +247,11 @@ describe("groups integration", () => {
 
   it("non-admin cannot promote a user", async () => {
     const sql = getTestSql();
-    const [user] = await sql`
+    const [user] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
       INSERT INTO users (external_id, tenant_id, role)
       VALUES ('user-no-promote', ${tenantId}, 'user')
       RETURNING id
-    `;
+    `);
 
     const regRes = await app.request("/api/agents/register", {
       method: "POST",

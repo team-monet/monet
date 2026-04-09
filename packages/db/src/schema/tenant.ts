@@ -36,6 +36,130 @@ export const enrichmentStatusEnum = pgEnum("enrichment_status", [
   "failed",
 ]);
 
+// Mirror of public.user_role enum from platform.ts.
+// The SQL DDL in tenant-schema-manager references public.user_role directly,
+// but Drizzle requires a local enum definition for the tenant-scoped schema.
+const tenantUserRoleEnum = pgEnum("user_role", [
+  "user",
+  "group_admin",
+  "tenant_admin",
+]);
+
+export const tenantUsers = pgTable(
+  "users",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    externalId: varchar("external_id", { length: 255 }).notNull(),
+    tenantId: uuid("tenant_id").notNull(),
+    displayName: varchar("display_name", { length: 255 }),
+    email: varchar("email", { length: 255 }),
+    role: tenantUserRoleEnum("role").notNull().default("user"),
+    dashboardApiKeyEncrypted: varchar("dashboard_api_key_encrypted", {
+      length: 1024,
+    }),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("users_tenant_id_external_id_unique").on(
+      table.tenantId,
+      table.externalId,
+    ),
+  ],
+);
+
+export const agents = pgTable("agents", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  externalId: varchar("external_id", { length: 255 }).notNull(),
+  tenantId: uuid("tenant_id").notNull(),
+  userId: uuid("user_id").references(() => tenantUsers.id),
+  role: tenantUserRoleEnum("role"),
+  apiKeyHash: varchar("api_key_hash", { length: 255 }).notNull(),
+  apiKeySalt: varchar("api_key_salt", { length: 255 }).notNull(),
+  isAutonomous: boolean("is_autonomous").notNull().default(false),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const agentGroups = pgTable("agent_groups", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull(),
+  name: varchar("name", { length: 255 }).notNull(),
+  description: varchar("description", { length: 1024 }).default(""),
+  memoryQuota: integer("memory_quota"),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const agentGroupMembers = pgTable("agent_group_members", {
+  agentId: uuid("agent_id")
+    .notNull()
+    .references(() => agents.id),
+  groupId: uuid("group_id")
+    .notNull()
+    .references(() => agentGroups.id),
+  joinedAt: timestamp("joined_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const userGroups = pgTable(
+  "user_groups",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id").notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: varchar("description", { length: 1024 }).notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("user_groups_tenant_id_name_unique").on(
+      table.tenantId,
+      table.name,
+    ),
+  ],
+);
+
+export const userGroupMembers = pgTable(
+  "user_group_members",
+  {
+    userGroupId: uuid("user_group_id")
+      .notNull()
+      .references(() => userGroups.id),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => tenantUsers.id),
+    joinedAt: timestamp("joined_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userGroupId, table.userId] }),
+  ],
+);
+
+export const userGroupAgentGroupPermissions = pgTable(
+  "user_group_agent_group_permissions",
+  {
+    userGroupId: uuid("user_group_id")
+      .notNull()
+      .references(() => userGroups.id),
+    agentGroupId: uuid("agent_group_id")
+      .notNull()
+      .references(() => agentGroups.id),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userGroupId, table.agentGroupId] }),
+  ],
+);
+
 export const memoryEntries = pgTable(
   "memory_entries",
   {

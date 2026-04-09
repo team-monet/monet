@@ -133,6 +133,16 @@ describe("tenant service", () => {
     }));
     const membershipValuesMock = vi.fn().mockResolvedValue(undefined);
     const permissionValuesMock = vi.fn().mockResolvedValue(undefined);
+    const slugLookupLimitMock = vi.fn().mockResolvedValue([]);
+    const slugLookupWhereMock = vi.fn(() => ({
+      limit: slugLookupLimitMock,
+    }));
+    const slugLookupFromMock = vi.fn(() => ({
+      where: slugLookupWhereMock,
+    }));
+    const slugLookupSelectMock = vi.fn(() => ({
+      from: slugLookupFromMock,
+    }));
     const insertMock = vi
       .fn()
       .mockReturnValueOnce({ values: tenantValuesMock })
@@ -142,6 +152,7 @@ describe("tenant service", () => {
       .mockReturnValueOnce({ values: permissionValuesMock });
 
     drizzleMock.mockReturnValue({
+      select: slugLookupSelectMock,
       insert: insertMock,
     });
     createTenantSchemaMock.mockResolvedValue(
@@ -171,6 +182,7 @@ describe("tenant service", () => {
     expect(drizzleClient).not.toBe(txSql);
     expect(drizzleClient.options).toBe(sql.options);
     expect(insertMock).toHaveBeenNthCalledWith(1, tenants);
+    expect(slugLookupSelectMock).toHaveBeenCalledWith({ id: tenants.id });
     expect(tenantValuesMock).toHaveBeenCalledWith({
       name: "Acme",
       slug: "acme",
@@ -230,5 +242,63 @@ describe("tenant service", () => {
       },
       rawApiKey: "mnt_test.key",
     });
+  });
+
+  it("rejects reserved tenant slugs", async () => {
+    const beginMock = vi.fn();
+    const sql = {
+      begin: beginMock,
+    } as unknown as SqlClient;
+
+    await expect(
+      provisionTenant({} as Database, sql, {
+        name: "Acme",
+        slug: "api",
+      }),
+    ).rejects.toThrow("Slug is reserved. Choose another slug");
+
+    expect(beginMock).not.toHaveBeenCalled();
+  });
+
+  it("returns a friendly error when slug already exists", async () => {
+    const txSql = {} as TransactionClient;
+    const beginMock = vi.fn(async (fn: (sql: TransactionClient) => Promise<unknown>) =>
+      fn(txSql),
+    );
+    const sql = {
+      begin: beginMock,
+      options: {
+        parsers: {},
+        serializers: {},
+      },
+    } as unknown as SqlClient;
+
+    const slugLookupLimitMock = vi.fn().mockResolvedValue([
+      { id: "00000000-0000-0000-0000-000000000999" },
+    ]);
+    const slugLookupWhereMock = vi.fn(() => ({
+      limit: slugLookupLimitMock,
+    }));
+    const slugLookupFromMock = vi.fn(() => ({
+      where: slugLookupWhereMock,
+    }));
+    const slugLookupSelectMock = vi.fn(() => ({
+      from: slugLookupFromMock,
+    }));
+    const insertMock = vi.fn();
+
+    drizzleMock.mockReturnValue({
+      select: slugLookupSelectMock,
+      insert: insertMock,
+    });
+
+    await expect(
+      provisionTenant({} as Database, sql, {
+        name: "Acme",
+        slug: "acme",
+      }),
+    ).rejects.toThrow("Tenant slug already exists.");
+
+    expect(insertMock).not.toHaveBeenCalled();
   });
 });

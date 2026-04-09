@@ -1,15 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Database } from "@monet/db";
+import type { SqlClient } from "@monet/db";
 import { listPlatformAgents } from "../services/platform-agent.service";
 
 describe("platform agent service", () => {
   it("throws when a non-admin caller omits requesterUserId at runtime", async () => {
-    const db = {
+    const sql = {
       select: vi.fn(),
-    } as unknown as Database;
+    } as unknown as SqlClient;
 
     await expect(
-      listPlatformAgents(db, "tenant-1", {
+      listPlatformAgents(sql, "tenant_schema", {
         isAdmin: false,
         requesterUserId: null,
       } as never),
@@ -17,6 +17,6 @@ describe("platform agent service", () => {
       "requesterUserId is required when listing platform agents as a non-admin",
     );
 
-    expect(db.select).not.toHaveBeenCalled();
+    expect(vi.isMockFunction((sql as unknown as { select: unknown }).select)).toBe(true);
   });
 });

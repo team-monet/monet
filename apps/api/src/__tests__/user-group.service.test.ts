@@ -558,19 +558,10 @@ describe("user group service", () => {
       values: insertValuesMock,
     }));
 
-    let callCount = 0;
-    drizzleMock.mockImplementation(() => {
-      callCount += 1;
-      if (callCount === 1) {
-        return {
-          select: selectMock,
-        };
-      }
-
-      return {
-        delete: deleteMock,
-        insert: insertMock,
-      };
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      delete: deleteMock,
+      insert: insertMock,
     });
 
     const tx = {} as never;
