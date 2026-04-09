@@ -17,6 +17,7 @@ import {
   DEFAULT_USER_GROUP_DESCRIPTION,
   DEFAULT_USER_GROUP_NAME,
   slugifyTenantName,
+  validateTenantSlug,
 } from "@monet/types";
 import { and, desc, eq, isNull, sql as drizzleSql } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
@@ -109,6 +110,11 @@ function normalizeTenantInput(input: CreateTenantInput) {
 
   if (!slug) {
     throw new Error("Tenant slug is required.");
+  }
+
+  const slugValidationError = validateTenantSlug(slug);
+  if (slugValidationError) {
+    throw new Error(slugValidationError);
   }
 
   return {
@@ -243,6 +249,16 @@ export async function createPlatformTenant(
   input: CreateTenantInput,
 ): Promise<CreatePlatformTenantResult> {
   const tenantInput = normalizeTenantInput(input);
+
+  const [existingTenantWithSlug] = await db
+    .select({ id: tenants.id })
+    .from(tenants)
+    .where(eq(tenants.slug, tenantInput.slug))
+    .limit(1);
+  if (existingTenantWithSlug) {
+    throw new Error("Tenant slug already exists.");
+  }
+
   const adminExternalId = `admin@${tenantInput.slug}`;
   const adminAgentId = randomUUID();
   const rawApiKey = generateApiKey(adminAgentId);
