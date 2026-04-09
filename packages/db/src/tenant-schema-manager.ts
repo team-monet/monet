@@ -22,6 +22,7 @@ export async function createTenantSchema(
   tenantId: string,
 ): Promise<string> {
   const schemaName = tenantSchemaNameFromId(tenantId);
+  const embeddingDimensions = parseInt(process.env.EMBEDDING_DIMENSIONS || "1024", 10);
 
   if (!SCHEMA_NAME_REGEX.test(schemaName)) {
     throw new Error(`Invalid tenant schema name: ${schemaName}`);
@@ -153,7 +154,7 @@ export async function createTenantSchema(
       memory_scope "${schemaName}".memory_scope NOT NULL DEFAULT 'group',
       tags TEXT[] NOT NULL DEFAULT '{}',
       auto_tags TEXT[] NOT NULL DEFAULT '{}',
-      embedding vector(1024),
+      embedding vector(${embeddingDimensions}),
       related_memory_ids UUID[] NOT NULL DEFAULT '{}',
       usefulness_score INTEGER NOT NULL DEFAULT 0,
       outdated BOOLEAN NOT NULL DEFAULT false,

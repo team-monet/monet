@@ -36,6 +36,9 @@ export const enrichmentStatusEnum = pgEnum("enrichment_status", [
   "failed",
 ]);
 
+// Mirror of public.user_role enum from platform.ts.
+// The SQL DDL in tenant-schema-manager references public.user_role directly,
+// but Drizzle requires a local enum definition for the tenant-scoped schema.
 const tenantUserRoleEnum = pgEnum("user_role", [
   "user",
   "group_admin",
