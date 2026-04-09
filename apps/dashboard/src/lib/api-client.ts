@@ -48,9 +48,13 @@ export class MonetApiClient {
   }
 
   private async fetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const normalizedPath = path.startsWith("/api/")
-      ? `/api/tenants/${this.tenantSlug}/${path.slice(5)}`
-      : path;
+    let normalizedPath: string;
+    if (path.startsWith("/api/")) {
+      normalizedPath = `/api/tenants/${this.tenantSlug}/${path.slice(5)}`;
+    } else {
+      console.warn(`[MonetApiClient] Unexpected path format: ${path} — expected /api/ prefix`);
+      normalizedPath = path;
+    }
     const url = `${this.baseUrl}${normalizedPath}`;
     const response = await fetch(url, {
       ...options,
