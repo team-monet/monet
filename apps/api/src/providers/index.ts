@@ -132,7 +132,7 @@ export function createEnrichmentProvider(
   return {
     generateSummary: (content: string) => chatProvider.generateSummary(content),
     extractTags: (content: string) => chatProvider.extractTags(content),
-    computeEmbedding: (content: string) => embeddingProvider.computeEmbedding(content),
+    computeEmbedding: (content: string, options) => embeddingProvider.computeEmbedding(content, options),
   };
 }
 

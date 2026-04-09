@@ -239,6 +239,7 @@ export function createMcpServer(
         if (hasError(result)) {
           return asToolError(describeServiceError(result));
         }
+
         return asToolResult(result);
       } catch (error) {
         return asToolError(error instanceof Error ? error.message : "Internal server error");
@@ -256,6 +257,12 @@ export function createMcpServer(
         if (hasError(result)) {
           return asToolError(describeServiceError(result));
         }
+
+        const updated = result as { entry: unknown; needsEnrichment?: boolean };
+        if (updated.needsEnrichment) {
+          enqueueEnrichment(sql, tenantSchemaName, args.id);
+        }
+
         return asToolResult(result);
       } catch (error) {
         return asToolError(error instanceof Error ? error.message : "Internal server error");

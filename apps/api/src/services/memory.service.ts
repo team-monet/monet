@@ -16,7 +16,7 @@ import {
   asc,
   desc,
   eq,
-  ilike,
+  isNotNull,
   lt,
   or,
   sql as drizzleSql,
@@ -84,22 +84,31 @@ const MEMORY_VERSION_RETURNING = {
   created_at: memoryVersions.createdAt,
 };
 
+const MAX_HYBRID_CURSOR_OFFSET = 1000;
+
 // ---------- Cursor helpers ----------
 
 interface SearchCursorPayload {
   createdAt: string;
   id: string;
   rank?: number;
+  offset?: number;
 }
 
-export function encodeCursor(createdAt: string, id: string, rank?: number): string {
-  return Buffer.from(JSON.stringify({ createdAt, id, rank })).toString("base64url");
+export function encodeCursor(
+  createdAt: string,
+  id: string,
+  rank?: number,
+  offset?: number,
+): string {
+  return Buffer.from(JSON.stringify({ createdAt, id, rank, offset })).toString("base64url");
 }
 
 const SearchCursorSchema = z.object({
   createdAt: z.string(),
   id: z.string(),
   rank: z.number().optional(),
+  offset: z.number().int().nonnegative().optional(),
 });
 
 export function decodeCursor(cursor: string): SearchCursorPayload | null {
@@ -247,7 +256,7 @@ function buildCreatedAtCursorCondition(cursor: SearchCursorPayload): SQL<unknown
 function buildSearchRankExpression(
   queryEmbedding: number[] | null,
 ): SQL<number | null> {
-  const usefulnessWeight = drizzleSql`GREATEST(${memoryEntries.usefulnessScore}, 1)`;
+  const usefulnessWeight = drizzleSql`(1 + LN(1 + GREATEST(${memoryEntries.usefulnessScore}, 0)))`;
   const outdatedWeight = drizzleSql`CASE WHEN ${memoryEntries.outdated} THEN 0.5 ELSE 1.0 END`;
 
   if (!queryEmbedding) {
@@ -261,6 +270,26 @@ function buildSearchRankExpression(
       ELSE ((1 - (${memoryEntries.embedding} <=> ${vectorLiteral}::vector)) * ${usefulnessWeight} * ${outdatedWeight})
     END
   `;
+}
+
+function buildLexicalQueryCondition(queryText: string): SQL<unknown> {
+  const lexicalRankExpression = buildLexicalMatchCountExpression(queryText);
+  return drizzleSql`${lexicalRankExpression} > 0`;
+}
+
+function buildLexicalMatchCountExpression(queryText: string): SQL<number> {
+  const likePattern = `%${escapeLike(queryText)}%`;
+
+  return drizzleSql<number>`(
+    CASE WHEN ${memoryEntries.content} ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END +
+    CASE WHEN ${memoryEntries.summary} ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END +
+    CASE WHEN COALESCE(array_to_string(${memoryEntries.tags}, ' '), '') ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END +
+    CASE WHEN COALESCE(array_to_string(${memoryEntries.autoTags}, ' '), '') ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END
+  )`;
+}
+
+function escapeLike(text: string): string {
+  return text.replace(/[%_\\]/g, "\\$&");
 }
 
 function buildSearchCursorCondition(
@@ -427,7 +456,11 @@ export async function searchMemories(
   const db = createMemoryDb(txSql);
   const limit = query.limit ?? 20;
   const rankExpression = buildSearchRankExpression(queryEmbedding);
-  const conditions: SQL<unknown>[] = [
+  const lexicalRankExpression = query.query
+    ? buildLexicalMatchCountExpression(query.query)
+    : null;
+  const hybridSearch = Boolean(queryEmbedding && lexicalRankExpression);
+  const baseConditions: SQL<unknown>[] = [
     buildScopeFilterCondition(agent, {
       includeUser: query.includeUser ?? false,
       includePrivate: query.includePrivate ?? false,
@@ -435,46 +468,165 @@ export async function searchMemories(
     buildNonExpiredCondition(),
   ];
 
-  if (query.query && !queryEmbedding) {
-    conditions.push(ilike(memoryEntries.content, `%${query.query}%`));
-  }
+  const lexicalCondition = query.query
+    ? buildLexicalQueryCondition(query.query)
+    : null;
 
   if (query.tags && query.tags.length > 0) {
-    conditions.push(arrayOverlaps(memoryEntries.tags, query.tags));
+    baseConditions.push(arrayOverlaps(memoryEntries.tags, query.tags));
   }
 
   if (query.memoryType) {
-    conditions.push(
+    baseConditions.push(
       drizzleSql`${memoryEntries.memoryType} = ${query.memoryType}::memory_type`,
     );
   }
 
   if (query.createdAfter) {
-    conditions.push(
+    baseConditions.push(
       drizzleSql`${memoryEntries.createdAt} >= ${query.createdAfter}::timestamptz`,
     );
   }
   if (query.createdBefore) {
-    conditions.push(
+    baseConditions.push(
       drizzleSql`${memoryEntries.createdAt} <= ${query.createdBefore}::timestamptz`,
     );
   }
   if (query.accessedAfter) {
-    conditions.push(
+    baseConditions.push(
       drizzleSql`${memoryEntries.lastAccessedAt} >= ${query.accessedAfter}::timestamptz`,
     );
   }
   if (query.accessedBefore) {
-    conditions.push(
+    baseConditions.push(
       drizzleSql`${memoryEntries.lastAccessedAt} <= ${query.accessedBefore}::timestamptz`,
     );
   }
 
-  if (query.cursor) {
-    const decoded = decodeCursor(query.cursor);
-    if (decoded) {
-      conditions.push(buildSearchCursorCondition(rankExpression, decoded));
+  const decodedCursor = query.cursor ? decodeCursor(query.cursor) : null;
+  if (decodedCursor && !hybridSearch) {
+    const cursorCondition = buildSearchCursorCondition(rankExpression, decodedCursor);
+    baseConditions.push(cursorCondition);
+  }
+
+  if (hybridSearch && lexicalCondition && lexicalRankExpression) {
+    const pageOffset = decodedCursor?.offset ?? 0;
+    const boundedOffset = Math.min(pageOffset, MAX_HYBRID_CURSOR_OFFSET);
+    const pageWindow = boundedOffset + limit + 1;
+    const candidateLimit = Math.max(pageWindow, Math.min(pageWindow * 3, 3000));
+
+    const semanticRows = await db
+      .select({
+        ...MEMORY_ENTRY_WITH_AUTHOR_SELECT,
+        search_rank: rankExpression,
+      })
+      .from(memoryEntries)
+      .leftJoin(agents, eq(agents.id, memoryEntries.authorAgentId))
+      .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+      .where(and(...baseConditions, isNotNull(memoryEntries.embedding)))
+      .orderBy(
+        drizzleSql`${rankExpression} DESC NULLS LAST`,
+        desc(memoryEntries.createdAt),
+        desc(memoryEntries.id),
+      )
+      .limit(candidateLimit);
+
+    const lexicalRows = await db
+      .select({
+        ...MEMORY_ENTRY_WITH_AUTHOR_SELECT,
+        search_rank: lexicalRankExpression,
+      })
+      .from(memoryEntries)
+      .leftJoin(agents, eq(agents.id, memoryEntries.authorAgentId))
+      .leftJoin(tenantUsers, eq(tenantUsers.id, agents.userId))
+      .where(and(...baseConditions, lexicalCondition))
+      .orderBy(
+        drizzleSql`${lexicalRankExpression} DESC NULLS LAST`,
+        desc(memoryEntries.createdAt),
+        desc(memoryEntries.id),
+      )
+      .limit(candidateLimit);
+
+    const fusedById = new Map<
+      string,
+      {
+        row: Record<string, unknown>;
+        score: number;
+        seenSemantic: boolean;
+        seenLexical: boolean;
+      }
+    >();
+
+    const RRF_K = 60;
+    const OVERLAP_BOOST = 1 / RRF_K;
+    const addRows = (rows: Record<string, unknown>[], source: "semantic" | "lexical") => {
+      rows.forEach((row, index) => {
+        const id = row.id as string;
+        const existing = fusedById.get(id);
+        const rrf = 1 / (RRF_K + index + 1);
+
+        if (existing) {
+          existing.score += rrf;
+          if (source === "semantic") {
+            existing.seenSemantic = true;
+          } else {
+            existing.seenLexical = true;
+          }
+          return;
+        }
+
+        fusedById.set(id, {
+          row,
+          score: rrf,
+          seenSemantic: source === "semantic",
+          seenLexical: source === "lexical",
+        });
+      });
+    };
+
+    addRows(semanticRows as Record<string, unknown>[], "semantic");
+    addRows(lexicalRows as Record<string, unknown>[], "lexical");
+
+    const fusedRows = Array.from(fusedById.values())
+      .map((entry) => ({
+        ...entry,
+        score: entry.score + (entry.seenSemantic && entry.seenLexical ? OVERLAP_BOOST : 0),
+      }))
+      .sort((a, b) => {
+        if (b.score !== a.score) {
+          return b.score - a.score;
+        }
+
+        const aCreatedAt = asTimestamp(a.row.created_at);
+        const bCreatedAt = asTimestamp(b.row.created_at);
+        if (bCreatedAt !== aCreatedAt) {
+          return bCreatedAt.localeCompare(aCreatedAt);
+        }
+
+        return (b.row.id as string).localeCompare(a.row.id as string);
+      });
+
+    const pageRows = fusedRows.slice(pageOffset, pageOffset + limit + 1);
+    const hasMore = pageRows.length > limit;
+    const items = pageRows.slice(0, limit).map((entry) => mapTier1Row(entry.row));
+
+    let nextCursor: string | null = null;
+    if (hasMore && items.length > 0) {
+      const last = pageRows[Math.min(limit - 1, pageRows.length - 1)];
+      nextCursor = encodeCursor(
+        asTimestamp(last.row.created_at),
+        last.row.id as string,
+        undefined,
+        pageOffset + limit,
+      );
     }
+
+    return { items, nextCursor };
+  }
+
+  const conditions = [...baseConditions];
+  if (lexicalCondition) {
+    conditions.push(lexicalCondition);
   }
 
   const rows = await db
@@ -629,6 +781,23 @@ export async function updateMemory(
   const newVersion = (entry.version as number) + 1;
   const newContent = input.content ?? (entry.content as string);
   const newTags = input.tags ?? (entry.tags as string[]);
+  const contentChanged = input.content !== undefined && input.content !== (entry.content as string);
+  const tagsChanged = input.tags !== undefined && !stringArraysEqual(input.tags, entry.tags as string[]);
+  const needsEnrichment = contentChanged || tagsChanged;
+  const enrichmentReset = contentChanged
+    ? {
+        summary: null,
+        autoTags: [],
+        embedding: null,
+        relatedMemoryIds: [],
+        enrichmentStatus: "pending" as const,
+      }
+    : tagsChanged
+      ? {
+          autoTags: [],
+          enrichmentStatus: "pending" as const,
+        }
+      : {};
   const [updated] = await db
     .update(memoryEntries)
     .set({
@@ -636,6 +805,7 @@ export async function updateMemory(
       tags: newTags,
       version: newVersion,
       lastAccessedAt: drizzleSql`NOW()`,
+      ...(needsEnrichment ? enrichmentReset : {}),
     })
     .where(
       and(
@@ -667,7 +837,10 @@ export async function updateMemory(
   // Audit log
   await writeAuditLog(txSql, agent.tenantId, agent.id, "memory.update", id, "success");
 
-  return { entry: mapRow(updated as Record<string, unknown>) };
+  return {
+    entry: mapRow(updated as Record<string, unknown>),
+    needsEnrichment,
+  };
 }
 
 export async function deleteMemory(
@@ -873,4 +1046,21 @@ function asTimestamp(value: unknown): string {
     return value.toISOString();
   }
   return String(value);
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+  const leftNormalized = [...new Set(left)].sort();
+  const rightNormalized = [...new Set(right)].sort();
+
+  if (leftNormalized.length !== rightNormalized.length) {
+    return false;
+  }
+
+  for (let index = 0; index < leftNormalized.length; index += 1) {
+    if (leftNormalized[index] !== rightNormalized[index]) {
+      return false;
+    }
+  }
+
+  return true;
 }

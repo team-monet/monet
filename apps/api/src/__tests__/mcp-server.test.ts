@@ -232,4 +232,38 @@ describe("MCP server factory", () => {
 
     await Promise.all([client.close(), server.close()]);
   });
+
+  it("memory_update re-enqueues enrichment when update invalidates embeddings", async () => {
+    memoryServiceMocks.updateMemory.mockResolvedValue({
+      entry: { id: "mem-2", content: "updated" },
+      needsEnrichment: true,
+    });
+
+    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const result = await client.callTool({
+      name: "memory_update",
+      arguments: {
+        id: "00000000-0000-0000-0000-000000000099",
+        content: "updated",
+        expectedVersion: 0,
+      },
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(enqueueEnrichment).toHaveBeenCalledWith(
+      expect.anything(),
+      "tenant_test",
+      "00000000-0000-0000-0000-000000000099",
+    );
+
+    await Promise.all([client.close(), server.close()]);
+  });
 });

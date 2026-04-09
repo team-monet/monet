@@ -343,10 +343,13 @@ describe("enqueueEnrichment", () => {
       }
 
       if (scopeCallCount === 3) {
+        const writeReturningMock = vi.fn().mockResolvedValue([{ id: "entry-1" }]);
         return fn({
           update: () => ({
             set: () => ({
-              where: async () => undefined,
+              where: () => ({
+                returning: writeReturningMock,
+              }),
             }),
           }),
         });
@@ -359,5 +362,135 @@ describe("enqueueEnrichment", () => {
     await waitForEnrichmentDrain(1000);
 
     expect(maxConcurrentCalls).toBe(1);
+  });
+
+  it("requeues stale enrichment write-back when memory version changed", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    setEnrichmentProviderForTests({
+      generateSummary: async () => "summary",
+      extractTags: async () => ["ops"],
+      computeEmbedding: async () => [0.1, 0.2, 0.3],
+    });
+
+    const staleWriteReturningMock = vi.fn().mockResolvedValue([]);
+    const staleResetReturningMock = vi.fn().mockResolvedValue([{ id: "entry-1" }]);
+    const freshWriteReturningMock = vi.fn().mockResolvedValue([{ id: "entry-1" }]);
+    let scopeCallCount = 0;
+    withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) => {
+      scopeCallCount += 1;
+
+      if (scopeCallCount === 1) {
+        return fn({
+          update: () => ({
+            set: () => ({
+              where: () => ({
+                returning: async () => [
+                  {
+                    id: "entry-1",
+                    content: "stale test",
+                    tags: ["existing"],
+                    version: 1,
+                  },
+                ],
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 2) {
+        return fn({
+          select: () => ({
+            from: () => ({
+              where: () => ({
+                orderBy: () => ({
+                  limit: async () => [],
+                }),
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 3) {
+        const updateMock = vi
+          .fn()
+          .mockImplementationOnce(() => ({
+            set: () => ({
+              where: () => ({
+                returning: staleWriteReturningMock,
+              }),
+            }),
+          }))
+          .mockImplementationOnce(() => ({
+            set: () => ({
+              where: () => ({
+                returning: staleResetReturningMock,
+              }),
+            }),
+          }));
+
+        return fn({
+          update: updateMock,
+        });
+      }
+
+      if (scopeCallCount === 4) {
+        return fn({
+          update: () => ({
+            set: () => ({
+              where: () => ({
+                returning: async () => [
+                  {
+                    id: "entry-1",
+                    content: "fresh test",
+                    tags: ["existing"],
+                    version: 2,
+                  },
+                ],
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 5) {
+        return fn({
+          select: () => ({
+            from: () => ({
+              where: () => ({
+                orderBy: () => ({
+                  limit: async () => [],
+                }),
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 6) {
+        return fn({
+          update: () => ({
+            set: () => ({
+              where: () => ({
+                returning: freshWriteReturningMock,
+              }),
+            }),
+          }),
+        });
+      }
+
+      throw new Error(`Unexpected withTenantDrizzleScope call #${scopeCallCount}`);
+    });
+
+    enqueueEnrichment({} as SqlClient, "tenant_test", "entry-1");
+    await waitForEnrichmentDrain(1000);
+
+    expect(staleWriteReturningMock).toHaveBeenCalledTimes(1);
+    expect(staleResetReturningMock).toHaveBeenCalledTimes(1);
+    expect(freshWriteReturningMock).toHaveBeenCalledTimes(1);
+    expect(scopeCallCount).toBe(6);
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("Memory enrichment failed"));
   });
 });

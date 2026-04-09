@@ -178,7 +178,10 @@ export async function computeQueryEmbedding(query: string): Promise<number[] | n
   }
 
   try {
-    return await withTimeout(embeddingProvider.computeEmbedding(query), QUERY_EMBEDDING_TIMEOUT_MS);
+    return await withTimeout(
+      embeddingProvider.computeEmbedding(query, { mode: "query" }),
+      QUERY_EMBEDDING_TIMEOUT_MS,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`Falling back to text search because query embedding failed: ${message}`);
@@ -197,7 +200,7 @@ function getProvider(opts: { logFailures: boolean }): EnrichmentProvider | null 
   return {
     generateSummary: (content: string) => chatProvider.generateSummary(content),
     extractTags: (content: string) => chatProvider.extractTags(content),
-    computeEmbedding: (content: string) => embeddingProvider.computeEmbedding(content),
+    computeEmbedding: (content: string, options) => embeddingProvider.computeEmbedding(content, options),
   };
 }
 
@@ -285,6 +288,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           id: memoryEntries.id,
           content: memoryEntries.content,
           tags: memoryEntries.tags,
+          version: memoryEntries.version,
         });
 
       if (row) {
@@ -296,6 +300,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           id: memoryEntries.id,
           content: memoryEntries.content,
           tags: memoryEntries.tags,
+          version: memoryEntries.version,
         })
         .from(memoryEntries)
         .where(
@@ -321,8 +326,8 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
     const mergedTags = [...new Set([...(entry.tags ?? []), ...extractedTags])].slice(0, 16);
     const relatedMemoryIds = await findRelatedMemoryIds(sql, job.schemaName, job.entryId, embedding);
 
-    await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
-      await db
+    const shouldRequeue = await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
+      const [updated] = await db
         .update(memoryEntries)
         .set({
           summary,
@@ -331,8 +336,36 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           relatedMemoryIds,
           enrichmentStatus: "completed",
         })
-        .where(eq(memoryEntries.id, job.entryId));
+        .where(
+          and(
+            eq(memoryEntries.id, job.entryId),
+            eq(memoryEntries.version, entry.version),
+          ),
+        )
+        .returning({ id: memoryEntries.id });
+
+      if (updated) {
+        return false;
+      }
+
+      const [staleRow] = await db
+        .update(memoryEntries)
+        .set({ enrichmentStatus: "pending" })
+        .where(
+          and(
+            eq(memoryEntries.id, job.entryId),
+            eq(memoryEntries.enrichmentStatus, "processing"),
+            ne(memoryEntries.version, entry.version),
+          ),
+        )
+        .returning({ id: memoryEntries.id });
+
+      return Boolean(staleRow);
     });
+
+    if (shouldRequeue) {
+      enqueueEnrichment(sql, job.schemaName, job.entryId);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await markEnrichmentFailed(sql, job.schemaName, job.entryId);

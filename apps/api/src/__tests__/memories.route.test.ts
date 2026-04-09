@@ -52,9 +52,14 @@ vi.mock("../services/memory.service.js", () => ({
   resolveMemoryWritePreflight: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock("../services/enrichment.service.js", () => ({
+const enrichmentServiceMocks = {
   computeQueryEmbedding: vi.fn().mockResolvedValue(null),
   enqueueEnrichment: vi.fn(),
+};
+
+vi.mock("../services/enrichment.service.js", () => ({
+  computeQueryEmbedding: (...args: unknown[]) => enrichmentServiceMocks.computeQueryEmbedding(...args),
+  enqueueEnrichment: (...args: unknown[]) => enrichmentServiceMocks.enqueueEnrichment(...args),
 }));
 
 function createTestApp() {
@@ -286,6 +291,32 @@ describe("memories route", () => {
       expect(res.status).toBe(409);
       const body = await res.json();
       expect(body.currentVersion).toBe(2);
+    });
+
+    it("re-enqueues enrichment when update invalidates embeddings", async () => {
+      serviceMocks.updateMemory.mockResolvedValue({
+        entry: { id: "mem-1", content: "updated" },
+        needsEnrichment: true,
+      });
+
+      const res = await app.request(
+        "/memories/00000000-0000-0000-0000-000000000099",
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: "updated",
+            expectedVersion: 1,
+          }),
+        },
+      );
+
+      expect(res.status).toBe(200);
+      expect(enrichmentServiceMocks.enqueueEnrichment).toHaveBeenCalledWith(
+        expect.anything(),
+        SCHEMA_NAME,
+        "00000000-0000-0000-0000-000000000099",
+      );
     });
   });
 

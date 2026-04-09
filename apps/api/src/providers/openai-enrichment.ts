@@ -1,4 +1,8 @@
-import type { EnrichmentConfig, EnrichmentProvider } from "./enrichment";
+import type {
+  EmbeddingMode,
+  EnrichmentConfig,
+  EnrichmentProvider,
+} from "./enrichment";
 import { EMBEDDING_DIMENSIONS } from "./enrichment";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
@@ -66,7 +70,11 @@ export class OpenAICompatibleEnrichmentProvider implements EnrichmentProvider {
     return text.trim().slice(0, 200);
   }
 
-  async computeEmbedding(content: string): Promise<number[]> {
+  async computeEmbedding(
+    content: string,
+    options?: { mode?: EmbeddingMode },
+  ): Promise<number[]> {
+    void options;
     const response = await fetch(`${this.embeddingBaseUrl}/embeddings`, {
       method: "POST",
       headers: this.buildHeaders(this.embeddingApiKey),

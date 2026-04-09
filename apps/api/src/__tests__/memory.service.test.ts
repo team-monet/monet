@@ -508,6 +508,205 @@ describe("updateMemory", () => {
       currentVersion: 4,
     });
   });
+
+  it("does not trigger enrichment for tag reordering only", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000510",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops", "docs"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({
+      limit: entryLimitMock,
+    }));
+    const entryFromMock = vi.fn(() => ({
+      where: entryWhereMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: entryFromMock,
+    }));
+
+    const returningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000510",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["docs", "ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 4,
+      },
+    ]);
+    const updateWhereMock = vi.fn(() => ({
+      returning: returningMock,
+    }));
+    const updateSetMock = vi.fn(() => ({
+      where: updateWhereMock,
+    }));
+    const updateMock = vi.fn(() => ({
+      set: updateSetMock,
+    }));
+
+    const memoryVersionInsertMock = vi.fn().mockResolvedValue(undefined);
+    const auditInsertMock = vi.fn().mockResolvedValue(undefined);
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: memoryVersionInsertMock })
+      .mockReturnValueOnce({ values: auditInsertMock });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+      insert: insertMock,
+    });
+
+    const result = await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000510",
+      {
+        tags: ["docs", "ops"],
+        expectedVersion: 3,
+      },
+    );
+
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        enrichmentStatus: "pending",
+      }),
+    );
+    expect(result).toMatchObject({ needsEnrichment: false });
+  });
+
+  it("keeps summary and embedding for tag-only updates", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000511",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({
+      limit: entryLimitMock,
+    }));
+    const entryFromMock = vi.fn(() => ({
+      where: entryWhereMock,
+    }));
+    const selectMock = vi.fn(() => ({
+      from: entryFromMock,
+    }));
+
+    const returningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000511",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops", "new"],
+        auto_tags: [],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: null,
+        user_id: null,
+        version: 4,
+      },
+    ]);
+    const updateWhereMock = vi.fn(() => ({
+      returning: returningMock,
+    }));
+    const updateSetMock = vi.fn(() => ({
+      where: updateWhereMock,
+    }));
+    const updateMock = vi.fn(() => ({
+      set: updateSetMock,
+    }));
+
+    const memoryVersionInsertMock = vi.fn().mockResolvedValue(undefined);
+    const auditInsertMock = vi.fn().mockResolvedValue(undefined);
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: memoryVersionInsertMock })
+      .mockReturnValueOnce({ values: auditInsertMock });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+      insert: insertMock,
+    });
+
+    const result = await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000511",
+      {
+        tags: ["ops", "new"],
+        expectedVersion: 3,
+      },
+    );
+
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        autoTags: [],
+        enrichmentStatus: "pending",
+      }),
+    );
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        summary: null,
+        embedding: null,
+      }),
+    );
+    expect(result).toMatchObject({ needsEnrichment: true });
+  });
 });
 
 describe("deleteMemory", () => {
@@ -864,8 +1063,77 @@ describe("searchMemories", () => {
     });
   });
 
-  it("ignores invalid cursors and keeps semantic rank values", async () => {
-    const limitMock = vi.fn().mockResolvedValue([
+  it("runs hybrid search and fuses semantic plus lexical matches", async () => {
+    const semanticLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000804",
+        content: "vector hit",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["semantic"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 4,
+        outdated: false,
+        created_at: new Date("2026-03-22T06:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.87,
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000806",
+        content: "semantic only",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["semantic"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 2,
+        outdated: false,
+        created_at: new Date("2026-03-22T05:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.62,
+      },
+    ]);
+    const semanticOrderByMock = vi.fn(() => ({
+      limit: semanticLimitMock,
+    }));
+    const semanticWhereMock = vi.fn(() => ({
+      orderBy: semanticOrderByMock,
+    }));
+    const semanticSecondLeftJoinMock = vi.fn(() => ({
+      where: semanticWhereMock,
+    }));
+    const semanticFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: semanticSecondLeftJoinMock,
+    }));
+    const semanticFromMock = vi.fn(() => ({
+      leftJoin: semanticFirstLeftJoinMock,
+    }));
+    const semanticSelectMock = vi.fn(() => ({
+      from: semanticFromMock,
+    }));
+
+    const lexicalLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000805",
+        content: "lexical hit",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["keyword"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 3,
+        outdated: false,
+        created_at: new Date("2026-03-22T07:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 0.2,
+      },
       {
         id: "00000000-0000-0000-0000-000000000804",
         content: "vector hit",
@@ -883,27 +1151,30 @@ describe("searchMemories", () => {
         search_rank: 0.87,
       },
     ]);
-    const orderByMock = vi.fn(() => ({
-      limit: limitMock,
+    const lexicalOrderByMock = vi.fn(() => ({
+      limit: lexicalLimitMock,
     }));
-    const whereMock = vi.fn(() => ({
-      orderBy: orderByMock,
+    const lexicalWhereMock = vi.fn(() => ({
+      orderBy: lexicalOrderByMock,
     }));
-    const secondLeftJoinMock = vi.fn(() => ({
-      where: whereMock,
+    const lexicalSecondLeftJoinMock = vi.fn(() => ({
+      where: lexicalWhereMock,
     }));
-    const firstLeftJoinMock = vi.fn(() => ({
-      leftJoin: secondLeftJoinMock,
+    const lexicalFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: lexicalSecondLeftJoinMock,
     }));
-    const fromMock = vi.fn(() => ({
-      leftJoin: firstLeftJoinMock,
+    const lexicalFromMock = vi.fn(() => ({
+      leftJoin: lexicalFirstLeftJoinMock,
     }));
-    const selectMock = vi.fn(() => ({
-      from: fromMock,
+    const lexicalSelectMock = vi.fn(() => ({
+      from: lexicalFromMock,
     }));
 
     drizzleMock.mockReturnValue({
-      select: selectMock,
+      select: vi
+        .fn()
+        .mockImplementationOnce(semanticSelectMock)
+        .mockImplementationOnce(lexicalSelectMock),
     });
 
     const result = await searchMemories(
@@ -911,13 +1182,94 @@ describe("searchMemories", () => {
       makeAgent(),
       {
         query: "vector",
-        cursor: "not-a-real-cursor",
+        includePrivate: true,
+        limit: 2,
       },
       [0.1, 0.2, 0.3],
     );
 
-    expect(result.items).toHaveLength(1);
+    expect(result.items).toHaveLength(2);
+    expect(result.items.map((item) => item.id)).toEqual([
+      "00000000-0000-0000-0000-000000000804",
+      "00000000-0000-0000-0000-000000000805",
+    ]);
+    expect(decodeCursor(result.nextCursor!)).toMatchObject({
+      id: "00000000-0000-0000-0000-000000000805",
+      offset: 2,
+    });
+  });
+
+  it("caps hybrid candidate limit when cursor offset is extremely large", async () => {
+    const semanticLimitMock = vi.fn().mockResolvedValue([]);
+    const semanticOrderByMock = vi.fn(() => ({
+      limit: semanticLimitMock,
+    }));
+    const semanticWhereMock = vi.fn(() => ({
+      orderBy: semanticOrderByMock,
+    }));
+    const semanticSecondLeftJoinMock = vi.fn(() => ({
+      where: semanticWhereMock,
+    }));
+    const semanticFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: semanticSecondLeftJoinMock,
+    }));
+    const semanticFromMock = vi.fn(() => ({
+      leftJoin: semanticFirstLeftJoinMock,
+    }));
+    const semanticSelectMock = vi.fn(() => ({
+      from: semanticFromMock,
+    }));
+
+    const lexicalLimitMock = vi.fn().mockResolvedValue([]);
+    const lexicalOrderByMock = vi.fn(() => ({
+      limit: lexicalLimitMock,
+    }));
+    const lexicalWhereMock = vi.fn(() => ({
+      orderBy: lexicalOrderByMock,
+    }));
+    const lexicalSecondLeftJoinMock = vi.fn(() => ({
+      where: lexicalWhereMock,
+    }));
+    const lexicalFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: lexicalSecondLeftJoinMock,
+    }));
+    const lexicalFromMock = vi.fn(() => ({
+      leftJoin: lexicalFirstLeftJoinMock,
+    }));
+    const lexicalSelectMock = vi.fn(() => ({
+      from: lexicalFromMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: vi
+        .fn()
+        .mockImplementationOnce(semanticSelectMock)
+        .mockImplementationOnce(lexicalSelectMock),
+    });
+
+    const largeOffsetCursor = encodeCursor(
+      "2026-03-22T07:00:00.000Z",
+      "00000000-0000-0000-0000-000000000805",
+      undefined,
+      99999999,
+    );
+
+    const result = await searchMemories(
+      {} as TransactionClient,
+      makeAgent(),
+      {
+        query: "vector",
+        includePrivate: true,
+        limit: 20,
+        cursor: largeOffsetCursor,
+      },
+      [0.1, 0.2, 0.3],
+    );
+
+    expect(result.items).toEqual([]);
     expect(result.nextCursor).toBeNull();
+    expect(semanticLimitMock).toHaveBeenCalledWith(3000);
+    expect(lexicalLimitMock).toHaveBeenCalledWith(3000);
   });
 });
 
