@@ -1198,6 +1198,79 @@ describe("searchMemories", () => {
       offset: 2,
     });
   });
+
+  it("caps hybrid candidate limit when cursor offset is extremely large", async () => {
+    const semanticLimitMock = vi.fn().mockResolvedValue([]);
+    const semanticOrderByMock = vi.fn(() => ({
+      limit: semanticLimitMock,
+    }));
+    const semanticWhereMock = vi.fn(() => ({
+      orderBy: semanticOrderByMock,
+    }));
+    const semanticSecondLeftJoinMock = vi.fn(() => ({
+      where: semanticWhereMock,
+    }));
+    const semanticFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: semanticSecondLeftJoinMock,
+    }));
+    const semanticFromMock = vi.fn(() => ({
+      leftJoin: semanticFirstLeftJoinMock,
+    }));
+    const semanticSelectMock = vi.fn(() => ({
+      from: semanticFromMock,
+    }));
+
+    const lexicalLimitMock = vi.fn().mockResolvedValue([]);
+    const lexicalOrderByMock = vi.fn(() => ({
+      limit: lexicalLimitMock,
+    }));
+    const lexicalWhereMock = vi.fn(() => ({
+      orderBy: lexicalOrderByMock,
+    }));
+    const lexicalSecondLeftJoinMock = vi.fn(() => ({
+      where: lexicalWhereMock,
+    }));
+    const lexicalFirstLeftJoinMock = vi.fn(() => ({
+      leftJoin: lexicalSecondLeftJoinMock,
+    }));
+    const lexicalFromMock = vi.fn(() => ({
+      leftJoin: lexicalFirstLeftJoinMock,
+    }));
+    const lexicalSelectMock = vi.fn(() => ({
+      from: lexicalFromMock,
+    }));
+
+    drizzleMock.mockReturnValue({
+      select: vi
+        .fn()
+        .mockImplementationOnce(semanticSelectMock)
+        .mockImplementationOnce(lexicalSelectMock),
+    });
+
+    const largeOffsetCursor = encodeCursor(
+      "2026-03-22T07:00:00.000Z",
+      "00000000-0000-0000-0000-000000000805",
+      undefined,
+      99999999,
+    );
+
+    const result = await searchMemories(
+      {} as TransactionClient,
+      makeAgent(),
+      {
+        query: "vector",
+        includePrivate: true,
+        limit: 20,
+        cursor: largeOffsetCursor,
+      },
+      [0.1, 0.2, 0.3],
+    );
+
+    expect(result.items).toEqual([]);
+    expect(result.nextCursor).toBeNull();
+    expect(semanticLimitMock).toHaveBeenCalledWith(3000);
+    expect(lexicalLimitMock).toHaveBeenCalledWith(3000);
+  });
 });
 
 describe("checkQuota", () => {

@@ -326,7 +326,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
     const mergedTags = [...new Set([...(entry.tags ?? []), ...extractedTags])].slice(0, 16);
     const relatedMemoryIds = await findRelatedMemoryIds(sql, job.schemaName, job.entryId, embedding);
 
-    await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
+    const shouldRequeue = await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
       const [updated] = await db
         .update(memoryEntries)
         .set({
@@ -344,10 +344,28 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
         )
         .returning({ id: memoryEntries.id });
 
-      // If no rows were updated, content/tags changed while this job was running.
-      // A newer enrichment job will write the current results.
-      void updated;
+      if (updated) {
+        return false;
+      }
+
+      const [staleRow] = await db
+        .update(memoryEntries)
+        .set({ enrichmentStatus: "pending" })
+        .where(
+          and(
+            eq(memoryEntries.id, job.entryId),
+            eq(memoryEntries.enrichmentStatus, "processing"),
+            ne(memoryEntries.version, entry.version),
+          ),
+        )
+        .returning({ id: memoryEntries.id });
+
+      return Boolean(staleRow);
     });
+
+    if (shouldRequeue) {
+      enqueueEnrichment(sql, job.schemaName, job.entryId);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await markEnrichmentFailed(sql, job.schemaName, job.entryId);

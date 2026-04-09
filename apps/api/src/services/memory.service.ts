@@ -84,6 +84,8 @@ const MEMORY_VERSION_RETURNING = {
   created_at: memoryVersions.createdAt,
 };
 
+const MAX_HYBRID_CURSOR_OFFSET = 1000;
+
 // ---------- Cursor helpers ----------
 
 interface SearchCursorPayload {
@@ -509,7 +511,8 @@ export async function searchMemories(
 
   if (hybridSearch && lexicalCondition && lexicalRankExpression) {
     const pageOffset = decodedCursor?.offset ?? 0;
-    const pageWindow = pageOffset + limit + 1;
+    const boundedOffset = Math.min(pageOffset, MAX_HYBRID_CURSOR_OFFSET);
+    const pageWindow = boundedOffset + limit + 1;
     const candidateLimit = Math.max(pageWindow, Math.min(pageWindow * 3, 3000));
 
     const semanticRows = await db
