@@ -7,6 +7,19 @@ It provides:
 - MCP endpoint so agents can read and write memory through standard MCP tools.
 - Dashboard UI for tenant/admin operations and memory inspection.
 
+## API and MCP URL Structure
+
+Tenant context is now encoded directly in the request path.
+
+- REST API routes are tenant-qualified: `/api/tenants/:tenantSlug/...`
+- MCP connections are tenant-qualified: `/mcp/:tenantSlug`
+
+Examples:
+
+- `GET /api/tenants/acme/agents/me`
+- `POST /api/tenants/acme/memories`
+- MCP URL: `https://api.example.com/mcp/acme`
+
 ## Repository Layout
 
 - `apps/api` - Monet API service (Hono + TypeScript).
@@ -14,6 +27,11 @@ It provides:
 - `packages/db` - Drizzle schema and migrations.
 - `packages/mcp-tools` - MCP tool definitions.
 - `packages/types` - shared types.
+
+Database architecture:
+
+- `public` schema: platform-level tables only (tenant registry, platform setup, OIDC config, nominations)
+- `tenant_<tenantId>` schemas: tenant identity + operational tables (users, agents, groups, memories, audit, rules)
 
 ## Documentation
 
@@ -447,7 +465,7 @@ API keys are one-time issuance.
 
 Rotation:
 
-1. Register replacement key via `POST /api/agents/register`.
+1. Register replacement key via `POST /api/tenants/:tenantSlug/agents/register`.
 2. Update clients.
 3. Revoke old key via `agents.revoked_at`.
 
@@ -456,7 +474,9 @@ Rotation:
 Register a new agent in an existing tenant:
 
 ```bash
-curl -sS -X POST "$API_BASE_URL/api/agents/register" \
+TENANT_SLUG="acme"
+
+curl -sS -X POST "$API_BASE_URL/api/tenants/$TENANT_SLUG/agents/register" \
   -H "Authorization: Bearer $EXISTING_AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -474,7 +494,9 @@ Response includes:
 Verify a newly issued key:
 
 ```bash
-curl -sS "$API_BASE_URL/api/agents/me" \
+TENANT_SLUG="acme"
+
+curl -sS "$API_BASE_URL/api/tenants/$TENANT_SLUG/agents/me" \
   -H "Authorization: Bearer $NEW_AGENT_API_KEY"
 ```
 
@@ -484,26 +506,34 @@ curl -sS "$API_BASE_URL/api/agents/me" \
 
 Use:
 
-- MCP URL: `http://127.0.0.1:${API_PORT}/mcp`
+- MCP URL: `http://127.0.0.1:${API_PORT}/mcp/${TENANT_SLUG}`
 - Header: `Authorization: Bearer <apiKey>`
 
 Smoke test:
 
 ```bash
-MCP_API_KEY="<apiKey>" pnpm local:mcp:smoke
+TENANT_SLUG="acme"
+MCP_API_KEY="<apiKey>" \
+MCP_URL="http://127.0.0.1:${API_PORT:-3301}/mcp/$TENANT_SLUG" \
+pnpm local:mcp:smoke
 ```
 
 Optional write verification:
 
 ```bash
-MCP_API_KEY="<apiKey>" MCP_SMOKE_WRITE=true pnpm local:mcp:smoke
+TENANT_SLUG="acme"
+MCP_API_KEY="<apiKey>" \
+MCP_URL="http://127.0.0.1:${API_PORT:-3301}/mcp/$TENANT_SLUG" \
+MCP_SMOKE_WRITE=true \
+pnpm local:mcp:smoke
 ```
 
 Manual key check:
 
 ```bash
+TENANT_SLUG="acme"
 API_KEY="<apiKey>"
-curl -sS http://127.0.0.1:${API_PORT:-3301}/api/agents/me \
+curl -sS "http://127.0.0.1:${API_PORT:-3301}/api/tenants/$TENANT_SLUG/agents/me" \
   -H "Authorization: Bearer $API_KEY"
 ```
 

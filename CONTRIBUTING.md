@@ -80,6 +80,7 @@ pnpm db:migrate
 - Validate request bodies defensively and return 4xx for client input problems.
 - Avoid leaking secrets in logs.
 - Keep hot-path logging minimal and purposeful.
+- Keep route examples and tests tenant-qualified (`/api/tenants/:tenantSlug/...`).
 
 ## Dashboard Changes
 
@@ -100,7 +101,10 @@ pnpm --filter @monet/dashboard dev:seeded
 4. Validate MCP only if you already have a tenant agent API key:
 
 ```bash
-MCP_API_KEY="<apiKey>" pnpm local:mcp:smoke
+TENANT_SLUG="acme"
+MCP_API_KEY="<apiKey>" \
+MCP_URL="http://127.0.0.1:${API_PORT:-3301}/mcp/$TENANT_SLUG" \
+pnpm local:mcp:smoke
 ```
 
 ## CI Notes

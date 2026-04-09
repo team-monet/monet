@@ -17,7 +17,9 @@ Avoid `user`, `user group`, and similar terms in product-facing language.
 
 ## Technical Mapping
 
-The current schema still uses older table names:
+Tenant identity and access-control tables are tenant-scoped and live in each
+tenant schema (`tenant_<tenantId>`). The implementation still uses these table
+names:
 
 - `users` = users
 - `user_groups` = user groups

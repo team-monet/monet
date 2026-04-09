@@ -23,6 +23,28 @@ For the recommended M4 deployment:
 If you need rolling or zero-downtime upgrades, treat that as a separate
 architecture track rather than an extension of this guide.
 
+## Tenant Schema Consolidation Upgrade (PR #136)
+
+The tenant schema consolidation refactor is a breaking surface change.
+
+Changes to account for:
+
+- REST API routes are now tenant-qualified: `/api/tenants/:tenantSlug/...`
+- MCP connections are now tenant-qualified: `/mcp/:tenantSlug`
+- tenant resolution now comes from the URL tenant slug instead of deriving tenant
+  context from agent lookup alone
+- tenant identity/access tables moved from `public` into each tenant schema
+
+Operator guidance for this upgrade:
+
+- take a full database backup before deployment
+- recreate the runtime database environment as part of the cutover
+- apply current migrations and restart services
+- verify tenant-qualified API and MCP paths in clients/integrations
+
+There is no separate data-transformation migration to run for this change, but
+you should still treat this as a backup-first maintenance event.
+
 ## Before You Upgrade
 
 Before every version change:

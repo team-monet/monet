@@ -6,7 +6,7 @@ Today, Monet’s operator-facing signals are:
 
 - structured JSON request logs for HTTP API and MCP
 - readiness and liveness endpoints
-- tenant-admin usage/benefit/health metrics from `/api/metrics`
+- tenant-admin usage/benefit/health metrics from `/api/tenants/:tenantSlug/metrics`
 - startup validation output and runtime warnings on stdout/stderr
 
 Monet does not currently ship a Prometheus exporter or OpenTelemetry pipeline.
@@ -45,7 +45,7 @@ Example API request log:
   "message": "http_request",
   "requestId": "8f0d2e54-64de-4bf1-a8f9-1479f91067c9",
   "method": "GET",
-  "path": "/api/agents/me",
+  "path": "/api/tenants/acme/agents/me",
   "statusCode": 200,
   "latencyMs": 12.41,
   "tenantId": "dca9d2f4-7db6-47e0-98d0-68e5516b74cb",
@@ -102,7 +102,8 @@ the failure is in database connectivity, migrations, or MCP availability.
 
 ## Tenant Metrics
 
-Tenant admins can inspect runtime metrics through `GET /api/metrics`.
+Tenant admins can inspect runtime metrics through
+`GET /api/tenants/:tenantSlug/metrics`.
 
 The response has three sections:
 
@@ -220,7 +221,8 @@ When debugging a request or incident:
 2. Pull the matching API or MCP request log.
 3. Check readiness and recent startup logs.
 4. Check for nearby warning/error lines about DB, enrichment, audit retention, or MCP transport.
-5. If the issue is tenant-specific, inspect `/api/metrics` for that tenant.
+5. If the issue is tenant-specific, inspect
+   `/api/tenants/:tenantSlug/metrics` for that tenant.
 
 ## Known Limits
 
@@ -229,7 +231,8 @@ Current observability gaps:
 - no built-in Prometheus scrape endpoint
 - no native OpenTelemetry export
 - non-request application logs are not yet uniformly structured JSON
-- `/api/metrics` is tenant-admin scoped, not a platform-wide operator endpoint
+- `/api/tenants/:tenantSlug/metrics` is tenant-admin scoped, not a
+  platform-wide operator endpoint
 
 For M4, the recommended operating model is still sufficient: structured request
 logs, readiness, and targeted tenant metrics give a workable production signal

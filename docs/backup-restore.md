@@ -158,6 +158,11 @@ Tenant data lives in two places:
 - the tenant schema, such as `tenant_1234_...`
 - shared platform tables keyed by `tenant_id`
 
+After tenant schema consolidation, tenant identity and access-control tables now
+live inside the tenant schema (including `users`, `agents`, `agent_groups`,
+`agent_group_members`, `user_groups`, `user_group_members`, and
+`user_group_agent_group_permissions`).
+
 Because of that split, the recommended per-tenant recovery workflow is:
 
 1. Restore the full database backup into a scratch PostgreSQL instance.
@@ -183,15 +188,8 @@ Example:
 At minimum, per-tenant recovery work must account for these shared tables:
 
 - `tenants`
-- `users`
 - `tenant_oauth_configs`
 - `tenant_admin_nominations`
-- `user_groups`
-- `agents`
-- `agent_groups`
-- `user_group_members`
-- `user_group_agent_group_permissions`
-- `agent_group_members`
 
 The tenant schema alone is not enough to recover a working tenant.
 

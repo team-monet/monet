@@ -89,8 +89,12 @@ Set these public URLs in `.env.runtime`:
 
 - `NEXTAUTH_URL=https://monet.example.com`
 - `PUBLIC_API_URL=https://api.monet.example.com`
-- `MCP_PUBLIC_URL=https://api.monet.example.com/mcp`
+- `MCP_PUBLIC_URL=https://api.monet.example.com`
 - `PUBLIC_OIDC_BASE_URL=https://auth.monet.example.com`
+
+Monet MCP connections are tenant-qualified at `/mcp/:tenantSlug`.
+If `MCP_PUBLIC_URL` is set to the API origin, dashboard-generated agent
+connection configs will resolve to `https://api.monet.example.com/mcp/<tenantSlug>`.
 
 Keep `KEYCLOAK_BASE_URL` and `LOCAL_OIDC_BASE_URL` on a URL the host and dashboard can actually reach during runtime and Keycloak bootstrap. In the simplest deployment, that can be the same Keycloak hostname if the host can resolve and reach it itself.
 
@@ -234,7 +238,8 @@ Transport security checks:
 - confirm the public dashboard URL loads over `https://`
 - confirm the public API URL responds over `https://`
 - confirm the public OIDC issuer is served over `https://`
-- confirm `MCP_PUBLIC_URL` uses `https://` and ends with `/mcp`
+- confirm `MCP_PUBLIC_URL` uses `https://`
+- confirm tenant MCP URLs resolve as `https://api.monet.example.com/mcp/<tenantSlug>`
 - keep raw host ports `4301`, `4310`, and `4400` private behind the reverse proxy unless you are intentionally using break-glass access
 
 Example checks:
@@ -302,7 +307,7 @@ If OIDC login fails:
 If the dashboard works but API calls fail:
 
 - confirm `PUBLIC_API_URL` points at the public API hostname
-- confirm the proxy forwards `/mcp` and API paths to `127.0.0.1:4301`
+- confirm the proxy forwards `/mcp/*` and `/api/tenants/*` paths to `127.0.0.1:4301`
 - inspect logs by `requestId`
 
 If enrichment is degraded:
