@@ -148,6 +148,39 @@ export async function syncDashboardAgentRole(userId: string, tenantId: string) {
   });
 }
 
+export async function updateDashboardCredentialIfOwnedAgent(
+  userId: string,
+  tenantId: string,
+  agentId: string,
+  apiKey: string,
+) {
+  return withTenantDb(tenantId, async (tenantDb) => {
+    const dashboardExternalId = `dashboard:${userId}`;
+    const rows = await tenantDb
+      .select({ id: agents.id })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.id, agentId),
+          eq(agents.userId, userId),
+          eq(agents.externalId, dashboardExternalId),
+        ),
+      )
+      .limit(1);
+
+    if (rows.length === 0) {
+      return false;
+    }
+
+    await tenantDb
+      .update(tenantUsers)
+      .set({ dashboardApiKeyEncrypted: encrypt(apiKey) })
+      .where(eq(tenantUsers.id, userId));
+
+    return true;
+  });
+}
+
 async function syncAgentGroups(
   tenantDb: Database,
   userId: string,

@@ -2,9 +2,16 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { auth } from "@/lib/auth";
 import { getApiClient } from "@/lib/api-client";
 import { buildMcpConfig, resolvePublicMcpUrl } from "@/lib/agent-connection";
+import { updateDashboardCredentialIfOwnedAgent } from "@/lib/dashboard-agent";
 import type { AgentTokenActionState, AgentMutationActionState } from "./actions-shared";
+
+interface SessionUser {
+  id?: string;
+  tenantId?: string;
+}
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
@@ -33,8 +40,20 @@ export async function regenerateAgentTokenAction(
   }
 
   try {
+    const session = await auth();
+    const sessionUser = session?.user as SessionUser | undefined;
     const client = await getApiClient();
     const result = await client.regenerateAgentToken(agentId);
+
+    if (sessionUser?.id && sessionUser?.tenantId) {
+      await updateDashboardCredentialIfOwnedAgent(
+        sessionUser.id,
+        sessionUser.tenantId,
+        agentId,
+        result.apiKey,
+      );
+    }
+
     revalidateAgentPaths(agentId);
 
     const mcpUrl = await resolvePublicMcpUrl(client.getTenantSlug());
