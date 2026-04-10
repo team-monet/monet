@@ -13,17 +13,31 @@ function CopyButton({ value, label }: { value: string; label: string }) {
   function fallbackCopyWithExecCommand(text: string) {
     const textArea = document.createElement("textarea");
     textArea.value = text;
-    textArea.setAttribute("readonly", "");
+    textArea.setAttribute("aria-hidden", "true");
+    textArea.readOnly = false;
+    textArea.contentEditable = "true";
     textArea.style.position = "fixed";
-    textArea.style.opacity = "0";
+    textArea.style.top = "0";
+    textArea.style.left = "0";
+    textArea.style.width = "1px";
+    textArea.style.height = "1px";
+    textArea.style.padding = "0";
+    textArea.style.border = "0";
+    textArea.style.outline = "0";
+    textArea.style.boxShadow = "none";
+    textArea.style.background = "transparent";
+    textArea.style.opacity = "0.01";
     textArea.style.pointerEvents = "none";
-    textArea.style.left = "-9999px";
+    textArea.style.zIndex = "-1";
 
     const selection = document.getSelection();
+    const ranges = selection
+      ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index))
+      : [];
     const activeElement = document.activeElement as HTMLElement | null;
 
     document.body.appendChild(textArea);
-    textArea.focus();
+    textArea.focus({ preventScroll: true });
     textArea.select();
     textArea.setSelectionRange(0, textArea.value.length);
 
@@ -34,37 +48,63 @@ function CopyButton({ value, label }: { value: string; label: string }) {
       document.body.removeChild(textArea);
       if (selection) {
         selection.removeAllRanges();
+        for (const range of ranges) {
+          selection.addRange(range);
+        }
       }
-      activeElement?.focus();
+      try {
+        activeElement?.focus({ preventScroll: true });
+      } catch {
+        // Ignore focus restoration issues.
+      }
     }
 
-    if (!successful) {
-      throw new Error("execCommand copy failed");
-    }
+    return successful;
   }
 
   async function handleCopy() {
+    setError(null);
+
+    let clipboardCopied = false;
+    let fallbackCopied = false;
+    let clipboardError: unknown;
+
     try {
-      setError(null);
+      const clipboardAttempt =
+        typeof window !== "undefined" && window.isSecureContext && navigator.clipboard?.writeText
+          ? navigator.clipboard.writeText(value)
+          : null;
 
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(value);
-      } else {
-        fallbackCopyWithExecCommand(value);
+      // Keep a synchronous fallback in the original click gesture.
+      fallbackCopied = fallbackCopyWithExecCommand(value);
+
+      if (clipboardAttempt) {
+        await clipboardAttempt;
+        clipboardCopied = true;
       }
+    } catch (err) {
+      clipboardError = err;
+    }
 
+    if (clipboardCopied || fallbackCopied) {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      try {
-        fallbackCopyWithExecCommand(value);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 2000);
-      } catch (fallbackErr) {
-        console.error(`Failed to copy ${label}:`, err, fallbackErr);
-        setError("Copy unavailable here. Select the value and copy manually.");
-      }
+      return;
     }
+
+    try {
+      // Last-resort fallback for browsers that block both clipboard APIs.
+      window.prompt(`Copy ${label}:`, value);
+    } catch {
+      // noop
+    }
+
+    if (clipboardError) {
+      console.error(`Failed to copy ${label}:`, clipboardError);
+    } else {
+      console.error(`Failed to copy ${label}: no clipboard strategy succeeded.`);
+    }
+    setError("Copy unavailable here. Select the value and copy manually.");
   }
 
   return (
