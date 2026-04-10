@@ -2,13 +2,17 @@ import { asc, eq, inArray, sql } from "drizzle-orm";
 import {
   agentGroupMembers,
   agentGroups as agentGroupsTable,
+  tenantSchemaNameFromId,
   tenantUsers,
+  withTenantDrizzleScope,
+  type Database,
+  type TransactionClient,
 } from "@monet/db";
 import type { Agent } from "@monet/types";
 import { getApiClient } from "@/lib/api-client";
 import { listAllowedAgentGroupsForUserByUserGroups } from "@/lib/agent-group-access";
 import { requireAuth } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { getSqlClient } from "@/lib/db";
 import AgentList from "./agent-list";
 import RegisterAgentDialog from "./register-agent-dialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -18,6 +22,13 @@ interface ExtendedUser {
   id?: string;
   role?: string | null;
   tenantId?: string;
+}
+
+async function withTenantDb<T>(
+  tenantId: string,
+  fn: (db: Database, sql: TransactionClient) => Promise<T>,
+): Promise<T> {
+  return withTenantDrizzleScope(getSqlClient(), tenantSchemaNameFromId(tenantId), fn);
 }
 
 export default async function AgentsPage() {
@@ -48,17 +59,17 @@ export default async function AgentsPage() {
 
     const [availableGroupsForSession, userRows, membershipRows] = await Promise.all([
       isAdmin
-        ? db
+        ? withTenantDb(tenantId, async (db) => db
             .selectDistinct({
               id: agentGroupsTable.id,
               name: agentGroupsTable.name,
             })
             .from(agentGroupsTable)
             .where(eq(agentGroupsTable.tenantId, tenantId))
-            .orderBy(asc(agentGroupsTable.name))
+            .orderBy(asc(agentGroupsTable.name)))
         : listAllowedAgentGroupsForUserByUserGroups(tenantId, userId),
       isAdmin
-        ? db
+        ? withTenantDb(tenantId, async (db) => db
             .select({
               id: tenantUsers.id,
               externalId: tenantUsers.externalId,
@@ -70,11 +81,11 @@ export default async function AgentsPage() {
             .orderBy(
               sql`coalesce(${tenantUsers.displayName}, ${tenantUsers.email}, ${tenantUsers.externalId})`,
               asc(tenantUsers.externalId),
-            )
+            ))
         : Promise.resolve([]),
       agents.length === 0
         ? Promise.resolve([])
-        : db
+        : withTenantDb(tenantId, async (db) => db
             .select({
               agentId: agentGroupMembers.agentId,
               groupName: agentGroupsTable.name,
@@ -85,7 +96,7 @@ export default async function AgentsPage() {
               eq(agentGroupsTable.id, agentGroupMembers.groupId),
             )
             .where(inArray(agentGroupMembers.agentId, agents.map((agent) => agent.id)))
-            .orderBy(asc(agentGroupsTable.name)),
+            .orderBy(asc(agentGroupsTable.name))),
     ]);
 
     availableGroups = availableGroupsForSession;
