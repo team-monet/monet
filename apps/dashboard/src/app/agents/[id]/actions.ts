@@ -46,12 +46,21 @@ export async function regenerateAgentTokenAction(
     const result = await client.regenerateAgentToken(agentId);
 
     if (sessionUser?.id && sessionUser?.tenantId) {
-      await updateDashboardCredentialIfOwnedAgent(
-        sessionUser.id,
-        sessionUser.tenantId,
-        agentId,
-        result.apiKey,
-      );
+      try {
+        await updateDashboardCredentialIfOwnedAgent(
+          sessionUser.id,
+          sessionUser.tenantId,
+          agentId,
+          result.apiKey,
+        );
+      } catch (credentialSyncError: unknown) {
+        console.error("Failed to sync dashboard-owned agent credential after token rotation", {
+          agentId,
+          userId: sessionUser.id,
+          tenantId: sessionUser.tenantId,
+          error: credentialSyncError,
+        });
+      }
     }
 
     revalidateAgentPaths(agentId);
