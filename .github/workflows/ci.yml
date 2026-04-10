@@ -58,6 +58,12 @@ jobs:
         if: env.RUN_PERF == 'true'
         uses: grafana/setup-k6-action@v1
 
+      - name: Build API server for load tests
+        if: env.RUN_PERF == 'true'
+        run: |
+          rm -rf apps/api/dist
+          pnpm --filter @monet/api build
+
       - name: Start API server for load tests
         if: env.RUN_PERF == 'true'
         run: |
@@ -75,6 +81,24 @@ jobs:
           echo "API server failed to become ready"
           cat /tmp/monet-api.log
           exit 1
+
+      - name: Validate authenticated API route mount
+        if: env.RUN_PERF == 'true'
+        run: |
+          status=$(curl -sS -o /tmp/monet-api-groups-body.txt -w "%{http_code}" http://127.0.0.1:3001/api/groups)
+          content_type=$(curl -sSI http://127.0.0.1:3001/api/groups | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type" {print tolower($2)}')
+
+          if [ "$status" != "401" ] && [ "$status" != "403" ]; then
+            echo "Expected /api/groups to return 401/403 without auth, got $status"
+            cat /tmp/monet-api-groups-body.txt
+            exit 1
+          fi
+
+          if ! printf "%s" "$content_type" | grep -q "application/json"; then
+            echo "Expected /api/groups error response to be JSON, got Content-Type: ${content_type:-<missing>}"
+            cat /tmp/monet-api-groups-body.txt
+            exit 1
+          fi
 
       - name: Seed load test data
         if: env.RUN_PERF == 'true'
