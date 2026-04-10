@@ -118,10 +118,13 @@ async function refreshAccessToken(token: ExtendedJWT) {
 
     const response = await fetch(tokenEndpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${Buffer.from(
+          `${config.clientId}:${decrypt(config.clientSecretEncrypted)}`
+        ).toString("base64")}`,
+      },
       body: new URLSearchParams({
-        client_id: config.clientId,
-        client_secret: decrypt(config.clientSecretEncrypted),
         grant_type: "refresh_token",
         refresh_token: token.refreshToken,
       }),

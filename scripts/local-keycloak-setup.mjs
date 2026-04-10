@@ -110,6 +110,10 @@ async function ensureRealm(baseUrl, token, realm) {
       loginWithEmailAllowed: true,
       duplicateEmailsAllowed: false,
       editUsernameAllowed: false,
+      accessTokenLifespan: 36000,
+      ssoSessionIdleTimeout: 1209600,
+      ssoSessionMaxLifespan: 2592000,
+      offlineSessionIdleTimeout: 2592000,
     },
   });
 }

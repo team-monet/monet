@@ -22,6 +22,8 @@ export default async function RootLayout({
 }) {
   const session = await auth();
   const user = session?.user as ExtendedUser | undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sessionError = (session as any)?.error;
 
   return (
     <html lang="en" suppressHydrationWarning>
@@ -47,7 +49,7 @@ export default async function RootLayout({
             } catch (_) {}
           `}
         </Script>
-        <AppShell hasSession={Boolean(session)} user={user}>
+        <AppShell hasSession={Boolean(session)} user={user} sessionError={sessionError}>
           {children}
         </AppShell>
       </body>

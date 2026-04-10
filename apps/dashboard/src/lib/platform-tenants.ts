@@ -19,7 +19,7 @@ import {
   slugifyTenantName,
   validateTenantSlug,
 } from "@monet/types";
-import { and, desc, eq, isNull, sql as drizzleSql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { db, getSqlClient } from "./db";
 import { decrypt, encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
@@ -205,7 +205,7 @@ export async function getPlatformTenant(tenantId: string) {
           externalId: tenantUsers.externalId,
         })
         .from(tenantUsers)
-        .where(drizzleSql`${tenantUsers.id} = ANY(${claimedByUserIds}::uuid[])`),
+        .where(inArray(tenantUsers.id, claimedByUserIds)),
     )).map((user) => [user.id, user]))
     : new Map<string, { id: string; displayName: string | null; email: string | null; externalId: string }>();
 
