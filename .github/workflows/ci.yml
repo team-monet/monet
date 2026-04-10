@@ -58,6 +58,12 @@ jobs:
         if: env.RUN_PERF == 'true'
         uses: grafana/setup-k6-action@v1
 
+      - name: Build API server for load tests
+        if: env.RUN_PERF == 'true'
+        run: |
+          rm -rf apps/api/dist
+          pnpm --filter @monet/api build
+
       - name: Start API server for load tests
         if: env.RUN_PERF == 'true'
         run: |
@@ -75,6 +81,25 @@ jobs:
           echo "API server failed to become ready"
           cat /tmp/monet-api.log
           exit 1
+
+      - name: Validate authenticated API route mount
+        if: env.RUN_PERF == 'true'
+        run: |
+          probe_url="http://127.0.0.1:3001/api/tenants/test-slug/groups"
+          status=$(curl -sS -D /tmp/monet-api-groups-headers.txt -o /tmp/monet-api-groups-body.txt -w "%{http_code}" "$probe_url")
+          content_type=$(tr -d '\r' </tmp/monet-api-groups-headers.txt | awk -F': ' 'tolower($1)=="content-type" {print tolower($2)}')
+
+          if [ "$status" = "404" ] && printf "%s" "$content_type" | grep -q "text/plain"; then
+            echo "Route mount probe hit a plain-text 404 at $probe_url (likely stale build artifact)"
+            cat /tmp/monet-api-groups-body.txt
+            exit 1
+          fi
+
+          if ! printf "%s" "$content_type" | grep -q "application/json"; then
+            echo "Expected $probe_url response to be JSON, got status $status with Content-Type: ${content_type:-<missing>}"
+            cat /tmp/monet-api-groups-body.txt
+            exit 1
+          fi
 
       - name: Seed load test data
         if: env.RUN_PERF == 'true'
