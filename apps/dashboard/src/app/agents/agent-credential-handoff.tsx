@@ -8,58 +8,83 @@ import { Label } from "@/components/ui/label";
 
 function CopyButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function fallbackCopyWithExecCommand(text: string) {
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.setAttribute("readonly", "");
+    textArea.style.position = "fixed";
+    textArea.style.opacity = "0";
+    textArea.style.pointerEvents = "none";
+    textArea.style.left = "-9999px";
+
+    const selection = document.getSelection();
+    const activeElement = document.activeElement as HTMLElement | null;
+
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    textArea.setSelectionRange(0, textArea.value.length);
+
+    let successful = false;
+    try {
+      successful = document.execCommand("copy");
+    } finally {
+      document.body.removeChild(textArea);
+      if (selection) {
+        selection.removeAllRanges();
+      }
+      activeElement?.focus();
+    }
+
+    if (!successful) {
+      throw new Error("execCommand copy failed");
+    }
+  }
 
   async function handleCopy() {
     try {
-      // 1. Try modern clipboard API first
-      if (navigator.clipboard && window.isSecureContext) {
+      setError(null);
+
+      if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(value);
       } else {
-        // 2. Fallback to older execCommand approach for non-secure contexts (http)
-        const textArea = document.createElement("textarea");
-        textArea.value = value;
-        // Ensure the textarea is not visible
-        textArea.style.position = "fixed";
-        textArea.style.left = "-9999px";
-        textArea.style.top = "0";
-        document.body.appendChild(textArea);
-        textArea.focus();
-        textArea.select();
-        
-        const successful = document.execCommand("copy");
-        document.body.removeChild(textArea);
-        
-        if (!successful) {
-          throw new Error("execCommand copy failed");
-        }
+        fallbackCopyWithExecCommand(value);
       }
-      
+
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
     } catch (err) {
-      console.error(`Failed to copy ${label}:`, err);
-      // In worst case, at least give user feedback
-      alert(`Could not automatically copy to clipboard. Please copy it manually from the display.`);
+      try {
+        fallbackCopyWithExecCommand(value);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 2000);
+      } catch (fallbackErr) {
+        console.error(`Failed to copy ${label}:`, err, fallbackErr);
+        setError("Copy unavailable here. Select the value and copy manually.");
+      }
     }
   }
 
   return (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      onClick={handleCopy}
-      className="h-8 min-w-[90px] gap-1.5 px-3 transition-all duration-200"
-    >
-      {copied ? (
-        <Check className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
-      ) : (
-        <Copy className="h-3.5 w-3.5" />
-      )}
-      <span className="text-xs font-medium">
-        {copied ? "Copied" : label}
-      </span>
-    </Button>
+    <div className="flex flex-col items-end gap-1">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={handleCopy}
+        className="h-8 min-w-[90px] gap-1.5 px-3 transition-all duration-200"
+      >
+        {copied ? (
+          <Check className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+        ) : (
+          <Copy className="h-3.5 w-3.5" />
+        )}
+        <span className="text-xs font-medium">{copied ? "Copied" : label}</span>
+      </Button>
+      {error && <p className="text-right text-xs text-destructive">{error}</p>}
+    </div>
   );
 }
 
@@ -92,7 +117,7 @@ export function AgentCredentialHandoff({
           <CopyButton value={apiKey} label="Copy key" />
         </div>
         <div className="overflow-hidden rounded-md border bg-muted px-3 py-2">
-          <code className="block truncate font-mono text-xs">{apiKey}</code>
+          <code className="block break-all font-mono text-xs">{apiKey}</code>
         </div>
       </div>
 
@@ -102,7 +127,7 @@ export function AgentCredentialHandoff({
           <CopyButton value={mcpUrl} label="Copy URL" />
         </div>
         <div className="overflow-hidden rounded-md border bg-muted px-3 py-2">
-          <code className="block truncate font-mono text-xs">{mcpUrl}</code>
+          <code className="block break-all font-mono text-xs">{mcpUrl}</code>
         </div>
       </div>
 

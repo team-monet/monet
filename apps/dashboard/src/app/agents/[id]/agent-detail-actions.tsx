@@ -57,20 +57,17 @@ function RegenerateTokenDialogInner({
     initialAgentTokenActionState,
   );
 
-  useEffect(() => {
-    if (state.status === "success") {
-      startTransition(() => {
-        router.refresh();
-      });
-    }
-  }, [router, state.status]);
-
   return (
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
         setOpen(nextOpen);
         if (!nextOpen) {
+          if (state.status === "success") {
+            startTransition(() => {
+              router.refresh();
+            });
+          }
           onReset();
         }
       }}
