@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { db } from "./db";
 import {
   agentGroupMembers,
   agentGroups,
@@ -150,7 +149,7 @@ export async function syncDashboardAgentRole(userId: string, tenantId: string) {
 }
 
 async function syncAgentGroups(
-  tenantDb: typeof db,
+  tenantDb: Database,
   userId: string,
   dashboardAgentId: string,
   tenantId: string,
