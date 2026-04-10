@@ -68,22 +68,34 @@ function CopyButton({ value, label }: { value: string; label: string }) {
     let clipboardCopied = false;
     let fallbackCopied = false;
     let clipboardError: unknown;
+    let fallbackError: unknown;
 
-    try {
-      const clipboardAttempt =
-        typeof window !== "undefined" && window.isSecureContext && navigator.clipboard?.writeText
-          ? navigator.clipboard.writeText(value)
-          : null;
+    const clipboardAttempt =
+      typeof window !== "undefined" && window.isSecureContext && navigator.clipboard?.writeText
+        ? navigator.clipboard.writeText(value)
+        : null;
 
-      // Keep a synchronous fallback in the original click gesture.
-      fallbackCopied = fallbackCopyWithExecCommand(value);
-
-      if (clipboardAttempt) {
+    if (clipboardAttempt) {
+      try {
         await clipboardAttempt;
         clipboardCopied = true;
+      } catch (err) {
+        clipboardError = err;
+
+        try {
+          // Defer fallback until clipboard write settles.
+          fallbackCopied = fallbackCopyWithExecCommand(value);
+        } catch (fallbackErr) {
+          fallbackError = fallbackErr;
+        }
       }
-    } catch (err) {
-      clipboardError = err;
+    } else {
+      try {
+        // Keep fallback in the original click gesture when no async clipboard API exists.
+        fallbackCopied = fallbackCopyWithExecCommand(value);
+      } catch (fallbackErr) {
+        fallbackError = fallbackErr;
+      }
     }
 
     if (clipboardCopied || fallbackCopied) {
@@ -101,6 +113,8 @@ function CopyButton({ value, label }: { value: string; label: string }) {
 
     if (clipboardError) {
       console.error(`Failed to copy ${label}:`, clipboardError);
+    } else if (fallbackError) {
+      console.error(`Failed to copy ${label} with execCommand fallback:`, fallbackError);
     } else {
       console.error(`Failed to copy ${label}: no clipboard strategy succeeded.`);
     }
