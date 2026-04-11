@@ -1,12 +1,13 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { authHeaders, buildUrl, pickRandom } from "./utils.js";
+import { authHeaders, buildTenantApiUrl, pickRandom } from "./utils.js";
 
 export function runTier1SearchScenario(data) {
   const queryToken = pickRandom(["load", "group-1", "group-2", "validation", "tier"]);
-  const url = buildUrl(
+  const url = buildTenantApiUrl(
     data.baseUrl,
-    `/api/memories?query=${encodeURIComponent(queryToken)}&limit=20`,
+    data.seed,
+    `/memories?query=${encodeURIComponent(queryToken)}&limit=20`,
   );
 
   const res = http.get(url, {

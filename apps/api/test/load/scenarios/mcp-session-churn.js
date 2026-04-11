@@ -1,6 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { authHeaders, buildUrl } from "./utils.js";
+import { authHeaders, buildTenantMcpUrl } from "./utils.js";
 
 const MCP_INIT_PAYLOAD = JSON.stringify({
   jsonrpc: "2.0",
@@ -18,14 +18,15 @@ const MCP_INIT_PAYLOAD = JSON.stringify({
 
 export function runMcpSessionChurnScenario(data) {
   const headers = authHeaders(data.seed);
-  const connectRes = http.post(buildUrl(data.baseUrl, "/mcp"), MCP_INIT_PAYLOAD, {
+  const mcpUrl = buildTenantMcpUrl(data.baseUrl, data.seed);
+  const connectRes = http.post(mcpUrl, MCP_INIT_PAYLOAD, {
     headers,
     timeout: data.requestTimeout,
   });
 
   const sessionId = connectRes.headers["Mcp-Session-Id"] || connectRes.headers["mcp-session-id"];
   if (sessionId) {
-    const disconnectRes = http.del(buildUrl(data.baseUrl, "/mcp"), null, {
+    const disconnectRes = http.del(mcpUrl, null, {
       headers: {
         ...headers,
         "Mcp-Session-Id": sessionId,

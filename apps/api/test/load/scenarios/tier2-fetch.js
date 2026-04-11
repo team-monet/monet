@@ -1,10 +1,10 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { authHeaders, buildUrl, pickRandom } from "./utils.js";
+import { authHeaders, buildTenantApiUrl, pickRandom } from "./utils.js";
 
 export function runTier2FetchScenario(data) {
   const memoryId = pickRandom(data.seed.sampleMemoryIds);
-  const url = buildUrl(data.baseUrl, `/api/memories/${memoryId}`);
+  const url = buildTenantApiUrl(data.baseUrl, data.seed, `/memories/${memoryId}`);
 
   const res = http.get(url, {
     headers: authHeaders(data.seed),
