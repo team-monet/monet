@@ -30,14 +30,14 @@ function normalizeTenantSlug(value) {
 }
 
 export function resolveTenantSlug(seed) {
+  const fromEnv = normalizeTenantSlug(__ENV.LOAD_TENANT_SLUG);
+  if (fromEnv) return fromEnv;
+
   const fromManifest = normalizeTenantSlug(seed && seed.tenantSlug);
   if (fromManifest) return fromManifest;
 
   const fromName = normalizeTenantSlug(seed && seed.tenantName);
   if (fromName) return fromName;
-
-  const fromEnv = normalizeTenantSlug(__ENV.LOAD_TENANT_SLUG);
-  if (fromEnv) return fromEnv;
 
   throw new Error(
     "Unable to resolve tenant slug for load tests. Set seed.tenantSlug/tenantName or LOAD_TENANT_SLUG.",
