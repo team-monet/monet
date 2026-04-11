@@ -1,6 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { authHeaders, buildUrl, pickRandom, randomMemoryType } from "./utils.js";
+import { authHeaders, buildTenantApiUrl, pickRandom, randomMemoryType } from "./utils.js";
 
 export function runMixedWorkloadScenario(data) {
   const action = Math.random();
@@ -8,7 +8,11 @@ export function runMixedWorkloadScenario(data) {
   if (action < 0.6) {
     const token = pickRandom(["load", "group-1", "group-2", "tier"]);
     const res = http.get(
-      buildUrl(data.baseUrl, `/api/memories?query=${encodeURIComponent(token)}&limit=10`),
+      buildTenantApiUrl(
+        data.baseUrl,
+        data.seed,
+        `/memories?query=${encodeURIComponent(token)}&limit=10`,
+      ),
       {
         headers: authHeaders(data.seed),
         timeout: data.requestTimeout,
@@ -26,7 +30,7 @@ export function runMixedWorkloadScenario(data) {
       tags: ["load", "mixed"],
       memoryScope: "group",
     });
-    const res = http.post(buildUrl(data.baseUrl, "/api/memories"), payload, {
+    const res = http.post(buildTenantApiUrl(data.baseUrl, data.seed, "/memories"), payload, {
       headers: authHeaders(data.seed),
       timeout: data.requestTimeout,
     });
@@ -37,7 +41,7 @@ export function runMixedWorkloadScenario(data) {
 
   if (action < 0.9) {
     const memoryId = pickRandom(data.seed.sampleMemoryIds);
-    const res = http.get(buildUrl(data.baseUrl, `/api/memories/${memoryId}`), {
+    const res = http.get(buildTenantApiUrl(data.baseUrl, data.seed, `/memories/${memoryId}`), {
       headers: authHeaders(data.seed),
       timeout: data.requestTimeout,
     });
@@ -46,7 +50,7 @@ export function runMixedWorkloadScenario(data) {
     return res.timings.duration;
   }
 
-  const res = http.get(buildUrl(data.baseUrl, "/api/agents/me"), {
+  const res = http.get(buildTenantApiUrl(data.baseUrl, data.seed, "/agents/me"), {
     headers: authHeaders(data.seed),
     timeout: data.requestTimeout,
   });

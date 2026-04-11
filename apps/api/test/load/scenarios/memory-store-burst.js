@@ -1,6 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { authHeaders, buildUrl, randomMemoryType } from "./utils.js";
+import { authHeaders, buildTenantApiUrl, randomMemoryType } from "./utils.js";
 
 export function runMemoryStoreBurstScenario(data) {
   const payload = JSON.stringify({
@@ -10,7 +10,7 @@ export function runMemoryStoreBurstScenario(data) {
     memoryScope: "group",
   });
 
-  const res = http.post(buildUrl(data.baseUrl, "/api/memories"), payload, {
+  const res = http.post(buildTenantApiUrl(data.baseUrl, data.seed, "/memories"), payload, {
     headers: authHeaders(data.seed),
     timeout: data.requestTimeout,
   });
