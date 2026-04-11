@@ -100,13 +100,14 @@ async function main() {
     const tenantResult = await provisionTenant(db, platformSql, { name: tenantName });
     const tenantId = tenantResult.tenant.id;
     const tenantSlug = tenantResult.tenant.slug;
+    const tenantApiBaseUrl = `${apiBaseUrl}/api/tenants/${tenantSlug}`;
     const bootstrapApiKey = tenantResult.rawApiKey;
     const bootstrapAgentId = tenantResult.agent.id;
     const groupIds: string[] = [];
 
     for (let i = 0; i < groupCount; i += 1) {
       const groupRes = await requestJson<GroupResponse | { message?: string }>(
-        `${apiBaseUrl}/api/groups`,
+        `${tenantApiBaseUrl}/groups`,
         {
           method: "POST",
           headers: {
@@ -132,7 +133,7 @@ async function main() {
 
     for (let i = 1; i < agentCount; i += 1) {
       const registerRes = await requestJson<RegisterAgentResponse | { message?: string }>(
-        `${apiBaseUrl}/api/agents/register`,
+        `${tenantApiBaseUrl}/agents/register`,
         {
           method: "POST",
           headers: {
@@ -156,7 +157,7 @@ async function main() {
     for (let i = 0; i < agentIds.length; i += 1) {
       const groupId = groupIds[i % groupIds.length];
       const membershipRes = await requestJson<{ success?: boolean; message?: string }>(
-        `${apiBaseUrl}/api/groups/${groupId}/members`,
+        `${tenantApiBaseUrl}/groups/${groupId}/members`,
         {
           method: "POST",
           headers: {
