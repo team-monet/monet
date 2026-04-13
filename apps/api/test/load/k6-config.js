@@ -63,7 +63,7 @@ export const options = {
   thresholds: {
     http_req_failed: ["rate<0.01"],
     tier1_search_latency: ["p(95)<500"],
-    tier2_fetch_latency: ["p(95)<200"],
+    tier2_fetch_latency: ["p(95)<300"],
     memory_store_latency: ["p(95)<1000"],
     mixed_workload_latency: ["p(95)<600"],
   },

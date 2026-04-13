@@ -8,6 +8,13 @@
       "when": 1775746000093,
       "tag": "0000_regular_silver_centurion",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1776100000000,
+      "tag": "0001_add_memory_versions_entry_version_index",
+      "breakpoints": true
     }
   ]
 }

@@ -216,7 +216,7 @@ async function main() {
             RETURNING id
           `;
 
-          if (sampleMemoryIds.length < 250) {
+          if (sampleMemoryIds.length < 1000) {
             sampleMemoryIds.push(row.id as string);
           }
         }
