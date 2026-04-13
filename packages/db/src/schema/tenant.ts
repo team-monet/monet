@@ -202,18 +202,27 @@ export const memoryEntries = pgTable(
   ]
 );
 
-export const memoryVersions = pgTable("memory_versions", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  memoryEntryId: uuid("memory_entry_id")
-    .notNull()
-    .references(() => memoryEntries.id, { onDelete: "cascade" }),
-  content: text("content").notNull(),
-  version: integer("version").notNull(),
-  authorAgentId: uuid("author_agent_id").notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+export const memoryVersions = pgTable(
+  "memory_versions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    memoryEntryId: uuid("memory_entry_id")
+      .notNull()
+      .references(() => memoryEntries.id, { onDelete: "cascade" }),
+    content: text("content").notNull(),
+    version: integer("version").notNull(),
+    authorAgentId: uuid("author_agent_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("idx_memory_versions_entry_version").on(
+      table.memoryEntryId,
+      table.version,
+    ),
+  ],
+);
 
 export const auditLog = pgTable("audit_log", {
   id: uuid("id").primaryKey().defaultRandom(),

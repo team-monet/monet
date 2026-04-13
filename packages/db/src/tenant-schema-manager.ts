@@ -188,6 +188,9 @@ export async function createTenantSchema(
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
+  await sql.unsafe(
+    `CREATE INDEX IF NOT EXISTS idx_memory_versions_entry_version ON "${schemaName}".memory_versions (memory_entry_id, version)`,
+  );
 
   // Audit log table
   await sql.unsafe(`
