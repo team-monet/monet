@@ -23,6 +23,7 @@ For the fastest local path:
 git clone https://github.com/team-monet/monet.git
 cd monet
 pnpm install
+cp .env.local-dev.example .env.local-dev
 pnpm local:up
 ```
 
