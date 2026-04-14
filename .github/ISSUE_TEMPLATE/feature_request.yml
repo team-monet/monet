@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose an improvement to Monet
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion.
+
+        Please focus on the **problem and use case** first, then possible solutions.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Security check
+      options:
+        - label: I confirm this is **not** a security vulnerability report.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and what is currently hard?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Share one or more approaches.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional alternatives or workarounds you've tried.
+  - type: textarea
+    id: impact
+    attributes:
+      label: Additional context
+      description: Who benefits, tradeoffs, examples, or related links.

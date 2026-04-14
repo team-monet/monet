@@ -1,6 +1,6 @@
 # Production Deployment Guide
 
-This is the recommended Monet production path for M4:
+This is the recommended Monet production path for the current open-source release:
 
 - single host
 - Docker Compose runtime stack
@@ -57,6 +57,72 @@ Generate a 32-byte encryption key with:
 
 ```bash
 openssl rand -base64 32
+```
+
+## Production Runtime Quickstart
+
+Use this path for first deployment on a fresh host.
+
+1. Create runtime env file:
+
+```bash
+cp .env.runtime.example .env.runtime
+```
+
+2. Set required values in `.env.runtime`:
+
+- `API_IMAGE`
+- `DASHBOARD_IMAGE`
+- `MIGRATE_IMAGE`
+- `NEXTAUTH_URL`
+- `NEXTAUTH_SECRET`
+- `ENCRYPTION_KEY`
+- `PUBLIC_API_URL`
+- `MCP_PUBLIC_URL`
+- `PUBLIC_OIDC_BASE_URL`
+- `KEYCLOAK_BASE_URL`
+- `LOCAL_OIDC_BASE_URL`
+- `KEYCLOAK_ADMIN`
+- `KEYCLOAK_ADMIN_PASSWORD`
+
+3. Pull or build images:
+
+```bash
+pnpm runtime:pull
+# or, for local image testing on the same host:
+# pnpm local:build
+```
+
+4. Start runtime stack and bootstrap Keycloak:
+
+```bash
+pnpm runtime:up
+pnpm runtime:keycloak:setup
+```
+
+5. Complete setup in the dashboard:
+
+- open `${NEXTAUTH_URL}/setup`
+- use the one-time bootstrap token from API startup logs
+- use `platform.*` values from `.runtime/keycloak.json`
+- configure tenant OIDC using `tenant.*` from `.runtime/keycloak.json`
+
+6. Verify deployment:
+
+```bash
+pnpm runtime:status
+curl -f http://127.0.0.1:4301/healthz
+curl -f http://127.0.0.1:4301/health/ready
+```
+
+7. Optional authenticated API smoke check (after issuing an agent API key):
+
+```bash
+TENANT_SLUG="<your-tenant-slug>"
+API_BASE_URL="https://api.monet.example.com"
+API_KEY="<your-agent-api-key>"
+curl -sS "$API_BASE_URL/api/tenants/$TENANT_SLUG/agents/me" \
+  -H "Authorization: Bearer $API_KEY"
 ```
 
 ## Network And Firewall
@@ -318,7 +384,7 @@ If enrichment is degraded:
 
 ## Scope Notes
 
-This guide describes the recommended single-node Compose deployment for M4.
+This guide describes the recommended single-node Compose deployment for the current open-source release.
 
 It does not cover:
 

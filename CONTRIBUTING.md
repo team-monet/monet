@@ -1,52 +1,29 @@
 # Contributing to Monet
 
-## Source of Truth
+Thanks for your interest in contributing to Monet.
 
-- Use GitHub Issues and Projects for active work tracking.
-- Use GitHub Milestones for release scope.
-- Do not create a parallel active backlog outside GitHub.
+This guide is for **external open-source contributors** and maintainers working in
+the public repository.
 
-## Development Setup
+## Where to Start
 
-1. Install dependencies:
+- Browse open [GitHub issues](https://github.com/team-monet/monet/issues) and pick
+  something unassigned or clearly open for contribution.
+- If you are proposing a change that is not tracked yet, open an issue first so
+  we can align on scope before implementation.
+- Use GitHub issues/PRs as the public collaboration path (there is currently no
+  separate public community forum).
 
-```bash
-pnpm install
-```
+## Setup and Validation Entry Points
 
-2. Create local env file:
+Please use the validated quickstarts/docs rather than this file as a full setup manual:
 
-```bash
-cp .env.local-dev.example .env.local-dev
-```
+- **Local development quickstart:** [docs/local-development.md](docs/local-development.md)
+- **Architecture overview:** [docs/architecture.md](docs/architecture.md)
+- **Production/self-hosting reference:** [docs/production-deployment.md](docs/production-deployment.md)
+- **Security policy:** [SECURITY.md](SECURITY.md)
 
-3. Start local infrastructure:
-
-```bash
-pnpm local:up
-```
-
-`pnpm local:up` starts PostgreSQL, pgAdmin, and Keycloak, and ensures the shared Ollama stack is running.
-
-4. Complete the setup flow:
-
-- Open `http://127.0.0.1:3310/setup`
-- Start `pnpm local:dev:api` and retrieve the one-time bootstrap token from that terminal output
-- Start `pnpm local:dev:dashboard`
-- Run `pnpm local:keycloak:setup`
-- Use the generated values in `.local-dev/keycloak.json` to configure platform OIDC against local Keycloak at `http://keycloak.localhost:3400`
-- Create the first tenant, configure tenant OIDC from the same file, and finish login through the dashboard
-
-## Branch and PR Flow
-
-1. Create or pick an issue.
-2. Create a feature branch from `main`.
-3. Keep changes scoped to one issue or tightly related set.
-4. Open PR with issue link and testing evidence.
-
-## Quality Gates
-
-Run before opening a PR:
+For most contributions, follow the local quickstart and then run:
 
 ```bash
 pnpm typecheck
@@ -55,60 +32,77 @@ pnpm test:unit
 pnpm test:integration
 ```
 
-If you changed DB schema:
+If your change modifies DB schema, also include migrations and verify them:
 
 ```bash
 pnpm db:generate
 pnpm db:migrate
 ```
 
-## Coding Standards
+## Branch and Pull Request Expectations
 
-- Keep changes small and focused.
-- Preserve backward compatibility unless issue scope explicitly allows breaking changes.
-- Add or update tests for behavior changes.
-- Update docs when commands, APIs, or behavior change.
+1. Start from `main` and create a branch (`feat/...`, `fix/...`, or similar).
+2. Keep each PR focused on one issue (or one tightly related change set).
+3. Link the issue in the PR description (for example, `Closes #123`).
+4. Include clear testing evidence (commands run + results).
+5. Update docs when behavior, commands, APIs, or workflows change.
 
-## Database and Migration Rules
+We prefer smaller, reviewable PRs over large multi-topic changes.
 
-- Schema changes must include migration artifacts in `packages/db/drizzle`.
-- Runtime code must not depend on tables/columns that are not created in migrations.
-- Validate migration paths from clean database state.
+## DCO (Developer Certificate of Origin)
 
-## API Changes
+Monet uses **DCO sign-off** instead of a CLA.
 
-- Validate request bodies defensively and return 4xx for client input problems.
-- Avoid leaking secrets in logs.
-- Keep hot-path logging minimal and purposeful.
-- Keep route examples and tests tenant-qualified (`/api/tenants/:tenantSlug/...`).
+Every commit in your PR must include a `Signed-off-by` trailer:
 
-## Dashboard Changes
-
-- Validate both local auth and tenant/admin flows.
-- Verify hydration-safe markup in React components.
-- Confirm navigation and action buttons are wired end-to-end.
-
-## Local Verification for MCP + Dashboard
-
-1. For real dashboard verification, run `pnpm local:up`, then `pnpm local:dev:api` and `pnpm local:dev:dashboard`, and complete `/setup`.
-2. For fast UI-only verification without OIDC, use:
-
-```bash
-pnpm --filter @monet/dashboard dev:seeded
+```text
+Signed-off-by: Your Name <you@example.com>
 ```
 
-3. Sign in with organization slug `test-org` when using seeded mode.
-4. Validate MCP only if you already have a tenant agent API key:
+The easiest way is to commit with `-s`:
 
 ```bash
-TENANT_SLUG="acme"
-MCP_API_KEY="<apiKey>" \
-MCP_URL="http://127.0.0.1:${API_PORT:-3301}/mcp/$TENANT_SLUG" \
-pnpm local:mcp:smoke
+git commit -s -m "your message"
 ```
 
-## CI Notes
+If you forget, you can fix commits locally (for example with rebase) and push again.
 
-CI runs on pushes and PRs to `main` and includes build, typecheck, lint, unit tests, integration tests, and optional perf gate.
+## Reporting Bugs, Feature Requests, and Questions
 
-Mirror CI behavior locally as much as possible before requesting review.
+Since there is no separate public community channel yet:
+
+- **Bug reports:** open a GitHub issue with repro steps, expected behavior,
+  actual behavior, and environment details.
+- **Feature requests:** open a GitHub issue describing the problem/use case,
+  not only the proposed implementation.
+- **Questions:** open a GitHub issue using a clear `[Question]` prefix in the title.
+
+For implementation-specific discussion, use PR comments/reviews so context stays
+attached to the change.
+
+## Security Reporting (Private)
+
+Please **do not** report security vulnerabilities in public issues or PRs.
+
+Use GitHub private vulnerability reporting as documented in
+[SECURITY.md](SECURITY.md):
+
+- [Report a vulnerability (private advisory)](https://github.com/team-monet/monet/security/advisories/new)
+
+## Lightweight Triage and Contribution Etiquette
+
+- Be respectful and assume positive intent.
+- Before starting substantial work, leave a short note on the issue to avoid
+  duplicate effort.
+- If your plans change, unassign yourself or post an update so others can pick it up.
+- Review comments should focus on code, behavior, and evidence.
+- Maintainers may close stale or out-of-scope issues/PRs to keep backlog quality high.
+
+## Additional References
+
+- [README.md](README.md)
+- [docs/architecture.md](docs/architecture.md)
+- [docs/local-development.md](docs/local-development.md)
+- [docs/production-deployment.md](docs/production-deployment.md)
+- [docs/observability.md](docs/observability.md)
+- [SECURITY.md](SECURITY.md)

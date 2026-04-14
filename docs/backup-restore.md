@@ -1,6 +1,6 @@
 # Backup And Restore Guide
 
-This guide covers the recommended backup and recovery model for the M4
+This guide covers the recommended backup and recovery model for the
 production path:
 
 - single host
@@ -38,12 +38,12 @@ Use a layered approach:
    RPO
 
 The current Compose stack does not configure WAL archiving for you. If you need
-point-in-time recovery, add PostgreSQL archiving outside the default M4 stack or
+point-in-time recovery, add PostgreSQL archiving outside the default stack or
 use a managed PostgreSQL offering with PITR support.
 
 ## Full Database Backup
 
-For the M4 runtime stack, take logical backups from the running `postgres`
+For the runtime stack, take logical backups from the running `postgres`
 container.
 
 Example:
@@ -78,7 +78,7 @@ Recommended approaches:
 - self-managed PostgreSQL with WAL archiving to durable object storage
 - scheduled base backups plus archived WAL segments
 
-For the M4 Compose path, logical dumps are still useful even when WAL archiving
+For the Compose path described here, logical dumps are still useful even when WAL archiving
 is enabled:
 
 - they are easy to inspect
@@ -251,7 +251,7 @@ the procedure.
 
 ## Scope Notes
 
-This guide is intentionally aligned with the current M4 architecture.
+This guide is intentionally aligned with the current architecture described in this repository.
 
 It does not provide:
 

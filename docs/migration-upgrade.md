@@ -1,6 +1,6 @@
 # Migration And Upgrade Guide
 
-This guide covers safe upgrades for the recommended M4 production path:
+This guide covers safe upgrades for the recommended production path in the current open-source release:
 
 - single host
 - Docker Compose runtime stack
@@ -8,12 +8,12 @@ This guide covers safe upgrades for the recommended M4 production path:
 - one API container
 - one dashboard container
 
-It is intentionally conservative. The default operating model for M4 upgrades is
+It is intentionally conservative. The default operating model for these upgrades is
 "take a maintenance window, stop traffic, migrate, verify, then resume."
 
 ## Upgrade Model
 
-For the recommended M4 deployment:
+For the recommended deployment:
 
 - upgrades are forward-only
 - database migrations must succeed before the API is considered ready
@@ -67,7 +67,7 @@ understood and accepted the existing fault.
 
 ## Standard Upgrade Procedure
 
-This is the recommended M4 upgrade sequence.
+This is the recommended upgrade sequence.
 
 1. Pull or build the new images.
 
@@ -153,7 +153,7 @@ Also verify one functional path after the upgrade:
 
 ## Rollback Guidance
 
-There is no automatic down-migration workflow in the recommended M4 path.
+There is no automatic down-migration workflow in the recommended path.
 
 Treat database migrations as forward-only. If an upgrade fails, your rollback
 options are:
@@ -194,7 +194,7 @@ If OIDC login breaks after upgrade:
 
 ## Breaking Change Policy
 
-For the M4 production path, upgrades should follow these rules:
+For this production path, upgrades should follow these rules:
 
 - new required env vars must be documented before release
 - manual upgrade steps must be documented before release
@@ -208,13 +208,13 @@ the release notes say so explicitly.
 
 ## Zero-Downtime Status
 
-Zero-downtime upgrades are not supported in the recommended M4 deployment.
+Zero-downtime upgrades are not supported in the recommended deployment.
 
 Reasons:
 
 - the recommended topology uses a single API instance
 - migrations run in front of application startup
-- distributed rate limiting is not part of the single-node M4 path
+- distributed rate limiting is not part of the single-node recommended path
 
 If you need zero-downtime or rolling upgrades, treat that as a later milestone
 with multi-instance coordination, distributed state, and a separately validated
