@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
+ARG VERSION=dev
+ARG GIT_SHA=unknown
+
 FROM node:22-alpine AS base
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
@@ -52,6 +55,10 @@ COPY packages/types/package.json packages/types/package.json
 RUN pnpm install --frozen-lockfile --prod --filter @monet/db...
 
 FROM node:22-bookworm-slim AS api-runtime
+ARG VERSION
+ARG GIT_SHA
+LABEL org.opencontainers.image.version=$VERSION \
+  org.opencontainers.image.revision=$GIT_SHA
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=api-prod-deps /app/node_modules /app/node_modules
@@ -71,9 +78,14 @@ COPY --from=api-build /app/packages/db/dist /app/packages/db/dist
 COPY --from=api-build /app/packages/mcp-tools/dist /app/packages/mcp-tools/dist
 COPY --from=api-build /app/packages/types/dist /app/packages/types/dist
 EXPOSE 3001
+USER node
 CMD ["node", "apps/api/dist/index.js"]
 
 FROM node:22-alpine AS migrate-runtime
+ARG VERSION
+ARG GIT_SHA
+LABEL org.opencontainers.image.version=$VERSION \
+  org.opencontainers.image.revision=$GIT_SHA
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=migrate-prod-deps /app/node_modules /app/node_modules
@@ -87,9 +99,14 @@ COPY --from=migrate-prod-deps /app/packages/types/node_modules /app/packages/typ
 COPY --from=migrate-build /app/packages/db/dist /app/packages/db/dist
 COPY --from=migrate-build /app/packages/db/drizzle /app/packages/db/drizzle
 COPY --from=migrate-build /app/packages/types/dist /app/packages/types/dist
+USER node
 CMD ["node", "packages/db/dist/migrate.js"]
 
 FROM node:22-alpine AS dashboard-runtime
+ARG VERSION
+ARG GIT_SHA
+LABEL org.opencontainers.image.version=$VERSION \
+  org.opencontainers.image.revision=$GIT_SHA
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV HOSTNAME=0.0.0.0
@@ -98,4 +115,5 @@ WORKDIR /app
 COPY --from=dashboard-build /app/apps/dashboard/.next/standalone /app
 COPY --from=dashboard-build /app/apps/dashboard/.next/static /app/apps/dashboard/.next/static
 EXPOSE 3000
+USER node
 CMD ["node", "apps/dashboard/server.js"]
