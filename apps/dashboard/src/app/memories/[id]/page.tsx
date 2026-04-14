@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { ChevronLeft, Calendar, Tag, Info, History, FileText } from "lucide-react";
+import { ChevronLeft, Calendar, Tag, Sparkles, Info, History, FileText } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { formatMemoryAuthor } from "@/lib/memory-display";
 
@@ -113,11 +113,17 @@ export default async function MemoryEntryDetailPage({ params }: PageProps) {
                 {memory.content}
               </div>
               
-              {memory.tags && memory.tags.length > 0 && (
+              {(memory.tags.length > 0 || memory.autoTags.length > 0) && (
                 <div className="flex flex-wrap gap-2 pt-2">
                   {memory.tags.map((tag: string) => (
                     <Badge key={tag} variant="outline" className="flex items-center gap-1">
                       <Tag className="h-3 w-3" />
+                      {tag}
+                    </Badge>
+                  ))}
+                  {memory.autoTags.map((tag: string) => (
+                    <Badge key={tag} variant="secondary" className="flex items-center gap-1 italic">
+                      <Sparkles className="h-3 w-3" />
                       {tag}
                     </Badge>
                   ))}
