@@ -1,6 +1,6 @@
 # Shared memory in action: support workflow wedge
 
-This runbook provides a deterministic, operator-friendly demo for M6 issue #87.
+This runbook provides a deterministic, operator-friendly demo for the support workflow scripts in this repository.
 
 **Support is our wedge; shared memory is the platform.**
 
@@ -131,13 +131,14 @@ Show (or re-run) memory creation via API examples:
 
 ```bash
 API_BASE_URL=http://127.0.0.1:3301
+TENANT_SLUG="demo-support-org"
 L1_KEY="<support-l1-agent-api-key>"
 
-curl -sS -X POST "$API_BASE_URL/api/memories" \
+curl -sS -X POST "$API_BASE_URL/api/tenants/$TENANT_SLUG/memories" \
   -H "Authorization: Bearer $L1_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "content":"[M6-87] customer-42 contact preference: email only between 09:00-17:00 America/Los_Angeles; avoid callback outside window.",
+    "content":"[demo-support] customer-42 contact preference: email only between 09:00-17:00 America/Los_Angeles; avoid callback outside window.",
     "memoryType":"preference",
     "memoryScope":"group",
     "tags":["support","handoff","customer-42","login-failure","workaround"]
@@ -153,7 +154,7 @@ Use `support-l2-agent` key in a fresh terminal/session:
 ```bash
 L2_KEY="<support-l2-agent-api-key>"
 
-curl -sS "$API_BASE_URL/api/memories?query=%5BM6-87%5D&limit=20" \
+curl -sS "$API_BASE_URL/api/tenants/$TENANT_SLUG/memories?query=%5Bdemo-support%5D&limit=20" \
   -H "Authorization: Bearer $L2_KEY"
 ```
 
@@ -166,7 +167,7 @@ Use private memory ID from the state file:
 ```bash
 PRIVATE_ID="<state.memories.privateFact.id>"
 
-curl -i -sS "$API_BASE_URL/api/memories/$PRIVATE_ID" \
+curl -i -sS "$API_BASE_URL/api/tenants/$TENANT_SLUG/memories/$PRIVATE_ID" \
   -H "Authorization: Bearer $L2_KEY"
 ```
 
@@ -176,7 +177,7 @@ Expected: `403` (private memory inaccessible to non-author agent).
 
 In dashboard, open the demo tenant and show:
 
-- Memory list entries for `[M6-87]`
+- Memory list entries for `[demo-support]`
 - Tag search using `support` / `customer-42`
 - Memory detail view with scope/type metadata
 
@@ -189,7 +190,7 @@ Optional API proof:
 ```bash
 ADMIN_KEY="<tenant-admin-api-key>"
 
-curl -sS "$API_BASE_URL/api/audit?limit=100" \
+curl -sS "$API_BASE_URL/api/tenants/$TENANT_SLUG/audit?limit=100" \
   -H "Authorization: Bearer $ADMIN_KEY"
 ```
 

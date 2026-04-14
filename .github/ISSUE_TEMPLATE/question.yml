@@ -1,0 +1,34 @@
+name: Question
+description: Ask a usage or implementation question
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions are welcome in GitHub issues.
+
+        Before submitting, check:
+        - README: https://github.com/team-monet/monet/blob/main/README.md
+        - Local development quickstart: https://github.com/team-monet/monet/blob/main/docs/local-development.md
+        - Architecture overview: https://github.com/team-monet/monet/blob/main/docs/architecture.md
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Security check
+      options:
+        - label: I confirm this is **not** a security vulnerability report.
+          required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: What do you need help with?
+      description: Ask your question clearly and include the desired outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Share what you tried, relevant commands, logs, or links.

@@ -11,11 +11,16 @@ Only the latest released version of Monet receives security updates.
 
 ## Reporting a Vulnerability
 
-We take security vulnerabilities seriously. Please do **not** report security issues through public GitHub issues.
+We take security vulnerabilities seriously.
 
-**Email:** security@monet.co
+Please do **not** report security issues through public GitHub issues, discussions, or pull requests.
 
-Include as much detail as possible:
+Use GitHub private vulnerability reporting instead:
+
+- **Preferred channel:** [Report a vulnerability (private GitHub advisory)](https://github.com/team-monet/monet/security/advisories/new)
+- **Advisories page:** [https://github.com/team-monet/monet/security/advisories](https://github.com/team-monet/monet/security/advisories)
+
+Include as much detail as possible in your report:
 - Description of the vulnerability
 - Steps to reproduce
 - Potential impact
@@ -23,15 +28,15 @@ Include as much detail as possible:
 
 ### What to Expect
 
-- **Acknowledgment:** Within 48 hours of your report
-- **Status updates:** Every 7 days while the issue is being investigated
-- **Resolution timeline:** We aim to resolve confirmed vulnerabilities within 90 days
+- **Acknowledgment:** We aim to acknowledge new reports within 48 hours
+- **Status updates:** We aim to provide periodic updates while investigating
+- **Resolution timeline:** We prioritize confirmed vulnerabilities based on severity and impact
 
 ## Coordinated Disclosure Policy
 
 We follow coordinated disclosure. Please:
 
-1. Report the vulnerability privately to security@monet.co before any public disclosure
+1. Report the vulnerability privately using GitHub private vulnerability reporting before any public disclosure
 2. Allow us 90 days to investigate and release a fix before publishing details
 3. Make a good-faith effort to avoid data destruction, service disruption, or access to data beyond what is needed to demonstrate the issue
 
@@ -43,9 +48,3 @@ We will:
 4. Credit you in the release notes (unless you prefer to remain anonymous)
 
 We will not pursue legal action against researchers who follow this policy.
-
-## Security Contact
-
-**Email:** security@monet.co
-
-For general questions about security practices, open a GitHub Discussion instead.

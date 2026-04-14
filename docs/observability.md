@@ -1,6 +1,6 @@
 # Observability Guide
 
-This guide describes the current Monet observability surface for M4.
+This guide describes Monet's current observability surface for the open-source release.
 
 Today, Monet’s operator-facing signals are:
 
@@ -234,6 +234,6 @@ Current observability gaps:
 - `/api/tenants/:tenantSlug/metrics` is tenant-admin scoped, not a
   platform-wide operator endpoint
 
-For M4, the recommended operating model is still sufficient: structured request
+For the current open-source release, the recommended operating model is still sufficient: structured request
 logs, readiness, and targeted tenant metrics give a workable production signal
 set while the deployment/docs milestone is completed.
