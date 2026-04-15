@@ -24,7 +24,7 @@ For durability planning and recovery procedures, follow the
 Use one Linux host with:
 
 - Docker Engine and Docker Compose v2
-- published images for `api`, `dashboard`, and `migrate`
+- published GHCR images for `api`, `dashboard`, and `migrate`
 - a reverse proxy that terminates TLS in front of Monet
 
 Recommended public hostnames:
@@ -48,7 +48,11 @@ Before deploying, make sure you have:
 - Docker and Docker Compose v2 installed on the target host
 - DNS records for your dashboard, API, and Keycloak hostnames
 - a reverse proxy or load balancer that can terminate TLS
-- registry images or locally built images for `API_IMAGE`, `DASHBOARD_IMAGE`, and `MIGRATE_IMAGE`
+- image coordinates for `API_IMAGE`, `DASHBOARD_IMAGE`, and `MIGRATE_IMAGE`
+  - recommended production source: GHCR images pinned to a release tag (for example `v0.1.0`)
+  - `ghcr.io/team-monet/monet-api`
+  - `ghcr.io/team-monet/monet-dashboard`
+  - `ghcr.io/team-monet/monet-migrate`
 - a strong `NEXTAUTH_SECRET`
 - a base64-encoded 32-byte `ENCRYPTION_KEY`
 - a plan for persistent Docker volumes and host backups
@@ -85,13 +89,36 @@ cp .env.runtime.example .env.runtime
 - `KEYCLOAK_ADMIN`
 - `KEYCLOAK_ADMIN_PASSWORD`
 
+For production, set image vars to pinned GHCR release tags (not floating `latest`):
+
+```bash
+API_IMAGE=ghcr.io/team-monet/monet-api:v0.1.0
+DASHBOARD_IMAGE=ghcr.io/team-monet/monet-dashboard:v0.1.0
+MIGRATE_IMAGE=ghcr.io/team-monet/monet-migrate:v0.1.0
+```
+
 3. Pull or build images:
 
 ```bash
+# recommended production path (published GHCR images)
 pnpm runtime:pull
+
+# equivalent explicit pulls
+docker pull ghcr.io/team-monet/monet-api:v0.1.0
+docker pull ghcr.io/team-monet/monet-dashboard:v0.1.0
+docker pull ghcr.io/team-monet/monet-migrate:v0.1.0
+
 # or, for local image testing on the same host:
 # pnpm local:build
 ```
+
+If GHCR package visibility is private, authenticate before pulling:
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
+```
+
+When the Monet repository and packages are public, GHCR pulls should not require authentication.
 
 4. Start runtime stack and bootstrap Keycloak:
 
@@ -228,6 +255,14 @@ Important env notes:
 
 The full template is in [`../.env.runtime.example`](../.env.runtime.example).
 
+The runtime template includes local defaults and commented GHCR examples:
+
+- `API_IMAGE`
+- `DASHBOARD_IMAGE`
+- `MIGRATE_IMAGE`
+
+For production deploys, use pinned release tags (for example `v0.1.0`) rather than `latest`.
+
 ## Deploy
 
 1. Pull or build the images.
@@ -235,7 +270,11 @@ The full template is in [`../.env.runtime.example`](../.env.runtime.example).
 If you are using published images:
 
 ```bash
+# pull configured images from .env.runtime
 pnpm runtime:pull
+
+# equivalent Docker Compose commands
+docker compose --env-file .env.runtime -f docker-compose.runtime.yml pull
 ```
 
 If you are testing local images on the same host:
