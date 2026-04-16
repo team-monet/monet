@@ -77,6 +77,8 @@ Default local Keycloak admin credentials come from `.env.local-dev`:
 - Nominate the generated tenant admin email
 - Sign in through normal tenant login using the generated tenant admin account
 
+> **For a dedicated end-to-end tenant creation guide, see [Tenant Creation and Management](tenant-creation.md).**
+
 ## Verification
 
 After setup, run these checks:

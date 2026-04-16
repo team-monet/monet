@@ -47,6 +47,8 @@ Read the full system overview here:
 
 - Local development: [docs/local-development.md](docs/local-development.md)
 - Production deployment: [docs/production-deployment.md](docs/production-deployment.md)
+- Tenant creation and management: [docs/tenant-creation.md](docs/tenant-creation.md)
+- Platform administration: [docs/platform-administration.md](docs/platform-administration.md)
 - Architecture overview: [docs/architecture.md](docs/architecture.md)
 - Observability: [docs/observability.md](docs/observability.md)
 - Backup and restore: [docs/backup-restore.md](docs/backup-restore.md)
