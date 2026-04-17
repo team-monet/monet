@@ -97,13 +97,11 @@ async function main() {
     startTtlExpiryJob(sql);
     startAuditRetentionJob(auditPurgeSql);
     void recoverPendingEnrichments(sql);
-    sessionStore.startIdleSweep(async (sessionId, session) => {
-      console.info(`Closing idle MCP session ${sessionId}`);
-      await Promise.allSettled([
-        session.transport.close(),
-        session.server.close(),
-      ]);
-      sessionStore.remove(sessionId);
+    sessionStore.startIdleSweep(async (sessionId) => {
+      const closed = await sessionStore.closeIfIdle(sessionId);
+      if (closed) {
+        console.info(`Closing idle MCP session ${sessionId}`);
+      }
     });
 
     function waitForInFlightRequests(timeoutMs: number): Promise<void> {

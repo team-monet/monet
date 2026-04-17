@@ -9,10 +9,22 @@ export class SessionLimitError extends Error {
   }
 }
 
-const IDLE_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_SESSIONS_PER_AGENT = 5;
 const MAX_TOTAL_SESSIONS = 1000;
+
+function currentIdleTtlMs(): number {
+  const raw = process.env.MCP_SESSION_IDLE_TTL_MS;
+  if (!raw) return DEFAULT_IDLE_TTL_MS;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_IDLE_TTL_MS;
+  }
+
+  return Math.floor(parsed);
+}
 
 export interface McpSession {
   transport: StreamableHTTPServerTransport;
@@ -27,6 +39,7 @@ export interface McpSession {
 
 export class SessionStore {
   private sessions = new Map<string, McpSession>();
+  private inFlightRequests = new Map<string, number>();
   private sweepTimer: NodeJS.Timeout | null = null;
 
   add(sessionId: string, session: McpSession): void {
@@ -38,6 +51,7 @@ export class SessionStore {
       throw new SessionLimitError("Per-agent session limit reached");
     }
     this.sessions.set(sessionId, session);
+    this.inFlightRequests.set(sessionId, 0);
   }
 
   get(sessionId: string): McpSession | undefined {
@@ -50,6 +64,7 @@ export class SessionStore {
 
   remove(sessionId: string): void {
     this.sessions.delete(sessionId);
+    this.inFlightRequests.delete(sessionId);
   }
 
   touch(sessionId: string): void {
@@ -75,10 +90,49 @@ export class SessionStore {
     if (!session) return;
 
     this.sessions.delete(sessionId);
+    this.inFlightRequests.delete(sessionId);
     await Promise.allSettled([
       session.transport.close(),
       session.server.close(),
     ]);
+  }
+
+  beginRequest(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+
+    const current = this.inFlightRequests.get(sessionId) ?? 0;
+    this.inFlightRequests.set(sessionId, current + 1);
+    return true;
+  }
+
+  endRequest(sessionId: string): void {
+    const current = this.inFlightRequests.get(sessionId);
+    if (current === undefined) return;
+    if (current <= 1) {
+      this.inFlightRequests.set(sessionId, 0);
+      return;
+    }
+    this.inFlightRequests.set(sessionId, current - 1);
+  }
+
+  async closeIfIdle(sessionId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+
+    const idleTtlMs = currentIdleTtlMs();
+    const firstIdleCheck = Date.now() - session.lastActivityAt.getTime() > idleTtlMs;
+    if (!firstIdleCheck) return false;
+    if ((this.inFlightRequests.get(sessionId) ?? 0) > 0) return false;
+
+    const latest = this.sessions.get(sessionId);
+    if (!latest) return false;
+    const secondIdleCheck = Date.now() - latest.lastActivityAt.getTime() > idleTtlMs;
+    if (!secondIdleCheck) return false;
+    if ((this.inFlightRequests.get(sessionId) ?? 0) > 0) return false;
+
+    await this.closeSession(sessionId);
+    return true;
   }
 
   async closeSessionsForAgent(agentId: string): Promise<number> {
@@ -98,12 +152,25 @@ export class SessionStore {
     ) => void | Promise<void>,
   ): void {
     if (this.sweepTimer) return;
+    const idleTtlMs = currentIdleTtlMs();
 
     this.sweepTimer = setInterval(async () => {
       const now = Date.now();
       for (const [sessionId, session] of this.sessions) {
-        if (now - session.lastActivityAt.getTime() > IDLE_TTL_MS) {
+        if (now - session.lastActivityAt.getTime() <= idleTtlMs) {
+          continue;
+        }
+        if ((this.inFlightRequests.get(sessionId) ?? 0) > 0) {
+          continue;
+        }
+
+        try {
           await onExpired(sessionId, session);
+        } catch (error) {
+          console.error("MCP idle session sweep failed", {
+            sessionId,
+            error,
+          });
         }
       }
     }, SWEEP_INTERVAL_MS);
