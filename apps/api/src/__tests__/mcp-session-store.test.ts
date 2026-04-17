@@ -1,12 +1,23 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionStore, SessionLimitError } from "../mcp/session-store";
 
 describe("MCP session store", () => {
   let store: SessionStore;
+  const originalIdleTtl = process.env.MCP_SESSION_IDLE_TTL_MS;
 
   beforeEach(() => {
     vi.useFakeTimers();
     store = new SessionStore();
+    delete process.env.MCP_SESSION_IDLE_TTL_MS;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (originalIdleTtl === undefined) {
+      delete process.env.MCP_SESSION_IDLE_TTL_MS;
+    } else {
+      process.env.MCP_SESSION_IDLE_TTL_MS = originalIdleTtl;
+    }
   });
 
   it("adds, gets, and removes sessions", () => {
@@ -258,6 +269,7 @@ describe("MCP session store", () => {
   });
 
   it("idle sweep expires stale sessions and preserves active ones", () => {
+    process.env.MCP_SESSION_IDLE_TTL_MS = String(30 * 60 * 1000);
     const onExpired = vi.fn();
     const base = {
       transport: {} as never,
@@ -299,6 +311,159 @@ describe("MCP session store", () => {
     expect(onExpired).toHaveBeenCalledWith("stale", expect.objectContaining({
       agentContext: expect.objectContaining({ id: "agent-1" }),
     }));
+
+    store.stopIdleSweep();
+  });
+
+  it("idle sweep skips sessions with in-flight requests", () => {
+    process.env.MCP_SESSION_IDLE_TTL_MS = String(30 * 60 * 1000);
+    const onExpired = vi.fn();
+
+    store.add("stale", {
+      transport: {} as never,
+      server: {} as never,
+      agentContext: {
+        id: "agent-1",
+        externalId: "agent-1",
+        tenantId: "tenant-1",
+        isAutonomous: false,
+        userId: null,
+        role: null,
+      },
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    });
+
+    store.beginRequest("stale");
+    vi.setSystemTime(new Date("2026-03-04T00:45:00.000Z"));
+
+    store.startIdleSweep(onExpired);
+    vi.advanceTimersByTime(5 * 60 * 1000);
+
+    expect(onExpired).not.toHaveBeenCalled();
+    store.stopIdleSweep();
+  });
+
+  it("closeIfIdle re-checks idle status and in-flight requests before closing", async () => {
+    process.env.MCP_SESSION_IDLE_TTL_MS = String(30 * 60 * 1000);
+
+    const transportClose = vi.fn().mockResolvedValue(undefined);
+    const serverClose = vi.fn().mockResolvedValue(undefined);
+
+    store.add("session-1", {
+      transport: { close: transportClose } as never,
+      server: { close: serverClose } as never,
+      agentContext: {
+        id: "agent-1",
+        externalId: "agent-1",
+        tenantId: "tenant-1",
+        isAutonomous: false,
+        userId: null,
+        role: null,
+      },
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    });
+
+    vi.setSystemTime(new Date("2026-03-04T00:31:00.000Z"));
+    store.beginRequest("session-1");
+    await expect(store.closeIfIdle("session-1")).resolves.toBe(false);
+    expect(store.get("session-1")).toBeDefined();
+    expect(transportClose).not.toHaveBeenCalled();
+
+    store.endRequest("session-1");
+    store.touch("session-1");
+    await expect(store.closeIfIdle("session-1")).resolves.toBe(false);
+    expect(store.get("session-1")).toBeDefined();
+
+    vi.setSystemTime(new Date("2026-03-04T01:02:00.000Z"));
+    await expect(store.closeIfIdle("session-1")).resolves.toBe(true);
+    expect(store.get("session-1")).toBeUndefined();
+    expect(transportClose).toHaveBeenCalledTimes(1);
+    expect(serverClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("idle sweep continues when a callback throws", () => {
+    process.env.MCP_SESSION_IDLE_TTL_MS = String(30 * 60 * 1000);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const onExpired = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("boom");
+      })
+      .mockImplementation(() => undefined);
+
+    const base = {
+      transport: {} as never,
+      server: {} as never,
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    };
+
+    store.add("stale-a", {
+      ...base,
+      agentContext: {
+        id: "agent-1",
+        externalId: "agent-1",
+        tenantId: "tenant-1",
+        isAutonomous: false,
+        userId: null,
+        role: null,
+      },
+    });
+    store.add("stale-b", {
+      ...base,
+      agentContext: {
+        id: "agent-2",
+        externalId: "agent-2",
+        tenantId: "tenant-1",
+        isAutonomous: false,
+        userId: null,
+        role: null,
+      },
+    });
+
+    vi.setSystemTime(new Date("2026-03-04T00:45:00.000Z"));
+    store.startIdleSweep(onExpired);
+    vi.advanceTimersByTime(5 * 60 * 1000);
+
+    expect(onExpired).toHaveBeenCalledTimes(2);
+    expect(consoleSpy).toHaveBeenCalled();
+
+    consoleSpy.mockRestore();
+    store.stopIdleSweep();
+  });
+
+  it("uses default 24h idle TTL when env var is missing", () => {
+    const onExpired = vi.fn();
+
+    store.add("session-1", {
+      transport: {} as never,
+      server: {} as never,
+      agentContext: {
+        id: "agent-1",
+        externalId: "agent-1",
+        tenantId: "tenant-1",
+        isAutonomous: false,
+        userId: null,
+        role: null,
+      },
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    });
+
+    vi.setSystemTime(new Date("2026-03-04T23:54:00.000Z"));
+    store.startIdleSweep(onExpired);
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    expect(onExpired).not.toHaveBeenCalled();
+
+    vi.setSystemTime(new Date("2026-03-05T00:05:00.000Z"));
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    expect(onExpired).toHaveBeenCalledTimes(1);
 
     store.stopIdleSweep();
   });

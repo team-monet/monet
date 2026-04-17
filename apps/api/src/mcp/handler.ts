@@ -166,6 +166,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             try {
               // The MCP SDK reads POST request bodies from the raw Node stream.
               // Do not pre-consume req here.
+              sessionStore.beginRequest(newSessionId);
               await transport.handleRequest(req, res);
               if (res.statusCode >= 400) {
                 await sessionStore.closeSession(newSessionId);
@@ -181,6 +182,8 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
                 message: "An internal error occurred",
               });
               return;
+            } finally {
+              sessionStore.endRequest(newSessionId);
             }
           }
 
@@ -205,6 +208,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           sessionStore.touch(sessionId);
           try {
+            sessionStore.beginRequest(sessionId);
             await session.transport.handleRequest(req, res);
             return;
           } catch (error) {
@@ -214,6 +218,8 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               message: "An internal error occurred",
             });
             return;
+          } finally {
+            sessionStore.endRequest(sessionId);
           }
         }
 
@@ -259,6 +265,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           sessionStore.touch(sessionId);
           try {
+            sessionStore.beginRequest(sessionId);
             await session.transport.handleRequest(req, res);
             return;
           } catch (error) {
@@ -268,6 +275,8 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               message: "An internal error occurred",
             });
             return;
+          } finally {
+            sessionStore.endRequest(sessionId);
           }
         }
 
