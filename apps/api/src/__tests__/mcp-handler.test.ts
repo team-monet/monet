@@ -372,6 +372,28 @@ describe("mcp handler", () => {
     warnSpy.mockRestore();
   });
 
+  it("logs mcp_session_not_found on DELETE with unknown session id", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { res } = createRes();
+
+    await handler.handle(
+      createReq("DELETE", {
+        authorization: "Bearer valid",
+        "mcp-session-id": "missing-session",
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(404);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const log = JSON.parse(warnSpy.mock.calls[0][0]);
+    expect(log.message).toBe("mcp_session_not_found");
+    expect(log.level).toBe("warn");
+    expect(log).not.toHaveProperty("sessionId");
+
+    warnSpy.mockRestore();
+  });
+
   it("logs mcp_session_mismatch on POST when agent does not match", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     sessionStore.add("session-foreign", {

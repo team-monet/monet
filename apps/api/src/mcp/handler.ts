@@ -411,6 +411,16 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           const session = sessionStore.get(sessionId);
           if (!session) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_not_found",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              agentId,
+              userAgent,
+            });
             writeJson(res, 404, { error: "not_found", message: "Session not found" });
             return;
           }
