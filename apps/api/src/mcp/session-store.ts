@@ -9,9 +9,8 @@ export class SessionLimitError extends Error {
   }
 }
 
-const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_IDLE_TTL_MS = 8 * 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
-const MAX_SESSIONS_PER_AGENT = 5;
 const MAX_TOTAL_SESSIONS = 1000;
 
 function currentIdleTtlMs(): number {
@@ -21,6 +20,18 @@ function currentIdleTtlMs(): number {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 1) {
     return DEFAULT_IDLE_TTL_MS;
+  }
+
+  return Math.floor(parsed);
+}
+
+export function maxSessionsPerAgent(): number {
+  const raw = process.env.MCP_MAX_SESSIONS_PER_AGENT;
+  if (!raw) return 5;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return 5;
   }
 
   return Math.floor(parsed);
@@ -47,7 +58,7 @@ export class SessionStore {
       throw new SessionLimitError("Total session limit reached");
     }
     const agentSessionCount = this.getByAgentId(session.agentContext.id).length;
-    if (agentSessionCount >= MAX_SESSIONS_PER_AGENT) {
+    if (agentSessionCount >= maxSessionsPerAgent()) {
       throw new SessionLimitError("Per-agent session limit reached");
     }
     this.sessions.set(sessionId, session);
