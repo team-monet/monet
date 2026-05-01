@@ -8,9 +8,9 @@ import { resolveTenantBySlug } from "../middleware/tenant";
 import { authenticateAgentFromBearerToken } from "../services/agent-auth.service";
 import { pushRulesToAgent } from "../services/rule-notification.service";
 import { getActiveRulesForAgent } from "../services/rule.service";
-import { logRequest } from "../lib/log";
+import { logRequest, writeStructuredLog } from "../lib/log";
 import { createMcpServer } from "./server";
-import { SessionLimitError } from "./session-store";
+import { SessionLimitError, maxSessionsPerAgent } from "./session-store";
 import type { SessionStore } from "./session-store";
 
 interface McpHandlerDeps {
@@ -65,6 +65,7 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
       const method = req.method ?? "GET";
       const path = requestPath(req);
       const sessionId = headerValue(req.headers["mcp-session-id"]);
+      const userAgent = headerValue(req.headers["user-agent"]);
       const requestId = randomUUID();
       const startedAt = performance.now();
       let agentId: string | undefined;
@@ -92,6 +93,15 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             tenant ?? undefined,
           );
           if (!auth.ok) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_auth_failure",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              statusCode: auth.status,
+            });
             writeJson(res, auth.status, {
               error: auth.error,
               message: auth.message,
@@ -153,6 +163,18 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               });
             } catch (error) {
               if (error instanceof SessionLimitError) {
+                writeStructuredLog({
+                  level: "warn",
+                  message: "mcp_session_limit",
+                  requestId,
+                  method,
+                  path,
+                  tenantSlug: requestedTenantSlug ?? undefined,
+                  agentId,
+                  userAgent,
+                  activeSessionCount: agentId ? sessionStore.getByAgentId(agentId).length : undefined,
+                  maxSessions: maxSessionsPerAgent(),
+                });
                 await Promise.allSettled([transport.close(), server.close()]);
                 writeJson(res, 429, {
                   error: "session_limit",
@@ -189,11 +211,30 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           const session = sessionStore.get(sessionId);
           if (!session) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_not_found",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              agentId,
+              userAgent,
+            });
             writeJson(res, 404, { error: "not_found", message: "Session not found" });
             return;
           }
 
           if (session.agentContext.id !== auth.agent.id) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_mismatch",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              agentId,
+            });
             writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
             return;
           }
@@ -202,6 +243,15 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             ? session.tenantSlug === requestedTenantSlug
             : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
           if (requestedTenantSlug && !sessionTenantMatches) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_mismatch",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug,
+              agentId,
+            });
             writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
             return;
           }
@@ -235,6 +285,15 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             tenant ?? undefined,
           );
           if (!auth.ok) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_auth_failure",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              statusCode: auth.status,
+            });
             writeJson(res, auth.status, {
               error: auth.error,
               message: auth.message,
@@ -246,11 +305,30 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
 
           const session = sessionStore.get(sessionId);
           if (!session) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_not_found",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              agentId,
+              userAgent,
+            });
             writeJson(res, 404, { error: "not_found", message: "Session not found" });
             return;
           }
 
           if (session.agentContext.id !== auth.agent.id) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_mismatch",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              agentId,
+            });
             writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
             return;
           }
@@ -259,6 +337,15 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             ? session.tenantSlug === requestedTenantSlug
             : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
           if (requestedTenantSlug && !sessionTenantMatches) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_mismatch",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug,
+              agentId,
+            });
             writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
             return;
           }
@@ -292,6 +379,15 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             tenant ?? undefined,
           );
           if (!auth.ok) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_auth_failure",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              statusCode: auth.status,
+            });
             writeJson(res, auth.status, {
               error: auth.error,
               message: auth.message,
@@ -320,6 +416,15 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
           }
 
           if (session.agentContext.id !== auth.agent.id) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_mismatch",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug ?? undefined,
+              agentId,
+            });
             writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
             return;
           }
@@ -328,6 +433,15 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             ? session.tenantSlug === requestedTenantSlug
             : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
           if (requestedTenantSlug && !sessionTenantMatches) {
+            writeStructuredLog({
+              level: "warn",
+              message: "mcp_session_mismatch",
+              requestId,
+              method,
+              path,
+              tenantSlug: requestedTenantSlug,
+              agentId,
+            });
             writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
             return;
           }

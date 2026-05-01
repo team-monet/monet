@@ -4,11 +4,13 @@ import { SessionStore, SessionLimitError } from "../mcp/session-store";
 describe("MCP session store", () => {
   let store: SessionStore;
   const originalIdleTtl = process.env.MCP_SESSION_IDLE_TTL_MS;
+  const originalMaxSessions = process.env.MCP_MAX_SESSIONS_PER_AGENT;
 
   beforeEach(() => {
     vi.useFakeTimers();
     store = new SessionStore();
     delete process.env.MCP_SESSION_IDLE_TTL_MS;
+    delete process.env.MCP_MAX_SESSIONS_PER_AGENT;
   });
 
   afterEach(() => {
@@ -17,6 +19,11 @@ describe("MCP session store", () => {
       delete process.env.MCP_SESSION_IDLE_TTL_MS;
     } else {
       process.env.MCP_SESSION_IDLE_TTL_MS = originalIdleTtl;
+    }
+    if (originalMaxSessions === undefined) {
+      delete process.env.MCP_MAX_SESSIONS_PER_AGENT;
+    } else {
+      process.env.MCP_MAX_SESSIONS_PER_AGENT = originalMaxSessions;
     }
   });
 
@@ -437,7 +444,7 @@ describe("MCP session store", () => {
     store.stopIdleSweep();
   });
 
-  it("uses default 24h idle TTL when env var is missing", () => {
+  it("uses default 8h idle TTL when env var is missing", () => {
     const onExpired = vi.fn();
 
     store.add("session-1", {
@@ -456,15 +463,64 @@ describe("MCP session store", () => {
       lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
     });
 
-    vi.setSystemTime(new Date("2026-03-04T23:54:00.000Z"));
+    vi.setSystemTime(new Date("2026-03-04T07:54:00.000Z"));
     store.startIdleSweep(onExpired);
     vi.advanceTimersByTime(5 * 60 * 1000);
     expect(onExpired).not.toHaveBeenCalled();
 
-    vi.setSystemTime(new Date("2026-03-05T00:05:00.000Z"));
+    vi.setSystemTime(new Date("2026-03-04T08:05:00.000Z"));
     vi.advanceTimersByTime(5 * 60 * 1000);
     expect(onExpired).toHaveBeenCalledTimes(1);
 
     store.stopIdleSweep();
+  });
+
+  it("respects MCP_MAX_SESSIONS_PER_AGENT env var", () => {
+    process.env.MCP_MAX_SESSIONS_PER_AGENT = "2";
+    store = new SessionStore();
+    const base = {
+      transport: {} as never,
+      server: {} as never,
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    };
+    const agentContext = {
+      id: "agent-1",
+      externalId: "agent-1",
+      tenantId: "tenant-1",
+      isAutonomous: false,
+      userId: null,
+      role: null,
+    };
+
+    store.add("session-1", { ...base, agentContext });
+    store.add("session-2", { ...base, agentContext });
+    expect(() => store.add("session-3", { ...base, agentContext })).toThrow(SessionLimitError);
+  });
+
+  it("falls back to default per-agent limit when env var is invalid", () => {
+    process.env.MCP_MAX_SESSIONS_PER_AGENT = "not-a-number";
+    store = new SessionStore();
+    const base = {
+      transport: {} as never,
+      server: {} as never,
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+    };
+    const agentContext = {
+      id: "agent-1",
+      externalId: "agent-1",
+      tenantId: "tenant-1",
+      isAutonomous: false,
+      userId: null,
+      role: null,
+    };
+
+    for (let i = 0; i < 5; i++) {
+      store.add(`session-${i}`, { ...base, agentContext });
+    }
+    expect(() => store.add("session-6", { ...base, agentContext })).toThrow(SessionLimitError);
   });
 });

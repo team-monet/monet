@@ -269,4 +269,178 @@ describe("mcp handler", () => {
 
     expect(res.statusCode).toBe(404);
   });
+
+  it("logs mcp_auth_failure on POST when auth fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    authMock.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      error: "unauthorized",
+      message: "Invalid API key",
+    });
+    const { res } = createRes();
+
+    await handler.handle(
+      createReq("POST", { authorization: "Bearer bad" }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(401);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const log = JSON.parse(warnSpy.mock.calls[0][0]);
+    expect(log.message).toBe("mcp_auth_failure");
+    expect(log.level).toBe("warn");
+    expect(log.statusCode).toBe(401);
+    expect(log).not.toHaveProperty("authorization");
+
+    warnSpy.mockRestore();
+  });
+
+  it("logs mcp_session_limit when per-agent limit is reached", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    for (let i = 0; i < 5; i++) {
+      sessionStore.add(`session-${i}`, {
+        transport: {
+          handleRequest: transportHandleRequestMock,
+          close: transportCloseMock,
+        } as never,
+        server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+        agentContext: agent,
+        tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+        connectedAt: new Date(),
+        lastActivityAt: new Date(),
+      });
+    }
+
+    const { res } = createRes();
+    await handler.handle(createReq("POST", { authorization: "Bearer valid" }), res);
+
+    expect(res.statusCode).toBe(429);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const log = JSON.parse(warnSpy.mock.calls[0][0]);
+    expect(log.message).toBe("mcp_session_limit");
+    expect(log.level).toBe("warn");
+    expect(log.activeSessionCount).toBe(5);
+    expect(log.maxSessions).toBe(5);
+    expect(log.agentId).toBe("agent-1");
+
+    warnSpy.mockRestore();
+  });
+
+  it("logs mcp_session_not_found on POST with unknown session id", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { res } = createRes();
+
+    await handler.handle(
+      createReq("POST", {
+        authorization: "Bearer valid",
+        "mcp-session-id": "missing-session",
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(404);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const log = JSON.parse(warnSpy.mock.calls[0][0]);
+    expect(log.message).toBe("mcp_session_not_found");
+    expect(log.level).toBe("warn");
+    expect(log).not.toHaveProperty("sessionId");
+
+    warnSpy.mockRestore();
+  });
+
+  it("logs mcp_session_not_found on GET with unknown session id", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { res } = createRes();
+
+    await handler.handle(
+      createReq("GET", {
+        authorization: "Bearer valid",
+        "mcp-session-id": "missing-session",
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(404);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const log = JSON.parse(warnSpy.mock.calls[0][0]);
+    expect(log.message).toBe("mcp_session_not_found");
+    expect(log.level).toBe("warn");
+    expect(log).not.toHaveProperty("sessionId");
+
+    warnSpy.mockRestore();
+  });
+
+  it("logs mcp_session_mismatch on POST when agent does not match", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    sessionStore.add("session-foreign", {
+      transport: {
+        handleRequest: transportHandleRequestMock,
+        close: transportCloseMock,
+      } as never,
+      server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+      agentContext: {
+        ...agent,
+        id: "agent-2",
+      },
+      tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+      connectedAt: new Date(),
+      lastActivityAt: new Date(),
+    });
+
+    const { res } = createRes();
+    await handler.handle(
+      createReq("POST", {
+        authorization: "Bearer valid",
+        "mcp-session-id": "session-foreign",
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(401);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const log = JSON.parse(warnSpy.mock.calls[0][0]);
+    expect(log.message).toBe("mcp_session_mismatch");
+    expect(log.level).toBe("warn");
+    expect(log.agentId).toBe("agent-1");
+
+    warnSpy.mockRestore();
+  });
+
+  it("logs mcp_session_mismatch on GET when agent does not match", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    sessionStore.add("session-foreign", {
+      transport: {
+        handleRequest: transportHandleRequestMock,
+        close: transportCloseMock,
+      } as never,
+      server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+      agentContext: {
+        ...agent,
+        id: "agent-2",
+      },
+      tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+      connectedAt: new Date(),
+      lastActivityAt: new Date(),
+    });
+
+    const { res } = createRes();
+    await handler.handle(
+      createReq("GET", {
+        authorization: "Bearer valid",
+        "mcp-session-id": "session-foreign",
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(401);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const log = JSON.parse(warnSpy.mock.calls[0][0]);
+    expect(log.message).toBe("mcp_session_mismatch");
+    expect(log.level).toBe("warn");
+    expect(log.agentId).toBe("agent-1");
+
+    warnSpy.mockRestore();
+  });
 });
