@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { SqlClient } from "@monet/db";
 import {
   createTenantSchema,
+  ensureVectorExtension,
   tenantSchemaNameFromId,
   tenantUsers,
   tenantAdminNominations,
@@ -265,7 +266,10 @@ export async function createPlatformTenant(
   const { hash, salt } = hashApiKey(rawApiKey);
 
   try {
-    const result = await getSqlClient().begin(async (txSql) => {
+    const sql = getSqlClient();
+    await ensureVectorExtension(sql);
+
+    const result = await sql.begin(async (txSql) => {
       const tx = txSql as unknown as SqlClient;
 
       const [tenant] = await tx`

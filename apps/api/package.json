@@ -13,7 +13,7 @@
     "lint": "eslint src/",
     "test": "vitest run --passWithNoTests --fileParallelism=false",
     "test:unit": "vitest run --passWithNoTests --dir src",
-    "test:integration": "vitest run --passWithNoTests --dir test --fileParallelism=false",
+    "test:integration": "vitest run --passWithNoTests --dir test --fileParallelism=false --config vitest.integration.config.ts",
     "test:load:seed": "tsx test/load/seed.ts",
     "test:load": "k6 run test/load/k6-config.js"
   },

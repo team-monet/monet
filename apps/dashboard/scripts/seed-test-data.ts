@@ -2,6 +2,7 @@ import "dotenv/config";
 import {
   createClient, 
   createTenantSchema, 
+  ensureVectorExtension,
   tenantSchemaNameFromId,
   tenants, 
   tenantUsers, 
@@ -85,6 +86,7 @@ async function seed() {
   const tenantId = tenant.id;
   const schemaName = tenantSchemaNameFromId(tenantId);
   console.log(`Creating tenant schema: ${schemaName}`);
+  await ensureVectorExtension(sql);
   await createTenantSchema(sql, tenantId);
 
   console.log("Creating test user...");

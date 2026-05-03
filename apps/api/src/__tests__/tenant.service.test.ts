@@ -19,11 +19,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const {
   drizzleMock,
   createTenantSchemaMock,
+  ensureVectorExtensionMock,
   provisionAgentWithApiKeyMock,
   seedDefaultGeneralGuidanceMock,
 } = vi.hoisted(() => ({
   drizzleMock: vi.fn(),
   createTenantSchemaMock: vi.fn(),
+  ensureVectorExtensionMock: vi.fn(),
   provisionAgentWithApiKeyMock: vi.fn(),
   seedDefaultGeneralGuidanceMock: vi.fn(),
 }));
@@ -37,6 +39,7 @@ vi.mock("@monet/db", async () => {
   return {
     ...actual,
     createTenantSchema: createTenantSchemaMock,
+    ensureVectorExtension: ensureVectorExtensionMock,
   };
 });
 
@@ -79,6 +82,10 @@ describe("tenant service", () => {
 
     const result = await ensureTenantSchemasCurrent(sql);
 
+    expect(ensureVectorExtensionMock).toHaveBeenCalledWith(sql);
+    expect(ensureVectorExtensionMock.mock.invocationCallOrder[0]).toBeLessThan(
+      drizzleMock.mock.invocationCallOrder[0],
+    );
     expect(drizzleMock).toHaveBeenCalledWith(sql);
     expect(selectMock).toHaveBeenCalledWith({ id: tenants.id });
     expect(createTenantSchemaMock).toHaveBeenNthCalledWith(
@@ -175,6 +182,10 @@ describe("tenant service", () => {
       slug: "acme",
     });
 
+    expect(ensureVectorExtensionMock).toHaveBeenCalledWith(sql);
+    expect(ensureVectorExtensionMock.mock.invocationCallOrder[0]).toBeLessThan(
+      beginMock.mock.invocationCallOrder[0],
+    );
     expect(beginMock).toHaveBeenCalledTimes(1);
     const drizzleClient = drizzleMock.mock.calls[0]?.[0] as {
       options?: typeof sql.options;
@@ -299,6 +310,7 @@ describe("tenant service", () => {
       }),
     ).rejects.toThrow("Tenant slug already exists.");
 
+    expect(ensureVectorExtensionMock).toHaveBeenCalledWith(sql);
     expect(insertMock).not.toHaveBeenCalled();
   });
 });
