@@ -114,9 +114,8 @@ function SubmitButtonCore({
     }
   }, [ignoreStuckPending, pending, routeKey]);
 
-  // Keep submit protection tied to actual form status, even if we hide a stuck spinner.
-  const effectiveDisabled = Boolean(disabled) || pending;
   const effectivePending = pending && !ignoreStuckPending;
+  const effectiveDisabled = Boolean(disabled) || effectivePending;
 
   return (
     <Button
