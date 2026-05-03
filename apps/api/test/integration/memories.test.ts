@@ -745,6 +745,15 @@ describe("memories integration", () => {
       tags: ["scope-stale-group"],
     });
 
+    const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "private" }),
+    });
+    expect(demoteRes.status).toBe(200);
+
+    // Move the agent to a different group to make the memory's stored group_id stale.
+    // This simulates a real membership change while keeping auth/role checks intact.
     const fallbackGroupRes = await app.request("/api/groups", {
       method: "POST",
       headers: authHeaders(),
@@ -759,21 +768,6 @@ describe("memories integration", () => {
       body: JSON.stringify({ agentId }),
     });
     expect(addFallbackMembershipRes.status).toBe(200);
-
-    const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
-      method: "PATCH",
-      headers: authHeaders(),
-      body: JSON.stringify({ scope: "private" }),
-    });
-    expect(demoteRes.status).toBe(200);
-
-    const sql = getTestSql();
-    await withTenantScope(sql, schemaName, async (txSql) => {
-      await txSql`
-        DELETE FROM agent_group_members
-        WHERE group_id = ${groupId} AND agent_id = ${agentId}
-      `;
-    });
 
     const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
       method: "PATCH",
