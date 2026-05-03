@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { searchMemoriesAction } from "../actions";
+import { useState, useEffect } from "react";
+import { searchMemoriesAction, listGroupsAction } from "../actions";
 import Link from "next/link";
 import { MemoryEntryTier1, MemoryType } from "@monet/types";
 import { Input } from "@/components/ui/input";
@@ -12,6 +12,13 @@ import { Search, Loader2, Calendar, Bot, ArrowRight, AlertTriangle, Tag, Sparkle
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { formatMemoryAuthor } from "@/lib/memory-display";
+import {
+  Select as ShadSelect,
+  SelectContent as ShadSelectContent,
+  SelectItem as ShadSelectItem,
+  SelectTrigger as ShadSelectTrigger,
+  SelectValue as ShadSelectValue,
+} from "@/components/ui/select";
 
 function getMemoryTypeVariant(type: MemoryType): "default" | "secondary" | "outline" | "destructive" {
   switch (type) {
@@ -33,10 +40,18 @@ function getScopeColor(scope: string) {
 
 export default function SearchPage() {
   const [query, setQuery] = useState("");
+  const [selectedGroupId, setSelectedGroupId] = useState("");
+  const [groups, setGroups] = useState<{ id: string; name: string }[]>([]);
   const [results, setResults] = useState<MemoryEntryTier1[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    listGroupsAction()
+      .then((result) => setGroups(result.groups))
+      .catch(() => setGroups([]));
+  }, []);
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -47,7 +62,7 @@ export default function SearchPage() {
     setResults([]);
     setNextCursor(null);
     try {
-      const response = await searchMemoriesAction(query);
+      const response = await searchMemoriesAction(query, 20, undefined, selectedGroupId || undefined);
       setResults(response.items);
       setNextCursor(response.nextCursor);
     } catch (err: any) { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -62,7 +77,7 @@ export default function SearchPage() {
 
     setLoading(true);
     try {
-      const response = await searchMemoriesAction(query, 20, nextCursor);
+      const response = await searchMemoriesAction(query, 20, nextCursor, selectedGroupId || undefined);
       setResults((prev) => [...prev, ...response.items]);
       setNextCursor(response.nextCursor);
     } catch (err: any) { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -97,6 +112,24 @@ export default function SearchPage() {
                 disabled={loading}
               />
             </div>
+            {groups.length > 0 && (
+              <ShadSelect
+                value={selectedGroupId || "all"}
+                onValueChange={(val) => setSelectedGroupId(val === "all" ? "" : val)}
+              >
+                <ShadSelectTrigger className="h-12 w-[180px]">
+                  <ShadSelectValue placeholder="All Groups" />
+                </ShadSelectTrigger>
+                <ShadSelectContent>
+                  <ShadSelectItem value="all">All Groups</ShadSelectItem>
+                  {groups.map((g) => (
+                    <ShadSelectItem key={g.id} value={g.id}>
+                      {g.name}
+                    </ShadSelectItem>
+                  ))}
+                </ShadSelectContent>
+              </ShadSelect>
+            )}
             <Button type="submit" size="lg" disabled={loading} className="h-12 px-8">
               {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : "Search"}
             </Button>

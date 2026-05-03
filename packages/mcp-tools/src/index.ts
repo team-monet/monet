@@ -41,6 +41,7 @@ export const MemorySearchInput = z.object({
   accessedBefore: z.string().datetime().optional().describe("Only include memories accessed on or before this timestamp"),
   cursor: z.string().optional().describe("Opaque cursor for ranked pagination"),
   limit: z.number().int().positive().max(50).default(10).describe("Max results to return"),
+  groupId: z.string().uuid().optional().describe("Filter to a specific agent group"),
 });
 
 export const MemoryFetchInput = z.object({
