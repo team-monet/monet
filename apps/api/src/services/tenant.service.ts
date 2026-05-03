@@ -3,6 +3,7 @@ import {
   agentGroups,
   asDrizzleSqlClient,
   createTenantSchema,
+  ensureVectorExtension,
   type Database,
   type SqlClient,
   tenants,
@@ -110,6 +111,8 @@ export async function configureTenantOauth(
 }
 
 export async function ensureTenantSchemasCurrent(sql: SqlClient): Promise<number> {
+  await ensureVectorExtension(sql);
+
   const db = createTenantDb(sql);
   const tenantRows = await db
     .select({ id: tenants.id })
@@ -146,6 +149,10 @@ export async function provisionTenant(
   const isolationMode = input.isolationMode ?? "logical";
 
   try {
+    // CREATE EXTENSION cannot run inside a transaction, so ensure it
+    // exists before entering the atomic tenant-provisioning block.
+    await ensureVectorExtension(sql);
+
     // Use a transaction for atomicity of tenant + agent creation
     const result = await sql.begin(async (txSql) => {
       const txDb = createTenantDb(txSql, sql.options);

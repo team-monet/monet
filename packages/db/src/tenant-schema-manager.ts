@@ -10,6 +10,25 @@ export function tenantSchemaNameFromId(tenantId: string): string {
 }
 
 /**
+ * Ensure the pgvector extension is installed.
+ * Must be called with a non-transactional client because PostgreSQL
+ * does not allow CREATE EXTENSION inside a transaction block.
+ */
+export async function ensureVectorExtension(
+  sql: postgres.Sql,
+): Promise<void> {
+  try {
+    await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS vector`);
+  } catch (error) {
+    throw new Error(
+      `pgvector extension is not available on this PostgreSQL server. Install pgvector before provisioning tenants.\n` +
+        `See: https://github.com/pgvector/pgvector#installation`,
+      { cause: error },
+    );
+  }
+}
+
+/**
  * Create a new tenant schema with all required tables, indexes, and security constraints.
  * The schema contains: users, agents, agent_groups, agent_group_members, user_groups,
  * user_group_members, user_group_agent_group_permissions, memory_entries, memory_versions,
@@ -27,9 +46,6 @@ export async function createTenantSchema(
   if (!SCHEMA_NAME_REGEX.test(schemaName)) {
     throw new Error(`Invalid tenant schema name: ${schemaName}`);
   }
-
-  // Ensure shared extensions exist before creating tenant tables that depend on them.
-  await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS vector`);
 
   await sql.unsafe(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
 

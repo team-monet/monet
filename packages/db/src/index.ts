@@ -13,6 +13,7 @@ export {
 export * from "./schema/index.js";
 export {
   createTenantSchema,
+  ensureVectorExtension,
   tenantSchemaNameFromId,
 } from "./tenant-schema-manager.js";
 export { withTenantDrizzleScope, withTenantScope } from "./scoped-client.js";
