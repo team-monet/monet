@@ -38,13 +38,18 @@ export default async function MemoryEntryDetailPage({ params }: PageProps) {
     const result = await client.getMemoryEntry(id);
     memory = result.entry;
     versions = result.versions;
-
-    if (memory?.groupId) {
-      const groupsResult = await client.listGroups();
-      groupName = groupsResult.groups.find((g) => g.id === memory!.groupId)?.name ?? null;
-    }
   } catch (err: unknown) {
     error = err instanceof Error ? err.message : "An unexpected error occurred";
+  }
+
+  if (!error && memory?.groupId) {
+    try {
+      const client = await getApiClient();
+      const groupsResult = await client.listGroups();
+      groupName = groupsResult.groups.find((g) => g.id === memory.groupId)?.name ?? null;
+    } catch {
+      // Best effort only; UI falls back to rendering raw group UUID.
+    }
   }
 
   if (error || !memory) {
