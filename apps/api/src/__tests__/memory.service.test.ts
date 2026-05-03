@@ -870,9 +870,12 @@ describe("listAgentMemories", () => {
     const orderByMock = vi.fn(() => ({
       limit: limitMock,
     }));
-    const whereMock = vi.fn(() => ({
-      orderBy: orderByMock,
-    }));
+    const whereMock = vi.fn((whereArg: unknown) => {
+      void whereArg;
+      return {
+        orderBy: orderByMock,
+      };
+    });
     const secondLeftJoinMock = vi.fn(() => ({
       where: whereMock,
     }));
@@ -1469,7 +1472,10 @@ describe("cross-group isolation", () => {
       },
     ]);
     const orderByMock = vi.fn(() => ({ limit: limitMock }));
-    const whereMock = vi.fn(() => ({ orderBy: orderByMock }));
+    const whereMock = vi.fn((whereArg: unknown) => {
+      void whereArg;
+      return { orderBy: orderByMock };
+    });
     const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
     const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
     const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
@@ -1554,7 +1560,10 @@ describe("cross-group isolation", () => {
       { tag: "ops" },
       { tag: "secret" },
     ]);
-    const whereMock = vi.fn(() => ({ orderBy: orderByMock }));
+    const whereMock = vi.fn((whereArg: unknown) => {
+      void whereArg;
+      return { orderBy: orderByMock };
+    });
     const fromMock = vi.fn(() => ({ where: whereMock }));
     const selectDistinctMock = vi.fn(() => ({ from: fromMock }));
     const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
@@ -1580,7 +1589,10 @@ describe("cross-group isolation", () => {
   it("searchMemories WHERE clause excludes null group_id for group-scoped memories", async () => {
     const limitMock = vi.fn().mockResolvedValue([]);
     const orderByMock = vi.fn(() => ({ limit: limitMock }));
-    const whereMock = vi.fn(() => ({ orderBy: orderByMock }));
+    const whereMock = vi.fn((whereArg: unknown) => {
+      void whereArg;
+      return { orderBy: orderByMock };
+    });
     const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
     const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
     const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
@@ -1633,7 +1645,10 @@ describe("cross-group isolation", () => {
   it("searchMemories WHERE clause restricts to authorized groupId when param is provided", async () => {
     const limitMock = vi.fn().mockResolvedValue([]);
     const orderByMock = vi.fn(() => ({ limit: limitMock }));
-    const whereMock = vi.fn(() => ({ orderBy: orderByMock }));
+    const whereMock = vi.fn((whereArg: unknown) => {
+      void whereArg;
+      return { orderBy: orderByMock };
+    });
     const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
     const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
     const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
@@ -1668,7 +1683,10 @@ describe("cross-group isolation", () => {
   it("searchMemories WHERE clause yields FALSE when agent has zero group memberships", async () => {
     const limitMock = vi.fn().mockResolvedValue([]);
     const orderByMock = vi.fn(() => ({ limit: limitMock }));
-    const whereMock = vi.fn(() => ({ orderBy: orderByMock }));
+    const whereMock = vi.fn((whereArg: unknown) => {
+      void whereArg;
+      return { orderBy: orderByMock };
+    });
     const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
     const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
     const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
