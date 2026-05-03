@@ -1,11 +1,11 @@
-# Default Agent Group Rules Proposal
+# Default General Guidance Proposal
 
-This document proposes the first baseline rule set for tenant-default agent groups in Monet.
+This document proposes the first tenant-global baseline rule set for Monet agents.
 
 The intent is:
 
 - seed a tenant-local starter rule set during tenant provisioning
-- attach that rule set to the tenant's default agent group
+- apply that rule set automatically to every agent in the tenant
 - allow the tenant admin to review and edit the seeded rules after bootstrap
 
 This is a content proposal only. It does not change the implementation model yet.
@@ -13,8 +13,8 @@ This is a content proposal only. It does not change the implementation model yet
 ## Proposed Rule Set
 
 - Rule set name: `Default General Guidance`
-- Initial attachment target: the default `General` agent group
-- Future behavior: if Monet later supports multiple default agent groups, this same baseline can be copied or selectively attached per group
+- Application scope: every agent in the tenant
+- Attachment model: tenant-global baseline guidance, independent of Agent Group membership
 
 ## Proposed Base Rules
 
@@ -67,7 +67,7 @@ These rules are written to fit the current data model of `name` + `description`.
 
 ## Why These First
 
-This baseline is intentionally conservative for the default `General` agent group:
+This baseline is intentionally conservative because it applies to every agent in the tenant:
 
 - it protects tenant isolation
 - it improves memory quality
@@ -89,5 +89,5 @@ If we proceed with this proposal, the likely implementation shape is:
 
 - seed these rules into the tenant schema during tenant provisioning
 - create one tenant-local rule set named `Default General Guidance`
-- attach the rule set to the default `General` agent group instead of individual agents
+- apply the rule set as tenant-global Default General Guidance instead of attaching it to a specific Agent Group
 - expose seeded rules in the tenant admin rules UI for review and editing in place
