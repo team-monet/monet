@@ -270,6 +270,18 @@ describe("validateStartupConfig", () => {
     expect(result.summary.enrichment.embeddingProvider).toBe("onnx");
   });
 
+  it("accepts chat provider none for embedding-only enrichment", () => {
+    const result = validateStartupConfig({
+      ...createBaseEnv(),
+      ENRICHMENT_CHAT_PROVIDER: "none",
+      ENRICHMENT_EMBEDDING_PROVIDER: "onnx",
+    });
+
+    expect(result.summary.enrichment.chatProvider).toBe("none");
+    expect(result.summary.enrichment.embeddingProvider).toBe("onnx");
+    expect(result.warnings).toEqual([]);
+  });
+
   it("maps legacy onnx shorthand to ollama chat plus onnx embeddings", () => {
     const env = createBaseEnv();
     delete env.ENRICHMENT_CHAT_PROVIDER;

@@ -15,6 +15,7 @@ export type MemoryType = z.infer<typeof MemoryType>;
 
 export const CreateMemoryEntryInput = z.object({
   content: z.string().min(1, "Content is required"),
+  summary: z.string().max(200).optional(),
   memoryType: MemoryType,
   memoryScope: MemoryScope.default("group"),
   tags: z.array(z.string()).min(1, "At least one tag is required"),

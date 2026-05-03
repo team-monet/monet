@@ -235,6 +235,11 @@ At minimum, set:
 
 Choose one enrichment mode:
 
+- ONNX embeddings only (default):
+  - `ENRICHMENT_CHAT_PROVIDER=none`
+  - `ENRICHMENT_EMBEDDING_PROVIDER=onnx`
+  - agents must provide `summary` and `tags` in `memory_store`
+
 - Ollama for both chat and embeddings:
   - `ENRICHMENT_CHAT_PROVIDER=ollama`
   - `ENRICHMENT_EMBEDDING_PROVIDER=ollama`
@@ -293,7 +298,7 @@ pnpm runtime:up
 
 What this does:
 
-- ensures the shared Ollama stack is up
+- optionally ensures the shared Ollama stack is up (only when configured)
 - starts PostgreSQL and Keycloak
 - runs platform migrations in the `migrate` image
 - starts the API and dashboard

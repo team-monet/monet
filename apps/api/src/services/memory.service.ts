@@ -32,6 +32,7 @@ import type {
   MemoryEntryTier1,
   UpdateMemoryEntryInput,
 } from "@monet/types";
+import { resolveConfiguredProviders } from "../providers";
 
 type MemorySqlClient = SqlClient | TransactionClient;
 type MemoryDrizzleOptions = NonNullable<SqlClient["options"]>;
@@ -419,6 +420,8 @@ export async function createMemory(
   preflight: MemoryWritePreflight | null = null,
 ) {
   const db = createMemoryDb(txSql);
+  const { chatProvider } = resolveConfiguredProviders();
+  const providedSummary = input.summary?.trim();
 
   // Autonomous agents cannot store user-scoped entries (they have no user binding)
   if (agent.isAutonomous && input.memoryScope === "user") {
@@ -428,6 +431,10 @@ export async function createMemory(
   // Group-scoped entries require group membership (M2 spec)
   if (input.memoryScope === "group" && preflight && !preflight.hasGroupMembership) {
       return { error: "validation" as const, message: "Agent must belong to a group to store group-scoped memories" };
+  }
+
+  if (chatProvider === "none" && !providedSummary) {
+    return { error: "validation" as const, message: "summary is required when chat enrichment is disabled" };
   }
 
   // Quota enforcement
@@ -444,6 +451,7 @@ export async function createMemory(
     .insert(memoryEntries)
     .values({
       content: input.content,
+      summary: providedSummary || null,
       memoryType: input.memoryType,
       memoryScope: input.memoryScope,
       tags: input.tags,
