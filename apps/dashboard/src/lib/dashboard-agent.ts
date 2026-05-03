@@ -302,17 +302,22 @@ async function syncAgentGroups(
     }
 
     if (toInsert.length > 0) {
-      await tx
-        .insert(agentGroupMembers)
-        .values(
-          toInsert.map((groupId) => ({
-            agentId: dashboardAgentId,
-            groupId,
-          })),
-        )
-        .onConflictDoNothing({
-          target: [agentGroupMembers.agentId, agentGroupMembers.groupId],
-        });
+      const values = toInsert.map((groupId) => ({
+        agentId: dashboardAgentId,
+        groupId,
+      }));
+
+      try {
+        await tx
+          .insert(agentGroupMembers)
+          .values(values)
+          .onConflictDoNothing({
+            target: [agentGroupMembers.agentId, agentGroupMembers.groupId],
+          });
+      } catch {
+        // Fallback for tenants where the composite PK upgrade has not run yet.
+        await tx.insert(agentGroupMembers).values(values);
+      }
     }
   });
 }
