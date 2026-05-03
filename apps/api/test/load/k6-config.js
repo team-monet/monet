@@ -3,6 +3,7 @@ import { runMemoryStoreBurstScenario } from "./scenarios/memory-store-burst.js";
 import { runMcpSessionChurnScenario } from "./scenarios/mcp-session-churn.js";
 import { runMixedWorkloadScenario } from "./scenarios/mixed-workload.js";
 import { runTier1SearchScenario } from "./scenarios/tier1-search.js";
+import { runTier1SearchTextScenario } from "./scenarios/tier1-search-text.js";
 import { runTier2FetchScenario } from "./scenarios/tier2-fetch.js";
 
 function parseEnvInt(name, fallback) {
@@ -28,6 +29,12 @@ const scenarios = {
     vus,
     duration,
     exec: "tier1Search",
+  },
+  tier1_search_text: {
+    executor: "constant-vus",
+    vus,
+    duration,
+    exec: "tier1SearchText",
   },
   tier2_fetch: {
     executor: "constant-vus",
@@ -62,14 +69,16 @@ export const options = {
   scenarios,
   thresholds: {
     http_req_failed: ["rate<0.01"],
-    tier1_search_latency: ["p(95)<500"],
+    tier1_search_text_latency: ["p(95)<500"],
     tier2_fetch_latency: ["p(95)<300"],
     memory_store_latency: ["p(95)<1000"],
-    mixed_workload_latency: ["p(95)<600"],
+    tier1_search_latency: [{ threshold: "p(95)<500", abortOnFail: false }],
+    mixed_workload_latency: [{ threshold: "p(95)<600", abortOnFail: false }],
   },
 };
 
 const tier1SearchLatency = new Trend("tier1_search_latency", true);
+const tier1SearchTextLatency = new Trend("tier1_search_text_latency", true);
 const tier2FetchLatency = new Trend("tier2_fetch_latency", true);
 const memoryStoreLatency = new Trend("memory_store_latency", true);
 const mixedWorkloadLatency = new Trend("mixed_workload_latency", true);
@@ -87,6 +96,10 @@ export function setup() {
 
 export function tier1Search(data) {
   tier1SearchLatency.add(runTier1SearchScenario(data));
+}
+
+export function tier1SearchText(data) {
+  tier1SearchTextLatency.add(runTier1SearchTextScenario(data));
 }
 
 export function tier2Fetch(data) {
