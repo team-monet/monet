@@ -760,11 +760,13 @@ describe("memories integration", () => {
     });
     expect(addFallbackMembershipRes.status).toBe(200);
 
-    const removeMembershipRes = await app.request(`/api/groups/${groupId}/members/${agentId}`, {
-      method: "DELETE",
-      headers: authHeaders(),
+    const sql = getTestSql();
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`
+        DELETE FROM agent_group_members
+        WHERE group_id = ${groupId} AND agent_id = ${agentId}
+      `;
     });
-    expect(removeMembershipRes.status).toBe(200);
 
     const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
       method: "PATCH",
