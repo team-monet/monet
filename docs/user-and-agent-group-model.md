@@ -49,28 +49,32 @@ These two layers are intentionally separate.
 
 ## Rule Scope Model
 
-Rules are scoped through Agent Groups and agent ownership, not User Groups.
+Rules are evaluated in three layers, from broadest to narrowest. Each layer is
+additive: narrower layers add more specific guidance without removing the
+baseline safety guidance that applies above them.
 
-### Tenant shared rule sets
+### 1. Default General Guidance
 
-- Tenant shared rule sets are tenant-wide resources managed by tenant admins.
-- Tenant shared rule sets may be attached to Agent Groups.
-- When attached to an Agent Group, the rule set applies to all agents assigned to that Agent Group.
+- Default General Guidance is the tenant-global baseline rule set.
+- It applies automatically to every agent in the tenant.
+- It applies regardless of Agent Group membership.
+- It exists so every agent has baseline operational guidance without requiring explicit assignment.
+- It is managed by tenant admins.
 
-### User-owned rule sets
+### 2. Shared Rules
 
-- User-owned rule sets are personal resources managed by the owning user.
+- Shared Rules are tenant-admin-managed rules and rule sets.
+- Shared rule sets may be assigned to one or more Agent Groups.
+- When assigned to an Agent Group, the rule set applies to all agents assigned to that Agent Group.
+- Shared Rules layer on top of Default General Guidance.
+
+### 3. My Rules
+
+- My Rules are user-owned rules and rule sets created and managed by the owning user.
+- A user selects which of their own agents a personal rule set applies to.
 - A user-owned rule set may only affect agents owned by that same user.
-- Regular users can apply personal rule sets to their own agents.
-- Regular users cannot apply personal rule sets to agents owned by another user.
-
-### Future Agent Group attachment behavior
-
-If user-owned rule sets become attachable to Agent Groups in the future, they must remain ownership-filtered:
-
-- A user-owned rule set attached to an Agent Group applies only to agents in that group where `agent.userId === ruleSet.ownerUserId`.
-- It must not affect other users' agents in the same Agent Group.
-- It must not affect autonomous or shared tenant agents unless a separate tenant-admin policy explicitly allows that.
+- My Rules must never affect agents owned by another user.
+- My Rules layer on top of Default General Guidance and any Shared Rules that apply to the agent.
 
 ### User Groups and rules
 
@@ -80,6 +84,14 @@ User Groups are permission-only for rule scope purposes:
 - User Groups do not directly carry rule sets.
 - User Groups do not directly apply rules to agents.
 - This avoids ambiguity when a user belongs to multiple User Groups.
+
+### Future Agent Group attachment behavior
+
+If user-owned rule sets become attachable to Agent Groups in the future, they must remain ownership-filtered:
+
+- A user-owned rule set attached to an Agent Group applies only to agents in that group where `agent.userId === ruleSet.ownerUserId`.
+- It must not affect other users' agents in the same Agent Group.
+- It must not affect autonomous or shared tenant agents unless a separate tenant-admin policy explicitly allows that.
 
 ## Agent Registration Rules
 
