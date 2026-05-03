@@ -114,12 +114,16 @@ describe("MCP server factory", () => {
     const tools = await client.listTools();
     const memoryStore = tools.tools.find((tool) => tool.name === "memory_store");
     const memorySearch = tools.tools.find((tool) => tool.name === "memory_search");
+    const memoryUpdate = tools.tools.find((tool) => tool.name === "memory_update");
     const memoryPromoteScope = tools.tools.find((tool) => tool.name === "memory_promote_scope");
 
     const memoryStoreSchema = memoryStore?.inputSchema as {
       properties?: Record<string, { description?: string }>;
     } | undefined;
     const memorySearchSchema = memorySearch?.inputSchema as {
+      properties?: Record<string, { description?: string }>;
+    } | undefined;
+    const memoryUpdateSchema = memoryUpdate?.inputSchema as {
       properties?: Record<string, { description?: string }>;
     } | undefined;
     const memoryPromoteScopeSchema = memoryPromoteScope?.inputSchema as {
@@ -133,6 +137,11 @@ describe("MCP server factory", () => {
 
     expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents");
     expect(memorySearchSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");
+    expect(memorySearchSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
+
+    expect(memoryUpdateSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
+    expect(memoryUpdateSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
+    expect(memoryUpdateSchema?.properties?.expectedVersion?.description).toContain("optimistic concurrency");
 
     expect(memoryPromoteScope?.description).toContain("creating agent only");
     expect(memoryPromoteScopeSchema?.properties?.scope?.description).toContain("all agents in the group can access");
