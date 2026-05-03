@@ -75,6 +75,31 @@ with_ollama_env() {
   MONET_OLLAMA_ENV_FILE="${ENV_FILE}" "${ROOT_DIR}/scripts/ollama-env.sh" "$@"
 }
 
+ollama_required() {
+  local chat_provider="${ENRICHMENT_CHAT_PROVIDER:-}"
+  local embedding_provider="${ENRICHMENT_EMBEDDING_PROVIDER:-}"
+  local legacy_provider="${ENRICHMENT_PROVIDER:-}"
+
+  if [[ "${chat_provider}" == "ollama" || "${embedding_provider}" == "ollama" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${legacy_provider}" && ("${legacy_provider}" == "ollama" || "${legacy_provider}" == "onnx") ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+start_ollama_if_required() {
+  if ollama_required; then
+    echo "Ollama is required by enrichment provider config; ensuring shared Ollama is running..."
+    with_ollama_env up
+  else
+    echo "Ollama is not required by enrichment provider config; skipping shared Ollama startup."
+  fi
+}
+
 pull_optional_image() {
   local image="$1"
   local label="$2"
@@ -90,7 +115,7 @@ pull_optional_image() {
 cmd_up() {
   require_env_file
   load_env_file
-  with_ollama_env up
+  start_ollama_if_required
   compose_runtime up -d postgres keycloak
   cmd_migrate
   compose_runtime up -d api dashboard
@@ -108,7 +133,7 @@ cmd_migrate() {
 cmd_pull() {
   require_env_file
   load_env_file
-  with_ollama_env up
+  start_ollama_if_required
   docker pull pgvector/pgvector:pg16
   docker pull quay.io/keycloak/keycloak:26.1
   pull_optional_image "${MIGRATE_IMAGE:-monet-migrate:local}" "migrate"
@@ -134,9 +159,15 @@ cmd_status() {
   load_env_file
   echo "Runtime stack:"
   compose_runtime ps
-  echo
-  echo "Shared Ollama:"
-  with_ollama_env status
+
+  if ollama_required; then
+    echo
+    echo "Shared Ollama:"
+    with_ollama_env status
+  else
+    echo
+    echo "Shared Ollama: skipped (not required by enrichment provider config)"
+  fi
 }
 
 cmd_logs() {
@@ -144,9 +175,15 @@ cmd_logs() {
   load_env_file
   echo "Runtime stack logs:"
   compose_runtime logs --tail 200 postgres migrate api keycloak dashboard
-  echo
-  echo "Shared Ollama logs:"
-  with_ollama_env logs
+
+  if ollama_required; then
+    echo
+    echo "Shared Ollama logs:"
+    with_ollama_env logs
+  else
+    echo
+    echo "Shared Ollama logs: skipped (not required by enrichment provider config)"
+  fi
 }
 
 cmd_reset() {
@@ -160,13 +197,13 @@ usage() {
 Usage: ./scripts/runtime-env.sh <command>
 
 Commands:
-  up       Ensure shared Ollama is running, migrate, then start the runtime stack
+  up       Start required dependencies, migrate, then start the runtime stack
   migrate  Run platform migrations inside the runtime image
   pull     Pull runtime dependencies and any non-local app images
   keycloak-setup Bootstrap runtime Keycloak realms, clients, and sample users
   down     Stop the runtime stack
-  status   Show runtime and shared Ollama status
-  logs     Tail runtime and shared Ollama logs
+  status   Show runtime status and Ollama status when required
+  logs     Tail runtime logs and Ollama logs when required
   reset    Destructive reset (removes runtime containers and local runtime volumes)
 EOF
 }
