@@ -101,6 +101,35 @@ describe("MCP server factory", () => {
     await Promise.all([client.close(), server.close()]);
   });
 
+  it("exposes scope and type semantics in tool schemas", async () => {
+    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const tools = await client.listTools();
+    const memoryStore = tools.tools.find((tool) => tool.name === "memory_store");
+    const memorySearch = tools.tools.find((tool) => tool.name === "memory_search");
+    const memoryPromoteScope = tools.tools.find((tool) => tool.name === "memory_promote_scope");
+
+    expect(memoryStore?.inputSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
+    expect(memoryStore?.inputSchema?.properties?.memoryScope?.description).toContain("all agents in the group can access");
+    expect(memoryStore?.inputSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
+    expect(memoryStore?.inputSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
+
+    expect(memorySearch?.inputSchema?.properties?.includeUser?.description).toContain("same user's agents");
+    expect(memorySearch?.inputSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");
+
+    expect(memoryPromoteScope?.description).toContain("creating agent only");
+    expect(memoryPromoteScope?.inputSchema?.properties?.scope?.description).toContain("all agents in the group can access");
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
   it("delivers base governance instructions even with no active rules", async () => {
     const server = createMcpServer(AGENT, "tenant_test", {} as never);
     const client = new Client({ name: "test-client", version: "1.0.0" });
