@@ -1,13 +1,20 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { authHeaders, buildTenantApiUrl, pickRandom } from "./utils.js";
+import {
+  authHeadersForGroup,
+  buildTenantApiUrl,
+  pickRandom,
+  pickRandomGroupSample,
+} from "./utils.js";
 
 export function runTier2FetchScenario(data) {
-  const memoryId = pickRandom(data.seed.sampleMemoryIds);
+  const groupSample = pickRandomGroupSample(data.seed);
+  const memoryId =
+    pickRandom(groupSample && groupSample.memoryIds) || pickRandom(data.seed.sampleMemoryIds);
   const url = buildTenantApiUrl(data.baseUrl, data.seed, `/memories/${memoryId}`);
 
   const res = http.get(url, {
-    headers: authHeaders(data.seed),
+    headers: authHeadersForGroup(data.seed, groupSample && groupSample.groupId),
     timeout: data.requestTimeout,
   });
 

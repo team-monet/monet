@@ -23,11 +23,17 @@ interface RegisterAgentResponse {
 interface SeedOutput {
   generatedAt: string;
   tenantId: string;
+  tenantSlug: string;
   tenantName: string;
   apiKeys: string[];
   agentIds: string[];
   groupIds: string[];
   sampleMemoryIds: string[];
+  groupSampleMemoryIds: Array<{
+    groupId: string;
+    memoryIds: string[];
+    apiKeys: string[];
+  }>;
   memoriesPerGroup: number;
 }
 
@@ -130,6 +136,10 @@ async function main() {
 
     const agentIds: string[] = [bootstrapAgentId];
     const apiKeys: string[] = [bootstrapApiKey];
+    const groupApiKeys = new Map<string, string[]>();
+    for (const groupId of groupIds) {
+      groupApiKeys.set(groupId, []);
+    }
 
     for (let i = 1; i < agentCount; i += 1) {
       const registerRes = await requestJson<RegisterAgentResponse | { message?: string }>(
@@ -156,6 +166,7 @@ async function main() {
     // Ensure each agent belongs to one group so group-scoped operations are valid.
     for (let i = 0; i < agentIds.length; i += 1) {
       const groupId = groupIds[i % groupIds.length];
+      const agentApiKey = apiKeys[i];
       const membershipRes = await requestJson<{ success?: boolean; message?: string }>(
         `${tenantApiBaseUrl}/groups/${groupId}/members`,
         {
@@ -173,14 +184,25 @@ async function main() {
           `Failed to add agent ${agentIds[i]} to group ${groupId}: ${JSON.stringify(membershipRes.body)}`,
         );
       }
+
+      const keys = groupApiKeys.get(groupId);
+      if (keys && agentApiKey) {
+        keys.push(agentApiKey);
+      }
     }
 
     const schemaName = tenantSchemaName(tenantId);
     const sampleMemoryIds: string[] = [];
+    const groupSampleMemoryIds: Array<{
+      groupId: string;
+      memoryIds: string[];
+      apiKeys: string[];
+    }> = [];
 
     for (let groupIndex = 0; groupIndex < groupIds.length; groupIndex += 1) {
       const groupId = groupIds[groupIndex];
       const vector = embeddingLiteral(groupIndex % 2 === 0 ? 0.15 : 0.85);
+      const groupMemoryIds: string[] = [];
 
       await withTenantScope(sql, schemaName, async (txSql) => {
         const tx = txSql as unknown as SqlClient;
@@ -216,10 +238,15 @@ async function main() {
             RETURNING id
           `;
 
-          if (sampleMemoryIds.length < 1000) {
-            sampleMemoryIds.push(row.id as string);
-          }
+          groupMemoryIds.push(row.id as string);
         }
+      });
+
+      sampleMemoryIds.push(...groupMemoryIds);
+      groupSampleMemoryIds.push({
+        groupId,
+        memoryIds: groupMemoryIds,
+        apiKeys: groupApiKeys.get(groupId) ?? [],
       });
 
       console.log(`Seeded ${memoriesPerGroup} memories for group ${groupId}`);
@@ -228,11 +255,13 @@ async function main() {
     const output: SeedOutput = {
       generatedAt: new Date().toISOString(),
       tenantId,
+      tenantSlug,
       tenantName,
       apiKeys,
       agentIds,
       groupIds,
       sampleMemoryIds,
+      groupSampleMemoryIds,
       memoriesPerGroup,
     };
 

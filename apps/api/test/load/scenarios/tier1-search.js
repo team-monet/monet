@@ -3,7 +3,7 @@ import { check, sleep } from "k6";
 import { authHeaders, buildTenantApiUrl, pickRandom } from "./utils.js";
 
 export function runTier1SearchScenario(data) {
-  const queryToken = pickRandom(["load", "group-1", "group-2", "validation", "tier"]);
+  const queryToken = pickRandom(["load", "validation", "tier"]);
   const url = buildTenantApiUrl(
     data.baseUrl,
     data.seed,
