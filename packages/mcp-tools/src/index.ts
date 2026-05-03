@@ -32,7 +32,7 @@ export const MemoryStoreInput = z.object({
 export const MemorySearchInput = z.object({
   query: z.string().optional().describe("Text query for semantic and full-text search"),
   tags: z.array(z.string()).optional().describe("Filter by tags"),
-  memoryType: MemoryType.optional().describe("Filter by memory type"),
+  memoryType: MemoryType.optional().describe("Filter by memory type. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
   includeUser: z.boolean().default(false).describe("Include \"user\" scope memories (shared across the same user's agents within the same group)"),
   includePrivate: z.boolean().default(false).describe("Include \"private\" scope memories (visible only to the creating agent)"),
   createdAfter: z.string().datetime().optional().describe("Only include memories created on or after this timestamp"),
@@ -49,6 +49,9 @@ export const MemoryFetchInput = z.object({
 
 export const MemoryUpdateInput = UpdateMemoryEntryInput.extend({
   id: z.string().uuid().describe("Memory entry ID to update"),
+  memoryScope: MemoryScope.optional().describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
+  memoryType: MemoryType.optional().describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
+  expectedVersion: z.number().int().nonnegative().describe("Current version of the memory entry for optimistic concurrency. The update will be rejected if the version does not match."),
 });
 
 export const MemoryDeleteInput = z.object({
