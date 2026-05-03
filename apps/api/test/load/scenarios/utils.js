@@ -14,6 +14,22 @@ export function authHeaders(seed) {
   };
 }
 
+export function pickRandomGroupSample(seed) {
+  return pickRandom(seed.groupSampleMemoryIds || []);
+}
+
+export function authHeadersForGroup(seed, groupId) {
+  const groupSample = (seed.groupSampleMemoryIds || []).find((group) => group.groupId === groupId);
+  const key = pickRandom(groupSample && groupSample.apiKeys);
+  if (!key) {
+    return authHeaders(seed);
+  }
+  return {
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+  };
+}
+
 export function buildUrl(baseUrl, path) {
   return `${baseUrl.replace(/\/$/, "")}${path}`;
 }

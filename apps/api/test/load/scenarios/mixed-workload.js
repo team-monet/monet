@@ -1,12 +1,19 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { authHeaders, buildTenantApiUrl, pickRandom, randomMemoryType } from "./utils.js";
+import {
+  authHeaders,
+  authHeadersForGroup,
+  buildTenantApiUrl,
+  pickRandom,
+  pickRandomGroupSample,
+  randomMemoryType,
+} from "./utils.js";
 
 export function runMixedWorkloadScenario(data) {
   const action = Math.random();
 
   if (action < 0.6) {
-    const token = pickRandom(["load", "group-1", "group-2", "tier"]);
+    const token = pickRandom(["load", "validation", "tier"]);
     const res = http.get(
       buildTenantApiUrl(
         data.baseUrl,
@@ -40,9 +47,11 @@ export function runMixedWorkloadScenario(data) {
   }
 
   if (action < 0.9) {
-    const memoryId = pickRandom(data.seed.sampleMemoryIds);
+    const groupSample = pickRandomGroupSample(data.seed);
+    const memoryId =
+      pickRandom(groupSample && groupSample.memoryIds) || pickRandom(data.seed.sampleMemoryIds);
     const res = http.get(buildTenantApiUrl(data.baseUrl, data.seed, `/memories/${memoryId}`), {
-      headers: authHeaders(data.seed),
+      headers: authHeadersForGroup(data.seed, groupSample && groupSample.groupId),
       timeout: data.requestTimeout,
     });
     check(res, { "mixed fetch avoids 5xx": (r) => r.status < 500 });
