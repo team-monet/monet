@@ -95,9 +95,46 @@ export async function createTenantSchema(
     CREATE TABLE IF NOT EXISTS "${schemaName}".agent_group_members (
       agent_id UUID NOT NULL REFERENCES "${schemaName}".agents(id),
       group_id UUID NOT NULL REFERENCES "${schemaName}".agent_groups(id),
-      joined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (agent_id, group_id)
     )
   `);
+
+  // Upgrade step for pre-existing tenant schemas created before
+  // agent_group_members had a composite primary key.
+  // 1) Deduplicate rows so a PK can be safely added.
+  // 2) Ensure the PK exists (idempotent across repeated schema initialization).
+  await sql.unsafe(`
+    WITH ranked AS (
+      SELECT
+        ctid,
+        row_number() OVER (
+          PARTITION BY agent_id, group_id
+          ORDER BY joined_at ASC, ctid ASC
+        ) AS row_num
+      FROM "${schemaName}".agent_group_members
+    )
+    DELETE FROM "${schemaName}".agent_group_members agm
+    USING ranked
+    WHERE agm.ctid = ranked.ctid
+      AND ranked.row_num > 1
+  `);
+
+  const existingAgentGroupMembersPrimaryKey = await sql.unsafe<{ constraint_name: string }[]>(
+    `SELECT tc.constraint_name
+       FROM information_schema.table_constraints tc
+      WHERE tc.table_schema = $1
+        AND tc.table_name = 'agent_group_members'
+        AND tc.constraint_type = 'PRIMARY KEY'
+      LIMIT 1`,
+    [schemaName],
+  );
+
+  if (existingAgentGroupMembersPrimaryKey.length === 0) {
+    await sql.unsafe(
+      `ALTER TABLE "${schemaName}".agent_group_members ADD CONSTRAINT agent_group_members_pkey PRIMARY KEY (agent_id, group_id)`,
+    );
+  }
 
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "${schemaName}".user_groups (

@@ -17,6 +17,7 @@ import {
   asc,
   desc,
   eq,
+  inArray,
   isNotNull,
   lt,
   or,
@@ -210,11 +211,36 @@ export interface MemoryWritePreflight {
   groupId: string | null;
 }
 
+async function getAgentGroupIds(
+  txSql: MemorySqlClient,
+  agentId: string,
+): Promise<string[]> {
+  const db = createMemoryDb(txSql);
+  const rows = await db
+    .select({ groupId: agentGroupMembers.groupId })
+    .from(agentGroupMembers)
+    .where(eq(agentGroupMembers.agentId, agentId));
+  return rows.map((r) => r.groupId);
+}
+
 function buildScopeFilterCondition(
   agent: AgentContext,
   opts: ScopeFilterOpts,
+  agentReadableGroupIds: string[],
 ): SQL<unknown> {
-  const conditions: SQL<unknown>[] = [eq(memoryEntries.memoryScope, "group")];
+  const conditions: SQL<unknown>[] = [];
+
+  if (agentReadableGroupIds.length > 0) {
+    conditions.push(
+      and(
+        eq(memoryEntries.memoryScope, "group"),
+        inArray(memoryEntries.groupId, agentReadableGroupIds),
+        isNotNull(memoryEntries.groupId),
+      )!,
+    );
+  } else {
+    conditions.push(drizzleSql`FALSE`);
+  }
 
   if (opts.includeUser && agent.userId) {
     conditions.push(
@@ -460,9 +486,18 @@ export async function searchMemories(
     accessedBefore?: string;
     cursor?: string;
     limit?: number;
+    groupId?: string;
   },
   queryEmbedding: number[] | null = null,
-) {
+): Promise<{ items: MemoryEntryTier1[]; nextCursor: string | null } | { error: "forbidden" }> {
+  const agentReadableGroupIds = await getAgentGroupIds(txSql, agent.id);
+
+  if (query.groupId && !agentReadableGroupIds.includes(query.groupId)) {
+    return { error: "forbidden" };
+  }
+
+  const effectiveGroupIds = query.groupId ? [query.groupId] : agentReadableGroupIds;
+
   const db = createMemoryDb(txSql);
   const limit = query.limit ?? 20;
   const rankExpression = buildSearchRankExpression(queryEmbedding);
@@ -474,7 +509,7 @@ export async function searchMemories(
     buildScopeFilterCondition(agent, {
       includeUser: query.includeUser ?? false,
       includePrivate: query.includePrivate ?? false,
-    }),
+    }, effectiveGroupIds),
     buildNonExpiredCondition(),
   ];
 
@@ -678,8 +713,17 @@ export async function listAgentMemories(
   query: {
     cursor?: string;
     limit?: number;
+    groupId?: string;
   },
-) {
+): Promise<{ items: MemoryEntryTier1[]; nextCursor: string | null } | { error: "forbidden" }> {
+  const agentReadableGroupIds = await getAgentGroupIds(txSql, agent.id);
+
+  if (query.groupId && !agentReadableGroupIds.includes(query.groupId)) {
+    return { error: "forbidden" };
+  }
+
+  const effectiveGroupIds = query.groupId ? [query.groupId] : agentReadableGroupIds;
+
   const db = createMemoryDb(txSql);
   const limit = query.limit ?? 20;
   const conditions: SQL<unknown>[] = [
@@ -688,6 +732,13 @@ export async function listAgentMemories(
     buildNonExpiredCondition(),
   ];
 
+  if (effectiveGroupIds.length > 0) {
+    conditions.push(inArray(memoryEntries.groupId, effectiveGroupIds));
+    conditions.push(isNotNull(memoryEntries.groupId));
+  } else {
+    conditions.push(drizzleSql`FALSE`);
+  }
+
   if (query.cursor) {
     const decoded = decodeCursor(query.cursor);
     if (decoded) {
@@ -695,8 +746,6 @@ export async function listAgentMemories(
     }
   }
 
-  // Group memories are visible to all group members. The current codebase treats
-  // group scope as globally visible within the tenant schema, so match that here.
   const rows = await db
     .select(MEMORY_ENTRY_WITH_AUTHOR_SELECT)
     .from(memoryEntries)
@@ -718,8 +767,6 @@ export async function listAgentMemories(
     );
   }
 
-  void agent;
-
   return { items, nextCursor };
 }
 
@@ -727,7 +774,9 @@ export async function fetchMemory(
   txSql: TransactionClient,
   agent: AgentContext,
   id: string,
-) {
+): Promise<{ error: "not_found" } | { error: "forbidden" } | { entry: ReturnType<typeof mapRow>; versions: ReturnType<typeof mapVersion>[] }> {
+  const agentReadableGroupIds = await getAgentGroupIds(txSql, agent.id);
+
   const db = createMemoryDb(txSql);
   const [entry] = await db
     .select(MEMORY_ENTRY_WITH_AUTHOR_SELECT)
@@ -742,7 +791,7 @@ export async function fetchMemory(
   }
 
   // Scope check
-  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent);
+  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent, agentReadableGroupIds);
   if (scopeErr) return scopeErr;
 
   // Increment usefulness score and update last_accessed_at
@@ -772,7 +821,14 @@ export async function updateMemory(
   agent: AgentContext,
   id: string,
   input: UpdateMemoryEntryInput,
-) {
+): Promise<
+  | { error: "not_found" }
+  | { error: "forbidden" }
+  | { error: "conflict"; currentVersion: number }
+  | { entry: ReturnType<typeof mapRow>; needsEnrichment: boolean }
+> {
+  const agentReadableGroupIds = await getAgentGroupIds(txSql, agent.id);
+
   const db = createMemoryDb(txSql);
   const [entry] = await db
     .select(MEMORY_ENTRY_RETURNING)
@@ -785,7 +841,7 @@ export async function updateMemory(
   }
 
   // Scope check
-  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent);
+  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent, agentReadableGroupIds);
   if (scopeErr) return scopeErr;
 
   const newVersion = (entry.version as number) + 1;
@@ -886,7 +942,9 @@ export async function markOutdated(
   txSql: TransactionClient,
   agent: AgentContext,
   id: string,
-) {
+): Promise<{ error: "not_found" } | { error: "forbidden" } | { success: true }> {
+  const agentReadableGroupIds = await getAgentGroupIds(txSql, agent.id);
+
   const db = createMemoryDb(txSql);
   const [entry] = await db
     .select(MEMORY_ENTRY_RETURNING)
@@ -899,7 +957,7 @@ export async function markOutdated(
   }
 
   // Scope check
-  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent);
+  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent, agentReadableGroupIds);
   if (scopeErr) return scopeErr;
 
   await db
@@ -926,7 +984,14 @@ export async function promoteScope(
   agent: AgentContext,
   id: string,
   newScope: string,
-) {
+): Promise<
+  | { error: "not_found" }
+  | { error: "forbidden" }
+  | { error: "no_change" }
+  | { success: true; scope: string }
+> {
+  const agentReadableGroupIds = await getAgentGroupIds(txSql, agent.id);
+
   const db = createMemoryDb(txSql);
   const [entry] = await db
     .select(MEMORY_ENTRY_RETURNING)
@@ -939,7 +1004,7 @@ export async function promoteScope(
   }
 
   // Scope check — must have access to current scope
-  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent);
+  const scopeErr = checkScopeAccess(entry as Record<string, unknown>, agent, agentReadableGroupIds);
   if (scopeErr) return scopeErr;
 
   const currentScope = entry.memory_scope as string;
@@ -958,10 +1023,26 @@ export async function promoteScope(
     return { error: "no_change" as const };
   }
 
+  let nextGroupId = (entry.group_id as string | null) ?? null;
+  if (newScope === "group") {
+    if (nextGroupId) {
+      if (!agentReadableGroupIds.includes(nextGroupId)) {
+        return { error: "forbidden" as const };
+      }
+    } else {
+      const fallbackGroupId = agentReadableGroupIds[0];
+      if (!fallbackGroupId) {
+        return { error: "forbidden" as const };
+      }
+      nextGroupId = fallbackGroupId;
+    }
+  }
+
   await db
     .update(memoryEntries)
     .set({
       memoryScope: newScope as "group" | "user" | "private",
+      groupId: newScope === "group" ? nextGroupId : (entry.group_id as string | null),
     })
     .where(eq(memoryEntries.id, id));
 
@@ -982,7 +1063,9 @@ export async function listTags(
   txSql: TransactionClient,
   agent: AgentContext,
   opts: ScopeFilterOpts = { includeUser: false, includePrivate: false },
-) {
+): Promise<string[]> {
+  const agentReadableGroupIds = await getAgentGroupIds(txSql, agent.id);
+
   const db = createMemoryDb(txSql);
   const tagExpression = drizzleSql<string>`unnest(${memoryEntries.tags})`;
 
@@ -991,7 +1074,7 @@ export async function listTags(
     .from(memoryEntries)
     .where(
       and(
-        buildScopeFilterCondition(agent, opts),
+        buildScopeFilterCondition(agent, opts, agentReadableGroupIds),
         buildNonExpiredCondition(),
       ),
     )
@@ -1007,10 +1090,15 @@ export async function listTags(
 function checkScopeAccess(
   entry: Record<string, unknown>,
   agent: AgentContext,
+  agentReadableGroupIds: string[],
 ): { error: "forbidden" } | null {
   const scope = entry.memory_scope as string;
 
-  if (scope === "group") return null;
+  if (scope === "group") {
+    const groupId = entry.group_id as string | null;
+    if (groupId && agentReadableGroupIds.includes(groupId)) return null;
+    return { error: "forbidden" };
+  }
 
   if (scope === "user") {
     if (agent.userId && (entry.user_id as string) === agent.userId) return null;

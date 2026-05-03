@@ -47,6 +47,7 @@ async function MemoriesTable({ searchParams }: { searchParams: Promise<{ [key: s
   const params = await searchParams;
   const type = params.memoryType as MemoryType;
   const tag = params.tag as string;
+  const groupId = params.groupId as string;
   const includeUser = params.includeUser === "true";
   const includePrivate = params.includePrivate === "true";
   const cursor = params.cursor as string;
@@ -61,6 +62,7 @@ async function MemoriesTable({ searchParams }: { searchParams: Promise<{ [key: s
     const result = await client.listMemories({
       memoryType: type,
       tags: tag,
+      groupId,
       includeUser,
       includePrivate,
       cursor,
@@ -84,6 +86,7 @@ async function MemoriesTable({ searchParams }: { searchParams: Promise<{ [key: s
     const nextParams = new URLSearchParams({ cursor: nextCursor });
     if (type) nextParams.set("memoryType", type);
     if (tag) nextParams.set("tag", tag);
+    if (groupId) nextParams.set("groupId", groupId);
     if (includeUser) nextParams.set("includeUser", "true");
     if (includePrivate) nextParams.set("includePrivate", "true");
     nextPageHref = `/memories?${nextParams.toString()}`;
@@ -196,12 +199,22 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
   const params = await searchParams;
   const type = params.memoryType as MemoryType;
   const tag = params.tag as string;
+  const groupId = params.groupId as string;
   const includeUser = params.includeUser === "true";
   const includePrivate = params.includePrivate === "true";
   const cursor = params.cursor as string;
 
+  let groups: { id: string; name: string }[] = [];
+  try {
+    const client = await getApiClient();
+    const result = await client.listGroups();
+    groups = result.groups;
+  } catch {
+    // ignore - filters will show "All Groups" only
+  }
+
   // Key forces Suspense to remount (and show skeleton) when filters change
-  const suspenseKey = [type, tag, includeUser, includePrivate, cursor].filter(Boolean).join("|") || "default";
+  const suspenseKey = [type, tag, groupId, includeUser, includePrivate, cursor].filter(Boolean).join("|") || "default";
 
   return (
     <div className="flex flex-col gap-6 p-4">
@@ -222,8 +235,10 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
 
       <MemoryFilters
         initialType={type}
+        initialGroupId={groupId}
         initialIncludeUser={includeUser}
         initialIncludePrivate={includePrivate}
+        groups={groups}
       />
 
       <Suspense key={suspenseKey} fallback={<MemoriesTableSkeleton />}>

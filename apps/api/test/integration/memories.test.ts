@@ -713,6 +713,59 @@ describe("memories integration", () => {
     expect(logs).toHaveLength(1);
   });
 
+  it("sets group_id when promoting private memory with null group", async () => {
+    const { body: created } = await storeMemory({
+      content: "private memory promoted to group",
+      memoryType: "fact",
+      memoryScope: "private",
+      tags: ["scope-group-id"],
+    });
+
+    const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "group" }),
+    });
+    expect(promoteRes.status).toBe(200);
+
+    const sql = getTestSql();
+    const [row] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
+      SELECT memory_scope, group_id
+      FROM memory_entries
+      WHERE id = ${created.id}
+    `);
+    expect(row.memory_scope).toBe("group");
+    expect(typeof row.group_id).toBe("string");
+  });
+
+  it("rejects promotion to stale group when agent is no longer a member", async () => {
+    const { body: created } = await storeMemory({
+      content: "stale group promotion should fail",
+      memoryType: "fact",
+      tags: ["scope-stale-group"],
+    });
+
+    const removeMembershipRes = await app.request(`/api/groups/${groupId}/members/${agentId}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+    expect(removeMembershipRes.status).toBe(200);
+
+    const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "private" }),
+    });
+    expect(demoteRes.status).toBe(200);
+
+    const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "group" }),
+    });
+    expect(promoteRes.status).toBe(403);
+  });
+
   it("rejects audit log update and delete operations", async () => {
     const { body: created } = await storeMemory({
       content: "append-only",

@@ -8,7 +8,8 @@ import {
   type TransactionClient,
 } from "@monet/db";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CreateMemoryEntryInput } from "@monet/types";
+import { CreateMemoryEntryInput, MemoryEntryTier1 } from "@monet/types";
+import { PgDialect } from "drizzle-orm/pg-core";
 
 const { drizzleMock } = vi.hoisted(() => ({
   drizzleMock: vi.fn(),
@@ -47,6 +48,35 @@ function makeAgent(overrides: Partial<AgentContext> = {}): AgentContext {
     role: null,
     ...overrides,
   };
+}
+
+function mockGroupIdSelect(groupIds: string[] = ["00000000-0000-0000-0000-000000000300"]) {
+  return vi.fn(() => ({
+    from: vi.fn(() => ({
+      where: vi.fn().mockResolvedValue(groupIds.map((id) => ({ groupId: id }))),
+    })),
+  }));
+}
+
+const GROUP_A = "00000000-0000-0000-0000-000000000300";
+const GROUP_B = "00000000-0000-0000-0000-000000000301";
+
+const pgDialect = new PgDialect();
+
+function whereSqlToString(whereArg: unknown): string {
+  try {
+    return pgDialect.sqlToQuery(whereArg as any).sql;
+  } catch {
+    return "";
+  }
+}
+
+function whereSqlParams(whereArg: unknown): unknown[] {
+  try {
+    return pgDialect.sqlToQuery(whereArg as any).params;
+  } catch {
+    return [];
+  }
 }
 
 beforeEach(() => {
@@ -315,7 +345,7 @@ describe("fetchMemory", () => {
         last_accessed_at: new Date("2026-03-22T01:10:00.000Z"),
         author_agent_id: AGENT_ID,
         author_agent_display_name: "test-agent · owner@example.com",
-        group_id: null,
+        group_id: "00000000-0000-0000-0000-000000000300",
         user_id: USER_ID,
         version: 2,
       },
@@ -358,14 +388,12 @@ describe("fetchMemory", () => {
       where: versionsWhereMock,
     }));
 
+    const groupIdSelectMock = mockGroupIdSelect();
     const selectMock = vi
       .fn()
-      .mockReturnValueOnce({
-        from: entryFromMock,
-      })
-      .mockReturnValueOnce({
-        from: versionsFromMock,
-      });
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: entryFromMock }))
+      .mockImplementationOnce(() => ({ from: versionsFromMock }));
 
     const updateWhereMock = vi.fn().mockResolvedValue(undefined);
     const updateSetMock = vi.fn(() => ({
@@ -405,7 +433,7 @@ describe("fetchMemory", () => {
         lastAccessedAt: "2026-03-22T01:10:00.000Z",
         authorAgentId: AGENT_ID,
         authorAgentDisplayName: "test-agent · owner@example.com",
-        groupId: null,
+        groupId: "00000000-0000-0000-0000-000000000300",
         userId: USER_ID,
         version: 2,
       },
@@ -450,7 +478,7 @@ describe("updateMemory", () => {
         created_at: new Date("2026-03-22T02:00:00.000Z"),
         last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
         author_agent_id: AGENT_ID,
-        group_id: null,
+        group_id: "00000000-0000-0000-0000-000000000300",
         user_id: null,
         version: 3,
       },
@@ -468,14 +496,12 @@ describe("updateMemory", () => {
     const versionFromMock = vi.fn(() => ({
       where: versionWhereMock,
     }));
+    const groupIdSelectMock = mockGroupIdSelect();
     const selectMock = vi
       .fn()
-      .mockReturnValueOnce({
-        from: entryFromMock,
-      })
-      .mockReturnValueOnce({
-        from: versionFromMock,
-      });
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: entryFromMock }))
+      .mockImplementationOnce(() => ({ from: versionFromMock }));
 
     const returningMock = vi.fn().mockResolvedValue([]);
     const updateWhereMock = vi.fn(() => ({
@@ -527,7 +553,7 @@ describe("updateMemory", () => {
         created_at: new Date("2026-03-22T02:00:00.000Z"),
         last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
         author_agent_id: AGENT_ID,
-        group_id: null,
+        group_id: "00000000-0000-0000-0000-000000000300",
         user_id: null,
         version: 3,
       },
@@ -538,9 +564,11 @@ describe("updateMemory", () => {
     const entryFromMock = vi.fn(() => ({
       where: entryWhereMock,
     }));
-    const selectMock = vi.fn(() => ({
-      from: entryFromMock,
-    }));
+    const groupIdSelectMock = mockGroupIdSelect();
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: entryFromMock }));
 
     const returningMock = vi.fn().mockResolvedValue([
       {
@@ -559,7 +587,7 @@ describe("updateMemory", () => {
         created_at: new Date("2026-03-22T02:00:00.000Z"),
         last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
         author_agent_id: AGENT_ID,
-        group_id: null,
+        group_id: "00000000-0000-0000-0000-000000000300",
         user_id: null,
         version: 4,
       },
@@ -623,7 +651,7 @@ describe("updateMemory", () => {
         created_at: new Date("2026-03-22T02:00:00.000Z"),
         last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
         author_agent_id: AGENT_ID,
-        group_id: null,
+        group_id: "00000000-0000-0000-0000-000000000300",
         user_id: null,
         version: 3,
       },
@@ -634,9 +662,11 @@ describe("updateMemory", () => {
     const entryFromMock = vi.fn(() => ({
       where: entryWhereMock,
     }));
-    const selectMock = vi.fn(() => ({
-      from: entryFromMock,
-    }));
+    const groupIdSelectMock = mockGroupIdSelect();
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: entryFromMock }));
 
     const returningMock = vi.fn().mockResolvedValue([
       {
@@ -655,7 +685,7 @@ describe("updateMemory", () => {
         created_at: new Date("2026-03-22T02:00:00.000Z"),
         last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
         author_agent_id: AGENT_ID,
-        group_id: null,
+        group_id: "00000000-0000-0000-0000-000000000300",
         user_id: null,
         version: 4,
       },
@@ -852,9 +882,11 @@ describe("listAgentMemories", () => {
     const fromMock = vi.fn(() => ({
       leftJoin: firstLeftJoinMock,
     }));
-    const selectMock = vi.fn(() => ({
-      from: fromMock,
-    }));
+    const groupIdSelectMock = mockGroupIdSelect();
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: fromMock }));
 
     drizzleMock.mockReturnValue({
       select: selectMock,
@@ -865,7 +897,7 @@ describe("listAgentMemories", () => {
       makeAgent(),
       "00000000-0000-0000-0000-000000000777",
       { limit: 2 },
-    );
+    ) as { items: MemoryEntryTier1[]; nextCursor: string | null };
 
     expect(fromMock).toHaveBeenCalledWith(memoryEntries);
     expect(limitMock).toHaveBeenCalledWith(3);
@@ -902,6 +934,63 @@ describe("listAgentMemories", () => {
       id: "00000000-0000-0000-0000-000000000702",
     });
   });
+
+  it("returns forbidden when groupId is not in agent memberships", async () => {
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
+    drizzleMock.mockReturnValue({
+      select: groupIdSelectMock,
+    });
+
+    const result = await listAgentMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      "00000000-0000-0000-0000-000000000777",
+      { groupId: GROUP_B, limit: 10 },
+    );
+
+    expect(result).toEqual({ error: "forbidden" });
+  });
+
+  it("restricts query to readable groups when no groupId is supplied", async () => {
+    const limitMock = vi.fn().mockResolvedValue([]);
+    const orderByMock = vi.fn(() => ({
+      limit: limitMock,
+    }));
+    const whereMock = vi.fn((_where: unknown) => ({
+      orderBy: orderByMock,
+    }));
+    const secondLeftJoinMock = vi.fn(() => ({
+      where: whereMock,
+    }));
+    const firstLeftJoinMock = vi.fn(() => ({
+      leftJoin: secondLeftJoinMock,
+    }));
+    const fromMock = vi.fn(() => ({
+      leftJoin: firstLeftJoinMock,
+    }));
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: fromMock }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    await listAgentMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      "00000000-0000-0000-0000-000000000777",
+      { limit: 10 },
+    );
+
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    const params = whereSqlParams(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
+    expect(params).toContain(GROUP_A);
+    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
+  });
 });
 
 describe("listTags", () => {
@@ -921,7 +1010,9 @@ describe("listTags", () => {
       from: fromMock,
     }));
 
+    const groupIdSelectMock = mockGroupIdSelect();
     drizzleMock.mockReturnValue({
+      select: groupIdSelectMock,
       selectDistinct: selectDistinctMock,
     });
 
@@ -1006,9 +1097,11 @@ describe("searchMemories", () => {
     const fromMock = vi.fn(() => ({
       leftJoin: firstLeftJoinMock,
     }));
-    const selectMock = vi.fn(() => ({
-      from: fromMock,
-    }));
+    const groupIdSelectMock = mockGroupIdSelect();
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: fromMock }));
 
     drizzleMock.mockReturnValue({
       select: selectMock,
@@ -1024,7 +1117,7 @@ describe("searchMemories", () => {
         limit: 2,
       },
       null,
-    );
+    ) as { items: MemoryEntryTier1[]; nextCursor: string | null };
 
     expect(fromMock).toHaveBeenCalledWith(memoryEntries);
     expect(limitMock).toHaveBeenCalledWith(3);
@@ -1170,9 +1263,11 @@ describe("searchMemories", () => {
       from: lexicalFromMock,
     }));
 
+    const groupIdSelectMock = mockGroupIdSelect();
     drizzleMock.mockReturnValue({
       select: vi
         .fn()
+        .mockImplementationOnce(groupIdSelectMock)
         .mockImplementationOnce(semanticSelectMock)
         .mockImplementationOnce(lexicalSelectMock),
     });
@@ -1186,7 +1281,7 @@ describe("searchMemories", () => {
         limit: 2,
       },
       [0.1, 0.2, 0.3],
-    );
+    ) as { items: MemoryEntryTier1[]; nextCursor: string | null };
 
     expect(result.items).toHaveLength(2);
     expect(result.items.map((item) => item.id)).toEqual([
@@ -1240,9 +1335,11 @@ describe("searchMemories", () => {
       from: lexicalFromMock,
     }));
 
+    const groupIdSelectMock2 = mockGroupIdSelect();
     drizzleMock.mockReturnValue({
       select: vi
         .fn()
+        .mockImplementationOnce(groupIdSelectMock2)
         .mockImplementationOnce(semanticSelectMock)
         .mockImplementationOnce(lexicalSelectMock),
     });
@@ -1264,7 +1361,7 @@ describe("searchMemories", () => {
         cursor: largeOffsetCursor,
       },
       [0.1, 0.2, 0.3],
-    );
+    ) as { items: MemoryEntryTier1[]; nextCursor: string | null };
 
     expect(result.items).toEqual([]);
     expect(result.nextCursor).toBeNull();
@@ -1332,5 +1429,272 @@ describe("buildSummary", () => {
     const summary = buildSummary(null, content);
     expect(summary.length).toBeLessThanOrEqual(200);
     expect(summary.endsWith(" ")).toBe(false);
+  });
+});
+
+describe("cross-group isolation", () => {
+  it("searchMemories WHERE clause restricts group-scoped memories to accessible groups", async () => {
+    const limitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000801",
+        content: "group A memory",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 5,
+        outdated: false,
+        created_at: new Date("2026-03-22T05:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        search_rank: 5,
+      },
+      {
+        id: "00000000-0000-0000-0000-000000000802",
+        content: "group B memory",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["secret"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 3,
+        outdated: false,
+        created_at: new Date("2026-03-22T04:00:00.000Z"),
+        author_agent_id: "00000000-0000-0000-0000-000000000888",
+        author_agent_display_name: "other-agent",
+        search_rank: 3,
+      },
+    ]);
+    const orderByMock = vi.fn(() => ({ limit: limitMock }));
+    const whereMock = vi.fn((_where: unknown) => ({ orderBy: orderByMock }));
+    const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
+    const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
+    const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: fromMock }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        query: "memory",
+        includeUser: true,
+        includePrivate: true,
+        limit: 10,
+      },
+      null,
+    );
+
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    const params = whereSqlParams(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
+    expect(params).toContain(GROUP_A);
+    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
+  });
+
+  it("fetchMemory returns forbidden for group-scoped memory in inaccessible group", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000901",
+        content: "secret group B memory",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["secret"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T01:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T01:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        author_agent_display_name: "test-agent",
+        group_id: GROUP_B,
+        user_id: null,
+        version: 0,
+      },
+    ]);
+    const entryWhereMock = vi.fn(() => ({ limit: entryLimitMock }));
+    const secondLeftJoinMock = vi.fn(() => ({ where: entryWhereMock }));
+    const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
+    const entryFromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: entryFromMock }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    const result = await fetchMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      "00000000-0000-0000-0000-000000000901",
+    );
+
+    expect(result).toEqual({ error: "forbidden" });
+  });
+
+  it("listTags WHERE clause restricts tags to accessible groups", async () => {
+    const orderByMock = vi.fn().mockResolvedValue([
+      { tag: "ops" },
+      { tag: "secret" },
+    ]);
+    const whereMock = vi.fn((_where: unknown) => ({ orderBy: orderByMock }));
+    const fromMock = vi.fn(() => ({ where: whereMock }));
+    const selectDistinctMock = vi.fn(() => ({ from: fromMock }));
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
+
+    drizzleMock.mockReturnValue({
+      select: groupIdSelectMock,
+      selectDistinct: selectDistinctMock,
+    });
+
+    await listTags(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      { includeUser: true, includePrivate: true },
+    );
+
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    const params = whereSqlParams(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
+    expect(params).toContain(GROUP_A);
+    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
+  });
+
+  it("searchMemories WHERE clause excludes null group_id for group-scoped memories", async () => {
+    const limitMock = vi.fn().mockResolvedValue([]);
+    const orderByMock = vi.fn(() => ({ limit: limitMock }));
+    const whereMock = vi.fn((_where: unknown) => ({ orderBy: orderByMock }));
+    const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
+    const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
+    const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: fromMock }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        query: "memory",
+        includeUser: true,
+        includePrivate: true,
+        limit: 10,
+      },
+      null,
+    );
+
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
+  });
+
+  it("searchMemories returns forbidden when groupId param is not in agent memberships", async () => {
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A]);
+    drizzleMock.mockReturnValue({
+      select: groupIdSelectMock,
+    });
+
+    const result = await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        query: "memory",
+        groupId: GROUP_B,
+        limit: 10,
+      },
+      null,
+    );
+
+    expect(result).toEqual({ error: "forbidden" });
+  });
+
+  it("searchMemories WHERE clause restricts to authorized groupId when param is provided", async () => {
+    const limitMock = vi.fn().mockResolvedValue([]);
+    const orderByMock = vi.fn(() => ({ limit: limitMock }));
+    const whereMock = vi.fn((_where: unknown) => ({ orderBy: orderByMock }));
+    const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
+    const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
+    const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
+    const groupIdSelectMock = mockGroupIdSelect([GROUP_A, GROUP_B]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: fromMock }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        query: "memory",
+        groupId: GROUP_A,
+        limit: 10,
+      },
+      null,
+    );
+
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    const params = whereSqlParams(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
+    expect(params).toContain(GROUP_A);
+    expect(params).not.toContain(GROUP_B);
+  });
+
+  it("searchMemories WHERE clause yields FALSE when agent has zero group memberships", async () => {
+    const limitMock = vi.fn().mockResolvedValue([]);
+    const orderByMock = vi.fn(() => ({ limit: limitMock }));
+    const whereMock = vi.fn((_where: unknown) => ({ orderBy: orderByMock }));
+    const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
+    const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
+    const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
+    const groupIdSelectMock = mockGroupIdSelect([]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(groupIdSelectMock)
+      .mockImplementationOnce(() => ({ from: fromMock }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+    });
+
+    await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        query: "memory",
+        includeUser: true,
+        includePrivate: true,
+        limit: 10,
+      },
+      null,
+    );
+
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain("FALSE");
   });
 });
