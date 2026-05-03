@@ -235,7 +235,6 @@ function buildScopeFilterCondition(
       and(
         eq(memoryEntries.memoryScope, "group"),
         inArray(memoryEntries.groupId, agentReadableGroupIds),
-        isNotNull(memoryEntries.groupId),
       )!,
     );
   } else {
