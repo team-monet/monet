@@ -49,8 +49,9 @@ export const MemoryFetchInput = z.object({
   id: z.string().uuid().describe("Memory entry ID to fetch full content"),
 });
 
-export const MemoryUpdateInput = UpdateMemoryEntryInput.extend({
+export const MemoryUpdateInput = UpdateMemoryEntryInput.omit({ summary: true }).extend({
   id: z.string().uuid().describe("Memory entry ID to update"),
+  summary: z.string().max(200).optional().describe("Optional human/agent-provided summary to update or correct the existing memory summary. Maximum 200 characters."),
   memoryScope: MemoryScope.optional().describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
   memoryType: MemoryType.optional().describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
   expectedVersion: z.number().int().nonnegative().describe("Current version of the memory entry for optimistic concurrency. The update will be rejected if the version does not match."),

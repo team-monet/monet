@@ -25,6 +25,7 @@ export type CreateMemoryEntryInput = z.infer<typeof CreateMemoryEntryInput>;
 
 export const UpdateMemoryEntryInput = z.object({
   content: z.string().min(1).optional(),
+  summary: z.string().max(200).optional(),
   tags: z.array(z.string()).min(1).optional(),
   memoryScope: MemoryScope.optional(),
   memoryType: MemoryType.optional(),
