@@ -294,6 +294,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
         .returning({
           id: memoryEntries.id,
           content: memoryEntries.content,
+          summary: memoryEntries.summary,
           tags: memoryEntries.tags,
           version: memoryEntries.version,
           memoryScope: memoryEntries.memoryScope,
@@ -310,6 +311,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
         .select({
           id: memoryEntries.id,
           content: memoryEntries.content,
+          summary: memoryEntries.summary,
           tags: memoryEntries.tags,
           version: memoryEntries.version,
           memoryScope: memoryEntries.memoryScope,
@@ -334,8 +336,16 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
 
     // Running these sequentially keeps local providers such as Ollama/ONNX
     // from overcommitting memory during a single enrichment job.
-    const summary = await provider.generateSummary(entry.content);
-    const extractedTags = await provider.extractTags(entry.content);
+    const { chatProvider } = resolveConfiguredProviders();
+    const shouldRunChatEnrichment = chatProvider !== "none";
+    const summary = entry.summary?.trim()
+      ? entry.summary.trim()
+      : shouldRunChatEnrichment
+        ? await provider.generateSummary(entry.content)
+        : null;
+    const extractedTags = shouldRunChatEnrichment
+      ? await provider.extractTags(entry.content)
+      : [];
     const embedding = await provider.computeEmbedding(entry.content);
 
     const mergedTags = [...new Set([...(entry.tags ?? []), ...extractedTags])].slice(0, 16);
@@ -356,7 +366,7 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
       const [updated] = await db
         .update(memoryEntries)
         .set({
-          summary,
+          summary: summary || null,
           embedding: drizzleSql`${toVectorLiteral(embedding)}::vector`,
           autoTags: mergedTags,
           relatedMemoryIds,

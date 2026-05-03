@@ -41,7 +41,8 @@ cp .env.local-dev.example .env.local-dev
 pnpm local:up
 ```
 
-This starts PostgreSQL, pgAdmin, Keycloak, and ensures shared Ollama is running.
+This starts PostgreSQL, pgAdmin, and Keycloak. Ollama is optional unless you
+configure `ENRICHMENT_CHAT_PROVIDER=ollama` and/or `ENRICHMENT_EMBEDDING_PROVIDER=ollama`.
 
 5. Start API and dashboard (two terminals):
 
@@ -106,8 +107,8 @@ curl -sS "http://127.0.0.1:3301/api/tenants/$TENANT_SLUG/agents/me" \
 
 ## Common Local Commands
 
-- `pnpm local:status` - show local infra + shared Ollama status
-- `pnpm local:logs` - tail local infra + shared Ollama logs
+- `pnpm local:status` - show local infra status (plus shared Ollama when enabled)
+- `pnpm local:logs` - tail local infra logs (plus shared Ollama when enabled)
 - `pnpm local:down` - stop local services, keep volumes
 - `pnpm local:db:reset` - reset local Postgres volume only
 - `pnpm local:reset` - full destructive local reset

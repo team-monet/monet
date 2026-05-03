@@ -134,6 +134,8 @@ describe("MCP server factory", () => {
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("all agents in the group can access");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
+    expect(memoryStoreSchema?.properties?.summary?.description).toContain("Required when chat enrichment is disabled");
+    expect(memoryStore?.description).toContain("you must provide both summary and tags");
 
     expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents");
     expect(memorySearchSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");

@@ -105,6 +105,21 @@ describe("createEnrichmentProvider", () => {
     });
   });
 
+  it("supports ENRICHMENT_CHAT_PROVIDER=none while keeping embedding provider", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "none";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
+    const chatProvider = createChatEnrichmentProvider();
+    const embeddingProvider = createEmbeddingEnrichmentProvider();
+
+    expect(chatProvider).toBeDefined();
+    expect(embeddingProvider).toBeDefined();
+    expect(resolveConfiguredProviders()).toEqual({
+      chatProvider: "none",
+      embeddingProvider: "onnx",
+    });
+  });
+
   it("throws for an unknown explicit provider", () => {
     process.env.ENRICHMENT_CHAT_PROVIDER = "unknown";
     expect(() => createChatEnrichmentProvider()).toThrow("Unknown ENRICHMENT_CHAT_PROVIDER");
@@ -285,6 +300,8 @@ describe("recoverPendingEnrichments", () => {
 
 describe("enqueueEnrichment", () => {
   afterEach(() => {
+    delete process.env.ENRICHMENT_CHAT_PROVIDER;
+    delete process.env.ENRICHMENT_EMBEDDING_PROVIDER;
     resetEnrichmentStateForTests();
   });
 
@@ -362,6 +379,60 @@ describe("enqueueEnrichment", () => {
     await waitForEnrichmentDrain(1000);
 
     expect(maxConcurrentCalls).toBe(1);
+  });
+
+  it("skips summary generation when the entry already has summary", async () => {
+    const generateSummary = vi.fn(async () => "generated");
+    const extractTags = vi.fn(async () => ["ops"]);
+    const computeEmbedding = vi.fn(async () => [0.1, 0.2, 0.3]);
+    setEnrichmentProviderForTests({ generateSummary, extractTags, computeEmbedding });
+
+    let scopeCallCount = 0;
+    withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) => {
+      scopeCallCount += 1;
+      if (scopeCallCount === 1) {
+        return fn({ update: () => ({ set: () => ({ where: () => ({ returning: async () => [{ id: "entry-1", content: "x", summary: "existing summary", tags: ["t"], version: 1, memoryScope: "group", groupId: "g", userId: null, authorAgentId: "a" }] }) }) }) });
+      }
+      if (scopeCallCount === 2) {
+        return fn({ select: () => ({ from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [] }) }) }) }) });
+      }
+      return fn({ update: () => ({ set: () => ({ where: () => ({ returning: async () => [{ id: "entry-1" }] }) }) }) });
+    });
+
+    enqueueEnrichment({} as SqlClient, "tenant_test", "entry-1");
+    await waitForEnrichmentDrain(1000);
+
+    expect(generateSummary).not.toHaveBeenCalled();
+    expect(extractTags).toHaveBeenCalledTimes(1);
+    expect(computeEmbedding).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips chat operations when chat provider is none but still computes embedding", async () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "none";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+    const generateSummary = vi.fn(async () => "generated");
+    const extractTags = vi.fn(async () => ["ops"]);
+    const computeEmbedding = vi.fn(async () => [0.1, 0.2, 0.3]);
+    setEnrichmentProviderForTests({ generateSummary, extractTags, computeEmbedding });
+
+    let scopeCallCount = 0;
+    withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) => {
+      scopeCallCount += 1;
+      if (scopeCallCount === 1) {
+        return fn({ update: () => ({ set: () => ({ where: () => ({ returning: async () => [{ id: "entry-1", content: "x", summary: null, tags: ["t"], version: 1, memoryScope: "group", groupId: "g", userId: null, authorAgentId: "a" }] }) }) }) });
+      }
+      if (scopeCallCount === 2) {
+        return fn({ select: () => ({ from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [] }) }) }) }) });
+      }
+      return fn({ update: () => ({ set: () => ({ where: () => ({ returning: async () => [{ id: "entry-1" }] }) }) }) });
+    });
+
+    enqueueEnrichment({} as SqlClient, "tenant_test", "entry-1");
+    await waitForEnrichmentDrain(1000);
+
+    expect(generateSummary).not.toHaveBeenCalled();
+    expect(extractTags).not.toHaveBeenCalled();
+    expect(computeEmbedding).toHaveBeenCalledTimes(1);
   });
 
   it("requeues stale enrichment write-back when memory version changed", async () => {

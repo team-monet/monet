@@ -342,6 +342,15 @@ function validateChatProviderConfig(
   provider: ChatProviderName,
   errors: string[],
 ): StartupSummaryValue {
+  if (provider === "none") {
+    return {
+      configured: true,
+      provider,
+      mode: "disabled",
+      note: "Chat enrichment is disabled. memory_store calls must provide summary and tags.",
+    };
+  }
+
   if (provider === "anthropic") {
     if (!env.ENRICHMENT_CHAT_API_KEY?.trim() && !env.ENRICHMENT_API_KEY?.trim()) {
       errors.push(

@@ -5,10 +5,11 @@ import type {
   EnrichmentProvider,
 } from "./enrichment";
 import { OnnxEnrichmentProvider } from "./onnx-enrichment";
+import { NoneEnrichmentProvider } from "./none-enrichment";
 import { OllamaEnrichmentProvider } from "./ollama-enrichment";
 import { OpenAICompatibleEnrichmentProvider } from "./openai-enrichment";
 
-export const CHAT_PROVIDERS = ["anthropic", "ollama", "openai"] as const;
+export const CHAT_PROVIDERS = ["anthropic", "none", "ollama", "openai"] as const;
 export const EMBEDDING_PROVIDERS = ["ollama", "onnx", "openai"] as const;
 export const LEGACY_ENRICHMENT_PROVIDERS = ["anthropic", "ollama", "onnx", "openai"] as const;
 
@@ -95,6 +96,8 @@ export function createChatEnrichmentProvider(
       return new OllamaEnrichmentProvider(chatConfigFromEnv(env));
     case "openai":
       return new OpenAICompatibleEnrichmentProvider(openAiConfigFromEnv(env));
+    case "none":
+      return new NoneEnrichmentProvider();
   }
 }
 
@@ -192,7 +195,7 @@ export function getEnrichmentProviderConfigStatus(
 }
 
 function parseChatProvider(value: string, envName: string): ChatProviderName {
-  if (value === "anthropic" || value === "ollama" || value === "openai") {
+  if (value === "anthropic" || value === "none" || value === "ollama" || value === "openai") {
     return value;
   }
 

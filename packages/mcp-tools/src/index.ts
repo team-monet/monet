@@ -23,6 +23,7 @@ export const TOOL_MEMORY_LIST_TAGS = "memory_list_tags" as const;
 
 export const MemoryStoreInput = z.object({
   content: z.string().describe("The knowledge or information to store"),
+  summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when chat enrichment is disabled. Maximum 200 characters. Safe to always provide regardless of provider mode."),
   memoryType: MemoryType.describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
   memoryScope: MemoryScope.default("group").describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
   tags: z.array(z.string()).min(1).describe("Tags for categorization and retrieval"),
@@ -77,7 +78,7 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_STORE,
     description:
-      "Store a new memory entry. Use this PROACTIVELY whenever you discover something worth remembering: decisions made, problems solved, patterns identified, user preferences learned, procedures followed, or important facts encountered. The entry will be searchable by tag and full-text immediately; semantic search becomes available after enrichment completes. Choose memoryType carefully (decision, pattern, issue, preference, fact, procedure) and always include descriptive tags for future retrieval.",
+      "Store a new memory entry. Use this PROACTIVELY whenever you discover something worth remembering: decisions made, problems solved, patterns identified, user preferences learned, procedures followed, or important facts encountered. The entry will be searchable by tag and full-text immediately; semantic search becomes available after enrichment completes. Choose memoryType carefully (decision, pattern, issue, preference, fact, procedure) and always include descriptive tags for future retrieval. When chat enrichment is disabled, you must provide both summary and tags.",
     inputSchema: MemoryStoreInput,
   },
   {
