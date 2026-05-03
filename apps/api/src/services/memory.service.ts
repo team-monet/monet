@@ -852,14 +852,22 @@ export async function updateMemory(
   if (scopeErr) return scopeErr;
 
   const newVersion = (entry.version as number) + 1;
+  const { chatProvider } = resolveConfiguredProviders();
+  const providedSummary = input.summary?.trim();
+  const hasProvidedSummary = Boolean(providedSummary);
   const newContent = input.content ?? (entry.content as string);
   const newTags = input.tags ?? (entry.tags as string[]);
   const contentChanged = input.content !== undefined && input.content !== (entry.content as string);
   const tagsChanged = input.tags !== undefined && !stringArraysEqual(input.tags, entry.tags as string[]);
   const needsEnrichment = contentChanged || tagsChanged;
+  const contentSummaryReset = hasProvidedSummary
+    ? { summary: providedSummary }
+    : chatProvider === "none"
+      ? { summary: (entry.summary as string | null) ?? null }
+      : { summary: null };
   const enrichmentReset = contentChanged
     ? {
-        summary: null,
+        ...contentSummaryReset,
         autoTags: [],
         embedding: null,
         relatedMemoryIds: [],
