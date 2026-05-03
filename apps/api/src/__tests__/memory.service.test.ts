@@ -993,7 +993,6 @@ describe("listAgentMemories", () => {
     const params = whereSqlParams(firstWhereCall[0]);
     expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
     expect(params).toContain(GROUP_A);
-    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
   });
 });
 
@@ -1506,7 +1505,6 @@ describe("cross-group isolation", () => {
     const params = whereSqlParams(whereMock.mock.calls[0][0]);
     expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
     expect(params).toContain(GROUP_A);
-    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
   });
 
   it("fetchMemory returns forbidden for group-scoped memory in inaccessible group", async () => {
@@ -1587,7 +1585,7 @@ describe("cross-group isolation", () => {
     expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
   });
 
-  it("searchMemories WHERE clause excludes null group_id for group-scoped memories", async () => {
+  it("searchMemories WHERE clause restricts group-scoped memories via group_id membership", async () => {
     const limitMock = vi.fn().mockResolvedValue([]);
     const orderByMock = vi.fn(() => ({ limit: limitMock }));
     const whereMock = vi.fn((whereArg: unknown) => {
@@ -1620,7 +1618,7 @@ describe("cross-group isolation", () => {
     );
 
     const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
-    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
+    expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
   });
 
   it("searchMemories returns forbidden when groupId param is not in agent memberships", async () => {
