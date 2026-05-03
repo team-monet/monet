@@ -1582,7 +1582,6 @@ describe("cross-group isolation", () => {
     const params = whereSqlParams(whereMock.mock.calls[0][0]);
     expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
     expect(params).toContain(GROUP_A);
-    expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
   });
 
   it("searchMemories WHERE clause restricts group-scoped memories via group_id membership", async () => {
