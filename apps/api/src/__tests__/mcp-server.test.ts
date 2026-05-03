@@ -116,16 +116,26 @@ describe("MCP server factory", () => {
     const memorySearch = tools.tools.find((tool) => tool.name === "memory_search");
     const memoryPromoteScope = tools.tools.find((tool) => tool.name === "memory_promote_scope");
 
-    expect(memoryStore?.inputSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
-    expect(memoryStore?.inputSchema?.properties?.memoryScope?.description).toContain("all agents in the group can access");
-    expect(memoryStore?.inputSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
-    expect(memoryStore?.inputSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
+    const memoryStoreSchema = memoryStore?.inputSchema as {
+      properties?: Record<string, { description?: string }>;
+    } | undefined;
+    const memorySearchSchema = memorySearch?.inputSchema as {
+      properties?: Record<string, { description?: string }>;
+    } | undefined;
+    const memoryPromoteScopeSchema = memoryPromoteScope?.inputSchema as {
+      properties?: Record<string, { description?: string }>;
+    } | undefined;
 
-    expect(memorySearch?.inputSchema?.properties?.includeUser?.description).toContain("same user's agents");
-    expect(memorySearch?.inputSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("all agents in the group can access");
+    expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
+    expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
+
+    expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents");
+    expect(memorySearchSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");
 
     expect(memoryPromoteScope?.description).toContain("creating agent only");
-    expect(memoryPromoteScope?.inputSchema?.properties?.scope?.description).toContain("all agents in the group can access");
+    expect(memoryPromoteScopeSchema?.properties?.scope?.description).toContain("all agents in the group can access");
 
     await Promise.all([client.close(), server.close()]);
   });
