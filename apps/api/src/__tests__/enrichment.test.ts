@@ -336,6 +336,7 @@ describe("enqueueEnrichment", () => {
                   {
                     id: "entry-1",
                     content: "sequential enrichment test",
+                    summary: null,
                     tags: ["existing"],
                   },
                 ],
