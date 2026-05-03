@@ -426,20 +426,26 @@ async function findRelatedMemoryIds(
 ): Promise<string[]> {
   return withTenantDrizzleScope(sql, schemaName, async (db) => {
     const scopeCondition =
-      scope.memoryScope === "group"
+      scope.memoryScope === "group" && scope.groupId
         ? and(
             eq(memoryEntries.memoryScope, "group"),
             eq(memoryEntries.groupId, scope.groupId),
           )
-        : scope.memoryScope === "user"
+        : scope.memoryScope === "user" && scope.userId
           ? and(
               eq(memoryEntries.memoryScope, "user"),
               eq(memoryEntries.userId, scope.userId),
             )
-          : and(
-              eq(memoryEntries.memoryScope, "private"),
-              eq(memoryEntries.authorAgentId, scope.authorAgentId),
-            );
+          : scope.memoryScope === "private" && scope.authorAgentId
+            ? and(
+                eq(memoryEntries.memoryScope, "private"),
+                eq(memoryEntries.authorAgentId, scope.authorAgentId),
+              )
+            : null;
+
+    if (!scopeCondition) {
+      return [];
+    }
 
     const rows = await db
       .select({ id: memoryEntries.id })
