@@ -809,6 +809,261 @@ describe("updateMemory", () => {
     expect(result).toMatchObject({ needsEnrichment: true });
   });
 
+  it("persists summary for summary-only updates", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000515",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: GROUP_A,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(mockGroupIdSelect())
+      .mockImplementationOnce(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: entryLimitMock })) })) }));
+
+    const returningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000515",
+        content: "stable content",
+        summary: "new summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: GROUP_A,
+        user_id: null,
+        version: 4,
+      },
+    ]);
+    const updateWhereMock = vi.fn(() => ({ returning: returningMock }));
+    const updateSetMock = vi.fn(() => ({ where: updateWhereMock }));
+    const updateMock = vi.fn(() => ({ set: updateSetMock }));
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) })
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+      insert: insertMock,
+    });
+
+    const result = await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000515",
+      {
+        summary: "  new summary  ",
+        expectedVersion: 3,
+      },
+    );
+
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summary: "new summary",
+      }),
+    );
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        enrichmentStatus: "pending",
+      }),
+    );
+    expect(result).toMatchObject({ needsEnrichment: false });
+  });
+
+  it("persists summary for tag-only updates when summary is provided", async () => {
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000516",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: GROUP_A,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(mockGroupIdSelect())
+      .mockImplementationOnce(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: entryLimitMock })) })) }));
+
+    const returningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000516",
+        content: "stable content",
+        summary: "updated summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops", "new"],
+        auto_tags: [],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: GROUP_A,
+        user_id: null,
+        version: 4,
+      },
+    ]);
+    const updateWhereMock = vi.fn(() => ({ returning: returningMock }));
+    const updateSetMock = vi.fn(() => ({ where: updateWhereMock }));
+    const updateMock = vi.fn(() => ({ set: updateSetMock }));
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) })
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+      insert: insertMock,
+    });
+
+    const result = await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000516",
+      {
+        tags: ["ops", "new"],
+        summary: "updated summary",
+        expectedVersion: 3,
+      },
+    );
+
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summary: "updated summary",
+        autoTags: [],
+        enrichmentStatus: "pending",
+      }),
+    );
+    expect(result).toMatchObject({ needsEnrichment: true });
+  });
+
+  it("persists summary-only updates when chat provider is none", async () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "none";
+
+    const entryLimitMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000517",
+        content: "stable content",
+        summary: "existing summary",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: GROUP_A,
+        user_id: null,
+        version: 3,
+      },
+    ]);
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(mockGroupIdSelect())
+      .mockImplementationOnce(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: entryLimitMock })) })) }));
+
+    const returningMock = vi.fn().mockResolvedValue([
+      {
+        id: "00000000-0000-0000-0000-000000000517",
+        content: "stable content",
+        summary: "summary from caller",
+        memory_type: "fact",
+        memory_scope: "group",
+        tags: ["ops"],
+        auto_tags: ["guide"],
+        related_memory_ids: ["00000000-0000-0000-0000-000000000599"],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T02:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T02:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: GROUP_A,
+        user_id: null,
+        version: 4,
+      },
+    ]);
+    const updateWhereMock = vi.fn(() => ({ returning: returningMock }));
+    const updateSetMock = vi.fn(() => ({ where: updateWhereMock }));
+    const updateMock = vi.fn(() => ({ set: updateSetMock }));
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) })
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+      insert: insertMock,
+    });
+
+    await updateMemory(
+      {} as TransactionClient,
+      makeAgent(),
+      "00000000-0000-0000-0000-000000000517",
+      {
+        summary: "summary from caller",
+        expectedVersion: 3,
+      },
+    );
+
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summary: "summary from caller",
+      }),
+    );
+  });
+
   it("uses caller-provided summary when chat provider is none", async () => {
     process.env.ENRICHMENT_CHAT_PROVIDER = "none";
 
