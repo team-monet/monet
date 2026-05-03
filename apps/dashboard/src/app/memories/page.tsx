@@ -233,13 +233,17 @@ export default async function MemoriesPage({ searchParams }: PageProps) {
         </Button>
       </div>
 
-      <MemoryFilters
-        initialType={type}
-        initialGroupId={groupId}
-        initialIncludeUser={includeUser}
-        initialIncludePrivate={includePrivate}
-        groups={groups}
-      />
+      <Suspense
+        fallback={<div className="mb-6 h-[106px] rounded-lg border bg-card p-4 shadow-sm" aria-hidden="true" />}
+      >
+        <MemoryFilters
+          initialType={type}
+          initialGroupId={groupId}
+          initialIncludeUser={includeUser}
+          initialIncludePrivate={includePrivate}
+          groups={groups}
+        />
+      </Suspense>
 
       <Suspense key={suspenseKey} fallback={<MemoriesTableSkeleton />}>
         <MemoriesTable searchParams={searchParams} />

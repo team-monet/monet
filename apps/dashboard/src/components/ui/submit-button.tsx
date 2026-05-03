@@ -4,6 +4,7 @@ import * as React from "react";
 import { useFormStatus } from "react-dom";
 import { Loader2 } from "lucide-react";
 import { usePathname, useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 import { Button } from "@/components/ui/button";
 
 interface SubmitButtonProps extends React.ComponentProps<typeof Button> {
@@ -19,13 +20,74 @@ export function SubmitButton({
   children,
   ...props
 }: SubmitButtonProps) {
+  return (
+    <Suspense
+      fallback={
+        <SubmitButtonCore
+          {...props}
+          label={label}
+          pendingLabel={pendingLabel}
+          disabled={disabled}
+          className={className}
+          routeKeyFactory={(pathname) => pathname}
+        >
+          {children}
+        </SubmitButtonCore>
+      }
+    >
+      <SubmitButtonWithQuery
+        {...props}
+        label={label}
+        pendingLabel={pendingLabel}
+        disabled={disabled}
+        className={className}
+      >
+        {children}
+      </SubmitButtonWithQuery>
+    </Suspense>
+  );
+}
+
+function SubmitButtonWithQuery({
+  label,
+  pendingLabel,
+  disabled,
+  className,
+  children,
+  ...props
+}: SubmitButtonProps) {
+  const searchParams = useSearchParams();
+
+  return (
+    <SubmitButtonCore
+      {...props}
+      label={label}
+      pendingLabel={pendingLabel}
+      disabled={disabled}
+      className={className}
+      routeKeyFactory={(pathname) => `${pathname}?${searchParams.toString()}`}
+    >
+      {children}
+    </SubmitButtonCore>
+  );
+}
+
+interface SubmitButtonCoreProps extends SubmitButtonProps {
+  routeKeyFactory: (pathname: string) => string;
+}
+
+function SubmitButtonCore({
+  label,
+  pendingLabel,
+  disabled,
+  className,
+  children,
+  routeKeyFactory,
+  ...props
+}: SubmitButtonCoreProps) {
   const { pending } = useFormStatus();
   const pathname = usePathname();
-  const searchParams = useSearchParams();
-  const routeKey = React.useMemo(() => {
-    const query = searchParams?.toString();
-    return query ? `${pathname}?${query}` : pathname;
-  }, [pathname, searchParams]);
+  const routeKey = routeKeyFactory(pathname);
 
   const submitRouteRef = React.useRef<string | null>(null);
   const [ignoreStuckPending, setIgnoreStuckPending] = React.useState(false);
@@ -52,12 +114,14 @@ export function SubmitButton({
     }
   }, [ignoreStuckPending, pending, routeKey]);
 
+  // Keep submit protection tied to actual form status, even if we hide a stuck spinner.
+  const effectiveDisabled = Boolean(disabled) || pending;
   const effectivePending = pending && !ignoreStuckPending;
 
   return (
     <Button
       type="submit"
-      disabled={disabled || effectivePending}
+      disabled={effectiveDisabled}
       className={className}
       {...props}
     >
