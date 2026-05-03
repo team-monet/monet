@@ -760,6 +760,13 @@ describe("memories integration", () => {
     });
     expect(addFallbackMembershipRes.status).toBe(200);
 
+    const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "private" }),
+    });
+    expect(demoteRes.status).toBe(200);
+
     const sql = getTestSql();
     await withTenantScope(sql, schemaName, async (txSql) => {
       await txSql`
@@ -767,13 +774,6 @@ describe("memories integration", () => {
         WHERE group_id = ${groupId} AND agent_id = ${agentId}
       `;
     });
-
-    const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
-      method: "PATCH",
-      headers: authHeaders(),
-      body: JSON.stringify({ scope: "private" }),
-    });
-    expect(demoteRes.status).toBe(200);
 
     const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
       method: "PATCH",
