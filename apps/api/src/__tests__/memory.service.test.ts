@@ -988,8 +988,9 @@ describe("listAgentMemories", () => {
       { limit: 10 },
     );
 
-    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
-    const params = whereSqlParams(whereMock.mock.calls[0][0]);
+    const firstWhereCall = whereMock.mock.calls[0] as unknown[];
+    const whereSql = whereSqlToString(firstWhereCall[0]);
+    const params = whereSqlParams(firstWhereCall[0]);
     expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
     expect(params).toContain(GROUP_A);
     expect(whereSql).toContain(`"memory_entries"."group_id" is not null`);
