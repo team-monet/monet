@@ -745,6 +745,21 @@ describe("memories integration", () => {
       tags: ["scope-stale-group"],
     });
 
+    const fallbackGroupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ name: "fallback-group" }),
+    });
+    expect(fallbackGroupRes.status).toBe(201);
+    const fallbackGroup = await fallbackGroupRes.json() as { id: string };
+
+    const addFallbackMembershipRes = await app.request(`/api/groups/${fallbackGroup.id}/members`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ agentId }),
+    });
+    expect(addFallbackMembershipRes.status).toBe(200);
+
     const removeMembershipRes = await app.request(`/api/groups/${groupId}/members/${agentId}`, {
       method: "DELETE",
       headers: authHeaders(),
