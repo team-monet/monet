@@ -101,6 +101,7 @@ memoriesRouter.get("/", async (c) => {
     accessedAfter: c.req.query("accessedAfter"),
     accessedBefore: c.req.query("accessedBefore"),
     cursor: c.req.query("cursor"),
+    groupId: c.req.query("groupId") || undefined,
     limit: (() => {
       const MAX_LIMIT = 100;
       return c.req.query("limit") ? Math.min(Math.max(1, Number(c.req.query("limit")) || 20), MAX_LIMIT) : undefined;
@@ -110,6 +111,9 @@ memoriesRouter.get("/", async (c) => {
 
   const result = await withTenantScope(sql, schemaName, async (txSql) => {
     const searchResult = await searchMemories(txSql, agent, query, queryEmbedding);
+    if ("error" in searchResult) {
+      return searchResult;
+    }
     await writeAuditLog(
       txSql as unknown as SqlClient,
       agent.tenantId,
@@ -125,6 +129,10 @@ memoriesRouter.get("/", async (c) => {
     return searchResult;
   });
 
+  if ("error" in result) {
+    return c.json({ error: "forbidden", message: "Access denied" }, 403);
+  }
+
   return c.json(result);
 });
 
@@ -137,6 +145,7 @@ memoriesRouter.get("/agent/:agentId", async (c) => {
 
   const query = {
     cursor: c.req.query("cursor"),
+    groupId: c.req.query("groupId") || undefined,
     limit: (() => {
       const MAX_LIMIT = 100;
       return c.req.query("limit") ? Math.min(Math.max(1, Number(c.req.query("limit")) || 20), MAX_LIMIT) : undefined;
@@ -146,6 +155,10 @@ memoriesRouter.get("/agent/:agentId", async (c) => {
   const result = await withTenantScope(sql, schemaName, (txSql) =>
     listAgentMemories(txSql, agent, targetAgentId, query),
   );
+
+  if ("error" in result && result.error === "forbidden") {
+    return c.json({ error: "forbidden", message: "Access denied" }, 403);
+  }
 
   return c.json(result);
 });

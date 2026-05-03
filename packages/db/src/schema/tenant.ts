@@ -96,17 +96,23 @@ export const agentGroups = pgTable("agent_groups", {
     .defaultNow(),
 });
 
-export const agentGroupMembers = pgTable("agent_group_members", {
-  agentId: uuid("agent_id")
-    .notNull()
-    .references(() => agents.id),
-  groupId: uuid("group_id")
-    .notNull()
-    .references(() => agentGroups.id),
-  joinedAt: timestamp("joined_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+export const agentGroupMembers = pgTable(
+  "agent_group_members",
+  {
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id),
+    groupId: uuid("group_id")
+      .notNull()
+      .references(() => agentGroups.id),
+    joinedAt: timestamp("joined_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.agentId, table.groupId] }),
+  ],
+);
 
 export const userGroups = pgTable(
   "user_groups",

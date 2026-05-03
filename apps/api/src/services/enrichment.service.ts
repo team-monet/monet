@@ -28,6 +28,13 @@ interface EnrichmentJob {
   schemaName: string;
 }
 
+interface RelatedMemoryScope {
+  memoryScope: "group" | "user" | "private";
+  groupId: string | null;
+  userId: string | null;
+  authorAgentId: string | null;
+}
+
 let providerOverride: EnrichmentProvider | null | undefined;
 let cachedChatProvider: ChatEnrichmentProvider | null | undefined;
 let cachedEmbeddingProvider: EmbeddingEnrichmentProvider | null | undefined;
@@ -289,6 +296,10 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           content: memoryEntries.content,
           tags: memoryEntries.tags,
           version: memoryEntries.version,
+          memoryScope: memoryEntries.memoryScope,
+          groupId: memoryEntries.groupId,
+          userId: memoryEntries.userId,
+          authorAgentId: memoryEntries.authorAgentId,
         });
 
       if (row) {
@@ -301,6 +312,10 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
           content: memoryEntries.content,
           tags: memoryEntries.tags,
           version: memoryEntries.version,
+          memoryScope: memoryEntries.memoryScope,
+          groupId: memoryEntries.groupId,
+          userId: memoryEntries.userId,
+          authorAgentId: memoryEntries.authorAgentId,
         })
         .from(memoryEntries)
         .where(
@@ -324,7 +339,18 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
     const embedding = await provider.computeEmbedding(entry.content);
 
     const mergedTags = [...new Set([...(entry.tags ?? []), ...extractedTags])].slice(0, 16);
-    const relatedMemoryIds = await findRelatedMemoryIds(sql, job.schemaName, job.entryId, embedding);
+    const relatedMemoryIds = await findRelatedMemoryIds(
+      sql,
+      job.schemaName,
+      job.entryId,
+      embedding,
+      {
+        memoryScope: entry.memoryScope,
+        groupId: entry.groupId,
+        userId: entry.userId,
+        authorAgentId: entry.authorAgentId,
+      },
+    );
 
     const shouldRequeue = await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
       const [updated] = await db
@@ -396,8 +422,31 @@ async function findRelatedMemoryIds(
   schemaName: string,
   entryId: string,
   embedding: number[],
+  scope: RelatedMemoryScope,
 ): Promise<string[]> {
   return withTenantDrizzleScope(sql, schemaName, async (db) => {
+    const scopeCondition =
+      scope.memoryScope === "group" && scope.groupId
+        ? and(
+            eq(memoryEntries.memoryScope, "group"),
+            eq(memoryEntries.groupId, scope.groupId),
+          )
+        : scope.memoryScope === "user" && scope.userId
+          ? and(
+              eq(memoryEntries.memoryScope, "user"),
+              eq(memoryEntries.userId, scope.userId),
+            )
+          : scope.memoryScope === "private" && scope.authorAgentId
+            ? and(
+                eq(memoryEntries.memoryScope, "private"),
+                eq(memoryEntries.authorAgentId, scope.authorAgentId),
+              )
+            : null;
+
+    if (!scopeCondition) {
+      return [];
+    }
+
     const rows = await db
       .select({ id: memoryEntries.id })
       .from(memoryEntries)
@@ -405,6 +454,7 @@ async function findRelatedMemoryIds(
         and(
           ne(memoryEntries.id, entryId),
           isNotNull(memoryEntries.embedding),
+          scopeCondition,
         ),
       )
       .orderBy(

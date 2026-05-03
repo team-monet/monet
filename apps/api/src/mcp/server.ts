@@ -201,6 +201,9 @@ export function createMcpServer(
         const queryEmbedding = args.query ? await computeQueryEmbedding(args.query) : null;
         const result = await withTenantScope(sql, tenantSchemaName, async (txSql) => {
           const searchResult = await searchMemories(txSql, agentContext, args, queryEmbedding);
+          if (hasError(searchResult)) {
+            return searchResult;
+          }
           await writeAuditLog(
             txSql as unknown as SqlClient,
             agentContext.tenantId,
@@ -209,12 +212,15 @@ export function createMcpServer(
             null,
             "success",
             {
-              resultCount: searchResult.items.length,
+              resultCount: (searchResult as { items: unknown[] }).items.length,
               searchType: queryEmbedding ? "vector" : "text",
             },
           );
           return searchResult;
         });
+        if (hasError(result)) {
+          return asToolError(describeServiceError(result));
+        }
         return asToolResult(result);
       } catch (error) {
         return asToolError(error instanceof Error ? error.message : "Internal server error");

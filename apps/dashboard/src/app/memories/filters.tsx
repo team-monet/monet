@@ -15,16 +15,25 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Loader2, X } from "lucide-react";
 
+interface GroupOption {
+  id: string;
+  name: string;
+}
+
 interface MemoryFiltersProps {
   initialType?: MemoryType;
+  initialGroupId?: string;
   initialIncludeUser: boolean;
   initialIncludePrivate: boolean;
+  groups: GroupOption[];
 }
 
 export function MemoryFilters({
   initialType,
+  initialGroupId,
   initialIncludeUser,
   initialIncludePrivate,
+  groups,
 }: MemoryFiltersProps) {
   const router = useRouter();
   const pathname = usePathname();
@@ -80,6 +89,28 @@ export function MemoryFilters({
           </ShadSelect>
         </div>
 
+        <div className="grid min-w-[180px] gap-2">
+          <div className="flex items-center justify-between">
+            <Label className="text-xs uppercase text-muted-foreground font-semibold">Group</Label>
+          </div>
+          <ShadSelect
+            value={initialGroupId || "all"}
+            onValueChange={(val) => updateUrl({ groupId: val === "all" ? "" : val })}
+          >
+            <ShadSelectTrigger>
+              <ShadSelectValue placeholder="Select group" />
+            </ShadSelectTrigger>
+            <ShadSelectContent>
+              <ShadSelectItem value="all">All Groups</ShadSelectItem>
+              {groups.map((g) => (
+                <ShadSelectItem key={g.id} value={g.id}>
+                  {g.name}
+                </ShadSelectItem>
+              ))}
+            </ShadSelectContent>
+          </ShadSelect>
+        </div>
+
         <div className="flex items-center gap-6 py-2">
           <div className="flex items-center space-x-2">
             <Checkbox
@@ -100,7 +131,7 @@ export function MemoryFilters({
         </div>
 
         <div className="ml-auto">
-          {(initialType || initialIncludeUser || initialIncludePrivate || currentQuery) && (
+          {(initialType || initialGroupId || initialIncludeUser || initialIncludePrivate || currentQuery) && (
             <Button
               type="button"
               variant="ghost"

@@ -4,10 +4,15 @@ import { getApiClient } from "@/lib/api-client";
 import { revalidatePath } from "next/cache";
 import { MemoryScope } from "@monet/types";
 
-export async function searchMemoriesAction(query: string, limit?: number, cursor?: string) {
+export async function searchMemoriesAction(query: string, limit?: number, cursor?: string, groupId?: string) {
   const client = await getApiClient();
   // MonetApiClient.listMemories handles all params now
-  return client.listMemories({ query, limit, cursor });
+  return client.listMemories({ query, limit, cursor, groupId });
+}
+
+export async function listGroupsAction() {
+  const client = await getApiClient();
+  return client.listGroups();
 }
 
 export async function deleteMemoryAction(id: string) {

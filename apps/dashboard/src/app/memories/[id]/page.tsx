@@ -31,6 +31,7 @@ export default async function MemoryEntryDetailPage({ params }: PageProps) {
   let memory: MemoryEntry | null = null;
   let versions: { id: string; version: number; createdAt: string; content: string }[] = [];
   let error = "";
+  let groupName: string | null = null;
 
   try {
     const client = await getApiClient();
@@ -39,6 +40,16 @@ export default async function MemoryEntryDetailPage({ params }: PageProps) {
     versions = result.versions;
   } catch (err: unknown) {
     error = err instanceof Error ? err.message : "An unexpected error occurred";
+  }
+
+  if (!error && memory?.groupId) {
+    try {
+      const client = await getApiClient();
+      const groupsResult = await client.listGroups();
+      groupName = groupsResult.groups.find((g) => g.id === memory.groupId)?.name ?? null;
+    } catch {
+      // Best effort only; UI falls back to rendering raw group UUID.
+    }
   }
 
   if (error || !memory) {
@@ -179,8 +190,8 @@ export default async function MemoryEntryDetailPage({ params }: PageProps) {
                     
                     {memory.groupId && (
                       <>
-                        <dt className="text-muted-foreground mt-2">Group ID</dt>
-                        <dd className="font-mono text-xs bg-muted p-1.5 rounded border">{memory.groupId}</dd>
+                        <dt className="text-muted-foreground mt-2">Group</dt>
+                        <dd className="font-medium text-sm">{groupName ?? memory.groupId}</dd>
                       </>
                     )}
                     

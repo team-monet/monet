@@ -20,7 +20,7 @@ import { tenantSchemaNameFromId, tenantUsers, withTenantDrizzleScope } from "@mo
 import { tenants } from "@monet/db";
 import { eq } from "drizzle-orm";
 import { decrypt } from "./crypto";
-import { ensureDashboardAgent, syncDashboardAgentRole } from "./dashboard-agent";
+import { ensureDashboardAgent, syncDashboardAgentRole, syncDashboardAgentGroups } from "./dashboard-agent";
 import {
   SESSION_EXPIRED_ERROR_MESSAGE,
   isRefreshAccessTokenError,
@@ -155,6 +155,7 @@ export class MonetApiClient {
     cursor?: string;
     limit?: number;
     query?: string;
+    groupId?: string;
   }): Promise<{ items: MemoryEntryTier1[]; nextCursor: string | null }> {
     const query = new URLSearchParams();
     if (params) {
@@ -465,6 +466,7 @@ export async function getApiClient() {
   } else {
     // Hot path: 1-query role sync keeps RBAC current without the full setup cost.
     await syncDashboardAgentRole(userId, tenantId);
+    await syncDashboardAgentGroups(userId, tenantId);
   }
 
   if (userRows.length === 0 || !userRows[0].dashboardApiKeyEncrypted) {

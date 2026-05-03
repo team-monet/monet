@@ -12,7 +12,7 @@ import {
   type Database,
   type TransactionClient,
 } from "@monet/db";
-import { and, asc, eq, inArray, ne } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 import { encrypt } from "./crypto";
 import { generateApiKey, hashApiKey } from "./api-key";
 import { getSqlClient } from "./db";
@@ -148,6 +148,29 @@ export async function syncDashboardAgentRole(userId: string, tenantId: string) {
   });
 }
 
+/**
+ * Sync dashboard agent group memberships for the hot path.
+ * Resolves the dashboard agent by externalId, computes the desired
+ * memberships from the user's other agents and user-group permissions,
+ * then performs a set-diff sync inside a DB transaction.
+ */
+export async function syncDashboardAgentGroups(userId: string, tenantId: string) {
+  return withTenantDb(tenantId, async (tenantDb) => {
+    const dashboardExternalId = `dashboard:${userId}`;
+    const [agentRow] = await tenantDb
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.userId, userId), eq(agents.externalId, dashboardExternalId)))
+      .limit(1);
+
+    if (!agentRow) {
+      return;
+    }
+
+    await syncAgentGroups(tenantDb, userId, agentRow.id, tenantId);
+  });
+}
+
 export async function updateDashboardCredentialIfOwnedAgent(
   userId: string,
   tenantId: string,
@@ -187,34 +210,32 @@ async function syncAgentGroups(
   dashboardAgentId: string,
   tenantId: string,
 ) {
-  // Find the preferred group from the user's other agents first.
-  const userAgents = await tenantDb
-    .select({ id: agents.id })
-    .from(agents)
-    .where(and(eq(agents.userId, userId), ne(agents.id, dashboardAgentId)));
+  await tenantDb.transaction(async (tx) => {
+    // 1. Find all groups from the user's other agents.
+    const userAgents = await tx
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.userId, userId), ne(agents.id, dashboardAgentId)));
 
-  let preferredGroupId: string | null = null;
-  if (userAgents.length > 0) {
-    const agentIds = userAgents.map((a) => a.id);
-    const memberships = await tenantDb
-      .select({
-        groupId: agentGroupMembers.groupId,
-        joinedAt: agentGroupMembers.joinedAt,
-      })
-      .from(agentGroupMembers)
-      .where(inArray(agentGroupMembers.agentId, agentIds))
-      .orderBy(asc(agentGroupMembers.joinedAt), asc(agentGroupMembers.groupId));
+    const groupIdsFromOtherAgents = new Set<string>();
+    if (userAgents.length > 0) {
+      const agentIds = userAgents.map((a) => a.id);
+      const memberships = await tx
+        .select({
+          groupId: agentGroupMembers.groupId,
+        })
+        .from(agentGroupMembers)
+        .where(inArray(agentGroupMembers.agentId, agentIds));
 
-    const orderedGroupIds = [...new Set(memberships.map((membership) => membership.groupId))];
-    preferredGroupId = orderedGroupIds[0] ?? null;
-  }
+      for (const membership of memberships) {
+        groupIdsFromOtherAgents.add(membership.groupId);
+      }
+    }
 
-  // Fall back to the first agent group the user's user-group memberships allow.
-  if (!preferredGroupId) {
-    const allowedGroups = await tenantDb
+    // 2. Find all groups from user-group permission chain.
+    const allowedGroups = await tx
       .selectDistinct({
         id: agentGroups.id,
-        name: agentGroups.name,
       })
       .from(userGroupMembers)
       .innerJoin(
@@ -238,42 +259,65 @@ async function syncAgentGroups(
           eq(userGroups.tenantId, tenantId),
           eq(agentGroups.tenantId, tenantId),
         ),
-      )
-      .orderBy(asc(agentGroups.name));
+      );
 
-    preferredGroupId = allowedGroups[0]?.id ?? null;
-  }
+    const groupIdsFromPermissions = new Set(allowedGroups.map((g) => g.id));
 
-  // Current memberships for dashboard agent
-  const currentMemberships = await tenantDb
-    .select({ groupId: agentGroupMembers.groupId })
-    .from(agentGroupMembers)
-    .where(eq(agentGroupMembers.agentId, dashboardAgentId));
+    // 3. Combine both sources into desired memberships.
+    const desiredGroupIds = new Set([...groupIdsFromOtherAgents, ...groupIdsFromPermissions]);
 
-  if (!preferredGroupId) {
-    if (currentMemberships.length > 0) {
-      await tenantDb
-        .delete(agentGroupMembers)
-        .where(eq(agentGroupMembers.agentId, dashboardAgentId));
-    }
-    return;
-  }
-
-  if (
-    currentMemberships.length === 1 &&
-    currentMemberships[0].groupId === preferredGroupId
-  ) {
-    return;
-  }
-
-  await tenantDb.transaction(async (tx) => {
-    await tx
-      .delete(agentGroupMembers)
+    // 4. Current memberships for dashboard agent.
+    const currentMemberships = await tx
+      .select({ groupId: agentGroupMembers.groupId })
+      .from(agentGroupMembers)
       .where(eq(agentGroupMembers.agentId, dashboardAgentId));
 
-    await tx.insert(agentGroupMembers).values({
-      agentId: dashboardAgentId,
-      groupId: preferredGroupId,
-    });
+    const currentGroupIds = new Set(currentMemberships.map((m) => m.groupId));
+
+    // 5. If already exactly matched, skip.
+    if (
+      currentGroupIds.size === desiredGroupIds.size &&
+      [...currentGroupIds].every((id) => desiredGroupIds.has(id))
+    ) {
+      return;
+    }
+
+    // 6. Delete stale, insert missing.
+    const toDelete = [...currentGroupIds].filter((id) => !desiredGroupIds.has(id));
+    const toInsert = [...desiredGroupIds].filter((id) => !currentGroupIds.has(id));
+
+    if (toDelete.length === 0 && toInsert.length === 0) {
+      return;
+    }
+
+    if (toDelete.length > 0) {
+      await tx
+        .delete(agentGroupMembers)
+        .where(
+          and(
+            eq(agentGroupMembers.agentId, dashboardAgentId),
+            inArray(agentGroupMembers.groupId, toDelete),
+          ),
+        );
+    }
+
+    if (toInsert.length > 0) {
+      const values = toInsert.map((groupId) => ({
+        agentId: dashboardAgentId,
+        groupId,
+      }));
+
+      try {
+        await tx
+          .insert(agentGroupMembers)
+          .values(values)
+          .onConflictDoNothing({
+            target: [agentGroupMembers.agentId, agentGroupMembers.groupId],
+          });
+      } catch {
+        // Fallback for tenants where the composite PK upgrade has not run yet.
+        await tx.insert(agentGroupMembers).values(values);
+      }
+    }
   });
 }

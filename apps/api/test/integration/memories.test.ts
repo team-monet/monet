@@ -713,6 +713,70 @@ describe("memories integration", () => {
     expect(logs).toHaveLength(1);
   });
 
+  it("sets group_id when promoting private memory with null group", async () => {
+    const { body: created } = await storeMemory({
+      content: "private memory promoted to group",
+      memoryType: "fact",
+      memoryScope: "private",
+      tags: ["scope-group-id"],
+    });
+
+    const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "group" }),
+    });
+    expect(promoteRes.status).toBe(200);
+
+    const sql = getTestSql();
+    const [row] = await withTenantScope(sql, schemaName, async (txSql) => txSql`
+      SELECT memory_scope, group_id
+      FROM memory_entries
+      WHERE id = ${created.id}
+    `);
+    expect(row.memory_scope).toBe("group");
+    expect(typeof row.group_id).toBe("string");
+  });
+
+  it("rejects promotion to stale group when agent is no longer a member", async () => {
+    const { body: created } = await storeMemory({
+      content: "stale group promotion should fail",
+      memoryType: "fact",
+      tags: ["scope-stale-group"],
+    });
+
+    const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "private" }),
+    });
+    expect(demoteRes.status).toBe(200);
+
+    // Move the agent to a different group to make the memory's stored group_id stale.
+    // This simulates a real membership change while keeping auth/role checks intact.
+    const fallbackGroupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ name: "fallback-group" }),
+    });
+    expect(fallbackGroupRes.status).toBe(201);
+    const fallbackGroup = await fallbackGroupRes.json() as { id: string };
+
+    const addFallbackMembershipRes = await app.request(`/api/groups/${fallbackGroup.id}/members`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ agentId }),
+    });
+    expect(addFallbackMembershipRes.status).toBe(200);
+
+    const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "group" }),
+    });
+    expect(promoteRes.status).toBe(403);
+  });
+
   it("rejects audit log update and delete operations", async () => {
     const { body: created } = await storeMemory({
       content: "append-only",
