@@ -47,6 +47,40 @@ These two layers are intentionally separate.
 - A user's role answers: "What administrative actions may this person perform?"
 - A user's group memberships answer: "Which agent groups may this person use?"
 
+## Rule Scope Model
+
+Rules are scoped through Agent Groups and agent ownership, not User Groups.
+
+### Tenant shared rule sets
+
+- Tenant shared rule sets are tenant-wide resources managed by tenant admins.
+- Tenant shared rule sets may be attached to Agent Groups.
+- When attached to an Agent Group, the rule set applies to all agents assigned to that Agent Group.
+
+### User-owned rule sets
+
+- User-owned rule sets are personal resources managed by the owning user.
+- A user-owned rule set may only affect agents owned by that same user.
+- Regular users can apply personal rule sets to their own agents.
+- Regular users cannot apply personal rule sets to agents owned by another user.
+
+### Future Agent Group attachment behavior
+
+If user-owned rule sets become attachable to Agent Groups in the future, they must remain ownership-filtered:
+
+- A user-owned rule set attached to an Agent Group applies only to agents in that group where `agent.userId === ruleSet.ownerUserId`.
+- It must not affect other users' agents in the same Agent Group.
+- It must not affect autonomous or shared tenant agents unless a separate tenant-admin policy explicitly allows that.
+
+### User Groups and rules
+
+User Groups are permission-only for rule scope purposes:
+
+- User Groups grant users access to Agent Groups.
+- User Groups do not directly carry rule sets.
+- User Groups do not directly apply rules to agents.
+- This avoids ambiguity when a user belongs to multiple User Groups.
+
 ## Agent Registration Rules
 
 ### Non-admin users
