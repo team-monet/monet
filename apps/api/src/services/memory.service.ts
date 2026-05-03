@@ -860,14 +860,15 @@ export async function updateMemory(
   const contentChanged = input.content !== undefined && input.content !== (entry.content as string);
   const tagsChanged = input.tags !== undefined && !stringArraysEqual(input.tags, entry.tags as string[]);
   const needsEnrichment = contentChanged || tagsChanged;
-  const contentSummaryReset = hasProvidedSummary
+  const summaryUpdate = hasProvidedSummary
     ? { summary: providedSummary }
-    : chatProvider === "none"
-      ? { summary: (entry.summary as string | null) ?? null }
-      : { summary: null };
+    : contentChanged
+      ? chatProvider === "none"
+        ? { summary: (entry.summary as string | null) ?? null }
+        : { summary: null }
+      : {};
   const enrichmentReset = contentChanged
     ? {
-        ...contentSummaryReset,
         autoTags: [],
         embedding: null,
         relatedMemoryIds: [],
@@ -886,6 +887,7 @@ export async function updateMemory(
       tags: newTags,
       version: newVersion,
       lastAccessedAt: drizzleSql`NOW()`,
+      ...summaryUpdate,
       ...(needsEnrichment ? enrichmentReset : {}),
     })
     .where(
