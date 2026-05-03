@@ -65,6 +65,31 @@ with_ollama_env() {
   MONET_OLLAMA_ENV_FILE="${ENV_FILE}" "${ROOT_DIR}/scripts/ollama-env.sh" "$@"
 }
 
+ollama_required() {
+  local chat_provider="${ENRICHMENT_CHAT_PROVIDER:-}"
+  local embedding_provider="${ENRICHMENT_EMBEDDING_PROVIDER:-}"
+  local legacy_provider="${ENRICHMENT_PROVIDER:-}"
+
+  if [[ "${chat_provider}" == "ollama" || "${embedding_provider}" == "ollama" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${legacy_provider}" && ("${legacy_provider}" == "ollama" || "${legacy_provider}" == "onnx") ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+start_ollama_if_required() {
+  if ollama_required; then
+    echo "Ollama is required by enrichment provider config; ensuring shared Ollama is running..."
+    with_ollama_env up
+  else
+    echo "Ollama is not required by enrichment provider config; skipping shared Ollama startup."
+  fi
+}
+
 build_release_image() {
   local target="$1"
   local tag="$2"
@@ -79,13 +104,13 @@ build_release_image() {
 cmd_up() {
   require_env_file
   load_env_file
-  with_ollama_env up
+  start_ollama_if_required
   compose_dev up -d
   wait_for_ready "$(keycloak_base_url)" 180
   cat <<EOF
 Infrastructure is ready.
 
-Shared Ollama remains in its own stack:
+If enrichment providers require Ollama, shared Ollama remains in its own stack:
   pnpm ollama:status
 
 Run the app processes on the host in separate terminals:
@@ -117,9 +142,14 @@ cmd_status() {
   load_env_file
   echo "Local infrastructure:"
   compose_dev ps
-  echo
-  echo "Shared Ollama:"
-  with_ollama_env status
+  if ollama_required; then
+    echo
+    echo "Shared Ollama:"
+    with_ollama_env status
+  else
+    echo
+    echo "Shared Ollama: skipped (not required by enrichment provider config)"
+  fi
 }
 
 cmd_logs() {
@@ -127,9 +157,14 @@ cmd_logs() {
   load_env_file
   echo "Local infrastructure logs:"
   compose_dev logs --tail 200 postgres pgadmin keycloak
-  echo
-  echo "Shared Ollama logs:"
-  with_ollama_env logs
+  if ollama_required; then
+    echo
+    echo "Shared Ollama logs:"
+    with_ollama_env logs
+  else
+    echo
+    echo "Shared Ollama logs: skipped (not required by enrichment provider config)"
+  fi
 }
 
 cmd_reset() {
@@ -173,12 +208,12 @@ usage() {
 Usage: ./scripts/local-env.sh <command>
 
 Commands:
-  up         Start local infrastructure (postgres, pgadmin, keycloak) and ensure shared Ollama is ready
+  up         Start local infrastructure and shared Ollama only when required
   build      Build release images for api, dashboard, and migrate
   migrate    Run platform migrations from the host against the local database
   down       Stop stack without deleting database volume
   status     Show container status for the local project
-  logs       Tail local infrastructure and shared Ollama logs
+  logs       Tail local infrastructure and Ollama logs when required
   metrics    Generate local usage metrics snapshot
   mcp-smoke  Run MCP connection smoke test (requires MCP_API_KEY env var)
   keycloak-setup Bootstrap local Keycloak realms, clients, and sample users
