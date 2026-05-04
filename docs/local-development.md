@@ -29,29 +29,77 @@ cd monet
 pnpm install
 ```
 
-3. Create local environment config:
+3. Run one-command container quickstart:
 
 ```bash
-cp .env.local-dev.example .env.local-dev
+pnpm quickstart
 ```
 
-4. Start local infrastructure:
+This command:
+
+- ensures `.env.runtime` exists (copied from template if missing)
+- starts runtime containers (postgres, keycloak, migrate, api, dashboard)
+- bootstraps Keycloak + demo tenant + demo API key
+- configures platform + tenant OIDC for dashboard login
+- prints ready-to-copy MCP config and local login details
+
+The API and dashboard remain running in containers after the command exits.
+
+> ⚠️ Quickstart output includes local bootstrap secrets/API keys.
+> `.env.runtime.example` defaults are for local evaluation only and are not production-safe.
+
+4. Verify runtime app URLs:
+
+- Dashboard: `http://127.0.0.1:4310`
+- API: `http://127.0.0.1:4301`
+
+The MCP config and demo key are printed by quickstart output.
+
+## Runtime Verification (container quickstart path)
+
+After `pnpm quickstart`, run:
+
+```bash
+pnpm runtime:status
+curl -f http://127.0.0.1:4301/healthz
+curl -f http://127.0.0.1:4301/health/ready
+```
+
+Expected results:
+
+- runtime services are shown as running
+- API health endpoints return `200`
+- dashboard login loads at `http://127.0.0.1:4310`
+
+## Manual / Advanced Local Flow
+
+If you prefer source-run development (host processes) or step-by-step control, use:
+
+1. Start infrastructure:
 
 ```bash
 pnpm local:up
 ```
 
-This starts PostgreSQL, pgAdmin, and Keycloak. Ollama is optional unless you
-configure `ENRICHMENT_CHAT_PROVIDER=ollama` and/or `ENRICHMENT_EMBEDDING_PROVIDER=ollama`.
+This local/source path uses ports:
 
-5. Start API and dashboard (two terminals):
+- Dashboard: `http://127.0.0.1:3310`
+- API: `http://127.0.0.1:3301`
+
+2. Run init-only bootstrap:
+
+```bash
+pnpm local:quickstart:init
+```
+
+3. Start API + dashboard yourself (two terminals):
 
 ```bash
 pnpm local:dev:api
 pnpm local:dev:dashboard
 ```
 
-6. Bootstrap local Keycloak realms/clients/users:
+4. (Optional) Bootstrap local Keycloak realms/clients/users directly:
 
 ```bash
 pnpm local:keycloak:setup
@@ -67,7 +115,7 @@ Default local Keycloak admin credentials come from `.env.local-dev`:
 - `KEYCLOAK_ADMIN`
 - `KEYCLOAK_ADMIN_PASSWORD`
 
-7. Complete initial setup in the dashboard:
+5. (Optional) Complete setup manually in the dashboard:
 
 - Open `http://127.0.0.1:3310/setup`
 - Copy the one-time bootstrap token from the API terminal logs
@@ -79,22 +127,6 @@ Default local Keycloak admin credentials come from `.env.local-dev`:
 - Sign in through normal tenant login using the generated tenant admin account
 
 > **For a dedicated end-to-end tenant creation guide, see [Tenant Creation and Management](tenant-creation.md).**
-
-## Verification
-
-After setup, run these checks:
-
-```bash
-pnpm local:status
-curl -f http://127.0.0.1:3301/healthz
-curl -f http://127.0.0.1:3301/health/ready
-```
-
-Expected results:
-
-- local stack services are shown as running
-- API health endpoints return `200`
-- dashboard login loads at `http://127.0.0.1:3310`
 
 Optional authenticated API check (after you have an agent API key):
 
@@ -112,6 +144,12 @@ curl -sS "http://127.0.0.1:3301/api/tenants/$TENANT_SLUG/agents/me" \
 - `pnpm local:down` - stop local services, keep volumes
 - `pnpm local:db:reset` - reset local Postgres volume only
 - `pnpm local:reset` - full destructive local reset
+
+## Common Runtime Commands
+
+- `pnpm runtime:status` - show runtime container status
+- `pnpm runtime:logs` - tail runtime logs
+- `pnpm runtime:down` - stop runtime stack
 
 ## Environment Reference
 

@@ -44,21 +44,29 @@ wait_for_ready() {
   local url="$1"
   local timeout_seconds="${2:-120}"
   local waited=0
+  local spinner='|/-\\'
+  local spin_index=0
 
   echo "Waiting for readiness: ${url}"
 
-  until curl --silent --show-error --fail "${url}" > /dev/null; do
+  until curl --silent --fail "${url}" > /dev/null 2>&1; do
+    local spin_char="${spinner:spin_index:1}"
+    printf "\rStill starting... %s (%ss/%ss)" "${spin_char}" "${waited}" "${timeout_seconds}"
+    spin_index=$(((spin_index + 1) % 4))
     sleep 2
     waited=$((waited + 2))
     if (( waited >= timeout_seconds )); then
-      echo "Readiness timed out after ${timeout_seconds}s."
-      echo "Check logs:"
+      echo
+      echo "Readiness check timed out after ${timeout_seconds}s."
+      echo "URL: ${url}"
+      echo "Troubleshooting:"
       echo "  pnpm local:logs"
+      echo "  curl -v ${url}"
       exit 1
     fi
   done
 
-  echo "Readiness passed."
+  printf "\rReady: %s%*s\n" "${url}" 20 ""
 }
 
 with_ollama_env() {
@@ -109,6 +117,9 @@ cmd_up() {
   wait_for_ready "$(keycloak_base_url)" 180
   cat <<EOF
 Infrastructure is ready.
+
+Next quickstart step:
+  pnpm local:quickstart:init
 
 If enrichment providers require Ollama, shared Ollama remains in its own stack:
   pnpm ollama:status
