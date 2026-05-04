@@ -203,7 +203,11 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
 
       <Card className="shadow-sm">
         <CardContent className="p-0">
-          <AuditFilters initialAction={action} />
+          <Suspense
+            fallback={<div className="h-[110px] p-4" aria-hidden="true" />}
+          >
+            <AuditFilters initialAction={action} />
+          </Suspense>
         </CardContent>
       </Card>
 
