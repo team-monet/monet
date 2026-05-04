@@ -50,23 +50,23 @@ Monet organizes memories by **type** and **scope**, matching how teams actually 
 | `private` | Only the authoring agent | Agent-specific working notes |
 
 ```text
-┌─────────────────────────────────────────────┐
-│                  Tenant                      │
-│                                              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+┌───────────────────────────────────────────────┐
+│                  Tenant                       │
+│                                               │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  │
 │  │ Agent A   │  │ Agent B   │  │ Agent C   │  │
 │  │ (Support) │  │ (Support) │  │ (Billing) │  │
 │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  │
-│        │              │              │         │
-│        ▼              ▼              ▼         │
+│        │              │              │        │
+│        ▼              ▼              ▼        │
 │  ┌─────────────────────────────────────────┐  │
 │  │           Shared Memory Layer           │  │
 │  │                                         │  │
-│  │  🔵 group scope   → visible to all     │  │
+│  │  🔵 group scope   → visible to all      │  │
 │  │  🟡 user scope    → per-user context    │  │
 │  │  🔴 private scope → agent-only          │  │
 │  └─────────────────────────────────────────┘  │
-└─────────────────────────────────────────────┘
+└───────────────────────────────────────────────┘
 ```
 
 ## Getting Started
@@ -77,15 +77,18 @@ Monet organizes memories by **type** and **scope**, matching how teams actually 
 - [pnpm](https://pnpm.io/)
 - [Docker](https://www.docker.com/) (for local infrastructure)
 
-### Quick Start (Local)
+### Quick Start (Containers)
 
 ```bash
 git clone https://github.com/team-monet/monet.git
 cd monet
 pnpm install
-cp .env.local-dev.example .env.local-dev
-pnpm local:up
+pnpm quickstart
 ```
+
+This one command ensures runtime env/config, starts containers (postgres,
+keycloak, migrate, api, dashboard), bootstraps Keycloak + demo tenant, and
+prints ready-to-copy MCP config and local login details.
 
 Then follow the full local setup guide:
 - **[Local Development Guide →](docs/local-development.md)**
@@ -94,11 +97,13 @@ Then follow the full local setup guide:
 
 Once Monet is running, connect any MCP-compatible agent:
 
+> Container quickstart (`pnpm quickstart`) defaults to API port `4301`.
+
 ```json
 {
   "mcpServers": {
     "monet": {
-      "url": "http://localhost:3301/mcp/your-tenant",
+      "url": "http://localhost:4301/mcp/demo",
       "headers": {
         "Authorization": "Bearer your-agent-api-key"
       }
@@ -120,24 +125,6 @@ Your agent now has access to these memory tools:
 | `memory_mark_outdated` | Mark a memory as outdated |
 | `memory_list_tags` | List all tags used across memories |
 
-### Quick API Example
-
-```bash
-# Store a memory
-curl -X POST http://localhost:3301/api/tenants/acme/memories \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "Always use pagination for list endpoints. Limit default is 50.",
-    "memoryType": "pattern",
-    "memoryScope": "group",
-    "tags": ["api", "best-practice", "pagination"]
-  }'
-
-# Search memories
-curl "http://localhost:3301/api/tenants/acme/memories?query=pagination+best+practice&limit=5" \
-  -H "Authorization: Bearer $API_KEY"
-```
 
 ## Architecture
 
@@ -145,16 +132,16 @@ Monet runs as a straightforward service stack designed for self-hosted deploymen
 
 ```text
 ┌─────────────┐  ┌──────────────┐
-│  Dashboard   │  │  API Service  │── /api/tenants/:slug/...
-│  (Next.js)   │  │              │── /mcp/:slug
+│  Dashboard  │  │  API Service │── /api/tenants/:slug/...
+│  (Next.js)  │  │              │── /mcp/:slug
 └─────────────┘  └──────┬───────┘
                         │
-        ┌───────────────┼───────────────┐
-        │               │               │
-   ┌────▼────┐   ┌──────▼──────┐   ┌───▼───┐
-   │ PostgreSQL │  │  OIDC Auth  │   │ Enrich │
-   │ + pgvector │  │ (Keycloak)  │   │ Pipeline│
-   └───────────┘  └─────────────┘   └────────┘
+        ┌───────────────┼──────────────┐
+        │               │              │
+   ┌────▼──────┐ ┌──────▼──────┐   ┌───▼─────┐
+   │ PostgreSQL│ │  OIDC Auth  │   │ Enrich  │
+   │ + pgvector│ │ (Keycloak)  │   │ Pipeline│
+   └───────────┘ └─────────────┘   └─────────┘
 ```
 
 **Core design decisions:**
@@ -164,19 +151,6 @@ Monet runs as a straightforward service stack designed for self-hosted deploymen
 - **Enrichment pipeline** — automatic summary, tag extraction, and vector embedding on every memory write
 
 Read the full architecture overview: **[docs/architecture.md →](docs/architecture.md)**
-
-## Production Deployment
-
-Monet is designed for single-host Docker Compose deployment — no Kubernetes required:
-
-```bash
-cp .env.runtime.example .env.runtime
-docker compose -f docker-compose.runtime.yml up -d
-```
-
-- **[Production Deployment Guide →](docs/production-deployment.md)**
-- **[Backup and Restore →](docs/backup-restore.md)**
-- **[Migration and Upgrade →](docs/migration-upgrade.md)**
 
 ## Documentation
 

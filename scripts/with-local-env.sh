@@ -26,9 +26,11 @@ postgres_user="${POSTGRES_USER:-postgres}"
 postgres_password="${POSTGRES_PASSWORD:-postgres}"
 api_port="${API_PORT:-3001}"
 ollama_port="${OLLAMA_PORT:-11434}"
+dashboard_port="${DASHBOARD_PORT:-3310}"
 
 export DATABASE_URL="${DATABASE_URL:-postgresql://${postgres_user}:${postgres_password}@${postgres_host}:${postgres_port}/${postgres_db}}"
 export INTERNAL_API_URL="${INTERNAL_API_URL:-http://127.0.0.1:${api_port}}"
 export OLLAMA_BASE_URL="${HOST_OLLAMA_BASE_URL:-http://127.0.0.1:${ollama_port}}"
+export PORT="${PORT:-${dashboard_port}}"
 
 exec "$@"
