@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
   SidebarInset,
@@ -21,7 +21,7 @@ import {
   SESSION_RECOVERY_PATH,
 } from "@/lib/session-errors";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { SessionProvider, useSession } from "next-auth/react";
+import { SessionProvider, signOut, useSession } from "next-auth/react";
 
 type ShellUser = {
   name?: string | null;
@@ -45,6 +45,7 @@ function SessionRecoveryWatcher({
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const { data: session, status } = useSession();
+  const signOutStartedRef = useRef(false);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const clientSessionError = (session as any)?.error;
   const sessionScope =
@@ -73,9 +74,17 @@ function SessionRecoveryWatcher({
     const currentPath = `${pathname}${currentSearch ? `?${currentSearch}` : ""}`;
     const callbackUrl = normalizeInternalCallbackUrl(currentPath, "/");
     const guardKey = buildSessionRecoveryGuardKey(effectiveScope, callbackUrl);
+    const loginPath = effectiveScope === "platform" ? "/platform/login" : "/login";
 
     if (hasActiveSessionRecoveryGuard(window.sessionStorage, guardKey)) {
-      router.replace(effectiveScope === "platform" ? "/platform/login" : "/login");
+      if (signOutStartedRef.current) {
+        return;
+      }
+      signOutStartedRef.current = true;
+      void signOut({ callbackUrl: loginPath }).catch(() => {
+        signOutStartedRef.current = false;
+        router.replace(loginPath);
+      });
       return;
     }
 
