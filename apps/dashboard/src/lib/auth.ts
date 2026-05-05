@@ -29,6 +29,7 @@ import { REFRESH_ACCESS_TOKEN_ERROR } from "./session-errors";
 interface ExtendedUser extends User {
   role?: string;
   tenantId?: string;
+  tenantSlug?: string;
   scope?: "tenant" | "platform";
   emailVerified?: boolean;
 }
@@ -38,6 +39,7 @@ interface ExtendedJWT {
   role: string | null;
   scope: "tenant" | "platform";
   tenantId?: string;
+  tenantSlug?: string;
   name?: string | null;
   email?: string | null;
   accessToken: string;
@@ -145,6 +147,22 @@ async function refreshAccessToken(token: ExtendedJWT) {
   }
 }
 
+async function resolveTenantSlugFromTenantId(
+  tenantId: string | undefined,
+): Promise<string | undefined> {
+  if (!tenantId) {
+    return undefined;
+  }
+
+  const [tenant] = await db
+    .select({ slug: tenants.slug })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+
+  return tenant?.slug;
+}
+
 export const authConfig: NextAuthConfig = {
   providers: [],
   session: {
@@ -226,6 +244,9 @@ export const authConfig: NextAuthConfig = {
           role: dbUser.role,
           scope: "tenant",
           tenantId: dbUser.tenantId,
+          tenantSlug:
+            extendedUser.tenantSlug ??
+            (await resolveTenantSlugFromTenantId(dbUser.tenantId)),
           name: dbUser.displayName ?? user.name ?? user.email,
           email: user.email,
           accessToken: account.access_token || "dev-bypass-token",
@@ -238,9 +259,23 @@ export const authConfig: NextAuthConfig = {
       }
 
       const extendedToken = token as unknown as ExtendedJWT;
+
+      if (
+        extendedToken.scope === "tenant" &&
+        extendedToken.tenantId &&
+        !extendedToken.tenantSlug
+      ) {
+        const resolvedTenantSlug = await resolveTenantSlugFromTenantId(
+          extendedToken.tenantId,
+        );
+        if (resolvedTenantSlug) {
+          extendedToken.tenantSlug = resolvedTenantSlug;
+        }
+      }
+
       // Refresh token 60 seconds before it expires
       if (Date.now() < (extendedToken.expiresAt - 60) * 1000) {
-        return token;
+        return extendedToken;
       }
 
       return refreshAccessToken(extendedToken) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -255,6 +290,10 @@ export const authConfig: NextAuthConfig = {
         sessionUser.email = (token.email as string | null | undefined) ?? null;
         sessionUser.tenantId =
           token.scope === "tenant" ? (token.tenantId as string) : undefined;
+        sessionUser.tenantSlug =
+          token.scope === "tenant"
+            ? ((token.tenantSlug as string | undefined) ?? undefined)
+            : undefined;
 
         if (token.error) {
           (session as any).error = token.error; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -319,6 +358,7 @@ const result = NextAuth(async (req) => {
           return {
             id: user.externalId,
             tenantId: tenant.id,
+            tenantSlug: tenant.slug,
             role: user.role,
             scope: "tenant",
             name: user.displayName ?? "Local User",
@@ -424,6 +464,7 @@ const result = NextAuth(async (req) => {
               email: profile.email,
               emailVerified: isProfileEmailVerified(profile),
               tenantId: tenant.id,
+              tenantSlug: tenant.slug,
               scope: "tenant",
             } as ExtendedUser;
           },
