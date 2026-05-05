@@ -55,7 +55,8 @@ services:
     command:
       - start-dev
       - --http-port=8080
-      - --hostname-strict=false
+      - --hostname=http://keycloak.localhost:${KEYCLOAK_PORT:-3400}
+      - --hostname-strict=true
     volumes:
       - keycloak_dev_data:/opt/keycloak/data
     logging:

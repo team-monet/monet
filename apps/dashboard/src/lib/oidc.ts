@@ -118,25 +118,33 @@ export function getOidcExampleIssuer(realm: string) {
 }
 
 export async function resolveOidcProviderConfig(issuer: string) {
-  const browserIssuer = resolveOidcIssuerForBrowser(issuer);
-  const serverIssuer = resolveOidcIssuerForServer(issuer);
   const discovery = await fetchOidcDiscoveryDocument(issuer);
 
   if (!discovery.authorization_endpoint || !discovery.token_endpoint) {
     throw new Error("OIDC discovery document is missing required endpoints.");
   }
 
+  const discoveredIssuer = discovery.issuer?.trim() || issuer;
+  const normalizedIssuer = trimTrailingSlash(discoveredIssuer);
+  const browserIssuer = resolveOidcIssuerForBrowser(normalizedIssuer);
+  const resolvedServerIssuer = resolveOidcIssuerForServer(normalizedIssuer);
+
   return {
     browserIssuer,
-    serverIssuer,
-    wellKnown: `${serverIssuer}/.well-known/openid-configuration`,
+    serverIssuer: resolvedServerIssuer,
+    issuer: browserIssuer,
+    wellKnown: `${browserIssuer}/.well-known/openid-configuration`,
     authorization: replaceUrlOrigin(
       discovery.authorization_endpoint,
       browserIssuer,
     ),
-    token: discovery.token_endpoint,
-    userinfo: discovery.userinfo_endpoint,
-    jwksEndpoint: discovery.jwks_uri,
+    token: replaceUrlOrigin(discovery.token_endpoint, resolvedServerIssuer),
+    userinfo: discovery.userinfo_endpoint
+      ? replaceUrlOrigin(discovery.userinfo_endpoint, resolvedServerIssuer)
+      : undefined,
+    jwksEndpoint: discovery.jwks_uri
+      ? replaceUrlOrigin(discovery.jwks_uri, resolvedServerIssuer)
+      : undefined,
   };
 }
 

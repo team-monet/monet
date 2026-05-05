@@ -516,7 +516,7 @@ async function ensureTenantUserOwnedMcpAgentApiKey(
 
 function renderLoginDetails(summary: KeycloakSummary | null) {
   const keycloakPort = env("KEYCLOAK_PORT", "3400");
-  const keycloakBaseUrl = env("KEYCLOAK_BASE_URL", `http://localhost:${keycloakPort}`);
+  const keycloakBaseUrl = env("KEYCLOAK_BASE_URL", `http://keycloak.localhost:${keycloakPort}`);
   const keycloakAdmin = env("KEYCLOAK_ADMIN", "admin");
   const keycloakAdminPassword = env("KEYCLOAK_ADMIN_PASSWORD", "admin");
   const platformAdminUsername = env("KEYCLOAK_PLATFORM_ADMIN_USERNAME", "platform-admin");
