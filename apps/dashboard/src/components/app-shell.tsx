@@ -10,8 +10,18 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ThemeToggle } from "@/components/theme-toggle";
-import { usePathname } from "next/navigation";
-import { signOut, SessionProvider, useSession } from "next-auth/react";
+import {
+  buildSessionRecoveryGuardKey,
+  clearActiveSessionRecoveryGuard,
+  hasActiveSessionRecoveryGuard,
+  isExcludedFromSessionRecovery,
+  isRefreshAccessTokenError,
+  normalizeInternalCallbackUrl,
+  setActiveSessionRecoveryGuard,
+  SESSION_RECOVERY_PATH,
+} from "@/lib/session-errors";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { SessionProvider, useSession } from "next-auth/react";
 
 type ShellUser = {
   name?: string | null;
@@ -19,7 +29,77 @@ type ShellUser = {
   image?: string | null;
   role?: string | null;
   scope?: "tenant" | "platform";
+  tenantSlug?: string;
 };
+
+function SessionRecoveryWatcher({
+  serverSessionError,
+  scopeHint,
+  tenantSlug,
+}: {
+  serverSessionError?: string;
+  scopeHint: "tenant" | "platform";
+  tenantSlug?: string;
+}) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const { data: session, status } = useSession();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const clientSessionError = (session as any)?.error;
+  const sessionScope =
+    (session?.user as { scope?: "tenant" | "platform" } | undefined)?.scope;
+  const effectiveScope = sessionScope === "platform" ? "platform" : scopeHint;
+
+  useEffect(() => {
+    if (status === "authenticated" && !isRefreshAccessTokenError(clientSessionError)) {
+      clearActiveSessionRecoveryGuard(window.sessionStorage);
+    }
+  }, [clientSessionError, status]);
+
+  useEffect(() => {
+    const effectiveError =
+      isRefreshAccessTokenError(clientSessionError) ||
+      isRefreshAccessTokenError(serverSessionError);
+    if (!effectiveError) {
+      return;
+    }
+
+    if (isExcludedFromSessionRecovery(pathname)) {
+      return;
+    }
+
+    const currentSearch = searchParams.toString();
+    const currentPath = `${pathname}${currentSearch ? `?${currentSearch}` : ""}`;
+    const callbackUrl = normalizeInternalCallbackUrl(currentPath, "/");
+    const guardKey = buildSessionRecoveryGuardKey(effectiveScope, callbackUrl);
+
+    if (hasActiveSessionRecoveryGuard(window.sessionStorage, guardKey)) {
+      router.replace(effectiveScope === "platform" ? "/platform/login" : "/login");
+      return;
+    }
+
+    setActiveSessionRecoveryGuard(window.sessionStorage, guardKey);
+
+    const recoveryUrl = new URL(SESSION_RECOVERY_PATH, window.location.origin);
+    recoveryUrl.searchParams.set("callbackUrl", callbackUrl);
+    recoveryUrl.searchParams.set("scope", effectiveScope);
+    if (effectiveScope === "tenant" && tenantSlug) {
+      recoveryUrl.searchParams.set("tenant", tenantSlug);
+    }
+    router.replace(`${recoveryUrl.pathname}?${recoveryUrl.searchParams.toString()}`);
+  }, [
+    clientSessionError,
+    effectiveScope,
+    pathname,
+    router,
+    searchParams,
+    serverSessionError,
+    tenantSlug,
+  ]);
+
+  return null;
+}
 
 function shouldHideSidebar(pathname: string) {
   return (
@@ -27,20 +107,6 @@ function shouldHideSidebar(pathname: string) {
     pathname === "/setup" ||
     pathname.startsWith("/platform")
   );
-}
-
-function SessionWatcher() {
-  const { data: session } = useSession();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const sessionError = (session as any)?.error;
-
-  useEffect(() => {
-    if (sessionError === "RefreshAccessTokenError") {
-      signOut({ callbackUrl: "/login" });
-    }
-  }, [sessionError]);
-
-  return null;
 }
 
 export function AppShell({
@@ -58,16 +124,15 @@ export function AppShell({
   const isTenantSession = user?.scope !== "platform";
   const showSidebar =
     hasSession && isTenantSession && !shouldHideSidebar(pathname);
-
-  useEffect(() => {
-    if (sessionError === "RefreshAccessTokenError") {
-      signOut({ callbackUrl: "/login" });
-    }
-  }, [sessionError]);
+  const scope = user?.scope === "platform" ? "platform" : "tenant";
 
   return (
     <SessionProvider refetchInterval={2 * 60} refetchOnWindowFocus={true}>
-      <SessionWatcher />
+      <SessionRecoveryWatcher
+        serverSessionError={sessionError}
+        scopeHint={scope}
+        tenantSlug={user?.tenantSlug ?? undefined}
+      />
       <TooltipProvider>
         {showSidebar ? (
           <SidebarProvider>
