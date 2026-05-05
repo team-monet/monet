@@ -47,7 +47,7 @@ dashboard_base_url() {
 
 keycloak_base_url() {
   local keycloak_port="${KEYCLOAK_PORT:-4400}"
-  printf "%s" "${KEYCLOAK_BASE_URL:-http://localhost:${keycloak_port}}"
+  printf "%s" "${KEYCLOAK_BASE_URL:-http://keycloak.localhost:${keycloak_port}}"
 }
 
 wait_for_ready() {

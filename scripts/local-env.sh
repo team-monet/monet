@@ -37,7 +37,7 @@ load_env_file() {
 
 keycloak_base_url() {
   local keycloak_port="${KEYCLOAK_PORT:-3400}"
-  printf "%s" "${KEYCLOAK_BASE_URL:-http://localhost:${keycloak_port}}"
+  printf "%s" "${KEYCLOAK_BASE_URL:-http://keycloak.localhost:${keycloak_port}}"
 }
 
 wait_for_ready() {
