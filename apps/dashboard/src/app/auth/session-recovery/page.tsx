@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { signIn, useSession } from "next-auth/react";
+import { signIn, signOut, useSession } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   buildSessionRecoveryGuardKey,
@@ -32,6 +32,7 @@ export default function SessionRecoveryPage() {
   const searchParams = useSearchParams();
   const { data: session, status } = useSession();
   const signInStartedRef = useRef(false);
+  const signOutStartedRef = useRef(false);
 
   useEffect(() => {
     const callbackUrl = normalizeInternalCallbackUrl(
@@ -46,19 +47,30 @@ export default function SessionRecoveryPage() {
       searchParams.get("tenant") ||
       (session?.user as { tenantSlug?: string } | undefined)?.tenantSlug;
 
+    const fallbackToLogin = () => {
+      if (signOutStartedRef.current) {
+        return;
+      }
+      signOutStartedRef.current = true;
+      void signOut({ callbackUrl: fallbackPath }).catch(() => {
+        signOutStartedRef.current = false;
+        router.replace(fallbackPath);
+      });
+    };
+
     if (status === "loading") {
       return;
     }
 
     const guardKey = buildSessionRecoveryGuardKey(scope, callbackUrl);
     if (!hasActiveSessionRecoveryGuard(window.sessionStorage, guardKey)) {
-      router.replace(fallbackPath);
+      fallbackToLogin();
       return;
     }
 
     if (scope === "tenant") {
       if (!tenantSlug) {
-        router.replace(TENANT_LOGIN_PATH);
+        fallbackToLogin();
         return;
       }
 
@@ -74,7 +86,7 @@ export default function SessionRecoveryPage() {
 
     void signIn(provider, { callbackUrl }).catch(() => {
       signInStartedRef.current = false;
-      router.replace(fallbackPath);
+      fallbackToLogin();
     });
   }, [router, searchParams, session, status]);
 
