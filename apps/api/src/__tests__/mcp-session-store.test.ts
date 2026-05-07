@@ -45,7 +45,7 @@ describe("MCP session store", () => {
     };
 
     store.add("session-1", session);
-    expect(store.get("session-1")).toBe(session);
+    expect(store.get("session-1")).toMatchObject(session);
     expect(store.count()).toBe(1);
 
     store.remove("session-1");
@@ -522,5 +522,28 @@ describe("MCP session store", () => {
       store.add(`session-${i}`, { ...base, agentContext });
     }
     expect(() => store.add("session-6", { ...base, agentContext })).toThrow(SessionLimitError);
+  });
+
+  it("beginRequest rejects sessions that are not ready", () => {
+    store.add("session-1", {
+      transport: {} as never,
+      server: {} as never,
+      agentContext: {
+        id: "agent-1",
+        externalId: "agent-1",
+        tenantId: "tenant-1",
+        isAutonomous: false,
+        userId: null,
+        role: null,
+      },
+      tenantSchemaName: "tenant_test",
+      connectedAt: new Date("2026-03-04T00:00:00.000Z"),
+      lastActivityAt: new Date("2026-03-04T00:00:00.000Z"),
+      state: "initializing",
+    });
+
+    expect(store.beginRequest("session-1")).toBe(false);
+    store.setState("session-1", "ready");
+    expect(store.beginRequest("session-1")).toBe(true);
   });
 });

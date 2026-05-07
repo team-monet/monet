@@ -197,7 +197,7 @@ describe("mcp handler", () => {
     expect(transportHandleRequestMock).toHaveBeenCalledTimes(1);
   });
 
-  it("returns 401 for session ownership mismatch without closing the foreign session", async () => {
+  it("returns 404 for session ownership mismatch without closing the foreign session", async () => {
     sessionStore.add("session-foreign", {
       transport: {
         handleRequest: transportHandleRequestMock,
@@ -222,7 +222,7 @@ describe("mcp handler", () => {
       res,
     );
 
-    expect(res.statusCode).toBe(401);
+    expect(res.statusCode).toBe(404);
     expect(sessionStore.get("session-foreign")).toBeDefined();
     expect(transportCloseMock).not.toHaveBeenCalled();
   });
@@ -343,9 +343,9 @@ describe("mcp handler", () => {
     expect(res.statusCode).toBe(404);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const log = JSON.parse(warnSpy.mock.calls[0][0]);
-    expect(log.message).toBe("mcp_session_not_found");
+    expect(log.message).toBe("mcp.session.missing");
     expect(log.level).toBe("warn");
-    expect(log).not.toHaveProperty("sessionId");
+    expect(log.sessionId).toBe("missing-session");
 
     warnSpy.mockRestore();
   });
@@ -365,9 +365,9 @@ describe("mcp handler", () => {
     expect(res.statusCode).toBe(404);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const log = JSON.parse(warnSpy.mock.calls[0][0]);
-    expect(log.message).toBe("mcp_session_not_found");
+    expect(log.message).toBe("mcp.session.missing");
     expect(log.level).toBe("warn");
-    expect(log).not.toHaveProperty("sessionId");
+    expect(log.sessionId).toBe("missing-session");
 
     warnSpy.mockRestore();
   });
@@ -387,14 +387,14 @@ describe("mcp handler", () => {
     expect(res.statusCode).toBe(404);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const log = JSON.parse(warnSpy.mock.calls[0][0]);
-    expect(log.message).toBe("mcp_session_not_found");
+    expect(log.message).toBe("mcp.session.missing");
     expect(log.level).toBe("warn");
-    expect(log).not.toHaveProperty("sessionId");
+    expect(log.sessionId).toBe("missing-session");
 
     warnSpy.mockRestore();
   });
 
-  it("logs mcp_session_mismatch on POST when agent does not match", async () => {
+  it("logs mcp.session.missing on POST when agent does not match", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     sessionStore.add("session-foreign", {
       transport: {
@@ -420,17 +420,17 @@ describe("mcp handler", () => {
       res,
     );
 
-    expect(res.statusCode).toBe(401);
+    expect(res.statusCode).toBe(404);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const log = JSON.parse(warnSpy.mock.calls[0][0]);
-    expect(log.message).toBe("mcp_session_mismatch");
+    expect(log.message).toBe("mcp.session.missing");
     expect(log.level).toBe("warn");
-    expect(log.agentId).toBe("agent-1");
+    expect(log.agentId).toBe("agent-2");
 
     warnSpy.mockRestore();
   });
 
-  it("logs mcp_session_mismatch on GET when agent does not match", async () => {
+  it("logs mcp.session.missing on GET when agent does not match", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     sessionStore.add("session-foreign", {
       transport: {
@@ -456,13 +456,97 @@ describe("mcp handler", () => {
       res,
     );
 
-    expect(res.statusCode).toBe(401);
+    expect(res.statusCode).toBe(404);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const log = JSON.parse(warnSpy.mock.calls[0][0]);
-    expect(log.message).toBe("mcp_session_mismatch");
+    expect(log.message).toBe("mcp.session.missing");
     expect(log.level).toBe("warn");
-    expect(log.agentId).toBe("agent-1");
+    expect(log.agentId).toBe("agent-2");
 
     warnSpy.mockRestore();
+  });
+
+  it("returns 503 when session is initializing", async () => {
+    sessionStore.add("session-init", {
+      transport: { handleRequest: transportHandleRequestMock, close: transportCloseMock } as never,
+      server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+      agentContext: agent,
+      tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+      connectedAt: new Date(),
+      lastActivityAt: new Date(),
+      state: "initializing",
+    });
+    const { res } = createRes();
+    await handler.handle(createReq("POST", {
+      authorization: "Bearer valid",
+      "mcp-session-id": "session-init",
+    }), res);
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("returns 404 when session is failed", async () => {
+    sessionStore.add("session-failed", {
+      transport: { handleRequest: transportHandleRequestMock, close: transportCloseMock } as never,
+      server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+      agentContext: agent,
+      tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+      connectedAt: new Date(),
+      lastActivityAt: new Date(),
+      state: "failed",
+    });
+    const { res } = createRes();
+    await handler.handle(createReq("POST", {
+      authorization: "Bearer valid",
+      "mcp-session-id": "session-failed",
+    }), res);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("marks and cleans up sessions when transport request throws", async () => {
+    transportHandleRequestMock.mockRejectedValueOnce(new Error("transport blew up"));
+    sessionStore.add("session-1", {
+      transport: { handleRequest: transportHandleRequestMock, close: transportCloseMock } as never,
+      server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+      agentContext: agent,
+      tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+      connectedAt: new Date(),
+      lastActivityAt: new Date(),
+      state: "ready",
+    });
+
+    const { res } = createRes();
+    await handler.handle(createReq("POST", {
+      authorization: "Bearer valid",
+      "mcp-session-id": "session-1",
+    }), res);
+
+    expect(res.statusCode).toBe(500);
+    expect(sessionStore.get("session-1")).toBeUndefined();
+  });
+
+  it("returns timeout response and cleans up sessions", async () => {
+    process.env.MCP_REQUEST_TIMEOUT_MS = "1";
+    transportHandleRequestMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      setTimeout(resolve, 25);
+    }));
+    sessionStore.add("session-timeout", {
+      transport: { handleRequest: transportHandleRequestMock, close: transportCloseMock } as never,
+      server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+      agentContext: agent,
+      tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+      connectedAt: new Date(),
+      lastActivityAt: new Date(),
+      state: "ready",
+    });
+
+    const { res } = createRes();
+    await handler.handle(createReq("POST", {
+      authorization: "Bearer valid",
+      "mcp-session-id": "session-timeout",
+    }), res);
+
+    expect(res.statusCode).toBe(504);
+    expect(sessionStore.get("session-timeout")).toBeUndefined();
+    delete process.env.MCP_REQUEST_TIMEOUT_MS;
   });
 });

@@ -21,6 +21,7 @@ import {
   writeAuditLog,
 } from "../services/memory.service";
 import type { RuleRecord } from "../services/rule.service";
+import { writeStructuredLog } from "../lib/log";
 import packageJson from "../../package.json" with { type: "json" };
 
 function asToolResult(data: unknown): CallToolResult {
@@ -39,6 +40,57 @@ function asToolError(message: string): CallToolResult {
     content: [{ type: "text", text: message }],
     isError: true,
   };
+}
+
+const DEFAULT_MCP_TOOL_TIMEOUT_MS = 60_000;
+
+class McpToolTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "McpToolTimeoutError";
+  }
+}
+
+function currentToolTimeoutMs(): number {
+  const raw = process.env.MCP_REQUEST_TIMEOUT_MS;
+  if (!raw) return DEFAULT_MCP_TOOL_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MCP_TOOL_TIMEOUT_MS;
+  return Math.floor(parsed);
+}
+
+async function withToolTimeout<T>(
+  operation: string,
+  tenantSchemaName: string,
+  agentId: string,
+  execute: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const timeoutMs = currentToolTimeoutMs();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await Promise.race([
+      execute(controller.signal),
+      new Promise<T>((_, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          reject(new McpToolTimeoutError(`${operation} timed out after ${timeoutMs}ms`));
+        }, { once: true });
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+    if (controller.signal.aborted) {
+      writeStructuredLog({
+        level: "warn",
+        message: "mcp.request.timeout",
+        tenantSchemaName,
+        agentId,
+        operation,
+        timeoutMs,
+      });
+    }
+  }
 }
 
 function hasError(result: unknown): result is { error: string; message?: string } {
@@ -325,6 +377,29 @@ export function createMcpServer(
     },
   };
 
-  registerAllTools(server, handlers);
+  const wrap = <TArgs,>(name: string, handler: (args: TArgs) => Promise<CallToolResult>) =>
+    async (args: TArgs): Promise<CallToolResult> => {
+      try {
+        return await withToolTimeout(name, tenantSchemaName, agentContext.id, () => handler(args));
+      } catch (error) {
+        if (error instanceof McpToolTimeoutError) {
+          return asToolError("Tool execution timed out");
+        }
+        throw error;
+      }
+    };
+
+  const timedHandlers: McpToolHandlers = {
+    memoryStore: wrap("memoryStore", handlers.memoryStore),
+    memorySearch: wrap("memorySearch", handlers.memorySearch),
+    memoryFetch: wrap("memoryFetch", handlers.memoryFetch),
+    memoryUpdate: wrap("memoryUpdate", handlers.memoryUpdate),
+    memoryDelete: wrap("memoryDelete", handlers.memoryDelete),
+    memoryPromoteScope: wrap("memoryPromoteScope", handlers.memoryPromoteScope),
+    memoryMarkOutdated: wrap("memoryMarkOutdated", handlers.memoryMarkOutdated),
+    memoryListTags: wrap("memoryListTags", handlers.memoryListTags),
+  };
+
+  registerAllTools(server, timedHandlers);
   return server;
 }

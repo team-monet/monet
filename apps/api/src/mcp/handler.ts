@@ -12,6 +12,16 @@ import { logRequest, writeStructuredLog } from "../lib/log";
 import { createMcpServer } from "./server";
 import { SessionLimitError, maxSessionsPerAgent } from "./session-store";
 import type { SessionStore } from "./session-store";
+import type { McpSession } from "./session-store";
+
+const DEFAULT_MCP_REQUEST_TIMEOUT_MS = 60_000;
+
+class McpRequestTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "McpRequestTimeoutError";
+  }
+}
 
 interface McpHandlerDeps {
   db: Database;
@@ -59,7 +69,173 @@ function writeJson(
   res.end(JSON.stringify(body));
 }
 
+function currentRequestTimeoutMs(): number {
+  const raw = process.env.MCP_REQUEST_TIMEOUT_MS;
+  if (!raw) return DEFAULT_MCP_REQUEST_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MCP_REQUEST_TIMEOUT_MS;
+  return Math.floor(parsed);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new McpRequestTimeoutError(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
 export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
+  function formatAgentIdPrefix(id: string | undefined): string | undefined {
+    if (!id) return undefined;
+    return id.slice(0, 8);
+  }
+
+  function logSessionEvent(input: {
+    level: "info" | "warn" | "error";
+    message: string;
+    requestId?: string;
+    method?: string;
+    path?: string;
+    tenantSlug?: string;
+    sessionId?: string;
+    session?: McpSession;
+    reason?: string;
+    error?: unknown;
+  }) {
+    writeStructuredLog({
+      level: input.level,
+      message: input.message,
+      requestId: input.requestId,
+      method: input.method,
+      path: input.path,
+      tenantSlug: input.tenantSlug,
+      agentId: input.session?.agentContext.id,
+      agentIdPrefix: formatAgentIdPrefix(input.session?.agentContext.id),
+      sessionId: input.sessionId,
+      sessionState: input.session?.state,
+      activeRequestCount: input.sessionId ? sessionStore.getInFlightCount(input.sessionId) : undefined,
+      reason: input.reason,
+      error: input.error instanceof Error ? input.error.message : input.error,
+    });
+  }
+
+  async function failAndCloseSession(
+    sessionId: string,
+    session: McpSession,
+    reason: string,
+    error?: unknown,
+  ): Promise<void> {
+    sessionStore.setState(
+      sessionId,
+      "failed",
+      { error: error instanceof Error ? error.message : reason },
+    );
+    logSessionEvent({
+      level: "error",
+      message: "mcp.session.failed",
+      sessionId,
+      session,
+      reason,
+      error,
+      tenantSlug: session.tenantSlug,
+    });
+    await sessionStore.closeSession(sessionId);
+  }
+
+  function resolveExistingSessionOrWriteError(input: {
+    sessionId: string;
+    requestedTenantSlug: string | null;
+    tenantId?: string;
+    authAgentId: string;
+    reqMeta: { requestId: string; method: string; path: string };
+    res: ServerResponse;
+  }): McpSession | null {
+    const session = sessionStore.get(input.sessionId);
+    if (!session) {
+      logSessionEvent({
+        level: "warn",
+        message: "mcp.session.missing",
+        requestId: input.reqMeta.requestId,
+        method: input.reqMeta.method,
+        path: input.reqMeta.path,
+        tenantSlug: input.requestedTenantSlug ?? undefined,
+        sessionId: input.sessionId,
+        reason: "missing",
+      });
+      writeJson(input.res, 404, { error: "not_found", message: "Session not found" });
+      return null;
+    }
+
+    if (session.agentContext.id !== input.authAgentId) {
+      logSessionEvent({
+        level: "warn",
+        message: "mcp.session.missing",
+        requestId: input.reqMeta.requestId,
+        method: input.reqMeta.method,
+        path: input.reqMeta.path,
+        tenantSlug: input.requestedTenantSlug ?? undefined,
+        sessionId: input.sessionId,
+        session,
+        reason: "agent_mismatch",
+      });
+      writeJson(input.res, 404, { error: "not_found", message: "Session not found" });
+      return null;
+    }
+
+    const sessionTenantMatches = session.tenantSlug
+      ? session.tenantSlug === input.requestedTenantSlug
+      : (session.tenantId ?? session.agentContext.tenantId) === input.tenantId;
+    if (input.requestedTenantSlug && !sessionTenantMatches) {
+      logSessionEvent({
+        level: "warn",
+        message: "mcp.session.missing",
+        requestId: input.reqMeta.requestId,
+        method: input.reqMeta.method,
+        path: input.reqMeta.path,
+        tenantSlug: input.requestedTenantSlug,
+        sessionId: input.sessionId,
+        session,
+        reason: "tenant_mismatch",
+      });
+      writeJson(input.res, 404, { error: "not_found", message: "Session not found" });
+      return null;
+    }
+
+    const sessionState = session.state ?? "ready";
+
+    if (sessionState === "initializing") {
+      writeJson(input.res, 503, { error: "unavailable", message: "Session is initializing" });
+      return null;
+    }
+
+    if (sessionState === "failed" || sessionState === "closed" || sessionState === "closing") {
+      logSessionEvent({
+        level: "warn",
+        message: "mcp.session.missing",
+        requestId: input.reqMeta.requestId,
+        method: input.reqMeta.method,
+        path: input.reqMeta.path,
+        tenantSlug: input.requestedTenantSlug ?? undefined,
+        sessionId: input.sessionId,
+        session,
+        reason: `state_${sessionState}`,
+      });
+      writeJson(input.res, 404, { error: "not_found", message: "Session not found" });
+      return null;
+    }
+
+    return session;
+  }
+
   return {
     async handle(req: IncomingMessage, res: ServerResponse) {
       const method = req.method ?? "GET";
@@ -143,10 +319,18 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             });
 
             transport.onclose = () => {
+              logSessionEvent({
+                level: "info",
+                message: "mcp.session.closed",
+                sessionId: newSessionId,
+                reason: "client",
+              });
               sessionStore.remove(newSessionId);
             };
             transport.onerror = (error) => {
-              console.error("MCP transport error", error);
+              const existing = sessionStore.get(newSessionId);
+              if (!existing) return;
+              void failAndCloseSession(newSessionId, existing, "transport_error", error);
             };
 
             await server.connect(transport);
@@ -160,6 +344,28 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
                 tenantSchemaName: schemaName,
                 connectedAt: new Date(),
                 lastActivityAt: new Date(),
+                state: "ready",
+                initializedAt: new Date(),
+              });
+              logSessionEvent({
+                level: "info",
+                message: "mcp.session.created",
+                requestId,
+                method,
+                path,
+                tenantSlug: requestedTenantSlug ?? undefined,
+                sessionId: newSessionId,
+                session: sessionStore.get(newSessionId),
+              });
+              logSessionEvent({
+                level: "info",
+                message: "mcp.session.ready",
+                requestId,
+                method,
+                path,
+                tenantSlug: requestedTenantSlug ?? undefined,
+                sessionId: newSessionId,
+                session: sessionStore.get(newSessionId),
               });
             } catch (error) {
               if (error instanceof SessionLimitError) {
@@ -188,8 +394,16 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             try {
               // The MCP SDK reads POST request bodies from the raw Node stream.
               // Do not pre-consume req here.
-              sessionStore.beginRequest(newSessionId);
-              await transport.handleRequest(req, res);
+              const began = sessionStore.beginRequest(newSessionId);
+              if (!began) {
+                writeJson(res, 503, { error: "unavailable", message: "Session is not ready" });
+                return;
+              }
+              await withTimeout(
+                transport.handleRequest(req, res),
+                currentRequestTimeoutMs(),
+                "MCP request timed out",
+              );
               if (res.statusCode >= 400) {
                 await sessionStore.closeSession(newSessionId);
                 return;
@@ -197,8 +411,28 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               sessionStore.touch(newSessionId);
               return;
             } catch (error) {
-              console.error("MCP request error (new session)", error);
-              await sessionStore.closeSession(newSessionId);
+              const createdSession = sessionStore.get(newSessionId);
+              if (error instanceof McpRequestTimeoutError) {
+                logSessionEvent({
+                  level: "warn",
+                  message: "mcp.request.timeout",
+                  requestId,
+                  method,
+                  path,
+                  tenantSlug: requestedTenantSlug ?? undefined,
+                  sessionId: newSessionId,
+                  session: createdSession,
+                  reason: "request_timeout",
+                });
+                if (createdSession) {
+                  await failAndCloseSession(newSessionId, createdSession, "request_timeout", error);
+                }
+                writeJson(res, 504, { error: "timeout", message: "MCP request timed out" });
+                return;
+              }
+              if (createdSession) {
+                await failAndCloseSession(newSessionId, createdSession, "request_error", error);
+              }
               writeJson(res, 500, {
                 error: "internal",
                 message: "An internal error occurred",
@@ -209,60 +443,46 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             }
           }
 
-          const session = sessionStore.get(sessionId);
-          if (!session) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_not_found",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug ?? undefined,
-              agentId,
-              userAgent,
-            });
-            writeJson(res, 404, { error: "not_found", message: "Session not found" });
-            return;
-          }
-
-          if (session.agentContext.id !== auth.agent.id) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_mismatch",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug ?? undefined,
-              agentId,
-            });
-            writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
-            return;
-          }
-
-          const sessionTenantMatches = session.tenantSlug
-            ? session.tenantSlug === requestedTenantSlug
-            : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
-          if (requestedTenantSlug && !sessionTenantMatches) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_mismatch",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug,
-              agentId,
-            });
-            writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
-            return;
-          }
+          const session = resolveExistingSessionOrWriteError({
+            sessionId,
+            requestedTenantSlug,
+            tenantId,
+            authAgentId: auth.agent.id,
+            reqMeta: { requestId, method, path },
+            res,
+          });
+          if (!session) return;
 
           sessionStore.touch(sessionId);
           try {
-            sessionStore.beginRequest(sessionId);
-            await session.transport.handleRequest(req, res);
+            const began = sessionStore.beginRequest(sessionId);
+            if (!began) {
+              writeJson(res, 503, { error: "unavailable", message: "Session is not ready" });
+              return;
+            }
+            await withTimeout(
+              session.transport.handleRequest(req, res),
+              currentRequestTimeoutMs(),
+              "MCP request timed out",
+            );
             return;
           } catch (error) {
-            console.error("MCP request error (existing session)", error);
+            if (error instanceof McpRequestTimeoutError) {
+              logSessionEvent({
+                level: "warn",
+                message: "mcp.request.timeout",
+                requestId,
+                method,
+                path,
+                tenantSlug: requestedTenantSlug ?? undefined,
+                sessionId,
+                session,
+              });
+              await failAndCloseSession(sessionId, session, "request_timeout", error);
+              writeJson(res, 504, { error: "timeout", message: "MCP request timed out" });
+              return;
+            }
+            await failAndCloseSession(sessionId, session, "transport_request_error", error);
             writeJson(res, 500, {
               error: "internal",
               message: "An internal error occurred",
@@ -303,60 +523,46 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
           agentId = auth.agent.id;
           tenantId = tenantId ?? auth.agent.tenantId;
 
-          const session = sessionStore.get(sessionId);
-          if (!session) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_not_found",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug ?? undefined,
-              agentId,
-              userAgent,
-            });
-            writeJson(res, 404, { error: "not_found", message: "Session not found" });
-            return;
-          }
-
-          if (session.agentContext.id !== auth.agent.id) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_mismatch",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug ?? undefined,
-              agentId,
-            });
-            writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
-            return;
-          }
-
-          const sessionTenantMatches = session.tenantSlug
-            ? session.tenantSlug === requestedTenantSlug
-            : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
-          if (requestedTenantSlug && !sessionTenantMatches) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_mismatch",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug,
-              agentId,
-            });
-            writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
-            return;
-          }
+          const session = resolveExistingSessionOrWriteError({
+            sessionId,
+            requestedTenantSlug,
+            tenantId,
+            authAgentId: auth.agent.id,
+            reqMeta: { requestId, method, path },
+            res,
+          });
+          if (!session) return;
 
           sessionStore.touch(sessionId);
           try {
-            sessionStore.beginRequest(sessionId);
-            await session.transport.handleRequest(req, res);
+            const began = sessionStore.beginRequest(sessionId);
+            if (!began) {
+              writeJson(res, 503, { error: "unavailable", message: "Session is not ready" });
+              return;
+            }
+            await withTimeout(
+              session.transport.handleRequest(req, res),
+              currentRequestTimeoutMs(),
+              "MCP request timed out",
+            );
             return;
           } catch (error) {
-            console.error("MCP request error (GET session)", error);
+            if (error instanceof McpRequestTimeoutError) {
+              logSessionEvent({
+                level: "warn",
+                message: "mcp.request.timeout",
+                requestId,
+                method,
+                path,
+                tenantSlug: requestedTenantSlug ?? undefined,
+                sessionId,
+                session,
+              });
+              await failAndCloseSession(sessionId, session, "request_timeout", error);
+              writeJson(res, 504, { error: "timeout", message: "MCP request timed out" });
+              return;
+            }
+            await failAndCloseSession(sessionId, session, "transport_request_error", error);
             writeJson(res, 500, {
               error: "internal",
               message: "An internal error occurred",
@@ -409,53 +615,27 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             return;
           }
 
-          const session = sessionStore.get(sessionId);
-          if (!session) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_not_found",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug ?? undefined,
-              agentId,
-              userAgent,
-            });
-            writeJson(res, 404, { error: "not_found", message: "Session not found" });
-            return;
-          }
+          const session = resolveExistingSessionOrWriteError({
+            sessionId,
+            requestedTenantSlug,
+            tenantId,
+            authAgentId: auth.agent.id,
+            reqMeta: { requestId, method, path },
+            res,
+          });
+          if (!session) return;
 
-          if (session.agentContext.id !== auth.agent.id) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_mismatch",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug ?? undefined,
-              agentId,
-            });
-            writeJson(res, 401, { error: "unauthorized", message: "Session authentication mismatch" });
-            return;
-          }
-
-          const sessionTenantMatches = session.tenantSlug
-            ? session.tenantSlug === requestedTenantSlug
-            : (session.tenantId ?? session.agentContext.tenantId) === tenantId;
-          if (requestedTenantSlug && !sessionTenantMatches) {
-            writeStructuredLog({
-              level: "warn",
-              message: "mcp_session_mismatch",
-              requestId,
-              method,
-              path,
-              tenantSlug: requestedTenantSlug,
-              agentId,
-            });
-            writeJson(res, 401, { error: "unauthorized", message: "Session tenant mismatch" });
-            return;
-          }
-
+          logSessionEvent({
+            level: "info",
+            message: "mcp.session.closed",
+            requestId,
+            method,
+            path,
+            tenantSlug: requestedTenantSlug ?? undefined,
+            sessionId,
+            session,
+            reason: "client",
+          });
           await sessionStore.closeSession(sessionId);
           writeJson(res, 200, { success: true });
           return;

@@ -46,11 +46,19 @@ export interface McpSession {
   tenantSchemaName: string;
   connectedAt: Date;
   lastActivityAt: Date;
+  state?: McpSessionState;
+  initializedAt?: Date;
+  failedAt?: Date;
+  closedAt?: Date;
+  lastError?: string;
 }
+
+export type McpSessionState = "initializing" | "ready" | "closing" | "closed" | "failed";
 
 export class SessionStore {
   private sessions = new Map<string, McpSession>();
   private inFlightRequests = new Map<string, number>();
+  private versions = new Map<string, number>();
   private sweepTimer: NodeJS.Timeout | null = null;
 
   add(sessionId: string, session: McpSession): void {
@@ -61,8 +69,13 @@ export class SessionStore {
     if (agentSessionCount >= maxSessionsPerAgent()) {
       throw new SessionLimitError("Per-agent session limit reached");
     }
-    this.sessions.set(sessionId, session);
+    this.sessions.set(sessionId, {
+      ...session,
+      state: session.state ?? "ready",
+      initializedAt: session.initializedAt ?? new Date(),
+    });
     this.inFlightRequests.set(sessionId, 0);
+    this.versions.set(sessionId, 0);
   }
 
   get(sessionId: string): McpSession | undefined {
@@ -76,12 +89,38 @@ export class SessionStore {
   remove(sessionId: string): void {
     this.sessions.delete(sessionId);
     this.inFlightRequests.delete(sessionId);
+    this.versions.delete(sessionId);
   }
 
   touch(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     session.lastActivityAt = new Date();
+    this.bumpVersion(sessionId);
+  }
+
+  getInFlightCount(sessionId: string): number {
+    return this.inFlightRequests.get(sessionId) ?? 0;
+  }
+
+  setState(sessionId: string, state: McpSessionState, details?: { error?: string }): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    const now = new Date();
+    session.state = state;
+    if (state === "ready") {
+      session.initializedAt = now;
+      session.failedAt = undefined;
+      session.closedAt = undefined;
+      session.lastError = undefined;
+    } else if (state === "failed") {
+      session.failedAt = now;
+      session.lastError = details?.error;
+    } else if (state === "closed") {
+      session.closedAt = now;
+    }
+    this.bumpVersion(sessionId);
+    return true;
   }
 
   getByAgentId(agentId: string): McpSession[] {
@@ -100,8 +139,11 @@ export class SessionStore {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    this.setState(sessionId, "closing");
+
     this.sessions.delete(sessionId);
     this.inFlightRequests.delete(sessionId);
+    this.versions.delete(sessionId);
     await Promise.allSettled([
       session.transport.close(),
       session.server.close(),
@@ -111,6 +153,7 @@ export class SessionStore {
   beginRequest(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
+    if ((session.state ?? "ready") !== "ready") return false;
 
     const current = this.inFlightRequests.get(sessionId) ?? 0;
     this.inFlightRequests.set(sessionId, current + 1);
@@ -122,9 +165,11 @@ export class SessionStore {
     if (current === undefined) return;
     if (current <= 1) {
       this.inFlightRequests.set(sessionId, 0);
+      this.bumpVersion(sessionId);
       return;
     }
     this.inFlightRequests.set(sessionId, current - 1);
+    this.bumpVersion(sessionId);
   }
 
   async closeIfIdle(sessionId: string): Promise<boolean> {
@@ -132,15 +177,20 @@ export class SessionStore {
     if (!session) return false;
 
     const idleTtlMs = currentIdleTtlMs();
+    const initialVersion = this.versions.get(sessionId) ?? 0;
     const firstIdleCheck = Date.now() - session.lastActivityAt.getTime() > idleTtlMs;
     if (!firstIdleCheck) return false;
     if ((this.inFlightRequests.get(sessionId) ?? 0) > 0) return false;
+    if ((session.state ?? "ready") !== "ready") return false;
 
     const latest = this.sessions.get(sessionId);
     if (!latest) return false;
+    const latestVersion = this.versions.get(sessionId) ?? 0;
+    if (latestVersion !== initialVersion) return false;
     const secondIdleCheck = Date.now() - latest.lastActivityAt.getTime() > idleTtlMs;
     if (!secondIdleCheck) return false;
     if ((this.inFlightRequests.get(sessionId) ?? 0) > 0) return false;
+    if ((latest.state ?? "ready") !== "ready") return false;
 
     await this.closeSession(sessionId);
     return true;
@@ -191,6 +241,12 @@ export class SessionStore {
     if (!this.sweepTimer) return;
     clearInterval(this.sweepTimer);
     this.sweepTimer = null;
+  }
+
+  private bumpVersion(sessionId: string): void {
+    const current = this.versions.get(sessionId);
+    if (current === undefined) return;
+    this.versions.set(sessionId, current + 1);
   }
 }
 
