@@ -133,7 +133,7 @@ export async function resolveOidcProviderConfig(issuer: string) {
     browserIssuer,
     serverIssuer: resolvedServerIssuer,
     issuer: browserIssuer,
-    wellKnown: `${browserIssuer}/.well-known/openid-configuration`,
+    wellKnown: `${resolvedServerIssuer}/.well-known/openid-configuration`,
     authorization: replaceUrlOrigin(
       discovery.authorization_endpoint,
       browserIssuer,
