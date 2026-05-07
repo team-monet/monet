@@ -540,28 +540,9 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
               writeJson(res, 503, { error: "unavailable", message: "Session is not ready" });
               return;
             }
-            await withTimeout(
-              session.transport.handleRequest(req, res),
-              currentRequestTimeoutMs(),
-              "MCP request timed out",
-            );
+            await session.transport.handleRequest(req, res);
             return;
           } catch (error) {
-            if (error instanceof McpRequestTimeoutError) {
-              logSessionEvent({
-                level: "warn",
-                message: "mcp.request.timeout",
-                requestId,
-                method,
-                path,
-                tenantSlug: requestedTenantSlug ?? undefined,
-                sessionId,
-                session,
-              });
-              await failAndCloseSession(sessionId, session, "request_timeout", error);
-              writeJson(res, 504, { error: "timeout", message: "MCP request timed out" });
-              return;
-            }
             await failAndCloseSession(sessionId, session, "transport_request_error", error);
             writeJson(res, 500, {
               error: "internal",

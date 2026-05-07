@@ -549,4 +549,30 @@ describe("mcp handler", () => {
     expect(sessionStore.get("session-timeout")).toBeUndefined();
     delete process.env.MCP_REQUEST_TIMEOUT_MS;
   });
+
+  it("does not apply request timeout to GET stream requests", async () => {
+    process.env.MCP_REQUEST_TIMEOUT_MS = "1";
+    transportHandleRequestMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      setTimeout(resolve, 25);
+    }));
+    sessionStore.add("session-get", {
+      transport: { handleRequest: transportHandleRequestMock, close: transportCloseMock } as never,
+      server: { close: vi.fn().mockResolvedValue(undefined) } as never,
+      agentContext: agent,
+      tenantSchemaName: "tenant_00000000_0000_0000_0000_000000000010",
+      connectedAt: new Date(),
+      lastActivityAt: new Date(),
+      state: "ready",
+    });
+
+    const { res } = createRes();
+    await handler.handle(createReq("GET", {
+      authorization: "Bearer valid",
+      "mcp-session-id": "session-get",
+    }), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(sessionStore.get("session-get")).toBeDefined();
+    delete process.env.MCP_REQUEST_TIMEOUT_MS;
+  });
 });
