@@ -13,9 +13,9 @@ import {
   type TransactionClient,
 } from "@monet/db";
 import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
 import { requireAdmin } from "@/lib/auth";
 import { getSqlClient } from "@/lib/db";
+import type { MemberActionState, UserGroupActionState } from "./actions-shared";
 
 async function withTenantDb<T>(tenantId: string, fn: (db: Database, sql: TransactionClient) => Promise<T>): Promise<T> {
   return withTenantDrizzleScope(getSqlClient(), tenantSchemaNameFromId(tenantId), fn);
@@ -58,13 +58,15 @@ async function ensureUserGroupInTenant(tenantId: string, userGroupId: string) {
   });
 }
 
-export async function createUserGroupAction(formData: FormData) {
+export async function createUserGroupAction(
+  formData: FormData,
+): Promise<UserGroupActionState> {
   const tenantId = await requireAdminTenantId();
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
 
   if (!name) {
-    redirect("/admin/user-groups?createError=User%20group%20name%20is%20required");
+    return { status: "error", message: "User group name is required" };
   }
 
   try {
@@ -77,29 +79,30 @@ export async function createUserGroupAction(formData: FormData) {
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to create user group";
-    redirect(`/admin/user-groups?createError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/user-groups");
-  redirect("/admin/user-groups?created=1");
+  return {
+    status: "success",
+    message: "The new user group is ready for members and agent-group permissions.",
+  };
 }
 
-export async function updateUserGroupAction(formData: FormData) {
+export async function updateUserGroupAction(
+  formData: FormData,
+): Promise<UserGroupActionState> {
   const tenantId = await requireAdminTenantId();
   const userGroupId = toSingle(formData.get("userGroupId"));
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
-  const redirectPath = userGroupId
-    ? userGroupDetailPath(userGroupId)
-    : "/admin/user-groups";
-
   if (!userGroupId || !name) {
-    redirect(`${redirectPath}?updateError=Group%20ID%20and%20name%20are%20required`);
+    return { status: "error", message: "Group ID and name are required" };
   }
 
   const group = await ensureUserGroupInTenant(tenantId, userGroupId);
   if (!group) {
-    redirect(`${redirectPath}?updateError=User%20group%20not%20found`);
+    return { status: "error", message: "User group not found" };
   }
 
   try {
@@ -111,24 +114,23 @@ export async function updateUserGroupAction(formData: FormData) {
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to update user group";
-    redirect(`${redirectPath}?updateError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/user-groups");
-  revalidatePath(redirectPath);
-  redirect(`${redirectPath}?updated=1`);
+  revalidatePath(userGroupDetailPath(userGroupId));
+  return { status: "success", message: "The group details were saved." };
 }
 
-export async function addUserGroupMemberAction(formData: FormData) {
+export async function addUserGroupMemberAction(
+  formData: FormData,
+): Promise<MemberActionState> {
   const tenantId = await requireAdminTenantId();
   const userGroupId = toSingle(formData.get("userGroupId"));
   const userId = toSingle(formData.get("userId"));
-  const redirectPath = userGroupId
-    ? userGroupDetailPath(userGroupId)
-    : "/admin/user-groups";
 
   if (!userGroupId || !userId) {
-    redirect(`${redirectPath}?memberError=User%20group%20and%20user%20are%20required`);
+    return { status: "error", message: "User group and user are required" };
   }
 
   const [group, user] = await Promise.all([
@@ -144,68 +146,76 @@ export async function addUserGroupMemberAction(formData: FormData) {
   ]);
 
   if (!group || !user) {
-    redirect(`${redirectPath}?memberError=User%20group%20or%20user%20not%20found`);
+    return { status: "error", message: "User group or user not found" };
   }
 
-  await withTenantDb(tenantId, async (db) => {
-    await db
-      .insert(userGroupMembers)
-      .values({ userGroupId, userId })
-      .onConflictDoNothing();
-  });
+  try {
+    await withTenantDb(tenantId, async (db) => {
+      await db
+        .insert(userGroupMembers)
+        .values({ userGroupId, userId })
+        .onConflictDoNothing();
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to add member";
+    return { status: "error", message };
+  }
 
   revalidatePath("/admin/user-groups");
-  revalidatePath(redirectPath);
-  redirect(`${redirectPath}?memberAdded=1`);
+  revalidatePath(userGroupDetailPath(userGroupId));
+  return { status: "success", message: "The user now belongs to this user group.", action: "add", userId };
 }
 
-export async function removeUserGroupMemberAction(formData: FormData) {
+export async function removeUserGroupMemberAction(
+  formData: FormData,
+): Promise<MemberActionState> {
   const tenantId = await requireAdminTenantId();
   const userGroupId = toSingle(formData.get("userGroupId"));
   const userId = toSingle(formData.get("userId"));
-  const redirectPath = userGroupId
-    ? userGroupDetailPath(userGroupId)
-    : "/admin/user-groups";
 
   if (!userGroupId || !userId) {
-    redirect(`${redirectPath}?memberError=User%20group%20and%20user%20are%20required`);
+    return { status: "error", message: "User group and user are required" };
   }
 
   const group = await ensureUserGroupInTenant(tenantId, userGroupId);
   if (!group) {
-    redirect(`${redirectPath}?memberError=User%20group%20not%20found`);
+    return { status: "error", message: "User group not found" };
   }
 
-  await withTenantDb(tenantId, async (db) => {
-    await db
-      .delete(userGroupMembers)
-      .where(
-        and(
-          eq(userGroupMembers.userGroupId, userGroupId),
-          eq(userGroupMembers.userId, userId),
-        ),
-      );
-  });
+  try {
+    await withTenantDb(tenantId, async (db) => {
+      await db
+        .delete(userGroupMembers)
+        .where(
+          and(
+            eq(userGroupMembers.userGroupId, userGroupId),
+            eq(userGroupMembers.userId, userId),
+          ),
+        );
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to remove member";
+    return { status: "error", message };
+  }
 
   revalidatePath("/admin/user-groups");
-  revalidatePath(redirectPath);
-  redirect(`${redirectPath}?memberRemoved=1`);
+  revalidatePath(userGroupDetailPath(userGroupId));
+  return { status: "success", message: "The user was removed from this user group.", action: "remove", userId };
 }
 
-export async function saveUserGroupAgentPermissionsAction(formData: FormData) {
+export async function saveUserGroupAgentPermissionsAction(
+  formData: FormData,
+): Promise<UserGroupActionState> {
   const tenantId = await requireAdminTenantId();
   const userGroupId = toSingle(formData.get("userGroupId"));
-  const redirectPath = userGroupId
-    ? userGroupDetailPath(userGroupId)
-    : "/admin/user-groups";
 
   if (!userGroupId) {
-    redirect(`${redirectPath}?permissionsError=User%20group%20is%20required`);
+    return { status: "error", message: "User group is required" };
   }
 
   const group = await ensureUserGroupInTenant(tenantId, userGroupId);
   if (!group) {
-    redirect(`${redirectPath}?permissionsError=User%20group%20not%20found`);
+    return { status: "error", message: "User group not found" };
   }
 
   const selectedAgentGroupIds = formData
@@ -229,28 +239,36 @@ export async function saveUserGroupAgentPermissionsAction(formData: FormData) {
         });
 
   if (agentGroupRows.length !== selectedAgentGroupIds.length) {
-    redirect(`${redirectPath}?permissionsError=One%20or%20more%20agent%20groups%20were%20invalid`);
+    return { status: "error", message: "One or more agent groups were invalid" };
   }
 
-  await withTenantDb(tenantId, async (db) => {
-    await db.transaction(async (tx) => {
-      await tx
-        .delete(userGroupAgentGroupPermissions)
-        .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId));
+  try {
+    await withTenantDb(tenantId, async (db) => {
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(userGroupAgentGroupPermissions)
+          .where(eq(userGroupAgentGroupPermissions.userGroupId, userGroupId));
 
-      if (selectedAgentGroupIds.length > 0) {
-        await tx.insert(userGroupAgentGroupPermissions).values(
-          selectedAgentGroupIds.map((agentGroupId) => ({
-            userGroupId,
-            agentGroupId,
-          })),
-        );
-      }
+        if (selectedAgentGroupIds.length > 0) {
+          await tx.insert(userGroupAgentGroupPermissions).values(
+            selectedAgentGroupIds.map((agentGroupId) => ({
+              userGroupId,
+              agentGroupId,
+            })),
+          );
+        }
+      });
     });
-  });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to save permissions";
+    return { status: "error", message };
+  }
 
   revalidatePath("/admin/user-groups");
-  revalidatePath(redirectPath);
+  revalidatePath(userGroupDetailPath(userGroupId));
   revalidatePath("/agents");
-  redirect(`${redirectPath}?permissionsSaved=1`);
+  return {
+    status: "success",
+    message: "The allowed agent groups for this user group were updated.",
+  };
 }

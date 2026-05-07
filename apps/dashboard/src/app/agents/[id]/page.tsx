@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Activity, ArrowLeft, Bot, Calendar, Scale, ShieldAlert, User, Users } from "lucide-react";
+import { Activity, ArrowLeft, Bot, Calendar, ShieldAlert, User, Users } from "lucide-react";
 import type { AgentDetail, RuleSet } from "@monet/types";
 import { getApiClient } from "@/lib/api-client";
 import { requireAuth } from "@/lib/auth";
@@ -8,9 +8,8 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { SubmitButton } from "@/components/ui/submit-button";
 import AgentDetailActions from "./agent-detail-actions";
-import { attachRuleSetToAgentAction, detachRuleSetFromAgentAction } from "./actions";
+import { AgentRulesManager } from "./agent-rules-manager";
 
 interface ExtendedUser {
   id?: string;
@@ -19,20 +18,12 @@ interface ExtendedUser {
 
 interface PageProps {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }
 
-function getSingleParam(value: string | string[] | undefined) {
-  return Array.isArray(value) ? value[0] : value;
-}
-
-export default async function AgentDetailPage({ params, searchParams }: PageProps) {
-  const [{ id }, query, session] = await Promise.all([params, searchParams, requireAuth()]);
+export default async function AgentDetailPage({ params }: PageProps) {
+  const [{ id }, session] = await Promise.all([params, requireAuth()]);
   const sessionUser = session.user as ExtendedUser;
   const isAdmin = sessionUser.role === "tenant_admin";
-  const ruleSetAttached = getSingleParam(query.ruleSetAttached) === "1";
-  const ruleSetDetached = getSingleParam(query.ruleSetDetached) === "1";
-  const ruleSetError = getSingleParam(query.ruleSetError);
 
   let agent: AgentDetail | null = null;
   let status: { activeSessions: number; revoked: boolean } | null = null;
@@ -81,7 +72,6 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
   const availableRuleSets = [...sharedRuleSets, ...personalRuleSets].filter(
     (ruleSet) => !agent.ruleSets.some((attachedRuleSet) => attachedRuleSet.id === ruleSet.id),
   );
-  const returnTo = `/agents/${agent.id}`;
 
   return (
     <div className="flex flex-col gap-6 p-4">
@@ -142,27 +132,6 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
           />
         </div>
       </div>
-
-      {ruleSetAttached && (
-        <Alert>
-          <AlertTitle>Rule set attached</AlertTitle>
-          <AlertDescription>The selected rule set is now attached to this agent.</AlertDescription>
-        </Alert>
-      )}
-
-      {ruleSetDetached && (
-        <Alert>
-          <AlertTitle>Rule set detached</AlertTitle>
-          <AlertDescription>The rule set was removed from this agent.</AlertDescription>
-        </Alert>
-      )}
-
-      {ruleSetError && (
-        <Alert variant="destructive">
-          <AlertTitle>Rule set update failed</AlertTitle>
-          <AlertDescription>{ruleSetError}</AlertDescription>
-        </Alert>
-      )}
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Card>
@@ -247,120 +216,14 @@ export default async function AgentDetailPage({ params, searchParams }: PageProp
       </div>
 
       {(canManageRuleSets || agent.ruleSets.length > 0) && (
-        <div className="grid gap-4 xl:grid-cols-3">
-          <Card className="xl:col-span-2">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Scale className="h-4 w-4" />
-                Direct Rule Sets
-              </CardTitle>
-              <CardDescription>
-                Rule sets currently attached directly to this agent. Group-inherited guidance is applied separately.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {agent.ruleSets.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No direct rule sets are attached to this agent.</p>
-              ) : (
-                agent.ruleSets.map((ruleSet) => (
-                  <div key={ruleSet.id} className="flex items-center justify-between gap-3 rounded-md border p-3">
-                    <div className="space-y-1">
-                      {ruleSet.ownerUserId ? (
-                        ruleSet.ownerUserId === sessionUser.id ? (
-                          <Link href={`/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
-                            {ruleSet.name}
-                          </Link>
-                        ) : (
-                          <p className="font-medium">{ruleSet.name}</p>
-                        )
-                      ) : (
-                        <Link href={`/admin/rules/sets/${ruleSet.id}`} className="font-medium hover:underline">
-                          {ruleSet.name}
-                        </Link>
-                      )}
-                      <p className="text-xs text-muted-foreground">
-                        {ruleSet.ruleIds.length} {ruleSet.ruleIds.length === 1 ? "rule" : "rules"} · {ruleSet.ownerUserId ? "Personal" : "Shared"}
-                      </p>
-                    </div>
-                    {canManageRuleSets && (
-                      <form action={detachRuleSetFromAgentAction}>
-                        <input type="hidden" name="agentId" value={agent.id} />
-                        <input type="hidden" name="ruleSetId" value={ruleSet.id} />
-                        <input type="hidden" name="returnTo" value={returnTo} />
-                        <SubmitButton label="Detach" pendingLabel="Detaching..." variant="outline" size="sm" />
-                      </form>
-                    )}
-                  </div>
-                ))
-              )}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Attach Rule Set</CardTitle>
-              <CardDescription>
-                {canManageRuleSets
-                  ? isOwnedBySessionUser
-                    ? "Apply either a shared rule set or one of your personal rule sets to this agent."
-                    : "Apply a shared rule set from the tenant catalog to this agent."
-                  : "Only tenant admins or the agent owner can modify direct rule sets."}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {canManageRuleSets ? (
-                <>
-                  <form action={attachRuleSetToAgentAction} className="space-y-3">
-                    <input type="hidden" name="agentId" value={agent.id} />
-                    <input type="hidden" name="returnTo" value={returnTo} />
-                    <div className="grid gap-2">
-                      <label htmlFor="ruleSetId" className="text-sm font-medium">
-                        Available rule sets
-                      </label>
-                      <select
-                        id="ruleSetId"
-                        name="ruleSetId"
-                        className="h-10 rounded-md border bg-background px-3 text-sm"
-                        defaultValue={availableRuleSets[0]?.id ?? ""}
-                        disabled={availableRuleSets.length === 0}
-                      >
-                        {availableRuleSets.length === 0 ? (
-                          <option value="">No more rule sets available</option>
-                        ) : (
-                          availableRuleSets.map((ruleSet) => (
-                            <option key={ruleSet.id} value={ruleSet.id}>
-                              {ruleSet.name} {ruleSet.ownerUserId ? "(Personal)" : "(Shared)"}
-                            </option>
-                          ))
-                        )}
-                      </select>
-                    </div>
-                    <SubmitButton
-                      label="Attach Rule Set"
-                      pendingLabel="Attaching..."
-                      className="w-full"
-                      disabled={availableRuleSets.length === 0}
-                    />
-                  </form>
-                  <div className="flex flex-col items-start gap-2">
-                    {isOwnedBySessionUser && (
-                      <Button asChild variant="ghost" className="px-0">
-                        <Link href="/rules">Manage personal rules</Link>
-                      </Button>
-                    )}
-                    <Button asChild variant="ghost" className="px-0">
-                      <Link href="/admin/rules">Browse shared rules</Link>
-                    </Button>
-                  </div>
-                </>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  Rule sets can be reviewed in the shared rules catalog.
-                </p>
-              )}
-            </CardContent>
-          </Card>
-        </div>
+        <AgentRulesManager
+          agentId={agent.id}
+          sessionUserId={sessionUser.id}
+          canManageRuleSets={canManageRuleSets}
+          isOwnedBySessionUser={isOwnedBySessionUser}
+          attachedRuleSets={agent.ruleSets}
+          availableRuleSets={availableRuleSets}
+        />
       )}
     </div>
   );

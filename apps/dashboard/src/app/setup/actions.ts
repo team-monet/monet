@@ -1,12 +1,13 @@
 "use server";
 
 import { cookies, headers } from "next/headers";
-import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
 import {
   exchangeBootstrapToken,
   savePlatformSetup,
   SETUP_SESSION_COOKIE_NAME,
 } from "@/lib/bootstrap";
+import type { SetupActionState } from "./actions-shared";
 
 function isSecureConnection(requestHeaders: Headers): boolean {
   const forwardedProto = requestHeaders.get("x-forwarded-proto");
@@ -20,10 +21,15 @@ function isSecureConnection(requestHeaders: Headers): boolean {
   return process.env.NEXTAUTH_URL?.startsWith("https://") ?? false;
 }
 
-export async function exchangeBootstrapTokenAction(formData: FormData) {
+export async function exchangeBootstrapTokenAction(
+  formData: FormData,
+): Promise<SetupActionState> {
   const token = formData.get("token");
   if (typeof token !== "string" || token.trim().length === 0) {
-    redirect("/setup?error=Bootstrap%20token%20is%20required");
+    return {
+      status: "error",
+      message: "Bootstrap token is required.",
+    };
   }
 
   try {
@@ -38,17 +44,25 @@ export async function exchangeBootstrapTokenAction(formData: FormData) {
       path: "/",
     });
   } catch (error) {
-    const message =
-      error instanceof Error
-        ? error.message
-        : "Failed to exchange bootstrap token";
-    redirect(`/setup?error=${encodeURIComponent(message)}`);
+    return {
+      status: "error",
+      message:
+        error instanceof Error
+          ? error.message
+          : "Failed to exchange bootstrap token",
+    };
   }
 
-  redirect("/setup?step=platform-auth");
+  revalidatePath("/setup");
+  return {
+    status: "success",
+    message: "Bootstrap token accepted. Continue with platform configuration.",
+  };
 }
 
-export async function savePlatformSetupAction(formData: FormData) {
+export async function savePlatformSetupAction(
+  formData: FormData,
+): Promise<SetupActionState> {
   const issuer = formData.get("issuer");
   const clientId = formData.get("clientId");
   const clientSecret = formData.get("clientSecret");
@@ -60,7 +74,10 @@ export async function savePlatformSetupAction(formData: FormData) {
     typeof clientSecret !== "string" ||
     typeof adminEmail !== "string"
   ) {
-    redirect("/setup?error=All%20platform%20OIDC%20fields%20are%20required");
+    return {
+      status: "error",
+      message: "All platform OIDC fields are required.",
+    };
   }
 
   try {
@@ -71,10 +88,16 @@ export async function savePlatformSetupAction(formData: FormData) {
       adminEmail,
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to save platform setup";
-    redirect(`/setup?error=${encodeURIComponent(message)}`);
+    return {
+      status: "error",
+      message:
+        error instanceof Error ? error.message : "Failed to save platform setup",
+    };
   }
 
-  redirect("/platform/login");
+  revalidatePath("/setup");
+  return {
+    status: "success",
+    message: "Platform OIDC configured. Continue to platform login.",
+  };
 }

@@ -3,19 +3,19 @@
 import { getApiClient } from "@/lib/api-client";
 import { requireAdmin } from "@/lib/auth";
 import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
+import type { ActionState } from "./actions-shared";
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-export async function createRuleAction(formData: FormData) {
+export async function createRuleAction(formData: FormData): Promise<ActionState> {
   await requireAdmin();
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
 
   if (!name || !description) {
-    redirect("/admin/rules?createError=Rule%20name%20and%20description%20are%20required");
+    return { status: "error", message: "Rule name and description are required" };
   }
 
   try {
@@ -23,21 +23,21 @@ export async function createRuleAction(formData: FormData) {
     await client.createRule({ name, description });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to create rule";
-    redirect(`/admin/rules?createError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/rules");
-  redirect("/admin/rules?created=1");
+  return { status: "success", message: "The new rule has been added successfully." };
 }
 
-export async function updateRuleAction(formData: FormData) {
+export async function updateRuleAction(formData: FormData): Promise<ActionState> {
   await requireAdmin();
   const ruleId = toSingle(formData.get("ruleId"));
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
 
   if (!ruleId || !name || !description) {
-    redirect("/admin/rules?updateError=Rule%20ID,%20name,%20and%20description%20are%20required");
+    return { status: "error", message: "Rule ID, name, and description are required" };
   }
 
   try {
@@ -45,19 +45,19 @@ export async function updateRuleAction(formData: FormData) {
     await client.updateRule(ruleId, { name, description });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to update rule";
-    redirect(`/admin/rules?updateError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/rules");
-  redirect("/admin/rules?updated=1");
+  return { status: "success", message: "Your changes were saved successfully." };
 }
 
-export async function createRuleSetAction(formData: FormData) {
+export async function createRuleSetAction(formData: FormData): Promise<ActionState> {
   await requireAdmin();
   const name = toSingle(formData.get("name"));
 
   if (!name) {
-    redirect("/admin/rules?setError=Rule%20set%20name%20is%20required");
+    return { status: "error", message: "Rule set name is required" };
   }
 
   try {
@@ -65,20 +65,20 @@ export async function createRuleSetAction(formData: FormData) {
     await client.createRuleSet({ name });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to create rule set";
-    redirect(`/admin/rules?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/rules");
-  redirect("/admin/rules?setCreated=1");
+  return { status: "success", message: "The new rule set has been created successfully." };
 }
 
-export async function deleteRuleSetAction(formData: FormData) {
+export async function deleteRuleSetAction(formData: FormData): Promise<ActionState> {
   await requireAdmin();
   const ruleSetId = toSingle(formData.get("ruleSetId"));
-  const returnTo = toSingle(formData.get("returnTo")) || "/admin/rules";
+  const returnTo = toSingle(formData.get("returnTo"));
 
   if (!ruleSetId) {
-    redirect(`${returnTo}?setError=Rule%20set%20ID%20is%20required`);
+    return { status: "error", message: "Rule set ID is required" };
   }
 
   try {
@@ -86,22 +86,25 @@ export async function deleteRuleSetAction(formData: FormData) {
     await client.deleteRuleSet(ruleSetId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to delete rule set";
-    redirect(`${returnTo}?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/rules");
   revalidatePath(`/admin/rules/sets/${ruleSetId}`);
-  redirect(`${returnTo}?setDeleted=1`);
+  if (returnTo) {
+    revalidatePath(returnTo);
+  }
+  return { status: "success", message: "The rule set has been removed." };
 }
 
-export async function addRuleToSetAction(formData: FormData) {
+export async function addRuleToSetAction(formData: FormData): Promise<ActionState> {
   await requireAdmin();
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const ruleId = toSingle(formData.get("ruleId"));
   const returnTo = toSingle(formData.get("returnTo")) || `/admin/rules/sets/${ruleSetId}`;
 
   if (!ruleSetId || !ruleId) {
-    redirect(`${returnTo}?setError=Rule%20set%20ID%20and%20rule%20ID%20are%20required`);
+    return { status: "error", message: "Rule set ID and rule ID are required" };
   }
 
   try {
@@ -109,22 +112,23 @@ export async function addRuleToSetAction(formData: FormData) {
     await client.addRuleToSet(ruleSetId, ruleId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to add rule to set";
-    redirect(`${returnTo}?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/rules");
   revalidatePath(`/admin/rules/sets/${ruleSetId}`);
-  redirect(`${returnTo}?ruleAdded=1`);
+  revalidatePath(returnTo);
+  return { status: "success", message: "The rule was added to this set." };
 }
 
-export async function removeRuleFromSetAction(formData: FormData) {
+export async function removeRuleFromSetAction(formData: FormData): Promise<ActionState> {
   await requireAdmin();
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const ruleId = toSingle(formData.get("ruleId"));
   const returnTo = toSingle(formData.get("returnTo")) || `/admin/rules/sets/${ruleSetId}`;
 
   if (!ruleSetId || !ruleId) {
-    redirect(`${returnTo}?setError=Rule%20set%20ID%20and%20rule%20ID%20are%20required`);
+    return { status: "error", message: "Rule set ID and rule ID are required" };
   }
 
   try {
@@ -132,10 +136,11 @@ export async function removeRuleFromSetAction(formData: FormData) {
     await client.removeRuleFromSet(ruleSetId, ruleId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to remove rule from set";
-    redirect(`${returnTo}?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/rules");
   revalidatePath(`/admin/rules/sets/${ruleSetId}`);
-  redirect(`${returnTo}?ruleRemoved=1`);
+  revalidatePath(returnTo);
+  return { status: "success", message: "The rule was removed from this set." };
 }

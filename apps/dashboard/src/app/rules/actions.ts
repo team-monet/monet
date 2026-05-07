@@ -2,7 +2,7 @@
 
 import { getApiClient } from "@/lib/api-client";
 import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
+import type { ActionState } from "./actions-shared";
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
@@ -15,12 +15,12 @@ function revalidateRulePaths(ruleSetId?: string) {
   }
 }
 
-export async function createPersonalRuleAction(formData: FormData) {
+export async function createPersonalRuleAction(formData: FormData): Promise<ActionState> {
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
 
   if (!name || !description) {
-    redirect("/rules?createError=Rule%20name%20and%20description%20are%20required");
+    return { status: "error", message: "Rule name and description are required" };
   }
 
   try {
@@ -28,20 +28,20 @@ export async function createPersonalRuleAction(formData: FormData) {
     await client.createPersonalRule({ name, description });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to create rule";
-    redirect(`/rules?createError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidateRulePaths();
-  redirect("/rules?created=1");
+  return { status: "success", message: "Your personal rule has been added." };
 }
 
-export async function updatePersonalRuleAction(formData: FormData) {
+export async function updatePersonalRuleAction(formData: FormData): Promise<ActionState> {
   const ruleId = toSingle(formData.get("ruleId"));
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
 
   if (!ruleId || !name || !description) {
-    redirect("/rules?updateError=Rule%20ID,%20name,%20and%20description%20are%20required");
+    return { status: "error", message: "Rule ID, name, and description are required" };
   }
 
   try {
@@ -49,19 +49,19 @@ export async function updatePersonalRuleAction(formData: FormData) {
     await client.updatePersonalRule(ruleId, { name, description });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to update rule";
-    redirect(`/rules?updateError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidateRulePaths();
-  redirect("/rules?updated=1");
+  return { status: "success", message: "Your changes were saved successfully." };
 }
 
-export async function deletePersonalRuleAction(formData: FormData) {
+export async function deletePersonalRuleAction(formData: FormData): Promise<ActionState> {
   const ruleId = toSingle(formData.get("ruleId"));
   const returnTo = toSingle(formData.get("returnTo")) || "/rules";
 
   if (!ruleId) {
-    redirect(`${returnTo}?deleteError=Rule%20ID%20is%20required`);
+    return { status: "error", message: "Rule ID is required" };
   }
 
   try {
@@ -69,18 +69,19 @@ export async function deletePersonalRuleAction(formData: FormData) {
     await client.deletePersonalRule(ruleId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to delete rule";
-    redirect(`${returnTo}?deleteError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidateRulePaths();
-  redirect(`${returnTo}?deleted=1`);
+  revalidatePath(returnTo);
+  return { status: "success", message: "The personal rule has been removed." };
 }
 
-export async function createPersonalRuleSetAction(formData: FormData) {
+export async function createPersonalRuleSetAction(formData: FormData): Promise<ActionState> {
   const name = toSingle(formData.get("name"));
 
   if (!name) {
-    redirect("/rules?setError=Rule%20set%20name%20is%20required");
+    return { status: "error", message: "Rule set name is required" };
   }
 
   try {
@@ -88,19 +89,19 @@ export async function createPersonalRuleSetAction(formData: FormData) {
     await client.createPersonalRuleSet({ name });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to create rule set";
-    redirect(`/rules?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidateRulePaths();
-  redirect("/rules?setCreated=1");
+  return { status: "success", message: "The personal rule set has been created." };
 }
 
-export async function deletePersonalRuleSetAction(formData: FormData) {
+export async function deletePersonalRuleSetAction(formData: FormData): Promise<ActionState> {
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const returnTo = toSingle(formData.get("returnTo")) || "/rules";
 
   if (!ruleSetId) {
-    redirect(`${returnTo}?setError=Rule%20set%20ID%20is%20required`);
+    return { status: "error", message: "Rule set ID is required" };
   }
 
   try {
@@ -108,20 +109,21 @@ export async function deletePersonalRuleSetAction(formData: FormData) {
     await client.deletePersonalRuleSet(ruleSetId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to delete rule set";
-    redirect(`${returnTo}?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidateRulePaths(ruleSetId);
-  redirect(`${returnTo}?setDeleted=1`);
+  revalidatePath(returnTo);
+  return { status: "success", message: "The personal rule set has been removed." };
 }
 
-export async function addPersonalRuleToSetAction(formData: FormData) {
+export async function addPersonalRuleToSetAction(formData: FormData): Promise<ActionState> {
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const ruleId = toSingle(formData.get("ruleId"));
   const returnTo = toSingle(formData.get("returnTo")) || `/rules/sets/${ruleSetId}`;
 
   if (!ruleSetId || !ruleId) {
-    redirect(`${returnTo}?setError=Rule%20set%20ID%20and%20rule%20ID%20are%20required`);
+    return { status: "error", message: "Rule set ID and rule ID are required" };
   }
 
   try {
@@ -129,20 +131,21 @@ export async function addPersonalRuleToSetAction(formData: FormData) {
     await client.addPersonalRuleToSet(ruleSetId, ruleId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to add rule to set";
-    redirect(`${returnTo}?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidateRulePaths(ruleSetId);
-  redirect(`${returnTo}?ruleAdded=1`);
+  revalidatePath(returnTo);
+  return { status: "success", message: "The rule was added to this set." };
 }
 
-export async function removePersonalRuleFromSetAction(formData: FormData) {
+export async function removePersonalRuleFromSetAction(formData: FormData): Promise<ActionState> {
   const ruleSetId = toSingle(formData.get("ruleSetId"));
   const ruleId = toSingle(formData.get("ruleId"));
   const returnTo = toSingle(formData.get("returnTo")) || `/rules/sets/${ruleSetId}`;
 
   if (!ruleSetId || !ruleId) {
-    redirect(`${returnTo}?setError=Rule%20set%20ID%20and%20rule%20ID%20are%20required`);
+    return { status: "error", message: "Rule set ID and rule ID are required" };
   }
 
   try {
@@ -150,9 +153,10 @@ export async function removePersonalRuleFromSetAction(formData: FormData) {
     await client.removePersonalRuleFromSet(ruleSetId, ruleId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to remove rule from set";
-    redirect(`${returnTo}?setError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidateRulePaths(ruleSetId);
-  redirect(`${returnTo}?ruleRemoved=1`);
+  revalidatePath(returnTo);
+  return { status: "success", message: "The rule was removed from this set." };
 }

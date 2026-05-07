@@ -1,7 +1,6 @@
 "use client";
 
-import { startTransition, useActionState, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useState, useTransition } from "react";
 import { KeyRound, ShieldAlert, ShieldCheck } from "lucide-react";
 import { AgentCredentialHandoff } from "@/app/agents/agent-credential-handoff";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -50,12 +49,23 @@ function RegenerateTokenDialogInner({
   isRevoked: boolean;
   onReset: () => void;
 }) {
-  const router = useRouter();
   const [open, setOpen] = useState(false);
-  const [state, formAction] = useActionState(
-    regenerateAgentTokenAction,
-    initialAgentTokenActionState,
-  );
+  const [state, setState] = useState<AgentTokenActionState>(initialAgentTokenActionState);
+  const [pending, startTransition] = useTransition();
+
+  const handleFormAction = (formData: FormData) => {
+    startTransition(async () => {
+      try {
+        const result = await regenerateAgentTokenAction(formData);
+        setState(result);
+      } catch (error) {
+        setState({
+          status: "error",
+          message: error instanceof Error ? error.message : "An unexpected error occurred",
+        });
+      }
+    });
+  };
 
   return (
     <Dialog
@@ -63,11 +73,6 @@ function RegenerateTokenDialogInner({
       onOpenChange={(nextOpen) => {
         setOpen(nextOpen);
         if (!nextOpen) {
-          if (state.status === "success") {
-            startTransition(() => {
-              router.refresh();
-            });
-          }
           onReset();
         }
       }}
@@ -102,7 +107,7 @@ function RegenerateTokenDialogInner({
             )}
           />
         ) : (
-          <form action={formAction} className="grid gap-4">
+          <form action={handleFormAction} className="grid gap-4">
             <input type="hidden" name="agentId" value={agentId} />
             <Alert>
               <AlertTitle>One-time credential handoff</AlertTitle>
@@ -123,7 +128,7 @@ function RegenerateTokenDialogInner({
               <Button type="button" variant="outline" onClick={() => setOpen(false)}>
                 Cancel
               </Button>
-              <SubmitButton label="Regenerate Token" pendingLabel="Regenerating..." />
+              <SubmitButton label="Regenerate Token" pendingLabel="Regenerating..." pending={pending} />
             </DialogFooter>
           </form>
         )}
@@ -165,27 +170,33 @@ function AdminMutationDialogInner({
   description: string;
   confirmLabel: string;
   pendingLabel: string;
-  action: (
-    previousState: AgentMutationActionState,
-    formData: FormData,
-  ) => Promise<AgentMutationActionState>;
+  action: (formData: FormData) => Promise<AgentMutationActionState>;
   triggerVariant: "destructive" | "outline";
   confirmVariant: "destructive" | "default";
   onReset: () => void;
 }) {
-  const router = useRouter();
   const [open, setOpen] = useState(false);
-  const [state, formAction] = useActionState(action, initialAgentMutationActionState);
+  const [state, setState] = useState<AgentMutationActionState>(initialAgentMutationActionState);
+  const [pending, startTransition] = useTransition();
 
-  useEffect(() => {
-    if (state.status === "success") {
-      setOpen(false);
-      onReset();
-      startTransition(() => {
-        router.refresh();
-      });
-    }
-  }, [onReset, router, state.status]);
+  const handleFormAction = (formData: FormData) => {
+    startTransition(async () => {
+      try {
+        const result = await action(formData);
+        setState(result);
+        if (result.status === "success") {
+          setOpen(false);
+          onReset();
+          window.location.reload(); 
+        }
+      } catch (error) {
+        setState({
+          status: "error",
+          message: error instanceof Error ? error.message : "An unexpected error occurred",
+        });
+      }
+    });
+  };
 
   return (
     <Dialog
@@ -212,7 +223,7 @@ function AdminMutationDialogInner({
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
-        <form action={formAction} className="grid gap-4">
+        <form action={handleFormAction} className="grid gap-4">
           <input type="hidden" name="agentId" value={agentId} />
           <MutationError state={state} />
           <DialogFooter>
@@ -223,6 +234,7 @@ function AdminMutationDialogInner({
               label={confirmLabel}
               pendingLabel={pendingLabel}
               variant={confirmVariant}
+              pending={pending}
             />
           </DialogFooter>
         </form>

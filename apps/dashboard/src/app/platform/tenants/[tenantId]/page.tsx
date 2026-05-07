@@ -3,30 +3,17 @@ import { notFound } from "next/navigation";
 import { requirePlatformAdmin } from "@/lib/auth";
 import { getOidcExampleIssuer } from "@/lib/oidc";
 import { getPlatformTenant } from "@/lib/platform-tenants";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { SubmitButton } from "@/components/ui/submit-button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  saveTenantAdminNominationAction,
-  saveTenantOidcConfigAction,
-} from "../../actions";
+import { TenantAdminNominationForm, TenantOidcForm } from "./tenant-settings-forms";
 
 type PageProps = {
   params: Promise<{ tenantId: string }>;
-  searchParams?: Promise<Record<string, string | string[] | undefined>>;
 };
-
-function getSingleParam(value: string | string[] | undefined) {
-  return Array.isArray(value) ? value[0] : value;
-}
 
 export default async function PlatformTenantDetailPage({
   params,
-  searchParams,
 }: PageProps) {
   await requirePlatformAdmin();
 
@@ -37,12 +24,6 @@ export default async function PlatformTenantDetailPage({
     notFound();
   }
 
-  const query = searchParams ? await searchParams : {};
-  const created = getSingleParam(query.created) === "1";
-  const oidcSaved = getSingleParam(query.oidcSaved) === "1";
-  const nominationSaved = getSingleParam(query.nominationSaved) === "1";
-  const configError = getSingleParam(query.configError);
-  const nominationError = getSingleParam(query.nominationError);
   const { tenant, oidcConfig, adminNominations } = tenantState;
   const tenantIssuerExample = getOidcExampleIssuer(tenant.slug);
 
@@ -76,50 +57,6 @@ export default async function PlatformTenantDetailPage({
           <Link href="/platform">Back to tenants</Link>
         </Button>
       </div>
-
-      {created ? (
-        <Alert>
-          <AlertTitle>Tenant created</AlertTitle>
-          <AlertDescription>
-            The tenant schema and initial admin agent were provisioned. Configure
-            OIDC next so the organization can sign in.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {oidcSaved ? (
-        <Alert>
-          <AlertTitle>OIDC saved</AlertTitle>
-          <AlertDescription>
-            Tenant sign-in now uses the configured OIDC provider.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {configError ? (
-        <Alert variant="destructive">
-          <AlertTitle>Could not save tenant OIDC</AlertTitle>
-          <AlertDescription>{configError}</AlertDescription>
-        </Alert>
-      ) : null}
-
-      {nominationSaved ? (
-        <Alert>
-          <AlertTitle>Tenant admin nominated</AlertTitle>
-          <AlertDescription>
-            The nominated user will become a tenant admin on their first
-            verified OIDC login.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {nominationError ? (
-        <Alert variant="destructive">
-          <AlertTitle>Could not save tenant admin nomination</AlertTitle>
-          <AlertDescription>{nominationError}</AlertDescription>
-        </Alert>
-      ) : null}
-
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
         <Card className="shadow-sm">
           <CardHeader className="space-y-2">
@@ -137,48 +74,16 @@ export default async function PlatformTenantDetailPage({
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <form action={saveTenantOidcConfigAction} className="space-y-4">
-              <input type="hidden" name="tenantId" value={tenant.id} />
-
-              <div className="space-y-2">
-                <Label htmlFor="issuer">OIDC issuer</Label>
-                <Input
-                  id="issuer"
-                  name="issuer"
-                  type="url"
-                  defaultValue={oidcConfig?.issuer ?? ""}
-                  placeholder={tenantIssuerExample}
-                  required
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="clientId">Client ID</Label>
-                <Input
-                  id="clientId"
-                  name="clientId"
-                  type="text"
-                  defaultValue={oidcConfig?.clientId ?? ""}
-                  placeholder="monet-acme"
-                  required
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="clientSecret">
-                  Client secret
-                  {oidcConfig ? " (leave blank to keep existing secret)" : ""}
-                </Label>
-                <Input
-                  id="clientSecret"
-                  name="clientSecret"
-                  type="password"
-                  placeholder={oidcConfig ? "Keep existing secret" : "Paste the client secret"}
-                />
-              </div>
-
-              <SubmitButton label="Save tenant OIDC" pendingLabel="Saving..." />
-            </form>
+            <TenantOidcForm
+              tenantId={tenant.id}
+              tenantIssuerExample={tenantIssuerExample}
+              oidcConfig={oidcConfig
+                ? {
+                    issuer: oidcConfig.issuer,
+                    clientId: oidcConfig.clientId,
+                  }
+                : null}
+            />
           </CardContent>
         </Card>
 
@@ -246,22 +151,7 @@ export default async function PlatformTenantDetailPage({
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            <form action={saveTenantAdminNominationAction} className="space-y-4">
-              <input type="hidden" name="tenantId" value={tenant.id} />
-
-              <div className="space-y-2">
-                <Label htmlFor="adminEmail">Tenant admin email</Label>
-                <Input
-                  id="adminEmail"
-                  name="email"
-                  type="email"
-                  placeholder="admin@acme.example"
-                  required
-                />
-              </div>
-
-              <SubmitButton label="Save tenant admin nomination" pendingLabel="Saving..." />
-            </form>
+            <TenantAdminNominationForm tenantId={tenant.id} />
 
             <div className="space-y-3">
               <div className="text-sm font-medium">Current nominations</div>
