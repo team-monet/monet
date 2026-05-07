@@ -1,12 +1,11 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
 import { getApiClient } from "@/lib/api-client";
 import { buildMcpConfig, resolvePublicMcpUrl } from "@/lib/agent-connection";
 import { updateDashboardCredentialIfOwnedAgent } from "@/lib/dashboard-agent";
-import type { AgentTokenActionState, AgentMutationActionState } from "./actions-shared";
+import type { AgentTokenActionState, AgentMutationActionState, RuleSetMutationActionState } from "./actions-shared";
 
 interface SessionUser {
   id?: string;
@@ -22,12 +21,7 @@ function revalidateAgentPaths(agentId: string) {
   revalidatePath(`/agents/${agentId}`);
 }
 
-function agentDetailPath(agentId: string) {
-  return `/agents/${agentId}`;
-}
-
 export async function regenerateAgentTokenAction(
-  _previousState: AgentTokenActionState,
   formData: FormData,
 ): Promise<AgentTokenActionState> {
   const agentId = toSingle(formData.get("agentId"));
@@ -82,7 +76,6 @@ export async function regenerateAgentTokenAction(
 }
 
 export async function revokeAgentAction(
-  _previousState: AgentMutationActionState,
   formData: FormData,
 ): Promise<AgentMutationActionState> {
   const agentId = toSingle(formData.get("agentId"));
@@ -97,21 +90,20 @@ export async function revokeAgentAction(
   try {
     const client = await getApiClient();
     await client.revokeAgent(agentId);
-    revalidateAgentPaths(agentId);
-    return {
-      status: "success",
-      message: "Agent revoked.",
-    };
   } catch (err: unknown) {
     return {
       status: "error",
       message: err instanceof Error ? err.message : "Failed to revoke agent.",
     };
   }
+  revalidateAgentPaths(agentId);
+  return {
+    status: "success",
+    message: "Agent revoked.",
+  };
 }
 
 export async function unrevokeAgentAction(
-  _previousState: AgentMutationActionState,
   formData: FormData,
 ): Promise<AgentMutationActionState> {
   const agentId = toSingle(formData.get("agentId"));
@@ -126,57 +118,75 @@ export async function unrevokeAgentAction(
   try {
     const client = await getApiClient();
     await client.unrevokeAgent(agentId);
-    revalidateAgentPaths(agentId);
-    return {
-      status: "success",
-      message: "Agent restored.",
-    };
   } catch (err: unknown) {
     return {
       status: "error",
       message: err instanceof Error ? err.message : "Failed to restore agent.",
     };
   }
+  revalidateAgentPaths(agentId);
+  return {
+    status: "success",
+    message: "Agent restored.",
+  };
 }
 
-export async function attachRuleSetToAgentAction(formData: FormData) {
+export async function attachRuleSetToAgentAction(
+  formData: FormData,
+): Promise<RuleSetMutationActionState> {
   const agentId = toSingle(formData.get("agentId"));
   const ruleSetId = toSingle(formData.get("ruleSetId"));
-  const returnTo = toSingle(formData.get("returnTo")) || agentDetailPath(agentId);
 
   if (!agentId || !ruleSetId) {
-    redirect(`${returnTo}?ruleSetError=Agent%20ID%20and%20rule%20set%20ID%20are%20required`);
+    return {
+      status: "error",
+      message: "Agent ID and rule set ID are required.",
+    };
   }
 
   try {
     const client = await getApiClient();
     await client.attachRuleSetToAgent(agentId, ruleSetId);
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Failed to attach rule set.";
-    redirect(`${returnTo}?ruleSetError=${encodeURIComponent(message)}`);
+    return {
+      status: "error",
+      message: err instanceof Error ? err.message : "Failed to attach rule set.",
+    };
   }
 
   revalidateAgentPaths(agentId);
-  redirect(`${returnTo}?ruleSetAttached=1`);
+  return {
+    status: "success",
+    message: "The selected rule set is now attached to this agent.",
+  };
 }
 
-export async function detachRuleSetFromAgentAction(formData: FormData) {
+export async function detachRuleSetFromAgentAction(
+  formData: FormData,
+): Promise<RuleSetMutationActionState> {
   const agentId = toSingle(formData.get("agentId"));
   const ruleSetId = toSingle(formData.get("ruleSetId"));
-  const returnTo = toSingle(formData.get("returnTo")) || agentDetailPath(agentId);
 
   if (!agentId || !ruleSetId) {
-    redirect(`${returnTo}?ruleSetError=Agent%20ID%20and%20rule%20set%20ID%20are%20required`);
+    return {
+      status: "error",
+      message: "Agent ID and rule set ID are required.",
+    };
   }
 
   try {
     const client = await getApiClient();
     await client.detachRuleSetFromAgent(agentId, ruleSetId);
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Failed to detach rule set.";
-    redirect(`${returnTo}?ruleSetError=${encodeURIComponent(message)}`);
+    return {
+      status: "error",
+      message: err instanceof Error ? err.message : "Failed to detach rule set.",
+    };
   }
 
   revalidateAgentPaths(agentId);
-  redirect(`${returnTo}?ruleSetDetached=1`);
+  return {
+    status: "success",
+    message: "The rule set was removed from this agent.",
+  };
 }

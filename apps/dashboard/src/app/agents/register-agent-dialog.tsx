@@ -1,8 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { startTransition, useActionState, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useState, useTransition } from "react";
 import { Bot, KeyRound, Plus, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SubmitButton } from "@/components/ui/submit-button";
@@ -77,27 +76,36 @@ function RegisterAgentForm({
   isAdmin,
   onClose,
   onReset,
+  onSuccess,
 }: {
   availableGroups: GroupOption[];
   bindableUsers: UserOption[];
   isAdmin: boolean;
   onClose: () => void;
   onReset: () => void;
+  onSuccess?: (agentId: string) => void;
 }) {
-  const router = useRouter();
   const [agentType, setAgentType] = useState<"user_proxy" | "autonomous">("user_proxy");
-  const [state, formAction] = useActionState(registerAgentAction, initialRegisterAgentFormState);
+  const [state, setState] = useState<RegisterAgentFormState>(initialRegisterAgentFormState);
+  const [pending, startTransition] = useTransition();
+  const formAction = (formData: FormData) => {
+    startTransition(async () => {
+      try {
+        setState(await registerAgentAction(formData));
+      } catch (error) {
+        setState({ status: "error", message: error instanceof Error ? error.message : "An unexpected error occurred" });
+      }
+    });
+  };
   const hasGroupOptions = availableGroups.length > 0;
   const requiresUserBinding = isAdmin && agentType === "user_proxy";
   const missingUserOptions = requiresUserBinding && bindableUsers.length === 0;
 
   useEffect(() => {
     if (state.status === "success") {
-      startTransition(() => {
-        router.refresh();
-      });
+      onSuccess?.(state.agentId);
     }
-  }, [router, state.status]);
+  }, [onSuccess, state]);
 
   if (state.status === "success") {
     return (
@@ -200,6 +208,7 @@ function RegisterAgentForm({
         <SubmitButton 
           label="Register Agent" 
           pendingLabel="Registering..." 
+          pending={pending}
           disabled={!hasGroupOptions || missingUserOptions} 
         />
       </DialogFooter>
@@ -211,10 +220,12 @@ export default function RegisterAgentDialog({
   availableGroups,
   bindableUsers,
   isAdmin,
+  onSuccess,
 }: {
   availableGroups: GroupOption[];
   bindableUsers: UserOption[];
   isAdmin: boolean;
+  onSuccess?: (agentId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [formKey, setFormKey] = useState(0);
@@ -284,6 +295,7 @@ export default function RegisterAgentDialog({
           isAdmin={isAdmin}
           onClose={closeDialog}
           onReset={resetForm}
+          onSuccess={onSuccess}
         />
       </DialogContent>
     </Dialog>

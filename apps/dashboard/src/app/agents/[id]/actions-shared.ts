@@ -29,10 +29,28 @@ export type AgentMutationActionState =
       message: string;
     };
 
+export type RuleSetMutationActionState =
+  | {
+      status: "idle";
+      message?: string;
+    }
+  | {
+      status: "error";
+      message: string;
+    }
+  | {
+      status: "success";
+      message: string;
+    };
+
 export const initialAgentTokenActionState: AgentTokenActionState = {
   status: "idle",
 };
 
 export const initialAgentMutationActionState: AgentMutationActionState = {
+  status: "idle",
+};
+
+export const initialRuleSetMutationActionState: RuleSetMutationActionState = {
   status: "idle",
 };

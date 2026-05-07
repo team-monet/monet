@@ -1,7 +1,6 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
 import {
   CreateTenantInput,
   normalizeTenantSlug,
@@ -13,6 +12,7 @@ import {
   saveTenantAdminNomination,
   saveTenantOidcConfig,
 } from "@/lib/platform-tenants";
+import type { PlatformActionState } from "./actions-shared";
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
@@ -36,7 +36,9 @@ function firstFieldError(
   return "Invalid input.";
 }
 
-export async function createPlatformTenantAction(formData: FormData) {
+export async function createPlatformTenantAction(
+  formData: FormData,
+): Promise<PlatformActionState> {
   await requirePlatformAdmin();
 
   const name = toSingle(formData.get("name"));
@@ -57,26 +59,27 @@ export async function createPlatformTenantAction(formData: FormData) {
       "slug",
       "isolationMode",
     );
-    redirect(`/platform?createError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
-
-  let tenantId: string;
 
   try {
     const result = await createPlatformTenant(parsed.data);
-    tenantId = result.tenant.id;
+    revalidatePath("/platform");
+    revalidatePath(tenantDetailPath(result.tenant.id));
+    return {
+      status: "success",
+      message: `Tenant "${result.tenant.name}" created successfully.`,
+    };
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to create tenant";
-    redirect(`/platform?createError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
-
-  revalidatePath("/platform");
-  revalidatePath(tenantDetailPath(tenantId));
-  redirect(`${tenantDetailPath(tenantId)}?created=1`);
 }
 
-export async function saveTenantOidcConfigAction(formData: FormData) {
+export async function saveTenantOidcConfigAction(
+  formData: FormData,
+): Promise<PlatformActionState> {
   await requirePlatformAdmin();
 
   const tenantId = toSingle(formData.get("tenantId"));
@@ -85,7 +88,7 @@ export async function saveTenantOidcConfigAction(formData: FormData) {
   const clientSecret = toSingle(formData.get("clientSecret"));
 
   if (!tenantId) {
-    redirect("/platform?configError=Tenant%20ID%20is%20required");
+    return { status: "error", message: "Tenant ID is required" };
   }
 
   try {
@@ -98,17 +101,17 @@ export async function saveTenantOidcConfigAction(formData: FormData) {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to save tenant OIDC configuration";
-    redirect(
-      `${tenantDetailPath(tenantId)}?configError=${encodeURIComponent(message)}`,
-    );
+    return { status: "error", message };
   }
 
   revalidatePath("/platform");
   revalidatePath(tenantDetailPath(tenantId));
-  redirect(`${tenantDetailPath(tenantId)}?oidcSaved=1`);
+  return { status: "success", message: "Tenant OIDC configuration saved." };
 }
 
-export async function saveTenantAdminNominationAction(formData: FormData) {
+export async function saveTenantAdminNominationAction(
+  formData: FormData,
+): Promise<PlatformActionState> {
   const session = await requirePlatformAdmin();
   const sessionUser = session.user as { id?: string };
 
@@ -116,19 +119,18 @@ export async function saveTenantAdminNominationAction(formData: FormData) {
   const email = toSingle(formData.get("email"));
 
   if (!tenantId) {
-    redirect("/platform?nominationError=Tenant%20ID%20is%20required");
+    return { status: "error", message: "Tenant ID is required" };
   }
 
   if (!email) {
-    redirect(
-      `${tenantDetailPath(tenantId)}?nominationError=${encodeURIComponent("Admin email is required.")}`,
-    );
+    return { status: "error", message: "Admin email is required." };
   }
 
   if (!sessionUser.id) {
-    redirect(
-      `${tenantDetailPath(tenantId)}?nominationError=${encodeURIComponent("Platform admin session is invalid.")}`,
-    );
+    return {
+      status: "error",
+      message: "Platform admin session is invalid.",
+    };
   }
 
   try {
@@ -140,11 +142,9 @@ export async function saveTenantAdminNominationAction(formData: FormData) {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to save tenant admin nomination";
-    redirect(
-      `${tenantDetailPath(tenantId)}?nominationError=${encodeURIComponent(message)}`,
-    );
+    return { status: "error", message };
   }
 
   revalidatePath(tenantDetailPath(tenantId));
-  redirect(`${tenantDetailPath(tenantId)}?nominationSaved=1`);
+  return { status: "success", message: "Tenant admin nomination saved." };
 }

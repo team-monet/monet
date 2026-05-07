@@ -2,7 +2,7 @@
 
 import { getApiClient } from "@/lib/api-client";
 import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
+import type { GroupActionState, GroupMemberActionState } from "./actions-shared";
 
 function toSingle(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
@@ -19,17 +19,22 @@ function groupDetailPath(groupId: string) {
   return `/admin/groups/${groupId}`;
 }
 
-export async function createGroupAction(formData: FormData) {
+export async function createGroupAction(
+  formData: FormData,
+): Promise<GroupActionState> {
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
   const memoryQuotaInput = toSingle(formData.get("memoryQuota"));
   const memoryQuota = parseOptionalNonNegativeInt(memoryQuotaInput);
 
   if (!name) {
-    redirect("/admin/groups?createError=Group%20name%20is%20required");
+    return { status: "error", message: "Group name is required" };
   }
   if (Number.isNaN(memoryQuota)) {
-    redirect("/admin/groups?createError=Memory%20quota%20must%20be%20a%20non-negative%20integer%20(0%20%3D%20unlimited)");
+    return {
+      status: "error",
+      message: "Memory quota must be a non-negative integer (0 = unlimited)",
+    };
   }
 
   try {
@@ -41,15 +46,17 @@ export async function createGroupAction(formData: FormData) {
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to create group";
-    redirect(`/admin/groups?createError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/groups");
   revalidatePath("/admin/quotas");
-  redirect("/admin/groups?created=1");
+  return { status: "success", message: "The new group has been added successfully." };
 }
 
-export async function updateGroupAction(formData: FormData) {
+export async function updateGroupAction(
+  formData: FormData,
+): Promise<GroupActionState> {
   const groupId = toSingle(formData.get("groupId"));
   const name = toSingle(formData.get("name"));
   const description = toSingle(formData.get("description"));
@@ -57,10 +64,13 @@ export async function updateGroupAction(formData: FormData) {
   const memoryQuota = parseOptionalNonNegativeInt(memoryQuotaInput);
 
   if (!groupId || !name) {
-    redirect("/admin/groups?updateError=Group%20ID%20and%20name%20are%20required");
+    return { status: "error", message: "Group ID and name are required" };
   }
   if (Number.isNaN(memoryQuota)) {
-    redirect("/admin/groups?updateError=Memory%20quota%20must%20be%20a%20non-negative%20integer%20(0%20%3D%20unlimited)");
+    return {
+      status: "error",
+      message: "Memory quota must be a non-negative integer (0 = unlimited)",
+    };
   }
 
   try {
@@ -72,21 +82,22 @@ export async function updateGroupAction(formData: FormData) {
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to update group";
-    redirect(`/admin/groups?updateError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/groups");
   revalidatePath("/admin/quotas");
-  redirect("/admin/groups?updated=1");
+  return { status: "success", message: "Your changes were saved successfully." };
 }
 
-export async function addGroupRuleSetAction(formData: FormData) {
+export async function addGroupRuleSetAction(
+  formData: FormData,
+): Promise<GroupActionState> {
   const groupId = toSingle(formData.get("groupId"));
   const ruleSetId = toSingle(formData.get("ruleSetId"));
-  const redirectPath = groupId ? groupDetailPath(groupId) : "/admin/groups";
 
   if (!groupId || !ruleSetId) {
-    redirect(`${redirectPath}?ruleSetError=Group%20and%20rule%20set%20are%20required`);
+    return { status: "error", message: "Group and rule set are required" };
   }
 
   try {
@@ -94,21 +105,22 @@ export async function addGroupRuleSetAction(formData: FormData) {
     await client.addGroupRuleSet(groupId, ruleSetId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to add rule set";
-    redirect(`${redirectPath}?ruleSetError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/groups");
   revalidatePath(groupDetailPath(groupId));
-  redirect(`${groupDetailPath(groupId)}?ruleSetAdded=1`);
+  return { status: "success", message: "The rule set was applied to this group." };
 }
 
-export async function removeGroupRuleSetAction(formData: FormData) {
+export async function removeGroupRuleSetAction(
+  formData: FormData,
+): Promise<GroupActionState> {
   const groupId = toSingle(formData.get("groupId"));
   const ruleSetId = toSingle(formData.get("ruleSetId"));
-  const redirectPath = groupId ? groupDetailPath(groupId) : "/admin/groups";
 
   if (!groupId || !ruleSetId) {
-    redirect(`${redirectPath}?ruleSetError=Group%20and%20rule%20set%20are%20required`);
+    return { status: "error", message: "Group and rule set are required" };
   }
 
   try {
@@ -116,21 +128,22 @@ export async function removeGroupRuleSetAction(formData: FormData) {
     await client.removeGroupRuleSet(groupId, ruleSetId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to remove rule set";
-    redirect(`${redirectPath}?ruleSetError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/groups");
   revalidatePath(groupDetailPath(groupId));
-  redirect(`${groupDetailPath(groupId)}?ruleSetRemoved=1`);
+  return { status: "success", message: "The rule set was removed from this group." };
 }
 
-export async function addGroupMemberAction(formData: FormData) {
+export async function addGroupMemberAction(
+  formData: FormData,
+): Promise<GroupMemberActionState> {
   const groupId = toSingle(formData.get("groupId"));
   const agentId = toSingle(formData.get("agentId"));
-  const redirectPath = groupId ? groupDetailPath(groupId) : "/admin/groups";
 
   if (!groupId || !agentId) {
-    redirect(`${redirectPath}?memberError=Group%20and%20agent%20are%20required`);
+    return { status: "error", message: "Group and agent are required" };
   }
 
   try {
@@ -138,22 +151,23 @@ export async function addGroupMemberAction(formData: FormData) {
     await client.addGroupMember(groupId, agentId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to add member";
-    redirect(`${redirectPath}?memberError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/groups");
   revalidatePath(groupDetailPath(groupId));
   revalidatePath("/agents");
-  redirect(`${groupDetailPath(groupId)}?memberAdded=1`);
+  return { status: "success", message: "The agent was added to the group.", action: "add", agentId };
 }
 
-export async function removeGroupMemberAction(formData: FormData) {
+export async function removeGroupMemberAction(
+  formData: FormData,
+): Promise<GroupMemberActionState> {
   const groupId = toSingle(formData.get("groupId"));
   const agentId = toSingle(formData.get("agentId"));
-  const redirectPath = groupId ? groupDetailPath(groupId) : "/admin/groups";
 
   if (!groupId || !agentId) {
-    redirect(`${redirectPath}?memberError=Group%20and%20agent%20are%20required`);
+    return { status: "error", message: "Group and agent are required" };
   }
 
   try {
@@ -161,11 +175,11 @@ export async function removeGroupMemberAction(formData: FormData) {
     await client.removeGroupMember(groupId, agentId);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to remove member";
-    redirect(`${redirectPath}?memberError=${encodeURIComponent(message)}`);
+    return { status: "error", message };
   }
 
   revalidatePath("/admin/groups");
   revalidatePath(groupDetailPath(groupId));
   revalidatePath("/agents");
-  redirect(`${groupDetailPath(groupId)}?memberRemoved=1`);
+  return { status: "success", message: "The agent was removed from the group.", action: "remove", agentId };
 }

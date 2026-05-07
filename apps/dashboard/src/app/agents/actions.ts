@@ -16,7 +16,6 @@ export async function getAgentStatusAction(id: string) {
 }
 
 export async function registerAgentAction(
-  _previousState: RegisterAgentFormState,
   formData: FormData,
 ): Promise<RegisterAgentFormState> {
   const name = toSingle(formData.get("name"));
