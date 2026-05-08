@@ -45,6 +45,67 @@ Operator guidance for this upgrade:
 There is no separate data-transformation migration to run for this change, but
 you should still treat this as a backup-first maintenance event.
 
+## v0.1.0 → v0.2.0 Upgrade Notes
+
+This section covers operator-visible changes when upgrading from v0.1.0 to v0.2.0.
+
+### Platform Migrations
+
+No new Drizzle platform migration files were introduced. The two existing migration
+files are unchanged. Running `pnpm runtime:migrate` (or the automatic startup
+migration) will be a no-op at the platform schema level.
+
+### Tenant Schema Upgrade (Automatic)
+
+The API performs an automatic tenant schema upgrade on startup:
+
+- **`agent_group_members` deduplication**: duplicate rows in the
+  `agent_group_members` table are removed, and the table is altered to use a
+  composite primary key `(agent_id, group_id)`.
+- This runs automatically when the API starts — no manual migration step is
+  required.
+- **Operators should be aware**: this modifies tenant data at startup. Duplicate
+  membership rows will be deleted. If you have scripts or integrations that
+  rely on duplicate membership rows, adjust them before upgrading.
+
+### Config Changes
+
+Review these config changes before upgrading:
+
+- **`ENRICHMENT_CHAT_PROVIDER`** default changed from `openai`/`ollama` to
+  `none`. When chat enrichment is disabled, agents must provide a `summary`
+  field in `memory_store` calls. If you were relying on automatic summary
+  generation, set `ENRICHMENT_CHAT_PROVIDER` explicitly to your previous
+  provider.
+- **`ENRICHMENT_EMBEDDING_PROVIDER`** runtime default is now `onnx`. This uses
+  local ONNX embeddings and requires no external API key. If you were relying
+  on a hosted embedding provider, set `ENRICHMENT_EMBEDDING_PROVIDER`
+  explicitly.
+- **Keycloak hostname default** changed to `keycloak.localhost` with
+  `--hostname-strict=true`. If your deployment overrides Keycloak hostname
+  settings, verify they still work after upgrade. If you were using the
+  previous default, update `KEYCLOAK_BASE_URL`, `PUBLIC_OIDC_BASE_URL`, and
+  `LOCAL_OIDC_BASE_URL` in `.env.runtime` to match.
+
+### New Environment Variables
+
+The following environment variables are new in v0.2.0 and have sensible defaults
+so no action is required unless you want to tune them:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_REQUEST_TIMEOUT_MS` | `60000` (60s) | Per-request MCP timeout in milliseconds |
+| `MCP_SESSION_IDLE_TTL_MS` | `28800000` (8h) | Idle session TTL — sessions with no activity are swept after this interval |
+| `MCP_MAX_SESSIONS_PER_AGENT` | `5` | Maximum concurrent MCP sessions per agent |
+
+### Backup and Rollback
+
+- **Take a full database backup before upgrading.**
+- Rollback is backup-based — there are no down migrations. If the upgrade
+  introduces issues, restore the pre-upgrade database backup and redeploy the
+  previous image tags.
+- Follow the standard [Rollback Guidance](#rollback-guidance) section below.
+
 ## Before You Upgrade
 
 Before every version change:
