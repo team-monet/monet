@@ -49,7 +49,7 @@ Before deploying, make sure you have:
 - DNS records for your dashboard, API, and Keycloak hostnames
 - a reverse proxy or load balancer that can terminate TLS
 - image coordinates for `API_IMAGE`, `DASHBOARD_IMAGE`, and `MIGRATE_IMAGE`
-  - recommended production source: GHCR images pinned to a release tag (for example `v0.1.0`)
+  - recommended production source: GHCR images pinned to a release tag (for example `v0.2.0`)
   - `ghcr.io/team-monet/monet-api`
   - `ghcr.io/team-monet/monet-dashboard`
   - `ghcr.io/team-monet/monet-migrate`
@@ -92,9 +92,9 @@ cp .env.runtime.example .env.runtime
 For production, set image vars to pinned GHCR release tags (not floating `latest`):
 
 ```bash
-API_IMAGE=ghcr.io/team-monet/monet-api:v0.1.0
-DASHBOARD_IMAGE=ghcr.io/team-monet/monet-dashboard:v0.1.0
-MIGRATE_IMAGE=ghcr.io/team-monet/monet-migrate:v0.1.0
+API_IMAGE=ghcr.io/team-monet/monet-api:v0.2.0
+DASHBOARD_IMAGE=ghcr.io/team-monet/monet-dashboard:v0.2.0
+MIGRATE_IMAGE=ghcr.io/team-monet/monet-migrate:v0.2.0
 ```
 
 3. Pull or build images:
@@ -104,9 +104,9 @@ MIGRATE_IMAGE=ghcr.io/team-monet/monet-migrate:v0.1.0
 pnpm runtime:pull
 
 # equivalent explicit pulls
-docker pull ghcr.io/team-monet/monet-api:v0.1.0
-docker pull ghcr.io/team-monet/monet-dashboard:v0.1.0
-docker pull ghcr.io/team-monet/monet-migrate:v0.1.0
+docker pull ghcr.io/team-monet/monet-api:v0.2.0
+docker pull ghcr.io/team-monet/monet-dashboard:v0.2.0
+docker pull ghcr.io/team-monet/monet-migrate:v0.2.0
 
 # or, for local image testing on the same host:
 # pnpm local:build
@@ -268,7 +268,7 @@ The runtime template includes local defaults and commented GHCR examples:
 - `DASHBOARD_IMAGE`
 - `MIGRATE_IMAGE`
 
-For production deploys, use pinned release tags (for example `v0.1.0`) rather than `latest`.
+For production deploys, use pinned release tags (for example `v0.2.0`) rather than `latest`.
 
 ## Deploy
 
