@@ -59,7 +59,7 @@ export default defineConfig({
     command: "pnpm dev:local",
     port: 3000,
     timeout: 120_000,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: true,
     env: {
       DEV_BYPASS_AUTH: "true",
       PORT: "3000",
