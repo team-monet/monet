@@ -14,7 +14,8 @@ import {
   rules, 
   ruleSets, 
   ruleSetRules, 
-  agentRuleSets
+  agentRuleSets,
+  platformInstallations,
 } from "@monet/db";
 import { eq } from "drizzle-orm";
 import { randomBytes, createHash, randomUUID } from "node:crypto";
@@ -75,6 +76,15 @@ async function seed() {
     END $$;
   `);
   await db.delete(tenants).execute();
+
+  console.log("Initializing platform...");
+  // Mark the platform as initialized so the dashboard doesn't redirect to /setup.
+  // This is required for E2E tests — the login page checks bootstrap status which
+  // reads from platform_installations.initialized_at.
+  await db.delete(platformInstallations).execute();
+  await db.insert(platformInstallations).values({
+    initializedAt: new Date(),
+  });
 
   console.log("Creating test tenant...");
   const [tenant] = await db.insert(tenants).values({

@@ -77,8 +77,8 @@ jobs:
 
       - name: Seed E2E test data
         run: |
-          # Seed the test-org tenant and default group for E2E tests
-          pnpm --filter @monet/dashboard exec tsx ./scripts/seed-e2e-data.ts || true
+          # Seed the platform installation, test-org tenant, and default groups for E2E tests
+          pnpm --filter @monet/dashboard exec tsx ./scripts/seed-test-data.ts
 
       - name: Start API server
         run: |
