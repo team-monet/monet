@@ -16,3 +16,10 @@ apps/api/.local-dev/
 .omc
 .env.runtime
 .claude
+
+# Playwright E2E artifacts
+apps/dashboard/e2e/.auth/
+apps/dashboard/e2e-artifacts/
+apps/dashboard/e2e-report/
+apps/dashboard/e2e-results.json
+apps/dashboard/test-results/
