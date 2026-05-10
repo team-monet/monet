@@ -13,6 +13,7 @@ import {
   Scale,
   BarChart3,
   LogOut,
+  Settings,
 } from "lucide-react"
 
 import {
@@ -120,6 +121,12 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
       url: "/admin/metrics",
       icon: BarChart3,
       isActive: pathname === "/admin/metrics",
+    },
+    {
+      title: "Agent Instructions",
+      url: "/admin/settings",
+      icon: Settings,
+      isActive: pathname === "/admin/settings",
     },
   ]
 
