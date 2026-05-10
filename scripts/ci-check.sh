@@ -75,6 +75,7 @@ main() {
   run_step "Typecheck" pnpm typecheck
   run_step "Lint" pnpm lint
   run_step "Unit tests" pnpm test:unit
+  run_step "Dashboard tests" pnpm --filter dashboard test
   prepare_database
   run_step "Integration tests" pnpm test:integration
 
