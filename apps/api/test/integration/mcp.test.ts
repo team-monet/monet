@@ -286,7 +286,7 @@ describe("MCP integration", () => {
     await Promise.all([client.close(), secondClient.client.close()]);
   });
 
-  it("marks memories outdated and keeps them searchable", async () => {
+  it("excludes outdated memories from search results", async () => {
     const { client } = await connectClient();
 
     const first = parseToolText(await client.callTool({
@@ -318,9 +318,8 @@ describe("MCP integration", () => {
       arguments: { query: "banana", tags: ["ranking"] },
     });
     const search = parseToolText(searchResult);
-    expect(search.items).toHaveLength(2);
-    expect(search.items.map((item: { id: string }) => item.id)).toContain(first.id);
-    expect(search.items.map((item: { id: string }) => item.id)).toContain(second.id);
+    expect(search.items).toHaveLength(1);
+    expect(search.items[0].id).toBe(first.id);
 
     await client.close();
   });
