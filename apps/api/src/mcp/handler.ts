@@ -307,8 +307,9 @@ export function createMcpHandler({ db, sql, sessionStore }: McpHandlerDeps) {
             const transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => newSessionId,
             });
-            const server = createMcpServer(auth.agent, schemaName, sql, {
+            const server = await createMcpServer(auth.agent, schemaName, sql, {
               activeRules,
+              tenantSlug: requestedTenantSlug ?? undefined,
               onInitialized: async () => {
                 try {
                   await pushRulesToAgent(auth.agent.id, sessionStore, sql, schemaName);

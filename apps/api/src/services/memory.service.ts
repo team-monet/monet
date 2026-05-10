@@ -209,7 +209,31 @@ export interface ScopeFilterOpts {
 export interface MemoryWritePreflight {
   hasGroupMembership: boolean;
   memoryQuota: number | null;
-  groupId: string | null;
+  groupIds: string[];
+  groupQuotasById?: Record<string, number | null>;
+}
+
+export async function getAgentGroupMemberships(
+  txSql: MemorySqlClient,
+  agentId: string,
+): Promise<Array<{ id: string; name: string; description: string | null }>> {
+  const db = createMemoryDb(txSql);
+  const rows = await db
+    .select({
+      id: agentGroups.id,
+      name: agentGroups.name,
+      description: agentGroups.description,
+    })
+    .from(agentGroupMembers)
+    .innerJoin(agentGroups, eq(agentGroups.id, agentGroupMembers.groupId))
+    .where(eq(agentGroupMembers.agentId, agentId))
+    .orderBy(asc(agentGroups.name));
+
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    description: row.description ?? null,
+  }));
 }
 
 async function getAgentGroupIds(
@@ -357,28 +381,38 @@ export async function resolveMemoryWritePreflight(
     return null;
   }
 
-  const rows = await withTenantDrizzleScope(platformSql, schemaName, async (db) => db
+  type MembershipRow = {
+    memoryQuota: number | null;
+    groupId: string;
+  };
+
+  const rows: MembershipRow[] = await withTenantDrizzleScope(platformSql, schemaName, async (db) => db
     .select({
       memoryQuota: agentGroups.memoryQuota,
       groupId: agentGroups.id,
     })
     .from(agentGroupMembers)
     .innerJoin(agentGroups, eq(agentGroups.id, agentGroupMembers.groupId))
-    .where(eq(agentGroupMembers.agentId, agent.id))
-    .limit(1));
+    .where(eq(agentGroupMembers.agentId, agent.id)));
 
   if (rows.length === 0) {
     return {
       hasGroupMembership: false,
       memoryQuota: null,
-      groupId: null,
+      groupIds: [],
+      groupQuotasById: {},
     };
   }
 
+  const groupQuotasById = Object.fromEntries(
+    rows.map((row: MembershipRow) => [row.groupId, row.memoryQuota ?? null]),
+  ) as Record<string, number | null>;
+
   return {
     hasGroupMembership: true,
-    memoryQuota: rows[0].memoryQuota ?? null,
-    groupId: rows[0].groupId ?? null,
+    memoryQuota: rows.length === 1 ? rows[0].memoryQuota ?? null : null,
+    groupIds: rows.map((row: MembershipRow) => row.groupId),
+    groupQuotasById,
   };
 }
 
@@ -437,15 +471,36 @@ export async function createMemory(
     return { error: "validation" as const, message: "summary is required when chat enrichment is disabled" };
   }
 
+  let groupId: string | null = null;
+  if (input.memoryScope === "group") {
+    const readableGroupIds = preflight?.groupIds ?? [];
+
+    if (readableGroupIds.length > 1 && !input.groupId) {
+      return {
+        error: "validation" as const,
+        message: "groupId is required when you belong to multiple groups. Use agent_context to discover your groups.",
+      };
+    }
+
+    if (input.groupId && !readableGroupIds.includes(input.groupId)) {
+      return {
+        error: "forbidden" as const,
+      };
+    }
+
+    groupId = input.groupId ?? (readableGroupIds.length === 1 ? readableGroupIds[0] : null);
+  }
+
   // Quota enforcement
-  const quotaErr = await checkQuota(txSql, agent, preflight?.memoryQuota ?? null);
+  const resolvedQuota = groupId
+    ? preflight?.groupQuotasById?.[groupId] ?? null
+    : preflight?.memoryQuota ?? null;
+  const quotaErr = await checkQuota(txSql, agent, resolvedQuota);
   if (quotaErr) return quotaErr;
 
   const expiresAt = input.ttlSeconds
     ? new Date(Date.now() + input.ttlSeconds * 1000)
     : null;
-
-  const groupId = preflight?.groupId ?? null;
 
   const [entry] = await db
     .insert(memoryEntries)

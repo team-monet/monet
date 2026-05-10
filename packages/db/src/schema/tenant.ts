@@ -166,6 +166,12 @@ export const userGroupAgentGroupPermissions = pgTable(
   ],
 );
 
+export const tenantSettings = pgTable("tenant_settings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantAgentInstructions: text("tenant_agent_instructions"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const memoryEntries = pgTable(
   "memory_entries",
   {

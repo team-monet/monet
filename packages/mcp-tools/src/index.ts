@@ -20,15 +20,19 @@ export const TOOL_MEMORY_DELETE = "memory_delete" as const;
 export const TOOL_MEMORY_PROMOTE_SCOPE = "memory_promote_scope" as const;
 export const TOOL_MEMORY_MARK_OUTDATED = "memory_mark_outdated" as const;
 export const TOOL_MEMORY_LIST_TAGS = "memory_list_tags" as const;
+export const TOOL_AGENT_CONTEXT = "agent_context" as const;
 
 export const MemoryStoreInput = z.object({
   content: z.string().describe("The knowledge or information to store"),
   summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when chat enrichment is disabled. Maximum 200 characters. Safe to always provide regardless of provider mode."),
   memoryType: MemoryType.describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
   memoryScope: MemoryScope.default("group").describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
+  groupId: z.string().uuid().optional().describe("Required when storing a group-scoped memory and you belong to multiple groups. If you belong to only one group, this defaults to that group."),
   tags: z.array(z.string()).min(1).describe("Tags for categorization and retrieval"),
   ttlSeconds: z.number().positive().optional().describe("Optional expiry time in seconds"),
 });
+
+export const AgentContextInput = z.object({});
 
 export const MemorySearchInput = z.object({
   query: z.string().optional().describe("Text query for semantic and full-text search"),
@@ -124,6 +128,12 @@ export const toolDefinitions = [
       "List all unique tags across memories in your accessible scopes. Use this to discover the existing tag vocabulary before storing new memories, so you can reuse established tags and maintain consistency.",
     inputSchema: MemoryListTagsInput,
   },
+  {
+    name: TOOL_AGENT_CONTEXT,
+    description:
+      "Discover your agent identity, tenant, user binding, and group memberships. Call this early to understand your current context before storing or searching memory.",
+    inputSchema: AgentContextInput,
+  },
 ] as const;
 
 function toolDescription(name: (typeof toolDefinitions)[number]["name"]) {
@@ -143,6 +153,7 @@ export interface McpToolHandlers {
   memoryPromoteScope: (args: z.infer<typeof MemoryPromoteScopeInput>) => Promise<CallToolResult>;
   memoryMarkOutdated: (args: z.infer<typeof MemoryMarkOutdatedInput>) => Promise<CallToolResult>;
   memoryListTags: (args: z.infer<typeof MemoryListTagsInput>) => Promise<CallToolResult>;
+  agentContext: (args: z.infer<typeof AgentContextInput>) => Promise<CallToolResult>;
 }
 
 export function registerAllTools(
@@ -188,4 +199,9 @@ export function registerAllTools(
     description: toolDescription(TOOL_MEMORY_LIST_TAGS),
     inputSchema: MemoryListTagsInput,
   }, handlers.memoryListTags);
+
+  server.registerTool(TOOL_AGENT_CONTEXT, {
+    description: toolDescription(TOOL_AGENT_CONTEXT),
+    inputSchema: AgentContextInput,
+  }, handlers.agentContext);
 }
