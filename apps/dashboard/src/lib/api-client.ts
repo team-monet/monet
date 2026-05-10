@@ -32,6 +32,10 @@ export interface ApiClientOptions {
   tenantSlug: string;
 }
 
+export interface TenantSettingsResponse {
+  tenantAgentInstructions: string | null;
+}
+
 export class MonetApiClient {
   private baseUrl: string;
   private apiKey: string;
@@ -277,6 +281,20 @@ export class MonetApiClient {
     return this.fetch<AgentGroup>(`/api/groups/${id}`, {
       method: "PATCH",
       body: JSON.stringify(input),
+    });
+  }
+
+  // Tenant settings
+  async getTenantSettings(): Promise<TenantSettingsResponse> {
+    return this.fetch<TenantSettingsResponse>("/api/settings");
+  }
+
+  async updateTenantSettings(data: {
+    tenantAgentInstructions: string;
+  }): Promise<TenantSettingsResponse> {
+    return this.fetch<TenantSettingsResponse>("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify(data),
     });
   }
 
