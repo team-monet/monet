@@ -119,7 +119,7 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_MARK_OUTDATED,
     description:
-      "Mark a memory entry as outdated. Use this when information is no longer current but still has historical value. The entry remains searchable but is ranked lower in results. Prefer this over deletion when the old context might still be useful for understanding past decisions.",
+      "Mark a memory entry as outdated. Use this when information is no longer current but still has historical value. Outdated entries are removed from memory_search results but remain fetchable by ID via memory_fetch. Prefer this over deletion when the old context might still be useful for understanding past decisions.",
     inputSchema: MemoryMarkOutdatedInput,
   },
   {
