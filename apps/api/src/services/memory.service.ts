@@ -247,6 +247,7 @@ function buildScopeFilterCondition(
       and(
         eq(memoryEntries.memoryScope, "user"),
         eq(memoryEntries.userId, agent.userId),
+        inArray(memoryEntries.groupId, agentReadableGroupIds),
       )!,
     );
   }
@@ -518,6 +519,7 @@ export async function searchMemories(
       includePrivate: query.includePrivate ?? false,
     }, effectiveGroupIds),
     buildNonExpiredCondition(),
+    eq(memoryEntries.outdated, false),
   ];
 
   const lexicalCondition = query.query
@@ -1118,7 +1120,13 @@ function checkScopeAccess(
   }
 
   if (scope === "user") {
-    if (agent.userId && (entry.user_id as string) === agent.userId) return null;
+    const entryGroupId = entry.group_id as string | null;
+    if (
+      agent.userId &&
+      (entry.user_id as string) === agent.userId &&
+      entryGroupId &&
+      agentReadableGroupIds.includes(entryGroupId)
+    ) return null;
     return { error: "forbidden" };
   }
 

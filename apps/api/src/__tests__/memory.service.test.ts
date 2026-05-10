@@ -2291,3 +2291,228 @@ describe("cross-group isolation", () => {
     expect(whereSql).toContain("FALSE");
   });
 });
+
+describe("access control matrix", () => {
+  const AGENT_ID_B = "00000000-0000-0000-0000-000000000002";
+  const USER_ID_B = "00000000-0000-0000-0000-000000000100";
+  const GROUP_C = "00000000-0000-0000-0000-000000000302";
+
+  function makeEntryRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "00000000-0000-0000-0000-000000000950",
+      content: "access-matrix-memory",
+      summary: null,
+      memory_type: "fact",
+      memory_scope: "group",
+      tags: ["matrix"],
+      auto_tags: [],
+      related_memory_ids: [],
+      usefulness_score: 1,
+      outdated: false,
+      ttl_seconds: null,
+      expires_at: null,
+      created_at: new Date("2026-03-22T08:00:00.000Z"),
+      last_accessed_at: new Date("2026-03-22T08:00:00.000Z"),
+      author_agent_id: AGENT_ID,
+      author_agent_display_name: "test-agent",
+      group_id: GROUP_A,
+      user_id: USER_ID,
+      version: 0,
+      ...overrides,
+    };
+  }
+
+  function makeSearchRow(overrides: Record<string, unknown> = {}) {
+    return {
+      ...makeEntryRow(overrides),
+      search_rank: 2,
+    };
+  }
+
+  function setupFetchMocks(entryRow: Record<string, unknown>, groupIds: string[]) {
+    const entryLimitMock = vi.fn().mockResolvedValue([entryRow]);
+    const entryWhereMock = vi.fn(() => ({ limit: entryLimitMock }));
+    const secondLeftJoinMock = vi.fn(() => ({ where: entryWhereMock }));
+    const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
+    const entryFromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
+
+    const versionsOrderByMock = vi.fn().mockResolvedValue([]);
+    const versionsWhereMock = vi.fn(() => ({ orderBy: versionsOrderByMock }));
+    const versionsFromMock = vi.fn(() => ({ where: versionsWhereMock }));
+
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(mockGroupIdSelect(groupIds))
+      .mockImplementationOnce(() => ({ from: entryFromMock }))
+      .mockImplementationOnce(() => ({ from: versionsFromMock }));
+
+    const updateWhereMock = vi.fn().mockResolvedValue([]);
+    const updateSetMock = vi.fn(() => ({ where: updateWhereMock }));
+    const updateMock = vi.fn(() => ({ set: updateSetMock }));
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      update: updateMock,
+    });
+
+    return { updateMock };
+  }
+
+  function setupSearchMocks(rows: Record<string, unknown>[], groupIds: string[]) {
+    const limitMock = vi.fn().mockResolvedValue(rows);
+    const orderByMock = vi.fn(() => ({ limit: limitMock }));
+    const whereMock = vi.fn((whereArg: unknown) => {
+      void whereArg;
+      return { orderBy: orderByMock };
+    });
+    const secondLeftJoinMock = vi.fn(() => ({ where: whereMock }));
+    const firstLeftJoinMock = vi.fn(() => ({ leftJoin: secondLeftJoinMock }));
+    const fromMock = vi.fn(() => ({ leftJoin: firstLeftJoinMock }));
+    const selectMock = vi
+      .fn()
+      .mockImplementationOnce(mockGroupIdSelect(groupIds))
+      .mockImplementationOnce(() => ({ from: fromMock }));
+
+    drizzleMock.mockReturnValue({ select: selectMock });
+    return { whereMock };
+  }
+
+  it("fetchMemory: author can fetch their own private memory", async () => {
+    setupFetchMocks(makeEntryRow({ memory_scope: "private", author_agent_id: AGENT_ID }), [GROUP_A]);
+    const result = await fetchMemory({} as TransactionClient, makeAgent(), "00000000-0000-0000-0000-000000000950");
+    expect("entry" in result && result.entry.id).toBe("00000000-0000-0000-0000-000000000950");
+  });
+
+  it("fetchMemory: non-author CANNOT fetch private memory", async () => {
+    const { updateMock } = setupFetchMocks(
+      makeEntryRow({ memory_scope: "private", author_agent_id: AGENT_ID }),
+      [GROUP_A],
+    );
+    const result = await fetchMemory(
+      {} as TransactionClient,
+      makeAgent({ id: AGENT_ID_B, externalId: "agent-b" }),
+      "00000000-0000-0000-0000-000000000950",
+    );
+    expect(result).toEqual({ error: "forbidden" });
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("searchMemories: private memory only visible to author", async () => {
+    const { whereMock } = setupSearchMocks([makeSearchRow({ memory_scope: "private" })], [GROUP_A]);
+    await searchMemories({} as TransactionClient, makeAgent(), { includePrivate: true, limit: 10 }, null);
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    const params = whereSqlParams(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain(`"memory_entries"."memory_scope" = $`);
+    expect(whereSql).toContain(`"memory_entries"."author_agent_id" = $`);
+    expect(params).toContain("private");
+    expect(params).toContain(AGENT_ID);
+  });
+
+  it("fetchMemory: user-scoped memory accessible when same userId AND same groupId", async () => {
+    setupFetchMocks(makeEntryRow({ memory_scope: "user", user_id: USER_ID, group_id: GROUP_A }), [GROUP_A]);
+    const result = await fetchMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      "00000000-0000-0000-0000-000000000950",
+    );
+    expect("entry" in result && result.entry.memoryScope).toBe("user");
+  });
+
+  it("fetchMemory: user-scoped memory FORBIDDEN when same userId but different groupId", async () => {
+    const { updateMock } = setupFetchMocks(
+      makeEntryRow({ memory_scope: "user", user_id: USER_ID, group_id: GROUP_B }),
+      [GROUP_A],
+    );
+    const result = await fetchMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      "00000000-0000-0000-0000-000000000950",
+    );
+    expect(result).toEqual({ error: "forbidden" });
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("searchMemories: user scope WHERE clause includes groupId restriction", async () => {
+    const { whereMock } = setupSearchMocks([makeSearchRow({ memory_scope: "user" })], [GROUP_A]);
+    await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      { includeUser: true, limit: 10 },
+      null,
+    );
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
+    const params = whereSqlParams(whereMock.mock.calls[0][0]);
+    expect(whereSql).toContain(`"memory_entries"."user_id" = $`);
+    expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
+    expect(params).toContain(USER_ID);
+    expect(params).toContain(GROUP_A);
+  });
+
+  it("searchMemories: user-scoped memory excluded when agent's groups don't include memory's groupId", async () => {
+    setupSearchMocks([], [GROUP_A]);
+    const result = await searchMemories(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      { includeUser: true, groupId: GROUP_B, limit: 10 },
+      null,
+    );
+    expect(result).toEqual({ error: "forbidden" });
+  });
+
+  it("fetchMemory: group-scoped memory accessible to agent in that group", async () => {
+    setupFetchMocks(makeEntryRow({ memory_scope: "group", group_id: GROUP_A }), [GROUP_A]);
+    const result = await fetchMemory({} as TransactionClient, makeAgent(), "00000000-0000-0000-0000-000000000950");
+    expect("entry" in result && result.entry.memoryScope).toBe("group");
+  });
+
+  it("fetchMemory: group-scoped memory FORBIDDEN to agent outside that group", async () => {
+    const { updateMock } = setupFetchMocks(makeEntryRow({ memory_scope: "group", group_id: GROUP_B }), [GROUP_A]);
+    const result = await fetchMemory({} as TransactionClient, makeAgent(), "00000000-0000-0000-0000-000000000950");
+    expect(result).toEqual({ error: "forbidden" });
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("fetchMemory: multi-group agent can access memories from any of their groups", async () => {
+    setupFetchMocks(makeEntryRow({ memory_scope: "group", group_id: GROUP_B }), [GROUP_A, GROUP_B]);
+    const result = await fetchMemory({} as TransactionClient, makeAgent(), "00000000-0000-0000-0000-000000000950");
+    expect("entry" in result && result.entry.groupId).toBe(GROUP_B);
+  });
+
+  it("fetchMemory: multi-group agent CANNOT access memory from group they don't belong to", async () => {
+    const { updateMock } = setupFetchMocks(makeEntryRow({ memory_scope: "group", group_id: GROUP_C }), [GROUP_A, GROUP_B]);
+    const result = await fetchMemory({} as TransactionClient, makeAgent(), "00000000-0000-0000-0000-000000000950");
+    expect(result).toEqual({ error: "forbidden" });
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("searchMemories: outdated memories are excluded from search results", async () => {
+    const { whereMock } = setupSearchMocks([makeSearchRow()], [GROUP_A]);
+    await searchMemories({} as TransactionClient, makeAgent(), { limit: 10 }, null);
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]).toLowerCase();
+    expect(whereSql).toContain(`"memory_entries"."outdated" =`);
+  });
+
+  it("fetchMemory: outdated memory CAN be fetched by ID", async () => {
+    setupFetchMocks(makeEntryRow({ outdated: true, memory_scope: "group", group_id: GROUP_A }), [GROUP_A]);
+    const result = await fetchMemory({} as TransactionClient, makeAgent(), "00000000-0000-0000-0000-000000000950");
+    expect("entry" in result && result.entry.outdated).toBe(true);
+  });
+
+  it("searchMemories: expired memories are excluded from search results", async () => {
+    const { whereMock } = setupSearchMocks([makeSearchRow()], [GROUP_A]);
+    await searchMemories({} as TransactionClient, makeAgent(), { limit: 10 }, null);
+    const whereSql = whereSqlToString(whereMock.mock.calls[0][0]).toLowerCase();
+    expect(whereSql).toContain(`"memory_entries"."expires_at" is null`);
+    expect(whereSql).toContain(`"memory_entries"."expires_at" > now()`);
+  });
+
+  it("fetchMemory: expired memory CAN be fetched by ID", async () => {
+    const pastExpiry = new Date("2026-01-01T00:00:00.000Z");
+    setupFetchMocks(
+      makeEntryRow({ memory_scope: "group", group_id: GROUP_A, expires_at: pastExpiry, user_id: USER_ID_B }),
+      [GROUP_A],
+    );
+    const result = await fetchMemory({} as TransactionClient, makeAgent(), "00000000-0000-0000-0000-000000000950");
+    expect("entry" in result && result.entry.expiresAt).toBe("2026-01-01T00:00:00.000Z");
+  });
+});
