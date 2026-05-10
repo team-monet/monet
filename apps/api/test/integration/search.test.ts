@@ -30,6 +30,7 @@ describe("search integration", () => {
   let agentId = "";
   let tenantId = "";
   let schemaName = "";
+  let currentGroupId = "";
 
   function authHeaders(key = apiKey) {
     return {
@@ -68,6 +69,7 @@ describe("search integration", () => {
       created_at?: string;
       last_accessed_at?: string;
       expires_at?: string | null;
+      group_id?: string | null;
     },
   ) {
     await withTenantScope(sql, schemaName, async (txSql) => {
@@ -110,6 +112,10 @@ describe("search integration", () => {
         } else {
           await txSql`UPDATE memory_entries SET expires_at = ${fields.expires_at}::timestamptz WHERE id = ${id}`;
         }
+      }
+
+      if (fields.group_id !== undefined) {
+        await txSql`UPDATE memory_entries SET group_id = ${fields.group_id} WHERE id = ${id}`;
       }
     });
   }
@@ -239,6 +245,7 @@ describe("search integration", () => {
       body: JSON.stringify({ name: "search-group" }),
     });
     const group = await groupRes.json() as { id: string };
+    currentGroupId = group.id;
     await app.request(`/api/groups/${group.id}/members`, {
       method: "POST",
       headers: authHeaders(),
@@ -490,6 +497,7 @@ describe("search integration", () => {
       await seedBaseline();
       await bindCurrentAgentToUser();
       const created = await createMemory({ content: "u-scope", memoryType: "fact", memoryScope: "user", tags: ["scope-flag"] });
+      await patchMemory(created.body.id, { group_id: currentGroupId });
       const { body } = await search({ tags: "scope-flag", includeUser: true });
       expect(body.items.length).toBe(1);
       expect(body.items[0].id).toBe(created.body.id);
@@ -506,7 +514,8 @@ describe("search integration", () => {
     it("both flags: all scopes visible", async () => {
       await seedBaseline();
       await bindCurrentAgentToUser();
-      await createMemory({ content: "u-scope", memoryType: "fact", memoryScope: "user", tags: ["scope-flag"] });
+      const userScoped = await createMemory({ content: "u-scope", memoryType: "fact", memoryScope: "user", tags: ["scope-flag"] });
+      await patchMemory(userScoped.body.id, { group_id: currentGroupId });
       await createMemory({ content: "p-scope", memoryType: "fact", memoryScope: "private", tags: ["scope-flag"] });
       await createMemory({ content: "g-scope", memoryType: "fact", memoryScope: "group", tags: ["scope-flag"] });
       const { body } = await search({ tags: "scope-flag", includeUser: true, includePrivate: true });
