@@ -228,7 +228,7 @@ describe("createMemory", () => {
       {
         hasGroupMembership: true,
         memoryQuota: 10,
-        groupId: "00000000-0000-0000-0000-000000000300",
+        groupIds: ["00000000-0000-0000-0000-000000000300"],
       },
     );
 
@@ -299,7 +299,7 @@ describe("createMemory", () => {
       {} as TransactionClient,
       makeAgent({ userId: USER_ID }),
       { content: "c", summary: "  provided summary  ", memoryType: "fact", memoryScope: "group", tags: ["ops"] },
-      { hasGroupMembership: true, memoryQuota: 10, groupId: GROUP_A },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
     );
 
     expect(memoryValuesMock).toHaveBeenCalledWith(expect.objectContaining({ summary: "provided summary" }));
@@ -312,7 +312,7 @@ describe("createMemory", () => {
       {} as TransactionClient,
       makeAgent({ userId: USER_ID }),
       { content: "c", memoryType: "fact", memoryScope: "group", tags: ["ops"] },
-      { hasGroupMembership: true, memoryQuota: 10, groupId: GROUP_A },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
     );
 
     expect(result).toEqual({
@@ -328,14 +328,14 @@ describe("createMemory", () => {
       {} as TransactionClient,
       makeAgent({ userId: USER_ID }),
       { content: "c", summary: "", memoryType: "fact", memoryScope: "group", tags: ["ops"] },
-      { hasGroupMembership: true, memoryQuota: 10, groupId: GROUP_A },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
     );
 
     const whitespaceResult = await createMemory(
       {} as TransactionClient,
       makeAgent({ userId: USER_ID }),
       { content: "c", summary: "   ", memoryType: "fact", memoryScope: "group", tags: ["ops"] },
-      { hasGroupMembership: true, memoryQuota: 10, groupId: GROUP_A },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
     );
 
     expect(emptyResult).toEqual({
@@ -347,19 +347,35 @@ describe("createMemory", () => {
       message: "summary is required when chat enrichment is disabled",
     });
   });
+
+  it("requires groupId when agent belongs to multiple groups", async () => {
+    const result = await createMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        content: "c",
+        memoryType: "fact",
+        memoryScope: "group",
+        tags: ["ops"],
+      },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A, GROUP_B] },
+    );
+
+    expect(result).toEqual({
+      error: "validation",
+      message: "groupId is required when you belong to multiple groups. Use agent_context to discover your groups.",
+    });
+  });
 });
 
 describe("resolveMemoryWritePreflight", () => {
-  it("returns the first matching group membership and quota through Drizzle", async () => {
-    const limitMock = vi.fn().mockResolvedValue([
+  it("returns matching group memberships and quota through Drizzle", async () => {
+    const whereMock = vi.fn().mockResolvedValue([
       {
         memoryQuota: 250,
         groupId: "00000000-0000-0000-0000-000000000222",
       },
     ]);
-    const whereMock = vi.fn(() => ({
-      limit: limitMock,
-    }));
     const innerJoinMock = vi.fn(() => ({
       where: whereMock,
     }));
@@ -387,7 +403,10 @@ describe("resolveMemoryWritePreflight", () => {
     expect(result).toEqual({
       hasGroupMembership: true,
       memoryQuota: 250,
-      groupId: "00000000-0000-0000-0000-000000000222",
+      groupIds: ["00000000-0000-0000-0000-000000000222"],
+      groupQuotasById: {
+        "00000000-0000-0000-0000-000000000222": 250,
+      },
     });
   });
 });

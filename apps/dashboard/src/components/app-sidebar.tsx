@@ -13,6 +13,7 @@ import {
   Scale,
   BarChart3,
   LogOut,
+  ClipboardList,
 } from "lucide-react"
 
 import {
@@ -85,6 +86,12 @@ export function AppSidebar({ user, ...props }: AppSidebarProps) {
   ]
 
   const adminNav = [
+    {
+      title: "Agent Instructions",
+      url: "/admin/settings",
+      icon: ClipboardList,
+      isActive: pathname === "/admin/settings",
+    },
     {
       title: "Shared Rules",
       url: "/admin/rules",
