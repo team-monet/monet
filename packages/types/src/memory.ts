@@ -18,6 +18,7 @@ export const CreateMemoryEntryInput = z.object({
   summary: z.string().max(200).optional(),
   memoryType: MemoryType,
   memoryScope: MemoryScope.default("group"),
+  groupId: z.string().uuid().optional(),
   tags: z.array(z.string()).min(1, "At least one tag is required"),
   ttlSeconds: z.number().positive().optional(),
 });

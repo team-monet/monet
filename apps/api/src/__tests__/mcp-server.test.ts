@@ -3,14 +3,36 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../mcp/server";
 
-vi.mock("@monet/db", () => ({
-  withTenantScope: vi.fn(
+const { withTenantScopeMock, tenantSettingsMock } = vi.hoisted(() => ({
+  withTenantScopeMock: vi.fn(
     async (
       _sql: unknown,
       _schemaName: string,
       fn: (txSql: unknown) => Promise<unknown>,
     ) => fn({}),
   ),
+  tenantSettingsMock: { tenantAgentInstructions: Symbol("tenantAgentInstructions") },
+}));
+
+vi.mock("@monet/db", () => ({
+  withTenantScope: withTenantScopeMock,
+  asDrizzleSqlClient: vi.fn(() => ({})),
+  tenantSettings: tenantSettingsMock,
+}));
+
+const drizzleSelectLimitMock = vi.fn().mockResolvedValue([]);
+const drizzleSelectFromMock = vi.fn(() => ({
+  limit: drizzleSelectLimitMock,
+}));
+const drizzleSelectMock = vi.fn(() => ({
+  from: drizzleSelectFromMock,
+}));
+const drizzleMock = vi.fn(() => ({
+  select: drizzleSelectMock,
+}));
+
+vi.mock("drizzle-orm/postgres-js", () => ({
+  drizzle: (...args: Parameters<typeof drizzleMock>) => drizzleMock(...args),
 }));
 
 const memoryServiceMocks = {
@@ -22,6 +44,7 @@ const memoryServiceMocks = {
   promoteScope: vi.fn(),
   markOutdated: vi.fn(),
   listTags: vi.fn(),
+  getAgentGroupMemberships: vi.fn().mockResolvedValue([]),
 };
 
 const enqueueEnrichment = vi.fn();
@@ -36,6 +59,7 @@ vi.mock("../services/memory.service.js", () => ({
   promoteScope: (...args: unknown[]) => memoryServiceMocks.promoteScope(...args),
   markOutdated: (...args: unknown[]) => memoryServiceMocks.markOutdated(...args),
   listTags: (...args: unknown[]) => memoryServiceMocks.listTags(...args),
+  getAgentGroupMemberships: (...args: unknown[]) => memoryServiceMocks.getAgentGroupMemberships(...args),
   resolveMemoryWritePreflight: vi.fn().mockResolvedValue(null),
 }));
 
@@ -73,10 +97,11 @@ function parseToolText(result: unknown) {
 describe("MCP server factory", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    drizzleSelectLimitMock.mockResolvedValue([]);
   });
 
   it("registers all eight tools", async () => {
-    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
@@ -86,7 +111,7 @@ describe("MCP server factory", () => {
     ]);
 
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(8);
+    expect(tools.tools).toHaveLength(9);
     expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
       "memory_store",
       "memory_search",
@@ -96,13 +121,14 @@ describe("MCP server factory", () => {
       "memory_promote_scope",
       "memory_mark_outdated",
       "memory_list_tags",
+      "agent_context",
     ]));
 
     await Promise.all([client.close(), server.close()]);
   });
 
   it("exposes scope and type semantics in tool schemas", async () => {
-    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
@@ -152,7 +178,7 @@ describe("MCP server factory", () => {
   });
 
   it("delivers base governance instructions even with no active rules", async () => {
-    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
@@ -171,7 +197,7 @@ describe("MCP server factory", () => {
   });
 
   it("publishes active rules through MCP initialize instructions", async () => {
-    const server = createMcpServer(AGENT, "tenant_test", {} as never, {
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never, {
       activeRules: [...ACTIVE_RULES],
     });
     const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -190,6 +216,42 @@ describe("MCP server factory", () => {
     await Promise.all([client.close(), server.close()]);
   });
 
+  it("returns agent_context payload with tenant and memberships", async () => {
+    memoryServiceMocks.getAgentGroupMemberships.mockResolvedValueOnce([
+      {
+        id: "00000000-0000-0000-0000-000000000301",
+        name: "Core Agents",
+        description: "Default group",
+      },
+    ]);
+
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never, {
+      tenantSlug: "acme",
+    });
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({ name: "agent_context", arguments: {} });
+    expect(result.isError).toBeUndefined();
+    expect(parseToolText(result)).toEqual({
+      agentId: AGENT.id,
+      externalId: AGENT.externalId,
+      tenantSlug: "acme",
+      userBinding: null,
+      groupMemberships: [
+        {
+          id: "00000000-0000-0000-0000-000000000301",
+          name: "Core Agents",
+          description: "Default group",
+        },
+      ],
+    });
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
   it("bounds active rule instructions when rules are large", async () => {
     const activeRules = Array.from({ length: 30 }, (_, index) => ({
       id: `00000000-0000-0000-0000-${String(index + 200).padStart(12, "0")}`,
@@ -200,7 +262,7 @@ describe("MCP server factory", () => {
       createdAt: "2026-03-16T00:00:00.000Z",
     }));
 
-    const server = createMcpServer(AGENT, "tenant_test", {} as never, {
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never, {
       activeRules,
     });
     const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -220,6 +282,27 @@ describe("MCP server factory", () => {
     await Promise.all([client.close(), server.close()]);
   });
 
+  it("truncates tenant instructions with visible marker", async () => {
+    drizzleSelectLimitMock.mockResolvedValueOnce([
+      { tenantAgentInstructions: "A".repeat(7000) },
+    ]);
+
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never, {
+      activeRules: [...ACTIVE_RULES],
+    });
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const instructions = client.getInstructions();
+    expect(instructions).toContain("Tenant instructions:");
+    expect(instructions).toContain("[TRUNCATED]");
+    expect(instructions?.length).toBeLessThanOrEqual(5000);
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
   it("memory_store enqueues enrichment after successful create", async () => {
     memoryServiceMocks.createMemory.mockResolvedValue({
       id: "mem-1",
@@ -227,7 +310,7 @@ describe("MCP server factory", () => {
       version: 0,
     });
 
-    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
@@ -258,7 +341,7 @@ describe("MCP server factory", () => {
       currentVersion: 4,
     });
 
-    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
@@ -289,7 +372,7 @@ describe("MCP server factory", () => {
       needsEnrichment: true,
     });
 
-    const server = createMcpServer(AGENT, "tenant_test", {} as never);
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 

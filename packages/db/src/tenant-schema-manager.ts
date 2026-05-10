@@ -384,6 +384,14 @@ export async function createTenantSchema(
     )
   `);
 
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}".tenant_settings (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_agent_instructions TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
   // Append-only audit log: revoke UPDATE and DELETE from public role
   await sql.unsafe(`REVOKE UPDATE, DELETE ON "${schemaName}".audit_log FROM PUBLIC`);
 

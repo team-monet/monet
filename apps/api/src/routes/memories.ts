@@ -63,6 +63,13 @@ memoriesRouter.post("/", async (c) => {
     );
   }
 
+  if ("error" in result && result.error === "forbidden") {
+    return c.json(
+      { error: "forbidden", message: "Access denied" },
+      403,
+    );
+  }
+
   enqueueEnrichment(sql, schemaName, result.id);
 
   return c.json(result, 201);
