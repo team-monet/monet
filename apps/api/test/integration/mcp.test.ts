@@ -146,7 +146,7 @@ describe("MCP integration", () => {
     const { client } = await connectClient();
     const tools = await client.listTools();
 
-    expect(tools.tools).toHaveLength(8);
+    expect(tools.tools).toHaveLength(9);
     expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
       "memory_store",
       "memory_search",
@@ -156,6 +156,7 @@ describe("MCP integration", () => {
       "memory_promote_scope",
       "memory_mark_outdated",
       "memory_list_tags",
+      "agent_context",
     ]));
 
     await client.close();
@@ -330,8 +331,8 @@ describe("MCP integration", () => {
 
     const firstTools = await first.client.listTools();
     const secondTools = await second.client.listTools();
-    expect(firstTools.tools).toHaveLength(8);
-    expect(secondTools.tools).toHaveLength(8);
+    expect(firstTools.tools).toHaveLength(9);
+    expect(secondTools.tools).toHaveLength(9);
 
     await first.transport.terminateSession();
     expect(sessionStore.count()).toBeGreaterThanOrEqual(1);
@@ -343,7 +344,7 @@ describe("MCP integration", () => {
     const { client } = await connectClient();
 
     const initialTools = await client.listTools();
-    expect(initialTools.tools).toHaveLength(8);
+    expect(initialTools.tools).toHaveLength(9);
 
     await withTenantScope(sql, schemaName, async (txSql) => {
       await txSql`

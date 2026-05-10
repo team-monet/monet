@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { withTenantScope } from "@monet/db";
+import { asDrizzleSqlClient, tenantSettings, withTenantScope } from "@monet/db";
+import { drizzle } from "drizzle-orm/postgres-js";
 import {
   registerAllTools,
   type McpToolHandlers,
@@ -12,6 +13,7 @@ import {
   createMemory,
   deleteMemory,
   fetchMemory,
+  getAgentGroupMemberships,
   listTags,
   markOutdated,
   promoteScope,
@@ -118,6 +120,7 @@ function describeServiceError(result: { error: string; message?: string }): stri
 
 interface CreateMcpServerOptions {
   activeRules?: RuleRecord[];
+  tenantSlug?: string;
   onInitialized?: () => void | Promise<void>;
 }
 
@@ -125,6 +128,7 @@ const MAX_RULE_NAME_INSTRUCTIONS_CHARS = 120;
 const MAX_RULE_DESCRIPTION_INSTRUCTIONS_CHARS = 240;
 const MAX_RULES_IN_INSTRUCTIONS = 20;
 const MAX_INSTRUCTIONS_CHARS = 5000;
+const INSTRUCTION_TRUNCATION_MARKER = " [TRUNCATED]";
 
 function normalizeInstructionText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
@@ -163,63 +167,167 @@ Your responsibilities:
 - MAINTAIN memory quality. Update outdated entries rather than creating duplicates. Use descriptive tags consistently (check memory_list_tags first). Choose the narrowest appropriate scope and promote later if needed.
 - RESPECT scope boundaries. Private memories are yours alone; user-scoped memories are visible to your operator; group-scoped memories are shared across all agents in your group.`;
 
-function formatInstructions(activeRules: RuleRecord[]): string {
-  const sections: string[] = [BASE_INSTRUCTIONS];
+const AGENT_CONTEXT_INSTRUCTION = "USE the agent_context tool early to understand your current tenant, user, and group permissions before storing or searching memory.";
 
-  if (activeRules.length > 0) {
-    const header = `Active rules (${activeRules.length}):`;
-    const footer =
-      "Full active rules are also sent after initialization via notifications/rules/updated. If later updates arrive, replace this summary with the latest rules.";
-    const candidateRules = activeRules.slice(0, MAX_RULES_IN_INSTRUCTIONS);
-    const ruleLines: string[] = [];
-    let omittedCount = activeRules.length - candidateRules.length;
-
-    for (const [index, rule] of candidateRules.entries()) {
-      const nextLine = summarizeRuleForInstructions(rule, index);
-      const nextInstructions = [
-        ...sections,
-        "",
-        header,
-        "",
-        ...ruleLines,
-        nextLine,
-        "",
-        footer,
-      ].join("\n");
-
-      if (nextInstructions.length > MAX_INSTRUCTIONS_CHARS) {
-        omittedCount += candidateRules.length - index;
-        break;
-      }
-
-      ruleLines.push(nextLine);
-    }
-
-    const rulesSection = [header, "", ...ruleLines];
-
-    if (omittedCount > 0) {
-      rulesSection.push(
-        "",
-        `Only ${ruleLines.length} of ${activeRules.length} rule(s) included here; ${omittedCount} omitted to keep initialization bounded.`,
-      );
-    }
-
-    rulesSection.push("", footer);
-    sections.push(rulesSection.join("\n"));
+function truncateSectionWithMarker(
+  value: string,
+  maxChars: number,
+  forceMarker: boolean,
+): string {
+  if (maxChars <= 0) {
+    return "";
   }
 
-  return sections.join("\n\n");
+  const marker = INSTRUCTION_TRUNCATION_MARKER;
+
+  if (value.length > maxChars) {
+    if (maxChars <= marker.length) {
+      return marker.slice(0, maxChars);
+    }
+
+    return `${value.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
+  }
+
+  if (!forceMarker) {
+    return value;
+  }
+
+  if (value.length + marker.length <= maxChars) {
+    return `${value}${marker}`;
+  }
+
+  if (maxChars <= marker.length) {
+    return marker.slice(0, maxChars);
+  }
+
+  return `${value.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
 }
 
-export function createMcpServer(
+function formatRulesSection(
+  activeRules: RuleRecord[],
+  maxChars: number,
+): { section: string | null; truncated: boolean } {
+  if (activeRules.length === 0) {
+    return { section: null, truncated: false };
+  }
+
+  const header = `Active rules (${activeRules.length}):`;
+  const footer =
+    "Full active rules are also sent after initialization via notifications/rules/updated. If later updates arrive, replace this summary with the latest rules.";
+  const candidateRules = activeRules.slice(0, MAX_RULES_IN_INSTRUCTIONS);
+  const ruleLines: string[] = [];
+  let omittedCount = activeRules.length - candidateRules.length;
+
+  for (const [index, rule] of candidateRules.entries()) {
+    const nextLine = summarizeRuleForInstructions(rule, index);
+    const nextRulesSection = [header, "", ...ruleLines, nextLine, "", footer].join("\n");
+
+    if (nextRulesSection.length > maxChars) {
+      omittedCount += candidateRules.length - index;
+      break;
+    }
+
+    ruleLines.push(nextLine);
+  }
+
+  const rulesSection = [header, "", ...ruleLines];
+
+  if (omittedCount > 0) {
+    rulesSection.push(
+      "",
+      `Only ${ruleLines.length} of ${activeRules.length} rule(s) included here; ${omittedCount} omitted to keep initialization bounded.`,
+    );
+  }
+
+  rulesSection.push("", footer);
+  const composed = rulesSection.join("\n");
+  const wasTrimmed = omittedCount > 0 || composed.length > maxChars;
+  const bounded = truncateSectionWithMarker(composed, maxChars, wasTrimmed);
+
+  return {
+    section: bounded.length > 0 ? bounded : null,
+    truncated: wasTrimmed,
+  };
+}
+
+function formatInstructions(activeRules: RuleRecord[], tenantAgentInstructions: string | null): string {
+  const baseSections: string[] = [BASE_INSTRUCTIONS, AGENT_CONTEXT_INSTRUCTION];
+  const baseInstructions = baseSections.join("\n\n");
+  let instructions = baseInstructions;
+
+  const appendSection = (section: string): void => {
+    instructions = `${instructions}\n\n${section}`;
+  };
+
+  if (tenantAgentInstructions?.trim()) {
+    const normalizedTenantInstructions = normalizeInstructionText(tenantAgentInstructions);
+    const tenantSection = `Tenant instructions:\n${normalizedTenantInstructions}`;
+    const tenantBudget = MAX_INSTRUCTIONS_CHARS - instructions.length - 2;
+    const tenantTruncated = tenantSection.length > tenantBudget;
+    const boundedTenantSection = truncateSectionWithMarker(tenantSection, tenantBudget, tenantTruncated);
+
+    if (boundedTenantSection.length > 0) {
+      appendSection(boundedTenantSection);
+    }
+
+    if (tenantTruncated) {
+      writeStructuredLog({
+        level: "warn",
+        message: "mcp.tenant_instructions.truncated",
+        tenantInstructionChars: normalizedTenantInstructions.length,
+        allowedChars: Math.max(0, tenantBudget),
+      });
+    }
+  }
+
+  const rulesBudget = MAX_INSTRUCTIONS_CHARS - instructions.length - 2;
+  const { section: rulesSection, truncated: rulesTruncated } = formatRulesSection(activeRules, rulesBudget);
+  if (rulesSection) {
+    appendSection(rulesSection);
+  }
+
+  if (rulesTruncated) {
+    writeStructuredLog({
+      level: "warn",
+      message: "mcp.rules_instructions.truncated",
+      activeRuleCount: activeRules.length,
+      allowedChars: Math.max(0, rulesBudget),
+    });
+  }
+
+  return instructions;
+}
+
+async function fetchTenantAgentInstructions(
+  sql: SqlClient,
+  tenantSchemaName: string,
+): Promise<string | null> {
+  try {
+    return await withTenantScope(sql, tenantSchemaName, async (txSql) => {
+      const db = drizzle(asDrizzleSqlClient(txSql, sql.options));
+      const rows = await db
+        .select({
+          tenantAgentInstructions: tenantSettings.tenantAgentInstructions,
+        })
+        .from(tenantSettings)
+        .limit(1);
+      return rows[0]?.tenantAgentInstructions ?? null;
+    });
+  } catch {
+    return null;
+  }
+}
+
+export async function createMcpServer(
   agentContext: AgentContext,
   tenantSchemaName: string,
   sql: SqlClient,
   options: CreateMcpServerOptions = {},
 ) {
-  const instructions = formatInstructions(options.activeRules ?? []);
+  const tenantAgentInstructions = await fetchTenantAgentInstructions(sql, tenantSchemaName);
+  const instructions = formatInstructions(options.activeRules ?? [], tenantAgentInstructions);
   const server = new McpServer({
-    name: "monet",
+    name: options.tenantSlug ? `monet-${options.tenantSlug}` : "monet",
     version: packageJson.version,
   }, { instructions });
 
@@ -234,7 +342,15 @@ export function createMcpServer(
       try {
         const preflight = await resolveMemoryWritePreflight(sql, tenantSchemaName, agentContext);
         const result = await withTenantScope(sql, tenantSchemaName, (txSql) =>
-          createMemory(txSql, agentContext, args, preflight),
+          createMemory(txSql, agentContext, {
+            content: args.content,
+            summary: args.summary,
+            memoryType: args.memoryType,
+            memoryScope: args.memoryScope,
+            groupId: args.groupId,
+            tags: args.tags,
+            ttlSeconds: args.ttlSeconds,
+          }, preflight),
         );
 
         if (hasError(result)) {
@@ -375,6 +491,22 @@ export function createMcpServer(
         return asToolError(error instanceof Error ? error.message : "Internal server error");
       }
     },
+    agentContext: async () => {
+      try {
+        const groupMemberships = await withTenantScope(sql, tenantSchemaName, (txSql) =>
+          getAgentGroupMemberships(txSql, agentContext.id),
+        );
+        return asToolResult({
+          agentId: agentContext.id,
+          externalId: agentContext.externalId,
+          tenantSlug: options.tenantSlug,
+          userBinding: agentContext.userId,
+          groupMemberships,
+        });
+      } catch (error) {
+        return asToolError(error instanceof Error ? error.message : "Internal server error");
+      }
+    },
   };
 
   const wrap = <TArgs,>(name: string, handler: (args: TArgs) => Promise<CallToolResult>) =>
@@ -398,6 +530,7 @@ export function createMcpServer(
     memoryPromoteScope: wrap("memoryPromoteScope", handlers.memoryPromoteScope),
     memoryMarkOutdated: wrap("memoryMarkOutdated", handlers.memoryMarkOutdated),
     memoryListTags: wrap("memoryListTags", handlers.memoryListTags),
+    agentContext: wrap("agentContext", handlers.agentContext),
   };
 
   registerAllTools(server, timedHandlers);
