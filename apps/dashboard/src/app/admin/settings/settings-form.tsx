@@ -75,7 +75,7 @@ export function SettingsForm({
             onChange={(event) => setInstructions(event.target.value)}
             maxLength={MAX_INSTRUCTIONS_LENGTH}
             rows={12}
-            placeholder="Add optional instructions for all agents in this tenant"
+            placeholder="Add optional instructions for all agents in this tenant including introduction of the tenant."
           />
           <p className="text-xs text-muted-foreground">
             {characterCount} / {MAX_INSTRUCTIONS_LENGTH} characters

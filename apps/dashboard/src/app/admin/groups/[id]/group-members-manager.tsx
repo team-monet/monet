@@ -142,7 +142,7 @@ export function GroupMembersManager({ groupId, members, availableAgents }: Group
           <DialogHeader>
             <DialogTitle>Change Agent Group?</DialogTitle>
             <DialogDescription>
-              This agent will be removed from its current group and lose access to all memories from that group, including memories it created. This cannot be undone.
+              This agent will be removed from its current group and lose access to all memories from that group, including memories it created.
             </DialogDescription>
           </DialogHeader>
           <form action={addAction} className="grid gap-4">
