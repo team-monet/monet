@@ -134,7 +134,7 @@ pnpm runtime:keycloak:setup
 - use `platform.*` values from `.runtime/keycloak.json`
 - configure tenant OIDC using `tenant.*` from `.runtime/keycloak.json`
 
-> **For a dedicated end-to-end tenant creation guide, see [Tenant Creation and Management](tenant-creation.md).**
+> **For a dedicated end-to-end tenant creation guide, see [Tenant Creation and Management](../admin/tenant-creation.md).**
 
 6. Verify deployment:
 
@@ -343,7 +343,7 @@ Operational checks:
 - confirm the dashboard can complete OIDC login
 - if semantic search is enabled, store a memory and verify search works
 
-> **For ongoing operational ownership and admin workflows, see [Platform Administration](platform-administration.md).**
+> **For ongoing operational ownership and admin workflows, see [Platform Administration](../admin/platform-administration.md).**
 
 ## Security Verification
 

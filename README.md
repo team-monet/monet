@@ -91,7 +91,7 @@ keycloak, migrate, api, dashboard), bootstraps Keycloak + demo tenant, and
 prints ready-to-copy MCP config and local login details.
 
 Then follow the full local setup guide:
-- **[Local Development Guide →](docs/local-development.md)**
+- **[Local Development Guide ->](docs/getting-started/local-development.md)**
 
 ### Connect Your Agent (MCP)
 
@@ -150,20 +150,22 @@ Monet runs as a straightforward service stack designed for self-hosted deploymen
 - **MCP as a first-class citizen** — dedicated endpoint, session lifecycle management, tool schema registry
 - **Enrichment pipeline** — automatic summary, tag extraction, and vector embedding on every memory write
 
-Read the full architecture overview: **[docs/architecture.md →](docs/architecture.md)**
+Read the full architecture overview: **[docs/architecture/overview.md ->](docs/architecture/overview.md)**
 
 ## Documentation
 
+Start with the full docs index: **[docs/README.md](docs/README.md)**
+
 | Guide | What You'll Find |
 |-------|-----------------|
-| [Local Development](docs/local-development.md) | Set up a local dev environment |
-| [Production Deployment](docs/production-deployment.md) | Deploy Monet to production |
-| [Tenant Management](docs/tenant-creation.md) | Create and manage tenants |
-| [Platform Administration](docs/platform-administration.md) | Platform setup and admin workflows |
-| [Architecture Overview](docs/architecture.md) | System design, data model, MCP internals |
-| [Observability](docs/observability.md) | Monitoring, logging, health checks |
-| [Backup & Restore](docs/backup-restore.md) | Data backup and recovery procedures |
-| [Migration & Upgrade](docs/migration-upgrade.md) | Version upgrades and schema migrations |
+| [Local Development](docs/getting-started/local-development.md) | Set up a local dev environment |
+| [Architecture Overview](docs/architecture/overview.md) | System design, data model, MCP internals |
+| [Tenant Management](docs/admin/tenant-creation.md) | Create and manage tenants |
+| [Platform Administration](docs/admin/platform-administration.md) | Platform setup and admin workflows |
+| [Production Deployment](docs/operations/production-deployment.md) | Deploy Monet to production |
+| [Observability](docs/operations/observability.md) | Monitoring, logging, health checks |
+| [Backup & Restore](docs/operations/backup-restore.md) | Data backup and recovery procedures |
+| [Migration & Upgrade](docs/operations/migration-upgrade.md) | Version upgrades and schema migrations |
 
 ## Contributing
 

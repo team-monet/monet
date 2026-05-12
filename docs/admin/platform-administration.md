@@ -63,7 +63,7 @@ Can:
 
 Tenant role model details are in:
 
-- [User And Agent Group Model](./user-and-agent-group-model.md)
+- [User And Agent Group Model](../architecture/user-and-agent-group-model.md)
 
 ---
 
@@ -72,7 +72,7 @@ Tenant role model details are in:
 Use this flow for a fresh deployment.
 
 1. Deploy runtime stack and bootstrap Keycloak/OIDC scaffolding:
-   - Follow [Production Deployment Guide](./production-deployment.md).
+   - Follow [Production Deployment Guide](../operations/production-deployment.md).
 2. Open dashboard setup page:
    - `/setup`
 3. Exchange one-time bootstrap token (from API startup logs).
@@ -92,7 +92,7 @@ Notes:
 
 For local setup specifics, see:
 
-- [Local Development Quickstart](./local-development.md)
+- [Local Development Quickstart](../getting-started/local-development.md)
 
 ---
 
@@ -130,7 +130,7 @@ The IdP must assert `email_verified=true`.
 
 Deployment and URL alignment details:
 
-- [Production Deployment Guide](./production-deployment.md)
+- [Production Deployment Guide](../operations/production-deployment.md)
 
 ---
 
@@ -181,7 +181,7 @@ Use:
 
 Monitoring details:
 
-- [Observability Guide](./observability.md)
+- [Observability Guide](../operations/observability.md)
 
 ### 5) Deactivate / offboard tenant (current OSS approach)
 
@@ -213,7 +213,7 @@ Inside each tenant, tenant admins govern:
 
 Reference:
 
-- [User And Agent Group Model](./user-and-agent-group-model.md)
+- [User And Agent Group Model](../architecture/user-and-agent-group-model.md)
 
 ---
 
@@ -253,8 +253,8 @@ Practical review cadence:
 
 Deep dives:
 
-- [Observability Guide](./observability.md)
-- [Backup And Restore Guide](./backup-restore.md)
+- [Observability Guide](../operations/observability.md)
+- [Backup And Restore Guide](../operations/backup-restore.md)
 
 ---
 
@@ -280,9 +280,9 @@ Deep dives:
 
 Canonical procedures:
 
-- backups and recovery: [Backup And Restore Guide](./backup-restore.md)
-- upgrades and rollback planning: [Migration And Upgrade Guide](./migration-upgrade.md)
-- health checks and alerting: [Observability Guide](./observability.md)
+- backups and recovery: [Backup And Restore Guide](../operations/backup-restore.md)
+- upgrades and rollback planning: [Migration And Upgrade Guide](../operations/migration-upgrade.md)
+- health checks and alerting: [Observability Guide](../operations/observability.md)
 
 ---
 
@@ -311,7 +311,7 @@ Canonical procedures:
 
 Architecture and isolation references:
 
-- [Monet Architecture Overview](./architecture.md)
+- [Monet Architecture Overview](../architecture/overview.md)
 
 ---
 
@@ -362,23 +362,24 @@ Checks:
 
 Detailed troubleshooting runbooks:
 
-- [Production Deployment Guide](./production-deployment.md)
-- [Migration And Upgrade Guide](./migration-upgrade.md)
-- [Observability Guide](./observability.md)
+- [Production Deployment Guide](../operations/production-deployment.md)
+- [Migration And Upgrade Guide](../operations/migration-upgrade.md)
+- [Observability Guide](../operations/observability.md)
 
 ---
 
 ## Related documentation map
 
-- [README](../README.md) — high-level product and repo entry point
-- [Local Development Quickstart](./local-development.md) — local setup and validation
-- [Production Deployment Guide](./production-deployment.md) — runtime deployment and bootstrap
-- [Monet Architecture Overview](./architecture.md) — boundaries, auth contexts, data model
-- [User And Agent Group Model](./user-and-agent-group-model.md) — tenant RBAC and group semantics
-- [Observability Guide](./observability.md) — logging, health, alerts, investigation
-- [Backup And Restore Guide](./backup-restore.md) — backup strategy and recovery procedures
-- [Migration And Upgrade Guide](./migration-upgrade.md) — maintenance-window upgrade model
-- [Shared memory in action: support workflow wedge](./demo-support-workflow.md) — demo tenant runbook
+- [README](../../README.md) — high-level product and repo entry point
+- [Documentation Index](../README.md) — categorized docs map
+- [Local Development Quickstart](../getting-started/local-development.md) — local setup and validation
+- [Production Deployment Guide](../operations/production-deployment.md) — runtime deployment and bootstrap
+- [Monet Architecture Overview](../architecture/overview.md) — boundaries, auth contexts, data model
+- [User And Agent Group Model](../architecture/user-and-agent-group-model.md) — tenant RBAC and group semantics
+- [Observability Guide](../operations/observability.md) — logging, health, alerts, investigation
+- [Backup And Restore Guide](../operations/backup-restore.md) — backup strategy and recovery procedures
+- [Migration And Upgrade Guide](../operations/migration-upgrade.md) — maintenance-window upgrade model
+- [Shared memory in action: support workflow wedge](../demos/demo-support-workflow.md) — demo tenant runbook
 
 ---
 

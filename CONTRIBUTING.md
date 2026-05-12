@@ -18,9 +18,9 @@ the public repository.
 
 Please use the validated quickstarts/docs rather than this file as a full setup manual:
 
-- **Local development quickstart:** [docs/local-development.md](docs/local-development.md)
-- **Architecture overview:** [docs/architecture.md](docs/architecture.md)
-- **Production/self-hosting reference:** [docs/production-deployment.md](docs/production-deployment.md)
+- **Local development quickstart:** [docs/getting-started/local-development.md](docs/getting-started/local-development.md)
+- **Architecture overview:** [docs/architecture/overview.md](docs/architecture/overview.md)
+- **Production/self-hosting reference:** [docs/operations/production-deployment.md](docs/operations/production-deployment.md)
 - **Security policy:** [SECURITY.md](SECURITY.md)
 
 For most contributions, follow the local quickstart and then run:
@@ -101,8 +101,9 @@ Use GitHub private vulnerability reporting as documented in
 ## Additional References
 
 - [README.md](README.md)
-- [docs/architecture.md](docs/architecture.md)
-- [docs/local-development.md](docs/local-development.md)
-- [docs/production-deployment.md](docs/production-deployment.md)
-- [docs/observability.md](docs/observability.md)
+- [docs/README.md](docs/README.md)
+- [docs/architecture/overview.md](docs/architecture/overview.md)
+- [docs/getting-started/local-development.md](docs/getting-started/local-development.md)
+- [docs/operations/production-deployment.md](docs/operations/production-deployment.md)
+- [docs/operations/observability.md](docs/operations/observability.md)
 - [SECURITY.md](SECURITY.md)
