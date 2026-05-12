@@ -1,9 +1,5 @@
 # Monet Documentation
 
-This directory is the source of truth for Monet documentation. Keeping docs in the
-repo means changes can be reviewed with the code they describe, versioned with
-releases, and published later through GitHub Pages if needed.
-
 ## Getting Started
 
 | Guide | What You'll Find |
@@ -32,9 +28,3 @@ releases, and published later through GitHub Pages if needed.
 | [Observability](operations/observability.md) | Logs, health checks, metrics, alerts, and investigation workflows |
 | [Backup And Restore](operations/backup-restore.md) | Backup strategy, recovery procedures, and recovery testing |
 | [Migration And Upgrade](operations/migration-upgrade.md) | Upgrade model, schema migration flow, rollback, and triage |
-
-## Public Docs And Wiki
-
-For public documentation, prefer publishing these repo docs with GitHub Pages so
-the source remains versioned and reviewable. Use the GitHub Wiki for informal
-notes, FAQs, or team knowledge that does not need to track a specific release.
