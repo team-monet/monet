@@ -122,7 +122,7 @@ services:
     command:
       - start-dev
       - --http-port=8080
-      - --hostname=http://keycloak.localhost:${KEYCLOAK_PORT:-4400}
+      - --hostname=${PUBLIC_OIDC_BASE_URL:-http://keycloak.localhost:${KEYCLOAK_PORT:-4400}}
       - --hostname-strict=true
     ports:
       - "${KEYCLOAK_PORT:-4400}:8080"
