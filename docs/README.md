@@ -16,7 +16,6 @@ releases, and published later through GitHub Pages if needed.
 |-------|-----------------|
 | [Architecture Overview](architecture/overview.md) | System design, data boundaries, MCP internals, and extension points |
 | [User And Agent Group Model](architecture/user-and-agent-group-model.md) | Tenant RBAC, user groups, agent groups, and rule scope semantics |
-| [Default General Guidance Proposal](architecture/default-agent-group-rules-proposal.md) | Proposed default rules for agent group behavior |
 
 ## Administration
 
@@ -33,13 +32,6 @@ releases, and published later through GitHub Pages if needed.
 | [Observability](operations/observability.md) | Logs, health checks, metrics, alerts, and investigation workflows |
 | [Backup And Restore](operations/backup-restore.md) | Backup strategy, recovery procedures, and recovery testing |
 | [Migration And Upgrade](operations/migration-upgrade.md) | Upgrade model, schema migration flow, rollback, and triage |
-| [Main Branch Protection](operations/branch-protection.md) | GitHub branch protection policy and setup |
-
-## Demos
-
-| Guide | What You'll Find |
-|-------|-----------------|
-| [Support Workflow Demo](demos/demo-support-workflow.md) | Shared-memory demo script, seed data, smoke checks, and reset flow |
 
 ## Public Docs And Wiki
 

@@ -153,8 +153,8 @@ curl -sS "http://127.0.0.1:3301/api/tenants/$TENANT_SLUG/agents/me" \
 
 ## Environment Reference
 
-- Local template: [`../.env.local-dev.example`](../.env.local-dev.example)
-- Runtime/production template: [`../.env.runtime.example`](../.env.runtime.example)
+- Local template: [`../../.env.local-dev.example`](../../.env.local-dev.example)
+- Runtime/production template: [`../../.env.runtime.example`](../../.env.runtime.example)
 
 For production deployment, continue with
 [Production Deployment Guide](../operations/production-deployment.md).
