@@ -260,7 +260,7 @@ Important env notes:
 - `ALLOW_INSECURE_PRIVATE_HTTP_ORIGINS=true` is an internal-trial escape hatch for raw private-network `http://` origins only; do not use it for internet-facing deployments
 - rotate the example `ENCRYPTION_KEY`; do not use the template value in production
 
-The full template is in [`../.env.runtime.example`](../.env.runtime.example).
+The full template is in [`../../.env.runtime.example`](../../.env.runtime.example).
 
 The runtime template includes local defaults and commented GHCR examples:
 

@@ -379,7 +379,6 @@ Detailed troubleshooting runbooks:
 - [Observability Guide](../operations/observability.md) — logging, health, alerts, investigation
 - [Backup And Restore Guide](../operations/backup-restore.md) — backup strategy and recovery procedures
 - [Migration And Upgrade Guide](../operations/migration-upgrade.md) — maintenance-window upgrade model
-- [Shared memory in action: support workflow wedge](../demos/demo-support-workflow.md) — demo tenant runbook
 
 ---
 
