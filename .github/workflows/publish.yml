@@ -12,7 +12,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: team-monet
-  PLATFORMS: linux/amd64
+  PLATFORMS: linux/amd64,linux/arm64/v8
 
 jobs:
   guard:
@@ -119,10 +119,36 @@ jobs:
             VERSION=${{ github.ref_name }}
             GIT_SHA=${{ github.sha }}
 
+  update-env-example:
+    name: Update .env.runtime.example
+    needs: publish-images
+    if: github.repository == 'team-monet/monet'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image tags
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          sed -i "s|API_IMAGE=ghcr.io/team-monet/monet-api:.*|API_IMAGE=ghcr.io/team-monet/monet-api:${VERSION}|" .env.runtime.example
+          sed -i "s|DASHBOARD_IMAGE=ghcr.io/team-monet/monet-dashboard:.*|DASHBOARD_IMAGE=ghcr.io/team-monet/monet-dashboard:${VERSION}|" .env.runtime.example
+          sed -i "s|MIGRATE_IMAGE=ghcr.io/team-monet/monet-migrate:.*|MIGRATE_IMAGE=ghcr.io/team-monet/monet-migrate:${VERSION}|" .env.runtime.example
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .env.runtime.example
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Bump image tags to ${GITHUB_REF_NAME}"
+          git push
+
   draft-release:
     name: Draft GitHub Release
     if: github.repository == 'team-monet/monet'
-    needs: publish-images
+    needs: [publish-images, update-env-example]
     runs-on: ubuntu-latest
     permissions:
       contents: write
