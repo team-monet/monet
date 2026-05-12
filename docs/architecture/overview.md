@@ -185,7 +185,7 @@ Operational constraints to plan around:
 - `EMBEDDING_DIMENSIONS` is an architectural setup parameter (defines vector column width at migration/schema creation time), not a casual runtime toggle
 - readiness indicates core dependency status, but missing enrichment providers degrade enrichment features rather than blocking API readiness
 
-For deployment procedures and runbooks, see [Production Deployment Guide](./production-deployment.md), [Local Development Quickstart](./local-development.md), and [Observability Guide](./observability.md).
+For deployment procedures and runbooks, see [Production Deployment Guide](../operations/production-deployment.md), [Local Development Quickstart](../getting-started/local-development.md), and [Observability Guide](../operations/observability.md).
 
 ## Extension Points / Integration Surfaces
 
@@ -200,9 +200,9 @@ When extending, keep tenant-qualified routing and tenant-scoped DB execution pat
 
 ## Pointers to Deeper Docs
 
-- [Local Development Quickstart](./local-development.md)
-- [Production Deployment Guide](./production-deployment.md)
-- [Migration and Upgrade Guide](./migration-upgrade.md)
-- [Observability Guide](./observability.md)
-- [Backup and Restore Guide](./backup-restore.md)
+- [Local Development Quickstart](../getting-started/local-development.md)
+- [Production Deployment Guide](../operations/production-deployment.md)
+- [Migration and Upgrade Guide](../operations/migration-upgrade.md)
+- [Observability Guide](../operations/observability.md)
+- [Backup and Restore Guide](../operations/backup-restore.md)
 - [User and Agent Group Model](./user-and-agent-group-model.md)

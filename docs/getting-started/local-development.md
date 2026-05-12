@@ -126,7 +126,7 @@ Default local Keycloak admin credentials come from `.env.local-dev`:
 - Nominate the generated tenant admin email
 - Sign in through normal tenant login using the generated tenant admin account
 
-> **For a dedicated end-to-end tenant creation guide, see [Tenant Creation and Management](tenant-creation.md).**
+> **For a dedicated end-to-end tenant creation guide, see [Tenant Creation and Management](../admin/tenant-creation.md).**
 
 Optional authenticated API check (after you have an agent API key):
 
@@ -157,4 +157,4 @@ curl -sS "http://127.0.0.1:3301/api/tenants/$TENANT_SLUG/agents/me" \
 - Runtime/production template: [`../.env.runtime.example`](../.env.runtime.example)
 
 For production deployment, continue with
-[Production Deployment Guide](./production-deployment.md).
+[Production Deployment Guide](../operations/production-deployment.md).

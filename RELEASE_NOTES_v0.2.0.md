@@ -96,8 +96,8 @@ MCP tool descriptions for `memory_search`, `memory_update`, and memory scope/typ
 ## 📚 Documentation
 
 - **README rewrite** — Updated with improved positioning, marketing copy, and clearer getting-started instructions (#161).
-- **Tenant creation guide** — New guide for creating and managing tenants (`docs/tenant-creation.md`).
-- **Platform administration guide** — New guide for platform setup and admin workflows (`docs/platform-administration.md`).
+- **Tenant creation guide** — New guide for creating and managing tenants (`docs/admin/tenant-creation.md`).
+- **Platform administration guide** — New guide for platform setup and admin workflows (`docs/admin/platform-administration.md`).
 
 ---
 
@@ -115,7 +115,7 @@ The `latest` tag is also updated to point to this release.
 
 ## 🔼 Upgrade Guide
 
-For upgrade instructions, including environment variable changes and migration steps, see **[docs/migration-upgrade.md](docs/migration-upgrade.md)**.
+For upgrade instructions, including environment variable changes and migration steps, see **[docs/operations/migration-upgrade.md](docs/operations/migration-upgrade.md)**.
 
 Key actions for this upgrade:
 

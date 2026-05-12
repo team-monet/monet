@@ -242,12 +242,12 @@ and dropping tenant schema, but it is not a general production lifecycle endpoin
 
 ## Related Documentation
 
-- [Architecture Overview](./architecture.md)
-- [Local Development Quickstart](./local-development.md)
-- [Production Deployment Guide](./production-deployment.md)
-- [User And Agent Group Model](./user-and-agent-group-model.md)
-- [Default Agent Group Rules Proposal](./default-agent-group-rules-proposal.md)
-- [Demo Support Workflow](./demo-support-workflow.md)
-- [Backup And Restore Guide](./backup-restore.md)
-- [Observability Guide](./observability.md)
-- [Migration And Upgrade Guide](./migration-upgrade.md)
+- [Architecture Overview](../architecture/overview.md)
+- [Local Development Quickstart](../getting-started/local-development.md)
+- [Production Deployment Guide](../operations/production-deployment.md)
+- [User And Agent Group Model](../architecture/user-and-agent-group-model.md)
+- [Default Agent Group Rules Proposal](../architecture/default-agent-group-rules-proposal.md)
+- [Demo Support Workflow](../demos/demo-support-workflow.md)
+- [Backup And Restore Guide](../operations/backup-restore.md)
+- [Observability Guide](../operations/observability.md)
+- [Migration And Upgrade Guide](../operations/migration-upgrade.md)
