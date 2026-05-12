@@ -484,7 +484,7 @@ describe("memories integration", () => {
 
   // ---------- Mark outdated ----------
 
-  it("marks a memory as outdated and keeps it searchable", async () => {
+  it("excludes outdated memory from search results but allows fetch by ID", async () => {
     const { body: created } = await storeMemory({
       content: "old info",
       memoryType: "fact",
@@ -498,17 +498,25 @@ describe("memories integration", () => {
     );
     expect(markRes.status).toBe(200);
 
-    // Search should still return the entry, but flagged as outdated
+    // Search should exclude outdated entries
     const searchRes = await app.request(
       "/api/memories?tags=outdated-test",
       { headers: authHeaders() },
     );
     const searchBody = await searchRes.json();
-    expect(searchBody.items).toHaveLength(1);
-    expect(searchBody.items[0].outdated).toBe(true);
+    expect(searchBody.items).toHaveLength(0);
+
+    // Fetch by ID should still return outdated entries
+    const fetchRes = await app.request(`/api/memories/${created.id}`, {
+      headers: authHeaders(),
+    });
+    expect(fetchRes.status).toBe(200);
+    const fetchBody = await fetchRes.json();
+    expect(fetchBody.entry.id).toBe(created.id);
+    expect(fetchBody.entry.outdated).toBe(true);
   });
 
-  it("ranks outdated entries below fresh entries", async () => {
+  it("excludes outdated entries from search while keeping fresh entries visible", async () => {
     const fresh = await storeMemory({
       content: "apple fresh memory",
       memoryType: "fact",
@@ -530,10 +538,9 @@ describe("memories integration", () => {
       headers: authHeaders(),
     });
     const searchBody = await searchRes.json();
-    expect(searchBody.items).toHaveLength(2);
+    expect(searchBody.items).toHaveLength(1);
     expect(searchBody.items[0].id).toBe(fresh.body.id);
-    expect(searchBody.items[1].id).toBe(stale.body.id);
-    expect(searchBody.items[1].outdated).toBe(true);
+    expect(searchBody.items.map((item: { id: string }) => item.id)).not.toContain(stale.body.id);
   });
 
   it("applies temporal and memoryType filters to search", async () => {
