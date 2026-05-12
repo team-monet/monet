@@ -40,6 +40,14 @@ function getDashboardBaseUrl() {
   return trimTrailingSlash(configured);
 }
 
+function hasSameOrigin(value: URL, base: URL) {
+  return (
+    value.protocol === base.protocol &&
+    value.hostname === base.hostname &&
+    value.port === base.port
+  );
+}
+
 export function replaceUrlOrigin(value: string, base: string) {
   try {
     const valueUrl = new URL(value);
@@ -63,15 +71,22 @@ export function resolveOidcIssuerForServer(issuer: string) {
 
   let issuerUrl: URL;
   let baseUrl: URL;
+  let publicBaseUrl: URL | null = null;
 
   try {
     issuerUrl = new URL(trimmedIssuer);
     baseUrl = new URL(localBaseUrl);
+    const publicBase = getPublicOidcBaseUrl();
+    publicBaseUrl = publicBase ? new URL(publicBase) : null;
   } catch {
     return trimmedIssuer;
   }
 
-  if (!LOOPBACK_HOSTNAMES.has(issuerUrl.hostname)) {
+  const shouldUseLocalOrigin =
+    LOOPBACK_HOSTNAMES.has(issuerUrl.hostname) ||
+    (publicBaseUrl ? hasSameOrigin(issuerUrl, publicBaseUrl) : false);
+
+  if (!shouldUseLocalOrigin) {
     return trimmedIssuer;
   }
 
