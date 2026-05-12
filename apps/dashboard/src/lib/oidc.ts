@@ -194,11 +194,14 @@ export async function validateOidcClientConfig(
   input: ValidateOidcClientConfigInput,
 ) {
   const discovery = await fetchOidcDiscoveryDocument(input.issuer);
-  const tokenEndpoint = discovery.token_endpoint;
+  const discoveredTokenEndpoint = discovery.token_endpoint;
 
-  if (!tokenEndpoint) {
+  if (!discoveredTokenEndpoint) {
     throw new Error("OIDC discovery document is missing token_endpoint");
   }
+
+  const serverIssuer = resolveOidcIssuerForServer(input.issuer);
+  const tokenEndpoint = replaceUrlOrigin(discoveredTokenEndpoint, serverIssuer);
 
   const response = await fetch(tokenEndpoint, {
     method: "POST",
