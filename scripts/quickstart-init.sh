@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${QUICKSTART_PROFILE:-local}"
 
+ensure_workspace_bootstrap_packages_built() {
+  echo "Building workspace packages required by quickstart bootstrap..."
+  pnpm install
+  pnpm --filter @monet/db... build
+}
+
 if [[ "${PROFILE}" == "runtime" ]]; then
   ENV_FILE="${MONET_RUNTIME_ENV_FILE:-${ROOT_DIR}/.env.runtime}"
   if [[ ! -f "${ENV_FILE}" ]]; then
@@ -27,12 +33,16 @@ EOF
   echo "Ensuring runtime database schema is up to date (migrations)..."
   "${ROOT_DIR}/scripts/runtime-env.sh" migrate
 
+  ensure_workspace_bootstrap_packages_built
+
   echo "Running runtime quickstart bootstrap..."
   exec pnpm --filter @monet/api exec tsx ../../scripts/quickstart-init.ts
 fi
 
 echo "Ensuring local database schema is up to date (migrations)..."
 "${ROOT_DIR}/scripts/local-env.sh" migrate
+
+ensure_workspace_bootstrap_packages_built
 
 echo "Running local quickstart bootstrap..."
 exec "${ROOT_DIR}/scripts/with-local-env.sh" \
