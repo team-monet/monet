@@ -10,6 +10,7 @@ import { withTenantScope } from "@monet/db";
 import {
   resetEnrichmentStateForTests,
   setEnrichmentProviderForTests,
+  waitForEnrichmentDrain,
 } from "../../src/services/enrichment.service";
 import {
   EMBEDDING_DIMENSIONS,
@@ -424,6 +425,7 @@ describe("search integration", () => {
     it("lexical cursor pagination", async () => {
       await seedBaseline();
       await seedPaginationFixtures();
+      await waitForEnrichmentDrain(5_000);
       const p1 = await search({ query: "page-anchor", limit: 2 });
       expect(p1.body.items).toHaveLength(2);
       expect(p1.body.nextCursor).toBeTruthy();
