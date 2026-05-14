@@ -347,7 +347,6 @@ export async function createMcpServer(
             summary: args.summary,
             memoryType: args.memoryType,
             memoryScope: args.memoryScope,
-            groupId: args.groupId,
             tags: args.tags,
             ttlSeconds: args.ttlSeconds,
           }, preflight),
