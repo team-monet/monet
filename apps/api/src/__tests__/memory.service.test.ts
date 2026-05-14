@@ -286,6 +286,64 @@ describe("createMemory", () => {
     });
   });
 
+  it("sets groupId for user-scoped memories when the agent has one group", async () => {
+    const countWhereMock = vi.fn().mockResolvedValue([{ count: 1 }]);
+    const selectMock = vi.fn(() => ({
+      from: vi.fn(() => ({ where: countWhereMock })),
+    }));
+
+    const memoryValuesMock = vi.fn(() => ({
+      returning: vi.fn().mockResolvedValue([{
+        id: "00000000-0000-0000-0000-000000000201",
+        content: "user scoped memory",
+        summary: null,
+        memory_type: "fact",
+        memory_scope: "user",
+        tags: ["user"],
+        auto_tags: [],
+        related_memory_ids: [],
+        usefulness_score: 0,
+        outdated: false,
+        ttl_seconds: null,
+        expires_at: null,
+        created_at: new Date("2026-03-22T01:00:00.000Z"),
+        last_accessed_at: new Date("2026-03-22T01:00:00.000Z"),
+        author_agent_id: AGENT_ID,
+        group_id: GROUP_A,
+        user_id: USER_ID,
+        version: 0,
+      }]),
+    }));
+    const insertMock = vi
+      .fn()
+      .mockReturnValueOnce({ values: memoryValuesMock })
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) })
+      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) });
+
+    drizzleMock.mockReturnValue({
+      select: selectMock,
+      insert: insertMock,
+    });
+
+    await createMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        content: "user scoped memory",
+        memoryType: "fact",
+        memoryScope: "user",
+        tags: ["user"],
+      },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
+    );
+
+    expect(memoryValuesMock).toHaveBeenCalledWith(expect.objectContaining({
+      memoryScope: "user",
+      groupId: GROUP_A,
+      userId: USER_ID,
+    }));
+  });
+
   it("persists caller-provided summary", async () => {
     const countWhereMock = vi.fn().mockResolvedValue([{ count: 1 }]);
     const selectMock = vi.fn(() => ({ from: vi.fn(() => ({ where: countWhereMock })) }));
@@ -356,6 +414,25 @@ describe("createMemory", () => {
         content: "c",
         memoryType: "fact",
         memoryScope: "group",
+        tags: ["ops"],
+      },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A, GROUP_B] },
+    );
+
+    expect(result).toEqual({
+      error: "validation",
+      message: "groupId is required when you belong to multiple groups. Use agent_context to discover your groups.",
+    });
+  });
+
+  it("requires groupId for user-scoped memory when agent belongs to multiple groups", async () => {
+    const result = await createMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      {
+        content: "c",
+        memoryType: "fact",
+        memoryScope: "user",
         tags: ["ops"],
       },
       { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A, GROUP_B] },

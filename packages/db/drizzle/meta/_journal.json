@@ -15,6 +15,13 @@
       "when": 1776100000000,
       "tag": "0001_add_memory_versions_entry_version_index",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1776200000000,
+      "tag": "0002_backfill_user_scoped_memory_group_metadata",
+      "breakpoints": true
     }
   ]
 }
