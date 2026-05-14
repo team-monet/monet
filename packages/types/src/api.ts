@@ -4,6 +4,7 @@ export const SearchQuery = z.object({
   query: z.string().optional(),
   tags: z.array(z.string()).optional(),
   memoryType: z.string().optional(),
+  preferredMemoryType: z.string().optional(),
   includeUser: z.boolean().default(false),
   includePrivate: z.boolean().default(false),
   fromDate: z.string().datetime().optional(),

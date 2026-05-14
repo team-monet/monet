@@ -321,6 +321,19 @@ describe("search integration", () => {
       expect(body.items).toHaveLength(1);
       expect(body.items[0].id).toBe(ids.type_decision);
     });
+
+    it("preferred memory type boosts matches without filtering other types", async () => {
+      const ids = await seedBaseline();
+      const { body: preferDecision } = await search({ tags: "typed", preferredMemoryType: "decision" });
+      expect(preferDecision.items).toHaveLength(2);
+      expect(preferDecision.items[0].id).toBe(ids.type_decision);
+      expect(preferDecision.items.some((item) => item.id === ids.type_fact)).toBe(true);
+
+      const { body: preferFact } = await search({ tags: "typed", preferredMemoryType: "fact" });
+      expect(preferFact.items).toHaveLength(2);
+      expect(preferFact.items[0].id).toBe(ids.type_fact);
+      expect(preferFact.items.some((item) => item.id === ids.type_decision)).toBe(true);
+    });
   });
 
   describe("semantic retrieval", () => {

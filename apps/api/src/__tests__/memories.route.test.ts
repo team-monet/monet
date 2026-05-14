@@ -190,7 +190,7 @@ describe("memories route", () => {
       });
 
       const res = await app.request(
-        "/memories?tags=a,b&memoryType=fact&createdAfter=2026-03-01T00:00:00.000Z&accessedBefore=2026-03-04T00:00:00.000Z",
+        "/memories?tags=a,b&memoryType=fact&preferredMemoryType=decision&createdAfter=2026-03-01T00:00:00.000Z&accessedBefore=2026-03-04T00:00:00.000Z",
       );
       expect(res.status).toBe(200);
       const body = await res.json();
@@ -202,6 +202,7 @@ describe("memories route", () => {
         expect.objectContaining({
           createdAfter: "2026-03-01T00:00:00.000Z",
           accessedBefore: "2026-03-04T00:00:00.000Z",
+          preferredMemoryType: "decision",
         }),
         null,
       );

@@ -37,7 +37,7 @@ export const AgentContextInput = z.object({});
 export const MemorySearchInput = z.object({
   query: z.string().optional().describe("Text query for semantic and full-text search"),
   tags: z.array(z.string()).optional().describe("Filter by tags"),
-  memoryType: MemoryType.optional().describe("Filter by memory type. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
+  memoryType: MemoryType.optional().describe("Soft preference for memory type. Matching memories rank higher, but other memory types can still be returned. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
   includeUser: z.boolean().default(false).describe("Include \"user\" scope memories (shared across the same user's agents within the same group)"),
   includePrivate: z.boolean().default(false).describe("Include \"private\" scope memories (visible only to the creating agent)"),
   createdAfter: z.string().datetime().optional().describe("Only include memories created on or after this timestamp"),

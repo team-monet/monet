@@ -101,6 +101,7 @@ memoriesRouter.get("/", async (c) => {
     query: c.req.query("query"),
     tags: c.req.query("tags") ? c.req.query("tags")!.split(",") : undefined,
     memoryType: c.req.query("memoryType"),
+    preferredMemoryType: c.req.query("preferredMemoryType"),
     includeUser: c.req.query("includeUser") === "true",
     includePrivate: c.req.query("includePrivate") === "true",
     createdAfter: c.req.query("createdAfter"),
