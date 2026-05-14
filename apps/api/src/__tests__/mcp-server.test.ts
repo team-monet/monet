@@ -45,6 +45,7 @@ const memoryServiceMocks = {
   markOutdated: vi.fn(),
   listTags: vi.fn(),
   getAgentGroupMemberships: vi.fn().mockResolvedValue([]),
+  writeAuditLog: vi.fn().mockResolvedValue(undefined),
 };
 
 const enqueueEnrichment = vi.fn();
@@ -60,6 +61,7 @@ vi.mock("../services/memory.service.js", () => ({
   markOutdated: (...args: unknown[]) => memoryServiceMocks.markOutdated(...args),
   listTags: (...args: unknown[]) => memoryServiceMocks.listTags(...args),
   getAgentGroupMemberships: (...args: unknown[]) => memoryServiceMocks.getAgentGroupMemberships(...args),
+  writeAuditLog: (...args: unknown[]) => memoryServiceMocks.writeAuditLog(...args),
   resolveMemoryWritePreflight: vi.fn().mockResolvedValue(null),
 }));
 
@@ -165,7 +167,9 @@ describe("MCP server factory", () => {
 
     expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents");
     expect(memorySearchSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");
+    expect(memorySearchSchema?.properties?.memoryType?.description).toContain("Soft preference");
     expect(memorySearchSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
+    expect(memorySearchSchema?.properties?.preferredMemoryType).toBeUndefined();
 
     expect(memoryUpdateSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
     expect(memoryUpdateSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
@@ -331,6 +335,46 @@ describe("MCP server factory", () => {
     expect(result.isError).toBeUndefined();
     expect(parseToolText(result)).toEqual(expect.objectContaining({ id: "mem-1" }));
     expect(enqueueEnrichment).toHaveBeenCalledWith(expect.anything(), "tenant_test", "mem-1");
+
+    await Promise.all([client.close(), server.close()]);
+  });
+
+  it("treats memory_search memoryType as a soft preference", async () => {
+    memoryServiceMocks.searchMemories.mockResolvedValue({
+      items: [],
+      nextCursor: null,
+    });
+
+    const server = await createMcpServer(AGENT, "tenant_test", {} as never);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    const result = await client.callTool({
+      name: "memory_search",
+      arguments: {
+        query: "banana",
+        memoryType: "decision",
+        tags: ["test"],
+      },
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(memoryServiceMocks.searchMemories).toHaveBeenCalledWith(
+      expect.anything(),
+      AGENT,
+      expect.objectContaining({
+        query: "banana",
+        tags: ["test"],
+        preferredMemoryType: "decision",
+      }),
+      null,
+    );
+    expect(memoryServiceMocks.searchMemories.mock.calls[0][2]).not.toHaveProperty("memoryType");
 
     await Promise.all([client.close(), server.close()]);
   });

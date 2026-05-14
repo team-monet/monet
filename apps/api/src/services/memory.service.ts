@@ -305,21 +305,36 @@ function buildCreatedAtCursorCondition(cursor: SearchCursorPayload): SQL<unknown
   )!;
 }
 
+function buildPreferredTypeBoostExpression(preferredMemoryType?: string): SQL<number> {
+  if (!preferredMemoryType) {
+    return drizzleSql<number>`0`;
+  }
+
+  return drizzleSql<number>`
+    CASE
+      WHEN ${memoryEntries.memoryType} = ${preferredMemoryType}::memory_type THEN 0.15
+      ELSE 0
+    END
+  `;
+}
+
 function buildSearchRankExpression(
   queryEmbedding: number[] | null,
+  preferredMemoryType?: string,
 ): SQL<number | null> {
   const usefulnessWeight = drizzleSql`(1 + LN(1 + GREATEST(${memoryEntries.usefulnessScore}, 0)))`;
   const outdatedWeight = drizzleSql`CASE WHEN ${memoryEntries.outdated} THEN 0.5 ELSE 1.0 END`;
+  const preferredTypeBoost = buildPreferredTypeBoostExpression(preferredMemoryType);
 
   if (!queryEmbedding) {
-    return drizzleSql<number>`(${usefulnessWeight} * ${outdatedWeight})`;
+    return drizzleSql<number>`((${usefulnessWeight} * ${outdatedWeight}) + ${preferredTypeBoost})`;
   }
 
   const vectorLiteral = toVectorLiteral(queryEmbedding);
   return drizzleSql<number | null>`
     CASE
       WHEN ${memoryEntries.embedding} IS NULL THEN NULL
-      ELSE ((1 - (${memoryEntries.embedding} <=> ${vectorLiteral}::vector)) * ${usefulnessWeight} * ${outdatedWeight})
+      ELSE (((1 - (${memoryEntries.embedding} <=> ${vectorLiteral}::vector)) * ${usefulnessWeight} * ${outdatedWeight}) + ${preferredTypeBoost})
     END
   `;
 }
@@ -338,6 +353,13 @@ function buildLexicalMatchCountExpression(queryText: string): SQL<number> {
     CASE WHEN COALESCE(array_to_string(${memoryEntries.tags}, ' '), '') ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END +
     CASE WHEN COALESCE(array_to_string(${memoryEntries.autoTags}, ' '), '') ILIKE ${likePattern} ESCAPE '\\' THEN 1 ELSE 0 END
   )`;
+}
+
+function buildLexicalRankExpression(queryText: string, preferredMemoryType?: string): SQL<number> {
+  const lexicalMatchCountExpression = buildLexicalMatchCountExpression(queryText);
+  const preferredTypeBoost = buildPreferredTypeBoostExpression(preferredMemoryType);
+
+  return drizzleSql<number>`(${lexicalMatchCountExpression} + ${preferredTypeBoost})`;
 }
 
 function escapeLike(text: string): string {
@@ -552,6 +574,7 @@ export async function searchMemories(
     query?: string;
     tags?: string[];
     memoryType?: string;
+    preferredMemoryType?: string;
     includeUser?: boolean;
     includePrivate?: boolean;
     createdAfter?: string;
@@ -574,9 +597,9 @@ export async function searchMemories(
 
   const db = createMemoryDb(txSql);
   const limit = query.limit ?? 20;
-  const rankExpression = buildSearchRankExpression(queryEmbedding);
+  const rankExpression = buildSearchRankExpression(queryEmbedding, query.preferredMemoryType);
   const lexicalRankExpression = query.query
-    ? buildLexicalMatchCountExpression(query.query)
+    ? buildLexicalRankExpression(query.query, query.preferredMemoryType)
     : null;
   const hybridSearch = Boolean(queryEmbedding && lexicalRankExpression);
   const baseConditions: SQL<unknown>[] = [

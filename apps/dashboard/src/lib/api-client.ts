@@ -153,6 +153,7 @@ export class MonetApiClient {
   // Memories
   async listMemories(params?: {
     memoryType?: MemoryType;
+    preferredMemoryType?: MemoryType;
     tags?: string;
     includeUser?: boolean;
     includePrivate?: boolean;

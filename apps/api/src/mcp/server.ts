@@ -367,8 +367,12 @@ export async function createMcpServer(
     memorySearch: async (args) => {
       try {
         const queryEmbedding = args.query ? await computeQueryEmbedding(args.query) : null;
+        const { memoryType, ...searchArgs } = args;
         const result = await withTenantScope(sql, tenantSchemaName, async (txSql) => {
-          const searchResult = await searchMemories(txSql, agentContext, args, queryEmbedding);
+          const searchResult = await searchMemories(txSql, agentContext, {
+            ...searchArgs,
+            preferredMemoryType: memoryType,
+          }, queryEmbedding);
           if (hasError(searchResult)) {
             return searchResult;
           }
