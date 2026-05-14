@@ -490,39 +490,29 @@ export async function createMemory(
   }
 
   // Group and user scopes are both bounded by agent group membership.
-  if (
-    (input.memoryScope === "group" || input.memoryScope === "user") &&
-    preflight &&
-    !preflight.hasGroupMembership
-  ) {
-    return {
-      error: "validation" as const,
-      message: `Agent must belong to a group to store ${input.memoryScope}-scoped memories`,
-    };
-  }
-
   if (chatProvider === "none" && !providedSummary) {
     return { error: "validation" as const, message: "summary is required when chat enrichment is disabled" };
   }
 
   let groupId: string | null = null;
   if (input.memoryScope === "group" || input.memoryScope === "user") {
-    const readableGroupIds = preflight?.groupIds ?? [];
-
-    if (readableGroupIds.length > 1 && !input.groupId) {
+    if (!preflight || !preflight.hasGroupMembership) {
       return {
         error: "validation" as const,
-        message: "groupId is required when you belong to multiple groups. Use agent_context to discover your groups.",
+        message: `Agent must belong to a group to store ${input.memoryScope}-scoped memories`,
       };
     }
 
-    if (input.groupId && !readableGroupIds.includes(input.groupId)) {
+    const readableGroupIds = preflight?.groupIds ?? [];
+
+    if (readableGroupIds.length > 1) {
       return {
-        error: "forbidden" as const,
+        error: "validation" as const,
+        message: `Agent must belong to exactly one group to store ${input.memoryScope}-scoped memories`,
       };
     }
 
-    groupId = input.groupId ?? (readableGroupIds.length === 1 ? readableGroupIds[0] : null);
+    groupId = readableGroupIds.length === 1 ? readableGroupIds[0] : null;
   }
 
   // Quota enforcement
@@ -1137,16 +1127,16 @@ export async function promoteScope(
 
   let nextGroupId = (entry.group_id as string | null) ?? null;
   if (newScope === "group" || newScope === "user") {
+    if (agentReadableGroupIds.length !== 1) {
+      return { error: "forbidden" as const };
+    }
+
     if (nextGroupId) {
       if (!agentReadableGroupIds.includes(nextGroupId)) {
         return { error: "forbidden" as const };
       }
     } else {
-      const fallbackGroupId = agentReadableGroupIds[0];
-      if (!fallbackGroupId) {
-        return { error: "forbidden" as const };
-      }
-      nextGroupId = fallbackGroupId;
+      nextGroupId = agentReadableGroupIds[0];
     }
   }
 

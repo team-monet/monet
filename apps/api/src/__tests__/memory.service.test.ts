@@ -406,7 +406,7 @@ describe("createMemory", () => {
     });
   });
 
-  it("requires groupId when agent belongs to multiple groups", async () => {
+  it("rejects group-scoped memory when agent belongs to multiple groups", async () => {
     const result = await createMemory(
       {} as TransactionClient,
       makeAgent({ userId: USER_ID }),
@@ -421,11 +421,11 @@ describe("createMemory", () => {
 
     expect(result).toEqual({
       error: "validation",
-      message: "groupId is required when you belong to multiple groups. Use agent_context to discover your groups.",
+      message: "Agent must belong to exactly one group to store group-scoped memories",
     });
   });
 
-  it("requires groupId for user-scoped memory when agent belongs to multiple groups", async () => {
+  it("rejects user-scoped memory when agent belongs to multiple groups", async () => {
     const result = await createMemory(
       {} as TransactionClient,
       makeAgent({ userId: USER_ID }),
@@ -440,7 +440,7 @@ describe("createMemory", () => {
 
     expect(result).toEqual({
       error: "validation",
-      message: "groupId is required when you belong to multiple groups. Use agent_context to discover your groups.",
+      message: "Agent must belong to exactly one group to store user-scoped memories",
     });
   });
 });

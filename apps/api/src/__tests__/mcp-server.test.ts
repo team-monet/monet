@@ -159,10 +159,11 @@ describe("MCP server factory", () => {
     } | undefined;
 
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
-    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("all agents in the group can access");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("all agents in this agent's group can access");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
     expect(memoryStoreSchema?.properties?.summary?.description).toContain("Required when chat enrichment is disabled");
+    expect(memoryStoreSchema?.properties?.groupId).toBeUndefined();
     expect(memoryStore?.description).toContain("you must provide both summary and tags");
 
     expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents");
@@ -176,7 +177,7 @@ describe("MCP server factory", () => {
     expect(memoryUpdateSchema?.properties?.expectedVersion?.description).toContain("optimistic concurrency");
 
     expect(memoryPromoteScope?.description).toContain("creating agent only");
-    expect(memoryPromoteScopeSchema?.properties?.scope?.description).toContain("all agents in the group can access");
+    expect(memoryPromoteScopeSchema?.properties?.scope?.description).toContain("all agents in this agent's group can access");
 
     await Promise.all([client.close(), server.close()]);
   });

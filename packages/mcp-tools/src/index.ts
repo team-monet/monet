@@ -26,8 +26,7 @@ export const MemoryStoreInput = z.object({
   content: z.string().describe("The knowledge or information to store"),
   summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when chat enrichment is disabled. Maximum 200 characters. Safe to always provide regardless of provider mode."),
   memoryType: MemoryType.describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
-  memoryScope: MemoryScope.default("group").describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
-  groupId: z.string().uuid().optional().describe("Required when storing a group- or user-scoped memory and you belong to multiple groups. If you belong to only one group, this defaults to that group."),
+  memoryScope: MemoryScope.default("group").describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user in this agent's group can access. \"group\": all agents in this agent's group can access."),
   tags: z.array(z.string()).min(1).describe("Tags for categorization and retrieval"),
   ttlSeconds: z.number().positive().optional().describe("Optional expiry time in seconds"),
 });
@@ -38,7 +37,7 @@ export const MemorySearchInput = z.object({
   query: z.string().optional().describe("Text query for semantic and full-text search"),
   tags: z.array(z.string()).optional().describe("Filter by tags"),
   memoryType: MemoryType.optional().describe("Soft preference for memory type. Matching memories rank higher, but other memory types can still be returned. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
-  includeUser: z.boolean().default(false).describe("Include \"user\" scope memories (shared across the same user's agents within the same group)"),
+  includeUser: z.boolean().default(false).describe("Include \"user\" scope memories shared across the same user's agents in this agent's group"),
   includePrivate: z.boolean().default(false).describe("Include \"private\" scope memories (visible only to the creating agent)"),
   createdAfter: z.string().datetime().optional().describe("Only include memories created on or after this timestamp"),
   createdBefore: z.string().datetime().optional().describe("Only include memories created on or before this timestamp"),
@@ -56,7 +55,7 @@ export const MemoryFetchInput = z.object({
 export const MemoryUpdateInput = UpdateMemoryEntryInput.omit({ summary: true }).extend({
   id: z.string().uuid().describe("Memory entry ID to update"),
   summary: z.string().max(200).optional().describe("Optional human/agent-provided summary to update or correct the existing memory summary. Maximum 200 characters."),
-  memoryScope: MemoryScope.optional().describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
+  memoryScope: MemoryScope.optional().describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user in this agent's group can access. \"group\": all agents in this agent's group can access."),
   memoryType: MemoryType.optional().describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
   expectedVersion: z.number().int().nonnegative().describe("Current version of the memory entry for optimistic concurrency. The update will be rejected if the version does not match."),
 });
@@ -67,7 +66,7 @@ export const MemoryDeleteInput = z.object({
 
 export const MemoryPromoteScopeInput = z.object({
   id: z.string().uuid().describe("Memory entry ID whose scope should change"),
-  scope: MemoryScope.describe("New visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
+  scope: MemoryScope.describe("New visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user in this agent's group can access. \"group\": all agents in this agent's group can access."),
 });
 
 export const MemoryMarkOutdatedInput = z.object({
@@ -75,7 +74,7 @@ export const MemoryMarkOutdatedInput = z.object({
 });
 
 export const MemoryListTagsInput = z.object({
-  includeUser: z.boolean().default(false).describe("Include \"user\" scope memories (shared across the same user's agents within the same group)"),
+  includeUser: z.boolean().default(false).describe("Include \"user\" scope memories shared across the same user's agents in this agent's group"),
   includePrivate: z.boolean().default(false).describe("Include \"private\" scope memories (visible only to the creating agent)"),
 });
 
@@ -113,7 +112,7 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_PROMOTE_SCOPE,
     description:
-      "Change a memory's visibility scope (\"private\" = creating agent only, \"user\" = same user's agents in the group, \"group\" = all agents in the group). Promotion widens visibility to a broader audience; demotion (narrowing) is allowed only by the original author. Use this when a memory should be shared more widely or restricted after reconsideration.",
+      "Change a memory's visibility scope (\"private\" = creating agent only, \"user\" = same user's agents in this agent's group, \"group\" = all agents in this agent's group). Promotion widens visibility to a broader audience; demotion (narrowing) is allowed only by the original author. Use this when a memory should be shared more widely or restricted after reconsideration.",
     inputSchema: MemoryPromoteScopeInput,
   },
   {
