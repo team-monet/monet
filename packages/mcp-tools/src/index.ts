@@ -27,7 +27,7 @@ export const MemoryStoreInput = z.object({
   summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when chat enrichment is disabled. Maximum 200 characters. Safe to always provide regardless of provider mode."),
   memoryType: MemoryType.describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
   memoryScope: MemoryScope.default("group").describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user, within the same group, can access. \"group\": all agents in the group can access, including those created by other users."),
-  groupId: z.string().uuid().optional().describe("Required when storing a group-scoped memory and you belong to multiple groups. If you belong to only one group, this defaults to that group."),
+  groupId: z.string().uuid().optional().describe("Required when storing a group- or user-scoped memory and you belong to multiple groups. If you belong to only one group, this defaults to that group."),
   tags: z.array(z.string()).min(1).describe("Tags for categorization and retrieval"),
   ttlSeconds: z.number().positive().optional().describe("Optional expiry time in seconds"),
 });

@@ -111,6 +111,17 @@ describe("memories integration", () => {
     return { res, body: await res.json() };
   }
 
+  async function bindCurrentAgentToUser() {
+    await withTenantScope(getTestSql(), schemaName, async (txSql) => {
+      const [user] = await txSql<{ id: string }[]>`
+        INSERT INTO users (tenant_id, external_id)
+        VALUES (${tenantId}, ${`ext-${agentId}`})
+        RETURNING id
+      `;
+      await txSql`UPDATE agents SET user_id = ${user.id} WHERE id = ${agentId}`;
+    });
+  }
+
   // ---------- Full CRUD lifecycle ----------
 
   it("full lifecycle: store → search → fetch → update → fetch → delete → search", async () => {
@@ -743,6 +754,70 @@ describe("memories integration", () => {
     `);
     expect(row.memory_scope).toBe("group");
     expect(typeof row.group_id).toBe("string");
+  });
+
+  it("stores user-scoped memory with a fetchable group boundary", async () => {
+    await bindCurrentAgentToUser();
+
+    const { res, body: created } = await storeMemory({
+      content: "user scoped memory should remain fetchable",
+      memoryType: "fact",
+      memoryScope: "user",
+      tags: ["user-scope-fetch"],
+    });
+    expect(res.status).toBe(201);
+
+    const [row] = await withTenantScope(getTestSql(), schemaName, async (txSql) => txSql`
+      SELECT memory_scope, group_id
+      FROM memory_entries
+      WHERE id = ${created.id}
+    `);
+    expect(row.memory_scope).toBe("user");
+    expect(row.group_id).toBe(groupId);
+
+    const fetchRes = await app.request(`/api/memories/${created.id}`, {
+      headers: authHeaders(),
+    });
+    expect(fetchRes.status).toBe(200);
+
+    const searchRes = await app.request("/api/memories?tags=user-scope-fetch&includeUser=true", {
+      headers: authHeaders(),
+    });
+    expect(searchRes.status).toBe(200);
+    const searchBody = await searchRes.json();
+    expect(searchBody.items).toHaveLength(1);
+    expect(searchBody.items[0].id).toBe(created.id);
+  });
+
+  it("sets group_id when promoting private memory to user scope", async () => {
+    const { body: created } = await storeMemory({
+      content: "private memory promoted to user",
+      memoryType: "fact",
+      memoryScope: "private",
+      tags: ["scope-user-group-id"],
+    });
+    await bindCurrentAgentToUser();
+
+    const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "user" }),
+    });
+    expect(promoteRes.status).toBe(200);
+
+    const [row] = await withTenantScope(getTestSql(), schemaName, async (txSql) => txSql`
+      SELECT memory_scope, group_id, user_id
+      FROM memory_entries
+      WHERE id = ${created.id}
+    `);
+    expect(row.memory_scope).toBe("user");
+    expect(row.group_id).toBe(groupId);
+    expect(typeof row.user_id).toBe("string");
+
+    const fetchRes = await app.request(`/api/memories/${created.id}`, {
+      headers: authHeaders(),
+    });
+    expect(fetchRes.status).toBe(200);
   });
 
   it("rejects promotion to stale group when agent is no longer a member", async () => {

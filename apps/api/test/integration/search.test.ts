@@ -499,7 +499,6 @@ describe("search integration", () => {
       await seedBaseline();
       await bindCurrentAgentToUser();
       const created = await createMemory({ content: "u-scope", memoryType: "fact", memoryScope: "user", tags: ["scope-flag"] });
-      await patchMemory(created.body.id, { group_id: currentGroupId });
       const { body } = await search({ tags: "scope-flag", includeUser: true });
       expect(body.items.length).toBe(1);
       expect(body.items[0].id).toBe(created.body.id);
@@ -517,7 +516,6 @@ describe("search integration", () => {
       await seedBaseline();
       await bindCurrentAgentToUser();
       const userScoped = await createMemory({ content: "u-scope", memoryType: "fact", memoryScope: "user", tags: ["scope-flag"] });
-      await patchMemory(userScoped.body.id, { group_id: currentGroupId });
       await createMemory({ content: "p-scope", memoryType: "fact", memoryScope: "private", tags: ["scope-flag"] });
       await createMemory({ content: "g-scope", memoryType: "fact", memoryScope: "group", tags: ["scope-flag"] });
       const { body } = await search({ tags: "scope-flag", includeUser: true, includePrivate: true });

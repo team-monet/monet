@@ -463,9 +463,20 @@ export async function createMemory(
     return { error: "validation" as const, message: "Autonomous agents cannot store user-scoped memories" };
   }
 
-  // Group-scoped entries require group membership (M2 spec)
-  if (input.memoryScope === "group" && preflight && !preflight.hasGroupMembership) {
-      return { error: "validation" as const, message: "Agent must belong to a group to store group-scoped memories" };
+  if (input.memoryScope === "user" && !agent.userId) {
+    return { error: "validation" as const, message: "User-scoped memories require a user binding" };
+  }
+
+  // Group and user scopes are both bounded by agent group membership.
+  if (
+    (input.memoryScope === "group" || input.memoryScope === "user") &&
+    preflight &&
+    !preflight.hasGroupMembership
+  ) {
+    return {
+      error: "validation" as const,
+      message: `Agent must belong to a group to store ${input.memoryScope}-scoped memories`,
+    };
   }
 
   if (chatProvider === "none" && !providedSummary) {
@@ -473,7 +484,7 @@ export async function createMemory(
   }
 
   let groupId: string | null = null;
-  if (input.memoryScope === "group") {
+  if (input.memoryScope === "group" || input.memoryScope === "user") {
     const readableGroupIds = preflight?.groupIds ?? [];
 
     if (readableGroupIds.length > 1 && !input.groupId) {
@@ -1097,8 +1108,12 @@ export async function promoteScope(
     return { error: "no_change" as const };
   }
 
+  if (newScope === "user" && !agent.userId) {
+    return { error: "forbidden" as const };
+  }
+
   let nextGroupId = (entry.group_id as string | null) ?? null;
-  if (newScope === "group") {
+  if (newScope === "group" || newScope === "user") {
     if (nextGroupId) {
       if (!agentReadableGroupIds.includes(nextGroupId)) {
         return { error: "forbidden" as const };
@@ -1116,7 +1131,8 @@ export async function promoteScope(
     .update(memoryEntries)
     .set({
       memoryScope: newScope as "group" | "user" | "private",
-      groupId: newScope === "group" ? nextGroupId : (entry.group_id as string | null),
+      groupId: newScope === "group" || newScope === "user" ? nextGroupId : (entry.group_id as string | null),
+      userId: newScope === "user" ? agent.userId : (entry.user_id as string | null),
     })
     .where(eq(memoryEntries.id, id));
 
