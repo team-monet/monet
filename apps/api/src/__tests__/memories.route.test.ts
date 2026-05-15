@@ -207,6 +207,79 @@ describe("memories route", () => {
         null,
       );
     });
+
+    it("returns 400 for invalid memoryType", async () => {
+      const res = await app.request("/memories?memoryType=not-a-type");
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("validation_error");
+      expect(body.message).toContain("Invalid memoryType");
+      expect(serviceMocks.searchMemories).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 for invalid preferredMemoryType", async () => {
+      const res = await app.request("/memories?preferredMemoryType=garbage");
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("validation_error");
+      expect(body.message).toContain("Invalid preferredMemoryType");
+      expect(serviceMocks.searchMemories).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 for empty memoryType", async () => {
+      const res = await app.request("/memories?memoryType=");
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("validation_error");
+      expect(body.message).toContain("Invalid memoryType");
+      expect(serviceMocks.searchMemories).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 for empty preferredMemoryType", async () => {
+      const res = await app.request("/memories?preferredMemoryType=");
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("validation_error");
+      expect(body.message).toContain("Invalid preferredMemoryType");
+      expect(serviceMocks.searchMemories).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 for case-mismatched memoryType", async () => {
+      const res = await app.request("/memories?memoryType=Fact");
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe("validation_error");
+      expect(serviceMocks.searchMemories).not.toHaveBeenCalled();
+    });
+
+    it("allows valid hard filter and preferred type together", async () => {
+      serviceMocks.searchMemories.mockResolvedValue({ items: [], nextCursor: null });
+
+      const res = await app.request("/memories?memoryType=fact&preferredMemoryType=decision");
+      expect(res.status).toBe(200);
+      expect(serviceMocks.searchMemories).toHaveBeenCalledWith(
+        expect.anything(),
+        AGENT,
+        expect.objectContaining({ memoryType: "fact", preferredMemoryType: "decision" }),
+        null,
+      );
+    });
+
+    it.each(["decision", "pattern", "issue", "preference", "fact", "procedure"])(
+      "accepts valid memoryType enum value: %s",
+      async (memoryType) => {
+        serviceMocks.searchMemories.mockResolvedValue({ items: [], nextCursor: null });
+
+        const res = await app.request(`/memories?memoryType=${memoryType}`);
+        expect(res.status).toBe(200);
+        expect(serviceMocks.searchMemories).toHaveBeenCalledWith(
+          expect.anything(),
+          AGENT,
+          expect.objectContaining({ memoryType }),
+          null,
+        );
+      },
+    );
   });
 
   describe("GET /memories/agent/:agentId", () => {
