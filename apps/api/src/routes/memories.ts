@@ -1,6 +1,11 @@
 import { Hono } from "hono";
 import { withTenantScope, type SqlClient } from "@monet/db";
-import { CreateMemoryEntryInput, UpdateMemoryEntryInput, MemoryScope } from "@monet/types";
+import {
+  CreateMemoryEntryInput,
+  UpdateMemoryEntryInput,
+  MemoryScope,
+  MemoryType,
+} from "@monet/types";
 import type { AppEnv } from "../middleware/context";
 import {
   createMemory,
@@ -115,6 +120,35 @@ memoriesRouter.get("/", async (c) => {
       return c.req.query("limit") ? Math.min(Math.max(1, Number(c.req.query("limit")) || 20), MAX_LIMIT) : undefined;
     })(),
   };
+
+  if (query.memoryType !== undefined) {
+    const memoryTypeValidation = MemoryType.safeParse(query.memoryType);
+    if (!memoryTypeValidation.success) {
+      return c.json(
+        {
+          error: "validation_error",
+          message:
+            "Invalid memoryType. Valid values: decision, pattern, issue, preference, fact, procedure",
+        },
+        400,
+      );
+    }
+  }
+
+  if (query.preferredMemoryType !== undefined) {
+    const preferredMemoryTypeValidation = MemoryType.safeParse(query.preferredMemoryType);
+    if (!preferredMemoryTypeValidation.success) {
+      return c.json(
+        {
+          error: "validation_error",
+          message:
+            "Invalid preferredMemoryType. Valid values: decision, pattern, issue, preference, fact, procedure",
+        },
+        400,
+      );
+    }
+  }
+
   const queryEmbedding = query.query ? await computeQueryEmbedding(query.query) : null;
 
   const result = await withTenantScope(sql, schemaName, async (txSql) => {
