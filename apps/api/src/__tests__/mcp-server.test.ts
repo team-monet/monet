@@ -160,10 +160,15 @@ describe("MCP server factory", () => {
 
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("all agents in this agent's group can access");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("Scope controls who can access");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("user-level preferences");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("team, project, workspace");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
+    expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("does not control who can access");
     expect(memoryStoreSchema?.properties?.summary?.description).toContain("Required when chat enrichment is disabled");
     expect(memoryStoreSchema?.properties?.groupId).toBeUndefined();
+    expect(memoryStore?.description).toContain("Choose memoryScope by access boundary first");
     expect(memoryStore?.description).toContain("you must provide both summary and tags");
 
     expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents");
