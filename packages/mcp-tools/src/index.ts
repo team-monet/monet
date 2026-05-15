@@ -22,11 +22,14 @@ export const TOOL_MEMORY_MARK_OUTDATED = "memory_mark_outdated" as const;
 export const TOOL_MEMORY_LIST_TAGS = "memory_list_tags" as const;
 export const TOOL_AGENT_CONTEXT = "agent_context" as const;
 
+const MEMORY_TYPE_GUIDANCE = "Classification for the memory entry. This does not control who can access the memory; choose memoryScope separately. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions.";
+const MEMORY_SCOPE_GUIDANCE = "Visibility scope for the memory entry. Scope controls who can access the memory; memoryType only classifies it. \"private\": only the creating agent can access. \"user\": agents bound to the same user in this agent's group can access; use only for user-level preferences, profile facts, or durable context that should follow the user. \"group\": all agents in this agent's group can access; use for team, project, workspace, procedures, issues, decisions, and group-level preferences.";
+
 export const MemoryStoreInput = z.object({
   content: z.string().describe("The knowledge or information to store"),
   summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when chat enrichment is disabled. Maximum 200 characters. Safe to always provide regardless of provider mode."),
-  memoryType: MemoryType.describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
-  memoryScope: MemoryScope.default("group").describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user in this agent's group can access. \"group\": all agents in this agent's group can access."),
+  memoryType: MemoryType.describe(MEMORY_TYPE_GUIDANCE),
+  memoryScope: MemoryScope.default("group").describe(MEMORY_SCOPE_GUIDANCE),
   tags: z.array(z.string()).min(1).describe("Tags for categorization and retrieval"),
   ttlSeconds: z.number().positive().optional().describe("Optional expiry time in seconds"),
 });
@@ -55,8 +58,8 @@ export const MemoryFetchInput = z.object({
 export const MemoryUpdateInput = UpdateMemoryEntryInput.omit({ summary: true }).extend({
   id: z.string().uuid().describe("Memory entry ID to update"),
   summary: z.string().max(200).optional().describe("Optional human/agent-provided summary to update or correct the existing memory summary. Maximum 200 characters."),
-  memoryScope: MemoryScope.optional().describe("Visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user in this agent's group can access. \"group\": all agents in this agent's group can access."),
-  memoryType: MemoryType.optional().describe("Classification for the memory entry. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions."),
+  memoryScope: MemoryScope.optional().describe(MEMORY_SCOPE_GUIDANCE),
+  memoryType: MemoryType.optional().describe(MEMORY_TYPE_GUIDANCE),
   expectedVersion: z.number().int().nonnegative().describe("Current version of the memory entry for optimistic concurrency. The update will be rejected if the version does not match."),
 });
 
@@ -66,7 +69,7 @@ export const MemoryDeleteInput = z.object({
 
 export const MemoryPromoteScopeInput = z.object({
   id: z.string().uuid().describe("Memory entry ID whose scope should change"),
-  scope: MemoryScope.describe("New visibility scope for the memory entry. \"private\": only the creating agent can access. \"user\": all agents created by the same user in this agent's group can access. \"group\": all agents in this agent's group can access."),
+  scope: MemoryScope.describe(`New visibility scope for the memory entry. ${MEMORY_SCOPE_GUIDANCE}`),
 });
 
 export const MemoryMarkOutdatedInput = z.object({
@@ -82,7 +85,7 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_STORE,
     description:
-      "Store a new memory entry. Use this PROACTIVELY whenever you discover something worth remembering: decisions made, problems solved, patterns identified, user preferences learned, procedures followed, or important facts encountered. The entry will be searchable by tag and full-text immediately; semantic search becomes available after enrichment completes. Choose memoryType carefully (decision, pattern, issue, preference, fact, procedure) and always include descriptive tags for future retrieval. When chat enrichment is disabled, you must provide both summary and tags.",
+      "Store a new memory entry. Use this PROACTIVELY whenever you discover something worth remembering: decisions made, problems solved, patterns identified, user preferences learned, procedures followed, or important facts encountered. Choose memoryScope by access boundary first, then memoryType as classification. Use user scope only for user-level preferences, profile facts, or durable context; use group scope for team, project, workspace, procedures, issues, decisions, and group-level preferences. The entry will be searchable by tag and full-text immediately; semantic search becomes available after enrichment completes. Always include descriptive tags for future retrieval. When chat enrichment is disabled, you must provide both summary and tags.",
     inputSchema: MemoryStoreInput,
   },
   {
