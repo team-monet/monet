@@ -2504,7 +2504,7 @@ describe("access control matrix", () => {
     expect(params).toContain(AGENT_ID);
   });
 
-  it("fetchMemory: user-scoped memory accessible when same userId AND same groupId", async () => {
+  it("fetchMemory: user-scoped memory accessible when same userId and same groupId", async () => {
     setupFetchMocks(makeEntryRow({ memory_scope: "user", user_id: USER_ID, group_id: GROUP_A }), [GROUP_A]);
     const result = await fetchMemory(
       {} as TransactionClient,
@@ -2514,9 +2514,23 @@ describe("access control matrix", () => {
     expect("entry" in result && result.entry.memoryScope).toBe("user");
   });
 
-  it("fetchMemory: user-scoped memory FORBIDDEN when same userId but different groupId", async () => {
-    const { updateMock } = setupFetchMocks(
+  it("fetchMemory: user-scoped memory accessible when same userId but different groupId", async () => {
+    setupFetchMocks(
       makeEntryRow({ memory_scope: "user", user_id: USER_ID, group_id: GROUP_B }),
+      [GROUP_A],
+    );
+    const result = await fetchMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      "00000000-0000-0000-0000-000000000950",
+    );
+    expect("entry" in result && result.entry.memoryScope).toBe("user");
+    expect("entry" in result && result.entry.groupId).toBe(GROUP_B);
+  });
+
+  it("fetchMemory: user-scoped memory forbidden for a different userId", async () => {
+    const { updateMock } = setupFetchMocks(
+      makeEntryRow({ memory_scope: "user", user_id: USER_ID_B, group_id: GROUP_A }),
       [GROUP_A],
     );
     const result = await fetchMemory(
@@ -2528,8 +2542,8 @@ describe("access control matrix", () => {
     expect(updateMock).not.toHaveBeenCalled();
   });
 
-  it("searchMemories: user scope WHERE clause includes groupId restriction", async () => {
-    const { whereMock } = setupSearchMocks([makeSearchRow({ memory_scope: "user" })], [GROUP_A]);
+  it("searchMemories: user scope WHERE clause is based on userId, not groupId", async () => {
+    const { whereMock } = setupSearchMocks([makeSearchRow({ memory_scope: "user" })], []);
     await searchMemories(
       {} as TransactionClient,
       makeAgent({ userId: USER_ID }),
@@ -2539,12 +2553,11 @@ describe("access control matrix", () => {
     const whereSql = whereSqlToString(whereMock.mock.calls[0][0]);
     const params = whereSqlParams(whereMock.mock.calls[0][0]);
     expect(whereSql).toContain(`"memory_entries"."user_id" = $`);
-    expect(whereSql).toContain(`"memory_entries"."group_id" in (`);
+    expect(whereSql).not.toContain(`"memory_entries"."group_id" in (`);
     expect(params).toContain(USER_ID);
-    expect(params).toContain(GROUP_A);
   });
 
-  it("searchMemories: user-scoped memory excluded when agent's groups don't include memory's groupId", async () => {
+  it("searchMemories: groupId filter still rejects inaccessible agent groups", async () => {
     setupSearchMocks([], [GROUP_A]);
     const result = await searchMemories(
       {} as TransactionClient,

@@ -271,7 +271,6 @@ function buildScopeFilterCondition(
       and(
         eq(memoryEntries.memoryScope, "user"),
         eq(memoryEntries.userId, agent.userId),
-        inArray(memoryEntries.groupId, agentReadableGroupIds),
       )!,
     );
   }
@@ -489,12 +488,13 @@ export async function createMemory(
     return { error: "validation" as const, message: "User-scoped memories require a user binding" };
   }
 
-  // Group and user scopes are both bounded by agent group membership.
   if (chatProvider === "none" && !providedSummary) {
     return { error: "validation" as const, message: "summary is required when chat enrichment is disabled" };
   }
 
   let groupId: string | null = null;
+  // Store the agent's group as provenance/quota attribution. User scope access
+  // is checked by user_id, not by this group_id.
   if (input.memoryScope === "group" || input.memoryScope === "user") {
     if (!preflight || !preflight.hasGroupMembership) {
       return {
@@ -1204,12 +1204,9 @@ function checkScopeAccess(
   }
 
   if (scope === "user") {
-    const entryGroupId = entry.group_id as string | null;
     if (
       agent.userId &&
-      (entry.user_id as string) === agent.userId &&
-      entryGroupId &&
-      agentReadableGroupIds.includes(entryGroupId)
+      (entry.user_id as string) === agent.userId
     ) return null;
     return { error: "forbidden" };
   }

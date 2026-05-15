@@ -112,13 +112,14 @@ describe("memories integration", () => {
   }
 
   async function bindCurrentAgentToUser() {
-    await withTenantScope(getTestSql(), schemaName, async (txSql) => {
+    return withTenantScope(getTestSql(), schemaName, async (txSql) => {
       const [user] = await txSql<{ id: string }[]>`
         INSERT INTO users (tenant_id, external_id)
         VALUES (${tenantId}, ${`ext-${agentId}`})
         RETURNING id
       `;
       await txSql`UPDATE agents SET user_id = ${user.id} WHERE id = ${agentId}`;
+      return user.id;
     });
   }
 
@@ -756,7 +757,7 @@ describe("memories integration", () => {
     expect(typeof row.group_id).toBe("string");
   });
 
-  it("stores user-scoped memory with a fetchable group boundary", async () => {
+  it("stores user-scoped memory with group provenance and fetches by user", async () => {
     await bindCurrentAgentToUser();
 
     const { res, body: created } = await storeMemory({
@@ -787,6 +788,74 @@ describe("memories integration", () => {
     const searchBody = await searchRes.json();
     expect(searchBody.items).toHaveLength(1);
     expect(searchBody.items[0].id).toBe(created.id);
+  });
+
+  it("shares user-scoped memory with the same user across agent groups", async () => {
+    const userId = await bindCurrentAgentToUser();
+
+    const { res, body: created } = await storeMemory({
+      content: "user scoped memory should follow the user across groups",
+      memoryType: "preference",
+      memoryScope: "user",
+      tags: ["user-scope-cross-group"],
+    });
+    expect(res.status).toBe(201);
+
+    const otherGroupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ name: "user-cross-group" }),
+    });
+    expect(otherGroupRes.status).toBe(201);
+    const otherGroup = await otherGroupRes.json() as { id: string };
+
+    const sameUserAgentRes = await app.request("/api/agents/register", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        externalId: "same-user-other-group",
+        userId,
+        groupId: otherGroup.id,
+      }),
+    });
+    expect(sameUserAgentRes.status).toBe(201);
+    const sameUserAgent = await sameUserAgentRes.json() as { apiKey: string };
+
+    const searchRes = await app.request("/api/memories?tags=user-scope-cross-group&includeUser=true", {
+      headers: authHeaders(sameUserAgent.apiKey),
+    });
+    expect(searchRes.status).toBe(200);
+    const searchBody = await searchRes.json();
+    expect(searchBody.items).toHaveLength(1);
+    expect(searchBody.items[0].id).toBe(created.id);
+
+    const fetchRes = await app.request(`/api/memories/${created.id}`, {
+      headers: authHeaders(sameUserAgent.apiKey),
+    });
+    expect(fetchRes.status).toBe(200);
+
+    const [differentUser] = await withTenantScope(getTestSql(), schemaName, async (txSql) => txSql<{ id: string }[]>`
+      INSERT INTO users (tenant_id, external_id)
+      VALUES (${tenantId}, ${`different-${agentId}`})
+      RETURNING id
+    `);
+
+    const differentUserAgentRes = await app.request("/api/agents/register", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        externalId: "different-user-other-group",
+        userId: differentUser.id,
+        groupId: otherGroup.id,
+      }),
+    });
+    expect(differentUserAgentRes.status).toBe(201);
+    const differentUserAgent = await differentUserAgentRes.json() as { apiKey: string };
+
+    const forbiddenFetchRes = await app.request(`/api/memories/${created.id}`, {
+      headers: authHeaders(differentUserAgent.apiKey),
+    });
+    expect(forbiddenFetchRes.status).toBe(403);
   });
 
   it("sets group_id when promoting private memory to user scope", async () => {

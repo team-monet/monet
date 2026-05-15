@@ -9,7 +9,7 @@ Use these terms in product copy, docs, tickets, and API discussions:
 - `User`: a person with a tenant login.
 - `Role`: the user's privilege level inside a tenant. Current roles are `user`, `group_admin`, and `tenant_admin`.
 - `User Group`: a collection of users used to grant access to agent groups.
-- `Agent Group`: an operational grouping for agents. Agent groups control runtime scope such as memory, quotas, and policy attachment.
+- `Agent Group`: an operational grouping for agents. Agent groups control runtime scope such as group memory, quotas, and policy attachment.
 - `Default User Group`: the tenant-local `Everyone` group created or reused automatically on first login.
 - `Default Agent Group`: the tenant-local `General` agent group used for baseline agent registration access.
 
@@ -46,6 +46,16 @@ These two layers are intentionally separate.
 
 - A user's role answers: "What administrative actions may this person perform?"
 - A user's group memberships answer: "Which agent groups may this person use?"
+
+## Memory Scope Model
+
+Memory access uses the creating agent and bound user, not user groups:
+
+- `private` memories are visible only to the creating agent.
+- `user` memories are visible to agents bound to the same user, regardless of agent group.
+- `group` memories are visible to agents in the same agent group.
+
+User-scoped memories may still carry the creating agent's `group_id` as provenance and quota attribution. That `group_id` is not an access boundary for user-scoped memory.
 
 ## Rule Scope Model
 

@@ -165,7 +165,7 @@ Your responsibilities:
 - COMPLY with all active rules provided by this server. These are organizational policies that govern your behavior — treat them as mandatory, not advisory.
 - USE shared memory proactively. Before starting non-trivial tasks, search for relevant prior context (decisions, known issues, patterns, preferences). After completing meaningful work, store durable takeaways for future sessions.
 - MAINTAIN memory quality. Update outdated entries rather than creating duplicates. Use descriptive tags consistently (check memory_list_tags first). Choose the narrowest appropriate scope and promote later if needed.
-- RESPECT scope boundaries. Private memories are yours alone; user-scoped memories are visible to your operator; group-scoped memories are shared across all agents in your group.`;
+- RESPECT scope boundaries. Private memories are yours alone; user-scoped memories are shared across agents bound to the same user; group-scoped memories are shared across all agents in your group.`;
 
 const AGENT_CONTEXT_INSTRUCTION = "USE the agent_context tool early to understand your current tenant, user, and group permissions before storing or searching memory.";
 
