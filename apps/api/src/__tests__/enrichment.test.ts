@@ -305,6 +305,96 @@ describe("enqueueEnrichment", () => {
     resetEnrichmentStateForTests();
   });
 
+  it("does not hide active jobs when test state is reset", async () => {
+    let releaseComputeEmbedding!: () => void;
+    const computeStarted = new Promise<void>((resolve) => {
+      setEnrichmentProviderForTests({
+        generateSummary: async () => "summary",
+        extractTags: async () => [],
+        computeEmbedding: async () => {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseComputeEmbedding = release;
+          });
+          return [0.1, 0.2, 0.3];
+        },
+      });
+    });
+
+    let scopeCallCount = 0;
+    withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) => {
+      scopeCallCount += 1;
+
+      if (scopeCallCount === 1) {
+        return fn({
+          update: () => ({
+            set: () => ({
+              where: () => ({
+                returning: async () => [
+                  {
+                    id: "entry-1",
+                    content: "reset while active",
+                    summary: "existing",
+                    tags: ["ops"],
+                    version: 1,
+                    memoryScope: "group",
+                    groupId: "group-1",
+                    userId: null,
+                    authorAgentId: "agent-1",
+                  },
+                ],
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 2) {
+        return fn({
+          select: () => ({
+            from: () => ({
+              where: () => ({
+                orderBy: () => ({
+                  limit: async () => [],
+                }),
+              }),
+            }),
+          }),
+        });
+      }
+
+      if (scopeCallCount === 3) {
+        return fn({
+          update: () => ({
+            set: () => ({
+              where: () => ({
+                returning: async () => [{ id: "entry-1" }],
+              }),
+            }),
+          }),
+        });
+      }
+
+      throw new Error(`Unexpected withTenantDrizzleScope call #${scopeCallCount}`);
+    });
+
+    enqueueEnrichment({} as SqlClient, "tenant_test", "entry-1");
+    await computeStarted;
+
+    expect(getActiveEnrichmentCount()).toBe(1);
+    resetEnrichmentStateForTests();
+    expect(getActiveEnrichmentCount()).toBe(1);
+
+    releaseComputeEmbedding();
+    const start = Date.now();
+    while (getActiveEnrichmentCount() !== 0 && Date.now() - start < 1000) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(getActiveEnrichmentCount()).toBe(0);
+    expect(scopeCallCount).toBe(1);
+  });
+
   it("runs provider work sequentially within a single job", async () => {
     let activeCalls = 0;
     let maxConcurrentCalls = 0;
