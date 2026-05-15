@@ -184,7 +184,11 @@ describe("MCP server factory", () => {
 
     expect(memoryPromoteScope?.description).toContain("creating agent only");
     expect(memoryPromoteScope?.description).toContain("same user's agents across agent groups");
+    expect(memoryPromoteScope?.description).toContain("removes same-user cross-group visibility");
+    expect(memoryPromoteScope?.description).toContain("same-user agents outside that group may no longer be able to search or fetch it");
+    expect(memoryPromoteScope?.description).toContain("private scope restricts it to the creating agent");
     expect(memoryPromoteScopeSchema?.properties?.scope?.description).toContain("all agents in this agent's group can access");
+    expect(memoryPromoteScopeSchema?.properties?.scope?.description).toContain("removes same-user cross-group visibility");
 
     await Promise.all([client.close(), server.close()]);
   });

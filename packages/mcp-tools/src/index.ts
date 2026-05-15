@@ -24,6 +24,7 @@ export const TOOL_AGENT_CONTEXT = "agent_context" as const;
 
 const MEMORY_TYPE_GUIDANCE = "Classification for the memory entry. This does not control who can access the memory; choose memoryScope separately. \"decision\": a chosen course of action. \"pattern\": a repeatable best practice. \"issue\": a problem, failure, or incident record. \"preference\": a user or team preference. \"fact\": objective reference information. \"procedure\": step-by-step instructions.";
 const MEMORY_SCOPE_GUIDANCE = "Visibility scope for the memory entry. Scope controls who can access the memory; memoryType only classifies it. \"private\": only the creating agent can access. \"user\": agents bound to the same user can access across agent groups; use only for user-level preferences, profile facts, or durable context that should follow the user. \"group\": all agents in this agent's group can access; use for team, project, workspace, procedures, issues, decisions, and group-level preferences.";
+const MEMORY_SCOPE_CHANGE_GUIDANCE = "Changing scope changes the access boundary. Moving a user-scoped memory to group scope removes same-user cross-group visibility; same-user agents outside that group may no longer be able to search or fetch it. Moving a memory to private scope restricts it to the creating agent and is allowed only for that author.";
 
 export const MemoryStoreInput = z.object({
   content: z.string().describe("The knowledge or information to store"),
@@ -69,7 +70,7 @@ export const MemoryDeleteInput = z.object({
 
 export const MemoryPromoteScopeInput = z.object({
   id: z.string().uuid().describe("Memory entry ID whose scope should change"),
-  scope: MemoryScope.describe(`New visibility scope for the memory entry. ${MEMORY_SCOPE_GUIDANCE}`),
+  scope: MemoryScope.describe(`New visibility scope for the memory entry. ${MEMORY_SCOPE_GUIDANCE} ${MEMORY_SCOPE_CHANGE_GUIDANCE}`),
 });
 
 export const MemoryMarkOutdatedInput = z.object({
@@ -115,7 +116,7 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_PROMOTE_SCOPE,
     description:
-      "Change a memory's visibility scope (\"private\" = creating agent only, \"user\" = same user's agents across agent groups, \"group\" = all agents in this agent's group). Promotion widens visibility to a broader audience; demotion (narrowing) is allowed only by the original author. Use this when a memory should be shared more widely or restricted after reconsideration.",
+      `Change a memory's visibility scope ("private" = creating agent only, "user" = same user's agents across agent groups, "group" = all agents in this agent's group). ${MEMORY_SCOPE_CHANGE_GUIDANCE} Use this when a memory should be shared more widely or restricted after reconsideration.`,
     inputSchema: MemoryPromoteScopeInput,
   },
   {
