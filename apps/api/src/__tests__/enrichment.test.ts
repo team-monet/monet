@@ -35,6 +35,7 @@ import {
   recoverPendingEnrichments,
   resetEnrichmentStateForTests,
   resolveMaxConcurrentEnrichments,
+  setBackgroundEnrichmentEnabledForTests,
   setEnrichmentProviderForTests,
   waitForEnrichmentDrain,
 } from "../services/enrichment.service";
@@ -44,6 +45,7 @@ describe("createEnrichmentProvider", () => {
     delete process.env.ENRICHMENT_PROVIDER;
     delete process.env.ENRICHMENT_CHAT_PROVIDER;
     delete process.env.ENRICHMENT_EMBEDDING_PROVIDER;
+    delete process.env.ENRICHMENT_BACKGROUND_ENABLED;
     delete process.env.ENRICHMENT_API_KEY;
     resetEnrichmentStateForTests();
   });
@@ -117,6 +119,25 @@ describe("createEnrichmentProvider", () => {
     expect(resolveConfiguredProviders()).toEqual({
       chatProvider: "none",
       embeddingProvider: "onnx",
+    });
+  });
+
+  it("reports background enrichment disabled while preserving semantic search", () => {
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "false";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
+    expect(getEnrichmentProviderConfigStatus()).toMatchObject({
+      configured: false,
+      status: "degraded",
+      chatProvider: null,
+      embeddingProvider: "onnx",
+      features: {
+        backgroundEnrichment: false,
+        semanticSearch: true,
+      },
+      reasons: expect.arrayContaining([
+        "Background enrichment is disabled by ENRICHMENT_BACKGROUND_ENABLED=false.",
+      ]),
     });
   });
 
@@ -202,6 +223,10 @@ describe("resolveMaxConcurrentEnrichments", () => {
 });
 
 describe("shutdown drain semantics", () => {
+  beforeEach(() => {
+    setBackgroundEnrichmentEnabledForTests(true);
+  });
+
   afterEach(() => {
     resetEnrichmentStateForTests();
   });
@@ -244,6 +269,7 @@ describe("shutdown drain semantics", () => {
 describe("recoverPendingEnrichments", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setBackgroundEnrichmentEnabledForTests(true);
   });
 
   afterEach(() => {
@@ -299,100 +325,42 @@ describe("recoverPendingEnrichments", () => {
 });
 
 describe("enqueueEnrichment", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setBackgroundEnrichmentEnabledForTests(true);
+  });
+
   afterEach(() => {
     delete process.env.ENRICHMENT_CHAT_PROVIDER;
     delete process.env.ENRICHMENT_EMBEDDING_PROVIDER;
+    delete process.env.ENRICHMENT_BACKGROUND_ENABLED;
     resetEnrichmentStateForTests();
   });
 
-  it("does not hide active jobs when test state is reset", async () => {
-    let releaseComputeEmbedding!: () => void;
-    const computeStarted = new Promise<void>((resolve) => {
-      setEnrichmentProviderForTests({
-        generateSummary: async () => "summary",
-        extractTags: async () => [],
-        computeEmbedding: async () => {
-          resolve();
-          await new Promise<void>((release) => {
-            releaseComputeEmbedding = release;
-          });
-          return [0.1, 0.2, 0.3];
-        },
-      });
-    });
-
-    let scopeCallCount = 0;
-    withTenantDrizzleScopeMock.mockImplementation(async (_sql, _schemaName, fn) => {
-      scopeCallCount += 1;
-
-      if (scopeCallCount === 1) {
-        return fn({
-          update: () => ({
-            set: () => ({
-              where: () => ({
-                returning: async () => [
-                  {
-                    id: "entry-1",
-                    content: "reset while active",
-                    summary: "existing",
-                    tags: ["ops"],
-                    version: 1,
-                    memoryScope: "group",
-                    groupId: "group-1",
-                    userId: null,
-                    authorAgentId: "agent-1",
-                  },
-                ],
-              }),
-            }),
-          }),
-        });
-      }
-
-      if (scopeCallCount === 2) {
-        return fn({
-          select: () => ({
-            from: () => ({
-              where: () => ({
-                orderBy: () => ({
-                  limit: async () => [],
-                }),
-              }),
-            }),
-          }),
-        });
-      }
-
-      if (scopeCallCount === 3) {
-        return fn({
-          update: () => ({
-            set: () => ({
-              where: () => ({
-                returning: async () => [{ id: "entry-1" }],
-              }),
-            }),
-          }),
-        });
-      }
-
-      throw new Error(`Unexpected withTenantDrizzleScope call #${scopeCallCount}`);
+  it("does not enqueue when background enrichment is disabled", () => {
+    let providerCalled = false;
+    setBackgroundEnrichmentEnabledForTests(false);
+    setEnrichmentProviderForTests({
+      generateSummary: async () => {
+        providerCalled = true;
+        return "summary";
+      },
+      extractTags: async () => {
+        providerCalled = true;
+        return [];
+      },
+      computeEmbedding: async () => {
+        providerCalled = true;
+        return [0.1, 0.2, 0.3];
+      },
     });
 
     enqueueEnrichment({} as SqlClient, "tenant_test", "entry-1");
-    await computeStarted;
-
-    expect(getActiveEnrichmentCount()).toBe(1);
-    resetEnrichmentStateForTests();
-    expect(getActiveEnrichmentCount()).toBe(1);
-
-    releaseComputeEmbedding();
-    const start = Date.now();
-    while (getActiveEnrichmentCount() !== 0 && Date.now() - start < 1000) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
 
     expect(getActiveEnrichmentCount()).toBe(0);
-    expect(scopeCallCount).toBe(1);
+    expect(getQueuedEnrichmentCount()).toBe(0);
+    expect(providerCalled).toBe(false);
+    expect(withTenantDrizzleScopeMock).not.toHaveBeenCalled();
   });
 
   it("runs provider work sequentially within a single job", async () => {

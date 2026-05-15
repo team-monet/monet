@@ -10,6 +10,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import {
   createChatEnrichmentProvider,
   createEmbeddingEnrichmentProvider,
+  isBackgroundEnrichmentEnabled,
   resolveConfiguredProviders,
 } from "../providers/index";
 import type {
@@ -26,7 +27,6 @@ const RELATED_MEMORY_LIMIT = 5;
 interface EnrichmentJob {
   entryId: string;
   schemaName: string;
-  generation: number;
 }
 
 interface RelatedMemoryScope {
@@ -39,12 +39,11 @@ interface RelatedMemoryScope {
 let providerOverride: EnrichmentProvider | null | undefined;
 let cachedChatProvider: ChatEnrichmentProvider | null | undefined;
 let cachedEmbeddingProvider: EmbeddingEnrichmentProvider | null | undefined;
+let backgroundEnrichmentEnabledOverride: boolean | undefined;
 let activeJobs = 0;
-const activeJobsByGeneration = new Map<number, number>();
 const queue: EnrichmentJob[] = [];
 const drainWaiters = new Set<() => void>();
 let shuttingDown = false;
-let currentGeneration = 0;
 
 export function markShuttingDown() {
   shuttingDown = true;
@@ -58,11 +57,17 @@ export function setEnrichmentProviderForTests(
   cachedEmbeddingProvider = undefined;
 }
 
+export function setBackgroundEnrichmentEnabledForTests(
+  enabled: boolean | undefined,
+) {
+  backgroundEnrichmentEnabledOverride = enabled;
+}
+
 export function resetEnrichmentStateForTests() {
   providerOverride = undefined;
   cachedChatProvider = undefined;
   cachedEmbeddingProvider = undefined;
-  currentGeneration += 1;
+  backgroundEnrichmentEnabledOverride = undefined;
   queue.length = 0;
   shuttingDown = false;
   notifyDrainWaiters();
@@ -134,11 +139,16 @@ export function enqueueEnrichment(
   entryId: string,
 ) {
   if (shuttingDown) return;
-  queue.push({ schemaName, entryId, generation: currentGeneration });
+  if (!isBackgroundEnrichmentJobEnabled()) return;
+  queue.push({ schemaName, entryId });
   drainQueue(sql);
 }
 
 export async function recoverPendingEnrichments(sql: SqlClient) {
+  if (!isBackgroundEnrichmentJobEnabled()) {
+    return;
+  }
+
   const provider = getProvider({ logFailures: true });
   if (!provider) {
     return;
@@ -167,7 +177,7 @@ export async function recoverPendingEnrichments(sql: SqlClient) {
     });
 
     for (const entry of entries) {
-      queue.push({ schemaName, entryId: entry.id, generation: currentGeneration });
+      queue.push({ schemaName, entryId: entry.id });
     }
   }
 
@@ -258,18 +268,15 @@ function getEmbeddingProvider(opts: { logFailures: boolean }): EmbeddingEnrichme
 function drainQueue(sql: SqlClient) {
   const maxConcurrentEnrichments = resolveMaxConcurrentEnrichments();
 
-  while (
-    activeJobsForGeneration(currentGeneration) < maxConcurrentEnrichments
-    && queue.length > 0
-  ) {
+  while (activeJobs < maxConcurrentEnrichments && queue.length > 0) {
     const job = queue.shift();
     if (!job) {
       return;
     }
 
-    incrementActiveJobs(job.generation);
+    activeJobs += 1;
     void runJob(sql, job).finally(() => {
-      decrementActiveJobs(job.generation);
+      activeJobs -= 1;
       drainQueue(sql);
     });
   }
@@ -284,10 +291,6 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
   }
 
   try {
-    if (isStaleJob(job)) {
-      return;
-    }
-
     const entry = await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
       const [row] = await db
         .update(memoryEntries)
@@ -341,10 +344,6 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
       return;
     }
 
-    if (isStaleJob(job)) {
-      return;
-    }
-
     // Running these sequentially keeps local providers such as Ollama/ONNX
     // from overcommitting memory during a single enrichment job.
     const { chatProvider } = resolveConfiguredProviders();
@@ -359,10 +358,6 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
       : [];
     const embedding = await provider.computeEmbedding(entry.content);
 
-    if (isStaleJob(job)) {
-      return;
-    }
-
     const mergedTags = [...new Set([...(entry.tags ?? []), ...extractedTags])].slice(0, 16);
     const relatedMemoryIds = await findRelatedMemoryIds(
       sql,
@@ -376,10 +371,6 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
         authorAgentId: entry.authorAgentId,
       },
     );
-
-    if (isStaleJob(job)) {
-      return;
-    }
 
     const shouldRequeue = await withTenantDrizzleScope(sql, job.schemaName, async (db) => {
       const [updated] = await db
@@ -423,15 +414,13 @@ async function runJob(sql: SqlClient, job: EnrichmentJob) {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (!isStaleJob(job)) {
-      try {
-        await markEnrichmentFailed(sql, job.schemaName, job.entryId);
-      } catch (markError) {
-        const markMessage = markError instanceof Error ? markError.message : String(markError);
-        console.warn(
-          `Failed to mark enrichment failed for ${job.schemaName}/${job.entryId}: ${markMessage}`,
-        );
-      }
+    try {
+      await markEnrichmentFailed(sql, job.schemaName, job.entryId);
+    } catch (markError) {
+      const markMessage = markError instanceof Error ? markError.message : String(markError);
+      console.warn(
+        `Failed to mark enrichment failed for ${job.schemaName}/${job.entryId}: ${markMessage}`,
+      );
     }
     console.warn(`Memory enrichment failed for ${job.schemaName}/${job.entryId}: ${message}`);
   }
@@ -547,7 +536,7 @@ function parsePositiveInteger(value: string | undefined): number | null {
 }
 
 function isQueueDrained(): boolean {
-  return activeJobsForGeneration(currentGeneration) === 0 && queue.length === 0;
+  return activeJobs === 0 && queue.length === 0;
 }
 
 function notifyDrainWaiters(): void {
@@ -559,25 +548,6 @@ function notifyDrainWaiters(): void {
   drainWaiters.clear();
 }
 
-function isStaleJob(job: EnrichmentJob): boolean {
-  return job.generation !== currentGeneration;
-}
-
-function activeJobsForGeneration(generation: number): number {
-  return activeJobsByGeneration.get(generation) ?? 0;
-}
-
-function incrementActiveJobs(generation: number): void {
-  activeJobs += 1;
-  activeJobsByGeneration.set(generation, activeJobsForGeneration(generation) + 1);
-}
-
-function decrementActiveJobs(generation: number): void {
-  activeJobs -= 1;
-  const nextCount = activeJobsForGeneration(generation) - 1;
-  if (nextCount <= 0) {
-    activeJobsByGeneration.delete(generation);
-  } else {
-    activeJobsByGeneration.set(generation, nextCount);
-  }
+function isBackgroundEnrichmentJobEnabled(): boolean {
+  return backgroundEnrichmentEnabledOverride ?? isBackgroundEnrichmentEnabled();
 }

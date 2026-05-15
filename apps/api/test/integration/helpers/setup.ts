@@ -12,6 +12,8 @@ const TEST_DB_URL =
   process.env.DATABASE_URL ??
   "postgresql://postgres:postgres@localhost:5432/monet_test";
 
+process.env.ENRICHMENT_BACKGROUND_ENABLED = "false";
+
 let sql: SqlClient | null = null;
 let db: ReturnType<typeof drizzle>;
 let schemaReadyPromise: Promise<void> | null = null;

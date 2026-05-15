@@ -286,6 +286,12 @@ function validateEnrichmentConfig(
   errors: string[],
   warnings: string[],
 ): StartupConfigSummary["enrichment"] {
+  const backgroundEnabled =
+    parseOptionalBooleanEnv(
+      "ENRICHMENT_BACKGROUND_ENABLED",
+      env.ENRICHMENT_BACKGROUND_ENABLED,
+      errors,
+    ) ?? true;
   const explicitChatProvider = parseChatProviderEnv(env.ENRICHMENT_CHAT_PROVIDER, errors);
   const explicitEmbeddingProvider = parseEmbeddingProviderEnv(
     env.ENRICHMENT_EMBEDDING_PROVIDER,
@@ -302,7 +308,14 @@ function validateEnrichmentConfig(
     );
   }
 
-  if (!chatProvider && !embeddingProvider) {
+  if (!backgroundEnabled) {
+    warnings.push("ENRICHMENT_BACKGROUND_ENABLED=false; background memory enrichment is disabled.");
+    if (!embeddingProvider) {
+      warnings.push(
+        "ENRICHMENT_EMBEDDING_PROVIDER is not configured; semantic search will run in degraded mode.",
+      );
+    }
+  } else if (!chatProvider && !embeddingProvider) {
     warnings.push(
       "ENRICHMENT_CHAT_PROVIDER and ENRICHMENT_EMBEDDING_PROVIDER are not configured; memory enrichment and semantic search will run in degraded mode.",
     );
@@ -323,13 +336,18 @@ function validateEnrichmentConfig(
     chatProvider,
     embeddingProvider,
     details: {
-      configured: Boolean(chatProvider && embeddingProvider),
-      backgroundEnrichment: Boolean(chatProvider && embeddingProvider),
+      configured: Boolean(backgroundEnabled && chatProvider && embeddingProvider),
+      backgroundEnrichment: Boolean(backgroundEnabled && chatProvider && embeddingProvider),
       semanticSearch: Boolean(embeddingProvider),
       legacyProvider,
-      chat: chatProvider
+      chat: backgroundEnabled && chatProvider
         ? validateChatProviderConfig(env, chatProvider, errors)
-        : { configured: false },
+        : {
+            configured: false,
+            ...(chatProvider && !backgroundEnabled
+              ? { note: "Background enrichment is disabled." }
+              : {}),
+          },
       embedding: embeddingProvider
         ? validateEmbeddingProviderConfig(env, embeddingProvider, errors)
         : { configured: false },

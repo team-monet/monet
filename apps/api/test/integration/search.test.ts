@@ -405,7 +405,7 @@ describe("search integration", () => {
         expect(created.res.status).toBe(201);
         ids.push(created.body.id);
         await patchMemory(created.body.id, {
-          embedding: vector(8),
+          embedding: vector(9),
           usefulness_score: idx,
           created_at: `2025-01-0${idx + 1}T00:00:00.000Z`,
           last_accessed_at: `2025-01-0${idx + 1}T00:00:00.000Z`,

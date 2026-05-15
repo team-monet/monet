@@ -29,6 +29,12 @@ export interface EnrichmentProviderConfigStatus {
   reasons: string[];
 }
 
+export function isBackgroundEnrichmentEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return parseBooleanEnv(env.ENRICHMENT_BACKGROUND_ENABLED, "ENRICHMENT_BACKGROUND_ENABLED", true);
+}
+
 const LEGACY_PROVIDER_MAP: Record<
   LegacyEnrichmentProviderName,
   {
@@ -145,8 +151,16 @@ export function getEnrichmentProviderConfigStatus(
   let chatProvider: ChatProviderName | null = null;
   let embeddingProvider: EmbeddingProviderName | null = null;
   const reasons: string[] = [];
+  let backgroundEnabled = true;
   let chatConfigured = false;
   let embeddingConfigured = false;
+
+  try {
+    backgroundEnabled = isBackgroundEnrichmentEnabled(env);
+  } catch (error) {
+    backgroundEnabled = false;
+    reasons.push(error instanceof Error ? error.message : String(error));
+  }
 
   try {
     const resolved = resolveConfiguredProviders(env);
@@ -156,29 +170,35 @@ export function getEnrichmentProviderConfigStatus(
     reasons.push(error instanceof Error ? error.message : String(error));
   }
 
-  try {
-    if (chatProvider) {
-      createChatEnrichmentProvider(env);
-      chatConfigured = true;
-    } else {
-      reasons.push("Chat enrichment is not configured.");
+  if (backgroundEnabled) {
+    try {
+      if (chatProvider) {
+        createChatEnrichmentProvider(env);
+        chatConfigured = true;
+      } else {
+        reasons.push("Chat enrichment is not configured.");
+      }
+    } catch (error) {
+      reasons.push(error instanceof Error ? error.message : String(error));
     }
-  } catch (error) {
-    reasons.push(error instanceof Error ? error.message : String(error));
+  } else {
+    reasons.push("Background enrichment is disabled by ENRICHMENT_BACKGROUND_ENABLED=false.");
   }
 
   try {
     if (embeddingProvider) {
       createEmbeddingEnrichmentProvider(env);
       embeddingConfigured = true;
-    } else {
+    } else if (backgroundEnabled) {
       reasons.push("Embedding provider is not configured.");
+    } else {
+      reasons.push("Embedding provider is not configured; semantic search will run in degraded mode.");
     }
   } catch (error) {
     reasons.push(error instanceof Error ? error.message : String(error));
   }
 
-  const backgroundEnrichment = chatConfigured && embeddingConfigured;
+  const backgroundEnrichment = backgroundEnabled && chatConfigured && embeddingConfigured;
   const semanticSearch = embeddingConfigured;
 
   return {
@@ -192,6 +212,27 @@ export function getEnrichmentProviderConfigStatus(
     },
     reasons,
   };
+}
+
+function parseBooleanEnv(
+  value: string | undefined,
+  envName: string,
+  defaultValue: boolean,
+): boolean {
+  const trimmed = value?.trim().toLowerCase();
+  if (!trimmed) {
+    return defaultValue;
+  }
+
+  if (["1", "true", "yes", "on"].includes(trimmed)) {
+    return true;
+  }
+
+  if (["0", "false", "no", "off"].includes(trimmed)) {
+    return false;
+  }
+
+  throw new Error(`${envName} must be a boolean: true or false.`);
 }
 
 function parseChatProvider(value: string, envName: string): ChatProviderName {

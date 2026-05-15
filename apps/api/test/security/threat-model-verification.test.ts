@@ -8,6 +8,7 @@ import {
 } from "../integration/helpers/setup";
 import {
   resetEnrichmentStateForTests,
+  setBackgroundEnrichmentEnabledForTests,
   setEnrichmentProviderForTests,
 } from "../../src/services/enrichment.service";
 import type { EnrichmentProvider } from "../../src/providers/enrichment";
@@ -38,6 +39,7 @@ describe("threat model verification", () => {
   it("does not leak authorization token or memory content in log output", async () => {
     const previousForceLogs = process.env.FORCE_REQUEST_LOGS;
     process.env.FORCE_REQUEST_LOGS = "true";
+    setBackgroundEnrichmentEnabledForTests(true);
     const failingProvider: EnrichmentProvider = {
       generateSummary: async () => {
         throw new Error("summary failure");
