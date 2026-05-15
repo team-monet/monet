@@ -252,6 +252,7 @@ Choose one enrichment mode:
 
 Important env notes:
 
+- `ENRICHMENT_BACKGROUND_ENABLED=false` pauses asynchronous memory enrichment writes. Semantic search can still use existing embeddings when `ENRICHMENT_EMBEDDING_PROVIDER` is configured.
 - `ENRICHMENT_CHAT_PROVIDER` and `ENRICHMENT_EMBEDDING_PROVIDER` are the canonical settings.
 - `ENRICHMENT_PROVIDER` is still accepted as legacy shorthand, but do not use it for new production configs.
 - `EMBEDDING_DIMENSIONS` must match your embedding model before the first migration.

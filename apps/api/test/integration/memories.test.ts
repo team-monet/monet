@@ -9,6 +9,7 @@ import {
 import { withTenantScope } from "@monet/db";
 import {
   resetEnrichmentStateForTests,
+  setBackgroundEnrichmentEnabledForTests,
   setEnrichmentProviderForTests,
 } from "../../src/services/enrichment.service";
 import {
@@ -646,6 +647,7 @@ describe("memories integration", () => {
   });
 
   it("completes enrichment asynchronously and records completed status", async () => {
+    setBackgroundEnrichmentEnabledForTests(true);
     setEnrichmentProviderForTests(makeProvider());
     const { body: created } = await storeMemory({
       content: "banana roadmap planning memory",
@@ -676,6 +678,7 @@ describe("memories integration", () => {
   });
 
   it("marks enrichment as failed when the provider errors", async () => {
+    setBackgroundEnrichmentEnabledForTests(true);
     setEnrichmentProviderForTests(makeProvider({
       computeEmbedding: async () => {
         throw new Error("embedding failure");

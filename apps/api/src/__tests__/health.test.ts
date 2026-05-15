@@ -40,6 +40,7 @@ describe("health endpoints", () => {
   const originalChatProvider = process.env.ENRICHMENT_CHAT_PROVIDER;
   const originalEmbeddingProvider = process.env.ENRICHMENT_EMBEDDING_PROVIDER;
   const originalLegacyProvider = process.env.ENRICHMENT_PROVIDER;
+  const originalBackgroundEnabled = process.env.ENRICHMENT_BACKGROUND_ENABLED;
   const sessionStore = {
     count: vi.fn(() => 0),
   };
@@ -48,6 +49,7 @@ describe("health endpoints", () => {
     process.env.ENRICHMENT_CHAT_PROVIDER = "ollama";
     process.env.ENRICHMENT_EMBEDDING_PROVIDER = "ollama";
     delete process.env.ENRICHMENT_PROVIDER;
+    delete process.env.ENRICHMENT_BACKGROUND_ENABLED;
     sessionStore.count.mockClear();
   });
 
@@ -68,6 +70,12 @@ describe("health endpoints", () => {
       delete process.env.ENRICHMENT_PROVIDER;
     } else {
       process.env.ENRICHMENT_PROVIDER = originalLegacyProvider;
+    }
+
+    if (originalBackgroundEnabled === undefined) {
+      delete process.env.ENRICHMENT_BACKGROUND_ENABLED;
+    } else {
+      process.env.ENRICHMENT_BACKGROUND_ENABLED = originalBackgroundEnabled;
     }
   });
 
@@ -173,6 +181,29 @@ describe("health endpoints", () => {
           status: "degraded",
           configured: false,
           chatProvider: null,
+          embeddingProvider: "onnx",
+          features: {
+            backgroundEnrichment: false,
+            semanticSearch: true,
+          },
+        },
+      },
+    });
+  });
+
+  it("GET /health/ready reports disabled background enrichment", async () => {
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "false";
+    process.env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+    const sql = createSqlMock();
+    const app = createApp(null, sql as never, sessionStore as never);
+    const res = await app.request("/health/ready");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      status: "ok",
+      components: {
+        enrichment: {
+          status: "degraded",
+          configured: false,
           embeddingProvider: "onnx",
           features: {
             backgroundEnrichment: false,

@@ -96,6 +96,32 @@ describe("validateStartupConfig", () => {
     );
   });
 
+  it("allows background enrichment to be disabled while keeping semantic search", () => {
+    const env = createBaseEnv();
+    env.ENRICHMENT_BACKGROUND_ENABLED = "false";
+    delete env.ENRICHMENT_CHAT_PROVIDER;
+    env.ENRICHMENT_EMBEDDING_PROVIDER = "onnx";
+
+    const result = validateStartupConfig(env);
+
+    expect(result.summary.enrichment.chatProvider).toBeNull();
+    expect(result.summary.enrichment.embeddingProvider).toBe("onnx");
+    expect(result.summary.enrichment.details).toMatchObject({
+      configured: false,
+      backgroundEnrichment: false,
+      semanticSearch: true,
+      chat: {
+        configured: false,
+      },
+      embedding: {
+        configured: true,
+      },
+    });
+    expect(result.warnings).toContain(
+      "ENRICHMENT_BACKGROUND_ENABLED=false; background memory enrichment is disabled.",
+    );
+  });
+
   it("fails when required config is missing or malformed", () => {
     try {
       validateStartupConfig({

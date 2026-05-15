@@ -81,6 +81,9 @@ Review these config changes before upgrading:
   local ONNX embeddings and requires no external API key. If you were relying
   on a hosted embedding provider, set `ENRICHMENT_EMBEDDING_PROVIDER`
   explicitly.
+- **`ENRICHMENT_BACKGROUND_ENABLED=false`** can be used to pause asynchronous
+  memory enrichment writes without disabling semantic search over existing
+  embeddings.
 - **Keycloak hostname default** changed to `keycloak.localhost` with
   `--hostname-strict=true`. If your deployment overrides Keycloak hostname
   settings, verify they still work after upgrade. If you were using the
