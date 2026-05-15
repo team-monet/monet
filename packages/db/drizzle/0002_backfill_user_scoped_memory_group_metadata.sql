@@ -15,7 +15,10 @@ BEGIN
           WITH author_groups AS (
             SELECT
               agent_id,
-              MIN(group_id) AS group_id,
+              CASE
+                WHEN COUNT(*) = 1 THEN (array_agg(group_id))[1]
+                ELSE NULL
+              END AS group_id,
               COUNT(*) AS group_count
             FROM %I.agent_group_members
             GROUP BY agent_id
