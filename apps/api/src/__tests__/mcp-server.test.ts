@@ -159,6 +159,7 @@ describe("MCP server factory", () => {
     } | undefined;
 
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("same user can access across agent groups");
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("all agents in this agent's group can access");
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("Scope controls who can access");
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("user-level preferences");
@@ -171,7 +172,7 @@ describe("MCP server factory", () => {
     expect(memoryStore?.description).toContain("Choose memoryScope by access boundary first");
     expect(memoryStore?.description).toContain("you must provide both summary and tags");
 
-    expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents");
+    expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents across agent groups");
     expect(memorySearchSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");
     expect(memorySearchSchema?.properties?.memoryType?.description).toContain("Soft preference");
     expect(memorySearchSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
@@ -182,6 +183,7 @@ describe("MCP server factory", () => {
     expect(memoryUpdateSchema?.properties?.expectedVersion?.description).toContain("optimistic concurrency");
 
     expect(memoryPromoteScope?.description).toContain("creating agent only");
+    expect(memoryPromoteScope?.description).toContain("same user's agents across agent groups");
     expect(memoryPromoteScopeSchema?.properties?.scope?.description).toContain("all agents in this agent's group can access");
 
     await Promise.all([client.close(), server.close()]);
