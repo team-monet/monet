@@ -488,7 +488,7 @@ export async function createMemory(
     return { error: "validation" as const, message: "User-scoped memories require a user binding" };
   }
 
-  const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+  const enrichmentAvailable = Boolean(chatProvider) && chatProvider !== "none" && isBackgroundEnrichmentEnabled();
   if (!enrichmentAvailable && !providedSummary) {
     return {
       error: "validation" as const,
@@ -510,13 +510,20 @@ export async function createMemory(
     const readableGroupIds = preflight?.groupIds ?? [];
 
     if (readableGroupIds.length > 1) {
-      return {
-        error: "validation" as const,
-        message: `Agent must belong to exactly one group to store ${input.memoryScope}-scoped memories`,
-      };
+      if (input.groupId) {
+        if (!readableGroupIds.includes(input.groupId)) {
+          return { error: "forbidden" as const };
+        }
+        groupId = input.groupId;
+      } else {
+        return {
+          error: "validation" as const,
+          message: `Agent belongs to multiple groups; specify groupId to store ${input.memoryScope}-scoped memories`,
+        };
+      }
+    } else {
+      groupId = readableGroupIds.length === 1 ? readableGroupIds[0] : null;
     }
-
-    groupId = readableGroupIds.length === 1 ? readableGroupIds[0] : null;
   }
 
   // Quota enforcement
@@ -938,6 +945,8 @@ export async function updateMemory(
 
   const newVersion = (entry.version as number) + 1;
   const { chatProvider } = resolveConfiguredProviders();
+  const enrichmentAvailable =
+    Boolean(chatProvider) && chatProvider !== "none" && isBackgroundEnrichmentEnabled();
   const providedSummary = input.summary?.trim();
   const hasProvidedSummary = Boolean(providedSummary);
   const newContent = input.content ?? (entry.content as string);
@@ -948,9 +957,9 @@ export async function updateMemory(
   const summaryUpdate = hasProvidedSummary
     ? { summary: providedSummary }
     : contentChanged
-      ? chatProvider === "none"
-        ? { summary: (entry.summary as string | null) ?? null }
-        : { summary: null }
+      ? enrichmentAvailable
+        ? { summary: null }
+        : { summary: (entry.summary as string | null) ?? null }
       : {};
   const enrichmentReset = contentChanged
     ? {
@@ -1086,9 +1095,11 @@ export async function promoteScope(
   agent: AgentContext,
   id: string,
   newScope: string,
+  groupId?: string,
 ): Promise<
   | { error: "not_found" }
   | { error: "forbidden" }
+  | { error: "validation"; message: string }
   | { error: "no_change" }
   | { success: true; scope: string }
 > {
@@ -1137,9 +1148,26 @@ export async function promoteScope(
       }
     } else {
       if (agentReadableGroupIds.length !== 1) {
-        return { error: "forbidden" as const };
+        if (groupId) {
+          if (!agentReadableGroupIds.includes(groupId)) {
+            return { error: "forbidden" as const };
+          }
+          nextGroupId = groupId;
+        } else {
+          if (agentReadableGroupIds.length === 0) {
+            return {
+              error: "validation" as const,
+              message: "Agent must belong to a group to assign group/user scope",
+            };
+          }
+          return {
+            error: "validation" as const,
+            message: "Agent belongs to multiple groups; specify groupId for group/user scope",
+          };
+        }
+      } else {
+        nextGroupId = agentReadableGroupIds[0];
       }
-      nextGroupId = agentReadableGroupIds[0];
     }
   }
 
