@@ -906,8 +906,8 @@ describe("memories integration", () => {
     });
     expect(demoteRes.status).toBe(200);
 
-    // Move the agent to a different group to make the memory's stored group_id stale.
-    // This simulates a real membership change while keeping auth/role checks intact.
+    // Add fallback membership. With single-group addMember semantics, this moves
+    // the agent away from the original group so the memory's stored group_id is stale.
     const fallbackGroupRes = await app.request("/api/groups", {
       method: "POST",
       headers: authHeaders(),
@@ -929,6 +929,50 @@ describe("memories integration", () => {
       body: JSON.stringify({ scope: "group" }),
     });
     expect(promoteRes.status).toBe(403);
+  });
+
+  it("allows multi-group agent to promote when stored group is still readable", async () => {
+    const { body: created } = await storeMemory({
+      content: "multi-group promotion should succeed when stored group is readable",
+      memoryType: "fact",
+      tags: ["scope-multi-group-allowed"],
+    });
+
+    const demoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "private" }),
+    });
+    expect(demoteRes.status).toBe(200);
+
+    const otherGroupRes = await app.request("/api/groups", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ name: "other-group" }),
+    });
+    expect(otherGroupRes.status).toBe(201);
+    const otherGroup = await otherGroupRes.json() as { id: string };
+
+    const addOtherMembershipRes = await app.request(`/api/groups/${otherGroup.id}/members`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ agentId }),
+    });
+    expect(addOtherMembershipRes.status).toBe(200);
+
+    // addMember uses single-group move semantics, so re-add the original
+    // membership directly to simulate an agent that can read multiple groups.
+    const sql = getTestSql();
+    await withTenantScope(sql, schemaName, async (txSql) => {
+      await txSql`INSERT INTO agent_group_members (agent_id, group_id) VALUES (${agentId}, ${groupId})`;
+    });
+
+    const promoteRes = await app.request(`/api/memories/${created.id}/scope`, {
+      method: "PATCH",
+      headers: authHeaders(),
+      body: JSON.stringify({ scope: "group" }),
+    });
+    expect(promoteRes.status).toBe(200);
   });
 
   it("rejects audit log update and delete operations", async () => {

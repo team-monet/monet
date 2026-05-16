@@ -1127,15 +1127,14 @@ export async function promoteScope(
 
   let nextGroupId = (entry.group_id as string | null) ?? null;
   if (newScope === "group" || newScope === "user") {
-    if (agentReadableGroupIds.length !== 1) {
-      return { error: "forbidden" as const };
-    }
-
     if (nextGroupId) {
       if (!agentReadableGroupIds.includes(nextGroupId)) {
         return { error: "forbidden" as const };
       }
     } else {
+      if (agentReadableGroupIds.length !== 1) {
+        return { error: "forbidden" as const };
+      }
       nextGroupId = agentReadableGroupIds[0];
     }
   }
