@@ -168,7 +168,7 @@ describe("MCP server factory", () => {
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("does not control who can access");
     expect(memoryStoreSchema?.properties?.summary?.description).toContain("Required when background enrichment is disabled or chat provider is not configured");
-    expect(memoryStoreSchema?.properties?.groupId).toBeUndefined();
+    expect(memoryStoreSchema?.properties?.groupId?.description).toContain("Required when agent belongs to multiple groups");
     expect(memoryStore?.description).toContain("Choose memoryScope by access boundary first");
     expect(memoryStore?.description).toContain("you must provide a summary");
 
