@@ -159,7 +159,7 @@ describe("MCP server factory", () => {
     } | undefined;
 
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("only the creating agent can access");
-    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("same user can access across agent groups");
+    expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("agents bound to the same user can access across agent groups");
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("all agents in this agent's group can access");
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("Scope controls who can access");
     expect(memoryStoreSchema?.properties?.memoryScope?.description).toContain("user-level preferences");
@@ -167,10 +167,10 @@ describe("MCP server factory", () => {
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("a chosen course of action");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("step-by-step instructions");
     expect(memoryStoreSchema?.properties?.memoryType?.description).toContain("does not control who can access");
-    expect(memoryStoreSchema?.properties?.summary?.description).toContain("Required when chat enrichment is disabled");
+    expect(memoryStoreSchema?.properties?.summary?.description).toContain("Required when background enrichment is disabled or chat provider is not configured");
     expect(memoryStoreSchema?.properties?.groupId).toBeUndefined();
     expect(memoryStore?.description).toContain("Choose memoryScope by access boundary first");
-    expect(memoryStore?.description).toContain("you must provide both summary and tags");
+    expect(memoryStore?.description).toContain("you must provide a summary");
 
     expect(memorySearchSchema?.properties?.includeUser?.description).toContain("same user's agents across agent groups");
     expect(memorySearchSchema?.properties?.includePrivate?.description).toContain("only to the creating agent");

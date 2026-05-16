@@ -23,6 +23,10 @@ import {
   EMBEDDING_DIMENSIONS,
   type EnrichmentProvider,
 } from "../../src/providers/enrichment";
+import {
+  isBackgroundEnrichmentEnabled,
+  resolveConfiguredProviders,
+} from "../../src/providers";
 
 function embedding(fill: number) {
   return Array.from({ length: EMBEDDING_DIMENSIONS }, () => fill);
@@ -48,6 +52,17 @@ function provider(): EnrichmentProvider {
 function parseToolText(result: { content?: Array<{ type: string; text?: string }>; isError?: boolean }) {
   const text = result.content?.find((entry) => entry.type === "text")?.text;
   return text ? JSON.parse(text) : null;
+}
+
+function memoryStoreArgs(input: Record<string, unknown>) {
+  const normalizedInput = { ...input };
+  const { chatProvider } = resolveConfiguredProviders();
+  const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+  if (!enrichmentAvailable && typeof normalizedInput.summary !== "string") {
+    const content = typeof normalizedInput.content === "string" ? normalizedInput.content : "";
+    normalizedInput.summary = content.slice(0, 200);
+  }
+  return normalizedInput;
 }
 
 describe("MCP integration", () => {
@@ -180,11 +195,11 @@ describe("MCP integration", () => {
 
     const storeResult = await client.callTool({
       name: "memory_store",
-      arguments: {
+      arguments: memoryStoreArgs({
         content: "banana decision from MCP",
         memoryType: "decision",
         tags: ["mcp", "banana"],
-      },
+      }),
     });
     const stored = parseToolText(storeResult);
     expect(stored.id).toBeDefined();
@@ -247,12 +262,12 @@ describe("MCP integration", () => {
 
     const storeResult = await client.callTool({
       name: "memory_store",
-      arguments: {
+      arguments: memoryStoreArgs({
         content: "share this MCP memory",
         memoryType: "fact",
         memoryScope: "private",
         tags: ["shareable"],
-      },
+      }),
     });
     const stored = parseToolText(storeResult);
 
@@ -291,20 +306,20 @@ describe("MCP integration", () => {
 
     const first = parseToolText(await client.callTool({
       name: "memory_store",
-      arguments: {
+      arguments: memoryStoreArgs({
         content: "banana fresh memory",
         memoryType: "fact",
         tags: ["ranking"],
-      },
+      }),
     }));
 
     const second = parseToolText(await client.callTool({
       name: "memory_store",
-      arguments: {
+      arguments: memoryStoreArgs({
         content: "banana outdated memory",
         memoryType: "fact",
         tags: ["ranking"],
-      },
+      }),
     }));
 
     const outdatedResult = await client.callTool({

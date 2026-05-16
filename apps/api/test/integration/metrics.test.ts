@@ -13,6 +13,10 @@ import {
 import {
   EMBEDDING_DIMENSIONS,
 } from "../../src/providers/enrichment";
+import {
+  isBackgroundEnrichmentEnabled,
+  resolveConfiguredProviders,
+} from "../../src/providers";
 
 function embedding(fill: number) {
   return Array.from({ length: EMBEDDING_DIMENSIONS }, () => fill);
@@ -65,10 +69,18 @@ describe("metrics integration", () => {
   }
 
   async function storeMemory(input: Record<string, unknown>) {
+    const normalizedInput = { ...input };
+    const { chatProvider } = resolveConfiguredProviders();
+    const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+    if (!enrichmentAvailable && typeof normalizedInput.summary !== "string") {
+      const content = typeof normalizedInput.content === "string" ? normalizedInput.content : "";
+      normalizedInput.summary = content.slice(0, 200);
+    }
+
     const res = await app.request("/api/memories", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify(input),
+      body: JSON.stringify(normalizedInput),
     });
     return { res, body: await res.json() };
   }
@@ -184,8 +196,11 @@ describe("metrics integration", () => {
     expect(usefulness.length).toBeGreaterThan(0);
 
     const quality = benefit.enrichmentQuality as Record<string, number>;
+    const { chatProvider } = resolveConfiguredProviders();
+    const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+    const expectedSummaryCount = enrichmentAvailable ? 1 : 3;
     expect(quality.total).toBe(3);
-    expect(quality.withSummary).toBe(1);
+    expect(quality.withSummary).toBe(expectedSummaryCount);
     expect(quality.withEmbedding).toBe(1);
 
     // Health section

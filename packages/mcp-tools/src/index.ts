@@ -28,7 +28,7 @@ const MEMORY_SCOPE_CHANGE_GUIDANCE = "Changing scope changes the access boundary
 
 export const MemoryStoreInput = z.object({
   content: z.string().describe("The knowledge or information to store"),
-  summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when chat enrichment is disabled. Maximum 200 characters. Safe to always provide regardless of provider mode."),
+  summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when background enrichment is disabled or chat provider is not configured. Maximum 200 characters. Safe to always provide regardless of provider mode."),
   memoryType: MemoryType.describe(MEMORY_TYPE_GUIDANCE),
   memoryScope: MemoryScope.default("group").describe(MEMORY_SCOPE_GUIDANCE),
   tags: z.array(z.string()).min(1).describe("Tags for categorization and retrieval"),
@@ -86,7 +86,7 @@ export const toolDefinitions = [
   {
     name: TOOL_MEMORY_STORE,
     description:
-      "Store a new memory entry. Use this PROACTIVELY whenever you discover something worth remembering: decisions made, problems solved, patterns identified, user preferences learned, procedures followed, or important facts encountered. Choose memoryScope by access boundary first, then memoryType as classification. Use user scope only for user-level preferences, profile facts, or durable context; use group scope for team, project, workspace, procedures, issues, decisions, and group-level preferences. The entry will be searchable by tag and full-text immediately; semantic search becomes available after enrichment completes. Always include descriptive tags for future retrieval. When chat enrichment is disabled, you must provide both summary and tags.",
+      "Store a new memory entry. Use this PROACTIVELY whenever you discover something worth remembering: decisions made, problems solved, patterns identified, user preferences learned, procedures followed, or important facts encountered. Choose memoryScope by access boundary first, then memoryType as classification. Use user scope only for user-level preferences, profile facts, or durable context; use group scope for team, project, workspace, procedures, issues, decisions, and group-level preferences. The entry will be searchable by tag and full-text immediately; semantic search becomes available after enrichment completes. Always include descriptive tags for future retrieval. When background enrichment is disabled or chat provider is not configured, you must provide a summary.",
     inputSchema: MemoryStoreInput,
   },
   {

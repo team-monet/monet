@@ -16,6 +16,10 @@ import {
   EMBEDDING_DIMENSIONS,
   type EnrichmentProvider,
 } from "../../src/providers/enrichment";
+import {
+  isBackgroundEnrichmentEnabled,
+  resolveConfiguredProviders,
+} from "../../src/providers";
 
 function embedding(fill: number) {
   return Array.from({ length: EMBEDDING_DIMENSIONS }, () => fill);
@@ -104,10 +108,18 @@ describe("memories integration", () => {
     input: Record<string, unknown>,
     key = apiKey,
   ) {
+    const normalizedInput = { ...input };
+    const { chatProvider } = resolveConfiguredProviders();
+    const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+    if (!enrichmentAvailable && typeof normalizedInput.summary !== "string") {
+      const content = typeof normalizedInput.content === "string" ? normalizedInput.content : "";
+      normalizedInput.summary = content.slice(0, 200);
+    }
+
     const res = await app.request("/api/memories", {
       method: "POST",
       headers: authHeaders(key),
-      body: JSON.stringify(input),
+      body: JSON.stringify(normalizedInput),
     });
     return { res, body: await res.json() };
   }
@@ -218,7 +230,7 @@ describe("memories integration", () => {
     expect(fetchRes.status).toBe(200);
     const fetchBody = await fetchRes.json();
     expect(fetchBody.entry.content).toBe(content);
-    expect(fetchBody.entry.summary).toBeNull();
+    expect(fetchBody.entry.summary).toBe(content);
     expect(fetchBody.entry.version).toBe(0);
   });
 
@@ -647,6 +659,7 @@ describe("memories integration", () => {
   });
 
   it("completes enrichment asynchronously and records completed status", async () => {
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "true";
     setBackgroundEnrichmentEnabledForTests(true);
     setEnrichmentProviderForTests(makeProvider());
     const { body: created } = await storeMemory({
@@ -678,6 +691,7 @@ describe("memories integration", () => {
   });
 
   it("marks enrichment as failed when the provider errors", async () => {
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "true";
     setBackgroundEnrichmentEnabledForTests(true);
     setEnrichmentProviderForTests(makeProvider({
       computeEmbedding: async () => {

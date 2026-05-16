@@ -32,7 +32,7 @@ import type {
   MemoryEntryTier1,
   UpdateMemoryEntryInput,
 } from "@monet/types";
-import { resolveConfiguredProviders } from "../providers";
+import { isBackgroundEnrichmentEnabled, resolveConfiguredProviders } from "../providers";
 
 type MemorySqlClient = SqlClient | TransactionClient;
 type MemoryDrizzleOptions = NonNullable<SqlClient["options"]>;
@@ -488,8 +488,12 @@ export async function createMemory(
     return { error: "validation" as const, message: "User-scoped memories require a user binding" };
   }
 
-  if (chatProvider === "none" && !providedSummary) {
-    return { error: "validation" as const, message: "summary is required when chat enrichment is disabled" };
+  const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+  if (!enrichmentAvailable && !providedSummary) {
+    return {
+      error: "validation" as const,
+      message: "summary is required when background enrichment is disabled or chat provider is not configured",
+    };
   }
 
   let groupId: string | null = null;
