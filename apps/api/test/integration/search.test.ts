@@ -16,6 +16,10 @@ import {
   EMBEDDING_DIMENSIONS,
   type EnrichmentProvider,
 } from "../../src/providers/enrichment";
+import {
+  isBackgroundEnrichmentEnabled,
+  resolveConfiguredProviders,
+} from "../../src/providers";
 
 function vector(axis: number, magnitude = 1): number[] {
   const values = Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0);
@@ -53,10 +57,18 @@ describe("search integration", () => {
   }
 
   async function createMemory(input: Record<string, unknown>) {
+    const normalizedInput = { ...input };
+    const { chatProvider } = resolveConfiguredProviders();
+    const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+    if (!enrichmentAvailable && typeof normalizedInput.summary !== "string") {
+      const content = typeof normalizedInput.content === "string" ? normalizedInput.content : "";
+      normalizedInput.summary = content.slice(0, 200);
+    }
+
     const res = await app.request("/api/memories", {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify(input),
+      body: JSON.stringify(normalizedInput),
     });
     return { res, body: await res.json() as { id: string } };
   }

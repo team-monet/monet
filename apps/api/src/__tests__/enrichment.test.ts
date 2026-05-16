@@ -5,6 +5,7 @@ import {
   createEmbeddingEnrichmentProvider,
   createEnrichmentProvider,
   getEnrichmentProviderConfigStatus,
+  isBackgroundEnrichmentEnabled,
   resolveConfiguredProviders,
 } from "../providers/index";
 
@@ -139,6 +140,26 @@ describe("createEnrichmentProvider", () => {
         "Background enrichment is disabled by ENRICHMENT_BACKGROUND_ENABLED=false.",
       ]),
     });
+  });
+
+  it("treats enrichment as unavailable when background enrichment is disabled", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "false";
+
+    const { chatProvider } = resolveConfiguredProviders();
+    const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+
+    expect(enrichmentAvailable).toBe(false);
+  });
+
+  it("treats enrichment as available when chat provider is configured and background enrichment is enabled", () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "true";
+
+    const { chatProvider } = resolveConfiguredProviders();
+    const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+
+    expect(enrichmentAvailable).toBe(true);
   });
 
   it("throws for an unknown explicit provider", () => {

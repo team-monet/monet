@@ -66,6 +66,7 @@ describe("threat model verification", () => {
       },
       body: JSON.stringify({
         content: sensitiveContent,
+        summary: sensitiveContent.slice(0, 200),
         memoryType: "fact",
         memoryScope: "private",
         tags: ["security"],

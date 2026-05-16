@@ -145,6 +145,7 @@ describe("scope promotion validation", () => {
 describe("createMemory", () => {
   afterEach(() => {
     delete process.env.ENRICHMENT_CHAT_PROVIDER;
+    delete process.env.ENRICHMENT_BACKGROUND_ENABLED;
   });
 
   it("rejects autonomous agents storing user-scoped memories", async () => {
@@ -363,7 +364,7 @@ describe("createMemory", () => {
     expect(memoryValuesMock).toHaveBeenCalledWith(expect.objectContaining({ summary: "provided summary" }));
   });
 
-  it("rejects missing summary when chat enrichment is disabled", async () => {
+  it("rejects missing summary when chat provider is not configured", async () => {
     process.env.ENRICHMENT_CHAT_PROVIDER = "none";
 
     const result = await createMemory(
@@ -375,11 +376,11 @@ describe("createMemory", () => {
 
     expect(result).toEqual({
       error: "validation",
-      message: "summary is required when chat enrichment is disabled",
+      message: "summary is required when background enrichment is disabled or chat provider is not configured",
     });
   });
 
-  it("rejects empty or whitespace summary when chat enrichment is disabled", async () => {
+  it("rejects empty or whitespace summary when chat provider is not configured", async () => {
     process.env.ENRICHMENT_CHAT_PROVIDER = "none";
 
     const emptyResult = await createMemory(
@@ -398,12 +399,75 @@ describe("createMemory", () => {
 
     expect(emptyResult).toEqual({
       error: "validation",
-      message: "summary is required when chat enrichment is disabled",
+      message: "summary is required when background enrichment is disabled or chat provider is not configured",
     });
     expect(whitespaceResult).toEqual({
       error: "validation",
-      message: "summary is required when chat enrichment is disabled",
+      message: "summary is required when background enrichment is disabled or chat provider is not configured",
     });
+  });
+
+  it("rejects missing summary when background enrichment is disabled and chat provider is configured", async () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "false";
+
+    const result = await createMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      { content: "c", memoryType: "fact", memoryScope: "group", tags: ["ops"] },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
+    );
+
+    expect(result).toEqual({
+      error: "validation",
+      message: "summary is required when background enrichment is disabled or chat provider is not configured",
+    });
+  });
+
+  it("accepts provided summary when background enrichment is disabled", async () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "false";
+
+    const countWhereMock = vi.fn().mockResolvedValue([{ count: 1 }]);
+    const selectMock = vi.fn(() => ({ from: vi.fn(() => ({ where: countWhereMock })) }));
+    const memoryValuesMock = vi.fn(() => ({
+      returning: vi.fn().mockResolvedValue([{ id: "m-bg-off", content: "c", summary: "provided", memory_type: "fact", memory_scope: "group", tags: ["ops"], auto_tags: [], related_memory_ids: [], usefulness_score: 0, outdated: false, ttl_seconds: null, expires_at: null, created_at: new Date("2026-01-01T00:00:00.000Z"), last_accessed_at: new Date("2026-01-01T00:00:00.000Z"), author_agent_id: AGENT_ID, group_id: GROUP_A, user_id: USER_ID, version: 0 }]),
+    }));
+    const insertMock = vi.fn().mockReturnValueOnce({ values: memoryValuesMock }).mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) }).mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) });
+    drizzleMock.mockReturnValue({ select: selectMock, insert: insertMock });
+
+    const result = await createMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      { content: "c", summary: "  provided  ", memoryType: "fact", memoryScope: "group", tags: ["ops"] },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
+    );
+
+    expect((result as { error?: string }).error).toBeUndefined();
+    expect(memoryValuesMock).toHaveBeenCalledWith(expect.objectContaining({ summary: "provided" }));
+  });
+
+  it("keeps summary optional when background enrichment is enabled and chat provider is configured", async () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "true";
+
+    const countWhereMock = vi.fn().mockResolvedValue([{ count: 1 }]);
+    const selectMock = vi.fn(() => ({ from: vi.fn(() => ({ where: countWhereMock })) }));
+    const memoryValuesMock = vi.fn(() => ({
+      returning: vi.fn().mockResolvedValue([{ id: "m-bg-on", content: "c", summary: null, memory_type: "fact", memory_scope: "group", tags: ["ops"], auto_tags: [], related_memory_ids: [], usefulness_score: 0, outdated: false, ttl_seconds: null, expires_at: null, created_at: new Date("2026-01-01T00:00:00.000Z"), last_accessed_at: new Date("2026-01-01T00:00:00.000Z"), author_agent_id: AGENT_ID, group_id: GROUP_A, user_id: USER_ID, version: 0 }]),
+    }));
+    const insertMock = vi.fn().mockReturnValueOnce({ values: memoryValuesMock }).mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) }).mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) });
+    drizzleMock.mockReturnValue({ select: selectMock, insert: insertMock });
+
+    const result = await createMemory(
+      {} as TransactionClient,
+      makeAgent({ userId: USER_ID }),
+      { content: "c", memoryType: "fact", memoryScope: "group", tags: ["ops"] },
+      { hasGroupMembership: true, memoryQuota: 10, groupIds: [GROUP_A] },
+    );
+
+    expect((result as { error?: string }).error).toBeUndefined();
+    expect(memoryValuesMock).toHaveBeenCalledWith(expect.objectContaining({ summary: null }));
   });
 
   it("rejects group-scoped memory when agent belongs to multiple groups", async () => {
