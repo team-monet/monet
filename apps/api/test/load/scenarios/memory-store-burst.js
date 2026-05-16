@@ -5,6 +5,7 @@ import { authHeaders, buildTenantApiUrl, randomMemoryType } from "./utils.js";
 export function runMemoryStoreBurstScenario(data) {
   const payload = JSON.stringify({
     content: `k6 store burst ${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  summary: "k6 load test burst summary",
     memoryType: randomMemoryType(),
     tags: ["load", "store-burst"],
     memoryScope: "group",

@@ -33,6 +33,7 @@ export function runMixedWorkloadScenario(data) {
   if (action < 0.8) {
     const payload = JSON.stringify({
       content: `k6 mixed store ${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  summary: "k6 load test mixed summary",
       memoryType: randomMemoryType(),
       tags: ["load", "mixed"],
       memoryScope: "group",
