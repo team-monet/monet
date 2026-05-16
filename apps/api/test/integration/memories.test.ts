@@ -110,7 +110,7 @@ describe("memories integration", () => {
   ) {
     const normalizedInput = { ...input };
     const { chatProvider } = resolveConfiguredProviders();
-    const enrichmentAvailable = chatProvider !== "none" && isBackgroundEnrichmentEnabled();
+    const enrichmentAvailable = Boolean(chatProvider) && chatProvider !== "none" && isBackgroundEnrichmentEnabled();
     if (!enrichmentAvailable && typeof normalizedInput.summary !== "string") {
       const content = typeof normalizedInput.content === "string" ? normalizedInput.content : "";
       normalizedInput.summary = content.slice(0, 200);
@@ -659,6 +659,7 @@ describe("memories integration", () => {
   });
 
   it("completes enrichment asynchronously and records completed status", async () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
     process.env.ENRICHMENT_BACKGROUND_ENABLED = "true";
     setBackgroundEnrichmentEnabledForTests(true);
     setEnrichmentProviderForTests(makeProvider());
@@ -691,6 +692,7 @@ describe("memories integration", () => {
   });
 
   it("marks enrichment as failed when the provider errors", async () => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
     process.env.ENRICHMENT_BACKGROUND_ENABLED = "true";
     setBackgroundEnrichmentEnabledForTests(true);
     setEnrichmentProviderForTests(makeProvider({

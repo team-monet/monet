@@ -31,6 +31,7 @@ export const MemoryStoreInput = z.object({
   summary: z.string().max(200).optional().describe("Optional human/agent-provided summary of the memory entry. Required when background enrichment is disabled or chat provider is not configured. Maximum 200 characters. Safe to always provide regardless of provider mode."),
   memoryType: MemoryType.describe(MEMORY_TYPE_GUIDANCE),
   memoryScope: MemoryScope.default("group").describe(MEMORY_SCOPE_GUIDANCE),
+  groupId: z.string().uuid().optional().describe("Optional group ID for group/user-scoped memories. Required when agent belongs to multiple groups. If omitted, the agent's single group is used."),
   tags: z.array(z.string()).min(1).describe("Tags for categorization and retrieval"),
   ttlSeconds: z.number().positive().optional().describe("Optional expiry time in seconds"),
 });
@@ -71,6 +72,7 @@ export const MemoryDeleteInput = z.object({
 export const MemoryPromoteScopeInput = z.object({
   id: z.string().uuid().describe("Memory entry ID whose scope should change"),
   scope: MemoryScope.describe(`New visibility scope for the memory entry. ${MEMORY_SCOPE_GUIDANCE} ${MEMORY_SCOPE_CHANGE_GUIDANCE}`),
+  groupId: z.string().uuid().optional().describe("Optional group ID to assign when promoting to group/user scope. Required when agent belongs to multiple groups and the memory has no stored group."),
 });
 
 export const MemoryMarkOutdatedInput = z.object({

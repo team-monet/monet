@@ -143,6 +143,11 @@ describe("scope promotion validation", () => {
 });
 
 describe("createMemory", () => {
+  beforeEach(() => {
+    process.env.ENRICHMENT_CHAT_PROVIDER = "openai";
+    process.env.ENRICHMENT_BACKGROUND_ENABLED = "true";
+  });
+
   afterEach(() => {
     delete process.env.ENRICHMENT_CHAT_PROVIDER;
     delete process.env.ENRICHMENT_BACKGROUND_ENABLED;
@@ -485,7 +490,7 @@ describe("createMemory", () => {
 
     expect(result).toEqual({
       error: "validation",
-      message: "Agent must belong to exactly one group to store group-scoped memories",
+      message: "Agent belongs to multiple groups; specify groupId to store group-scoped memories",
     });
   });
 
@@ -504,7 +509,7 @@ describe("createMemory", () => {
 
     expect(result).toEqual({
       error: "validation",
-      message: "Agent must belong to exactly one group to store user-scoped memories",
+      message: "Agent belongs to multiple groups; specify groupId to store user-scoped memories",
     });
   });
 });

@@ -6,6 +6,7 @@ import {
   MemoryScope,
   MemoryType,
 } from "@monet/types";
+import { z } from "zod";
 import type { AppEnv } from "../middleware/context";
 import {
   createMemory,
@@ -317,7 +318,11 @@ memoriesRouter.patch("/:id/scope", async (c) => {
   const id = c.req.param("id");
 
   const body = await c.req.json();
-  const parsed = MemoryScope.safeParse(body.scope);
+  const promoteScopeInput = z.object({
+    scope: MemoryScope,
+    groupId: z.string().uuid().optional(),
+  });
+  const parsed = promoteScopeInput.safeParse(body);
   if (!parsed.success) {
     return c.json(
       { error: "validation_error", message: "Invalid scope. Must be one of: group, user, private" },
@@ -326,7 +331,7 @@ memoriesRouter.patch("/:id/scope", async (c) => {
   }
 
   const result = await withTenantScope(sql, schemaName, (txSql) =>
-    promoteScope(txSql, agent, id, parsed.data),
+    promoteScope(txSql, agent, id, parsed.data.scope, parsed.data.groupId),
   );
 
   if ("error" in result) {
@@ -335,6 +340,9 @@ memoriesRouter.patch("/:id/scope", async (c) => {
     }
     if (result.error === "forbidden") {
       return c.json({ error: "forbidden", message: "Access denied" }, 403);
+    }
+    if (result.error === "validation") {
+      return c.json({ error: "validation_error", message: result.message }, 400);
     }
     if (result.error === "no_change") {
       return c.json({ error: "no_change", message: "Scope is already set to this value" }, 400);

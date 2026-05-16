@@ -347,6 +347,7 @@ export async function createMcpServer(
             summary: args.summary,
             memoryType: args.memoryType,
             memoryScope: args.memoryScope,
+            groupId: args.groupId,
             tags: args.tags,
             ttlSeconds: args.ttlSeconds,
           }, preflight),
@@ -461,7 +462,7 @@ export async function createMcpServer(
     memoryPromoteScope: async (args) => {
       try {
         const result = await withTenantScope(sql, tenantSchemaName, (txSql) =>
-          promoteScope(txSql, agentContext, args.id, args.scope),
+          promoteScope(txSql, agentContext, args.id, args.scope, args.groupId),
         );
         if (hasError(result)) {
           return asToolError(describeServiceError(result));
