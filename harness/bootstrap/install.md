@@ -4,6 +4,12 @@
 
 Work through the phases in order. After each, tell the user what happened in one line. If a step fails, show the error, explain the likely cause, propose a fix, and retry — never leave a half-configured state.
 
+**This playbook is self-contained — no clone or pre-install needed.** You install the substrate yourself (Phase 2), and you read any prompt file you need (`roster.json`, `agents/<name>.md`) from one of:
+- a local `with-monet` checkout if one exists (prefer it), else
+- this repo's raw URLs, base `https://raw.githubusercontent.com/team-monet/with-monet/main/` (e.g. `…/agents/stig.md`).
+
+(Raw fetch needs the repo to be **public**; if it's private and you can't fetch, that's the one time to ask the user to clone `with-monet` and point you at the local path.)
+
 ---
 
 ## Phase 1 — Orient
@@ -40,8 +46,8 @@ Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override.
 **Always install the full team.** Stig is a context engine whose entire purpose is to orchestrate the worker actuators — never install Stig alone. Stig is the **lead** (the one the user talks to, the only one that delegates, and the only one that touches Monet); the workers are its **subagent actuators**.
 
 - **Claude Code:**
-  - **Workers → subagents.** Write one `.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, security, reliability, aria` — each = a frontmatter header (`name` + the worker's `role` from `with-monet/roster.json` as `description`) + the agent body from `with-monet/agents/<name>.md`.
-  - **Stig → lead.** Put the body of `with-monet/agents/stig.md` into the repo's `CLAUDE.md` (append; don't clobber), so the main agent acts as Stig and can delegate to the worker subagents. (A subagent can't spawn subagents, so the lead must be the main agent.)
+  - **Workers → subagents.** Write one `.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, security, reliability, aria` — each = a frontmatter header (`name` + the worker's `role` from `roster.json` as `description`) + the agent body from `agents/<name>.md` (local checkout or the raw base above).
+  - **Stig → lead.** Put the body of `agents/stig.md` into the repo's `CLAUDE.md` (append; don't clobber), so the main agent acts as Stig and can delegate to the worker subagents. (A subagent can't spawn subagents, so the lead must be the main agent.)
 - **Cursor / Continue / others** — install the lead + the worker team in that host's agent format; ask the user where those live.
 
 The user may request a trimmed worker set, but the team is the default — never reduce to Stig-only.
