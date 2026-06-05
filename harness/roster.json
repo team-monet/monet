@@ -1,0 +1,15 @@
+{
+  "lead": "stig",
+  "agents": [
+    { "name": "stig", "role": "state-centric lead", "mode": "primary", "prompt": "agents/stig.md", "touchesMonet": true },
+    { "name": "explorer", "role": "code investigation", "mode": "subagent", "prompt": "agents/explorer.md" },
+    { "name": "researcher", "role": "external research / prior art", "mode": "subagent", "prompt": "agents/researcher.md" },
+    { "name": "analyst", "role": "analysis / planning under constraints", "mode": "subagent", "prompt": "agents/analyst.md" },
+    { "name": "developer", "role": "implementation", "mode": "subagent", "prompt": "agents/developer.md" },
+    { "name": "tester", "role": "verification", "mode": "subagent", "prompt": "agents/tester.md" },
+    { "name": "reviewer", "role": "code review", "mode": "subagent", "prompt": "agents/reviewer.md" },
+    { "name": "security", "role": "trust-boundary / auth / secrets review", "mode": "subagent", "prompt": "agents/security.md" },
+    { "name": "reliability", "role": "incident / regression / readiness review", "mode": "subagent", "prompt": "agents/reliability.md" },
+    { "name": "aria", "role": "product scope / acceptance criteria", "mode": "subagent", "prompt": "agents/aria.md" }
+  ]
+}
