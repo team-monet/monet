@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
+.monet/
+.DS_Store
+*.log
