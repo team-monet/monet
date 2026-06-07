@@ -13,8 +13,27 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore } from "./engine";
 
+// Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
+// concept — long body + many observations — otherwise serializes to tens of thousands of chars and
+// the host rejects it: "N chars … exceeds maximum allowed tokens"). memory_fetch is bounded at the
+// source (below); ok() is the last-resort safety net for every tool (overview/gather/agent_context).
+const RESULT_MAX_CHARS = 40_000; // hard ceiling on any serialized tool result
+const FETCH_MAX_OBS = 20; // most-recent observations returned by memory_fetch
+const FETCH_OBS_MAX_CHARS = 1_200; // per-observation cap
+const FETCH_BODY_MAX_CHARS = 6_000; // concept body cap
+
+/** Truncate `s` to `max` chars, flagging whether it was clipped (so callers can signal it). */
+function clip(s: string, max: number): { text: string; clipped: boolean } {
+  if (s.length <= max) return { text: s, clipped: false };
+  return { text: `${s.slice(0, max)}\n…[truncated ${s.length - max} chars]`, clipped: true };
+}
+
 function ok(content: Record<string, unknown>): CallToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(content, null, 2) }] };
+  let text = JSON.stringify(content, null, 2);
+  if (text.length > RESULT_MAX_CHARS) {
+    text = `${text.slice(0, RESULT_MAX_CHARS)}\n\n…[result truncated at ${RESULT_MAX_CHARS} chars to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
+  }
+  return { content: [{ type: "text", text }] };
 }
 function err(message: string): CallToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
@@ -124,11 +143,25 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
       try {
         const c = await core.getConcept(id, { synthesize: false });
         if (!c) return err(`concept not found: ${id}`);
+        // Bound the result: keep the most-recent observations and clip long text, so a heavily-supported
+        // concept still fetches instead of being rejected by the host's tool-result limit.
+        const total = c.observations.length;
+        const kept = c.observations.slice(Math.max(0, total - FETCH_MAX_OBS));
+        const omitted = total - kept.length;
+        const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
         return ok({
           id: c.id,
           kind: c.kind,
-          body: c.body,
-          observations: c.observations,
+          body: body.text,
+          ...(body.clipped ? { bodyTruncated: true } : {}),
+          observations: kept.map((o) => clip(o, FETCH_OBS_MAX_CHARS).text),
+          observationCount: total,
+          ...(omitted > 0
+            ? {
+                observationsOmitted: omitted,
+                observationsNote: `Showing the ${kept.length} most-recent of ${total} observations; older ones omitted to fit the host limit.`,
+              }
+            : {}),
           supportCount: c.supportCount,
           confidence: c.confidence,
           version: c.version,
