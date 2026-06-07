@@ -7,7 +7,7 @@
  *   3. no answer-leak     — search returns a CARD (shape, not content), so the agent
  *                           can't fake understanding from a summary — it must fetch (#232)
  */
-import { MonetCore } from "./engine.js";
+import { MonetCore } from "../src/engine";
 
 function line(): void {
   console.log("─".repeat(72));

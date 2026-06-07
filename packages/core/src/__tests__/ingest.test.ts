@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MonetCore } from "../engine.js";
+import { MonetCore } from "../engine";
 
 describe("resolve-or-create ingest (#239 keystone)", () => {
   it("merges similar evidence into ONE concept, keeping every observation", async () => {

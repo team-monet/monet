@@ -18,7 +18,7 @@ function parse(r: unknown): Record<string, unknown> {
 async function main(): Promise<void> {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: ["--import", "tsx", "src/mcp-cli.ts"],
+    args: ["--import", "tsx", "scripts/mcp-cli.ts"],
     env: { ...process.env, MONET_STORAGE_DIR: `/tmp/monet-core-smoke-${process.pid}` },
   });
   const client = new Client({ name: "smoke", version: "0.0.1" });

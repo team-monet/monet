@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MonetCore } from "../engine.js";
+import { MonetCore } from "../engine";
 
 /**
  * The agent-as-Synthesizer dance (ADR §4.6) at the engine level — what the MCP

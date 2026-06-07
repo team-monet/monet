@@ -1,7 +1,7 @@
 {
   "name": "@team-monet/core",
   "version": "0.1.0",
-  "description": "Monet — state-centric memory substrate engine (proprietary).",
+  "description": "Monet — state-centric memory substrate engine.",
   "license": "AGPL-3.0-only",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,14 +19,16 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsup",
     "prepare": "pnpm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --dir src",
-    "demo": "tsx src/demo.ts",
-    "embed:check": "tsx src/embed-check.ts",
-    "mcp": "tsx src/mcp-cli.ts",
-    "mcp:smoke": "tsx src/mcp-smoke.ts"
+    "demo": "tsx scripts/demo.ts",
+    "knows": "tsx scripts/knows-demo.ts",
+    "eval": "tsx src/eval/run.ts",
+    "embed:check": "tsx scripts/embed-check.ts",
+    "mcp": "tsx scripts/mcp-cli.ts",
+    "mcp:smoke": "tsx scripts/mcp-smoke.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
@@ -39,6 +41,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^25.3.3",
+    "tsup": "^8.5.1",
     "tsx": "^4",
     "typescript": "^5.7",
     "vitest": "^3"

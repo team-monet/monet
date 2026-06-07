@@ -11,7 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { MonetCore } from "./engine.js";
+import { MonetCore } from "./engine";
 
 function ok(content: Record<string, unknown>): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(content, null, 2) }] };
@@ -36,10 +36,16 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         .describe(
           'Observation kind. Use "correction" when this overrides/contradicts a prior memory — if it lands on an existing concept the substrate opens a contradiction and marks it disputed for mediation.',
         ),
+      sourceRefs: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Pointer(s) HOME to the source (file paths, URLs, tool calls, prior concept/observation ids) — never a copy. Lets memories that share a source link up, and enables later return-to-source re-reading.",
+        ),
     },
-    async ({ content, circle, kind }) => {
+    async ({ content, circle, kind, sourceRefs }) => {
       try {
-        const r = await core.store(content, { circle, kind });
+        const r = await core.store(content, { circle, kind, sourceRefs });
         return ok({
           action: r.action,
           conceptId: r.conceptId,
@@ -67,6 +73,45 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         });
       } catch (e) {
         return err(`search failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_overview",
+    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub.',
+    { circle: z.string().optional(), entity: z.string().optional() },
+    async ({ circle, entity }) => {
+      try {
+        if (entity) return ok({ entity, concepts: core.conceptsForEntity(entity, circle) });
+        return ok({ ...core.overview(circle) });
+      } catch (e) {
+        return err(`overview failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_gather",
+    "Rebuild the FULL working context for an intent — not just the most-similar few. Seeds from the intent, then spreads across the connection graph (entity, causal, and same-session co-occurrence edges, ≤2 hops) and stops when evidence saturates. Use at the start of a task or when resuming a thread: it recovers the related concepts — decisions, open questions, files worked on together — that a plain memory_search misses because they're worded differently. Returns structural cards (ranked); call memory_fetch(id) to read one.",
+    {
+      intent: z.string(),
+      circle: z.string().optional(),
+      limit: z.number().int().positive().optional(),
+      depth: z.enum(["1", "2"]).optional().describe("Graph hops from the seeds (default 2)."),
+    },
+    async ({ intent, circle, limit, depth }) => {
+      try {
+        const r = await core.gather(intent, { circle, limit, depth: depth ? Number(depth) : undefined });
+        return ok({
+          ranked: r.ranked,
+          seed: r.seed,
+          stopReason: r.stopReason,
+          reachableByType: r.reachableByType,
+          guidance: "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one.",
+        });
+      } catch (e) {
+        return err(`gather failed: ${msg(e)}`);
       }
     },
   );

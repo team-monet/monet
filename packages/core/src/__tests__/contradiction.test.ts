@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MonetCore } from "../engine.js";
+import { MonetCore } from "../engine";
 
 /**
  * Contradiction & correction lifecycle (#240, ADR §4.4): detect drift instead of silently
