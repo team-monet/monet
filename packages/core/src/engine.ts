@@ -581,11 +581,8 @@ export class MonetCore {
 
   /** Session checkpoint (touch, batch): synthesize every dirty concept. Returns the count. */
   async checkpoint(circle?: string): Promise<number> {
-    const rows = (
-      circle
-        ? this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle)
-        : this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1`).all()
-    ) as ConceptRow[];
+    circle ??= this.defaultCircle; // honor the per-project default; pass a circle explicitly to scope elsewhere
+    const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle) as ConceptRow[];
     for (const r of rows) await this.synthesizeRow(r);
     return rows.length;
   }
@@ -812,11 +809,8 @@ export class MonetCore {
 
   /** Concepts with unsynthesized evidence + their raw observations (for the agent to synthesize). */
   listDirty(circle?: string): Array<{ id: string; slug: string; kind: string; observations: string[] }> {
-    const rows = (
-      circle
-        ? this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle)
-        : this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1`).all()
-    ) as ConceptRow[];
+    circle ??= this.defaultCircle; // honor the per-project default; pass a circle explicitly to scope elsewhere
+    const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle) as ConceptRow[];
     return rows.map((r) => ({
       id: r.id,
       slug: r.slug,

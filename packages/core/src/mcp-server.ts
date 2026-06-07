@@ -94,8 +94,10 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
       try {
         const results = await core.search(query, { circle: scope(circle), limit });
         return ok({
+          circle: scope(circle),
           results,
-          guidance: "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it.",
+          guidance:
+            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if `circle` above isn't your session default, pass it: memory_fetch(id, circle).",
         });
       } catch (e) {
         return err(`search failed: ${msg(e)}`);
@@ -130,11 +132,13 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
       try {
         const r = await core.gather(intent, { circle: scope(circle), limit, depth: depth ? Number(depth) : undefined });
         return ok({
+          circle: scope(circle),
           ranked: r.ranked,
           seed: r.seed,
           stopReason: r.stopReason,
           reachableByType: r.reachableByType,
-          guidance: "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one.",
+          guidance:
+            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if `circle` above isn't your session default, pass it: memory_fetch(id, circle).",
         });
       } catch (e) {
         return err(`gather failed: ${msg(e)}`);
