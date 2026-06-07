@@ -31,7 +31,7 @@
     "@huggingface/transformers": "^3.0.0"
   },
   "devDependencies": {
-    "@team-monet/core": "github:team-monet/monet-core#4e37d8e7fff9cd86bf12b8d83b7b4db1adb79148",
+    "@team-monet/core": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "commander": "^12.1.0",
     "zod": "^3.25.76",
@@ -43,6 +43,6 @@
     "vitest": "^3"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3", "esbuild", "@team-monet/core"]
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
   }
 }
