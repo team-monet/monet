@@ -1191,8 +1191,8 @@ export class MonetCore {
    */
   private backfillGraph(): void {
     const concepts = this.db
-      .prepare(`SELECT id, body, circle, embedding FROM concepts WHERE kind != 'workstream' ORDER BY created_at, id`)
-      .all() as Array<{ id: string; body: string; circle: string; embedding: string }>;
+      .prepare(`SELECT id, body, circle, embedding, source_refs FROM concepts WHERE kind != 'workstream' ORDER BY created_at, id`)
+      .all() as Array<{ id: string; body: string; circle: string; embedding: string; source_refs: string | null }>;
     if (concepts.length === 0) return;
 
     this.db.transaction(() => {
@@ -1204,6 +1204,14 @@ export class MonetCore {
         const text = [c.body, ...obs.map((o) => o.content)].filter(Boolean).join("\n");
         const refs = new Set<string>();
         for (const o of obs) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) refs.add(r);
+        // Merge the observations' refs back onto the concept row too: a DB ingested with graphEnabled:false
+        // never ran store()'s concept-level source_refs update, so gather()/toGatherCard (which read
+        // concepts.source_refs) would otherwise lose every return-to-source pointer after the upgrade.
+        if (refs.size) {
+          const cur = c.source_refs ? (JSON.parse(c.source_refs) as string[]) : [];
+          const merged = [...new Set([...cur, ...refs])];
+          this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(JSON.stringify(merged), c.id);
+        }
         this.deriveEntityEdges(c.id, text, [...refs], c.circle);
         for (const nb of this.bestMatches(jsonToEmb(c.embedding), c.circle, EDGE_NEIGHBORS)) {
           if (nb.match.id === c.id || nb.match.kind === "workstream") continue;

@@ -183,4 +183,22 @@ describe("codex-review fixes", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("backfill restores concept source_refs from observations after a graph-disabled ingest (P2)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-backfill-refs-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      // graphEnabled:false skips store()'s concept-level source_refs update, so the refs live only on
+      // the observation row — gather() (which reads concepts.source_refs) would lose them post-upgrade.
+      const old = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1, graphEnabled: false });
+      const a = await old.store("Auth uses JSON web tokens for sessions.", { sourceRefs: ["docs/auth.md", "src/auth.ts"] });
+      old.close();
+      const upgraded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const card = (await upgraded.gather("Auth uses JSON web tokens for sessions.")).ranked.find((c) => c.id === a.conceptId);
+      expect([...(card?.sourceRefs ?? [])].sort()).toEqual(["docs/auth.md", "src/auth.ts"]);
+      upgraded.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

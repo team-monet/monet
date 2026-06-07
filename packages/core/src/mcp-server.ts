@@ -31,7 +31,9 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
 function ok(content: Record<string, unknown>): CallToolResult {
   let text = JSON.stringify(content, null, 2);
   if (text.length > RESULT_MAX_CHARS) {
-    text = `${text.slice(0, RESULT_MAX_CHARS)}\n\n…[result truncated at ${RESULT_MAX_CHARS} chars to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
+    const note = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
+    // Reserve room for the note so the FINAL payload stays at/under the hard ceiling, not over it.
+    text = text.slice(0, Math.max(0, RESULT_MAX_CHARS - note.length)) + note;
   }
   return { content: [{ type: "text", text }] };
 }
@@ -166,12 +168,20 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           confidence: c.confidence,
           version: c.version,
           needsSynthesis: c.needsSynthesis,
-          ...(c.needsSynthesis
+          // Only invite synthesis when ALL evidence is shown. memory_synthesize clears `dirty` with the
+          // body the agent writes, so synthesizing from a truncated view would discard the omitted
+          // observations from the canonical body — don't ask for it here.
+          ...(c.needsSynthesis && omitted === 0
             ? {
                 synthesisInstruction:
                   "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body).",
               }
-            : {}),
+            : c.needsSynthesis
+              ? {
+                  synthesisDeferred:
+                    "This concept needs synthesis but has more observations than shown — do NOT call memory_synthesize from this partial view (it would drop the omitted evidence). Leave it dirty.",
+                }
+              : {}),
         });
       } catch (e) {
         return err(`fetch failed: ${msg(e)}`);
