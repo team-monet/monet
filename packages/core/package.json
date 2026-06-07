@@ -1,5 +1,5 @@
 {
-  "name": "@monet/core",
+  "name": "@team-monet/core",
   "version": "0.1.0",
   "description": "Monet — state-centric memory substrate engine (proprietary).",
   "license": "AGPL-3.0-only",
@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "prepack": "pnpm run build",
+    "prepare": "pnpm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --dir src",
     "demo": "tsx src/demo.ts",
