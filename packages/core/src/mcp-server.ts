@@ -45,6 +45,11 @@ const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
   const server = new McpServer({ name: "monet-core", version: "0.0.1" }, { capabilities: { tools: {} } });
 
+  // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
+  // circle the local client derived from the working tree) — so one shared store isolates per project.
+  const dc = core.getDefaultCircle();
+  const scope = (circle?: string): string => circle ?? dc;
+
   server.tool(
     "memory_store",
     "Store something worth remembering. The substrate dedupes automatically: similar evidence resolves into an existing concept (no duplicates); novel evidence creates a new one. Cheap and instant — synthesis happens later, on read.",
@@ -66,7 +71,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     },
     async ({ content, circle, kind, sourceRefs }) => {
       try {
-        const r = await core.store(content, { circle, kind, sourceRefs });
+        const r = await core.store(content, { circle: scope(circle), kind, sourceRefs });
         return ok({
           action: r.action,
           conceptId: r.conceptId,
@@ -87,7 +92,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     { query: z.string(), circle: z.string().optional(), limit: z.number().int().positive().optional() },
     async ({ query, circle, limit }) => {
       try {
-        const results = await core.search(query, { circle, limit });
+        const results = await core.search(query, { circle: scope(circle), limit });
         return ok({
           results,
           guidance: "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it.",
@@ -104,8 +109,8 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       try {
-        if (entity) return ok({ entity, concepts: core.conceptsForEntity(entity, circle) });
-        return ok({ ...core.overview(circle) });
+        if (entity) return ok({ entity, concepts: core.conceptsForEntity(entity, scope(circle)) });
+        return ok({ ...core.overview(scope(circle)) });
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
       }
@@ -123,7 +128,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     },
     async ({ intent, circle, limit, depth }) => {
       try {
-        const r = await core.gather(intent, { circle, limit, depth: depth ? Number(depth) : undefined });
+        const r = await core.gather(intent, { circle: scope(circle), limit, depth: depth ? Number(depth) : undefined });
         return ok({
           ranked: r.ranked,
           seed: r.seed,
@@ -224,8 +229,8 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     },
     async ({ circle, summary, workstream }) => {
       try {
-        const saved = workstream ? await core.saveWorkstream(workstream, { circle, summary }) : null;
-        const dirty = core.listDirty(circle);
+        const saved = workstream ? await core.saveWorkstream(workstream, { circle: scope(circle), summary }) : null;
+        const dirty = core.listDirty(scope(circle));
         return ok({
           workstream: saved ? { id: saved.id, status: saved.payload.status, version: saved.version } : null,
           dirtyCount: dirty.length,
@@ -286,8 +291,8 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context.",
     { circle: z.string().optional() },
     async ({ circle }) => {
-      const state = core.prewarm(circle);
-      return ok({ agentId: core.getAgentId(), mode: "local", ...state });
+      const state = core.prewarm(scope(circle));
+      return ok({ agentId: core.getAgentId(), mode: "local", circle: scope(circle), ...state });
     },
   );
 

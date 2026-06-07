@@ -238,6 +238,9 @@ export interface MonetCoreOptions {
   agentId?: string;
   /** Where this runtime is working (repo/path) — recorded on the session (ADR §3.6). */
   scopeContext?: string;
+  /** Circle used when a caller doesn't pass one. Lets a single shared store isolate per project:
+   *  the runtime derives a stable circle from the working tree and every memory op lands in it. Default "default". */
+  defaultCircle?: string;
   /** A concept unconfirmed for longer than this drifts active→stale (ADR §4.4). Default 30d. */
   staleAfterMs?: number;
   /** Id generator (default randomUUID). Inject a deterministic sequence for reproducible eval/tests. */
@@ -289,6 +292,7 @@ export class MonetCore {
   private tauAmbiguous: number;
   private agentId: string;
   private scopeContext: string | null;
+  private defaultCircle: string;
   private staleAfterMs: number;
   private sessionId: string | null = null; // lazily opened on first write/checkpoint
   private graphEnabled: boolean;
@@ -314,6 +318,7 @@ export class MonetCore {
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.scopeContext = opts.scopeContext ?? null;
+    this.defaultCircle = opts.defaultCircle ?? "default";
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
     this.graphEnabled = opts.graphEnabled ?? true;
     this.graphParams = { ...DEFAULT_GRAPH_PARAMS, ...opts.graph, wType: { ...DEFAULT_GRAPH_PARAMS.wType, ...opts.graph?.wType } };
@@ -825,6 +830,11 @@ export class MonetCore {
 
   getAgentId(): string {
     return this.agentId;
+  }
+
+  /** The circle applied when a caller passes none (per-project isolation in a shared store). */
+  getDefaultCircle(): string {
+    return this.defaultCircle;
   }
 
   conceptCount(circle = "default"): number {
