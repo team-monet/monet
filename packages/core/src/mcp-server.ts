@@ -145,12 +145,13 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
   server.tool(
     "memory_fetch",
     "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer.",
-    { id: z.string() },
-    async ({ id }) => {
+    { id: z.string(), circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle). Pass it when reading results of a search/gather you ran on an explicit circle.") },
+    async ({ id, circle }) => {
       try {
         // Scope enforcement: an id from another project's circle must not be readable here (ids leak
-        // across sessions / get pasted from prior output). Check before getConcept's usefulness bump.
-        if (core.circleOf(id) !== dc) return err(`concept not found: ${id}`);
+        // across sessions / get pasted from prior output). `scope(circle)` honors an explicit circle the
+        // client searched, defaulting to this session's circle. Check before getConcept's usefulness bump.
+        if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
         const c = await core.getConcept(id, { synthesize: false });
         if (!c) return err(`concept not found: ${id}`);
         // Bound the result: keep the most-recent observations and clip long text, so a heavily-supported
@@ -200,10 +201,10 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
   server.tool(
     "memory_synthesize",
     "Write back a synthesized body for a concept — you, the agent, are the synthesizer. Reconcile the concept's observations into one coherent statement. Clears the dirty flag and records a revision.",
-    { id: z.string(), body: z.string() },
-    async ({ id, body }) => {
+    { id: z.string(), body: z.string(), circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle).") },
+    async ({ id, body, circle }) => {
       try {
-        if (core.circleOf(id) !== dc) return err(`concept not found: ${id}`); // scope enforcement
+        if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`); // scope enforcement
         const c = await core.applySynthesis(id, body);
         if (!c) return err(`concept not found: ${id}`);
         return ok({ id: c.id, version: c.version, dirty: c.dirty, message: "synthesis stored" });
@@ -259,10 +260,11 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
       detail: z.string(),
       observationId: z.string().optional(),
       kind: z.enum(["value-conflict", "staleness", "scope-conflict"]).optional(),
+      circle: z.string().optional().describe("The circle the conceptId belongs to (defaults to this session's circle)."),
     },
-    async ({ conceptId, detail, observationId, kind }) => {
+    async ({ conceptId, detail, observationId, kind, circle }) => {
       try {
-        if (core.circleOf(conceptId) !== dc) return err(`concept not found: ${conceptId}`); // scope enforcement
+        if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`); // scope enforcement
         const c = core.flagContradiction(conceptId, { detail, observationId, kind });
         return ok({ contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail });
       } catch (e) {
@@ -279,10 +281,11 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
       decision: z.enum(["accept-new", "keep-current", "dismiss"]),
       body: z.string().optional(),
       resolvedBy: z.string().optional(),
+      circle: z.string().optional().describe("The circle the contradiction belongs to (defaults to this session's circle)."),
     },
-    async ({ contradictionId, decision, body, resolvedBy }) => {
+    async ({ contradictionId, decision, body, resolvedBy, circle }) => {
       try {
-        if (core.circleOfContradiction(contradictionId) !== dc) return err(`contradiction not found: ${contradictionId}`); // scope enforcement
+        if (core.circleOfContradiction(contradictionId) !== scope(circle)) return err(`contradiction not found: ${contradictionId}`); // scope enforcement
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
         return ok({ conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
