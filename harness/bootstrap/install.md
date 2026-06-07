@@ -18,28 +18,28 @@ Work through the phases in order. After each, tell the user what happened in one
    - Claude Code → MCP: `./.mcp.json`; agents: `./.claude/agents/<name>.md`.
    - Cursor → MCP: `./.cursor/mcp.json`; agents: rules/prompts dir.
    - Unknown host → ask the user where its MCP config and custom-agent prompts live.
-2. Confirm: *"You're on **<host>**, in **<repo>**. I'll set up Monet Local for it — open questions: anything special about your setup?"*
+2. Confirm: *"You're on **<host>**, in **<repo>**. I'll set up Monet for it — open questions: anything special about your setup?"*
 
-## Phase 2 — Get Monet Local
+## Phase 2 — Get Monet
 
-Goal: the `monet-local` MCP server (the state-centric memory substrate) available on this machine.
+Goal: the `monet` MCP server (the state-centric memory substrate) available on this machine.
 
 - Install from npm (published):
   ```
-  npm i -g @team-monet/local      # provides the `monet-local` command
+  npm i -g @team-monet/monet      # provides the `monet` command
   ```
-  Zero-install alternative: `npx -y @team-monet/local start`. Requires `node` ≥ 22 and network access — the first run downloads the MiniLM embedding model once.
-- Dev / unpublished fallback: build from a local `team-monet/monet` checkout (`pnpm --filter @team-monet/local build`) and use `node <abs>/apps/local/dist/index.js`.
+  Zero-install alternative: `npx -y @team-monet/monet start`. Requires `node` ≥ 22 and network access — the first run downloads the MiniLM embedding model once.
+- Dev / unpublished fallback: clone `team-monet/monet`, then `pnpm install && pnpm build`, and use `node <abs>/dist/index.js`.
 
-## Phase 3 — Configure the monet-local MCP server (host-specific)
+## Phase 3 — Configure the monet MCP server (host-specific)
 
-Write an MCP server entry for **this host** (template: `with-monet/mcp/monet-local.json`). With the published CLI:
+Write an MCP server entry for **this host** (template: `with-monet/mcp/monet.json`). With the published CLI:
 
 ```jsonc
-{ "mcpServers": { "monet-local": { "command": "monet-local", "args": ["start"] } } }
+{ "mcpServers": { "monet": { "command": "monet", "args": ["start"] } } }
 ```
 
-Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override. (Dev/unpublished: `"command": "node", "args": ["<abs>/apps/local/dist/index.js"]`.) Merge into the host's MCP config (don't clobber existing servers), then verify it comes up — it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
+Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override. (Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`.) Merge into the host's MCP config (don't clobber existing servers), then verify it comes up — it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
 
 ## Phase 4 — Install the agent team (host-specific)
 
@@ -64,7 +64,7 @@ For each chosen source: read it, and `memory_store` the durable facts/decisions/
 
 ## Phase 6 — Offer to start
 
-If the host only loads MCP servers at launch (Claude Code reads `.mcp.json` on startup), tell the user to reload/restart the session so `monet-local` connects before starting.
+If the host only loads MCP servers at launch (Claude Code reads `.mcp.json` on startup), tell the user to reload/restart the session so `monet` connects before starting.
 
 Ask: *"Ready? I'll run `agent_context` to restore state and begin as Stig on this repo."* On yes: call `agent_context` (no query), report the restored state (active workstreams, living model, open contradictions), and continue as Stig.
 

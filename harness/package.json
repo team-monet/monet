@@ -1,7 +1,7 @@
 {
   "name": "with-monet",
   "version": "0.0.1",
-  "description": "Agent-agnostic harness pairing Stig + a focused worker team with Monet Local's state-centric memory substrate.",
+  "description": "Agent-agnostic harness pairing Stig + a focused worker team with Monet's state-centric memory substrate.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": { "with-monet": "./bootstrap/cli.mjs" },

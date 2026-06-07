@@ -8,5 +8,5 @@ const line = "Set up Monet for this project: read https://raw.githubusercontent.
 console.log("with-monet — agent-first Monet onboarding\n");
 console.log("You don't run an installer. Open your coding agent and paste this one line:\n");
 console.log(`  ${line}\n`);
-console.log("The agent then follows bootstrap/install.md: orient → get Monet Local → configure");
+console.log("The agent then follows bootstrap/install.md: orient → get Monet → configure");
 console.log("the MCP server → install the team → offer memory ingest → offer to start.");

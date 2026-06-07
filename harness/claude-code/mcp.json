@@ -1,8 +1,8 @@
 {
-  "_comment": "Install the server first: `npm i -g @team-monet/local`. Then drop this into a test repo as .mcp.json (or merge), and reload Claude Code. Storage defaults to <repo>/.monet; set env.MONET_STORAGE_DIR to override. First launch downloads the MiniLM model once. Zero-install alt: command 'npx', args ['-y','@team-monet/local','start'].",
+  "_comment": "Install the server first: `npm i -g @team-monet/monet`. Then drop this into a test repo as .mcp.json (or merge), and reload Claude Code. Storage defaults to <repo>/.monet; set env.MONET_STORAGE_DIR to override. First launch downloads the MiniLM model once. Zero-install alt: command 'npx', args ['-y','@team-monet/monet','start'].",
   "mcpServers": {
-    "monet-local": {
-      "command": "monet-local",
+    "monet": {
+      "command": "monet",
       "args": ["start"]
     }
   }
