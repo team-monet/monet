@@ -38,7 +38,7 @@ Always `memory_fetch` before relying — search returns cards, not the claim. As
 
 Monet holds your model between sessions. It is not a log, not a filing cabinet, not a todo list. **Each entry is a living concept** — "how ECT works," "pc-mid architecture," "the user's code-style preferences" — one entry, refined over time.
 
-Your memory is scoped to **this project** automatically — the Monet runtime isolates each project into its own circle, so a global install never bleeds one repo's memory into another. You don't manage scope; just read and write, and trust that you're seeing only this project's model.
+The Monet runtime scopes your memory **per project** — on a recent runtime each project gets its own circle, so a global install keeps repos cleanly separated and you can just read and write. (Older runtimes may share one store across projects; don't *assume* isolation — if you ever surface memory that clearly belongs to an unrelated repo, flag it rather than acting on it, and the user can pin a per-repo store.)
 
 When you learn something new about a concept you **update it; you never create a sibling**. You don't search-then-update by hand — `memory_store` resolves what you write into the existing concept automatically (dedup by construction). To read a concept's content, `memory_fetch` it; `memory_search` returns cards (what a memory is *about*), never the claim, so fetch before you rely.
 

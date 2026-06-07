@@ -45,7 +45,7 @@ Register `monet` at **user scope** so it's available in every project (template:
 
 **Storage is one global brain, isolated per project.** With no `MONET_STORAGE_DIR`, the store lives at `~/.monet` (shared across all your projects) and Monet isolates each project into its own *circle* automatically, so memory never bleeds between repos. Per-project auto-isolation needs `@team-monet/monet` recent enough to derive the circle from the working tree; on older versions the global store is shared across projects — if that matters, set `env.MONET_STORAGE_DIR` to a per-project path (e.g. `<repo>/.monet`) for a hard filesystem split.
 
-Merge into the host's **user-level** MCP config **without clobbering existing servers** — read it, add `monet`, write it back, and back up the file first. Verify it comes up: it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
+Merge into the host's **user-level** MCP config **without clobbering existing servers** — read it, add `monet`, write it back, and back up the file first. Verify it comes up: it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_overview`, `memory_gather`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
 
 ## Phase 4 — Install the agent team (user scope)
 
@@ -54,12 +54,12 @@ Merge into the host's **user-level** MCP config **without clobbering existing se
 - **Claude Code:**
   - **Workers → user-level subagents.** Write one `~/.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, security, reliability, aria`. Each file is YAML frontmatter + the body from `agents/<name>.md`. Pull the frontmatter from that worker's entry in `roster.json`:
     - `name` → frontmatter `name`
-    - `description` → frontmatter `description` — **this trigger text is what makes Claude Code actually delegate** (its auto-dispatch matches the task against the description). Use it verbatim; do **not** replace it with a bare role label.
+    - `description` → frontmatter `description` — **this trigger text is what makes Claude Code actually delegate** (its auto-dispatch matches the task against the description). Use it verbatim; do **not** replace it with a bare role label. The descriptions contain colons, so **quote them** in YAML (`description: "…"`) or the frontmatter won't parse.
     - `model` → frontmatter `model` (`haiku`/`sonnet`/`opus`, or omit to inherit the session model). These are sensible defaults — offer to retune (e.g. cheaper models for read-only workers, stronger for `reviewer`/`security`).
     ```md
     ---
     name: explorer
-    description: Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, …
+    description: "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, …"
     model: haiku
     ---
     <body of agents/explorer.md>
@@ -85,6 +85,8 @@ Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"*
 - skip for now.
 
 For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. Summarize what landed.
+
+**Legacy memory in one circle?** If `memory_overview(circle:"default")` shows a meaningful pile of existing unscoped memory (from before per-project circles), don't leave it stranded in `"default"`. Offer to organize it into per-project circles — follow the interactive migration playbook [`bootstrap/migrate-memory.md`](migrate-memory.md) (same raw-URL base as above): scan the user's project root, group repos, and assign circles *with* them. Skip if `"default"` is empty.
 
 ## Phase 6 — Offer to start
 
