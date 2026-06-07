@@ -7,7 +7,7 @@
  *             where the agent needs that prior knowledge. A probe is satisfied iff the
  *             retrieval arm surfaces the gold concept(s) in its top-k.
  *
- * Probe categories map 1:1 to the three metrics the eval reports (ADR §4.7 / roadmap):
+ * Probe categories map 1:1 to the three metrics the eval reports (ADR §4.7):
  *   - "mistake"     → repeated-mistake rate      (a recorded gotcha/correction must resurface)
  *   - "reexplain"   → re-explain rate            (an established fact/decision must resurface)
  *   - "restoration" → context-restoration recall (rebuild a whole thread from durable concepts)
