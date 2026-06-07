@@ -2,7 +2,7 @@
   "name": "@monet/core",
   "version": "0.1.0",
   "description": "Monet — state-centric memory substrate engine (proprietary).",
-  "license": "UNLICENSED",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

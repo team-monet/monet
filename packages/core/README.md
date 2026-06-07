@@ -1,6 +1,6 @@
 # @monet/core
 
-**Proprietary — state-centric memory substrate engine.**
+**Open source under [AGPL-3.0](./LICENSE) — state-centric memory substrate engine.**
 
 The core engine behind Monet (local-first memory):
 two-layer observation/concept store, resolve-or-create dedup, lazy enrichment,
@@ -23,7 +23,10 @@ Architecture: see ADR 0001 (state-centric memory substrate).
 - `pnpm embed:check` — calibrate/verify the local embedder (needs the optional `@huggingface/transformers`).
 - `pnpm mcp` / `pnpm mcp:smoke` — run / smoke-test the MCP server.
 
+## License
+
+Monet Core is licensed under the **GNU Affero General Public License v3.0** (`AGPL-3.0-only`) — see [LICENSE](./LICENSE). You're free to use, study, modify, self-host, and contribute. Under AGPL's copyleft, anyone who conveys a modified version — or offers it to others over a network — must release their corresponding source under the same terms. **Commercial licenses without AGPL obligations are available from the copyright holder.**
+
 ## Status
 
-Private repository. Not for distribution. Consumed by `monet-local` (and later the
-example-host + `example-agent`) as a private package.
+Public, open source under AGPL-3.0. Consumed by `monet-local` (the open client) and, internally, by the example-host and `example-agent`.
