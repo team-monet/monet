@@ -1,4 +1,4 @@
-export { MonetCore } from "./engine.js";
+export { MonetCore } from "./engine";
 export type {
   Concept,
   SearchCard,
@@ -11,10 +11,19 @@ export type {
   LivingModelCard,
   Contradiction,
   PrewarmContradiction,
-} from "./engine.js";
-export { HashingEmbeddingProvider, cosine } from "./embedding.js";
-export type { EmbeddingProvider, EmbeddingThresholds } from "./embedding.js";
-export { OnnxEmbeddingProvider, createLocalEmbedder } from "./embedding-onnx.js";
-export { DeterministicSynthesizer } from "./synthesis.js";
-export type { Synthesizer } from "./synthesis.js";
-export { createMonetCoreMcpServer } from "./mcp-server.js";
+  GatherResult,
+  GatherCard,
+  MemoryOverview,
+  EntityHub,
+  ConnectedConcept,
+} from "./engine";
+export { renderOverview } from "./render-overview";
+export { extractEntities } from "./extract-entities";
+export type { ExtractedEntity, EntityKind } from "./extract-entities";
+export type { GraphParams } from "./graph";
+export { HashingEmbeddingProvider, cosine } from "./embedding";
+export type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
+export { OnnxEmbeddingProvider, createLocalEmbedder } from "./embedding-onnx";
+export { DeterministicSynthesizer } from "./synthesis";
+export type { Synthesizer } from "./synthesis";
+export { createMonetCoreMcpServer } from "./mcp-server";

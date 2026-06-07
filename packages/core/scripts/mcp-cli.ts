@@ -8,9 +8,9 @@
  */
 import path from "node:path";
 import fs from "node:fs";
-import { MonetCore } from "./engine.js";
-import { createLocalEmbedder } from "./embedding-onnx.js";
-import { createMonetCoreMcpServer } from "./mcp-server.js";
+import { MonetCore } from "../src/engine";
+import { createLocalEmbedder } from "../src/embedding-onnx";
+import { createMonetCoreMcpServer } from "../src/mcp-server";
 
 function resolveDbPath(): string {
   const projectDir = path.join(process.cwd(), ".monet");

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MonetCore } from "../engine.js";
+import { MonetCore } from "../engine";
 
 /**
  * Prewarm (#242, ADR §4.2): query-independent session-start state — active workstreams,

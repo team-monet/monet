@@ -17,8 +17,38 @@
  */
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend } from "./embedding.js";
-import { Synthesizer, DeterministicSynthesizer } from "./synthesis.js";
+import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend } from "./embedding";
+import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
+import { extractEntities } from "./extract-entities";
+import {
+  spread,
+  fuse,
+  evidenceGapStop,
+  rrfFuse,
+  DEFAULT_GRAPH_PARAMS,
+  type GraphParams,
+  type Adj,
+  type Ranked,
+} from "./graph";
+
+// ---- graph derivation tunables (#245, ADR §3.7) -------------------------
+const EDGE_NEIGHBORS = 6; // top-M cosine neighbours per store (dedup argmax + `related` edges)
+const MAX_NEIGHBORS = 25; // cap co-member / co-occurrence fan-out per store
+const MAX_DF_ABS = 50; // entity hub gate (absolute concept frequency)
+const MAX_DF_FRAC = 0.1; // entity hub gate (fraction of concepts in scope)
+const RARE_DF_MAX = 5; // a structural entity this rare alone justifies an `about` edge
+const EDGE_MIN_STRENGTH = 2.0; // else summed rarity·kindBoost over shared entities must reach this
+const CO_OCCURRED_WEIGHT = 0.85;
+const FOLLOWS_WEIGHT = 0.5;
+const ASSERTED_WEIGHT = 0.95;
+const SEED_K = 10; // gather seed-set size
+const RRF_K = 60; // RRF constant for seed fusion
+const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
+const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
+// Edges that may BOOST a similarity hit's rank: the "worked-on-together / causal" signals.
+// about/related are excluded — they re-encode similarity and would reorder single-fact hits.
+const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"]);
+const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s*:\s*#?([\w:-]+)/gi;
 
 export type IngestAction = "created" | "attached" | "ambiguous";
 
@@ -132,6 +162,73 @@ export interface PrewarmState {
   openContradictions: PrewarmContradiction[];
 }
 
+/** A gather result row: a search card plus why it was pulled in (#245, ADR §4.7). */
+export interface GatherCard extends SearchCard {
+  /** True if this concept matched the intent directly (a seed); false if reached via the graph. */
+  viaSeed: boolean;
+  sourceRefs?: string[];
+}
+
+/** What gather(intent) returns: the seed set, the ranked gathered set, and why it stopped. */
+export interface GatherResult {
+  seed: SearchCard[];
+  ranked: GatherCard[];
+  stopReason: string;
+  /** Per-edge-type count of distinct concepts reachable from the seeds (explainability + anti-gaming). */
+  reachableByType: Record<string, number>;
+}
+
+/** An entity hub (#245): a rare, shared anchor — "everything the agent knows touches X". */
+export interface EntityHub {
+  key: string;
+  kind: string; // path | id | err | lib | noun
+  surface: string;
+  df: number;
+  members: number; // distinct active concepts mentioning it
+}
+
+/** A concept ranked by THREAD-edge connectivity (worked-together/causal, not worded-similarly). */
+export interface ConnectedConcept {
+  id: string;
+  title: string;
+  kind: string;
+  degree: number;
+  confidence: number;
+  status: string;
+}
+
+/**
+ * A glanceable, read-only snapshot of everything stored for a circle (the "what your agent
+ * knows" view). Composes prewarm (living model + threads + contradictions) + scoped counts +
+ * the connection-graph shape. Carries identity/shape only — never concept bodies (§4.5).
+ */
+export interface MemoryOverview {
+  circle: string;
+  agentId: string;
+  generatedAt: number;
+  counts: {
+    concepts: number;
+    observations: number;
+    dirty: number;
+    workstreams: number;
+    sessions: number;
+    edges: number;
+    entities: number;
+    disputed: number;
+    stale: number;
+  };
+  health: { avgConfidence: number; graphDensity: number };
+  livingModel: LivingModelCard[];
+  activeThreads: PrewarmState["activeWorkstreams"];
+  openContradictions: PrewarmContradiction[];
+  graph: {
+    hubs: EntityHub[];
+    connected: ConnectedConcept[];
+    edgesByType: Array<{ type: string; count: number }>;
+    thread: { label: string; size: number; members: Array<{ id: string; title: string; kind: string }> } | null;
+  };
+}
+
 export interface MonetCoreOptions {
   embedder?: EmbeddingProvider;
   synthesizer?: Synthesizer;
@@ -142,6 +239,14 @@ export interface MonetCoreOptions {
   scopeContext?: string;
   /** A concept unconfirmed for longer than this drifts active→stale (ADR §4.4). Default 30d. */
   staleAfterMs?: number;
+  /** Id generator (default randomUUID). Inject a deterministic sequence for reproducible eval/tests. */
+  idGen?: () => string;
+  /** Build the connection graph at store time + enable gather() (#245). Default true. */
+  graphEnabled?: boolean;
+  /** Override spreading/fusion/stop tunables (ADR §3.7/§4.7). Merged over defaults. */
+  graph?: Partial<GraphParams>;
+  /** Min cosine for a `related` edge. Default: embedder-bound (0.45 MiniLM / 0.40 lexical). */
+  edgeSimMin?: number;
 }
 
 interface ConceptRow {
@@ -159,6 +264,7 @@ interface ConceptRow {
   dirty: number;
   updated_at: number;
   usefulness_score: number;
+  source_refs: string | null;
 }
 
 interface ContradictionRow {
@@ -184,6 +290,12 @@ export class MonetCore {
   private scopeContext: string | null;
   private staleAfterMs: number;
   private sessionId: string | null = null; // lazily opened on first write/checkpoint
+  private graphEnabled: boolean;
+  private graphParams: GraphParams;
+  private edgeSimMin: number;
+  private newId: () => string;
+  /** The previous concept written in the current session — for `follows` edges (ADR §3.7). */
+  private lastConceptInSession: string | null = null;
 
   constructor(dbPath = ":memory:", opts: MonetCoreOptions = {}) {
     this.db = new Database(dbPath);
@@ -195,9 +307,16 @@ export class MonetCore {
     this.tauAttach = opts.tauAttach ?? this.embedder.recommendedThresholds?.tauAttach ?? 0.55;
     this.tauAmbiguous = opts.tauAmbiguous ?? this.embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
     this.agentId = opts.agentId ?? "local-agent";
+    this.newId = opts.idGen ?? randomUUID;
     this.scopeContext = opts.scopeContext ?? null;
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
+    this.graphEnabled = opts.graphEnabled ?? true;
+    this.graphParams = { ...DEFAULT_GRAPH_PARAMS, ...opts.graph, wType: { ...DEFAULT_GRAPH_PARAMS.wType, ...opts.graph?.wType } };
+    // A `related` edge needs more overlap than a semantic model implies; bind to the embedder scale.
+    const semantic = (this.embedder.recommendedThresholds?.tauAttach ?? 0) >= 0.7;
+    this.edgeSimMin = opts.edgeSimMin ?? (semantic ? 0.45 : 0.4);
     this.init();
+    this.migrate();
   }
 
   private init(): void {
@@ -212,6 +331,7 @@ export class MonetCore {
         superseded_by TEXT,
         session_id TEXT,
         author_agent_id TEXT NOT NULL,
+        source_refs TEXT,
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
       );
       CREATE TABLE IF NOT EXISTS sessions (
@@ -237,6 +357,7 @@ export class MonetCore {
         version INTEGER NOT NULL DEFAULT 0,
         dirty INTEGER NOT NULL DEFAULT 0,
         usefulness_score INTEGER NOT NULL DEFAULT 0,
+        source_refs TEXT,
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
       );
@@ -266,24 +387,77 @@ export class MonetCore {
       CREATE INDEX IF NOT EXISTS idx_obs_concept ON observations(concept_id);
       CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id);
       CREATE INDEX IF NOT EXISTS idx_contradiction_concept ON contradictions(concept_id, status);
+
+      -- Connection graph (ADR §3.7, #245). First-class, TRAVERSED edges — not dead metadata.
+      -- All edges are concept→concept and scoped to a circle; spread never crosses scope.
+      CREATE TABLE IF NOT EXISTS memory_edge (
+        id TEXT PRIMARY KEY,
+        src_id TEXT NOT NULL,
+        src_type TEXT NOT NULL DEFAULT 'concept',
+        dst_id TEXT NOT NULL,
+        dst_type TEXT NOT NULL DEFAULT 'concept',
+        type TEXT NOT NULL,                       -- about|related|co_occurred|follows|supersedes|contradicts|resolves|derived_from|supports|part_of
+        weight REAL NOT NULL DEFAULT 0.6,
+        origin TEXT NOT NULL DEFAULT 'cheap',     -- cheap|nn|ingest|asserted|coaccess
+        count INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        last_reinforced_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        scope TEXT NOT NULL DEFAULT 'default'
+      );
+      CREATE INDEX IF NOT EXISTS idx_edge_src ON memory_edge(src_id, type);
+      CREATE INDEX IF NOT EXISTS idx_edge_dst ON memory_edge(dst_id, type);
+      CREATE INDEX IF NOT EXISTS idx_edge_scope ON memory_edge(scope);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_edge ON memory_edge(src_id, dst_id, type, scope);
+
+      -- Entity hubs backing about-edges (ADR §3.7). Entities are NOT concepts (never searched).
+      CREATE TABLE IF NOT EXISTS entities (
+        key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        surface TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'default',
+        df INTEGER NOT NULL DEFAULT 0,            -- per-scope concept frequency (rarity signal)
+        PRIMARY KEY (key, scope)
+      );
+      CREATE TABLE IF NOT EXISTS concept_entities (
+        concept_id TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'default',
+        PRIMARY KEY (concept_id, entity_key, scope)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ce_entity ON concept_entities(entity_key, scope);
+      CREATE INDEX IF NOT EXISTS idx_ce_concept ON concept_entities(concept_id);
     `);
   }
 
-  /** Sift tier (inline): append observation → embed → resolve-or-create. Marks dirty. */
-  async store(content: string, opts: { circle?: string; kind?: string } = {}): Promise<IngestResult> {
+  /** Guarded migration for older DBs: add source_refs columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
+  private migrate(): void {
+    for (const table of ["observations", "concepts"]) {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "source_refs")) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN source_refs TEXT`);
+      }
+    }
+  }
+
+  /** Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty. */
+  async store(content: string, opts: { circle?: string; kind?: string; sourceRefs?: string[] } = {}): Promise<IngestResult> {
     const circle = opts.circle ?? "default";
     const emb = await this.embedder.embed(content);
-    const obsId = randomUUID();
+    const obsId = this.newId();
     const sessionId = this.ensureSession();
+    const sourceRefs = opts.sourceRefs ?? [];
+    const refsJson = sourceRefs.length ? JSON.stringify(sourceRefs) : null;
 
     this.db
       .prepare(
-        `INSERT INTO observations (id, content, embedding, kind, circle, session_id, author_agent_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO observations (id, content, embedding, kind, circle, session_id, author_agent_id, source_refs)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(obsId, content, embToJson(emb), opts.kind ?? "statement", circle, sessionId, this.agentId);
+      .run(obsId, content, embToJson(emb), opts.kind ?? "statement", circle, sessionId, this.agentId, refsJson);
 
-    const { match, score } = this.bestMatch(emb, circle);
+    // ONE cosine scan serves both dedup (argmax) and `related` edge derivation (top-M) — no extra cost.
+    const matches = this.bestMatches(emb, circle, EDGE_NEIGHBORS);
+    const { match, score } = matches[0] ?? { match: null, score: 0 };
 
     let action: IngestAction;
     let row: ConceptRow;
@@ -299,6 +473,12 @@ export class MonetCore {
     }
 
     this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
+
+    if (this.graphEnabled) {
+      if (refsJson) this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(refsJson, row.id);
+      this.deriveEdges(row.id, content, sourceRefs, circle, sessionId, matches);
+      this.lastConceptInSession = row.id;
+    }
 
     // Contradiction detection is agent-judged, expressed cheaply: a "correction" that lands on
     // an EXISTING concept is the agent saying "this overrides what's there" → open a conflict
@@ -414,7 +594,7 @@ export class MonetCore {
         )
         .run(body, title, embToJson(emb), version, id);
     } else {
-      id = randomUUID();
+      id = this.newId();
       version = 0;
       this.db
         .prepare(
@@ -481,7 +661,7 @@ export class MonetCore {
   flagContradiction(conceptId: string, opts: { observationId?: string; detail?: string; kind?: string } = {}): Contradiction {
     const row = this.getRow(conceptId);
     if (!row) throw new Error(`concept not found: ${conceptId}`);
-    const id = randomUUID();
+    const id = this.newId();
     this.db
       .prepare(
         `INSERT INTO contradictions (id, concept_id, observation_id, kind, status, detail)
@@ -649,32 +829,557 @@ export class MonetCore {
     return this.getRow(id)?.dirty === 1;
   }
 
+  /** Observability/testing: list connection-graph edges (optionally filtered by circle/type). */
+  edges(opts: { circle?: string; type?: string } = {}): Array<{ srcId: string; dstId: string; type: string; weight: number; origin: string; count: number }> {
+    const where: string[] = [];
+    const args: string[] = [];
+    if (opts.circle) (where.push("scope = ?"), args.push(opts.circle));
+    if (opts.type) (where.push("type = ?"), args.push(opts.type));
+    const sql = `SELECT src_id AS srcId, dst_id AS dstId, type, weight, origin, count FROM memory_edge${
+      where.length ? ` WHERE ${where.join(" AND ")}` : ""
+    } ORDER BY src_id, dst_id, type`;
+    return this.db.prepare(sql).all(...args) as Array<{ srcId: string; dstId: string; type: string; weight: number; origin: string; count: number }>;
+  }
+
+  /** Observability/testing: the entity keys a concept is tagged with (#245 `about` hubs). */
+  conceptEntities(conceptId: string): string[] {
+    return (
+      this.db.prepare(`SELECT entity_key FROM concept_entities WHERE concept_id = ? ORDER BY entity_key`).all(conceptId) as Array<{
+        entity_key: string;
+      }>
+    ).map((r) => r.entity_key);
+  }
+
+  // ---- #245 "what your agent knows" overview (read-only) ------------------
+
+  /**
+   * Entity hubs — rare shared anchors ("everything it knows touches X"). GATED for honesty:
+   * only entities mentioned by ≥minMembers active concepts AND with df/n ≤ maxDfFrac (so
+   * stopword-grade common nouns never masquerade as anchors); structural kinds (path/id/err/lib)
+   * rank before plain nouns. Without this gate a df=12 filler noun outranks a df=3 real symbol.
+   */
+  topEntityHubs(
+    circle = "default",
+    opts: { limit?: number; minMembers?: number; maxDfFrac?: number; nounMinMembers?: number } = {},
+  ): EntityHub[] {
+    const limit = opts.limit ?? 6;
+    const minMembers = opts.minMembers ?? 2;
+    const nounMin = opts.nounMinMembers ?? 3; // a structural entity anchors at 2; a plain noun needs more
+    const maxDfFrac = opts.maxDfFrac ?? 0.5;
+    const n = this.conceptCount(circle);
+    if (n === 0) return [];
+    return this.db
+      .prepare(
+        `SELECT ce.entity_key AS key, e.surface AS surface, e.kind AS kind, e.df AS df,
+                COUNT(DISTINCT ce.concept_id) AS members
+           FROM concept_entities ce
+           JOIN entities e ON e.key = ce.entity_key AND e.scope = ce.scope
+           JOIN concepts c ON c.id = ce.concept_id
+          WHERE ce.scope = ? AND c.status = 'active' AND c.kind != 'workstream'
+          GROUP BY ce.entity_key
+         HAVING members >= ? AND (CAST(e.df AS REAL) / ?) <= ?
+            AND (e.kind IN ('path','id','err','lib') OR members >= ?)
+          ORDER BY (e.kind IN ('path','id','err','lib')) DESC, members DESC, e.df DESC, ce.entity_key
+          LIMIT ?`,
+      )
+      .all(circle, minMembers, n, maxDfFrac, nounMin, limit) as EntityHub[];
+  }
+
+  /**
+   * Concepts ranked by connection degree over THREAD edges ONLY (the same set fuse() spreads on:
+   * worked-together / causal). Excludes `related`/`about` — otherwise similarity edges float
+   * near-duplicate filler to the top and bury the real cluster.
+   */
+  topConnectedConcepts(circle = "default", limit = 6): ConnectedConcept[] {
+    const placeholders = [...THREAD_TYPES].map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT c.id AS id, c.title AS title, c.kind AS kind, c.confidence AS confidence, c.status AS status,
+                COUNT(DISTINCT e.dst_id) AS degree
+           FROM concepts c
+           JOIN memory_edge e ON e.src_id = c.id
+          WHERE e.scope = ? AND c.kind != 'workstream' AND e.type IN (${placeholders})
+          GROUP BY c.id
+          ORDER BY degree DESC, c.id
+          LIMIT ?`,
+      )
+      .all(circle, ...THREAD_TYPES, limit) as ConnectedConcept[];
+  }
+
+  /** Undirected edge counts by type (symmetric mirror collapsed, directed counted once). */
+  edgeCountsByType(circle = "default"): Array<{ type: string; count: number }> {
+    return this.db
+      .prepare(
+        `SELECT type, COUNT(*) AS count FROM (
+            SELECT DISTINCT type, MIN(src_id, dst_id) AS a, MAX(src_id, dst_id) AS b
+              FROM memory_edge WHERE scope = ?
+          ) GROUP BY type ORDER BY count DESC, type`,
+      )
+      .all(circle) as Array<{ type: string; count: number }>;
+  }
+
+  /** The single largest "worked together" cluster (co_occurred connected component), or null. */
+  topThread(circle = "default", minSize = 2): MemoryOverview["graph"]["thread"] {
+    const edges = this.edges({ circle, type: "co_occurred" });
+    if (edges.length === 0) return null;
+    const adj = new Map<string, Set<string>>();
+    const link = (a: string, b: string): void => {
+      if (!adj.has(a)) adj.set(a, new Set());
+      adj.get(a)!.add(b);
+    };
+    for (const e of edges) {
+      link(e.srcId, e.dstId);
+      link(e.dstId, e.srcId);
+    }
+    const seen = new Set<string>();
+    let best: string[] = [];
+    for (const start of [...adj.keys()].sort()) {
+      if (seen.has(start)) continue;
+      const comp: string[] = [];
+      const stack = [start];
+      seen.add(start);
+      while (stack.length) {
+        const id = stack.pop()!;
+        comp.push(id);
+        for (const nb of adj.get(id) ?? []) if (!seen.has(nb)) (seen.add(nb), stack.push(nb));
+      }
+      if (comp.length > best.length || (comp.length === best.length && comp.sort()[0] < (best[0] ?? "~"))) best = comp.sort();
+    }
+    if (best.length < minSize) return null;
+    const members = best
+      .map((id) => this.getRow(id))
+      .filter((r): r is ConceptRow => r !== null)
+      .sort((a, b) => b.support_count - a.support_count || (a.id < b.id ? -1 : 1))
+      .slice(0, 4)
+      .map((r) => ({ id: r.id, title: r.title, kind: r.kind }));
+    // Label = the most-shared entity surface across the component, else the lead member's title.
+    const hubKeys = new Set(this.topEntityHubs(circle, { limit: 20 }).map((h) => h.key));
+    const entityCounts = new Map<string, { surface: string; n: number }>();
+    for (const id of best) {
+      for (const key of this.conceptEntities(id)) {
+        if (!hubKeys.has(key)) continue;
+        const surface = key.split(":").slice(1).join(":");
+        const cur = entityCounts.get(key) ?? { surface, n: 0 };
+        cur.n++;
+        entityCounts.set(key, cur);
+      }
+    }
+    let label = members[0]?.title ?? "thread";
+    let bestN = 1;
+    for (const { surface, n } of entityCounts.values()) if (n > bestN) (label = surface), (bestN = n);
+    return { label, size: best.length, members };
+  }
+
+  /** Concepts mentioning an entity (hub drill-in). */
+  conceptsForEntity(entityKey: string, circle = "default"): Array<{ id: string; title: string; kind: string }> {
+    return this.db
+      .prepare(
+        `SELECT c.id AS id, c.title AS title, c.kind AS kind
+           FROM concepts c JOIN concept_entities ce ON ce.concept_id = c.id
+          WHERE ce.entity_key = ? AND ce.scope = ? AND c.kind != 'workstream' ORDER BY c.id`,
+      )
+      .all(entityKey, circle) as Array<{ id: string; title: string; kind: string }>;
+  }
+
+  private disputedCount(circle = "default"): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND status = 'disputed'`).get(circle) as { n: number }).n;
+  }
+
+  private scopedCount(sql: string, circle: string): number {
+    return (this.db.prepare(sql).get(circle) as { n: number }).n;
+  }
+
+  /**
+   * The "what your agent knows" snapshot (ADR §4.7 read surface). READ-ONLY: opens no session,
+   * triggers no synthesis, never returns bodies. Composes prewarm + scoped counts + graph shape.
+   */
+  overview(
+    circle = "default",
+    opts: { conceptLimit?: number; hubLimit?: number; connectedLimit?: number } = {},
+  ): MemoryOverview {
+    const pre = this.prewarm(circle, { conceptLimit: opts.conceptLimit ?? 6 });
+    const edgesByType = this.edgeCountsByType(circle);
+    const edges = edgesByType.reduce((a, e) => a + e.count, 0);
+    const concepts = this.conceptCount(circle);
+    const avg = this.db
+      .prepare(`SELECT AVG(confidence) AS a FROM concepts WHERE circle = ? AND kind != 'workstream' AND status = 'active'`)
+      .get(circle) as { a: number | null };
+    return {
+      circle,
+      agentId: this.agentId,
+      generatedAt: Date.now(),
+      counts: {
+        concepts,
+        observations: this.scopedCount(`SELECT COUNT(*) AS n FROM observations WHERE circle = ?`, circle),
+        dirty: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND dirty = 1`, circle),
+        workstreams: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind = 'workstream'`, circle),
+        sessions: this.scopedCount(`SELECT COUNT(DISTINCT session_id) AS n FROM observations WHERE circle = ? AND session_id IS NOT NULL`, circle),
+        edges,
+        entities: this.scopedCount(`SELECT COUNT(*) AS n FROM entities WHERE scope = ?`, circle),
+        disputed: this.disputedCount(circle),
+        stale: this.getStaleConcepts(circle).length,
+      },
+      health: {
+        avgConfidence: Number((avg.a ?? 0).toFixed(2)),
+        graphDensity: concepts === 0 ? 0 : Number((edges / concepts).toFixed(2)),
+      },
+      livingModel: pre.topConcepts,
+      activeThreads: pre.activeWorkstreams,
+      openContradictions: pre.openContradictions,
+      graph: {
+        hubs: this.topEntityHubs(circle, { limit: opts.hubLimit ?? 6 }),
+        connected: this.topConnectedConcepts(circle, opts.connectedLimit ?? 6),
+        edgesByType,
+        thread: this.topThread(circle),
+      },
+    };
+  }
+
   close(): void {
     this.db.close();
   }
 
   // ---- internals ---------------------------------------------------------
 
-  private bestMatch(emb: Float32Array, circle: string): { match: ConceptRow | null; score: number } {
-    // Workstreams are identity-upserted state, not embedding-resolved knowledge — keep them
-    // out of dedup candidates and search cards (they're restored via getActiveWorkstreams).
+  /**
+   * Top-m concepts by cosine in a circle (workstreams excluded — identity-upserted, not
+   * embedding-resolved). matches[0] is the argmax the old bestMatch returned (so dedup is
+   * unchanged); the rest feed `related` edge derivation, reusing this single scan.
+   */
+  private bestMatches(emb: Float32Array, circle: string, m: number): Array<{ match: ConceptRow; score: number }> {
     const rows = this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream'`)
       .all(circle) as ConceptRow[];
-    let match: ConceptRow | null = null;
-    let score = 0;
-    for (const r of rows) {
-      const s = cosine(emb, jsonToEmb(r.embedding));
-      if (s > score) {
-        score = s;
-        match = r;
+    return rows
+      .map((r) => ({ match: r, score: cosine(emb, jsonToEmb(r.embedding)) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score || (a.match.id < b.match.id ? -1 : 1))
+      .slice(0, m);
+  }
+
+  // ---- #245 graph: derivation (write path) -------------------------------
+
+  /**
+   * Derive connection-graph edges at store time (Sift, inline, deterministic — ADR §3.7/§4.6):
+   * `about` (shared rare entity), `related` (semantic NN, reusing the dedup scan), `co_occurred`
+   * + `follows` (same session), and agent-asserted typed edges parsed from content. All scoped
+   * to the circle; spread never crosses scope. Idempotent + reinforcing via uq_edge.
+   */
+  private deriveEdges(
+    conceptId: string,
+    content: string,
+    sourceRefs: string[],
+    circle: string,
+    sessionId: string,
+    matches: Array<{ match: ConceptRow; score: number }>,
+  ): void {
+    const n = this.conceptCount(circle); // total concepts in scope, for df-fraction hub gate
+
+    // 1) ENTITY / `about` — shared sourceRefs feed the SAME machinery as a synthetic path entity.
+    const ents = extractEntities(content);
+    for (const ref of sourceRefs) ents.push({ key: `ref:${ref}`, kind: "path", surface: ref, weight: 3 });
+    const strength = new Map<string, number>();
+    for (const e of ents) {
+      const df = this.upsertEntity(conceptId, e.key, e.kind, e.surface, circle);
+      if (this.isHubDf(df, n)) continue; // common term → not an anchor
+      const rar = this.rarityFromDf(df, n) * (KIND_BOOST[e.kind] ?? 1);
+      const strongAlone = e.kind !== "noun" && df <= RARE_DF_MAX; // one shared rare file/symbol is enough
+      for (const m of this.coMembers(e.key, circle, conceptId, MAX_NEIGHBORS)) {
+        const next = (strength.get(m) ?? 0) + rar;
+        strength.set(m, strongAlone ? Math.max(next, EDGE_MIN_STRENGTH) : next);
       }
     }
-    return { match, score };
+    for (const [m, s] of strength) {
+      if (s >= EDGE_MIN_STRENGTH) this.upsertEdgeBoth(conceptId, m, "about", Math.min(1, s / 4), "cheap", circle);
+    }
+
+    // 2) SEMANTIC / `related` — reuse the dedup scan; only the "related but not duplicate" band.
+    for (const nb of matches) {
+      if (nb.match.id === conceptId || nb.match.kind === "workstream") continue;
+      if (nb.score >= this.edgeSimMin && nb.score < this.tauAttach) {
+        this.upsertEdgeBoth(conceptId, nb.match.id, "related", nb.score, "nn", circle);
+      }
+    }
+
+    // 3) TEMPORAL / `co_occurred` + `follows` — same session = "worked on together" (the restoration signal).
+    const mates = this.db
+      .prepare(
+        `SELECT DISTINCT concept_id AS id FROM observations
+          WHERE session_id = ? AND concept_id IS NOT NULL AND concept_id != ?
+          ORDER BY created_at DESC, concept_id DESC LIMIT ?`, // created_at is whole-ms; id breaks ties deterministically
+      )
+      .all(sessionId, conceptId, MAX_NEIGHBORS) as Array<{ id: string }>;
+    for (const m of mates) this.upsertEdgeBoth(conceptId, m.id, "co_occurred", CO_OCCURRED_WEIGHT, "cheap", circle);
+    if (this.lastConceptInSession && this.lastConceptInSession !== conceptId) {
+      this.upsertEdge(this.lastConceptInSession, conceptId, "follows", FOLLOWS_WEIGHT, "cheap", circle);
+    }
+
+    // 4) AGENT-ASSERTED — `resolves: #slug` etc. The strongest signal: the agent said so.
+    ASSERTED_RE.lastIndex = 0;
+    let mm: RegExpExecArray | null;
+    while ((mm = ASSERTED_RE.exec(content))) {
+      const type = mm[1].toLowerCase().replace("-", "_");
+      const target = this.resolveRef(mm[2], circle, conceptId);
+      if (target) this.upsertEdge(conceptId, target, type, ASSERTED_WEIGHT, "asserted", circle);
+    }
+  }
+
+  /** One directed edge, idempotent + reinforcing (count↑, weight = max) on re-encounter. */
+  private upsertEdge(src: string, dst: string, type: string, weight: number, origin: string, scope: string): void {
+    if (src === dst) return;
+    this.db
+      .prepare(
+        `INSERT INTO memory_edge (id, src_id, dst_id, type, weight, origin, scope)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(src_id, dst_id, type, scope)
+         DO UPDATE SET count = count + 1, weight = max(weight, excluded.weight), last_reinforced_at = unixepoch() * 1000`,
+      )
+      .run(this.newId(), src, dst, type, weight, origin, scope);
+  }
+
+  /** A symmetric edge: store both directions so spread reaches it from either endpoint. */
+  private upsertEdgeBoth(a: string, b: string, type: string, weight: number, origin: string, scope: string): void {
+    this.upsertEdge(a, b, type, weight, origin, scope);
+    this.upsertEdge(b, a, type, weight, origin, scope);
+  }
+
+  /** Record concept→entity membership and return the entity's updated per-scope df (rarity). */
+  private upsertEntity(conceptId: string, key: string, kind: string, surface: string, scope: string): number {
+    const ins = this.db
+      .prepare(`INSERT OR IGNORE INTO concept_entities (concept_id, entity_key, scope) VALUES (?, ?, ?)`)
+      .run(conceptId, key, scope);
+    this.db
+      .prepare(
+        `INSERT INTO entities (key, kind, surface, scope, df) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(key, scope) DO UPDATE SET df = df + ?`,
+      )
+      .run(key, kind, surface, scope, ins.changes, ins.changes);
+    const row = this.db.prepare(`SELECT df FROM entities WHERE key = ? AND scope = ?`).get(key, scope) as { df: number } | undefined;
+    return row?.df ?? 0;
+  }
+
+  private coMembers(entityKey: string, circle: string, excludeId: string, limit: number): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT concept_id AS id FROM concept_entities WHERE entity_key = ? AND scope = ? AND concept_id != ?
+           ORDER BY concept_id LIMIT ?`, // deterministic subset under the cap (graph.ts determinism contract)
+        )
+        .all(entityKey, circle, excludeId, limit) as Array<{ id: string }>
+    ).map((r) => r.id);
+  }
+
+  private isHubDf(df: number, n: number): boolean {
+    return df > MAX_DF_ABS || (n > 0 && df / n > MAX_DF_FRAC);
+  }
+
+  private rarityFromDf(df: number, n: number): number {
+    return Math.log((n + 1) / (df + 1));
+  }
+
+  private isHub(key: string, circle: string): boolean {
+    const row = this.db.prepare(`SELECT df FROM entities WHERE key = ? AND scope = ?`).get(key, circle) as { df: number } | undefined;
+    return row ? this.isHubDf(row.df, this.conceptCount(circle)) : true;
+  }
+
+  private rarity(key: string, circle: string): number {
+    const row = this.db.prepare(`SELECT df FROM entities WHERE key = ? AND scope = ?`).get(key, circle) as { df: number } | undefined;
+    return this.rarityFromDf(row?.df ?? 0, this.conceptCount(circle));
+  }
+
+  private resolveRef(ref: string, circle: string, excludeId: string): string | null {
+    const bySlug = this.db
+      .prepare(`SELECT id FROM concepts WHERE circle = ? AND slug = ? AND id != ? LIMIT 1`)
+      .get(circle, slugify(ref), excludeId) as { id: string } | undefined;
+    if (bySlug) return bySlug.id;
+    const byId = this.db.prepare(`SELECT id FROM concepts WHERE id = ? AND circle = ?`).get(ref, circle) as { id: string } | undefined;
+    return byId?.id ?? null;
+  }
+
+  // ---- #245 graph: gather (read path) ------------------------------------
+
+  /**
+   * gather(intent) — ADR §4.7's active context-builder: hybrid seed → 2-hop weighted spreading
+   * activation across the MAGMA graph → similarity-floored fusion → seed-relative evidence-gap
+   * stop. Strictly scope-isolated. Read-only (never opens a session). Where plain top-k returns
+   * the most-similar few, gather recovers the whole neighbourhood — the divergent-vocabulary
+   * thread members similarity alone misses. Cold graph ⇒ degrades exactly to search().
+   */
+  async gather(intent: string, opts: { circle?: string; limit?: number; depth?: number } = {}): Promise<GatherResult> {
+    const circle = opts.circle ?? "default";
+    const limit = opts.limit ?? 12;
+    const params = opts.depth ? { ...this.graphParams, hopLimit: Math.max(1, Math.min(opts.depth, 3)) } : this.graphParams;
+    const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };
+
+    const emb = await this.embedder.embed(intent);
+    const dense = this.scoreAllConcepts(emb, circle); // [{id, cos}] desc
+    const sim = new Map<string, number>();
+    for (const d of dense) if (d.cos > 0) sim.set(d.id, d.cos);
+
+    const denseIds = dense.filter((d) => d.cos > 0).map((d) => d.id);
+    const lexIds = this.lexicalSeed(intent, circle, 30);
+    const fused = rrfFuse([denseIds, lexIds], RRF_K).slice(0, SEED_K);
+    const seedIds = fused.map((f) => f.id);
+
+    const seedStrength = new Map<string, number>();
+    const maxRrf = fused[0]?.rrf ?? 1;
+    for (const f of fused) seedStrength.set(f.id, maxRrf > 0 ? f.rrf / maxRrf : 1);
+
+    // Entity-anchored seeding from the PROBE TEXT ONLY (never scenario metadata) — complementary.
+    for (const e of extractEntities(intent)) {
+      if (this.isHub(e.key, circle)) continue;
+      const boost = (params.wType.about ?? 1) * this.rarity(e.key, circle) * (KIND_BOOST[e.kind] ?? 1) * 0.1;
+      for (const m of this.coMembers(e.key, circle, "", MAX_NEIGHBORS)) {
+        seedStrength.set(m, Math.max(seedStrength.get(m) ?? 0, boost));
+      }
+    }
+    if (seedStrength.size === 0) return empty;
+
+    // Spread ONLY over thread/causal edges (worked-together / caused-by). about/related are NOT
+    // spread — they re-encode similarity (the seed signal) and would inject single-fact noise;
+    // entity recall enters gather via the entity-anchored SEEDING above, not via spread.
+    const activation = spread(seedStrength, (id) => this.adjacency(id, circle, THREAD_TYPES), params);
+
+    const priors = new Map<string, number>();
+    for (const id of activation.keys()) if (!sim.has(id)) priors.set(id, this.nodePrior(id));
+    const ranked = fuse(activation, sim, seedStrength, priors, params);
+
+    const embCache = new Map<string, Float32Array | null>();
+    const embOf = (id: string): Float32Array | null => {
+      if (!embCache.has(id)) embCache.set(id, this.embOf(id));
+      return embCache.get(id) ?? null;
+    };
+    const { accepted, stopReason } = evidenceGapStop(ranked, seedIds.length, embOf, cosine, params);
+
+    return {
+      seed: seedIds.map((id) => this.cardOf(id)).filter((c): c is SearchCard => c !== null),
+      ranked: accepted
+        .slice(0, limit)
+        .map((r) => this.toGatherCard(r))
+        .filter((c): c is GatherCard => c !== null),
+      stopReason,
+      reachableByType: this.reachableByType(seedIds, circle, params.hopLimit),
+    };
+  }
+
+  /** Thin id-only overload for retrieval callers (the eval arm). Ranked, stop-trimmed. */
+  async gatherIds(intent: string, opts: { circle?: string; limit?: number; depth?: number } = {}): Promise<string[]> {
+    const r = await this.gather(intent, opts);
+    return r.ranked.map((c) => c.id);
+  }
+
+  /** Public, test-scoped wrapper over the private endSession so the eval can mark session boundaries. */
+  endSessionForEval(summary?: string): void {
+    this.endSession(summary);
+  }
+
+  private scoreAllConcepts(emb: Float32Array, circle: string): Array<{ id: string; cos: number }> {
+    const rows = this.db
+      .prepare(`SELECT id, embedding FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+      .all(circle) as Array<{ id: string; embedding: string }>;
+    return rows
+      .map((r) => ({ id: r.id, cos: cosine(emb, jsonToEmb(r.embedding)) }))
+      .sort((a, b) => b.cos - a.cos || (a.id < b.id ? -1 : 1));
+  }
+
+  /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). */
+  private lexicalSeed(intent: string, circle: string, n: number): string[] {
+    const q = new Set(tokenize(intent));
+    if (q.size === 0) return [];
+    const rows = this.db
+      .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+      .all(circle) as Array<{ id: string; title: string; body: string }>;
+    return rows
+      .map((r) => {
+        let overlap = 0;
+        for (const t of new Set(tokenize(`${r.title} ${r.body}`))) if (q.has(t)) overlap++;
+        return { id: r.id, overlap };
+      })
+      .filter((x) => x.overlap > 0)
+      .sort((a, b) => b.overlap - a.overlap || (a.id < b.id ? -1 : 1))
+      .slice(0, n)
+      .map((x) => x.id);
+  }
+
+  /**
+   * All edges traversable from a node (symmetric stored both ways; directed reachable either end).
+   * `only` restricts to a subset of edge types (used to spread thread/causal signal separately).
+   */
+  private adjacency(id: string, circle: string, only?: Set<string>): Adj[] {
+    const out = this.db
+      .prepare(`SELECT dst_id AS dst, type, weight FROM memory_edge WHERE src_id = ? AND scope = ?`)
+      .all(id, circle) as Adj[];
+    const placeholders = DIRECTED_TYPES.map(() => "?").join(",");
+    const inc = this.db
+      .prepare(`SELECT src_id AS dst, type, weight FROM memory_edge WHERE dst_id = ? AND scope = ? AND type IN (${placeholders})`)
+      .all(id, circle, ...DIRECTED_TYPES) as Adj[];
+    const all = out.concat(inc);
+    return only ? all.filter((e) => only.has(e.type)) : all;
+  }
+
+  private nodePrior(id: string): number {
+    const m = this.nodeMeta(id);
+    if (!m) return 1;
+    const ageDays = Math.max(0, (Date.now() - m.updatedAt) / 86_400_000);
+    return Math.max(1e-3, m.confidence * Math.log1p(m.usefulness + m.support) * Math.exp(-ageDays / 30));
+  }
+
+  private nodeMeta(id: string): { confidence: number; usefulness: number; support: number; updatedAt: number } | null {
+    const r = this.db
+      .prepare(`SELECT confidence, usefulness_score, support_count, updated_at FROM concepts WHERE id = ?`)
+      .get(id) as { confidence: number; usefulness_score: number; support_count: number; updated_at: number } | undefined;
+    return r ? { confidence: r.confidence, usefulness: r.usefulness_score, support: r.support_count, updatedAt: r.updated_at } : null;
+  }
+
+  private embOf(id: string): Float32Array | null {
+    const r = this.db.prepare(`SELECT embedding FROM concepts WHERE id = ?`).get(id) as { embedding: string } | undefined;
+    return r ? jsonToEmb(r.embedding) : null;
+  }
+
+  private openContraCount(id: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`).get(id) as { n: number }).n;
+  }
+
+  private cardOf(id: string): SearchCard | null {
+    const row = this.getRow(id);
+    if (!row) return null;
+    return toCard(row, row.confidence, this.openContraCount(id));
+  }
+
+  private toGatherCard(r: Ranked): GatherCard | null {
+    const row = this.getRow(r.id);
+    if (!row) return null;
+    const refs = row.source_refs ? (JSON.parse(row.source_refs) as string[]) : undefined;
+    return { ...toCard(row, r.score, this.openContraCount(r.id)), viaSeed: r.viaSeed, sourceRefs: refs };
+  }
+
+  /** Per-edge-type: distinct non-seed concepts reachable from the seeds within `hop` (explainability). */
+  private reachableByType(seedIds: string[], circle: string, hop: number): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const type of Object.keys(this.graphParams.wType)) {
+      const seen = new Set(seedIds);
+      let frontier = [...seedIds];
+      for (let h = 0; h < hop; h++) {
+        const next: string[] = [];
+        for (const id of frontier) {
+          const nbrs = this.db
+            .prepare(
+              `SELECT dst_id AS nbr FROM memory_edge WHERE src_id = ? AND scope = ? AND type = ?
+               UNION SELECT src_id AS nbr FROM memory_edge WHERE dst_id = ? AND scope = ? AND type = ?`,
+            )
+            .all(id, circle, type, id, circle, type) as Array<{ nbr: string }>;
+          for (const { nbr } of nbrs) if (!seen.has(nbr)) { seen.add(nbr); next.push(nbr); }
+        }
+        frontier = next;
+      }
+      const reached = seen.size - seedIds.length;
+      if (reached > 0) result[type] = reached;
+    }
+    return result;
   }
 
   private create(content: string, emb: Float32Array, circle: string, kind?: string): ConceptRow {
-    const id = randomUUID();
+    const id = this.newId();
     const title = firstLine(content);
     this.db
       .prepare(
@@ -726,7 +1431,7 @@ export class MonetCore {
         `INSERT INTO concept_revisions (id, concept_id, version, body, trigger_observation_id)
          VALUES (?, ?, ?, ?, NULL)`,
       )
-      .run(randomUUID(), conceptId, version, body);
+      .run(this.newId(), conceptId, version, body);
   }
 
   private getRow(id: string): ConceptRow | null {
@@ -736,7 +1441,7 @@ export class MonetCore {
   /** Lazily open the current session on first write/checkpoint (read-only opens stay session-free). */
   private ensureSession(): string {
     if (this.sessionId) return this.sessionId;
-    const id = randomUUID();
+    const id = this.newId();
     this.db
       .prepare(`INSERT INTO sessions (id, agent_id, scope_context, status) VALUES (?, ?, ?, 'active')`)
       .run(id, this.agentId, this.scopeContext);
@@ -751,6 +1456,7 @@ export class MonetCore {
       .prepare(`UPDATE sessions SET ended_at = unixepoch() * 1000, status = 'ended', summary = ? WHERE id = ?`)
       .run(summary ?? null, this.sessionId);
     this.sessionId = null;
+    this.lastConceptInSession = null; // `follows` never bridges a session boundary
   }
 }
 
@@ -863,6 +1569,15 @@ function splitLines(body: string): string[] {
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
+}
+
+/** Lexical tokens for the gather seed's lexical arm — lowercase alphanumerics, length ≥ 2. */
+function tokenize(s: string): string[] {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
 }
 
 function slugify(s: string): string {

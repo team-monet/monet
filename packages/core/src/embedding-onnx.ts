@@ -1,5 +1,5 @@
-import type { EmbeddingProvider, EmbeddingThresholds } from "./embedding.js";
-import { HashingEmbeddingProvider } from "./embedding.js";
+import type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
+import { HashingEmbeddingProvider } from "./embedding";
 
 /**
  * Real semantic embeddings via a bundled ONNX model (transformers.js) — in-process,

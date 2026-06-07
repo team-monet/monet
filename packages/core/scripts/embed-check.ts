@@ -11,9 +11,9 @@
  * Requires @huggingface/transformers (downloads MiniLM once on first run). Exits non-zero
  * if the calibration regresses, so it can gate threshold changes.
  */
-import { OnnxEmbeddingProvider } from "./embedding-onnx.js";
-import { cosine } from "./embedding.js";
-import { MonetCore } from "./engine.js";
+import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
+import { cosine } from "../src/embedding";
+import { MonetCore } from "../src/engine";
 
 const BASE = "We decided to use SQLite as the storage backend for Monet Local.";
 const cases: Array<[string, string]> = [

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MonetCore } from "../engine.js";
+import { MonetCore } from "../engine";
 
 /**
  * Session-state survival (#241, ADR §3.6/§4.3): the agent compresses a session into a
