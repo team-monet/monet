@@ -9,7 +9,7 @@
 import { describe, it, expect } from "vitest";
 import { HashingEmbeddingProvider } from "../embedding";
 import { STARTER_SUITE } from "../eval/scenarios";
-import { noMemoryArm, monetSearchArm } from "../eval/strategies";
+import { noMemoryArm, monetSearchArm, monetGatherArm } from "../eval/strategies";
 import { runSuite, auditScenarios, K_LADDER } from "../eval/harness";
 
 const embedder = (): HashingEmbeddingProvider => new HashingEmbeddingProvider();
@@ -23,7 +23,7 @@ describe("memory eval — integrity, value, and headroom (deterministic lexical 
   it("covers all three metric categories with a non-trivial number of probes", async () => {
     const report = await runSuite(STARTER_SUITE, [monetSearchArm], embedder());
     const c = report.arms[0].metrics!.counts;
-    expect(c).toEqual({ mistake: 4, reexplain: 6, restoration: 4 });
+    expect(c).toEqual({ mistake: 6, reexplain: 8, restoration: 6 });
   });
 
   it("monet-search strictly improves every metric over no-memory at every k", async () => {
@@ -63,5 +63,31 @@ describe("memory eval — integrity, value, and headroom (deterministic lexical 
     const probe = report.arms[0].probes.find((p) => p.scenarioId === "port-correction")!;
     expect(probe.goldIds).toHaveLength(1);
     expect(probe.recallByK[3]).toBe(1);
+  });
+
+  it("graph-backed gather completes restoration threads without single-fact regression (#245)", async () => {
+    // Eval-suite-level guard that the #245 win holds across the WHOLE scenario suite; the
+    // function-level byte-identical precision gate lives in gather.test.ts. gather must close
+    // more of a divergent thread than plain similarity, while never ranking a lone gotcha/fact
+    // worse than search. Structural invariants, not magic numbers, so the suite can grow freely.
+    const report = await runSuite(STARTER_SUITE, [monetSearchArm, monetGatherArm], embedder());
+    const search = report.arms.find((a) => a.arm === "monet-search")!.metrics!;
+    const gather = report.arms.find((a) => a.arm === "monet-gather")!.metrics!;
+
+    for (const k of K_LADDER) {
+      // No single-fact regression at any budget.
+      expect(gather.byK[k].repeatedMistakeRate).toBeLessThanOrEqual(search.byK[k].repeatedMistakeRate);
+      expect(gather.byK[k].reExplainRate).toBeLessThanOrEqual(search.byK[k].reExplainRate);
+      // Thread restoration: gather is never worse than similarity at any budget.
+      expect(gather.byK[k].restorationRecall).toBeGreaterThanOrEqual(search.byK[k].restorationRecall);
+    }
+    // The headline #245 result: gather completes strictly more of a thread within budget.
+    expect(gather.byK[5].restorationRecall).toBeGreaterThan(search.byK[5].restorationRecall);
+
+    // Rank quality: gather lifts restoration and overall, and never drops single-fact MRR.
+    expect(gather.mrr.restoration).toBeGreaterThan(search.mrr.restoration);
+    expect(gather.mrr.overall).toBeGreaterThan(search.mrr.overall);
+    expect(gather.mrr.mistake).toBeGreaterThanOrEqual(search.mrr.mistake);
+    expect(gather.mrr.reexplain).toBeGreaterThanOrEqual(search.mrr.reexplain);
   });
 });

@@ -57,10 +57,14 @@ export interface Scenario {
 
 /**
  * The starter suite. Deliberately spans:
- *   - lexically-strong probes (1,2,3,5,6) — pass even on the lexical fallback embedder,
- *   - one paraphrase-only probe (4) — passes on MiniLM, exposes the lexical embedder's gap,
- *   - one multi-gold restoration probe (5) — the case plain top-k search under-serves and
- *     the #245 graph-backed `gather` is meant to close (seed→spread→stop).
+ *   - lexically-strong probes — pass even on the lexical fallback embedder,
+ *   - paraphrase-only probes (e.g. deploy-gate, error-convention, branching) — pass on
+ *     MiniLM, expose the lexical embedder's semantic gap,
+ *   - multi-gold restoration threads (auth/search/incident/checkout/cache/rollout) — the
+ *     case plain top-k search under-serves and the #245 graph-backed `gather` is meant to
+ *     close (seed→spread→stop); the cache thread (5 members) is currently the widest such case.
+ * Probe-category counts are asserted in eval.test.ts, so adding a scenario forces that
+ * assertion to be updated in lockstep — a deliberate tripwire against silent suite drift.
  */
 /**
  * Shared background corpus — plausible coding-agent memories seeded into EVERY scenario
@@ -412,7 +416,7 @@ export const STARTER_SUITE: Scenario[] = [
   {
     id: "incident-thread",
     title: "Restore the prod-incident thread",
-    rationale: "A larger (4-concept) restoration thread — recall over more members is where plain top-k drops most and gather wins biggest; recovered via session co-occurrence (no shared entity links symptom→cause→fix), with an in-session tangent for realism.",
+    rationale: "A larger (4-concept) restoration thread — recall over more members is where plain top-k drops most and gather's completion gain shows clearly; recovered via session co-occurrence (no shared entity links symptom→cause→fix), with an in-session tangent for realism.",
     seed: [
       { key: "inc-symptom", kind: "issue", content: "Production returned intermittent 500s under load last Tuesday." },
       { key: "inc-cause", kind: "fact", content: "Traced to the database client running out of available connections during sustained traffic." },
@@ -445,6 +449,143 @@ export const STARTER_SUITE: Scenario[] = [
         query: "Help me resume the checkout refactor.",
         gold: ["co-task", "co-decision", "co-openq"],
         note: "Entity-cohesive thread: about edges (shared CheckoutService) carry recall here, complementing co-occurrence.",
+      },
+    ],
+  },
+
+  // ── Broadened coverage ──────────────────────────────────────
+  // More single-fact gotchas/decisions and larger restoration threads so the recall
+  // numbers aren't overfit to a thin suite. Single-fact scenarios deliberately carry NO
+  // tangents (their seed sits alone in its work session ⇒ no co_occurred/follows edges),
+  // which keeps the precision guarantee testable: with no thread to spread over, gather's
+  // ranking must stay identical to plain search (no single-fact regression).
+  {
+    id: "secret-logging",
+    title: "Don't log full request bodies",
+    rationale: "A security gotcha must resurface when the agent is about to add logging that would leak credentials.",
+    seed: [
+      {
+        key: "secret-logging",
+        kind: "issue",
+        content:
+          "Gotcha: never log full request bodies or Authorization headers — they carry bearer tokens. Redact secrets before emitting any log line.",
+      },
+    ],
+    distractors: [{ key: "d-loglevel", content: "Log verbosity is controlled by the LOG_LEVEL variable; it defaults to info in production." }],
+    probes: [
+      {
+        category: "mistake",
+        query: "Adding some debug logging — I'll just dump the whole incoming request object so I can see everything.",
+        gold: ["secret-logging"],
+        note: "Without recall the agent logs raw requests and leaks tokens, repeating a known incident; competes with the pino/telemetry background.",
+      },
+    ],
+  },
+  {
+    id: "force-push",
+    title: "Never force-push shared history",
+    rationale: "A workflow gotcha must out-rank generic git facts when the agent is about to rewrite shared history.",
+    seed: [
+      {
+        key: "force-push",
+        kind: "issue",
+        content:
+          "Gotcha: never force-push to main or any shared branch — rewriting already-pushed history breaks every teammate's clone. Undo with a fresh revert commit instead.",
+      },
+    ],
+    distractors: [{ key: "d-stash", content: "Use `git stash` to shelve work-in-progress before switching branches." }],
+    probes: [
+      {
+        category: "mistake",
+        query: "My branch history is messy and a couple of people have already pulled it; I'll just force-push to tidy it up.",
+        gold: ["force-push"],
+        note: "The gotcha must surface so the agent doesn't rewrite shared history and strand teammates.",
+      },
+    ],
+  },
+  {
+    id: "commit-convention",
+    title: "Conventional Commits",
+    rationale: "An established convention worded differently from the query must resurface so messages match the house format.",
+    seed: [
+      {
+        key: "commit-convention",
+        kind: "preference",
+        content:
+          "Commit messages follow Conventional Commits (feat:/fix:/chore:/docs: prefixes); the release changelog is generated from them, so the prefix is load-bearing.",
+      },
+    ],
+    distractors: [{ key: "d-release-notes", content: "Human-readable release notes are drafted by hand in the GitHub Releases UI." }],
+    probes: [
+      {
+        category: "reexplain",
+        query: "How should I word the message when I commit this change?",
+        gold: ["commit-convention"],
+        note: "Paraphrase of the commit-format rule; competes with release/changelog background noise.",
+      },
+    ],
+  },
+  {
+    id: "dep-policy",
+    title: "New dependencies need sign-off",
+    rationale: "A team policy must resurface so the agent doesn't silently add a dependency that was meant to be discussed.",
+    seed: [
+      {
+        key: "dep-policy",
+        kind: "decision",
+        content:
+          "Policy: adding a new runtime dependency requires a maintainer sign-off; prefer the standard library or an existing dependency before reaching for a new package.",
+      },
+    ],
+    distractors: [{ key: "d-renovate", content: "Renovate opens automated pull requests to bump existing dependencies every week." }],
+    probes: [
+      {
+        category: "reexplain",
+        query: "Can I just pull in a small npm package to handle this instead of writing it myself?",
+        gold: ["dep-policy"],
+        note: "The established add-a-dependency policy must resurface instead of being re-litigated each time.",
+      },
+    ],
+  },
+  {
+    id: "cache-thread",
+    title: "Restore the lookup-cache thread (five members)",
+    rationale:
+      "Currently the widest restoration thread (5 concepts) — recall over more divergent members is exactly where plain top-k drops most and graph-backed gather has the most to add. Recovered via same-session co-occurrence, with an in-session tangent so co-occurrence isn't a pristine gold-only clique.",
+    seed: [
+      { key: "cache-task", kind: "fact", content: "Adding an in-memory LRU in front of the concept lookup path to cut repeated work within a single session." },
+      { key: "cache-decision", kind: "decision", content: "Chose a bounded LRU with a five-minute time-to-live over a Redis round-trip — the local tier should avoid a network hop." },
+      { key: "cache-openq", kind: "issue", content: "Unresolved: how to evict a cached entry the instant its underlying record is edited part-way through a session." },
+      { key: "cache-measure", kind: "fact", content: "Measured the payoff: median lookup latency fell from roughly forty milliseconds to six after the change landed." },
+      { key: "cache-deferred", kind: "decision", content: "Deferred for now: making the cache capacity tunable per circle — a fixed ceiling is good enough at this stage." },
+    ],
+    tangents: [{ key: "cache-tan1", content: "Fixed an unrelated flaky timer assertion in the test suite while in this file." }],
+    probes: [
+      {
+        category: "restoration",
+        query: "Get me back into the lookup-caching work from last session.",
+        gold: ["cache-task", "cache-decision", "cache-openq", "cache-measure", "cache-deferred"],
+        note: "Five divergent members via session co-occurrence; the latency-measurement and deferred-sizing members are the ones plain search tends to drop.",
+      },
+    ],
+  },
+  {
+    id: "rollout-thread",
+    title: "Restore the gradual-rollout thread",
+    rationale:
+      "Another divergent restoration thread recovered via session co-occurrence — coverage beyond the existing threads; its members share little vocabulary, so same-session co-occurrence (not entity edges) carries the thread, with an in-session tangent for realism.",
+    seed: [
+      { key: "roll-task", kind: "fact", content: "Rolling out the reworked ranking gradually behind a runtime toggle rather than flipping it on for everyone at once." },
+      { key: "roll-decision", kind: "decision", content: "Chose a ten-percent canary cohort selected by hashing the user id, ramping daily as long as the metrics hold." },
+      { key: "roll-openq", kind: "issue", content: "Unresolved: there is still no automatic revert if its error rate spikes — backing it out is a manual flip today." },
+    ],
+    tangents: [{ key: "roll-tan1", content: "Renamed a confusing local variable in the ranker while I was already in the file." }],
+    probes: [
+      {
+        category: "restoration",
+        query: "Pick up the gradual rollout of the reworked ranking.",
+        gold: ["roll-task", "roll-decision", "roll-openq"],
+        note: "Divergent members (toggle / canary cohort / manual-revert gap) recovered via co-occurrence, not shared vocabulary.",
       },
     ],
   },

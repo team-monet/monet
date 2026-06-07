@@ -1,0 +1,71 @@
+name: Eval (MiniLM, nightly)
+
+# The real-recall gate. Runs the eval suite on the actual shipping
+# embedder (all-MiniLM-L6-v2 via @huggingface/transformers) — too slow/networked for every PR,
+# so it runs nightly and on demand. src/__tests__/eval.onnx.test.ts FAILS the job on a
+# semantic-recall regression; `pnpm eval` is also captured as a human-readable artifact.
+#
+# Note: scheduled runs only fire from the default branch. Use the "Run workflow" button
+# (workflow_dispatch) to trigger it on a branch.
+
+on:
+  schedule:
+    - cron: "17 7 * * *" # 07:17 UTC nightly (off the top of the hour, per GitHub guidance)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  minilm-eval:
+    name: MiniLM recall gate + report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # onnxruntime-node ships a prebuilt linux/x64 binary inside the package (no build script),
+      # so a plain install yields a working MiniLM on ubuntu-latest — no approve-builds needed.
+      - name: Install dependencies (incl. optional @huggingface/transformers)
+        run: pnpm install --frozen-lockfile
+
+      # transformers.js v3 ignores cache-dir env vars and caches the model INSIDE node_modules,
+      # so this targets that path (after install, which recreates node_modules). Best-effort: a
+      # miss just re-downloads the model. Any pnpm-lock.yaml change busts the exact key, but the
+      # restore-keys prefix still reuses the previous cache, so a full re-download is rare.
+      - name: Cache the MiniLM model
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.pnpm/@huggingface+transformers@*/node_modules/@huggingface/transformers/.cache
+          key: minilm-model-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            minilm-model-${{ runner.os }}-
+
+      - name: MiniLM recall gate (fails the job on a semantic-recall regression)
+        env:
+          MONET_EVAL_ONNX: "1"
+        run: pnpm exec vitest run --dir src eval.onnx
+
+      - name: Capture the eval report
+        if: always()
+        run: pnpm -s eval --embedder=onnx --verbose | tee eval-report.txt
+
+      - name: Upload the eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minilm-eval-report
+          path: eval-report.txt
+          if-no-files-found: warn
