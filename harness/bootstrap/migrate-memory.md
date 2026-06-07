@@ -8,7 +8,7 @@
 - **Non-destructive until confirmed.** Preview every reassignment; apply only on an explicit go-ahead; work in batches; keep anything ambiguous in `"default"` and say so.
 
 ## Phase 0 — When to run this
-Run when `memory_overview(circle:"default")` shows a meaningful pile of legacy, unscoped memory, or whenever the user asks to organize / migrate / "sort out" their memory. Offer it during onboarding (`install.md` Phase 5) when a non-empty `"default"` circle is detected.
+Run when the legacy `"default"` circle holds a meaningful pile of unscoped memory — gauge it with `memory_list(circle:"default")` (or `memory_overview` / a broad `memory_search` if your runtime exposes them) — or whenever the user asks to organize / migrate / "sort out" their memory. Offer it during onboarding (`install.md` Phase 5) when a non-empty `"default"` circle is detected.
 
 ## Phase 1 — Map the user's projects
 Ask the user for the **root folder** that holds their work (e.g. `~/code`, `~/work`, `~/src`). Scan it (your own file tools):
@@ -19,7 +19,7 @@ Ask the user for the **root folder** that holds their work (e.g. `~/code`, `~/wo
 Present the map and ask for the shape: *"Under `~/code` I see `acme-api`, `acme-web`, and a monorepo `platform` (3 packages). Want one circle per repo, group `acme-*` into one `acme` circle, split the monorepo by package, or something else?"* Confirm the grouping and names **before touching any memory**.
 
 ## Phase 2 — Read the existing memory
-List and read what's in `"default"`: `memory_overview(circle:"default")` for shape, then read concepts. For each memory you have two strong signals for where it belongs:
+Enumerate `"default"` with `memory_list(circle:"default", withProvenance:true)` (and `memory_overview` for a quick shape, if available), then `memory_fetch` the ones you need to read in full. For each memory you have two strong signals for where it belongs:
 - its **content** — the files, services, decisions, and conventions it's about; and
 - its **provenance** — the project path(s) it was originally created in (Monet recorded the working directory on every session). Provenance is the strongest prior; content disambiguates and catches cross-project facts.
 
@@ -31,16 +31,21 @@ Group the memories against the Phase 1 projects and present your proposal in **d
 Let the user correct, merge, split, or send a memory to a shared/global circle. For a memory that genuinely **spans projects** (only possible because everything shared one circle, so it merged), say so plainly and offer the choice: home it in the dominant project, copy it into each, or keep it shared. The user's preference wins — don't guess silently.
 
 ## Phase 4 — Apply
-On confirmation, reassign each memory's circle with `memory_reassign_circle` (moves the concept, its observations, and its graph membership into the target circle — no re-embedding, no duplicates; dedupes into an existing target concept if one matches). Work through the confirmed batches, reporting progress. Leave anything the user wasn't sure about in `"default"` and tell them what's still there.
+On confirmation, work through the confirmed batches, reporting progress:
+- **Move** (the common case): `memory_reassign_circle(id, toCircle)` — moves the concept, its observations, and its graph membership into the target circle (no re-embedding, no duplicates; dedupes into an existing target concept if one matches).
+- **Copy into several** (a shared decision/convention the user wants in multiple projects): reassign it to its home circle, then `memory_store` its content into each additional circle (re-storing dedupes within that circle). Reassign *moves*, store *copies* — don't expect repeated reassigns to leave a memory in more than one place.
+
+Leave anything the user wasn't sure about in `"default"` and tell them what's still there.
 
 ## Phase 5 — Verify and hand off
-For each new circle, run `memory_overview` and show the user their memory, now organized: *"Here's what each project now knows."* Confirm it feels right. From here every project session prewarms only its own circle — clean, isolated, and theirs. Note that new memory auto-scopes to the project going forward, so this is a one-time tidy-up.
+For each new circle, show the user their memory, now organized (`memory_list`/`memory_overview`): *"Here's what each project now knows."* Confirm it feels right. On a runtime that scopes per project, each session now prewarms only its own circle and new memory auto-scopes there — a one-time tidy-up. (If the runtime doesn't yet auto-scope, say so plainly: this organized the *existing* memory, but new writes still land in `"default"` until per-project circles are configured.)
 
 ---
 
 ## Tools this playbook relies on
-- `memory_overview(circle)` — counts + shape of a circle. *(exists)*
-- `memory_search` / `memory_fetch(id)` — read a memory's content. *(exists)*
+- `memory_search` / `memory_fetch(id)` — find and read a memory's content. *(exists)*
+- `memory_store(content, circle)` — used for the **copy-into-each** case (re-store a shared memory into an extra circle). *(exists)*
+- `memory_overview(circle)` — quick counts + shape of a circle, if your runtime exposes it. *(optional)*
 - **`memory_list(circle, withProvenance)`** — enumerate every concept in a circle with its content card **and** the project path(s) its observations came from (the recorded session scope). *Lets you group by provenance + content.* *(new — substrate work)*
 - **`memory_reassign_circle(id, toCircle)`** — move a concept + its observations + graph membership to another circle, deduping into any existing target concept. *(new — substrate work)*
 
