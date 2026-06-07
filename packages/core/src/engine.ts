@@ -460,7 +460,7 @@ export class MonetCore {
 
   /** Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty. */
   async store(content: string, opts: { circle?: string; kind?: string; sourceRefs?: string[] } = {}): Promise<IngestResult> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const emb = await this.embedder.embed(content);
     const obsId = this.newId();
     const sessionId = this.ensureSession();
@@ -529,7 +529,7 @@ export class MonetCore {
    * hint — and deliberately NO content. Never triggers synthesis. (ADR §4.5, #232.)
    */
   async search(query: string, opts: { circle?: string; limit?: number } = {}): Promise<SearchCard[]> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const limit = opts.limit ?? 5;
     const emb = await this.embedder.embed(query);
     // Workstreams are identity-upserted state, not embedding-resolved knowledge — keep them
@@ -597,7 +597,7 @@ export class MonetCore {
    * never marked dirty. Restored next session via getActiveWorkstreams / prewarm (#242).
    */
   async saveWorkstream(payload: WorkstreamPayload, opts: { circle?: string; summary?: string } = {}): Promise<Workstream> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const sessionId = this.ensureSession();
     const full: WorkstreamPayload = { ...payload, lastSessionId: sessionId };
     const slug = `workstream:${circle}`;
@@ -652,7 +652,8 @@ export class MonetCore {
    * contradictions. Bounded + ranked. Carries identity/shape, never concept bodies
    * (the no-answer-leak rule, §4.5) — the agent fetches a concept when it needs content.
    */
-  prewarm(circle = "default", opts: { conceptLimit?: number } = {}): PrewarmState {
+  prewarm(circle?: string, opts: { conceptLimit?: number } = {}): PrewarmState {
+    circle ??= this.defaultCircle;
     const conceptLimit = opts.conceptLimit ?? 7;
     const now = Date.now();
 
@@ -837,6 +838,20 @@ export class MonetCore {
     return this.defaultCircle;
   }
 
+  /** The circle a concept lives in, or null if it doesn't exist — for id-based scope enforcement. */
+  circleOf(conceptId: string): string | null {
+    const r = this.db.prepare(`SELECT circle FROM concepts WHERE id = ?`).get(conceptId) as { circle: string } | undefined;
+    return r?.circle ?? null;
+  }
+
+  /** The circle of the concept a contradiction belongs to, or null — for id-based scope enforcement. */
+  circleOfContradiction(contradictionId: string): string | null {
+    const r = this.db
+      .prepare(`SELECT c.circle AS circle FROM contradictions k JOIN concepts c ON c.id = k.concept_id WHERE k.id = ?`)
+      .get(contradictionId) as { circle: string } | undefined;
+    return r?.circle ?? null;
+  }
+
   conceptCount(circle = "default"): number {
     const r = this.db
       .prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind != 'workstream'`)
@@ -1015,7 +1030,8 @@ export class MonetCore {
   }
 
   /** Concepts mentioning an entity (hub drill-in). */
-  conceptsForEntity(entityKey: string, circle = "default"): Array<{ id: string; title: string; kind: string }> {
+  conceptsForEntity(entityKey: string, circle?: string): Array<{ id: string; title: string; kind: string }> {
+    circle ??= this.defaultCircle;
     return this.db
       .prepare(
         `SELECT c.id AS id, c.title AS title, c.kind AS kind
@@ -1038,9 +1054,10 @@ export class MonetCore {
    * triggers no synthesis, never returns bodies. Composes prewarm + scoped counts + graph shape.
    */
   overview(
-    circle = "default",
+    circle?: string,
     opts: { conceptLimit?: number; hubLimit?: number; connectedLimit?: number } = {},
   ): MemoryOverview {
+    circle ??= this.defaultCircle;
     const pre = this.prewarm(circle, { conceptLimit: opts.conceptLimit ?? 6 });
     const edgesByType = this.edgeCountsByType(circle);
     const edges = edgesByType.reduce((a, e) => a + e.count, 0);
@@ -1339,7 +1356,7 @@ export class MonetCore {
    * thread members similarity alone misses. Cold graph ⇒ degrades exactly to search().
    */
   async gather(intent: string, opts: { circle?: string; limit?: number; depth?: number } = {}): Promise<GatherResult> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const limit = opts.limit ?? 12;
     const params = opts.depth ? { ...this.graphParams, hopLimit: Math.max(1, Math.min(opts.depth, 3)) } : this.graphParams;
     const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };

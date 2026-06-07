@@ -148,6 +148,9 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     { id: z.string() },
     async ({ id }) => {
       try {
+        // Scope enforcement: an id from another project's circle must not be readable here (ids leak
+        // across sessions / get pasted from prior output). Check before getConcept's usefulness bump.
+        if (core.circleOf(id) !== dc) return err(`concept not found: ${id}`);
         const c = await core.getConcept(id, { synthesize: false });
         if (!c) return err(`concept not found: ${id}`);
         // Bound the result: keep the most-recent observations and clip long text, so a heavily-supported
@@ -200,6 +203,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     { id: z.string(), body: z.string() },
     async ({ id, body }) => {
       try {
+        if (core.circleOf(id) !== dc) return err(`concept not found: ${id}`); // scope enforcement
         const c = await core.applySynthesis(id, body);
         if (!c) return err(`concept not found: ${id}`);
         return ok({ id: c.id, version: c.version, dirty: c.dirty, message: "synthesis stored" });
@@ -258,6 +262,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     },
     async ({ conceptId, detail, observationId, kind }) => {
       try {
+        if (core.circleOf(conceptId) !== dc) return err(`concept not found: ${conceptId}`); // scope enforcement
         const c = core.flagContradiction(conceptId, { detail, observationId, kind });
         return ok({ contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail });
       } catch (e) {
@@ -277,6 +282,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     },
     async ({ contradictionId, decision, body, resolvedBy }) => {
       try {
+        if (core.circleOfContradiction(contradictionId) !== dc) return err(`contradiction not found: ${contradictionId}`); // scope enforcement
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
         return ok({ conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });

@@ -64,16 +64,25 @@ describe("default circle — per-project isolation in a shared store", () => {
     d.close();
   });
 
+  it("core APIs honor defaultCircle without an explicit circle (engine, not just the MCP wrapper)", async () => {
+    const core = new MonetCore(":memory:", { defaultCircle: "proj-a" });
+    await core.store("Project A standardized on SQLite."); // NO circle passed
+    expect(core.conceptCount("proj-a")).toBe(1); // landed in the default circle, not "default"
+    expect(core.conceptCount("default")).toBe(0);
+    expect((await core.search("SQLite")).length).toBeGreaterThan(0); // search also scopes to proj-a
+    core.close();
+  });
+
   it("two projects sharing one store don't see each other's memory", async () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-circle-"));
     const dbPath = join(dir, "monet.db");
     try {
-      // Each runtime stores into its own default circle (what the MCP server does on a circle-less call).
+      // Each runtime stores with no explicit circle — the engine routes it to that runtime's default circle.
       const a = new MonetCore(dbPath, { defaultCircle: "proj-a" });
-      await a.store("Project A standardized on SQLite.", { circle: a.getDefaultCircle() });
+      await a.store("Project A standardized on SQLite.");
       a.close();
       const b = new MonetCore(dbPath, { defaultCircle: "proj-b" });
-      await b.store("Project B standardized on Postgres.", { circle: b.getDefaultCircle() });
+      await b.store("Project B standardized on Postgres.");
       b.close();
       // Same physical DB, but each project's concept lives only in its own circle.
       const verify = new MonetCore(dbPath);
