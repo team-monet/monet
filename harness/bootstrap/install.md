@@ -39,7 +39,7 @@ Write an MCP server entry for **this host** (template: `with-monet/mcp/monet.jso
 { "mcpServers": { "monet": { "command": "monet", "args": ["start"] } } }
 ```
 
-Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override. (Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`.) Merge into the host's MCP config (don't clobber existing servers), then verify it comes up — it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_gather`, `memory_fetch`, `memory_synthesize`, `memory_overview`, `memory_list`, `memory_reassign_circle`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
+Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override. (Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`.) Merge into the host's MCP config (don't clobber existing servers), then verify it comes up — it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools the published server exposes: `agent_context`, `memory_store`, `memory_search`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`. (Newer runtimes additionally expose `memory_gather`, `memory_overview`, `memory_list`, `memory_reassign_circle`, `memory_flag_contradiction`, `memory_resolve` — the consolidation playbook uses these **when present**; check your actual tool list rather than assuming.)
 
 ## Phase 4 — Install the agent team (host-specific)
 
