@@ -111,7 +111,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       try {
-        if (entity) return ok({ entity, concepts: core.conceptsForEntity(entity, scope(circle)) });
+        if (entity) return ok({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) });
         return ok({ ...core.overview(scope(circle)) });
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
@@ -241,11 +241,12 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         const saved = workstream ? await core.saveWorkstream(workstream, { circle: scope(circle), summary }) : null;
         const dirty = core.listDirty(scope(circle));
         return ok({
+          circle: scope(circle),
           workstream: saved ? { id: saved.id, status: saved.payload.status, version: saved.version } : null,
           dirtyCount: dirty.length,
           dirty,
           guidance: dirty.length
-            ? "For each dirty concept: read observations → write a coherent body → memory_synthesize(id, body)."
+            ? "For each dirty concept: read observations → write a coherent body → memory_synthesize(id, body). If `circle` above isn't your session default, pass it: memory_synthesize(id, body, circle)."
             : saved
               ? "Workstream saved — next session's agent_context will restore it. Nothing left to synthesize."
               : "Nothing to synthesize.",

@@ -635,7 +635,8 @@ export class MonetCore {
   }
 
   /** Restore a circle's active/paused workstreams (the read path prewarm #242 consumes). */
-  getActiveWorkstreams(circle = "default"): Workstream[] {
+  getActiveWorkstreams(circle?: string): Workstream[] {
+    circle ??= this.defaultCircle;
     const rows = this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind = 'workstream' AND status != 'archived'`)
       .all(circle) as ConceptRow[];
@@ -759,7 +760,8 @@ export class MonetCore {
   }
 
   /** Open contradictions in a circle, joined with concept titles (prewarm + listing). */
-  getOpenContradictions(circle = "default"): PrewarmContradiction[] {
+  getOpenContradictions(circle?: string): PrewarmContradiction[] {
+    circle ??= this.defaultCircle;
     return this.db
       .prepare(
         `SELECT k.id AS id, k.concept_id AS conceptId, c.title AS conceptTitle, k.kind AS kind, k.detail AS detail
@@ -771,7 +773,8 @@ export class MonetCore {
   }
 
   /** Active concepts unconfirmed past staleAfterMs (ADR §4.4) — detectable + surfaced at prewarm. */
-  getStaleConcepts(circle = "default"): LivingModelCard[] {
+  getStaleConcepts(circle?: string): LivingModelCard[] {
+    circle ??= this.defaultCircle;
     const now = Date.now();
     const rows = this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' AND status = 'active'`)
@@ -846,7 +849,8 @@ export class MonetCore {
     return r?.circle ?? null;
   }
 
-  conceptCount(circle = "default"): number {
+  conceptCount(circle?: string): number {
+    circle ??= this.defaultCircle;
     const r = this.db
       .prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind != 'workstream'`)
       .get(circle) as { n: number };
@@ -902,9 +906,10 @@ export class MonetCore {
    * rank before plain nouns. Without this gate a df=12 filler noun outranks a df=3 real symbol.
    */
   topEntityHubs(
-    circle = "default",
+    circle?: string,
     opts: { limit?: number; minMembers?: number; maxDfFrac?: number; nounMinMembers?: number } = {},
   ): EntityHub[] {
+    circle ??= this.defaultCircle;
     const limit = opts.limit ?? 6;
     const minMembers = opts.minMembers ?? 2;
     const nounMin = opts.nounMinMembers ?? 3; // a structural entity anchors at 2; a plain noun needs more
@@ -933,7 +938,8 @@ export class MonetCore {
    * worked-together / causal). Excludes `related`/`about` — otherwise similarity edges float
    * near-duplicate filler to the top and bury the real cluster.
    */
-  topConnectedConcepts(circle = "default", limit = 6): ConnectedConcept[] {
+  topConnectedConcepts(circle?: string, limit = 6): ConnectedConcept[] {
+    circle ??= this.defaultCircle;
     const placeholders = [...THREAD_TYPES].map(() => "?").join(",");
     // Count distinct thread/causal neighbours in BOTH directions (matching adjacency()'s traversal):
     // directed causal edges (supports/resolves/derived_from/…) are stored one-way, so a hub that
@@ -960,7 +966,8 @@ export class MonetCore {
   }
 
   /** Undirected edge counts by type (symmetric mirror collapsed, directed counted once). */
-  edgeCountsByType(circle = "default"): Array<{ type: string; count: number }> {
+  edgeCountsByType(circle?: string): Array<{ type: string; count: number }> {
+    circle ??= this.defaultCircle;
     return this.db
       .prepare(
         `SELECT type, COUNT(*) AS count FROM (
@@ -972,7 +979,8 @@ export class MonetCore {
   }
 
   /** The single largest "worked together" cluster (co_occurred connected component), or null. */
-  topThread(circle = "default", minSize = 2): MemoryOverview["graph"]["thread"] {
+  topThread(circle?: string, minSize = 2): MemoryOverview["graph"]["thread"] {
+    circle ??= this.defaultCircle;
     const edges = this.edges({ circle, type: "co_occurred" });
     if (edges.length === 0) return null;
     const adj = new Map<string, Set<string>>();
@@ -1035,7 +1043,8 @@ export class MonetCore {
       .all(entityKey, circle) as Array<{ id: string; title: string; kind: string }>;
   }
 
-  private disputedCount(circle = "default"): number {
+  private disputedCount(circle?: string): number {
+    circle ??= this.defaultCircle;
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND status = 'disputed'`).get(circle) as { n: number }).n;
   }
 
