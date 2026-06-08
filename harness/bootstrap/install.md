@@ -14,11 +14,13 @@ Work through the phases in order. After each, tell the user what happened in one
 
 ## Phase 1 — Orient
 
-1. Identify your host: which coding agent are you running inside (Claude Code, Cursor, Continue, Aider, …)? Note (a) where this host reads **MCP server config** and (b) where it reads **agent/subagent prompts**.
-   - Claude Code → MCP: `./.mcp.json`; agents: `./.claude/agents/<name>.md`.
-   - Cursor → MCP: `./.cursor/mcp.json`; agents: rules/prompts dir.
-   - Unknown host → ask the user where its MCP config and custom-agent prompts live.
-2. Confirm: *"You're on **<host>**, in **<repo>**. I'll set up Monet for it — open questions: anything special about your setup?"*
+You install Monet **globally for this user** (every project), not just the current repo — so the team and memory work everywhere without re-installing per project. (If the user prefers, you can scope it to just this repo instead — confirm in step 2.)
+
+1. Identify your host (Claude Code, Cursor, Continue, Aider, …) and note where it reads, **at user scope**, (a) **MCP server config** and (b) **agent/subagent prompts**.
+   - Claude Code → MCP: user scope via `claude mcp add --scope user …` (or `~/.claude.json`); subagents: `~/.claude/agents/<name>.md`; lead persona: `~/.claude/CLAUDE.md` (global memory). *(Project scope, if requested: `./.mcp.json`, `./.claude/agents/<name>.md`, `./CLAUDE.md`.)*
+   - Cursor → MCP: `~/.cursor/mcp.json`; agents: its user-level rules/prompts dir.
+   - Unknown host → ask the user where its user-level MCP config and custom-agent prompts live.
+2. Confirm: *"You're on **<host>**. I'll install Monet **globally** so it works across all your projects — or scoped to just this repo if you'd rather. Anything special about your setup?"*
 
 ## Phase 2 — Get Monet
 
@@ -31,33 +33,50 @@ Goal: the `monet` MCP server (the state-centric memory substrate) available on t
   Zero-install alternative: `npx -y @team-monet/monet start`. Requires `node` ≥ 22 and network access — the first run downloads the MiniLM embedding model once.
 - Dev / unpublished fallback: clone `team-monet/monet`, then `pnpm install && pnpm build`, and use `node <abs>/dist/index.js`.
 
-## Phase 3 — Configure the monet MCP server (host-specific)
+## Phase 3 — Configure the monet MCP server (user scope)
 
-Write an MCP server entry for **this host** (template: `with-monet/mcp/monet.json`). With the published CLI:
+Register `monet` at **user scope** so it's available in every project (template: `with-monet/mcp/monet.json`):
 
-```jsonc
-{ "mcpServers": { "monet": { "command": "monet", "args": ["start"] } } }
-```
+- **Claude Code:** `claude mcp add --scope user monet -- monet start`, or merge the entry below into `~/.claude.json` under `mcpServers`:
+  ```jsonc
+  { "mcpServers": { "monet": { "command": "monet", "args": ["start"] } } }
+  ```
+  *(Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`. Per-repo install instead: write `./.mcp.json`.)*
 
-Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override. (Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`.) Merge into the host's MCP config (don't clobber existing servers), then verify it comes up — it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools the published server exposes: `agent_context`, `memory_store`, `memory_search`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`. (Newer runtimes additionally expose `memory_gather`, `memory_overview`, `memory_list`, `memory_reassign_circle`, `memory_flag_contradiction`, `memory_resolve` — the consolidation playbook uses these **when present**; check your actual tool list rather than assuming.)
+**Storage is one global brain, isolated per project.** With no `MONET_STORAGE_DIR`, the store lives at `~/.monet` (shared across all your projects) and Monet isolates each project into its own *circle* automatically, so memory never bleeds between repos. Per-project auto-isolation needs `@team-monet/monet` recent enough to derive the circle from the working tree; on older versions the global store is shared across projects — if that matters, set `env.MONET_STORAGE_DIR` to a per-project path (e.g. `<repo>/.monet`) for a hard filesystem split.
 
-## Phase 4 — Install the agent team (host-specific)
+Merge into the host's **user-level** MCP config **without clobbering existing servers** — read it, add `monet`, write it back, and back up the file first. Verify it comes up: it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_overview`, `memory_gather`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
 
-**Always install the full team.** Stig is a context engine whose entire purpose is to orchestrate the worker actuators — never install Stig alone. Stig is the **lead** (the one the user talks to, the only one that delegates, and the only one that touches Monet); the workers are its **subagent actuators**.
+## Phase 4 — Install the agent team (user scope)
+
+**Always install the full team.** Stig is a context engine whose entire purpose is to orchestrate the workers — never install Stig alone. Stig is the **lead** (the one the user talks to, the only one that delegates, the only one that touches Monet); the workers are its **subagent actuators**.
 
 - **Claude Code:**
-  - **Workers → subagents.** Write one `.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, security, reliability, aria` — each = a frontmatter header (`name` + the worker's `role` from `roster.json` as `description`), then a `<!-- MONET:AGENT -->` sentinel line (right after the frontmatter), then the agent body from `agents/<name>.md` (local checkout or the raw base above). The sentinel lets a later consolidation pass tell Monet's installed workers apart from the user's *own* custom `.claude/agents/*.md`.
-  - **Stig → lead.** Append the body of `agents/stig.md` into the repo's `CLAUDE.md` so the main agent acts as Stig and can delegate to the worker subagents (a subagent can't spawn subagents, so the lead must be the main agent). **Wrap the appended prompt in the exact sentinels below** (bare markers — a later memory-consolidation pass keys on them to retire the *user's* knowledge from `CLAUDE.md` without ever touching Stig's prompt; keep the `BEGIN MONET:STIG` / `END MONET:STIG` tokens verbatim):
+  - **Workers → user-level subagents.** Write one `~/.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, security, reliability, aria`. Each file is YAML frontmatter + the body from `agents/<name>.md`. Pull the frontmatter from that worker's entry in `roster.json`:
+    - `name` → frontmatter `name`
+    - `description` → frontmatter `description` — **this trigger text is what makes Claude Code actually delegate** (its auto-dispatch matches the task against the description). Use it verbatim; do **not** replace it with a bare role label. The descriptions contain colons, so **quote them** in YAML (`description: "…"`) or the frontmatter won't parse.
+    - `model` → frontmatter `model` (`haiku`/`sonnet`/`opus`, or omit to inherit the session model). These are sensible defaults — offer to retune (e.g. cheaper models for read-only workers, stronger for `reviewer`/`security`).
+    ```md
+    ---
+    name: explorer
+    description: "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, …"
+    model: haiku
+    ---
+    <!-- with-monet:agent -->
+    <body of agents/explorer.md>
     ```
-    <!-- BEGIN MONET:STIG -->
-    <!-- Monet-managed; do not capture, retire, or edit. -->
+    Add the `<!-- with-monet:agent -->` marker right after the frontmatter — it lets a later memory-consolidation pass tell Monet's installed workers apart from your *own* custom subagents, so it never captures or retires the team.
+    **Don't clobber.** If `~/.claude/agents/<name>.md` already exists, back it up (`<name>.md.bak`) and tell the user before overwriting — generic names (`developer`, `reviewer`, …) can collide with the user's own subagents.
+  - **Stig → lead, in global memory.** Append the body of `agents/stig.md` to `~/.claude/CLAUDE.md` so the **main agent** acts as Stig in every project and can delegate to the workers via the Task tool (a subagent can't spawn subagents, so the lead must be the main agent). Wrap it in idempotent markers so re-running doesn't duplicate it:
+    ```
+    <!-- BEGIN with-monet:stig -->
     …agents/stig.md body…
-    <!-- END MONET:STIG -->
+    <!-- END with-monet:stig -->
     ```
-    Append; don't clobber anything already in `CLAUDE.md`.
-- **Cursor / Continue / others** — install the lead + the worker team in that host's agent format; ask the user where those live. **Mark every installed prompt file** (lead and workers) with a `<!-- MONET:AGENT -->` sentinel as the file's first line — **but for formats with leading frontmatter (e.g. Cursor `.mdc` rules, whose `---` block sets `description`/`globs`/`alwaysApply`), put the sentinel immediately *after* the closing `---`** so you don't shove a comment ahead of the frontmatter and break activation. On hosts where the team lives in a rules/prompts dir the consolidation pass would otherwise scan (`.cursor/rules`, `.continue/rules`, …), this marker is what stops it from capturing/retiring Monet's own wiring. (Claude Code's workers in `.claude/agents/` carry the same `MONET:AGENT` marker — consolidation recognizes Monet's workers by that marker or their installed names, **not** a blanket `.claude/agents/` path skip, so your own custom subagents there are still treated as user knowledge.)
+    If the markers already exist, replace the block in place; never append a second copy, and never clobber the user's other `CLAUDE.md` content (back it up first).
+- **Cursor / Continue / others** — install the lead + worker team in that host's user-level agent format; ask the user where those live. **Mark each installed prompt** with a `<!-- with-monet:agent -->` sentinel (after any leading frontmatter — e.g. Cursor `.mdc` rules — so you don't break activation metadata), so a consolidation pass never captures or retires Monet's own wiring.
 
-The user may request a trimmed worker set, but the team is the default — never reduce to Stig-only.
+The user may request a trimmed worker set, but the full team is the default — never reduce to Stig-only.
 
 ## Phase 5 — Offer the memory-ingest pipeline
 
@@ -67,15 +86,15 @@ Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"*
 - a path or URL the user names,
 - skip for now.
 
-For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. **Skip Monet's own wiring:** when the source is `CLAUDE.md` (which you just appended Stig's prompt to) or any installed agent prompt, do **not** store anything inside the `<!-- BEGIN MONET:STIG -->…<!-- END MONET:STIG -->` block or any `<!-- MONET:AGENT -->`-marked file — that's the lead/worker prompt, not the user's knowledge. Summarize what landed.
+For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. **Skip Monet's own wiring:** when the source is `CLAUDE.md` (which holds Stig's prompt) or an installed agent prompt, don't store the `<!-- BEGIN with-monet:stig -->…<!-- END with-monet:stig -->` block or any `<!-- with-monet:agent -->`-marked file. Summarize what landed.
 
-If you find a real pile of existing memory — a non-empty legacy `"default"` circle, other agents' rule files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, or scattered notes/ADRs — offer the fuller **consolidation** flow ([`bootstrap/consolidate-memory.md`](consolidate-memory.md)): capture each source into Monet *and then retire it* (a pointer or archive), so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; the consolidation playbook does the organize-and-retire, interactively and reversibly.
+**Existing memory to consolidate?** If you find a meaningful pile — a non-empty legacy `"default"` circle (`memory_overview(circle:"default")`), other agents' rule files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, or scattered notes/ADRs — don't leave it scattered. Offer the interactive consolidation playbook [`bootstrap/consolidate-memory.md`](consolidate-memory.md) (same raw-URL base as above): capture each source into Monet, organize into per-project circles *with* the user, then retire the source (a pointer or archive) so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; consolidation does the organize-and-retire, interactively and reversibly. Skip if there's nothing meaningful to consolidate.
 
 ## Phase 6 — Offer to start
 
-If the host only loads MCP servers at launch (Claude Code reads `.mcp.json` on startup), tell the user to reload/restart the session so `monet` connects before starting.
+If the host only loads MCP servers at launch (Claude Code picks up user-scope servers and `~/.claude/agents/` on startup), tell the user to reload/restart so `monet` connects and the team registers before starting.
 
-Ask: *"Ready? I'll run `agent_context` to restore state and begin as Stig on this repo."* On yes: call `agent_context` (no query), report the restored state (active workstreams, living model, open contradictions), and continue as Stig.
+Ask: *"Ready? I'll run `agent_context` to restore state and begin as Stig on this project."* On yes: call `agent_context` (no query), report the restored state (active workstreams, living model, open contradictions), and continue as Stig.
 
 ## Phase 7 — One last thing (star Monet)
 
@@ -90,4 +109,5 @@ If they say yes, open the URL for them; **don't star on their behalf** (it's the
 ## Principles
 - **Agent-first:** you do the install; the user converses, approves, and steers.
 - **Fix-forward:** on any failure, diagnose and resolve with the user rather than dumping a stack trace.
-- **Customizable:** honor preferences surfaced along the way — storage location, which agents to install, ingest scope, how much autonomy Stig gets.
+- **Customizable:** honor preferences surfaced along the way — global vs per-repo install, storage location, which workers to install and on which models, ingest scope, how much autonomy Stig gets.
+- **Non-destructive:** back up before overwriting, merge into existing config rather than replacing it, and never clobber the user's own subagents or `CLAUDE.md`.

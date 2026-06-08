@@ -1,5 +1,5 @@
 {
-  "_comment": "MCP config template for the Monet server. Install it first: `npm i -g @team-monet/monet` (or use the npx command below). Copy into your host's MCP config (.mcp.json for Claude Code). Storage defaults to <repo>/.monet; set env.MONET_STORAGE_DIR to override.",
+  "_comment": "MCP config template for the Monet server. Install it first: `npm i -g @team-monet/monet` (or use the npx command below). Register at USER scope for all projects (Claude Code: `claude mcp add --scope user monet -- monet start`, or merge into ~/.claude.json), or per-repo into ./.mcp.json. Storage defaults to the global ~/.monet (isolated per project by circle); set env.MONET_STORAGE_DIR for a per-repo store.",
   "mcpServers": {
     "monet": {
       "command": "monet",
