@@ -9,7 +9,7 @@
  * even in a reasonable budget?". A single loose k saturates to 100% on a small store and
  * measures nothing; the ladder exposes rank quality and leaves headroom for #245 to close.
  *
- * Per arm, at each k, we report the three metrics the roadmap names:
+ * Per arm, at each k, we report the three metrics the eval reports:
  *   - repeated-mistake rate = fraction of "mistake" probes whose gotcha is NOT fully in top-k
  *   - re-explain rate       = fraction of "reexplain" probes whose fact/decision is NOT in top-k
  *   - context-restoration   = mean recall@k over "restoration" probes (|gold ∩ topk| / |gold|)

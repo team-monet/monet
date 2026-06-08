@@ -29,4 +29,4 @@ Monet Core is licensed under the **GNU Affero General Public License v3.0** (`AG
 
 ## Status
 
-Public, open source under AGPL-3.0. Consumed by `monet` (the open client) and, internally, by the example-host and `example-agent`.
+Public, open source under AGPL-3.0. Consumed by `monet` (the open local client).
