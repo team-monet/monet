@@ -11,6 +11,7 @@ import fs from "node:fs";
 import { MonetCore } from "../src/engine";
 import { createLocalEmbedder } from "../src/embedding-onnx";
 import { createMonetCoreMcpServer } from "../src/mcp-server";
+import { deriveCircle } from "../src/circle";
 
 function resolveDbPath(): string {
   const projectDir = path.join(process.cwd(), ".monet");
@@ -23,10 +24,16 @@ function resolveDbPath(): string {
 
 async function main(): Promise<void> {
   const dbPath = resolveDbPath();
-  const core = new MonetCore(dbPath, { embedder: await createLocalEmbedder(), scopeContext: process.cwd() });
+  // Per-project circle so a shared ~/.monet store isolates per project (MONET_CIRCLE overrides).
+  const circle = process.env.MONET_CIRCLE || deriveCircle();
+  const core = new MonetCore(dbPath, {
+    embedder: await createLocalEmbedder(),
+    scopeContext: process.cwd(),
+    defaultCircle: circle,
+  });
   await createMonetCoreMcpServer(core);
   // stderr so it doesn't corrupt the stdio MCP channel
-  console.error(`monet-core MCP server running (stdio) · ${dbPath}`);
+  console.error(`monet-core MCP server running (stdio) · ${dbPath} · circle=${circle}`);
 }
 
 main().catch((e) => {

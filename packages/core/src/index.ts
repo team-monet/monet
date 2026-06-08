@@ -27,3 +27,4 @@ export { OnnxEmbeddingProvider, createLocalEmbedder } from "./embedding-onnx";
 export { DeterministicSynthesizer } from "./synthesis";
 export type { Synthesizer } from "./synthesis";
 export { createMonetCoreMcpServer } from "./mcp-server";
+export { deriveCircle } from "./circle";

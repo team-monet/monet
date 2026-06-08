@@ -238,6 +238,9 @@ export interface MonetCoreOptions {
   agentId?: string;
   /** Where this runtime is working (repo/path) — recorded on the session (ADR §3.6). */
   scopeContext?: string;
+  /** Circle used when a caller doesn't pass one. Lets a single shared store isolate per project:
+   *  the runtime derives a stable circle from the working tree and every memory op lands in it. Default "default". */
+  defaultCircle?: string;
   /** A concept unconfirmed for longer than this drifts active→stale (ADR §4.4). Default 30d. */
   staleAfterMs?: number;
   /** Id generator (default randomUUID). Inject a deterministic sequence for reproducible eval/tests. */
@@ -289,6 +292,7 @@ export class MonetCore {
   private tauAmbiguous: number;
   private agentId: string;
   private scopeContext: string | null;
+  private defaultCircle: string;
   private staleAfterMs: number;
   private sessionId: string | null = null; // lazily opened on first write/checkpoint
   private graphEnabled: boolean;
@@ -314,6 +318,7 @@ export class MonetCore {
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.scopeContext = opts.scopeContext ?? null;
+    this.defaultCircle = opts.defaultCircle ?? "default";
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
     this.graphEnabled = opts.graphEnabled ?? true;
     this.graphParams = { ...DEFAULT_GRAPH_PARAMS, ...opts.graph, wType: { ...DEFAULT_GRAPH_PARAMS.wType, ...opts.graph?.wType } };
@@ -455,7 +460,7 @@ export class MonetCore {
 
   /** Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty. */
   async store(content: string, opts: { circle?: string; kind?: string; sourceRefs?: string[] } = {}): Promise<IngestResult> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const emb = await this.embedder.embed(content);
     const obsId = this.newId();
     const sessionId = this.ensureSession();
@@ -524,7 +529,7 @@ export class MonetCore {
    * hint — and deliberately NO content. Never triggers synthesis. (ADR §4.5, #232.)
    */
   async search(query: string, opts: { circle?: string; limit?: number } = {}): Promise<SearchCard[]> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const limit = opts.limit ?? 5;
     const emb = await this.embedder.embed(query);
     // Workstreams are identity-upserted state, not embedding-resolved knowledge — keep them
@@ -576,11 +581,8 @@ export class MonetCore {
 
   /** Session checkpoint (touch, batch): synthesize every dirty concept. Returns the count. */
   async checkpoint(circle?: string): Promise<number> {
-    const rows = (
-      circle
-        ? this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle)
-        : this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1`).all()
-    ) as ConceptRow[];
+    circle ??= this.defaultCircle; // honor the per-project default; pass a circle explicitly to scope elsewhere
+    const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle) as ConceptRow[];
     for (const r of rows) await this.synthesizeRow(r);
     return rows.length;
   }
@@ -592,7 +594,7 @@ export class MonetCore {
    * never marked dirty. Restored next session via getActiveWorkstreams / prewarm (#242).
    */
   async saveWorkstream(payload: WorkstreamPayload, opts: { circle?: string; summary?: string } = {}): Promise<Workstream> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const sessionId = this.ensureSession();
     const full: WorkstreamPayload = { ...payload, lastSessionId: sessionId };
     const slug = `workstream:${circle}`;
@@ -633,7 +635,8 @@ export class MonetCore {
   }
 
   /** Restore a circle's active/paused workstreams (the read path prewarm #242 consumes). */
-  getActiveWorkstreams(circle = "default"): Workstream[] {
+  getActiveWorkstreams(circle?: string): Workstream[] {
+    circle ??= this.defaultCircle;
     const rows = this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind = 'workstream' AND status != 'archived'`)
       .all(circle) as ConceptRow[];
@@ -647,7 +650,8 @@ export class MonetCore {
    * contradictions. Bounded + ranked. Carries identity/shape, never concept bodies
    * (the no-answer-leak rule, §4.5) — the agent fetches a concept when it needs content.
    */
-  prewarm(circle = "default", opts: { conceptLimit?: number } = {}): PrewarmState {
+  prewarm(circle?: string, opts: { conceptLimit?: number } = {}): PrewarmState {
+    circle ??= this.defaultCircle;
     const conceptLimit = opts.conceptLimit ?? 7;
     const now = Date.now();
 
@@ -756,7 +760,8 @@ export class MonetCore {
   }
 
   /** Open contradictions in a circle, joined with concept titles (prewarm + listing). */
-  getOpenContradictions(circle = "default"): PrewarmContradiction[] {
+  getOpenContradictions(circle?: string): PrewarmContradiction[] {
+    circle ??= this.defaultCircle;
     return this.db
       .prepare(
         `SELECT k.id AS id, k.concept_id AS conceptId, c.title AS conceptTitle, k.kind AS kind, k.detail AS detail
@@ -768,7 +773,8 @@ export class MonetCore {
   }
 
   /** Active concepts unconfirmed past staleAfterMs (ADR §4.4) — detectable + surfaced at prewarm. */
-  getStaleConcepts(circle = "default"): LivingModelCard[] {
+  getStaleConcepts(circle?: string): LivingModelCard[] {
+    circle ??= this.defaultCircle;
     const now = Date.now();
     const rows = this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' AND status = 'active'`)
@@ -806,11 +812,8 @@ export class MonetCore {
 
   /** Concepts with unsynthesized evidence + their raw observations (for the agent to synthesize). */
   listDirty(circle?: string): Array<{ id: string; slug: string; kind: string; observations: string[] }> {
-    const rows = (
-      circle
-        ? this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle)
-        : this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1`).all()
-    ) as ConceptRow[];
+    circle ??= this.defaultCircle; // honor the per-project default; pass a circle explicitly to scope elsewhere
+    const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle) as ConceptRow[];
     return rows.map((r) => ({
       id: r.id,
       slug: r.slug,
@@ -827,7 +830,27 @@ export class MonetCore {
     return this.agentId;
   }
 
-  conceptCount(circle = "default"): number {
+  /** The circle applied when a caller passes none (per-project isolation in a shared store). */
+  getDefaultCircle(): string {
+    return this.defaultCircle;
+  }
+
+  /** The circle a concept lives in, or null if it doesn't exist — for id-based scope enforcement. */
+  circleOf(conceptId: string): string | null {
+    const r = this.db.prepare(`SELECT circle FROM concepts WHERE id = ?`).get(conceptId) as { circle: string } | undefined;
+    return r?.circle ?? null;
+  }
+
+  /** The circle of the concept a contradiction belongs to, or null — for id-based scope enforcement. */
+  circleOfContradiction(contradictionId: string): string | null {
+    const r = this.db
+      .prepare(`SELECT c.circle AS circle FROM contradictions k JOIN concepts c ON c.id = k.concept_id WHERE k.id = ?`)
+      .get(contradictionId) as { circle: string } | undefined;
+    return r?.circle ?? null;
+  }
+
+  conceptCount(circle?: string): number {
+    circle ??= this.defaultCircle;
     const r = this.db
       .prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind != 'workstream'`)
       .get(circle) as { n: number };
@@ -883,9 +906,10 @@ export class MonetCore {
    * rank before plain nouns. Without this gate a df=12 filler noun outranks a df=3 real symbol.
    */
   topEntityHubs(
-    circle = "default",
+    circle?: string,
     opts: { limit?: number; minMembers?: number; maxDfFrac?: number; nounMinMembers?: number } = {},
   ): EntityHub[] {
+    circle ??= this.defaultCircle;
     const limit = opts.limit ?? 6;
     const minMembers = opts.minMembers ?? 2;
     const nounMin = opts.nounMinMembers ?? 3; // a structural entity anchors at 2; a plain noun needs more
@@ -914,7 +938,8 @@ export class MonetCore {
    * worked-together / causal). Excludes `related`/`about` — otherwise similarity edges float
    * near-duplicate filler to the top and bury the real cluster.
    */
-  topConnectedConcepts(circle = "default", limit = 6): ConnectedConcept[] {
+  topConnectedConcepts(circle?: string, limit = 6): ConnectedConcept[] {
+    circle ??= this.defaultCircle;
     const placeholders = [...THREAD_TYPES].map(() => "?").join(",");
     // Count distinct thread/causal neighbours in BOTH directions (matching adjacency()'s traversal):
     // directed causal edges (supports/resolves/derived_from/…) are stored one-way, so a hub that
@@ -941,7 +966,8 @@ export class MonetCore {
   }
 
   /** Undirected edge counts by type (symmetric mirror collapsed, directed counted once). */
-  edgeCountsByType(circle = "default"): Array<{ type: string; count: number }> {
+  edgeCountsByType(circle?: string): Array<{ type: string; count: number }> {
+    circle ??= this.defaultCircle;
     return this.db
       .prepare(
         `SELECT type, COUNT(*) AS count FROM (
@@ -953,7 +979,8 @@ export class MonetCore {
   }
 
   /** The single largest "worked together" cluster (co_occurred connected component), or null. */
-  topThread(circle = "default", minSize = 2): MemoryOverview["graph"]["thread"] {
+  topThread(circle?: string, minSize = 2): MemoryOverview["graph"]["thread"] {
+    circle ??= this.defaultCircle;
     const edges = this.edges({ circle, type: "co_occurred" });
     if (edges.length === 0) return null;
     const adj = new Map<string, Set<string>>();
@@ -1005,7 +1032,8 @@ export class MonetCore {
   }
 
   /** Concepts mentioning an entity (hub drill-in). */
-  conceptsForEntity(entityKey: string, circle = "default"): Array<{ id: string; title: string; kind: string }> {
+  conceptsForEntity(entityKey: string, circle?: string): Array<{ id: string; title: string; kind: string }> {
+    circle ??= this.defaultCircle;
     return this.db
       .prepare(
         `SELECT c.id AS id, c.title AS title, c.kind AS kind
@@ -1015,7 +1043,8 @@ export class MonetCore {
       .all(entityKey, circle) as Array<{ id: string; title: string; kind: string }>;
   }
 
-  private disputedCount(circle = "default"): number {
+  private disputedCount(circle?: string): number {
+    circle ??= this.defaultCircle;
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND status = 'disputed'`).get(circle) as { n: number }).n;
   }
 
@@ -1028,9 +1057,10 @@ export class MonetCore {
    * triggers no synthesis, never returns bodies. Composes prewarm + scoped counts + graph shape.
    */
   overview(
-    circle = "default",
+    circle?: string,
     opts: { conceptLimit?: number; hubLimit?: number; connectedLimit?: number } = {},
   ): MemoryOverview {
+    circle ??= this.defaultCircle;
     const pre = this.prewarm(circle, { conceptLimit: opts.conceptLimit ?? 6 });
     const edgesByType = this.edgeCountsByType(circle);
     const edges = edgesByType.reduce((a, e) => a + e.count, 0);
@@ -1329,7 +1359,7 @@ export class MonetCore {
    * thread members similarity alone misses. Cold graph ⇒ degrades exactly to search().
    */
   async gather(intent: string, opts: { circle?: string; limit?: number; depth?: number } = {}): Promise<GatherResult> {
-    const circle = opts.circle ?? "default";
+    const circle = opts.circle ?? this.defaultCircle;
     const limit = opts.limit ?? 12;
     const params = opts.depth ? { ...this.graphParams, hopLimit: Math.max(1, Math.min(opts.depth, 3)) } : this.graphParams;
     const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };
