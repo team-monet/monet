@@ -47,14 +47,15 @@ Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override.
 
 - **Claude Code:**
   - **Workers → subagents.** Write one `.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, security, reliability, aria` — each = a frontmatter header (`name` + the worker's `role` from `roster.json` as `description`) + the agent body from `agents/<name>.md` (local checkout or the raw base above).
-  - **Stig → lead.** Append the body of `agents/stig.md` into the repo's `CLAUDE.md` so the main agent acts as Stig and can delegate to the worker subagents (a subagent can't spawn subagents, so the lead must be the main agent). **Wrap the appended prompt in sentinels** so it stays distinguishable from the user's own notes — this is what lets a later memory-consolidation pass retire the *user's* knowledge from `CLAUDE.md` without ever touching Stig's prompt:
+  - **Stig → lead.** Append the body of `agents/stig.md` into the repo's `CLAUDE.md` so the main agent acts as Stig and can delegate to the worker subagents (a subagent can't spawn subagents, so the lead must be the main agent). **Wrap the appended prompt in the exact sentinels below** (bare markers — a later memory-consolidation pass keys on them to retire the *user's* knowledge from `CLAUDE.md` without ever touching Stig's prompt; keep the `BEGIN MONET:STIG` / `END MONET:STIG` tokens verbatim):
     ```
-    <!-- BEGIN MONET:STIG — Monet-managed; do not capture or edit -->
+    <!-- BEGIN MONET:STIG -->
+    <!-- Monet-managed; do not capture, retire, or edit. -->
     …agents/stig.md body…
     <!-- END MONET:STIG -->
     ```
     Append; don't clobber anything already in `CLAUDE.md`.
-- **Cursor / Continue / others** — install the lead + the worker team in that host's agent format; ask the user where those live.
+- **Cursor / Continue / others** — install the lead + the worker team in that host's agent format; ask the user where those live. **Mark every installed prompt file** (lead and workers) with a `<!-- MONET:AGENT -->` sentinel at the top — on hosts where the team lives in a rules/prompts dir the consolidation pass would otherwise scan (`.cursor/rules`, `.continue/rules`, …), this is what stops it from capturing/retiring Monet's own wiring. (For Claude Code the workers live in `.claude/agents/`, which consolidation excludes by path.)
 
 The user may request a trimmed worker set, but the team is the default — never reduce to Stig-only.
 
