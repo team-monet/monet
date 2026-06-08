@@ -83,6 +83,18 @@ export function blend(current: Float32Array, next: Float32Array, currentCount: n
   return normalize(out);
 }
 
+/**
+ * Support-weighted blend of two concept centroids — for MERGING two concepts (each already an
+ * average of its own evidence). Weighting each vector by its support keeps a heavily-supported
+ * source from being underweighted as if it were a single new observation.
+ */
+export function blendWeighted(a: Float32Array, wa: number, b: Float32Array, wb: number): Float32Array {
+  const out = new Float32Array(a.length);
+  const total = wa + wb || 1;
+  for (let i = 0; i < out.length; i++) out[i] = (a[i] * wa + b[i] * wb) / total;
+  return normalize(out);
+}
+
 function normalize(v: Float32Array): Float32Array {
   let mag = 0;
   for (let i = 0; i < v.length; i++) mag += v[i] * v[i];

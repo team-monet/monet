@@ -17,7 +17,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { StoragePort, BetterSqlitePort } from "./storage";
-import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend } from "./embedding";
+import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend, blendWeighted } from "./embedding";
 import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
 import {
@@ -873,25 +873,33 @@ export class MonetCore {
    * project's circle. Workstreams are excluded (identity-scoped session state, not knowledge).
    * Ordered recency-first (updated_at desc, id asc) for a stable, reviewable listing.
    */
-  listMemories(circle?: string, opts: { withProvenance?: boolean } = {}): MemoryListEntry[] {
+  listMemories(circle?: string, opts: { withProvenance?: boolean; limit?: number; offset?: number } = {}): MemoryListEntry[] {
     circle ??= this.defaultCircle;
-    const rows = this.db
-      .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' ORDER BY updated_at DESC, id`)
-      .all(circle) as ConceptRow[];
+    // Bounded paging (a real legacy circle can exceed the host's tool-result cap): pass limit/offset to
+    // page through; omit limit for the full circle (internal callers/tests). Stable order makes paging safe.
+    const params: Array<string | number> = [circle];
+    let sql = `SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' ORDER BY updated_at DESC, id`;
+    if (opts.limit != null) {
+      sql += ` LIMIT ? OFFSET ?`;
+      params.push(Math.max(0, Math.floor(opts.limit)), Math.max(0, Math.floor(opts.offset ?? 0)));
+    }
+    const rows = this.db.prepare(sql).all(...params) as ConceptRow[];
     const contradictions = this.openContradictionCounts(circle);
 
-    // One grouped scan for provenance: distinct session scope_context per concept in this circle.
+    // Provenance only for the page's concepts: distinct session scope_context per returned concept.
     const provByConcept = new Map<string, string[]>();
-    if (opts.withProvenance) {
+    if (opts.withProvenance && rows.length) {
+      const ids = rows.map((r) => r.id);
+      const placeholders = ids.map(() => "?").join(",");
       const prov = this.db
         .prepare(
           `SELECT o.concept_id AS cid, s.scope_context AS scope
              FROM observations o JOIN sessions s ON s.id = o.session_id
-            WHERE o.circle = ? AND o.concept_id IS NOT NULL AND s.scope_context IS NOT NULL
+            WHERE o.concept_id IN (${placeholders}) AND s.scope_context IS NOT NULL
             GROUP BY o.concept_id, s.scope_context
             ORDER BY o.concept_id, s.scope_context`,
         )
-        .all(circle) as Array<{ cid: string; scope: string }>;
+        .all(...ids) as Array<{ cid: string; scope: string }>;
       for (const p of prov) {
         const list = provByConcept.get(p.cid) ?? [];
         list.push(p.scope);
@@ -1496,20 +1504,32 @@ export class MonetCore {
     const moved = this.db
       .prepare(`UPDATE observations SET concept_id = ?, circle = ? WHERE concept_id = ?`)
       .run(target.id, toCircle, src.id);
-    // 2) Fold body + support + vector into the target (blend stored vectors — never re-embed).
+    // 2) Carry contradictions onto the target BEFORE recomputing status (their observations followed
+    //    in step 1) — so a disputed source doesn't get silently restored to active by the merge.
+    this.db.prepare(`UPDATE contradictions SET concept_id = ? WHERE concept_id = ?`).run(target.id, src.id);
+    // 3) Fold body + support + vector + source_refs into the target (never re-embed; blend the two
+    //    centroids WEIGHTED by support so a heavily-supported source isn't treated as one sample).
     const lines = splitLines(target.body);
     for (const l of splitLines(src.body)) if (!lines.includes(l)) lines.push(l);
     const supportCount = target.support_count + src.support_count;
-    const blended = blend(jsonToEmb(target.embedding), jsonToEmb(src.embedding), target.support_count);
+    const blended = blendWeighted(jsonToEmb(target.embedding), target.support_count, jsonToEmb(src.embedding), src.support_count);
+    // Union return-to-source pointers — gather cards and source-keyed idempotency read concept-level
+    // source_refs, so a dedup-merge must not drop the moved concept's refs.
+    const refs = [
+      ...new Set([
+        ...(target.source_refs ? (JSON.parse(target.source_refs) as string[]) : []),
+        ...(src.source_refs ? (JSON.parse(src.source_refs) as string[]) : []),
+      ]),
+    ];
     const version = target.version + 1;
+    // Stay disputed while any open contradiction (target's own or the carried one) remains.
+    const status = this.openContraCount(target.id) > 0 ? "disputed" : "active";
     this.db
       .prepare(
-        `UPDATE concepts SET body = ?, support_count = ?, embedding = ?, version = ?,
-                status = 'active', dirty = 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
+        `UPDATE concepts SET body = ?, support_count = ?, embedding = ?, source_refs = ?, version = ?,
+                status = ?, dirty = 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
       )
-      .run(lines.join("\n"), supportCount, embToJson(blended), version, target.id);
-    // 3) Carry contradictions onto the target (their observations followed in step 1).
-    this.db.prepare(`UPDATE contradictions SET concept_id = ? WHERE concept_id = ?`).run(target.id, src.id);
+      .run(lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, version, status, target.id);
     // 4) Drop the source: its graph footprint in fromCircle, its revision history, then the row.
     this.unwindConceptGraph(src.id, fromCircle);
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
@@ -1565,6 +1585,21 @@ export class MonetCore {
       }
     }
     this.deriveAssertedEdges(conceptId, text, circle);
+    // INCOMING asserted edges: a concept already in this circle may have asserted an edge TO this one
+    // (e.g. `supports: #thisSlug`) while this one was still elsewhere — resolveRef found nothing then, so
+    // the directed edge was dropped. Now that it's here, re-derive the assertions of circle-mates whose
+    // text references it (by slug or id) so those edges land. Without this, a batch migration that moves
+    // the referencing concept before its target permanently loses the asserted edge. Bounded to textual
+    // candidates; deriveAssertedEdges is idempotent (uq_edge), so re-deriving an existing edge is a no-op.
+    const referrers = this.db
+      .prepare(
+        `SELECT id, body FROM concepts WHERE circle = ? AND id != ? AND kind != 'workstream' AND (body LIKE ? OR body LIKE ?)`,
+      )
+      .all(circle, conceptId, `%${row.slug}%`, `%${conceptId}%`) as Array<{ id: string; body: string }>;
+    for (const r of referrers) {
+      const rObs = this.db.prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at`).all(r.id) as Array<{ content: string }>;
+      this.deriveAssertedEdges(r.id, [r.body, ...rObs.map((o) => o.content)].filter(Boolean).join("\n"), circle);
+    }
     const mates = this.db
       .prepare(
         `SELECT DISTINCT o2.concept_id AS id FROM observations o1

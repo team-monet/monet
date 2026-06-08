@@ -122,23 +122,32 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_list",
-    "Enumerate every memory in a circle as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` to include the project path(s) each memory's evidence came from. Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
+    "Enumerate a circle's memories as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` for the project path(s) each memory's evidence came from. PAGINATED: returns up to `limit` (default 50) from `offset`, plus `total` and a `nextOffset` cursor when more remain — page until `nextOffset` is absent so a large legacy circle is fully enumerable. Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
     {
       circle: z.string().optional(),
       withProvenance: z
         .boolean()
         .optional()
         .describe("Include each memory's `provenance`: the distinct working-dir paths its observations were recorded under (the strongest signal for which project it belongs to)."),
+      limit: z.number().int().positive().max(200).optional().describe("Max memories to return (default 50)."),
+      offset: z.number().int().nonnegative().optional().describe("Start index for paging (default 0); pass the prior response's `nextOffset` to continue."),
     },
-    async ({ circle, withProvenance }) => {
+    async ({ circle, withProvenance, limit, offset }) => {
       try {
-        const memories = core.listMemories(scope(circle), { withProvenance });
+        const lim = limit ?? 50;
+        const off = offset ?? 0;
+        const memories = core.listMemories(scope(circle), { withProvenance, limit: lim, offset: off });
+        const total = core.conceptCount(scope(circle));
+        const nextOffset = off + memories.length < total ? off + memories.length : null;
         return ok({
           circle: scope(circle),
+          total,
+          offset: off,
           count: memories.length,
+          ...(nextOffset != null ? { nextOffset } : {}),
           memories,
           guidance:
-            "Cards show what each memory is about, not what it says. Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.",
+            `Cards show what each memory is about, not what it says. ${nextOffset != null ? `More remain — call again with offset=${nextOffset} to get the rest. ` : ""}Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.`,
         });
       } catch (e) {
         return err(`list failed: ${msg(e)}`);

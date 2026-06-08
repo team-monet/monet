@@ -40,6 +40,19 @@ describe("listMemories", () => {
     core.close();
   });
 
+  it("pages with limit/offset over a stable order (a big legacy circle stays fully enumerable)", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 }); // distinct concepts
+    for (let i = 0; i < 5; i++) await core.store(`Distinct fact number ${i} about widget ${i}.`, { circle: "c" });
+    const all = core.listMemories("c");
+    expect(all).toHaveLength(5);
+    const ids = all.map((m) => m.id);
+    expect(core.listMemories("c", { limit: 2, offset: 0 }).map((m) => m.id)).toEqual(ids.slice(0, 2));
+    expect(core.listMemories("c", { limit: 2, offset: 2 }).map((m) => m.id)).toEqual(ids.slice(2, 4));
+    const last = core.listMemories("c", { limit: 2, offset: 4 });
+    expect(last.map((m) => m.id)).toEqual(ids.slice(4)); // one left over
+    core.close();
+  });
+
   it("withProvenance aggregates the working dirs of every session that contributed evidence", async () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-mig-"));
     const dbPath = join(dir, "monet.db");
@@ -109,6 +122,23 @@ describe("reassignCircle — move", () => {
     core.close();
   });
 
+  it("rebuilds an asserted edge when the referenced concept arrives in the circle later", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const target = await core.store("The migration plan for the API.", { circle: "default" });
+    const referrer = await core.store(`Switched the API to Postgres. supports: #${target.concept.slug}`, { circle: "default" });
+    // The asserted edge exists in "default" at store time.
+    expect(core.edges({ circle: "default", type: "supports" }).some((e) => e.srcId === referrer.conceptId && e.dstId === target.conceptId)).toBe(true);
+
+    // Move the REFERRER first — its target isn't in "proj" yet, so the edge can't resolve on this move.
+    core.reassignCircle(referrer.conceptId, "proj");
+    expect(core.edges({ circle: "proj", type: "supports" })).toHaveLength(0);
+
+    // Now move the TARGET — its arrival must rebuild the incoming asserted edge in "proj".
+    core.reassignCircle(target.conceptId, "proj");
+    expect(core.edges({ circle: "proj", type: "supports" }).some((e) => e.srcId === referrer.conceptId && e.dstId === target.conceptId)).toBe(true);
+    core.close();
+  });
+
   it("is a no-op when the target circle is the current one", async () => {
     const core = new MonetCore(":memory:");
     const a = await core.store("Some fact.", { circle: "c1" });
@@ -165,6 +195,33 @@ describe("reassignCircle — merge (dedup into an existing target)", () => {
     expect(merged.supportCount).toBe(2); // support summed
     expect(merged.observations).toHaveLength(2); // both observations now under the target
     expect(merged.needsSynthesis).toBe(true); // marked dirty to re-synthesize the combined body
+    core.close();
+  });
+
+  it("unions sourceRefs and preserves a disputed source's status on merge", async () => {
+    const core = new MonetCore(":memory:");
+    const a = await core.store("We standardized on the jose library for auth tokens.", {
+      circle: "default",
+      sourceRefs: ["/work/default/NOTES.md"],
+    });
+    const b = await core.store("We standardized on the jose library for auth tokens.", {
+      circle: "acme-api",
+      sourceRefs: ["/work/acme-api/AGENTS.md"],
+    });
+    core.flagContradiction(a.conceptId, { detail: "jose vs jsonwebtoken" }); // source is disputed before the merge
+
+    const r = core.reassignCircle(a.conceptId, "acme-api");
+    expect(r!.action).toBe("merged");
+    const target = r!.conceptId;
+
+    // Both sources' return-to-source pointers survive (gather exposes concept-level source_refs).
+    const g = await core.gather("jose library auth tokens", { circle: "acme-api" });
+    const card = g.ranked.find((c) => c.id === target);
+    expect(card?.sourceRefs).toEqual(expect.arrayContaining(["/work/acme-api/AGENTS.md", "/work/default/NOTES.md"]));
+
+    // The carried-over open contradiction keeps the survivor disputed — not silently restored to active.
+    expect((await core.getConcept(target, { synthesize: false }))!.status).toBe("disputed");
+    expect(core.getOpenContradictions("acme-api").some((c) => c.conceptId === target)).toBe(true);
     core.close();
   });
 });
