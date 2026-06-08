@@ -121,6 +121,32 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
   );
 
   server.tool(
+    "memory_list",
+    "Enumerate every memory in a circle as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` to include the project path(s) each memory's evidence came from. Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
+    {
+      circle: z.string().optional(),
+      withProvenance: z
+        .boolean()
+        .optional()
+        .describe("Include each memory's `provenance`: the distinct working-dir paths its observations were recorded under (the strongest signal for which project it belongs to)."),
+    },
+    async ({ circle, withProvenance }) => {
+      try {
+        const memories = core.listMemories(scope(circle), { withProvenance });
+        return ok({
+          circle: scope(circle),
+          count: memories.length,
+          memories,
+          guidance:
+            "Cards show what each memory is about, not what it says. Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.",
+        });
+      } catch (e) {
+        return err(`list failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
     "memory_gather",
     "Rebuild the FULL working context for an intent — not just the most-similar few. Seeds from the intent, then spreads across the connection graph (entity, causal, and same-session co-occurrence edges, ≤2 hops) and stops when evidence saturates. Use at the start of a task or when resuming a thread: it recovers the related concepts — decisions, open questions, files worked on together — that a plain memory_search misses because they're worded differently. Returns structural cards (ranked); call memory_fetch(id) to read one.",
     {
@@ -298,6 +324,41 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         return ok({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_reassign_circle",
+    "Move a memory — its concept, its observations, and its graph membership — from its current circle into another. The apply step of a memory migration: home a piece of unscoped \"default\" memory into its project's circle. Dedupes: if the target circle already holds a matching memory, the two MERGE (no duplicate, no re-embedding) and `action` comes back \"merged\". Non-destructive to other memories; moves one at a time so you can preview, confirm, then apply in batches. Pass `circle` = the id's CURRENT circle (e.g. \"default\") if it isn't your session default.",
+    {
+      id: z.string(),
+      toCircle: z.string().describe("The destination circle (e.g. the project's per-project circle)."),
+      circle: z.string().optional().describe("The id's CURRENT circle (defaults to this session's circle). Pass \"default\" when migrating legacy unscoped memory."),
+    },
+    async ({ id, toCircle, circle }) => {
+      try {
+        // Scope enforcement: you may only reassign an id that lives in the circle you named (the
+        // caller's session default, or an explicit source circle) — ids leak across sessions/output.
+        if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
+        const r = core.reassignCircle(id, toCircle);
+        if (!r) return err(`concept not found: ${id}`);
+        return ok({
+          action: r.action,
+          conceptId: r.conceptId,
+          fromCircle: r.fromCircle,
+          toCircle: r.toCircle,
+          observationsMoved: r.observationsMoved,
+          ...(r.mergedIntoId ? { mergedIntoId: r.mergedIntoId } : {}),
+          message:
+            r.action === "merged"
+              ? `Deduped into an existing memory in ${r.toCircle} (no duplicate). Read it with memory_fetch(id, "${r.toCircle}").`
+              : r.action === "moved"
+                ? `Moved to ${r.toCircle}. It now lives in that circle — fetch/search it there.`
+                : `Already in ${r.toCircle}; nothing to do.`,
+        });
+      } catch (e) {
+        return err(`reassign failed: ${msg(e)}`);
       }
     },
   );

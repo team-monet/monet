@@ -16,7 +16,11 @@ export type {
   MemoryOverview,
   EntityHub,
   ConnectedConcept,
+  MemoryListEntry,
+  ReassignResult,
 } from "./engine";
+export { BetterSqlitePort } from "./storage";
+export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";
 export { renderOverview } from "./render-overview";
 export { extractEntities } from "./extract-entities";
 export type { ExtractedEntity, EntityKind } from "./extract-entities";
