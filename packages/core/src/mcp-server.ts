@@ -122,7 +122,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_list",
-    "Enumerate a circle's memories as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` for the project path(s) each memory's evidence came from. PAGINATED: returns up to `limit` (default 50) from `offset`, plus `total` and a `nextOffset` cursor when more remain — page until `nextOffset` is absent so a large legacy circle is fully enumerable. Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
+    "Enumerate a circle's memories as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` for the project path(s) each memory's evidence came from. PAGINATED with a KEYSET cursor: returns up to `limit` (default 50) plus a `nextCursor` when more remain; pass it back as `cursor` to continue, until it's absent. The cursor walks a stable order, so it's SAFE to reassign each page out of the circle before fetching the next (an offset would skip rows as the circle shrinks). Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
     {
       circle: z.string().optional(),
       withProvenance: z
@@ -130,24 +130,28 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         .optional()
         .describe("Include each memory's `provenance`: the distinct working-dir paths its observations were recorded under (the strongest signal for which project it belongs to)."),
       limit: z.number().int().positive().max(200).optional().describe("Max memories to return (default 50)."),
-      offset: z.number().int().nonnegative().optional().describe("Start index for paging (default 0); pass the prior response's `nextOffset` to continue."),
+      cursor: z.string().optional().describe("Opaque keyset cursor from the prior response's `nextCursor`; omit for the first page."),
     },
-    async ({ circle, withProvenance, limit, offset }) => {
+    async ({ circle, withProvenance, limit, cursor }) => {
       try {
         const lim = limit ?? 50;
-        const off = offset ?? 0;
-        const memories = core.listMemories(scope(circle), { withProvenance, limit: lim, offset: off });
-        const total = core.conceptCount(scope(circle));
-        const nextOffset = off + memories.length < total ? off + memories.length : null;
+        // Cursor is "<updatedAt>:<id>" (ids carry no colon). Walks the stable updated_at DESC, id ASC order.
+        let parsed: { updatedAt: number; id: string } | undefined;
+        if (cursor) {
+          const i = cursor.indexOf(":");
+          if (i > 0) parsed = { updatedAt: Number(cursor.slice(0, i)), id: cursor.slice(i + 1) };
+        }
+        const memories = core.listMemories(scope(circle), { withProvenance, limit: lim, cursor: parsed });
+        const last = memories[memories.length - 1];
+        const nextCursor = memories.length === lim && last ? `${last.updatedAt}:${last.id}` : null;
         return ok({
           circle: scope(circle),
-          total,
-          offset: off,
+          total: core.conceptCount(scope(circle)), // current size — shrinks as you reassign out
           count: memories.length,
-          ...(nextOffset != null ? { nextOffset } : {}),
+          ...(nextCursor ? { nextCursor } : {}),
           memories,
           guidance:
-            `Cards show what each memory is about, not what it says. ${nextOffset != null ? `More remain — call again with offset=${nextOffset} to get the rest. ` : ""}Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.`,
+            `Cards show what each memory is about, not what it says. ${nextCursor ? `More remain — call again with cursor=\"${nextCursor}\" (safe to reassign this page first). ` : ""}Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.`,
         });
       } catch (e) {
         return err(`list failed: ${msg(e)}`);

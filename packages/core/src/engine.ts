@@ -303,6 +303,7 @@ interface ConceptRow {
   updated_at: number;
   usefulness_score: number;
   source_refs: string | null;
+  aliases: string | null;
 }
 
 interface ContradictionRow {
@@ -404,6 +405,7 @@ export class MonetCore {
         dirty INTEGER NOT NULL DEFAULT 0,
         usefulness_score INTEGER NOT NULL DEFAULT 0,
         source_refs TEXT,
+        aliases TEXT,
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
       );
@@ -475,13 +477,19 @@ export class MonetCore {
     `);
   }
 
-  /** Guarded migration for older DBs: add source_refs columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
+  /** Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
   private migrate(): void {
     for (const table of ["observations", "concepts"]) {
       const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
       if (!cols.some((c) => c.name === "source_refs")) {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN source_refs TEXT`);
       }
+    }
+    // aliases: slugs/ids a concept ANSWERS TO after absorbing another on merge — so an asserted
+    // reference to a merged-away slug (`supports: #old-slug`) still resolves to the survivor.
+    const conceptCols = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
+    if (!conceptCols.some((c) => c.name === "aliases")) {
+      this.db.exec(`ALTER TABLE concepts ADD COLUMN aliases TEXT`);
     }
     // One-time graph backfill for pre-graph DBs (P2, Codex review): the graph tables exist but hold no
     // edges for concepts stored before the graph feature. Version-gated so it runs at most once, and only
@@ -872,16 +880,33 @@ export class MonetCore {
    * migration leans on: group "default" by content + provenance, then reassignCircle each into its
    * project's circle. Workstreams are excluded (identity-scoped session state, not knowledge).
    * Ordered recency-first (updated_at desc, id asc) for a stable, reviewable listing.
+   *
+   * Paging: prefer the KEYSET `cursor` (the last returned entry's {updatedAt, id}) over `offset`.
+   * The migration workflow reassigns each page OUT of the source circle as it goes, so the circle
+   * shrinks between calls — an offset would then skip rows. A keyset cursor walks the stable order
+   * and is immune to that (already-moved rows simply aren't there). `offset` is kept for internal/
+   * test callers enumerating a static circle; omit limit for the full circle.
    */
-  listMemories(circle?: string, opts: { withProvenance?: boolean; limit?: number; offset?: number } = {}): MemoryListEntry[] {
+  listMemories(
+    circle?: string,
+    opts: { withProvenance?: boolean; limit?: number; offset?: number; cursor?: { updatedAt: number; id: string } } = {},
+  ): MemoryListEntry[] {
     circle ??= this.defaultCircle;
-    // Bounded paging (a real legacy circle can exceed the host's tool-result cap): pass limit/offset to
-    // page through; omit limit for the full circle (internal callers/tests). Stable order makes paging safe.
     const params: Array<string | number> = [circle];
-    let sql = `SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' ORDER BY updated_at DESC, id`;
+    let where = `circle = ? AND kind != 'workstream'`;
+    if (opts.cursor) {
+      // Rows strictly AFTER (updatedAt, id) in the `updated_at DESC, id ASC` order.
+      where += ` AND (updated_at < ? OR (updated_at = ? AND id > ?))`;
+      params.push(opts.cursor.updatedAt, opts.cursor.updatedAt, opts.cursor.id);
+    }
+    let sql = `SELECT * FROM concepts WHERE ${where} ORDER BY updated_at DESC, id`;
     if (opts.limit != null) {
-      sql += ` LIMIT ? OFFSET ?`;
-      params.push(Math.max(0, Math.floor(opts.limit)), Math.max(0, Math.floor(opts.offset ?? 0)));
+      sql += ` LIMIT ?`;
+      params.push(Math.max(0, Math.floor(opts.limit)));
+      if (!opts.cursor && opts.offset != null) {
+        sql += ` OFFSET ?`;
+        params.push(Math.max(0, Math.floor(opts.offset)));
+      }
     }
     const rows = this.db.prepare(sql).all(...params) as ConceptRow[];
     const contradictions = this.openContradictionCounts(circle);
@@ -1468,12 +1493,23 @@ export class MonetCore {
   }
 
   private resolveRef(ref: string, circle: string, excludeId: string): string | null {
+    const slug = slugify(ref);
     const bySlug = this.db
       .prepare(`SELECT id FROM concepts WHERE circle = ? AND slug = ? AND id != ? LIMIT 1`)
-      .get(circle, slugify(ref), excludeId) as { id: string } | undefined;
+      .get(circle, slug, excludeId) as { id: string } | undefined;
     if (bySlug) return bySlug.id;
     const byId = this.db.prepare(`SELECT id FROM concepts WHERE id = ? AND circle = ?`).get(ref, circle) as { id: string } | undefined;
-    return byId?.id ?? null;
+    if (byId) return byId.id;
+    // Alias fallback (only when the direct lookup misses): a survivor that absorbed another concept on
+    // merge carries the absorbed slug/id, so `supports: #merged-away-slug` still lands on the survivor.
+    const aliased = this.db
+      .prepare(`SELECT id, aliases FROM concepts WHERE circle = ? AND id != ? AND aliases IS NOT NULL`)
+      .all(circle, excludeId) as Array<{ id: string; aliases: string }>;
+    for (const a of aliased) {
+      const list = JSON.parse(a.aliases) as string[];
+      if (list.includes(ref) || list.includes(slug)) return a.id;
+    }
+    return null;
   }
 
   // ---- circle migration (reassignCircle internals) -----------------------
@@ -1521,15 +1557,25 @@ export class MonetCore {
         ...(src.source_refs ? (JSON.parse(src.source_refs) as string[]) : []),
       ]),
     ];
+    // Carry the absorbed concept's slug + id (and any aliases it already held) onto the survivor, so an
+    // asserted reference to the now-deleted source (`supports: #src-slug`) still resolves here.
+    const aliases = [
+      ...new Set([
+        ...(target.aliases ? (JSON.parse(target.aliases) as string[]) : []),
+        ...(src.aliases ? (JSON.parse(src.aliases) as string[]) : []),
+        src.slug,
+        src.id,
+      ]),
+    ];
     const version = target.version + 1;
     // Stay disputed while any open contradiction (target's own or the carried one) remains.
     const status = this.openContraCount(target.id) > 0 ? "disputed" : "active";
     this.db
       .prepare(
-        `UPDATE concepts SET body = ?, support_count = ?, embedding = ?, source_refs = ?, version = ?,
+        `UPDATE concepts SET body = ?, support_count = ?, embedding = ?, source_refs = ?, aliases = ?, version = ?,
                 status = ?, dirty = 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
       )
-      .run(lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, version, status, target.id);
+      .run(lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, JSON.stringify(aliases), version, status, target.id);
     // 4) Drop the source: its graph footprint in fromCircle, its revision history, then the row.
     this.unwindConceptGraph(src.id, fromCircle);
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
@@ -1588,17 +1634,25 @@ export class MonetCore {
     // INCOMING asserted edges: a concept already in this circle may have asserted an edge TO this one
     // (e.g. `supports: #thisSlug`) while this one was still elsewhere — resolveRef found nothing then, so
     // the directed edge was dropped. Now that it's here, re-derive the assertions of circle-mates whose
-    // text references it (by slug or id) so those edges land. Without this, a batch migration that moves
-    // the referencing concept before its target permanently loses the asserted edge. Bounded to textual
-    // candidates; deriveAssertedEdges is idempotent (uq_edge), so re-deriving an existing edge is a no-op.
+    // text references it — by slug, id, OR any alias it absorbed on merge, and matching either the
+    // synthesized body OR the raw observations (a synthesized body may no longer carry the `#slug`
+    // marker). deriveAssertedEdges is idempotent (uq_edge), so re-deriving an existing edge is a no-op.
+    const needles = [...new Set([row.slug, conceptId, ...(row.aliases ? (JSON.parse(row.aliases) as string[]) : [])])].filter(Boolean);
+    const likeParams = needles.map((n) => `%${n}%`);
+    const bodyLikes = needles.map(() => `c.body LIKE ?`).join(" OR ");
+    const obsLikes = needles.map(() => `o.content LIKE ?`).join(" OR ");
     const referrers = this.db
       .prepare(
-        `SELECT id, body FROM concepts WHERE circle = ? AND id != ? AND kind != 'workstream' AND (body LIKE ? OR body LIKE ?)`,
+        `SELECT DISTINCT c.id AS id FROM concepts c
+            LEFT JOIN observations o ON o.concept_id = c.id
+           WHERE c.circle = ? AND c.id != ? AND c.kind != 'workstream' AND ((${bodyLikes}) OR (${obsLikes}))`,
       )
-      .all(circle, conceptId, `%${row.slug}%`, `%${conceptId}%`) as Array<{ id: string; body: string }>;
-    for (const r of referrers) {
-      const rObs = this.db.prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at`).all(r.id) as Array<{ content: string }>;
-      this.deriveAssertedEdges(r.id, [r.body, ...rObs.map((o) => o.content)].filter(Boolean).join("\n"), circle);
+      .all(circle, conceptId, ...likeParams, ...likeParams) as Array<{ id: string }>;
+    for (const ref of referrers) {
+      const refRow = this.getRow(ref.id);
+      if (!refRow) continue;
+      const refObs = this.db.prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at`).all(ref.id) as Array<{ content: string }>;
+      this.deriveAssertedEdges(ref.id, [refRow.body, ...refObs.map((o) => o.content)].filter(Boolean).join("\n"), circle);
     }
     const mates = this.db
       .prepare(

@@ -53,6 +53,28 @@ describe("listMemories", () => {
     core.close();
   });
 
+  it("a keyset cursor enumerates the whole circle even as pages are reassigned OUT (no skips)", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    for (let i = 0; i < 6; i++) await core.store(`Distinct fact ${i} about widget ${i}.`, { circle: "default" });
+    const seen: string[] = [];
+    let cursor: { updatedAt: number; id: string } | undefined;
+    for (let guard = 0; guard < 20; guard++) {
+      const page = core.listMemories("default", { limit: 2, cursor });
+      if (page.length === 0) break;
+      const last = page[page.length - 1];
+      cursor = { updatedAt: last.updatedAt, id: last.id };
+      for (const m of page) {
+        seen.push(m.id);
+        core.reassignCircle(m.id, "proj"); // drain the source as we page — an offset would skip rows here
+      }
+      if (page.length < 2) break;
+    }
+    expect(new Set(seen).size).toBe(6); // every memory enumerated exactly once despite the shrinking source
+    expect(core.conceptCount("default")).toBe(0);
+    expect(core.conceptCount("proj")).toBe(6);
+    core.close();
+  });
+
   it("withProvenance aggregates the working dirs of every session that contributed evidence", async () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-mig-"));
     const dbPath = join(dir, "monet.db");
@@ -222,6 +244,26 @@ describe("reassignCircle — merge (dedup into an existing target)", () => {
     // The carried-over open contradiction keeps the survivor disputed — not silently restored to active.
     expect((await core.getConcept(target, { synthesize: false }))!.status).toBe("disputed");
     expect(core.getOpenContradictions("acme-api").some((c) => c.conceptId === target)).toBe(true);
+    core.close();
+  });
+
+  it("an asserted reference to a merged-away source still resolves to the survivor (alias)", async () => {
+    const core = new MonetCore(":memory:");
+    const target = await core.store("We standardized on the jose library for auth tokens everywhere.", { circle: "proj" });
+    const src = await core.store("We standardized on the jose library for auth tokens.", { circle: "default" });
+    expect(src.conceptId).not.toBe(target.conceptId); // distinct concepts, different slugs
+    // A separate concept asserts an edge to the SOURCE (by id).
+    const referrer = await core.store(`Key rotation runbook for the platform. supports: #${src.conceptId}`, { circle: "default" });
+    expect(referrer.conceptId).not.toBe(src.conceptId);
+
+    // Move the referrer first (target not in "proj" yet), then merge the source into "proj".
+    core.reassignCircle(referrer.conceptId, "proj");
+    const r = core.reassignCircle(src.conceptId, "proj");
+    expect(r!.action).toBe("merged");
+    expect(r!.conceptId).toBe(target.conceptId);
+
+    // The asserted edge survives the merge — re-pointed onto the survivor via the carried-over alias.
+    expect(core.edges({ circle: "proj", type: "supports" }).some((e) => e.srcId === referrer.conceptId && e.dstId === target.conceptId)).toBe(true);
     core.close();
   });
 });
