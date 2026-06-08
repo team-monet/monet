@@ -49,6 +49,7 @@ const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "der
 // about/related are excluded — they re-encode similarity and would reorder single-fact hits.
 const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"]);
 const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s*:\s*#?([\w:-]+)/gi;
+const GRAPH_SCHEMA_VERSION = 1; // PRAGMA user_version gate for the one-time graph backfill (P2)
 
 export type IngestAction = "created" | "attached" | "ambiguous";
 
@@ -294,12 +295,16 @@ export class MonetCore {
   private graphParams: GraphParams;
   private edgeSimMin: number;
   private newId: () => string;
-  /** The previous concept written in the current session — for `follows` edges (ADR §3.7). */
-  private lastConceptInSession: string | null = null;
+  /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
+   *  Keyed by circle so a session that writes to several circles never chains `follows` across them. */
+  private lastConceptByCircle = new Map<string, string>();
 
   constructor(dbPath = ":memory:", opts: MonetCoreOptions = {}) {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
+    // Two local processes can share one .monet DB (e.g. the MCP server + a `monet` CLI call). Without a
+    // busy timeout a writer that meets the WAL lock fails immediately with SQLITE_BUSY; wait instead.
+    this.db.pragma("busy_timeout = 5000");
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.synthesizer = opts.synthesizer ?? new DeterministicSynthesizer();
     // Thresholds belong with the embedding space (cosine distributions differ per model).
@@ -437,6 +442,15 @@ export class MonetCore {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN source_refs TEXT`);
       }
     }
+    // One-time graph backfill for pre-graph DBs (P2, Codex review): the graph tables exist but hold no
+    // edges for concepts stored before the graph feature. Version-gated so it runs at most once, and only
+    // when the graph is enabled — a graph-disabled open must NOT consume the upgrade slot (the next
+    // graph-enabled open should still backfill).
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (this.graphEnabled && version < GRAPH_SCHEMA_VERSION) {
+      this.backfillGraph();
+      this.db.pragma(`user_version = ${GRAPH_SCHEMA_VERSION}`);
+    }
   }
 
   /** Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty. */
@@ -475,9 +489,19 @@ export class MonetCore {
     this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
 
     if (this.graphEnabled) {
-      if (refsJson) this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(refsJson, row.id);
+      // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
+      // must not erase earlier return-to-source pointers — gather()/toGatherCard expose only the
+      // concept-level `source_refs`, so a replace would silently drop every prior ref.
+      if (sourceRefs.length) {
+        const cur = this.db.prepare(`SELECT source_refs FROM concepts WHERE id = ?`).get(row.id) as
+          | { source_refs: string | null }
+          | undefined;
+        const existing = cur?.source_refs ? (JSON.parse(cur.source_refs) as string[]) : [];
+        const merged = [...new Set([...existing, ...sourceRefs])];
+        this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(JSON.stringify(merged), row.id);
+      }
       this.deriveEdges(row.id, content, sourceRefs, circle, sessionId, matches);
-      this.lastConceptInSession = row.id;
+      this.lastConceptByCircle.set(circle, row.id);
     }
 
     // Contradiction detection is agent-judged, expressed cheaply: a "correction" that lands on
@@ -892,13 +916,23 @@ export class MonetCore {
    */
   topConnectedConcepts(circle = "default", limit = 6): ConnectedConcept[] {
     const placeholders = [...THREAD_TYPES].map(() => "?").join(",");
+    // Count distinct thread/causal neighbours in BOTH directions (matching adjacency()'s traversal):
+    // directed causal edges (supports/resolves/derived_from/…) are stored one-way, so a hub that
+    // everything POINTS AT — a plan many memories support/resolve — has only incoming edges. Ranking
+    // outgoing degree alone (the old `e.src_id = c.id`) omitted exactly those sinks, the most
+    // informative hubs, and misreported the graph vs. what gather() can actually reach. DISTINCT on the
+    // neighbour collapses the symmetric co_occurred mirror so it is never double-counted.
     return this.db
       .prepare(
         `SELECT c.id AS id, c.title AS title, c.kind AS kind, c.confidence AS confidence, c.status AS status,
-                COUNT(DISTINCT e.dst_id) AS degree
+                COUNT(DISTINCT nb.other) AS degree
            FROM concepts c
-           JOIN memory_edge e ON e.src_id = c.id
-          WHERE e.scope = ? AND c.kind != 'workstream' AND e.type IN (${placeholders})
+           JOIN (
+             SELECT src_id AS cid, dst_id AS other, type, scope FROM memory_edge
+             UNION ALL
+             SELECT dst_id AS cid, src_id AS other, type, scope FROM memory_edge
+           ) nb ON nb.cid = c.id
+          WHERE nb.scope = ? AND c.kind != 'workstream' AND nb.type IN (${placeholders})
           GROUP BY c.id
           ORDER BY degree DESC, c.id
           LIMIT ?`,
@@ -1073,25 +1107,8 @@ export class MonetCore {
     sessionId: string,
     matches: Array<{ match: ConceptRow; score: number }>,
   ): void {
-    const n = this.conceptCount(circle); // total concepts in scope, for df-fraction hub gate
-
-    // 1) ENTITY / `about` — shared sourceRefs feed the SAME machinery as a synthetic path entity.
-    const ents = extractEntities(content);
-    for (const ref of sourceRefs) ents.push({ key: `ref:${ref}`, kind: "path", surface: ref, weight: 3 });
-    const strength = new Map<string, number>();
-    for (const e of ents) {
-      const df = this.upsertEntity(conceptId, e.key, e.kind, e.surface, circle);
-      if (this.isHubDf(df, n)) continue; // common term → not an anchor
-      const rar = this.rarityFromDf(df, n) * (KIND_BOOST[e.kind] ?? 1);
-      const strongAlone = e.kind !== "noun" && df <= RARE_DF_MAX; // one shared rare file/symbol is enough
-      for (const m of this.coMembers(e.key, circle, conceptId, MAX_NEIGHBORS)) {
-        const next = (strength.get(m) ?? 0) + rar;
-        strength.set(m, strongAlone ? Math.max(next, EDGE_MIN_STRENGTH) : next);
-      }
-    }
-    for (const [m, s] of strength) {
-      if (s >= EDGE_MIN_STRENGTH) this.upsertEdgeBoth(conceptId, m, "about", Math.min(1, s / 4), "cheap", circle);
-    }
+    // 1) ENTITY / `about` — shared rare anchors (and sourceRefs).
+    this.deriveEntityEdges(conceptId, content, sourceRefs, circle);
 
     // 2) SEMANTIC / `related` — reuse the dedup scan; only the "related but not duplicate" band.
     for (const nb of matches) {
@@ -1101,20 +1118,60 @@ export class MonetCore {
       }
     }
 
-    // 3) TEMPORAL / `co_occurred` + `follows` — same session = "worked on together" (the restoration signal).
+    // 3) TEMPORAL / `co_occurred` + `follows` — same session AND same circle = "worked on together"
+    //    (the restoration signal). Constrained to the current circle: a session may write to several
+    //    circles, and these edges are circle-scoped, so their targets must be too — otherwise read-path
+    //    spread (adjacency() trusts the edge's scope, never rechecks the neighbour's circle) would surface
+    //    foreign-circle memories. `follows` is tracked per circle for the same reason.
     const mates = this.db
       .prepare(
         `SELECT DISTINCT concept_id AS id FROM observations
-          WHERE session_id = ? AND concept_id IS NOT NULL AND concept_id != ?
+          WHERE session_id = ? AND circle = ? AND concept_id IS NOT NULL AND concept_id != ?
           ORDER BY created_at DESC, concept_id DESC LIMIT ?`, // created_at is whole-ms; id breaks ties deterministically
       )
-      .all(sessionId, conceptId, MAX_NEIGHBORS) as Array<{ id: string }>;
+      .all(sessionId, circle, conceptId, MAX_NEIGHBORS) as Array<{ id: string }>;
     for (const m of mates) this.upsertEdgeBoth(conceptId, m.id, "co_occurred", CO_OCCURRED_WEIGHT, "cheap", circle);
-    if (this.lastConceptInSession && this.lastConceptInSession !== conceptId) {
-      this.upsertEdge(this.lastConceptInSession, conceptId, "follows", FOLLOWS_WEIGHT, "cheap", circle);
+    const prevInCircle = this.lastConceptByCircle.get(circle);
+    if (prevInCircle && prevInCircle !== conceptId) {
+      this.upsertEdge(prevInCircle, conceptId, "follows", FOLLOWS_WEIGHT, "cheap", circle);
     }
 
     // 4) AGENT-ASSERTED — `resolves: #slug` etc. The strongest signal: the agent said so.
+    this.deriveAssertedEdges(conceptId, content, circle);
+  }
+
+  /**
+   * ENTITY / `about` derivation — shared rare anchors (structural entities + sourceRefs as synthetic
+   * path entities). Extracted so both the write path (deriveEdges) and the one-time backfill use the
+   * exact same gating. `n` (scope size, for the df-fraction hub gate) is read fresh from the circle.
+   */
+  private deriveEntityEdges(conceptId: string, content: string, sourceRefs: string[], circle: string): void {
+    const n = this.conceptCount(circle);
+    const ents = extractEntities(content);
+    for (const ref of sourceRefs) ents.push({ key: `ref:${ref}`, kind: "path", surface: ref, weight: 3 });
+    const strength = new Map<string, number>();
+    for (const e of ents) {
+      const df = this.upsertEntity(conceptId, e.key, e.kind, e.surface, circle);
+      // A rare structural anchor (concrete file/symbol/err/lib or sourceRef, df ≤ RARE_DF_MAX) is the
+      // strongest possible link and bypasses the df-FRACTION gate — that fraction is meaningless at small n
+      // (df=2 of n=2 reads as "common" yet is the rarest, most specific anchor), so without this the
+      // `strongAlone` path below was dead until ~10× unrelated filler concepts existed. df ≤ RARE_DF_MAX (5)
+      // can never be a true hub, so the absolute cap inside isHubDf is not needed for it.
+      const strongAlone = e.kind !== "noun" && df <= RARE_DF_MAX; // one shared rare file/symbol is enough
+      if (!strongAlone && this.isHubDf(df, n)) continue; // common term → not an anchor
+      const rar = this.rarityFromDf(df, n) * (KIND_BOOST[e.kind] ?? 1);
+      for (const m of this.coMembers(e.key, circle, conceptId, MAX_NEIGHBORS)) {
+        const next = (strength.get(m) ?? 0) + rar;
+        strength.set(m, strongAlone ? Math.max(next, EDGE_MIN_STRENGTH) : next);
+      }
+    }
+    for (const [m, s] of strength) {
+      if (s >= EDGE_MIN_STRENGTH) this.upsertEdgeBoth(conceptId, m, "about", Math.min(1, s / 4), "cheap", circle);
+    }
+  }
+
+  /** AGENT-ASSERTED `resolves: #slug` / `supports: #slug` edges parsed from content. Shared write/backfill. */
+  private deriveAssertedEdges(conceptId: string, content: string, circle: string): void {
     ASSERTED_RE.lastIndex = 0;
     let mm: RegExpExecArray | null;
     while ((mm = ASSERTED_RE.exec(content))) {
@@ -1122,6 +1179,72 @@ export class MonetCore {
       const target = this.resolveRef(mm[2], circle, conceptId);
       if (target) this.upsertEdge(conceptId, target, type, ASSERTED_WEIGHT, "asserted", circle);
     }
+  }
+
+  /**
+   * ONE-TIME graph backfill for DBs created before the connection graph existed (P2, Codex review):
+   * the graph tables are created empty by init() but edges are only ever derived at store time, so a
+   * pre-graph .monet DB has no hubs/threads and gather() degrades to plain search for its concepts.
+   * Re-derive entity/`about`/`related`/asserted edges from stored bodies+observations, and reconstruct
+   * `co_occurred`/`follows` best-effort from observation session+circle ordering. Idempotent (uq_edge /
+   * INSERT OR IGNORE), version-gated to run exactly once, and wrapped in a single transaction.
+   */
+  private backfillGraph(): void {
+    const concepts = this.db
+      .prepare(`SELECT id, body, circle, embedding, source_refs FROM concepts WHERE kind != 'workstream' ORDER BY created_at, id`)
+      .all() as Array<{ id: string; body: string; circle: string; embedding: string; source_refs: string | null }>;
+    if (concepts.length === 0) return;
+
+    this.db.transaction(() => {
+      // structural + semantic + asserted, per concept (df accumulates as a circle's concepts are processed)
+      for (const c of concepts) {
+        const obs = this.db
+          .prepare(`SELECT content, source_refs FROM observations WHERE concept_id = ? ORDER BY created_at`)
+          .all(c.id) as Array<{ content: string; source_refs: string | null }>;
+        const text = [c.body, ...obs.map((o) => o.content)].filter(Boolean).join("\n");
+        const refs = new Set<string>();
+        for (const o of obs) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) refs.add(r);
+        // Merge the observations' refs back onto the concept row too: a DB ingested with graphEnabled:false
+        // never ran store()'s concept-level source_refs update, so gather()/toGatherCard (which read
+        // concepts.source_refs) would otherwise lose every return-to-source pointer after the upgrade.
+        if (refs.size) {
+          const cur = c.source_refs ? (JSON.parse(c.source_refs) as string[]) : [];
+          const merged = [...new Set([...cur, ...refs])];
+          this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(JSON.stringify(merged), c.id);
+        }
+        this.deriveEntityEdges(c.id, text, [...refs], c.circle);
+        for (const nb of this.bestMatches(jsonToEmb(c.embedding), c.circle, EDGE_NEIGHBORS)) {
+          if (nb.match.id === c.id || nb.match.kind === "workstream") continue;
+          if (nb.score >= this.edgeSimMin && nb.score < this.tauAttach) {
+            this.upsertEdgeBoth(c.id, nb.match.id, "related", nb.score, "nn", c.circle);
+          }
+        }
+        this.deriveAssertedEdges(c.id, text, c.circle);
+      }
+      // temporal: reconstruct co_occurred + follows from observation session order, within each circle.
+      const sessions = this.db
+        .prepare(`SELECT DISTINCT session_id FROM observations WHERE session_id IS NOT NULL`)
+        .all() as Array<{ session_id: string }>;
+      for (const s of sessions) {
+        const seq = this.db
+          .prepare(
+            `SELECT DISTINCT concept_id AS id, circle FROM observations
+              WHERE session_id = ? AND concept_id IS NOT NULL ORDER BY created_at, concept_id`,
+          )
+          .all(s.session_id) as Array<{ id: string; circle: string }>;
+        const priorByCircle = new Map<string, string[]>();
+        const lastByCircle = new Map<string, string>();
+        for (const r of seq) {
+          const prior = priorByCircle.get(r.circle) ?? [];
+          for (const p of prior.slice(-MAX_NEIGHBORS)) this.upsertEdgeBoth(r.id, p, "co_occurred", CO_OCCURRED_WEIGHT, "cheap", r.circle);
+          const prev = lastByCircle.get(r.circle);
+          if (prev && prev !== r.id) this.upsertEdge(prev, r.id, "follows", FOLLOWS_WEIGHT, "cheap", r.circle);
+          prior.push(r.id);
+          priorByCircle.set(r.circle, prior);
+          lastByCircle.set(r.circle, r.id);
+        }
+      }
+    })();
   }
 
   /** One directed edge, idempotent + reinforcing (count↑, weight = max) on re-encounter. */
@@ -1456,7 +1579,7 @@ export class MonetCore {
       .prepare(`UPDATE sessions SET ended_at = unixepoch() * 1000, status = 'ended', summary = ? WHERE id = ?`)
       .run(summary ?? null, this.sessionId);
     this.sessionId = null;
-    this.lastConceptInSession = null; // `follows` never bridges a session boundary
+    this.lastConceptByCircle.clear(); // `follows` never bridges a session boundary
   }
 }
 
