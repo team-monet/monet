@@ -62,8 +62,10 @@ Merge into the host's **user-level** MCP config **without clobbering existing se
     description: "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, …"
     model: haiku
     ---
+    <!-- with-monet:agent -->
     <body of agents/explorer.md>
     ```
+    Add the `<!-- with-monet:agent -->` marker right after the frontmatter — it lets a later memory-consolidation pass tell Monet's installed workers apart from your *own* custom subagents, so it never captures or retires the team.
     **Don't clobber.** If `~/.claude/agents/<name>.md` already exists, back it up (`<name>.md.bak`) and tell the user before overwriting — generic names (`developer`, `reviewer`, …) can collide with the user's own subagents.
   - **Stig → lead, in global memory.** Append the body of `agents/stig.md` to `~/.claude/CLAUDE.md` so the **main agent** acts as Stig in every project and can delegate to the workers via the Task tool (a subagent can't spawn subagents, so the lead must be the main agent). Wrap it in idempotent markers so re-running doesn't duplicate it:
     ```
@@ -72,7 +74,7 @@ Merge into the host's **user-level** MCP config **without clobbering existing se
     <!-- END with-monet:stig -->
     ```
     If the markers already exist, replace the block in place; never append a second copy, and never clobber the user's other `CLAUDE.md` content (back it up first).
-- **Cursor / Continue / others** — install the lead + worker team in that host's user-level agent format; ask the user where those live.
+- **Cursor / Continue / others** — install the lead + worker team in that host's user-level agent format; ask the user where those live. **Mark each installed prompt** with a `<!-- with-monet:agent -->` sentinel (after any leading frontmatter — e.g. Cursor `.mdc` rules — so you don't break activation metadata), so a consolidation pass never captures or retires Monet's own wiring.
 
 The user may request a trimmed worker set, but the full team is the default — never reduce to Stig-only.
 
@@ -84,9 +86,9 @@ Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"*
 - a path or URL the user names,
 - skip for now.
 
-For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. Summarize what landed.
+For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. **Skip Monet's own wiring:** when the source is `CLAUDE.md` (which holds Stig's prompt) or an installed agent prompt, don't store the `<!-- BEGIN with-monet:stig -->…<!-- END with-monet:stig -->` block or any `<!-- with-monet:agent -->`-marked file. Summarize what landed.
 
-**Legacy memory in one circle?** If `memory_overview(circle:"default")` shows a meaningful pile of existing unscoped memory (from before per-project circles), don't leave it stranded in `"default"`. Offer to organize it into per-project circles — follow the interactive migration playbook [`bootstrap/migrate-memory.md`](migrate-memory.md) (same raw-URL base as above): scan the user's project root, group repos, and assign circles *with* them. Skip if `"default"` is empty.
+**Existing memory to consolidate?** If you find a meaningful pile — a non-empty legacy `"default"` circle (`memory_overview(circle:"default")`), other agents' rule files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, or scattered notes/ADRs — don't leave it scattered. Offer the interactive consolidation playbook [`bootstrap/consolidate-memory.md`](consolidate-memory.md) (same raw-URL base as above): capture each source into Monet, organize into per-project circles *with* the user, then retire the source (a pointer or archive) so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; consolidation does the organize-and-retire, interactively and reversibly. Skip if there's nothing meaningful to consolidate.
 
 ## Phase 6 — Offer to start
 
