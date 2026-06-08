@@ -1,15 +1,86 @@
 {
   "lead": "stig",
+  "_note": "Subagent `description` is what Claude Code's main agent matches to decide WHEN to delegate (Task tool) — it must be trigger-phrased, not an identity label. `model` maps to the .claude/agents/<name>.md frontmatter (sonnet|opus|haiku|inherit); these are sensible defaults you can override at install time. The lead `stig` runs as the main agent (installed into CLAUDE.md), so it has no model of its own — it uses the session's model.",
   "agents": [
-    { "name": "stig", "role": "state-centric lead", "mode": "primary", "prompt": "agents/stig.md", "touchesMonet": true },
-    { "name": "explorer", "role": "code investigation", "mode": "subagent", "prompt": "agents/explorer.md" },
-    { "name": "researcher", "role": "external research / prior art", "mode": "subagent", "prompt": "agents/researcher.md" },
-    { "name": "analyst", "role": "analysis / planning under constraints", "mode": "subagent", "prompt": "agents/analyst.md" },
-    { "name": "developer", "role": "implementation", "mode": "subagent", "prompt": "agents/developer.md" },
-    { "name": "tester", "role": "verification", "mode": "subagent", "prompt": "agents/tester.md" },
-    { "name": "reviewer", "role": "code review", "mode": "subagent", "prompt": "agents/reviewer.md" },
-    { "name": "security", "role": "trust-boundary / auth / secrets review", "mode": "subagent", "prompt": "agents/security.md" },
-    { "name": "reliability", "role": "incident / regression / readiness review", "mode": "subagent", "prompt": "agents/reliability.md" },
-    { "name": "aria", "role": "product scope / acceptance criteria", "mode": "subagent", "prompt": "agents/aria.md" }
+    {
+      "name": "stig",
+      "role": "state-centric lead",
+      "mode": "primary",
+      "prompt": "agents/stig.md",
+      "touchesMonet": true,
+      "description": "The lead. Runs as the main agent (installed into CLAUDE.md), holds project context via Monet, and delegates to the workers below via the Task tool."
+    },
+    {
+      "name": "explorer",
+      "role": "code investigation",
+      "mode": "subagent",
+      "prompt": "agents/explorer.md",
+      "model": "haiku",
+      "description": "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, and how a feature works, then report concise findings. Read-only — never edits."
+    },
+    {
+      "name": "researcher",
+      "role": "external research / prior art",
+      "mode": "subagent",
+      "prompt": "agents/researcher.md",
+      "model": "haiku",
+      "description": "Use PROACTIVELY when a decision needs external prior art, library docs, or web research the repo can't answer. Returns options and tradeoffs, not edits."
+    },
+    {
+      "name": "analyst",
+      "role": "analysis / planning under constraints",
+      "mode": "subagent",
+      "prompt": "agents/analyst.md",
+      "model": "sonnet",
+      "description": "Use PROACTIVELY for architecture and planning under constraints: assess feasibility, risks, and the approach before implementation. Does not write code."
+    },
+    {
+      "name": "developer",
+      "role": "implementation",
+      "mode": "subagent",
+      "prompt": "agents/developer.md",
+      "model": "sonnet",
+      "description": "Use PROACTIVELY to implement and refactor code, add tests, and run local validation, once the approach and the user's go-ahead are clear."
+    },
+    {
+      "name": "tester",
+      "role": "verification",
+      "mode": "subagent",
+      "prompt": "agents/tester.md",
+      "model": "sonnet",
+      "description": "Use PROACTIVELY to verify a change: design and run tests, reproduce regressions, and judge whether it actually works."
+    },
+    {
+      "name": "reviewer",
+      "role": "code review",
+      "mode": "subagent",
+      "prompt": "agents/reviewer.md",
+      "model": "opus",
+      "description": "Use PROACTIVELY after writing or changing code to review for correctness, security, and maintainability. Returns findings by severity; does not mutate PRs."
+    },
+    {
+      "name": "security",
+      "role": "trust-boundary / auth / secrets review",
+      "mode": "subagent",
+      "prompt": "agents/security.md",
+      "model": "opus",
+      "description": "Use PROACTIVELY for trust-boundary, auth, secrets, or data-exposure concerns: threat-model and review for security risk."
+    },
+    {
+      "name": "reliability",
+      "role": "incident / regression / readiness review",
+      "mode": "subagent",
+      "prompt": "agents/reliability.md",
+      "model": "sonnet",
+      "description": "Use PROACTIVELY for incident, regression, or release-readiness review: SLOs, observability, and operational risk."
+    },
+    {
+      "name": "aria",
+      "role": "product scope / acceptance criteria",
+      "mode": "subagent",
+      "prompt": "agents/aria.md",
+      "model": "sonnet",
+      "description": "Use PROACTIVELY when product scope or acceptance criteria are unclear: define what and why, scope the work, and set acceptance criteria."
+    }
   ]
 }
