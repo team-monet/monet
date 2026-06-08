@@ -55,7 +55,7 @@ Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override.
     <!-- END MONET:STIG -->
     ```
     Append; don't clobber anything already in `CLAUDE.md`.
-- **Cursor / Continue / others** — install the lead + the worker team in that host's agent format; ask the user where those live. **Mark every installed prompt file** (lead and workers) with a `<!-- MONET:AGENT -->` sentinel at the top — on hosts where the team lives in a rules/prompts dir the consolidation pass would otherwise scan (`.cursor/rules`, `.continue/rules`, …), this is what stops it from capturing/retiring Monet's own wiring. (For Claude Code the workers live in `.claude/agents/`, which consolidation excludes by path.)
+- **Cursor / Continue / others** — install the lead + the worker team in that host's agent format; ask the user where those live. **Mark every installed prompt file** (lead and workers) with a `<!-- MONET:AGENT -->` sentinel as the file's first line — **but for formats with leading frontmatter (e.g. Cursor `.mdc` rules, whose `---` block sets `description`/`globs`/`alwaysApply`), put the sentinel immediately *after* the closing `---`** so you don't shove a comment ahead of the frontmatter and break activation. On hosts where the team lives in a rules/prompts dir the consolidation pass would otherwise scan (`.cursor/rules`, `.continue/rules`, …), this marker is what stops it from capturing/retiring Monet's own wiring. (For Claude Code the workers live in `.claude/agents/`, which consolidation excludes by path.)
 
 The user may request a trimmed worker set, but the team is the default — never reduce to Stig-only.
 
@@ -67,7 +67,7 @@ Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"*
 - a path or URL the user names,
 - skip for now.
 
-For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. Summarize what landed.
+For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. **Skip Monet's own wiring:** when the source is `CLAUDE.md` (which you just appended Stig's prompt to) or any installed agent prompt, do **not** store anything inside the `<!-- BEGIN MONET:STIG -->…<!-- END MONET:STIG -->` block or any `<!-- MONET:AGENT -->`-marked file — that's the lead/worker prompt, not the user's knowledge. Summarize what landed.
 
 If you find a real pile of existing memory — a non-empty legacy `"default"` circle, other agents' rule files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, or scattered notes/ADRs — offer the fuller **consolidation** flow ([`bootstrap/consolidate-memory.md`](consolidate-memory.md)): capture each source into Monet *and then retire it* (a pointer or archive), so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; the consolidation playbook does the organize-and-retire, interactively and reversibly.
 
