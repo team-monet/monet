@@ -73,6 +73,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
       try {
         const r = await core.store(content, { circle: scope(circle), kind, sourceRefs });
         return ok({
+          circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
           conceptId: r.conceptId,
           score: Number(r.score.toFixed(3)),
@@ -166,6 +167,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
         return ok({
           id: c.id,
+          circle: c.circle, // pass this back to memory_synthesize if it isn't your session default
           kind: c.kind,
           body: body.text,
           ...(body.clipped ? { bodyTruncated: true } : {}),
@@ -187,7 +189,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           ...(c.needsSynthesis && omitted === 0
             ? {
                 synthesisInstruction:
-                  "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body).",
+                  "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body) — pass this concept's `circle` (above) if it isn't your session default.",
               }
             : c.needsSynthesis
               ? {
@@ -211,7 +213,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`); // scope enforcement
         const c = await core.applySynthesis(id, body);
         if (!c) return err(`concept not found: ${id}`);
-        return ok({ id: c.id, version: c.version, dirty: c.dirty, message: "synthesis stored" });
+        return ok({ id: c.id, circle: scope(circle), version: c.version, dirty: c.dirty, message: "synthesis stored" });
       } catch (e) {
         return err(`synthesize failed: ${msg(e)}`);
       }
@@ -271,7 +273,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
       try {
         if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`); // scope enforcement
         const c = core.flagContradiction(conceptId, { detail, observationId, kind });
-        return ok({ contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail });
+        return ok({ circle: scope(circle), contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail });
       } catch (e) {
         return err(`flag failed: ${msg(e)}`);
       }
@@ -293,7 +295,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         if (core.circleOfContradiction(contradictionId) !== scope(circle)) return err(`contradiction not found: ${contradictionId}`); // scope enforcement
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
-        return ok({ conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
+        return ok({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
       }
