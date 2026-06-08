@@ -39,7 +39,7 @@ Write an MCP server entry for **this host** (template: `with-monet/mcp/monet.jso
 { "mcpServers": { "monet": { "command": "monet", "args": ["start"] } } }
 ```
 
-Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override. (Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`.) Merge into the host's MCP config (don't clobber existing servers), then verify it comes up — it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_fetch`, `memory_synthesize`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
+Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override. (Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`.) Merge into the host's MCP config (don't clobber existing servers), then verify it comes up — it logs `semantic embeddings ready (MiniLM, 384-dim)` and `MCP server running`. Tools it exposes: `agent_context`, `memory_store`, `memory_search`, `memory_gather`, `memory_fetch`, `memory_synthesize`, `memory_overview`, `memory_list`, `memory_reassign_circle`, `memory_checkpoint`, `memory_flag_contradiction`, `memory_resolve`.
 
 ## Phase 4 — Install the agent team (host-specific)
 
@@ -47,7 +47,13 @@ Storage defaults to `<repo>/.monet` — set `env.MONET_STORAGE_DIR` to override.
 
 - **Claude Code:**
   - **Workers → subagents.** Write one `.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, security, reliability, aria` — each = a frontmatter header (`name` + the worker's `role` from `roster.json` as `description`) + the agent body from `agents/<name>.md` (local checkout or the raw base above).
-  - **Stig → lead.** Put the body of `agents/stig.md` into the repo's `CLAUDE.md` (append; don't clobber), so the main agent acts as Stig and can delegate to the worker subagents. (A subagent can't spawn subagents, so the lead must be the main agent.)
+  - **Stig → lead.** Append the body of `agents/stig.md` into the repo's `CLAUDE.md` so the main agent acts as Stig and can delegate to the worker subagents (a subagent can't spawn subagents, so the lead must be the main agent). **Wrap the appended prompt in sentinels** so it stays distinguishable from the user's own notes — this is what lets a later memory-consolidation pass retire the *user's* knowledge from `CLAUDE.md` without ever touching Stig's prompt:
+    ```
+    <!-- BEGIN MONET:STIG — Monet-managed; do not capture or edit -->
+    …agents/stig.md body…
+    <!-- END MONET:STIG -->
+    ```
+    Append; don't clobber anything already in `CLAUDE.md`.
 - **Cursor / Continue / others** — install the lead + the worker team in that host's agent format; ask the user where those live.
 
 The user may request a trimmed worker set, but the team is the default — never reduce to Stig-only.
@@ -61,6 +67,8 @@ Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"*
 - skip for now.
 
 For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. Summarize what landed.
+
+If you find a real pile of existing memory — a non-empty legacy `"default"` circle, other agents' rule files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, or scattered notes/ADRs — offer the fuller **consolidation** flow ([`bootstrap/consolidate-memory.md`](consolidate-memory.md)): capture each source into Monet *and then retire it* (a pointer or archive), so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; the consolidation playbook does the organize-and-retire, interactively and reversibly.
 
 ## Phase 6 — Offer to start
 
