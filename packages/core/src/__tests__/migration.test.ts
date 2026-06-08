@@ -161,6 +161,31 @@ describe("reassignCircle — move", () => {
     core.close();
   });
 
+  it("re-homes graph edges on reassign even when graph WRITES are disabled (don't just delete them)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-mig-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      // Build a graph with edges under a graph-ENABLED open (shared rare entity → an `about` edge).
+      const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      await a.store("The AuthService validates every request.");
+      await a.store("We split AuthService into smaller modules.");
+      expect(a.edges({ circle: "default", type: "about" }).length).toBeGreaterThan(0);
+      a.close();
+
+      // Reopen with graph writes DISABLED, then migrate both concepts.
+      const b = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1, graphEnabled: false });
+      for (const m of b.listMemories("default")) b.reassignCircle(m.id, "proj");
+
+      // The old circle is left with no stranded cross-circle edges, AND the graph is rebuilt in "proj"
+      // — not silently deleted (which the version-gated backfill would never restore).
+      expect(b.edges({ circle: "default" })).toHaveLength(0);
+      expect(b.edges({ circle: "proj", type: "about" }).length).toBeGreaterThan(0);
+      b.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("is a no-op when the target circle is the current one", async () => {
     const core = new MonetCore(":memory:");
     const a = await core.store("Some fact.", { circle: "c1" });

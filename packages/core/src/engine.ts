@@ -1523,8 +1523,12 @@ export class MonetCore {
     // Unwind the concept's footprint in the old circle (entity df + edges), then re-derive it inside
     // the new circle so it reconnects to whatever is already there. Cross-circle edges never survive:
     // a moved concept's old neighbours stay put, and read-path spread trusts an edge's scope blindly.
+    // BOTH steps run regardless of graphEnabled: the unwind is unconditional (a graph-enabled DB later
+    // reopened with graphEnabled:false must still not strand cross-circle edges), so the re-home must be
+    // too — otherwise the move would DELETE the graph footprint without rebuilding it, and the one-time
+    // backfill won't restore it (its version slot is already consumed). Both are no-ops on an empty graph.
     this.unwindConceptGraph(id, fromCircle);
-    if (this.graphEnabled) this.rederiveConceptGraph(id, toCircle);
+    this.rederiveConceptGraph(id, toCircle);
     return { action: "moved", conceptId: id, fromCircle, toCircle, observationsMoved: moved.changes };
   }
 
@@ -1581,7 +1585,8 @@ export class MonetCore {
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
     this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(src.id);
     // 5) Re-derive the target over the absorbed evidence (idempotent; picks up any new entities/edges).
-    if (this.graphEnabled) this.rederiveConceptGraph(target.id, toCircle);
+    //    Unconditional, mirroring the unconditional unwind above — see moveConcept's note.
+    this.rederiveConceptGraph(target.id, toCircle);
     return { action: "merged", conceptId: target.id, mergedIntoId: target.id, fromCircle, toCircle, observationsMoved: moved.changes };
   }
 
