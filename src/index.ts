@@ -3,11 +3,13 @@ import { ensureMonetDir, getDbPath } from "./db/index.js";
 
 async function main() {
   ensureMonetDir();
-  // Derive a per-project circle from the working tree so one shared store isolates each repo.
-  const circle = deriveCircle(process.cwd());
+  // Prefer an explicit project dir over cwd — a host may spawn this server elsewhere.
+  // (Claude Code sets CLAUDE_PROJECT_DIR for stdio MCP servers and discourages relying on cwd.)
+  const projectDir = process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const circle = deriveCircle(projectDir);
   const core = new MonetCore(getDbPath(), {
     embedder: await createLocalEmbedder(),
-    scopeContext: process.cwd(),
+    scopeContext: projectDir,
     defaultCircle: circle,
   });
   await createMonetCoreMcpServer(core);
