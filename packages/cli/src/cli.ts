@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import path from "node:path";
 import fs from "node:fs";
-import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
+import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer, deriveCircle } from "@team-monet/core";
 import { ensureMonetDir, getDbPath } from "./db/index.js";
 
 const program = new Command();
@@ -21,9 +21,17 @@ program
       process.env.MONET_STORAGE_DIR = path.resolve(options.dir);
     }
     ensureMonetDir();
-    const core = new MonetCore(getDbPath(), { embedder: await createLocalEmbedder(), scopeContext: process.cwd() });
+    // Derive a per-project circle from the working tree so one shared store (e.g. ~/.monet)
+    // isolates each repo: every circle-less memory op lands in this project's own circle.
+    const circle = deriveCircle(process.cwd());
+    const core = new MonetCore(getDbPath(), {
+      embedder: await createLocalEmbedder(),
+      scopeContext: process.cwd(),
+      defaultCircle: circle,
+    });
     console.error(`Monet started`);
     console.error(`Storage: ${getDbPath()}`);
+    console.error(`Circle:  ${circle}`);
     await createMonetCoreMcpServer(core);
   });
 
