@@ -69,14 +69,6 @@ program
     }
   });
 
-program
-  .command("install")
-  .description("Show installation guide for Monet")
-  .action(async () => {
-    const { main: installMain } = await import("./install.js");
-    await installMain();
-  });
-
 // YAML helper for Hermes
 function toYaml(obj: Record<string, unknown>, indent = 0): string {
   const spaces = " ".repeat(indent);
