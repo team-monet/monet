@@ -43,7 +43,7 @@ function err(message: string): CallToolResult {
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
-  const server = new McpServer({ name: "monet-core", version: "0.0.1" }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: "monet-core", version: "0.2.0" }, { capabilities: { tools: {} } });
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
@@ -116,6 +116,45 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         return ok({ ...core.overview(scope(circle)) });
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_list",
+    "Enumerate a circle's memories as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` for the project path(s) each memory's evidence came from. PAGINATED with a KEYSET cursor: returns up to `limit` (default 50) plus a `nextCursor` when more remain; pass it back as `cursor` to continue, until it's absent. The cursor walks a stable order, so it's SAFE to reassign each page out of the circle before fetching the next (an offset would skip rows as the circle shrinks). Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
+    {
+      circle: z.string().optional(),
+      withProvenance: z
+        .boolean()
+        .optional()
+        .describe("Include each memory's `provenance`: the distinct working-dir paths its observations were recorded under (the strongest signal for which project it belongs to)."),
+      limit: z.number().int().positive().max(200).optional().describe("Max memories to return (default 50)."),
+      cursor: z.string().optional().describe("Opaque keyset cursor from the prior response's `nextCursor`; omit for the first page."),
+    },
+    async ({ circle, withProvenance, limit, cursor }) => {
+      try {
+        const lim = limit ?? 50;
+        // Cursor is "<updatedAt>:<id>" (ids carry no colon). Walks the stable updated_at DESC, id ASC order.
+        let parsed: { updatedAt: number; id: string } | undefined;
+        if (cursor) {
+          const i = cursor.indexOf(":");
+          if (i > 0) parsed = { updatedAt: Number(cursor.slice(0, i)), id: cursor.slice(i + 1) };
+        }
+        const memories = core.listMemories(scope(circle), { withProvenance, limit: lim, cursor: parsed });
+        const last = memories[memories.length - 1];
+        const nextCursor = memories.length === lim && last ? `${last.updatedAt}:${last.id}` : null;
+        return ok({
+          circle: scope(circle),
+          total: core.conceptCount(scope(circle)), // current size — shrinks as you reassign out
+          count: memories.length,
+          ...(nextCursor ? { nextCursor } : {}),
+          memories,
+          guidance:
+            `Cards show what each memory is about, not what it says. ${nextCursor ? `More remain — call again with cursor=\"${nextCursor}\" (safe to reassign this page first). ` : ""}Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.`,
+        });
+      } catch (e) {
+        return err(`list failed: ${msg(e)}`);
       }
     },
   );
@@ -298,6 +337,41 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         return ok({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_reassign_circle",
+    "Move a memory — its concept, its observations, and its graph membership — from its current circle into another. The apply step of a memory migration: home a piece of unscoped \"default\" memory into its project's circle. Dedupes: if the target circle already holds a matching memory, the two MERGE (no duplicate, no re-embedding) and `action` comes back \"merged\". Non-destructive to other memories; moves one at a time so you can preview, confirm, then apply in batches. Pass `circle` = the id's CURRENT circle (e.g. \"default\") if it isn't your session default.",
+    {
+      id: z.string(),
+      toCircle: z.string().describe("The destination circle (e.g. the project's per-project circle)."),
+      circle: z.string().optional().describe("The id's CURRENT circle (defaults to this session's circle). Pass \"default\" when migrating legacy unscoped memory."),
+    },
+    async ({ id, toCircle, circle }) => {
+      try {
+        // Scope enforcement: you may only reassign an id that lives in the circle you named (the
+        // caller's session default, or an explicit source circle) — ids leak across sessions/output.
+        if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
+        const r = core.reassignCircle(id, toCircle);
+        if (!r) return err(`concept not found: ${id}`);
+        return ok({
+          action: r.action,
+          conceptId: r.conceptId,
+          fromCircle: r.fromCircle,
+          toCircle: r.toCircle,
+          observationsMoved: r.observationsMoved,
+          ...(r.mergedIntoId ? { mergedIntoId: r.mergedIntoId } : {}),
+          message:
+            r.action === "merged"
+              ? `Deduped into an existing memory in ${r.toCircle} (no duplicate). Read it with memory_fetch(id, "${r.toCircle}").`
+              : r.action === "moved"
+                ? `Moved to ${r.toCircle}. It now lives in that circle — fetch/search it there.`
+                : `Already in ${r.toCircle}; nothing to do.`,
+        });
+      } catch (e) {
+        return err(`reassign failed: ${msg(e)}`);
       }
     },
   );

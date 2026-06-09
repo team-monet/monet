@@ -15,9 +15,9 @@
  * like an answer and stops agents from fetching (#232). The full content lives only in
  * `body`, reachable via `getConcept` (fetch).
  */
-import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend } from "./embedding";
+import { StoragePort, BetterSqlitePort } from "./storage";
+import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend, blendWeighted } from "./embedding";
 import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
 import {
@@ -230,6 +230,40 @@ export interface MemoryOverview {
   };
 }
 
+/**
+ * One row of `listMemories` — a structural card for a stored concept, plus (optionally) the
+ * project path(s) its evidence came from. Identity/shape only, NEVER the body (§4.5): the
+ * migration agent groups by title + kind + provenance, then fetches a concept to read it.
+ */
+export interface MemoryListEntry {
+  id: string;
+  slug: string;
+  title: string;
+  kind: string;
+  status: string;
+  confidence: number;
+  supportCount: number;
+  contradictions: number;
+  updatedAt: number;
+  /** Distinct `scope_context` (working dir) of the sessions that authored this concept's
+   *  observations — the recorded provenance. Present only when `withProvenance` is set. */
+  provenance?: string[];
+}
+
+/** Outcome of `reassignCircle` — what the move did and which concept survived. */
+export interface ReassignResult {
+  /** moved: relocated as-is. merged: deduped into an existing target concept. noop: already there. */
+  action: "moved" | "merged" | "noop";
+  /** The surviving concept's id — the moved concept, or (on merge) the target it folded into. */
+  conceptId: string;
+  fromCircle: string;
+  toCircle: string;
+  /** Set on `merged`: the pre-existing target concept the source was absorbed into (== conceptId). */
+  mergedIntoId?: string;
+  /** Observations relocated into the target circle. */
+  observationsMoved: number;
+}
+
 export interface MonetCoreOptions {
   embedder?: EmbeddingProvider;
   synthesizer?: Synthesizer;
@@ -269,6 +303,7 @@ interface ConceptRow {
   updated_at: number;
   usefulness_score: number;
   source_refs: string | null;
+  aliases: string | null;
 }
 
 interface ContradictionRow {
@@ -285,7 +320,7 @@ interface ContradictionRow {
 }
 
 export class MonetCore {
-  private db: Database.Database;
+  private db: StoragePort;
   private embedder: EmbeddingProvider;
   private synthesizer: Synthesizer;
   private tauAttach: number;
@@ -303,12 +338,14 @@ export class MonetCore {
    *  Keyed by circle so a session that writes to several circles never chains `follows` across them. */
   private lastConceptByCircle = new Map<string, string>();
 
-  constructor(dbPath = ":memory:", opts: MonetCoreOptions = {}) {
-    this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    // Two local processes can share one .monet DB (e.g. the MCP server + a `monet` CLI call). Without a
-    // busy timeout a writer that meets the WAL lock fails immediately with SQLITE_BUSY; wait instead.
-    this.db.pragma("busy_timeout = 5000");
+  /**
+   * `db` is either a path for the default SQLite-backed store (":memory:" or a file), or a
+   * pre-built StoragePort to run the engine on an alternative backend / an in-test fake. The
+   * SQLite-specific connection setup (WAL + busy timeout, so the MCP server and a `monet` CLI
+   * call can share one .monet DB without an immediate SQLITE_BUSY) lives in BetterSqlitePort.
+   */
+  constructor(db: string | StoragePort = ":memory:", opts: MonetCoreOptions = {}) {
+    this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.synthesizer = opts.synthesizer ?? new DeterministicSynthesizer();
     // Thresholds belong with the embedding space (cosine distributions differ per model).
@@ -368,6 +405,7 @@ export class MonetCore {
         dirty INTEGER NOT NULL DEFAULT 0,
         usefulness_score INTEGER NOT NULL DEFAULT 0,
         source_refs TEXT,
+        aliases TEXT,
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
       );
@@ -439,13 +477,19 @@ export class MonetCore {
     `);
   }
 
-  /** Guarded migration for older DBs: add source_refs columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
+  /** Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
   private migrate(): void {
     for (const table of ["observations", "concepts"]) {
       const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
       if (!cols.some((c) => c.name === "source_refs")) {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN source_refs TEXT`);
       }
+    }
+    // aliases: slugs/ids a concept ANSWERS TO after absorbing another on merge — so an asserted
+    // reference to a merged-away slug (`supports: #old-slug`) still resolves to the survivor.
+    const conceptCols = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
+    if (!conceptCols.some((c) => c.name === "aliases")) {
+      this.db.exec(`ALTER TABLE concepts ADD COLUMN aliases TEXT`);
     }
     // One-time graph backfill for pre-graph DBs (P2, Codex review): the graph tables exist but hold no
     // edges for concepts stored before the graph feature. Version-gated so it runs at most once, and only
@@ -493,18 +537,22 @@ export class MonetCore {
 
     this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
 
+    // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
+    // must not erase earlier return-to-source pointers. Recorded UNCONDITIONALLY — NOT gated on the
+    // graph: gather()/toGatherCard and any source-keyed lookup read the concept-level `source_refs`, so
+    // a graph-disabled store must still record provenance. Otherwise a re-ingest/idempotency check that
+    // keys on the source pointer (e.g. the consolidation playbook's "did I already capture this file?")
+    // would wrongly report "never captured" on a graph-off runtime.
+    if (sourceRefs.length) {
+      const cur = this.db.prepare(`SELECT source_refs FROM concepts WHERE id = ?`).get(row.id) as
+        | { source_refs: string | null }
+        | undefined;
+      const existing = cur?.source_refs ? (JSON.parse(cur.source_refs) as string[]) : [];
+      const merged = [...new Set([...existing, ...sourceRefs])];
+      this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(JSON.stringify(merged), row.id);
+    }
+
     if (this.graphEnabled) {
-      // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
-      // must not erase earlier return-to-source pointers — gather()/toGatherCard expose only the
-      // concept-level `source_refs`, so a replace would silently drop every prior ref.
-      if (sourceRefs.length) {
-        const cur = this.db.prepare(`SELECT source_refs FROM concepts WHERE id = ?`).get(row.id) as
-          | { source_refs: string | null }
-          | undefined;
-        const existing = cur?.source_refs ? (JSON.parse(cur.source_refs) as string[]) : [];
-        const merged = [...new Set([...existing, ...sourceRefs])];
-        this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(JSON.stringify(merged), row.id);
-      }
       this.deriveEdges(row.id, content, sourceRefs, circle, sessionId, matches);
       this.lastConceptByCircle.set(circle, row.id);
     }
@@ -826,6 +874,78 @@ export class MonetCore {
     }));
   }
 
+  /**
+   * Enumerate every concept in a circle as a structural card (no bodies — §4.5), optionally with
+   * the project path(s) its observations came from. The read surface the interactive memory
+   * migration leans on: group "default" by content + provenance, then reassignCircle each into its
+   * project's circle. Workstreams are excluded (identity-scoped session state, not knowledge).
+   * Ordered recency-first (updated_at desc, id asc) for a stable, reviewable listing.
+   *
+   * Paging: prefer the KEYSET `cursor` (the last returned entry's {updatedAt, id}) over `offset`.
+   * The migration workflow reassigns each page OUT of the source circle as it goes, so the circle
+   * shrinks between calls — an offset would then skip rows. A keyset cursor walks the stable order
+   * and is immune to that (already-moved rows simply aren't there). `offset` is kept for internal/
+   * test callers enumerating a static circle; omit limit for the full circle.
+   */
+  listMemories(
+    circle?: string,
+    opts: { withProvenance?: boolean; limit?: number; offset?: number; cursor?: { updatedAt: number; id: string } } = {},
+  ): MemoryListEntry[] {
+    circle ??= this.defaultCircle;
+    const params: Array<string | number> = [circle];
+    let where = `circle = ? AND kind != 'workstream'`;
+    if (opts.cursor) {
+      // Rows strictly AFTER (updatedAt, id) in the `updated_at DESC, id ASC` order.
+      where += ` AND (updated_at < ? OR (updated_at = ? AND id > ?))`;
+      params.push(opts.cursor.updatedAt, opts.cursor.updatedAt, opts.cursor.id);
+    }
+    let sql = `SELECT * FROM concepts WHERE ${where} ORDER BY updated_at DESC, id`;
+    if (opts.limit != null) {
+      sql += ` LIMIT ?`;
+      params.push(Math.max(0, Math.floor(opts.limit)));
+      if (!opts.cursor && opts.offset != null) {
+        sql += ` OFFSET ?`;
+        params.push(Math.max(0, Math.floor(opts.offset)));
+      }
+    }
+    const rows = this.db.prepare(sql).all(...params) as ConceptRow[];
+    const contradictions = this.openContradictionCounts(circle);
+
+    // Provenance only for the page's concepts: distinct session scope_context per returned concept.
+    const provByConcept = new Map<string, string[]>();
+    if (opts.withProvenance && rows.length) {
+      const ids = rows.map((r) => r.id);
+      const placeholders = ids.map(() => "?").join(",");
+      const prov = this.db
+        .prepare(
+          `SELECT o.concept_id AS cid, s.scope_context AS scope
+             FROM observations o JOIN sessions s ON s.id = o.session_id
+            WHERE o.concept_id IN (${placeholders}) AND s.scope_context IS NOT NULL
+            GROUP BY o.concept_id, s.scope_context
+            ORDER BY o.concept_id, s.scope_context`,
+        )
+        .all(...ids) as Array<{ cid: string; scope: string }>;
+      for (const p of prov) {
+        const list = provByConcept.get(p.cid) ?? [];
+        list.push(p.scope);
+        provByConcept.set(p.cid, list);
+      }
+    }
+
+    return rows.map((r) => ({
+      id: r.id,
+      slug: r.slug,
+      title: r.title,
+      kind: r.kind,
+      status: r.status,
+      confidence: Number(r.confidence.toFixed(2)),
+      supportCount: r.support_count,
+      contradictions: contradictions.get(r.id) ?? 0,
+      updatedAt: r.updated_at,
+      ...(opts.withProvenance ? { provenance: provByConcept.get(r.id) ?? [] } : {}),
+    }));
+  }
+
   getAgentId(): string {
     return this.agentId;
   }
@@ -847,6 +967,38 @@ export class MonetCore {
       .prepare(`SELECT c.circle AS circle FROM contradictions k JOIN concepts c ON c.id = k.concept_id WHERE k.id = ?`)
       .get(contradictionId) as { circle: string } | undefined;
     return r?.circle ?? null;
+  }
+
+  /**
+   * Move a concept — its observations and its graph membership (entities + edges) — from its
+   * current circle into `toCircle`. The apply step of the interactive memory migration: organize
+   * a pile of unscoped "default" memory into per-project circles. Dedupes: if `toCircle` already
+   * holds a concept this one resolves to (cosine ≥ tauAttach), the two MERGE — the source's
+   * evidence, support, and vector fold into the target and the source row is removed (no duplicate,
+   * no re-embedding). Otherwise the concept relocates as-is and re-homes its graph in the new
+   * circle. Atomic. Returns what happened, or null if `id` doesn't exist. Workstreams (identity-
+   * scoped session state, not knowledge) cannot be reassigned.
+   */
+  reassignCircle(id: string, toCircle: string): ReassignResult | null {
+    const src = this.getRow(id);
+    if (!src) return null;
+    if (src.kind === "workstream") throw new Error("cannot reassign a workstream concept");
+    const fromCircle = src.circle;
+    if (fromCircle === toCircle) {
+      return { action: "noop", conceptId: id, fromCircle, toCircle, observationsMoved: 0 };
+    }
+    // Dedup target: the best match already in toCircle (bestMatches excludes workstreams; the source
+    // lives in fromCircle, so it can never match itself). score ≥ tauAttach ⇒ "same concept" ⇒ merge.
+    const top = this.bestMatches(jsonToEmb(src.embedding), toCircle, 1)[0];
+    const mergeInto = top && top.score >= this.tauAttach ? top.match : null;
+    const result = this.db.transaction(() =>
+      mergeInto ? this.mergeConceptInto(src, mergeInto, toCircle) : this.moveConcept(src, toCircle),
+    )();
+    // `follows` is in-memory + circle-keyed: the source just left (or ceased to exist in) fromCircle,
+    // so a later store there must not chain a follows edge onto it (it would point out-of-circle / at a
+    // deleted row). Drop any lastConcept pointer to it.
+    for (const [c, v] of this.lastConceptByCircle) if (v === src.id) this.lastConceptByCircle.delete(c);
+    return result;
   }
 
   conceptCount(circle?: string): number {
@@ -1341,12 +1493,181 @@ export class MonetCore {
   }
 
   private resolveRef(ref: string, circle: string, excludeId: string): string | null {
+    const slug = slugify(ref);
     const bySlug = this.db
       .prepare(`SELECT id FROM concepts WHERE circle = ? AND slug = ? AND id != ? LIMIT 1`)
-      .get(circle, slugify(ref), excludeId) as { id: string } | undefined;
+      .get(circle, slug, excludeId) as { id: string } | undefined;
     if (bySlug) return bySlug.id;
     const byId = this.db.prepare(`SELECT id FROM concepts WHERE id = ? AND circle = ?`).get(ref, circle) as { id: string } | undefined;
-    return byId?.id ?? null;
+    if (byId) return byId.id;
+    // Alias fallback (only when the direct lookup misses): a survivor that absorbed another concept on
+    // merge carries the absorbed slug/id, so `supports: #merged-away-slug` still lands on the survivor.
+    const aliased = this.db
+      .prepare(`SELECT id, aliases FROM concepts WHERE circle = ? AND id != ? AND aliases IS NOT NULL`)
+      .all(circle, excludeId) as Array<{ id: string; aliases: string }>;
+    for (const a of aliased) {
+      const list = JSON.parse(a.aliases) as string[];
+      if (list.includes(ref) || list.includes(slug)) return a.id;
+    }
+    return null;
+  }
+
+  // ---- circle migration (reassignCircle internals) -----------------------
+
+  /** Relocate a concept + its observations into toCircle, re-homing its graph membership there. */
+  private moveConcept(src: ConceptRow, toCircle: string): ReassignResult {
+    const id = src.id;
+    const fromCircle = src.circle;
+    this.db.prepare(`UPDATE concepts SET circle = ?, updated_at = unixepoch() * 1000 WHERE id = ?`).run(toCircle, id);
+    const moved = this.db.prepare(`UPDATE observations SET circle = ? WHERE concept_id = ?`).run(toCircle, id);
+    // Unwind the concept's footprint in the old circle (entity df + edges), then re-derive it inside
+    // the new circle so it reconnects to whatever is already there. Cross-circle edges never survive:
+    // a moved concept's old neighbours stay put, and read-path spread trusts an edge's scope blindly.
+    // BOTH steps run regardless of graphEnabled: the unwind is unconditional (a graph-enabled DB later
+    // reopened with graphEnabled:false must still not strand cross-circle edges), so the re-home must be
+    // too — otherwise the move would DELETE the graph footprint without rebuilding it, and the one-time
+    // backfill won't restore it (its version slot is already consumed). Both are no-ops on an empty graph.
+    this.unwindConceptGraph(id, fromCircle);
+    this.rederiveConceptGraph(id, toCircle);
+    return { action: "moved", conceptId: id, fromCircle, toCircle, observationsMoved: moved.changes };
+  }
+
+  /**
+   * Dedupe `src` into an existing `target` in toCircle: re-point src's observations onto the target,
+   * fold its body/support/vector in (blended, NOT re-embedded), carry over its contradictions, drop
+   * the src row + its revisions, then re-derive the target's graph over the now-larger evidence. The
+   * target is marked dirty so the agent re-synthesizes the combined body on next touch.
+   */
+  private mergeConceptInto(src: ConceptRow, target: ConceptRow, toCircle: string): ReassignResult {
+    const fromCircle = src.circle;
+    // 1) Re-point evidence: src's observations become the target's, in the target circle.
+    const moved = this.db
+      .prepare(`UPDATE observations SET concept_id = ?, circle = ? WHERE concept_id = ?`)
+      .run(target.id, toCircle, src.id);
+    // 2) Carry contradictions onto the target BEFORE recomputing status (their observations followed
+    //    in step 1) — so a disputed source doesn't get silently restored to active by the merge.
+    this.db.prepare(`UPDATE contradictions SET concept_id = ? WHERE concept_id = ?`).run(target.id, src.id);
+    // 3) Fold body + support + vector + source_refs into the target (never re-embed; blend the two
+    //    centroids WEIGHTED by support so a heavily-supported source isn't treated as one sample).
+    const lines = splitLines(target.body);
+    for (const l of splitLines(src.body)) if (!lines.includes(l)) lines.push(l);
+    const supportCount = target.support_count + src.support_count;
+    const blended = blendWeighted(jsonToEmb(target.embedding), target.support_count, jsonToEmb(src.embedding), src.support_count);
+    // Union return-to-source pointers — gather cards and source-keyed idempotency read concept-level
+    // source_refs, so a dedup-merge must not drop the moved concept's refs.
+    const refs = [
+      ...new Set([
+        ...(target.source_refs ? (JSON.parse(target.source_refs) as string[]) : []),
+        ...(src.source_refs ? (JSON.parse(src.source_refs) as string[]) : []),
+      ]),
+    ];
+    // Carry the absorbed concept's slug + id (and any aliases it already held) onto the survivor, so an
+    // asserted reference to the now-deleted source (`supports: #src-slug`) still resolves here.
+    const aliases = [
+      ...new Set([
+        ...(target.aliases ? (JSON.parse(target.aliases) as string[]) : []),
+        ...(src.aliases ? (JSON.parse(src.aliases) as string[]) : []),
+        src.slug,
+        src.id,
+      ]),
+    ];
+    const version = target.version + 1;
+    // Stay disputed while any open contradiction (target's own or the carried one) remains.
+    const status = this.openContraCount(target.id) > 0 ? "disputed" : "active";
+    this.db
+      .prepare(
+        `UPDATE concepts SET body = ?, support_count = ?, embedding = ?, source_refs = ?, aliases = ?, version = ?,
+                status = ?, dirty = 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
+      )
+      .run(lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, JSON.stringify(aliases), version, status, target.id);
+    // 4) Drop the source: its graph footprint in fromCircle, its revision history, then the row.
+    this.unwindConceptGraph(src.id, fromCircle);
+    this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
+    this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(src.id);
+    // 5) Re-derive the target over the absorbed evidence (idempotent; picks up any new entities/edges).
+    //    Unconditional, mirroring the unconditional unwind above — see moveConcept's note.
+    this.rederiveConceptGraph(target.id, toCircle);
+    return { action: "merged", conceptId: target.id, mergedIntoId: target.id, fromCircle, toCircle, observationsMoved: moved.changes };
+  }
+
+  /**
+   * Remove a concept's footprint from a circle's graph: its entity memberships (decrementing each
+   * entity's per-scope df, dropping entities that fall to zero) and every edge that touches it.
+   * Leaves no cross-circle dangling edge behind once the concept itself has left the circle.
+   */
+  private unwindConceptGraph(conceptId: string, circle: string): void {
+    const keys = (
+      this.db
+        .prepare(`SELECT entity_key AS key FROM concept_entities WHERE concept_id = ? AND scope = ?`)
+        .all(conceptId, circle) as Array<{ key: string }>
+    ).map((r) => r.key);
+    for (const key of keys) {
+      this.db.prepare(`DELETE FROM concept_entities WHERE concept_id = ? AND entity_key = ? AND scope = ?`).run(conceptId, key, circle);
+      this.db.prepare(`UPDATE entities SET df = df - 1 WHERE key = ? AND scope = ?`).run(key, circle);
+      this.db.prepare(`DELETE FROM entities WHERE key = ? AND scope = ? AND df <= 0`).run(key, circle);
+    }
+    this.db.prepare(`DELETE FROM memory_edge WHERE scope = ? AND (src_id = ? OR dst_id = ?)`).run(circle, conceptId, conceptId);
+  }
+
+  /**
+   * Re-derive a concept's graph membership inside `circle` from its stored body + observations — the
+   * same Sift derivation store() runs, used after a move/merge to re-home (or extend) the concept in
+   * its target circle. Reconstructs entity/`about`, `related` (NN), asserted, and same-session
+   * `co_occurred` edges (the observations keep their session_id, so "worked together" grouping
+   * survives the migration among co-moved siblings). All scoped to `circle`; idempotent via uq_edge /
+   * INSERT OR IGNORE. `follows` (order-sensitive, weakest signal) is intentionally not reconstructed.
+   */
+  private rederiveConceptGraph(conceptId: string, circle: string): void {
+    const row = this.getRow(conceptId);
+    if (!row) return;
+    const obs = this.db
+      .prepare(`SELECT content, source_refs FROM observations WHERE concept_id = ? ORDER BY created_at`)
+      .all(conceptId) as Array<{ content: string; source_refs: string | null }>;
+    const text = [row.body, ...obs.map((o) => o.content)].filter(Boolean).join("\n");
+    const refs = new Set<string>();
+    if (row.source_refs) for (const r of JSON.parse(row.source_refs) as string[]) refs.add(r);
+    for (const o of obs) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) refs.add(r);
+
+    this.deriveEntityEdges(conceptId, text, [...refs], circle);
+    for (const nb of this.bestMatches(jsonToEmb(row.embedding), circle, EDGE_NEIGHBORS)) {
+      if (nb.match.id === conceptId || nb.match.kind === "workstream") continue;
+      if (nb.score >= this.edgeSimMin && nb.score < this.tauAttach) {
+        this.upsertEdgeBoth(conceptId, nb.match.id, "related", nb.score, "nn", circle);
+      }
+    }
+    this.deriveAssertedEdges(conceptId, text, circle);
+    // INCOMING asserted edges: a concept already in this circle may have asserted an edge TO this one
+    // (e.g. `supports: #thisSlug`) while this one was still elsewhere — resolveRef found nothing then, so
+    // the directed edge was dropped. Now that it's here, re-derive the assertions of circle-mates whose
+    // text references it — by slug, id, OR any alias it absorbed on merge, and matching either the
+    // synthesized body OR the raw observations (a synthesized body may no longer carry the `#slug`
+    // marker). deriveAssertedEdges is idempotent (uq_edge), so re-deriving an existing edge is a no-op.
+    const needles = [...new Set([row.slug, conceptId, ...(row.aliases ? (JSON.parse(row.aliases) as string[]) : [])])].filter(Boolean);
+    const likeParams = needles.map((n) => `%${n}%`);
+    const bodyLikes = needles.map(() => `c.body LIKE ?`).join(" OR ");
+    const obsLikes = needles.map(() => `o.content LIKE ?`).join(" OR ");
+    const referrers = this.db
+      .prepare(
+        `SELECT DISTINCT c.id AS id FROM concepts c
+            LEFT JOIN observations o ON o.concept_id = c.id
+           WHERE c.circle = ? AND c.id != ? AND c.kind != 'workstream' AND ((${bodyLikes}) OR (${obsLikes}))`,
+      )
+      .all(circle, conceptId, ...likeParams, ...likeParams) as Array<{ id: string }>;
+    for (const ref of referrers) {
+      const refRow = this.getRow(ref.id);
+      if (!refRow) continue;
+      const refObs = this.db.prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at`).all(ref.id) as Array<{ content: string }>;
+      this.deriveAssertedEdges(ref.id, [refRow.body, ...refObs.map((o) => o.content)].filter(Boolean).join("\n"), circle);
+    }
+    const mates = this.db
+      .prepare(
+        `SELECT DISTINCT o2.concept_id AS id FROM observations o1
+            JOIN observations o2 ON o2.session_id = o1.session_id
+           WHERE o1.concept_id = ? AND o2.circle = ? AND o2.concept_id IS NOT NULL AND o2.concept_id != ?
+           ORDER BY o2.concept_id LIMIT ?`,
+      )
+      .all(conceptId, circle, conceptId, MAX_NEIGHBORS) as Array<{ id: string }>;
+    for (const m of mates) this.upsertEdgeBoth(conceptId, m.id, "co_occurred", CO_OCCURRED_WEIGHT, "cheap", circle);
   }
 
   // ---- #245 graph: gather (read path) ------------------------------------

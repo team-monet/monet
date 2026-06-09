@@ -8,12 +8,38 @@ structural search cards, contradiction lifecycle, workstreams + session survival
 query-independent prewarm, and pluggable local embeddings (MiniLM via ONNX, with a
 lexical hashing fallback).
 
-Architecture: see ADR 0001 (state-centric memory substrate).
+Architecture: two layers — raw **observations** (what was seen, with provenance) distil into
+durable **concepts** (what's true now). Writes resolve-or-create against existing concepts, and
+contradictions are tracked and mediated rather than silently overwritten.
 
 ## Surfaces
 
-- `MonetCore` — the pure in-process engine API.
-- `createMonetCoreMcpServer` — an MCP-server adapter over the engine.
+- `MonetCore` — the pure in-process engine API (`store`, `search`, `gather`, `checkpoint`, `overview`, …).
+- `createMonetCoreMcpServer` — an MCP-server adapter that exposes the engine over stdio.
+- `createLocalEmbedder` — the on-device MiniLM embedder (with a lexical fallback).
+- `deriveCircle` — a stable per-project *circle* from the working tree, so one shared store isolates each repo.
+
+## Usage
+
+```ts
+import { MonetCore, createLocalEmbedder, deriveCircle, createMonetCoreMcpServer } from "@team-monet/core";
+
+// One local SQLite store, partitioned per project by `circle`.
+const core = new MonetCore("memory.db", {
+  embedder: await createLocalEmbedder(),        // on-device MiniLM, lexical fallback
+  defaultCircle: deriveCircle(process.cwd()),   // per-working-tree isolation
+});
+
+await core.store("CI runs fully offline; no network calls in the test suite.");
+const cards = await core.search("how does CI run?");  // structural cards (ids/titles), not bodies
+console.log(core.stats());                            // { concepts, observations, workstreams, … }
+
+// Or expose the same engine to an MCP host (this is what @team-monet/monet does):
+await createMonetCoreMcpServer(core);
+```
+
+Most users don't import this directly — they install [`@team-monet/monet`](https://github.com/team-monet/monet),
+the local-first MCP server + CLI built on this engine.
 
 ## Scripts
 
