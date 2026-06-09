@@ -8,8 +8,7 @@
   "homepage": "https://github.com/team-monet/monet",
   "keywords": ["mcp", "memory", "agent", "monet", "local-first", "state-centric", "embeddings"],
   "bin": {
-    "monet": "./dist/cli.js",
-    "install-monet": "./dist/install.js"
+    "monet": "./dist/cli.js"
   },
   "files": ["dist"],
   "publishConfig": { "access": "public" },
@@ -18,7 +17,6 @@
     "dev:cli": "tsx watch src/cli.ts",
     "build": "node build.mjs",
     "build:cli": "node build.mjs cli",
-    "build:install": "node build.mjs install",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests --dir src",
