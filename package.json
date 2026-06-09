@@ -31,7 +31,7 @@
     "@huggingface/transformers": "^3.0.0"
   },
   "devDependencies": {
-    "@team-monet/core": "^0.1.0",
+    "@team-monet/core": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "commander": "^12.1.0",
     "zod": "^3.25.76",
