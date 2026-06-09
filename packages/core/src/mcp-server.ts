@@ -43,7 +43,7 @@ function err(message: string): CallToolResult {
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
-  const server = new McpServer({ name: "monet-core", version: "0.0.1" }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: "monet-core", version: "0.2.0" }, { capabilities: { tools: {} } });
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
