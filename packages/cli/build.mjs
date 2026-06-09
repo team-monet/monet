@@ -1,5 +1,5 @@
 /**
- * Publish build for @team-monet/local.
+ * Publish build for @team-monet/monet.
  *
  * Bundles the pure-JS dependency graph (including the @team-monet/core workspace engine) into
  * self-contained ESM, but EXTERNALIZES native / heavy modules so esbuild never tries to
@@ -8,7 +8,7 @@
  *   - @huggingface/transformers + onnxruntime-* + sharp — native; the optional MiniLM embedder
  *
  * Those are declared as (optional) runtime dependencies of this package; everything else
- * is bundled. Run `node build.mjs` for all targets, or `node build.mjs <index|cli|install>`.
+ * is bundled. Run `node build.mjs` for all targets, or `node build.mjs <index|cli>`.
  */
 import { build } from "esbuild";
 import { rmSync } from "node:fs";
@@ -25,7 +25,6 @@ const EXTERNAL = [
 const TARGETS = {
   index: { entryPoints: ["src/index.ts"], outfile: "dist/index.js" },
   cli: { entryPoints: ["src/cli.ts"], outfile: "dist/cli.js" },
-  install: { entryPoints: ["src/install.js"], outfile: "dist/install.js" },
 };
 
 const only = process.argv[2];
