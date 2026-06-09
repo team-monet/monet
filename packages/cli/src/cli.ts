@@ -21,12 +21,15 @@ program
       process.env.MONET_STORAGE_DIR = path.resolve(options.dir);
     }
     ensureMonetDir();
-    // Derive a per-project circle from the working tree so one shared store (e.g. ~/.monet)
-    // isolates each repo: every circle-less memory op lands in this project's own circle.
-    const circle = deriveCircle(process.cwd());
+    // Identify the project we're serving so one shared store (e.g. ~/.monet) isolates each repo
+    // into its own circle. A host may spawn this stdio server from a cwd that isn't the user's
+    // repo — Claude Code sets CLAUDE_PROJECT_DIR and documents that servers shouldn't rely on cwd
+    // — so prefer an explicit project dir, then fall back to cwd.
+    const projectDir = process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    const circle = deriveCircle(projectDir);
     const core = new MonetCore(getDbPath(), {
       embedder: await createLocalEmbedder(),
-      scopeContext: process.cwd(),
+      scopeContext: projectDir,
       defaultCircle: circle,
     });
     console.error(`Monet started`);
