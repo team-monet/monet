@@ -32,22 +32,23 @@ restart your host.
 claude mcp add --scope user monet -- monet start
 ```
 
-**Any host** — generate a starting config block:
+**Other hosts** — `monet config` prints a starting config block:
 
 ```sh
-monet config --agent claude-code   # also: cursor | hermes | openclaw
+monet config --agent claude-code   # targets: claude-code, cursor, hermes, openclaw
 ```
 
-For Claude Code it prints a ready-to-paste `mcpServers` entry (and defaults to a **per-repo** store):
+For **Claude Code** it emits a ready-to-paste `mcpServers` entry; the store defaults to the
+directory where you run the command:
 
 ```jsonc
 { "mcpServers": { "monet": { "command": "monet", "args": ["start"],
-    "env": { "MONET_STORAGE_DIR": "<cwd>/.monet" } } } }
+    "env": { "MONET_STORAGE_DIR": "<dir>/.monet" } } } }
 ```
 
-Other hosts differ in where MCP servers are declared and how the key is spelled (e.g. Cursor
-uses `~/.cursor/mcp.json`), so treat the output as a starting point and match your host's
-schema — the command part is always `monet start`.
+For the other targets the emitted block is a **starting point, not guaranteed paste-ready** —
+MCP config keys and file locations differ between hosts (e.g. Cursor's `~/.cursor/mcp.json`).
+Match your host's schema; the command is always `monet start`.
 
 Restart your host so it picks up the server. On startup Monet logs its store and the active
 project circle to stderr:
@@ -63,10 +64,12 @@ Want a whole agent team wired in one paste, not just the server? Use the
 
 ## Where your memory lives
 
-By default Monet keeps **one global store at `~/.monet`** and **isolates each project into
-its own _circle_** — derived from your **project directory** (`CLAUDE_PROJECT_DIR` when your
-host sets it, e.g. Claude Code; otherwise the working tree's git root, else cwd; override with
-`MONET_PROJECT_DIR`) — so memory never bleeds between repos while still sharing a single brain.
+By default Monet keeps **one global store at `~/.monet`** and **partitions each project into
+its own _circle_**, derived from your project directory — `MONET_PROJECT_DIR` if you set it,
+else `CLAUDE_PROJECT_DIR` (Claude Code sets this for MCP servers), else the working tree
+(git root → cwd). On hosts that expose the project directory this keeps repos isolated
+automatically; if a host launches the server from some other directory and sets none of those,
+the circle falls back to that cwd — so for a hard guarantee, use a per-repo store (below).
 The storage directory resolves in this order:
 
 1. `MONET_STORAGE_DIR`, if set;
