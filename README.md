@@ -11,10 +11,91 @@ and speaks **MCP**, so it drops into Claude Code, Cursor, VS Code, and other MCP
 
 ```sh
 npm i -g @team-monet/monet
-monet start        # run the MCP server (stdio)
 ```
 
-Or wire it into your agent team with the [with-monet](https://github.com/team-monet/with-monet) harness.
+Requires **Node ≥ 22**. Installs a native module (`better-sqlite3`) — most platforms pull a
+prebuilt binary; others compile it on install (needs a C/C++ toolchain). The first
+`monet start` downloads the on-device MiniLM embedding model **once** (a few seconds), then
+runs fully offline.
+
+Zero-install alternative: `npx -y @team-monet/monet start`.
+
+## Quickstart — wire it into your agent
+
+Monet is an **MCP server**: your agent host launches `monet start` and talks to it over
+stdio, so `monet start` on its own just waits for a host to connect. Register it, then
+restart your host.
+
+**Claude Code** (one command — uses the shared global store, see below):
+
+```sh
+claude mcp add --scope user monet -- monet start
+```
+
+**Other hosts** — `monet config` prints a starting config block:
+
+```sh
+monet config --agent claude-code   # targets: claude-code, cursor, hermes, openclaw
+```
+
+For **Claude Code** it emits a ready-to-paste `mcpServers` entry; the store defaults to the
+directory where you run the command:
+
+```jsonc
+{ "mcpServers": { "monet": { "command": "monet", "args": ["start"],
+    "env": { "MONET_STORAGE_DIR": "<dir>/.monet" } } } }
+```
+
+For the other targets the emitted block is a **starting point, not guaranteed paste-ready** —
+MCP config keys and file locations differ between hosts (e.g. Cursor's `~/.cursor/mcp.json`).
+Match your host's schema; the command is always `monet start`.
+
+Restart your host so it picks up the server. On startup Monet logs its store and the active
+project circle to stderr:
+
+```
+Monet started
+Storage: /Users/you/.monet/monet.db
+Circle:  my-repo-1a2b3c4d
+```
+
+Want a whole agent team wired in one paste, not just the server? Use the
+[with-monet](https://github.com/team-monet/with-monet) harness.
+
+## Where your memory lives
+
+By default Monet keeps **one global store at `~/.monet`** and **partitions each project into
+its own _circle_**, derived from your project directory — `MONET_PROJECT_DIR` if you set it,
+else `CLAUDE_PROJECT_DIR` (Claude Code sets this for MCP servers), else the working tree
+(git root → cwd). On hosts that expose the project directory this keeps repos isolated
+automatically; if a host launches the server from some other directory and sets none of those,
+the circle falls back to that cwd — so for a hard guarantee, use a per-repo store (below).
+The storage directory resolves in this order:
+
+1. `MONET_STORAGE_DIR`, if set;
+2. else `./.monet` in the current directory, if it exists (a per-repo store);
+3. else `~/.monet` (the shared global store).
+
+Two ways to isolate projects, depending on how you registered Monet:
+
+- **Shared store + circles** (default for `claude mcp add … monet start`): one `~/.monet`
+  DB, logically partitioned per project by circle.
+- **Per-repo store** (what `monet config` emits, via `MONET_STORAGE_DIR=<repo>/.monet`): a
+  separate DB file per repo — a hard filesystem split. You can also pass `monet start --dir <path>`.
+
+Inspect the current store:
+
+```sh
+monet status
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `monet start [--dir <path>]` | Run the MCP server over stdio. Your agent host spawns this. |
+| `monet config [--agent <host>] [--yaml] [--output <file>]` | Print or write an MCP config block (`--agent`: `claude-code`, `cursor`, `hermes`, `openclaw`). |
+| `monet status` | Show the storage path and store-wide counts (concepts, observations, workstreams, unsynthesized). |
 
 ## What's inside
 
