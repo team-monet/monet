@@ -32,18 +32,22 @@ restart your host.
 claude mcp add --scope user monet -- monet start
 ```
 
-**Any host** — generate a config block to merge into its MCP settings:
+**Any host** — generate a starting config block:
 
 ```sh
-monet config --agent claude-code   # or: cursor | hermes | openclaw
+monet config --agent claude-code   # also: cursor | hermes | openclaw
 ```
 
-`monet config` prints a ready-to-paste entry (and defaults to a **per-repo** store):
+For Claude Code it prints a ready-to-paste `mcpServers` entry (and defaults to a **per-repo** store):
 
 ```jsonc
 { "mcpServers": { "monet": { "command": "monet", "args": ["start"],
     "env": { "MONET_STORAGE_DIR": "<cwd>/.monet" } } } }
 ```
+
+Other hosts differ in where MCP servers are declared and how the key is spelled (e.g. Cursor
+uses `~/.cursor/mcp.json`), so treat the output as a starting point and match your host's
+schema — the command part is always `monet start`.
 
 Restart your host so it picks up the server. On startup Monet logs its store and the active
 project circle to stderr:
@@ -60,9 +64,10 @@ Want a whole agent team wired in one paste, not just the server? Use the
 ## Where your memory lives
 
 By default Monet keeps **one global store at `~/.monet`** and **isolates each project into
-its own _circle_** — derived from your working tree (git root, else cwd) — so memory never
-bleeds between repos while still sharing a single brain. The storage directory resolves in
-this order:
+its own _circle_** — derived from your **project directory** (`CLAUDE_PROJECT_DIR` when your
+host sets it, e.g. Claude Code; otherwise the working tree's git root, else cwd; override with
+`MONET_PROJECT_DIR`) — so memory never bleeds between repos while still sharing a single brain.
+The storage directory resolves in this order:
 
 1. `MONET_STORAGE_DIR`, if set;
 2. else `./.monet` in the current directory, if it exists (a per-repo store);
