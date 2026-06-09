@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import path from "node:path";
 import fs from "node:fs";
-import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
+import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer, deriveCircle } from "@team-monet/core";
 import { ensureMonetDir, getDbPath } from "./db/index.js";
 
 const program = new Command();
@@ -10,7 +10,7 @@ const program = new Command();
 program
   .name("monet")
   .description("Monet — local-first memory for AI agents (state-centric substrate)")
-  .version("0.1.0");
+  .version("0.2.0");
 
 program
   .command("start")
@@ -21,9 +21,20 @@ program
       process.env.MONET_STORAGE_DIR = path.resolve(options.dir);
     }
     ensureMonetDir();
-    const core = new MonetCore(getDbPath(), { embedder: await createLocalEmbedder(), scopeContext: process.cwd() });
+    // Identify the project we're serving so one shared store (e.g. ~/.monet) isolates each repo
+    // into its own circle. A host may spawn this stdio server from a cwd that isn't the user's
+    // repo — Claude Code sets CLAUDE_PROJECT_DIR and documents that servers shouldn't rely on cwd
+    // — so prefer an explicit project dir, then fall back to cwd.
+    const projectDir = process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    const circle = deriveCircle(projectDir);
+    const core = new MonetCore(getDbPath(), {
+      embedder: await createLocalEmbedder(),
+      scopeContext: projectDir,
+      defaultCircle: circle,
+    });
     console.error(`Monet started`);
     console.error(`Storage: ${getDbPath()}`);
+    console.error(`Circle:  ${circle}`);
     await createMonetCoreMcpServer(core);
   });
 
