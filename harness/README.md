@@ -17,7 +17,7 @@ The substrate — the `@team-monet/core` engine (in [`team-monet/monet-core`](ht
 ## The team
 
 - **`stig`** — state-centric lead. Restores via `agent_context` (prewarm), delegates with pre-assembled context, and is the only agent that touches Monet.
-- Workers Stig delegates to: `explorer`, `researcher`, `analyst`, `developer`, `tester`, `reviewer`, `security`, `reliability`, `aria`.
+- Workers Stig delegates to: `explorer`, `researcher`, `analyst`, `developer`, `tester`, `reviewer`, `auditor`, `security`, `reliability`, `aria`.
 
 ## Install — agent-first (paste one line into your agent)
 

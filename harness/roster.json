@@ -59,6 +59,14 @@
       "description": "Use PROACTIVELY after writing or changing code to review for correctness, security, and maintainability. Returns findings by severity; does not mutate PRs."
     },
     {
+      "name": "auditor",
+      "role": "context-free second review",
+      "mode": "subagent",
+      "prompt": "agents/auditor.md",
+      "model": "opus",
+      "description": "Use PROACTIVELY as the independent second review on substantive changes: audits the diff against the codebase with NO design context — data-model closure, sibling precedents, advertised contracts, invariant bypass, bounds, determinism. Pairs with reviewer (who audits against intent); brief it with only the diff location."
+    },
+    {
       "name": "security",
       "role": "trust-boundary / auth / secrets review",
       "mode": "subagent",
