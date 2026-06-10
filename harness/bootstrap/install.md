@@ -66,8 +66,9 @@ Merge into the host's **user-level** MCP config **without clobbering existing se
     <body of agents/explorer.md>
     ```
     Add the `<!-- with-monet:agent -->` marker right after the frontmatter — it lets a later memory-consolidation pass tell Monet's installed workers apart from your *own* custom subagents, so it never captures or retires the team.
+    **Write each file transparently, one at a time.** Use your host's file-write tool so the user sees every file's content as it's written; never generate a script that batch-writes the agents directory. Host permission systems treat opaque scripted writes to agent config as suspect and will (rightly) block them — per-file writes the user can read are both the polite and the working path.
     **Don't clobber.** If `~/.claude/agents/<name>.md` already exists, back it up (`<name>.md.bak`) and tell the user before overwriting — generic names (`developer`, `reviewer`, …) can collide with the user's own subagents.
-  - **Stig → lead, in global memory.** Append the body of `agents/stig.md` to `~/.claude/CLAUDE.md` so the **main agent** acts as Stig in every project and can delegate to the workers via the Task tool (a subagent can't spawn subagents, so the lead must be the main agent). Wrap it in idempotent markers so re-running doesn't duplicate it:
+  - **Stig → lead, in global memory — ask first.** This is the install's highest-impact write, so it gets its own decision point. Ask: *"Install Stig as the lead persona in your global `~/.claude/CLAUDE.md`? This changes how every session on this machine starts."* A general "go ahead with the install" doesn't cover this — wait for an explicit yes (your host's permission system will likely insist on the same); on a no, offer to scope Stig to the current repo's `./CLAUDE.md` instead (the per-repo option from Phase 1). On yes, append the body of `agents/stig.md` to `~/.claude/CLAUDE.md` so the **main agent** acts as Stig in every project and can delegate to the workers via the Task tool (a subagent can't spawn subagents, so the lead must be the main agent). Wrap it in idempotent markers so re-running doesn't duplicate it:
     ```
     <!-- BEGIN with-monet:stig -->
     …agents/stig.md body…
@@ -109,5 +110,6 @@ If they say yes, open the URL for them; **don't star on their behalf** (it's the
 ## Principles
 - **Agent-first:** you do the install; the user converses, approves, and steers.
 - **Fix-forward:** on any failure, diagnose and resolve with the user rather than dumping a stack trace.
+- **Permission prompts are checkpoints, not failures:** hosts may challenge writes to agent-config locations (the agents dir, global `CLAUDE.md`) because they change how the agent itself behaves. That's expected — pause, show the user what you're about to write and why, and proceed on their explicit OK. Never work around a denial with a script or an indirect write.
 - **Customizable:** honor preferences surfaced along the way — global vs per-repo install, storage location, which workers to install and on which models, ingest scope, how much autonomy Stig gets.
 - **Non-destructive:** back up before overwriting, merge into existing config rather than replacing it, and never clobber the user's own subagents or `CLAUDE.md`.
