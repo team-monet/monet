@@ -121,7 +121,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_overview",
-    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — review with memory_fetch, then use memory_detach with destConceptId to consolidate if they are the same concept. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub.',
+    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub.',
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       try {
@@ -201,11 +201,11 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_fetch",
-    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page through them with observationsOffset; totalObservations tells you when you have them all.",
+    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them.",
     {
       id: z.string(),
       circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle). Pass it when reading results of a search/gather you ran on an explicit circle."),
-      observationsOffset: z.number().int().min(0).optional().describe("Page through observations: skip this many (by insertion order) before applying the per-page cap. Use with totalObservations to retrieve all observation ids across pages."),
+      observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages."),
     },
     async ({ id, circle, observationsOffset }) => {
       try {
@@ -213,15 +213,15 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         // across sessions / get pasted from prior output). `scope(circle)` honors an explicit circle the
         // client searched, defaulting to this session's circle. Check before getConcept's usefulness bump.
         if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
-        const c = await core.getConcept(id, { synthesize: false, observationsOffset: observationsOffset ?? 0 });
+        // pageSize=FETCH_MAX_OBS: the engine slices exactly one page newest-first from the offset,
+        // so the MCP layer receives at most FETCH_MAX_OBS observations with no secondary cap needed.
+        const c = await core.getConcept(id, { synthesize: false, observationsOffset: observationsOffset ?? 0, pageSize: FETCH_MAX_OBS });
         if (!c) return err(`concept not found: ${id}`);
-        // Bound the result: keep the most-recent observations from the offset window and clip long text,
-        // so a heavily-supported concept still fetches instead of being rejected by the host's limit.
         const total = c.totalObservations;
         const offset = c.observationsOffset;
-        // Within the offset-sliced window apply the per-page cap from the most-recent end.
-        const kept = c.observations.slice(Math.max(0, c.observations.length - FETCH_MAX_OBS));
-        const omitted = c.observations.length - kept.length;
+        // Engine already returned exactly one page; all observations in c.observations are kept.
+        const kept = c.observations;
+        const omitted = 0;
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
         return ok({
           id: c.id,
@@ -232,30 +232,29 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           observations: kept.map((o) => ({ id: o.id, content: clip(o.content, FETCH_OBS_MAX_CHARS).text })),
           totalObservations: total,
           observationsOffset: offset,
-          ...(omitted > 0
+          // Note: omitted is always 0 (engine returns exactly one page). Use kept.length vs total
+          // to detect whether more pages exist. Offset here is newest-first (offset 0 = newest page).
+          ...(kept.length === 0 && offset > 0
             ? {
-                observationsOmitted: omitted,
-                observationsNote: `Showing the ${kept.length} most-recent of ${c.observations.length} observations at offset ${offset}; some omitted to fit the host limit.`,
+                observationsNote: `No observations at offset ${offset} of ${total}.`,
               }
             : offset > 0
               ? {
-                  observationsNote: kept.length === 0
-                    ? `No observations at offset ${offset} of ${total}.`
-                    : `Showing observations ${offset}–${offset + kept.length - 1} of ${total}.`,
+                  observationsNote: `Showing observations ${offset + 1}–${offset + kept.length} of ${total} (newest-first). Page forward: increment offset by ${FETCH_MAX_OBS}.`,
                 }
-              : total > kept.length + omitted
+              : total > kept.length
                 ? {
-                    observationsNote: `Showing the ${kept.length} most-recent of ${total} observations; older ones omitted. Use observationsOffset to page.`,
+                    observationsNote: `Showing the ${kept.length} newest of ${total} observations. Use observationsOffset to page older ones (step by ${FETCH_MAX_OBS}).`,
                   }
                 : {}),
           supportCount: c.supportCount,
           confidence: c.confidence,
           version: c.version,
           needsSynthesis: c.needsSynthesis,
-          // Only invite synthesis when ALL evidence is shown. memory_synthesize clears `dirty` with the
-          // body the agent writes, so synthesizing from a truncated view would discard the omitted
-          // observations from the canonical body — don't ask for it here.
-          ...(c.needsSynthesis && omitted === 0 && offset === 0 && total <= FETCH_MAX_OBS
+          // Only invite synthesis when ALL evidence is shown (offset=0 AND total fits one page).
+          // memory_synthesize clears `dirty` with the body the agent writes, so synthesizing from
+          // a partial view would discard the unseen observations from the canonical body.
+          ...(c.needsSynthesis && offset === 0 && total <= FETCH_MAX_OBS
             ? {
                 synthesisInstruction:
                   "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body) — pass this concept's `circle` (above) if it isn't your session default.",

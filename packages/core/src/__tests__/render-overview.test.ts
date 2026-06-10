@@ -68,4 +68,31 @@ describe("renderOverview", () => {
     expect(out).not.toContain("NEEDS ATTENTION");
     c.close();
   });
+
+  it("POSSIBLE DUPLICATES section shows 8-char short ids for both concepts in each row", async () => {
+    // tauAttach=0.9, tauAmbiguous=0.1 forces the two similar stores into the ambiguous band.
+    let seq = 0;
+    const c = new MonetCore(":memory:", { idGen: () => `dup${String(seq++).padStart(5, "0")}`, tauAttach: 0.9, tauAmbiguous: 0.1 });
+    await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const r2 = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(r2.action).toBe("ambiguous");
+
+    const o = c.overview("default");
+    expect(o.possibleDuplicates).toHaveLength(1);
+    const pd = o.possibleDuplicates[0]!;
+
+    // Render at a generous width so neither id is truncated away from the row.
+    const out = stripAnsi(renderOverview(o, { color: false, width: 200 }));
+    expect(out).toContain("POSSIBLE DUPLICATES");
+
+    // Both 8-char id prefixes must appear in the output.
+    const shortA = pd.conceptAId.slice(0, 8);
+    const shortB = pd.conceptBId.slice(0, 8);
+    expect(out).toContain(`[${shortA}]`);
+    expect(out).toContain(`[${shortB}]`);
+
+    // The row must also still contain the score.
+    expect(out).toContain("score:");
+    c.close();
+  });
 });

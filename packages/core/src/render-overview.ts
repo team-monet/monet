@@ -160,7 +160,9 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
   if (o.possibleDuplicates?.length) {
     out.push(yellow(bold("POSSIBLE DUPLICATES")));
     for (const pd of o.possibleDuplicates as PossibleDuplicatePair[]) {
-      out.push(truncate(`  · ${pd.conceptATitle} / ${pd.conceptBTitle}  (score: ${pd.score.toFixed(3)})`, width));
+      const aId = dim(`[${pd.conceptAId.slice(0, 8)}]`);
+      const bId = dim(`[${pd.conceptBId.slice(0, 8)}]`);
+      out.push(truncate(`  · ${pd.conceptATitle} ${aId} / ${pd.conceptBTitle} ${bId}  (score: ${pd.score.toFixed(3)})`, width));
     }
     out.push("");
   }

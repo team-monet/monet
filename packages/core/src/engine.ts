@@ -43,6 +43,7 @@ const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
 const SEED_K = 10; // gather seed-set size
 const RRF_K = 60; // RRF constant for seed fusion
+const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
 const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
 const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
 // Edges that may BOOST a similarity hit's rank: the "worked-on-together / causal" signals.
@@ -714,7 +715,7 @@ export class MonetCore {
    */
   async getConcept(
     id: string,
-    opts: { synthesize?: boolean; observationsOffset?: number } = {},
+    opts: { synthesize?: boolean; observationsOffset?: number; pageSize?: number } = {},
   ): Promise<
     (Concept & { observations: ObservationEntry[]; totalObservations: number; observationsOffset: number; revisions: number; synthesizedNow: boolean; needsSynthesis: boolean }) | null
   > {
@@ -729,8 +730,19 @@ export class MonetCore {
       .prepare(`SELECT id, content FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
       .all(id) as Array<{ id: string; content: string }>;
     const totalObservations = allObs.length;
+    // observationsOffset pages newest-first: offset 0 = newest PAGE_SIZE observations,
+    // offset PAGE_SIZE = next-older PAGE_SIZE, etc. Keeps the default page (offset 0)
+    // identical to the pre-pagination behaviour (newest observations visible first).
+    // pageSize=0 means "return all" (used by internal callers that don't page).
     const observationsOffset = opts.observationsOffset ?? 0;
-    const obs = allObs.slice(observationsOffset);
+    const pageSize = opts.pageSize ?? 0;
+    const obs =
+      pageSize > 0
+        ? allObs.slice(
+            Math.max(0, totalObservations - pageSize - observationsOffset),
+            Math.max(0, totalObservations - observationsOffset),
+          )
+        : allObs;
     const revs = this.db.prepare(`SELECT COUNT(*) AS n FROM concept_revisions WHERE concept_id = ?`).get(id) as {
       n: number;
     };
@@ -1653,7 +1665,8 @@ export class MonetCore {
             AND e.src_id < e.dst_id
             AND ca.kind != 'workstream'
             AND cb.kind != 'workstream'
-          ORDER BY e.weight DESC`,
+          ORDER BY e.weight DESC
+          LIMIT ${OVERVIEW_DUP_PAIRS_MAX}`,
       )
       .all(circle) as PossibleDuplicatePair[];
   }
