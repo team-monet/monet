@@ -61,6 +61,10 @@ This reasoning should be visible in your implementation summary.
 - If the issue spec is ambiguous, flag it rather than silently implementing
 - Leave the codebase better than you found it
 
+## Evidence Over Instructions
+
+If what you find contradicts the briefing's premises — a file that does not match its description, a spec amendment your own step-0 findings refute — STOP and report the conflict instead of implementing. The briefing is a hypothesis; your evidence is data. Never implement against your own evidence.
+
 ## Output Format
 
 ```
