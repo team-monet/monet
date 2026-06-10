@@ -43,6 +43,7 @@ const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
 const SEED_K = 10; // gather seed-set size
 const RRF_K = 60; // RRF constant for seed fusion
+const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
 const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
 const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
 // Edges that may BOOST a similarity hit's rank: the "worked-on-together / causal" signals.
@@ -88,6 +89,49 @@ export interface IngestResult {
   score: number;
   concept: Concept;
   contradiction?: Contradiction; // set when a kind="correction" attaches to an existing concept
+  nearMatchId?: string; // set on ambiguous fork: the existing concept this nearly matched
+  nearMatchScore?: number; // the cosine score of the near match
+}
+
+/** Options for store() — resolution mode and direct attachment. */
+export interface StoreOpts {
+  circle?: string;
+  kind?: string;
+  sourceRefs?: string[];
+  /** Resolution mode. "auto" (default): the substrate resolves similar evidence into an existing
+   *  concept automatically. "forceNew": always create a new concept, bypassing deduplication —
+   *  use for bulk import or migration flows where each item is known to be distinct. */
+  resolution?: "auto" | "forceNew";
+  /** Concept id to attach this observation to directly, bypassing automatic deduplication.
+   *  Must exist in the same circle. Mutually exclusive with resolution="forceNew". */
+  attachTo?: string;
+}
+
+/** One stored observation as returned by getConcept (id needed to call detach). */
+export interface ObservationEntry {
+  id: string;
+  content: string;
+}
+
+/** A near-duplicate pair surfaced at store time (possible_duplicate_of edge). */
+export interface PossibleDuplicatePair {
+  conceptAId: string;
+  conceptATitle: string;
+  conceptBId: string;
+  conceptBTitle: string;
+  score: number;
+}
+
+/** Outcome of detach() — what moved and where it landed. */
+export interface DetachResult {
+  sourceConceptId: string;
+  destConceptId: string;
+  destAction: "created" | "attached";
+  observationsMoved: number;
+  sourceConcept: Concept;
+  destConcept: Concept;
+  /** True when detaching ALL observations into a named destConceptId consolidates the source away. */
+  sourceDeleted: boolean;
 }
 
 /**
@@ -217,11 +261,13 @@ export interface MemoryOverview {
     entities: number;
     disputed: number;
     stale: number;
+    possibleDuplicates: number;
   };
   health: { avgConfidence: number; graphDensity: number };
   livingModel: LivingModelCard[];
   activeThreads: PrewarmState["activeWorkstreams"];
   openContradictions: PrewarmContradiction[];
+  possibleDuplicates: PossibleDuplicatePair[];
   graph: {
     hubs: EntityHub[];
     connected: ConnectedConcept[];
@@ -503,8 +549,22 @@ export class MonetCore {
   }
 
   /** Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty. */
-  async store(content: string, opts: { circle?: string; kind?: string; sourceRefs?: string[] } = {}): Promise<IngestResult> {
+  async store(content: string, opts: StoreOpts = {}): Promise<IngestResult> {
     const circle = opts.circle ?? this.defaultCircle;
+
+    // Validate resolution options before embedding (fast-fail).
+    if (opts.resolution === "forceNew" && opts.attachTo) {
+      throw new Error("resolution 'forceNew' and attachTo are mutually exclusive");
+    }
+    if (opts.attachTo) {
+      const targetCheck = this.db.prepare(`SELECT id, circle, kind FROM concepts WHERE id = ?`).get(opts.attachTo) as
+        | { id: string; circle: string; kind: string }
+        | undefined;
+      if (!targetCheck) throw new Error(`attachTo concept not found: ${opts.attachTo}`);
+      if (targetCheck.circle !== circle) throw new Error(`attachTo concept is in circle '${targetCheck.circle}' not '${circle}'`);
+      if (targetCheck.kind === "workstream") throw new Error("cannot attach to a workstream concept");
+    }
+
     const emb = await this.embedder.embed(content);
     const obsId = this.newId();
     const sessionId = this.ensureSession();
@@ -524,15 +584,49 @@ export class MonetCore {
 
     let action: IngestAction;
     let row: ConceptRow;
-    if (match && score >= this.tauAttach) {
+    let nearMatchId: string | undefined;
+    let nearMatchScore: number | undefined;
+
+    if (opts.attachTo) {
+      // Direct attach: bypass scoring, land on named concept.
+      const targetRow = this.getRow(opts.attachTo)!;
+      row = this.attach(targetRow, content, emb);
       action = "attached";
-      row = this.attach(match, content, emb);
-    } else if (match && score >= this.tauAmbiguous) {
-      action = "ambiguous"; // conservative dedup: surface, but still attach (never silently fork)
-      row = this.attach(match, content, emb);
-    } else {
-      action = "created";
+    } else if (opts.resolution === "forceNew") {
+      // Always create a new concept regardless of similarity.
+      // forceNew intentionally records no possible_duplicate_of edge — the caller asserts distinctness (bulk import); the returned score still reports the nearest neighbor.
       row = this.create(content, emb, circle, opts.kind);
+      action = "created";
+    } else {
+      // Auto resolution: score-based deduplication.
+      if (match && score >= this.tauAttach) {
+        action = "attached";
+        row = this.attach(match, content, emb);
+      } else if (match && score >= this.tauAmbiguous) {
+        // A wrong fork is recoverable (the pair can be merged later); a wrong merge is not
+        // (split loses provenance). Ambiguous-band evidence therefore forks, with a
+        // possible_duplicate_of edge for later mediation.
+        // Exception: kind="correction" is exempt from fork-on-ambiguous — the caller is
+        // explicitly asserting "this overrides existing memory", so the intent disambiguates.
+        if (opts.kind === "correction") {
+          // Attach to the near match and let the existing correction path open a contradiction.
+          action = "ambiguous";
+          row = this.attach(match, content, emb);
+          nearMatchId = match.id;
+          nearMatchScore = score;
+        } else {
+          action = "ambiguous";
+          row = this.create(content, emb, circle, opts.kind);
+          nearMatchId = match.id;
+          nearMatchScore = score;
+          if (this.graphEnabled) {
+            this.upsertEdgeBoth(row.id, match.id, "possible_duplicate_of", score, "cheap", circle);
+          }
+        }
+      } else {
+        action = "created";
+        row = this.create(content, emb, circle, opts.kind);
+      }
     }
 
     this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
@@ -553,6 +647,8 @@ export class MonetCore {
     }
 
     if (this.graphEnabled) {
+      // For ambiguous forks the possible_duplicate_of edge was already recorded above; deriveEdges
+      // also runs to derive entity/about, co_occurred, and asserted edges for the new concept.
       this.deriveEdges(row.id, content, sourceRefs, circle, sessionId, matches);
       this.lastConceptByCircle.set(circle, row.id);
     }
@@ -560,8 +656,13 @@ export class MonetCore {
     // Contradiction detection is agent-judged, expressed cheaply: a "correction" that lands on
     // an EXISTING concept is the agent saying "this overrides what's there" → open a conflict
     // (ADR §4.1 step 4 / §4.6). Novel corrections (action="created") have nothing to contradict.
+    // For attachTo: always flag regardless of the action-string gate (the caller explicitly named
+    // a target, so it is always an existing concept by validation above).
+    // For ambiguous corrections: action="ambiguous" but the correction was attached to the near match
+    // (F6 exemption), so we must treat it as existing to open the contradiction.
     let contradiction: Contradiction | undefined;
-    if (opts.kind === "correction" && (action === "attached" || action === "ambiguous")) {
+    const onExisting = action === "attached" || opts.attachTo !== undefined || (action === "ambiguous" && opts.kind === "correction");
+    if (opts.kind === "correction" && onExisting) {
       contradiction = this.flagContradiction(row.id, {
         observationId: obsId,
         kind: "value-conflict",
@@ -569,7 +670,20 @@ export class MonetCore {
       });
       row = this.getRow(row.id)!; // reflect disputed status + decayed confidence
     }
-    return { action, conceptId: row.id, score, concept: toConcept(row), contradiction };
+
+    // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
+    const returnScore = opts.resolution === "forceNew" ? (matches[0]?.score ?? 0)
+      : opts.attachTo ? cosine(emb, jsonToEmb(row.embedding))
+      : score;
+
+    return {
+      action,
+      conceptId: row.id,
+      score: returnScore,
+      concept: toConcept(row),
+      contradiction,
+      ...(nearMatchId !== undefined ? { nearMatchId, nearMatchScore } : {}),
+    };
   }
 
   /**
@@ -601,9 +715,9 @@ export class MonetCore {
    */
   async getConcept(
     id: string,
-    opts: { synthesize?: boolean } = {},
+    opts: { synthesize?: boolean; observationsOffset?: number; pageSize?: number } = {},
   ): Promise<
-    (Concept & { observations: string[]; revisions: number; synthesizedNow: boolean; needsSynthesis: boolean }) | null
+    (Concept & { observations: ObservationEntry[]; totalObservations: number; observationsOffset: number; revisions: number; synthesizedNow: boolean; needsSynthesis: boolean }) | null
   > {
     let row = this.getRow(id);
     if (!row) return null;
@@ -612,15 +726,31 @@ export class MonetCore {
     const synthesizedNow = row.dirty === 1 && (opts.synthesize ?? true);
     if (synthesizedNow) row = await this.synthesizeRow(row);
 
-    const obs = this.db
-      .prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at`)
-      .all(id) as Array<{ content: string }>;
+    const allObs = this.db
+      .prepare(`SELECT id, content FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
+      .all(id) as Array<{ id: string; content: string }>;
+    const totalObservations = allObs.length;
+    // observationsOffset pages newest-first: offset 0 = newest PAGE_SIZE observations,
+    // offset PAGE_SIZE = next-older PAGE_SIZE, etc. Keeps the default page (offset 0)
+    // identical to the pre-pagination behaviour (newest observations visible first).
+    // pageSize=0 means "return all" (used by internal callers that don't page).
+    const observationsOffset = opts.observationsOffset ?? 0;
+    const pageSize = opts.pageSize ?? 0;
+    const obs =
+      pageSize > 0
+        ? allObs.slice(
+            Math.max(0, totalObservations - pageSize - observationsOffset),
+            Math.max(0, totalObservations - observationsOffset),
+          )
+        : allObs;
     const revs = this.db.prepare(`SELECT COUNT(*) AS n FROM concept_revisions WHERE concept_id = ?`).get(id) as {
       n: number;
     };
     return {
       ...toConcept(row),
-      observations: obs.map((o) => o.content),
+      observations: obs.map((o) => ({ id: o.id, content: o.content })),
+      totalObservations,
+      observationsOffset,
       revisions: revs.n,
       synthesizedNow,
       needsSynthesis: row.dirty === 1,
@@ -770,7 +900,7 @@ export class MonetCore {
         .run(opts.by ?? null, contradictionId);
     } else {
       const allIds = (
-        this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at`).all(conceptId) as Array<{ id: string }>
+        this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`).all(conceptId) as Array<{ id: string }>
       ).map((o) => o.id);
       const priors = allIds.filter((oid) => oid !== c.observation_id);
       const winnerObsId = opts.decision === "accept-new" ? c.observation_id : priors[priors.length - 1] ?? null;
@@ -1001,6 +1131,382 @@ export class MonetCore {
     return result;
   }
 
+  /**
+   * Detach one or more observations from their source concept, either creating a new concept
+   * or folding them into an existing destination concept. The source concept is recomputed
+   * from its remaining evidence. Use to undo a wrong merge or consolidate a possible-duplicate
+   * pair: memory_fetch both, pick observations to move, call detach with destConceptId.
+   * When ALL observations are detached into a named destConceptId the emptied source is deleted.
+   */
+  async detach(sourceConceptId: string, observationIds: string[], opts: { destConceptId?: string; circle?: string } = {}): Promise<DetachResult> {
+    if (observationIds.length === 0) throw new Error("observationIds must be non-empty");
+
+    const srcRow = this.getRow(sourceConceptId);
+    if (!srcRow) throw new Error("concept not found");
+    if (srcRow.kind === "workstream") throw new Error("cannot detach from a workstream concept");
+    const circle = srcRow.circle;
+    if (opts.circle && opts.circle !== circle) throw new Error("circle mismatch");
+
+    // Validate all observation ids belong to source.
+    const srcObsRows = this.db
+      .prepare(`SELECT id, content, embedding, superseded_by, source_refs, created_at FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
+      .all(sourceConceptId) as Array<{ id: string; content: string; embedding: string; superseded_by: string | null; source_refs: string | null; created_at: number }>;
+    const srcObsIds = new Set(srcObsRows.map((o) => o.id));
+    for (const id of observationIds) {
+      if (!srcObsIds.has(id)) throw new Error(`observation ${id} does not belong to concept ${sourceConceptId}`);
+    }
+
+    const totalCount = srcObsRows.length;
+    const isConsolidation = !!opts.destConceptId;
+
+    if (opts.destConceptId && opts.destConceptId === sourceConceptId) {
+      throw new Error("destConceptId must differ from the source concept");
+    }
+
+    // Last-observation guard: only allow detaching ALL observations when consolidating into an
+    // existing destination (the emptied source will be deleted). Detach-to-new always requires
+    // at least one observation to remain on the source.
+    if (observationIds.length >= totalCount && !isConsolidation) {
+      throw new Error("cannot detach the last observation from a concept — use memory_reassign_circle to move the whole concept instead");
+    }
+
+    // Validate destination if given.
+    let destRow: ConceptRow | null = null;
+    if (opts.destConceptId) {
+      destRow = this.getRow(opts.destConceptId);
+      if (!destRow) throw new Error(`destConceptId concept not found: ${opts.destConceptId}`);
+      if (destRow.circle !== circle) throw new Error(`destConceptId concept is in circle '${destRow.circle}' not '${circle}'`);
+      if (destRow.kind === "workstream") throw new Error("cannot attach to a workstream concept");
+    }
+
+    const detachingSet = new Set(observationIds);
+    const detachingRows = srcObsRows.filter((o) => detachingSet.has(o.id));
+    const remainingRows = srcObsRows.filter((o) => !detachingSet.has(o.id));
+
+    const destAction: "created" | "attached" = destRow ? "attached" : "created";
+    let destConceptId: string;
+
+    const result = this.db.transaction((): DetachResult => {
+      // 1. Destination: create or use existing.
+      if (!destRow) {
+        // Create from the first detached observation (by created_at order).
+        // Carry the source concept's kind so that splitting a "decision" concept
+        // produces another "decision", not a "fact" (the create() default).
+        const firstObs = detachingRows[0]!;
+        const firstEmb = jsonToEmb(firstObs.embedding);
+        const newRow = this.create(firstObs.content, firstEmb, circle, srcRow.kind);
+        destConceptId = newRow.id;
+        destRow = this.getRow(destConceptId)!;
+      } else {
+        destConceptId = destRow.id;
+      }
+
+      // 2. Superseded hygiene: no cross-concept superseded_by pointers may survive a detach.
+      // Outbound: a detached observation whose superseder stays behind — clear its superseded_by.
+      for (const obs of detachingRows) {
+        if (obs.superseded_by && !detachingSet.has(obs.superseded_by)) {
+          this.db.prepare(`UPDATE observations SET superseded_by = NULL WHERE id = ?`).run(obs.id);
+        }
+      }
+      // Inbound: a remaining observation (one NOT being detached) whose superseded_by points at
+      // an observation being moved — clear those pointers. Observations that are themselves part
+      // of the detaching set are excluded: when both members of a supersession pair move together,
+      // the pointer is intra-concept at the destination and must survive.
+      const detachingIds = Array.from(detachingSet);
+      const inboundPlaceholders = detachingIds.map(() => "?").join(",");
+      const inboundExclPlaceholders = detachingIds.map(() => "?").join(",");
+      this.db
+        .prepare(
+          `UPDATE observations SET superseded_by = NULL WHERE superseded_by IN (${inboundPlaceholders}) AND id NOT IN (${inboundExclPlaceholders})`
+        )
+        .run(...detachingIds, ...detachingIds);
+
+      // 3. Re-point detached observations to destination concept.
+      const placeholders = observationIds.map(() => "?").join(",");
+      this.db
+        .prepare(`UPDATE observations SET concept_id = ?, circle = ? WHERE id IN (${placeholders})`)
+        .run(destConceptId, circle, ...observationIds);
+
+      // 3.5. Recompute source_refs from per-observation refs.
+      // Observations carry their own source_refs; concepts.source_refs is the aggregate used by
+      // gather()/toGatherCard.  Detach invalidates both endpoints.
+      {
+        // Source: aggregate over the observations that REMAIN.
+        const srcRefs = new Set<string>();
+        for (const o of remainingRows) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) srcRefs.add(r);
+        this.db
+          .prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`)
+          .run(srcRefs.size ? JSON.stringify([...srcRefs]) : null, sourceConceptId);
+
+        // Destination: aggregate over the observations that MOVED.
+        const movedRefs = new Set<string>();
+        for (const o of detachingRows) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) movedRefs.add(r);
+        if (destAction === "created") {
+          // New concept: its sole source of refs is the moved observations.
+          this.db
+            .prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`)
+            .run(movedRefs.size ? JSON.stringify([...movedRefs]) : null, destConceptId);
+        } else {
+          // Existing destination: union the destination's current refs with moved refs.
+          const destRefsCur = destRow!.source_refs ? (JSON.parse(destRow!.source_refs) as string[]) : [];
+          const merged = [...new Set([...destRefsCur, ...movedRefs])];
+          this.db
+            .prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`)
+            .run(merged.length ? JSON.stringify(merged) : null, destConceptId);
+        }
+      }
+
+      // 3.7. Contradiction hygiene: no open contradiction may reference an observation that lives
+      // in a different concept from its concept_id.  The contradiction row's observation_id is the
+      // *correcting* observation; the observations it was correcting are all prior obs on the source.
+      {
+        const openContras = this.db
+          .prepare(`SELECT id, observation_id FROM contradictions WHERE concept_id = ? AND status = 'open'`)
+          .all(sourceConceptId) as Array<{ id: string; observation_id: string | null }>;
+
+        for (const contra of openContras) {
+          if (!contra.observation_id || !detachingSet.has(contra.observation_id)) {
+            // The correcting observation is staying on the source.
+            // Mirror case (F3): check whether all prior evidence for this contradiction is moving
+            // away. If so, the dispute has nothing left to dispute — dismiss it.
+            if (contra.observation_id) {
+              const correctingIndex = srcObsRows.findIndex((o) => o.id === contra.observation_id);
+              const priorIds = new Set(srcObsRows.slice(0, correctingIndex).map((o) => o.id));
+              // Only act when there were prior observations (an empty priorIds means nothing to dismiss).
+              if (priorIds.size > 0) {
+                const priorRemainingCount = [...priorIds].filter((id) => !detachingSet.has(id)).length;
+                if (priorRemainingCount === 0) {
+                  // All prior evidence moved away; correcting obs stays — dispute dissolves.
+                  this.db
+                    .prepare(
+                      `UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000 WHERE id = ?`,
+                    )
+                    .run(contra.id);
+                }
+                // If some prior obs remain, leave the contradiction open (no action).
+              }
+            }
+            continue;
+          }
+          // The correcting observation is moving away.  Check whether all the "prior" observations
+          // it was correcting also move (entire dispute travels) or some stay (dispute is split).
+          // "Prior" means: observations that existed on the source concept BEFORE the correcting
+          // observation (by insertion order in srcObsRows, which is ORDER BY created_at, rowid).
+          // Observations created AFTER the correcting observation (e.g. guard obs added later) are
+          // not party to the dispute and must not influence the branch.
+          const correctingIndex = srcObsRows.findIndex((o) => o.id === contra.observation_id);
+          // Observations that appear earlier in the sorted list (index < correctingIndex) are "prior".
+          const priorIds = new Set(srcObsRows.slice(0, correctingIndex).map((o) => o.id));
+          // Count how many prior obs are staying on the source (i.e., not in the detaching set).
+          const priorRemainingCount = [...priorIds].filter((id) => !detachingSet.has(id)).length;
+          if (priorRemainingCount === 0) {
+            // All prior (pre-correction) observations also moved: entire dispute travels.
+            // Re-point the contradiction row to the destination.
+            this.db
+              .prepare(`UPDATE contradictions SET concept_id = ? WHERE id = ?`)
+              .run(destConceptId, contra.id);
+            // Destination becomes disputed (mirror flagContradiction's status flip).
+            this.db
+              .prepare(`UPDATE concepts SET status = 'disputed', updated_at = unixepoch() * 1000 WHERE id = ?`)
+              .run(destConceptId);
+          } else {
+            // Dispute is split: correcting obs leaves but some prior obs remain.  The conflict as
+            // constituted dissolves — dismiss it (mirror resolveContradiction "dismiss" path:
+            // mark dismissed, do NOT supersede any observation).
+            this.db
+              .prepare(
+                `UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000 WHERE id = ?`,
+              )
+              .run(contra.id);
+          }
+        }
+
+        // Restore source to active if no open contradictions remain after the moves above.
+        const srcOpenCount = (
+          this.db
+            .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`)
+            .get(sourceConceptId) as { n: number }
+        ).n;
+        if (srcOpenCount === 0) {
+          const currentSrcStatus = (
+            this.db.prepare(`SELECT status FROM concepts WHERE id = ?`).get(sourceConceptId) as { status: string } | undefined
+          )?.status;
+          if (currentSrcStatus === "disputed") {
+            this.db
+              .prepare(`UPDATE concepts SET status = 'active', updated_at = unixepoch() * 1000 WHERE id = ?`)
+              .run(sourceConceptId);
+          }
+        }
+      }
+
+      // 4. Recompute source from remaining observations (skip when consolidation empties the source).
+      let sourceDeleted = false;
+      if (remainingRows.length === 0) {
+        // Consolidation folds the source into the destination, so its disputes travel with it; no
+        // contradiction row may outlive its concept.  Sweep ALL rows (including those with
+        // observation_id = NULL, which the travel loop above skips) unconditionally onto the
+        // destination before the DELETE.  This mirrors mergeConceptInto's unconditional carry.
+        this.db
+          .prepare(`UPDATE contradictions SET concept_id = ? WHERE concept_id = ?`)
+          .run(destConceptId, sourceConceptId);
+        // If any re-pointed row is open, ensure the destination is marked 'disputed'.
+        const openCarried = (
+          this.db
+            .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`)
+            .get(destConceptId) as { n: number }
+        ).n;
+        if (openCarried > 0) {
+          this.db
+            .prepare(`UPDATE concepts SET status = 'disputed', updated_at = unixepoch() * 1000 WHERE id = ? AND status != 'disputed'`)
+            .run(destConceptId);
+        }
+        // Carry the source's slug + id (and any aliases it already held) onto the destination,
+        // so asserted references to the now-deleted source (e.g. `supports: #src-slug`) still
+        // resolve to the keeper.  Mirrors mergeConceptInto's unconditional alias carry.
+        const destRowForAlias = this.db
+          .prepare(`SELECT aliases FROM concepts WHERE id = ?`)
+          .get(destConceptId) as { aliases: string | null };
+        const mergedAliases = [
+          ...new Set([
+            ...(destRowForAlias.aliases ? (JSON.parse(destRowForAlias.aliases) as string[]) : []),
+            ...(srcRow.aliases ? (JSON.parse(srcRow.aliases) as string[]) : []),
+            srcRow.slug,
+            srcRow.id,
+          ]),
+        ];
+        this.db
+          .prepare(`UPDATE concepts SET aliases = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
+          .run(JSON.stringify(mergedAliases), destConceptId);
+        // Consolidation: all observations moved to an existing dest — delete the source concept.
+        // Graph must be unwound first; no rederive since the concept no longer exists.
+        this.unwindConceptGraph(sourceConceptId, circle);
+        this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(sourceConceptId);
+        this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(sourceConceptId);
+        sourceDeleted = true;
+      } else {
+        const remEmbs = remainingRows.map((o) => jsonToEmb(o.embedding));
+        let srcEmb = remEmbs[0]!;
+        for (let i = 1; i < remEmbs.length; i++) {
+          srcEmb = blend(srcEmb, remEmbs[i]!, i);
+        }
+        const srcBody = remainingRows.map((o) => o.content).join("\n");
+        const srcSupportCount = remainingRows.length;
+        const srcConfidence = Math.max(0.3, srcRow.confidence * (remainingRows.length / totalCount));
+        // F2: recompute title and slug from the first remaining observation so the source card
+        // no longer shows the moved-away fact (the title previously derived from obs[0] which may
+        // have just been detached).
+        const newSrcTitle = firstLine(remainingRows[0]!.content);
+        const newSrcSlug = slugify(newSrcTitle);
+        this.db
+          .prepare(
+            `UPDATE concepts SET body = ?, embedding = ?, support_count = ?, confidence = ?,
+                    title = ?, slug = ?,
+                    dirty = 1, version = version + 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
+          )
+          .run(srcBody, embToJson(srcEmb), srcSupportCount, srcConfidence, newSrcTitle, newSrcSlug, sourceConceptId);
+      }
+
+      // 5. Destination finalize.
+      if (destAction === "created") {
+        if (detachingRows.length > 1) {
+          // More than one observation: blend all stored embeddings and join content.
+          const dstEmbs = detachingRows.map((o) => jsonToEmb(o.embedding));
+          let dstEmb = dstEmbs[0]!;
+          for (let i = 1; i < dstEmbs.length; i++) {
+            dstEmb = blend(dstEmb, dstEmbs[i]!, i);
+          }
+          const dstBody = detachingRows.map((o) => o.content).join("\n");
+          this.db
+            .prepare(
+              `UPDATE concepts SET body = ?, embedding = ?, support_count = ?,
+                      dirty = 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
+            )
+            .run(dstBody, embToJson(dstEmb), detachingRows.length, destConceptId);
+        }
+        // single-observation case: create() already used its content+embedding, nothing more to do
+      } else {
+        // destAction === "attached": attach each detached obs in order, refreshing destRow between calls.
+        for (const obs of detachingRows) {
+          const currentDest = this.getRow(destConceptId)!;
+          this.attach(currentDest, obs.content, jsonToEmb(obs.embedding));
+        }
+      }
+
+      // 6. Graph: unwind source + rederive (source already handled above in the deletion path).
+      //
+      // Preserve possible_duplicate_of edges: unwindConceptGraph erases ALL edges touching a
+      // concept, but rederiveConceptGraph never recreates possible_duplicate_of (those are
+      // recorded only at store-time).  Snapshot each unwound concept's duplicate-pair edges BEFORE
+      // the unwind and re-insert them AFTER the rederive.
+      //
+      // Exclusion rule: when a destConceptId is present, the possible_duplicate_of edge connecting
+      // sourceConceptId ↔ destConceptId must NOT be restored — detaching into the suspected
+      // duplicate resolves that pair (mirrors the existing consolidation behaviour).
+      //
+      // When the source is fully deleted its edges die with it — correct, don't restore those.
+      type DupEdge = { src_id: string; dst_id: string; weight: number; origin: string };
+      const snapDupEdges = (conceptId: string): DupEdge[] =>
+        this.db
+          .prepare(
+            `SELECT src_id, dst_id, weight, origin FROM memory_edge
+              WHERE scope = ? AND type = 'possible_duplicate_of' AND (src_id = ? OR dst_id = ?)`,
+          )
+          .all(circle, conceptId, conceptId) as DupEdge[];
+      const isDupPair = (e: DupEdge, a: string, b: string) =>
+        (e.src_id === a && e.dst_id === b) || (e.src_id === b && e.dst_id === a);
+
+      let srcDupSnapshot: DupEdge[] = [];
+      let dstDupSnapshot: DupEdge[] = [];
+
+      if (!sourceDeleted) {
+        srcDupSnapshot = snapDupEdges(sourceConceptId);
+        this.unwindConceptGraph(sourceConceptId, circle);
+        this.rederiveConceptGraph(sourceConceptId, circle);
+        // Restore surviving duplicate-pair edges on the source (exclude src↔dest pair).
+        for (const e of srcDupSnapshot) {
+          if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
+          this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
+        }
+      }
+      if (destAction === "created") {
+        this.rederiveConceptGraph(destConceptId, circle);
+      } else {
+        dstDupSnapshot = snapDupEdges(destConceptId);
+        this.unwindConceptGraph(destConceptId, circle);
+        this.rederiveConceptGraph(destConceptId, circle);
+        // Restore surviving duplicate-pair edges on the destination (exclude src↔dest pair).
+        for (const e of dstDupSnapshot) {
+          if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
+          this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
+        }
+      }
+
+      const updatedSrc = sourceDeleted ? null : this.getRow(sourceConceptId);
+      const updatedDest = this.getRow(destConceptId)!;
+      // When the source is deleted we synthesize a tombstone Concept for the result shape so
+      // callers can still read destConcept normally; sourceConcept reflects the deleted state.
+      const sourceConcept = updatedSrc
+        ? toConcept(updatedSrc)
+        : { ...toConcept({ ...srcRow, support_count: 0 }), supportCount: 0 };
+      return {
+        sourceConceptId,
+        destConceptId,
+        destAction,
+        observationsMoved: observationIds.length,
+        sourceConcept,
+        destConcept: toConcept(updatedDest),
+        sourceDeleted,
+      };
+    })();
+
+    // Clean up in-memory follows pointer if the source was deleted (mirrors reassignCircle's cleanup).
+    if (result.sourceDeleted) {
+      for (const [c, v] of this.lastConceptByCircle) if (v === sourceConceptId) this.lastConceptByCircle.delete(c);
+    }
+
+    return result;
+  }
+
   conceptCount(circle?: string): number {
     circle ??= this.defaultCircle;
     const r = this.db
@@ -1200,6 +1706,40 @@ export class MonetCore {
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND status = 'disputed'`).get(circle) as { n: number }).n;
   }
 
+  private getPossibleDuplicatePairs(circle: string): PossibleDuplicatePair[] {
+    return this.db
+      .prepare(
+        `SELECT e.src_id AS conceptAId, ca.title AS conceptATitle,
+                e.dst_id AS conceptBId, cb.title AS conceptBTitle,
+                e.weight AS score
+           FROM memory_edge e
+           JOIN concepts ca ON ca.id = e.src_id
+           JOIN concepts cb ON cb.id = e.dst_id
+          WHERE e.scope = ? AND e.type = 'possible_duplicate_of'
+            AND e.src_id < e.dst_id
+            AND ca.kind != 'workstream'
+            AND cb.kind != 'workstream'
+          ORDER BY e.weight DESC
+          LIMIT ${OVERVIEW_DUP_PAIRS_MAX}`,
+      )
+      .all(circle) as PossibleDuplicatePair[];
+  }
+
+  private possibleDuplicateCount(circle: string): number {
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM memory_edge e
+          JOIN concepts ca ON ca.id = e.src_id
+          JOIN concepts cb ON cb.id = e.dst_id
+         WHERE e.scope = ? AND e.type = 'possible_duplicate_of'
+           AND e.src_id < e.dst_id
+           AND ca.kind != 'workstream'
+           AND cb.kind != 'workstream'`,
+      )
+      .get(circle) as { n: number };
+    return r.n;
+  }
+
   private scopedCount(sql: string, circle: string): number {
     return (this.db.prepare(sql).get(circle) as { n: number }).n;
   }
@@ -1234,6 +1774,7 @@ export class MonetCore {
         entities: this.scopedCount(`SELECT COUNT(*) AS n FROM entities WHERE scope = ?`, circle),
         disputed: this.disputedCount(circle),
         stale: this.getStaleConcepts(circle).length,
+        possibleDuplicates: this.possibleDuplicateCount(circle),
       },
       health: {
         avgConfidence: Number((avg.a ?? 0).toFixed(2)),
@@ -1242,6 +1783,7 @@ export class MonetCore {
       livingModel: pre.topConcepts,
       activeThreads: pre.activeWorkstreams,
       openContradictions: pre.openContradictions,
+      possibleDuplicates: this.getPossibleDuplicatePairs(circle),
       graph: {
         hubs: this.topEntityHubs(circle, { limit: opts.hubLimit ?? 6 }),
         connected: this.topConnectedConcepts(circle, opts.connectedLimit ?? 6),
@@ -1879,7 +2421,9 @@ export class MonetCore {
       .prepare(
         `UPDATE concepts
             SET body = ?, version = ?, support_count = ?, embedding = ?,
-                confidence = ?, status = 'active', dirty = 1, updated_at = unixepoch() * 1000
+                confidence = ?,
+                status = CASE WHEN status = 'disputed' THEN 'disputed' ELSE 'active' END,
+                dirty = 1, updated_at = unixepoch() * 1000
           WHERE id = ?`,
       )
       .run(body, version, supportCount, embToJson(blended), confidence, concept.id);

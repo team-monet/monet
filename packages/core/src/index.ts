@@ -4,6 +4,7 @@ export type {
   SearchCard,
   IngestResult,
   IngestAction,
+  StoreOpts,
   MonetCoreOptions,
   Workstream,
   WorkstreamPayload,
@@ -18,6 +19,9 @@ export type {
   ConnectedConcept,
   MemoryListEntry,
   ReassignResult,
+  ObservationEntry,
+  DetachResult,
+  PossibleDuplicatePair,
 } from "./engine";
 export { BetterSqlitePort } from "./storage";
 export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";

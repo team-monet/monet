@@ -43,7 +43,7 @@ function err(message: string): CallToolResult {
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
-  const server = new McpServer({ name: "monet-core", version: "0.2.0" }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: "monet-core", version: "0.3.0" }, { capabilities: { tools: {} } });
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
@@ -52,7 +52,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_store",
-    "Store something worth remembering. The substrate dedupes automatically: similar evidence resolves into an existing concept (no duplicates); novel evidence creates a new one. Cheap and instant — synthesis happens later, on read.",
+    'Store something worth remembering. By default the substrate deduplicates automatically: similar evidence resolves into an existing concept; novel evidence creates a new one. Pass resolution="forceNew" to always create a new concept (useful for bulk import flows where each item is known to be distinct). Pass attachTo=<conceptId> to attach directly to a specific concept, bypassing automatic scoring. Cheap and instant — synthesis happens later, on read.',
     {
       content: z.string(),
       circle: z.string().optional(),
@@ -68,10 +68,22 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         .describe(
           "Pointer(s) HOME to the source (file paths, URLs, tool calls, prior concept/observation ids) — never a copy. Lets memories that share a source link up, and enables later return-to-source re-reading.",
         ),
+      resolution: z
+        .enum(["auto", "forceNew"])
+        .optional()
+        .describe(
+          'Resolution mode. "auto" (default): the substrate resolves similar evidence into an existing concept automatically. "forceNew": always create a new concept, bypassing deduplication — use for bulk import or migration flows where each item is known to be distinct.',
+        ),
+      attachTo: z
+        .string()
+        .optional()
+        .describe(
+          "Concept id to attach this observation to directly, bypassing automatic deduplication. The concept must exist in the same circle. Mutually exclusive with resolution=\"forceNew\". Useful for manually consolidating a possible-duplicate pair surfaced by memory_overview.",
+        ),
     },
-    async ({ content, circle, kind, sourceRefs }) => {
+    async ({ content, circle, kind, sourceRefs, resolution, attachTo }) => {
       try {
-        const r = await core.store(content, { circle: scope(circle), kind, sourceRefs });
+        const r = await core.store(content, { circle: scope(circle), kind, sourceRefs, resolution, attachTo });
         return ok({
           circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
@@ -80,6 +92,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           ...(r.contradiction
             ? { contradiction: { id: r.contradiction.id, status: r.contradiction.status, detail: r.contradiction.detail } }
             : {}),
+          ...(r.nearMatchId ? { nearMatchId: r.nearMatchId, nearMatchScore: r.nearMatchScore } : {}),
         });
       } catch (e) {
         return err(`store failed: ${msg(e)}`);
@@ -108,7 +121,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_overview",
-    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub.',
+    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub.',
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       try {
@@ -188,21 +201,27 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_fetch",
-    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer.",
-    { id: z.string(), circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle). Pass it when reading results of a search/gather you ran on an explicit circle.") },
-    async ({ id, circle }) => {
+    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them.",
+    {
+      id: z.string(),
+      circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle). Pass it when reading results of a search/gather you ran on an explicit circle."),
+      observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages."),
+    },
+    async ({ id, circle, observationsOffset }) => {
       try {
         // Scope enforcement: an id from another project's circle must not be readable here (ids leak
         // across sessions / get pasted from prior output). `scope(circle)` honors an explicit circle the
         // client searched, defaulting to this session's circle. Check before getConcept's usefulness bump.
         if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
-        const c = await core.getConcept(id, { synthesize: false });
+        // pageSize=FETCH_MAX_OBS: the engine slices exactly one page newest-first from the offset,
+        // so the MCP layer receives at most FETCH_MAX_OBS observations with no secondary cap needed.
+        const c = await core.getConcept(id, { synthesize: false, observationsOffset: observationsOffset ?? 0, pageSize: FETCH_MAX_OBS });
         if (!c) return err(`concept not found: ${id}`);
-        // Bound the result: keep the most-recent observations and clip long text, so a heavily-supported
-        // concept still fetches instead of being rejected by the host's tool-result limit.
-        const total = c.observations.length;
-        const kept = c.observations.slice(Math.max(0, total - FETCH_MAX_OBS));
-        const omitted = total - kept.length;
+        const total = c.totalObservations;
+        const offset = c.observationsOffset;
+        // Engine already returned exactly one page; all observations in c.observations are kept.
+        const kept = c.observations;
+        const omitted = 0;
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
         return ok({
           id: c.id,
@@ -210,22 +229,32 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           kind: c.kind,
           body: body.text,
           ...(body.clipped ? { bodyTruncated: true } : {}),
-          observations: kept.map((o) => clip(o, FETCH_OBS_MAX_CHARS).text),
-          observationCount: total,
-          ...(omitted > 0
+          observations: kept.map((o) => ({ id: o.id, content: clip(o.content, FETCH_OBS_MAX_CHARS).text })),
+          totalObservations: total,
+          observationsOffset: offset,
+          // Note: omitted is always 0 (engine returns exactly one page). Use kept.length vs total
+          // to detect whether more pages exist. Offset here is newest-first (offset 0 = newest page).
+          ...(kept.length === 0 && offset > 0
             ? {
-                observationsOmitted: omitted,
-                observationsNote: `Showing the ${kept.length} most-recent of ${total} observations; older ones omitted to fit the host limit.`,
+                observationsNote: `No observations at offset ${offset} of ${total}.`,
               }
-            : {}),
+            : offset > 0
+              ? {
+                  observationsNote: `Showing observations ${offset + 1}–${offset + kept.length} of ${total} (newest-first). Page forward: increment offset by ${FETCH_MAX_OBS}.`,
+                }
+              : total > kept.length
+                ? {
+                    observationsNote: `Showing the ${kept.length} newest of ${total} observations. Use observationsOffset to page older ones (step by ${FETCH_MAX_OBS}).`,
+                  }
+                : {}),
           supportCount: c.supportCount,
           confidence: c.confidence,
           version: c.version,
           needsSynthesis: c.needsSynthesis,
-          // Only invite synthesis when ALL evidence is shown. memory_synthesize clears `dirty` with the
-          // body the agent writes, so synthesizing from a truncated view would discard the omitted
-          // observations from the canonical body — don't ask for it here.
-          ...(c.needsSynthesis && omitted === 0
+          // Only invite synthesis when ALL evidence is shown (offset=0 AND total fits one page).
+          // memory_synthesize clears `dirty` with the body the agent writes, so synthesizing from
+          // a partial view would discard the unseen observations from the canonical body.
+          ...(c.needsSynthesis && offset === 0 && total <= FETCH_MAX_OBS
             ? {
                 synthesisInstruction:
                   "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body) — pass this concept's `circle` (above) if it isn't your session default.",
@@ -337,6 +366,47 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         return ok({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_detach",
+    "Split one or more observations out of a concept. The named observations are moved out of their source concept and either create a new concept (default) or are attached to an existing concept you specify with destConceptId. The source concept is recomputed (embedding, support count, confidence, body) from its remaining evidence and marked for re-synthesis. Use to undo a wrong merge, or to consolidate a possible-duplicate pair: memory_fetch both concepts, pick the observations to move, call memory_detach with destConceptId to fold them into the keeper. Detaching ALL observations into a destConceptId consolidates the source away (it is deleted). Cannot detach the last observation without destConceptId — move the whole concept with memory_reassign_circle instead.",
+    {
+      conceptId: z.string().describe("The concept to detach observations FROM."),
+      observationIds: z.array(z.string()).min(1).describe("Ids of the observations to detach (from memory_fetch's observations[].id)."),
+      destConceptId: z
+        .string()
+        .optional()
+        .describe(
+          "Attach the detached observations TO this existing concept instead of creating a new one. Must be in the same circle. Used to consolidate a possible-duplicate pair. Detaching ALL observations with this set removes the source concept entirely.",
+        ),
+      circle: z
+        .string()
+        .optional()
+        .describe("The circle the conceptId belongs to (defaults to this session's circle). Pass it when working with an explicit circle."),
+    },
+    async ({ conceptId, observationIds, destConceptId, circle }) => {
+      try {
+        if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`);
+        if (destConceptId && core.circleOf(destConceptId) !== scope(circle)) return err(`destConceptId concept not found: ${destConceptId}`);
+        const r = await core.detach(conceptId, observationIds, { destConceptId, circle: scope(circle) });
+        return ok({
+          circle: scope(circle),
+          sourceConceptId: r.sourceConceptId,
+          destConceptId: r.destConceptId,
+          destAction: r.destAction,
+          observationsMoved: r.observationsMoved,
+          sourceDeleted: r.sourceDeleted,
+          message: r.sourceDeleted
+            ? `Source concept consolidated into ${r.destConceptId} and removed.`
+            : r.destAction === "created"
+              ? `Created new concept ${r.destConceptId} from the detached observations. The source concept has been recomputed.`
+              : `Attached detached observations to existing concept ${r.destConceptId}. The source concept has been recomputed.`,
+        });
+      } catch (e) {
+        return err(`detach failed: ${msg(e)}`);
       }
     },
   );

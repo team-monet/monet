@@ -120,3 +120,49 @@ describe("staleness (#240 / #179 class)", () => {
     core.close();
   });
 });
+
+describe("attach() status preservation (#fix — attach must never clear 'disputed')", () => {
+  it("a plain store/attach onto a disputed concept keeps it disputed (open contradiction survives)", async () => {
+    // Set up a disputed concept via a correction.
+    const core = new MonetCore(":memory:");
+    const a = await core.store(BASE);
+    const corr = await core.store(CORRECTION, { kind: "correction" });
+    expect(corr.conceptId).toBe(a.conceptId);
+    const conceptId = a.conceptId;
+
+    // Confirm disputed before attaching more evidence.
+    const before = (await core.getConcept(conceptId, { synthesize: false }))!;
+    expect(before.status).toBe("disputed");
+    expect(core.getOpenContradictions()).toHaveLength(1);
+
+    // Attach a plain (non-correction) observation — must NOT clear 'disputed'.
+    await core.store("Additional context about our storage backend choice.", { attachTo: conceptId });
+
+    const after = (await core.getConcept(conceptId, { synthesize: false }))!;
+    expect(after.status).toBe("disputed"); // must remain disputed: open contradiction still present
+    expect(core.getOpenContradictions()).toHaveLength(1); // contradiction row still open
+
+    core.close();
+  });
+
+  it("a stale concept (status='active') receiving new evidence keeps status='active' — CASE WHEN preserves non-disputed", async () => {
+    // Stale is time-based, not a status enum field; stale concepts always have status='active'.
+    // The attach() CASE WHEN only guards 'disputed' → it must still write 'active' for all other statuses.
+    const core = new MonetCore(":memory:", { staleAfterMs: 5 });
+    const a = await core.store("Deployment process uses bare-metal servers.");
+    await new Promise((r) => setTimeout(r, 25)); // age past staleness threshold
+
+    // Verify concept is considered stale (time-based) and its status is 'active'.
+    expect(core.getStaleConcepts()).toHaveLength(1);
+    const staleRow = (await core.getConcept(a.conceptId, { synthesize: false }))!;
+    expect(staleRow.status).toBe("active"); // stale is time-based, status is still 'active'
+
+    // Attach new evidence — concept status must remain 'active' (CASE WHEN does not break this).
+    await core.store("Confirmed: bare-metal still in use.", { attachTo: a.conceptId });
+
+    const after = (await core.getConcept(a.conceptId, { synthesize: false }))!;
+    expect(after.status).toBe("active"); // 'active' preserved through attach
+
+    core.close();
+  });
+});
