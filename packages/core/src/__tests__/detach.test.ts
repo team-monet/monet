@@ -2,6 +2,8 @@
  * detach() — split observations out of a concept, either into a new concept or an existing one.
  * Covers: basic detach→new concept; detach→destConceptId; source embedding recompute; last-obs
  * guard; possible_duplicate_of edge removal on consolidation; superseded_by hygiene; dirty mark.
+ * Also covers: kind propagation on create (Finding 1); source_refs recompute (Finding 2);
+ * contradiction row hygiene (Finding 3).
  */
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
@@ -260,6 +262,255 @@ describe("detach — superseded_by hygiene", () => {
 
     // The remaining obs (formerly superseded by the now-moved obs) must have superseded_by cleared.
     expect(c.supersededObservationCount()).toBe(0);
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1: kind propagation — detach-to-new must carry the source's kind
+// ---------------------------------------------------------------------------
+describe("detach — kind propagation to new concept (Finding 1)", () => {
+  it("new destination concept inherits the source concept's kind", async () => {
+    // Source concept is a "decision"; detaching one of its observations must
+    // produce a destination concept that is also a "decision", not a "fact".
+    const c = core();
+    const a = await c.store("We decided to use TypeScript for all new modules.", { kind: "decision" });
+    const a2 = await c.store("We decided to adopt pnpm as the package manager.", {
+      attachTo: a.conceptId,
+      kind: "decision",
+    });
+
+    const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    expect(fetched.kind).toBe("decision");
+    const obs2Id = fetched.observations[1]!.id;
+
+    const r = await c.detach(a.conceptId, [obs2Id]);
+    expect(r.destAction).toBe("created");
+
+    const dest = (await c.getConcept(r.destConceptId, { synthesize: false }))!;
+    expect(dest.kind).toBe("decision");
+    c.close();
+  });
+
+  it("explicit-destination mode keeps the destination's own kind unchanged", async () => {
+    // When detaching into an existing concept the destination's kind must not change.
+    const c = core();
+    const dest = await c.store("A fact-kind destination concept.", { kind: "fact" });
+    const src = await c.store("A decision-kind source concept.", { kind: "decision" });
+    await c.store("Second obs for source.", { attachTo: src.conceptId, kind: "decision" });
+
+    const fetched = (await c.getConcept(src.conceptId, { synthesize: false }))!;
+    const obs2Id = fetched.observations[1]!.id;
+
+    const r = await c.detach(src.conceptId, [obs2Id], { destConceptId: dest.conceptId });
+    expect(r.destAction).toBe("attached");
+
+    const destAfter = (await c.getConcept(dest.conceptId, { synthesize: false }))!;
+    expect(destAfter.kind).toBe("fact"); // unchanged
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2: source_refs recompute after detach
+// ---------------------------------------------------------------------------
+describe("detach — source_refs recompute (Finding 2)", () => {
+  it("source_refs are recomputed: source loses refs belonging only to the detached obs", async () => {
+    // Use a core with graphEnabled so gather() actually returns results.
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+
+    // Store obs1 with ref "file://alpha.md" → creates the concept.
+    const a = await c.store("Alpha content for the source concept.", {
+      sourceRefs: ["file://alpha.md"],
+    });
+    // Attach obs2 with ref "file://beta.md".
+    await c.store("Beta content attached to source.", {
+      attachTo: a.conceptId,
+      sourceRefs: ["file://beta.md"],
+    });
+
+    const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    expect(fetched.observations).toHaveLength(2);
+    const obs2Id = fetched.observations[1]!.id;
+
+    // Detach obs2 (the beta one) into a new concept.
+    const r = await c.detach(a.conceptId, [obs2Id]);
+    expect(r.destAction).toBe("created");
+
+    // Source should now have only "file://alpha.md" in its refs.
+    // Destination should have "file://beta.md".
+    // Verify via gather() which reads concepts.source_refs for GatherCard.sourceRefs.
+    // (ranked is GatherCard[] and includes seeds re-ranked; no need to fall back to seed.)
+    const gSrc = await c.gather("Alpha content for the source concept.");
+    const srcCard = gSrc.ranked.find((card) => card.id === a.conceptId);
+    expect(srcCard?.sourceRefs).toEqual(["file://alpha.md"]);
+
+    const gDst = await c.gather("Beta content attached to source.");
+    const dstCard = gDst.ranked.find((card) => card.id === r.destConceptId);
+    expect(dstCard?.sourceRefs).toEqual(["file://beta.md"]);
+
+    c.close();
+  });
+
+  it("source_refs on attached destination: union of dest's existing refs and moved refs", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+
+    // Dest concept with its own ref.
+    const dest = await c.store("Destination concept.", { sourceRefs: ["file://dest.md"] });
+    // Source concept: obs1 with ref alpha, obs2 with ref beta.
+    const src = await c.store("Source obs one.", { sourceRefs: ["file://alpha.md"] });
+    await c.store("Source obs two.", { attachTo: src.conceptId, sourceRefs: ["file://beta.md"] });
+
+    const fetched = (await c.getConcept(src.conceptId, { synthesize: false }))!;
+    const obs2Id = fetched.observations[1]!.id;
+
+    await c.detach(src.conceptId, [obs2Id], { destConceptId: dest.conceptId });
+
+    // Destination should now have dest.md ∪ beta.md.
+    const gDst = await c.gather("Destination concept.");
+    const dstCard = gDst.ranked.find((card) => card.id === dest.conceptId);
+    const refs = dstCard?.sourceRefs ?? [];
+    expect(refs).toContain("file://dest.md");
+    expect(refs).toContain("file://beta.md");
+
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3: contradiction row hygiene
+// ---------------------------------------------------------------------------
+describe("detach — contradiction row hygiene (Finding 3)", () => {
+  it("(a) detach the correcting observation alone → contradiction dismissed, source restored, no superseded_by", async () => {
+    // Set up: base concept with one observation, a correction opens a contradiction.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const base = await c.store("Old decision: use Redis for caching.");
+    const corr = await c.store("New decision: use Memcached instead of Redis.", {
+      attachTo: base.conceptId,
+      kind: "correction",
+    });
+    expect(corr.contradiction).toBeDefined();
+    const contradictionId = corr.contradiction!.id;
+
+    // Add a third uninvolved observation so we can detach the correction without triggering
+    // the last-obs guard (source must keep at least one observation).
+    await c.store("Context: caching layer decision made in Q2.", { attachTo: base.conceptId });
+
+    // Pre-condition: source MUST still be 'disputed' after the guard obs was attached.
+    // (Before the attach() root fix, attaching any evidence cleared 'disputed' to 'active',
+    // making this check vacuous and the restore assertion below tautologically true.)
+    const before = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(before.status).toBe("disputed"); // genuine pre-condition, not vacuous
+
+    // Detach only the correcting observation (obs[1]) — leave original (obs[0]) and context (obs[2]).
+    const fetched = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    const corrObsId = fetched.observations[1]!.id; // the correction
+    await c.detach(base.conceptId, [corrObsId]);
+
+    // The contradiction must no longer be open on the source.
+    const openContradictions = c.getOpenContradictions();
+    expect(openContradictions.some((k) => k.id === contradictionId)).toBe(false);
+
+    // Source must be restored to active (no remaining open contradictions).
+    const srcAfter = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(srcAfter.status).toBe("active");
+
+    // No observations must have been superseded (dismiss must not call accept-new logic).
+    expect(c.supersededObservationCount()).toBe(0);
+
+    c.close();
+  });
+
+  it("(b) detach ALL dispute observations together → contradiction travels to dest, dest disputed, source restored", async () => {
+    // Set up: base obs A + correction obs B + uninvolved guard obs C.
+    // Detach A + B together: the entire dispute moves to dest; C stays.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const base = await c.store("Old plan: deploy to bare metal.");
+    const corr = await c.store("New plan: deploy to Kubernetes instead.", {
+      attachTo: base.conceptId,
+      kind: "correction",
+    });
+    expect(corr.contradiction).toBeDefined();
+    const contradictionId = corr.contradiction!.id;
+
+    // Add guard obs C so source retains at least one observation after A+B are detached.
+    await c.store("Context note: infrastructure decision.", { attachTo: base.conceptId });
+
+    const fetched = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(fetched.observations).toHaveLength(3); // A, B, C
+    const obsAId = fetched.observations[0]!.id; // original
+    const obsBId = fetched.observations[1]!.id; // correction
+
+    // Detach A and B together (the entire dispute).
+    const r = await c.detach(base.conceptId, [obsAId, obsBId]);
+    expect(r.destAction).toBe("created");
+
+    // The contradiction row must now be on the destination, not the source.
+    const srcContradictions = c.getOpenContradictions();
+    // (getOpenContradictions returns all circles; check by id)
+    expect(srcContradictions.some((k) => k.id === contradictionId && k.conceptId === base.conceptId)).toBe(false);
+    expect(srcContradictions.some((k) => k.id === contradictionId && k.conceptId === r.destConceptId)).toBe(true);
+
+    // Destination must be disputed.
+    const destAfter = (await c.getConcept(r.destConceptId, { synthesize: false }))!;
+    expect(destAfter.status).toBe("disputed");
+
+    // Source must be restored to active.
+    const srcAfter = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(srcAfter.status).toBe("active");
+
+    c.close();
+  });
+
+  it("(c) entire dispute travels to an EXISTING destination → dest disputed, src restored, no clobber", async () => {
+    // This tests F1 from the root-cause analysis: when detach() step 3.7 re-points the
+    // contradiction and marks the destination 'disputed', step 5's attach() loop must NOT
+    // clobber 'disputed' back to 'active'.  The attach() fix handles this automatically.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    // Create an independent existing destination concept to receive the dispute.
+    const dest = await c.store("Existing destination concept: infrastructure overview.");
+
+    // Create source: base obs A + correction obs B + uninvolved guard obs C.
+    const base = await c.store("Old plan: migrate to AWS.");
+    const corr = await c.store("New plan: stay on-prem instead of AWS.", {
+      attachTo: base.conceptId,
+      kind: "correction",
+    });
+    expect(corr.contradiction).toBeDefined();
+    const contradictionId = corr.contradiction!.id;
+
+    // Guard obs C so source retains at least one observation after A+B are detached.
+    await c.store("Context note: cost analysis is pending.", { attachTo: base.conceptId });
+
+    // Pre-condition: source is genuinely 'disputed' after adding the guard obs.
+    // (Proves the fix: attach() no longer demotes 'disputed' → 'active'.)
+    const srcBefore = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(srcBefore.status).toBe("disputed");
+    expect(srcBefore.observations).toHaveLength(3); // A, B, C
+
+    const obsAId = srcBefore.observations[0]!.id; // original
+    const obsBId = srcBefore.observations[1]!.id; // correction
+
+    // Detach A + B into the EXISTING destination.
+    const r = await c.detach(base.conceptId, [obsAId, obsBId], { destConceptId: dest.conceptId });
+    expect(r.destAction).toBe("attached");
+    expect(r.destConceptId).toBe(dest.conceptId);
+
+    // The contradiction row must be re-pointed to the destination.
+    const allOpen = c.getOpenContradictions();
+    expect(allOpen.some((k) => k.id === contradictionId && k.conceptId === base.conceptId)).toBe(false);
+    expect(allOpen.some((k) => k.id === contradictionId && k.conceptId === dest.conceptId)).toBe(true);
+
+    // Destination must be 'disputed' — attach() in step 5 must NOT have clobbered it back to 'active'.
+    const destAfter = (await c.getConcept(dest.conceptId, { synthesize: false }))!;
+    expect(destAfter.status).toBe("disputed");
+
+    // Source must be restored to active (no remaining open contradictions on source).
+    const srcAfter = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(srcAfter.status).toBe("active");
+    expect(allOpen.some((k) => k.conceptId === base.conceptId)).toBe(false);
+
     c.close();
   });
 });

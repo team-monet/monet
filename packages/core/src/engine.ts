@@ -868,7 +868,7 @@ export class MonetCore {
         .run(opts.by ?? null, contradictionId);
     } else {
       const allIds = (
-        this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at`).all(conceptId) as Array<{ id: string }>
+        this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`).all(conceptId) as Array<{ id: string }>
       ).map((o) => o.id);
       const priors = allIds.filter((oid) => oid !== c.observation_id);
       const winnerObsId = opts.decision === "accept-new" ? c.observation_id : priors[priors.length - 1] ?? null;
@@ -1115,8 +1115,8 @@ export class MonetCore {
 
     // Validate all observation ids belong to source.
     const srcObsRows = this.db
-      .prepare(`SELECT id, content, embedding, superseded_by, created_at FROM observations WHERE concept_id = ? ORDER BY created_at`)
-      .all(sourceConceptId) as Array<{ id: string; content: string; embedding: string; superseded_by: string | null; created_at: number }>;
+      .prepare(`SELECT id, content, embedding, superseded_by, source_refs, created_at FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
+      .all(sourceConceptId) as Array<{ id: string; content: string; embedding: string; superseded_by: string | null; source_refs: string | null; created_at: number }>;
     const srcObsIds = new Set(srcObsRows.map((o) => o.id));
     for (const id of observationIds) {
       if (!srcObsIds.has(id)) throw new Error(`observation ${id} does not belong to concept ${sourceConceptId}`);
@@ -1147,9 +1147,11 @@ export class MonetCore {
       // 1. Destination: create or use existing.
       if (!destRow) {
         // Create from the first detached observation (by created_at order).
+        // Carry the source concept's kind so that splitting a "decision" concept
+        // produces another "decision", not a "fact" (the create() default).
         const firstObs = detachingRows[0]!;
         const firstEmb = jsonToEmb(firstObs.embedding);
-        const newRow = this.create(firstObs.content, firstEmb, circle);
+        const newRow = this.create(firstObs.content, firstEmb, circle, srcRow.kind);
         destConceptId = newRow.id;
         destRow = this.getRow(destConceptId)!;
       } else {
@@ -1181,6 +1183,99 @@ export class MonetCore {
       this.db
         .prepare(`UPDATE observations SET concept_id = ?, circle = ? WHERE id IN (${placeholders})`)
         .run(destConceptId, circle, ...observationIds);
+
+      // 3.5. Recompute source_refs from per-observation refs.
+      // Observations carry their own source_refs; concepts.source_refs is the aggregate used by
+      // gather()/toGatherCard.  Detach invalidates both endpoints.
+      {
+        // Source: aggregate over the observations that REMAIN.
+        const srcRefs = new Set<string>();
+        for (const o of remainingRows) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) srcRefs.add(r);
+        this.db
+          .prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`)
+          .run(srcRefs.size ? JSON.stringify([...srcRefs]) : null, sourceConceptId);
+
+        // Destination: aggregate over the observations that MOVED.
+        const movedRefs = new Set<string>();
+        for (const o of detachingRows) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) movedRefs.add(r);
+        if (destAction === "created") {
+          // New concept: its sole source of refs is the moved observations.
+          this.db
+            .prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`)
+            .run(movedRefs.size ? JSON.stringify([...movedRefs]) : null, destConceptId);
+        } else {
+          // Existing destination: union the destination's current refs with moved refs.
+          const destRefsCur = destRow!.source_refs ? (JSON.parse(destRow!.source_refs) as string[]) : [];
+          const merged = [...new Set([...destRefsCur, ...movedRefs])];
+          this.db
+            .prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`)
+            .run(merged.length ? JSON.stringify(merged) : null, destConceptId);
+        }
+      }
+
+      // 3.7. Contradiction hygiene: no open contradiction may reference an observation that lives
+      // in a different concept from its concept_id.  The contradiction row's observation_id is the
+      // *correcting* observation; the observations it was correcting are all prior obs on the source.
+      {
+        const openContras = this.db
+          .prepare(`SELECT id, observation_id FROM contradictions WHERE concept_id = ? AND status = 'open'`)
+          .all(sourceConceptId) as Array<{ id: string; observation_id: string | null }>;
+
+        for (const contra of openContras) {
+          if (!contra.observation_id || !detachingSet.has(contra.observation_id)) {
+            // The correcting observation is staying on the source → no action needed.
+            continue;
+          }
+          // The correcting observation is moving away.  Check whether all the "prior" observations
+          // it was correcting also move (entire dispute travels) or some stay (dispute is split).
+          // "Prior" means: observations that existed on the source concept BEFORE the correcting
+          // observation (by insertion order in srcObsRows, which is ORDER BY created_at, rowid).
+          // Observations created AFTER the correcting observation (e.g. guard obs added later) are
+          // not party to the dispute and must not influence the branch.
+          const correctingIndex = srcObsRows.findIndex((o) => o.id === contra.observation_id);
+          // Observations that appear earlier in the sorted list (index < correctingIndex) are "prior".
+          const priorIds = new Set(srcObsRows.slice(0, correctingIndex).map((o) => o.id));
+          // Count how many prior obs are staying on the source (i.e., not in the detaching set).
+          const priorRemainingCount = [...priorIds].filter((id) => !detachingSet.has(id)).length;
+          if (priorRemainingCount === 0) {
+            // All prior (pre-correction) observations also moved: entire dispute travels.
+            // Re-point the contradiction row to the destination.
+            this.db
+              .prepare(`UPDATE contradictions SET concept_id = ? WHERE id = ?`)
+              .run(destConceptId, contra.id);
+            // Destination becomes disputed (mirror flagContradiction's status flip).
+            this.db
+              .prepare(`UPDATE concepts SET status = 'disputed', updated_at = unixepoch() * 1000 WHERE id = ?`)
+              .run(destConceptId);
+          } else {
+            // Dispute is split: correcting obs leaves but some prior obs remain.  The conflict as
+            // constituted dissolves — dismiss it (mirror resolveContradiction "dismiss" path:
+            // mark dismissed, do NOT supersede any observation).
+            this.db
+              .prepare(
+                `UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000 WHERE id = ?`,
+              )
+              .run(contra.id);
+          }
+        }
+
+        // Restore source to active if no open contradictions remain after the moves above.
+        const srcOpenCount = (
+          this.db
+            .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`)
+            .get(sourceConceptId) as { n: number }
+        ).n;
+        if (srcOpenCount === 0) {
+          const currentSrcStatus = (
+            this.db.prepare(`SELECT status FROM concepts WHERE id = ?`).get(sourceConceptId) as { status: string } | undefined
+          )?.status;
+          if (currentSrcStatus === "disputed") {
+            this.db
+              .prepare(`UPDATE concepts SET status = 'active', updated_at = unixepoch() * 1000 WHERE id = ?`)
+              .run(sourceConceptId);
+          }
+        }
+      }
 
       // 4. Recompute source from remaining observations.
       const remEmbs = remainingRows.map((o) => jsonToEmb(o.embedding));
@@ -2162,7 +2257,9 @@ export class MonetCore {
       .prepare(
         `UPDATE concepts
             SET body = ?, version = ?, support_count = ?, embedding = ?,
-                confidence = ?, status = 'active', dirty = 1, updated_at = unixepoch() * 1000
+                confidence = ?,
+                status = CASE WHEN status = 'disputed' THEN 'disputed' ELSE 'active' END,
+                dirty = 1, updated_at = unixepoch() * 1000
           WHERE id = ?`,
       )
       .run(body, version, supportCount, embToJson(blended), confidence, concept.id);
