@@ -201,21 +201,27 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_fetch",
-    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach.",
-    { id: z.string(), circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle). Pass it when reading results of a search/gather you ran on an explicit circle.") },
-    async ({ id, circle }) => {
+    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page through them with observationsOffset; totalObservations tells you when you have them all.",
+    {
+      id: z.string(),
+      circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle). Pass it when reading results of a search/gather you ran on an explicit circle."),
+      observationsOffset: z.number().int().min(0).optional().describe("Page through observations: skip this many (by insertion order) before applying the per-page cap. Use with totalObservations to retrieve all observation ids across pages."),
+    },
+    async ({ id, circle, observationsOffset }) => {
       try {
         // Scope enforcement: an id from another project's circle must not be readable here (ids leak
         // across sessions / get pasted from prior output). `scope(circle)` honors an explicit circle the
         // client searched, defaulting to this session's circle. Check before getConcept's usefulness bump.
         if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
-        const c = await core.getConcept(id, { synthesize: false });
+        const c = await core.getConcept(id, { synthesize: false, observationsOffset: observationsOffset ?? 0 });
         if (!c) return err(`concept not found: ${id}`);
-        // Bound the result: keep the most-recent observations and clip long text, so a heavily-supported
-        // concept still fetches instead of being rejected by the host's tool-result limit.
-        const total = c.observations.length;
-        const kept = c.observations.slice(Math.max(0, total - FETCH_MAX_OBS));
-        const omitted = total - kept.length;
+        // Bound the result: keep the most-recent observations from the offset window and clip long text,
+        // so a heavily-supported concept still fetches instead of being rejected by the host's limit.
+        const total = c.totalObservations;
+        const offset = c.observationsOffset;
+        // Within the offset-sliced window apply the per-page cap from the most-recent end.
+        const kept = c.observations.slice(Math.max(0, c.observations.length - FETCH_MAX_OBS));
+        const omitted = c.observations.length - kept.length;
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
         return ok({
           id: c.id,
@@ -224,13 +230,24 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           body: body.text,
           ...(body.clipped ? { bodyTruncated: true } : {}),
           observations: kept.map((o) => ({ id: o.id, content: clip(o.content, FETCH_OBS_MAX_CHARS).text })),
-          observationCount: total,
+          totalObservations: total,
+          observationsOffset: offset,
           ...(omitted > 0
             ? {
                 observationsOmitted: omitted,
-                observationsNote: `Showing the ${kept.length} most-recent of ${total} observations; older ones omitted to fit the host limit.`,
+                observationsNote: `Showing the ${kept.length} most-recent of ${c.observations.length} observations at offset ${offset}; some omitted to fit the host limit.`,
               }
-            : {}),
+            : offset > 0
+              ? {
+                  observationsNote: kept.length === 0
+                    ? `No observations at offset ${offset} of ${total}.`
+                    : `Showing observations ${offset}–${offset + kept.length - 1} of ${total}.`,
+                }
+              : total > kept.length + omitted
+                ? {
+                    observationsNote: `Showing the ${kept.length} most-recent of ${total} observations; older ones omitted. Use observationsOffset to page.`,
+                  }
+                : {}),
           supportCount: c.supportCount,
           confidence: c.confidence,
           version: c.version,
@@ -238,7 +255,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           // Only invite synthesis when ALL evidence is shown. memory_synthesize clears `dirty` with the
           // body the agent writes, so synthesizing from a truncated view would discard the omitted
           // observations from the canonical body — don't ask for it here.
-          ...(c.needsSynthesis && omitted === 0
+          ...(c.needsSynthesis && omitted === 0 && offset === 0 && total <= FETCH_MAX_OBS
             ? {
                 synthesisInstruction:
                   "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body) — pass this concept's `circle` (above) if it isn't your session default.",
@@ -356,7 +373,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_detach",
-    "Split one or more observations out of a concept. The named observations are moved out of their source concept and either create a new concept (default) or are attached to an existing concept you specify with destConceptId. The source concept is recomputed (embedding, support count, confidence, body) from its remaining evidence and marked for re-synthesis. Use to undo a wrong merge, or to consolidate a possible-duplicate pair: memory_fetch both concepts, pick the observations to move, call memory_detach with destConceptId to fold them into the keeper. Cannot detach the last observation — move the whole concept with memory_reassign_circle instead.",
+    "Split one or more observations out of a concept. The named observations are moved out of their source concept and either create a new concept (default) or are attached to an existing concept you specify with destConceptId. The source concept is recomputed (embedding, support count, confidence, body) from its remaining evidence and marked for re-synthesis. Use to undo a wrong merge, or to consolidate a possible-duplicate pair: memory_fetch both concepts, pick the observations to move, call memory_detach with destConceptId to fold them into the keeper. Detaching ALL observations into a destConceptId consolidates the source away (it is deleted). Cannot detach the last observation without destConceptId — move the whole concept with memory_reassign_circle instead.",
     {
       conceptId: z.string().describe("The concept to detach observations FROM."),
       observationIds: z.array(z.string()).min(1).describe("Ids of the observations to detach (from memory_fetch's observations[].id)."),
@@ -364,7 +381,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
         .string()
         .optional()
         .describe(
-          "Attach the detached observations TO this existing concept instead of creating a new one. Must be in the same circle. Used to consolidate a possible-duplicate pair.",
+          "Attach the detached observations TO this existing concept instead of creating a new one. Must be in the same circle. Used to consolidate a possible-duplicate pair. Detaching ALL observations with this set removes the source concept entirely.",
         ),
       circle: z
         .string()
@@ -382,8 +399,10 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
           destConceptId: r.destConceptId,
           destAction: r.destAction,
           observationsMoved: r.observationsMoved,
-          message:
-            r.destAction === "created"
+          sourceDeleted: r.sourceDeleted,
+          message: r.sourceDeleted
+            ? `Source concept consolidated into ${r.destConceptId} and removed.`
+            : r.destAction === "created"
               ? `Created new concept ${r.destConceptId} from the detached observations. The source concept has been recomputed.`
               : `Attached detached observations to existing concept ${r.destConceptId}. The source concept has been recomputed.`,
         });

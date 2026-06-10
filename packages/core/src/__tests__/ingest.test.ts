@@ -241,3 +241,57 @@ describe("lazy enrichment (Sift inline, Sieve deferred — §4.6)", () => {
     core.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// F6 — ambiguous-band corrections are exempt from fork-on-ambiguous
+// ---------------------------------------------------------------------------
+describe("F6 — ambiguous-band correction exemption from fork-on-ambiguous", () => {
+  it("ambiguous-band correction attaches to near match, opens contradiction, no possible_duplicate_of edge, no new concept", async () => {
+    // tauAttach=0.9 (nothing attaches on score), tauAmbiguous=0.1 (everything in band) —
+    // same setup as the existing ambiguous-fork test so scores are in the ambiguous band.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const a = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+
+    // Ambiguous-band score but kind=correction → must attach to near match, not fork.
+    const b = await c.store("Monet Local uses SQLite for its local storage backend.", { kind: "correction" });
+
+    // Action is still "ambiguous" (score honesty) but conceptId is the existing concept.
+    expect(b.action).toBe("ambiguous");
+    expect(b.conceptId).toBe(a.conceptId);
+
+    // A contradiction must have been opened (the correction path ran).
+    expect(b.contradiction).toBeDefined();
+    expect(b.contradiction!.status).toBe("open");
+
+    // The near-match concept must be disputed.
+    const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    expect(fetched.status).toBe("disputed");
+
+    // No possible_duplicate_of edge — the correction was attached, not forked.
+    const dupEdges = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(dupEdges.length).toBe(0);
+
+    // Only one concept exists.
+    expect(c.conceptCount()).toBe(1);
+
+    c.close();
+  });
+
+  it("ambiguous-band NON-correction still forks and records possible_duplicate_of (existing behaviour)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const a = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const b = await c.store("Monet Local uses SQLite for its local storage backend."); // no kind=correction
+
+    expect(b.action).toBe("ambiguous");
+    expect(b.conceptId).not.toBe(a.conceptId); // forked
+    expect(c.conceptCount()).toBe(2);
+
+    const dupEdges = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(dupEdges.some((e) =>
+      (e.srcId === a.conceptId && e.dstId === b.conceptId) ||
+      (e.srcId === b.conceptId && e.dstId === a.conceptId),
+    )).toBe(true);
+
+    c.close();
+  });
+});

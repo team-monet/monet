@@ -129,6 +129,8 @@ export interface DetachResult {
   observationsMoved: number;
   sourceConcept: Concept;
   destConcept: Concept;
+  /** True when detaching ALL observations into a named destConceptId consolidates the source away. */
+  sourceDeleted: boolean;
 }
 
 /**
@@ -554,11 +556,12 @@ export class MonetCore {
       throw new Error("resolution 'forceNew' and attachTo are mutually exclusive");
     }
     if (opts.attachTo) {
-      const targetCheck = this.db.prepare(`SELECT id, circle FROM concepts WHERE id = ?`).get(opts.attachTo) as
-        | { id: string; circle: string }
+      const targetCheck = this.db.prepare(`SELECT id, circle, kind FROM concepts WHERE id = ?`).get(opts.attachTo) as
+        | { id: string; circle: string; kind: string }
         | undefined;
       if (!targetCheck) throw new Error(`attachTo concept not found: ${opts.attachTo}`);
       if (targetCheck.circle !== circle) throw new Error(`attachTo concept is in circle '${targetCheck.circle}' not '${circle}'`);
+      if (targetCheck.kind === "workstream") throw new Error("cannot attach to a workstream concept");
     }
 
     const emb = await this.embedder.embed(content);
@@ -602,12 +605,22 @@ export class MonetCore {
         // A wrong fork is recoverable (the pair can be merged later); a wrong merge is not
         // (split loses provenance). Ambiguous-band evidence therefore forks, with a
         // possible_duplicate_of edge for later mediation.
-        action = "ambiguous";
-        row = this.create(content, emb, circle, opts.kind);
-        nearMatchId = match.id;
-        nearMatchScore = score;
-        if (this.graphEnabled) {
-          this.upsertEdgeBoth(row.id, match.id, "possible_duplicate_of", score, "cheap", circle);
+        // Exception: kind="correction" is exempt from fork-on-ambiguous — the caller is
+        // explicitly asserting "this overrides existing memory", so the intent disambiguates.
+        if (opts.kind === "correction") {
+          // Attach to the near match and let the existing correction path open a contradiction.
+          action = "ambiguous";
+          row = this.attach(match, content, emb);
+          nearMatchId = match.id;
+          nearMatchScore = score;
+        } else {
+          action = "ambiguous";
+          row = this.create(content, emb, circle, opts.kind);
+          nearMatchId = match.id;
+          nearMatchScore = score;
+          if (this.graphEnabled) {
+            this.upsertEdgeBoth(row.id, match.id, "possible_duplicate_of", score, "cheap", circle);
+          }
         }
       } else {
         action = "created";
@@ -644,8 +657,10 @@ export class MonetCore {
     // (ADR §4.1 step 4 / §4.6). Novel corrections (action="created") have nothing to contradict.
     // For attachTo: always flag regardless of the action-string gate (the caller explicitly named
     // a target, so it is always an existing concept by validation above).
+    // For ambiguous corrections: action="ambiguous" but the correction was attached to the near match
+    // (F6 exemption), so we must treat it as existing to open the contradiction.
     let contradiction: Contradiction | undefined;
-    const onExisting = action === "attached" || opts.attachTo !== undefined;
+    const onExisting = action === "attached" || opts.attachTo !== undefined || (action === "ambiguous" && opts.kind === "correction");
     if (opts.kind === "correction" && onExisting) {
       contradiction = this.flagContradiction(row.id, {
         observationId: obsId,
@@ -699,9 +714,9 @@ export class MonetCore {
    */
   async getConcept(
     id: string,
-    opts: { synthesize?: boolean } = {},
+    opts: { synthesize?: boolean; observationsOffset?: number } = {},
   ): Promise<
-    (Concept & { observations: ObservationEntry[]; revisions: number; synthesizedNow: boolean; needsSynthesis: boolean }) | null
+    (Concept & { observations: ObservationEntry[]; totalObservations: number; observationsOffset: number; revisions: number; synthesizedNow: boolean; needsSynthesis: boolean }) | null
   > {
     let row = this.getRow(id);
     if (!row) return null;
@@ -710,15 +725,20 @@ export class MonetCore {
     const synthesizedNow = row.dirty === 1 && (opts.synthesize ?? true);
     if (synthesizedNow) row = await this.synthesizeRow(row);
 
-    const obs = this.db
-      .prepare(`SELECT id, content FROM observations WHERE concept_id = ? ORDER BY created_at`)
+    const allObs = this.db
+      .prepare(`SELECT id, content FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
       .all(id) as Array<{ id: string; content: string }>;
+    const totalObservations = allObs.length;
+    const observationsOffset = opts.observationsOffset ?? 0;
+    const obs = allObs.slice(observationsOffset);
     const revs = this.db.prepare(`SELECT COUNT(*) AS n FROM concept_revisions WHERE concept_id = ?`).get(id) as {
       n: number;
     };
     return {
       ...toConcept(row),
       observations: obs.map((o) => ({ id: o.id, content: o.content })),
+      totalObservations,
+      observationsOffset,
       revisions: revs.n,
       synthesizedNow,
       needsSynthesis: row.dirty === 1,
@@ -1104,12 +1124,14 @@ export class MonetCore {
    * or folding them into an existing destination concept. The source concept is recomputed
    * from its remaining evidence. Use to undo a wrong merge or consolidate a possible-duplicate
    * pair: memory_fetch both, pick observations to move, call detach with destConceptId.
+   * When ALL observations are detached into a named destConceptId the emptied source is deleted.
    */
   async detach(sourceConceptId: string, observationIds: string[], opts: { destConceptId?: string; circle?: string } = {}): Promise<DetachResult> {
     if (observationIds.length === 0) throw new Error("observationIds must be non-empty");
 
     const srcRow = this.getRow(sourceConceptId);
     if (!srcRow) throw new Error("concept not found");
+    if (srcRow.kind === "workstream") throw new Error("cannot detach from a workstream concept");
     const circle = srcRow.circle;
     if (opts.circle && opts.circle !== circle) throw new Error("circle mismatch");
 
@@ -1122,9 +1144,17 @@ export class MonetCore {
       if (!srcObsIds.has(id)) throw new Error(`observation ${id} does not belong to concept ${sourceConceptId}`);
     }
 
-    // Cannot detach the last observation.
     const totalCount = srcObsRows.length;
-    if (observationIds.length >= totalCount) {
+    const isConsolidation = !!opts.destConceptId;
+
+    if (opts.destConceptId && opts.destConceptId === sourceConceptId) {
+      throw new Error("destConceptId must differ from the source concept");
+    }
+
+    // Last-observation guard: only allow detaching ALL observations when consolidating into an
+    // existing destination (the emptied source will be deleted). Detach-to-new always requires
+    // at least one observation to remain on the source.
+    if (observationIds.length >= totalCount && !isConsolidation) {
       throw new Error("cannot detach the last observation from a concept — use memory_reassign_circle to move the whole concept instead");
     }
 
@@ -1134,6 +1164,7 @@ export class MonetCore {
       destRow = this.getRow(opts.destConceptId);
       if (!destRow) throw new Error(`destConceptId concept not found: ${opts.destConceptId}`);
       if (destRow.circle !== circle) throw new Error(`destConceptId concept is in circle '${destRow.circle}' not '${circle}'`);
+      if (destRow.kind === "workstream") throw new Error("cannot attach to a workstream concept");
     }
 
     const detachingSet = new Set(observationIds);
@@ -1223,7 +1254,26 @@ export class MonetCore {
 
         for (const contra of openContras) {
           if (!contra.observation_id || !detachingSet.has(contra.observation_id)) {
-            // The correcting observation is staying on the source → no action needed.
+            // The correcting observation is staying on the source.
+            // Mirror case (F3): check whether all prior evidence for this contradiction is moving
+            // away. If so, the dispute has nothing left to dispute — dismiss it.
+            if (contra.observation_id) {
+              const correctingIndex = srcObsRows.findIndex((o) => o.id === contra.observation_id);
+              const priorIds = new Set(srcObsRows.slice(0, correctingIndex).map((o) => o.id));
+              // Only act when there were prior observations (an empty priorIds means nothing to dismiss).
+              if (priorIds.size > 0) {
+                const priorRemainingCount = [...priorIds].filter((id) => !detachingSet.has(id)).length;
+                if (priorRemainingCount === 0) {
+                  // All prior evidence moved away; correcting obs stays — dispute dissolves.
+                  this.db
+                    .prepare(
+                      `UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000 WHERE id = ?`,
+                    )
+                    .run(contra.id);
+                }
+                // If some prior obs remain, leave the contradiction open (no action).
+              }
+            }
             continue;
           }
           // The correcting observation is moving away.  Check whether all the "prior" observations
@@ -1277,21 +1327,55 @@ export class MonetCore {
         }
       }
 
-      // 4. Recompute source from remaining observations.
-      const remEmbs = remainingRows.map((o) => jsonToEmb(o.embedding));
-      let srcEmb = remEmbs[0]!;
-      for (let i = 1; i < remEmbs.length; i++) {
-        srcEmb = blend(srcEmb, remEmbs[i]!, i);
+      // 4. Recompute source from remaining observations (skip when consolidation empties the source).
+      let sourceDeleted = false;
+      if (remainingRows.length === 0) {
+        // Consolidation folds the source into the destination, so its disputes travel with it; no
+        // contradiction row may outlive its concept.  Sweep ALL rows (including those with
+        // observation_id = NULL, which the travel loop above skips) unconditionally onto the
+        // destination before the DELETE.  This mirrors mergeConceptInto's unconditional carry.
+        this.db
+          .prepare(`UPDATE contradictions SET concept_id = ? WHERE concept_id = ?`)
+          .run(destConceptId, sourceConceptId);
+        // If any re-pointed row is open, ensure the destination is marked 'disputed'.
+        const openCarried = (
+          this.db
+            .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`)
+            .get(destConceptId) as { n: number }
+        ).n;
+        if (openCarried > 0) {
+          this.db
+            .prepare(`UPDATE concepts SET status = 'disputed', updated_at = unixepoch() * 1000 WHERE id = ? AND status != 'disputed'`)
+            .run(destConceptId);
+        }
+        // Consolidation: all observations moved to an existing dest — delete the source concept.
+        // Graph must be unwound first; no rederive since the concept no longer exists.
+        this.unwindConceptGraph(sourceConceptId, circle);
+        this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(sourceConceptId);
+        this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(sourceConceptId);
+        sourceDeleted = true;
+      } else {
+        const remEmbs = remainingRows.map((o) => jsonToEmb(o.embedding));
+        let srcEmb = remEmbs[0]!;
+        for (let i = 1; i < remEmbs.length; i++) {
+          srcEmb = blend(srcEmb, remEmbs[i]!, i);
+        }
+        const srcBody = remainingRows.map((o) => o.content).join("\n");
+        const srcSupportCount = remainingRows.length;
+        const srcConfidence = Math.max(0.3, srcRow.confidence * (remainingRows.length / totalCount));
+        // F2: recompute title and slug from the first remaining observation so the source card
+        // no longer shows the moved-away fact (the title previously derived from obs[0] which may
+        // have just been detached).
+        const newSrcTitle = firstLine(remainingRows[0]!.content);
+        const newSrcSlug = slugify(newSrcTitle);
+        this.db
+          .prepare(
+            `UPDATE concepts SET body = ?, embedding = ?, support_count = ?, confidence = ?,
+                    title = ?, slug = ?,
+                    dirty = 1, version = version + 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
+          )
+          .run(srcBody, embToJson(srcEmb), srcSupportCount, srcConfidence, newSrcTitle, newSrcSlug, sourceConceptId);
       }
-      const srcBody = remainingRows.map((o) => o.content).join("\n");
-      const srcSupportCount = remainingRows.length;
-      const srcConfidence = Math.max(0.3, srcRow.confidence * (remainingRows.length / totalCount));
-      this.db
-        .prepare(
-          `UPDATE concepts SET body = ?, embedding = ?, support_count = ?, confidence = ?,
-                  dirty = 1, version = version + 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
-        )
-        .run(srcBody, embToJson(srcEmb), srcSupportCount, srcConfidence, sourceConceptId);
 
       // 5. Destination finalize.
       if (destAction === "created") {
@@ -1319,9 +1403,11 @@ export class MonetCore {
         }
       }
 
-      // 6. Graph: unwind source + rederive.
-      this.unwindConceptGraph(sourceConceptId, circle);
-      this.rederiveConceptGraph(sourceConceptId, circle);
+      // 6. Graph: unwind source + rederive (source already handled above in the deletion path).
+      if (!sourceDeleted) {
+        this.unwindConceptGraph(sourceConceptId, circle);
+        this.rederiveConceptGraph(sourceConceptId, circle);
+      }
       if (destAction === "created") {
         this.rederiveConceptGraph(destConceptId, circle);
       } else {
@@ -1329,17 +1415,28 @@ export class MonetCore {
         this.rederiveConceptGraph(destConceptId, circle);
       }
 
-      const updatedSrc = this.getRow(sourceConceptId)!;
+      const updatedSrc = sourceDeleted ? null : this.getRow(sourceConceptId);
       const updatedDest = this.getRow(destConceptId)!;
+      // When the source is deleted we synthesize a tombstone Concept for the result shape so
+      // callers can still read destConcept normally; sourceConcept reflects the deleted state.
+      const sourceConcept = updatedSrc
+        ? toConcept(updatedSrc)
+        : { ...toConcept({ ...srcRow, support_count: 0 }), supportCount: 0 };
       return {
         sourceConceptId,
         destConceptId,
         destAction,
         observationsMoved: observationIds.length,
-        sourceConcept: toConcept(updatedSrc),
+        sourceConcept,
         destConcept: toConcept(updatedDest),
+        sourceDeleted,
       };
     })();
+
+    // Clean up in-memory follows pointer if the source was deleted (mirrors reassignCircle's cleanup).
+    if (result.sourceDeleted) {
+      for (const [c, v] of this.lastConceptByCircle) if (v === sourceConceptId) this.lastConceptByCircle.delete(c);
+    }
 
     return result;
   }

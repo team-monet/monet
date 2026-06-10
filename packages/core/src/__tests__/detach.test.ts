@@ -7,6 +7,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
+import { BetterSqlitePort } from "../storage";
 import { cosine } from "../embedding";
 
 /** Force all stores into separate concepts (no dedup interference). */
@@ -510,6 +511,315 @@ describe("detach — contradiction row hygiene (Finding 3)", () => {
     const srcAfter = (await c.getConcept(base.conceptId, { synthesize: false }))!;
     expect(srcAfter.status).toBe("active");
     expect(allOpen.some((k) => k.conceptId === base.conceptId)).toBe(false);
+
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 — consolidation path allows detaching ALL observations when destConceptId is provided
+// ---------------------------------------------------------------------------
+describe("detach — F1: one-observation consolidation into destConceptId", () => {
+  it("detaches the only observation into destConceptId → observation on dest, source deleted", async () => {
+    // Simulate the common output of an ambiguous fork: one-observation source.
+    const db = new BetterSqlitePort(":memory:");
+    const c = new MonetCore(db, { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const keeper = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const fork = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(fork.action).toBe("ambiguous");
+
+    // Fork has exactly one observation — this is the common state to consolidate.
+    const forkFetched = (await c.getConcept(fork.conceptId, { synthesize: false }))!;
+    expect(forkFetched.observations).toHaveLength(1);
+    const forkObsId = forkFetched.observations[0]!.id;
+
+    const r = await c.detach(fork.conceptId, [forkObsId], { destConceptId: keeper.conceptId });
+
+    // The detached observation must now be on the keeper.
+    const keeperAfter = (await c.getConcept(keeper.conceptId, { synthesize: false }))!;
+    expect(keeperAfter.observations.map((o) => o.id)).toContain(forkObsId);
+
+    // Source must be deleted.
+    expect(r.sourceDeleted).toBe(true);
+    expect(await c.getConcept(fork.conceptId, { synthesize: false })).toBeNull();
+
+    // Raw assertion: no contradiction row may outlive the deleted source concept.
+    const orphaned = db
+      .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ?`)
+      .get(fork.conceptId) as { n: number };
+    expect(orphaned.n).toBe(0);
+
+    c.close();
+  });
+
+  it("possible_duplicate_of edge is gone and overview.possibleDuplicates is empty after consolidation", async () => {
+    const db = new BetterSqlitePort(":memory:");
+    const c = new MonetCore(db, { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const keeper = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const fork = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(fork.action).toBe("ambiguous");
+
+    const before = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(before.length).toBeGreaterThan(0);
+
+    const forkFetched = (await c.getConcept(fork.conceptId, { synthesize: false }))!;
+    const forkObsId = forkFetched.observations[0]!.id;
+
+    await c.detach(fork.conceptId, [forkObsId], { destConceptId: keeper.conceptId });
+
+    const after = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(after.some((e) =>
+      (e.srcId === keeper.conceptId && e.dstId === fork.conceptId) ||
+      (e.srcId === fork.conceptId && e.dstId === keeper.conceptId),
+    )).toBe(false);
+
+    const overview = c.overview("default");
+    expect(overview.possibleDuplicates).toHaveLength(0);
+
+    // Raw assertion: no contradiction row may outlive the deleted source concept.
+    const orphaned = db
+      .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ?`)
+      .get(fork.conceptId) as { n: number };
+    expect(orphaned.n).toBe(0);
+
+    c.close();
+  });
+
+  it("detach-all-to-new (no destConceptId) still throws the last-observation error", async () => {
+    const c = core();
+    const a = await c.store("Only observation.");
+    const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    const obsId = fetched.observations[0]!.id;
+    await expect(c.detach(a.conceptId, [obsId])).rejects.toThrow(/last observation/);
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2 — title/slug recomputed after detaching the first (title-bearing) observation
+// ---------------------------------------------------------------------------
+describe("detach — F2: title/slug recompute after detaching first observation", () => {
+  it("source title derives from the first REMAINING observation when the original title obs is detached", async () => {
+    const c = core();
+    const a = await c.store("First observation: the title-bearing content.");
+    await c.store("Second observation: the remaining content.", { attachTo: a.conceptId });
+
+    const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    const obs1Id = fetched.observations[0]!.id; // the title-bearing one
+
+    await c.detach(a.conceptId, [obs1Id]);
+
+    const srcAfter = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    // Title must now derive from the second observation, not the detached one.
+    expect(srcAfter.title).toContain("Second observation");
+    expect(srcAfter.title).not.toContain("First observation");
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — mirror contradiction case: correcting obs stays, all prior evidence moves
+// ---------------------------------------------------------------------------
+describe("detach — F3: mirror contradiction hygiene (prior moves, correction stays)", () => {
+  it("(a) detach all prior evidence, correction stays → contradiction dismissed, source active", async () => {
+    const db = new BetterSqlitePort(":memory:");
+    const c = new MonetCore(db, { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const base = await c.store("Old setting: timeout 30s.");
+    const corr = await c.store("New setting: timeout 60s.", {
+      attachTo: base.conceptId,
+      kind: "correction",
+    });
+    expect(corr.contradiction).toBeDefined();
+    const contradictionId = corr.contradiction!.id;
+
+    // Add a guard obs so we can detach the prior without hitting last-obs.
+    await c.store("Guard observation.", { attachTo: base.conceptId });
+
+    const fetched = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    // obs[0]=base(prior), obs[1]=correction, obs[2]=guard(post-correction, not party to dispute)
+    expect(fetched.observations).toHaveLength(3);
+    const priorObsId = fetched.observations[0]!.id; // prior (to be detached)
+    const corrObsId = fetched.observations[1]!.id;  // correction (stays)
+    const guardObsId = fetched.observations[2]!.id; // guard (stays)
+
+    // Sanity: source is disputed.
+    expect(fetched.status).toBe("disputed");
+
+    // Detach only the prior — correction stays.
+    await c.detach(base.conceptId, [priorObsId]);
+
+    // The contradiction must be dismissed (all prior evidence moved, correction stays).
+    const openContras = c.getOpenContradictions();
+    expect(openContras.some((k) => k.id === contradictionId)).toBe(false);
+
+    // Raw assertion: the row must be present with status='dismissed', not absent.
+    // Distinguishes a proper dismiss (row survives with dismissed status) from accidental deletion.
+    const rawRow = db
+      .prepare(`SELECT status FROM contradictions WHERE id = ?`)
+      .get(contradictionId) as { status: string } | undefined;
+    expect(rawRow).toBeDefined();
+    expect(rawRow!.status).toBe("dismissed");
+
+    // Source must be restored to active.
+    const srcAfter = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(srcAfter.status).toBe("active");
+    expect(srcAfter.observations.map((o) => o.id)).toContain(corrObsId);
+    expect(srcAfter.observations.map((o) => o.id)).toContain(guardObsId);
+
+    c.close();
+  });
+
+  it("(b) detach SOME prior evidence, correction stays → contradiction still open, source still disputed", async () => {
+    const db = new BetterSqlitePort(":memory:");
+    const c = new MonetCore(db, { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const base = await c.store("Old setting: cache size 100.");
+    // Add a second prior obs before the correction so there are 2 prior observations.
+    await c.store("Additional prior: was already low.", { attachTo: base.conceptId });
+    const corr = await c.store("New setting: cache size 200.", {
+      attachTo: base.conceptId,
+      kind: "correction",
+    });
+    expect(corr.contradiction).toBeDefined();
+    const contradictionId = corr.contradiction!.id;
+    // Add a guard obs so we can detach one prior without hitting last-obs.
+    await c.store("Guard obs.", { attachTo: base.conceptId });
+
+    const fetched = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    // obs[0]=base(prior1), obs[1]=additional(prior2), obs[2]=correction, obs[3]=guard
+    expect(fetched.observations).toHaveLength(4);
+    const prior1Id = fetched.observations[0]!.id;
+
+    // Source is disputed.
+    expect(fetched.status).toBe("disputed");
+
+    // Detach only obs[0] (one of two priors) — one prior and correction stay.
+    await c.detach(base.conceptId, [prior1Id]);
+
+    // Contradiction must still be open.
+    const openContras = c.getOpenContradictions();
+    expect(openContras.some((k) => k.id === contradictionId)).toBe(true);
+
+    // Raw assertion: the row must be present with status='open', not absent.
+    const rawRow = db
+      .prepare(`SELECT status FROM contradictions WHERE id = ?`)
+      .get(contradictionId) as { status: string } | undefined;
+    expect(rawRow).toBeDefined();
+    expect(rawRow!.status).toBe("open");
+
+    // Source must still be disputed.
+    const srcAfter = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(srcAfter.status).toBe("disputed");
+
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4 — workstream concept guard on store(attachTo), detach(source), detach(destConceptId)
+// ---------------------------------------------------------------------------
+describe("detach — F4: workstream concept rejection", () => {
+  it("store({ attachTo: workstreamId }) throws 'cannot attach to a workstream concept'", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const ws = await c.saveWorkstream({ status: "active", openQuestions: ["q1"] });
+    await expect(
+      c.store("Some new observation.", { attachTo: ws.id }),
+    ).rejects.toThrow(/cannot attach to a workstream concept/);
+    c.close();
+  });
+
+  it("detach({ destConceptId: workstreamId }) throws 'cannot attach to a workstream concept'", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const ws = await c.saveWorkstream({ status: "active" });
+    const a = await c.store("Obs one.");
+    await c.store("Obs two.", { attachTo: a.conceptId });
+    const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    const obs2Id = fetched.observations[1]!.id;
+    await expect(
+      c.detach(a.conceptId, [obs2Id], { destConceptId: ws.id }),
+    ).rejects.toThrow(/cannot attach to a workstream concept/);
+    c.close();
+  });
+
+  it("detach(workstreamId as source) throws 'cannot detach from a workstream concept'", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const ws = await c.saveWorkstream({ status: "active" });
+    await expect(
+      c.detach(ws.id, ["any-obs-id"]),
+    ).rejects.toThrow(/cannot detach from a workstream concept/);
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F7 — destConceptId === sourceConceptId rejected
+// ---------------------------------------------------------------------------
+describe("detach — F7: self-consolidation rejected", () => {
+  it("throws when destConceptId equals sourceConceptId", async () => {
+    const c = core();
+    const a = await c.store("Some observation.");
+    await c.store("Second observation.", { attachTo: a.conceptId });
+    const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    const obs2Id = fetched.observations[1]!.id;
+    await expect(
+      c.detach(a.conceptId, [obs2Id], { destConceptId: a.conceptId }),
+    ).rejects.toThrow(/destConceptId must differ from the source concept/);
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NULL-observation contradiction survives consolidation (orphan-row bug fix)
+// ---------------------------------------------------------------------------
+describe("detach — NULL-observation contradiction travels on consolidation", () => {
+  it("open contradiction with observation_id=NULL travels to dest; no orphaned row on deleted source", async () => {
+    // Setup: one-observation source concept with a NULL-observation contradiction
+    // (flagContradiction without observationId — the publicly reachable path).
+    const db = new BetterSqlitePort(":memory:");
+    const c = new MonetCore(db, { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    const keeper = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const source = await c.store("Monet Local uses SQLite for its local storage backend.");
+    // source is ambiguous (one observation, one-obs ambiguous fork).
+    expect(source.action).toBe("ambiguous");
+
+    // Flag a NULL-observation contradiction on the source — no observationId supplied.
+    const contra = c.flagContradiction(source.conceptId, {
+      detail: "a reviewer questions whether SQLite is correct here",
+    });
+    expect(contra.status).toBe("open");
+    // Verify the observation_id is NULL at the raw row level.
+    const rawBefore = db
+      .prepare(`SELECT observation_id FROM contradictions WHERE id = ?`)
+      .get(contra.id) as { observation_id: string | null };
+    expect(rawBefore.observation_id).toBeNull();
+
+    // Source is now disputed.
+    const srcBefore = (await c.getConcept(source.conceptId, { synthesize: false }))!;
+    expect(srcBefore.status).toBe("disputed");
+
+    // Consolidate: detach the only observation into keeper → source is deleted.
+    const forkFetched = (await c.getConcept(source.conceptId, { synthesize: false }))!;
+    const forkObsId = forkFetched.observations[0]!.id;
+    const r = await c.detach(source.conceptId, [forkObsId], { destConceptId: keeper.conceptId });
+    expect(r.sourceDeleted).toBe(true);
+
+    // Raw assertion: ZERO contradiction rows pointing at the now-deleted source.
+    const orphaned = db
+      .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ?`)
+      .get(source.conceptId) as { n: number };
+    expect(orphaned.n).toBe(0);
+
+    // The contradiction row must now live on the destination with status='open'.
+    const movedRow = db
+      .prepare(`SELECT concept_id, status FROM contradictions WHERE id = ?`)
+      .get(contra.id) as { concept_id: string; status: string } | undefined;
+    expect(movedRow).toBeDefined();
+    expect(movedRow!.concept_id).toBe(keeper.conceptId);
+    expect(movedRow!.status).toBe("open");
+
+    // Destination must be marked disputed (open contradiction landed there).
+    const destAfter = (await c.getConcept(keeper.conceptId, { synthesize: false }))!;
+    expect(destAfter.status).toBe("disputed");
 
     c.close();
   });
