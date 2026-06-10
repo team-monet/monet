@@ -1360,6 +1360,23 @@ export class MonetCore {
             .prepare(`UPDATE concepts SET status = 'disputed', updated_at = unixepoch() * 1000 WHERE id = ? AND status != 'disputed'`)
             .run(destConceptId);
         }
+        // Carry the source's slug + id (and any aliases it already held) onto the destination,
+        // so asserted references to the now-deleted source (e.g. `supports: #src-slug`) still
+        // resolve to the keeper.  Mirrors mergeConceptInto's unconditional alias carry.
+        const destRowForAlias = this.db
+          .prepare(`SELECT aliases FROM concepts WHERE id = ?`)
+          .get(destConceptId) as { aliases: string | null };
+        const mergedAliases = [
+          ...new Set([
+            ...(destRowForAlias.aliases ? (JSON.parse(destRowForAlias.aliases) as string[]) : []),
+            ...(srcRow.aliases ? (JSON.parse(srcRow.aliases) as string[]) : []),
+            srcRow.slug,
+            srcRow.id,
+          ]),
+        ];
+        this.db
+          .prepare(`UPDATE concepts SET aliases = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
+          .run(JSON.stringify(mergedAliases), destConceptId);
         // Consolidation: all observations moved to an existing dest — delete the source concept.
         // Graph must be unwound first; no rederive since the concept no longer exists.
         this.unwindConceptGraph(sourceConceptId, circle);
@@ -1416,15 +1433,52 @@ export class MonetCore {
       }
 
       // 6. Graph: unwind source + rederive (source already handled above in the deletion path).
+      //
+      // Preserve possible_duplicate_of edges: unwindConceptGraph erases ALL edges touching a
+      // concept, but rederiveConceptGraph never recreates possible_duplicate_of (those are
+      // recorded only at store-time).  Snapshot each unwound concept's duplicate-pair edges BEFORE
+      // the unwind and re-insert them AFTER the rederive.
+      //
+      // Exclusion rule: when a destConceptId is present, the possible_duplicate_of edge connecting
+      // sourceConceptId ↔ destConceptId must NOT be restored — detaching into the suspected
+      // duplicate resolves that pair (mirrors the existing consolidation behaviour).
+      //
+      // When the source is fully deleted its edges die with it — correct, don't restore those.
+      type DupEdge = { src_id: string; dst_id: string; weight: number; origin: string };
+      const snapDupEdges = (conceptId: string): DupEdge[] =>
+        this.db
+          .prepare(
+            `SELECT src_id, dst_id, weight, origin FROM memory_edge
+              WHERE scope = ? AND type = 'possible_duplicate_of' AND (src_id = ? OR dst_id = ?)`,
+          )
+          .all(circle, conceptId, conceptId) as DupEdge[];
+      const isDupPair = (e: DupEdge, a: string, b: string) =>
+        (e.src_id === a && e.dst_id === b) || (e.src_id === b && e.dst_id === a);
+
+      let srcDupSnapshot: DupEdge[] = [];
+      let dstDupSnapshot: DupEdge[] = [];
+
       if (!sourceDeleted) {
+        srcDupSnapshot = snapDupEdges(sourceConceptId);
         this.unwindConceptGraph(sourceConceptId, circle);
         this.rederiveConceptGraph(sourceConceptId, circle);
+        // Restore surviving duplicate-pair edges on the source (exclude src↔dest pair).
+        for (const e of srcDupSnapshot) {
+          if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
+          this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
+        }
       }
       if (destAction === "created") {
         this.rederiveConceptGraph(destConceptId, circle);
       } else {
+        dstDupSnapshot = snapDupEdges(destConceptId);
         this.unwindConceptGraph(destConceptId, circle);
         this.rederiveConceptGraph(destConceptId, circle);
+        // Restore surviving duplicate-pair edges on the destination (exclude src↔dest pair).
+        for (const e of dstDupSnapshot) {
+          if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
+          this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
+        }
       }
 
       const updatedSrc = sourceDeleted ? null : this.getRow(sourceConceptId);

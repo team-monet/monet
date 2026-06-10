@@ -3,7 +3,8 @@
  * Covers: basic detach→new concept; detach→destConceptId; source embedding recompute; last-obs
  * guard; possible_duplicate_of edge removal on consolidation; superseded_by hygiene; dirty mark.
  * Also covers: kind propagation on create (Finding 1); source_refs recompute (Finding 2);
- * contradiction row hygiene (Finding 3).
+ * contradiction row hygiene (Finding 3); alias carry on consolidation-delete (review-F1);
+ * possible_duplicate_of edge preservation across non-consolidating detach (review-F2).
  */
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
@@ -820,6 +821,261 @@ describe("detach — NULL-observation contradiction travels on consolidation", (
     // Destination must be marked disputed (open contradiction landed there).
     const destAfter = (await c.getConcept(keeper.conceptId, { synthesize: false }))!;
     expect(destAfter.status).toBe("disputed");
+
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review-F1 — consolidation-delete carries source slug/id/aliases onto destination
+// ---------------------------------------------------------------------------
+describe("detach — review-F1: alias carry on consolidation-delete", () => {
+  it("destination aliases contain source slug and id after full-consolidation detach", async () => {
+    const db = new BetterSqlitePort(":memory:");
+    const c = new MonetCore(db, { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    const keeper = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const fork = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(fork.action).toBe("ambiguous");
+
+    // Fetch the source's slug and id before consolidation.
+    const forkRow = db
+      .prepare(`SELECT id, slug FROM concepts WHERE id = ?`)
+      .get(fork.conceptId) as { id: string; slug: string };
+    const forkId = forkRow.id;
+    const forkSlug = forkRow.slug;
+
+    const forkFetched = (await c.getConcept(fork.conceptId, { synthesize: false }))!;
+    const forkObsId = forkFetched.observations[0]!.id;
+
+    const r = await c.detach(fork.conceptId, [forkObsId], { destConceptId: keeper.conceptId });
+    expect(r.sourceDeleted).toBe(true);
+
+    // Raw assertion: the destination's aliases must include the source's slug and id.
+    const destRow = db
+      .prepare(`SELECT aliases FROM concepts WHERE id = ?`)
+      .get(keeper.conceptId) as { aliases: string | null };
+    expect(destRow.aliases).not.toBeNull();
+    const aliases = JSON.parse(destRow.aliases!) as string[];
+    expect(aliases).toContain(forkId);
+    expect(aliases).toContain(forkSlug);
+
+    c.close();
+  });
+
+  it("asserted reference to the consolidated-away source resolves to the keeper via the alias", async () => {
+    // A third concept asserts `supports: #forkId` — after consolidation this edge must exist
+    // with the keeper as its destination (because keeper's aliases now include forkId).
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    const keeper = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const fork = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(fork.action).toBe("ambiguous");
+
+    // A third concept that references the fork concept by id.
+    const referrer = await c.store(`Key rotation runbook. supports: #${fork.conceptId}`);
+
+    const forkFetched = (await c.getConcept(fork.conceptId, { synthesize: false }))!;
+    const forkObsId = forkFetched.observations[0]!.id;
+
+    const r = await c.detach(fork.conceptId, [forkObsId], { destConceptId: keeper.conceptId });
+    expect(r.sourceDeleted).toBe(true);
+
+    // After consolidation, rederiving the keeper's graph re-scans referrers by alias.
+    // The asserted edge from the referrer must now point at the keeper (the survivor).
+    const supportsEdges = c.edges({ circle: "default", type: "supports" });
+    expect(supportsEdges.some((e) => e.srcId === referrer.conceptId && e.dstId === keeper.conceptId)).toBe(true);
+
+    c.close();
+  });
+
+  it("consolidation-delete with source that already had aliases carries all of them forward", async () => {
+    // Simulate a source that had a previous alias (from a prior merge).
+    const db = new BetterSqlitePort(":memory:");
+    const c = new MonetCore(db, { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    const keeper = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const fork = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(fork.action).toBe("ambiguous");
+
+    // Manually assign a pre-existing alias on the fork (simulates it having absorbed another
+    // concept earlier — a realistic state the engine can produce via mergeConceptInto).
+    const priorAliasId = "prior-alias-xyz";
+    db.prepare(`UPDATE concepts SET aliases = ? WHERE id = ?`).run(JSON.stringify([priorAliasId]), fork.conceptId);
+
+    const forkRow = db
+      .prepare(`SELECT id, slug FROM concepts WHERE id = ?`)
+      .get(fork.conceptId) as { id: string; slug: string };
+
+    const forkFetched = (await c.getConcept(fork.conceptId, { synthesize: false }))!;
+    const forkObsId = forkFetched.observations[0]!.id;
+
+    const r = await c.detach(fork.conceptId, [forkObsId], { destConceptId: keeper.conceptId });
+    expect(r.sourceDeleted).toBe(true);
+
+    const destRow = db
+      .prepare(`SELECT aliases FROM concepts WHERE id = ?`)
+      .get(keeper.conceptId) as { aliases: string | null };
+    const aliases = JSON.parse(destRow.aliases!) as string[];
+    expect(aliases).toContain(priorAliasId);
+    expect(aliases).toContain(forkRow.id);
+    expect(aliases).toContain(forkRow.slug);
+
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review-F2 — non-consolidating detach preserves possible_duplicate_of edges
+// ---------------------------------------------------------------------------
+describe("detach — review-F2: possible_duplicate_of edge preservation", () => {
+  it("(a) fork A↔B pair survives when detaching an unrelated obs from A into a NEW concept", async () => {
+    // Fork A and B as an ambiguous pair → possible_duplicate_of edge exists.
+    // Then add a second (unrelated) observation to A and detach it into a new concept.
+    // A still exists → A↔B pair must survive the unwind/rederive.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    const a = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const b = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(b.action).toBe("ambiguous");
+
+    const pairBefore = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(pairBefore.some((e) =>
+      (e.srcId === a.conceptId && e.dstId === b.conceptId) ||
+      (e.srcId === b.conceptId && e.dstId === a.conceptId),
+    )).toBe(true);
+
+    // Add an unrelated observation to A so we can detach it (leaves at least one obs on A).
+    await c.store("Unrelated fact about disk I/O performance.", { attachTo: a.conceptId });
+    const aFetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    const unrelatedObsId = aFetched.observations[1]!.id;
+
+    // Detach the unrelated obs into a NEW concept (no destConceptId).
+    const r = await c.detach(a.conceptId, [unrelatedObsId]);
+    expect(r.destAction).toBe("created");
+    expect(r.sourceDeleted).toBe(false);
+
+    // A↔B pair must still be present.
+    const pairAfter = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(pairAfter.some((e) =>
+      (e.srcId === a.conceptId && e.dstId === b.conceptId) ||
+      (e.srcId === b.conceptId && e.dstId === a.conceptId),
+    )).toBe(true);
+
+    // overview must still count the pair.
+    const ov = c.overview("default");
+    expect(ov.counts.possibleDuplicates).toBeGreaterThanOrEqual(1);
+    expect(ov.possibleDuplicates.some((pd) =>
+      [pd.conceptAId, pd.conceptBId].includes(a.conceptId) &&
+      [pd.conceptAId, pd.conceptBId].includes(b.conceptId),
+    )).toBe(true);
+
+    c.close();
+  });
+
+  it("(b) destination D's unrelated pair edge D↔E survives when detaching an obs FROM another concept INTO D", async () => {
+    // D and E form an ambiguous pair.
+    // Then detach an observation from a separate concept X into D.
+    // D↔E pair must survive D's unwind/rederive.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    const d = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const e = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(e.action).toBe("ambiguous");
+
+    const pairBefore = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(pairBefore.some((ed) =>
+      (ed.srcId === d.conceptId && ed.dstId === e.conceptId) ||
+      (ed.srcId === e.conceptId && ed.dstId === d.conceptId),
+    )).toBe(true);
+
+    // A separate concept X with two observations (so we can detach one without last-obs guard).
+    const x = await c.store("Completely unrelated concept: network timeout configuration.");
+    await c.store("Network retry policy for connection pooling.", { attachTo: x.conceptId });
+    const xFetched = (await c.getConcept(x.conceptId, { synthesize: false }))!;
+    const xObs2Id = xFetched.observations[1]!.id;
+
+    // Detach obs2 from X INTO D (D is the destination).
+    const r = await c.detach(x.conceptId, [xObs2Id], { destConceptId: d.conceptId });
+    expect(r.destAction).toBe("attached");
+    expect(r.destConceptId).toBe(d.conceptId);
+
+    // D↔E pair must still be present after D was unwound/rederived.
+    const pairAfter = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(pairAfter.some((ed) =>
+      (ed.srcId === d.conceptId && ed.dstId === e.conceptId) ||
+      (ed.srcId === e.conceptId && ed.dstId === d.conceptId),
+    )).toBe(true);
+
+    // overview must still count the D↔E pair.
+    const ov = c.overview("default");
+    expect(ov.counts.possibleDuplicates).toBeGreaterThanOrEqual(1);
+    expect(ov.possibleDuplicates.some((pd) =>
+      [pd.conceptAId, pd.conceptBId].includes(d.conceptId) &&
+      [pd.conceptAId, pd.conceptBId].includes(e.conceptId),
+    )).toBe(true);
+
+    c.close();
+  });
+
+  it("(c) consolidating A into B removes A↔B pair and A is deleted (existing consolidation behaviour)", async () => {
+    // Verifies existing consolidation behaviour is unaffected by the F2 preservation logic.
+    // A↔B pair (the one being resolved) must be gone after consolidation.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    const a = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const b = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(b.action).toBe("ambiguous");
+
+    // Consolidate: detach A's only obs into B → A is deleted.
+    const aFetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    const aObsId = aFetched.observations[0]!.id;
+    const r = await c.detach(a.conceptId, [aObsId], { destConceptId: b.conceptId });
+    expect(r.sourceDeleted).toBe(true);
+
+    // A↔B pair must be gone.
+    const after = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(after.some((e) =>
+      (e.srcId === a.conceptId && e.dstId === b.conceptId) ||
+      (e.srcId === b.conceptId && e.dstId === a.conceptId),
+    )).toBe(false);
+
+    // overview reflects the resolved state.
+    const ov = c.overview("default");
+    expect(ov.possibleDuplicates.some((pd) =>
+      [pd.conceptAId, pd.conceptBId].includes(a.conceptId),
+    )).toBe(false);
+
+    c.close();
+  });
+
+  it("(d) non-consolidating detach from A into existing B (destConceptId=B) removes A↔B pair, A survives", async () => {
+    // When detaching a partial set of A's observations into B (where B is the suspected
+    // duplicate), A survives with remaining observations. The A↔B pair edge must be removed
+    // (the routing into the suspected duplicate resolves the pair); A itself must survive.
+    const c = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+    // A and B are an ambiguous pair.
+    const a = await c.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const b = await c.store("Monet Local uses SQLite for its local storage backend.");
+    expect(b.action).toBe("ambiguous");
+
+    // Give A a second observation so it survives the partial detach.
+    await c.store("Additional context: SQLite WAL mode is enabled.", { attachTo: a.conceptId });
+
+    const aFetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
+    const aObs1Id = aFetched.observations[0]!.id;
+
+    // Detach A's first obs into B (the suspected duplicate) — A still has one obs left.
+    const r = await c.detach(a.conceptId, [aObs1Id], { destConceptId: b.conceptId });
+    expect(r.sourceDeleted).toBe(false);
+
+    // A↔B pair must be gone (we explicitly routed into the duplicate).
+    const after = c.edges({ circle: "default", type: "possible_duplicate_of" });
+    expect(after.some((e) =>
+      (e.srcId === a.conceptId && e.dstId === b.conceptId) ||
+      (e.srcId === b.conceptId && e.dstId === a.conceptId),
+    )).toBe(false);
 
     c.close();
   });
