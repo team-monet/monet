@@ -12,7 +12,8 @@ describe("agent-driven synthesis (the MCP dance)", () => {
   it("fetch without auto-synthesis flags needsSynthesis + returns raw evidence", async () => {
     const core = new MonetCore(":memory:");
     const a = await core.store("We use SQLite for Monet Local storage.");
-    await core.store("Monet Local stores its data in SQLite.");
+    // Score ~0.87 — robustly above tauAttach (0.55) so it attaches to the same concept.
+    await core.store("Monet Local uses SQLite for storage.");
 
     const raw = (await core.getConcept(a.conceptId, { synthesize: false }))!;
     expect(raw.needsSynthesis).toBe(true); // dirty, not auto-cleaned

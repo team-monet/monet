@@ -9,7 +9,7 @@
  * escape bytes; stripping the colored output yields exactly the plain output. Width math counts
  * VISIBLE characters, so colored substrings never break alignment and no line exceeds `width`.
  */
-import type { MemoryOverview, EntityHub, ConnectedConcept } from "./engine";
+import type { MemoryOverview, EntityHub, ConnectedConcept, PossibleDuplicatePair } from "./engine";
 
 interface RenderOpts {
   color?: boolean;
@@ -154,6 +154,14 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
     out.push("");
   } else if (k.concepts > 0) {
     out.push(green("✓") + dim(" no open contradictions · nothing stale"));
+    out.push("");
+  }
+
+  if (o.possibleDuplicates?.length) {
+    out.push(yellow(bold("POSSIBLE DUPLICATES")));
+    for (const pd of o.possibleDuplicates as PossibleDuplicatePair[]) {
+      out.push(truncate(`  · ${pd.conceptATitle} / ${pd.conceptBTitle}  (score: ${pd.score.toFixed(3)})`, width));
+    }
     out.push("");
   }
 
