@@ -1079,10 +1079,14 @@ export class MonetCore {
         )
         .run(winnerObsId, opts.by ?? null, contradictionId);
       // accept-new / keep-current: a verdict is evidence that the concept's state is confirmed — refresh.
+      // ensureSession() must be called before stamping so that if this resolve is the FIRST write of
+      // an MCP session (no store() has run yet), sessionId is non-null — otherwise the next store()
+      // in the same session sees null ≠ current-session and incorrectly applies the cross-session bump.
+      const resolveSessionId = this.ensureSession();
       const now = Date.now();
       this.db
         .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
-        .run(now, this.sessionId, conceptId);
+        .run(now, resolveSessionId, conceptId);
     }
 
     // Restore the concept once nothing is left open against it.
@@ -1380,6 +1384,14 @@ export class MonetCore {
         const firstEmb = jsonToEmb(firstObs.embedding);
         const newRow = this.create(firstObs.content, firstEmb, circle, srcRow.kind);
         destConceptId = newRow.id;
+        // Inherit the source's temporal fields: create() stamps last_confirmed_at = now, but moved
+        // observations are OLD evidence — the new concept must carry the source's original
+        // last_confirmed_at and last_confirmed_session_id so it cannot evade getStaleConcepts/prewarm
+        // for a full staleness window.  srcRow is captured before any source mutation in this
+        // transaction, so these values are correct pre-split.
+        this.db
+          .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
+          .run(srcRow.last_confirmed_at, srcRow.last_confirmed_session_id, destConceptId);
         destRow = this.getRow(destConceptId)!;
       } else {
         destConceptId = destRow.id;

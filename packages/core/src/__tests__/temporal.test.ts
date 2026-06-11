@@ -250,6 +250,9 @@ describe("3. Damping — same-session attaches do not bump confidence or refresh
     // Use a second MonetCore instance pointing at the same DB to get a new session id.
     // Instead, just call endSessionForEval to close the session, then store one more.
     // The engine lazily opens a new session on the next write — endSessionForEval resets sessionId.
+    // 10ms delay before the new-session attach so the new last_confirmed_at is strictly greater
+    // than originalLca — guards against sub-millisecond flakes (mirrors contradiction tests).
+    await new Promise((res) => setTimeout(res, 10));
     const r2 = await core.store("SQLite is used for local persistence — new session.");
     // This should attach (tauAttach=0) and trigger cross-session logic.
     const afterNewSession = rawRow(core, r.conceptId)!;
@@ -799,6 +802,94 @@ describe("8. memory_resolve MCP — contradiction path regression + dismissal pa
     }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/decision.*required|required.*decision/i);
+
+    core.close();
+  });
+});
+
+// ---- Fix 1 — detach-to-NEW inherits source's temporal fields ----------------
+
+describe("Fix 1 — detach-to-NEW: new concept inherits source last_confirmed_at/session", () => {
+  it("splitting a stale-aged source into a NEW concept: new concept carries source's old last_confirmed_at (not now)", async () => {
+    // tauAttach=1.1 prevents auto-merging; staleAfterMs=5 so old timestamps read stale.
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, staleAfterMs: 5 });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const db = (core as any).db as import("../storage").StoragePort;
+
+    // Create source concept.
+    const sourceResult = await core.store("Auth tokens are signed with jose.");
+    const sourceId = sourceResult.conceptId;
+
+    // Add a second observation so we can detach the first without hitting the last-obs guard.
+    await core.store("jose handles JWT signing and verification.", { attachTo: sourceId });
+
+    // Freeze source's last_confirmed_at to a stale-aged timestamp (well in the past).
+    const staleTs = Date.now() - 2000; // 2 seconds ago — definitely > staleAfterMs=5ms
+    const staleSessionId = "stale-session-id-frozen";
+    db.prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`).run(staleTs, staleSessionId, sourceId);
+
+    // Sanity: source reads stale before detach.
+    expect(core.getStaleConcepts().some((c) => c.id === sourceId)).toBe(true);
+
+    // Detach the first observation into a NEW concept (no destConceptId).
+    const fetchedSource = (await core.getConcept(sourceId, { synthesize: false }))!;
+    const firstObsId = fetchedSource.observations[0]!.id;
+    const detachResult = await core.detach(sourceId, [firstObsId]);
+    expect(detachResult.sourceDeleted).toBe(false);
+
+    // New concept must carry the source's OLD last_confirmed_at (not Date.now()).
+    const newConceptId = detachResult.destConceptId;
+    const newRow = rawRow(core, newConceptId)!;
+    expect(newRow.last_confirmed_at).toBe(staleTs);
+    expect(newRow.last_confirmed_session_id).toBe(staleSessionId);
+
+    // New concept must read stale (not evade staleness detection).
+    expect(core.getStaleConcepts().some((c) => c.id === newConceptId)).toBe(true);
+
+    core.close();
+  });
+});
+
+// ---- Fix 2 — resolveContradiction must open a session before stamping -------
+
+describe("Fix 2 — resolveContradiction: ensureSession before stamping last_confirmed_session_id", () => {
+  it("accept-new as the FIRST write of a session: subsequent same-session store() must be damped (not cross-session-bumped)", async () => {
+    // tauAttach=0 forces every store to attach; tauAmbiguous=0 forces ambiguous band.
+    const core = new MonetCore(":memory:", { tauAttach: 0, tauAmbiguous: 0 });
+
+    // Create a concept and flag a contradiction in the SAME session.
+    const r = await core.store("We use SQLite for storage.");
+    const contra = core.flagContradiction(r.conceptId, { detail: "actually Postgres" });
+
+    // End the session explicitly — next write is a new session.
+    core.endSessionForEval();
+
+    // resolveContradiction as the FIRST write of the new MCP session (no store() before this).
+    // Pre-fix: sessionId is null at this point → stamps last_confirmed_session_id = null.
+    core.resolveContradiction(contra.id, { decision: "accept-new" });
+
+    // After resolve: last_confirmed_session_id must be NON-null (a real session was opened).
+    const afterResolve = rawRow(core, r.conceptId)!;
+    expect(afterResolve.last_confirmed_session_id).not.toBeNull();
+
+    // Now store() an attaching observation in the SAME instance (same session as the resolve).
+    // Pre-fix: sessionId was null when stamped on the concept → store() sees null ≠ current-session
+    //          → treats it as cross-session → bumps confidence +0.1 and refreshes last_confirmed_at.
+    // Post-fix: sessionId was properly set by ensureSession() in resolveContradiction → store()
+    //           sees same-session → is damped (no confidence bump, no refresh).
+    const confidenceBefore = afterResolve.confidence;
+    const lcaBefore = afterResolve.last_confirmed_at;
+
+    // Wait a tick so any timestamp refresh would be detectable.
+    await new Promise((res) => setTimeout(res, 5));
+
+    await core.store("We use SQLite for storage — attaching obs.");
+    const afterStore = rawRow(core, r.conceptId)!;
+
+    // Confidence must NOT be bumped (same-session damping).
+    expect(afterStore.confidence).toBeCloseTo(confidenceBefore, 5);
+    // last_confirmed_at must NOT be refreshed (same-session damping).
+    expect(afterStore.last_confirmed_at).toBe(lcaBefore);
 
     core.close();
   });
