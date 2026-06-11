@@ -139,18 +139,23 @@ describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () 
 // ---- 1b. Migration ordering: graph-disabled open preserves user_version=0 ---
 
 describe("1b. Migration ordering — graph-disabled open does not consume graph backfill slot", () => {
-  it("graph-disabled open: user_version stays 0 and last_confirmed_at stays NULL for pre-existing rows", () => {
+  it("graph-disabled open: user_version stays 0 but last_confirmed_at is backfilled immediately (Fix B atomic backfill)", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-temporal-graph-disabled-"));
     const dbPath = join(dir, "test.db");
     try {
       // Stage 1: Graph-DISABLED open on a fresh DB.
-      // The schema is created (tables/columns exist) but user_version must remain 0
-      // because neither the graph backfill nor the temporal backfill runs.
+      // The schema is created (tables/columns exist). user_version must remain 0
+      // (graph-disabled means the graph backfill slot is preserved for the next graph-enabled open).
+      // Fix B: the temporal backfill now runs ATOMICALLY in the column-guard branch — independent
+      // of graphEnabled and user_version — so last_confirmed_at is non-NULL immediately.
       const coreDisabled = new MonetCore(dbPath, { graphEnabled: false });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const dbDisabled = (coreDisabled as any).db as import("../storage").StoragePort;
 
       // Simulate a pre-0.6.0 row by inserting directly with last_confirmed_at = NULL.
+      // Insert AFTER the migrate() has already run so the column exists; the row itself
+      // has NULL to simulate a pre-existing record that the column-guard backfill missed
+      // (will be caught by the WHERE-NULL catch-up pass on the next open).
       const preExistingId = "pre-existing-concept-id-" + Math.random().toString(36).slice(2);
       const nowMs = Date.now();
       dbDisabled.prepare(
@@ -158,19 +163,30 @@ describe("1b. Migration ordering — graph-disabled open does not consume graph 
          VALUES (?, 'pre-existing', 'pre-existing', 'pre-existing', 'fact', 'active', 0.7, 1, 'default', 1, 0, '[]', ?, NULL, NULL)`,
       ).run(preExistingId, nowMs);
 
+      // user_version must still be 0 (graph-disabled, slot preserved for graph-enabled open).
       const versionAfterDisabled = dbDisabled.pragma("user_version", { simple: true }) as number;
       expect(versionAfterDisabled).toBe(0);
 
-      const rowAfterDisabled = dbDisabled
-        .prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
-        .get(preExistingId) as { last_confirmed_at: number | null };
-      expect(rowAfterDisabled.last_confirmed_at).toBeNull();
-
       coreDisabled.close();
 
-      // Stage 2: Graph-ENABLED open on the same DB.
-      // Graph backfill runs (0 → 1), then temporal backfill runs (1 → 2).
-      // NULL rows must get last_confirmed_at = updated_at.
+      // Stage 2: Re-open (graph-disabled again). The WHERE-NULL catch-up pass fires and
+      // backfills the row we inserted in Stage 1 with last_confirmed_at = NULL.
+      const coreDisabled2 = new MonetCore(dbPath, { graphEnabled: false });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const dbDisabled2 = (coreDisabled2 as any).db as import("../storage").StoragePort;
+
+      const rowAfterCatchUp = dbDisabled2
+        .prepare(`SELECT last_confirmed_at, updated_at FROM concepts WHERE id = ?`)
+        .get(preExistingId) as { last_confirmed_at: number | null; updated_at: number };
+      // Fix B: WHERE-NULL catch-up runs → value is now backfilled (non-NULL, equals updated_at).
+      expect(rowAfterCatchUp.last_confirmed_at).not.toBeNull();
+      expect(rowAfterCatchUp.last_confirmed_at).toBe(rowAfterCatchUp.updated_at);
+
+      coreDisabled2.close();
+
+      // Stage 3: Graph-ENABLED open on the same DB.
+      // Graph backfill runs (0 → 1), temporal version-gate bump runs (1 → 2).
+      // Temporal values must be byte-unchanged (WHERE-NULL pass updates 0 rows; rows already filled).
       const coreEnabled = new MonetCore(dbPath, { graphEnabled: true });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const dbEnabled = (coreEnabled as any).db as import("../storage").StoragePort;
@@ -179,9 +195,10 @@ describe("1b. Migration ordering — graph-disabled open does not consume graph 
       expect(versionAfterEnabled).toBe(2);
 
       const rowAfterEnabled = dbEnabled
-        .prepare(`SELECT last_confirmed_at, updated_at FROM concepts WHERE id = ?`)
-        .get(preExistingId) as { last_confirmed_at: number | null; updated_at: number };
-      expect(rowAfterEnabled.last_confirmed_at).toBe(rowAfterEnabled.updated_at);
+        .prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
+        .get(preExistingId) as { last_confirmed_at: number | null };
+      // Temporal value must be byte-unchanged from the catch-up pass — NOT overwritten.
+      expect(rowAfterEnabled.last_confirmed_at).toBe(rowAfterCatchUp.last_confirmed_at);
 
       coreEnabled.close();
     } finally {
@@ -1126,6 +1143,346 @@ describe("P2 fix — evidence-attributed temporal state on both sides of a detac
     const keeperAfter = rawRow(core, keeperId)!;
     expect(keeperAfter.last_confirmed_at).toBe(sourceLca);
     expect(keeperAfter.last_confirmed_session_id).toBe(sourceRow.last_confirmed_session_id);
+
+    core.close();
+  });
+});
+
+// ---- Fix A — closed contradictions are inert on retry -----------------------
+
+describe("Fix A — resolveContradiction is a no-op when contradiction is already closed", () => {
+  it("accept-new twice: second call returns alreadyClosed, last_confirmed_at byte-unchanged", async () => {
+    const core = new MonetCore(":memory:");
+    const r = await core.store("We use SQLite for storage.", { kind: "fact" });
+    const contra = core.flagContradiction(r.conceptId, { detail: "actually Postgres" });
+
+    // First resolve — open contradiction; must mutate.
+    await new Promise((res) => setTimeout(res, 10));
+    const first = core.resolveContradiction(contra.id, { decision: "accept-new" });
+    expect(first).not.toBeNull();
+    expect("alreadyClosed" in first!).toBe(false);
+    const afterFirst = rawRow(core, r.conceptId)!;
+    const lcaAfterFirst = afterFirst.last_confirmed_at;
+    expect(lcaAfterFirst).not.toBeNull();
+
+    // Age the DB timestamp so any re-stamp would produce a strictly different value.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const db = (core as any).db as import("../storage").StoragePort;
+    db.prepare(`UPDATE concepts SET last_confirmed_at = last_confirmed_at - 5000 WHERE id = ?`).run(r.conceptId);
+    const aged = rawRow(core, r.conceptId)!.last_confirmed_at;
+    expect(aged).not.toBe(lcaAfterFirst); // verify the age is detectable
+
+    // Second resolve on the same (now closed) contradiction.
+    await new Promise((res) => setTimeout(res, 10));
+    const second = core.resolveContradiction(contra.id, { decision: "accept-new" });
+    expect(second).not.toBeNull();
+    expect("alreadyClosed" in second!).toBe(true);
+    expect((second as { alreadyClosed: true; contradictionStatus: string }).contradictionStatus).toBe("resolved");
+
+    // last_confirmed_at must be byte-identical to the aged value — zero mutations.
+    const afterSecond = rawRow(core, r.conceptId)!;
+    expect(afterSecond.last_confirmed_at).toBe(aged);
+
+    core.close();
+  });
+
+  it("dismiss-then-resolve: resolve on already-dismissed contradiction returns alreadyClosed, no mutations", async () => {
+    const core = new MonetCore(":memory:");
+    const r = await core.store("We use SQLite for storage.", { kind: "fact" });
+    const contra = core.flagContradiction(r.conceptId, { detail: "not a real conflict" });
+
+    // Dismiss first.
+    core.resolveContradiction(contra.id, { decision: "dismiss" });
+    const afterDismiss = rawRow(core, r.conceptId)!;
+    const lcaAfterDismiss = afterDismiss.last_confirmed_at;
+
+    // Age so any re-stamp is detectable.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const db = (core as any).db as import("../storage").StoragePort;
+    db.prepare(`UPDATE concepts SET last_confirmed_at = last_confirmed_at - 5000 WHERE id = ?`).run(r.conceptId);
+    const aged = rawRow(core, r.conceptId)!.last_confirmed_at;
+    expect(aged).not.toBe(lcaAfterDismiss);
+
+    // Now attempt resolve on the dismissed contradiction.
+    await new Promise((res) => setTimeout(res, 10));
+    const retry = core.resolveContradiction(contra.id, { decision: "accept-new" });
+    expect(retry).not.toBeNull();
+    expect("alreadyClosed" in retry!).toBe(true);
+    expect((retry as { alreadyClosed: true; contradictionStatus: string }).contradictionStatus).toBe("dismissed");
+
+    // Temporal field must be byte-unchanged.
+    const afterRetry = rawRow(core, r.conceptId)!;
+    expect(afterRetry.last_confirmed_at).toBe(aged);
+
+    core.close();
+  });
+
+  it("resolve-then-dismiss: dismiss on already-resolved contradiction returns alreadyClosed, no mutations", async () => {
+    const core = new MonetCore(":memory:");
+    const r = await core.store("We use SQLite for storage.", { kind: "fact" });
+    const contra = core.flagContradiction(r.conceptId, { detail: "another conflict" });
+
+    // Resolve first.
+    core.resolveContradiction(contra.id, { decision: "keep-current" });
+    const afterResolve = rawRow(core, r.conceptId)!;
+
+    // Age so re-stamp is detectable.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const db = (core as any).db as import("../storage").StoragePort;
+    db.prepare(`UPDATE concepts SET last_confirmed_at = last_confirmed_at - 5000 WHERE id = ?`).run(r.conceptId);
+    const aged = rawRow(core, r.conceptId)!.last_confirmed_at;
+    expect(aged).not.toBe(afterResolve.last_confirmed_at);
+
+    // Now attempt dismiss on the already-resolved contradiction.
+    await new Promise((res) => setTimeout(res, 10));
+    const retry = core.resolveContradiction(contra.id, { decision: "dismiss" });
+    expect(retry).not.toBeNull();
+    expect("alreadyClosed" in retry!).toBe(true);
+    expect((retry as { alreadyClosed: true; contradictionStatus: string }).contradictionStatus).toBe("resolved");
+
+    // Temporal field must be byte-unchanged.
+    const afterRetry = rawRow(core, r.conceptId)!;
+    expect(afterRetry.last_confirmed_at).toBe(aged);
+
+    core.close();
+  });
+
+  it("alreadyClosed result is surfaced coherently at the MCP layer", async () => {
+    const core = new MonetCore(":memory:");
+    const r = await core.store("We use SQLite for storage.");
+    const contra = core.flagContradiction(r.conceptId, { detail: "test" });
+
+    // Resolve once successfully.
+    core.resolveContradiction(contra.id, { decision: "accept-new" });
+
+    // Retry via MCP — must return a success response (not an error) with alreadyClosed:true.
+    const client = await mcpClient(core);
+    const result = await client.callTool({
+      name: "memory_resolve",
+      arguments: { contradictionId: contra.id, decision: "accept-new" },
+    }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+
+    // Must NOT be an error response — alreadyClosed is a graceful idempotent no-op.
+    expect(result.isError).toBeFalsy();
+    const parsed = parseResult(result);
+    expect(parsed.alreadyClosed).toBe(true);
+    expect(parsed.contradictionId).toBe(contra.id);
+    expect(typeof parsed.contradictionStatus).toBe("string");
+
+    core.close();
+  });
+});
+
+// ---- Fix B — temporal backfill migration matrix -----------------------------
+
+describe("Fix B — temporal backfill migration matrix", () => {
+  it("State A: pre-0.6 store, graph-DISABLED first open → backfill happens immediately; structural write AFTER does not affect already-backfilled values; later graph-enabled open leaves temporal values byte-unchanged", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-fixb-stateA-disabled-"));
+    const dbPath = join(dir, "test.db");
+    try {
+      // Stage 1: fresh open, graph-disabled (State A: columns added, backfill runs atomically).
+      const core1 = new MonetCore(dbPath, { graphEnabled: false, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const db1 = (core1 as any).db as import("../storage").StoragePort;
+
+      // Store a concept — it must get last_confirmed_at immediately (not NULL).
+      const r1 = await core1.store("Fact stored on graph-disabled first open.");
+      const row1 = db1.prepare(`SELECT last_confirmed_at, updated_at FROM concepts WHERE id = ?`)
+        .get(r1.conceptId) as { last_confirmed_at: number | null; updated_at: number };
+      expect(row1.last_confirmed_at).not.toBeNull(); // Fix B: backfill ran atomically in column-guard
+
+      const lcaBefore = row1.last_confirmed_at!;
+
+      // Structural write: bump updated_at without evidence (simulate synthesize/checkpoint).
+      db1.prepare(`UPDATE concepts SET updated_at = updated_at + 10000 WHERE id = ?`).run(r1.conceptId);
+
+      const rowAfterStructural = db1.prepare(`SELECT last_confirmed_at, updated_at FROM concepts WHERE id = ?`)
+        .get(r1.conceptId) as { last_confirmed_at: number | null; updated_at: number };
+      // last_confirmed_at must be byte-unchanged by the structural write.
+      expect(rowAfterStructural.last_confirmed_at).toBe(lcaBefore);
+
+      core1.close();
+
+      // Stage 2: graph-enabled open — runs graph backfill (0→1) + version-gate bump (1→2).
+      // Temporal values must be byte-unchanged (WHERE-NULL pass updates 0 rows).
+      const core2 = new MonetCore(dbPath, { graphEnabled: true, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const db2 = (core2 as any).db as import("../storage").StoragePort;
+
+      const version2 = db2.pragma("user_version", { simple: true }) as number;
+      expect(version2).toBe(2);
+
+      const rowAfterGraphEnabled = db2.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
+        .get(r1.conceptId) as { last_confirmed_at: number | null };
+      // Temporal value must be byte-identical to what the first open set.
+      expect(rowAfterGraphEnabled.last_confirmed_at).toBe(lcaBefore);
+
+      core2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("State B: stranded store (columns exist, values NULL, user_version 0) → WHERE-NULL catch-up path fires, excluding kind='workstream'", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-fixb-stateB-stranded-"));
+    const dbPath = join(dir, "test.db");
+    try {
+      // Build a store, then manually craft the stranded state: NULL last_confirmed_at, user_version=0.
+      const core0 = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const r0 = await core0.store("Concept written before the simulated crash.");
+      const ws0 = await core0.saveWorkstream({ status: "active", nextSteps: ["catch up"] });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const db0 = (core0 as any).db as import("../storage").StoragePort;
+      // Force stranded state: NULL temporal fields, user_version=0.
+      db0.prepare(`UPDATE concepts SET last_confirmed_at = NULL WHERE last_confirmed_at IS NOT NULL`).run();
+      db0.pragma("user_version = 0");
+
+      // Verify the workstream row is NULL (it was NULL by design or just set to NULL above).
+      const wsRowBefore = db0.prepare(`SELECT last_confirmed_at, kind FROM concepts WHERE id = ?`)
+        .get(ws0.id) as { last_confirmed_at: number | null; kind: string };
+      expect(wsRowBefore.kind).toBe("workstream");
+      expect(wsRowBefore.last_confirmed_at).toBeNull();
+
+      core0.close();
+
+      // Re-open under new code (graph-enabled). WHERE-NULL catch-up pass must fire.
+      const core1 = new MonetCore(dbPath, { graphEnabled: true, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const db1 = (core1 as any).db as import("../storage").StoragePort;
+
+      const rowAfterCatchUp = db1.prepare(`SELECT last_confirmed_at, updated_at FROM concepts WHERE id = ?`)
+        .get(r0.conceptId) as { last_confirmed_at: number | null; updated_at: number };
+      // Non-workstream concept must be backfilled.
+      expect(rowAfterCatchUp.last_confirmed_at).not.toBeNull();
+      expect(rowAfterCatchUp.last_confirmed_at).toBe(rowAfterCatchUp.updated_at);
+
+      // Workstream row must still be NULL — excluded by kind != 'workstream' guard.
+      const wsRowAfter = db1.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
+        .get(ws0.id) as { last_confirmed_at: number | null };
+      expect(wsRowAfter.last_confirmed_at).toBeNull();
+
+      core1.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("State C: already-migrated store (columns exist, values backfilled, user_version 2) → open is a pure no-op; all temporal values byte-unchanged", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-fixb-stateC-migrated-"));
+    const dbPath = join(dir, "test.db");
+    try {
+      // Build a fully migrated store.
+      const core0 = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const r0 = await core0.store("Migrated concept.");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const db0 = (core0 as any).db as import("../storage").StoragePort;
+      const version0 = db0.pragma("user_version", { simple: true }) as number;
+      expect(version0).toBe(2); // fully migrated
+      const lcaBefore = (db0.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
+      expect(lcaBefore).not.toBeNull();
+      core0.close();
+
+      // Re-open — must be a pure no-op (WHERE-NULL updates 0 rows; version-gate no-op).
+      const core1 = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const db1 = (core1 as any).db as import("../storage").StoragePort;
+
+      const version1 = db1.pragma("user_version", { simple: true }) as number;
+      expect(version1).toBe(2); // unchanged
+
+      const lcaAfter = (db1.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
+      // Must be byte-identical — no spurious update.
+      expect(lcaAfter).toBe(lcaBefore);
+
+      core1.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("State D: fresh 0.6.0 store — post-0.6.0 workstream rows keep NULL temporal fields (no false stamping by any backfill path)", async () => {
+    // Workstream rows are kind='workstream'. They are NULL by design and excluded from all
+    // backfill paths (kind != 'workstream' guard in both the column-guard and WHERE-NULL branches).
+    const core = new MonetCore(":memory:");
+    const ws = await core.saveWorkstream({ status: "active", nextSteps: ["do a thing"] });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const db = (core as any).db as import("../storage").StoragePort;
+    const wsRow = db.prepare(`SELECT last_confirmed_at, kind FROM concepts WHERE id = ?`)
+      .get(ws.id) as { last_confirmed_at: number | null; kind: string };
+    expect(wsRow.kind).toBe("workstream");
+    // Workstream temporal field must remain NULL — excluded by design from staleness consumers.
+    expect(wsRow.last_confirmed_at).toBeNull();
+    core.close();
+  });
+});
+
+// ---- Fix C — dismiss with contradiction-only fields is rejected ---------------
+
+describe("Fix C — dismissal branch rejects contradiction-path-only fields", () => {
+  it("conceptAId + conceptBId + decision → clean error naming the conflict; pair is NOT dismissed", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const a = await core.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const b = await core.store("Monet Local uses SQLite for its local storage backend.");
+    expect(b.action).toBe("ambiguous");
+
+    const client = await mcpClient(core);
+    const result = await client.callTool({
+      name: "memory_resolve",
+      arguments: { conceptAId: a.conceptId, conceptBId: b.conceptId, decision: "accept-new" },
+    }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+
+    // Must be an error response naming the conflict.
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/decision.*contradiction|contradiction.*verdict/i);
+
+    // Pair must NOT have been dismissed.
+    const ov = core.overview("default");
+    expect(ov.counts.possibleDuplicates).toBe(1);
+
+    core.close();
+  });
+
+  it("conceptAId + conceptBId + body → clean error naming the conflict; pair is NOT dismissed", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const a = await core.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const b = await core.store("Monet Local uses SQLite for its local storage backend.");
+    expect(b.action).toBe("ambiguous");
+
+    const client = await mcpClient(core);
+    const result = await client.callTool({
+      name: "memory_resolve",
+      arguments: { conceptAId: a.conceptId, conceptBId: b.conceptId, body: "The reconciled body." },
+    }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+
+    // Must be an error response naming the conflict.
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/body.*contradiction|contradiction.*verdict/i);
+
+    // Pair must NOT have been dismissed.
+    const ov = core.overview("default");
+    expect(ov.counts.possibleDuplicates).toBe(1);
+
+    core.close();
+  });
+
+  it("pure dismissal payload (conceptAId + conceptBId, no contradiction-only fields) still works", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+    const a = await core.store("We decided to use SQLite as the storage backend for Monet Local.");
+    const b = await core.store("Monet Local uses SQLite for its local storage backend.");
+    expect(b.action).toBe("ambiguous");
+
+    const client = await mcpClient(core);
+    const result = await client.callTool({
+      name: "memory_resolve",
+      arguments: { conceptAId: a.conceptId, conceptBId: b.conceptId },
+    }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+
+    expect(result.isError).toBeFalsy();
+    const parsed = parseResult(result);
+    expect(parsed.action).toBe("duplicate-pair-dismissed");
+
+    const ov = core.overview("default");
+    expect(ov.counts.possibleDuplicates).toBe(0);
 
     core.close();
   });

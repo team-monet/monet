@@ -608,10 +608,36 @@ export class MonetCore {
     // 0.6.0 temporal layer (TEMPORAL_SCHEMA_VERSION = 2):
     //   - last_confirmed_at / last_confirmed_session_id on concepts (evidence-confirmation timestamps)
     //   - dismissed_at / dismissed_by on memory_edge (pair-dismissal for possible_duplicate_of edges)
-    // Column-guard pattern: PRAGMA table_info, then ALTER only if missing.
+    //
+    // Three historical store-states and which path covers each:
+    //
+    //   State A — pre-0.6 store, FIRST open under new code (columns MISSING):
+    //     The column-guard fires (ALTER TABLE). The backfill runs ATOMICALLY in the same branch
+    //     so no structural write in the window between column-add and a later graph-enabled open
+    //     can corrupt evidence timestamps. Works for both graph-disabled AND graph-enabled opens.
+    //
+    //   State B — stranded old-code state (columns EXIST, values NULL, user_version 0):
+    //     Occurs when an earlier open added the columns but crashed, or was graph-disabled under
+    //     pre-fix code that deferred the backfill. The column-guard does not fire (columns exist),
+    //     so a WHERE-NULL catch-up pass runs unconditionally after the column-guard block. This
+    //     covers the stranded state independent of graphEnabled and user_version.
+    //
+    //   State C — already-migrated store (columns EXIST, values backfilled, user_version 2):
+    //     Column-guard does not fire. WHERE-NULL pass updates zero rows (no-op). Pure no-op open.
+    //
+    //   State D — fresh 0.6.0 store (no pre-existing rows):
+    //     Columns added by the initial schema CREATE TABLE (last_confirmed_at already present).
+    //     Column-guard does not fire. WHERE-NULL pass updates zero rows. Workstream rows written
+    //     by saveWorkstream() remain NULL by design (excluded by kind != 'workstream' guard).
+    //
+    // Column-guard pattern: PRAGMA table_info, then ALTER only if missing (SQLite has no IF NOT EXISTS).
     const conceptCols2 = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
     if (!conceptCols2.some((c) => c.name === "last_confirmed_at")) {
+      // State A: columns missing — add AND backfill atomically in this branch. Independent of
+      // graphEnabled and user_version. Workstream rows are excluded: they are NULL by design
+      // (excluded from staleness consumers and merge paths), so stamping them would be incorrect.
       this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_at INTEGER`);
+      this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
     }
     if (!conceptCols2.some((c) => c.name === "last_confirmed_session_id")) {
       this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_session_id TEXT`);
@@ -623,14 +649,16 @@ export class MonetCore {
     if (!edgeCols.some((c) => c.name === "dismissed_by")) {
       this.db.exec(`ALTER TABLE memory_edge ADD COLUMN dismissed_by TEXT`);
     }
-    // Temporal backfill: NULL rows get last_confirmed_at = updated_at; version bumped to
-    // TEMPORAL_SCHEMA_VERSION. Invariant: only runs when version == GRAPH_SCHEMA_VERSION (graph
-    // backfill already consumed its slot). A graph-disabled open leaves user_version=0 so the
-    // graph slot is preserved; this gate is therefore never reached until a graph-enabled open
-    // advances to version 1 first. NULLs self-heal on that first graph-enabled open.
+    // State B catch-up: columns exist but NULLs remain (stranded old-code state).
+    // Runs after the column-guard so it is safe regardless of whether ALTER fired this open.
+    // The WHERE-NULL predicate makes it a no-op for State C and D (no rows to update).
+    // Excludes kind='workstream' — those rows are NULL by design.
+    this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
+    // Version gate: bump to TEMPORAL_SCHEMA_VERSION once the graph backfill slot has been consumed.
+    // Guards the graph-schema-version invariant; the temporal backfill itself is now independent
+    // of this gate (handled in State A and B paths above).
     const versionNow = this.db.pragma("user_version", { simple: true }) as number;
     if (versionNow >= GRAPH_SCHEMA_VERSION && versionNow < TEMPORAL_SCHEMA_VERSION) {
-      this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL`);
       this.db.pragma(`user_version = ${TEMPORAL_SCHEMA_VERSION}`);
     }
   }
@@ -1040,13 +1068,21 @@ export class MonetCore {
    * observation wins; keep-current: the prior wins; dismiss: not a real conflict. The loser is
    * superseded; the agent's reconciled `body` (if given) is written; the concept restores to
    * active + confidence once no open contradictions remain. Returns the updated concept.
+   *
+   * Idempotency gate: if the contradiction is already resolved or dismissed, returns
+   * { alreadyClosed: true, contradictionStatus: string } with ZERO mutations — no temporal stamp,
+   * no observation supersede, no status rewrite, no session opened. Mirrors the pair-dismissal
+   * idempotency shape (AND dismissed_at IS NULL guard on that path).
    */
   resolveContradiction(
     contradictionId: string,
     opts: { decision: "accept-new" | "keep-current" | "dismiss"; body?: string; by?: string },
-  ): Concept | null {
+  ): Concept | { alreadyClosed: true; contradictionStatus: string } | null {
     const c = this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(contradictionId) as ContradictionRow | undefined;
     if (!c) return null;
+    // Already closed (resolved or dismissed): return idempotent no-op with zero mutations.
+    // A retry with a stale contradictionId must NOT re-stamp last_confirmed_at (no new evidence).
+    if (c.status !== "open") return { alreadyClosed: true, contradictionStatus: c.status };
     const conceptId = c.concept_id;
 
     if (opts.decision === "dismiss") {

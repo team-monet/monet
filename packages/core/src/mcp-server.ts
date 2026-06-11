@@ -393,6 +393,11 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         if (conceptAId !== undefined || conceptBId !== undefined) {
           if (!conceptAId || !conceptBId) return err("duplicate-pair dismissal requires both conceptAId and conceptBId");
           if (contradictionId !== undefined) return err("provide either contradictionId (contradiction verdict) or conceptAId+conceptBId (duplicate-pair dismissal), not both");
+          // Reject contradiction-path-only fields: an agent passing `decision` or `body` alongside
+          // conceptAId+conceptBId is attempting a contradiction verdict on a duplicate pair, which
+          // would silently hide the pair instead. Name the conflict and point at both valid shapes.
+          if (decision !== undefined) return err("field 'decision' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
+          if (body !== undefined) return err("field 'body' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
           // Scope enforcement: both concepts must live in the caller-named circle.
           const circleA = core.circleOf(conceptAId);
           const circleB = core.circleOf(conceptBId);
@@ -410,6 +415,8 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         if (core.circleOfContradiction(contradictionId) !== scope(circle)) return err(`contradiction not found: ${contradictionId}`); // scope enforcement
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
+        // Idempotent no-op: contradiction already resolved or dismissed — zero mutations occurred.
+        if ("alreadyClosed" in c) return ok({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus });
         return ok({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
