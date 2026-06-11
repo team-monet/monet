@@ -22,6 +22,10 @@ export type {
   ObservationEntry,
   DetachResult,
   PossibleDuplicatePair,
+  RenameCircleResult,
+  MergeCircleResult,
+  MergeConceptResult,
+  BatchReassignResult,
 } from "./engine";
 export { BetterSqlitePort } from "./storage";
 export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";

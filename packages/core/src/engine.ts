@@ -314,6 +314,43 @@ export interface ReassignResult {
   observationsMoved: number;
 }
 
+/** Result of renameCircle(). */
+export interface RenameCircleResult {
+  from: string;
+  to: string;
+  action: "renamed" | "noop";
+  conceptsUpdated: number;
+  observationsUpdated: number;
+  edgesUpdated: number;
+  entitiesUpdated: number;
+}
+
+/** Per-concept result within a mergeCircle(). Includes an error variant for failed per-item moves. */
+export interface MergeConceptResult {
+  action: "moved" | "merged" | "noop" | "error";
+  conceptId: string;
+  fromCircle: string;
+  toCircle: string;
+  mergedIntoId?: string;
+  observationsMoved: number;
+  error?: string;
+}
+
+/** Result of mergeCircle(). */
+export interface MergeCircleResult {
+  from: string;
+  into: string;
+  conceptResults: MergeConceptResult[];
+  counts: { moved: number; merged: number; noop: number; error: number };
+}
+
+/** Result of batchReassignCircle(). */
+export interface BatchReassignResult {
+  toCircle: string;
+  results: Array<ReassignResult | { id: string; action: "error"; error: string }>;
+  counts: { moved: number; merged: number; noop: number; error: number };
+}
+
 export interface MonetCoreOptions {
   embedder?: EmbeddingProvider;
   synthesizer?: Synthesizer;
@@ -541,6 +578,17 @@ export class MonetCore {
     if (!conceptCols.some((c) => c.name === "aliases")) {
       this.db.exec(`ALTER TABLE concepts ADD COLUMN aliases TEXT`);
     }
+    // circle_aliases: stable name-resolution layer for circle renames and archive status.
+    // from_name → to_name for active aliases (canonical rename); status='archived' marks hidden circles.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS circle_aliases (
+        from_name  TEXT PRIMARY KEY,
+        to_name    TEXT NOT NULL,
+        status     TEXT NOT NULL DEFAULT 'active',
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ca_to ON circle_aliases(to_name);
+    `);
     // One-time graph backfill for pre-graph DBs (P2, Codex review): the graph tables exist but hold no
     // edges for concepts stored before the graph feature. Version-gated so it runs at most once, and only
     // when the graph is enabled — a graph-disabled open must NOT consume the upgrade slot (the next
@@ -552,9 +600,29 @@ export class MonetCore {
     }
   }
 
+  // ---- librarian: alias resolution ----------------------------------------
+
+  /**
+   * Single-hop alias lookup: if from_name has an active alias entry, returns to_name; otherwise
+   * returns the name unchanged. Aliases are a write-home lookup layer — no concept row ever stores
+   * an aliased name; this resolves BEFORE any circle-accepting entry point consumes it.
+   * Public via resolveCircleName() for the MCP layer's scope-enforcement checks.
+   */
+  private resolveCircle(name: string): string {
+    const row = this.db
+      .prepare(`SELECT to_name FROM circle_aliases WHERE from_name = ? AND status = 'active'`)
+      .get(name) as { to_name: string } | undefined;
+    return row ? row.to_name : name;
+  }
+
+  /** Public wrapper for MCP scope-enforcement (resolveCircle is private). */
+  resolveCircleName(name: string): string {
+    return this.resolveCircle(name);
+  }
+
   /** Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty. */
   async store(content: string, opts: StoreOpts = {}): Promise<IngestResult> {
-    const circle = opts.circle ?? this.defaultCircle;
+    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
 
     // Validate resolution options before embedding (fast-fail).
     if (opts.resolution === "forceNew" && opts.attachTo) {
@@ -699,19 +767,28 @@ export class MonetCore {
    * before cross-circle rows, then id ascending. When `opts.circle` is provided, scopes exactly
    * to that circle (unchanged single-circle behavior).
    */
-  async search(query: string, opts: { circle?: string; limit?: number } = {}): Promise<SearchCard[]> {
+  async search(query: string, opts: { circle?: string; limit?: number; includeArchived?: boolean } = {}): Promise<SearchCard[]> {
     const limit = opts.limit ?? 5;
     const emb = await this.embedder.embed(query);
+    const resolvedCircle = opts.circle !== undefined ? this.resolveCircle(opts.circle) : undefined;
     // Workstreams are identity-upserted state, not embedding-resolved knowledge — keep them
     // out of dedup candidates and search cards (they're restored via getActiveWorkstreams).
-    const rows: ConceptRow[] = opts.circle !== undefined
+    const rows: ConceptRow[] = resolvedCircle !== undefined
       ? this.db
           .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream'`)
-          .all(opts.circle) as ConceptRow[]
-      : this.db
-          .prepare(`SELECT * FROM concepts WHERE kind != 'workstream'`)
-          .all() as ConceptRow[];
-    const contradictions = this.openContradictionCountsGlobal(opts.circle);
+          .all(resolvedCircle) as ConceptRow[]
+      : opts.includeArchived
+        ? this.db
+            .prepare(`SELECT * FROM concepts WHERE kind != 'workstream'`)
+            .all() as ConceptRow[]
+        : this.db
+            .prepare(
+              `SELECT c.* FROM concepts c
+                LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
+               WHERE c.kind != 'workstream' AND ca.from_name IS NULL`,
+            )
+            .all() as ConceptRow[];
+    const contradictions = this.openContradictionCountsGlobal(resolvedCircle);
     const defaultCircle = this.defaultCircle;
     return rows
       .map((r) => ({ row: r, score: cosine(emb, jsonToEmb(r.embedding)) }))
@@ -719,7 +796,7 @@ export class MonetCore {
         const diff = b.score - a.score;
         if (Math.abs(diff) > 1e-9) return diff;
         // Tie-break in store-wide mode: same-circle-as-defaultCircle first, then id ascending.
-        if (opts.circle === undefined) {
+        if (resolvedCircle === undefined) {
           const aHome = a.row.circle === defaultCircle ? 0 : 1;
           const bHome = b.row.circle === defaultCircle ? 0 : 1;
           if (aHome !== bHome) return aHome - bHome;
@@ -782,7 +859,7 @@ export class MonetCore {
 
   /** Session checkpoint (touch, batch): synthesize every dirty concept. Returns the count. */
   async checkpoint(circle?: string): Promise<number> {
-    circle ??= this.defaultCircle; // honor the per-project default; pass a circle explicitly to scope elsewhere
+    circle = this.resolveCircle(circle ?? this.defaultCircle); // honor the per-project default; pass a circle explicitly to scope elsewhere
     const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ?`).all(circle) as ConceptRow[];
     for (const r of rows) await this.synthesizeRow(r);
     return rows.length;
@@ -795,7 +872,7 @@ export class MonetCore {
    * never marked dirty. Restored next session via getActiveWorkstreams / prewarm (#242).
    */
   async saveWorkstream(payload: WorkstreamPayload, opts: { circle?: string; summary?: string } = {}): Promise<Workstream> {
-    const circle = opts.circle ?? this.defaultCircle;
+    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
     const sessionId = this.ensureSession();
     const full: WorkstreamPayload = { ...payload, lastSessionId: sessionId };
     const slug = `workstream:${circle}`;
@@ -851,8 +928,11 @@ export class MonetCore {
    * contradictions. Bounded + ranked. Carries identity/shape, never concept bodies
    * (the no-answer-leak rule, §4.5) — the agent fetches a concept when it needs content.
    */
-  prewarm(circle?: string, opts: { conceptLimit?: number } = {}): PrewarmState {
-    circle ??= this.defaultCircle;
+  prewarm(circle?: string, opts: { conceptLimit?: number } = {}): PrewarmState & { resolvedFrom?: string } {
+    const rawCircle = circle ?? this.defaultCircle;
+    const resolved = this.resolveCircle(rawCircle);
+    const resolvedFrom = resolved !== rawCircle ? rawCircle : undefined;
+    circle = resolved;
     const conceptLimit = opts.conceptLimit ?? 7;
     const now = Date.now();
 
@@ -879,7 +959,13 @@ export class MonetCore {
       .map(({ r }) => livingModelCard(r));
     const staleConcepts = active.filter(isStale).map(livingModelCard);
 
-    return { activeWorkstreams, topConcepts, staleConcepts, openContradictions: this.getOpenContradictions(circle) };
+    return {
+      activeWorkstreams,
+      topConcepts,
+      staleConcepts,
+      openContradictions: this.getOpenContradictions(circle),
+      ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
+    };
   }
 
   /**
@@ -1055,7 +1141,7 @@ export class MonetCore {
     circle?: string,
     opts: { withProvenance?: boolean; limit?: number; offset?: number; cursor?: { updatedAt: number; id: string } } = {},
   ): MemoryListEntry[] {
-    circle ??= this.defaultCircle;
+    circle = this.resolveCircle(circle ?? this.defaultCircle);
     const params: Array<string | number> = [circle];
     let where = `circle = ? AND kind != 'workstream'`;
     if (opts.cursor) {
@@ -1143,21 +1229,31 @@ export class MonetCore {
    * circle. Atomic. Returns what happened, or null if `id` doesn't exist. Workstreams (identity-
    * scoped session state, not knowledge) cannot be reassigned.
    */
-  reassignCircle(id: string, toCircle: string): ReassignResult | null {
+  reassignCircle(id: string, toCircle: string, opts: { resolution?: "auto" | "forceNew" } = {}): ReassignResult | null {
     const src = this.getRow(id);
     if (!src) return null;
     if (src.kind === "workstream") throw new Error("cannot reassign a workstream concept");
     const fromCircle = src.circle;
-    if (fromCircle === toCircle) {
-      return { action: "noop", conceptId: id, fromCircle, toCircle, observationsMoved: 0 };
+    const resolvedTo = this.resolveCircle(toCircle);
+    if (fromCircle === resolvedTo) {
+      return { action: "noop", conceptId: id, fromCircle, toCircle: resolvedTo, observationsMoved: 0 };
     }
-    // Dedup target: the best match already in toCircle (bestMatches excludes workstreams; the source
+    // Dedup target: the best match already in resolvedTo (bestMatches excludes workstreams; the source
     // lives in fromCircle, so it can never match itself). score ≥ tauAttach ⇒ "same concept" ⇒ merge.
-    const top = this.bestMatches(jsonToEmb(src.embedding), toCircle, 1)[0];
-    const mergeInto = top && top.score >= this.tauAttach ? top.match : null;
+    // Under forceNew: never merge; if score >= tauAmbiguous, record a possible_duplicate_of edge.
+    const top = this.bestMatches(jsonToEmb(src.embedding), resolvedTo, 1)[0];
+    let mergeInto: ConceptRow | null = null;
+    if (opts.resolution !== "forceNew") {
+      mergeInto = (top && top.score >= this.tauAttach) ? top.match : null;
+    }
     const result = this.db.transaction(() =>
-      mergeInto ? this.mergeConceptInto(src, mergeInto, toCircle) : this.moveConcept(src, toCircle),
+      mergeInto ? this.mergeConceptInto(src, mergeInto, resolvedTo) : this.moveConcept(src, resolvedTo),
     )();
+    // Under forceNew with a near-match: record possible_duplicate_of edge (both directions).
+    if (opts.resolution === "forceNew" && top && top.score >= this.tauAmbiguous && this.graphEnabled) {
+      const survivingId = result.conceptId;
+      this.upsertEdgeBoth(survivingId, top.match.id, "possible_duplicate_of", top.score, "cheap", resolvedTo);
+    }
     // `follows` is in-memory + circle-keyed: the source just left (or ceased to exist in) fromCircle,
     // so a later store there must not chain a follows edge onto it (it would point out-of-circle / at a
     // deleted row). Drop any lastConcept pointer to it.
@@ -1179,7 +1275,8 @@ export class MonetCore {
     if (!srcRow) throw new Error("concept not found");
     if (srcRow.kind === "workstream") throw new Error("cannot detach from a workstream concept");
     const circle = srcRow.circle;
-    if (opts.circle && opts.circle !== circle) throw new Error("circle mismatch");
+    const resolvedOpts = opts.circle ? this.resolveCircle(opts.circle) : opts.circle;
+    if (resolvedOpts && resolvedOpts !== circle) throw new Error("circle mismatch");
 
     // Validate all observation ids belong to source.
     const srcObsRows = this.db
@@ -1785,8 +1882,10 @@ export class MonetCore {
   overview(
     circle?: string,
     opts: { conceptLimit?: number; hubLimit?: number; connectedLimit?: number } = {},
-  ): MemoryOverview {
-    circle ??= this.defaultCircle;
+  ): MemoryOverview & { resolvedFrom?: string } {
+    const rawCircle = circle ?? this.defaultCircle;
+    circle = this.resolveCircle(rawCircle);
+    const resolvedFrom = circle !== rawCircle ? rawCircle : undefined;
     const pre = this.prewarm(circle, { conceptLimit: opts.conceptLimit ?? 6 });
     const edgesByType = this.edgeCountsByType(circle);
     const edges = edgesByType.reduce((a, e) => a + e.count, 0);
@@ -1828,6 +1927,7 @@ export class MonetCore {
         const others = this.listCircles(circle);
         return others.length > 0 ? { otherCircles: others } : {};
       })(),
+      ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
     };
   }
 
@@ -1835,8 +1935,11 @@ export class MonetCore {
    * List circles in the store, excluding `excludeCircle` (typically the current circle).
    * Returns up to 20 circles ordered by most recent activity, with concept count (excluding
    * workstreams) and last activity timestamp. Used by overview() to surface otherCircles.
+   * Archived circles are excluded by default; pass `includeArchived: true` to include them.
+   * Each entry carries `archived: boolean`.
    */
-  listCircles(excludeCircle?: string): Array<{ circle: string; concepts: number; lastActivity: number }> {
+  listCircles(excludeCircle?: string, opts: { includeArchived?: boolean } = {}): Array<{ circle: string; concepts: number; lastActivity: number; archived: boolean }> {
+    // Build rows: all circles present in the concepts table.
     const rows: Array<{ circle: string; concepts: number; lastActivity: number }> = excludeCircle !== undefined
       ? this.db
           .prepare(
@@ -1854,11 +1957,245 @@ export class MonetCore {
               ORDER BY lastActivity DESC LIMIT 20`,
           )
           .all() as Array<{ circle: string; concepts: number; lastActivity: number }>;
-    return rows;
+    // Enrich with archived flag (left join on circle_aliases).
+    const enriched = rows.map((r) => {
+      const alias = this.db
+        .prepare(`SELECT status FROM circle_aliases WHERE from_name = ?`)
+        .get(r.circle) as { status: string } | undefined;
+      return { ...r, archived: alias?.status === "archived" };
+    });
+    return opts.includeArchived ? enriched : enriched.filter((r) => !r.archived);
   }
 
   close(): void {
     this.db.close();
+  }
+
+  // ---- librarian: circle lifecycle -----------------------------------------
+
+  /**
+   * No-op stub: future governed-circles axis must refuse cross-boundary merges/renames here.
+   * All merges and renames today operate within the same (implicit) sharing scope.
+   */
+  private assertSameSharingScope(_from: string, _to: string): void {
+    // Seam for future governed-circles: when that axis exists, throw if `from` and `to` are in
+    // different governance domains. Today, all circles share one implicit domain — no-op.
+  }
+
+  /**
+   * Atomically rename a circle: bulk-updates all five scope-bearing tables (concepts, observations,
+   * memory_edge, entities, concept_entities) from→to; updates workstream slugs in the to-circle
+   * after the rename; upserts an active alias from→to; flattens chains (any alias that pointed
+   * to `from` is updated to point to `to`); renames the in-memory lastConceptByCircle key.
+   * from===to → action "noop". Nonexistent from (no concepts AND no alias rows naming it) → throws.
+   */
+  renameCircle(from: string, to: string): RenameCircleResult {
+    // Resolve the destination FIRST so renaming B→C when alias C→D exists physically lands in D.
+    to = this.resolveCircle(to);
+    if (from === to) return { from, to, action: "noop", conceptsUpdated: 0, observationsUpdated: 0, edgesUpdated: 0, entitiesUpdated: 0 };
+    this.assertSameSharingScope(from, to);
+    // Existence check: from must either have concepts or already have an alias entry.
+    const hasConcepts = (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ?`).get(from) as { n: number }).n > 0;
+    const hasAlias = !!this.db.prepare(`SELECT 1 FROM circle_aliases WHERE from_name = ? OR to_name = ?`).get(from, from);
+    if (!hasConcepts && !hasAlias) throw new Error(`circle not found: ${from}`);
+
+    return this.db.transaction((): RenameCircleResult => {
+      const conceptsUpdated = (this.db.prepare(`UPDATE concepts SET circle = ? WHERE circle = ?`).run(to, from)).changes;
+      const observationsUpdated = (this.db.prepare(`UPDATE observations SET circle = ? WHERE circle = ?`).run(to, from)).changes;
+      const edgesUpdated = (this.db.prepare(`UPDATE memory_edge SET scope = ? WHERE scope = ?`).run(to, from)).changes;
+      // entities: (key, scope) is a compound PK — a bulk UPDATE fails if `to` already has the same key
+      // (e.g. when renaming circle-B into `canonical` after circle-A was already renamed there).
+      // Merge: add from's df into any matching `to` row (upsert), then delete the from rows.
+      const fromEntities = this.db
+        .prepare(`SELECT key, kind, surface, df FROM entities WHERE scope = ?`)
+        .all(from) as Array<{ key: string; kind: string; surface: string; df: number }>;
+      for (const e of fromEntities) {
+        this.db
+          .prepare(
+            `INSERT INTO entities (key, kind, surface, scope, df) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(key, scope) DO UPDATE SET df = df + excluded.df`,
+          )
+          .run(e.key, e.kind, e.surface, to, e.df);
+      }
+      const entitiesUpdated = (this.db.prepare(`DELETE FROM entities WHERE scope = ?`).run(from)).changes;
+      // concept_entities: (concept_id, entity_key, scope) PK — same pattern (INSERT OR IGNORE for new).
+      const fromCE = this.db
+        .prepare(`SELECT concept_id, entity_key FROM concept_entities WHERE scope = ?`)
+        .all(from) as Array<{ concept_id: string; entity_key: string }>;
+      for (const ce of fromCE) {
+        this.db
+          .prepare(`INSERT OR IGNORE INTO concept_entities (concept_id, entity_key, scope) VALUES (?, ?, ?)`)
+          .run(ce.concept_id, ce.entity_key, to);
+      }
+      this.db.prepare(`DELETE FROM concept_entities WHERE scope = ?`).run(from);
+      // Update workstream slugs: workstream slug = 'workstream:${circle}' — after renaming the circle
+      // field, the slug still contains the old name and would fork a duplicate workstream on next checkpoint.
+      this.db
+        .prepare(`UPDATE concepts SET slug = 'workstream:' || ? WHERE kind = 'workstream' AND circle = ?`)
+        .run(to, to);
+      // Upsert alias from→to (active).
+      this.db
+        .prepare(
+          `INSERT INTO circle_aliases (from_name, to_name, status) VALUES (?, ?, 'active')
+           ON CONFLICT(from_name) DO UPDATE SET to_name = ?, status = 'active'`,
+        )
+        .run(from, to, to);
+      // Flatten chains: any alias that pointed to `from` should now point to `to`.
+      this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(to, from);
+      // Update in-memory lastConceptByCircle if the key matches `from`.
+      const prev = this.lastConceptByCircle.get(from);
+      if (prev !== undefined) {
+        this.lastConceptByCircle.delete(from);
+        this.lastConceptByCircle.set(to, prev);
+      }
+      return { from, to, action: "renamed", conceptsUpdated, observationsUpdated, edgesUpdated, entitiesUpdated };
+    })();
+  }
+
+  /**
+   * Merge all concepts from `from` into `into`. Calls assertSameSharingScope. Loops reassignCircle
+   * per concept; each is individually atomic. Workstream concepts in `from` are DELETED (not moved)
+   * because a workstream slug is circle-scoped (`workstream:${circle}`); after the circle empties
+   * there is no valid home for it — the `into` circle already has its own workstream. Upserts an
+   * active alias from→into and flattens chains. Default resolution: forceNew.
+   */
+  async mergeCircle(
+    from: string,
+    into: string,
+    opts: { resolution?: "auto" | "forceNew" } = {},
+  ): Promise<MergeCircleResult> {
+    // Resolve the destination FIRST so merging B→C when alias C→D exists lands in D.
+    into = this.resolveCircle(into);
+    this.assertSameSharingScope(from, into);
+    const resolution = opts.resolution ?? "forceNew";
+
+    const conceptRows = this.db
+      .prepare(`SELECT id, kind FROM concepts WHERE circle = ?`)
+      .all(from) as Array<{ id: string; kind: string }>;
+
+    const conceptResults: MergeConceptResult[] = [];
+    let moved = 0, merged = 0, noop = 0, error = 0;
+
+    for (const row of conceptRows) {
+      if (row.kind === "workstream") {
+        // Workstream concepts are circle-identity-scoped; delete instead of moving.
+        // Unwind graph + delete revisions + delete the concept row.
+        try {
+          this.db.transaction(() => {
+            this.unwindConceptGraph(row.id, from);
+            this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(row.id);
+            this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(row.id);
+          })();
+          conceptResults.push({ action: "noop" as const, conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0 });
+          noop++;
+        } catch (e) {
+          conceptResults.push({ action: "noop" as const, conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0, error: (e instanceof Error ? e.message : String(e)) });
+          error++;
+        }
+        continue;
+      }
+      try {
+        const r = this.reassignCircle(row.id, into, { resolution });
+        if (r === null) {
+          conceptResults.push({ action: "error", conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0, error: "concept not found during merge" });
+          error++;
+        } else {
+          conceptResults.push(r);
+          if (r.action === "moved") moved++;
+          else if (r.action === "merged") merged++;
+          else noop++;
+        }
+      } catch (e) {
+        conceptResults.push({ action: "error", conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0, error: (e instanceof Error ? e.message : String(e)) });
+        error++;
+      }
+    }
+
+    // Upsert alias from→into (active) + flatten chains.
+    this.db
+      .prepare(
+        `INSERT INTO circle_aliases (from_name, to_name, status) VALUES (?, ?, 'active')
+         ON CONFLICT(from_name) DO UPDATE SET to_name = ?, status = 'active'`,
+      )
+      .run(from, into, into);
+    this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(into, from);
+
+    return { from, into, conceptResults, counts: { moved, merged, noop, error } };
+  }
+
+  /**
+   * Archive a circle: upserts a circle_aliases row with status='archived'. Archived circles
+   * are hidden from store-wide search/gather scans and from listCircles by default.
+   * Explicit access (reads and writes) still works — archived = hidden by default, not sealed.
+   *
+   * Throws if `name` is an active rename/merge alias (to_name !== name): archiving an alias row
+   * would overwrite the redirect's to_name and destroy the alias. Archive the canonical circle
+   * (the to_name) instead.
+   */
+  archiveCircle(name: string): void {
+    const existing = this.db
+      .prepare(`SELECT to_name, status FROM circle_aliases WHERE from_name = ?`)
+      .get(name) as { to_name: string; status: string } | undefined;
+    if (existing && existing.to_name !== name && existing.status === "active") {
+      throw new Error(`cannot archive '${name}': it is an alias pointing to '${existing.to_name}' — archive the canonical circle instead`);
+    }
+    this.db
+      .prepare(
+        `INSERT INTO circle_aliases (from_name, to_name, status) VALUES (?, ?, 'archived')
+         ON CONFLICT(from_name) DO UPDATE SET to_name = ?, status = 'archived'`,
+      )
+      .run(name, name, name);
+  }
+
+  /**
+   * Unarchive a circle: sets the circle_aliases row back to status='active'.
+   * If no alias row exists (the circle was never archived), this is a no-op.
+   *
+   * Throws if `name` is an active rename/merge alias (to_name !== name): unarchiving an alias row
+   * would overwrite the redirect's to_name. Unarchive the canonical circle instead.
+   */
+  unarchiveCircle(name: string): void {
+    const existing = this.db
+      .prepare(`SELECT to_name, status FROM circle_aliases WHERE from_name = ?`)
+      .get(name) as { to_name: string; status: string } | undefined;
+    if (existing && existing.to_name !== name && existing.status === "active") {
+      throw new Error(`cannot unarchive '${name}': it is an alias pointing to '${existing.to_name}' — unarchive the canonical circle instead`);
+    }
+    this.db
+      .prepare(`UPDATE circle_aliases SET status = 'active' WHERE from_name = ?`)
+      .run(name);
+  }
+
+  /**
+   * Move a batch of concept ids to `toCircle`. Sequential per-item (each internally atomic).
+   * Errors captured per item without aborting the batch. Counts {moved, merged, noop, error}.
+   */
+  batchReassignCircle(
+    ids: string[],
+    toCircle: string,
+    opts: { resolution?: "auto" | "forceNew" } = {},
+  ): BatchReassignResult {
+    const resolvedTo = this.resolveCircle(toCircle);
+    const results: BatchReassignResult["results"] = [];
+    let moved = 0, merged = 0, noop = 0, error = 0;
+    for (const id of ids) {
+      try {
+        const r = this.reassignCircle(id, resolvedTo, opts);
+        if (r === null) {
+          results.push({ id, action: "error", error: `concept not found: ${id}` });
+          error++;
+        } else {
+          results.push(r);
+          if (r.action === "moved") moved++;
+          else if (r.action === "merged") merged++;
+          else noop++;
+        }
+      } catch (e) {
+        results.push({ id, action: "error", error: (e instanceof Error ? e.message : String(e)) });
+        error++;
+      }
+    }
+    return { toCircle: resolvedTo, results, counts: { moved, merged, noop, error } };
   }
 
   // ---- internals ---------------------------------------------------------
@@ -2291,18 +2628,19 @@ export class MonetCore {
    * defaultCircle-scoped when circle is undefined (conservative; dense+lexical cover all circles).
    * When `opts.circle` is provided, strictly scope-isolated (unchanged behavior).
    */
-  async gather(intent: string, opts: { circle?: string; limit?: number; depth?: number } = {}): Promise<GatherResult> {
+  async gather(intent: string, opts: { circle?: string; limit?: number; depth?: number; includeArchived?: boolean } = {}): Promise<GatherResult> {
     const limit = opts.limit ?? 12;
     const params = opts.depth ? { ...this.graphParams, hopLimit: Math.max(1, Math.min(opts.depth, 3)) } : this.graphParams;
     const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };
+    const resolvedCircle = opts.circle !== undefined ? this.resolveCircle(opts.circle) : undefined;
 
     const emb = await this.embedder.embed(intent);
-    const dense = this.scoreAllConcepts(emb, opts.circle); // [{id, cos}] desc
+    const dense = this.scoreAllConcepts(emb, resolvedCircle, opts.includeArchived); // [{id, cos}] desc
     const sim = new Map<string, number>();
     for (const d of dense) if (d.cos > 0) sim.set(d.id, d.cos);
 
     const denseIds = dense.filter((d) => d.cos > 0).map((d) => d.id);
-    const lexIds = this.lexicalSeed(intent, opts.circle, 30);
+    const lexIds = this.lexicalSeed(intent, resolvedCircle, 30, opts.includeArchived);
     const fused = rrfFuse([denseIds, lexIds], RRF_K).slice(0, SEED_K);
     const seedIds = fused.map((f) => f.id);
 
@@ -2313,7 +2651,7 @@ export class MonetCore {
     // Entity-anchored seeding from the PROBE TEXT ONLY (never scenario metadata) — complementary.
     // When circle is undefined (store-wide), scope entity seeding to defaultCircle (conservative —
     // dense+lexical seeds already cover all circles).
-    const entityCircle = opts.circle ?? this.defaultCircle;
+    const entityCircle = resolvedCircle ?? this.defaultCircle;
     for (const e of extractEntities(intent)) {
       if (this.isHub(e.key, entityCircle)) continue;
       const boost = (params.wType.about ?? 1) * this.rarity(e.key, entityCircle) * (KIND_BOOST[e.kind] ?? 1) * 0.1;
@@ -2347,7 +2685,7 @@ export class MonetCore {
     const { accepted, stopReason } = evidenceGapStop(ranked, seedIds.length, embOf, cosine, params);
 
     // reachableByType: when circle undefined, pass defaultCircle (explainability metric approximation).
-    const reachCircle = opts.circle ?? this.defaultCircle;
+    const reachCircle = resolvedCircle ?? this.defaultCircle;
     return {
       seed: seedIds.map((id) => this.cardOf(id)).filter((c): c is SearchCard => c !== null),
       ranked: accepted
@@ -2370,31 +2708,47 @@ export class MonetCore {
     this.endSession(summary);
   }
 
-  /** Score all concepts by cosine. When `circle` is omitted, scores across all circles. */
-  private scoreAllConcepts(emb: Float32Array, circle?: string): Array<{ id: string; cos: number }> {
+  /** Score all concepts by cosine. When `circle` is omitted, scores across all circles. Archived circles excluded by default. */
+  private scoreAllConcepts(emb: Float32Array, circle?: string, includeArchived?: boolean): Array<{ id: string; cos: number }> {
     const rows: Array<{ id: string; embedding: string }> = circle !== undefined
       ? this.db
           .prepare(`SELECT id, embedding FROM concepts WHERE circle = ? AND kind != 'workstream'`)
           .all(circle) as Array<{ id: string; embedding: string }>
-      : this.db
-          .prepare(`SELECT id, embedding FROM concepts WHERE kind != 'workstream'`)
-          .all() as Array<{ id: string; embedding: string }>;
+      : includeArchived
+        ? this.db
+            .prepare(`SELECT id, embedding FROM concepts WHERE kind != 'workstream'`)
+            .all() as Array<{ id: string; embedding: string }>
+        : this.db
+            .prepare(
+              `SELECT c.id, c.embedding FROM concepts c
+                LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
+               WHERE c.kind != 'workstream' AND ca.from_name IS NULL`,
+            )
+            .all() as Array<{ id: string; embedding: string }>;
     return rows
       .map((r) => ({ id: r.id, cos: cosine(emb, jsonToEmb(r.embedding)) }))
       .sort((a, b) => b.cos - a.cos || (a.id < b.id ? -1 : 1));
   }
 
-  /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). When `circle` is omitted, seeds from all circles. */
-  private lexicalSeed(intent: string, circle: string | undefined, n: number): string[] {
+  /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). When `circle` is omitted, seeds from all circles. Archived circles excluded by default. */
+  private lexicalSeed(intent: string, circle: string | undefined, n: number, includeArchived?: boolean): string[] {
     const q = new Set(tokenize(intent));
     if (q.size === 0) return [];
     const rows: Array<{ id: string; title: string; body: string }> = circle !== undefined
       ? this.db
           .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind != 'workstream'`)
           .all(circle) as Array<{ id: string; title: string; body: string }>
-      : this.db
-          .prepare(`SELECT id, title, body FROM concepts WHERE kind != 'workstream'`)
-          .all() as Array<{ id: string; title: string; body: string }>;
+      : includeArchived
+        ? this.db
+            .prepare(`SELECT id, title, body FROM concepts WHERE kind != 'workstream'`)
+            .all() as Array<{ id: string; title: string; body: string }>
+        : this.db
+            .prepare(
+              `SELECT c.id, c.title, c.body FROM concepts c
+                LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
+               WHERE c.kind != 'workstream' AND ca.from_name IS NULL`,
+            )
+            .all() as Array<{ id: string; title: string; body: string }>;
     return rows
       .map((r) => {
         let overlap = 0;
