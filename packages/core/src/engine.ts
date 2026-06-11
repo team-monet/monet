@@ -51,6 +51,8 @@ const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "der
 const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"]);
 const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s*:\s*#?([\w:-]+)/gi;
 const GRAPH_SCHEMA_VERSION = 1; // PRAGMA user_version gate for the one-time graph backfill (P2)
+const TEMPORAL_SCHEMA_VERSION = 2; // PRAGMA user_version gate for the temporal layer (0.6.0)
+const STALE_CONCEPTS_PREWARM_LIMIT = 20; // cap on staleConcepts in prewarm — a list serialized into a capped response gets a bound at birth
 
 export type IngestAction = "created" | "attached" | "ambiguous";
 
@@ -66,6 +68,8 @@ export interface Concept {
   circle: string;
   supportCount: number;
   dirty: boolean;
+  /** Unix ms of the last evidence-based confirmation (create, cross-session attach, or accepted contradiction resolution). Null for pre-0.6.0 rows that have not yet been backfilled, and legitimately null for kind='workstream' rows written by saveWorkstream() (workstreams are excluded from staleness and merge paths, so the NULL is inert). */
+  lastConfirmedAt: number | null;
 }
 
 /**
@@ -295,6 +299,7 @@ export interface MemoryListEntry {
   supportCount: number;
   contradictions: number;
   updatedAt: number;
+  lastConfirmedAt: number | null;
   /** Distinct `scope_context` (working dir) of the sessions that authored this concept's
    *  observations — the recorded provenance. Present only when `withProvenance` is set. */
   provenance?: string[];
@@ -391,6 +396,8 @@ interface ConceptRow {
   usefulness_score: number;
   source_refs: string | null;
   aliases: string | null;
+  last_confirmed_at: number | null;
+  last_confirmed_session_id: string | null;
 }
 
 interface ContradictionRow {
@@ -598,6 +605,34 @@ export class MonetCore {
       this.backfillGraph();
       this.db.pragma(`user_version = ${GRAPH_SCHEMA_VERSION}`);
     }
+    // 0.6.0 temporal layer (TEMPORAL_SCHEMA_VERSION = 2):
+    //   - last_confirmed_at / last_confirmed_session_id on concepts (evidence-confirmation timestamps)
+    //   - dismissed_at / dismissed_by on memory_edge (pair-dismissal for possible_duplicate_of edges)
+    // Column-guard pattern: PRAGMA table_info, then ALTER only if missing.
+    const conceptCols2 = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
+    if (!conceptCols2.some((c) => c.name === "last_confirmed_at")) {
+      this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_at INTEGER`);
+    }
+    if (!conceptCols2.some((c) => c.name === "last_confirmed_session_id")) {
+      this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_session_id TEXT`);
+    }
+    const edgeCols = this.db.prepare(`PRAGMA table_info(memory_edge)`).all() as Array<{ name: string }>;
+    if (!edgeCols.some((c) => c.name === "dismissed_at")) {
+      this.db.exec(`ALTER TABLE memory_edge ADD COLUMN dismissed_at INTEGER`);
+    }
+    if (!edgeCols.some((c) => c.name === "dismissed_by")) {
+      this.db.exec(`ALTER TABLE memory_edge ADD COLUMN dismissed_by TEXT`);
+    }
+    // Temporal backfill: NULL rows get last_confirmed_at = updated_at; version bumped to
+    // TEMPORAL_SCHEMA_VERSION. Invariant: only runs when version == GRAPH_SCHEMA_VERSION (graph
+    // backfill already consumed its slot). A graph-disabled open leaves user_version=0 so the
+    // graph slot is preserved; this gate is therefore never reached until a graph-enabled open
+    // advances to version 1 first. NULLs self-heal on that first graph-enabled open.
+    const versionNow = this.db.pragma("user_version", { simple: true }) as number;
+    if (versionNow >= GRAPH_SCHEMA_VERSION && versionNow < TEMPORAL_SCHEMA_VERSION) {
+      this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL`);
+      this.db.pragma(`user_version = ${TEMPORAL_SCHEMA_VERSION}`);
+    }
   }
 
   // ---- librarian: alias resolution ----------------------------------------
@@ -662,7 +697,7 @@ export class MonetCore {
     if (opts.attachTo) {
       // Direct attach: bypass scoring, land on named concept.
       const targetRow = this.getRow(opts.attachTo)!;
-      row = this.attach(targetRow, content, emb);
+      row = this.attach(targetRow, content, emb, sessionId);
       action = "attached";
     } else if (opts.resolution === "forceNew") {
       // Always create a new concept regardless of similarity.
@@ -673,7 +708,7 @@ export class MonetCore {
       // Auto resolution: score-based deduplication.
       if (match && score >= this.tauAttach) {
         action = "attached";
-        row = this.attach(match, content, emb);
+        row = this.attach(match, content, emb, sessionId);
       } else if (match && score >= this.tauAmbiguous) {
         // A wrong fork is recoverable (the pair can be merged later); a wrong merge is not
         // (split loses provenance). Ambiguous-band evidence therefore forks, with a
@@ -683,7 +718,7 @@ export class MonetCore {
         if (opts.kind === "correction") {
           // Attach to the near match and let the existing correction path open a contradiction.
           action = "ambiguous";
-          row = this.attach(match, content, emb);
+          row = this.attach(match, content, emb, sessionId);
           nearMatchId = match.id;
           nearMatchScore = score;
         } else {
@@ -950,14 +985,25 @@ export class MonetCore {
     const active = this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' AND status = 'active'`)
       .all(circle) as ConceptRow[];
-    const isStale = (r: ConceptRow): boolean => now - r.updated_at > this.staleAfterMs;
+    const isStale = (r: ConceptRow): boolean => now - (r.last_confirmed_at ?? r.updated_at) > this.staleAfterMs;
     const topConcepts = active
       .filter((r) => !isStale(r))
       .map((r) => ({ r, score: livingModelScore(r, now) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, conceptLimit)
       .map(({ r }) => livingModelCard(r));
-    const staleConcepts = active.filter(isStale).map(livingModelCard);
+    const staleConcepts = active
+      .filter(isStale)
+      // Sort stalest-first (ascending confirmation age) so the cap keeps the oldest, not an
+      // arbitrary rowid-order slice.  Deterministic tiebreak on id prevents non-determinism
+      // (ordering non-determinism has shipped real bugs in this repo — sibling topConcepts sorts).
+      .sort((a, b) => {
+        const aTs = a.last_confirmed_at ?? a.updated_at;
+        const bTs = b.last_confirmed_at ?? b.updated_at;
+        return aTs !== bTs ? aTs - bTs : a.id < b.id ? -1 : 1;
+      })
+      .slice(0, STALE_CONCEPTS_PREWARM_LIMIT)
+      .map(livingModelCard);
 
     return {
       activeWorkstreams,
@@ -1007,6 +1053,7 @@ export class MonetCore {
       this.db
         .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`)
         .run(opts.by ?? null, contradictionId);
+      // dismiss: do NOT refresh temporal fields (no new evidence confirms; the conflict is simply set aside)
     } else {
       const allIds = (
         this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`).all(conceptId) as Array<{ id: string }>
@@ -1031,6 +1078,11 @@ export class MonetCore {
           `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`,
         )
         .run(winnerObsId, opts.by ?? null, contradictionId);
+      // accept-new / keep-current: a verdict is evidence that the concept's state is confirmed — refresh.
+      const now = Date.now();
+      this.db
+        .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
+        .run(now, this.sessionId, conceptId);
     }
 
     // Restore the concept once nothing is left open against it.
@@ -1066,7 +1118,7 @@ export class MonetCore {
     const rows = this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' AND status = 'active'`)
       .all(circle) as ConceptRow[];
-    return rows.filter((r) => now - r.updated_at > this.staleAfterMs).map(livingModelCard);
+    return rows.filter((r) => now - (r.last_confirmed_at ?? r.updated_at) > this.staleAfterMs).map(livingModelCard);
   }
 
   /** Count of observations superseded by a correction/resolution (observability + tests). */
@@ -1192,6 +1244,7 @@ export class MonetCore {
       supportCount: r.support_count,
       contradictions: contradictions.get(r.id) ?? 0,
       updatedAt: r.updated_at,
+      lastConfirmedAt: r.last_confirmed_at ?? null,
       ...(opts.withProvenance ? { provenance: provByConcept.get(r.id) ?? [] } : {}),
     }));
   }
@@ -1508,6 +1561,22 @@ export class MonetCore {
         this.db
           .prepare(`UPDATE concepts SET aliases = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
           .run(JSON.stringify(mergedAliases), destConceptId);
+        // Temporal: FULL consolidation MAX-carries last_confirmed_at — mirrors mergeConceptInto's exact semantics.
+        // The session id belongs to whichever side is newer.
+        // PARTIAL detach into an existing dest intentionally does NOT carry temporal fields: a
+        // concept-level confirmation timestamp cannot be attributed to a subset of moved observations.
+        {
+          const destRowForTemporal = this.db
+            .prepare(`SELECT last_confirmed_at, last_confirmed_session_id, updated_at FROM concepts WHERE id = ?`)
+            .get(destConceptId) as { last_confirmed_at: number | null; last_confirmed_session_id: string | null; updated_at: number };
+          const srcLca = srcRow.last_confirmed_at ?? srcRow.updated_at;
+          const tgtLca = destRowForTemporal.last_confirmed_at ?? destRowForTemporal.updated_at;
+          const mergedLca = Math.max(srcLca, tgtLca);
+          const mergedLcaSession = srcLca > tgtLca ? srcRow.last_confirmed_session_id : destRowForTemporal.last_confirmed_session_id;
+          this.db
+            .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
+            .run(mergedLca, mergedLcaSession, destConceptId);
+        }
         // Consolidation: all observations moved to an existing dest — delete the source concept.
         // Graph must be unwound first; no rederive since the concept no longer exists.
         this.unwindConceptGraph(sourceConceptId, circle);
@@ -1557,9 +1626,10 @@ export class MonetCore {
         // single-observation case: create() already used its content+embedding, nothing more to do
       } else {
         // destAction === "attached": attach each detached obs in order, refreshing destRow between calls.
+        // null sessionId: moved observations are old evidence, not new confirmation — no temporal refresh.
         for (const obs of detachingRows) {
           const currentDest = this.getRow(destConceptId)!;
-          this.attach(currentDest, obs.content, jsonToEmb(obs.embedding));
+          this.attach(currentDest, obs.content, jsonToEmb(obs.embedding), null);
         }
       }
 
@@ -1575,11 +1645,11 @@ export class MonetCore {
       // duplicate resolves that pair (mirrors the existing consolidation behaviour).
       //
       // When the source is fully deleted its edges die with it — correct, don't restore those.
-      type DupEdge = { src_id: string; dst_id: string; weight: number; origin: string };
+      type DupEdge = { src_id: string; dst_id: string; weight: number; origin: string; dismissed_at: number | null; dismissed_by: string | null };
       const snapDupEdges = (conceptId: string): DupEdge[] =>
         this.db
           .prepare(
-            `SELECT src_id, dst_id, weight, origin FROM memory_edge
+            `SELECT src_id, dst_id, weight, origin, dismissed_at, dismissed_by FROM memory_edge
               WHERE scope = ? AND type = 'possible_duplicate_of' AND (src_id = ? OR dst_id = ?)`,
           )
           .all(circle, conceptId, conceptId) as DupEdge[];
@@ -1594,9 +1664,18 @@ export class MonetCore {
         this.unwindConceptGraph(sourceConceptId, circle);
         this.rederiveConceptGraph(sourceConceptId, circle);
         // Restore surviving duplicate-pair edges on the source (exclude src↔dest pair).
+        // Carry dismissed_at/dismissed_by so a dismissed pair is not un-dismissed by a detach/rederive cycle.
         for (const e of srcDupSnapshot) {
           if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
           this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
+          if (e.dismissed_at !== null) {
+            this.db
+              .prepare(
+                `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?
+                  WHERE scope = ? AND type = 'possible_duplicate_of' AND src_id = ? AND dst_id = ?`,
+              )
+              .run(e.dismissed_at, e.dismissed_by, circle, e.src_id, e.dst_id);
+          }
         }
       }
       if (destAction === "created") {
@@ -1606,9 +1685,18 @@ export class MonetCore {
         this.unwindConceptGraph(destConceptId, circle);
         this.rederiveConceptGraph(destConceptId, circle);
         // Restore surviving duplicate-pair edges on the destination (exclude src↔dest pair).
+        // Carry dismissed_at/dismissed_by so a dismissed pair is not un-dismissed by a detach/rederive cycle.
         for (const e of dstDupSnapshot) {
           if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
           this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
+          if (e.dismissed_at !== null) {
+            this.db
+              .prepare(
+                `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?
+                  WHERE scope = ? AND type = 'possible_duplicate_of' AND src_id = ? AND dst_id = ?`,
+              )
+              .run(e.dismissed_at, e.dismissed_by, circle, e.src_id, e.dst_id);
+          }
         }
       }
 
@@ -1847,6 +1935,7 @@ export class MonetCore {
            JOIN concepts ca ON ca.id = e.src_id
            JOIN concepts cb ON cb.id = e.dst_id
           WHERE e.scope = ? AND e.type = 'possible_duplicate_of'
+            AND e.dismissed_at IS NULL
             AND e.src_id < e.dst_id
             AND ca.kind != 'workstream'
             AND cb.kind != 'workstream'
@@ -1863,6 +1952,7 @@ export class MonetCore {
           JOIN concepts ca ON ca.id = e.src_id
           JOIN concepts cb ON cb.id = e.dst_id
          WHERE e.scope = ? AND e.type = 'possible_duplicate_of'
+           AND e.dismissed_at IS NULL
            AND e.src_id < e.dst_id
            AND ca.kind != 'workstream'
            AND cb.kind != 'workstream'`,
@@ -1873,6 +1963,44 @@ export class MonetCore {
 
   private scopedCount(sql: string, circle: string): number {
     return (this.db.prepare(sql).get(circle) as { n: number }).n;
+  }
+
+  /**
+   * Dismiss a possible-duplicate pair — the agent asserts these two concepts are NOT duplicates.
+   * Sets dismissed_at + dismissed_by on all possible_duplicate_of edges between the pair (both
+   * directions are stored by upsertEdgeBoth, so both rows are updated). The dismissal survives
+   * a detach/rederive cycle (snapDupEdges carries dismissed_at/dismissed_by through restore).
+   * A reinforcing near-miss (ON CONFLICT path in upsertEdge) does NOT clear dismissed fields.
+   *
+   * Scope gate: mirrors the circle/scope validation that single-concept mutation ops perform —
+   * both concept ids must exist and live in the same circle (the scope of the edge).
+   *
+   * Graceful error when either concept is gone (consolidated away or never existed): returns an
+   * object with `error` instead of throwing, so callers can surface a friendly message.
+   */
+  dismissPossibleDuplicate(
+    conceptAId: string,
+    conceptBId: string,
+    dismissedBy?: string,
+  ): { dismissed: true; conceptAId: string; conceptBId: string; rowsUpdated: number } | { dismissed: false; error: string } {
+    const rowA = this.db.prepare(`SELECT id, circle FROM concepts WHERE id = ?`).get(conceptAId) as { id: string; circle: string } | undefined;
+    const rowB = this.db.prepare(`SELECT id, circle FROM concepts WHERE id = ?`).get(conceptBId) as { id: string; circle: string } | undefined;
+    if (!rowA) return { dismissed: false, error: `concept not found: ${conceptAId}` };
+    if (!rowB) return { dismissed: false, error: `concept not found: ${conceptBId}` };
+    if (rowA.circle !== rowB.circle) return { dismissed: false, error: `concepts are in different circles: '${rowA.circle}' vs '${rowB.circle}'` };
+    const circle = rowA.circle;
+    // Verify both ids are in the defaultCircle-resolved scope (mirrors circleOf gate used elsewhere).
+    // circle is already the resolved circle from the row, not a user-supplied alias — no re-resolve needed.
+    const now = Date.now();
+    const result = this.db
+      .prepare(
+        `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?
+          WHERE scope = ? AND type = 'possible_duplicate_of'
+            AND dismissed_at IS NULL
+            AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))`,
+      )
+      .run(now, dismissedBy ?? null, circle, conceptAId, conceptBId, conceptBId, conceptAId);
+    return { dismissed: true, conceptAId, conceptBId, rowsUpdated: result.changes };
   }
 
   /**
@@ -2372,7 +2500,9 @@ export class MonetCore {
     })();
   }
 
-  /** One directed edge, idempotent + reinforcing (count↑, weight = max) on re-encounter. */
+  /** One directed edge, idempotent + reinforcing (count↑, weight = max) on re-encounter.
+   *  The ON CONFLICT clause intentionally does NOT touch dismissed_at / dismissed_by — a dismissal
+   *  survives reinforcement (a reinforcing near-miss does not un-dismiss a user-dismissed pair). */
   private upsertEdge(src: string, dst: string, type: string, weight: number, origin: string, scope: string): void {
     if (src === dst) return;
     this.db
@@ -2517,12 +2647,20 @@ export class MonetCore {
     const version = target.version + 1;
     // Stay disputed while any open contradiction (target's own or the carried one) remains.
     const status = this.openContraCount(target.id) > 0 ? "disputed" : "active";
+    // Temporal: carry MAX(last_confirmed_at) — the merge preserves the most-recent confirmation.
+    // The session id belongs to whichever timestamp is newer.
+    const srcLca = src.last_confirmed_at ?? src.updated_at;
+    const tgtLca = target.last_confirmed_at ?? target.updated_at;
+    const mergedLca = Math.max(srcLca, tgtLca);
+    const mergedLcaSession = srcLca > tgtLca ? src.last_confirmed_session_id : target.last_confirmed_session_id;
     this.db
       .prepare(
         `UPDATE concepts SET body = ?, support_count = ?, embedding = ?, source_refs = ?, aliases = ?, version = ?,
-                status = ?, dirty = 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
+                status = ?, dirty = 1, updated_at = unixepoch() * 1000,
+                last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`,
       )
-      .run(lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, JSON.stringify(aliases), version, status, target.id);
+      .run(lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, JSON.stringify(aliases), version, status,
+           mergedLca, mergedLcaSession, target.id);
     // 4) Drop the source: its graph footprint in fromCircle, its revision history, then the row.
     this.unwindConceptGraph(src.id, fromCircle);
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
@@ -2841,17 +2979,28 @@ export class MonetCore {
   private create(content: string, emb: Float32Array, circle: string, kind?: string): ConceptRow {
     const id = this.newId();
     const title = firstLine(content);
+    const sessionId = this.sessionId; // lazily opened; stamp if available (forceNew path also goes through ensureSession before create)
+    const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO concepts (id, slug, title, body, kind, embedding, support_count, version, dirty, circle)
-         VALUES (?, ?, ?, ?, ?, ?, 1, 0, 1, ?)`,
+        `INSERT INTO concepts (id, slug, title, body, kind, embedding, support_count, version, dirty, circle,
+                               last_confirmed_at, last_confirmed_session_id)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 0, 1, ?, ?, ?)`,
       )
-      .run(id, slugify(title), title, content.trim(), kind ?? "fact", embToJson(emb), circle);
+      .run(id, slugify(title), title, content.trim(), kind ?? "fact", embToJson(emb), circle, now, sessionId);
     return this.getRow(id)!;
   }
 
-  private attach(concept: ConceptRow, content: string, emb: Float32Array): ConceptRow {
-    // Sift only: append raw evidence (usable fallback), update vector + meta, mark dirty.
+  /**
+   * Sift only: append raw evidence (usable fallback), update vector + meta, mark dirty.
+   * `sessionId` drives the same-session gate (ADR 0.6.0 temporal layer):
+   *   - cross-session (sessionId differs from last_confirmed_session_id): apply +0.1 confidence increment,
+   *     refresh last_confirmed_at + last_confirmed_session_id.
+   *   - same-session (ids match): SKIP confidence increment and temporal refresh — still attaches the
+   *     observation, updates running-mean embedding/body, and increments supportCount.
+   *   - null sessionId: moved/old observations (detach reattach path) — no temporal refresh, no confidence bump.
+   */
+  private attach(concept: ConceptRow, content: string, emb: Float32Array, sessionId?: string | null): ConceptRow {
     const lines = splitLines(concept.body);
     const trimmed = content.trim();
     if (!lines.includes(trimmed)) lines.push(trimmed);
@@ -2859,18 +3008,37 @@ export class MonetCore {
     const version = concept.version + 1;
     const supportCount = concept.support_count + 1;
     const blended = blend(jsonToEmb(concept.embedding), emb, concept.support_count);
-    const confidence = Math.min(1, concept.confidence + 0.1);
 
-    this.db
-      .prepare(
-        `UPDATE concepts
-            SET body = ?, version = ?, support_count = ?, embedding = ?,
-                confidence = ?,
-                status = CASE WHEN status = 'disputed' THEN 'disputed' ELSE 'active' END,
-                dirty = 1, updated_at = unixepoch() * 1000
-          WHERE id = ?`,
-      )
-      .run(body, version, supportCount, embToJson(blended), confidence, concept.id);
+    // Cross-session = sessionId provided AND differs from the concept's last_confirmed_session_id.
+    // Same-session = sessionId provided AND matches. null = detach reattach (old evidence, no confirm).
+    const isCrossSession = sessionId != null && sessionId !== concept.last_confirmed_session_id;
+    const confidence = isCrossSession ? Math.min(1, concept.confidence + 0.1) : concept.confidence;
+    const now = Date.now();
+
+    if (isCrossSession) {
+      this.db
+        .prepare(
+          `UPDATE concepts
+              SET body = ?, version = ?, support_count = ?, embedding = ?,
+                  confidence = ?,
+                  status = CASE WHEN status = 'disputed' THEN 'disputed' ELSE 'active' END,
+                  dirty = 1, updated_at = unixepoch() * 1000,
+                  last_confirmed_at = ?, last_confirmed_session_id = ?
+            WHERE id = ?`,
+        )
+        .run(body, version, supportCount, embToJson(blended), confidence, now, sessionId, concept.id);
+    } else {
+      this.db
+        .prepare(
+          `UPDATE concepts
+              SET body = ?, version = ?, support_count = ?, embedding = ?,
+                  confidence = ?,
+                  status = CASE WHEN status = 'disputed' THEN 'disputed' ELSE 'active' END,
+                  dirty = 1, updated_at = unixepoch() * 1000
+            WHERE id = ?`,
+        )
+        .run(body, version, supportCount, embToJson(blended), confidence, concept.id);
+    }
     return this.getRow(concept.id)!;
   }
 
@@ -2937,6 +3105,7 @@ function toConcept(r: ConceptRow): Concept {
     circle: r.circle,
     supportCount: r.support_count,
     dirty: r.dirty === 1,
+    lastConfirmedAt: r.last_confirmed_at ?? null,
   };
 }
 

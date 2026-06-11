@@ -267,6 +267,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
           supportCount: c.supportCount,
           confidence: c.confidence,
           version: c.version,
+          lastConfirmedAt: c.lastConfirmedAt,
           needsSynthesis: c.needsSynthesis,
           // Only invite synthesis when ALL evidence is shown (offset=0 AND total fits one page).
           // memory_synthesize clears `dirty` with the body the agent writes, so synthesizing from
@@ -367,16 +368,45 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
 
   server.tool(
     "memory_resolve",
-    "Mediate a contradiction — never silent last-write-wins. decision: 'accept-new' (the correcting evidence wins), 'keep-current' (the prior wins), or 'dismiss' (not a real conflict). The losing observation is superseded; for accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain.",
+    "Mediate a contradiction OR dismiss a possible-duplicate pair — two verdict families, one tool. " +
+    "CONTRADICTION VERDICT: pass `contradictionId` + `decision` ('accept-new' / 'keep-current' / 'dismiss'). " +
+    "accept-new: the correcting evidence wins; keep-current: the prior wins; dismiss: not a real conflict. " +
+    "The losing observation is superseded; for accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain. " +
+    "DUPLICATE-PAIR DISMISSAL: pass `conceptAId` + `conceptBId` (omit contradictionId/decision). " +
+    "Asserts these two concepts are NOT duplicates — they leave the possibleDuplicates list and survive any future detach/rederive cycle. " +
+    "Dismissing a pair where no live possible_duplicate_of edge exists succeeds idempotently with rowsUpdated: 0 (\"nothing to dismiss\" signal). " +
+    "Pass `resolvedBy` / `circle` for either family. Existing contradiction-path callers are unaffected.",
     {
-      contradictionId: z.string(),
-      decision: z.enum(["accept-new", "keep-current", "dismiss"]),
+      // Contradiction-resolution fields (existing — backward compatible).
+      contradictionId: z.string().optional().describe("The contradiction to mediate. Required for contradiction verdicts; omit for duplicate-pair dismissal."),
+      decision: z.enum(["accept-new", "keep-current", "dismiss"]).optional().describe("Verdict for a contradiction. Required when contradictionId is present."),
       body: z.string().optional(),
       resolvedBy: z.string().optional(),
-      circle: z.string().optional().describe("The circle the contradiction belongs to (defaults to this session's circle)."),
+      circle: z.string().optional().describe("The circle the contradiction or concepts belong to (defaults to this session's circle)."),
+      // Duplicate-pair dismissal fields (new in 0.6.0).
+      conceptAId: z.string().optional().describe("First concept of a possible-duplicate pair to dismiss. Required for duplicate-pair dismissal; omit for contradiction verdicts."),
+      conceptBId: z.string().optional().describe("Second concept of a possible-duplicate pair to dismiss. Required for duplicate-pair dismissal; omit for contradiction verdicts."),
     },
-    async ({ contradictionId, decision, body, resolvedBy, circle }) => {
+    async ({ contradictionId, decision, body, resolvedBy, circle, conceptAId, conceptBId }) => {
       try {
+        // --- Duplicate-pair dismissal path ---
+        if (conceptAId !== undefined || conceptBId !== undefined) {
+          if (!conceptAId || !conceptBId) return err("duplicate-pair dismissal requires both conceptAId and conceptBId");
+          if (contradictionId !== undefined) return err("provide either contradictionId (contradiction verdict) or conceptAId+conceptBId (duplicate-pair dismissal), not both");
+          // Scope enforcement: both concepts must live in the caller-named circle.
+          const circleA = core.circleOf(conceptAId);
+          const circleB = core.circleOf(conceptBId);
+          if (circleA === null) return err(`concept not found: ${conceptAId}`);
+          if (circleB === null) return err(`concept not found: ${conceptBId}`);
+          if (circleA !== scope(circle)) return err(`concept not found: ${conceptAId}`);
+          if (circleB !== scope(circle)) return err(`concept not found: ${conceptBId}`);
+          const r = core.dismissPossibleDuplicate(conceptAId, conceptBId, resolvedBy);
+          if (!r.dismissed) return err(r.error);
+          return ok({ circle: scope(circle), action: "duplicate-pair-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated });
+        }
+        // --- Contradiction verdict path (original, unchanged) ---
+        if (!contradictionId) return err("contradictionId is required for contradiction verdicts");
+        if (!decision) return err("decision is required for contradiction verdicts");
         if (core.circleOfContradiction(contradictionId) !== scope(circle)) return err(`contradiction not found: ${contradictionId}`); // scope enforcement
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
@@ -589,7 +619,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
 }
 
 export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
-  const server = new McpServer({ name: "monet-core", version: "0.5.0" }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: "monet-core", version: "0.6.0" }, { capabilities: { tools: {} } });
   registerMonetCoreTools(server, core);
   const transport = new StdioServerTransport();
   await server.connect(transport);
