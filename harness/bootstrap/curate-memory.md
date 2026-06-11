@@ -22,7 +22,12 @@ For each dirty concept: `memory_fetch` → reconcile the observations into one c
 
 ## Phase 2 — Mediate possible duplicates
 
-For each pair in `possibleDuplicates`: `memory_fetch` BOTH concepts and judge on bodies, never titles. Propose with reasoning: "These look like the same concept — [A] and [B]. Consolidate?" On yes: `memory_detach` the loser's observations into the keeper (`destConceptId`) — the loser is consolidated away and its name survives as an alias on the keeper. Work in batches of 3–5 pairs, pausing for confirmation between batches.
+For each pair in `possibleDuplicates`: `memory_fetch` BOTH concepts and judge on bodies, never titles. Two verdicts:
+
+- **Same concept (consolidate):** `memory_detach` the loser's observations into the keeper (`destConceptId`) — the loser is consolidated away and its name survives as an alias on the keeper.
+- **Distinct concepts (keep both, ≥ 0.6.0):** call `memory_resolve` with `conceptAId` + `conceptBId` (omit `contradictionId` and `decision`) — the pair drains from `memory_overview.possibleDuplicates`; re-dismissing an already-dismissed pair returns `rowsUpdated: 0` (idempotent).
+
+Work in batches of 3–5 pairs, pausing for confirmation between batches.
 
 ## Phase 3 — Propose circle reorganizations
 
@@ -37,7 +42,9 @@ Rules of the road: `forceNew` is the default for every curation move — near-ma
 
 ## Phase 4 — Stale review
 
-For each stale concept the overview surfaced: "Last confirmed [when]: [title] — still true?" Options: the user confirms (store a confirming observation), corrects (store with `kind: "correction"` — opens a dispute to mediate), or retires it (consolidate into a successor concept, or leave archived-by-staleness).
+Staleness derives from `lastConfirmedAt` (≥ 0.6.0) — a concept is stale when its last evidence-based confirmation is older than the staleness window (~30 days by default), not merely when it was last edited. `memory_fetch` alone does NOT reset the clock; confirmation requires new evidence. To re-confirm a still-true stale concept, `memory_store` fresh confirming evidence — a cross-session attach refreshes `lastConfirmedAt` and clears the stale signal.
+
+For each stale concept the overview surfaced: "Last confirmed [when]: [title] — still true?" Options: the user confirms (store a confirming observation — this refreshes `lastConfirmedAt`), corrects (store with `kind: "correction"` — opens a dispute to mediate), or retires it (consolidate into a successor concept, or leave archived-by-staleness).
 
 ## Phase 5 — Report
 
