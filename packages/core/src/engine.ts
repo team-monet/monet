@@ -81,6 +81,8 @@ export interface SearchCard {
   confidence: number;
   score: number;
   fetchHint: string;
+  /** The circle this memory lives in. Always present — useful in store-wide (omitted-circle) results. */
+  circle: string;
 }
 
 export interface IngestResult {
@@ -274,6 +276,8 @@ export interface MemoryOverview {
     edgesByType: Array<{ type: string; count: number }>;
     thread: { label: string; size: number; members: Array<{ id: string; title: string; kind: string }> } | null;
   };
+  /** Other circles present in the store (name + concept count + last activity). Omitted when the store has only one circle. */
+  otherCircles?: Array<{ circle: string; concepts: number; lastActivity: number }>;
 }
 
 /**
@@ -689,20 +693,39 @@ export class MonetCore {
   /**
    * Tier-1 read: returns a structural CARD per match — kind, depth, confidence, a fetch
    * hint — and deliberately NO content. Never triggers synthesis. (ADR §4.5, #232.)
+   *
+   * When `opts.circle` is omitted, searches across ALL circles (store-wide). Cards carry their
+   * home `circle` field. Tie-break (|scoreDiff| ≤ 1e-9): same-circle-as-defaultCircle rows rank
+   * before cross-circle rows, then id ascending. When `opts.circle` is provided, scopes exactly
+   * to that circle (unchanged single-circle behavior).
    */
   async search(query: string, opts: { circle?: string; limit?: number } = {}): Promise<SearchCard[]> {
-    const circle = opts.circle ?? this.defaultCircle;
     const limit = opts.limit ?? 5;
     const emb = await this.embedder.embed(query);
     // Workstreams are identity-upserted state, not embedding-resolved knowledge — keep them
     // out of dedup candidates and search cards (they're restored via getActiveWorkstreams).
-    const rows = this.db
-      .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream'`)
-      .all(circle) as ConceptRow[];
-    const contradictions = this.openContradictionCounts(circle);
+    const rows: ConceptRow[] = opts.circle !== undefined
+      ? this.db
+          .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+          .all(opts.circle) as ConceptRow[]
+      : this.db
+          .prepare(`SELECT * FROM concepts WHERE kind != 'workstream'`)
+          .all() as ConceptRow[];
+    const contradictions = this.openContradictionCountsGlobal(opts.circle);
+    const defaultCircle = this.defaultCircle;
     return rows
       .map((r) => ({ row: r, score: cosine(emb, jsonToEmb(r.embedding)) }))
-      .sort((a, b) => b.score - a.score)
+      .sort((a, b) => {
+        const diff = b.score - a.score;
+        if (Math.abs(diff) > 1e-9) return diff;
+        // Tie-break in store-wide mode: same-circle-as-defaultCircle first, then id ascending.
+        if (opts.circle === undefined) {
+          const aHome = a.row.circle === defaultCircle ? 0 : 1;
+          const bHome = b.row.circle === defaultCircle ? 0 : 1;
+          if (aHome !== bHome) return aHome - bHome;
+        }
+        return a.row.id < b.row.id ? -1 : 1;
+      })
       .slice(0, limit)
       .map(({ row, score }) => toCard(row, score, contradictions.get(row.id) ?? 0));
   }
@@ -965,13 +988,24 @@ export class MonetCore {
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE superseded_by IS NOT NULL`).get() as { n: number }).n;
   }
 
-  private openContradictionCounts(circle: string): Map<string, number> {
-    const rows = this.db
-      .prepare(
-        `SELECT k.concept_id AS cid, COUNT(*) AS n FROM contradictions k JOIN concepts c ON c.id = k.concept_id
-          WHERE k.status = 'open' AND c.circle = ? GROUP BY k.concept_id`,
-      )
-      .all(circle) as Array<{ cid: string; n: number }>;
+  /**
+   * Count open contradictions per concept. When `circle` is provided, scopes to that circle
+   * (original behavior). When omitted, counts across all circles (store-wide — for use with
+   * store-wide search results).
+   */
+  private openContradictionCountsGlobal(circle?: string): Map<string, number> {
+    const rows: Array<{ cid: string; n: number }> = circle !== undefined
+      ? this.db
+          .prepare(
+            `SELECT k.concept_id AS cid, COUNT(*) AS n FROM contradictions k JOIN concepts c ON c.id = k.concept_id
+              WHERE k.status = 'open' AND c.circle = ? GROUP BY k.concept_id`,
+          )
+          .all(circle) as Array<{ cid: string; n: number }>
+      : this.db
+          .prepare(
+            `SELECT concept_id AS cid, COUNT(*) AS n FROM contradictions WHERE status = 'open' GROUP BY concept_id`,
+          )
+          .all() as Array<{ cid: string; n: number }>;
     const m = new Map<string, number>();
     for (const r of rows) m.set(r.cid, r.n);
     return m;
@@ -1039,7 +1073,7 @@ export class MonetCore {
       }
     }
     const rows = this.db.prepare(sql).all(...params) as ConceptRow[];
-    const contradictions = this.openContradictionCounts(circle);
+    const contradictions = this.openContradictionCountsGlobal(circle);
 
     // Provenance only for the page's concepts: distinct session scope_context per returned concept.
     const provByConcept = new Map<string, string[]>();
@@ -1790,7 +1824,37 @@ export class MonetCore {
         edgesByType,
         thread: this.topThread(circle),
       },
+      ...((): { otherCircles?: Array<{ circle: string; concepts: number; lastActivity: number }> } => {
+        const others = this.listCircles(circle);
+        return others.length > 0 ? { otherCircles: others } : {};
+      })(),
     };
+  }
+
+  /**
+   * List circles in the store, excluding `excludeCircle` (typically the current circle).
+   * Returns up to 20 circles ordered by most recent activity, with concept count (excluding
+   * workstreams) and last activity timestamp. Used by overview() to surface otherCircles.
+   */
+  listCircles(excludeCircle?: string): Array<{ circle: string; concepts: number; lastActivity: number }> {
+    const rows: Array<{ circle: string; concepts: number; lastActivity: number }> = excludeCircle !== undefined
+      ? this.db
+          .prepare(
+            `SELECT circle, COUNT(*) AS concepts, MAX(updated_at) AS lastActivity
+               FROM concepts WHERE kind != 'workstream' AND circle != ?
+              GROUP BY circle
+              ORDER BY lastActivity DESC LIMIT 20`,
+          )
+          .all(excludeCircle) as Array<{ circle: string; concepts: number; lastActivity: number }>
+      : this.db
+          .prepare(
+            `SELECT circle, COUNT(*) AS concepts, MAX(updated_at) AS lastActivity
+               FROM concepts WHERE kind != 'workstream'
+              GROUP BY circle
+              ORDER BY lastActivity DESC LIMIT 20`,
+          )
+          .all() as Array<{ circle: string; concepts: number; lastActivity: number }>;
+    return rows;
   }
 
   close(): void {
@@ -2217,23 +2281,28 @@ export class MonetCore {
   /**
    * gather(intent) — ADR §4.7's active context-builder: hybrid seed → 2-hop weighted spreading
    * activation across the MAGMA graph → similarity-floored fusion → seed-relative evidence-gap
-   * stop. Strictly scope-isolated. Read-only (never opens a session). Where plain top-k returns
-   * the most-similar few, gather recovers the whole neighbourhood — the divergent-vocabulary
-   * thread members similarity alone misses. Cold graph ⇒ degrades exactly to search().
+   * stop. Read-only (never opens a session). Where plain top-k returns the most-similar few,
+   * gather recovers the whole neighbourhood — the divergent-vocabulary thread members similarity
+   * alone misses. Cold graph ⇒ degrades exactly to search().
+   *
+   * When `opts.circle` is omitted, seeds from ALL circles; each seed spreads within ITS OWN
+   * circle (edges are circle-scoped, so cross-circle spreading is structurally impossible —
+   * this supplies the right scope per seed). Entity seeding and reachableByType remain
+   * defaultCircle-scoped when circle is undefined (conservative; dense+lexical cover all circles).
+   * When `opts.circle` is provided, strictly scope-isolated (unchanged behavior).
    */
   async gather(intent: string, opts: { circle?: string; limit?: number; depth?: number } = {}): Promise<GatherResult> {
-    const circle = opts.circle ?? this.defaultCircle;
     const limit = opts.limit ?? 12;
     const params = opts.depth ? { ...this.graphParams, hopLimit: Math.max(1, Math.min(opts.depth, 3)) } : this.graphParams;
     const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };
 
     const emb = await this.embedder.embed(intent);
-    const dense = this.scoreAllConcepts(emb, circle); // [{id, cos}] desc
+    const dense = this.scoreAllConcepts(emb, opts.circle); // [{id, cos}] desc
     const sim = new Map<string, number>();
     for (const d of dense) if (d.cos > 0) sim.set(d.id, d.cos);
 
     const denseIds = dense.filter((d) => d.cos > 0).map((d) => d.id);
-    const lexIds = this.lexicalSeed(intent, circle, 30);
+    const lexIds = this.lexicalSeed(intent, opts.circle, 30);
     const fused = rrfFuse([denseIds, lexIds], RRF_K).slice(0, SEED_K);
     const seedIds = fused.map((f) => f.id);
 
@@ -2242,10 +2311,13 @@ export class MonetCore {
     for (const f of fused) seedStrength.set(f.id, maxRrf > 0 ? f.rrf / maxRrf : 1);
 
     // Entity-anchored seeding from the PROBE TEXT ONLY (never scenario metadata) — complementary.
+    // When circle is undefined (store-wide), scope entity seeding to defaultCircle (conservative —
+    // dense+lexical seeds already cover all circles).
+    const entityCircle = opts.circle ?? this.defaultCircle;
     for (const e of extractEntities(intent)) {
-      if (this.isHub(e.key, circle)) continue;
-      const boost = (params.wType.about ?? 1) * this.rarity(e.key, circle) * (KIND_BOOST[e.kind] ?? 1) * 0.1;
-      for (const m of this.coMembers(e.key, circle, "", MAX_NEIGHBORS)) {
+      if (this.isHub(e.key, entityCircle)) continue;
+      const boost = (params.wType.about ?? 1) * this.rarity(e.key, entityCircle) * (KIND_BOOST[e.kind] ?? 1) * 0.1;
+      for (const m of this.coMembers(e.key, entityCircle, "", MAX_NEIGHBORS)) {
         seedStrength.set(m, Math.max(seedStrength.get(m) ?? 0, boost));
       }
     }
@@ -2254,7 +2326,14 @@ export class MonetCore {
     // Spread ONLY over thread/causal edges (worked-together / caused-by). about/related are NOT
     // spread — they re-encode similarity (the seed signal) and would inject single-fact noise;
     // entity recall enters gather via the entity-anchored SEEDING above, not via spread.
-    const activation = spread(seedStrength, (id) => this.adjacency(id, circle, THREAD_TYPES), params);
+    // In store-wide mode each seed spreads within its OWN circle — edges are circle-scoped by
+    // schema so cross-circle spreading is structurally impossible; this just supplies the right
+    // scope per seed.
+    const activation = spread(
+      seedStrength,
+      (id) => this.adjacency(id, this.circleOf(id) ?? this.defaultCircle, THREAD_TYPES),
+      params,
+    );
 
     const priors = new Map<string, number>();
     for (const id of activation.keys()) if (!sim.has(id)) priors.set(id, this.nodePrior(id));
@@ -2267,6 +2346,8 @@ export class MonetCore {
     };
     const { accepted, stopReason } = evidenceGapStop(ranked, seedIds.length, embOf, cosine, params);
 
+    // reachableByType: when circle undefined, pass defaultCircle (explainability metric approximation).
+    const reachCircle = opts.circle ?? this.defaultCircle;
     return {
       seed: seedIds.map((id) => this.cardOf(id)).filter((c): c is SearchCard => c !== null),
       ranked: accepted
@@ -2274,7 +2355,7 @@ export class MonetCore {
         .map((r) => this.toGatherCard(r))
         .filter((c): c is GatherCard => c !== null),
       stopReason,
-      reachableByType: this.reachableByType(seedIds, circle, params.hopLimit),
+      reachableByType: this.reachableByType(seedIds, reachCircle, params.hopLimit),
     };
   }
 
@@ -2289,22 +2370,31 @@ export class MonetCore {
     this.endSession(summary);
   }
 
-  private scoreAllConcepts(emb: Float32Array, circle: string): Array<{ id: string; cos: number }> {
-    const rows = this.db
-      .prepare(`SELECT id, embedding FROM concepts WHERE circle = ? AND kind != 'workstream'`)
-      .all(circle) as Array<{ id: string; embedding: string }>;
+  /** Score all concepts by cosine. When `circle` is omitted, scores across all circles. */
+  private scoreAllConcepts(emb: Float32Array, circle?: string): Array<{ id: string; cos: number }> {
+    const rows: Array<{ id: string; embedding: string }> = circle !== undefined
+      ? this.db
+          .prepare(`SELECT id, embedding FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+          .all(circle) as Array<{ id: string; embedding: string }>
+      : this.db
+          .prepare(`SELECT id, embedding FROM concepts WHERE kind != 'workstream'`)
+          .all() as Array<{ id: string; embedding: string }>;
     return rows
       .map((r) => ({ id: r.id, cos: cosine(emb, jsonToEmb(r.embedding)) }))
       .sort((a, b) => b.cos - a.cos || (a.id < b.id ? -1 : 1));
   }
 
-  /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). */
-  private lexicalSeed(intent: string, circle: string, n: number): string[] {
+  /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). When `circle` is omitted, seeds from all circles. */
+  private lexicalSeed(intent: string, circle: string | undefined, n: number): string[] {
     const q = new Set(tokenize(intent));
     if (q.size === 0) return [];
-    const rows = this.db
-      .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind != 'workstream'`)
-      .all(circle) as Array<{ id: string; title: string; body: string }>;
+    const rows: Array<{ id: string; title: string; body: string }> = circle !== undefined
+      ? this.db
+          .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+          .all(circle) as Array<{ id: string; title: string; body: string }>
+      : this.db
+          .prepare(`SELECT id, title, body FROM concepts WHERE kind != 'workstream'`)
+          .all() as Array<{ id: string; title: string; body: string }>;
     return rows
       .map((r) => {
         let overlap = 0;
@@ -2535,6 +2625,7 @@ function toCard(r: ConceptRow, score: number, contradictions: number): SearchCar
     confidence: r.confidence,
     score,
     fetchHint: fetchHint(r.kind),
+    circle: r.circle,
   };
 }
 

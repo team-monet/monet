@@ -43,7 +43,7 @@ function err(message: string): CallToolResult {
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
-  const server = new McpServer({ name: "monet-core", version: "0.3.0" }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: "monet-core", version: "0.4.0" }, { capabilities: { tools: {} } });
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
@@ -102,16 +102,22 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_search",
-    "Search memory. Returns structural CARDS — what each memory is about and how much is in it (kind, support count, confidence, fetch hint) — but NEVER the content. To actually read a memory you MUST call memory_fetch; the answer is never in the search result.",
-    { query: z.string(), circle: z.string().optional(), limit: z.number().int().positive().optional() },
+    "Search memory. Returns structural CARDS — what each memory is about and how much is in it (kind, support count, confidence, fetch hint) — but NEVER the content. To actually read a memory you MUST call memory_fetch; the answer is never in the search result. Omit circle to search across all circles — cards include each memory's home circle; pass circle to restrict.",
+    {
+      query: z.string(),
+      circle: z.string().optional().describe("Restrict search to this circle. Omit to search across all circles — cards include each memory's home circle."),
+      limit: z.number().int().positive().optional(),
+    },
     async ({ query, circle, limit }) => {
       try {
-        const results = await core.search(query, { circle: scope(circle), limit });
+        // When circle is omitted, search store-wide (circle: undefined); when provided, scope exactly.
+        const results = await core.search(query, { circle: circle !== undefined ? scope(circle) : undefined, limit });
+        const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
         return ok({
-          circle: scope(circle),
+          circle: circleLabel,
           results,
           guidance:
-            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if `circle` above isn't your session default, pass it: memory_fetch(id, circle).",
+            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
         });
       } catch (e) {
         return err(`search failed: ${msg(e)}`);
@@ -121,7 +127,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_overview",
-    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub.',
+    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub. otherCircles lists other circles in the store (name + concept count + last activity).',
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       try {
@@ -174,24 +180,26 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_gather",
-    "Rebuild the FULL working context for an intent — not just the most-similar few. Seeds from the intent, then spreads across the connection graph (entity, causal, and same-session co-occurrence edges, ≤2 hops) and stops when evidence saturates. Use at the start of a task or when resuming a thread: it recovers the related concepts — decisions, open questions, files worked on together — that a plain memory_search misses because they're worded differently. Returns structural cards (ranked); call memory_fetch(id) to read one.",
+    "Rebuild the FULL working context for an intent — not just the most-similar few. Seeds from the intent, then spreads across the connection graph (entity, causal, and same-session co-occurrence edges, ≤2 hops) and stops when evidence saturates. Use at the start of a task or when resuming a thread: it recovers the related concepts — decisions, open questions, files worked on together — that a plain memory_search misses because they're worded differently. Returns structural cards (ranked); call memory_fetch(id) to read one. Omit circle to search across all circles — cards include each memory's home circle; pass circle to restrict (spreading stays within each seed's home circle).",
     {
       intent: z.string(),
-      circle: z.string().optional(),
+      circle: z.string().optional().describe("Restrict gathering to this circle. Omit to gather across all circles — cards include each memory's home circle (spreading stays within each seed's home circle)."),
       limit: z.number().int().positive().optional(),
       depth: z.enum(["1", "2"]).optional().describe("Graph hops from the seeds (default 2)."),
     },
     async ({ intent, circle, limit, depth }) => {
       try {
-        const r = await core.gather(intent, { circle: scope(circle), limit, depth: depth ? Number(depth) : undefined });
+        // When circle is omitted, gather store-wide (circle: undefined); when provided, scope exactly.
+        const r = await core.gather(intent, { circle: circle !== undefined ? scope(circle) : undefined, limit, depth: depth ? Number(depth) : undefined });
+        const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
         return ok({
-          circle: scope(circle),
+          circle: circleLabel,
           ranked: r.ranked,
           seed: r.seed,
           stopReason: r.stopReason,
           reachableByType: r.reachableByType,
           guidance:
-            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if `circle` above isn't your session default, pass it: memory_fetch(id, circle).",
+            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
         });
       } catch (e) {
         return err(`gather failed: ${msg(e)}`);
@@ -204,15 +212,18 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them.",
     {
       id: z.string(),
-      circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle). Pass it when reading results of a search/gather you ran on an explicit circle."),
+      circle: z.string().optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
       observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages."),
     },
     async ({ id, circle, observationsOffset }) => {
       try {
-        // Scope enforcement: an id from another project's circle must not be readable here (ids leak
-        // across sessions / get pasted from prior output). `scope(circle)` honors an explicit circle the
-        // client searched, defaulting to this session's circle. Check before getConcept's usefulness bump.
-        if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
+        // Scope enforcement:
+        // - homeCircle null → concept not found (id doesn't exist).
+        // - caller provided circle explicitly → id must live in that circle (back-compat gate).
+        // - caller omitted circle → look up store-wide; the response surfaces the home circle.
+        const homeCircle = core.circleOf(id);
+        if (homeCircle === null) return err(`concept not found: ${id}`);
+        if (circle !== undefined && homeCircle !== scope(circle)) return err(`concept not found: ${id}`);
         // pageSize=FETCH_MAX_OBS: the engine slices exactly one page newest-first from the offset,
         // so the MCP layer receives at most FETCH_MAX_OBS observations with no secondary cap needed.
         const c = await core.getConcept(id, { synthesize: false, observationsOffset: observationsOffset ?? 0, pageSize: FETCH_MAX_OBS });
@@ -448,11 +459,18 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context.",
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them.",
     { circle: z.string().optional() },
     async ({ circle }) => {
       const state = core.prewarm(scope(circle));
-      return ok({ agentId: core.getAgentId(), mode: "local", circle: scope(circle), ...state });
+      const others = core.listCircles(scope(circle)).slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
+      return ok({
+        agentId: core.getAgentId(),
+        mode: "local",
+        circle: scope(circle),
+        ...state,
+        ...(others.length > 0 ? { otherCircles: others } : {}),
+      });
     },
   );
 

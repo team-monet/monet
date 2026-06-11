@@ -167,6 +167,14 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
     out.push("");
   }
 
+  if (o.otherCircles && o.otherCircles.length > 0) {
+    out.push(bold("OTHER ROOMS") + dim("  — other circles in this store"));
+    for (const oc of o.otherCircles) {
+      out.push(truncate(`  ${padEndV(oc.circle, 28)}  ${oc.concepts} memories`, width));
+    }
+    out.push("");
+  }
+
   out.push(dim(`read-only · monet knows ${o.circle}   → fetch <id> to read one`));
   return out.join("\n");
 }
