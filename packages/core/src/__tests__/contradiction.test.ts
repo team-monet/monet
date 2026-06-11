@@ -74,11 +74,14 @@ describe("mediated resolution (never silent last-write-wins)", () => {
     const { core, conceptId, contradictionId } = await disputed();
     expect(core.supersededObservationCount()).toBe(0);
 
-    const resolved = core.resolveContradiction(contradictionId, {
+    const resolvedRaw = core.resolveContradiction(contradictionId, {
       decision: "accept-new",
       body: "Monet Local does NOT use SQLite; the storage backend changed.",
       by: "agent",
     })!;
+    // The contradiction was open — resolveContradiction returns a Concept (not alreadyClosed).
+    expect("alreadyClosed" in resolvedRaw).toBe(false);
+    const resolved = resolvedRaw as import("../engine").Concept;
     expect(resolved.status).toBe("active");
     expect(resolved.body).toContain("does NOT use SQLite");
     expect(core.getOpenContradictions()).toHaveLength(0);
@@ -89,7 +92,10 @@ describe("mediated resolution (never silent last-write-wins)", () => {
 
   it("dismiss restores the concept and supersedes nothing", async () => {
     const { core, contradictionId } = await disputed();
-    const resolved = core.resolveContradiction(contradictionId, { decision: "dismiss", by: "agent" })!;
+    const resolvedRaw = core.resolveContradiction(contradictionId, { decision: "dismiss", by: "agent" })!;
+    // The contradiction was open — resolveContradiction returns a Concept (not alreadyClosed).
+    expect("alreadyClosed" in resolvedRaw).toBe(false);
+    const resolved = resolvedRaw as import("../engine").Concept;
     expect(resolved.status).toBe("active");
     expect(core.getOpenContradictions()).toHaveLength(0);
     expect(core.supersededObservationCount()).toBe(0);
