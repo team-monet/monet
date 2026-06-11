@@ -1,0 +1,57 @@
+name: release
+
+# Publishes @team-monet/monet to npm via trusted publishing (OIDC).
+# Trigger: push a tag matching the package version, e.g. `git tag v0.4.0 && git push origin v0.4.0`.
+# One-time npm-side setup: npmjs.com -> @team-monet/monet -> Settings -> Trusted Publisher
+#   -> GitHub Actions -> repository team-monet/monet, workflow release.yml.
+# Note: @team-monet/core must already be published at the version pinned in package.json
+# (publish ordering: core first, then this client).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for npm trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm
+        run: npm install -g npm@latest && npm --version
+
+      - name: Verify tag matches package version
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: node build.mjs
+
+      - name: Inspect artifact
+        run: npm pack --dry-run
+
+      - name: Publish (trusted publishing, with provenance)
+        run: npm publish
