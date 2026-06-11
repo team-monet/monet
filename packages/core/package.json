@@ -52,5 +52,9 @@
       "better-sqlite3",
       "esbuild"
     ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/team-monet/monet-core.git"
   }
 }
