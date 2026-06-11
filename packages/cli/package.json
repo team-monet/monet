@@ -4,14 +4,29 @@
   "description": "Monet — local-first, state-centric memory for coding agents (MCP server): resolve-or-create dedup, contradiction detection, session-state survival, and query-independent prewarm.",
   "license": "AGPL-3.0-only",
   "type": "module",
-  "repository": { "type": "git", "url": "git+https://github.com/team-monet/monet.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/team-monet/monet.git"
+  },
   "homepage": "https://github.com/team-monet/monet",
-  "keywords": ["mcp", "memory", "agent", "monet", "local-first", "state-centric", "embeddings"],
+  "keywords": [
+    "mcp",
+    "memory",
+    "agent",
+    "monet",
+    "local-first",
+    "state-centric",
+    "embeddings"
+  ],
   "bin": {
     "monet": "./dist/cli.js"
   },
-  "files": ["dist"],
-  "publishConfig": { "access": "public" },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:cli": "tsx watch src/cli.ts",
@@ -41,6 +56,10 @@
     "vitest": "^3"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
-  }
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  },
+  "packageManager": "pnpm@10.33.2"
 }
