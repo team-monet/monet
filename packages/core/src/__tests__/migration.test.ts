@@ -292,3 +292,58 @@ describe("reassignCircle — merge (dedup into an existing target)", () => {
     core.close();
   });
 });
+
+describe("batchReassignCircle — forceNew vs auto, per-item error capture", () => {
+  it("forceNew keeps concepts distinct at the destination and records possible_duplicate_of edges", async () => {
+    const core = new MonetCore(":memory:"); // default dedup thresholds
+    // Identical content in two circles guarantees cosine >= tauAttach.
+    await core.store("We use SQLite for local persistence.", { circle: "src" });
+    await core.store("We use SQLite for local persistence.", { circle: "dst" });
+
+    const srcIds = core.listMemories("src").map((m) => m.id);
+    const result = core.batchReassignCircle(srcIds, "dst", { resolution: "forceNew" });
+    // forceNew: moved, not merged.
+    expect(result.counts.moved).toBe(1);
+    expect(result.counts.merged).toBe(0);
+    expect(result.counts.error).toBe(0);
+    // Near-match → possible_duplicate_of edge recorded in dst.
+    const dupEdges = core.edges({ circle: "dst", type: "possible_duplicate_of" });
+    expect(dupEdges.length).toBeGreaterThan(0);
+    core.close();
+  });
+
+  it("auto resolution merges a matching concept on batch move", async () => {
+    const core = new MonetCore(":memory:");
+    await core.store("We use SQLite for local persistence.", { circle: "src" });
+    await core.store("We use SQLite for local persistence.", { circle: "dst" });
+
+    const srcIds = core.listMemories("src").map((m) => m.id);
+    const result = core.batchReassignCircle(srcIds, "dst", { resolution: "auto" });
+    expect(result.counts.merged).toBe(1);
+    expect(result.counts.moved).toBe(0);
+    expect(result.counts.error).toBe(0);
+    expect(core.conceptCount("src")).toBe(0);
+    core.close();
+  });
+
+  it("per-item error is captured for a deleted id mid-batch without aborting remaining items", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const a = await core.store("Fact A.", { circle: "src" });
+    const b = await core.store("Fact B.", { circle: "src", resolution: "forceNew" });
+
+    // Delete concept B directly to simulate a mid-batch missing id.
+    // We simulate by including a bogus id in the batch alongside a real one.
+    const result = core.batchReassignCircle([a.conceptId, "nonexistent-id", b.conceptId], "dst");
+
+    expect(result.counts.moved).toBe(2); // A and B both moved successfully
+    expect(result.counts.error).toBe(1); // the nonexistent-id errored
+    // The errored entry carries the id and error message.
+    const errEntry = result.results.find((r) => "error" in r && r.action === "error") as { id: string; action: "error"; error: string } | undefined;
+    expect(errEntry?.id).toBe("nonexistent-id");
+    expect(errEntry?.error).toBeTruthy();
+    // Real concepts moved.
+    expect(core.circleOf(a.conceptId)).toBe("dst");
+    expect(core.circleOf(b.conceptId)).toBe("dst");
+    core.close();
+  });
+});

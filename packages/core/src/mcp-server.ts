@@ -42,13 +42,18 @@ function err(message: string): CallToolResult {
 }
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
-  const server = new McpServer({ name: "monet-core", version: "0.4.0" }, { capabilities: { tools: {} } });
+/**
+ * Register all monet-core tools on `server` and return it (does NOT connect a transport).
+ * Used internally by createMonetCoreMcpServer and by tests that inject an InMemoryTransport.
+ */
+export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpServer {
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
+  // resolveCircleName() transparently follows circle_aliases, so a caller using an old name routes to
+  // the canonical circle without needing to know about the rename.
   const dc = core.getDefaultCircle();
-  const scope = (circle?: string): string => circle ?? dc;
+  const scope = (circle?: string): string => core.resolveCircleName(circle ?? dc);
 
   server.tool(
     "memory_store",
@@ -132,7 +137,8 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
     async ({ circle, entity }) => {
       try {
         if (entity) return ok({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) });
-        return ok({ ...core.overview(scope(circle)) });
+        const ov = core.overview(scope(circle));
+        return ok({ ...ov, ...(ov.resolvedFrom !== undefined ? { resolvedFrom: ov.resolvedFrom } : {}) });
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
       }
@@ -424,18 +430,76 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
 
   server.tool(
     "memory_reassign_circle",
-    "Move a memory — its concept, its observations, and its graph membership — from its current circle into another. The apply step of a memory migration: home a piece of unscoped \"default\" memory into its project's circle. Dedupes: if the target circle already holds a matching memory, the two MERGE (no duplicate, no re-embedding) and `action` comes back \"merged\". Non-destructive to other memories; moves one at a time so you can preview, confirm, then apply in batches. Pass `circle` = the id's CURRENT circle (e.g. \"default\") if it isn't your session default.",
+    "Move a memory — its concept, its observations, and its graph membership — from its current circle into another. The apply step of a memory migration: home a piece of unscoped \"default\" memory into its project's circle. Dedupes: if the target circle already holds a matching memory, the two MERGE (no duplicate, no re-embedding) and `action` comes back \"merged\". Pass `ids` (array) for a batch move; pass `id` (string) for a single move — exactly one of `id`/`ids` is required. Pass `circle` = the id's CURRENT circle if it isn't your session default. resolution: \"auto\" (default) merges into a matching destination concept. \"forceNew\": always keep distinct, recording a possible_duplicate_of edge on near-match — use for curation batch moves.",
     {
-      id: z.string(),
+      id: z.string().optional().describe("Single concept id to move. Exactly one of `id` or `ids` is required."),
+      ids: z.array(z.string()).optional().describe("Batch of concept ids to move (each individually atomic; errors captured per item without aborting the batch). Exactly one of `id` or `ids` is required."),
       toCircle: z.string().describe("The destination circle (e.g. the project's per-project circle)."),
       circle: z.string().optional().describe("The id's CURRENT circle (defaults to this session's circle). Pass \"default\" when migrating legacy unscoped memory."),
+      resolution: z
+        .enum(["auto", "forceNew"])
+        .optional()
+        .describe('"auto" (default): merge into a matching destination concept. "forceNew": always keep distinct, recording a possible_duplicate_of edge on near-match — use for curation batch moves.'),
     },
-    async ({ id, toCircle, circle }) => {
+    async ({ id, ids, toCircle, circle, resolution }) => {
       try {
-        // Scope enforcement: you may only reassign an id that lives in the circle you named (the
-        // caller's session default, or an explicit source circle) — ids leak across sessions/output.
-        if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`);
-        const r = core.reassignCircle(id, toCircle);
+        // Validate: exactly one of id/ids.
+        if (id !== undefined && ids !== undefined) return err("provide exactly one of `id` or `ids`, not both");
+        if (id === undefined && ids === undefined) return err("provide exactly one of `id` or `ids`");
+        const opts = resolution ? { resolution } : {};
+
+        if (ids !== undefined) {
+          // Batch mode.
+          // Scope enforcement (F1): for each id, the concept must live in the caller-named circle.
+          // Ids that fail produce a per-item error without aborting the batch; ids that pass go
+          // to batchReassignCircle. Mirrors the single-id circleOf check.
+          type BatchItem = { id: string; action: "error"; error: string } | (typeof r.results)[number];
+          const callerCircle = scope(circle);
+          const passIds: string[] = [];
+          // scopeErrorByInput[i] is defined only for ids[i] that fail the scope check.
+          const scopeErrorByInput: Array<{ id: string; action: "error"; error: string } | null> = ids.map((id) => {
+            if (core.circleOf(id) !== callerCircle) {
+              return { id, action: "error" as const, error: `concept not found: ${id}` };
+            }
+            passIds.push(id);
+            return null;
+          });
+          const r = core.batchReassignCircle(passIds, toCircle, opts);
+          // Weave scope-error items back in, preserving input id ordering.
+          let passIdx = 0;
+          const mergedResults: BatchItem[] = ids.map((_id, i) => {
+            const scopeErr = scopeErrorByInput[i];
+            if (scopeErr) return scopeErr;
+            return r.results[passIdx++]!;
+          });
+          const totalCounts = {
+            moved: r.counts.moved,
+            merged: r.counts.merged,
+            noop: r.counts.noop,
+            error: r.counts.error + scopeErrorByInput.filter(Boolean).length,
+          };
+          // F4: when results are large, elide per-item success entries to avoid blind mid-JSON clip.
+          const BATCH_INLINE_LIMIT = 25;
+          if (mergedResults.length > BATCH_INLINE_LIMIT) {
+            const errorItems = mergedResults.filter((res) => res.action === "error");
+            return ok({
+              toCircle: r.toCircle,
+              counts: totalCounts,
+              errors: errorItems,
+              note: `per-item results elided for ${mergedResults.length - errorItems.length} items — all non-error items succeeded with the actions in counts`,
+            });
+          }
+          return ok({
+            toCircle: r.toCircle,
+            counts: totalCounts,
+            results: mergedResults,
+          });
+        }
+
+        // Single mode.
+        // Scope enforcement: the caller may only reassign an id that lives in the circle they named.
+        if (core.circleOf(id!) !== scope(circle)) return err(`concept not found: ${id}`);
+        const r = core.reassignCircle(id!, toCircle, opts);
         if (!r) return err(`concept not found: ${id}`);
         return ok({
           action: r.action,
@@ -458,22 +522,75 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
   );
 
   server.tool(
+    "memory_circle_manage",
+    "Create, rename, merge, or archive project-locality circles. RENAME establishes a stable alias so sessions that derive the old name keep resolving. MERGE moves every concept from one circle into another (default resolution forceNew: near-matches are kept distinct and linked with a possible_duplicate_of edge for later mediation). ARCHIVE hides a circle from store-wide recall and listings without deleting or sealing it. LIST enumerates the store's circles including archived ones. Topic organization belongs to the entity/edge graph — circles are write-home/project locality.",
+    {
+      action: z.enum(["rename", "merge", "archive", "unarchive", "list"]),
+      circle: z.string().optional().describe("The circle to act on (rename/merge source, archive/unarchive target). Required for rename, merge, archive, unarchive."),
+      to: z.string().optional().describe("Destination circle name for rename or merge."),
+      resolution: z
+        .enum(["auto", "forceNew"])
+        .optional()
+        .describe('For merge: "auto" deduplicates into existing concepts; "forceNew" (default) keeps all distinct and records possible_duplicate_of edges for near-matches.'),
+    },
+    async ({ action, circle, to, resolution }) => {
+      try {
+        if (action === "rename") {
+          if (!circle) return err("rename requires `circle`");
+          if (!to) return err("rename requires `to`");
+          const r = core.renameCircle(circle, to);
+          return ok(r as unknown as Record<string, unknown>);
+        }
+        if (action === "merge") {
+          if (!circle) return err("merge requires `circle`");
+          if (!to) return err("merge requires `to`");
+          const r = await core.mergeCircle(circle, to, { resolution: resolution ?? "forceNew" });
+          return ok(r as unknown as Record<string, unknown>);
+        }
+        if (action === "archive") {
+          if (!circle) return err("archive requires `circle`");
+          core.archiveCircle(circle);
+          return ok({ action: "archived", circle });
+        }
+        if (action === "unarchive") {
+          if (!circle) return err("unarchive requires `circle`");
+          core.unarchiveCircle(circle);
+          return ok({ action: "unarchived", circle });
+        }
+        // list
+        const circles = core.listCircles(undefined, { includeArchived: true });
+        return ok({ circles });
+      } catch (e) {
+        return err(`circle_manage failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them.",
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name.",
     { circle: z.string().optional() },
     async ({ circle }) => {
-      const state = core.prewarm(scope(circle));
-      const others = core.listCircles(scope(circle)).slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
+      const resolvedCircle = scope(circle);
+      const state = core.prewarm(resolvedCircle);
+      const others = core.listCircles(resolvedCircle).slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
       return ok({
         agentId: core.getAgentId(),
         mode: "local",
-        circle: scope(circle),
+        circle: resolvedCircle,
+        ...(state.resolvedFrom !== undefined ? { resolvedFrom: state.resolvedFrom } : {}),
         ...state,
         ...(others.length > 0 ? { otherCircles: others } : {}),
       });
     },
   );
 
+  return server;
+}
+
+export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
+  const server = new McpServer({ name: "monet-core", version: "0.5.0" }, { capabilities: { tools: {} } });
+  registerMonetCoreTools(server, core);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   return server;
