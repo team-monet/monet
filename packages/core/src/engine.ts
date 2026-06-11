@@ -1337,8 +1337,8 @@ export class MonetCore {
 
     // Validate all observation ids belong to source.
     const srcObsRows = this.db
-      .prepare(`SELECT id, content, embedding, superseded_by, source_refs, created_at FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
-      .all(sourceConceptId) as Array<{ id: string; content: string; embedding: string; superseded_by: string | null; source_refs: string | null; created_at: number }>;
+      .prepare(`SELECT id, content, embedding, superseded_by, source_refs, created_at, session_id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
+      .all(sourceConceptId) as Array<{ id: string; content: string; embedding: string; superseded_by: string | null; source_refs: string | null; created_at: number; session_id: string | null }>;
     const srcObsIds = new Set(srcObsRows.map((o) => o.id));
     for (const id of observationIds) {
       if (!srcObsIds.has(id)) throw new Error(`observation ${id} does not belong to concept ${sourceConceptId}`);
@@ -1384,14 +1384,30 @@ export class MonetCore {
         const firstEmb = jsonToEmb(firstObs.embedding);
         const newRow = this.create(firstObs.content, firstEmb, circle, srcRow.kind);
         destConceptId = newRow.id;
-        // Inherit the source's temporal fields: create() stamps last_confirmed_at = now, but moved
-        // observations are OLD evidence — the new concept must carry the source's original
-        // last_confirmed_at and last_confirmed_session_id so it cannot evade getStaleConcepts/prewarm
-        // for a full staleness window.  srcRow is captured before any source mutation in this
-        // transaction, so these values are correct pre-split.
-        this.db
-          .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
-          .run(srcRow.last_confirmed_at, srcRow.last_confirmed_session_id, destConceptId);
+        // Evidence-attributed temporal stamp for the NEW destination: freshness must travel WITH
+        // the evidence that earned it, capped to the source's pre-split stamp.
+        //
+        // NEW-dest last_confirmed_at = min(srcRow.last_confirmed_at, max(created_at of MOVED obs))
+        //   — neither side can exceed the pre-split source stamp.
+        //   — if the moved observations are the older ones, the destination correctly reads stale.
+        //   — if they are the newer ones, the destination carries the fresh stamp they earned.
+        //
+        // Session id: taken from the newest moved observation (the one whose created_at equals
+        // max(created_at of moved)).  Ties broken by rowid-order (already in detachingRows order).
+        //
+        // Note: resolution-driven confirmations are not observation-bound and therefore not
+        // reflected here — the safe direction is conservative (may produce an extra stale-review
+        // prompt; never produces false freshness).
+        {
+          const srcPreSplitLca = srcRow.last_confirmed_at ?? srcRow.updated_at;
+          const maxMovedCreatedAt = detachingRows.reduce((m, o) => Math.max(m, o.created_at), 0);
+          const newestMovedObs = detachingRows.reduce((best, o) => o.created_at >= best.created_at ? o : best, detachingRows[0]!);
+          const destLca = Math.min(srcPreSplitLca, maxMovedCreatedAt);
+          const destLcaSession = newestMovedObs.session_id;
+          this.db
+            .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
+            .run(destLca, destLcaSession, destConceptId);
+        }
         destRow = this.getRow(destConceptId)!;
       } else {
         destConceptId = destRow.id;
@@ -1616,6 +1632,33 @@ export class MonetCore {
                     dirty = 1, version = version + 1, updated_at = unixepoch() * 1000 WHERE id = ?`,
           )
           .run(srcBody, embToJson(srcEmb), srcSupportCount, srcConfidence, newSrcTitle, newSrcSlug, sourceConceptId);
+
+        // SOURCE temporal recompute (partial detach — source survives):
+        // last_confirmed_at = min(pre-split value, max(created_at of REMAINING observations))
+        // This conservatively lowers the stamp when the observations that earned freshness moved
+        // away, so the source cannot evade stale-review for a full staleness window on stale evidence.
+        //
+        // Direction: only falls back, never raises (min() with pre-split value).
+        //
+        // Resolution-driven confirmations are not observation-bound, so this recompute can
+        // conservatively lower a resolution-confirmed timestamp — the safe direction (extra
+        // stale-review prompt, never false freshness).
+        //
+        // Session id: taken from the newest remaining observation when the value actually changed.
+        {
+          const srcPreSplitLca = srcRow.last_confirmed_at ?? srcRow.updated_at;
+          const maxRemainingCreatedAt = remainingRows.reduce((m, o) => Math.max(m, o.created_at), 0);
+          const recomputedLca = Math.min(srcPreSplitLca, maxRemainingCreatedAt);
+          if (recomputedLca < srcPreSplitLca) {
+            // The remaining evidence is older than the pre-split stamp — fall back.
+            const newestRemainingObs = remainingRows.reduce((best, o) => o.created_at >= best.created_at ? o : best, remainingRows[0]!);
+            this.db
+              .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
+              .run(recomputedLca, newestRemainingObs.session_id, sourceConceptId);
+          }
+          // If recomputedLca === srcPreSplitLca, the remaining evidence supports the existing
+          // stamp — no change needed.
+        }
       }
 
       // 5. Destination finalize.
