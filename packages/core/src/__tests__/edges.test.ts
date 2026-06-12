@@ -32,6 +32,52 @@ describe("extractEntities", () => {
     expect(auth).not.toContain("noun:the"); // stopword
     expect(auth).not.toContain("noun:change"); // code-chatter stopword
   });
+
+  // Regression: LEXICON is a plain `{}` which inherits Object.prototype. Any text containing
+  // the word "constructor" causes LEXICON["constructor"] to return the Object constructor Function
+  // (truthy), so add("lib", Function, 2) is called with a non-string surface value, crashing at
+  // surface.toLowerCase() — "surface.toLowerCase is not a function". Fix: LEXICON must be a
+  // null-prototype object so it has no inherited properties.
+  it("does not crash on text containing Object.prototype property names (e.g. 'constructor')", () => {
+    // Unit: bare word "constructor" must not throw.
+    expect(() => extractEntities("constructor")).not.toThrow();
+    // The word must be treated as a plain noun, not a lib hit.
+    const keys = extractEntities("constructor").map((e) => e.key);
+    expect(keys.some((k) => k.startsWith("lib:"))).toBe(false);
+    expect(keys).toContain("noun:constructor");
+  });
+
+  // Integration-shaped: exact crashing corpus from the production detach-consolidation failure.
+  // Observation text A (being moved to destConceptId) followed by a dest body containing
+  // "constructor" — the combination that triggered the real crash.
+  it("does not crash on the production detach consolidation corpus (text A + dest body with 'constructor')", () => {
+    const textA =
+      "aart dashboard polish (June 2026, src/cli/commands/dashboard.ts PAGE only — " +
+      "pure client-side, no API/security change, typecheck + 6 dashboard tests green, " +
+      "verified live in browser w/ zero console errors): (1) Runs tab — a client-side filter " +
+      "box (matches block id + status, incl. 'unapproved'), a live \"N runs\" / \"M / N runs\" " +
+      "count, and relative timestamps (\"2h ago\") with the absolute time in the cell title. " +
+      "(2) Blocks tab — a new `capabilities` column (browser.* now visibly show the `browser` " +
+      "capability, closing the block↔pack loop) plus its own filter (id/type/capability). " +
+      "Reusable helpers added to PAGE: ago(iso), filterBar(kind,placeholder), applyFilter(kind), " +
+      "wireFilter(kind), with state in `filters={runs,blocks}` and `NOUN` map. Filter design " +
+      "hides rows by a lowercased data-k attribute WITHOUT re-fetching, so it survives the 5s " +
+      "auto-refresh; wireFilter restores the typed text + re-applies after each full re-render; " +
+      "the auto-refresh interval skips when a `filter-*` input is focused (so typing isn't " +
+      "interrupted). Verified: typing 'failed' → 1/4 runs; 'browser' → 10/23 blocks " +
+      "(23 = 21 native + user-registered echo/upper); filter persists across a forced render().";
+    // Destination body that contains "constructor" — the word found in real consolidated concept bodies.
+    const destBody =
+      "127.0.0.1 setup: esc() escapes &<>\", NaNms latency, 5s poll, N runs · X completed · " +
+      "Y failed · Z running, 129 passed, constructor function wired in init.";
+    const combined = [destBody, textA].join("\n");
+    expect(() => extractEntities(combined)).not.toThrow();
+    // No lib entity should be derived from prototype-inherited keys.
+    const entities = extractEntities(combined);
+    const libKeys = entities.filter((e) => e.kind === "lib").map((e) => e.surface);
+    // "constructor" must not appear as a lib surface (it would be the Object constructor Function).
+    expect(libKeys.every((s) => typeof s === "string")).toBe(true);
+  });
 });
 
 /** Distinct concepts per store (dedup off), matching how the eval exercises the graph. */

@@ -26,8 +26,11 @@ export interface ExtractedEntity {
   weight: number;
 }
 
-/** Canonical library/tool names (case-insensitive match → canonical surface). */
-const LEXICON: Record<string, string> = {};
+/** Canonical library/tool names (case-insensitive match → canonical surface).
+ *  Must be a null-prototype object so that text tokens matching Object.prototype
+ *  property names (e.g. "constructor") do not resolve to inherited non-string
+ *  values and crash surface.toLowerCase() (see #extract-constructor-crash). */
+const LEXICON: Record<string, string> = Object.create(null) as Record<string, string>;
 for (const name of [
   "jose", "jsonwebtoken", "pnpm", "npm", "yarn", "sqlite", "better-sqlite3", "vite", "postgres",
   "postgresql", "pgvector", "sqlite-vec", "drizzle", "turbo", "turborepo", "eslint", "prettier",
