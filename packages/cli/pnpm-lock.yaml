@@ -16,8 +16,8 @@ importers:
         specifier: ^1.27.1
         version: 1.29.0(zod@3.25.76)
       '@team-monet/core':
-        specifier: ^0.6.1
-        version: 0.6.1
+        specifier: ^0.6.2
+        version: 0.6.2
       '@types/better-sqlite3':
         specifier: ^7.6.12
         version: 7.6.13
@@ -871,8 +871,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@team-monet/core@0.6.1':
-    resolution: {integrity: sha512-aY+unnhSIWyVaLe8b/MQ3tWavQ46PN8vHrKBJ+XSx7gNZO7jmKD7RfP96Sx7samhbnQdkxjqVTNoWCBXJPYMiw==}
+  '@team-monet/core@0.6.2':
+    resolution: {integrity: sha512-m/O6zUHarMd0LV5yRt/iRGvqu6/FNTkuq7JsLfBG1oyUyUyBYbPNL0+BKT/V/XuNxw4LSKqrx78MnCzIhSSmBg==}
 
   '@types/better-sqlite3@7.6.13':
     resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
@@ -2228,7 +2228,7 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.61.1':
     optional: true
 
-  '@team-monet/core@0.6.1':
+  '@team-monet/core@0.6.2':
     dependencies:
       '@modelcontextprotocol/sdk': 1.29.0(zod@3.25.76)
       better-sqlite3: 11.10.0
