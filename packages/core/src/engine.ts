@@ -3283,7 +3283,9 @@ function jsonToEmb(s: string): Float32Array {
 }
 
 function firstLine(content: string): string {
-  const line = content.trim().split(/[\n.]/)[0].trim();
+  // A period BETWEEN digits is not a sentence end — version numbers like "0.5.0" or
+  // "v0.6.0" stay intact instead of truncating the title at their first dot.
+  const line = content.trim().split(/\n|(?<!\d)\.|\.(?!\d)/)[0].trim();
   return line.length > 80 ? line.slice(0, 77) + "…" : line || content.trim().slice(0, 80);
 }
 
