@@ -10,7 +10,7 @@ const program = new Command();
 program
   .name("monet")
   .description("Monet — local-first memory for AI agents (state-centric substrate)")
-  .version("0.6.0");
+  .version("0.6.1");
 
 program
   .command("start")
