@@ -229,6 +229,44 @@ export function registerMonetCoreTools(
   const scope = (circle?: string): string => core.resolveCircleName(circle ?? dc);
 
   /**
+   * Capture the prewarm block BEFORE a handler runs (Fix B: snapshot prior state, not post-mutation
+   * state). Returns the block string if the one-shot is unconsumed and the store has content for the
+   * given resolved circle, or an empty string if there is nothing to restore. Returns null when
+   * capturePrewarmSnapshot() should be skipped because autoPrewarm is off or the one-shot is already
+   * consumed. The returned string (including empty string) must be passed to wrapSuccess so it knows
+   * the one-shot was consumed on success (or must be discarded on error via discardPrewarmSnapshot).
+   *
+   * Separated from wrapSuccess so that mutating handlers can call this BEFORE core.store() / etc.,
+   * then consume on success or discard on error — ensuring the block never contains facts written
+   * in the same call.
+   *
+   * The resolved circle must be the same circle the handler will operate on (Fix A), NOT scope()
+   * (the session default). Pass scope(circle) for tools that have an explicit circle input, or
+   * scope() for multi-circle ops (reassign, circle_manage) where the session default is the right
+   * anchor.
+   */
+  function capturePrewarmSnapshot(resolvedCircle: string): string | null {
+    if (!autoPrewarm || prewarmed) return null;
+    const block = buildPrewarmBlock(core, resolvedCircle);
+    return block; // empty string = nothing to restore, but the snapshot was taken
+  }
+
+  /**
+   * Consume the one-shot (mark as prewarmed) when the snapshot was successfully delivered.
+   * Called inside wrapSuccess when a captured block (empty or non-empty) is committed.
+   */
+  function consumePrewarmSnapshot(): void {
+    prewarmed = true;
+  }
+
+  /**
+   * Discard a pre-captured snapshot on error — the one-shot is NOT consumed, so the next
+   * successful call re-captures (possibly with different state). Preserves the error-first
+   * semantics: a failing call never advances the lifecycle.
+   */
+  // (no-op at runtime — the caller simply doesn't call consumePrewarmSnapshot on the error path)
+
+  /**
    * Wrap a successful (non-error) CallToolResult with lifecycle decorations.
    *
    * MCP tool results are content ARRAYS. content[0] is ALWAYS the pure ok() JSON result —
@@ -247,6 +285,9 @@ export function registerMonetCoreTools(
    * `isMutating`: was this a mutating tool call?
    * `isCheckpointWithWorkstream`: was this a successful memory_checkpoint with a workstream?
    * `toolName`: name of the tool (to suppress prewarm block for agent_context).
+   * `capturedBlock`: pre-captured prewarm block string from capturePrewarmSnapshot(), or null if
+   *   the caller is agent_context (which handles its own lifecycle) or autoPrewarm is off. When
+   *   non-null, consumePrewarmSnapshot() is called here and the block (if non-empty) is attached.
    */
   function wrapSuccess(
     result: CallToolResult,
@@ -254,7 +295,8 @@ export function registerMonetCoreTools(
       isMutating,
       isCheckpointWithWorkstream,
       toolName,
-    }: { isMutating: boolean; isCheckpointWithWorkstream: boolean; toolName: string },
+      capturedBlock,
+    }: { isMutating: boolean; isCheckpointWithWorkstream: boolean; toolName: string; capturedBlock?: string | null },
   ): CallToolResult {
     if (result.content[0]?.type !== "text") return result;
 
@@ -267,11 +309,19 @@ export function registerMonetCoreTools(
       if (toolName === "agent_context") {
         // First call is agent_context: its payload IS the prewarm — no double-inject.
         prewarmed = true;
+      } else if (capturedBlock !== null && capturedBlock !== undefined) {
+        // Pre-captured block provided (Fix A + Fix B): consume the one-shot and attach if non-empty.
+        consumePrewarmSnapshot();
+        if (capturedBlock.length > 0) {
+          prewarmBlock = capturedBlock;
+          carryingPrewarm = true;
+        }
       } else {
-        // First successful non-agent_context call: attempt to build the block.
+        // Fallback: no pre-captured block supplied (should not happen for well-formed callers).
+        // Build inline as before so existing agent_context and legacy paths degrade gracefully.
         const resolvedCircle = scope();
         const block = buildPrewarmBlock(core, resolvedCircle);
-        prewarmed = true; // consumed regardless (even if block is empty)
+        prewarmed = true;
         if (block.length > 0) {
           prewarmBlock = block;
           carryingPrewarm = true;
@@ -317,19 +367,24 @@ export function registerMonetCoreTools(
    * Used in each tool handler in place of bare ok() for lifecycle-aware responses.
    * Widened to `object` (from `Record<string, unknown>`) so typed response literals
    * pass without casts — removes the `as unknown as Record<string, unknown>` pattern.
+   *
+   * Both accept a `capturedBlock` from capturePrewarmSnapshot() called BEFORE the handler ran.
+   * For agent_context, pass no capturedBlock (it manages its own lifecycle).
    */
   const readOk = (
     content: object,
     toolName: string,
+    capturedBlock?: string | null,
   ): CallToolResult =>
-    wrapSuccess(ok(content), { isMutating: false, isCheckpointWithWorkstream: false, toolName });
+    wrapSuccess(ok(content), { isMutating: false, isCheckpointWithWorkstream: false, toolName, capturedBlock });
 
   const mutOk = (
     content: object,
     toolName: string,
     isCheckpointWithWorkstream = false,
+    capturedBlock?: string | null,
   ): CallToolResult =>
-    wrapSuccess(ok(content), { isMutating: true, isCheckpointWithWorkstream, toolName });
+    wrapSuccess(ok(content), { isMutating: true, isCheckpointWithWorkstream, toolName, capturedBlock });
 
   server.tool(
     "memory_store",
@@ -363,6 +418,8 @@ export function registerMonetCoreTools(
         ),
     },
     async ({ content, circle, kind, sourceRefs, resolution, attachTo }) => {
+      // Fix A + Fix B: capture the snapshot BEFORE the mutation so the block reflects prior state.
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         const r = await core.store(content, { circle: scope(circle), kind, sourceRefs, resolution, attachTo });
         return mutOk({
@@ -374,7 +431,7 @@ export function registerMonetCoreTools(
             ? { contradiction: { id: r.contradiction.id, status: r.contradiction.status, detail: r.contradiction.detail } }
             : {}),
           ...(r.nearMatchId ? { nearMatchId: r.nearMatchId, nearMatchScore: r.nearMatchScore } : {}),
-        }, "memory_store");
+        }, "memory_store", false, capturedBlock);
       } catch (e) {
         return err(`store failed: ${msg(e)}`);
       }
@@ -390,6 +447,8 @@ export function registerMonetCoreTools(
       limit: z.number().int().positive().optional(),
     },
     async ({ query, circle, limit }) => {
+      // Fix A: snapshot uses the call's resolved circle; fall back to session default for all-circle searches.
+      const capturedBlock = capturePrewarmSnapshot(circle !== undefined ? scope(circle) : scope());
       try {
         // When circle is omitted, search store-wide (circle: undefined); when provided, scope exactly.
         const results = await core.search(query, { circle: circle !== undefined ? scope(circle) : undefined, limit });
@@ -399,7 +458,7 @@ export function registerMonetCoreTools(
           results,
           guidance:
             "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
-        }, "memory_search");
+        }, "memory_search", capturedBlock);
       } catch (e) {
         return err(`search failed: ${msg(e)}`);
       }
@@ -411,10 +470,11 @@ export function registerMonetCoreTools(
     'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub. otherCircles lists other circles in the store (name + concept count + last activity).',
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
-        if (entity) return readOk({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) }, "memory_overview");
+        if (entity) return readOk({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) }, "memory_overview", capturedBlock);
         const ov = core.overview(scope(circle));
-        return readOk({ ...ov, ...(ov.resolvedFrom !== undefined ? { resolvedFrom: ov.resolvedFrom } : {}) }, "memory_overview");
+        return readOk({ ...ov, ...(ov.resolvedFrom !== undefined ? { resolvedFrom: ov.resolvedFrom } : {}) }, "memory_overview", capturedBlock);
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
       }
@@ -434,6 +494,7 @@ export function registerMonetCoreTools(
       cursor: z.string().optional().describe("Opaque keyset cursor from the prior response's `nextCursor`; omit for the first page."),
     },
     async ({ circle, withProvenance, limit, cursor }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         const lim = limit ?? 50;
         // Cursor is "<updatedAt>:<id>" (ids carry no colon). Walks the stable updated_at DESC, id ASC order.
@@ -453,7 +514,7 @@ export function registerMonetCoreTools(
           memories,
           guidance:
             `Cards show what each memory is about, not what it says. ${nextCursor ? `More remain — call again with cursor=\"${nextCursor}\" (safe to reassign this page first). ` : ""}Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.`,
-        }, "memory_list");
+        }, "memory_list", capturedBlock);
       } catch (e) {
         return err(`list failed: ${msg(e)}`);
       }
@@ -470,6 +531,8 @@ export function registerMonetCoreTools(
       depth: z.enum(["1", "2"]).optional().describe("Graph hops from the seeds (default 2)."),
     },
     async ({ intent, circle, limit, depth }) => {
+      // Fix A: snapshot uses the call's resolved circle; fall back to session default for all-circle gathers.
+      const capturedBlock = capturePrewarmSnapshot(circle !== undefined ? scope(circle) : scope());
       try {
         // When circle is omitted, gather store-wide (circle: undefined); when provided, scope exactly.
         const r = await core.gather(intent, { circle: circle !== undefined ? scope(circle) : undefined, limit, depth: depth ? Number(depth) : undefined });
@@ -482,7 +545,7 @@ export function registerMonetCoreTools(
           reachableByType: r.reachableByType,
           guidance:
             "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
-        }, "memory_gather");
+        }, "memory_gather", capturedBlock);
       } catch (e) {
         return err(`gather failed: ${msg(e)}`);
       }
@@ -498,6 +561,10 @@ export function registerMonetCoreTools(
       observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages."),
     },
     async ({ id, circle, observationsOffset }) => {
+      // Fix A: use the caller's explicit circle if provided; fall back to the scope default.
+      // For memory_fetch, scope(circle) is the right anchor — the homeCircle lookup happens
+      // below and gates access, but the prewarm snapshot reflects what the caller intended to work in.
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         // Scope enforcement:
         // - homeCircle null → concept not found (id doesn't exist).
@@ -559,7 +626,7 @@ export function registerMonetCoreTools(
                     "This concept needs synthesis but has more observations than shown — do NOT call memory_synthesize from this partial view (it would drop the omitted evidence). Leave it dirty.",
                 }
               : {}),
-        }, "memory_fetch");
+        }, "memory_fetch", capturedBlock);
       } catch (e) {
         return err(`fetch failed: ${msg(e)}`);
       }
@@ -571,11 +638,12 @@ export function registerMonetCoreTools(
     "Write back a synthesized body for a concept — you, the agent, are the synthesizer. Reconcile the concept's observations into one coherent statement. Clears the dirty flag and records a revision.",
     { id: z.string(), body: z.string(), circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle).") },
     async ({ id, body, circle }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`); // scope enforcement
         const c = await core.applySynthesis(id, body);
         if (!c) return err(`concept not found: ${id}`);
-        return mutOk({ id: c.id, circle: scope(circle), version: c.version, dirty: c.dirty, message: "synthesis stored" }, "memory_synthesize");
+        return mutOk({ id: c.id, circle: scope(circle), version: c.version, dirty: c.dirty, message: "synthesis stored" }, "memory_synthesize", false, capturedBlock);
       } catch (e) {
         return err(`synthesize failed: ${msg(e)}`);
       }
@@ -601,6 +669,7 @@ export function registerMonetCoreTools(
         .optional(),
     },
     async ({ circle, summary, workstream }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         const saved = workstream ? await core.saveWorkstream(workstream, { circle: scope(circle), summary }) : null;
         const dirty = core.listDirty(scope(circle));
@@ -616,7 +685,7 @@ export function registerMonetCoreTools(
             : saved
               ? "Workstream saved — next session's agent_context will restore it. Nothing left to synthesize."
               : "Nothing to synthesize.",
-        }, "memory_checkpoint", isCheckpointWithWorkstream);
+        }, "memory_checkpoint", isCheckpointWithWorkstream, capturedBlock);
       } catch (e) {
         return err(`checkpoint failed: ${msg(e)}`);
       }
@@ -634,10 +703,11 @@ export function registerMonetCoreTools(
       circle: z.string().optional().describe("The circle the conceptId belongs to (defaults to this session's circle)."),
     },
     async ({ conceptId, detail, observationId, kind, circle }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`); // scope enforcement
         const c = core.flagContradiction(conceptId, { detail, observationId, kind });
-        return mutOk({ circle: scope(circle), contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail }, "memory_flag_contradiction");
+        return mutOk({ circle: scope(circle), contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail }, "memory_flag_contradiction", false, capturedBlock);
       } catch (e) {
         return err(`flag failed: ${msg(e)}`);
       }
@@ -666,6 +736,7 @@ export function registerMonetCoreTools(
       conceptBId: z.string().optional().describe("Second concept of a possible-duplicate pair to dismiss. Required for duplicate-pair dismissal; omit for contradiction verdicts."),
     },
     async ({ contradictionId, decision, body, resolvedBy, circle, conceptAId, conceptBId }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         // --- Duplicate-pair dismissal path ---
         if (conceptAId !== undefined || conceptBId !== undefined) {
@@ -685,7 +756,7 @@ export function registerMonetCoreTools(
           if (circleB !== scope(circle)) return err(`concept not found: ${conceptBId}`);
           const r = core.dismissPossibleDuplicate(conceptAId, conceptBId, resolvedBy);
           if (!r.dismissed) return err(r.error);
-          return mutOk({ circle: scope(circle), action: "duplicate-pair-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated }, "memory_resolve");
+          return mutOk({ circle: scope(circle), action: "duplicate-pair-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated }, "memory_resolve", false, capturedBlock);
         }
         // --- Contradiction verdict path (original, unchanged) ---
         if (!contradictionId) return err("contradictionId is required for contradiction verdicts");
@@ -694,8 +765,8 @@ export function registerMonetCoreTools(
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
         // Idempotent no-op: contradiction already resolved or dismissed — zero mutations occurred.
-        if ("alreadyClosed" in c) return mutOk({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus }, "memory_resolve");
-        return mutOk({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) }, "memory_resolve");
+        if ("alreadyClosed" in c) return mutOk({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus }, "memory_resolve", false, capturedBlock);
+        return mutOk({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) }, "memory_resolve", false, capturedBlock);
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
       }
@@ -720,6 +791,7 @@ export function registerMonetCoreTools(
         .describe("The circle the conceptId belongs to (defaults to this session's circle). Pass it when working with an explicit circle."),
     },
     async ({ conceptId, observationIds, destConceptId, circle }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`);
         if (destConceptId && core.circleOf(destConceptId) !== scope(circle)) return err(`destConceptId concept not found: ${destConceptId}`);
@@ -736,7 +808,7 @@ export function registerMonetCoreTools(
             : r.destAction === "created"
               ? `Created new concept ${r.destConceptId} from the detached observations. The source concept has been recomputed.`
               : `Attached detached observations to existing concept ${r.destConceptId}. The source concept has been recomputed.`,
-        }, "memory_detach");
+        }, "memory_detach", false, capturedBlock);
       } catch (e) {
         return err(`detach failed: ${msg(e)}`);
       }
@@ -757,6 +829,10 @@ export function registerMonetCoreTools(
         .describe('"auto" (default): merge into a matching destination concept. "forceNew": always keep distinct, recording a possible_duplicate_of edge on near-match — use for curation batch moves.'),
     },
     async ({ id, ids, toCircle, circle, resolution }) => {
+      // memory_reassign_circle is a multi-circle op (source + dest). Snapshot uses the session
+      // default as the prewarm anchor — documented choice: the "from" circle is a migration source
+      // and may not reflect the agent's working context; the session default is the stable anchor.
+      const capturedBlock = capturePrewarmSnapshot(scope());
       try {
         // Validate: exactly one of id/ids.
         if (id !== undefined && ids !== undefined) return err("provide exactly one of `id` or `ids`, not both");
@@ -802,13 +878,13 @@ export function registerMonetCoreTools(
               counts: totalCounts,
               errors: errorItems,
               note: `per-item results elided for ${mergedResults.length - errorItems.length} items — all non-error items succeeded with the actions in counts`,
-            }, "memory_reassign_circle");
+            }, "memory_reassign_circle", false, capturedBlock);
           }
           return mutOk({
             toCircle: r.toCircle,
             counts: totalCounts,
             results: mergedResults,
-          }, "memory_reassign_circle");
+          }, "memory_reassign_circle", false, capturedBlock);
         }
 
         // Single mode.
@@ -829,7 +905,7 @@ export function registerMonetCoreTools(
               : r.action === "moved"
                 ? `Moved to ${r.toCircle}. It now lives in that circle — fetch/search it there.`
                 : `Already in ${r.toCircle}; nothing to do.`,
-        }, "memory_reassign_circle");
+        }, "memory_reassign_circle", false, capturedBlock);
       } catch (e) {
         return err(`reassign failed: ${msg(e)}`);
       }
@@ -849,6 +925,10 @@ export function registerMonetCoreTools(
         .describe('For merge: "auto" deduplicates into existing concepts; "forceNew" (default) keeps all distinct and records possible_duplicate_of edges for near-matches.'),
     },
     async ({ action, circle, to, resolution }) => {
+      // memory_circle_manage is a multi-circle op (rename/merge touch source+dest circles; archive/
+      // unarchive/list touch a single circle but the caller's working context is the session default).
+      // Snapshot uses the session default as the prewarm anchor — documented choice.
+      const capturedBlock = capturePrewarmSnapshot(scope());
       try {
         if (action === "rename") {
           if (!circle) return err("rename requires `circle`");
@@ -863,7 +943,7 @@ export function registerMonetCoreTools(
             edgesUpdated: r.edgesUpdated,
             entitiesUpdated: r.entitiesUpdated,
           };
-          return mutOk(response, "memory_circle_manage");
+          return mutOk(response, "memory_circle_manage", false, capturedBlock);
         }
         if (action === "merge") {
           if (!circle) return err("merge requires `circle`");
@@ -875,23 +955,23 @@ export function registerMonetCoreTools(
             conceptResults: r.conceptResults,
             counts: r.counts,
           };
-          return mutOk(response, "memory_circle_manage");
+          return mutOk(response, "memory_circle_manage", false, capturedBlock);
         }
         if (action === "archive") {
           if (!circle) return err("archive requires `circle`");
           core.archiveCircle(circle);
           const response: CircleArchiveResponse = { action: "archived", circle };
-          return mutOk(response, "memory_circle_manage");
+          return mutOk(response, "memory_circle_manage", false, capturedBlock);
         }
         if (action === "unarchive") {
           if (!circle) return err("unarchive requires `circle`");
           core.unarchiveCircle(circle);
           const response: CircleUnarchiveResponse = { action: "unarchived", circle };
-          return mutOk(response, "memory_circle_manage");
+          return mutOk(response, "memory_circle_manage", false, capturedBlock);
         }
         // list — read-only (enumerate circles)
         const response: CircleListResponse = { circles: core.listCircles(undefined, { includeArchived: true }) };
-        return readOk(response, "memory_circle_manage");
+        return readOk(response, "memory_circle_manage", capturedBlock);
       } catch (e) {
         return err(`circle_manage failed: ${msg(e)}`);
       }

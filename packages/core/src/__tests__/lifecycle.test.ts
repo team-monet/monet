@@ -643,6 +643,166 @@ describe("12. Fix 5a: deriveOptsFromEnv env-var mapping", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 14. Fix A: prewarm block reflects the CALL'S resolved circle (not the default)
+// ---------------------------------------------------------------------------
+
+describe("14. Fix A: prewarm block reflects the call's explicit circle, not the session default", () => {
+  it("memory_search({circle:'foo'}) on populated foo / empty default → block contains foo content", async () => {
+    // Setup: "foo" has content; default is empty.
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Foo circle concept: GraphQL used for API.", { circle: "foo" });
+
+    // Confirm: foo is populated, default is empty.
+    expect(core.conceptCount("foo")).toBeGreaterThan(0);
+    expect(core.conceptCount("default")).toBe(0);
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      const result = await client.callTool({
+        name: "memory_search",
+        arguments: { query: "GraphQL", circle: "foo" },
+      });
+
+      // Block must be present (foo has content).
+      const block = prewarmText(result);
+      expect(block).toContain(PREWARM_HEADER);
+      // Block must mention foo's content — the concept title or keyword.
+      expect(block).toContain("GraphQL");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("memory_search({circle:'foo'}) on populated foo / empty default → block does NOT reflect default (which has nothing)", async () => {
+    // The key correctness check: default is empty, so if the block were built from default
+    // it would be empty entirely — no PREWARM_HEADER at all. The block being present with
+    // foo content proves we snapshotted foo, not default.
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Foo circle concept: Redis used for caching.", { circle: "foo" });
+    expect(core.conceptCount("default")).toBe(0);
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      const result = await client.callTool({
+        name: "memory_search",
+        arguments: { query: "Redis", circle: "foo" },
+      });
+      // If bug is present: scope() resolves default → default is empty → block is empty → no PREWARM_HEADER.
+      // After fix: scope("foo") → foo is populated → block present.
+      expect(prewarmText(result)).toContain(PREWARM_HEADER);
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15. Fix B — test 1: fresh empty store, first call memory_store → NO block
+// ---------------------------------------------------------------------------
+
+describe("15. Fix B: first call memory_store on empty store → no block (nothing to restore)", () => {
+  it("fresh store: first call memory_store → no prewarm block (one-shot consumed correctly)", async () => {
+    const core = new MonetCore(":memory:");
+    // Deliberately empty store — no prior session context exists.
+    expect(core.conceptCount("default")).toBe(0);
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      const result = await client.callTool({
+        name: "memory_store",
+        arguments: { content: "First ever fact written into this store." },
+      });
+      // No prior context → no block. One-shot must be consumed (next call also no block).
+      expect(prewarmText(result)).not.toContain(PREWARM_HEADER);
+
+      // Verify one-shot was consumed: second call also no block.
+      const second = await client.callTool({
+        name: "memory_search",
+        arguments: { query: "fact" },
+      });
+      expect(prewarmText(second)).not.toContain(PREWARM_HEADER);
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 16. Fix B — THE KILLER: prior concept A in circle, first call memory_store(B) →
+//     block present (mentions A), does NOT mention B
+// ---------------------------------------------------------------------------
+
+describe("16. Fix B (killer): first call memory_store(B) → block shows prior A, not B", () => {
+  it("circle has concept A; first MCP call is memory_store(B) → block mentions A title, NOT B", async () => {
+    // Setup: circle already has concept A from a prior session.
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Prior concept A: the project uses TypeScript strictly.", { resolution: "forceNew" });
+    expect(core.conceptCount("default")).toBe(1);
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      // First MCP call is a MUTATION — storing new fact B.
+      const result = await client.callTool({
+        name: "memory_store",
+        arguments: { content: "New fact B: switched to Bun runtime from Node." },
+      });
+
+      // Block must be present: the store had prior context.
+      const block = prewarmText(result);
+      expect(block).toContain(PREWARM_HEADER);
+
+      // Block must mention A (the pre-existing concept).
+      expect(block).toContain("TypeScript");
+
+      // Block must NOT mention B (the fact just written in this same call).
+      // If the block was built AFTER the mutation, B might appear — that's the bug.
+      expect(block).not.toContain("Bun runtime");
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 17. Fix B: error-first with explicit circle → one-shot not consumed;
+//     next success carries correctly-circled block
+// ---------------------------------------------------------------------------
+
+describe("17. Fix B: error-first with explicit circle → one-shot survives, next success carries circled block", () => {
+  it("failing memory_store (no content) leaves one-shot unconsumed; next success (same circle) carries block", async () => {
+    // Setup: "bar" has content; default is empty.
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Bar circle concept: Postgres for persistence.", { circle: "bar" });
+    expect(core.conceptCount("bar")).toBeGreaterThan(0);
+    expect(core.conceptCount("default")).toBe(0);
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      // First call: memory_store with no content → error.
+      const failResult = await client.callTool({
+        name: "memory_store",
+        arguments: { circle: "bar" }, // missing required `content`
+      });
+      expect(isError(failResult)).toBe(true);
+      // One-shot must NOT be consumed on error.
+      expect(prewarmText(failResult)).not.toContain(PREWARM_HEADER);
+
+      // Second call: memory_search with explicit circle "bar" → success → block from bar.
+      const okResult = await client.callTool({
+        name: "memory_search",
+        arguments: { query: "Postgres", circle: "bar" },
+      });
+      const block = prewarmText(okResult);
+      expect(block).toContain(PREWARM_HEADER);
+      // Block must reflect bar's content, not the empty default.
+      expect(block).toContain("Postgres");
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 13. Fix 5b: stale>=5 and dirty>=10 curation thresholds
 // ---------------------------------------------------------------------------
 
