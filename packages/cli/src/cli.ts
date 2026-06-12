@@ -10,7 +10,7 @@ const program = new Command();
 program
   .name("monet")
   .description("Monet — local-first memory for AI agents (state-centric substrate)")
-  .version("0.7.0");
+  .version("0.8.0");
 
 program
   .command("start")
@@ -40,14 +40,21 @@ program
 
 program
   .command("status")
-  .description("Show Monet status and statistics")
-  .action(async () => {
+  .description("Show Monet status and statistics (optionally scoped to a circle)")
+  .option("--circle <name>", "Scope stats to a named circle")
+  .action(async (options) => {
     ensureMonetDir();
     const core = new MonetCore(getDbPath());
-    const s = core.stats();
+    const s = core.stats(options.circle);
     console.log(`Monet Status`);
     console.log(`------------------`);
     console.log(`Storage:       ${getDbPath()}`);
+    if (s.circle !== undefined) {
+      const circleLabel = s.resolvedFrom !== undefined
+        ? `${s.circle} (resolved from ${s.resolvedFrom})`
+        : s.circle;
+      console.log(`Circle:        ${circleLabel}`);
+    }
     console.log(`Concepts:      ${s.concepts}`);
     console.log(`Observations:  ${s.observations}`);
     console.log(`Workstreams:   ${s.workstreams}`);
