@@ -53,5 +53,19 @@ jobs:
       - name: Inspect artifact
         run: npm pack --dry-run
 
+      # Guards against double-publish failures (npm internal retry after a successful upload, or workflow re-runs).
+      - name: Check if version is already published
+        id: check
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null || true)" ]; then
+            echo "::notice::${PKG_NAME}@${PKG_VERSION} is already on npm; skipping publish."
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish (trusted publishing, with provenance)
+        if: steps.check.outputs.already_published == 'false'
         run: npm publish
