@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore } from "./engine";
+import type { MergeConceptResult } from "./engine";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
 // concept — long body + many observations — otherwise serializes to tens of thousands of chars and
@@ -41,6 +42,32 @@ function err(message: string): CallToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * memory_circle_manage response payloads — one per action. Serializing through these (instead of
+ * casting engine results to Record) keeps the wire shape compiler-checked; field order mirrors the
+ * engine result literals (renameCircle/mergeCircle) so the serialized JSON is unchanged.
+ */
+type CircleRenameResponse = {
+  from: string;
+  to: string;
+  action: "renamed" | "noop";
+  conceptsUpdated: number;
+  observationsUpdated: number;
+  edgesUpdated: number;
+  entitiesUpdated: number;
+};
+type CircleMergeResponse = {
+  from: string;
+  into: string;
+  conceptResults: MergeConceptResult[];
+  counts: { moved: number; merged: number; noop: number; error: number };
+};
+type CircleArchiveResponse = { action: "archived"; circle: string };
+type CircleUnarchiveResponse = { action: "unarchived"; circle: string };
+type CircleListResponse = {
+  circles: Array<{ circle: string; concepts: number; lastActivity: number; archived: boolean }>;
+};
 
 /**
  * Register all monet-core tools on `server` and return it (does NOT connect a transport).
@@ -576,27 +603,44 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
           if (!circle) return err("rename requires `circle`");
           if (!to) return err("rename requires `to`");
           const r = core.renameCircle(circle, to);
-          return ok(r as unknown as Record<string, unknown>);
+          const response: CircleRenameResponse = {
+            from: r.from,
+            to: r.to,
+            action: r.action,
+            conceptsUpdated: r.conceptsUpdated,
+            observationsUpdated: r.observationsUpdated,
+            edgesUpdated: r.edgesUpdated,
+            entitiesUpdated: r.entitiesUpdated,
+          };
+          return ok(response);
         }
         if (action === "merge") {
           if (!circle) return err("merge requires `circle`");
           if (!to) return err("merge requires `to`");
           const r = await core.mergeCircle(circle, to, { resolution: resolution ?? "forceNew" });
-          return ok(r as unknown as Record<string, unknown>);
+          const response: CircleMergeResponse = {
+            from: r.from,
+            into: r.into,
+            conceptResults: r.conceptResults,
+            counts: r.counts,
+          };
+          return ok(response);
         }
         if (action === "archive") {
           if (!circle) return err("archive requires `circle`");
           core.archiveCircle(circle);
-          return ok({ action: "archived", circle });
+          const response: CircleArchiveResponse = { action: "archived", circle };
+          return ok(response);
         }
         if (action === "unarchive") {
           if (!circle) return err("unarchive requires `circle`");
           core.unarchiveCircle(circle);
-          return ok({ action: "unarchived", circle });
+          const response: CircleUnarchiveResponse = { action: "unarchived", circle };
+          return ok(response);
         }
         // list
-        const circles = core.listCircles(undefined, { includeArchived: true });
-        return ok({ circles });
+        const response: CircleListResponse = { circles: core.listCircles(undefined, { includeArchived: true }) };
+        return ok(response);
       } catch (e) {
         return err(`circle_manage failed: ${msg(e)}`);
       }
