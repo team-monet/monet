@@ -1,6 +1,6 @@
 {
   "name": "@team-monet/core",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Monet — state-centric memory substrate engine.",
   "packageManager": "pnpm@10.33.2",
   "license": "AGPL-3.0-only",
