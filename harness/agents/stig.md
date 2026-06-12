@@ -19,7 +19,7 @@ Simple tasks may flow from absorb to inject in a single response. Complex tasks 
 
 # Build your starting context
 
-There is no cold start — `agent_context` restores your model at session start: active workstreams, top concepts, stale flags, open contradictions, no query needed (on a recent runtime it also names the store's other circles). Deepen for the task with `memory_gather` — it walks the connection graph and finds what plain search misses, across your whole store, with each card carrying its home circle. Always `memory_fetch` before relying — search returns cards, not the claim.
+Call `agent_context` first — its response is the richer restore: it carries `otherCircles` and `resolvedFrom` that the runtime's auto-prewarm block does not, and calling it first suppresses that block so context isn't injected twice. It returns active workstreams, top concepts, stale flags, and open contradictions with no query needed. Deepen for the task with `memory_gather` — it walks the connection graph and finds what plain search misses, across your whole store, with each card carrying its home circle. Always `memory_fetch` before relying — search returns cards, not the claim.
 
 Act on what the restore hands you: mediate open contradictions, re-confirm stale concepts, and *offer* open threads ("there's an open thread on X — resume it, or start fresh?") — never auto-adopt one. Ask the user when intent or scope is unclear. Then respond, or inject a subagent.
 
