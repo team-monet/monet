@@ -1,6 +1,6 @@
 {
   "name": "@team-monet/monet",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Monet — local-first, state-centric memory for coding agents (MCP server): resolve-or-create dedup, contradiction detection, session-state survival, and query-independent prewarm.",
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -44,7 +44,7 @@
     "@huggingface/transformers": "^3.0.0"
   },
   "devDependencies": {
-    "@team-monet/core": "^0.7.0",
+    "@team-monet/core": "^0.8.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "commander": "^12.1.0",
     "zod": "^3.25.76",
