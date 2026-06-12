@@ -14,6 +14,14 @@ import { z } from "zod";
 import { MonetCore } from "./engine";
 import type { MergeConceptResult } from "./engine";
 
+/**
+ * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions`
+ * option. Tells the agent to call agent_context first, use memory_store/search/gather during
+ * the session, and close with memory_checkpoint.
+ */
+export const MONET_SERVER_INSTRUCTIONS =
+  "Monet is the user's persistent memory substrate; start by calling agent_context (no arguments) to restore active workstreams, the living model, and open contradictions from prior sessions; during the session use memory_store to record durable knowledge and memory_search/memory_gather (cards) + memory_fetch (content) to recall; end by calling memory_checkpoint with a workstream snapshot (open questions, decisions, next steps) so the session survives; without a checkpoint, session state is lost.";
+
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
 // concept — long body + many observations — otherwise serializes to tens of thousands of chars and
 // the host rejects it: "N chars … exceeds maximum allowed tokens"). memory_fetch is bounded at the
@@ -29,7 +37,13 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
   return { text: `${s.slice(0, max)}\n…[truncated ${s.length - max} chars]`, clipped: true };
 }
 
-function ok(content: Record<string, unknown>): CallToolResult {
+// ok() is the canonical serializer for successful tool results. content[0] is ALWAYS the
+// pure JSON payload — byte-identical to what callers (scripts/mcp-smoke.ts, test helpers)
+// expect to JSON.parse. Any lifecycle decorations (prewarm block, nudge line) are appended
+// as ADDITIONAL content items by wrapSuccess so they never interfere with content[0].
+// Per-item bounds: ok()'s JSON is capped at RESULT_MAX_CHARS; the prewarm block is capped
+// at PREWARM_BLOCK_MAX_CHARS; the nudge line is short and uncapped (its fixed text is ~80 chars).
+function ok(content: object): CallToolResult {
   let text = JSON.stringify(content, null, 2);
   if (text.length > RESULT_MAX_CHARS) {
     const note = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
@@ -42,6 +56,111 @@ function err(message: string): CallToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+// ---------------------------------------------------------------------------
+// Session lifecycle helpers (0.7.0)
+// ---------------------------------------------------------------------------
+
+/** Max characters for the prepended prewarm block (keeps it well under the ceiling). */
+const PREWARM_BLOCK_MAX_CHARS = 2_500;
+
+/**
+ * Build the compact prewarm block to prepend on the first successful tool response.
+ * Calls core.prewarm(circle) + core.overview(circle); renders non-empty sections only.
+ * Returns the full delimited block string, or an empty string if the store is empty.
+ */
+function buildPrewarmBlock(core: MonetCore, circle: string): string {
+  const state = core.prewarm(circle);
+  const ov = core.overview(circle);
+
+  const lines: string[] = [];
+
+  // Active workstreams — up to 5.
+  const workstreams = state.activeWorkstreams.slice(0, 5);
+  if (workstreams.length > 0) {
+    lines.push("Active workstreams:");
+    for (const ws of workstreams) {
+      const next = ws.nextSteps[0] ? ` | next: ${ws.nextSteps[0]}` : "";
+      lines.push(`  • [${ws.status}] ${ws.title}${next}`);
+    }
+  }
+
+  // Top concepts — up to 7.
+  const topConcepts = state.topConcepts.slice(0, 7);
+  if (topConcepts.length > 0) {
+    lines.push("Top concepts:");
+    for (const c of topConcepts) {
+      lines.push(`  • ${c.title} (${c.kind}, conf ${c.confidence.toFixed(2)})`);
+    }
+  }
+
+  // Stale concepts — up to 5.
+  const stale = state.staleConcepts.slice(0, 5);
+  if (stale.length > 0) {
+    lines.push("Stale (needs re-confirmation):");
+    for (const c of stale) {
+      lines.push(`  • ${c.title}`);
+    }
+  }
+
+  // Open contradictions — up to 5.
+  const contras = state.openContradictions.slice(0, 5);
+  if (contras.length > 0) {
+    lines.push("Open contradictions:");
+    for (const c of contras) {
+      const detail = c.detail ? ` — ${c.detail.slice(0, 80)}` : "";
+      lines.push(`  • ${c.conceptTitle}${detail}`);
+    }
+  }
+
+  // Nothing stored at all → empty render → no block.
+  if (lines.length === 0) return "";
+
+  // Curation attention line — only when thresholds trip.
+  const advisory = buildCurationAdvisory(ov);
+  if (advisory !== null) {
+    lines.push(`Curation attention: ${advisory}.`);
+  }
+
+  const body = lines.join("\n");
+  const block = `=== MONET SESSION CONTEXT (auto-prewarm) ===\n${body}\n=== END SESSION CONTEXT ===\n\n`;
+
+  // Enforce PREWARM_BLOCK_MAX_CHARS (truncate item lines, never mid-line).
+  if (block.length <= PREWARM_BLOCK_MAX_CHARS) return block;
+  // Reserve footer length BEFORE accumulating so the footer is always included within the cap.
+  const FOOTER = "=== END SESSION CONTEXT ===\n\n";
+  const budget = PREWARM_BLOCK_MAX_CHARS - FOOTER.length;
+  const parts = block.split("\n");
+  let result = "";
+  for (const part of parts) {
+    const candidate = result + part + "\n";
+    if (candidate.length > budget) break;
+    result = candidate;
+  }
+  result += FOOTER;
+  return result;
+}
+
+/**
+ * Build the curation advisory string when thresholds trip.
+ * Returns a non-empty string (for injection into the prewarm block or agent_context payload)
+ * when any threshold is met, or null when none trip.
+ * Thresholds: possibleDuplicates>=3, disputed>=1, stale>=5, dirty>=10.
+ * Single source of truth — used by both buildPrewarmBlock and the agent_context tool handler.
+ */
+function buildCurationAdvisory(ov: ReturnType<MonetCore["overview"]>): string | null {
+  const signals: string[] = [];
+  if (ov.counts.possibleDuplicates >= 3)
+    signals.push(`possibleDuplicates=${ov.counts.possibleDuplicates}`);
+  if (ov.counts.disputed >= 1)
+    signals.push(`disputed=${ov.counts.disputed}`);
+  if (ov.counts.stale >= 5)
+    signals.push(`stale=${ov.counts.stale}`);
+  if (ov.counts.dirty >= 10)
+    signals.push(`dirty=${ov.counts.dirty}`);
+  if (signals.length === 0) return null;
+  return `${signals.join(", ")} — run the curate-memory ritual`;
+}
 
 /**
  * memory_circle_manage response payloads — one per action. Serializing through these (instead of
@@ -70,10 +189,37 @@ type CircleListResponse = {
 };
 
 /**
+ * Options for registerMonetCoreTools. Both default to true.
+ *
+ * autoPrewarm: prepend a compact session context block on the first successful non-agent_context
+ *   tool response in this server process. Useful for agents that don't explicitly call agent_context.
+ *
+ * checkpointNudge: append a reminder line when the session accumulates ≥10 unsaved mutations
+ *   (and every 20 more) without a memory_checkpoint with a workstream payload.
+ */
+export interface RegisterMonetCoreToolsOpts {
+  autoPrewarm?: boolean;
+  checkpointNudge?: boolean;
+}
+
+/**
  * Register all monet-core tools on `server` and return it (does NOT connect a transport).
  * Used internally by createMonetCoreMcpServer and by tests that inject an InMemoryTransport.
  */
-export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpServer {
+export function registerMonetCoreTools(
+  server: McpServer,
+  core: MonetCore,
+  opts?: RegisterMonetCoreToolsOpts,
+): McpServer {
+  const autoPrewarm = opts?.autoPrewarm ?? true;
+  const checkpointNudge = opts?.checkpointNudge ?? true;
+
+  // --- lifecycle closure state ---
+  // Auto-prewarm: one-shot per server process.
+  let prewarmed = false;
+  // Checkpoint nudge: count mutating calls; track last nudge position.
+  let mutatingCalls = 0;
+  let lastNudgeAt = 0;
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
@@ -81,6 +227,109 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
   // the canonical circle without needing to know about the rename.
   const dc = core.getDefaultCircle();
   const scope = (circle?: string): string => core.resolveCircleName(circle ?? dc);
+
+  /**
+   * Wrap a successful (non-error) CallToolResult with lifecycle decorations.
+   *
+   * MCP tool results are content ARRAYS. content[0] is ALWAYS the pure ok() JSON result —
+   * byte-identical to what it was before any lifecycle decoration. This preserves every
+   * consumer that does JSON.parse(content[0].text) (scripts/mcp-smoke.ts, test helpers).
+   *
+   * When decorations apply:
+   *  - The prewarm block ships as content[1] (a separate text item).
+   *  - The nudge line ships as the final content item (content[1] or content[2] depending
+   *    on whether a prewarm block is also present).
+   *
+   * A host that drops extra content items degrades to no-prewarm/no-nudge — acceptable
+   * best-effort. No combined-ceiling math: each item is independently bounded (ok()'s result
+   * at RESULT_MAX_CHARS via ok(); the block at PREWARM_BLOCK_MAX_CHARS via buildPrewarmBlock()).
+   *
+   * `isMutating`: was this a mutating tool call?
+   * `isCheckpointWithWorkstream`: was this a successful memory_checkpoint with a workstream?
+   * `toolName`: name of the tool (to suppress prewarm block for agent_context).
+   */
+  function wrapSuccess(
+    result: CallToolResult,
+    {
+      isMutating,
+      isCheckpointWithWorkstream,
+      toolName,
+    }: { isMutating: boolean; isCheckpointWithWorkstream: boolean; toolName: string },
+  ): CallToolResult {
+    if (result.content[0]?.type !== "text") return result;
+
+    let prewarmBlock = "";
+    let nudgeLine = "";
+    let carryingPrewarm = false;
+
+    // --- auto-prewarm ---
+    if (autoPrewarm && !prewarmed) {
+      if (toolName === "agent_context") {
+        // First call is agent_context: its payload IS the prewarm — no double-inject.
+        prewarmed = true;
+      } else {
+        // First successful non-agent_context call: attempt to build the block.
+        const resolvedCircle = scope();
+        const block = buildPrewarmBlock(core, resolvedCircle);
+        prewarmed = true; // consumed regardless (even if block is empty)
+        if (block.length > 0) {
+          prewarmBlock = block;
+          carryingPrewarm = true;
+        }
+      }
+    }
+
+    // --- checkpoint nudge ---
+    if (checkpointNudge && isMutating && !isCheckpointWithWorkstream && !carryingPrewarm) {
+      mutatingCalls += 1;
+      const shouldNudge =
+        mutatingCalls >= 10 && (lastNudgeAt === 0 || mutatingCalls - lastNudgeAt >= 20);
+      if (shouldNudge) {
+        nudgeLine =
+          "[monet] Session has unsaved state — call memory_checkpoint with a workstream snapshot to preserve it.";
+        lastNudgeAt = mutatingCalls;
+      }
+    } else if (checkpointNudge && isMutating && isCheckpointWithWorkstream) {
+      // Successful checkpoint-with-workstream resets the counter.
+      mutatingCalls = 0;
+      lastNudgeAt = 0;
+    } else if (checkpointNudge && isMutating && !isCheckpointWithWorkstream && carryingPrewarm) {
+      // Mutating call that carries the prewarm block: count it but don't nudge.
+      mutatingCalls += 1;
+    }
+
+    if (prewarmBlock === "" && nudgeLine === "") return result;
+
+    // content[0] is always the pure result from ok() — never modified.
+    // Lifecycle items are appended as additional content items.
+    const extra: Array<{ type: "text"; text: string }> = [];
+    if (prewarmBlock !== "") extra.push({ type: "text", text: prewarmBlock });
+    if (nudgeLine !== "") extra.push({ type: "text", text: nudgeLine });
+
+    return {
+      ...result,
+      content: [result.content[0], ...result.content.slice(1), ...extra],
+    };
+  }
+
+  /**
+   * Convenience wrappers that call ok() then wrapSuccess() with the right metadata.
+   * Used in each tool handler in place of bare ok() for lifecycle-aware responses.
+   * Widened to `object` (from `Record<string, unknown>`) so typed response literals
+   * pass without casts — removes the `as unknown as Record<string, unknown>` pattern.
+   */
+  const readOk = (
+    content: object,
+    toolName: string,
+  ): CallToolResult =>
+    wrapSuccess(ok(content), { isMutating: false, isCheckpointWithWorkstream: false, toolName });
+
+  const mutOk = (
+    content: object,
+    toolName: string,
+    isCheckpointWithWorkstream = false,
+  ): CallToolResult =>
+    wrapSuccess(ok(content), { isMutating: true, isCheckpointWithWorkstream, toolName });
 
   server.tool(
     "memory_store",
@@ -116,7 +365,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
     async ({ content, circle, kind, sourceRefs, resolution, attachTo }) => {
       try {
         const r = await core.store(content, { circle: scope(circle), kind, sourceRefs, resolution, attachTo });
-        return ok({
+        return mutOk({
           circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
           conceptId: r.conceptId,
@@ -125,7 +374,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
             ? { contradiction: { id: r.contradiction.id, status: r.contradiction.status, detail: r.contradiction.detail } }
             : {}),
           ...(r.nearMatchId ? { nearMatchId: r.nearMatchId, nearMatchScore: r.nearMatchScore } : {}),
-        });
+        }, "memory_store");
       } catch (e) {
         return err(`store failed: ${msg(e)}`);
       }
@@ -145,12 +394,12 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         // When circle is omitted, search store-wide (circle: undefined); when provided, scope exactly.
         const results = await core.search(query, { circle: circle !== undefined ? scope(circle) : undefined, limit });
         const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
-        return ok({
+        return readOk({
           circle: circleLabel,
           results,
           guidance:
             "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
-        });
+        }, "memory_search");
       } catch (e) {
         return err(`search failed: ${msg(e)}`);
       }
@@ -163,9 +412,9 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       try {
-        if (entity) return ok({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) });
+        if (entity) return readOk({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) }, "memory_overview");
         const ov = core.overview(scope(circle));
-        return ok({ ...ov, ...(ov.resolvedFrom !== undefined ? { resolvedFrom: ov.resolvedFrom } : {}) });
+        return readOk({ ...ov, ...(ov.resolvedFrom !== undefined ? { resolvedFrom: ov.resolvedFrom } : {}) }, "memory_overview");
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
       }
@@ -196,7 +445,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         const memories = core.listMemories(scope(circle), { withProvenance, limit: lim, cursor: parsed });
         const last = memories[memories.length - 1];
         const nextCursor = memories.length === lim && last ? `${last.updatedAt}:${last.id}` : null;
-        return ok({
+        return readOk({
           circle: scope(circle),
           total: core.conceptCount(scope(circle)), // current size — shrinks as you reassign out
           count: memories.length,
@@ -204,7 +453,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
           memories,
           guidance:
             `Cards show what each memory is about, not what it says. ${nextCursor ? `More remain — call again with cursor=\"${nextCursor}\" (safe to reassign this page first). ` : ""}Group by title/kind + provenance, then memory_reassign_circle(id, toCircle) to move each into its project's circle. memory_fetch(id) to read one.`,
-        });
+        }, "memory_list");
       } catch (e) {
         return err(`list failed: ${msg(e)}`);
       }
@@ -225,7 +474,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         // When circle is omitted, gather store-wide (circle: undefined); when provided, scope exactly.
         const r = await core.gather(intent, { circle: circle !== undefined ? scope(circle) : undefined, limit, depth: depth ? Number(depth) : undefined });
         const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
-        return ok({
+        return readOk({
           circle: circleLabel,
           ranked: r.ranked,
           seed: r.seed,
@@ -233,7 +482,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
           reachableByType: r.reachableByType,
           guidance:
             "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
-        });
+        }, "memory_gather");
       } catch (e) {
         return err(`gather failed: ${msg(e)}`);
       }
@@ -267,7 +516,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         const kept = c.observations;
         const omitted = 0;
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
-        return ok({
+        return readOk({
           id: c.id,
           circle: c.circle, // pass this back to memory_synthesize if it isn't your session default
           kind: c.kind,
@@ -310,7 +559,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
                     "This concept needs synthesis but has more observations than shown — do NOT call memory_synthesize from this partial view (it would drop the omitted evidence). Leave it dirty.",
                 }
               : {}),
-        });
+        }, "memory_fetch");
       } catch (e) {
         return err(`fetch failed: ${msg(e)}`);
       }
@@ -326,7 +575,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`); // scope enforcement
         const c = await core.applySynthesis(id, body);
         if (!c) return err(`concept not found: ${id}`);
-        return ok({ id: c.id, circle: scope(circle), version: c.version, dirty: c.dirty, message: "synthesis stored" });
+        return mutOk({ id: c.id, circle: scope(circle), version: c.version, dirty: c.dirty, message: "synthesis stored" }, "memory_synthesize");
       } catch (e) {
         return err(`synthesize failed: ${msg(e)}`);
       }
@@ -355,7 +604,9 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
       try {
         const saved = workstream ? await core.saveWorkstream(workstream, { circle: scope(circle), summary }) : null;
         const dirty = core.listDirty(scope(circle));
-        return ok({
+        // A successful checkpoint WITH a workstream payload resets the nudge counter.
+        const isCheckpointWithWorkstream = saved !== null;
+        return mutOk({
           circle: scope(circle),
           workstream: saved ? { id: saved.id, status: saved.payload.status, version: saved.version } : null,
           dirtyCount: dirty.length,
@@ -365,7 +616,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
             : saved
               ? "Workstream saved — next session's agent_context will restore it. Nothing left to synthesize."
               : "Nothing to synthesize.",
-        });
+        }, "memory_checkpoint", isCheckpointWithWorkstream);
       } catch (e) {
         return err(`checkpoint failed: ${msg(e)}`);
       }
@@ -386,7 +637,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
       try {
         if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`); // scope enforcement
         const c = core.flagContradiction(conceptId, { detail, observationId, kind });
-        return ok({ circle: scope(circle), contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail });
+        return mutOk({ circle: scope(circle), contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail }, "memory_flag_contradiction");
       } catch (e) {
         return err(`flag failed: ${msg(e)}`);
       }
@@ -434,7 +685,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
           if (circleB !== scope(circle)) return err(`concept not found: ${conceptBId}`);
           const r = core.dismissPossibleDuplicate(conceptAId, conceptBId, resolvedBy);
           if (!r.dismissed) return err(r.error);
-          return ok({ circle: scope(circle), action: "duplicate-pair-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated });
+          return mutOk({ circle: scope(circle), action: "duplicate-pair-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated }, "memory_resolve");
         }
         // --- Contradiction verdict path (original, unchanged) ---
         if (!contradictionId) return err("contradictionId is required for contradiction verdicts");
@@ -443,8 +694,8 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
         // Idempotent no-op: contradiction already resolved or dismissed — zero mutations occurred.
-        if ("alreadyClosed" in c) return ok({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus });
-        return ok({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) });
+        if ("alreadyClosed" in c) return mutOk({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus }, "memory_resolve");
+        return mutOk({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) }, "memory_resolve");
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
       }
@@ -473,7 +724,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`);
         if (destConceptId && core.circleOf(destConceptId) !== scope(circle)) return err(`destConceptId concept not found: ${destConceptId}`);
         const r = await core.detach(conceptId, observationIds, { destConceptId, circle: scope(circle) });
-        return ok({
+        return mutOk({
           circle: scope(circle),
           sourceConceptId: r.sourceConceptId,
           destConceptId: r.destConceptId,
@@ -485,7 +736,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
             : r.destAction === "created"
               ? `Created new concept ${r.destConceptId} from the detached observations. The source concept has been recomputed.`
               : `Attached detached observations to existing concept ${r.destConceptId}. The source concept has been recomputed.`,
-        });
+        }, "memory_detach");
       } catch (e) {
         return err(`detach failed: ${msg(e)}`);
       }
@@ -546,18 +797,18 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
           const BATCH_INLINE_LIMIT = 25;
           if (mergedResults.length > BATCH_INLINE_LIMIT) {
             const errorItems = mergedResults.filter((res) => res.action === "error");
-            return ok({
+            return mutOk({
               toCircle: r.toCircle,
               counts: totalCounts,
               errors: errorItems,
               note: `per-item results elided for ${mergedResults.length - errorItems.length} items — all non-error items succeeded with the actions in counts`,
-            });
+            }, "memory_reassign_circle");
           }
-          return ok({
+          return mutOk({
             toCircle: r.toCircle,
             counts: totalCounts,
             results: mergedResults,
-          });
+          }, "memory_reassign_circle");
         }
 
         // Single mode.
@@ -565,7 +816,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
         if (core.circleOf(id!) !== scope(circle)) return err(`concept not found: ${id}`);
         const r = core.reassignCircle(id!, toCircle, opts);
         if (!r) return err(`concept not found: ${id}`);
-        return ok({
+        return mutOk({
           action: r.action,
           conceptId: r.conceptId,
           fromCircle: r.fromCircle,
@@ -578,7 +829,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
               : r.action === "moved"
                 ? `Moved to ${r.toCircle}. It now lives in that circle — fetch/search it there.`
                 : `Already in ${r.toCircle}; nothing to do.`,
-        });
+        }, "memory_reassign_circle");
       } catch (e) {
         return err(`reassign failed: ${msg(e)}`);
       }
@@ -612,7 +863,7 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
             edgesUpdated: r.edgesUpdated,
             entitiesUpdated: r.entitiesUpdated,
           };
-          return ok(response);
+          return mutOk(response, "memory_circle_manage");
         }
         if (action === "merge") {
           if (!circle) return err("merge requires `circle`");
@@ -624,23 +875,23 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
             conceptResults: r.conceptResults,
             counts: r.counts,
           };
-          return ok(response);
+          return mutOk(response, "memory_circle_manage");
         }
         if (action === "archive") {
           if (!circle) return err("archive requires `circle`");
           core.archiveCircle(circle);
           const response: CircleArchiveResponse = { action: "archived", circle };
-          return ok(response);
+          return mutOk(response, "memory_circle_manage");
         }
         if (action === "unarchive") {
           if (!circle) return err("unarchive requires `circle`");
           core.unarchiveCircle(circle);
           const response: CircleUnarchiveResponse = { action: "unarchived", circle };
-          return ok(response);
+          return mutOk(response, "memory_circle_manage");
         }
-        // list
+        // list — read-only (enumerate circles)
         const response: CircleListResponse = { circles: core.listCircles(undefined, { includeArchived: true }) };
-        return ok(response);
+        return readOk(response, "memory_circle_manage");
       } catch (e) {
         return err(`circle_manage failed: ${msg(e)}`);
       }
@@ -649,29 +900,51 @@ export function registerMonetCoreTools(server: McpServer, core: MonetCore): McpS
 
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name.",
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
     { circle: z.string().optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);
       const state = core.prewarm(resolvedCircle);
+      const ov = core.overview(resolvedCircle);
+      const advisory = buildCurationAdvisory(ov);
       const others = core.listCircles(resolvedCircle).slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
-      return ok({
+      return wrapSuccess(ok({
         agentId: core.getAgentId(),
         mode: "local",
         circle: resolvedCircle,
         ...(state.resolvedFrom !== undefined ? { resolvedFrom: state.resolvedFrom } : {}),
         ...state,
+        ...(advisory !== null ? { curationAttention: advisory } : {}),
         ...(others.length > 0 ? { otherCircles: others } : {}),
-      });
+      }), { isMutating: false, isCheckpointWithWorkstream: false, toolName: "agent_context" });
     },
   );
 
   return server;
 }
 
+/**
+ * Derive RegisterMonetCoreToolsOpts from environment variables.
+ * Exported for testing — lets tests verify the env-var mapping without spawning a process.
+ * MONET_NO_AUTOPREWARM=1  → autoPrewarm:false
+ * MONET_NO_CHECKPOINT_NUDGE=1 → checkpointNudge:false
+ */
+export function deriveOptsFromEnv(env: NodeJS.ProcessEnv = process.env): RegisterMonetCoreToolsOpts {
+  return {
+    autoPrewarm: env.MONET_NO_AUTOPREWARM !== "1",
+    checkpointNudge: env.MONET_NO_CHECKPOINT_NUDGE !== "1",
+  };
+}
+
 export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
-  const server = new McpServer({ name: "monet-core", version: "0.6.0" }, { capabilities: { tools: {} } });
-  registerMonetCoreTools(server, core);
+  const server = new McpServer(
+    { name: "monet-core", version: "0.7.0" },
+    {
+      capabilities: { tools: {} },
+      instructions: MONET_SERVER_INSTRUCTIONS,
+    },
+  );
+  registerMonetCoreTools(server, core, deriveOptsFromEnv());
   const transport = new StdioServerTransport();
   await server.connect(transport);
   return server;
