@@ -87,6 +87,7 @@ Inspect the current store:
 
 ```sh
 monet status
+monet status --circle my-repo-1a2b3c4d   # scoped to a single circle
 ```
 
 ## Commands
@@ -95,7 +96,7 @@ monet status
 |---|---|
 | `monet start [--dir <path>]` | Run the MCP server over stdio. Your agent host spawns this. |
 | `monet config [--agent <host>] [--yaml] [--output <file>]` | Print or write an MCP config block (`--agent`: `claude-code`, `cursor`, `hermes`, `openclaw`). |
-| `monet status` | Show the storage path and store-wide counts (concepts, observations, workstreams, unsynthesized). |
+| `monet status [--circle <name>]` | Show the storage path and store-wide counts (concepts, observations, workstreams, unsynthesized). Pass `--circle` to scope counts to a single circle. |
 
 ## What's inside
 
