@@ -683,11 +683,41 @@ export class MonetCore {
     return this.resolveCircle(name);
   }
 
-  /** Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty. */
+  /**
+   * Sift tier (inline): append observation → embed → resolve-or-create → derive edges. Marks dirty.
+   *
+   * Atomicity design (ADR data-integrity fix, 2026-06-12):
+   *
+   * The entire mutation path — observation insert, resolution (attach/create/fork +
+   * possible_duplicate_of edges), concept updates (source_refs, embedding, confidence,
+   * temporal stamps), entity extraction + graph derivation, and flagContradiction — is wrapped
+   * in one `db.transaction()` envelope. If anything in that envelope throws (e.g. a crash
+   * during entity extraction or graph derivation), ALL writes roll back atomically. The error
+   * propagates to the caller and NOTHING persists.
+   *
+   * What sits OUTSIDE the transaction and why:
+   *  - `embedder.embed(content)` — async; better-sqlite3 transaction callbacks are synchronous.
+   *    Embedding is a pure computation with no side effects; computing it before the transaction
+   *    is safe.
+   *  - `bestMatches()` — read-only; no writes, safe before or inside the transaction.
+   *  - `ensureSession()` — the session row is an audit trail of what was attempted, independent
+   *    of whether the store succeeds. It must survive a rolled-back store so the session id is
+   *    stable for the lifetime of the MonetCore instance. Session creation is cheap and idempotent
+   *    (already guarded by `if (this.sessionId) return this.sessionId`).
+   *  - Validation checks before embedding — fast-fail, no writes.
+   *
+   * Nested-transaction safety: attach(), create(), flagContradiction(), and deriveEdges() / all
+   * graph helpers (upsertEdge, upsertEntity, etc.) issue plain `prepare().run()` calls — none
+   * open their own `db.transaction()`. SQLite/better-sqlite3 would raise on a nested BEGIN
+   * anyway; the absence of inner transactions means the outer envelope covers everything cleanly.
+   *
+   * The `lastConceptByCircle` in-memory pointer is updated AFTER the transaction commits so it
+   * only reflects state that is durably persisted.
+   */
   async store(content: string, opts: StoreOpts = {}): Promise<IngestResult> {
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
 
-    // Validate resolution options before embedding (fast-fail).
+    // Validate resolution options before embedding (fast-fail, no writes).
     if (opts.resolution === "forceNew" && opts.attachTo) {
       throw new Error("resolution 'forceNew' and attachTo are mutually exclusive");
     }
@@ -700,111 +730,131 @@ export class MonetCore {
       if (targetCheck.kind === "workstream") throw new Error("cannot attach to a workstream concept");
     }
 
+    // OUTSIDE the transaction: async embedding computation and read-only dedup scan.
     const emb = await this.embedder.embed(content);
-    const obsId = this.newId();
-    const sessionId = this.ensureSession();
-    const sourceRefs = opts.sourceRefs ?? [];
-    const refsJson = sourceRefs.length ? JSON.stringify(sourceRefs) : null;
-
-    this.db
-      .prepare(
-        `INSERT INTO observations (id, content, embedding, kind, circle, session_id, author_agent_id, source_refs)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(obsId, content, embToJson(emb), opts.kind ?? "statement", circle, sessionId, this.agentId, refsJson);
-
     // ONE cosine scan serves both dedup (argmax) and `related` edge derivation (top-M) — no extra cost.
     const matches = this.bestMatches(emb, circle, EDGE_NEIGHBORS);
     const { match, score } = matches[0] ?? { match: null, score: 0 };
 
-    let action: IngestAction;
-    let row: ConceptRow;
-    let nearMatchId: string | undefined;
-    let nearMatchScore: number | undefined;
+    const obsId = this.newId();
+    // OUTSIDE the transaction: session row is an audit trail; must survive a rolled-back store.
+    const sessionId = this.ensureSession();
+    const sourceRefs = opts.sourceRefs ?? [];
+    const refsJson = sourceRefs.length ? JSON.stringify(sourceRefs) : null;
 
-    if (opts.attachTo) {
-      // Direct attach: bypass scoring, land on named concept.
-      const targetRow = this.getRow(opts.attachTo)!;
-      row = this.attach(targetRow, content, emb, sessionId);
-      action = "attached";
-    } else if (opts.resolution === "forceNew") {
-      // Always create a new concept regardless of similarity.
-      // forceNew intentionally records no possible_duplicate_of edge — the caller asserts distinctness (bulk import); the returned score still reports the nearest neighbor.
-      row = this.create(content, emb, circle, opts.kind);
-      action = "created";
-    } else {
-      // Auto resolution: score-based deduplication.
-      if (match && score >= this.tauAttach) {
+    // TRANSACTION: the entire mutation path — observation, concept, graph derivation,
+    // contradiction — is atomic. Any throw inside rolls back ALL writes.
+    const txResult = this.db.transaction((): {
+      action: IngestAction;
+      row: ConceptRow;
+      nearMatchId?: string;
+      nearMatchScore?: number;
+      contradiction?: Contradiction;
+    } => {
+      this.db
+        .prepare(
+          `INSERT INTO observations (id, content, embedding, kind, circle, session_id, author_agent_id, source_refs)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(obsId, content, embToJson(emb), opts.kind ?? "statement", circle, sessionId, this.agentId, refsJson);
+
+      let action: IngestAction;
+      let row: ConceptRow;
+      let nearMatchId: string | undefined;
+      let nearMatchScore: number | undefined;
+
+      if (opts.attachTo) {
+        // Direct attach: bypass scoring, land on named concept.
+        const targetRow = this.getRow(opts.attachTo!)!;
+        row = this.attach(targetRow, content, emb, sessionId);
         action = "attached";
-        row = this.attach(match, content, emb, sessionId);
-      } else if (match && score >= this.tauAmbiguous) {
-        // A wrong fork is recoverable (the pair can be merged later); a wrong merge is not
-        // (split loses provenance). Ambiguous-band evidence therefore forks, with a
-        // possible_duplicate_of edge for later mediation.
-        // Exception: kind="correction" is exempt from fork-on-ambiguous — the caller is
-        // explicitly asserting "this overrides existing memory", so the intent disambiguates.
-        if (opts.kind === "correction") {
-          // Attach to the near match and let the existing correction path open a contradiction.
-          action = "ambiguous";
-          row = this.attach(match, content, emb, sessionId);
-          nearMatchId = match.id;
-          nearMatchScore = score;
-        } else {
-          action = "ambiguous";
-          row = this.create(content, emb, circle, opts.kind);
-          nearMatchId = match.id;
-          nearMatchScore = score;
-          if (this.graphEnabled) {
-            this.upsertEdgeBoth(row.id, match.id, "possible_duplicate_of", score, "cheap", circle);
-          }
-        }
-      } else {
-        action = "created";
+      } else if (opts.resolution === "forceNew") {
+        // Always create a new concept regardless of similarity.
+        // forceNew intentionally records no possible_duplicate_of edge — the caller asserts distinctness (bulk import); the returned score still reports the nearest neighbor.
         row = this.create(content, emb, circle, opts.kind);
+        action = "created";
+      } else {
+        // Auto resolution: score-based deduplication.
+        if (match && score >= this.tauAttach) {
+          action = "attached";
+          row = this.attach(match, content, emb, sessionId);
+        } else if (match && score >= this.tauAmbiguous) {
+          // A wrong fork is recoverable (the pair can be merged later); a wrong merge is not
+          // (split loses provenance). Ambiguous-band evidence therefore forks, with a
+          // possible_duplicate_of edge for later mediation.
+          // Exception: kind="correction" is exempt from fork-on-ambiguous — the caller is
+          // explicitly asserting "this overrides existing memory", so the intent disambiguates.
+          if (opts.kind === "correction") {
+            // Attach to the near match and let the existing correction path open a contradiction.
+            action = "ambiguous";
+            row = this.attach(match, content, emb, sessionId);
+            nearMatchId = match.id;
+            nearMatchScore = score;
+          } else {
+            action = "ambiguous";
+            row = this.create(content, emb, circle, opts.kind);
+            nearMatchId = match.id;
+            nearMatchScore = score;
+            if (this.graphEnabled) {
+              this.upsertEdgeBoth(row.id, match.id, "possible_duplicate_of", score, "cheap", circle);
+            }
+          }
+        } else {
+          action = "created";
+          row = this.create(content, emb, circle, opts.kind);
+        }
       }
-    }
 
-    this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
+      this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
 
-    // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
-    // must not erase earlier return-to-source pointers. Recorded UNCONDITIONALLY — NOT gated on the
-    // graph: gather()/toGatherCard and any source-keyed lookup read the concept-level `source_refs`, so
-    // a graph-disabled store must still record provenance. Otherwise a re-ingest/idempotency check that
-    // keys on the source pointer (e.g. the consolidation playbook's "did I already capture this file?")
-    // would wrongly report "never captured" on a graph-off runtime.
-    if (sourceRefs.length) {
-      const cur = this.db.prepare(`SELECT source_refs FROM concepts WHERE id = ?`).get(row.id) as
-        | { source_refs: string | null }
-        | undefined;
-      const existing = cur?.source_refs ? (JSON.parse(cur.source_refs) as string[]) : [];
-      const merged = [...new Set([...existing, ...sourceRefs])];
-      this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(JSON.stringify(merged), row.id);
-    }
+      // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
+      // must not erase earlier return-to-source pointers. Recorded UNCONDITIONALLY — NOT gated on the
+      // graph: gather()/toGatherCard and any source-keyed lookup read the concept-level `source_refs`, so
+      // a graph-disabled store must still record provenance. Otherwise a re-ingest/idempotency check that
+      // keys on the source pointer (e.g. the consolidation playbook's "did I already capture this file?")
+      // would wrongly report "never captured" on a graph-off runtime.
+      if (sourceRefs.length) {
+        const cur = this.db.prepare(`SELECT source_refs FROM concepts WHERE id = ?`).get(row.id) as
+          | { source_refs: string | null }
+          | undefined;
+        const existing = cur?.source_refs ? (JSON.parse(cur.source_refs) as string[]) : [];
+        const merged = [...new Set([...existing, ...sourceRefs])];
+        this.db.prepare(`UPDATE concepts SET source_refs = ? WHERE id = ?`).run(JSON.stringify(merged), row.id);
+      }
 
+      if (this.graphEnabled) {
+        // For ambiguous forks the possible_duplicate_of edge was already recorded above; deriveEdges
+        // also runs to derive entity/about, co_occurred, and asserted edges for the new concept.
+        this.deriveEdges(row.id, content, sourceRefs, circle, sessionId, matches);
+      }
+
+      // Contradiction detection is agent-judged, expressed cheaply: a "correction" that lands on
+      // an EXISTING concept is the agent saying "this overrides what's there" → open a conflict
+      // (ADR §4.1 step 4 / §4.6). Novel corrections (action="created") have nothing to contradict.
+      // For attachTo: always flag regardless of the action-string gate (the caller explicitly named
+      // a target, so it is always an existing concept by validation above).
+      // For ambiguous corrections: action="ambiguous" but the correction was attached to the near match
+      // (F6 exemption), so we must treat it as existing to open the contradiction.
+      let contradiction: Contradiction | undefined;
+      const onExisting = action === "attached" || opts.attachTo !== undefined || (action === "ambiguous" && opts.kind === "correction");
+      if (opts.kind === "correction" && onExisting) {
+        contradiction = this.flagContradiction(row.id, {
+          observationId: obsId,
+          kind: "value-conflict",
+          detail: `correction: ${firstLine(content)}`,
+        });
+        row = this.getRow(row.id)!; // reflect disputed status + decayed confidence
+      }
+
+      return { action, row, nearMatchId, nearMatchScore, contradiction };
+    })();
+
+    // OUTSIDE the transaction: update in-memory pointer only after a committed write.
     if (this.graphEnabled) {
-      // For ambiguous forks the possible_duplicate_of edge was already recorded above; deriveEdges
-      // also runs to derive entity/about, co_occurred, and asserted edges for the new concept.
-      this.deriveEdges(row.id, content, sourceRefs, circle, sessionId, matches);
-      this.lastConceptByCircle.set(circle, row.id);
+      this.lastConceptByCircle.set(circle, txResult.row.id);
     }
 
-    // Contradiction detection is agent-judged, expressed cheaply: a "correction" that lands on
-    // an EXISTING concept is the agent saying "this overrides what's there" → open a conflict
-    // (ADR §4.1 step 4 / §4.6). Novel corrections (action="created") have nothing to contradict.
-    // For attachTo: always flag regardless of the action-string gate (the caller explicitly named
-    // a target, so it is always an existing concept by validation above).
-    // For ambiguous corrections: action="ambiguous" but the correction was attached to the near match
-    // (F6 exemption), so we must treat it as existing to open the contradiction.
-    let contradiction: Contradiction | undefined;
-    const onExisting = action === "attached" || opts.attachTo !== undefined || (action === "ambiguous" && opts.kind === "correction");
-    if (opts.kind === "correction" && onExisting) {
-      contradiction = this.flagContradiction(row.id, {
-        observationId: obsId,
-        kind: "value-conflict",
-        detail: `correction: ${firstLine(content)}`,
-      });
-      row = this.getRow(row.id)!; // reflect disputed status + decayed confidence
-    }
+    const { action, row, nearMatchId, nearMatchScore, contradiction } = txResult;
 
     // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
     const returnScore = opts.resolution === "forceNew" ? (matches[0]?.score ?? 0)
@@ -947,30 +997,37 @@ export class MonetCore {
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind = 'workstream' AND slug = ?`)
       .get(circle, slug) as ConceptRow | undefined;
 
-    let id: string;
-    let version: number;
-    if (existing) {
-      id = existing.id;
-      version = existing.version + 1;
-      this.db
-        .prepare(
-          `UPDATE concepts
-              SET body = ?, title = ?, embedding = ?, version = ?, status = 'active',
-                  dirty = 0, updated_at = unixepoch() * 1000
-            WHERE id = ?`,
-        )
-        .run(body, title, embToJson(emb), version, id);
-    } else {
-      id = this.newId();
-      version = 0;
-      this.db
-        .prepare(
-          `INSERT INTO concepts (id, slug, title, body, kind, status, embedding, support_count, version, dirty, circle)
-           VALUES (?, ?, ?, ?, 'workstream', 'active', ?, 1, 0, 0, ?)`,
-        )
-        .run(id, slug, title, body, embToJson(emb), circle);
-    }
-    this.writeRevision(id, version, body);
+    // TRANSACTION: workstream concept write + revision must be all-or-nothing.
+    // endSession() lives OUTSIDE the envelope — it is session lifecycle and should proceed
+    // regardless of the workstream write outcome (same reasoning as ensureSession in store()).
+    const id = this.db.transaction((): string => {
+      let conceptId: string;
+      let version: number;
+      if (existing) {
+        conceptId = existing.id;
+        version = existing.version + 1;
+        this.db
+          .prepare(
+            `UPDATE concepts
+                SET body = ?, title = ?, embedding = ?, version = ?, status = 'active',
+                    dirty = 0, updated_at = unixepoch() * 1000
+              WHERE id = ?`,
+          )
+          .run(body, title, embToJson(emb), version, conceptId);
+      } else {
+        conceptId = this.newId();
+        version = 0;
+        this.db
+          .prepare(
+            `INSERT INTO concepts (id, slug, title, body, kind, status, embedding, support_count, version, dirty, circle)
+             VALUES (?, ?, ?, ?, 'workstream', 'active', ?, 1, 0, 0, ?)`,
+          )
+          .run(conceptId, slug, title, body, embToJson(emb), circle);
+      }
+      this.writeRevision(conceptId, version, body);
+      return conceptId;
+    })();
+
     this.endSession(opts.summary);
     return toWorkstream(this.getRow(id)!);
   }
@@ -1051,16 +1108,22 @@ export class MonetCore {
     const row = this.getRow(conceptId);
     if (!row) throw new Error(`concept not found: ${conceptId}`);
     const id = this.newId();
-    this.db
-      .prepare(
-        `INSERT INTO contradictions (id, concept_id, observation_id, kind, status, detail)
-         VALUES (?, ?, ?, ?, 'open', ?)`,
-      )
-      .run(id, conceptId, opts.observationId ?? null, opts.kind ?? "value-conflict", opts.detail ?? "");
-    this.db
-      .prepare(`UPDATE concepts SET status = 'disputed', confidence = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
-      .run(Math.max(0.1, row.confidence - 0.3), conceptId);
-    return toContradiction(this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(id) as ContradictionRow);
+    // Atomic: contradiction insert + concept status/confidence update must be all-or-nothing.
+    // Called both standalone (MCP/agent) and from inside store()'s own transaction envelope;
+    // better-sqlite3 flattens a nested transaction call into a savepoint so this is safe either way.
+    const contraRow = this.db.transaction((): ContradictionRow => {
+      this.db
+        .prepare(
+          `INSERT INTO contradictions (id, concept_id, observation_id, kind, status, detail)
+           VALUES (?, ?, ?, ?, 'open', ?)`,
+        )
+        .run(id, conceptId, opts.observationId ?? null, opts.kind ?? "value-conflict", opts.detail ?? "");
+      this.db
+        .prepare(`UPDATE concepts SET status = 'disputed', confidence = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
+        .run(Math.max(0.1, row.confidence - 0.3), conceptId);
+      return this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(id) as ContradictionRow;
+    })();
+    return toContradiction(contraRow);
   }
 
   /**
@@ -1085,57 +1148,64 @@ export class MonetCore {
     if (c.status !== "open") return { alreadyClosed: true, contradictionStatus: c.status };
     const conceptId = c.concept_id;
 
-    if (opts.decision === "dismiss") {
-      this.db
-        .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`)
-        .run(opts.by ?? null, contradictionId);
-      // dismiss: do NOT refresh temporal fields (no new evidence confirms; the conflict is simply set aside)
-    } else {
-      const allIds = (
-        this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`).all(conceptId) as Array<{ id: string }>
-      ).map((o) => o.id);
-      const priors = allIds.filter((oid) => oid !== c.observation_id);
-      const winnerObsId = opts.decision === "accept-new" ? c.observation_id : priors[priors.length - 1] ?? null;
+    // ensureSession() OUTSIDE the transaction: the session row is an audit trail that must survive
+    // even if the resolution transaction rolls back. Mirrors the same decision in store().
+    // Called here so sessionId is available inside the transaction closure (dismiss path skips it,
+    // but we capture it unconditionally to keep the closure simple).
+    const resolveSessionId = this.ensureSession();
 
-      if (winnerObsId) {
-        const supersede = this.db.prepare(`UPDATE observations SET superseded_by = ? WHERE id = ?`);
-        for (const loser of allIds.filter((oid) => oid !== winnerObsId)) supersede.run(winnerObsId, loser);
-      }
-      if (opts.body !== undefined) {
-        const row = this.getRow(conceptId)!;
-        const version = row.version + 1;
+    // TRANSACTION: all writes for a single resolution verdict must be all-or-nothing.
+    // Partial resolution (e.g. observations superseded but contradiction status not updated) would
+    // leave data in an inconsistent disputed state with no path to recovery.
+    return this.db.transaction((): Concept | { alreadyClosed: true; contradictionStatus: string } => {
+      if (opts.decision === "dismiss") {
         this.db
-          .prepare(`UPDATE concepts SET body = ?, version = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
-          .run(opts.body, version, conceptId);
-        this.writeRevision(conceptId, version, opts.body);
-      }
-      this.db
-        .prepare(
-          `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`,
-        )
-        .run(winnerObsId, opts.by ?? null, contradictionId);
-      // accept-new / keep-current: a verdict is evidence that the concept's state is confirmed — refresh.
-      // ensureSession() must be called before stamping so that if this resolve is the FIRST write of
-      // an MCP session (no store() has run yet), sessionId is non-null — otherwise the next store()
-      // in the same session sees null ≠ current-session and incorrectly applies the cross-session bump.
-      const resolveSessionId = this.ensureSession();
-      const now = Date.now();
-      this.db
-        .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
-        .run(now, resolveSessionId, conceptId);
-    }
+          .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`)
+          .run(opts.by ?? null, contradictionId);
+        // dismiss: do NOT refresh temporal fields (no new evidence confirms; the conflict is simply set aside)
+      } else {
+        const allIds = (
+          this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`).all(conceptId) as Array<{ id: string }>
+        ).map((o) => o.id);
+        const priors = allIds.filter((oid) => oid !== c.observation_id);
+        const winnerObsId = opts.decision === "accept-new" ? c.observation_id : priors[priors.length - 1] ?? null;
 
-    // Restore the concept once nothing is left open against it.
-    const open = this.db.prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`).get(conceptId) as {
-      n: number;
-    };
-    if (open.n === 0) {
-      const row = this.getRow(conceptId)!;
-      this.db
-        .prepare(`UPDATE concepts SET status = 'active', confidence = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
-        .run(Math.min(1, row.confidence + 0.2), conceptId);
-    }
-    return toConcept(this.getRow(conceptId)!);
+        if (winnerObsId) {
+          const supersede = this.db.prepare(`UPDATE observations SET superseded_by = ? WHERE id = ?`);
+          for (const loser of allIds.filter((oid) => oid !== winnerObsId)) supersede.run(winnerObsId, loser);
+        }
+        if (opts.body !== undefined) {
+          const row = this.getRow(conceptId)!;
+          const version = row.version + 1;
+          this.db
+            .prepare(`UPDATE concepts SET body = ?, version = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
+            .run(opts.body, version, conceptId);
+          this.writeRevision(conceptId, version, opts.body);
+        }
+        this.db
+          .prepare(
+            `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`,
+          )
+          .run(winnerObsId, opts.by ?? null, contradictionId);
+        // accept-new / keep-current: a verdict is evidence that the concept's state is confirmed — refresh.
+        const now = Date.now();
+        this.db
+          .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
+          .run(now, resolveSessionId, conceptId);
+      }
+
+      // Restore the concept once nothing is left open against it.
+      const open = this.db.prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`).get(conceptId) as {
+        n: number;
+      };
+      if (open.n === 0) {
+        const row = this.getRow(conceptId)!;
+        this.db
+          .prepare(`UPDATE concepts SET status = 'active', confidence = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
+          .run(Math.min(1, row.confidence + 0.2), conceptId);
+      }
+      return toConcept(this.getRow(conceptId)!);
+    })();
   }
 
   /** Open contradictions in a circle, joined with concept titles (prewarm + listing). */
@@ -1193,11 +1263,14 @@ export class MonetCore {
   async applySynthesis(id: string, body: string): Promise<Concept | null> {
     const row = this.getRow(id);
     if (!row) return null;
-    this.db
-      .prepare(`UPDATE concepts SET body = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
-      .run(body, id);
-    this.writeRevision(id, row.version, body);
-    return toConcept(this.getRow(id)!);
+    // Atomic: concept body update + revision write must be all-or-nothing.
+    return this.db.transaction((): Concept => {
+      this.db
+        .prepare(`UPDATE concepts SET body = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
+        .run(body, id);
+      this.writeRevision(id, row.version, body);
+      return toConcept(this.getRow(id)!);
+    })();
   }
 
   /** Concepts with unsynthesized evidence + their raw observations (for the agent to synthesize). */
