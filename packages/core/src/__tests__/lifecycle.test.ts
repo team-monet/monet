@@ -911,3 +911,124 @@ describe("13. Fix 5b: stale>=5 and dirty>=10 curation thresholds", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 18. memory_fetch deferred snapshot — circle-omitted fetch uses homeCircle
+// ---------------------------------------------------------------------------
+
+describe("18. memory_fetch: prewarm snapshot deferred to after homeCircle resolution", () => {
+  /**
+   * Test 1: concept lives in "foo"; default is empty; first call memory_fetch(id) with NO circle.
+   * Pre-fix: capturePrewarmSnapshot(scope(undefined)) = scope of default = empty → no block.
+   * Post-fix: snapshot deferred; homeCircle = "foo" → block built from "foo" → block present.
+   */
+  it("fetch omit-circle → block reflects homeCircle content (pre-fix: no/wrong block)", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const r = await core.store("Foo circle concept: Kafka used for event streaming.", { circle: "foo" });
+    const conceptId = r.conceptId;
+
+    // Confirm: "foo" is populated; default is empty.
+    expect(core.conceptCount("foo")).toBeGreaterThan(0);
+    expect(core.conceptCount("default")).toBe(0);
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      // First call: memory_fetch with circle omitted → store-wide lookup → homeCircle = "foo".
+      const result = await client.callTool({
+        name: "memory_fetch",
+        arguments: { id: conceptId }, // no circle
+      });
+      expect(isError(result)).toBe(false);
+
+      // Block must be present and reflect "foo"'s content.
+      const block = prewarmText(result);
+      expect(block).toContain(PREWARM_HEADER);
+      expect(block).toContain("Kafka");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  /**
+   * Test 2: same setup but explicit circle:"foo" passed.
+   * This path was already correct (scope(circle) resolves to "foo").
+   * Regression: must still work after the fix.
+   */
+  it("fetch explicit circle:'foo' → block reflects foo content (regression guard)", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const r = await core.store("Foo concept: Redis used for caching.", { circle: "foo" });
+    const conceptId = r.conceptId;
+
+    expect(core.conceptCount("foo")).toBeGreaterThan(0);
+    expect(core.conceptCount("default")).toBe(0);
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      const result = await client.callTool({
+        name: "memory_fetch",
+        arguments: { id: conceptId, circle: "foo" },
+      });
+      expect(isError(result)).toBe(false);
+
+      const block = prewarmText(result);
+      expect(block).toContain(PREWARM_HEADER);
+      expect(block).toContain("Redis");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  /**
+   * Test 3: fetch with a nonexistent id → error; one-shot NOT consumed.
+   * Next successful call must still carry the block.
+   */
+  it("fetch nonexistent id → error; one-shot survives; next success carries block", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Some concept for later recall.", { circle: "foo" });
+
+    const { client, cleanup } = await makePair(core);
+    try {
+      // First call: fetch a nonexistent id → error.
+      const failResult = await client.callTool({
+        name: "memory_fetch",
+        arguments: { id: "nonexistent-id-000000" },
+      });
+      expect(isError(failResult)).toBe(true);
+      // One-shot must NOT be consumed on error.
+      expect(prewarmText(failResult)).not.toContain(PREWARM_HEADER);
+
+      // Second call: a successful read → block must be present.
+      const okResult = await client.callTool({
+        name: "memory_search",
+        arguments: { query: "concept", circle: "foo" },
+      });
+      const block = prewarmText(okResult);
+      expect(block).toContain(PREWARM_HEADER);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  /**
+   * Test 4 (sanity): fetch with omitted circle still returns the concept body (read path unchanged).
+   */
+  it("fetch omit-circle still returns the concept data (read path sanity)", async () => {
+    const core = new MonetCore(":memory:");
+    const r = await core.store("Sanity check: concept body is always returned.", { circle: "foo" });
+    const conceptId = r.conceptId;
+
+    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
+    try {
+      const result = await client.callTool({
+        name: "memory_fetch",
+        arguments: { id: conceptId }, // no circle
+      });
+      expect(isError(result)).toBe(false);
+      const payload = parsePayload(result) as Record<string, unknown>;
+      expect(payload).toHaveProperty("id", conceptId);
+      expect(payload).toHaveProperty("circle", "foo");
+    } finally {
+      await cleanup();
+    }
+  });
+});

@@ -561,10 +561,11 @@ export function registerMonetCoreTools(
       observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages."),
     },
     async ({ id, circle, observationsOffset }) => {
-      // Fix A: use the caller's explicit circle if provided; fall back to the scope default.
-      // For memory_fetch, scope(circle) is the right anchor — the homeCircle lookup happens
-      // below and gates access, but the prewarm snapshot reflects what the caller intended to work in.
-      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      // memory_fetch is READ-ONLY — the pre-mutation capture rule (Fix B) does not apply here.
+      // We defer capturePrewarmSnapshot until after homeCircle is resolved so that an omit-circle
+      // call (store-wide lookup) snapshots the concept's actual home circle rather than the
+      // session default, which may be empty/unrelated. Error paths (id not found, scope-gate
+      // rejection) return before the snapshot is taken, so they never consume the one-shot.
       try {
         // Scope enforcement:
         // - homeCircle null → concept not found (id doesn't exist).
@@ -572,7 +573,12 @@ export function registerMonetCoreTools(
         // - caller omitted circle → look up store-wide; the response surfaces the home circle.
         const homeCircle = core.circleOf(id);
         if (homeCircle === null) return err(`concept not found: ${id}`);
+        // Scope-gate: if the caller named a circle explicitly, the id must live there.
+        // Check BEFORE taking the snapshot so a rejection never consumes the one-shot.
         if (circle !== undefined && homeCircle !== scope(circle)) return err(`concept not found: ${id}`);
+        // Snapshot circle: explicit caller circle wins; else use the fetched concept's homeCircle.
+        const snapshotCircle = circle !== undefined ? scope(circle) : homeCircle;
+        const capturedBlock = capturePrewarmSnapshot(snapshotCircle);
         // pageSize=FETCH_MAX_OBS: the engine slices exactly one page newest-first from the offset,
         // so the MCP layer receives at most FETCH_MAX_OBS observations with no secondary cap needed.
         const c = await core.getConcept(id, { synthesize: false, observationsOffset: observationsOffset ?? 0, pageSize: FETCH_MAX_OBS });
