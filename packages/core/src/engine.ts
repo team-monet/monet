@@ -1074,7 +1074,9 @@ export class MonetCore {
     const topConcepts = active
       .filter((r) => !isStale(r))
       .map((r) => ({ r, score: livingModelScore(r, now) }))
-      .sort((a, b) => b.score - a.score)
+      // Deterministic tiebreak on id prevents non-determinism (ordering non-determinism has
+      // shipped real bugs in this repo — sibling staleConcepts sort).
+      .sort((a, b) => b.score !== a.score ? b.score - a.score : (a.r.id < b.r.id ? -1 : 1))
       .slice(0, conceptLimit)
       .map(({ r }) => livingModelCard(r));
     const staleConcepts = active
@@ -1902,14 +1904,35 @@ export class MonetCore {
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM observations`).get() as { n: number }).n;
   }
 
-  stats(): { concepts: number; observations: number; dirty: number; workstreams: number; sessions: number } {
-    const n = (sql: string): number => (this.db.prepare(sql).get() as { n: number }).n;
+  stats(circle?: string): { concepts: number; observations: number; dirty: number; workstreams: number; sessions: number } & { circle?: string; resolvedFrom?: string } {
+    if (circle === undefined) {
+      const n = (sql: string): number => (this.db.prepare(sql).get() as { n: number }).n;
+      return {
+        concepts: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind != 'workstream'`),
+        observations: n(`SELECT COUNT(*) AS n FROM observations`),
+        dirty: n(`SELECT COUNT(*) AS n FROM concepts WHERE dirty = 1`),
+        workstreams: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'workstream'`),
+        // Store-wide: counts all session rows, including sessions that only called saveWorkstream
+        // and wrote no observations. Sessions are not circle-keyed, so this is the only
+        // computable store-wide definition.
+        sessions: n(`SELECT COUNT(*) AS n FROM sessions`),
+      };
+    }
+    const resolved = this.resolveCircle(circle);
+    const resolvedFrom = resolved !== circle ? circle : undefined;
     return {
-      concepts: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind != 'workstream'`),
-      observations: n(`SELECT COUNT(*) AS n FROM observations`),
-      dirty: n(`SELECT COUNT(*) AS n FROM concepts WHERE dirty = 1`),
-      workstreams: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'workstream'`),
-      sessions: n(`SELECT COUNT(*) AS n FROM sessions`),
+      concepts: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind != 'workstream'`, resolved),
+      observations: this.scopedCount(`SELECT COUNT(*) AS n FROM observations WHERE circle = ?`, resolved),
+      dirty: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND dirty = 1`, resolved),
+      workstreams: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind = 'workstream'`, resolved),
+      // Per-circle: counts only sessions that wrote at least one observation to this circle.
+      // Sessions that only called saveWorkstream contribute no observations, so they are
+      // invisible here — intentional and mirrors overview()'s precedent. The sessions table
+      // is not circle-keyed, so DISTINCT observation session_ids is the only computable
+      // per-circle definition.
+      sessions: this.scopedCount(`SELECT COUNT(DISTINCT session_id) AS n FROM observations WHERE circle = ? AND session_id IS NOT NULL`, resolved),
+      circle: resolved,
+      ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
     };
   }
 
@@ -3082,15 +3105,15 @@ export class MonetCore {
   private nodePrior(id: string): number {
     const m = this.nodeMeta(id);
     if (!m) return 1;
-    const ageDays = Math.max(0, (Date.now() - m.updatedAt) / 86_400_000);
+    const ageDays = Math.max(0, (Date.now() - (m.lastConfirmedAt ?? m.updatedAt)) / 86_400_000);
     return Math.max(1e-3, m.confidence * Math.log1p(m.usefulness + m.support) * Math.exp(-ageDays / 30));
   }
 
-  private nodeMeta(id: string): { confidence: number; usefulness: number; support: number; updatedAt: number } | null {
+  private nodeMeta(id: string): { confidence: number; usefulness: number; support: number; updatedAt: number; lastConfirmedAt: number | null } | null {
     const r = this.db
-      .prepare(`SELECT confidence, usefulness_score, support_count, updated_at FROM concepts WHERE id = ?`)
-      .get(id) as { confidence: number; usefulness_score: number; support_count: number; updated_at: number } | undefined;
-    return r ? { confidence: r.confidence, usefulness: r.usefulness_score, support: r.support_count, updatedAt: r.updated_at } : null;
+      .prepare(`SELECT confidence, usefulness_score, support_count, updated_at, last_confirmed_at FROM concepts WHERE id = ?`)
+      .get(id) as { confidence: number; usefulness_score: number; support_count: number; updated_at: number; last_confirmed_at: number | null } | undefined;
+    return r ? { confidence: r.confidence, usefulness: r.usefulness_score, support: r.support_count, updatedAt: r.updated_at, lastConfirmedAt: r.last_confirmed_at } : null;
   }
 
   private embOf(id: string): Float32Array | null {
@@ -3285,7 +3308,7 @@ function toWorkstream(r: ConceptRow): Workstream {
 
 /** Living-model rank (ADR §4.2): confidence × usefulness × recency-decay (~2-week half-ish). */
 function livingModelScore(r: ConceptRow, now: number): number {
-  const ageDays = Math.max(0, (now - r.updated_at) / 86_400_000);
+  const ageDays = Math.max(0, (now - (r.last_confirmed_at ?? r.updated_at)) / 86_400_000);
   const recency = Math.exp(-ageDays / 14); // fresh ≈ 1, decays with staleness
   return r.confidence * (1 + r.usefulness_score) * recency;
 }
