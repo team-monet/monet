@@ -211,16 +211,21 @@ describe("1b. Migration ordering — graph-disabled open does not consume graph 
 
 describe("2. Staleness divergence — structural op updates updated_at but not last_confirmed_at", () => {
   it("a concept's staleness is based on last_confirmed_at, not updated_at", async () => {
-    // staleAfterMs=10 so we can control staleness with very short times.
-    const core = new MonetCore(":memory:", { staleAfterMs: 10 });
+    // Use a large staleAfterMs (10 min) so "fresh" timestamps never race the window on any runner.
+    // The concept's last_confirmed_at is set by store() to ~now; with a 10-minute window it will
+    // never appear stale before we deliberately age it below.
+    const STALE_AFTER_MS = 600_000; // 10 minutes
+    const core = new MonetCore(":memory:", { staleAfterMs: STALE_AFTER_MS });
     const r = await core.store("Auth tokens are signed with jose.");
 
-    // Immediately: concept is fresh.
+    // Immediately: concept is fresh (last_confirmed_at ≈ now, window = 10 min).
+    // No wall-clock race: even on the slowest CI runner, test setup cannot consume 10 minutes.
     expect(core.getStaleConcepts().some((c) => c.id === r.conceptId)).toBe(false);
 
-    // Freeze last_confirmed_at in the past (> staleAfterMs ago) but set updated_at to NOW
-    // to simulate a structural op that bumped updated_at but not last_confirmed_at.
-    const pastTs = Date.now() - 1000; // 1s ago, definitely > 10ms
+    // Pin last_confirmed_at to 2× the stale window in the past, set updated_at to NOW —
+    // simulates a structural op that bumped updated_at but not last_confirmed_at.
+    // Using 2× ensures staleness regardless of runner speed.
+    const pastTs = Date.now() - STALE_AFTER_MS * 2;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const db = (core as any).db as import("../storage").StoragePort;
     db.prepare(`UPDATE concepts SET last_confirmed_at = ?, updated_at = unixepoch() * 1000 WHERE id = ?`).run(pastTs, r.conceptId);
@@ -962,7 +967,7 @@ describe("P2 fix — evidence-attributed temporal state on both sides of a detac
    *
    * Returns { core, db, sourceId, obs1Id, obs2Id, oldCreatedAt, freshCreatedAt }.
    */
-  async function buildSourceWithOldAndFreshObs(staleAfterMs = 500): Promise<{
+  async function buildSourceWithOldAndFreshObs(staleAfterMs = 600_000): Promise<{
     core: MonetCore;
     db: import("../storage").StoragePort;
     sourceId: string;
@@ -981,8 +986,9 @@ describe("P2 fix — evidence-attributed temporal state on both sides of a detac
     const fetched1 = (await core.getConcept(sourceId, { synthesize: false }))!;
     const obs1Id = fetched1.observations[0]!.id;
 
-    // Age obs1's created_at to the far past (well beyond staleAfterMs).
-    const oldCreatedAt = Date.now() - 2000;
+    // Age obs1's created_at to 2× staleAfterMs in the past — deterministically stale regardless
+    // of runner speed. With staleAfterMs=600_000 (10 min) this is 20 minutes ago.
+    const oldCreatedAt = Date.now() - staleAfterMs * 2;
     db.prepare(`UPDATE observations SET created_at = ?, session_id = ? WHERE id = ?`).run(oldCreatedAt, "session-old", obs1Id);
 
     // Session B attaches a cross-session observation. end the current session first.
@@ -1009,10 +1015,10 @@ describe("P2 fix — evidence-attributed temporal state on both sides of a detac
   }
 
   it("Q1: move FRESH obs to NEW → dest carries fresh stamp; source falls back to old obs created_at (reads stale)", async () => {
-    // staleAfterMs=1000: oldCreatedAt = now-2000 is stale (2000 > 1000);
-    // freshCreatedAt ≈ now is not stale (0 < 1000). Gives ~1s margin before the test itself ages.
+    // staleAfterMs=600_000 (10 min): oldCreatedAt = now - 20 min is always stale;
+    // freshCreatedAt ≈ now will never age past 10 min on any CI runner — deterministic on both sides.
     const { core, sourceId, obs2Id, obs1Id, oldCreatedAt, freshCreatedAt } =
-      await buildSourceWithOldAndFreshObs(1000);
+      await buildSourceWithOldAndFreshObs();
 
     // Verify source currently reads fresh (last_confirmed_at = freshCreatedAt, not stale).
     expect(core.getStaleConcepts().some((c) => c.id === sourceId)).toBe(false);
@@ -1041,9 +1047,10 @@ describe("P2 fix — evidence-attributed temporal state on both sides of a detac
   });
 
   it("Q2: move OLD obs to NEW → dest carries old timestamp (reads stale); source keeps fresh stamp", async () => {
-    // staleAfterMs=1000: oldCreatedAt = now-2000 is stale; freshCreatedAt ≈ now is not stale.
+    // staleAfterMs=600_000 (10 min): oldCreatedAt = now - 20 min is always stale;
+    // freshCreatedAt ≈ now will never age past 10 min — no wall-clock race on either verdict.
     const { core, sourceId, obs1Id, obs2Id, oldCreatedAt, freshCreatedAt } =
-      await buildSourceWithOldAndFreshObs(1000);
+      await buildSourceWithOldAndFreshObs();
 
     // Detach the OLD observation (obs1) to a NEW concept.
     const r = await core.detach(sourceId, [obs1Id]);
@@ -1072,9 +1079,10 @@ describe("P2 fix — evidence-attributed temporal state on both sides of a detac
   });
 
   it("Q3: move obs into EXISTING dest (partial) → dest temporal fields unchanged; source recomputes correctly", async () => {
-    // staleAfterMs=1000: oldCreatedAt = now-2000 is stale; freshCreatedAt ≈ now is not stale.
+    // staleAfterMs=600_000 (10 min): oldCreatedAt = now - 20 min is always stale;
+    // freshCreatedAt ≈ now will never age past 10 min — deterministic, no wall-clock race.
     const { core, db, sourceId, obs2Id, obs1Id, oldCreatedAt, freshCreatedAt } =
-      await buildSourceWithOldAndFreshObs(1000);
+      await buildSourceWithOldAndFreshObs();
 
     // Create an independent destination concept with a known last_confirmed_at.
     const destResult = await core.store("Existing destination concept with its own evidence.");
