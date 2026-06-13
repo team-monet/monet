@@ -1179,9 +1179,11 @@ export class MonetCore {
         if (opts.body !== undefined) {
           const row = this.getRow(conceptId)!;
           const version = row.version + 1;
+          // empty/whitespace body → keep existing title (never blank it)
+          const nextTitle = row.kind === 'workstream' ? row.title : (firstLine(opts.body) || row.title);
           this.db
-            .prepare(`UPDATE concepts SET body = ?, version = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
-            .run(opts.body, version, conceptId);
+            .prepare(`UPDATE concepts SET body = ?, title = ?, version = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
+            .run(opts.body, nextTitle, version, conceptId);
           this.writeRevision(conceptId, version, opts.body);
         }
         this.db
@@ -1267,9 +1269,11 @@ export class MonetCore {
     if (!row) return null;
     // Atomic: concept body update + revision write must be all-or-nothing.
     return this.db.transaction((): Concept => {
+      // empty/whitespace body → keep existing title (never blank it)
+      const nextTitle = row.kind === 'workstream' ? row.title : (firstLine(body) || row.title);
       this.db
-        .prepare(`UPDATE concepts SET body = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
-        .run(body, id);
+        .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
+        .run(body, nextTitle, id);
       this.writeRevision(id, row.version, body);
       return toConcept(this.getRow(id)!);
     })();
@@ -3232,12 +3236,14 @@ export class MonetCore {
   /** Sieve tier (deferred): run the synthesizer over the concept's evidence, clear dirty. */
   private async synthesizeRow(concept: ConceptRow): Promise<ConceptRow> {
     const obs = this.db
-      .prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at`)
+      .prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
       .all(concept.id) as Array<{ content: string }>;
     const { body } = await this.synthesizer.synthesize(obs.map((o) => o.content), { body: concept.body });
+    // empty/whitespace body → keep existing title (never blank it)
+    const nextTitle = concept.kind === 'workstream' ? concept.title : (firstLine(body) || concept.title);
     this.db
-      .prepare(`UPDATE concepts SET body = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
-      .run(body, concept.id);
+      .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
+      .run(body, nextTitle, concept.id);
     this.writeRevision(concept.id, concept.version, body);
     return this.getRow(concept.id)!;
   }
