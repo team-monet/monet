@@ -42,6 +42,8 @@ await Promise.all(
       format: "esm",
       target: "node22",
       sourcemap: false,
+      minify: true,
+      legalComments: "none",
       external: EXTERNAL,
       // ESM output needs a real `require` so bundled CJS deps (e.g. commander's
       // `require("node:events")`) resolve instead of hitting esbuild's throwing stub.
