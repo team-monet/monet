@@ -1,8 +1,8 @@
 # with-monet
 
-**An agent-agnostic harness that pairs a state-centric coding lead (`Stig`) and a focused worker team with [Monet](https://github.com/team-monet/monet)'s memory substrate.**
+**An agent-agnostic harness that pairs a state-centric coding lead (`Stig`) and a focused worker team with [Monet](https://www.npmjs.com/package/@team-monet/monet)'s memory substrate.**
 
-The substrate — the `monet` MCP server + CLI (in [`team-monet/monet`](https://github.com/team-monet/monet), on npm as `@team-monet/monet`) — maintains a persistent memory model so the agent doesn't have to. `with-monet` is the *lightweight* harness that points the coding agent you already use (Claude Code) at that substrate and gives it a team that knows how to use it.
+The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet`](https://www.npmjs.com/package/@team-monet/monet) on npm) — maintains a persistent memory model so the agent doesn't have to. `with-monet` is the *lightweight* harness that points the coding agent you already use (Claude Code) at that substrate and gives it a team that knows how to use it.
 
 ## Where this sits
 
