@@ -1,14 +1,13 @@
 {
   "name": "@team-monet/monet",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Monet — local-first, state-centric memory for coding agents. MCP server + CLI.",
   "license": "LicenseRef-Monet-Proprietary",
   "type": "module",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/team-monet/monet.git"
+  "homepage": "https://github.com/team-monet/with-monet",
+  "bugs": {
+    "url": "https://github.com/team-monet/with-monet/issues"
   },
-  "homepage": "https://github.com/team-monet/monet",
   "keywords": [
     "mcp",
     "memory",
