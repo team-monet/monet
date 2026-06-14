@@ -13,12 +13,18 @@ name: Publish closed client
 #   No NPM_TOKEN secret needed. The id-token: write permission below is what unlocks OIDC.
 #
 # NO --provenance: the private core repo must not be linked via provenance attestations.
+#   NPM_CONFIG_PROVENANCE=false makes this explicit and durable even if the repo goes public.
 #
 # Secrets required (set in GitHub repo Settings → Secrets → Actions):
 #   MONET_CORE_TOKEN  — GitHub PAT (classic or fine-grained) with read-only
 #                       access to the private repo team-monet/monet-core.
 #                       Fine-grained: repository "monet-core", permission "Contents: Read".
 #                       Classic: scope "repo" (read is sufficient for checkout).
+
+# Never cancel an in-flight publish — a partial publish is worse than a duplicate attempt.
+concurrency:
+  group: publish-${{ github.workflow }}
+  cancel-in-progress: false
 
 on:
   push:
@@ -112,7 +118,11 @@ jobs:
       # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
       # --access public is required for scoped packages on first publish; safe to repeat.
       # NO --provenance flag: the private core repo must not be linked via attestations.
+      # NPM_CONFIG_PROVENANCE=false is set explicitly so provenance stays OFF even if
+      # this repo is ever made public (npm enables provenance by default on public repos).
       - name: Publish to npm (OIDC trusted publishing)
         if: ${{ inputs.dry_run != 'true' }}
         working-directory: monet-client
+        env:
+          NPM_CONFIG_PROVENANCE: "false"
         run: npm publish --access public
