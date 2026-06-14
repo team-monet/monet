@@ -1,9 +1,8 @@
 {
   "name": "@team-monet/monet",
-  "version": "0.8.1",
+  "version": "1.0.0",
   "description": "Monet — local-first, state-centric memory for coding agents. MCP server + CLI.",
-  "private": true,
-  "license": "AGPL-3.0-only",
+  "license": "LicenseRef-Monet-Proprietary",
   "type": "module",
   "repository": {
     "type": "git",
@@ -25,9 +24,6 @@
   "files": [
     "dist"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:cli": "tsx watch src/cli.ts",
@@ -45,7 +41,7 @@
     "@huggingface/transformers": "^3.0.0"
   },
   "devDependencies": {
-    "@team-monet/core": "^0.8.1",
+    "@team-monet/core": "file:../monet-core",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "commander": "^12.1.0",
     "zod": "^3.25.76",

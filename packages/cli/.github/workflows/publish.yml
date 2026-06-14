@@ -1,0 +1,112 @@
+name: Publish closed client
+
+# Runs on a version tag (v1.x.x) or a manual trigger.
+# Publishes the closed @team-monet/monet artifact to public npm.
+#
+# Deliberately does NOT use OIDC trusted publishing or --provenance:
+# the private core repo must not be linked to the published package via
+# provenance attestations, and the public client repo does not support
+# id-token write permission for the same reason.
+#
+# Secrets required (set in GitHub repo Settings → Secrets → Actions):
+#   NPM_TOKEN         — npm classic automation token (Automation type).
+#                       Create at npmjs.com → Access Tokens → Generate New Token → Automation.
+#   MONET_CORE_TOKEN  — GitHub PAT (classic or fine-grained) with read-only
+#                       access to the private repo team-monet/monet-core.
+#                       Fine-grained: repository "monet-core", permission "Contents: Read".
+#                       Classic: scope "repo" (read is sufficient for checkout).
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (pack but do not publish)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+  # Explicitly NO id-token permission — provenance is intentionally disabled.
+
+jobs:
+  publish:
+    name: Build closed artifact and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the public client repo.
+      - name: Checkout monet-client
+        uses: actions/checkout@v4
+        with:
+          path: monet-client
+
+      # 2. Check out the PRIVATE core repo alongside the client.
+      #    The file: dep in package.json resolves to ../monet-core relative
+      #    to the client root, so both repos must be siblings at the workspace root.
+      - name: Checkout monet-core (private)
+        uses: actions/checkout@v4
+        with:
+          repository: team-monet/monet-core
+          token: ${{ secrets.MONET_CORE_TOKEN }}
+          path: monet-core
+
+      # Directory layout after the two checkouts:
+      #   $GITHUB_WORKSPACE/
+      #     monet-client/   ← public repo (this workflow)
+      #     monet-core/     ← private repo (file:../monet-core)
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Read version from client packageManager field.
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: monet-client/pnpm-lock.yaml
+
+      # Build core first so its dist/ is available for the client bundle step.
+      - name: Install core dependencies
+        working-directory: monet-core
+        run: pnpm install --frozen-lockfile
+
+      - name: Build core
+        working-directory: monet-core
+        run: pnpm build
+
+      # Install client dependencies — the file:../monet-core specifier now
+      # resolves to the freshly built local checkout.
+      - name: Install client dependencies
+        working-directory: monet-client
+        run: pnpm install --frozen-lockfile
+
+      # Build the closed esbuild bundle (minified, no sourcemaps, no comments).
+      - name: Build closed client artifact
+        working-directory: monet-client
+        run: pnpm build
+
+      # Smoke-check the tarball contents before publishing.
+      - name: Verify tarball (no source, no sourcemap)
+        working-directory: monet-client
+        run: npm pack --dry-run
+
+      # Publish to npm. --access public is required for scoped packages on first publish;
+      # safe to repeat on subsequent publishes. NO --provenance flag.
+      - name: Publish to npm
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: monet-client
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+        # npm reads NODE_AUTH_TOKEN from the environment automatically.
+        # No .npmrc manipulation needed when using this env var name.
