@@ -16,5 +16,6 @@ export default defineConfig({
   clean: true,
   sourcemap: false,
   treeshake: true,
+  minify: true,
   external: ["better-sqlite3", "@modelcontextprotocol/sdk", "zod", "@huggingface/transformers"],
 });

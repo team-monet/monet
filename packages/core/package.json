@@ -2,6 +2,7 @@
   "name": "@team-monet/core",
   "version": "0.8.1",
   "description": "Monet — state-centric memory substrate engine.",
+  "private": true,
   "packageManager": "pnpm@10.33.2",
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -20,7 +21,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/strip-dts-comments.mjs",
     "prepare": "pnpm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --dir src",
