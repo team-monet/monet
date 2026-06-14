@@ -98,19 +98,6 @@ monet status --circle my-repo-1a2b3c4d   # scoped to a single circle
 | `monet config [--agent <host>] [--yaml] [--output <file>]` | Print or write an MCP config block (`--agent`: `claude-code`, `cursor`, `hermes`, `openclaw`). |
 | `monet status [--circle <name>]` | Show the storage path and store-wide counts (concepts, observations, workstreams, unsynthesized). Pass `--circle` to scope counts to a single circle. |
 
-## What's inside
-
-- **State-centric substrate** — a two-layer observation/concept store with resolve-or-create dedup.
-- **Contradiction & drift handling**, **session-state survival**, and **query-independent prewarm**.
-- **On-device embeddings** (MiniLM via ONNX, with a lexical fallback) — your data never leaves your machine.
-
-The engine is [`@team-monet/core`](https://github.com/team-monet/monet-core); this package is
-the local runtime (MCP server + CLI) built around it.
-
 ## License
 
-Monet is licensed under **AGPL-3.0-only** (see [LICENSE](./LICENSE)) — free to use, study,
-modify, self-host, and contribute. Under AGPL's copyleft, anyone who conveys a modified
-version, or offers it to others over a network, must release their corresponding source
-under the same terms. **Commercial licenses without AGPL obligations are available from the
-copyright holder.**
+Monet is licensed under **AGPL-3.0-only** (see [LICENSE](./LICENSE)).
