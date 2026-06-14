@@ -28,7 +28,7 @@ program
       process.env.MONET_STORAGE_DIR = path.resolve(options.dir);
     }
     ensureMonetDir();
-    // Identify the project we're serving so one shared store (e.g. ~/.monet) isolates each repo
+    // Identify the project we're serving so one shared store (e.g. ~/.monet) organizes each repo
     // into its own circle. A host may spawn this stdio server from a cwd that isn't the user's
     // repo — Claude Code sets CLAUDE_PROJECT_DIR and documents that servers shouldn't rely on cwd
     // — so prefer an explicit project dir, then fall back to cwd.

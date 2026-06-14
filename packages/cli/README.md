@@ -16,7 +16,7 @@ Your agent installs Monet, wires up the MCP server, and pulls in a memory-aware 
 
 ## Zero config
 
-Monet keeps one local store at `~/.monet` and automatically isolates each project into its own *circle* — nothing to set up, and memory never bleeds between repos. Everything stays on your machine.
+Monet keeps one local store at `~/.monet` and automatically **organizes** each project into its own *circle* — nothing to set up. Everything stays on your machine.
 
 ## License
 
