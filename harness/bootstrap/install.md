@@ -81,15 +81,18 @@ The user may request a trimmed worker set, but the full team is the default — 
 
 ## Phase 5 — Offer the memory-ingest pipeline
 
-Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"* Offer sources:
-- existing/old Monet memories or an export,
-- `CLAUDE.md` / `AGENTS.md` / `README`s / `docs/` in this repo,
-- a path or URL the user names,
-- skip for now.
+Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"* The richest sources are the ones that already capture how you and your team work:
+
+- **Agent reference files** — `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, Cursor/Cline/Copilot/Windsurf/Continue rules, and any other agent instructions you've written. These often hold the most distilled project knowledge.
+- **`README`s and `docs/`** in this repo — architectural decisions, conventions, ADRs.
+- **Notes and decision docs** — `NOTES.md`, `TODO`, scratch docs, anything that records *why* decisions were made.
+- A path or URL the user names.
+- Skip for now.
+- (If you're coming from a prior Monet store, say so and I can pull that in too.)
 
 For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. **Skip Monet's own wiring:** when the source is `CLAUDE.md` (which holds Stig's prompt) or an installed agent prompt, don't store the `<!-- BEGIN with-monet:stig -->…<!-- END with-monet:stig -->` block or any `<!-- with-monet:agent -->`-marked file. Summarize what landed.
 
-**Existing memory to consolidate?** If you find a meaningful pile — a non-empty legacy `"default"` circle (`memory_overview(circle:"default")`), other agents' rule files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, or scattered notes/ADRs — don't leave it scattered. Offer the interactive consolidation playbook [`bootstrap/consolidate-memory.md`](consolidate-memory.md) (same raw-URL base as above): capture each source into Monet, organize into per-project circles *with* the user, then retire the source (a pointer or archive) so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; consolidation does the organize-and-retire, interactively and reversibly. Skip if there's nothing meaningful to consolidate.
+**Existing knowledge to consolidate?** If you find a meaningful pile — agent reference files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, scattered notes/ADRs, or an existing Monet store — don't leave it scattered. Offer the interactive consolidation playbook [`bootstrap/consolidate-memory.md`](consolidate-memory.md) (same raw-URL base as above): capture each source into Monet, organize into per-project circles *with* the user, then retire the source (a pointer or archive) so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; consolidation does the organize-and-retire, interactively and reversibly. Skip if there's nothing meaningful to consolidate.
 
 ## Phase 6 — Offer to start
 
