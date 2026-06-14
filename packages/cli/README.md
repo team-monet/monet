@@ -18,17 +18,6 @@ Your agent installs Monet, wires up the MCP server, and pulls in a memory-aware 
 
 Monet keeps one local store at `~/.monet` and automatically isolates each project into its own *circle* — nothing to set up, and memory never bleeds between repos. Everything stays on your machine.
 
-## Manual install (advanced)
-
-Prefer to wire the server yourself?
-
-```sh
-npm i -g @team-monet/monet
-claude mcp add --scope user monet -- monet start   # Claude Code; restart your host after
-```
-
-Requires **Node ≥ 22**. Other MCP hosts: `monet config --agent <claude-code|cursor|hermes|openclaw>`.
-
 ## License
 
 Monet is distributed under a **proprietary license** — free to use for any purpose; redistribution, decompilation, and derivative works are not permitted. Full terms are in the `LICENSE` file included in this package.
