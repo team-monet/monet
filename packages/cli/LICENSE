@@ -1,16 +1,22 @@
-Monet Proprietary License
+Monet Software License (Proprietary — Free to Use)
 
-Copyright (c) 2024-2025 team-monet. All rights reserved.
+Copyright (c) 2026 John Lee (Monet). All rights reserved.
 
-PLACEHOLDER — John Lee will replace this text with the finalized proprietary license before publication.
+This software (the "Software") is made available free of charge under the following terms. By installing or using the Software, you agree to them.
 
-Permitted:
-  - Use of this software for any purpose, commercial or non-commercial.
+1. License grant. You are granted a worldwide, royalty-free, non-exclusive, non-transferable license to install and use the Software for any lawful purpose, whether personal or commercial, including via standard package managers for your own use.
 
-Not permitted:
-  - Redistribution of source code.
-  - Reverse-engineering, decompiling, or disassembling the compiled artifact.
-  - Publishing or redistributing derivative works.
+2. Restrictions. You may not:
+   (a) redistribute, republish, sublicense, sell, rent, or lease the Software, or make it available to third parties as a standalone offering;
+   (b) modify, adapt, or create derivative works of the Software;
+   (c) reverse engineer, decompile, or disassemble the Software, or attempt to derive its source code, except to the extent applicable law prohibits this restriction;
+   (d) remove or alter any copyright, trademark, or other proprietary notices;
+   (e) use the Software to develop or train a competing product or service.
 
-No source code is provided, implied, or licensed under this agreement.
-No warranty is given. The software is provided "as is".
+3. Ownership. The Software is licensed, not sold. All right, title, and interest, including all intellectual property rights, remain with the copyright holder. No rights are granted except as expressly stated here.
+
+4. No warranty. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+5. Limitation of liability. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+6. Termination. This license terminates automatically if you breach it. Upon termination you must cease all use and destroy all copies of the Software.
