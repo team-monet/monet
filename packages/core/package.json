@@ -4,7 +4,7 @@
   "description": "Monet — state-centric memory substrate engine.",
   "private": true,
   "packageManager": "pnpm@10.33.2",
-  "license": "AGPL-3.0-only",
+  "license": "LicenseRef-Monet-Proprietary",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

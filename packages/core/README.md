@@ -39,4 +39,4 @@ await createMonetCoreMcpServer(core);
 
 ## License
 
-[AGPL-3.0](./LICENSE)
+Proprietary and Confidential — see [LICENSE](./LICENSE).
