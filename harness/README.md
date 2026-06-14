@@ -1,8 +1,8 @@
 # with-monet
 
-**An agent-agnostic harness that pairs a state-centric coding lead (`Stig`) and a focused worker team with [Monet](https://github.com/team-monet/monet)'s memory substrate.**
+**An agent-agnostic harness that pairs a state-centric coding lead (`Stig`) and a focused worker team with [Monet](https://www.npmjs.com/package/@team-monet/monet)'s memory substrate.**
 
-The substrate — the `monet` MCP server + CLI (in [`team-monet/monet`](https://github.com/team-monet/monet), on npm as `@team-monet/monet`) — maintains a persistent memory model so the agent doesn't have to. `with-monet` is the *lightweight* harness that points the coding agent you already use (Claude Code) at that substrate and gives it a team that knows how to use it.
+The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet`](https://www.npmjs.com/package/@team-monet/monet) on npm) — maintains a persistent memory model so the agent doesn't have to. `with-monet` is the *lightweight* harness that points the coding agent you already use (Claude Code) at that substrate and gives it a team that knows how to use it.
 
 ## Where this sits
 
@@ -29,3 +29,5 @@ Paste into your agent:
 _(Local dev: point at `with-monet/bootstrap/install.md` instead of the URL. The substrate it installs — `monet` — ships on npm as `@team-monet/monet`.)_
 
 The agent then follows the [bootstrap playbook](bootstrap/install.md): **orient → get Monet → configure the MCP server → install the team → offer memory ingest → offer to start.** Why agent-first: the agent already has tools in your environment, so it can install, verify, and recover from failures conversationally — and we can tailor the experience to each user.
+
+> ⭐ **Like Monet? [Star this repo](https://github.com/team-monet/with-monet)** — it's the best way to support the project.
