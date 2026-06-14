@@ -2,15 +2,22 @@
 import { Command } from "commander";
 import path from "node:path";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer, deriveCircle } from "@team-monet/core";
 import { ensureMonetDir, getDbPath } from "./db/index.js";
+
+// Read version from package.json so it can never drift from the published version.
+// esbuild inlines the import.meta.url-relative path at bundle time; the bundled
+// dist/cli.js ends up alongside the package root, so this resolves correctly at runtime.
+const _require = createRequire(import.meta.url);
+const { version } = _require("../package.json") as { version: string };
 
 const program = new Command();
 
 program
   .name("monet")
   .description("Monet — local-first memory for AI agents (state-centric substrate)")
-  .version("0.8.1");
+  .version(version);
 
 program
   .command("start")

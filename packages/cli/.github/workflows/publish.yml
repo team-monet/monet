@@ -1,16 +1,20 @@
 name: Publish closed client
 
 # Runs on a version tag (v1.x.x) or a manual trigger.
-# Publishes the closed @team-monet/monet artifact to public npm.
+# Publishes the closed @team-monet/monet artifact to public npm via OIDC trusted publishing.
 #
-# Deliberately does NOT use OIDC trusted publishing or --provenance:
-# the private core repo must not be linked to the published package via
-# provenance attestations, and the public client repo does not support
-# id-token write permission for the same reason.
+# OIDC trusted publishing (token-less):
+#   Configure at npmjs.com → @team-monet/monet → Settings → Publishing → Trusted Publishers.
+#   Add a GitHub Actions publisher:
+#     Repository:        team-monet/monet
+#     Workflow filename: publish.yml
+#     Environment:       (leave blank — this workflow uses no GitHub environment)
+#   Then enable "Allow publish" (npm's post-May-2026 required toggle).
+#   No NPM_TOKEN secret needed. The id-token: write permission below is what unlocks OIDC.
+#
+# NO --provenance: the private core repo must not be linked via provenance attestations.
 #
 # Secrets required (set in GitHub repo Settings → Secrets → Actions):
-#   NPM_TOKEN         — npm classic automation token (Automation type).
-#                       Create at npmjs.com → Access Tokens → Generate New Token → Automation.
 #   MONET_CORE_TOKEN  — GitHub PAT (classic or fine-grained) with read-only
 #                       access to the private repo team-monet/monet-core.
 #                       Fine-grained: repository "monet-core", permission "Contents: Read".
@@ -33,7 +37,7 @@ on:
 
 permissions:
   contents: read
-  # Explicitly NO id-token permission — provenance is intentionally disabled.
+  id-token: write  # Required for OIDC trusted publishing to npm.
 
 jobs:
   publish:
@@ -72,8 +76,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: "https://registry.npmjs.org"
           cache: pnpm
           cache-dependency-path: monet-client/pnpm-lock.yaml
+
+      # Ensure npm >= 11.5.1 for OIDC trusted publishing support.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
 
       # Build core first so its dist/ is available for the client bundle step.
       - name: Install core dependencies
@@ -100,13 +109,10 @@ jobs:
         working-directory: monet-client
         run: npm pack --dry-run
 
-      # Publish to npm. --access public is required for scoped packages on first publish;
-      # safe to repeat on subsequent publishes. NO --provenance flag.
-      - name: Publish to npm
+      # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
+      # --access public is required for scoped packages on first publish; safe to repeat.
+      # NO --provenance flag: the private core repo must not be linked via attestations.
+      - name: Publish to npm (OIDC trusted publishing)
         if: ${{ inputs.dry_run != 'true' }}
         working-directory: monet-client
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
-        # npm reads NODE_AUTH_TOKEN from the environment automatically.
-        # No .npmrc manipulation needed when using this env var name.

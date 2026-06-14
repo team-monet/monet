@@ -1,6 +1,6 @@
 # monet
 
-**Local-first, state-centric memory for coding agents.** Open source (AGPL-3.0).
+**Local-first, state-centric memory for coding agents.**
 
 Monet gives your coding agent a memory that persists across sessions — not by hoarding
 transcripts, but by maintaining structured **state**: decisions, conventions, errors, and
@@ -100,4 +100,5 @@ monet status --circle my-repo-1a2b3c4d   # scoped to a single circle
 
 ## License
 
-Monet is licensed under **AGPL-3.0-only** (see [LICENSE](./LICENSE)).
+Monet is distributed under a proprietary license (see [LICENSE](./LICENSE)).
+Free to use for any purpose; redistribution, decompilation, and derivative works are not permitted.
