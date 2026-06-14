@@ -14,7 +14,7 @@ export default defineConfig({
   format: ["esm"],
   dts: true,
   clean: true,
-  sourcemap: true,
+  sourcemap: false,
   treeshake: true,
   external: ["better-sqlite3", "@modelcontextprotocol/sdk", "zod", "@huggingface/transformers"],
 });
