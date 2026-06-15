@@ -12,6 +12,16 @@ Work through the phases in order. After each, tell the user what happened in one
 
 ---
 
+## Updating an existing install (team files only)
+
+Already set up and just want the latest team (Stig + workers)? You don't need to re-run onboarding — re-run **Phase 4 only** against the latest sources:
+1. Re-read `roster.json`, `agents/*.md`, and `agents/stig.md` from the raw-URL base (or your local `with-monet` checkout).
+2. Re-apply Phase 4's write step **to the same scope the team was installed in** — detect that from where the existing markers live: user scope (`~/.claude/CLAUDE.md` + `~/.claude/agents/<name>.md`) or per-repo (`./CLAUDE.md` + `./.claude/agents/<name>.md`). Rewrite the Stig block (between the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) and each agent file **in that location** — never silently switch a per-repo install to global. **Reconcile, don't clobber:** preserve your local edits, apply the new changes, guard the invariants, and keep `.bak` (see Phase 4).
+
+Skip Phases 1–3 (substrate + MCP already configured) and 5–7 — except: if your host only loads agents/MCP at startup (Claude Code does), **reload or restart it afterward** so the updated Stig + workers take effect; a running session keeps the old prompts until you do. Phase 4 is idempotent, so this is safe to repeat.
+
+---
+
 ## Phase 1 — Orient
 
 You install Monet **globally for this user** (every project), not just the current repo — so the team and memory work everywhere without re-installing per project. (If the user prefers, you can scope it to just this repo instead — confirm in step 2.)
@@ -68,6 +78,14 @@ Merge into the host's **user-level** MCP config **without clobbering existing se
     Add the `<!-- with-monet:agent -->` marker right after the frontmatter — it lets a later memory-consolidation pass tell Monet's installed workers apart from your *own* custom subagents, so it never captures or retires the team.
     **Write each file transparently, one at a time.** Use your host's file-write tool so the user sees every file's content as it's written; never generate a script that batch-writes the agents directory. Host permission systems treat opaque scripted writes to agent config as suspect and will (rightly) block them — per-file writes the user can read are both the polite and the working path.
     **Don't clobber.** If `~/.claude/agents/<name>.md` already exists, back it up (`<name>.md.bak`) and tell the user before overwriting — generic names (`developer`, `reviewer`, …) can collide with the user's own subagents.
+    **Reconcile, don't clobber — when a prior install exists with local edits.** Don't blindly overwrite a Stig block or agent file the user has changed. Compare the installed version against the new canonical and merge: keep the user's customizations (extra rules, model choices, tone), apply the new changes. Ensure these invariants survive — and warn the user if one of their edits conflicts with them:
+    - the Stig block's `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers and each worker's `<!-- with-monet:agent -->` marker (lose them and a later update can't find the block),
+    - the **Git & PR guardrail**,
+    - "subagents can't spawn subagents — you are the only orchestrator",
+    - the Monet lifecycle (`agent_context` at start; `memory_store` / `memory_checkpoint`),
+    - each agent's frontmatter `name` + `description` — the `description` is Claude Code's dispatch trigger; if it's broken, delegation silently stops.
+
+    Show the merged result, write only on the user's approval, and keep the `.bak`. A coding agent can do this reconciliation by judgment — no version-pinning or 3-way merge tooling required; `.bak` plus approve-before-write keep it safe.
   - **Stig → lead, in global memory — ask first.** This is the install's highest-impact write, so it gets its own decision point. Ask: *"Install Stig as the lead persona in your global `~/.claude/CLAUDE.md`? This changes how every session on this machine starts."* A general "go ahead with the install" doesn't cover this — wait for an explicit yes (your host's permission system will likely insist on the same); on a no, offer to scope Stig to the current repo's `./CLAUDE.md` instead (the per-repo option from Phase 1). On yes, append the body of `agents/stig.md` to `~/.claude/CLAUDE.md` so the **main agent** acts as Stig in every project and can delegate to the workers via the Task tool (a subagent can't spawn subagents, so the lead must be the main agent). Wrap it in idempotent markers so re-running doesn't duplicate it:
     ```
     <!-- BEGIN with-monet:stig -->
@@ -91,6 +109,12 @@ Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"*
 - (If you're coming from a prior Monet store, say so and I can pull that in too — if it's a *separate* old install with its own MCP server, see the cross-server note in `consolidate-memory.md`.)
 
 For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. **Skip Monet's own wiring:** when the source is `CLAUDE.md` (which holds Stig's prompt) or an installed agent prompt, don't store the `<!-- BEGIN with-monet:stig -->…<!-- END with-monet:stig -->` block or any `<!-- with-monet:agent -->`-marked file. Summarize what landed.
+
+Then capture **how you and your team work**, as two distinct kinds:
+- **Team ways of working** — conventions, build/test/lint commands, repo layout, norms. Store as project/reference concepts.
+- **Personal preferences** — how *you* like the agent to work: voice (e.g. teammate vs. assistant), autonomy, output format. Store as `user` concepts.
+
+Ask directly for the preferences that aren't written down anywhere — especially how you want the agent to *sound*. These get injected into every briefing and applied to how the agent talks to you.
 
 **Existing knowledge to consolidate?** If you find a meaningful pile — agent reference files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, scattered notes/ADRs, or an existing Monet store — don't leave it scattered. Offer the interactive consolidation playbook [`bootstrap/consolidate-memory.md`](consolidate-memory.md) (same raw-URL base as above): capture each source into Monet, organize into per-project circles *with* the user, then retire the source (a pointer or archive) so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; consolidation does the organize-and-retire, interactively and reversibly. Skip if there's nothing meaningful to consolidate.
 

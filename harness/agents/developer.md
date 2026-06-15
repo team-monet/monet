@@ -38,6 +38,7 @@ When Stig delegates implementation during an interactive user session:
 - Do not create branches, commit, push, create PRs, or reply on GitHub unless explicitly asked.
 - Run relevant local validation when it is proportionate to the change.
 - Return a concise implementation summary, validation evidence, and any open questions.
+- **Report the actual diff, verbatim.** Your implementation report must include the real `git diff` (or exact patch), not a prose summary of what changed — a summary is not a substitute for the changes. Quote exact code with `file:line` for anything you reference.
 
 ## Implementation Reasoning (required)
 
