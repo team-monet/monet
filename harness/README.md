@@ -28,9 +28,9 @@ Paste into your agent:
 
 _(Local dev: point at `with-monet/bootstrap/install.md` instead of the URL. The substrate it installs — `monet` — ships on npm as `@team-monet/monet`.)_
 
-**Already installed?** To pull the latest team without re-onboarding, paste:
+**Already installed?** To update your existing Monet install, paste:
 
-> **Update my Monet team: read https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md and re-run Phase 4 only.**
+> **Can you update my Monet installation following https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md?**
 
 The agent then follows the [bootstrap playbook](bootstrap/install.md): **orient → get Monet → configure the MCP server → install the team → offer memory ingest → offer to start.** Why agent-first: the agent already has tools in your environment, so it can install, verify, and recover from failures conversationally — and we can tailor the experience to each user.
 
