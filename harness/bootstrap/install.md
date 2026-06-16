@@ -127,11 +127,18 @@ Ask: *"Want me to seed Monet from existing knowledge so you don't start empty?"*
 
 For each chosen source: read it, and `memory_store` the durable facts/decisions/patterns (the substrate dedups automatically — store liberally, don't pre-curate). Don't ingest secrets. **Skip Monet's own wiring:** when the source is `CLAUDE.md` (which holds Stig's prompt) or an installed agent prompt, don't store the `<!-- BEGIN with-monet:stig -->…<!-- END with-monet:stig -->` block or any `<!-- with-monet:agent -->`-marked file. Summarize what landed.
 
-Then capture **how you and your team work**, as two distinct kinds:
-- **Team ways of working** — conventions, build/test/lint commands, repo layout, norms. Store as project/reference concepts.
-- **Personal preferences** — how *you* like the agent to work: voice (e.g. teammate vs. assistant), autonomy, output format. Store as `user` concepts.
+Then build the first **context profile** — how this project works, and how this user likes to work. Keep these as two separate memory families; don't bury personal style inside a project convention blob. Also capture at the right granularity: store a coherent high-level concept when the future task needs the whole working model, and store detailed scoped facts when exact recall matters.
 
-Ask directly for the preferences that aren't written down anywhere — especially how you want the agent to *sound*. These get injected into every briefing and applied to how the agent talks to you.
+- **Team ways of working (team-scoped):** conventions, build/test/lint commands, repo layout, review/release norms, deployment/runbook facts, and "how we do things here." Store as project/reference concepts in the relevant project circle. Include the applicability scope ("repo-wide", "frontend only", "release flow", etc.) and the evidence/source.
+- **Personal preferences (user-scoped):** how *this user* likes the agent to work: voice (e.g. teammate vs. assistant), autonomy, update cadence, approval boundaries, output format, and risk tolerance. Store as `kind: "user"` concepts, with the body saying whether the preference is global or project-specific.
+
+For both families, prefer a **two-resolution capture** when the source supports it:
+- a compact conceptual memory that explains the pattern or preference and why it matters;
+- separate precise memories for exact commands, file paths, config keys, model choices, branch/release rules, approval boundaries, output formats, or any wording the agent may need verbatim later. Use `resolution: "forceNew"` for these precise fact memories when they might otherwise collapse into the broader concept; exact recall is the point.
+
+Ask directly for the preferences that aren't written down anywhere — especially how the user wants the agent to *sound* and how much autonomy they want before edits, tests, git actions, or external calls. Store durable answers immediately, and store exact boundaries as their own precise facts instead of only summarizing them into a broad preference. Do not store secrets, one-off moods, or absences like "no preference stated."
+
+Verify the context profile like any other capture: `memory_search` / `memory_fetch` the new ways-of-working and personal-preference concepts, synthesize if needed, and summarize what Monet now knows. These concepts are what Stig gathers at task start, injects into worker briefings under distinct headings, and applies to its own user-facing writing.
 
 **Existing knowledge to consolidate?** If you find a meaningful pile — agent reference files (`CLAUDE.md`/`AGENTS.md`/Cursor/Cline/Copilot/Windsurf rules), a tool-managed memory store, scattered notes/ADRs, or an existing Monet store — don't leave it scattered. Offer the interactive consolidation playbook [`bootstrap/consolidate-memory.md`](consolidate-memory.md) (same raw-URL base as above): capture each source into Monet, organize into per-project circles *with* the user, then retire the source (a pointer or archive) so Monet becomes the single place to read from. This Phase-5 pass ingests but never retires; consolidation does the organize-and-retire, interactively and reversibly. Skip if there's nothing meaningful to consolidate.
 

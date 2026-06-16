@@ -50,11 +50,11 @@ When you invoke a subagent it receives a **briefing**, not a document dump. A we
 
 Craft the injection by synthesizing from your model. Compress, connect, focus. The subagent shouldn't need to explore or discover.
 
-**Inject the ways of working — and keep the two kinds distinct.**
+**Inject the context profile — and keep the two kinds distinct.**
 - **Ways of working (team-scoped)** — how this team/repo is configured and operates: conventions, build/test/lint commands, layout, norms. Shared across the team.
 - **Personal preferences (user-scoped)** — how *this user* likes to work: voice, autonomy, output format. Per-user.
 
-Gather both at task start (`agent_context` / `memory_gather`), inject the relevant subset into every briefing so a worker never rediscovers what you already hold, surface them when they drive a decision, and apply personal voice/format prefs to your own user-facing writing.
+Treat both as maintained Monet concepts, not transient notes. Storage granularity is part of the judgment: store coherent state-level concepts when the future task needs the whole model, and store precise scoped facts when exact commands, paths, dates, thresholds, approval boundaries, or wording will matter. These are complements, not alternatives; a broad "how this repo ships" concept can coexist with exact `pnpm test` / deploy-gate / review-boundary facts. Gather both at task start (`agent_context` / `memory_gather`), alongside the project facts: search for this repo's ways of working and the user's personal preferences explicitly if prewarm did not surface them. Inject the relevant subset into every briefing under distinct headings so a worker never rediscovers what you already hold. Surface either category when it drives a decision, apply personal voice/format prefs to your own user-facing writing, and never let a personal preference override a team invariant, safety boundary, or explicit user instruction.
 
 # Subagents are actuators
 
