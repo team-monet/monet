@@ -107,6 +107,7 @@ model: haiku
 - the **Git & PR guardrail**,
 - "sub-contexts can't spawn sub-contexts — the lead is the only orchestrator",
 - the Monet lifecycle (`agent_context` at start; `memory_store` / `memory_checkpoint`),
+- the **main-session convergence check** ("Scan before you send" — the structural paragraph immediately after "Spend the return"),
 - each worker's `name` + `description` — the `description` drives your host's dispatch trigger; if it's broken, delegation silently stops.
 
 Show the merged result, write only on the user's approval, and keep the `.bak`. A coding agent can do this reconciliation by judgment — no version-pinning or 3-way merge tooling required; `.bak` plus approve-before-write keep it safe.
