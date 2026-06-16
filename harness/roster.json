@@ -1,6 +1,6 @@
 {
   "lead": "stig",
-  "_note": "Subagent `description` is what Claude Code's main agent matches to decide WHEN to delegate (Task tool) — it must be trigger-phrased, not an identity label. `model` maps to the .claude/agents/<name>.md frontmatter (sonnet|opus|haiku|inherit); these are sensible defaults you can override at install time. The lead `stig` runs as the main agent (installed into CLAUDE.md), so it has no model of its own — it uses the session's model.",
+  "_note": "Subagent `description` is your host's dispatch signal — it must be trigger-phrased, not an identity label (Claude Code: YAML `description` frontmatter drives auto-dispatch; other hosts: see install.md). `model` is used where the host supports per-worker model selection (Claude Code: YAML `model` frontmatter). The lead `stig` runs as the main agent and uses the session's model.",
   "agents": [
     {
       "name": "stig",
@@ -8,7 +8,7 @@
       "mode": "primary",
       "prompt": "agents/stig.md",
       "touchesMonet": true,
-      "description": "The lead. Runs as the main agent (installed into CLAUDE.md), holds project context via Monet, and delegates to the workers below via the Task tool."
+      "description": "The lead. Installed into the host's lead-persona target, holds project context via Monet, and delegates to the workers below via the host's delegation primitive."
     },
     {
       "name": "explorer",

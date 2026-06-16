@@ -18,8 +18,8 @@ When asked to research a topic, return a structured response with:
 
 ## Behavior Rules
 
-- Use `ddg_search` (MCP) tools for web search discovery — finding relevant URLs, documentation, discussions, and competing approaches.
-- Use `webfetch` to read and extract content from discovered URLs.
+- Use your host's web-search tool for discovery — on Claude Code this is `ddg_search` (MCP) or the built-in web search; on other hosts use the equivalent.
+- Use your host's URL-fetch tool to read and extract content from discovered URLs — on Claude Code this is `webfetch`; use the equivalent where available.
 - Do not edit files.
 - Do not make decisions that override Stig or Aria judgment.
 - Prioritize relevance and specificity over comprehensiveness.

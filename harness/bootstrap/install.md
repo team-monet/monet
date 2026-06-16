@@ -16,9 +16,9 @@ Work through the phases in order. After each, tell the user what happened in one
 
 Already set up and just want the latest team (Stig + workers)? You don't need to re-run onboarding — re-run **Phase 4 only** against the latest sources:
 1. Re-read `roster.json`, `agents/*.md`, and `agents/stig.md` from the raw-URL base (or your local `with-monet` checkout).
-2. Re-apply Phase 4's write step **to the same scope the team was installed in** — detect that from where the existing markers live: user scope (`~/.claude/CLAUDE.md` + `~/.claude/agents/<name>.md`) or per-repo (`./CLAUDE.md` + `./.claude/agents/<name>.md`). Rewrite the Stig block (between the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) and each agent file **in that location** — never silently switch a per-repo install to global. **Reconcile, don't clobber:** preserve your local edits, apply the new changes, guard the invariants, and keep `.bak` (see Phase 4).
+2. Re-apply Phase 4's write step **to the same scope the team was installed in** — detect that from where the existing `<!-- BEGIN with-monet:stig -->` / `<!-- with-monet:agent -->` markers already live — in your host's lead-persona file and its worker/subagent locations (the surfaces you found in Phase 1), at whichever scope (user or repo) they were installed. Rewrite the Stig block (between the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) and each agent file **in that location** — never silently switch a per-repo install to global. **Reconcile, don't clobber:** preserve your local edits, apply the new changes, guard the invariants, and keep `.bak` (see Phase 4).
 
-Skip Phases 1–3 (substrate + MCP already configured) and 5–7 — except: if your host only loads agents/MCP at startup (Claude Code does), **reload or restart it afterward** so the updated Stig + workers take effect; a running session keeps the old prompts until you do. Phase 4 is idempotent, so this is safe to repeat.
+Skip Phases 1–3 (substrate + MCP already configured) and 5–7 — except: if your host loads agents/MCP only at startup (most do — you noted this in Phase 1), **reload or restart it afterward** so the updated Stig + workers take effect; a running session keeps the old prompts until you do. Phase 4 is idempotent, so this is safe to repeat.
 
 ---
 
@@ -26,10 +26,11 @@ Skip Phases 1–3 (substrate + MCP already configured) and 5–7 — except: if 
 
 You install Monet **globally for this user** (every project), not just the current repo — so the team and memory work everywhere without re-installing per project. (If the user prefers, you can scope it to just this repo instead — confirm in step 2.)
 
-1. Identify your host (Claude Code, Cursor, Continue, Aider, …) and note where it reads, **at user scope**, (a) **MCP server config** and (b) **agent/subagent prompts**.
-   - Claude Code → MCP: user scope via `claude mcp add --scope user …` (or `~/.claude.json`); subagents: `~/.claude/agents/<name>.md`; lead persona: `~/.claude/CLAUDE.md` (global memory). *(Project scope, if requested: `./.mcp.json`, `./.claude/agents/<name>.md`, `./CLAUDE.md`.)*
-   - Cursor → MCP: `~/.cursor/mcp.json`; agents: its user-level rules/prompts dir.
-   - Unknown host → ask the user where its user-level MCP config and custom-agent prompts live.
+1. **Identify your host and its install surfaces.** You're the agent running inside it, so you know — or its docs do — where it keeps, at user scope, (a) its **MCP server config**, (b) its **always-on lead-persona / system prompt**, and (c) its **named-subagent definitions** (if it has them). Note two capabilities that gate the rest of the install:
+   - **MCP support — required.** Monet is an MCP server and Stig's whole loop is MCP tools (`agent_context`, `memory_store`, `memory_checkpoint`). If the host can't run MCP servers, **stop** and tell the user Monet needs an MCP-capable host.
+   - **Real isolated subagents — needed for the worker team.** Each worker must run in its *own fresh context* the lead can delegate into — not an always-on "rule" that bleeds into the main context. If the host has this, you'll install the full team (Phase 4 Tier B); if it doesn't, the harness can't run here and you'll **stop** — Stig is an orchestrator, so with no workers there's nothing to orchestrate. **Feature-detect it from the host's docs — don't infer it from the host's name** (host capabilities change fast).
+
+   Also note whether the host loads MCP/agents only at startup (you'll tell the user to reload afterward). Anything unclear — check the host's docs or ask the user; don't guess.
 2. Confirm: *"You're on **<host>**. I'll install Monet **globally** so it works across all your projects — or scoped to just this repo if you'd rather. Anything special about your setup?"*
 
 ## Phase 2 — Get Monet
@@ -45,13 +46,13 @@ Goal: the `monet` MCP server (the state-centric memory substrate) available on t
 
 ## Phase 3 — Configure the monet MCP server (user scope)
 
-Register `monet` at **user scope** so it's available in every project (template: `with-monet/mcp/monet.json`):
+Register `monet` in your host's MCP config at **user scope** so it's available in every project (template: `with-monet/mcp/monet.json`). The entry to merge is:
+```jsonc
+{ "mcpServers": { "monet": { "command": "monet", "args": ["start"] } } }
+```
+*(Dev/unpublished fallback: use `"command": "node", "args": ["<abs>/dist/index.js"]` in place of `"command": "monet"`.)*
 
-- **Claude Code:** `claude mcp add --scope user monet -- monet start`, or merge the entry below into `~/.claude.json` under `mcpServers`:
-  ```jsonc
-  { "mcpServers": { "monet": { "command": "monet", "args": ["start"] } } }
-  ```
-  *(Dev/unpublished: `"command": "node", "args": ["<abs>/dist/index.js"]`. Per-repo install instead: write `./.mcp.json`.)*
+Merge that entry into your host's user-level MCP config in whatever form the host expects — a CLI command, a JSON config file, or a settings UI — **without clobbering** existing servers. You know your host's MCP setup, or its docs do; if you're unsure, ask the user. (A host with no MCP support → you already stopped at Phase 1.)
 
 **Storage — one global brain, organized per project.** By default the store lives at `~/.monet` (shared across all the user's projects) and Monet organizes each project into its own *circle* automatically — no config required. If the user prefers a hard filesystem split per repo, offer it: set `env.MONET_STORAGE_DIR` to a per-project path (e.g. `<repo>/.monet`) in the MCP config block you write for them. Default to the shared global store unless they ask.
 
@@ -59,43 +60,58 @@ Merge into the host's **user-level** MCP config **without clobbering existing se
 
 ## Phase 4 — Install the agent team (user scope)
 
-**Always install the full team.** Stig is a context engine whose entire purpose is to orchestrate the workers — never install Stig alone. Stig is the **lead** (the one the user talks to, the only one that delegates, the only one that touches Monet); the workers are its **subagent actuators**.
+**Install the full team wherever the host supports it.** Stig is a context engine whose purpose is to orchestrate the workers, so don't drop the workers by *choice* on a host that can run them. Stig is the **lead** (the one the user talks to, the only one that delegates, the only one that touches Monet); the workers are its **subagent actuators**. (A host that *can't* provide isolated subagents can't run the orchestration team at all — see Tier B.)
 
-- **Claude Code:**
-  - **Workers → user-level subagents.** Write one `~/.claude/agents/<name>.md` per worker — `explorer, researcher, analyst, developer, tester, reviewer, auditor, security, reliability, aria`. Each file is YAML frontmatter + the body from `agents/<name>.md`. Pull the frontmatter from that worker's entry in `roster.json`:
-    - `name` → frontmatter `name`
-    - `description` → frontmatter `description` — **this trigger text is what makes Claude Code actually delegate** (its auto-dispatch matches the task against the description). Use it verbatim; do **not** replace it with a bare role label. The descriptions contain colons, so **quote them** in YAML (`description: "…"`) or the frontmatter won't parse.
-    - `model` → frontmatter `model` (`haiku`/`sonnet`/`opus`, or omit to inherit the session model). These are sensible defaults — offer to retune (e.g. cheaper models for read-only workers, stronger for `reviewer`/`security`).
-    ```md
-    ---
-    name: explorer
-    description: "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, …"
-    model: haiku
-    ---
-    <!-- with-monet:agent -->
-    <body of agents/explorer.md>
-    ```
-    Add the `<!-- with-monet:agent -->` marker right after the frontmatter — it lets a later memory-consolidation pass tell Monet's installed workers apart from your *own* custom subagents, so it never captures or retires the team.
-    **Write each file transparently, one at a time.** Use your host's file-write tool so the user sees every file's content as it's written; never generate a script that batch-writes the agents directory. Host permission systems treat opaque scripted writes to agent config as suspect and will (rightly) block them — per-file writes the user can read are both the polite and the working path.
-    **Don't clobber.** If `~/.claude/agents/<name>.md` already exists, back it up (`<name>.md.bak`) and tell the user before overwriting — generic names (`developer`, `reviewer`, …) can collide with the user's own subagents.
-    **Reconcile, don't clobber — when a prior install exists with local edits.** Don't blindly overwrite a Stig block or agent file the user has changed. Compare the installed version against the new canonical and merge: keep the user's customizations (extra rules, model choices, tone), apply the new changes. Ensure these invariants survive — and warn the user if one of their edits conflicts with them:
-    - the Stig block's `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers and each worker's `<!-- with-monet:agent -->` marker (lose them and a later update can't find the block),
-    - the **Git & PR guardrail**,
-    - "subagents can't spawn subagents — you are the only orchestrator",
-    - the Monet lifecycle (`agent_context` at start; `memory_store` / `memory_checkpoint`),
-    - each agent's frontmatter `name` + `description` — the `description` is Claude Code's dispatch trigger; if it's broken, delegation silently stops.
+**Tier A — Lead persona (ask first, highest-impact write).** This is the install's highest-impact write, so it gets its own decision point. Ask: *"Install Stig as the lead persona in your [host's lead-persona location]? This changes how every session on this machine starts."* A general "go ahead with the install" doesn't cover this — wait for an explicit yes (your host's permission system will likely insist on the same). On a no, offer to scope Stig to the current repo's equivalent per-repo location instead (the per-repo option from Phase 1).
 
-    Show the merged result, write only on the user's approval, and keep the `.bak`. A coding agent can do this reconciliation by judgment — no version-pinning or 3-way merge tooling required; `.bak` plus approve-before-write keep it safe.
-  - **Stig → lead, in global memory — ask first.** This is the install's highest-impact write, so it gets its own decision point. Ask: *"Install Stig as the lead persona in your global `~/.claude/CLAUDE.md`? This changes how every session on this machine starts."* A general "go ahead with the install" doesn't cover this — wait for an explicit yes (your host's permission system will likely insist on the same); on a no, offer to scope Stig to the current repo's `./CLAUDE.md` instead (the per-repo option from Phase 1). On yes, append the body of `agents/stig.md` to `~/.claude/CLAUDE.md` so the **main agent** acts as Stig in every project and can delegate to the workers via the Task tool (a subagent can't spawn subagents, so the lead must be the main agent). Wrap it in idempotent markers so re-running doesn't duplicate it:
-    ```
-    <!-- BEGIN with-monet:stig -->
-    …agents/stig.md body…
-    <!-- END with-monet:stig -->
-    ```
-    If the markers already exist, replace the block in place; never append a second copy, and never clobber the user's other `CLAUDE.md` content (back it up first).
-- **Cursor / Continue / others** — install the lead + worker team in that host's user-level agent format; ask the user where those live. **Mark each installed prompt** with a `<!-- with-monet:agent -->` sentinel (after any leading frontmatter — e.g. Cursor `.mdc` rules — so you don't break activation metadata), so a consolidation pass never captures or retires Monet's own wiring.
+Write the body of `agents/stig.md` (wrapped in the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) into your host's lead-persona target so the **main agent** acts as Stig and can delegate to workers. A key constraint that must survive regardless of host: the lead is the only agent that delegates and the only one that touches Monet — sub-contexts cannot spawn further sub-contexts, so the lead must be the main agent.
 
-The user may request a trimmed worker set, but the full team is the default — never reduce to Stig-only.
+Write it into your host's **always-on lead-persona location** — the file or setting whose content is injected into every session (you know your host's; its docs or the user can confirm). Honor the global-vs-repo scope choice from Phase 1: if the host exposes both a user-scope and a repo-scope location, use the one chosen — never silently switch one for the other.
+
+Wrap the body in idempotent markers so re-running doesn't duplicate it. If the host's lead-persona file requires frontmatter (some hosts' rule files do), put the markers and body **below** that frontmatter — a leading HTML comment can break the file's activation metadata:
+```
+<!-- BEGIN with-monet:stig -->
+…agents/stig.md body…
+<!-- END with-monet:stig -->
+```
+If the markers already exist, replace the block in place; never append a second copy, and never clobber the user's other content in that file (back it up first).
+
+**Tier B — Workers (only where the host has real isolated subagents).** Install the worker team only if your host has a **true named-subagent primitive** — one that gives each worker its *own fresh, isolated context* the lead delegates into, separate from the lead's context and with its own tool access. An always-on "rules"/"instructions" mechanism is **not** this: it bleeds every persona into the main context, breaking the "workers run separately, never touch Monet" invariant. **Feature-detect** this from the host's docs — don't infer it from the host's name. Confirm too that the host's subagents have the tool access each worker needs (file-edit for `developer`/`tester`, web for `researcher`); if they're read-only, tell the user — those workers can't do their job there.
+
+If the host has it: write one worker prompt per worker — `explorer, researcher, analyst, developer, tester, reviewer, auditor, security, reliability, aria` — into the host's subagent location, mapping each worker's `roster.json` fields to the host's format:
+- `name` → the host's agent name.
+- `description` → the host's dispatch/trigger text — **use it verbatim, not a bare role label**; it's what routes a task to the right worker. (The descriptions contain colons, so quote them if the host's format needs it.)
+- `model` → the roster's `haiku`/`sonnet`/`opus` are a **guidance default**; translate them to your host's own model identifiers, or omit to inherit the session model. Offer to retune (cheaper for read-only workers, stronger for `reviewer`/`security`).
+
+Add the `<!-- with-monet:agent -->` marker right after any leading frontmatter — it lets a later memory-consolidation pass tell Monet's installed workers apart from the user's *own* custom sub-contexts, so it never captures or retires the team.
+
+Example worker file (one common format — adapt the frontmatter to your host):
+```md
+---
+name: explorer
+description: "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, …"
+model: haiku
+---
+<!-- with-monet:agent -->
+<body of agents/explorer.md>
+```
+
+**If the host has no real isolated subagents: stop — don't install the team here.** Stig is fundamentally an orchestrator: its whole job is to inject context into delegatable workers, so without real isolated subagents there's no coherent install — workers-as-rules or in-conversation role-play breaks the isolation invariant, and the Stig prompt itself would still tell the lead to delegate to workers that don't exist. Tell the user this host can't run the Stig + worker harness (it needs a real subagent primitive alongside MCP); they can still use the **Monet MCP server standalone** for memory. Both requirements — MCP *and* isolated subagents — gate the install; missing either means stop, same as the no-MCP case in Phase 1.
+
+**Write each file transparently, one at a time.** Use your host's file-write tool so the user sees every file's content as it's written; never generate a script that batch-writes the agents directory. Host permission systems treat opaque scripted writes to agent config as suspect and will (rightly) block them — per-file writes the user can read are both the polite and the working path.
+
+**Don't clobber.** If the target file already exists, back it up (`<name>.md.bak`) and tell the user before overwriting — generic names (`developer`, `reviewer`, …) can collide with the user's own sub-contexts.
+
+**Reconcile, don't clobber — when a prior install exists with local edits.** Don't blindly overwrite a Stig block or agent file the user has changed. Compare the installed version against the new canonical and merge: keep the user's customizations (extra rules, model choices, tone), apply the new changes. Ensure these invariants survive — and warn the user if one of their edits conflicts with them:
+- the Stig block's `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers and each worker's `<!-- with-monet:agent -->` marker (lose them and a later update can't find the block),
+- the **Git & PR guardrail**,
+- "sub-contexts can't spawn sub-contexts — the lead is the only orchestrator",
+- the Monet lifecycle (`agent_context` at start; `memory_store` / `memory_checkpoint`),
+- each worker's `name` + `description` — the `description` drives your host's dispatch trigger; if it's broken, delegation silently stops.
+
+Show the merged result, write only on the user's approval, and keep the `.bak`. A coding agent can do this reconciliation by judgment — no version-pinning or 3-way merge tooling required; `.bak` plus approve-before-write keep it safe.
+
+The user may request a trimmed worker set, but the full team is the default — don't reduce to Stig-only by *choice*. (A host without real isolated subagents can't run the team at all — the install stops there, per Tier B.)
 
 ## Phase 5 — Offer the memory-ingest pipeline
 
@@ -120,7 +136,7 @@ Ask directly for the preferences that aren't written down anywhere — especiall
 
 ## Phase 6 — Offer to start
 
-If the host only loads MCP servers at launch (Claude Code picks up user-scope servers and `~/.claude/agents/` on startup), tell the user to reload/restart so `monet` connects and the team registers before starting.
+If your host loads MCP servers and agent prompts only at launch (most do — per Phase 1), tell the user to reload/restart so `monet` connects and the team registers before starting.
 
 Ask: *"Ready? I'll run `agent_context` to restore state and begin as Stig on this project."* On yes: call `agent_context` (no query), report the restored state (active workstreams, living model, open contradictions), and continue as Stig.
 
