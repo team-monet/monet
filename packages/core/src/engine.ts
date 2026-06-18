@@ -2590,11 +2590,22 @@ export class MonetCore {
    * exact same gating. `n` (scope size, for the df-fraction hub gate) is read fresh from the circle.
    */
   private deriveEntityEdges(conceptId: string, content: string, sourceRefs: string[], circle: string): void {
-    const n = this.conceptCount(circle);
+    const n = this.conceptCount(circle); // computed once — avoids N+1 COUNT queries
     const ents = extractEntities(content);
     for (const ref of sourceRefs) ents.push({ key: `ref:${ref}`, kind: "path", surface: ref, weight: 3 });
     const strength = new Map<string, number>();
     for (const e of ents) {
+      // Write-time hub filter: read the entity's CURRENT df (0 if unseen) before writing.
+      // A rare structural anchor (non-noun, df ≤ RARE_DF_MAX) bypasses the hub gate — it can
+      // never be a true hub (df ≤ 5 < MAX_DF_ABS) and the df-fraction is meaningless at small n.
+      // For every other entity: if the PRE-INSERT df already flags it as a hub, skip it entirely
+      // — no concept_entities row, no df increment, no about-edge. This keeps entities.df
+      // consistent with concept_entities (df == number of concept_entities rows for that key+scope).
+      const curRow = this.db.prepare(`SELECT df FROM entities WHERE key = ? AND scope = ?`).get(e.key, circle) as { df: number } | undefined;
+      const curDf = curRow?.df ?? 0;
+      const strongAlonePreInsert = e.kind !== "noun" && curDf <= RARE_DF_MAX;
+      if (!strongAlonePreInsert && this.isHubDf(curDf, n)) continue; // hub at write time — skip entirely
+      // Not a hub (or strongAlone): persist the membership and get the post-insert df for edge math.
       const df = this.upsertEntity(conceptId, e.key, e.kind, e.surface, circle);
       // A rare structural anchor (concrete file/symbol/err/lib or sourceRef, df ≤ RARE_DF_MAX) is the
       // strongest possible link and bypasses the df-FRACTION gate — that fraction is meaningless at small n
@@ -2602,7 +2613,7 @@ export class MonetCore {
       // `strongAlone` path below was dead until ~10× unrelated filler concepts existed. df ≤ RARE_DF_MAX (5)
       // can never be a true hub, so the absolute cap inside isHubDf is not needed for it.
       const strongAlone = e.kind !== "noun" && df <= RARE_DF_MAX; // one shared rare file/symbol is enough
-      if (!strongAlone && this.isHubDf(df, n)) continue; // common term → not an anchor
+      if (!strongAlone && this.isHubDf(df, n)) continue; // just became a hub on this store — no about-edge (defense-in-depth)
       const rar = this.rarityFromDf(df, n) * (KIND_BOOST[e.kind] ?? 1);
       for (const m of this.coMembers(e.key, circle, conceptId, MAX_NEIGHBORS)) {
         const next = (strength.get(m) ?? 0) + rar;
