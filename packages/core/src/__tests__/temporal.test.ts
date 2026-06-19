@@ -76,12 +76,12 @@ function parseResult(result: { content: Array<{ type: string; text: string }> })
 // ---- 1. Migration ----------------------------------------------------------
 
 describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () => {
-  it("columns exist, last_confirmed_at backfilled to updated_at, user_version == 2", () => {
+  it("columns exist, last_confirmed_at backfilled to updated_at, user_version == 3 (AROUSAL_SCHEMA_VERSION)", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-temporal-"));
     const dbPath = join(dir, "test.db");
     try {
       // Phase 1: simulate a pre-0.6.0 store by opening with the first engine, which will run
-      // the migration. user_version goes from 0 → 2 (GRAPH_SCHEMA_VERSION=1 backfill + TEMPORAL=2).
+      // the migration. user_version goes from 0 → 3 (GRAPH=1 backfill + TEMPORAL=2 + AROUSAL=3).
       const core = new MonetCore(dbPath);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db = (core as any).db as import("../storage").StoragePort;
@@ -91,14 +91,20 @@ describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () 
       expect(conceptCols.some((c) => c.name === "last_confirmed_at")).toBe(true);
       expect(conceptCols.some((c) => c.name === "last_confirmed_session_id")).toBe(true);
 
+      // Verify arousal columns exist on concepts (slice 2). arousal_peak was dropped (M-1 fix).
+      expect(conceptCols.some((c) => c.name === "usefulness_last_fetched_at")).toBe(true);
+      expect(conceptCols.some((c) => c.name === "arousal_score")).toBe(true);
+      expect(conceptCols.some((c) => c.name === "arousal_last_updated_at")).toBe(true);
+      expect(conceptCols.some((c) => c.name === "arousal_peak")).toBe(false);
+
       // Verify dismissed columns exist on memory_edge.
       const edgeCols = db.prepare(`PRAGMA table_info(memory_edge)`).all() as Array<{ name: string }>;
       expect(edgeCols.some((c) => c.name === "dismissed_at")).toBe(true);
       expect(edgeCols.some((c) => c.name === "dismissed_by")).toBe(true);
 
-      // Verify user_version == 2.
+      // Verify user_version == 3 (fully migrated through AROUSAL_SCHEMA_VERSION).
       const version = db.pragma("user_version", { simple: true }) as number;
-      expect(version).toBe(2);
+      expect(version).toBe(3);
 
       core.close();
     } finally {
@@ -128,7 +134,7 @@ describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db2 = (coreB as any).db as import("../storage").StoragePort;
       const version2 = db2.pragma("user_version", { simple: true }) as number;
-      expect(version2).toBe(2);
+      expect(version2).toBe(3); // AROUSAL_SCHEMA_VERSION — fully migrated
       coreB.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -185,14 +191,14 @@ describe("1b. Migration ordering — graph-disabled open does not consume graph 
       coreDisabled2.close();
 
       // Stage 3: Graph-ENABLED open on the same DB.
-      // Graph backfill runs (0 → 1), temporal version-gate bump runs (1 → 2).
+      // Graph backfill runs (0 → 1), temporal version-gate bump runs (1 → 2), arousal bump (2 → 3).
       // Temporal values must be byte-unchanged (WHERE-NULL pass updates 0 rows; rows already filled).
       const coreEnabled = new MonetCore(dbPath, { graphEnabled: true });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const dbEnabled = (coreEnabled as any).db as import("../storage").StoragePort;
 
       const versionAfterEnabled = dbEnabled.pragma("user_version", { simple: true }) as number;
-      expect(versionAfterEnabled).toBe(2);
+      expect(versionAfterEnabled).toBe(3); // AROUSAL_SCHEMA_VERSION
 
       const rowAfterEnabled = dbEnabled
         .prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
@@ -1311,14 +1317,14 @@ describe("Fix B — temporal backfill migration matrix", () => {
 
       core1.close();
 
-      // Stage 2: graph-enabled open — runs graph backfill (0→1) + version-gate bump (1→2).
+      // Stage 2: graph-enabled open — runs graph backfill (0→1) + temporal bump (1→2) + arousal bump (2→3).
       // Temporal values must be byte-unchanged (WHERE-NULL pass updates 0 rows).
       const core2 = new MonetCore(dbPath, { graphEnabled: true, tauAttach: 1.1, tauAmbiguous: 1.1 });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db2 = (core2 as any).db as import("../storage").StoragePort;
 
       const version2 = db2.pragma("user_version", { simple: true }) as number;
-      expect(version2).toBe(2);
+      expect(version2).toBe(3); // AROUSAL_SCHEMA_VERSION
 
       const rowAfterGraphEnabled = db2.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
         .get(r1.conceptId) as { last_confirmed_at: number | null };
@@ -1375,7 +1381,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
     }
   });
 
-  it("State C: already-migrated store (columns exist, values backfilled, user_version 2) → open is a pure no-op; all temporal values byte-unchanged", async () => {
+  it("State C: already-migrated store (columns exist, values backfilled, user_version 3) → open is a pure no-op; all temporal values byte-unchanged", async () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-fixb-stateC-migrated-"));
     const dbPath = join(dir, "test.db");
     try {
@@ -1385,7 +1391,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db0 = (core0 as any).db as import("../storage").StoragePort;
       const version0 = db0.pragma("user_version", { simple: true }) as number;
-      expect(version0).toBe(2); // fully migrated
+      expect(version0).toBe(3); // fully migrated (AROUSAL_SCHEMA_VERSION)
       const lcaBefore = (db0.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
       expect(lcaBefore).not.toBeNull();
       core0.close();
@@ -1396,7 +1402,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       const db1 = (core1 as any).db as import("../storage").StoragePort;
 
       const version1 = db1.pragma("user_version", { simple: true }) as number;
-      expect(version1).toBe(2); // unchanged
+      expect(version1).toBe(3); // AROUSAL_SCHEMA_VERSION — unchanged on re-open
 
       const lcaAfter = (db1.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
       // Must be byte-identical — no spurious update.

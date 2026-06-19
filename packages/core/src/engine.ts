@@ -52,8 +52,18 @@ const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradic
 const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s*:\s*#?([\w:-]+)/gi;
 const GRAPH_SCHEMA_VERSION = 1; // PRAGMA user_version gate for the one-time graph backfill (P2)
 const TEMPORAL_SCHEMA_VERSION = 2; // PRAGMA user_version gate for the temporal layer (0.6.0)
+const AROUSAL_SCHEMA_VERSION = 3; // PRAGMA user_version gate for the V-A arousal layer (slice 2)
 const STALE_CONCEPTS_PREWARM_LIMIT = 20; // cap on staleConcepts in prewarm — a list serialized into a capped response gets a bound at birth
 const USEFULNESS_DECAY_TAU_DAYS = 60; // usefulness decays slower than recency (14-day / 30-day taus) — once-useful concepts fade but are not penalised as sharply as staleness
+// ---- V-A arousal tunables (slice 2) -------------------------------------------
+// Arousal is a decay-resistant signal: contradictions and cross-session confirmations
+// spike it; it decays slowly (tau=120d) but is floored at AROUSAL_FLOOR_FRAC of the cumulative arousal_score (see below).
+// Weights are modest (0.5/0.3) so arousal is a boost, never the dominant ranking term.
+// These are tuning defaults pending sign-off; expose as constructor opts if the pattern holds.
+const AROUSAL_DECAY_TAU_DAYS = 120; // arousal decays at half the rate of usefulness (more persistent)
+const AROUSAL_FLOOR_FRAC = 0.1; // decay-resistant floor — a concept retains ≥10% of its cumulative arousal signal regardless of idle time (arousal_score never decrements)
+const AROUSAL_WEIGHT_LIVING = 0.5; // boost factor in livingModelScore
+const AROUSAL_WEIGHT_GATHER = 0.3; // boost factor in nodePrior (gather path)
 
 export type IngestAction = "created" | "attached" | "ambiguous";
 
@@ -395,6 +405,9 @@ interface ConceptRow {
   dirty: number;
   updated_at: number;
   usefulness_score: number;
+  usefulness_last_fetched_at: number | null;
+  arousal_score: number;
+  arousal_last_updated_at: number | null;
   source_refs: string | null;
   aliases: string | null;
   last_confirmed_at: number | null;
@@ -661,6 +674,45 @@ export class MonetCore {
     const versionNow = this.db.pragma("user_version", { simple: true }) as number;
     if (versionNow >= GRAPH_SCHEMA_VERSION && versionNow < TEMPORAL_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${TEMPORAL_SCHEMA_VERSION}`);
+    }
+    // AROUSAL_SCHEMA_VERSION = 3: adds usefulness_last_fetched_at, arousal_score,
+    // arousal_last_updated_at to concepts.
+    //
+    // Column-guard pattern (SQLite has no ADD COLUMN IF NOT EXISTS): PRAGMA table_info,
+    // then ALTER only if missing. Same pattern as last_confirmed_at above.
+    //
+    // Backfill:
+    //   - arousal_* stay 0 / NULL (forward-looking — no historical contradiction events to replay).
+    //   - usefulness_last_fetched_at = COALESCE(last_confirmed_at, updated_at) for rows with
+    //     usefulness_score > 0, so they don't instantly decay to ~0 on the first open under new code.
+    //     Relies on the temporal backfill above having populated last_confirmed_at already.
+    //     Rows with usefulness_score = 0 stay NULL (never fetched → no meaningful fetch timestamp).
+    //   - Workstream rows are excluded (NULL is correct; they are excluded from all ranking paths).
+    {
+      const conceptCols3 = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
+      const hasFetchedAt = conceptCols3.some((c) => c.name === "usefulness_last_fetched_at");
+      const hasArousalScore = conceptCols3.some((c) => c.name === "arousal_score");
+      const hasArousalUpdatedAt = conceptCols3.some((c) => c.name === "arousal_last_updated_at");
+      if (!hasFetchedAt) {
+        this.db.exec(`ALTER TABLE concepts ADD COLUMN usefulness_last_fetched_at INTEGER`);
+        // Backfill: concepts that have been fetched before (usefulness_score > 0) get a proxy
+        // fetch timestamp so they decay from now rather than from the epoch.
+        this.db.exec(
+          `UPDATE concepts SET usefulness_last_fetched_at = COALESCE(last_confirmed_at, updated_at)
+           WHERE usefulness_score > 0 AND kind != 'workstream'`,
+        );
+      }
+      if (!hasArousalScore) {
+        this.db.exec(`ALTER TABLE concepts ADD COLUMN arousal_score INTEGER NOT NULL DEFAULT 0`);
+      }
+      if (!hasArousalUpdatedAt) {
+        this.db.exec(`ALTER TABLE concepts ADD COLUMN arousal_last_updated_at INTEGER`);
+      }
+    }
+    // Version bump to AROUSAL_SCHEMA_VERSION once TEMPORAL slot is consumed.
+    const versionAfterTemporal = this.db.pragma("user_version", { simple: true }) as number;
+    if (versionAfterTemporal >= TEMPORAL_SCHEMA_VERSION && versionAfterTemporal < AROUSAL_SCHEMA_VERSION) {
+      this.db.pragma(`user_version = ${AROUSAL_SCHEMA_VERSION}`);
     }
   }
 
@@ -936,7 +988,11 @@ export class MonetCore {
     let row = this.getRow(id);
     if (!row) return null;
     // A fetch is a "touch": it signals the concept was useful (drives prewarm ranking, §4.2).
-    this.db.prepare(`UPDATE concepts SET usefulness_score = usefulness_score + 1 WHERE id = ?`).run(id);
+    // Also record the precise fetch timestamp so usefulness decay starts from the last actual fetch,
+    // not from last_confirmed_at (which is a confirmation event, not a retrieval event).
+    this.db
+      .prepare(`UPDATE concepts SET usefulness_score = usefulness_score + 1, usefulness_last_fetched_at = ? WHERE id = ?`)
+      .run(Date.now(), id);
     const synthesizedNow = row.dirty === 1 && (opts.synthesize ?? true);
     if (synthesizedNow) row = await this.synthesizeRow(row);
 
@@ -1124,6 +1180,16 @@ export class MonetCore {
       this.db
         .prepare(`UPDATE concepts SET status = 'disputed', confidence = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
         .run(Math.max(0.1, row.confidence - 0.3), conceptId);
+      // Arousal +3: a contradiction is a high-salience event — the concept is contested.
+      const nowMs = Date.now();
+      this.db
+        .prepare(
+          `UPDATE concepts
+              SET arousal_score = arousal_score + 3,
+                  arousal_last_updated_at = ?
+            WHERE id = ?`,
+        )
+        .run(nowMs, conceptId);
       return this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(id) as ContradictionRow;
     })();
     return toContradiction(contraRow);
@@ -1197,6 +1263,15 @@ export class MonetCore {
         this.db
           .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
           .run(now, resolveSessionId, conceptId);
+        // Arousal +1: a real resolution (not dismiss) signals the concept is being actively mediated.
+        this.db
+          .prepare(
+            `UPDATE concepts
+                SET arousal_score = arousal_score + 1,
+                    arousal_last_updated_at = ?
+              WHERE id = ?`,
+          )
+          .run(now, conceptId);
       }
 
       // Restore the concept once nothing is left open against it.
@@ -1705,21 +1780,49 @@ export class MonetCore {
         this.db
           .prepare(`UPDATE concepts SET aliases = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
           .run(JSON.stringify(mergedAliases), destConceptId);
-        // Temporal: FULL consolidation MAX-carries last_confirmed_at — mirrors mergeConceptInto's exact semantics.
-        // The session id belongs to whichever side is newer.
+        // Temporal + V-A: FULL consolidation MAX-carries last_confirmed_at and all V-A columns
+        // — mirrors mergeConceptInto's exact semantics (usefulness additive, arousal MAX).
         // PARTIAL detach into an existing dest intentionally does NOT carry temporal fields: a
         // concept-level confirmation timestamp cannot be attributed to a subset of moved observations.
         {
           const destRowForTemporal = this.db
-            .prepare(`SELECT last_confirmed_at, last_confirmed_session_id, updated_at FROM concepts WHERE id = ?`)
-            .get(destConceptId) as { last_confirmed_at: number | null; last_confirmed_session_id: string | null; updated_at: number };
+            .prepare(
+              `SELECT last_confirmed_at, last_confirmed_session_id, updated_at,
+                      usefulness_score, usefulness_last_fetched_at,
+                      arousal_score, arousal_last_updated_at
+                 FROM concepts WHERE id = ?`,
+            )
+            .get(destConceptId) as {
+              last_confirmed_at: number | null; last_confirmed_session_id: string | null; updated_at: number;
+              usefulness_score: number; usefulness_last_fetched_at: number | null;
+              arousal_score: number; arousal_last_updated_at: number | null;
+            };
           const srcLca = srcRow.last_confirmed_at ?? srcRow.updated_at;
           const tgtLca = destRowForTemporal.last_confirmed_at ?? destRowForTemporal.updated_at;
           const mergedLca = Math.max(srcLca, tgtLca);
           const mergedLcaSession = srcLca > tgtLca ? srcRow.last_confirmed_session_id : destRowForTemporal.last_confirmed_session_id;
+          // Usefulness carry: additive — both sides' fetch history contributes (mirrors mergeConceptInto).
+          const mergedUsefulness = srcRow.usefulness_score + destRowForTemporal.usefulness_score;
+          const srcFetch = srcRow.usefulness_last_fetched_at;
+          const tgtFetch = destRowForTemporal.usefulness_last_fetched_at;
+          const mergedFetchedAt = srcFetch != null && tgtFetch != null
+            ? Math.max(srcFetch, tgtFetch)
+            : (srcFetch ?? tgtFetch);
+          // Arousal carry: MAX on score + timestamp (mirrors mergeConceptInto).
+          const mergedArousalScore = Math.max(srcRow.arousal_score, destRowForTemporal.arousal_score);
+          const srcArousalTs = srcRow.arousal_last_updated_at;
+          const tgtArousalTs = destRowForTemporal.arousal_last_updated_at;
+          const mergedArousalTs = srcArousalTs != null && tgtArousalTs != null
+            ? Math.max(srcArousalTs, tgtArousalTs)
+            : (srcArousalTs ?? tgtArousalTs);
           this.db
-            .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
-            .run(mergedLca, mergedLcaSession, destConceptId);
+            .prepare(
+              `UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ?,
+                      usefulness_score = ?, usefulness_last_fetched_at = ?,
+                      arousal_score = ?, arousal_last_updated_at = ?
+                WHERE id = ?`,
+            )
+            .run(mergedLca, mergedLcaSession, mergedUsefulness, mergedFetchedAt, mergedArousalScore, mergedArousalTs, destConceptId);
         }
         // Consolidation: all observations moved to an existing dest — delete the source concept.
         // Graph must be unwound first; no rederive since the concept no longer exists.
@@ -2851,14 +2954,37 @@ export class MonetCore {
     const tgtLca = target.last_confirmed_at ?? target.updated_at;
     const mergedLca = Math.max(srcLca, tgtLca);
     const mergedLcaSession = srcLca > tgtLca ? src.last_confirmed_session_id : target.last_confirmed_session_id;
+    // Usefulness carry: additive (like support_count) — both sides' fetch history contributes.
+    const mergedUsefulness = src.usefulness_score + target.usefulness_score;
+    // Precise usefulness decay: carry MAX(usefulness_last_fetched_at) — whichever was fetched more recently.
+    const srcFetch = src.usefulness_last_fetched_at;
+    const tgtFetch = target.usefulness_last_fetched_at;
+    const mergedFetchedAt = srcFetch != null && tgtFetch != null
+      ? Math.max(srcFetch, tgtFetch)
+      : (srcFetch ?? tgtFetch);
+    // Arousal carry: MAX on score + timestamp (the more-aroused side's signal prevails).
+    const mergedArousalScore = Math.max(src.arousal_score, target.arousal_score);
+    const srcArousalTs = src.arousal_last_updated_at;
+    const tgtArousalTs = target.arousal_last_updated_at;
+    const mergedArousalTs = srcArousalTs != null && tgtArousalTs != null
+      ? Math.max(srcArousalTs, tgtArousalTs)
+      : (srcArousalTs ?? tgtArousalTs);
     this.db
       .prepare(
         `UPDATE concepts SET body = ?, support_count = ?, embedding = ?, source_refs = ?, aliases = ?, version = ?,
                 status = ?, dirty = 1, updated_at = unixepoch() * 1000,
-                last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`,
+                last_confirmed_at = ?, last_confirmed_session_id = ?,
+                usefulness_score = ?, usefulness_last_fetched_at = ?,
+                arousal_score = ?, arousal_last_updated_at = ?
+           WHERE id = ?`,
       )
-      .run(lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, JSON.stringify(aliases), version, status,
-           mergedLca, mergedLcaSession, target.id);
+      .run(
+        lines.join("\n"), supportCount, embToJson(blended), refs.length ? JSON.stringify(refs) : null, JSON.stringify(aliases), version, status,
+        mergedLca, mergedLcaSession,
+        mergedUsefulness, mergedFetchedAt,
+        mergedArousalScore, mergedArousalTs,
+        target.id,
+      );
     // 4) Drop the source: its graph footprint in fromCircle, its revision history, then the row.
     this.unwindConceptGraph(src.id, fromCircle);
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
@@ -3116,16 +3242,48 @@ export class MonetCore {
   private nodePrior(id: string): number {
     const m = this.nodeMeta(id);
     if (!m) return 1;
-    const ageDays = Math.max(0, (Date.now() - (m.lastConfirmedAt ?? m.updatedAt)) / 86_400_000);
-    const usefulnessDecayed = m.usefulness * Math.exp(-ageDays / USEFULNESS_DECAY_TAU_DAYS);
-    return Math.max(1e-3, m.confidence * Math.log1p(usefulnessDecayed + m.support) * Math.exp(-ageDays / 30));
+    const now = Date.now();
+    // Precise usefulness decay: use actual fetch timestamp (usefulness_last_fetched_at) instead
+    // of the confirmation proxy. Falls back to COALESCE(last_confirmed_at, updated_at) for
+    // never-fetched or workstream rows where usefulness_last_fetched_at is NULL.
+    const fetchTs = m.usefulnessLastFetchedAt ?? m.lastConfirmedAt ?? m.updatedAt;
+    const usefulnessDays = Math.max(0, (now - fetchTs) / 86_400_000);
+    const usefulnessDecayed = m.usefulness * Math.exp(-usefulnessDays / USEFULNESS_DECAY_TAU_DAYS);
+    // Recency for the overall prior uses confirmed age (unchanged from slice 1).
+    const ageDays = Math.max(0, (now - (m.lastConfirmedAt ?? m.updatedAt)) / 86_400_000);
+    // Arousal boost (decay-resistant; floored at AROUSAL_FLOOR_FRAC of cumulative arousal score).
+    const arousalDays = m.arousalLastUpdatedAt != null ? Math.max(0, (now - m.arousalLastUpdatedAt) / 86_400_000) : 0;
+    const effectiveArousal = Math.max(m.arousalScore * AROUSAL_FLOOR_FRAC, m.arousalScore * Math.exp(-arousalDays / AROUSAL_DECAY_TAU_DAYS));
+    return Math.max(1e-3, m.confidence * Math.log1p(usefulnessDecayed + m.support) * Math.exp(-ageDays / 30) * (1 + AROUSAL_WEIGHT_GATHER * effectiveArousal));
   }
 
-  private nodeMeta(id: string): { confidence: number; usefulness: number; support: number; updatedAt: number; lastConfirmedAt: number | null } | null {
+  private nodeMeta(id: string): {
+    confidence: number; usefulness: number; support: number; updatedAt: number;
+    lastConfirmedAt: number | null; usefulnessLastFetchedAt: number | null;
+    arousalScore: number; arousalLastUpdatedAt: number | null;
+  } | null {
     const r = this.db
-      .prepare(`SELECT confidence, usefulness_score, support_count, updated_at, last_confirmed_at FROM concepts WHERE id = ?`)
-      .get(id) as { confidence: number; usefulness_score: number; support_count: number; updated_at: number; last_confirmed_at: number | null } | undefined;
-    return r ? { confidence: r.confidence, usefulness: r.usefulness_score, support: r.support_count, updatedAt: r.updated_at, lastConfirmedAt: r.last_confirmed_at } : null;
+      .prepare(
+        `SELECT confidence, usefulness_score, support_count, updated_at, last_confirmed_at,
+                usefulness_last_fetched_at, arousal_score, arousal_last_updated_at
+           FROM concepts WHERE id = ?`,
+      )
+      .get(id) as {
+        confidence: number; usefulness_score: number; support_count: number; updated_at: number;
+        last_confirmed_at: number | null; usefulness_last_fetched_at: number | null;
+        arousal_score: number; arousal_last_updated_at: number | null;
+      } | undefined;
+    if (!r) return null;
+    return {
+      confidence: r.confidence,
+      usefulness: r.usefulness_score,
+      support: r.support_count,
+      updatedAt: r.updated_at,
+      lastConfirmedAt: r.last_confirmed_at,
+      usefulnessLastFetchedAt: r.usefulness_last_fetched_at,
+      arousalScore: r.arousal_score,
+      arousalLastUpdatedAt: r.arousal_last_updated_at,
+    };
   }
 
   private embOf(id: string): Float32Array | null {
@@ -3222,10 +3380,12 @@ export class MonetCore {
                   confidence = ?,
                   status = CASE WHEN status = 'disputed' THEN 'disputed' ELSE 'active' END,
                   dirty = 1, updated_at = unixepoch() * 1000,
-                  last_confirmed_at = ?, last_confirmed_session_id = ?
+                  last_confirmed_at = ?, last_confirmed_session_id = ?,
+                  arousal_score = arousal_score + 1,
+                  arousal_last_updated_at = ?
             WHERE id = ?`,
         )
-        .run(body, version, supportCount, embToJson(blended), confidence, now, sessionId, concept.id);
+        .run(body, version, supportCount, embToJson(blended), confidence, now, sessionId, now, concept.id);
     } else {
       this.db
         .prepare(
@@ -3320,12 +3480,21 @@ function toWorkstream(r: ConceptRow): Workstream {
   return { id: r.id, slug: r.slug, title: r.title, circle: r.circle, version: r.version, payload, updatedAt: r.updated_at };
 }
 
-/** Living-model rank (ADR §4.2): confidence × usefulness × recency-decay (~2-week half-ish). */
+/** Living-model rank (ADR §4.2): confidence × usefulness × recency-decay (~2-week half-ish) × arousal boost. */
 function livingModelScore(r: ConceptRow, now: number): number {
   const ageDays = Math.max(0, (now - (r.last_confirmed_at ?? r.updated_at)) / 86_400_000);
   const recency = Math.exp(-ageDays / 14); // fresh ≈ 1, decays with staleness
-  const usefulnessDecayed = r.usefulness_score * Math.exp(-ageDays / USEFULNESS_DECAY_TAU_DAYS);
-  return r.confidence * (1 + usefulnessDecayed) * recency;
+  // Precise usefulness decay: use actual fetch timestamp rather than confirmation age as the proxy.
+  // Falls back to COALESCE(last_confirmed_at, updated_at) for pre-migration or never-fetched rows.
+  const fetchTs = r.usefulness_last_fetched_at ?? r.last_confirmed_at ?? r.updated_at;
+  const usefulnessDays = Math.max(0, (now - fetchTs) / 86_400_000);
+  const usefulnessDecayed = r.usefulness_score * Math.exp(-usefulnessDays / USEFULNESS_DECAY_TAU_DAYS);
+  // Arousal boost: decay-resistant signal from contradictions and cross-session confirms.
+  // Floored at AROUSAL_FLOOR_FRAC * arousal_score so a concept retains ≥10% of its cumulative
+  // arousal signal regardless of idle time (arousal_score never decrements).
+  const arousalDays = r.arousal_last_updated_at != null ? Math.max(0, (now - r.arousal_last_updated_at) / 86_400_000) : 0;
+  const effectiveArousal = Math.max(r.arousal_score * AROUSAL_FLOOR_FRAC, r.arousal_score * Math.exp(-arousalDays / AROUSAL_DECAY_TAU_DAYS));
+  return r.confidence * (1 + usefulnessDecayed) * recency * (1 + AROUSAL_WEIGHT_LIVING * effectiveArousal);
 }
 
 function workstreamTitle(p: WorkstreamPayload): string {
