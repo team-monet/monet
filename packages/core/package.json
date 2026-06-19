@@ -50,7 +50,9 @@
   },
   "pnpm": {
     "overrides": {
-      "esbuild": "^0.28.1"
+      "esbuild": "^0.28.1",
+      "hono": "^4.12.25",
+      "protobufjs": "^7.6.3"
     },
     "onlyBuiltDependencies": [
       "better-sqlite3",
