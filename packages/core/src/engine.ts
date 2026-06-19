@@ -53,6 +53,7 @@ const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s
 const GRAPH_SCHEMA_VERSION = 1; // PRAGMA user_version gate for the one-time graph backfill (P2)
 const TEMPORAL_SCHEMA_VERSION = 2; // PRAGMA user_version gate for the temporal layer (0.6.0)
 const STALE_CONCEPTS_PREWARM_LIMIT = 20; // cap on staleConcepts in prewarm — a list serialized into a capped response gets a bound at birth
+const USEFULNESS_DECAY_TAU_DAYS = 60; // usefulness decays slower than recency (14-day / 30-day taus) — once-useful concepts fade but are not penalised as sharply as staleness
 
 export type IngestAction = "created" | "attached" | "ambiguous";
 
@@ -3116,7 +3117,8 @@ export class MonetCore {
     const m = this.nodeMeta(id);
     if (!m) return 1;
     const ageDays = Math.max(0, (Date.now() - (m.lastConfirmedAt ?? m.updatedAt)) / 86_400_000);
-    return Math.max(1e-3, m.confidence * Math.log1p(m.usefulness + m.support) * Math.exp(-ageDays / 30));
+    const usefulnessDecayed = m.usefulness * Math.exp(-ageDays / USEFULNESS_DECAY_TAU_DAYS);
+    return Math.max(1e-3, m.confidence * Math.log1p(usefulnessDecayed + m.support) * Math.exp(-ageDays / 30));
   }
 
   private nodeMeta(id: string): { confidence: number; usefulness: number; support: number; updatedAt: number; lastConfirmedAt: number | null } | null {
@@ -3322,7 +3324,8 @@ function toWorkstream(r: ConceptRow): Workstream {
 function livingModelScore(r: ConceptRow, now: number): number {
   const ageDays = Math.max(0, (now - (r.last_confirmed_at ?? r.updated_at)) / 86_400_000);
   const recency = Math.exp(-ageDays / 14); // fresh ≈ 1, decays with staleness
-  return r.confidence * (1 + r.usefulness_score) * recency;
+  const usefulnessDecayed = r.usefulness_score * Math.exp(-ageDays / USEFULNESS_DECAY_TAU_DAYS);
+  return r.confidence * (1 + usefulnessDecayed) * recency;
 }
 
 function workstreamTitle(p: WorkstreamPayload): string {
