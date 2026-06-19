@@ -2595,25 +2595,20 @@ export class MonetCore {
     for (const ref of sourceRefs) ents.push({ key: `ref:${ref}`, kind: "path", surface: ref, weight: 3 });
     const strength = new Map<string, number>();
     for (const e of ents) {
-      // Write-time hub filter: read the entity's CURRENT df (0 if unseen) before writing.
-      // A rare structural anchor (non-noun, df ≤ RARE_DF_MAX) bypasses the hub gate — it can
-      // never be a true hub (df ≤ 5 < MAX_DF_ABS) and the df-fraction is meaningless at small n.
-      // For every other entity: if the PRE-INSERT df already flags it as a hub, skip it entirely
-      // — no concept_entities row, no df increment, no about-edge. This keeps entities.df
-      // consistent with concept_entities (df == number of concept_entities rows for that key+scope).
-      const curRow = this.db.prepare(`SELECT df FROM entities WHERE key = ? AND scope = ?`).get(e.key, circle) as { df: number } | undefined;
-      const curDf = curRow?.df ?? 0;
-      const strongAlonePreInsert = e.kind !== "noun" && curDf <= RARE_DF_MAX;
-      if (!strongAlonePreInsert && this.isHubDf(curDf, n)) continue; // hub at write time — skip entirely
-      // Not a hub (or strongAlone): persist the membership and get the post-insert df for edge math.
+      // Always upsert so df grows monotonically with membership. If we skipped the df increment,
+      // a hub's frozen df would fall below the df-fraction threshold as n grows and the entity
+      // would un-hub — resuming about-edges (a flip-flop). Keeping df == COUNT(rows) also keeps
+      // unwindConceptGraph's per-row decrement exact.
       const df = this.upsertEntity(conceptId, e.key, e.kind, e.surface, circle);
-      // A rare structural anchor (concrete file/symbol/err/lib or sourceRef, df ≤ RARE_DF_MAX) is the
-      // strongest possible link and bypasses the df-FRACTION gate — that fraction is meaningless at small n
+      // Write-time hub gate (post-insert basis): suppress only the about-EDGE for hub entities.
+      // Both df and n are post-insert here, so the basis is consistent (no off-by-one).
+      // A rare structural anchor (non-noun, df ≤ RARE_DF_MAX) bypasses the hub gate — it can
+      // never be a true hub (df ≤ 5 < MAX_DF_ABS) and the df-fraction is meaningless at small n
       // (df=2 of n=2 reads as "common" yet is the rarest, most specific anchor), so without this the
       // `strongAlone` path below was dead until ~10× unrelated filler concepts existed. df ≤ RARE_DF_MAX (5)
       // can never be a true hub, so the absolute cap inside isHubDf is not needed for it.
       const strongAlone = e.kind !== "noun" && df <= RARE_DF_MAX; // one shared rare file/symbol is enough
-      if (!strongAlone && this.isHubDf(df, n)) continue; // just became a hub on this store — no about-edge (defense-in-depth)
+      if (!strongAlone && this.isHubDf(df, n)) continue; // hub entity — skip about-edge only
       const rar = this.rarityFromDf(df, n) * (KIND_BOOST[e.kind] ?? 1);
       for (const m of this.coMembers(e.key, circle, conceptId, MAX_NEIGHBORS)) {
         const next = (strength.get(m) ?? 0) + rar;
