@@ -9,9 +9,17 @@
  *
  * Those are declared as (optional) runtime dependencies of this package; everything else
  * is bundled. Run `node build.mjs` for all targets, or `node build.mjs <index|cli>`.
+ *
+ * Post-bundle step: copies the dashboard static assets (index.html, app.js, style.css)
+ * from src/dashboard/static/ (vendored in-repo) into dist/dashboard/ so they ship in
+ * the npm tarball and are resolved at runtime relative to import.meta.url in dist/cli.js.
  */
 import { build } from "esbuild";
-import { rmSync } from "node:fs";
+import { rmSync, mkdirSync, copyFileSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const EXTERNAL = [
   "better-sqlite3",
@@ -52,3 +60,38 @@ await Promise.all(
     });
   }),
 );
+
+// ── Dashboard asset copy ─────────────────────────────────────────────────────
+// Only copy when building the full bundle (not a targeted single-target build).
+// Dashboard assets are read-only viewer code — no engine IP, safe to ship readable.
+// Assets are vendored in-repo at src/dashboard/static/ — never read from a sibling dir.
+if (!only || only === "cli") {
+  const DASHBOARD_SRC = join(__dirname, "src", "dashboard", "static");
+  const DASHBOARD_OUT = join(__dirname, "dist", "dashboard");
+  const ASSETS = ["index.html", "app.js", "style.css"];
+
+  if (!existsSync(DASHBOARD_SRC)) {
+    console.error(
+      `[build] ERROR: in-repo dashboard assets not found at ${DASHBOARD_SRC}. ` +
+      "Run: cp path/to/{index.html,app.js,style.css} src/dashboard/static/"
+    );
+    process.exit(1);
+  }
+
+  const missing = ASSETS.filter((a) => !existsSync(join(DASHBOARD_SRC, a)));
+  if (missing.length > 0) {
+    console.error(
+      `[build] ERROR: missing dashboard asset(s) in ${DASHBOARD_SRC}: ${missing.join(", ")}`
+    );
+    process.exit(1);
+  }
+
+  mkdirSync(DASHBOARD_OUT, { recursive: true });
+  for (const asset of ASSETS) {
+    const src = join(DASHBOARD_SRC, asset);
+    const dst = join(DASHBOARD_OUT, asset);
+    copyFileSync(src, dst);
+    console.log(`[build] copied dashboard/${asset}`);
+  }
+  console.log(`[build] dashboard assets → dist/dashboard/`);
+}

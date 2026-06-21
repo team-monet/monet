@@ -1,6 +1,6 @@
 {
   "name": "@team-monet/monet",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Monet — local-first, state-centric memory for coding agents. MCP server + CLI.",
   "license": "LicenseRef-Monet-Proprietary",
   "type": "module",

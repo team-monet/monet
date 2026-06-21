@@ -140,4 +140,23 @@ function generateAgentConfig(agentType: string): Record<string, unknown> {
   }
 }
 
+program
+  .command("dashboard")
+  .description("Open the Monet memory dashboard in your browser")
+  .option("-p, --port <number>", "Port to listen on", "7373")
+  .option("-d, --dir <path>", "Storage directory (default: .monet or ~/.monet)")
+  .action(async (options) => {
+    const port = parseInt(process.env.PORT || options.port, 10);
+    if (isNaN(port) || port < 1 || port > 65535) {
+      console.error(`Invalid port: ${options.port}`);
+      process.exit(1);
+    }
+    if (options.dir) {
+      process.env.MONET_STORAGE_DIR = path.resolve(options.dir);
+    }
+    ensureMonetDir();
+    const { startDashboard } = await import("./dashboard/server.js");
+    startDashboard(port);
+  });
+
 program.parse();

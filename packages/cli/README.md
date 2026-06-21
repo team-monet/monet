@@ -18,6 +18,24 @@ Your agent installs Monet, wires up the MCP server, and pulls in a memory-aware 
 
 Monet keeps one local store at `~/.monet` and automatically **organizes** each project into its own *circle* — nothing to set up. Everything stays on your machine.
 
+## See your memory — `monet dashboard`
+
+Run one command to open a local web view of your Monet memory as an explorable, force-directed graph:
+
+```bash
+monet dashboard
+```
+
+It opens in your browser automatically. Nodes are concepts (colored by kind, sized by importance), edges are the relationships between them, and a detail panel lets you read any concept's full body and evidence. Timeline and Health views surface contradictions, duplicates, and low-confidence concepts.
+
+**100% local. Fully offline. Strictly read-only.** The server copies your store into a temporary snapshot on each request — the live database is never written to or locked. No network connections are made; run it with wifi off and the graph still renders.
+
+```bash
+monet dashboard              # opens at http://localhost:7373
+monet dashboard -p 8080      # -p, --port <n>   custom port
+monet dashboard -d ./path    # -d, --dir <path>  point at a specific store
+```
+
 ## License
 
 Monet is distributed under a **proprietary license** — free to use for any purpose; redistribution, decompilation, and derivative works are not permitted. Full terms are in the `LICENSE` file included in this package.
