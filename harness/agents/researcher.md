@@ -26,6 +26,7 @@ When asked to research a topic, return a structured response with:
 - When research reveals the question is underspecified, flag what's missing.
 - Stay neutral: present options and tradeoffs, then recommend based on stated context.
 - If no external research is needed, say so briefly.
+- **Return sources verbatim.** Quote the exact relevant excerpt and its URL, not a paraphrased takeaway — a finding the orchestrator can't trace back to its source is unusable.
 
 ## Evidence Over Instructions
 
