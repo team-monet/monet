@@ -11,7 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { MonetCore } from "./engine";
+import { MonetCore, FIRST_BLOCK_SUMMARY_MAX_CHARS } from "./engine";
 import type { MergeConceptResult } from "./engine";
 
 /**
@@ -65,90 +65,181 @@ const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 const PREWARM_BLOCK_MAX_CHARS = 2_500;
 
 /**
+ * Max characters for the firstBlock array serialized into the agent_context JSON payload.
+ * At 800 chars/summary cap × ~5 entries = 4 000 chars fits comfortably; above this the
+ * structured path emits a compact advisory instead of an unbounded array (Finding 4).
+ */
+const FIRST_BLOCK_INJECTION_MAX_CHARS = 6_000;
+
+/**
+ * Preview length for each entry's summary in memory_first_block action:"list" responses.
+ * The curation/recovery path must stay parseable at any pin count — truncating summaries to
+ * this preview keeps the list well under the 40k ok() ceiling (50 pins × 120 chars = 6 000 chars
+ * for summaries alone, leaving ample room for conceptId, position, etc.).
+ */
+const FIRST_BLOCK_LIST_SUMMARY_PREVIEW_CHARS = 120;
+
+/**
+ * Default page size for memory_first_block action:"list" (offset pagination).
+ * At ~300 chars/row (conceptId + position + flags + 120-char summary + JSON pretty-print
+ * overhead), 100 rows ≈ 30 000 chars — comfortably under the 40 000-char RESULT_MAX_CHARS
+ * ceiling even with the enclosing object. Callers may pass offset+limit to page through all
+ * pins without a hard count cap hiding any entry.
+ */
+const FIRST_BLOCK_LIST_DEFAULT_LIMIT = 100;
+
+/**
+ * Hard maximum for memory_first_block action:"list" limit — clamped at request time so a
+ * caller cannot request an arbitrarily large slice that serialises to more than RESULT_MAX_CHARS.
+ * At ~300 chars/row (preview mode), 200 rows ≈ 60 000 chars… but with the 120-char preview cap
+ * in place each row is ≈ 200 chars, so 200 × 200 = 40 000 — right at the ceiling.  We keep
+ * it at 200 (rather than 100) so a single list call can fully page a moderate store in one
+ * shot, while still keeping the serialised output provably under RESULT_MAX_CHARS.
+ * (Finding 1 — Codex PR-32)
+ */
+const FIRST_BLOCK_LIST_MAX_LIMIT = 200;
+
+/**
+ * Tighter page-size cap for memory_first_block action:"list" when full=true (untruncated
+ * summaries). Each summary can be up to FIRST_BLOCK_SUMMARY_MAX_CHARS = 800 chars; at the
+ * max-limit 200 that would yield 200 × 800 = 160 000 chars — far above the 40 000-char
+ * RESULT_MAX_CHARS ceiling, which causes ok() to truncate the JSON mid-payload leaving a
+ * non-parseable result.  40 entries × 800 chars = 32 000 chars for summaries alone, safely
+ * under the 40 000 ceiling even after accounting for conceptId/position/flags/JSON overhead.
+ * (full=true overflow — Codex PR-32 follow-up)
+ */
+const FIRST_BLOCK_LIST_FULL_MAX_LIMIT = 40;
+
+/**
  * Build the compact prewarm block to prepend on the first successful tool response.
  * Calls core.prewarm(circle) + core.overview(circle); renders non-empty sections only.
  * Returns the full delimited block string, or an empty string if the store is empty.
+ *
+ * First Block renders FIRST (before workstreams) and is protected from truncation:
+ * if the block + the first block alone exceeds the budget, the curation advisory notes it
+ * rather than silently cutting entries.
  */
 function buildPrewarmBlock(core: MonetCore, circle: string): string {
   const state = core.prewarm(circle);
   const ov = core.overview(circle);
 
-  const lines: string[] = [];
+  // === FIRST BLOCK (always-first, protected from truncation) ===
+  // Only inject active entries; disputed entries are suppressed here and counted in curationAttention.
+  const activeFirstBlock = state.firstBlock.filter((e) => e.conceptStatus === "active");
+  const firstBlockLines: string[] = [];
+  if (activeFirstBlock.length > 0) {
+    firstBlockLines.push("First block (always-first, user-curated):");
+    for (const e of activeFirstBlock) {
+      const staleTag = e.summaryDirty ? ' [summary stale — refresh with memory_first_block action="update_summary"]' : "";
+      firstBlockLines.push(`  • [${e.conceptId}] ${e.summary}${staleTag}`);
+    }
+  }
+
+  // === LOWER-PRIORITY SECTIONS (subject to truncation) ===
+  const lowerLines: string[] = [];
+
+  // Curation attention line — placed FIRST in the lower-priority block so that long
+  // workstream/top-concept/stale/contradiction content cannot exhaust the budget and drop it.
+  // (Finding B — Codex round-5: advisory must survive even when lower content is large.)
+  const advisory = buildCurationAdvisory(ov, state.firstBlock);
+  if (advisory !== null) {
+    lowerLines.push(`Curation attention: ${advisory}.`);
+  }
 
   // Active workstreams — up to 5.
   const workstreams = state.activeWorkstreams.slice(0, 5);
   if (workstreams.length > 0) {
-    lines.push("Active workstreams:");
+    lowerLines.push("Active workstreams:");
     for (const ws of workstreams) {
       const next = ws.nextSteps[0] ? ` | next: ${ws.nextSteps[0]}` : "";
-      lines.push(`  • [${ws.status}] ${ws.title}${next}`);
+      lowerLines.push(`  • [${ws.status}] ${ws.title}${next}`);
     }
   }
 
   // Top concepts — up to 7.
   const topConcepts = state.topConcepts.slice(0, 7);
   if (topConcepts.length > 0) {
-    lines.push("Top concepts:");
+    lowerLines.push("Top concepts:");
     for (const c of topConcepts) {
-      lines.push(`  • ${c.title} (${c.kind}, conf ${c.confidence.toFixed(2)})`);
+      lowerLines.push(`  • ${c.title} (${c.kind}, conf ${c.confidence.toFixed(2)})`);
     }
   }
 
   // Stale concepts — up to 5.
   const stale = state.staleConcepts.slice(0, 5);
   if (stale.length > 0) {
-    lines.push("Stale (needs re-confirmation):");
+    lowerLines.push("Stale (needs re-confirmation):");
     for (const c of stale) {
-      lines.push(`  • ${c.title}`);
+      lowerLines.push(`  • ${c.title}`);
     }
   }
 
   // Open contradictions — up to 5.
   const contras = state.openContradictions.slice(0, 5);
   if (contras.length > 0) {
-    lines.push("Open contradictions:");
+    lowerLines.push("Open contradictions:");
     for (const c of contras) {
       const detail = c.detail ? ` — ${c.detail.slice(0, 80)}` : "";
-      lines.push(`  • ${c.conceptTitle}${detail}`);
+      lowerLines.push(`  • ${c.conceptTitle}${detail}`);
     }
   }
 
   // Nothing stored at all → empty render → no block.
-  if (lines.length === 0) return "";
+  if (firstBlockLines.length === 0 && lowerLines.length === 0) return "";
 
-  // Curation attention line — only when thresholds trip.
-  const advisory = buildCurationAdvisory(ov);
-  if (advisory !== null) {
-    lines.push(`Curation attention: ${advisory}.`);
-  }
-
-  const body = lines.join("\n");
-  const block = `=== MONET SESSION CONTEXT (auto-prewarm) ===\n${body}\n=== END SESSION CONTEXT ===\n\n`;
-
-  // Enforce PREWARM_BLOCK_MAX_CHARS (truncate item lines, never mid-line).
-  if (block.length <= PREWARM_BLOCK_MAX_CHARS) return block;
-  // Reserve footer length BEFORE accumulating so the footer is always included within the cap.
+  const HEADER = "=== MONET SESSION CONTEXT (auto-prewarm) ===\n";
   const FOOTER = "=== END SESSION CONTEXT ===\n\n";
-  const budget = PREWARM_BLOCK_MAX_CHARS - FOOTER.length;
-  const parts = block.split("\n");
-  let result = "";
-  for (const part of parts) {
-    const candidate = result + part + "\n";
-    if (candidate.length > budget) break;
-    result = candidate;
+
+  // Build the first-block blob (protected — injected unconditionally within the cap).
+  const firstBlockBlob = firstBlockLines.length > 0 ? firstBlockLines.join("\n") + "\n" : "";
+  // Build the lower-priority blob (subject to truncation).
+  const lowerBlob = lowerLines.length > 0 ? lowerLines.join("\n") + "\n" : "";
+
+  const fullBlock = HEADER + firstBlockBlob + lowerBlob + FOOTER;
+
+  // Enforce PREWARM_BLOCK_MAX_CHARS. First-block lines are written first and are protected —
+  // truncation can only cut into the lower-priority sections.
+  if (fullBlock.length <= PREWARM_BLOCK_MAX_CHARS) return fullBlock;
+
+  const budget = PREWARM_BLOCK_MAX_CHARS - HEADER.length - FOOTER.length;
+  let used = firstBlockBlob.length;
+
+  // If the first-block blob alone already exceeds the budget, emit a compact advisory instead of
+  // returning an unbounded block (which defeats the cap's purpose) or silently dropping pins.
+  // The advisory tells the agent how many items are pinned and how to trim them.
+  if (used >= budget) {
+    const pinnedCount = activeFirstBlock.length;
+    const oversizeAdvisory =
+      `[First Block: ${pinnedCount} pinned item${pinnedCount === 1 ? "" : "s"} exceed the prewarm budget ` +
+      `(${used} chars vs ${budget} char budget) — review/trim via memory_first_block or the dashboard.]\n`;
+    return HEADER + oversizeAdvisory + FOOTER;
   }
-  result += FOOTER;
-  return result;
+
+  // Fit as many lower-priority lines as possible within the remaining budget.
+  const remaining = budget - used;
+  let lowerFitted = "";
+  for (const part of lowerBlob.split("\n")) {
+    const candidate = lowerFitted + part + "\n";
+    if (candidate.length > remaining) break;
+    lowerFitted = candidate;
+  }
+  used += lowerFitted.length;
+
+  return HEADER + firstBlockBlob + lowerFitted + FOOTER;
 }
 
 /**
  * Build the curation advisory string when thresholds trip.
  * Returns a non-empty string (for injection into the prewarm block or agent_context payload)
  * when any threshold is met, or null when none trip.
- * Thresholds: possibleDuplicates>=3, disputed>=1, stale>=5, dirty>=10.
+ * Thresholds: possibleDuplicates>=3, disputed>=1, stale>=5, dirty>=10,
+ *             firstBlockStale>=1, firstBlockDisputed>=1.
  * Single source of truth — used by both buildPrewarmBlock and the agent_context tool handler.
  */
-function buildCurationAdvisory(ov: ReturnType<MonetCore["overview"]>): string | null {
+function buildCurationAdvisory(
+  ov: ReturnType<MonetCore["overview"]>,
+  firstBlock?: ReturnType<MonetCore["listFirstBlock"]>,
+): string | null {
   const signals: string[] = [];
   if (ov.counts.possibleDuplicates >= 3)
     signals.push(`possibleDuplicates=${ov.counts.possibleDuplicates}`);
@@ -158,6 +249,12 @@ function buildCurationAdvisory(ov: ReturnType<MonetCore["overview"]>): string | 
     signals.push(`stale=${ov.counts.stale}`);
   if (ov.counts.dirty >= 10)
     signals.push(`dirty=${ov.counts.dirty}`);
+  if (firstBlock) {
+    const staleCount = firstBlock.filter((e) => e.summaryDirty).length;
+    const disputedCount = firstBlock.filter((e) => e.conceptStatus === "disputed").length;
+    if (staleCount >= 1) signals.push(`firstBlockStale=${staleCount}`);
+    if (disputedCount >= 1) signals.push(`firstBlockDisputed=${disputedCount}`);
+  }
   if (signals.length === 0) return null;
   return `${signals.join(", ")} — run the curate-memory ritual`;
 }
@@ -388,7 +485,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_store",
-    'Store something worth remembering. By default the substrate deduplicates automatically: similar evidence resolves into an existing concept; novel evidence creates a new one. Pass resolution="forceNew" to always create a new concept (useful for bulk import flows where each item is known to be distinct). Pass attachTo=<conceptId> to attach directly to a specific concept, bypassing automatic scoring. Cheap and instant — synthesis happens later, on read.',
+    'Store something worth remembering. By default the substrate deduplicates automatically: similar evidence resolves into an existing concept; novel evidence creates a new one. Pass resolution="forceNew" to always create a new concept (useful for bulk import flows where each item is known to be distinct). Pass attachTo=<conceptId> to attach directly to a specific concept, bypassing automatic scoring. Cheap and instant — synthesis happens later, on read. If the stored concept is a preference, way-of-working, or something the user flagged as important, consider suggesting memory_first_block with action="promote" to pin it to the First Block — but only propose; never auto-promote; the user must confirm.',
     {
       content: z.string(),
       circle: z.string().optional(),
@@ -984,22 +1081,149 @@ export function registerMonetCoreTools(
     },
   );
 
+  // ---- First Block tools --------------------------------------------------
+
+  server.tool(
+    "memory_first_block",
+    `Manage the First Block — the user-curated, always-injected-first section of agent_context. Dispatch via the \`action\` parameter:
+
+  • "promote"        — Pin a concept. Requires conceptId + summary (up to ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars). The agent sees the summary at every session start without a search query; full detail is one memory_fetch away. Only the user may promote (never auto-promote). Returns the new entry and totalSummaryChars (a cost signal — keep the total manageable). Errors on double-promote.
+  • "remove"         — Unpin a concept. Requires conceptId. Does NOT affect the concept itself. Returns { removed: true/false }.
+  • "list"           — List entries for a circle, position-ordered. Returns { total, offset, limit, entries: [{ conceptId, summary, summaryDirty, position, conceptStatus }] }. Paginates: pass offset (default 0) and limit (default ${FIRST_BLOCK_LIST_DEFAULT_LIMIT}, capped at ${FIRST_BLOCK_LIST_MAX_LIMIT} in preview mode or ${FIRST_BLOCK_LIST_FULL_MAX_LIMIT} in full=true mode) to page through ALL pins without missing any. By default, summary is truncated to a short preview; pass full=true to get untruncated summaries — note that full=true uses a smaller page cap (${FIRST_BLOCK_LIST_FULL_MAX_LIMIT}) to stay within the response size limit. summaryDirty=true means the underlying concept changed and needs a refresh (use update_summary). Disputed concepts are suppressed from auto-injection but still listed here for curation.
+  • "reorder"        — Reorder the block. Requires orderedConceptIds (all currently pinned ids in the desired order; must be a complete list — no partial reorder). Use list (paging if needed) to discover all ids first. Positions are assigned 0, 1, 2, …
+  • "update_summary" — Refresh a stale summary and clear summaryDirty. Requires conceptId + summary. Use when summaryDirty=true (seen in list or agent_context): memory_fetch the concept, write the updated summary here. Max ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars.
+
+  circle is optional for all actions (defaults to this session's circle).`,
+    {
+      action: z.enum(["promote", "remove", "list", "reorder", "update_summary"]).describe(
+        'The operation to perform. One of: "promote", "remove", "list", "reorder", "update_summary".',
+      ),
+      conceptId: z.string().optional().describe("Required for promote, remove, update_summary. The concept to act on."),
+      summary: z.string().optional().describe(`Required for promote and update_summary. The summary text (max ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars).`),
+      orderedConceptIds: z.array(z.string()).optional().describe("Required for reorder. All pinned conceptIds in the desired order (complete list)."),
+      circle: z.string().optional().describe("The circle to operate on (defaults to this session's circle)."),
+      promotedBy: z.string().optional().describe("promote only — optional label recording who performed the promotion."),
+      offset: z.number().int().min(0).optional().describe("list only — zero-based offset into the position-ordered pin list (default 0)."),
+      limit: z.number().int().min(1).optional().describe(`list only — max entries to return per page (default ${FIRST_BLOCK_LIST_DEFAULT_LIMIT}; capped at ${FIRST_BLOCK_LIST_MAX_LIMIT} in preview mode or ${FIRST_BLOCK_LIST_FULL_MAX_LIMIT} when full=true). Use with offset to page through all pins.`),
+      full: z.boolean().optional().describe("list only — if true, return the complete untruncated summary for each entry instead of the default 120-char preview. Use when you need to inspect the full existing summary before update_summary or remove (e.g. to avoid clobbering a long summary). Page narrowly when using full=true. (Finding 3 — Codex PR-32)"),
+    },
+    async ({ action, conceptId, summary, orderedConceptIds, circle, promotedBy, offset, limit, full }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      try {
+        if (action === "promote") {
+          if (!conceptId) return err('action "promote" requires conceptId');
+          if (!summary) return err('action "promote" requires summary');
+          if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`);
+          const r = core.promoteToFirstBlock(conceptId, summary, scope(circle), { promotedBy });
+          return mutOk({ circle: scope(circle), ...r }, "memory_first_block", false, capturedBlock);
+        }
+
+        if (action === "remove") {
+          if (!conceptId) return err('action "remove" requires conceptId');
+          if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`);
+          const r = core.removeFromFirstBlock(conceptId, scope(circle));
+          return mutOk({ circle: scope(circle), conceptId, removed: r.removed }, "memory_first_block", false, capturedBlock);
+        }
+
+        if (action === "list") {
+          const allEntries = core.listFirstBlock(scope(circle));
+          const total = allEntries.length;
+          // Offset-pagination so ALL pins are addressable regardless of count — no hard cap
+          // hides entries from reorder/remove/update_summary. (Finding A — Codex round-5)
+          const pageOffset = offset ?? 0;
+          // Clamp the effective limit to prevent the JSON payload from overflowing RESULT_MAX_CHARS.
+          // Preview mode (full=false): up to FIRST_BLOCK_LIST_MAX_LIMIT (200) — 120-char summaries
+          // keep each row ≈ 200 chars, so 200 rows ≈ 40 000 chars. (Finding 1 — Codex PR-32)
+          // Full mode (full=true): capped at the tighter FIRST_BLOCK_LIST_FULL_MAX_LIMIT (40) —
+          // 800-char max summaries × 40 = 32 000 chars, safely under the 40 000 ceiling.
+          // (full=true overflow — Codex PR-32 follow-up)
+          const maxLimit = full ? FIRST_BLOCK_LIST_FULL_MAX_LIMIT : FIRST_BLOCK_LIST_MAX_LIMIT;
+          const pageLimit = Math.min(limit ?? FIRST_BLOCK_LIST_DEFAULT_LIMIT, maxLimit);
+          const pageEntries = allEntries.slice(pageOffset, pageOffset + pageLimit);
+          // By default, truncate each summary to a short preview so the page response stays
+          // well under the 40k ok() ceiling even at the maximum page size. When full=true,
+          // return the complete untruncated summary so the caller can inspect it before
+          // update_summary or remove. (Finding 3 — Codex PR-32; Finding A — Codex round-3)
+          const compactEntries = pageEntries.map((e) => ({
+            conceptId: e.conceptId,
+            position: e.position,
+            summaryDirty: e.summaryDirty,
+            conceptStatus: e.conceptStatus,
+            summary: full
+              ? e.summary
+              : e.summary.length > FIRST_BLOCK_LIST_SUMMARY_PREVIEW_CHARS
+                ? e.summary.slice(0, FIRST_BLOCK_LIST_SUMMARY_PREVIEW_CHARS) + "…"
+                : e.summary,
+          }));
+          return readOk(
+            {
+              circle: scope(circle),
+              total,
+              offset: pageOffset,
+              limit: pageLimit,
+              entries: compactEntries,
+            },
+            "memory_first_block",
+            capturedBlock,
+          );
+        }
+
+        if (action === "reorder") {
+          if (!orderedConceptIds) return err('action "reorder" requires orderedConceptIds');
+          core.reorderFirstBlock(orderedConceptIds, scope(circle));
+          return mutOk({ circle: scope(circle), orderedConceptIds, message: "First Block reordered." }, "memory_first_block", false, capturedBlock);
+        }
+
+        if (action === "update_summary") {
+          if (!conceptId) return err('action "update_summary" requires conceptId');
+          if (!summary) return err('action "update_summary" requires summary');
+          if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`);
+          const r = core.updateFirstBlockSummary(conceptId, summary, scope(circle));
+          if (!r) return err(`concept ${conceptId} is not in the First Block for circle '${scope(circle)}'`);
+          return mutOk({ circle: scope(circle), ...r }, "memory_first_block", false, capturedBlock);
+        }
+
+        return err(`unknown action: ${String(action)}`);
+      } catch (e) {
+        return err(`memory_first_block (${action}) failed: ${msg(e)}`);
+      }
+    },
+  );
+
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (user-curated always-first section — each entry is a rich summary of a pinned concept; fetch the concept by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
     { circle: z.string().optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);
       const state = core.prewarm(resolvedCircle);
       const ov = core.overview(resolvedCircle);
-      const advisory = buildCurationAdvisory(ov);
+      // buildCurationAdvisory uses the FULL firstBlock set (pre-filter) so that
+      // firstBlockDisputed counts disputed entries even though they are excluded from injection.
+      const advisory = buildCurationAdvisory(ov, state.firstBlock);
       const others = core.listCircles(resolvedCircle).slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
+
+      // Finding 5: exclude disputed entries from the injection payload (matching the rendered
+      // auto-prewarm path). The curationAttention advisory above already counts them.
+      const activeFirstBlock = state.firstBlock.filter((e) => e.conceptStatus === "active");
+
+      // Finding 4: bound the firstBlock in the structured payload. If the active entries alone
+      // would overflow FIRST_BLOCK_INJECTION_MAX_CHARS, replace with a compact advisory instead
+      // of an unbounded array (mirroring the rendered path's oversize advisory).
+      const firstBlockSerial = JSON.stringify(activeFirstBlock);
+      const injectedFirstBlock: typeof activeFirstBlock | string =
+        firstBlockSerial.length > FIRST_BLOCK_INJECTION_MAX_CHARS
+          ? `[First Block: ${activeFirstBlock.length} pinned item${activeFirstBlock.length === 1 ? "" : "s"} exceed the injection budget ` +
+            `(${firstBlockSerial.length} chars vs ${FIRST_BLOCK_INJECTION_MAX_CHARS} char budget) — review/trim via memory_first_block or the dashboard.]`
+          : activeFirstBlock;
+
       return wrapSuccess(ok({
         agentId: core.getAgentId(),
         mode: "local",
         circle: resolvedCircle,
         ...(state.resolvedFrom !== undefined ? { resolvedFrom: state.resolvedFrom } : {}),
         ...state,
+        firstBlock: injectedFirstBlock,
         ...(advisory !== null ? { curationAttention: advisory } : {}),
         ...(others.length > 0 ? { otherCircles: others } : {}),
       }), { isMutating: false, isCheckpointWithWorkstream: false, toolName: "agent_context" });

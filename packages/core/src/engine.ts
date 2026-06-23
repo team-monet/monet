@@ -53,6 +53,10 @@ const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s
 const GRAPH_SCHEMA_VERSION = 1; // PRAGMA user_version gate for the one-time graph backfill (P2)
 const TEMPORAL_SCHEMA_VERSION = 2; // PRAGMA user_version gate for the temporal layer (0.6.0)
 const AROUSAL_SCHEMA_VERSION = 3; // PRAGMA user_version gate for the V-A arousal layer (slice 2)
+const FIRST_BLOCK_SCHEMA_VERSION = 4; // PRAGMA user_version gate for the first_block table
+export const FIRST_BLOCK_SUMMARY_MAX_CHARS = 800; // hard cap on a first_block summary (cost signal)
+/** Promote boosts usefulness so the promoted concept ranks higher in the living model. */
+const FIRST_BLOCK_PROMOTION_USEFULNESS_BOOST = 10;
 const STALE_CONCEPTS_PREWARM_LIMIT = 20; // cap on staleConcepts in prewarm — a list serialized into a capped response gets a bound at birth
 const USEFULNESS_DECAY_TAU_DAYS = 60; // usefulness decays slower than recency (14-day / 30-day taus) — once-useful concepts fade but are not penalised as sharply as staleness
 // ---- V-A arousal tunables (slice 2) -------------------------------------------
@@ -222,6 +226,18 @@ export interface PrewarmState {
   topConcepts: LivingModelCard[];
   staleConcepts: LivingModelCard[]; // active but unconfirmed past staleAfterMs — surfaced for re-confirmation
   openContradictions: PrewarmContradiction[];
+  /** User-curated always-first section. Each entry is a generous summary of a specific concept.
+   *  Summaries are user-maintained; summaryDirty=true means the underlying concept changed and the
+   *  summary should be refreshed via memory_first_block action="update_summary". Disputed concepts are
+   *  excluded from injection but counted in curationAttention. */
+  firstBlock: Array<{
+    id: string;
+    conceptId: string;
+    summary: string;
+    summaryDirty: boolean;
+    position: number;
+    conceptStatus: "active" | "disputed";
+  }>;
 }
 
 /** A gather result row: a search card plus why it was pulled in (#245, ADR §4.7). */
@@ -582,6 +598,23 @@ export class MonetCore {
       );
       CREATE INDEX IF NOT EXISTS idx_ce_entity ON concept_entities(entity_key, scope);
       CREATE INDEX IF NOT EXISTS idx_ce_concept ON concept_entities(concept_id);
+
+      -- First Block: user-curated, always-injected-first section of agent_context / prewarm output.
+      -- Each entry = a generous summary + reference to the underlying concept (concept_id, circle).
+      -- Never auto-populated; promoted only by the user via memory_first_block action="promote".
+      -- summary_dirty=1 when the underlying concept changed (invalidate hook) — user refreshes manually.
+      CREATE TABLE IF NOT EXISTS first_block (
+        id TEXT PRIMARY KEY,
+        concept_id TEXT NOT NULL,
+        circle TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        summary_dirty INTEGER NOT NULL DEFAULT 0,
+        position INTEGER NOT NULL DEFAULT 0,
+        promoted_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        promoted_by TEXT,
+        UNIQUE (concept_id, circle)
+      );
+      CREATE INDEX IF NOT EXISTS idx_first_block_circle ON first_block(circle, position);
     `);
   }
 
@@ -713,6 +746,14 @@ export class MonetCore {
     const versionAfterTemporal = this.db.pragma("user_version", { simple: true }) as number;
     if (versionAfterTemporal >= TEMPORAL_SCHEMA_VERSION && versionAfterTemporal < AROUSAL_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${AROUSAL_SCHEMA_VERSION}`);
+    }
+    // FIRST_BLOCK_SCHEMA_VERSION = 4: the first_block table is created by init() (CREATE TABLE IF NOT EXISTS),
+    // so older DBs get it automatically on first open. The version bump is purely a sentinel so a
+    // future migration can gate on "≥ 4" without re-running the CREATE (which is already idempotent).
+    // The table needs no backfill — it starts empty and is user-populated.
+    const versionAfterArousal = this.db.pragma("user_version", { simple: true }) as number;
+    if (versionAfterArousal >= AROUSAL_SCHEMA_VERSION && versionAfterArousal < FIRST_BLOCK_SCHEMA_VERSION) {
+      this.db.pragma(`user_version = ${FIRST_BLOCK_SCHEMA_VERSION}`);
     }
   }
 
@@ -859,6 +900,13 @@ export class MonetCore {
       }
 
       this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
+
+      // First Block hook: any path that ATTACHED to an EXISTING concept invalidates its summary.
+      // New-concept branches (create / forceNew + non-correction ambiguous) do NOT set dirty —
+      // there is no existing summary to invalidate for a brand-new concept.
+      if (action === "attached" || (action === "ambiguous" && opts.kind === "correction")) {
+        this.invalidateFirstBlockEntry(row.id);
+      }
 
       // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
       // must not erase earlier return-to-source pointers. Recorded UNCONDITIONALLY — NOT gated on the
@@ -1150,6 +1198,7 @@ export class MonetCore {
       .map(livingModelCard);
 
     return {
+      firstBlock: this.getFirstBlock(circle),
       activeWorkstreams,
       topConcepts,
       staleConcepts,
@@ -1190,6 +1239,10 @@ export class MonetCore {
             WHERE id = ?`,
         )
         .run(nowMs, conceptId);
+      // First Block hook: status flipped to 'disputed' — invalidate the summary.
+      // flagContradiction does NOT set dirty=1 (it writes status + decays confidence), so this
+      // cannot rely on a dirty-based trigger; the hook must be explicit here.
+      this.invalidateFirstBlockEntry(conceptId);
       return this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(id) as ContradictionRow;
     })();
     return toContradiction(contraRow);
@@ -1242,6 +1295,10 @@ export class MonetCore {
         if (winnerObsId) {
           const supersede = this.db.prepare(`UPDATE observations SET superseded_by = ? WHERE id = ?`);
           for (const loser of allIds.filter((oid) => oid !== winnerObsId)) supersede.run(winnerObsId, loser);
+          // First Block hook: winner supersedes losers → effective content changes even without an
+          // explicit body. Invalidate so the user refreshes the pinned summary.
+          // dismiss never reaches this branch; the hook is safe to fire unconditionally here.
+          this.invalidateFirstBlockEntry(conceptId);
         }
         if (opts.body !== undefined) {
           const row = this.getRow(conceptId)!;
@@ -1252,6 +1309,9 @@ export class MonetCore {
             .prepare(`UPDATE concepts SET body = ?, title = ?, version = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
             .run(opts.body, nextTitle, version, conceptId);
           this.writeRevision(conceptId, version, opts.body);
+          // First Block hook: body explicitly changed — invalidate regardless of supersede path.
+          // Idempotent if winnerObsId already fired above (dirty=1 twice is harmless).
+          this.invalidateFirstBlockEntry(conceptId);
         }
         this.db
           .prepare(
@@ -1351,6 +1411,9 @@ export class MonetCore {
         .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
         .run(body, nextTitle, id);
       this.writeRevision(id, row.version, body);
+      // First Block hook: the body the summary distilled from just changed — invalidate it.
+      // Mirror synthesizeRow exactly: plain UPDATE on the concept row, no re-read → no recursion risk.
+      this.invalidateFirstBlockEntry(id);
       return toConcept(this.getRow(id)!);
     })();
   }
@@ -1826,6 +1889,9 @@ export class MonetCore {
         }
         // Consolidation: all observations moved to an existing dest — delete the source concept.
         // Graph must be unwound first; no rederive since the concept no longer exists.
+        // First Block hook: source is deleted — remove its entry (referential integrity — no dangling row).
+        // Mirrors mergeConceptInto's deleteFirstBlockEntry(src.id) before DELETE FROM concepts.
+        this.deleteFirstBlockEntry(sourceConceptId);
         this.unwindConceptGraph(sourceConceptId, circle);
         this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(sourceConceptId);
         this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(sourceConceptId);
@@ -1878,6 +1944,8 @@ export class MonetCore {
           // If recomputedLca === srcPreSplitLca, the remaining evidence supports the existing
           // stamp — no change needed.
         }
+        // First Block hook (source survives): source body changed — invalidate its summary.
+        this.invalidateFirstBlockEntry(sourceConceptId);
       }
 
       // 5. Destination finalize.
@@ -1905,6 +1973,8 @@ export class MonetCore {
           const currentDest = this.getRow(destConceptId)!;
           this.attach(currentDest, obs.content, jsonToEmb(obs.embedding), null);
         }
+        // First Block hook (destination received new observations): invalidate its summary.
+        this.invalidateFirstBlockEntry(destConceptId);
       }
 
       // 6. Graph: unwind source + rederive (source already handled above in the deletion path).
@@ -2465,6 +2535,25 @@ export class MonetCore {
         .run(from, to, to);
       // Flatten chains: any alias that pointed to `from` should now point to `to`.
       this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(to, from);
+      // first_block rows carry an explicit circle column that must follow the rename —
+      // getFirstBlock joins via c.circle but removeFromFirstBlock/reorderFirstBlock filter on
+      // fb.circle directly, so a stale fb.circle causes remove/reorder to miss the row and
+      // double-promote under the new circle name bypasses the UNIQUE(concept_id, circle) guard.
+      // When the destination already has pins, offset the moved rows' positions to append AFTER
+      // the destination's existing pins, preserving the source's relative order. (Finding B — Codex round-3)
+      const destMax = (this.db.prepare(
+        `SELECT COALESCE(MAX(position), -1) AS m FROM first_block WHERE circle = ?`
+      ).get(to) as { m: number }).m;
+      const srcRows = this.db.prepare(
+        `SELECT concept_id FROM first_block WHERE circle = ? ORDER BY position ASC, concept_id ASC`
+      ).all(from) as Array<{ concept_id: string }>;
+      this.db.prepare(`UPDATE first_block SET circle = ? WHERE circle = ?`).run(to, from);
+      if (srcRows.length > 0) {
+        const updatePos = this.db.prepare(`UPDATE first_block SET position = ? WHERE concept_id = ? AND circle = ?`);
+        for (let i = 0; i < srcRows.length; i++) {
+          updatePos.run(destMax + 1 + i, srcRows[i]!.concept_id, to);
+        }
+      }
       // Update in-memory lastConceptByCircle if the key matches `from`.
       const prev = this.lastConceptByCircle.get(from);
       if (prev !== undefined) {
@@ -2505,6 +2594,9 @@ export class MonetCore {
         // Unwind graph + delete revisions + delete the concept row.
         try {
           this.db.transaction(() => {
+            // First Block hook: workstream concept deleted — remove any entry (referential integrity).
+            // Largely unreachable once promoteToFirstBlock rejects workstreams, but kept correct.
+            this.deleteFirstBlockEntry(row.id);
             this.unwindConceptGraph(row.id, from);
             this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(row.id);
             this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(row.id);
@@ -2619,6 +2711,210 @@ export class MonetCore {
       }
     }
     return { toCircle: resolvedTo, results, counts: { moved, merged, noop, error } };
+  }
+
+  // ---- First Block: user-curated always-first prewarm section ----------------
+
+  /**
+   * Read the first_block entries for a circle, joined to their concept's status.
+   * Ordered by (position ASC, concept_id ASC) for determinism.
+   * Private — callers use prewarm() for injection; public surface is the five MCP tools.
+   */
+  private getFirstBlock(circle: string): Array<{
+    id: string;
+    conceptId: string;
+    summary: string;
+    summaryDirty: boolean;
+    position: number;
+    conceptStatus: "active" | "disputed";
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT fb.id AS id, fb.concept_id AS conceptId, fb.summary AS summary,
+                fb.summary_dirty AS summaryDirty, fb.position AS position,
+                c.status AS conceptStatus
+           FROM first_block fb
+           JOIN concepts c ON c.id = fb.concept_id
+          WHERE c.circle = ?
+          ORDER BY fb.position ASC, fb.concept_id ASC`,
+      )
+      .all(circle) as Array<{
+        id: string; conceptId: string; summary: string;
+        summaryDirty: number; position: number; conceptStatus: string;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      conceptId: r.conceptId,
+      summary: r.summary,
+      summaryDirty: r.summaryDirty === 1,
+      position: r.position,
+      conceptStatus: r.conceptStatus as "active" | "disputed",
+    }));
+  }
+
+  /** Mark the first_block entry for a concept as summary_dirty=1 (underlying concept changed). */
+  private invalidateFirstBlockEntry(conceptId: string): void {
+    this.db.prepare(`UPDATE first_block SET summary_dirty = 1 WHERE concept_id = ?`).run(conceptId);
+  }
+
+  /** Delete the first_block entry for a concept (concept is being deleted — referential integrity). */
+  private deleteFirstBlockEntry(conceptId: string): void {
+    this.db.prepare(`DELETE FROM first_block WHERE concept_id = ?`).run(conceptId);
+  }
+
+  /**
+   * Re-home a first_block pin when its concept SURVIVES a circle move (moveConcept path).
+   * Updates the pin's circle column to `toCircle` and offsets its position to land AFTER the
+   * destination circle's existing pins, preserving the pin's existence for agent_context/prewarm.
+   *
+   * This mirrors the round-3 position-offset fix already applied to renameCircle: both operations
+   * move a surviving concept and must keep its pin reachable in the destination.
+   *
+   * PRINCIPLE: a concept that survives a circle move keeps its pin (re-homed to the destination);
+   * only DELETE the pin when the concept ITSELF is deleted (use deleteFirstBlockEntry for that).
+   *
+   * Must be called BEFORE the concept row's circle column is updated (or within the same
+   * transaction), because the destination max-position query filters by fb.circle directly.
+   * (Finding 2 — Codex PR-32)
+   */
+  private rehomeFirstBlockEntry(conceptId: string, toCircle: string): void {
+    // Only act if the concept actually has a pin.
+    const row = this.db
+      .prepare(`SELECT id FROM first_block WHERE concept_id = ?`)
+      .get(conceptId) as { id: string } | undefined;
+    if (!row) return;
+    // Find the highest position already in the destination circle so we can append after it.
+    const { m: destMax } = this.db
+      .prepare(`SELECT COALESCE(MAX(position), -1) AS m FROM first_block WHERE circle = ?`)
+      .get(toCircle) as { m: number };
+    this.db
+      .prepare(`UPDATE first_block SET circle = ?, position = ? WHERE concept_id = ?`)
+      .run(toCircle, destMax + 1, conceptId);
+  }
+
+  // ---- First Block: public surface (called by MCP tools) ------------------
+
+  /**
+   * Promote a concept into the First Block. The summary is the user-authored always-injected
+   * description. Idempotent on concept_id+circle (UNIQUE constraint → error on double-promote).
+   * Position = MAX(position)+1 in the same circle, atomically with the insert.
+   * Boost the concept's usefulness so it surfaces higher in the living model.
+   * Returns the new entry + total summary chars across the circle (cost signal).
+   */
+  promoteToFirstBlock(
+    conceptId: string,
+    summary: string,
+    circle: string,
+    opts: { promotedBy?: string } = {},
+  ): { id: string; conceptId: string; summary: string; position: number; totalSummaryChars: number } {
+    if (summary.length > FIRST_BLOCK_SUMMARY_MAX_CHARS) {
+      throw new Error(`summary exceeds ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars (got ${summary.length})`);
+    }
+    const concept = this.getRow(conceptId);
+    if (!concept) throw new Error(`concept not found: ${conceptId}`);
+    if (concept.kind === "workstream") throw new Error("cannot pin a workstream concept to the First Block");
+    if (concept.circle !== circle) throw new Error(`concept ${conceptId} is in circle '${concept.circle}' not '${circle}'`);
+
+    const id = this.newId();
+    const now = Date.now();
+
+    return this.db.transaction(() => {
+      const maxPos = (this.db.prepare(`SELECT COALESCE(MAX(position), -1) AS m FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ?`).get(circle) as { m: number }).m;
+      const position = maxPos + 1;
+      this.db
+        .prepare(
+          `INSERT INTO first_block (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by)
+           VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+        )
+        .run(id, conceptId, circle, summary, position, now, opts.promotedBy ?? null);
+      // Boost usefulness — same columns getConcept writes, the ground-truth usefulness signal.
+      this.db
+        .prepare(
+          `UPDATE concepts SET usefulness_score = usefulness_score + ?, usefulness_last_fetched_at = ? WHERE id = ?`,
+        )
+        .run(FIRST_BLOCK_PROMOTION_USEFULNESS_BOOST, now, conceptId);
+      // Total summary chars across the circle (cost feedback for the user).
+      const totalRow = this.db
+        .prepare(`SELECT COALESCE(SUM(LENGTH(fb.summary)), 0) AS total FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ?`)
+        .get(circle) as { total: number };
+      return { id, conceptId, summary, position, totalSummaryChars: totalRow.total };
+    })();
+  }
+
+  /** Remove a concept from the First Block. Does NOT touch the concept itself. */
+  removeFromFirstBlock(conceptId: string, circle: string): { removed: boolean } {
+    const r = this.db.prepare(`DELETE FROM first_block WHERE concept_id = ? AND circle = ?`).run(conceptId, circle);
+    return { removed: r.changes > 0 };
+  }
+
+  /** List the First Block entries for a circle, position-ordered. */
+  listFirstBlock(circle: string): ReturnType<MonetCore["getFirstBlock"]> {
+    return this.getFirstBlock(circle);
+  }
+
+  /**
+   * Atomically reorder the First Block by assigning new positions matching `orderedConceptIds`.
+   * All ids must already be in the first_block for this circle.
+   */
+  reorderFirstBlock(orderedConceptIds: string[], circle: string): void {
+    this.db.transaction(() => {
+      // Validate: the supplied list must exactly equal the circle's currently-pinned set.
+      // A partial list or unknown/wrong-circle id yields silent colliding positions or a no-op,
+      // both of which are bugs the caller cannot detect without this guard.
+      const pinned = (
+        this.db
+          .prepare(`SELECT concept_id FROM first_block WHERE circle = ? ORDER BY position`)
+          .all(circle) as Array<{ concept_id: string }>
+      ).map((r) => r.concept_id);
+
+      if (orderedConceptIds.length !== pinned.length) {
+        throw new Error(
+          `reorderFirstBlock: supplied ${orderedConceptIds.length} id(s) but circle '${circle}' has ${pinned.length} pinned concept(s)`,
+        );
+      }
+      const pinnedSet = new Set(pinned);
+      for (const id of orderedConceptIds) {
+        if (!pinnedSet.has(id)) {
+          throw new Error(
+            `reorderFirstBlock: id '${id}' is not pinned in circle '${circle}'`,
+          );
+        }
+      }
+
+      // Distinctness check: length-equal + all-members + distinct together prove exact set-equality.
+      // Without this, [a, a, b] passes the above checks when pinned = {a, b, c} and silently
+      // corrupts positions (a→0, a→1, b→2; c never written).
+      if (new Set(orderedConceptIds).size !== orderedConceptIds.length) {
+        throw new Error(
+          `reorderFirstBlock: orderedConceptIds contains duplicate ids — each pinned concept must appear exactly once`,
+        );
+      }
+
+      for (let i = 0; i < orderedConceptIds.length; i++) {
+        this.db
+          .prepare(`UPDATE first_block SET position = ? WHERE concept_id = ? AND circle = ?`)
+          .run(i, orderedConceptIds[i]!, circle);
+      }
+    })();
+  }
+
+  /**
+   * Update the summary for a First Block entry and clear summary_dirty.
+   * Returns the updated entry, or null if the concept is not in the block for this circle.
+   */
+  updateFirstBlockSummary(
+    conceptId: string,
+    newSummary: string,
+    circle: string,
+  ): { conceptId: string; summary: string; summaryDirty: boolean } | null {
+    if (newSummary.length > FIRST_BLOCK_SUMMARY_MAX_CHARS) {
+      throw new Error(`summary exceeds ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars (got ${newSummary.length})`);
+    }
+    const r = this.db
+      .prepare(`UPDATE first_block SET summary = ?, summary_dirty = 0 WHERE concept_id = ? AND circle = ?`)
+      .run(newSummary, conceptId, circle);
+    if (r.changes === 0) return null;
+    return { conceptId, summary: newSummary, summaryDirty: false };
   }
 
   // ---- internals ---------------------------------------------------------
@@ -2892,6 +3188,11 @@ export class MonetCore {
   private moveConcept(src: ConceptRow, toCircle: string): ReassignResult {
     const id = src.id;
     const fromCircle = src.circle;
+    // First Block hook: re-home the pin BEFORE updating the concept row so that rehomeFirstBlockEntry
+    // can query the destination max-position while the concept's circle column still reads fromCircle
+    // (the query is on fb.circle, not c.circle, so this ordering is safe). The concept SURVIVES this
+    // move, so its pin must survive too — UPDATE circle+position rather than DELETE. (Finding 2 — Codex PR-32)
+    this.rehomeFirstBlockEntry(id, toCircle);
     this.db.prepare(`UPDATE concepts SET circle = ?, updated_at = unixepoch() * 1000 WHERE id = ?`).run(toCircle, id);
     const moved = this.db.prepare(`UPDATE observations SET circle = ? WHERE concept_id = ?`).run(toCircle, id);
     // Unwind the concept's footprint in the old circle (entity df + edges), then re-derive it inside
@@ -2985,6 +3286,11 @@ export class MonetCore {
         mergedArousalScore, mergedArousalTs,
         target.id,
       );
+    // First Block hooks (merge):
+    //   target mutated → invalidate its summary so the user knows to refresh it.
+    //   source deleted → remove its entry (referential integrity — no dangling row to a deleted concept).
+    this.invalidateFirstBlockEntry(target.id);
+    this.deleteFirstBlockEntry(src.id);
     // 4) Drop the source: its graph footprint in fromCircle, its revision history, then the row.
     this.unwindConceptGraph(src.id, fromCircle);
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
@@ -3413,6 +3719,9 @@ export class MonetCore {
       .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
       .run(body, nextTitle, concept.id);
     this.writeRevision(concept.id, concept.version, body);
+    // First Block hook: the body the summary distilled from just changed — invalidate it.
+    // Plain UPDATE on the concept row, no re-read → no recursion risk.
+    this.invalidateFirstBlockEntry(concept.id);
     return this.getRow(concept.id)!;
   }
 
