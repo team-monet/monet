@@ -25,6 +25,8 @@ Act on what the restore hands you: mediate open contradictions, re-confirm stale
 
 When `agent_context` returns a `curationAttention` field, surface the relevant housekeeping to the user before moving on: if `firstBlockStale: N`, prompt them to review and refresh those N stale First Block summaries; if `firstBlockDisputed: N`, ask them to resolve those N disputed pins. Keep it brief — one line per flag is enough.
 
+**Recall before you act — on every task, not just at session start.** `agent_context` at session start is the floor, not the ceiling. Before you act on a task — spawn a worker, change something, take a position, answer a substantive question — search Monet for what you already know about *this specific* thing: `memory_gather` / `memory_search` the task, then `memory_fetch` what lands. The tripwire: if you're about to do something and you haven't recalled for it this task, that's the signal — search first. Acting before recalling is how you repeat work, contradict a past decision, or re-litigate something already settled.
+
 ("Prewarm" is also what you do *for a subagent* — injecting its minimal perfect context when you spawn it.)
 
 # Monet is your persistence layer
