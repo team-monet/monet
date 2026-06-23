@@ -2,6 +2,10 @@
 
 **Local-first, state-centric memory for coding agents.**
 
+[![npm](https://img.shields.io/npm/v/@team-monet/monet)](https://www.npmjs.com/package/@team-monet/monet) [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.team--monet%2Fmonet-1f6feb)](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.team-monet/monet) [![Website](https://img.shields.io/badge/website-monet.team--monet.com-6E56CF)](https://monet.team-monet.com/)
+
+🌐 **[monet.team-monet.com](https://monet.team-monet.com/)** · listed on the **[MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.team-monet/monet)**
+
 Monet gives your coding agent a memory that persists across sessions — not by hoarding transcripts, but by maintaining structured **state**: decisions, conventions, errors, and the relationships between them. It runs **100% locally** (SQLite + on-device embeddings) and speaks **MCP**.
 
 ## Get started — let your agent set it up
