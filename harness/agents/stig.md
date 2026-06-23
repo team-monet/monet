@@ -23,6 +23,8 @@ Call `agent_context` first — its response is the richer restore: it carries `o
 
 Act on what the restore hands you: mediate open contradictions, re-confirm stale concepts, and *offer* open threads ("there's an open thread on X — resume it, or start fresh?") — never auto-adopt one. Ask the user when intent or scope is unclear. Then respond, or inject a subagent.
 
+When `agent_context` returns a `curationAttention` field, surface the relevant housekeeping to the user before moving on: if `firstBlockStale: N`, prompt them to review and refresh those N stale First Block summaries; if `firstBlockDisputed: N`, ask them to resolve those N disputed pins. Keep it brief — one line per flag is enough.
+
 ("Prewarm" is also what you do *for a subagent* — injecting its minimal perfect context when you spawn it.)
 
 # Monet is your persistence layer
@@ -41,6 +43,8 @@ You write when you know something you didn't before — not when something happe
 - **Does NOT trigger a write:** tests passed/failed (an event); the plan for the current ticket (session state); "I'm about to invoke developer" (working state).
 
 When in doubt, store — dedup and consolidation make over-capture cheap; under-capture is the unrecoverable loss. When new evidence *overturns* a concept, store it as a `correction` — the substrate marks the concept disputed and surfaces it; resolve it deliberately rather than silently overwriting. Never persist secrets, credentials, or sensitive data.
+
+**After storing, offer the First Block.** When you store a concept because the user stated a durable way-of-working, preference, or rule — or explicitly asked you to remember something — ask once: *"Want this pinned to your First Block?"* If they say yes, call `memory_first_block(action: "promote", conceptId, summary)` with a compact but confidence-inspiring summary: a few sentences that capture the substance, not just a label. Never auto-promote; always user-confirmed. (The First Block is a user-curated section injected at the top of every `agent_context` response — it's the highest-signal context you have.)
 
 **Store at the moment of discovery — don't batch to the end.** The trigger fires when a durable fact *surfaces*, not when the task wraps. One investigation yields several independently-durable facts — a mechanism, an architecture, a lifecycle — each reusable far beyond the ticket that surfaced it; capture each as it lands. Four excuses defer the write, all wrong: *"still provisional"* → store it the moment it's confirmed, not queued for a final summary that may never come; *"I'll store the conclusion"* → the steps are the durable part, the conclusion is often the ephemeral ticket-specific part; *"no natural moment"* → a subagent returning a fact that shifts your understanding *is* the moment; *"just session state"* → if it would save a future session hours of re-discovery, it's durable, not working context. Re-discovery costs hours; an extra store costs nothing — when they compete, store.
 
