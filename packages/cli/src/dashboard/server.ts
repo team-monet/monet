@@ -244,6 +244,23 @@ const SQL = {
     SELECT concept_id, entity_key, scope
     FROM concept_entities
   `,
+
+  // first_block rows joined to their concept for title + status.
+  // The table may not exist in stores not yet migrated by the new engine;
+  // the caller guards with an existence check before running this query.
+  firstBlock: `
+    SELECT
+      fb.concept_id   AS conceptId,
+      fb.circle,
+      fb.summary,
+      fb.summary_dirty AS summaryDirty,
+      fb.position,
+      c.title         AS title,
+      c.status        AS conceptStatus
+    FROM first_block fb
+    LEFT JOIN concepts c ON c.id = fb.concept_id
+    ORDER BY fb.position ASC
+  `,
 } as const;
 
 // ── API handlers ─────────────────────────────────────────────────────────────
@@ -376,6 +393,48 @@ async function handleEntities(): Promise<unknown> {
   }
 }
 
+async function handleFirstBlock(circle: string | null): Promise<unknown> {
+  if (!fs.existsSync(getDbPath())) return { rows: [] };
+  const snap = await makeSnapshot();
+  try {
+    // The first_block table only exists in stores migrated by the new engine.
+    // Check for its existence before querying so the endpoint returns an empty
+    // payload (rather than a 500) when pointed at an older store.
+    const db = new Database(snap, { readonly: true });
+    let tableExists = false;
+    try {
+      const row = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='table' AND name='first_block'`
+      ).get();
+      tableExists = !!row;
+    } finally {
+      db.close();
+    }
+    if (!tableExists) return { rows: [] };
+
+    let rows = querySnap(snap, SQL.firstBlock);
+    // Filter by circle when requested.  Resolve aliases so that a caller passing
+    // a canonical name (e.g. "example-circle") matches rows stored under the raw alias
+    // (e.g. "code-6849de25"), mirroring the alias aggregation in handleGraph().
+    if (circle) {
+      const aliases = querySnap(snap, SQL.aliases) as Array<{ from_name: string; to_name: string }>;
+      const aliasMap: Record<string, string> = {};
+      for (const a of aliases) aliasMap[a.from_name] = a.to_name;
+      // Accept both the raw name and the canonical (aliased) name so callers can
+      // pass either form.  A row's circle field holds the raw DB value; resolve it
+      // to canonical before comparing against the requested circle.
+      rows = rows.filter(r => {
+        const rawCircle = r["circle"] as string;
+        const canonCircle = aliasMap[rawCircle] || rawCircle;
+        return rawCircle === circle || canonCircle === circle;
+      });
+    }
+    return { rows };
+  } finally {
+    try { fs.unlinkSync(snap); } catch { /* ignore */ }
+  }
+}
+
 // ── Static file serving ──────────────────────────────────────────────────────
 
 const MIME: Record<string, string> = {
@@ -462,6 +521,15 @@ export function startDashboard(port: number): void {
 
       if (pathname === "/api/entities") {
         const data = await handleEntities();
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(data));
+        return;
+      }
+
+      if (pathname === "/api/firstblock") {
+        const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
+        const circle = url.searchParams.get("circle");
+        const data = await handleFirstBlock(circle);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(data));
         return;

@@ -48,12 +48,17 @@ let ENTITIES = null;     // /api/entities payload (lazy)
 // response arrives, the result is discarded so a slow in-flight response from a
 // prior Refresh cannot overwrite a freshly-invalidated cache.
 let _entitiesGen = 0;
+let FIRST_BLOCK = null;  // /api/firstblock payload (lazy, invalidated on Refresh)
+// Generation counter — incremented when Refresh clears the FIRST_BLOCK cache.
+// Mirrors _entitiesGen: a stale in-flight response is discarded rather than
+// repopulating a cache that was intentionally cleared by Refresh.
+let _firstBlockGen = 0;
 
 const state = {
   circle: 'all',
   search: '',
   selectedId: null,
-  activeTab: 'graph',
+  activeTab: 'firstblock',
   kindsOff: new Set(),
   flags: new Set(),
   minConfidence: 0,
@@ -411,6 +416,23 @@ async function fetchEntities() {
   if (_entitiesGen !== gen) return ENTITIES; // stale — discard
   ENTITIES = data;
   return ENTITIES;
+}
+
+async function fetchFirstBlock() {
+  if (FIRST_BLOCK) return FIRST_BLOCK;
+  // Capture generation at call time so a delayed response from a prior Refresh
+  // (which set FIRST_BLOCK=null and incremented _firstBlockGen) cannot repopulate
+  // the cache after it was intentionally cleared, mirroring the _entitiesGen guard.
+  const gen = _firstBlockGen;
+  const r = await fetch('/api/firstblock');
+  if (!r.ok) throw new Error(`/api/firstblock returned ${r.status}`);
+  const data = await r.json();
+  // Return a guaranteed empty payload when stale rather than FIRST_BLOCK (which
+  // Refresh just set to null).  Callers destructure data.rows immediately after
+  // `await`; returning null would throw.
+  if (_firstBlockGen !== gen) return { rows: [] }; // stale — discard
+  FIRST_BLOCK = data;
+  return FIRST_BLOCK;
 }
 
 // ── Top bar & stat bar ───────────────────────────────────────────────────────
@@ -3032,6 +3054,72 @@ function renderHealth() {
   }
 }
 
+// ── First Block view ─────────────────────────────────────────────────────────
+
+async function renderFirstBlock() {
+  const list = document.getElementById('firstblock-list');
+  if (!list) return;
+
+  const gen = _firstBlockGen;
+  let data;
+  try {
+    data = await fetchFirstBlock();
+  } catch (err) {
+    list.innerHTML = `<div style="padding:24px 16px;color:var(--danger);font-size:13px">Failed to load First Block: ${escHtml(err.message)}</div>`;
+    return;
+  }
+  if (gen !== _firstBlockGen) return; // stale — a newer Refresh superseded this; don't render
+
+  let rows = data.rows || [];
+
+  // Filter by current circle selection when not "all"
+  if (state.circle !== 'all') {
+    rows = rows.filter(r => {
+      const canon = canonicalCircle(r.circle);
+      return canon === state.circle || r.circle === state.circle;
+    });
+  }
+
+  if (!rows.length) {
+    list.innerHTML = '<div style="padding:24px 16px;color:var(--text-muted);font-size:13px">No First Block entries for this circle.</div>';
+    return;
+  }
+
+  list.innerHTML = '';
+  for (const row of rows) {
+    const isDisputed = row.conceptStatus === 'disputed';
+    const isDirty    = !!row.summaryDirty;
+
+    const item = document.createElement('div');
+    item.className = 'fb-item' + (isDisputed ? ' fb-disputed' : '');
+    item.dataset.id = row.conceptId;
+
+    const flags = [];
+    if (isDisputed) flags.push(`<span class="badge-disputed">disputed</span>`);
+    if (isDirty)    flags.push(`<span class="badge-dirty">stale summary</span>`);
+
+    item.innerHTML = `
+      <div class="fb-pos">${row.position + 1}</div>
+      <div class="fb-body">
+        <div class="fb-title-row">
+          <span class="fb-title" title="${escHtml(row.title || row.conceptId)}">${escHtml(row.title || row.conceptId)}</span>
+          <span class="fb-title-link" title="Jump to concept in graph">&#x2197; graph</span>
+        </div>
+        <div class="fb-summary">${escHtml(row.summary || '')}</div>
+        ${flags.length ? `<div class="fb-flags">${flags.join('')}</div>` : ''}
+      </div>
+    `;
+
+    // Click anywhere on the row — open the concept in the graph view
+    item.addEventListener('click', () => {
+      selectConcept(row.conceptId);
+      switchTab('graph');
+    });
+
+    list.appendChild(item);
+  }
+}
+
 // ── Tab switching ────────────────────────────────────────────────────────────
 
 function switchTab(tab) {
@@ -3050,6 +3138,8 @@ function switchTab(tab) {
     setTimeout(renderTimeline, 50); // let layout settle
   } else if (tab === 'health') {
     renderHealth();
+  } else if (tab === 'firstblock') {
+    renderFirstBlock();
   }
 }
 
@@ -3064,6 +3154,7 @@ function rerenderActiveView() {
   else if (state.activeTab === 'entities') renderEntitiesTable();
   else if (state.activeTab === 'timeline') renderTimeline();
   else if (state.activeTab === 'health') renderHealth();
+  else if (state.activeTab === 'firstblock') renderFirstBlock();
   // 'graph' tab: canvas is kept current by redrawGraph(); nothing more to do here.
 }
 
@@ -3260,6 +3351,11 @@ async function init() {
       // (entities refresh race, round-5 class-A fix).
       ENTITIES = null;
       _entitiesGen++;
+      // Invalidate the first_block cache and bump its generation counter so any
+      // in-flight /api/firstblock response that arrives after this point is discarded,
+      // mirroring the entities refresh race fix above.
+      FIRST_BLOCK = null;
+      _firstBlockGen++;
       // If the entity overlay is on, refetch entities BEFORE redrawing so the
       // overlay survives a Refresh.  buildGraph checks `state.entityOverlay && ENTITIES`
       // and silently skips entity nodes when ENTITIES is null — which is the window
@@ -3290,11 +3386,12 @@ async function init() {
     if (e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
     if (e.key === 'Escape') deselectConcept();
     if (e.key === 'f' || e.key === 'F') { fitToView([...SIM.nodes, ...SIM.entityNodes]); scheduleSave(); }
-    if (e.key === '1') switchTab('graph');
-    if (e.key === '2') switchTab('concepts');
-    if (e.key === '3') switchTab('entities');
-    if (e.key === '4') switchTab('timeline');
-    if (e.key === '5') switchTab('health');
+    if (e.key === '1') switchTab('firstblock');
+    if (e.key === '2') switchTab('graph');
+    if (e.key === '3') switchTab('concepts');
+    if (e.key === '4') switchTab('entities');
+    if (e.key === '5') switchTab('timeline');
+    if (e.key === '6') switchTab('health');
   });
 
   // Health item click handlers added per render
