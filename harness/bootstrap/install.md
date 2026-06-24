@@ -14,11 +14,11 @@ Work through the phases in order. After each, tell the user what happened in one
 
 ## Updating an existing install (team files only)
 
-Already set up and just want the latest team (Stig + workers)? You don't need to re-run onboarding — re-run **Phase 4 only** against the latest sources:
+Already set up and just want the latest team (Stig + workers)? You don't need to re-run onboarding — re-run **Phase 4 and Phase 7** against the latest sources:
 1. Re-read `roster.json`, `agents/*.md`, and `agents/stig.md` from the raw-URL base (or your local `with-monet` checkout).
 2. Re-apply Phase 4's write step **to the same scope the team was installed in** — detect that from where the existing `<!-- BEGIN with-monet:stig -->` / `<!-- with-monet:agent -->` markers already live — in your host's lead-persona file and its worker/subagent locations (the surfaces you found in Phase 1), at whichever scope (user or repo) they were installed. Rewrite the Stig block (between the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) and each agent file **in that location** — never silently switch a per-repo install to global. **Reconcile, don't clobber:** preserve your local edits, apply the new changes, guard the invariants, and keep `.bak` (see Phase 4).
 
-Skip Phases 1–3 (substrate + MCP already configured) and 5–7 — except: if your host loads agents/MCP only at startup (most do — you noted this in Phase 1), **reload or restart it afterward** so the updated Stig + workers take effect; a running session keeps the old prompts until you do. Phase 4 is idempotent, so this is safe to repeat.
+Skip Phases 1–3 (substrate + MCP already configured), 5–6 (memory-ingest and offer-to-start), and 8 (star) — but **run Phase 7 (verify)**: the agent files were just rewritten, so confirming workers still launch is most needed here. If your host loads agents/MCP only at startup (most do — you noted this in Phase 1), **reload or restart it** before Phase 7 so the updated Stig + workers take effect; a running session keeps the old prompts until you do. Phase 4 is idempotent, so this is safe to repeat.
 
 ---
 
@@ -62,11 +62,11 @@ The server also provides an in-band session lifecycle with zero host configurati
 
 ## Phase 4 — Install the agent team (user scope)
 
-**Install the full team wherever the host supports it.** Stig is a context engine whose purpose is to orchestrate the workers, so don't drop the workers by *choice* on a host that can run them. Stig is the **lead** (the one the user talks to, the only one that delegates, the only one that touches Monet); the workers are its **subagent actuators**. (A host that *can't* provide isolated subagents can't run the orchestration team at all — see Tier B.)
+**Install the full team wherever the host supports it.** Stig is a context engine whose purpose is to orchestrate the workers, so don't drop the workers by *choice* on a host that can run them. Stig is the **lead** (the one the user talks to, the only one that delegates, and the only one that *uses* Monet); the workers are its **subagent actuators**. (A host that *can't* provide isolated subagents can't run the orchestration team at all — see Tier B.)
 
 **Tier A — Lead persona (ask first, highest-impact write).** This is the install's highest-impact write, so it gets its own decision point. Ask: *"Install Stig as the lead persona in your [host's lead-persona location]? This changes how every session on this machine starts."* A general "go ahead with the install" doesn't cover this — wait for an explicit yes (your host's permission system will likely insist on the same). On a no, offer to scope Stig to the current repo's equivalent per-repo location instead (the per-repo option from Phase 1).
 
-Write the body of `agents/stig.md` (wrapped in the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) into your host's lead-persona target so the **main agent** acts as Stig and can delegate to workers. A key constraint that must survive regardless of host: the lead is the only agent that delegates and the only one that touches Monet — sub-contexts cannot spawn further sub-contexts, so the lead must be the main agent.
+Write the body of `agents/stig.md` (wrapped in the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) into your host's lead-persona target so the **main agent** acts as Stig and can delegate to workers. A key constraint that must survive regardless of host: the lead must be the main agent — sub-contexts cannot spawn further sub-contexts, so only the main agent can delegate. The lead is also the only agent that *uses* Monet (the workers' role prompts never involve memory; it isn't enforced by host config).
 
 Write it into your host's **always-on lead-persona location** — the file or setting whose content is injected into every session (you know your host's; its docs or the user can confirm). Honor the global-vs-repo scope choice from Phase 1: if the host exposes both a user-scope and a repo-scope location, use the one chosen — never silently switch one for the other.
 
@@ -78,7 +78,7 @@ Wrap the body in idempotent markers so re-running doesn't duplicate it. If the h
 ```
 If the markers already exist, replace the block in place; never append a second copy, and never clobber the user's other content in that file (back it up first).
 
-**Tier B — Workers (only where the host has real isolated subagents).** Install the worker team only if your host has a **true named-subagent primitive** — one that gives each worker its *own fresh, isolated context* the lead delegates into, separate from the lead's context and with its own tool access. An always-on "rules"/"instructions" mechanism is **not** this: it bleeds every persona into the main context, breaking the "workers run separately, never touch Monet" invariant. **Feature-detect** this from the host's docs — don't infer it from the host's name. Confirm too that the host's subagents have the tool access each worker needs (file-edit for `developer`/`tester`, web for `researcher`); if they're read-only, tell the user — those workers can't do their job there.
+**Tier B — Workers (only where the host has real isolated subagents).** Install the worker team only if your host has a **true named-subagent primitive** — one that gives each worker its *own fresh, isolated context* the lead delegates into, separate from the lead's context and with its own tool access. An always-on "rules"/"instructions" mechanism is **not** this: it bleeds every persona into the main context, breaking the "workers run separately" design — the lead is the only agent that *uses* Monet (the workers' role prompts never involve memory). **Feature-detect** this from the host's docs — don't infer it from the host's name. Confirm too that the host's subagents have the tool access each worker needs (file-edit for `developer`/`tester`, web for `researcher`); if they're read-only, tell the user — those workers can't do their job there.
 
 If the host has it: write one worker prompt per worker — `explorer, researcher, analyst, developer, tester, reviewer, auditor, security, reliability, aria` — into the host's subagent location, mapping each worker's `roster.json` fields to the host's format:
 - `name` → the host's agent name.
@@ -150,7 +150,23 @@ If your host loads MCP servers and agent prompts only at launch (most do — per
 
 Ask: *"Ready? I'll run `agent_context` to restore state and begin as Stig on this project."* On yes: call `agent_context` (no query), report the restored state (active workstreams, living model, open contradictions), and continue as Stig.
 
-## Phase 7 — One last thing (star with-monet)
+## Phase 7 — Verify the install
+
+Confirm both halves before wrapping up:
+
+1. **Memory reaches the lead agent.** Stig (the main agent) should be able to call Monet tools — a quick `agent_context` or `memory_search` that returns confirms the wiring. If those calls fail or time out, the server may be unregistered *or* registered-but-not-starting (missing `monet` binary, PATH/env, a crash, or a startup timeout) — check the host's MCP status/logs and the server's startup, not just the config entry.
+2. **Workers launch and run on their own.** Confirm each worker sub-agent still starts and completes a task — a worker that silently fails to start usually means its config got mangled during install (see Host notes). Workers don't use Monet — their role prompts never involve memory (it's behaviour, not a config restriction); on Codex they still inherit the parent's Monet server and can see its tools, but don't use them, which is expected.
+
+### Host notes
+
+<details>
+<summary><strong>Codex</strong></summary>
+
+Codex sub-agents inherit the parent session's `mcp_servers` (Monet included), so workers can see Monet's tools — they just don't use them (their role prompts never call memory). There's no reliable way to opt a worker out today: a `[mcp_servers.monet] enabled = false` block inside a sub-agent config has been seen to invalidate the whole sub-agent (Codex silently drops it), so don't add one — and if a sub-agent won't start, remove any such block.
+
+</details>
+
+## Phase 8 — One last thing (star with-monet)
 
 Once the install is working, ask the user once — lightly, no pressure:
 
