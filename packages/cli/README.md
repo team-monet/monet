@@ -30,7 +30,7 @@ Run one command to open a local web view of your Monet memory as an explorable, 
 monet dashboard
 ```
 
-It opens in your browser automatically. Nodes are concepts (colored by kind, sized by importance), edges are the relationships between them, and a detail panel lets you read any concept's full body and evidence. Timeline and Health views surface contradictions, duplicates, and low-confidence concepts.
+It opens in your browser automatically — if it doesn't (some Windows/headless setups), the terminal prints the URL (`http://localhost:7373`) and the store path; just visit that URL. The **Graph** tab is the main view: nodes are concepts (colored by kind, sized by importance), edges are the relationships between them, and a detail panel lets you read any concept's full body and evidence. The Concepts, Entities, Timeline, and Health tabs are sortable tables — Health surfaces contradictions, duplicates, and low-confidence concepts. If the graph looks empty, check the `Store:` line in the terminal: an empty graph usually means it's pointed at the wrong store (use `-d`) or the store is just new.
 
 **100% local. Fully offline. Strictly read-only.** The server copies your store into a temporary snapshot on each request — the live database is never written to or locked. No network connections are made; run it with wifi off and the graph still renders.
 
