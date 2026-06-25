@@ -150,6 +150,16 @@ If your host loads MCP servers and agent prompts only at launch (most do — per
 
 Ask: *"Ready? I'll run `agent_context` to restore state and begin as Stig on this project."* On yes: call `agent_context` (no query), report the restored state (active workstreams, living model, open contradictions), and continue as Stig.
 
+### Show them their memory — `monet dashboard`
+
+Once Monet is running and has a little memory in it, offer to open the dashboard so the install pays off visibly:
+
+> *"Want to see your memory? `monet dashboard` opens a local graph of everything Monet knows."*
+
+- It's a **local, offline, strictly read-only web view** — `monet dashboard` starts a server on `http://127.0.0.1:7373` and tries to open your browser. The terminal only prints the URL and a `Store:` line; the actual view is in the **browser**. If it doesn't open automatically (some Windows/headless setups), visit the printed URL by hand.
+- The **Graph** tab is the main view — the force-directed "second brain" of concepts and their links. The other tabs (Concepts / Entities / Timeline / Health) are **tables** by design, so landing on one looks like a flat data dump; switch to Graph.
+- Looks empty or sparse? Two reasons: a brand-new store hasn't accumulated much yet (it fills in across sessions), or the dashboard is reading the wrong store. The banner's `Store:` line shows exactly which DB it opened — if that's not your project's store, point it explicitly: `monet dashboard -d <folder containing monet.db>`. Default port is `7373`; override with `-p <port>`.
+
 ## Phase 7 — Verify the install
 
 Confirm both halves before wrapping up:
