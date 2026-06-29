@@ -89,15 +89,22 @@ const FIRST_BLOCK_LIST_SUMMARY_PREVIEW_CHARS = 120;
 const FIRST_BLOCK_LIST_DEFAULT_LIMIT = 100;
 
 /**
- * Hard maximum for memory_first_block action:"list" limit — clamped at request time so a
- * caller cannot request an arbitrarily large slice that serialises to more than RESULT_MAX_CHARS.
- * At ~300 chars/row (preview mode), 200 rows ≈ 60 000 chars… but with the 120-char preview cap
- * in place each row is ≈ 200 chars, so 200 × 200 = 40 000 — right at the ceiling.  We keep
- * it at 200 (rather than 100) so a single list call can fully page a moderate store in one
- * shot, while still keeping the serialised output provably under RESULT_MAX_CHARS.
- * (Finding 1 — Codex PR-32)
+ * Hard maximum for memory_first_block action:"list" limit in preview (full=false) mode —
+ * clamped at request time so a caller cannot request a slice that serialises past
+ * RESULT_MAX_CHARS and gets truncated mid-object by ok() (which would leave an un-parseable
+ * response exactly when paging through a large First Block store).
+ *
+ * Worst-case size math (the floor that determines this cap): each row carries conceptId
+ * (36-char uuid), position, summaryDirty, conceptStatus, and a 120-char preview summary
+ * (120-char slice + "…"), pretty-printed at 2-space indent.  Measured at the max-summary
+ * boundary that is ~301 chars/row → 200 rows ≈ 60 000 chars, well OVER the 40 000-char
+ * RESULT_MAX_CHARS ceiling (ok() would truncate the JSON mid-object).  At 130 rows the
+ * serialized payload is ~38 700 chars, comfortably under the 39 871-char effective ceiling
+ * (RESULT_MAX_CHARS minus the ok() truncate-note reservation).  130 keeps the cap close to
+ * the 100-row default (1.3×) while staying provably under the ceiling; callers page with
+ * offset+limit.  (Finding 1 — Codex PR #33)
  */
-const FIRST_BLOCK_LIST_MAX_LIMIT = 200;
+const FIRST_BLOCK_LIST_MAX_LIMIT = 130;
 
 /**
  * Tighter page-size cap for memory_first_block action:"list" when full=true (untruncated
@@ -128,7 +135,7 @@ function buildPrewarmBlock(core: MonetCore, circle: string): string {
   const activeFirstBlock = state.firstBlock.filter((e) => e.conceptStatus === "active");
   const firstBlockLines: string[] = [];
   if (activeFirstBlock.length > 0) {
-    firstBlockLines.push("First block (always-first, user-curated):");
+    firstBlockLines.push("Governing workflows and preferences — MUST follow unless a system/developer instruction or an explicit user instruction overrides:");
     for (const e of activeFirstBlock) {
       const staleTag = e.summaryDirty ? ' [summary stale — refresh with memory_first_block action="update_summary"]' : "";
       firstBlockLines.push(`  • [${e.conceptId}] ${e.summary}${staleTag}`);
@@ -204,15 +211,21 @@ function buildPrewarmBlock(core: MonetCore, circle: string): string {
   const budget = PREWARM_BLOCK_MAX_CHARS - HEADER.length - FOOTER.length;
   let used = firstBlockBlob.length;
 
-  // If the first-block blob alone already exceeds the budget, emit a compact advisory instead of
-  // returning an unbounded block (which defeats the cap's purpose) or silently dropping pins.
-  // The advisory tells the agent how many items are pinned and how to trim them.
+  // If the first-block blob alone already exceeds the budget, replace it with a compact advisory
+  // (telling the agent how many items are pinned and how to trim them) and use THAT as the
+  // first-block blob — then CONTINUE into the lower-section fitting below so active workstreams,
+  // top concepts, stale, and open contradictions still render instead of being dropped.  The
+  // advisory is short (a single line), so there is room left for the normal lower-section fitting
+  // even with several long pins.  (Finding 3 — Codex PR #33: oversize pins must not drop
+  // session-resume context on auto-prewarm.)
+  let firstBlockBlobFinal = firstBlockBlob;
   if (used >= budget) {
     const pinnedCount = activeFirstBlock.length;
     const oversizeAdvisory =
       `[First Block: ${pinnedCount} pinned item${pinnedCount === 1 ? "" : "s"} exceed the prewarm budget ` +
       `(${used} chars vs ${budget} char budget) — review/trim via memory_first_block or the dashboard.]\n`;
-    return HEADER + oversizeAdvisory + FOOTER;
+    firstBlockBlobFinal = oversizeAdvisory;
+    used = oversizeAdvisory.length;
   }
 
   // Fit as many lower-priority lines as possible within the remaining budget.
@@ -225,7 +238,7 @@ function buildPrewarmBlock(core: MonetCore, circle: string): string {
   }
   used += lowerFitted.length;
 
-  return HEADER + firstBlockBlob + lowerFitted + FOOTER;
+  return HEADER + firstBlockBlobFinal + lowerFitted + FOOTER;
 }
 
 /**
@@ -485,7 +498,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_store",
-    'Store something worth remembering. By default the substrate deduplicates automatically: similar evidence resolves into an existing concept; novel evidence creates a new one. Pass resolution="forceNew" to always create a new concept (useful for bulk import flows where each item is known to be distinct). Pass attachTo=<conceptId> to attach directly to a specific concept, bypassing automatic scoring. Cheap and instant — synthesis happens later, on read. If the stored concept is a preference, way-of-working, or something the user flagged as important, consider suggesting memory_first_block with action="promote" to pin it to the First Block — but only propose; never auto-promote; the user must confirm.',
+    'Store something worth remembering. By default the substrate deduplicates automatically: similar evidence resolves into an existing concept; novel evidence creates a new one. Pass resolution="forceNew" to always create a new concept (useful for bulk import flows where each item is known to be distinct). Pass attachTo=<conceptId> to attach directly to a specific concept, bypassing automatic scoring. Cheap and instant — synthesis happens later, on read. If the stored concept is a preference, way-of-working, or something the user flagged as important, consider suggesting memory_first_block with action="promote" to pin it to the First Block — but only propose; never auto-promote; the user must confirm. Use kind="procedure" for behavioral rules and kind="preference" for style/voice/format preferences — these kinds trigger the mandatory First Block offer.',
     {
       content: z.string(),
       circle: z.string().optional(),
@@ -1131,20 +1144,31 @@ export function registerMonetCoreTools(
           // Offset-pagination so ALL pins are addressable regardless of count — no hard cap
           // hides entries from reorder/remove/update_summary. (Finding A — Codex round-5)
           const pageOffset = offset ?? 0;
-          // Clamp the effective limit to prevent the JSON payload from overflowing RESULT_MAX_CHARS.
-          // Preview mode (full=false): up to FIRST_BLOCK_LIST_MAX_LIMIT (200) — 120-char summaries
-          // keep each row ≈ 200 chars, so 200 rows ≈ 40 000 chars. (Finding 1 — Codex PR-32)
-          // Full mode (full=true): capped at the tighter FIRST_BLOCK_LIST_FULL_MAX_LIMIT (40) —
-          // 800-char max summaries × 40 = 32 000 chars, safely under the 40 000 ceiling.
-          // (full=true overflow — Codex PR-32 follow-up)
+          // Two caps cooperate to keep the JSON payload provably under RESULT_MAX_CHARS:
+          //  • A max-count upper bound (FIRST_BLOCK_LIST_MAX_LIMIT / _FULL_MAX_LIMIT) as a cheap
+          //    limit on rows requested.
+          //  • A serialized-size fit: summaries are arbitrary strings, and JSON.stringify expands
+          //    quotes/backslashes/newlines/control chars, so a preview page of escape-heavy
+          //    summaries can still exceed RESULT_MAX_CHARS even under the count cap. ok() would
+          //    then truncate content[0] mid-JSON and leave an un-parseable response exactly when
+          //    paging through a large First Block store. We therefore fit entries against the
+          //    ACTUAL serialized payload size, stopping early when the budget is reached and
+          //    reporting the real `total` so offset paging covers the rest. The count cap stays
+          //    as a cheap upper bound; the size fit is the real guarantee.
+          //    (Finding 1 — Codex PR #33; Fix B — Codex PR #33 round 2)
           const maxLimit = full ? FIRST_BLOCK_LIST_FULL_MAX_LIMIT : FIRST_BLOCK_LIST_MAX_LIMIT;
-          const pageLimit = Math.min(limit ?? FIRST_BLOCK_LIST_DEFAULT_LIMIT, maxLimit);
-          const pageEntries = allEntries.slice(pageOffset, pageOffset + pageLimit);
+          const requestedLimit = Math.min(limit ?? FIRST_BLOCK_LIST_DEFAULT_LIMIT, maxLimit);
+          // Reserve room for ok()'s own truncate-note so the FINAL payload stays under the
+          // ceiling, not over it (ok() reserves the same note when it truncates). We stop one
+          // entry before the serialized payload would cross the budget, so the returned page
+          // never needs ok()'s truncation in the first place.
+          const okNote = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
+          const sizeBudget = RESULT_MAX_CHARS - okNote.length;
           // By default, truncate each summary to a short preview so the page response stays
           // well under the 40k ok() ceiling even at the maximum page size. When full=true,
           // return the complete untruncated summary so the caller can inspect it before
           // update_summary or remove. (Finding 3 — Codex PR-32; Finding A — Codex round-3)
-          const compactEntries = pageEntries.map((e) => ({
+          const buildEntry = (e: { conceptId: string; position: number; summaryDirty: boolean; conceptStatus: string; summary: string }) => ({
             conceptId: e.conceptId,
             position: e.position,
             summaryDirty: e.summaryDirty,
@@ -1154,7 +1178,31 @@ export function registerMonetCoreTools(
               : e.summary.length > FIRST_BLOCK_LIST_SUMMARY_PREVIEW_CHARS
                 ? e.summary.slice(0, FIRST_BLOCK_LIST_SUMMARY_PREVIEW_CHARS) + "…"
                 : e.summary,
-          }));
+          });
+          // Fit-until-budget: add entries one at a time and stop before the serialized page
+          // would cross sizeBudget. This is O(n) JSON.stringify calls, but n is bounded by
+          // maxLimit (≤130), so it is cheap. We re-serialize the whole page each step; for
+          // the bounded page sizes here that is far cheaper than a second ok() truncation
+          // rescue and keeps the guarantee airtight regardless of escape expansion.
+          const compactEntries: ReturnType<typeof buildEntry>[] = [];
+          let pageLimit = 0;
+          for (let i = 0; i < requestedLimit; i++) {
+            const src = allEntries[pageOffset + i];
+            if (!src) break; // fewer pins than requested remain
+            const candidate = [...compactEntries, buildEntry(src)];
+            // Serialize the full envelope the way ok() will, to measure the real payload.
+            const serialized = JSON.stringify(
+              { circle: scope(circle), total, offset: pageOffset, limit: candidate.length, entries: candidate },
+              null,
+              2,
+            );
+            if (serialized.length > sizeBudget && compactEntries.length > 0) {
+              // Adding this entry would cross the budget; stop and let the caller page.
+              break;
+            }
+            compactEntries.push(candidate[candidate.length - 1]!);
+            pageLimit = compactEntries.length;
+          }
           return readOk(
             {
               circle: scope(circle),
@@ -1192,7 +1240,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (user-curated always-first section — each entry is a rich summary of a pinned concept; fetch the concept by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
     { circle: z.string().optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);

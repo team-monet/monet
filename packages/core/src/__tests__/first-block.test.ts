@@ -1770,3 +1770,331 @@ describe("Step 11: full=true page-size overflow guard", () => {
     core.close();
   });
 });
+
+// ==============================================================================
+// STEP 12 — Codex PR #33 P2 regressions (3 fixes)
+// ==============================================================================
+
+describe("Step 12: Codex PR #33 P2 regressions", () => {
+  // ---------------------------------------------------------------------------
+  // Fix 1 — memory_first_block `list` can exceed the response ceiling.
+  // At the old FIRST_BLOCK_LIST_MAX_LIMIT (200), a full preview page of max-length
+  // (120-char) summaries serialised to ~60 000 chars, so ok() truncated content[0]
+  // mid-object and clients could not JSON.parse the list response.  The cap was lowered
+  // to 130 so a max-preview page stays valid JSON under the 40 000-char ceiling; callers
+  // page with offset+limit.
+  // ---------------------------------------------------------------------------
+  it("Fix 1: a max-preview list page parses as valid JSON under the ceiling (not truncated mid-object)", async () => {
+    // Reproduce the exact overflow: at the old FIRST_BLOCK_LIST_MAX_LIMIT (200), a caller
+    // requesting limit=100000 with 200 max-summary pins got ~60 000 chars of preview JSON,
+    // so ok() truncated content[0] mid-object and JSON.parse threw.  The cap was lowered to
+    // 130 so the worst-case preview page stays parseable; callers page with offset+limit.
+    const STORED_PINS = 200; // > the new cap, so the clamped page is full
+    const NEW_CAP = 130;     // FIRST_BLOCK_LIST_MAX_LIMIT after the fix
+    const RESULT_MAX_CHARS = 40_000;
+
+    const core = freshCore({ tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const bigSummary = "M".repeat(800); // truncated to a 120-char preview per row
+    for (let i = 0; i < STORED_PINS; i++) {
+      const id = await storeOne(core, `Fix-1 pin concept ${i} unique-fix1-${i}.`);
+      promote(core, id, bigSummary);
+    }
+
+    type McpResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
+    const { client } = await mcpHarness(core);
+    const raw = (await client.callTool({ name: "memory_first_block", arguments: {
+      action: "list",
+      limit: 100_000, // request far more than the cap — must be clamped, not overflow
+    }})) as McpResult;
+
+    expect(raw.isError).toBeFalsy();
+    const text = raw.content[0]!.text;
+
+    // Primary regression assertion: the response MUST parse as valid JSON.  At the old cap
+    // ok() sliced content[0] inside the entries array and this threw.
+    let parsed: { total: number; offset: number; limit: number; entries: Array<{ summary: string }> };
+    expect(() => { parsed = JSON.parse(text) as typeof parsed; }).not.toThrow();
+
+    // And the whole serialized response must stay under the hard ceiling.
+    expect(text.length).toBeLessThan(RESULT_MAX_CHARS);
+
+    // The page is clamped to the new preview cap (130), not the old 200; the remainder is
+    // addressable via offset pagination (total still reflects the full store).
+    expect(parsed!.total).toBe(STORED_PINS);
+    expect(parsed!.limit).toBeLessThanOrEqual(NEW_CAP);
+    expect(parsed!.entries).toHaveLength(parsed!.limit);
+
+    // Every preview summary is at most 121 chars (120-char slice + "…").
+    for (const entry of parsed!.entries) {
+      expect(entry.summary.length).toBeLessThanOrEqual(121);
+    }
+
+    core.close();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 2 — mergeCircle loses pin order.
+  // mergeCircle iterated `SELECT concepts` (row/creation) order, so a user-reordered
+  // source block like [B, A] was appended to the destination in creation order instead of
+  // first_block.position order.  The source pin selection is now ordered by position so
+  // destination positions are assigned in the user's curated order.
+  // ---------------------------------------------------------------------------
+  it("Fix 2: mergeCircle carries source pin position order into the destination First Block", async () => {
+    // Use forceNew so every source concept moves (no dedup-merge deletes anything).
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+
+    // Destination circle "B" with one existing pin (position 0).
+    const b0 = await storeOne(core, "Dest circle B base concept unique-fix2-b0.", "B");
+    promote(core, b0, "B-base summary.", "B");
+
+    // Source circle "A": create A then B (creation order), then REORDER to [B, A]
+    // so position order is the reverse of creation order.
+    const aId = await storeOne(core, "Source circle A concept alpha unique-fix2-a.", "A");
+    const bId = await storeOne(core, "Source circle B concept beta unique-fix2-b.", "A");
+    promote(core, aId, "A summary.", "A"); // position 0 (creation order)
+    promote(core, bId, "B summary.", "A"); // position 1 (creation order)
+
+    // Reorder so position order becomes [B, A] — the reverse of creation/row order.
+    core.reorderFirstBlock([bId, aId], "A");
+    const srcEntries = core.listFirstBlock("A");
+    expect(srcEntries[0]!.conceptId).toBe(bId); // position 0
+    expect(srcEntries[1]!.conceptId).toBe(aId); // position 1
+
+    // Merge A → B.  Before the fix the helper appended in creation order (aId then bId);
+    // after the fix it appends in position order (bId then aId).
+    await core.mergeCircle("A", "B", { resolution: "forceNew" });
+
+    const entries = core.listFirstBlock("B");
+    expect(entries).toHaveLength(3);
+
+    // Source circle emptied.
+    expect(core.listFirstBlock("A")).toHaveLength(0);
+
+    // Destination order must reflect the SOURCE position order, not creation order:
+    // after B's existing base pin (position 0), the moved pins follow as [B, A]
+    // → bId at position 1, aId at position 2.
+    const byPos = [...entries].sort((x, y) => x.position - y.position);
+    expect(byPos.map((e) => e.conceptId)).toEqual([b0, bId, aId]);
+
+    core.close();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix 3 — oversize pins drop lower prewarm sections.
+  // When active First Block summaries exceeded the prewarm budget, buildPrewarmBlock
+  // early-returned ONLY the oversize advisory and dropped all of lowerLines (workstreams,
+  // contradictions, …) even though the advisory left room for them.  The path now uses
+  // the advisory as the first-block blob and continues fitting lower sections.
+  // ---------------------------------------------------------------------------
+  it("Fix 3: oversize First Block pins still render workstreams + open contradictions alongside the advisory", async () => {
+    // PREWARM_BLOCK_MAX_CHARS = 2_500; budget = cap - header(44) - footer(24) ≈ 2_432.
+    // 4 pins × 700-char summaries = 2_800 chars of summaries alone → exceeds the budget,
+    // tripping the oversize path.
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+
+    const bigSummary = "z".repeat(700);
+    for (let i = 0; i < 4; i++) {
+      const id = (await core.store(`Fix-3 oversized pin concept ${i} token-fix3-${i}oken.`, {
+        circle: "default",
+        resolution: "forceNew",
+      })).conceptId;
+      core.promoteToFirstBlock(id, bigSummary, "default");
+    }
+
+    // An ACTIVE workstream — must still render after the oversize advisory.
+    await core.saveWorkstream({ status: "active", nextSteps: ["resume the migration"] });
+
+    // An OPEN contradiction — must still render after the oversize advisory.
+    const contraId = await storeOne(core, "Fix-3 contradiction concept unique-fix3-contra.");
+    core.flagContradiction(contraId, { detail: "Fix-3 conflict detail" });
+
+    // Trigger the rendered block via autoPrewarm on the first tool call.
+    const server = new McpServer({ name: "test", version: "0.0.0" }, { capabilities: { tools: {} } });
+    registerMonetCoreTools(server, core, { autoPrewarm: true, checkpointNudge: false });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(ct);
+    const result = (await client.callTool({ name: "memory_first_block", arguments: { action: "list" } })) as McpContent;
+
+    const blockText = result.content.slice(1).map((c) => c.text).join("");
+
+    // Must still be bounded by the prewarm cap.
+    expect(blockText.length).toBeLessThanOrEqual(2_500);
+
+    // The oversize advisory must be present (replaces the raw pinned summaries).
+    expect(blockText).toMatch(/exceed.*prewarm budget/i);
+    expect(blockText).not.toContain(bigSummary);
+
+    // The lower-priority sections must STILL render — the regression is that they were
+    // dropped entirely by the early return.  (Before the fix, none of these would appear.)
+    expect(blockText).toMatch(/Active workstreams:/i);
+    expect(blockText).toMatch(/Open contradictions:/i);
+
+    core.close();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix A — mergeCircle unpinned merge order follows insertion (rowid) order, not UUID
+  // order.  The prior fix ordered source concepts by `(fb.concept_id IS NULL), fb.position
+  // ASC, c.id ASC`.  That preserves PINNED order, but the UNPINNED tail is ordered by `c.id`
+  // (a random UUID) instead of insertion order.  For resolution:"auto" merges the order
+  // unpinned near-duplicates are processed decides which concept SURVIVES (merge-into-
+  // earlier), so UUID order could arbitrarily pick the survivor's id/title/body.  A later
+  // round added `c.created_at ASC` with `c.id ASC` as a same-ms tiebreak — but created_at is
+  // unixepoch()*1000 (whole-ms) and bulk imports land many concepts in the same ms, so ties
+  // still fall through to UUID order.  The ORDER BY now uses `c.rowid ASC` (concepts is a
+  // normal rowid table, not WITHOUT ROWID) — the canonical monotonic insertion key — so the
+  // unpinned tail is processed oldest-first deterministically regardless of created_at.
+  // ---------------------------------------------------------------------------
+  it("Fix A: mergeCircle processes unpinned source concepts in rowid order — survivor is insertion-stable even when created_at ties", async () => {
+    // Build three UNPINNED near-duplicate concepts in source circle "A" and deliberately
+    // TIE them on created_at (all stamped to the same value, as a same-ms bulk import would).
+    // Because they are near-identical (HashingEmbeddingProvider → score=1.0 ≥ tauAttach), the
+    // FIRST one moved into an empty destination "B" becomes the survivor the OTHERS merge
+    // into.  The survivor MUST therefore be the FIRST-INSERTED concept (lowest rowid), `a`.
+    // Before the rowid fix this assertion was non-deterministic — a created_at tie fell
+    // through to c.id ASC (random UUID order) and could pick b or c as the survivor.
+    type McpResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
+
+    const core = new MonetCore(":memory:");
+    const db = (core as unknown as { db: import("../storage").StoragePort }).db;
+
+    // Three near-duplicate, UNPINNED facts in source circle "A" (same content → 1.0 match
+    // once they meet in the destination, so resolution:"auto" merges the later arrivals into
+    // the first-arriving).  forceNew keeps them DISTINCT in the source so there are 3 to merge
+    // — storeOne()'s default resolution:"auto" would attach the 2nd/3rd to the 1st instead.
+    // Insert consecutively so rowid(a) < rowid(b) < rowid(c) (true insertion order).
+    const a = (await core.store("Fix-A duplicate fact alpha token-fixa.", { circle: "A", resolution: "forceNew" })).conceptId;
+    const b = (await core.store("Fix-A duplicate fact alpha token-fixa.", { circle: "A", resolution: "forceNew" })).conceptId;
+    const c = (await core.store("Fix-A duplicate fact alpha token-fixa.", { circle: "A", resolution: "forceNew" })).conceptId;
+
+    // Deliberately TIE created_at — stamp all three to the SAME value so a created_at-based
+    // ORDER BY would leave them in an arbitrary (c.id) order and pick a non-deterministic
+    // survivor.  The rowid fix must ignore this tie and process them by rowid = insertion order.
+    const tied = Date.parse("2024-01-01T00:00:00.000Z");
+    db.prepare(`UPDATE concepts SET created_at = ? WHERE id = ?`).run(tied, a);
+    db.prepare(`UPDATE concepts SET created_at = ? WHERE id = ?`).run(tied, b);
+    db.prepare(`UPDATE concepts SET created_at = ? WHERE id = ?`).run(tied, c);
+
+    // Sanity: rowid ordering mirrors insertion order (a < b < c).
+    const rowids = (() => {
+      const r = db.prepare(`SELECT id, rowid AS r FROM concepts WHERE circle = 'A' AND kind != 'workstream' ORDER BY rowid ASC`).all() as Array<{ id: string; r: number }>;
+      return r.map((x) => x.id);
+    })();
+    expect(rowids).toEqual([a, b, c]);
+
+    // None are pinned — the unpinned tail is the path the fix orders by rowid.
+    expect(core.listFirstBlock("A")).toHaveLength(0);
+    expect(core.listFirstBlock("B")).toHaveLength(0);
+
+    await core.mergeCircle("A", "B", { resolution: "auto" });
+
+    // After merge, exactly ONE concept survives in B (the others merged into it).
+    expect(core.conceptCount("B")).toBe(1);
+
+    // The survivor MUST be the FIRST-INSERTED concept (a, lowest rowid), because the unpinned
+    // tail is processed insertion-first (rowid ASC) and the first-arriving concept in the empty
+    // destination is the merge target.  Before the rowid fix, the created_at tie fell through
+    // to c.id ASC and could arbitrarily pick b or c — this assertion failed non-deterministically.
+    const row = db.prepare(`SELECT id FROM concepts WHERE circle = 'B' AND kind != 'workstream'`).get() as { id: string } | undefined;
+    expect(row?.id).toBe(a);
+
+    // The merged-away ids (b, c) no longer exist as concepts anywhere.
+    const stillExists = (id: string) => !!db.prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(id);
+    expect(stillExists(b)).toBe(false);
+    expect(stillExists(c)).toBe(false);
+
+    // Source circle emptied.
+    expect((db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = 'A' AND kind != 'workstream'`).get() as { n: number }).n).toBe(0);
+
+    core.close();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix B — memory_first_block `list` cap must account for JSON escaping.
+  // The FIRST_BLOCK_LIST_MAX_LIMIT=130 cap assumes plain-text size, but summaries are
+  // arbitrary strings and JSON.stringify expands quotes/backslashes/newlines/control
+  // chars.  A preview page of escape-heavy summaries can still exceed RESULT_MAX_CHARS,
+  // so ok() truncates content[0] mid-JSON → un-parseable.  The list path now fits entries
+  // against the ACTUAL serialized payload size, stopping early so the response provably
+  // stays under the ceiling.  Callers page with offset+limit; `total` still reports the
+  // full store.  No data is silently dropped — the page is just shrunk and the rest is
+  // addressable via offset.
+  // ---------------------------------------------------------------------------
+  it("Fix B: a max-preview list page of escape-heavy summaries parses as valid JSON under the ceiling", async () => {
+    // Reproduce the escape-expansion overflow: build pins whose 120-char previews are dense
+    // with characters JSON.stringify expands (quotes, backslashes, newlines, tabs).  Each
+    // such char takes 2 bytes in the JSON output, so a near-130-row preview page can balloon
+    // past RESULT_MAX_CHARS even though the raw preview char count is under the count cap.
+    // Request a large limit; the size-aware fit must shrink the page so the serialized
+    // response stays valid JSON AND under the ceiling, with `total` still reporting all pins.
+    const STORED_PINS = 160;  // > the count cap (130), so the count cap alone would allow a full page
+    const RESULT_MAX_CHARS = 40_000;
+
+    const core = freshCore({ tauAttach: 1.1, tauAmbiguous: 1.1 });
+    // A 120-char preview full of JSON-escapable characters.  JSON.stringify turns each `"`
+    // and `\` into 2 chars and each control char ("\n","\t") into 2 chars, so the serialized
+    // preview is far larger than 120 bytes.
+    const escapeHeavy = '"\\\n\t'.repeat(30); // 120 chars, all escapable
+    expect(escapeHeavy.length).toBe(120);
+    for (let i = 0; i < STORED_PINS; i++) {
+      const id = await storeOne(core, `Fix-B pin concept ${i} unique-fixb-${i}.`);
+      promote(core, id, escapeHeavy);
+    }
+
+    type McpResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
+    const { client } = await mcpHarness(core);
+    const raw = (await client.callTool({ name: "memory_first_block", arguments: {
+      action: "list",
+      limit: 100_000, // request far more than the cap — must be shrunk by the size-aware fit
+    }})) as McpResult;
+
+    expect(raw.isError).toBeFalsy();
+    const text = raw.content[0]!.text;
+
+    // Primary regression assertion: the response MUST parse as valid JSON.  Before the fix the
+    // escape-heavy page ballooned past the ceiling and ok() sliced content[0] mid-object.
+    let parsed: { total: number; offset: number; limit: number; entries: Array<{ summary: string }> };
+    expect(() => { parsed = JSON.parse(text) as typeof parsed; }).not.toThrow();
+
+    // And the whole serialized response MUST stay under the hard ceiling.
+    expect(text.length).toBeLessThan(RESULT_MAX_CHARS);
+
+    // No data is silently dropped: `total` still reflects the full store so offset paging
+    // reaches the remainder.  The page may be smaller than the count cap, but it is non-empty
+    // (the first entry alone fits well within the budget).
+    expect(parsed!.total).toBe(STORED_PINS);
+    expect(parsed!.entries.length).toBeGreaterThan(0);
+    expect(parsed!.entries.length).toBeLessThanOrEqual(parsed!.limit);
+    // The returned limit reflects the fitted page size actually returned (≤ the count cap).
+    expect(parsed!.limit).toBeLessThanOrEqual(130);
+
+    // The offset-paging contract still holds: requesting a later offset returns the NEXT
+    // slice, so no pin is silently hidden by the size-aware shrink.  Compare by conceptId
+    // (all summaries are identical by construction), and assert the second page continues
+    // exactly where the first ended — no overlap, no gap.
+    const page0Ids = parsed!.entries.map((e) => (e as { conceptId?: string }).conceptId);
+    const firstLen = parsed!.entries.length;
+    expect(firstLen).toBeGreaterThan(0);
+    const nextRaw = (await client.callTool({ name: "memory_first_block", arguments: {
+      action: "list",
+      limit: 100_000,
+      offset: firstLen, // advance past the fitted first page
+    }})) as McpResult;
+    const nextText = nextRaw.content[0]!.text;
+    let nextPage: { total: number; offset: number; entries: Array<{ conceptId?: string; summary: string }> };
+    expect(() => { nextPage = JSON.parse(nextText) as typeof nextPage; }).not.toThrow();
+    expect(nextText.length).toBeLessThan(RESULT_MAX_CHARS);
+    expect(nextPage!.total).toBe(STORED_PINS);
+    expect(nextPage!.offset).toBe(firstLen);
+    expect(nextPage!.entries.length).toBeGreaterThan(0);
+    // The second page starts where the first ended — no overlap (conceptIds disjoint).
+    const nextIds = nextPage!.entries.map((e) => e.conceptId);
+    for (const id of nextIds) expect(page0Ids).not.toContain(id);
+    // Together the two pages reach strictly more pins than the first page alone.
+    expect(firstLen + nextPage!.entries.length).toBeGreaterThan(firstLen);
+
+    core.close();
+  });
+});

@@ -2581,8 +2581,25 @@ export class MonetCore {
     this.assertSameSharingScope(from, into);
     const resolution = opts.resolution ?? "forceNew";
 
+    // Order pinned concepts by their source first_block.position so rehomeFirstBlockEntry
+    // assigns destination positions in the user's curated order, not row/creation order.
+    // Unpinned concepts (fb.concept_id IS NULL) sort last; for resolution:"auto" merges the
+    // order the unpinned near-duplicates are processed decides which concept survives
+    // (merge-into-earlier), so that tail MUST be ordered by true insertion order. c.id is a
+    // random UUID and would let UUID order arbitrarily pick the survivor; c.created_at is
+    // unixepoch()*1000 (whole-ms) and bulk imports land many concepts in the same ms, so
+    // created_at ties and falls through to UUID order. c.rowid is the canonical monotonic
+    // insertion key (concepts is a normal rowid table, not WITHOUT ROWID) — it never ties, so
+    // it alone gives a deterministic oldest-first order, which is exactly what the original
+    // no-ORDER-BY query returned before the pin-order fix. (Finding 2 — Codex PR #33; Fix A —
+    // Codex PR #33 round 2; rowid tiebreak — Codex P2 round 3)
     const conceptRows = this.db
-      .prepare(`SELECT id, kind FROM concepts WHERE circle = ?`)
+      .prepare(
+        `SELECT c.id, c.kind FROM concepts c
+         LEFT JOIN first_block fb ON fb.concept_id = c.id AND fb.circle = c.circle
+         WHERE c.circle = ?
+         ORDER BY (fb.concept_id IS NULL), fb.position ASC, c.rowid ASC`,
+      )
       .all(from) as Array<{ id: string; kind: string }>;
 
     const conceptResults: MergeConceptResult[] = [];
