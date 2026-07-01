@@ -66,7 +66,7 @@ The server also provides an in-band session lifecycle with zero host configurati
 
 **Tier A — Lead persona (ask first, highest-impact write).** This is the install's highest-impact write, so it gets its own decision point. Ask: *"Install Stig as the lead persona in your [host's lead-persona location]? This changes how every session on this machine starts."* A general "go ahead with the install" doesn't cover this — wait for an explicit yes (your host's permission system will likely insist on the same). On a no, offer to scope Stig to the current repo's equivalent per-repo location instead (the per-repo option from Phase 1).
 
-Write the body of `agents/stig.md` (wrapped in the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) into your host's lead-persona target so the **main agent** acts as Stig and can delegate to workers. A key constraint that must survive regardless of host: the lead must be the main agent — sub-contexts cannot spawn further sub-contexts, so only the main agent can delegate. The lead is also the only agent that *uses* Monet (the workers' role prompts never involve memory; it isn't enforced by host config).
+Write the body of `agents/stig.md` (wrapped in the `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers) into your host's lead-persona target so the **main agent** acts as Stig and can delegate to workers. A key constraint that must survive regardless of host: the lead must be the main agent — sub-contexts cannot spawn further sub-contexts, so only the main agent can delegate. The lead is also the only agent that *uses* Monet. Where the host supports a per-subagent tool denylist, Monet access is denied in worker configs at install time (enforced); where it does not, the workers' role prompts are the guarantee (behavioral).
 
 Write it into your host's **always-on lead-persona location** — the file or setting whose content is injected into every session (you know your host's; its docs or the user can confirm). Honor the global-vs-repo scope choice from Phase 1: if the host exposes both a user-scope and a repo-scope location, use the one chosen — never silently switch one for the other.
 
@@ -84,15 +84,20 @@ If the host has it: write one worker prompt per worker — `explorer, researcher
 - `name` → the host's agent name.
 - `description` → the host's dispatch/trigger text — **use it verbatim, not a bare role label**; it's what routes a task to the right worker. (The descriptions contain colons, so quote them if the host's format needs it.)
 - `model` → the roster's `haiku`/`sonnet`/`opus` are a **guidance default**; translate them to your host's own model identifiers, or omit to inherit the session model. Offer to retune (cheaper for read-only workers, stronger for `reviewer`/`security`).
+- `touchesMonet` (denylist enforcement) → for every worker whose roster entry is NOT `touchesMonet: true` (i.e. all workers — only `stig` carries `touchesMonet: true`): if the host provides a per-subagent tool denylist, deny the Monet MCP server's tools using it. Feature-detected; degrades gracefully:
+  - **Claude Code**: add `disallowedTools: mcp__monet` to the generated frontmatter. The `mcp__monet` prefix is server-level and covers all of Monet's tools while leaving every other inherited tool intact. `stig` (the lead) must NOT get this — it needs full Monet access.
+  - **Codex**: no reliable per-subagent denylist exists — skip this field entirely and rely on the behavioral guarantee. (Do NOT add `[mcp_servers.monet] enabled = false` — that invalidates the whole sub-agent; see Host notes.)
+  - **Other hosts**: apply their equivalent per-subagent tool denylist for `monet` if they expose one; otherwise fall back to the behavioral guarantee.
 
 Add the `<!-- with-monet:agent -->` marker right after any leading frontmatter — it lets a later memory-consolidation pass tell Monet's installed workers apart from the user's *own* custom sub-contexts, so it never captures or retires the team.
 
-Example worker file (one common format — adapt the frontmatter to your host):
+Example worker file for **Claude Code** (adapt frontmatter to your host; non-Claude-Code hosts omit `disallowedTools`):
 ```md
 ---
 name: explorer
 description: "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, …"
 model: haiku
+disallowedTools: mcp__monet
 ---
 <!-- with-monet:agent -->
 <body of agents/explorer.md>
@@ -165,14 +170,14 @@ Once Monet is running and has a little memory in it, offer to open the dashboard
 Confirm both halves before wrapping up:
 
 1. **Memory reaches the lead agent.** Stig (the main agent) should be able to call Monet tools — a quick `agent_context` or `memory_search` that returns confirms the wiring. If those calls fail or time out, the server may be unregistered *or* registered-but-not-starting (missing `monet` binary, PATH/env, a crash, or a startup timeout) — check the host's MCP status/logs and the server's startup, not just the config entry.
-2. **Workers launch and run on their own.** Confirm each worker sub-agent still starts and completes a task — a worker that silently fails to start usually means its config got mangled during install (see Host notes). Workers don't use Monet — their role prompts never involve memory (it's behaviour, not a config restriction); on Codex they still inherit the parent's Monet server and can see its tools, but don't use them, which is expected.
+2. **Workers launch and run on their own.** Confirm each worker sub-agent still starts and completes a task — a worker that silently fails to start usually means its config got mangled during install (see Host notes). Workers don't use Monet — on hosts that support a per-subagent tool denylist (Claude Code: `disallowedTools: mcp__monet`), this is enforced at config level for every worker whose roster entry lacks `touchesMonet: true`; on hosts without a denylist mechanism, it is a behavioral guarantee (role prompts never call memory tools). On Codex, workers inherit the parent's Monet server and can see its tools but don't use them — this is expected and cannot be prevented at config level (see Host notes).
 
 ### Host notes
 
 <details>
 <summary><strong>Codex</strong></summary>
 
-Codex sub-agents inherit the parent session's `mcp_servers` (Monet included), so workers can see Monet's tools — they just don't use them (their role prompts never call memory). There's no reliable way to opt a worker out today: a `[mcp_servers.monet] enabled = false` block inside a sub-agent config has been seen to invalidate the whole sub-agent (Codex silently drops it), so don't add one — and if a sub-agent won't start, remove any such block.
+Codex sub-agents inherit the parent session's `mcp_servers` (Monet included), so workers can see Monet's tools — they just don't use them (their role prompts never call memory). Codex has no reliable per-subagent tool denylist: this is the behavioral-fallback case for the `touchesMonet` enforcement described in Phase 4 — no config-level Monet restriction is applied here. Do not add a `[mcp_servers.monet] enabled = false` block inside a sub-agent config — this has been seen to invalidate the whole sub-agent (Codex silently drops it). If a sub-agent won't start, check for and remove any such block.
 
 </details>
 
