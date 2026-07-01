@@ -3,8 +3,9 @@ import { Command } from "commander";
 import path from "node:path";
 import fs from "node:fs";
 import { createRequire } from "node:module";
-import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer, deriveCircle } from "@team-monet/core";
+import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
 import { ensureMonetDir, getDbPath } from "./db/index.js";
+import { deriveCircle } from "./circle.js";
 
 // Read version from package.json so it can never drift from the published version.
 // esbuild inlines the import.meta.url-relative path at bundle time; the bundled

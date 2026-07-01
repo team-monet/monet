@@ -1,5 +1,6 @@
-import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer, deriveCircle } from "@team-monet/core";
+import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
 import { ensureMonetDir, getDbPath } from "./db/index.js";
+import { deriveCircle } from "./circle.js";
 
 async function main() {
   ensureMonetDir();
