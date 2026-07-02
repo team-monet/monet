@@ -53,14 +53,23 @@ jobs:
           restore-keys: |
             minilm-model-${{ runner.os }}-
 
+      # Two explicit vitest positional filters, not one: "eval.onnx" matches ONLY
+      # eval.onnx.test.ts (eval-baseline.onnx.test.ts does not contain that substring), so the
+      # Phase 0 md-baseline gate needs its own filter listed here rather than assuming the
+      # existing pattern already covers it — verified by running both filters together locally
+      # before wiring this in.
       - name: MiniLM recall gate (fails the job on a semantic-recall regression)
         env:
           MONET_EVAL_ONNX: "1"
-        run: pnpm exec vitest run --dir src eval.onnx
+        run: pnpm exec vitest run --dir src eval.onnx eval-baseline.onnx
 
       - name: Capture the eval report
         if: always()
         run: pnpm -s eval --embedder=onnx --verbose | tee eval-report.txt
+
+      - name: Capture the md-baseline eval report (bm25, chunk-cosine-rag, md-tree)
+        if: always()
+        run: pnpm -s eval:baseline --embedder=onnx --verbose | tee eval-baseline-report.txt
 
       - name: Upload the eval report
         if: always()
@@ -68,4 +77,12 @@ jobs:
         with:
           name: minilm-eval-report
           path: eval-report.txt
+          if-no-files-found: warn
+
+      - name: Upload the md-baseline eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minilm-eval-baseline-report
+          path: eval-baseline-report.txt
           if-no-files-found: warn

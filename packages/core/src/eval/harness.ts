@@ -75,8 +75,14 @@ export interface SuiteReport {
  * Seed a fresh in-memory core for one scenario: shared background corpus first (realistic
  * noise so top-k is selective), then the scenario's own seeds + distractors. Returns the
  * core and the key→conceptId map (dedup #239 may collapse several keys onto one concept).
+ *
+ * Exported (Phase 0 md-baseline addition) so the md-tree exporter and baseline harness seed
+ * from the IDENTICAL path the three engine arms are scored against — same background noise,
+ * same session-boundary co-occurrence model — rather than a parallel reimplementation that
+ * could silently drift from the real seeding mechanics. Does not change this file's own
+ * behavior or DEFAULT_ARMS/`pnpm eval` output shape.
  */
-async function seedScenario(
+export async function seedScenario(
   scenario: Scenario,
   embedder: EmbeddingProvider,
 ): Promise<{ core: MonetCore; map: Map<string, string> }> {
@@ -165,14 +171,23 @@ export async function restorationReachability(scenarios: Scenario[], embedder: E
   return out;
 }
 
-function recallAt(goldIds: string[], retrieved: string[], k: number): number {
+/**
+ * Exported (Phase 0 md-baseline addition): the md-tree arm's "gold-containing-file@k" number
+ * (§2.2) reuses this exact primitive over a file-id space instead of concept ids, rather than
+ * forking the |gold ∩ topk| / |gold| logic a second time.
+ */
+export function recallAt(goldIds: string[], retrieved: string[], k: number): number {
   if (goldIds.length === 0) return 0;
   const top = new Set(retrieved.slice(0, k));
   return goldIds.filter((id) => top.has(id)).length / goldIds.length;
 }
 
-/** Mean reciprocal rank over the gold set: average of 1/rank for each gold member (0 if absent). */
-function meanReciprocalRank(goldIds: string[], retrieved: string[]): number {
+/**
+ * Exported (Phase 0 md-baseline addition): so the chunk-granularity scoring path in
+ * harness-baseline.ts computes MRR identically to the concept-granularity arms, over a
+ * chunk-id space instead of concept ids, rather than forking this logic a second time.
+ */
+export function meanReciprocalRank(goldIds: string[], retrieved: string[]): number {
   if (goldIds.length === 0) return 0;
   let sum = 0;
   for (const id of goldIds) {

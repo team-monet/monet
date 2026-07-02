@@ -28,6 +28,7 @@
     "demo": "tsx scripts/demo.ts",
     "knows": "tsx scripts/knows-demo.ts",
     "eval": "tsx src/eval/run.ts",
+    "eval:baseline": "tsx src/eval/run-baseline.ts",
     "embed:check": "tsx scripts/embed-check.ts",
     "mcp": "tsx scripts/mcp-cli.ts",
     "mcp:smoke": "tsx scripts/mcp-smoke.ts"

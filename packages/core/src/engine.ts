@@ -3493,6 +3493,32 @@ export class MonetCore {
     this.endSession(summary);
   }
 
+  /**
+   * Eval-scoped: return raw {id, text} for every concept in the circle without triggering
+   * synthesis, usefulness scoring, or any write-side effect. Used by offline baseline arms
+   * (dense-rag, bm25) that need the corpus text independently of the Monet retrieval stack.
+   * `text` is title + " " + body (the same surface a BM25 / cosine baseline would index).
+   */
+  allConceptTextsForEval(circle: string): Array<{ id: string; text: string }> {
+    const rows = this.db
+      .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+      .all(circle) as Array<{ id: string; title: string; body: string }>;
+    return rows.map((r) => ({ id: r.id, text: `${r.title} ${r.body}`.trim() }));
+  }
+
+  /**
+   * Eval-scoped, Phase 0 md-tree exporter addition (not in the ported reference — the
+   * exporter needs title/body/kind separately, not pre-joined, to write index-line
+   * summaries and topic-file prose). Same non-mutating shape as allConceptTextsForEval:
+   * no synthesis, no usefulness touch, no write-side effect.
+   */
+  allConceptsForExport(circle: string): Array<{ id: string; title: string; body: string; kind: string }> {
+    const rows = this.db
+      .prepare(`SELECT id, title, body, kind FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+      .all(circle) as Array<{ id: string; title: string; body: string; kind: string }>;
+    return rows.map((r) => ({ id: r.id, title: r.title, body: r.body, kind: r.kind }));
+  }
+
   /** Score all concepts by cosine. When `circle` is omitted, scores across all circles. Archived circles excluded by default. */
   private scoreAllConcepts(emb: Float32Array, circle?: string, includeArchived?: boolean): Array<{ id: string; cos: number }> {
     const rows: Array<{ id: string; embedding: string }> = circle !== undefined
