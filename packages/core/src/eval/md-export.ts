@@ -95,7 +95,7 @@ export interface MdExportResult {
 // returns the single LARGEST component and has private-field access this eval code doesn't
 // have. Same algorithm, applied here to get ALL components via the public API.)
 
-function coOccurredClusters(core: MonetCore, circle: string, allIds: string[]): string[][] {
+export function coOccurredClusters(core: MonetCore, circle: string, allIds: string[]): string[][] {
   const edges = core.edges({ circle, type: "co_occurred" });
   const adj = new Map<string, Set<string>>();
   const link = (a: string, b: string): void => {
@@ -126,7 +126,7 @@ function coOccurredClusters(core: MonetCore, circle: string, allIds: string[]): 
 
 // ── Cluster naming / topic labeling ────────────────────────────────────────────────────────
 
-function slugify(s: string): string {
+export function slugify(s: string): string {
   return (
     s
       .toLowerCase()
@@ -136,11 +136,28 @@ function slugify(s: string): string {
   );
 }
 
-/** One-line summary: first sentence (or first ~120 chars) of the body — a human index blurb, not the full claim. */
-function oneLineSummary(body: string): string {
-  const firstSentence = body.match(/^[^.!?]*[.!?]/)?.[0]?.trim();
+/**
+ * One-line summary: first sentence (or first ~120 chars) of the body — a human index blurb, not
+ * the full claim.
+ *
+ * F1 fix (post-review, confirmed in shipped artifacts — e.g. eval-corpus/publish/100/index.md):
+ * the prior regex `/^[^.!?]*[.!?]/` excluded `.!?` from the character class but NOT `\n`, so a
+ * body whose first sentence spans a newline (a heading/list-prefixed body, e.g. "## Section\n\n###
+ * 1.") matched through the newline and produced a "one-line" summary that wasn't one line — it
+ * embedded a literal `\n`, which splits the index.md bullet it's interpolated into across two
+ * malformed markdown lines. Excluding `\n` from the class (`[^.!?\n]`) stops the match at the first
+ * line break. That alone isn't sufficient, though: the `candidate = body` (verbatim) fallback branch
+ * — taken whenever there's no `.!?` within 160 chars, or the first "sentence" is longer than that —
+ * can ALSO carry newlines (a body with no early punctuation but an early line break), so both
+ * branches are passed through a whitespace-collapse before the final length/truncation step.
+ * Verified empirically against the real corpus (eval-corpus/source/monet.db): exactly 4 concepts'
+ * bodies triggered the bug under the old regex.
+ */
+export function oneLineSummary(body: string): string {
+  const firstSentence = body.match(/^[^.!?\n]*[.!?]/)?.[0]?.trim();
   const candidate = firstSentence && firstSentence.length <= 160 ? firstSentence : body;
-  return candidate.length > 140 ? candidate.slice(0, 137).trimEnd() + "…" : candidate;
+  const collapsed = candidate.replace(/\s+/g, " ").trim();
+  return collapsed.length > 140 ? collapsed.slice(0, 137).trimEnd() + "…" : collapsed;
 }
 
 // ── Header-boundary chunker with paragraph fallback (spec §2.2) ───────────────────────────
@@ -207,7 +224,7 @@ export interface ChunkedSegment {
  * regressions) and the maintenance liability of a signal whose "healthy" state looks like a
  * failure.
  */
-function sectionsForMembers(members: Array<{ id: string; title: string; body: string; kind: string }>): ChunkedSegment[] {
+export function sectionsForMembers(members: Array<{ id: string; title: string; body: string; kind: string }>): ChunkedSegment[] {
   return members.map((m) => ({ text: `## ${m.title}\n\n${m.body}`.trim(), conceptId: m.id }));
 }
 
@@ -243,7 +260,7 @@ function paragraphFallback(fileBody: string): ChunkedSegment[] {
  * back to fixed-size paragraph chunks (over `fileBody`) only when there are no members at all,
  * the one genuinely header-less case (nothing to derive sections from).
  */
-function chunkTopicFile(fileBody: string, sections: ChunkedSegment[]): ChunkedSegment[] {
+export function chunkTopicFile(fileBody: string, sections: ChunkedSegment[]): ChunkedSegment[] {
   return sections.length > 0 ? sections : paragraphFallback(fileBody);
 }
 
