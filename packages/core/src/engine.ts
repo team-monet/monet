@@ -3937,7 +3937,14 @@ function tokenize(s: string): string[] {
     .filter((t) => t.length >= 2);
 }
 
-function slugify(s: string): string {
+// Exported (round 3, F2 fix — scrub-db.mjs's slug-scrubbing gap) SOLELY so
+// src/__tests__/db-slugify.test.ts can byte-verify src/db-slugify.mjs's plain-.mjs mirror against
+// this real implementation (scrub-db.mjs is invoked with plain `node`, not `tsx`, so it cannot
+// import this .ts function directly — see src/db-slugify.mjs's own doc comment for the full
+// rationale, same "small tolerable duplication, byte-verified" precedent as src/extract-entities.mjs).
+// Logic/body is UNCHANGED by this export — only visibility changed; every in-engine call site below
+// continues to use the unqualified local reference, unaffected by this becoming exported.
+export function slugify(s: string): string {
   return s
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")

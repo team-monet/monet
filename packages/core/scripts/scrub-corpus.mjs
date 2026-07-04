@@ -130,6 +130,11 @@ import {
   TILDE_PATH_RE,
   PRIVATE_ENDPOINT_RE,
 } from "../src/eval/scrub-patterns.mjs";
+// Round 5, J1 fix — see src/eval/slug-ref-rename.mjs's own module doc for the full leak writeup and
+// why this parity wiring (buildSlugRenameMap here, rewriteAssertedSlugRefs applied to `body` below)
+// is required for db-vs-publish parity with scripts/scrub-db.mjs's own identical rewrite.
+import { buildSlugRenameMap, rewriteAssertedSlugRefs } from "../src/eval/slug-ref-rename.mjs";
+import { slugify } from "../src/db-slugify.mjs";
 
 export { scrubString, scrubJson };
 
@@ -412,9 +417,22 @@ function assertScopeAlreadyApplied(rows, dbPath) {
   }
 }
 
-function dumpPublishableCorpus(dbPath, outPath) {
+export function dumpPublishableCorpus(dbPath, outPath) {
   const db = new Database(dbPath, { readonly: true });
   try {
+    // Round 5, J1 fix — PARITY: build the IDENTICAL old-slug -> new-slug rename map
+    // scripts/scrub-db.mjs's scrubConceptSlugs computes against its OWN (already title-scrubbed)
+    // db-scrubbed copy, but here from THIS (raw, unscrubbed) db — see buildSlugRenameMap's own doc
+    // comment (src/eval/slug-ref-rename.mjs) for the determinism argument proving these two
+    // independently-computed maps are guaranteed identical. MUST read ALL concepts (no `kind`
+    // filter) — scrubConceptSlugs' own query has no kind filter either (every concept, including
+    // kind='workstream' rows, occupies slug-space and participates in disambiguation), so filtering
+    // this map-building query to `kind != 'workstream'` (like the row-dump query below) would
+    // silently compute a DIFFERENT disambiguation than scrub-db.mjs's — a real parity bug, not a
+    // cosmetic one, if this repo's corpus ever has a workstream-vs-non-workstream slug collision.
+    const allRowsForRenameMap = db.prepare(`SELECT id, title, slug, circle FROM concepts ORDER BY id`).all();
+    const renameMap = buildSlugRenameMap(allRowsForRenameMap, { scrubString, slugify });
+
     const rows = db
       .prepare(
         `SELECT id, title, body, kind, circle, created_at AS createdAt, updated_at AS updatedAt, support_count AS supportCount
@@ -422,9 +440,20 @@ function dumpPublishableCorpus(dbPath, outPath) {
       )
       .all();
     assertScopeAlreadyApplied(rows, dbPath);
-    const scrubbed = rows.map((r) => scrubJson(r));
+    // Round 5, J1 fix: rewrite stale asserted-ref tokens in `body` BEFORE the general scrubJson
+    // pass below (ordering doesn't affect correctness here — the two operate on disjoint concerns,
+    // ref-token rewriting vs. PII-pattern redaction — but rewriting first matches
+    // scripts/scrub-db.mjs's own db-side ordering for readability/parity-of-intent between the two
+    // pipelines).
+    let bodyRefRewrites = 0;
+    const withRewrittenRefs = rows.map((r) => {
+      const { text, hits } = rewriteAssertedSlugRefs(r.body, renameMap);
+      bodyRefRewrites += hits;
+      return hits > 0 ? { ...r, body: text } : r;
+    });
+    const scrubbed = withRewrittenRefs.map((r) => scrubJson(r));
     writeFileSync(outPath, JSON.stringify(scrubbed, null, 2) + "\n", "utf8");
-    return { count: scrubbed.length };
+    return { count: scrubbed.length, bodyRefRewrites };
   } finally {
     db.close();
   }
@@ -524,7 +553,10 @@ function main() {
 
     assertDerivedDbExists(dbPath, size, mdSizeDir);
     const dumpStats = dumpPublishableCorpus(dbPath, join(outSizeDir, "corpus.json"));
-    console.log(`[${size}] corpus.json — ${dumpStats.count} concepts (no embedding, no raw source_refs)`);
+    console.log(
+      `[${size}] corpus.json — ${dumpStats.count} concepts (no embedding, no raw source_refs) ` +
+        `bodyRefRewrites=${dumpStats.bodyRefRewrites}`,
+    );
   }
 
   const manifestPath = join(REPO_ROOT, "eval-corpus", "SCRUB_MANIFEST.json");
