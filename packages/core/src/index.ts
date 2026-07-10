@@ -1,10 +1,11 @@
-export { MonetCore } from "./engine";
+export { MonetCore, EmbedderMismatchError } from "./engine";
 export type {
   Concept,
   SearchCard,
   IngestResult,
   IngestAction,
   StoreOpts,
+  SourceStoreOpts,
   MonetCoreOptions,
   Workstream,
   WorkstreamPayload,
@@ -40,3 +41,19 @@ export { DeterministicSynthesizer } from "./synthesis";
 export type { Synthesizer } from "./synthesis";
 export { createMonetCoreMcpServer } from "./mcp-server";
 export { deriveCircle } from "./circle";
+export type {
+  GraftPayload,
+  GraftResult,
+  SyncConceptRow,
+  SyncObservationRow,
+  SyncRevisionRow,
+  SyncContradictionRow,
+  SyncEdgeRow,
+  SyncFirstBlockRow,
+  SyncCircleAliasRow,
+  SyncEntityRow,
+  SyncConceptEntityRow,
+  SyncConceptTombstoneRow,
+  SyncConceptRestorationRow,
+  SyncSessionRow,
+} from "./sync-types";

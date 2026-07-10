@@ -27,6 +27,12 @@ export interface EmbeddingProvider {
   readonly dim: number;
   /** Thresholds calibrated for this embedder's cosine distribution (see above). */
   readonly recommendedThresholds?: EmbeddingThresholds;
+  /**
+   * A stable string identifier for this embedder's model and configuration (e.g.
+   * "hashing:dim=256" or "Xenova/all-MiniLM-L6-v2"). Used by the sync layer to reject
+   * cross-machine grafts where the vector spaces are incompatible.
+   */
+  readonly modelId?: string;
   /** May be sync (lexical) or async (a real model). The engine always awaits it. */
   embed(text: string): Float32Array | Promise<Float32Array>;
 }
@@ -36,9 +42,11 @@ export class HashingEmbeddingProvider implements EmbeddingProvider {
   // Calibrated for the lexical (token/trigram) cosine distribution — looser than a
   // semantic model because lexical overlap saturates lower. (Preserved spike defaults.)
   readonly recommendedThresholds: EmbeddingThresholds = { tauAttach: 0.55, tauAmbiguous: 0.4 };
+  readonly modelId: string;
 
   constructor(dim = 256) {
     this.dim = dim;
+    this.modelId = `hashing:dim=${dim}`;
   }
 
   embed(text: string): Float32Array {

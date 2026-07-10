@@ -31,12 +31,14 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   // sits well above "related" (so merely-related evidence forks rather than wrongly
   // merging — the ADR's conservative-dedup rule: prefer a duplicate over a bad merge).
   readonly recommendedThresholds: EmbeddingThresholds = { tauAttach: 0.72, tauAmbiguous: 0.5 };
+  readonly modelId: string;
   private readonly model: string;
   private extractor: Promise<FeatureExtractor> | null = null;
 
   constructor(opts: { model?: string; dim?: number } = {}) {
     this.model = opts.model ?? "Xenova/all-MiniLM-L6-v2";
     this.dim = opts.dim ?? 384;
+    this.modelId = this.model;
   }
 
   private load(): Promise<FeatureExtractor> {

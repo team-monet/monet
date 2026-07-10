@@ -90,6 +90,54 @@ describe("detach — to an existing destination concept", () => {
     expect(dstFetched.observations).toHaveLength(2);
     c.close();
   });
+
+  it("merging new content into an existing destination grows the destination body", async () => {
+    const c = core();
+    const conceptB = await c.store("The destination concept.");
+    const conceptA = await c.store("Observation for concept A.");
+    await c.store("Second obs for concept A, with genuinely new content.", { attachTo: conceptA.conceptId });
+
+    const fetched = (await c.getConcept(conceptA.conceptId, { synthesize: false }))!;
+    const obs2Id = fetched.observations[1]!.id;
+
+    const r = await c.detach(conceptA.conceptId, [obs2Id], { destConceptId: conceptB.conceptId });
+    expect(r.destAction).toBe("attached");
+
+    const dstFetched = (await c.getConcept(conceptB.conceptId, { synthesize: false }))!;
+    // Regression guard: the moved observation's row is bulk-repointed to destConceptId BEFORE the
+    // consolidate loop calls attach(); without excluding it by id, attach()'s own duplicate-content
+    // guard matches the moved row against itself and the body silently never grows.
+    expect(dstFetched.body).toBe("The destination concept.\nSecond obs for concept A, with genuinely new content.");
+    expect(dstFetched.supportCount).toBe(2);
+    // Observation-row semantics: the moved row was re-pointed, not duplicated — exactly 2 rows.
+    expect(dstFetched.observations).toHaveLength(2);
+    expect(dstFetched.totalObservations).toBe(2);
+    c.close();
+  });
+
+  it("merging a byte-identical duplicate into an existing destination does not grow the body", async () => {
+    const c = core();
+    const sharedText = "Identical content shared by both concepts.";
+    const conceptB = await c.store(sharedText);
+    const conceptA = await c.store("Observation for concept A.");
+    await c.store(sharedText, { attachTo: conceptA.conceptId });
+
+    const fetched = (await c.getConcept(conceptA.conceptId, { synthesize: false }))!;
+    const obs2Id = fetched.observations[1]!.id;
+
+    const r = await c.detach(conceptA.conceptId, [obs2Id], { destConceptId: conceptB.conceptId });
+    expect(r.destAction).toBe("attached");
+
+    const dstFetched = (await c.getConcept(conceptB.conceptId, { synthesize: false }))!;
+    // The moved observation duplicates content already in the destination — body must not double up.
+    expect(dstFetched.body).toBe(sharedText);
+    expect(dstFetched.supportCount).toBe(2);
+    // Observation-row semantics: still exactly 2 rows (re-pointed, not dropped or duplicated) even
+    // though the body text itself correctly did not grow.
+    expect(dstFetched.observations).toHaveLength(2);
+    expect(dstFetched.totalObservations).toBe(2);
+    c.close();
+  });
 });
 
 describe("detach — source embedding recompute", () => {
