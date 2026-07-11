@@ -40,6 +40,41 @@ monet dashboard -p 8080      # -p, --port <n>   custom port
 monet dashboard -d ./path    # -d, --dir <path>  point at a specific store
 ```
 
+## Register Markdown sources — `monet source`
+
+The source commands configure the local registry only. They do **not** clone, scan, parse, ingest, or sync any content. A newly added source stays `pending-initial-sync` until a separate sync implementation is available.
+
+Both source types use default-deny access lists, so at least one caller ID and one project ID are required:
+
+```bash
+# Register the current repository; --path defaults to the resolved project directory
+monet source add "Project docs" \
+  --type repo-md \
+  --include "README.md" --include "docs/**/*.md" \
+  --exclude "vendor/**" \
+  --allow-caller codex --allow-project my-project
+
+# Register a remote repository. Monet allocates the local path but does not clone it.
+monet source add "Shared docs" \
+  --type git-md --circle shared-docs \
+  --remote https://github.com/acme/docs.git --branch main \
+  --allow-scheme https --allow-host github.com \
+  --allow-caller codex --allow-project my-project
+
+monet source list
+monet source list --json
+monet source show <source-id>
+monet source show <source-id> --path-only
+monet source update <source-id> --include "handbook/**/*.md" --clear-excludes
+monet source remove <source-id> --yes
+```
+
+`source update` changes mutable registry configuration only: name, include/exclude patterns, ACLs, Git transport policy, write-back policy, refresh policy, and auto-detection preference. Source identity (type, circle, repository/root, remote, and branch) is immutable; remove and add a new source to change it. Removal creates a tombstone and never deletes the registered local path.
+
+When the Monet store is project-local, registering the repository root is safe: Monet permanently retains a source-relative exclusion for its managed `.monet/sources` subtree, including after `--clear-excludes`. A repo root equal to or inside that managed subtree is rejected. Active sources cannot share the same canonical local path; removing a source releases the path for a new source ID while preserving the old ID tombstone.
+
+All source commands use the existing storage resolution (`MONET_STORAGE_DIR`, an existing `./.monet`, then `~/.monet`). To override it for one invocation, put `--dir` on the parent command, for example `monet source --dir ./scratch-store list`.
+
 ## License
 
 Monet is distributed under a **proprietary license** — free to use for any purpose; redistribution, decompilation, and derivative works are not permitted. Full terms are in the `LICENSE` file included in this package.

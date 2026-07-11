@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
 import { ensureMonetDir, getDbPath } from "./db/index.js";
 import { deriveCircle } from "./circle.js";
+import { registerSourceCommands, SourceCliError } from "./source-cli.js";
 
 // Read version from package.json so it can never drift from the published version.
 // esbuild inlines the import.meta.url-relative path at bundle time; the bundled
@@ -160,4 +161,23 @@ program
     startDashboard(port);
   });
 
-program.parse();
+registerSourceCommands(program, {
+  openCore(storageDir) {
+    if (storageDir) process.env.MONET_STORAGE_DIR = path.resolve(storageDir);
+    const monetDir = ensureMonetDir();
+    return new MonetCore(getDbPath(), { sourceStorageDir: path.join(monetDir, "sources") });
+  },
+  deriveCircle,
+  projectDir() {
+    return path.resolve(process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd());
+  },
+});
+
+void program.parseAsync().catch((error: unknown) => {
+  if (error instanceof SourceCliError) {
+    console.error(`monet source: ${error.message}`);
+  } else {
+    console.error(error instanceof Error ? error.message : String(error));
+  }
+  process.exitCode = 1;
+});
