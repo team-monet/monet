@@ -46,6 +46,8 @@ export interface StoragePort {
   pragma(source: string, options?: PragmaOptions): unknown;
   /** Wrap `fn` so invoking the returned function runs it in a single atomic transaction. */
   transaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R;
+  /** Acquire SQLite's write reservation before `fn` reads; serializes registry/circle identity changes. */
+  immediateTransaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R;
   close(): void;
 }
 
@@ -77,6 +79,10 @@ export class BetterSqlitePort implements StoragePort {
 
   transaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
     return this.db.transaction(fn);
+  }
+
+  immediateTransaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+    return this.db.transaction(fn).immediate;
   }
 
   close(): void {

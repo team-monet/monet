@@ -100,6 +100,10 @@ class CrashingEntityPort implements StoragePort {
     return this.inner.transaction(fn);
   }
 
+  immediateTransaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+    return this.inner.immediateTransaction(fn);
+  }
+
   close(): void {
     this.inner.close();
   }

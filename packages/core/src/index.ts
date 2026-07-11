@@ -30,6 +30,27 @@ export type {
 } from "./engine";
 export { BetterSqlitePort } from "./storage";
 export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";
+export type {
+  SourceType,
+  SourceWriteBack,
+  SourceRefreshMode,
+  SourceLifecycle,
+  SourceStatus,
+  SourceTransportScheme,
+  SourceAccessPolicy,
+  SourceTransportPolicy,
+  SourceRefreshPolicy,
+  SourceRepoMapping,
+  CreateRepoMdSource,
+  CreateGitMdSource,
+  CreateSourceInput,
+  UpdateSourceInput,
+  KnowledgeSource,
+  SourceListOptions,
+  SourceGetOptions,
+  SourceAuthorizationContext,
+  SourceRunFence,
+} from "./source-types";
 export { renderOverview } from "./render-overview";
 export { extractEntities } from "./extract-entities";
 export type { ExtractedEntity, EntityKind } from "./extract-entities";

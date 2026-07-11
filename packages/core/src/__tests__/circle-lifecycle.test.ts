@@ -217,6 +217,44 @@ describe("mergeCircle", () => {
 
     core.close();
   });
+
+  it("rolls back every prior move and publishes no alias when a later merge item fails", async () => {
+    const core = freshCore();
+    const first = await core.store("First merge item.", { circle: "src", resolution: "forceNew" });
+    const second = await core.store("Second merge item.", { circle: "src", resolution: "forceNew" });
+    const destination = await core.store("Destination item.", { circle: "dst", resolution: "forceNew" });
+    const db = (core as unknown as { db: import("../storage").StoragePort }).db;
+    db.exec(`
+      CREATE TRIGGER inject_mid_merge_failure
+      BEFORE UPDATE OF circle ON concepts
+      WHEN OLD.id = '${second.conceptId}'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected mid-merge failure');
+      END;
+    `);
+
+    await expect(core.mergeCircle("src", "dst")).rejects.toThrow(/mergeCircle failed.*injected mid-merge failure/);
+
+    expect(core.circleOf(first.conceptId)).toBe("src");
+    expect(core.circleOf(second.conceptId)).toBe("src");
+    expect(core.circleOf(destination.conceptId)).toBe("dst");
+    expect(core.conceptCount("src")).toBe(2);
+    expect(core.conceptCount("dst")).toBe(1);
+    expect(core.resolveCircleName("src")).toBe("src");
+
+    // No alias was published, so a post-failure source remains attached to the original circle.
+    const source = core.createSource({
+      id: "post-failure-source",
+      type: "repo-md",
+      name: "Post-failure source",
+      localPath: "/tmp/monet-post-failure-source",
+      circle: "src",
+      access: { allowedCallerIds: ["caller"], allowedProjectIds: ["project"] },
+    });
+    expect(source.circle).toBe("src");
+    expect(core.updateSource(source.id, { name: "Still attached" }).circle).toBe("src");
+    core.close();
+  });
 });
 
 // ---- archiveCircle / unarchiveCircle ----------------------------------------

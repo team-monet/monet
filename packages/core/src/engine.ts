@@ -17,6 +17,15 @@
  */
 import { randomUUID } from "node:crypto";
 import { StoragePort, BetterSqlitePort } from "./storage";
+import { SourceRegistry } from "./source-registry";
+import type {
+  CreateSourceInput,
+  KnowledgeSource,
+  SourceAuthorizationContext,
+  SourceGetOptions,
+  SourceListOptions,
+  UpdateSourceInput,
+} from "./source-types";
 import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend, blendWeighted } from "./embedding";
 import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
@@ -57,6 +66,7 @@ const AROUSAL_SCHEMA_VERSION = 3; // PRAGMA user_version gate for the V-A arousa
 const FIRST_BLOCK_SCHEMA_VERSION = 4; // PRAGMA user_version gate for the first_block table
 const SYNC_SCHEMA_VERSION = 5; // PRAGMA user_version gate for sync engine primitives (slice 1a)
 const SOURCE_SCHEMA_VERSION = 6; // PRAGMA user_version gate for source-concept prerequisites (ingest_operations, concept_tombstones/restorations, source_identity/active_observation_id)
+const SOURCE_REGISTRY_SCHEMA_VERSION = 7; // PRAGMA user_version gate for the durable knowledge_sources registry
 export const FIRST_BLOCK_SUMMARY_MAX_CHARS = 800; // hard cap on a first_block summary (cost signal)
 
 /**
@@ -430,6 +440,8 @@ export interface MonetCoreOptions {
   graph?: Partial<GraphParams>;
   /** Min cosine for a `related` edge. Default: embedder-bound (0.45 MiniLM / 0.40 lexical). */
   edgeSimMin?: number;
+  /** Monet-owned base directory returned for git-md checkouts. The registry never creates or deletes it. */
+  sourceStorageDir?: string;
 }
 
 interface ConceptRow {
@@ -511,6 +523,7 @@ export class MonetCore {
   private graphParams: GraphParams;
   private edgeSimMin: number;
   private newId: () => string;
+  private sourceRegistry: SourceRegistry;
   /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
    *  Keyed by circle so a session that writes to several circles never chains `follows` across them. */
   private lastConceptByCircle = new Map<string, string>();
@@ -531,6 +544,11 @@ export class MonetCore {
     this.tauAmbiguous = opts.tauAmbiguous ?? this.embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
+    this.sourceRegistry = new SourceRegistry(this.db, {
+      idGen: this.newId,
+      sourceStorageDir: opts.sourceStorageDir,
+      canonicalizeCircle: (circle) => this.resolveCircle(circle),
+    });
     this.scopeContext = opts.scopeContext ?? null;
     this.defaultCircle = opts.defaultCircle ?? "default";
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -540,6 +558,7 @@ export class MonetCore {
     const semantic = (this.embedder.recommendedThresholds?.tauAttach ?? 0) >= 0.7;
     this.edgeSimMin = opts.edgeSimMin ?? (semantic ? 0.45 : 0.4);
     this.init();
+    this.sourceRegistry.ensureSchema();
     this.migrate();
   }
 
@@ -916,6 +935,14 @@ export class MonetCore {
     const versionAfterSync = this.db.pragma("user_version", { simple: true }) as number;
     if (versionAfterSync >= SYNC_SCHEMA_VERSION && versionAfterSync < SOURCE_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${SOURCE_SCHEMA_VERSION}`);
+    }
+    // SOURCE_REGISTRY_SCHEMA_VERSION = 7: knowledge_sources is created idempotently by the
+    // registry before migrate(). A v6 database needs no backfill; its registry starts empty.
+    // Fresh graph-disabled opens still remain at version 0 so they do not consume the graph
+    // backfill slot, preserving the existing migration ordering contract.
+    const versionAfterSource = this.db.pragma("user_version", { simple: true }) as number;
+    if (versionAfterSource >= SOURCE_SCHEMA_VERSION && versionAfterSource < SOURCE_REGISTRY_SCHEMA_VERSION) {
+      this.db.pragma(`user_version = ${SOURCE_REGISTRY_SCHEMA_VERSION}`);
     }
   }
 
@@ -3020,6 +3047,37 @@ export class MonetCore {
     this.db.close();
   }
 
+  // ---- source registry ----------------------------------------------------
+
+  createSource(input: CreateSourceInput): KnowledgeSource {
+    return this.sourceRegistry.createSource(input);
+  }
+
+  updateSource(id: string, patch: UpdateSourceInput): KnowledgeSource {
+    return this.sourceRegistry.updateSource(id, patch);
+  }
+
+  listSources(options: SourceListOptions = {}): KnowledgeSource[] {
+    return this.sourceRegistry.listSources(options);
+  }
+
+  getSource(id: string, options: SourceGetOptions = {}): KnowledgeSource | null {
+    return this.sourceRegistry.getSource(id, options);
+  }
+
+  removeSource(id: string): KnowledgeSource | null {
+    return this.sourceRegistry.removeSource(id);
+  }
+
+  authorizeSource(sourceId: string, callerId: string, projectId: string): boolean;
+  authorizeSource(sourceId: string, context: SourceAuthorizationContext): boolean;
+  authorizeSource(sourceId: string, callerOrContext: string | SourceAuthorizationContext, projectId?: string): boolean {
+    if (typeof callerOrContext === "string") {
+      return this.sourceRegistry.authorizeSource(sourceId, callerOrContext, projectId ?? "");
+    }
+    return this.sourceRegistry.authorizeSource(sourceId, callerOrContext);
+  }
+
   // ---- sync: engine primitives (slice 1a) ----------------------------------
 
   /**
@@ -3509,6 +3567,15 @@ export class MonetCore {
     // different governance domains. Today, all circles share one implicit domain — no-op.
   }
 
+  /** Source circles are immutable registry identity, even before ingest and after tombstoning. */
+  private assertNoRegisteredSourceCircleParticipants(operation: "rename" | "merge", circles: string[]): void {
+    const placeholders = circles.map(() => "?").join(", ");
+    const source = this.db
+      .prepare(`SELECT id FROM knowledge_sources WHERE circle IN (${placeholders}) LIMIT 1`)
+      .get(...circles) as { id: string } | undefined;
+    if (source) throw new Error(`cannot ${operation} circles participating in registered sources`);
+  }
+
   /**
    * Atomically rename a circle: bulk-updates all five scope-bearing tables (concepts, observations,
    * memory_edge, entities, concept_entities) from→to; updates workstream slugs in the to-circle
@@ -3517,22 +3584,24 @@ export class MonetCore {
    * from===to → action "noop". Nonexistent from (no concepts AND no alias rows naming it) → throws.
    */
   renameCircle(from: string, to: string): RenameCircleResult {
-    // Resolve the destination FIRST so renaming B→C when alias C→D exists physically lands in D.
-    to = this.resolveCircle(to);
-    if (from === to) return { from, to, action: "noop", conceptsUpdated: 0, observationsUpdated: 0, edgesUpdated: 0, entitiesUpdated: 0 };
-    this.assertSameSharingScope(from, to);
-    if (this.db.prepare(`SELECT 1 FROM concepts WHERE circle = ? AND kind = 'source' LIMIT 1`).get(from)) {
-      throw new Error("cannot rename a circle containing source concepts");
-    }
-    if (this.db.prepare(`SELECT 1 FROM concepts WHERE circle = ? AND status = 'retired' LIMIT 1`).get(from)) {
-      throw new Error("cannot rename a circle containing retired concepts");
-    }
-    // Existence check: from must either have concepts or already have an alias entry.
-    const hasConcepts = (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ?`).get(from) as { n: number }).n > 0;
-    const hasAlias = !!this.db.prepare(`SELECT 1 FROM circle_aliases WHERE from_name = ? OR to_name = ?`).get(from, from);
-    if (!hasConcepts && !hasAlias) throw new Error(`circle not found: ${from}`);
+    return this.db.immediateTransaction((): RenameCircleResult => {
+      // Resolve and authorize after acquiring the write reservation. A concurrent source create
+      // either commits first and blocks this rename, or waits and observes the alias afterward.
+      to = this.resolveCircle(to);
+      if (from === to) return { from, to, action: "noop", conceptsUpdated: 0, observationsUpdated: 0, edgesUpdated: 0, entitiesUpdated: 0 };
+      this.assertSameSharingScope(from, to);
+      this.assertNoRegisteredSourceCircleParticipants("rename", [from, to]);
+      if (this.db.prepare(`SELECT 1 FROM concepts WHERE circle = ? AND kind = 'source' LIMIT 1`).get(from)) {
+        throw new Error("cannot rename a circle containing source concepts");
+      }
+      if (this.db.prepare(`SELECT 1 FROM concepts WHERE circle = ? AND status = 'retired' LIMIT 1`).get(from)) {
+        throw new Error("cannot rename a circle containing retired concepts");
+      }
+      // Existence check: from must either have concepts or already have an alias entry.
+      const hasConcepts = (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ?`).get(from) as { n: number }).n > 0;
+      const hasAlias = !!this.db.prepare(`SELECT 1 FROM circle_aliases WHERE from_name = ? OR to_name = ?`).get(from, from);
+      if (!hasConcepts && !hasAlias) throw new Error(`circle not found: ${from}`);
 
-    return this.db.transaction((): RenameCircleResult => {
       const conceptsUpdated = (this.db.prepare(`UPDATE concepts SET circle = ? WHERE circle = ?`).run(to, from)).changes;
       const observationsUpdated = (this.db.prepare(`UPDATE observations SET circle = ? WHERE circle = ?`).run(to, from)).changes;
       const edgesUpdated = (this.db.prepare(`UPDATE memory_edge SET scope = ? WHERE scope = ?`).run(to, from)).changes;
@@ -3616,91 +3685,86 @@ export class MonetCore {
     into: string,
     opts: { resolution?: "auto" | "forceNew" } = {},
   ): Promise<MergeCircleResult> {
-    // Resolve the destination FIRST so merging B→C when alias C→D exists lands in D.
-    into = this.resolveCircle(into);
-    this.assertSameSharingScope(from, into);
-    const resolution = opts.resolution ?? "forceNew";
-    const sourceParticipant = this.db
-      .prepare(`SELECT id FROM concepts WHERE kind = 'source' AND circle IN (?, ?) LIMIT 1`)
-      .get(from, into) as { id: string } | undefined;
-    if (sourceParticipant) throw new Error("cannot merge circles containing source concepts");
-    const retiredParticipant = this.db
-      .prepare(`SELECT id FROM concepts WHERE status = 'retired' AND circle IN (?, ?) LIMIT 1`)
-      .get(from, into) as { id: string } | undefined;
-    if (retiredParticipant) throw new Error("cannot merge circles containing retired concepts");
+    const lastConceptSnapshot = new Map(this.lastConceptByCircle);
+    try {
+      return this.db.immediateTransaction((): MergeCircleResult => {
+        // The whole merge, including per-concept savepoints and alias publication, stays under
+        // one write reservation shared with source creation. Any item failure escapes this
+        // callback, rolling back every prior move and preventing alias publication.
+        into = this.resolveCircle(into);
+        this.assertSameSharingScope(from, into);
+        this.assertNoRegisteredSourceCircleParticipants("merge", [from, into]);
+        const resolution = opts.resolution ?? "forceNew";
+        const sourceParticipant = this.db
+          .prepare(`SELECT id FROM concepts WHERE kind = 'source' AND circle IN (?, ?) LIMIT 1`)
+          .get(from, into) as { id: string } | undefined;
+        if (sourceParticipant) throw new Error("cannot merge circles containing source concepts");
+        const retiredParticipant = this.db
+          .prepare(`SELECT id FROM concepts WHERE status = 'retired' AND circle IN (?, ?) LIMIT 1`)
+          .get(from, into) as { id: string } | undefined;
+        if (retiredParticipant) throw new Error("cannot merge circles containing retired concepts");
 
-    // Order pinned concepts by their source first_block.position so rehomeFirstBlockEntry
-    // assigns destination positions in the user's curated order, not row/creation order.
-    // Unpinned concepts (fb.concept_id IS NULL) sort last; for resolution:"auto" merges the
-    // order the unpinned near-duplicates are processed decides which concept survives
-    // (merge-into-earlier), so that tail MUST be ordered by true insertion order. c.id is a
-    // random UUID and would let UUID order arbitrarily pick the survivor; c.created_at is
-    // unixepoch()*1000 (whole-ms) and bulk imports land many concepts in the same ms, so
-    // created_at ties and falls through to UUID order. c.rowid is the canonical monotonic
-    // insertion key (concepts is a normal rowid table, not WITHOUT ROWID) — it never ties, so
-    // it alone gives a deterministic oldest-first order, which is exactly what the original
-    // no-ORDER-BY query returned before the pin-order fix. (Finding 2 — Codex PR #33; Fix A —
-    // Codex PR #33 round 2; rowid tiebreak — Codex P2 round 3)
-    const conceptRows = this.db
-      .prepare(
-        `SELECT c.id, c.kind FROM concepts c
-         LEFT JOIN first_block fb ON fb.concept_id = c.id AND fb.circle = c.circle
-         WHERE c.circle = ?
-         ORDER BY (fb.concept_id IS NULL), fb.position ASC, c.rowid ASC`,
-      )
-      .all(from) as Array<{ id: string; kind: string }>;
+        // Pinned concepts preserve curated order; the unpinned tail uses rowid so forceNew/auto
+        // survivor selection is deterministic even when created_at timestamps tie.
+        const conceptRows = this.db
+          .prepare(
+            `SELECT c.id, c.kind FROM concepts c
+             LEFT JOIN first_block fb ON fb.concept_id = c.id AND fb.circle = c.circle
+             WHERE c.circle = ?
+             ORDER BY (fb.concept_id IS NULL), fb.position ASC, c.rowid ASC`,
+          )
+          .all(from) as Array<{ id: string; kind: string }>;
 
-    const conceptResults: MergeConceptResult[] = [];
-    let moved = 0, merged = 0, noop = 0, error = 0;
+        const conceptResults: MergeConceptResult[] = [];
+        let moved = 0, merged = 0, noop = 0;
 
-    for (const row of conceptRows) {
-      if (row.kind === "workstream") {
-        // Workstream concepts are circle-identity-scoped; delete instead of moving.
-        // Unwind graph + delete revisions + delete the concept row.
-        try {
-          this.db.transaction(() => {
-            // First Block hook: workstream concept deleted — remove any entry (referential integrity).
-            // Largely unreachable once promoteToFirstBlock rejects workstreams, but kept correct.
-            this.deleteFirstBlockEntry(row.id);
-            this.unwindConceptGraph(row.id, from);
-            this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(row.id);
-            this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(row.id);
-          })();
-          conceptResults.push({ action: "noop" as const, conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0 });
-          noop++;
-        } catch (e) {
-          conceptResults.push({ action: "noop" as const, conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0, error: (e instanceof Error ? e.message : String(e)) });
-          error++;
-        }
-        continue;
-      }
-      try {
-        const r = this.reassignCircle(row.id, into, { resolution });
-        if (r === null) {
-          conceptResults.push({ action: "error", conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0, error: "concept not found during merge" });
-          error++;
-        } else {
-          conceptResults.push(r);
-          if (r.action === "moved") moved++;
-          else if (r.action === "merged") merged++;
+        for (const row of conceptRows) {
+          if (row.kind === "workstream") {
+            try {
+              // This nested transaction is a savepoint under the outer immediate transaction.
+              this.db.transaction(() => {
+                this.deleteFirstBlockEntry(row.id);
+                this.unwindConceptGraph(row.id, from);
+                this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(row.id);
+                this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(row.id);
+              })();
+            } catch (error) {
+              throw new Error(`mergeCircle failed for workstream '${row.id}': ${error instanceof Error ? error.message : String(error)}`);
+            }
+            conceptResults.push({ action: "noop", conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0 });
+            noop++;
+            continue;
+          }
+
+          let result: ReassignResult | null;
+          try {
+            result = this.reassignCircle(row.id, into, { resolution });
+          } catch (error) {
+            throw new Error(`mergeCircle failed for concept '${row.id}': ${error instanceof Error ? error.message : String(error)}`);
+          }
+          if (result === null) throw new Error(`mergeCircle failed for concept '${row.id}': concept disappeared`);
+          conceptResults.push(result);
+          if (result.action === "moved") moved++;
+          else if (result.action === "merged") merged++;
           else noop++;
         }
-      } catch (e) {
-        conceptResults.push({ action: "error", conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0, error: (e instanceof Error ? e.message : String(e)) });
-        error++;
-      }
+
+        this.db
+          .prepare(
+            `INSERT INTO circle_aliases (from_name, to_name, status) VALUES (?, ?, 'active')
+             ON CONFLICT(from_name) DO UPDATE SET to_name = ?, status = 'active'`,
+          )
+          .run(from, into, into);
+        this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(into, from);
+
+        return { from, into, conceptResults, counts: { moved, merged, noop, error: 0 } };
+      })();
+    } catch (error) {
+      // reassignCircle updates this in-memory follows cache after each savepoint. Restore it when
+      // the outer transaction rolls back so subsequent stores cannot observe phantom movement.
+      this.lastConceptByCircle = lastConceptSnapshot;
+      throw error;
     }
-
-    // Upsert alias from→into (active) + flatten chains.
-    this.db
-      .prepare(
-        `INSERT INTO circle_aliases (from_name, to_name, status) VALUES (?, ?, 'active')
-         ON CONFLICT(from_name) DO UPDATE SET to_name = ?, status = 'active'`,
-      )
-      .run(from, into, into);
-    this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(into, from);
-
-    return { from, into, conceptResults, counts: { moved, merged, noop, error } };
   }
 
   /**
