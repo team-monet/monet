@@ -16,7 +16,7 @@ import type {
   UpdateSourceInput,
 } from "./source-types";
 
-interface SourceRow {
+export interface SourceRow {
   id: string;
   type: "repo-md" | "git-md";
   name: string;
@@ -39,6 +39,9 @@ interface SourceRow {
   refresh_interval_seconds: number | null;
   config_version: number;
   applied_config_version: number | null;
+  active_run_id: string | null;
+  active_snapshot_id: string | null;
+  active_ingest_config_hash: string | null;
   lease_fence: number;
   lifecycle: "active" | "tombstoned";
   created_at: number;
@@ -334,7 +337,7 @@ function parseJsonArray<T>(value: string): T[] {
   return JSON.parse(value) as T[];
 }
 
-function rowToSource(row: SourceRow): KnowledgeSource {
+export function rowToSource(row: SourceRow): KnowledgeSource {
   const transportSchemes = parseJsonArray<SourceTransportScheme>(row.transport_schemes_json);
   const transportHosts = parseJsonArray<string>(row.transport_hosts_json);
   return {
@@ -361,6 +364,9 @@ function rowToSource(row: SourceRow): KnowledgeSource {
       : { mode: row.refresh_mode, intervalSeconds: row.refresh_interval_seconds },
     configVersion: row.config_version,
     appliedConfigVersion: row.applied_config_version,
+    activeRunId: row.active_run_id,
+    activeSnapshotId: row.active_snapshot_id,
+    activeIngestConfigHash: row.active_ingest_config_hash,
     leaseFence: row.lease_fence,
     lifecycle: row.lifecycle,
     status: deriveStatus(row),
@@ -406,6 +412,7 @@ export class SourceRegistry {
 
   /** Additive and idempotent; engine migration owns the user_version sentinel. */
   ensureSchema(): void {
+    this.db.immediateTransaction(() => {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS knowledge_sources (
         id TEXT PRIMARY KEY,
@@ -430,6 +437,9 @@ export class SourceRegistry {
         refresh_interval_seconds INTEGER,
         config_version INTEGER NOT NULL DEFAULT 1 CHECK (config_version > 0),
         applied_config_version INTEGER,
+        active_run_id TEXT,
+        active_snapshot_id TEXT,
+        active_ingest_config_hash TEXT,
         lease_fence INTEGER NOT NULL DEFAULT 1 CHECK (lease_fence > 0),
         lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'tombstoned')),
         created_at INTEGER NOT NULL,
@@ -442,6 +452,15 @@ export class SourceRegistry {
     const columns = this.db.prepare(`PRAGMA table_info(knowledge_sources)`).all() as Array<{ name: string }>;
     if (!columns.some((column) => column.name === "local_path_key")) {
       this.db.exec(`ALTER TABLE knowledge_sources ADD COLUMN local_path_key TEXT`);
+    }
+    if (!columns.some((column) => column.name === "active_run_id")) {
+      this.db.exec(`ALTER TABLE knowledge_sources ADD COLUMN active_run_id TEXT`);
+    }
+    if (!columns.some((column) => column.name === "active_snapshot_id")) {
+      this.db.exec(`ALTER TABLE knowledge_sources ADD COLUMN active_snapshot_id TEXT`);
+    }
+    if (!columns.some((column) => column.name === "active_ingest_config_hash")) {
+      this.db.exec(`ALTER TABLE knowledge_sources ADD COLUMN active_ingest_config_hash TEXT`);
     }
     const rows = this.db.prepare(`SELECT id, local_path FROM knowledge_sources WHERE local_path_key IS NULL`).all() as Array<{
       id: string;
@@ -456,6 +475,7 @@ export class SourceRegistry {
       CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_sources_active_local_path_key
         ON knowledge_sources(local_path_key) WHERE lifecycle = 'active';
     `);
+    })();
   }
 
   private canonicalize(input: CreateSourceInput, forcedId?: string, existingGitLocalPath?: string): CanonicalSourceConfig {
@@ -639,7 +659,7 @@ export class SourceRegistry {
     for (const key of Object.keys(patch)) {
       if (!MUTABLE_KEYS.has(key) && !IMMUTABLE_KEYS.has(key)) throw new Error(`unknown source update field: ${key}`);
     }
-    const txn = this.db.transaction(() => {
+    const txn = this.db.immediateTransaction(() => {
       const current = this.getSource(sourceId, { includeTombstoned: true });
       if (!current) throw new Error("source not found");
       if (current.lifecycle === "tombstoned") throw new Error("tombstoned source cannot be updated");
@@ -777,7 +797,7 @@ export class SourceRegistry {
 
   removeSource(id: string): KnowledgeSource | null {
     const sourceId = requireNonemptyString(id, "id");
-    const txn = this.db.transaction(() => {
+    const txn = this.db.immediateTransaction(() => {
       const current = this.getSource(sourceId, { includeTombstoned: true });
       if (!current) return null;
       if (current.lifecycle === "tombstoned") return current;

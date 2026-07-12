@@ -114,13 +114,12 @@ describe("source-pipeline core prerequisites", () => {
         sourceRefs: [sourceRef],
         operationId: "source-a:binding-a:fingerprint-v2:snapshot-v2",
       });
-      // Appending source evidence never exposes a blended stale/current body before the connector
-      // deliberately commits the successor read model.
-      expect((await core.getConcept(first.conceptId, { synthesize: false }))!.body).toBe("Version one: source-backed content.");
+      // Generic fetch remains fenced both before and after the connector commits its read model.
+      expect(await core.getConcept(first.conceptId, { synthesize: false })).toBeNull();
       const refreshed = await core.refreshSourceConcept(first.conceptId, second.observationId, first.observationId);
       expect(refreshed.body).toBe("Version two: refreshed source-backed content.");
       expect(refreshed.title).toBe("Version two: refreshed source-backed content");
-      expect((await core.getConcept(first.conceptId, { synthesize: false }))!.needsSynthesis).toBe(false);
+      expect(await core.getConcept(first.conceptId, { synthesize: false })).toBeNull();
 
       await expect(core.store("Native evidence.", { attachTo: first.conceptId })).rejects.toThrow("source concept");
       await expect(core.detach(first.conceptId, [second.observationId])).rejects.toThrow("source concept");
@@ -164,6 +163,7 @@ describe("source-pipeline core prerequisites", () => {
       expect(core.stats("source-only").sessions).toBe(0);
       expect(core.overview("source-only").counts.sessions).toBe(0);
       expect(core.overview("source-only").counts.observations).toBe(0);
+      expect(core.listCircles().map((entry) => entry.circle)).not.toContain("source-only");
 
       // Same engine instance, same underlying session_id — the native circle still counts it
       // normally, proving the exclusion is scoped to the source-only circle's observation kind,
@@ -171,12 +171,13 @@ describe("source-pipeline core prerequisites", () => {
       expect(core.stats("native-circle").sessions).toBe(1);
       expect(core.overview("native-circle").counts.sessions).toBe(1);
       expect(core.overview("native-circle").counts.observations).toBe(1);
+      expect(core.listCircles().find((entry) => entry.circle === "native-circle")?.concepts).toBe(1);
     } finally {
       core.close();
     }
   });
 
-  it("does not rederive stale source assertions after a source-body refresh", async () => {
+  it("never exposes source assertions through generic graph reads", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     try {
       const target = await core.store("Target record.", { resolution: "forceNew" });
@@ -185,7 +186,7 @@ describe("source-pipeline core prerequisites", () => {
         sourceRefs: [sourceRef],
         operationId: "source-a:binding-a:fingerprint-v1:snapshot-v1",
       });
-      expect(core.edges({ circle: "default", type: "supports" }).some((e) => e.srcId === source.conceptId && e.dstId === target.conceptId)).toBe(true);
+      expect(core.edges({ circle: "default", type: "supports" }).some((e) => e.srcId === source.conceptId && e.dstId === target.conceptId)).toBe(false);
 
       const successor = await core.storeSource("This replacement has no asserted target.", {
         attachTo: source.conceptId,
@@ -316,7 +317,7 @@ describe("source-pipeline core prerequisites", () => {
       expect(core.prewarm().topConcepts.map((c) => c.id)).not.toContain(source.conceptId);
 
       expect(core.restoreConcept(source.conceptId)!.status).toBe("active");
-      expect((await core.search("retire source retrieval")).map((c) => c.id)).toContain(source.conceptId);
+      expect((await core.search("retire source retrieval")).map((c) => c.id)).not.toContain(source.conceptId);
     } finally {
       core.close();
     }
@@ -475,19 +476,11 @@ describe("source-pipeline core prerequisites", () => {
   it("closes graph reads and direct mutations over retired concepts", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     try {
-      const target = await core.storeSource("Target source record.", {
-        sourceRefs: [sourceRef],
-        operationId: "source-a:binding-target:fingerprint-v1:snapshot-v1",
-      });
+      const target = await core.store("Target native record.", { resolution: "forceNew" });
       const referrer = await core.store(`Retired referrer supports: #${target.concept.slug}.`, { resolution: "forceNew" });
       expect(core.edges({ circle: "default", type: "supports" }).some((edge) => edge.srcId === referrer.conceptId)).toBe(true);
       core.retireConcept(referrer.conceptId);
-      const targetRefresh = await core.storeSource("Target source record.", {
-        attachTo: target.conceptId,
-        sourceRefs: [sourceRef],
-        operationId: "source-a:binding-target:fingerprint-v2:snapshot-v2",
-      });
-      await core.refreshSourceConcept(target.conceptId, targetRefresh.observationId, target.observationId);
+      await core.store("Target native record updated.", { attachTo: target.conceptId });
 
       expect(core.edges({ circle: "default" }).some((edge) => edge.srcId === referrer.conceptId || edge.dstId === referrer.conceptId)).toBe(false);
       expect(core.topConnectedConcepts().map((concept) => concept.id)).not.toContain(referrer.conceptId);

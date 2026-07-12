@@ -1,6 +1,7 @@
 export { MonetCore, EmbedderMismatchError } from "./engine";
 export type {
   Concept,
+  SourceConceptRollbackResult,
   SearchCard,
   IngestResult,
   IngestAction,
@@ -29,7 +30,47 @@ export type {
   BatchReassignResult,
 } from "./engine";
 export { BetterSqlitePort } from "./storage";
+export {
+  DEFAULT_SOURCE_SCANNER_LIMITS,
+  SOURCE_SCANNER_VERSION,
+  computeSourceIngestConfigHash,
+  computeSourceManifestHash,
+  effectiveSourceScanConfig,
+  matchesSourceGlob,
+  scanSourceSnapshot,
+} from "./source-scanner";
+export {
+  DEFAULT_SOURCE_MAX_CHUNKS,
+  SOURCE_CHUNKER_VERSION,
+  chunkSourceText,
+  canonicalizeSourceChunkMetadata,
+  computeSourceContentHash,
+  computeSourceIngestFingerprint,
+  computeSourceOperationId,
+  computeSourceRefOccurrences,
+  hashSourceDomain,
+  sourceHeadingIdentityKey,
+  sourceHeadingAnchor,
+} from "./source-chunker";
 export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";
+export type {
+  EffectiveSourceScanConfig,
+  EffectiveSourceScanConfigInput,
+  ScanSourceSnapshotInput,
+  SourceScanDiagnostic,
+  SourceScanDiagnosticCode,
+  SourceScanFile,
+  SourceScanResult,
+  SourceScannerLimits,
+} from "./source-scanner";
+export type {
+  ChunkSourceTextInput,
+  ChunkSourceTextResult,
+  SourceChunk,
+  SourceChunkDiagnostic,
+  SourceChunkMetadata,
+  SourceHeadingIdentity,
+} from "./source-chunker";
 export type {
   SourceType,
   SourceWriteBack,
@@ -50,6 +91,20 @@ export type {
   SourceGetOptions,
   SourceAuthorizationContext,
   SourceRunFence,
+  SourceSyncRunState,
+  SourceSyncRunResult,
+  SourceChunkWriteState,
+  SourceSyncRun,
+  BeginSourceRunInput,
+  BeginSourceRunResult,
+  SourceManifestFileInput,
+  SourceManifestChunkInput,
+  StageSourceManifestInput,
+  RecordSourceBindingReceiptInput,
+  PublishSourceRunInput,
+  SourceFileRecord,
+  SourceChunkRecord,
+  SourceCleanupItem,
 } from "./source-types";
 export { renderOverview } from "./render-overview";
 export { extractEntities } from "./extract-entities";

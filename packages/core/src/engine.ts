@@ -18,12 +18,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import { StoragePort, BetterSqlitePort } from "./storage";
 import { SourceRegistry } from "./source-registry";
+import { SourceLedger } from "./source-ledger";
 import type {
+  BeginSourceRunInput,
+  BeginSourceRunResult,
   CreateSourceInput,
   KnowledgeSource,
   SourceAuthorizationContext,
   SourceGetOptions,
   SourceListOptions,
+  PublishSourceRunInput,
+  RecordSourceBindingReceiptInput,
+  SourceChunkRecord,
+  SourceCleanupItem,
+  SourceFileRecord,
+  SourceSyncRun,
+  StageSourceManifestInput,
   UpdateSourceInput,
 } from "./source-types";
 import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend, blendWeighted } from "./embedding";
@@ -68,6 +78,7 @@ const SYNC_SCHEMA_VERSION = 5; // PRAGMA user_version gate for sync engine primi
 const SOURCE_SCHEMA_VERSION = 6; // PRAGMA user_version gate for source-concept prerequisites (ingest_operations, concept_tombstones/restorations, source_identity/active_observation_id)
 const SOURCE_REGISTRY_SCHEMA_VERSION = 7; // PRAGMA user_version gate for the durable knowledge_sources registry
 const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
+const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/activation ledger
 export const FIRST_BLOCK_SUMMARY_MAX_CHARS = 800; // hard cap on a first_block summary (cost signal)
 
 /**
@@ -115,6 +126,12 @@ export interface Concept {
   dirty: boolean;
   /** Unix ms of the last evidence-based confirmation (create, cross-session attach, or accepted contradiction resolution). Null for pre-0.6.0 rows that have not yet been backfilled, and legitimately null for kind='workstream' rows written by saveWorkstream() (workstreams are excluded from staleness and merge paths, so the NULL is inert). */
   lastConfirmedAt: number | null;
+}
+
+/** Connector-only result for reversing one activated source observation. */
+export interface SourceConceptRollbackResult {
+  concept: Concept;
+  replayed: boolean;
 }
 
 /**
@@ -532,6 +549,7 @@ export class MonetCore {
   private edgeSimMin: number;
   private newId: () => string;
   private sourceRegistry: SourceRegistry;
+  private sourceLedger: SourceLedger;
   /** Stable store identity for sync; unlike agentId this is persisted and never defaults globally. */
   private syncDeviceId = "";
   /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
@@ -559,6 +577,7 @@ export class MonetCore {
       sourceStorageDir: opts.sourceStorageDir,
       canonicalizeCircle: (circle) => this.resolveCircle(circle),
     });
+    this.sourceLedger = new SourceLedger(this.db, { idGen: this.newId });
     this.scopeContext = opts.scopeContext ?? null;
     this.defaultCircle = opts.defaultCircle ?? "default";
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -571,6 +590,11 @@ export class MonetCore {
     this.initSyncIdentity(opts.syncDeviceId);
     this.sourceRegistry.ensureSchema();
     this.migrate();
+    this.sourceLedger.ensureSchema();
+    const versionAfterLedger = this.db.pragma("user_version", { simple: true }) as number;
+    if (versionAfterLedger >= SYNC_CLOSURE_SCHEMA_VERSION && versionAfterLedger < SOURCE_LEDGER_SCHEMA_VERSION) {
+      this.db.pragma(`user_version = ${SOURCE_LEDGER_SCHEMA_VERSION}`);
+    }
   }
 
   private initSyncIdentity(requested?: string): void {
@@ -1722,17 +1746,17 @@ export class MonetCore {
     // out of dedup candidates and search cards (they're restored via getActiveWorkstreams).
     const rows: ConceptRow[] = resolvedCircle !== undefined
       ? this.db
-          .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind != 'workstream' AND status != 'retired'`)
+          .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND status != 'retired'`)
           .all(resolvedCircle) as ConceptRow[]
       : opts.includeArchived
         ? this.db
-            .prepare(`SELECT * FROM concepts WHERE kind != 'workstream' AND status != 'retired'`)
+            .prepare(`SELECT * FROM concepts WHERE kind NOT IN ('workstream', 'source') AND status != 'retired'`)
             .all() as ConceptRow[]
         : this.db
             .prepare(
               `SELECT c.* FROM concepts c
                 LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
-               WHERE c.kind != 'workstream' AND c.status != 'retired' AND ca.from_name IS NULL`,
+               WHERE c.kind NOT IN ('workstream', 'source') AND c.status != 'retired' AND ca.from_name IS NULL`,
             )
             .all() as ConceptRow[];
     const contradictions = this.openContradictionCountsGlobal(resolvedCircle);
@@ -1770,16 +1794,14 @@ export class MonetCore {
     if (!row) return null;
     // Retirement is a public read fence. Internal lifecycle/maintenance code uses getRow()
     // directly, so restore can still locate the tombstoned row without exposing its evidence.
-    if (row.status === "retired") return null;
+    if (row.status === "retired" || row.kind === "source") return null;
     // A fetch is a "touch": it signals the concept was useful (drives prewarm ranking, §4.2).
     // Also record the precise fetch timestamp so usefulness decay starts from the last actual fetch,
     // not from last_confirmed_at (which is a confirmation event, not a retrieval event).
     this.db
       .prepare(`UPDATE concepts SET usefulness_score = usefulness_score + 1, usefulness_last_fetched_at = ? WHERE id = ?`)
       .run(Date.now(), id);
-    // Source chunks are connector-owned read models. Their body is refreshed explicitly, never
-    // synthesized from an agent fetch.
-    const synthesizedNow = row.kind !== "source" && row.dirty === 1 && (opts.synthesize ?? true);
+    const synthesizedNow = row.dirty === 1 && (opts.synthesize ?? true);
     if (synthesizedNow) row = await this.synthesizeRow(row);
 
     const allObs = this.db
@@ -1809,7 +1831,7 @@ export class MonetCore {
       observationsOffset,
       revisions: revs.n,
       synthesizedNow,
-      needsSynthesis: row.kind !== "source" && row.dirty === 1,
+      needsSynthesis: row.dirty === 1,
     };
   }
 
@@ -2092,7 +2114,7 @@ export class MonetCore {
       .prepare(
         `SELECT k.id AS id, k.concept_id AS conceptId, c.title AS conceptTitle, k.kind AS kind, k.detail AS detail
            FROM contradictions k JOIN concepts c ON c.id = k.concept_id
-          WHERE k.status = 'open' AND c.circle = ?
+          WHERE k.status = 'open' AND c.circle = ? AND c.kind != 'source'
           ORDER BY k.detected_at DESC`,
       )
       .all(circle) as PrewarmContradiction[];
@@ -2115,7 +2137,7 @@ export class MonetCore {
    * counted here. Test-only helper (observability + tests).
    */
   supersededObservationCount(): number {
-    return (this.db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE superseded_by IS NOT NULL`).get() as { n: number }).n;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE o.superseded_by IS NOT NULL AND c.kind != 'source'`).get() as { n: number }).n;
   }
 
   /**
@@ -2259,6 +2281,157 @@ export class MonetCore {
     })();
   }
 
+  /**
+   * Connector-only compensation for a refresh that committed before the source run lost its
+   * config/lease fence. Only the exact successor→predecessor edge written by refreshSourceConcept
+   * is reversible; every other state is rejected. An exact completed compensation is replay-safe.
+   */
+  async rollbackSourceRunBinding(runId: string, bindingId: string): Promise<SourceConceptRollbackResult> {
+    const authorize = (): { conceptId: string; successorObservationId: string; predecessorObservationId: string } => {
+      const row = this.db.prepare(
+        `SELECT run.state AS run_state,run.source_id,
+                cleanup.kind AS cleanup_kind,cleanup.acknowledged_at,cleanup.operation_id AS cleanup_operation,
+                cleanup.target_run_id AS cleanup_target_run,
+                cleanup.concept_id AS cleanup_concept,cleanup.observation_id AS cleanup_observation,
+                cleanup.predecessor_observation_id AS cleanup_predecessor,
+                staged.write_state,staged.operation_id,staged.concept_id,staged.observation_id,staged.predecessor_observation_id,
+                op.writer_domain,op.source_concept_id,op.concept_id AS op_concept,op.observation_id AS op_observation,
+                source.active_run_id,source.active_snapshot_id,
+                prior.source_id AS prior_source,prior.snapshot_id AS prior_snapshot,prior.concept_id AS prior_concept,
+                prior.observation_id AS prior_observation,prior.lifecycle AS prior_lifecycle,
+                snapshot.state AS snapshot_state
+           FROM source_sync_runs run
+           JOIN source_cleanup_items cleanup ON cleanup.run_id=run.id AND cleanup.binding_id=?
+           JOIN source_staged_chunks staged ON staged.run_id=run.id AND staged.binding_id=cleanup.binding_id
+           JOIN ingest_operations op ON op.operation_id=staged.operation_id
+           JOIN knowledge_sources source ON source.id=run.source_id
+           JOIN source_chunks prior ON prior.run_id=source.active_run_id AND prior.binding_id=staged.binding_id
+           JOIN source_snapshots snapshot ON snapshot.run_id=source.active_run_id
+          WHERE run.id=?`,
+      ).get(bindingId, runId) as Record<string, unknown> | undefined;
+      if (!row) throw new Error("source rollback has no durable authorized run binding");
+      if (row.run_state !== "aborted" || row.cleanup_kind !== "reconcile-orphan" || row.acknowledged_at !== null
+          || typeof row.cleanup_operation !== "string" || row.cleanup_operation !== row.operation_id
+          || row.write_state !== "committed" || typeof row.concept_id !== "string"
+          || typeof row.observation_id !== "string" || typeof row.predecessor_observation_id !== "string"
+          || row.cleanup_concept !== row.concept_id || row.cleanup_observation !== row.observation_id
+          || row.cleanup_predecessor !== row.predecessor_observation_id
+          || row.writer_domain !== "source" || row.source_concept_id !== row.concept_id
+          || row.op_concept !== row.concept_id || row.op_observation !== row.observation_id
+          || row.cleanup_target_run !== row.active_run_id
+          || row.prior_source !== row.source_id || row.prior_lifecycle !== "active"
+          || row.prior_concept !== row.concept_id || row.prior_observation !== row.predecessor_observation_id
+          || row.prior_snapshot !== row.active_snapshot_id || row.snapshot_state !== "active") {
+        throw new Error("source rollback durable authorization or active predecessor ownership is stale");
+      }
+      if (this.db.prepare(`SELECT 1 FROM source_chunks WHERE observation_id=? LIMIT 1`).get(row.observation_id)) {
+        throw new Error("source rollback successor has already been published");
+      }
+      return {
+        conceptId: row.concept_id,
+        successorObservationId: row.observation_id,
+        predecessorObservationId: row.predecessor_observation_id,
+      } as { conceptId: string; successorObservationId: string; predecessorObservationId: string };
+    };
+    const authorized = authorize();
+    const { conceptId, successorObservationId, predecessorObservationId } = authorized;
+    const readObservation = (observationId: string): {
+      content: string; concept_id: string | null; kind: string; source_refs: string | null;
+      superseded_by: string | null; superseded_at: number | null;
+    } | undefined => this.db.prepare(
+      `SELECT content,concept_id,kind,source_refs,superseded_by,superseded_at FROM observations WHERE id=?`,
+    ).get(observationId) as {
+      content: string; concept_id: string | null; kind: string; source_refs: string | null;
+      superseded_by: string | null; superseded_at: number | null;
+    } | undefined;
+    const validateOwner = (row: ConceptRow, observation: ReturnType<typeof readObservation>, label: string): NonNullable<ReturnType<typeof readObservation>> => {
+      if (!observation || observation.concept_id !== row.id) {
+        throw new Error(`source rollback ${label} does not belong to the source concept`);
+      }
+      if (observation.kind !== "source" || canonicalSourceIdentityFromJson(observation.source_refs) !== row.source_identity) {
+        throw new Error(`source rollback ${label} identity does not match the source concept`);
+      }
+      return observation;
+    };
+    const classify = (row: ConceptRow): "forward" | "replay" => {
+      if (row.kind !== "source") throw new Error("rollbackSourceRunBinding requires a source concept");
+      if (row.status !== "active" || !row.source_identity || !row.active_observation_id) {
+        throw new Error("source rollback requires an active source projection");
+      }
+      const successor = validateOwner(row, readObservation(successorObservationId), "successor");
+      const predecessor = validateOwner(row, readObservation(predecessorObservationId), "predecessor");
+      if (row.active_observation_id === successorObservationId
+          && successor.superseded_by === null && successor.superseded_at === null
+          && predecessor.superseded_by === successorObservationId && predecessor.superseded_at !== null) {
+        return "forward";
+      }
+      if (row.active_observation_id === predecessorObservationId
+          && predecessor.superseded_by === null && predecessor.superseded_at === null
+          && successor.superseded_by === null && successor.superseded_at !== null) {
+        return "replay";
+      }
+      throw new Error("source rollback state does not match the exact refresh edge or its completed replay");
+    };
+
+    const initial = this.getRow(conceptId);
+    if (!initial) throw new Error(`concept not found: ${conceptId}`);
+    const initialState = classify(initial);
+    if (initialState === "replay") {
+      return this.db.immediateTransaction(() => {
+        const current = authorize();
+        if (current.conceptId !== conceptId || current.successorObservationId !== successorObservationId
+            || current.predecessorObservationId !== predecessorObservationId) {
+          throw new Error("source rollback durable authorization changed during replay");
+        }
+        const row = this.getRow(conceptId);
+        if (!row || classify(row) !== "replay") throw new Error("source rollback replay state changed");
+        return { concept: toConcept(row), replayed: true };
+      })();
+    }
+    const predecessor = validateOwner(initial, readObservation(predecessorObservationId), "predecessor");
+    const body = predecessor.content.trim();
+    const embedding = await this.embedder.embed(predecessor.content);
+
+    return this.db.immediateTransaction((): SourceConceptRollbackResult => {
+      const currentAuthorization = authorize();
+      if (currentAuthorization.conceptId !== conceptId
+          || currentAuthorization.successorObservationId !== successorObservationId
+          || currentAuthorization.predecessorObservationId !== predecessorObservationId) {
+        throw new Error("source rollback durable authorization changed during compensation");
+      }
+      const row = this.getRow(conceptId);
+      if (!row) throw new Error("source concept disappeared during rollback");
+      const state = classify(row);
+      if (state === "replay") return { concept: toConcept(row), replayed: true };
+      const currentPredecessor = validateOwner(row, readObservation(predecessorObservationId), "predecessor");
+      const version = row.version + 1;
+      const title = firstLine(body) || row.title;
+      this.unwindConceptGraph(conceptId, row.circle);
+      const terminalAt = Date.now();
+      const terminal = this.db.prepare(
+        `UPDATE observations SET superseded_by=NULL,superseded_at=?
+          WHERE id=? AND concept_id=? AND superseded_by IS NULL AND superseded_at IS NULL`,
+      ).run(terminalAt, successorObservationId, conceptId);
+      if (terminal.changes !== 1) throw new Error("source rollback successor changed during compensation");
+      const restored = this.db.prepare(
+        `UPDATE observations SET superseded_by=NULL,superseded_at=NULL
+          WHERE id=? AND concept_id=? AND superseded_by=? AND superseded_at IS NOT NULL`,
+      ).run(predecessorObservationId, conceptId, successorObservationId);
+      if (restored.changes !== 1) throw new Error("source rollback predecessor changed during compensation");
+      const activated = this.db.prepare(
+        `UPDATE concepts SET title=?,body=?,embedding=?,source_refs=?,version=?,dirty=0,
+                active_observation_id=?,updated_at=unixepoch()*1000
+          WHERE id=? AND kind='source' AND status='active' AND active_observation_id=?
+            AND circle=? AND source_identity=?`,
+      ).run(title, body, embToJson(embedding), currentPredecessor.source_refs, version,
+        predecessorObservationId, conceptId, successorObservationId, row.circle, row.source_identity);
+      if (activated.changes !== 1) throw new Error("source rollback active observation compare-and-swap failed");
+      this.writeRevision(conceptId, version, body);
+      this.rederiveConceptGraph(conceptId, row.circle);
+      return { concept: toConcept(this.getRow(conceptId)!), replayed: false };
+    })();
+  }
+
   /** Return the exact active source-ledger observation, or reject a stale/foreign refresh. */
   private currentSourceObservation(conceptId: string, observationId: string, sourceIdentity: string): { content: string } {
     const observation = this.db
@@ -2367,12 +2540,12 @@ export class MonetCore {
       ? this.db
           .prepare(
             `SELECT k.concept_id AS cid, COUNT(*) AS n FROM contradictions k JOIN concepts c ON c.id = k.concept_id
-              WHERE k.status = 'open' AND c.circle = ? GROUP BY k.concept_id`,
+              WHERE k.status = 'open' AND c.circle = ? AND c.kind != 'source' GROUP BY k.concept_id`,
           )
           .all(circle) as Array<{ cid: string; n: number }>
       : this.db
           .prepare(
-            `SELECT concept_id AS cid, COUNT(*) AS n FROM contradictions WHERE status = 'open' GROUP BY concept_id`,
+            `SELECT k.concept_id AS cid, COUNT(*) AS n FROM contradictions k JOIN concepts c ON c.id = k.concept_id WHERE k.status = 'open' AND c.kind != 'source' GROUP BY k.concept_id`,
           )
           .all() as Array<{ cid: string; n: number }>;
     const m = new Map<string, number>();
@@ -2438,7 +2611,7 @@ export class MonetCore {
   ): MemoryListEntry[] {
     circle = this.resolveCircle(circle ?? this.defaultCircle);
     const params: Array<string | number> = [circle];
-    let where = `circle = ? AND kind != 'workstream' AND status != 'retired'`;
+    let where = `circle = ? AND kind NOT IN ('workstream', 'source') AND status != 'retired'`;
     if (opts.cursor) {
       // Rows strictly AFTER (updatedAt, id) in the `updated_at DESC, id ASC` order.
       where += ` AND (updated_at < ? OR (updated_at = ? AND id > ?))`;
@@ -2503,14 +2676,14 @@ export class MonetCore {
 
   /** The circle a concept lives in, or null if it doesn't exist — for id-based scope enforcement. */
   circleOf(conceptId: string): string | null {
-    const r = this.db.prepare(`SELECT circle FROM concepts WHERE id = ?`).get(conceptId) as { circle: string } | undefined;
+    const r = this.db.prepare(`SELECT circle FROM concepts WHERE id = ? AND kind != 'source'`).get(conceptId) as { circle: string } | undefined;
     return r?.circle ?? null;
   }
 
   /** The circle of the concept a contradiction belongs to, or null — for id-based scope enforcement. */
   circleOfContradiction(contradictionId: string): string | null {
     const r = this.db
-      .prepare(`SELECT c.circle AS circle FROM contradictions k JOIN concepts c ON c.id = k.concept_id WHERE k.id = ?`)
+      .prepare(`SELECT c.circle AS circle FROM contradictions k JOIN concepts c ON c.id = k.concept_id WHERE k.id = ? AND c.kind != 'source'`)
       .get(contradictionId) as { circle: string } | undefined;
     return r?.circle ?? null;
   }
@@ -3080,23 +3253,18 @@ export class MonetCore {
   }
 
   /**
-   * Population size for the df/n hub-gate math ONLY (deriveEntityEdges, isHub, rarity,
-   * topEntityHubs) — distinct from the public, source-EXCLUSIVE conceptCount()/stats() used for
-   * user-facing counts. deriveEdges runs on source CREATE (only source ATTACH is skipped — see
-   * storeInternal's `!(row.kind === "source" && opts.attachTo)` graph-derivation guard), so entity
-   * df already accumulates over a source-INCLUSIVE population. The denominator must match that
-   * same basis or df/n reads artificially high (n undercounted relative to df) and skews the hub
-   * gate / rarity score. Workstreams are still excluded — they are never entity-tagged.
+   * Population size for generic graph projections. Source concepts are connector-owned read
+   * models and must not affect generic hub thresholds, rarity, ranking, or counts.
    */
   private entityScopeSize(circle: string): number {
     const r = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind != 'workstream' AND status != 'retired'`)
+      .prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND status != 'retired'`)
       .get(circle) as { n: number };
     return r.n;
   }
 
   observationCount(): number {
-    return (this.db.prepare(`SELECT COUNT(*) AS n FROM observations`).get() as { n: number }).n;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE c.kind != 'source' AND c.status != 'retired'`).get() as { n: number }).n;
   }
 
   stats(circle?: string): { concepts: number; observations: number; dirty: number; workstreams: number; sessions: number } & { circle?: string; resolvedFrom?: string } {
@@ -3109,7 +3277,14 @@ export class MonetCore {
         workstreams: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'workstream'`),
         // Store-wide stats retain the established sessions-table semantics: a workstream-only
         // session is real session state even though it has no observation in a visible circle.
-        sessions: n(`SELECT COUNT(*) AS n FROM sessions`),
+        sessions: n(`SELECT COUNT(*) AS n FROM sessions s
+          WHERE NOT EXISTS (
+            SELECT 1 FROM observations so JOIN concepts sc ON sc.id = so.concept_id
+             WHERE so.session_id = s.id AND sc.kind = 'source'
+          ) OR EXISTS (
+            SELECT 1 FROM observations no JOIN concepts nc ON nc.id = no.concept_id
+             WHERE no.session_id = s.id AND nc.kind != 'source' AND nc.status != 'retired'
+          )`),
       };
     }
     const resolved = this.resolveCircle(circle);
@@ -3131,12 +3306,13 @@ export class MonetCore {
   }
 
   isDirty(id: string): boolean {
-    return this.getRow(id)?.dirty === 1;
+    const row = this.getRow(id);
+    return row?.kind !== "source" && row?.status !== "retired" && row?.dirty === 1;
   }
 
   /** Observability/testing: list connection-graph edges (optionally filtered by circle/type). */
   edges(opts: { circle?: string; type?: string } = {}): Array<{ srcId: string; dstId: string; type: string; weight: number; origin: string; count: number }> {
-    const where: string[] = ["src.status != 'retired'", "dst.status != 'retired'"];
+    const where: string[] = ["src.status != 'retired'", "dst.status != 'retired'", "src.kind != 'source'", "dst.kind != 'source'"];
     const args: string[] = [];
     if (opts.circle) (where.push("e.scope = ?"), args.push(opts.circle));
     if (opts.type) (where.push("e.type = ?"), args.push(opts.type));
@@ -3150,7 +3326,7 @@ export class MonetCore {
   /** Observability/testing: the entity keys a concept is tagged with (#245 `about` hubs). */
   conceptEntities(conceptId: string): string[] {
     return (
-      this.db.prepare(`SELECT entity_key FROM concept_entities WHERE concept_id = ? ORDER BY entity_key`).all(conceptId) as Array<{
+      this.db.prepare(`SELECT ce.entity_key FROM concept_entities ce JOIN concepts c ON c.id = ce.concept_id WHERE ce.concept_id = ? AND c.kind != 'source' AND c.status != 'retired' ORDER BY ce.entity_key`).all(conceptId) as Array<{
         entity_key: string;
       }>
     ).map((r) => r.entity_key);
@@ -3177,16 +3353,17 @@ export class MonetCore {
     if (n === 0) return [];
     return this.db
       .prepare(
-        `SELECT ce.entity_key AS key, e.surface AS surface, e.kind AS kind, e.df AS df,
+        `SELECT ce.entity_key AS key, e.surface AS surface, e.kind AS kind,
+                COUNT(DISTINCT ce.concept_id) AS df,
                 COUNT(DISTINCT ce.concept_id) AS members
            FROM concept_entities ce
            JOIN entities e ON e.key = ce.entity_key AND e.scope = ce.scope
            JOIN concepts c ON c.id = ce.concept_id
-          WHERE ce.scope = ? AND c.status = 'active' AND c.kind != 'workstream'
+          WHERE ce.scope = ? AND c.status = 'active' AND c.kind NOT IN ('workstream', 'source')
           GROUP BY ce.entity_key
-         HAVING members >= ? AND (CAST(e.df AS REAL) / ?) <= ?
+         HAVING members >= ? AND (CAST(members AS REAL) / ?) <= ?
             AND (e.kind IN ('path','id','err','lib') OR members >= ?)
-          ORDER BY (e.kind IN ('path','id','err','lib')) DESC, members DESC, e.df DESC, ce.entity_key
+          ORDER BY (e.kind IN ('path','id','err','lib')) DESC, members DESC, ce.entity_key
           LIMIT ?`,
       )
       .all(circle, minMembers, n, maxDfFrac, nounMin, limit) as EntityHub[];
@@ -3216,8 +3393,8 @@ export class MonetCore {
              UNION ALL
              SELECT dst_id AS cid, src_id AS other, type, scope FROM memory_edge
            ) nb ON nb.cid = c.id
-           JOIN concepts other ON other.id = nb.other AND other.kind != 'workstream' AND other.status != 'retired'
-          WHERE nb.scope = ? AND c.kind != 'workstream' AND c.status != 'retired' AND nb.type IN (${placeholders})
+           JOIN concepts other ON other.id = nb.other AND other.kind NOT IN ('workstream', 'source') AND other.status != 'retired'
+          WHERE nb.scope = ? AND c.kind NOT IN ('workstream', 'source') AND c.status != 'retired' AND nb.type IN (${placeholders})
           GROUP BY c.id
           ORDER BY degree DESC, c.id
           LIMIT ?`,
@@ -3233,8 +3410,8 @@ export class MonetCore {
         `SELECT type, COUNT(*) AS count FROM (
             SELECT DISTINCT e.type AS type, MIN(e.src_id, e.dst_id) AS a, MAX(e.src_id, e.dst_id) AS b
               FROM memory_edge e
-              JOIN concepts src ON src.id = e.src_id AND src.status != 'retired'
-              JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired'
+              JOIN concepts src ON src.id = e.src_id AND src.status != 'retired' AND src.kind != 'source'
+              JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired' AND dst.kind != 'source'
              WHERE e.scope = ?
           ) GROUP BY type ORDER BY count DESC, type`,
       )
@@ -3272,7 +3449,7 @@ export class MonetCore {
     if (best.length < minSize) return null;
     const members = best
       .map((id) => this.getRow(id))
-      .filter((r): r is ConceptRow => r !== null && r.status !== "retired")
+      .filter((r): r is ConceptRow => r !== null && r.status !== "retired" && r.kind !== "source")
       .sort((a, b) => b.support_count - a.support_count || (a.id < b.id ? -1 : 1))
       .slice(0, 4)
       .map((r) => ({ id: r.id, title: r.title, kind: r.kind }));
@@ -3301,14 +3478,14 @@ export class MonetCore {
       .prepare(
         `SELECT c.id AS id, c.title AS title, c.kind AS kind
            FROM concepts c JOIN concept_entities ce ON ce.concept_id = c.id
-          WHERE ce.entity_key = ? AND ce.scope = ? AND c.kind != 'workstream' AND c.status != 'retired' ORDER BY c.id`,
+          WHERE ce.entity_key = ? AND ce.scope = ? AND c.kind NOT IN ('workstream', 'source') AND c.status != 'retired' ORDER BY c.id`,
       )
       .all(entityKey, circle) as Array<{ id: string; title: string; kind: string }>;
   }
 
   private disputedCount(circle?: string): number {
     circle ??= this.defaultCircle;
-    return (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND status = 'disputed'`).get(circle) as { n: number }).n;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND status = 'disputed' AND kind != 'source'`).get(circle) as { n: number }).n;
   }
 
   private getPossibleDuplicatePairs(circle: string): PossibleDuplicatePair[] {
@@ -3323,8 +3500,8 @@ export class MonetCore {
           WHERE e.scope = ? AND e.type = 'possible_duplicate_of'
             AND e.dismissed_at IS NULL
             AND e.src_id < e.dst_id
-            AND ca.kind != 'workstream' AND ca.status != 'retired'
-            AND cb.kind != 'workstream' AND cb.status != 'retired'
+            AND ca.kind NOT IN ('workstream', 'source') AND ca.status != 'retired'
+            AND cb.kind NOT IN ('workstream', 'source') AND cb.status != 'retired'
           ORDER BY e.weight DESC
           LIMIT ${OVERVIEW_DUP_PAIRS_MAX}`,
       )
@@ -3340,8 +3517,8 @@ export class MonetCore {
          WHERE e.scope = ? AND e.type = 'possible_duplicate_of'
            AND e.dismissed_at IS NULL
            AND e.src_id < e.dst_id
-           AND ca.kind != 'workstream' AND ca.status != 'retired'
-           AND cb.kind != 'workstream' AND cb.status != 'retired'`,
+           AND ca.kind NOT IN ('workstream', 'source') AND ca.status != 'retired'
+           AND cb.kind NOT IN ('workstream', 'source') AND cb.status != 'retired'`,
       )
       .get(circle) as { n: number };
     return r.n;
@@ -3427,7 +3604,7 @@ export class MonetCore {
         workstreams: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind = 'workstream'`, circle),
         sessions: this.scopedCount(`SELECT COUNT(DISTINCT o.session_id) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE o.circle = ? AND o.session_id IS NOT NULL AND c.status != 'retired' AND c.kind != 'source'`, circle),
         edges,
-        entities: this.scopedCount(`SELECT COUNT(*) AS n FROM entities WHERE scope = ?`, circle),
+        entities: this.scopedCount(`SELECT COUNT(DISTINCT ce.entity_key) AS n FROM concept_entities ce JOIN concepts c ON c.id = ce.concept_id WHERE ce.scope = ? AND c.kind != 'source' AND c.status != 'retired'`, circle),
         disputed: this.disputedCount(circle),
         stale: this.getStaleConcepts(circle).length,
         possibleDuplicates: this.possibleDuplicateCount(circle),
@@ -3467,7 +3644,7 @@ export class MonetCore {
       ? this.db
           .prepare(
             `SELECT circle, COUNT(*) AS concepts, MAX(updated_at) AS lastActivity
-               FROM concepts WHERE kind != 'workstream' AND status != 'retired' AND circle != ?
+               FROM concepts WHERE kind NOT IN ('workstream', 'source') AND status != 'retired' AND circle != ?
               GROUP BY circle
               ORDER BY lastActivity DESC LIMIT 20`,
           )
@@ -3475,7 +3652,7 @@ export class MonetCore {
       : this.db
           .prepare(
             `SELECT circle, COUNT(*) AS concepts, MAX(updated_at) AS lastActivity
-               FROM concepts WHERE kind != 'workstream' AND status != 'retired'
+               FROM concepts WHERE kind NOT IN ('workstream', 'source') AND status != 'retired'
               GROUP BY circle
               ORDER BY lastActivity DESC LIMIT 20`,
           )
@@ -3523,6 +3700,62 @@ export class MonetCore {
       return this.sourceRegistry.authorizeSource(sourceId, callerOrContext, projectId ?? "");
     }
     return this.sourceRegistry.authorizeSource(sourceId, callerOrContext);
+  }
+
+  beginSourceRun(input: BeginSourceRunInput): BeginSourceRunResult {
+    return this.sourceLedger.beginRun(input);
+  }
+
+  stageSourceManifest(input: StageSourceManifestInput): SourceSyncRun {
+    return this.sourceLedger.stageManifest(input);
+  }
+
+  recordSourceBindingReceipt(input: RecordSourceBindingReceiptInput): SourceChunkRecord {
+    return this.sourceLedger.recordBindingReceipt(input);
+  }
+
+  beginSourceActivation(runId: string): string {
+    return this.sourceLedger.beginActivation(runId);
+  }
+
+  publishSourceRun(input: PublishSourceRunInput): SourceSyncRun {
+    return this.sourceLedger.publishRun(input);
+  }
+
+  abortSourceRun(runId: string, result: "failed" | "partial", reason?: string): SourceSyncRun {
+    return this.sourceLedger.abortRun(runId, result, reason);
+  }
+
+  acknowledgeSourceCleanup(itemId: string): SourceCleanupItem {
+    return this.sourceLedger.acknowledgeCleanup(itemId);
+  }
+
+  getSourceRun(runId: string): SourceSyncRun | null {
+    return this.sourceLedger.getRun(runId);
+  }
+
+  listSourceRuns(sourceId: string): SourceSyncRun[] {
+    return this.sourceLedger.listRuns(sourceId);
+  }
+
+  resumeSourceRun(sourceId: string): SourceSyncRun | null {
+    return this.sourceLedger.resumeRun(sourceId);
+  }
+
+  listSourceFiles(runId: string, published = false): SourceFileRecord[] {
+    return this.sourceLedger.listFiles(runId, published);
+  }
+
+  listSourceChunks(runId: string, published = false): SourceChunkRecord[] {
+    return this.sourceLedger.listChunks(runId, published);
+  }
+
+  listSourceCleanupItems(runId: string): SourceCleanupItem[] {
+    return this.sourceLedger.listCleanupItems(runId);
+  }
+
+  nextSourceBindingGeneration(sourceId: string, bindingId: string): number {
+    return this.sourceLedger.nextBindingGeneration(sourceId, bindingId);
   }
 
   // ---- sync: engine primitives (slice 1a) ----------------------------------
@@ -5085,7 +5318,7 @@ export class MonetCore {
            FROM first_block fb
            JOIN concepts c ON c.id = fb.concept_id
           WHERE c.circle = ? AND fb.circle = c.circle
-            AND c.status != 'retired' AND fb.deleted_at IS NULL
+            AND c.status != 'retired' AND c.kind != 'source' AND fb.deleted_at IS NULL
           ORDER BY fb.position ASC, fb.concept_id ASC`,
       )
       .all(circle) as Array<{
@@ -5202,7 +5435,7 @@ export class MonetCore {
     const now = Date.now();
 
     return this.db.transaction(() => {
-      const maxPos = (this.db.prepare(`SELECT COALESCE(MAX(fb.position), -1) AS m FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND fb.deleted_at IS NULL`).get(circle) as { m: number }).m;
+      const maxPos = (this.db.prepare(`SELECT COALESCE(MAX(fb.position), -1) AS m FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND c.kind != 'source' AND fb.deleted_at IS NULL`).get(circle) as { m: number }).m;
       const position = maxPos + 1;
       const existing = this.db.prepare(`SELECT id, deleted_at FROM first_block WHERE concept_id = ? AND circle = ?`).get(conceptId, circle) as { id: string; deleted_at: number | null } | undefined;
       if (existing && existing.deleted_at === null) throw new Error(`concept ${conceptId} is already pinned in circle '${circle}'`);
@@ -5225,7 +5458,7 @@ export class MonetCore {
         .run(FIRST_BLOCK_PROMOTION_USEFULNESS_BOOST, now, conceptId);
       // Total summary chars across the circle (cost feedback for the user).
       const totalRow = this.db
-        .prepare(`SELECT COALESCE(SUM(LENGTH(fb.summary)), 0) AS total FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND fb.deleted_at IS NULL`)
+        .prepare(`SELECT COALESCE(SUM(LENGTH(fb.summary)), 0) AS total FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND c.kind != 'source' AND fb.deleted_at IS NULL`)
         .get(circle) as { total: number };
       return { id: entryId, conceptId, summary, position, totalSummaryChars: totalRow.total };
     })();
@@ -5678,7 +5911,7 @@ export class MonetCore {
       this.db
         .prepare(
           `SELECT ce.concept_id AS id FROM concept_entities ce
-            JOIN concepts c ON c.id = ce.concept_id AND c.status != 'retired' AND c.kind != 'workstream'
+            JOIN concepts c ON c.id = ce.concept_id AND c.status != 'retired' AND c.kind NOT IN ('workstream', 'source')
            WHERE ce.entity_key = ? AND ce.scope = ? AND ce.concept_id != ?
            ORDER BY ce.concept_id LIMIT ?`, // deterministic subset under the cap (graph.ts determinism contract)
         )
@@ -6088,7 +6321,7 @@ export class MonetCore {
    */
   allConceptTextsForEval(circle: string): Array<{ id: string; text: string }> {
     const rows = this.db
-      .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+      .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND status != 'retired'`)
       .all(circle) as Array<{ id: string; title: string; body: string }>;
     return rows.map((r) => ({ id: r.id, text: `${r.title} ${r.body}`.trim() }));
   }
@@ -6101,7 +6334,7 @@ export class MonetCore {
    */
   allConceptsForExport(circle: string): Array<{ id: string; title: string; body: string; kind: string }> {
     const rows = this.db
-      .prepare(`SELECT id, title, body, kind FROM concepts WHERE circle = ? AND kind != 'workstream'`)
+      .prepare(`SELECT id, title, body, kind FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND status != 'retired'`)
       .all(circle) as Array<{ id: string; title: string; body: string; kind: string }>;
     return rows.map((r) => ({ id: r.id, title: r.title, body: r.body, kind: r.kind }));
   }
@@ -6110,17 +6343,17 @@ export class MonetCore {
   private scoreAllConcepts(emb: Float32Array, circle?: string, includeArchived?: boolean): Array<{ id: string; cos: number }> {
     const rows: Array<{ id: string; embedding: string }> = circle !== undefined
       ? this.db
-          .prepare(`SELECT id, embedding FROM concepts WHERE circle = ? AND kind != 'workstream' AND status != 'retired'`)
+          .prepare(`SELECT id, embedding FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND status != 'retired'`)
           .all(circle) as Array<{ id: string; embedding: string }>
       : includeArchived
         ? this.db
-            .prepare(`SELECT id, embedding FROM concepts WHERE kind != 'workstream' AND status != 'retired'`)
+            .prepare(`SELECT id, embedding FROM concepts WHERE kind NOT IN ('workstream', 'source') AND status != 'retired'`)
             .all() as Array<{ id: string; embedding: string }>
         : this.db
             .prepare(
               `SELECT c.id, c.embedding FROM concepts c
                 LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
-               WHERE c.kind != 'workstream' AND c.status != 'retired' AND ca.from_name IS NULL`,
+               WHERE c.kind NOT IN ('workstream', 'source') AND c.status != 'retired' AND ca.from_name IS NULL`,
             )
             .all() as Array<{ id: string; embedding: string }>;
     return rows
@@ -6134,17 +6367,17 @@ export class MonetCore {
     if (q.size === 0) return [];
     const rows: Array<{ id: string; title: string; body: string }> = circle !== undefined
       ? this.db
-          .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind != 'workstream' AND status != 'retired'`)
+          .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND status != 'retired'`)
           .all(circle) as Array<{ id: string; title: string; body: string }>
       : includeArchived
         ? this.db
-            .prepare(`SELECT id, title, body FROM concepts WHERE kind != 'workstream' AND status != 'retired'`)
+            .prepare(`SELECT id, title, body FROM concepts WHERE kind NOT IN ('workstream', 'source') AND status != 'retired'`)
             .all() as Array<{ id: string; title: string; body: string }>
         : this.db
             .prepare(
               `SELECT c.id, c.title, c.body FROM concepts c
                 LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
-               WHERE c.kind != 'workstream' AND c.status != 'retired' AND ca.from_name IS NULL`,
+               WHERE c.kind NOT IN ('workstream', 'source') AND c.status != 'retired' AND ca.from_name IS NULL`,
             )
             .all() as Array<{ id: string; title: string; body: string }>;
     return rows
@@ -6168,7 +6401,7 @@ export class MonetCore {
     const out = this.db
       .prepare(
         `SELECT e.dst_id AS dst, e.type AS type, e.weight AS weight FROM memory_edge e
-          JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired' AND dst.kind != 'workstream'
+          JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired' AND dst.kind NOT IN ('workstream', 'source')
          WHERE e.src_id = ? AND e.scope = ?`,
       )
       .all(id, circle) as Adj[];
@@ -6176,7 +6409,7 @@ export class MonetCore {
     const inc = this.db
       .prepare(
         `SELECT e.src_id AS dst, e.type AS type, e.weight AS weight FROM memory_edge e
-          JOIN concepts src ON src.id = e.src_id AND src.status != 'retired' AND src.kind != 'workstream'
+          JOIN concepts src ON src.id = e.src_id AND src.status != 'retired' AND src.kind NOT IN ('workstream', 'source')
          WHERE e.dst_id = ? AND e.scope = ? AND e.type IN (${placeholders})`,
       )
       .all(id, circle, ...DIRECTED_TYPES) as Adj[];
@@ -6242,13 +6475,13 @@ export class MonetCore {
 
   private cardOf(id: string): SearchCard | null {
     const row = this.getRow(id);
-    if (!row || row.status === "retired") return null;
+    if (!row || row.status === "retired" || row.kind === "source") return null;
     return toCard(row, row.confidence, this.openContraCount(id));
   }
 
   private toGatherCard(r: Ranked): GatherCard | null {
     const row = this.getRow(r.id);
-    if (!row || row.status === "retired") return null;
+    if (!row || row.status === "retired" || row.kind === "source") return null;
     const refs = row.source_refs ? (JSON.parse(row.source_refs) as string[]) : undefined;
     return { ...toCard(row, r.score, this.openContraCount(r.id)), viaSeed: r.viaSeed, sourceRefs: refs };
   }
@@ -6265,11 +6498,11 @@ export class MonetCore {
           const nbrs = this.db
             .prepare(
               `SELECT e.dst_id AS nbr FROM memory_edge e
-                 JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired' AND dst.kind != 'workstream'
+                 JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired' AND dst.kind NOT IN ('workstream', 'source')
                 WHERE e.src_id = ? AND e.scope = ? AND e.type = ?
                UNION
                SELECT e.src_id AS nbr FROM memory_edge e
-                 JOIN concepts src ON src.id = e.src_id AND src.status != 'retired' AND src.kind != 'workstream'
+                 JOIN concepts src ON src.id = e.src_id AND src.status != 'retired' AND src.kind NOT IN ('workstream', 'source')
                 WHERE e.dst_id = ? AND e.scope = ? AND e.type = ?`,
             )
             .all(id, circle, type, id, circle, type) as Array<{ nbr: string }>;

@@ -43,7 +43,7 @@ function gitInput(overrides: Partial<CreateGitMdSource> = {}): CreateGitMdSource
 }
 
 describe("source registry schema and persistence", () => {
-  it("migrates a v6 database through the v8 sync-closure schema and reopens idempotently", () => {
+  it("migrates a v6 database through the v9 source-ledger schema and reopens idempotently", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-registry-migrate-"));
     const dbPath = join(dir, "monet.db");
     try {
@@ -55,7 +55,7 @@ describe("source registry schema and persistence", () => {
 
       const migrated = new MonetCore(dbPath);
       const migratedDb = (migrated as unknown as { db: StoragePort }).db;
-      expect(migratedDb.pragma("user_version", { simple: true })).toBe(8);
+      expect(migratedDb.pragma("user_version", { simple: true })).toBe(9);
       const columns = migratedDb.prepare("PRAGMA table_info(knowledge_sources)").all() as Array<{ name: string }>;
       expect(columns.some((column) => column.name === "local_path_key")).toBe(true);
       const indexes = migratedDb.prepare("PRAGMA index_list(knowledge_sources)").all() as Array<{ name: string; partial: number }>;
@@ -79,7 +79,7 @@ describe("source registry schema and persistence", () => {
 
       const reopened = new MonetCore(dbPath);
       const reopenedDb = (reopened as unknown as { db: StoragePort }).db;
-      expect(reopenedDb.pragma("user_version", { simple: true })).toBe(8);
+      expect(reopenedDb.pragma("user_version", { simple: true })).toBe(9);
       expect((reopenedDb.prepare("SELECT device_id FROM sync_meta WHERE singleton = 1").get() as { device_id: string }).device_id).toBe(deviceId);
       expect(reopened.listSources()).toEqual([]);
       reopened.close();

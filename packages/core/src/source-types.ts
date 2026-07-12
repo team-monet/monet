@@ -1,3 +1,6 @@
+import type { EffectiveSourceScanConfig } from "./source-scanner";
+import type { SourceChunkMetadata } from "./source-chunker";
+
 /** Durable source kinds supported by the P0 registry. */
 export type SourceType = "repo-md" | "git-md";
 
@@ -96,8 +99,11 @@ export interface KnowledgeSource {
   writeBack: SourceWriteBack;
   refresh: SourceRefreshPolicy;
   configVersion: number;
-  /** Remains null in the registry slice; a future atomic activation promotes it. */
+  /** Last source config atomically activated by the ledger, or null before first publication. */
   appliedConfigVersion: number | null;
+  activeRunId: string | null;
+  activeSnapshotId: string | null;
+  activeIngestConfigHash: string | null;
   /** Advanced by every config mutation and by tombstoning to fence future runs. */
   leaseFence: number;
   lifecycle: SourceLifecycle;
@@ -125,4 +131,123 @@ export interface SourceRunFence {
   sourceId: string;
   configVersion: number;
   leaseFence: number;
+}
+
+export type SourceSyncRunState = "scanning" | "staging" | "activating" | "published" | "cleaning" | "cleaned" | "aborted";
+export type SourceSyncRunResult = "success" | "failed" | "partial";
+export type SourceChunkWriteState = "intent" | "engine-written" | "committed" | "skipped";
+
+export interface SourceSyncRun {
+  id: string;
+  sourceId: string;
+  snapshotId: string;
+  ingestConfigHash: string;
+  /** Schema/parser version for effectiveConfig; independent of the registry configVersion fence. */
+  scanConfigVersion: string;
+  effectiveConfig: EffectiveSourceScanConfig;
+  configVersion: number;
+  leaseFence: number;
+  complete: boolean;
+  state: SourceSyncRunState;
+  result: SourceSyncRunResult | null;
+  reason: string | null;
+  activationToken: string | null;
+  manifestHash: string | null;
+  fileCount: number;
+  chunkCount: number;
+  createdAt: number;
+  updatedAt: number;
+  publishedAt: number | null;
+  finishedAt: number | null;
+}
+
+export interface BeginSourceRunInput {
+  sourceId: string;
+  snapshotId: string;
+}
+
+export type BeginSourceRunResult =
+  | { kind: "noop"; source: KnowledgeSource }
+  | { kind: "started"; run: SourceSyncRun };
+
+export interface SourceManifestFileInput {
+  relativePath: string;
+  type: "file";
+  contentHash: string;
+  byteLength: number;
+}
+
+export interface SourceManifestChunkInput {
+  bindingId: string;
+  /** Monotone staged-attempt incarnation; aborted attempts reserve their generation permanently. */
+  bindingGeneration: number;
+  operationId: string;
+  relativePath: string;
+  headingPath: string[];
+  occurrence: number;
+  segmentIndex: number;
+  contentHash: string;
+  ingestFingerprint: string;
+  metadata: SourceChunkMetadata;
+  sourceRef: string;
+  content: string;
+  /** Explicit proof for carrying one active binding across a changed natural identity. */
+  bindingIdHint?: { bindingId: string; priorRunId: string };
+}
+
+export interface StageSourceManifestInput {
+  runId: string;
+  scanStatus: "complete" | "partial";
+  manifestHash: string;
+  files: SourceManifestFileInput[];
+  chunks: SourceManifestChunkInput[];
+}
+
+export interface RecordSourceBindingReceiptInput {
+  runId: string;
+  bindingId: string;
+  conceptId?: string | null;
+  observationId?: string | null;
+  predecessorObservationId?: string | null;
+  writeState: Exclude<SourceChunkWriteState, "intent">;
+}
+
+export interface PublishSourceRunInput {
+  runId: string;
+  activationToken: string;
+  expectedManifestHash?: string;
+}
+
+export interface SourceFileRecord extends SourceManifestFileInput {
+  sourceId: string;
+  runId: string;
+  snapshotId: string;
+  configVersion: number;
+}
+
+export interface SourceChunkRecord extends SourceManifestChunkInput {
+  sourceId: string;
+  runId: string;
+  snapshotId: string;
+  configVersion: number;
+  conceptId: string | null;
+  observationId: string | null;
+  predecessorObservationId: string | null;
+  writeState: SourceChunkWriteState;
+  lifecycle: "active" | "superseded" | "deleted" | null;
+}
+
+export interface SourceCleanupItem {
+  id: string;
+  sourceId: string;
+  runId: string;
+  /** Quarantine items diagnose foreign ownership and never authorize engine retirement/supersession. */
+  kind: "retire-absent" | "reconcile-orphan" | "quarantine-non-authorizing";
+  bindingId: string;
+  operationId: string | null;
+  conceptId: string | null;
+  observationId: string | null;
+  predecessorObservationId: string | null;
+  createdAt: number;
+  acknowledgedAt: number | null;
 }
