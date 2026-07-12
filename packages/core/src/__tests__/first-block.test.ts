@@ -637,11 +637,11 @@ describe("Step 5: regression tests (bug-fix verification)", () => {
     await core.detach(srcId, obsIds, { destConceptId: dstId });
     // Source is gone — its first_block entry must also be gone (no dangling FK row).
     expect(isPresent(core, srcId)).toBe(false);
-    // Confirm via direct query: COUNT(*) FROM first_block WHERE concept_id = srcId must be 0.
+    // Syncable removals retain a tombstone row, but it must be hidden from the read API.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const db = (core as any).db as import("../storage").StoragePort;
-    const count = db.prepare("SELECT COUNT(*) AS n FROM first_block WHERE concept_id = ?").get(srcId) as { n: number };
-    expect(count.n).toBe(0);
+    const tombstone = db.prepare("SELECT deleted_at FROM first_block WHERE concept_id = ?").get(srcId) as { deleted_at: number | null };
+    expect(tombstone.deleted_at).not.toBeNull();
     core.close();
   });
 

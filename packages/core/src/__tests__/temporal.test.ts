@@ -18,7 +18,7 @@
  *  8. memory_resolve MCP: existing contradiction path regression-covered unchanged; dismissal
  *     path works end-to-end; scope gates are enforced at the MCP boundary.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,9 +102,9 @@ describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () 
       expect(edgeCols.some((c) => c.name === "dismissed_at")).toBe(true);
       expect(edgeCols.some((c) => c.name === "dismissed_by")).toBe(true);
 
-      // Verify user_version == SOURCE_REGISTRY_SCHEMA_VERSION (7) — fully migrated through all versions.
+      // Verify user_version == SYNC_CLOSURE_SCHEMA_VERSION (8) — fully migrated through all versions.
       const version = db.pragma("user_version", { simple: true }) as number;
-      expect(version).toBe(7);
+      expect(version).toBe(8);
 
       core.close();
     } finally {
@@ -134,7 +134,7 @@ describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db2 = (coreB as any).db as import("../storage").StoragePort;
       const version2 = db2.pragma("user_version", { simple: true }) as number;
-      expect(version2).toBe(7); // SOURCE_REGISTRY_SCHEMA_VERSION — fully migrated
+      expect(version2).toBe(8); // SYNC_CLOSURE_SCHEMA_VERSION — fully migrated
       coreB.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -198,7 +198,7 @@ describe("1b. Migration ordering — graph-disabled open does not consume graph 
       const dbEnabled = (coreEnabled as any).db as import("../storage").StoragePort;
 
       const versionAfterEnabled = dbEnabled.pragma("user_version", { simple: true }) as number;
-      expect(versionAfterEnabled).toBe(7); // SOURCE_REGISTRY_SCHEMA_VERSION
+      expect(versionAfterEnabled).toBe(8); // SYNC_CLOSURE_SCHEMA_VERSION
 
       const rowAfterEnabled = dbEnabled
         .prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
@@ -358,12 +358,20 @@ describe("5. resolveContradiction — accept-new refreshes; dismiss does not", (
     const contra = core.flagContradiction(r.conceptId, { detail: "stale fact" });
     const before = rawRow(core, r.conceptId)!;
 
-    await new Promise((res) => setTimeout(res, 5));
-
-    core.resolveContradiction(contra.id, { decision: "dismiss" });
+    const dismissAt = before.last_confirmed_at! + 5000;
+    vi.useFakeTimers();
+    vi.setSystemTime(dismissAt);
+    try {
+      core.resolveContradiction(contra.id, { decision: "dismiss" });
+    } finally {
+      vi.useRealTimers();
+    }
     const after = rawRow(core, r.conceptId)!;
     // dismiss: last_confirmed_at must be UNCHANGED.
     expect(after.last_confirmed_at).toBe(before.last_confirmed_at);
+    const dismissedAt = ((core as any).db.prepare(`SELECT resolved_at FROM contradictions WHERE id = ?`).get(contra.id) as { resolved_at: number }).resolved_at;
+    expect(dismissedAt).toBe(dismissAt);
+    expect(dismissedAt).toBeGreaterThan(before.last_confirmed_at!);
 
     core.close();
   });
@@ -1324,7 +1332,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       const db2 = (core2 as any).db as import("../storage").StoragePort;
 
       const version2 = db2.pragma("user_version", { simple: true }) as number;
-      expect(version2).toBe(7); // SOURCE_REGISTRY_SCHEMA_VERSION
+      expect(version2).toBe(8); // SYNC_CLOSURE_SCHEMA_VERSION
 
       const rowAfterGraphEnabled = db2.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
         .get(r1.conceptId) as { last_confirmed_at: number | null };
@@ -1391,7 +1399,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db0 = (core0 as any).db as import("../storage").StoragePort;
       const version0 = db0.pragma("user_version", { simple: true }) as number;
-      expect(version0).toBe(7); // fully migrated (SOURCE_REGISTRY_SCHEMA_VERSION)
+      expect(version0).toBe(8); // fully migrated (SYNC_CLOSURE_SCHEMA_VERSION)
       const lcaBefore = (db0.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
       expect(lcaBefore).not.toBeNull();
       core0.close();
@@ -1402,7 +1410,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       const db1 = (core1 as any).db as import("../storage").StoragePort;
 
       const version1 = db1.pragma("user_version", { simple: true }) as number;
-      expect(version1).toBe(7); // SOURCE_REGISTRY_SCHEMA_VERSION — unchanged on re-open
+      expect(version1).toBe(8); // SYNC_CLOSURE_SCHEMA_VERSION — unchanged on re-open
 
       const lcaAfter = (db1.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
       // Must be byte-identical — no spurious update.

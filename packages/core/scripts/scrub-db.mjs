@@ -1913,6 +1913,47 @@ function assertNoOverlap(dbDir, outDir) {
  *      memory_edge's own non-dismissed_by columns, every other untouched column on the tables
  *      above) survives byte-for-byte from the copy — no separate preservation step needed.
  */
+function supportsDeterministicSyncClock(db) {
+  const columns = db.prepare(`PRAGMA table_info(sync_meta)`).all();
+  const hasClockMode = columns.some((column) => column.name === "clock_mode");
+  if (!hasClockMode) {
+    const userVersion = db.pragma("user_version", { simple: true });
+    const hasV8ClosureState = columns.some((column) => column.name === "closure_migrated");
+    const hasSyncMutationTriggers = db.prepare(
+      `SELECT 1 FROM sqlite_master
+        WHERE type = 'trigger' AND name LIKE 'sync_%' AND sql LIKE '%UPDATE sync_meta%'
+        LIMIT 1`,
+    ).get();
+    if (userVersion >= 8 || hasV8ClosureState || hasSyncMutationTriggers) {
+      throw new Error(
+        "scrub-db.mjs: v8 sync clock is missing clock_mode; refusing a nondeterministic scrub copy",
+      );
+    }
+    return false;
+  }
+  const row = db.prepare(`SELECT clock_mode FROM sync_meta WHERE singleton = 1`).get();
+  if (!row) throw new Error("scrub-db.mjs: sync_meta.clock_mode exists without its singleton row");
+  const incompatibleTrigger = db.prepare(
+    `SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND name LIKE 'sync_%' AND sql LIKE '%UPDATE sync_meta%'
+        AND sql NOT LIKE '%clock_mode%'
+      LIMIT 1`,
+  ).get();
+  if (incompatibleTrigger) {
+    throw new Error(
+      `scrub-db.mjs: sync trigger ${incompatibleTrigger.name} ignores clock_mode; refusing a nondeterministic scrub copy`,
+    );
+  }
+  return true;
+}
+
+function setSyncClockMode(db, mode) {
+  db.transaction(() => {
+    const result = db.prepare(`UPDATE sync_meta SET clock_mode = ? WHERE singleton = 1`).run(mode);
+    if (result.changes !== 1) throw new Error(`scrub-db.mjs: failed to set sync clock mode to ${mode}`);
+  })();
+}
+
 function scrubSizeDb(srcDbPath, dstDbPath) {
   mkdirSync(dirname(dstDbPath), { recursive: true });
 
@@ -1934,10 +1975,20 @@ function scrubSizeDb(srcDbPath, dstDbPath) {
   }
 
   const db = new Database(dstDbPath);
+  let logicalClockEnabled = false;
+  let succeeded = false;
   try {
     // Step 2 (round 3, F4 fix): checkpoint the COPY — never the source — to replay any frames that
     // arrived via the copied -wal sidecar into the copy's own main file.
     checkpointWal(db, dstDbPath);
+    // Generic sync remains epoch-ms based. Scrubbing is the narrow exception: it performs a fixed
+    // offline mutation sequence that must produce byte-identical output regardless of run time.
+    // v8 copies therefore opt into persisted-logical allocation for the scrub writes only. Older
+    // schemas have no mode column and retain their historical behavior.
+    if (supportsDeterministicSyncClock(db)) {
+      setSyncClockMode(db, "logical");
+      logicalClockEnabled = true;
+    }
 
     // Step 3: order matters — concepts/observations must be scrubbed FIRST (scrubConceptSlugs
     // needs the scrubbed title; pruneStaleEntities re-extracts from the already-scrubbed
@@ -1982,12 +2033,20 @@ function scrubSizeDb(srcDbPath, dstDbPath) {
     // a scrubbed db with an unresolvable ref-collision baked in.
     assertSlugsUniquePerCircle(db);
 
+    // A shipped database must always resume the public epoch-ms clock contract. Restore before
+    // VACUUM/checkpoint so the final single-file artifact contains the normal mode durably.
+    if (logicalClockEnabled) {
+      setSyncClockMode(db, "wall");
+      logicalClockEnabled = false;
+    }
+
     // Step 4 (round 3, F1 fix): VACUUM after every UPDATE/DELETE-based scrub step above has run,
     // to drop freed-page remnants of pre-scrub content — then Step 5, checkpoint again to flush
     // VACUUM's own WAL writes (see vacuumDb()'s doc comment for why a checkpoint is required here,
     // not optional).
     vacuumDb(db, dstDbPath);
     checkpointWal(db, dstDbPath);
+    succeeded = true;
 
     return {
       concepts,
@@ -2002,7 +2061,19 @@ function scrubSizeDb(srcDbPath, dstDbPath) {
       futureProofed,
     };
   } finally {
+    // Best-effort restoration protects diagnostics that inspect a failed run. The failed artifact
+    // is removed regardless, so a logical-mode or partially scrubbed database cannot be accepted.
+    if (logicalClockEnabled) {
+      try {
+        setSyncClockMode(db, "wall");
+      } catch {
+        // Removal below is the hard safety boundary if the connection cannot restore the flag.
+      }
+    }
     db.close();
+    if (!succeeded) {
+      for (const path of [dstDbPath, `${dstDbPath}-wal`, `${dstDbPath}-shm`]) rmSync(path, { force: true });
+    }
   }
 }
 

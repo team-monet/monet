@@ -43,7 +43,7 @@ function gitInput(overrides: Partial<CreateGitMdSource> = {}): CreateGitMdSource
 }
 
 describe("source registry schema and persistence", () => {
-  it("migrates a v6 database to v7 and reopens idempotently", () => {
+  it("migrates a v6 database through the v8 sync-closure schema and reopens idempotently", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-registry-migrate-"));
     const dbPath = join(dir, "monet.db");
     try {
@@ -55,16 +55,32 @@ describe("source registry schema and persistence", () => {
 
       const migrated = new MonetCore(dbPath);
       const migratedDb = (migrated as unknown as { db: StoragePort }).db;
-      expect(migratedDb.pragma("user_version", { simple: true })).toBe(7);
+      expect(migratedDb.pragma("user_version", { simple: true })).toBe(8);
       const columns = migratedDb.prepare("PRAGMA table_info(knowledge_sources)").all() as Array<{ name: string }>;
       expect(columns.some((column) => column.name === "local_path_key")).toBe(true);
       const indexes = migratedDb.prepare("PRAGMA index_list(knowledge_sources)").all() as Array<{ name: string; partial: number }>;
       expect(indexes).toContainEqual(expect.objectContaining({ name: "uq_knowledge_sources_active_local_path_key", partial: 1 }));
+      for (const [table, expected] of [
+        ["concepts", ["sync_revision", "sync_writer"]],
+        ["circle_aliases", ["updated_at", "sync_revision", "sync_writer"]],
+        ["contradictions", ["updated_at", "sync_revision", "sync_writer"]],
+        ["first_block", ["updated_at", "sync_revision", "sync_writer", "deleted_at"]],
+        ["sessions", ["updated_at", "sync_revision", "sync_writer"]],
+        ["memory_edge", ["legacy_count", "sync_updated_at"]],
+        ["concept_tombstones", ["updated_at"]],
+        ["concept_restorations", ["updated_at"]],
+      ] as const) {
+        const names = (migratedDb.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
+        expect(names).toEqual(expect.arrayContaining([...expected]));
+      }
+      expect(migratedDb.prepare("PRAGMA table_info(memory_edge_components)").all()).not.toEqual([]);
+      const deviceId = (migratedDb.prepare("SELECT device_id FROM sync_meta WHERE singleton = 1").get() as { device_id: string }).device_id;
       migrated.close();
 
       const reopened = new MonetCore(dbPath);
       const reopenedDb = (reopened as unknown as { db: StoragePort }).db;
-      expect(reopenedDb.pragma("user_version", { simple: true })).toBe(7);
+      expect(reopenedDb.pragma("user_version", { simple: true })).toBe(8);
+      expect((reopenedDb.prepare("SELECT device_id FROM sync_meta WHERE singleton = 1").get() as { device_id: string }).device_id).toBe(deviceId);
       expect(reopened.listSources()).toEqual([]);
       reopened.close();
     } finally {

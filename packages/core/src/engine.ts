@@ -15,7 +15,7 @@
  * like an answer and stops agents from fetching (#232). The full content lives only in
  * `body`, reachable via `getConcept` (fetch).
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { StoragePort, BetterSqlitePort } from "./storage";
 import { SourceRegistry } from "./source-registry";
 import type {
@@ -29,7 +29,7 @@ import type {
 import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend, blendWeighted } from "./embedding";
 import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
-import type { GraftPayload, GraftResult, SyncConceptRow } from "./sync-types";
+import type { GraftPayload, GraftResult, SyncConceptRow, SyncEdgeComponentRow, SyncEdgeRow } from "./sync-types";
 import {
   spread,
   fuse,
@@ -67,6 +67,7 @@ const FIRST_BLOCK_SCHEMA_VERSION = 4; // PRAGMA user_version gate for the first_
 const SYNC_SCHEMA_VERSION = 5; // PRAGMA user_version gate for sync engine primitives (slice 1a)
 const SOURCE_SCHEMA_VERSION = 6; // PRAGMA user_version gate for source-concept prerequisites (ingest_operations, concept_tombstones/restorations, source_identity/active_observation_id)
 const SOURCE_REGISTRY_SCHEMA_VERSION = 7; // PRAGMA user_version gate for the durable knowledge_sources registry
+const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
 export const FIRST_BLOCK_SUMMARY_MAX_CHARS = 800; // hard cap on a first_block summary (cost signal)
 
 /**
@@ -425,6 +426,8 @@ export interface MonetCoreOptions {
   tauAttach?: number;
   tauAmbiguous?: number;
   agentId?: string;
+  /** Stable per-store sync identity override (primarily for deterministic tests). Persisted on first open. */
+  syncDeviceId?: string;
   /** Where this runtime is working (repo/path) — recorded on the session (ADR §3.6). */
   scopeContext?: string;
   /** Circle used when a caller doesn't pass one. Lets a single shared store isolate per project:
@@ -470,6 +473,8 @@ interface ConceptRow {
   aliases: string | null;
   last_confirmed_at: number | null;
   last_confirmed_session_id: string | null;
+  sync_revision: number;
+  sync_writer: string | null;
 }
 
 interface ContradictionRow {
@@ -483,6 +488,9 @@ interface ContradictionRow {
   detected_at: number;
   resolved_at: number | null;
   resolved_by: string | null;
+  updated_at: number;
+  sync_revision: number;
+  sync_writer: string | null;
 }
 
 interface IngestOperationRow {
@@ -524,6 +532,8 @@ export class MonetCore {
   private edgeSimMin: number;
   private newId: () => string;
   private sourceRegistry: SourceRegistry;
+  /** Stable store identity for sync; unlike agentId this is persisted and never defaults globally. */
+  private syncDeviceId = "";
   /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
    *  Keyed by circle so a session that writes to several circles never chains `follows` across them. */
   private lastConceptByCircle = new Map<string, string>();
@@ -558,8 +568,84 @@ export class MonetCore {
     const semantic = (this.embedder.recommendedThresholds?.tauAttach ?? 0) >= 0.7;
     this.edgeSimMin = opts.edgeSimMin ?? (semantic ? 0.45 : 0.4);
     this.init();
+    this.initSyncIdentity(opts.syncDeviceId);
     this.sourceRegistry.ensureSchema();
     this.migrate();
+  }
+
+  private initSyncIdentity(requested?: string): void {
+    const existing = this.db.prepare(`SELECT device_id FROM sync_meta WHERE singleton = 1`).get() as { device_id: string } | undefined;
+    const deviceId = existing?.device_id ?? requested ?? randomUUID();
+    if (existing && requested && requested !== existing.device_id) {
+      throw new Error(`syncDeviceId mismatch: store is '${existing.device_id}', requested '${requested}'`);
+    }
+    if (!existing) {
+      // Wall time only seeds a store once. Fold in legacy semantic timestamps so the first logical
+      // tick is newer than every row already present in a pre-v8 database.
+      const seed = Math.max(Date.now(), this.maxPersistedSyncTimestamp());
+      this.db
+        .prepare(`INSERT INTO sync_meta (singleton, device_id, last_mutation_at) VALUES (1, ?, ?)`)
+        .run(deviceId, seed);
+    }
+    this.syncDeviceId = deviceId;
+  }
+
+  /** Highest semantic timestamp already persisted in any sync-relevant row family. */
+  private maxPersistedSyncTimestamp(): number {
+    const timestampColumns: Record<string, string[]> = {
+      observations: ["created_at", "updated_at", "superseded_at"],
+      sessions: ["started_at", "ended_at", "updated_at"],
+      concepts: ["created_at", "updated_at", "last_confirmed_at", "usefulness_last_fetched_at", "arousal_last_updated_at"],
+      concept_revisions: ["created_at"],
+      contradictions: ["detected_at", "resolved_at", "updated_at"],
+      ingest_operations: ["created_at"],
+      concept_tombstones: ["retired_at", "updated_at"],
+      concept_restorations: ["restored_at", "updated_at"],
+      concept_deletions: ["deleted_at", "updated_at"],
+      memory_edge: ["created_at", "last_reinforced_at", "dismissed_at", "sync_updated_at"],
+      first_block: ["promoted_at", "updated_at", "deleted_at"],
+      circle_aliases: ["created_at", "updated_at"],
+      memory_edge_components: ["created_at", "last_reinforced_at", "updated_at"],
+      concept_activity_components: ["usefulness_last_at", "arousal_last_at", "updated_at"],
+      legacy_sync_state: ["updated_at"],
+      knowledge_sources: ["created_at", "updated_at", "tombstoned_at"],
+    };
+    const selects: string[] = [];
+    for (const [table, candidates] of Object.entries(timestampColumns)) {
+      const available = new Set(
+        (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name),
+      );
+      for (const column of candidates) {
+        if (available.has(column)) selects.push(`SELECT ${column} AS timestamp FROM ${table} WHERE ${column} IS NOT NULL`);
+      }
+    }
+    if (selects.length === 0) return 0;
+    return (this.db.prepare(
+      `SELECT COALESCE(MAX(timestamp), 0) AS timestamp FROM (${selects.join(" UNION ALL ")})`,
+    ).get() as { timestamp: number }).timestamp;
+  }
+
+  /** Persisted sync clock: epoch-compatible normally, deterministic +1 in maintenance mode. */
+  private nextSyncTimestamp(semanticFloor = 0): number {
+    const wallFloor = Math.max(Date.now(), semanticFloor);
+    this.db
+      .prepare(
+        `UPDATE sync_meta
+            SET last_mutation_at = CASE clock_mode
+              WHEN 'logical' THEN last_mutation_at + 1
+              ELSE MAX(last_mutation_at + 1, ?)
+            END
+          WHERE singleton = 1`,
+      )
+      .run(wallFloor);
+    return (this.db.prepare(`SELECT last_mutation_at AS t FROM sync_meta WHERE singleton = 1`).get() as { t: number }).t;
+  }
+
+  private syncExportedAt(): number {
+    const row = this.db.prepare(`SELECT last_mutation_at AS t FROM sync_meta WHERE singleton = 1`).get() as { t: number };
+    // A watermark must never run ahead of the persisted mutation clock: otherwise an export made
+    // between two same-ms writes can cause the second write to fall below the caller's watermark.
+    return row.t;
   }
 
   private init(): void {
@@ -576,7 +662,10 @@ export class MonetCore {
         session_id TEXT,
         author_agent_id TEXT NOT NULL,
         source_refs TEXT,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        sync_revision INTEGER NOT NULL DEFAULT 1,
+        sync_writer TEXT
       );
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -585,7 +674,10 @@ export class MonetCore {
         started_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         ended_at INTEGER,
         status TEXT NOT NULL DEFAULT 'active',
-        summary TEXT
+        summary TEXT,
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        sync_revision INTEGER NOT NULL DEFAULT 1,
+        sync_writer TEXT
       );
       CREATE TABLE IF NOT EXISTS concepts (
         id TEXT PRIMARY KEY,
@@ -606,7 +698,9 @@ export class MonetCore {
         active_observation_id TEXT,
         aliases TEXT,
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
-        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        sync_revision INTEGER NOT NULL DEFAULT 1,
+        sync_writer TEXT
       );
       CREATE TABLE IF NOT EXISTS concept_revisions (
         id TEXT PRIMARY KEY,
@@ -626,7 +720,10 @@ export class MonetCore {
         resolution_obs_id TEXT,
         detected_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         resolved_at INTEGER,
-        resolved_by TEXT
+        resolved_by TEXT,
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        sync_revision INTEGER NOT NULL DEFAULT 1,
+        sync_writer TEXT
       );
       -- A store operation is committed in the same transaction as its observation and concept
       -- mutation. Retried connector writes therefore return the original observation instead of
@@ -648,13 +745,22 @@ export class MonetCore {
       -- concept's body/observations from leaking through an otherwise incremental export.
       CREATE TABLE IF NOT EXISTS concept_tombstones (
         concept_id TEXT PRIMARY KEY,
-        retired_at INTEGER NOT NULL
+        retired_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
       );
       -- Restorations are separate ordered lifecycle events. Tombstone history stays durable so
       -- an older retirement delta cannot re-hide a later explicit restore on another replica.
       CREATE TABLE IF NOT EXISTS concept_restorations (
         concept_id TEXT PRIMARY KEY,
-        restored_at INTEGER NOT NULL
+        restored_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+      );
+      CREATE TABLE IF NOT EXISTS concept_deletions (
+        concept_id TEXT PRIMARY KEY,
+        deleted_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        writer_id TEXT NOT NULL,
+        concept_kind TEXT NOT NULL CHECK (concept_kind = 'native')
       );
       CREATE INDEX IF NOT EXISTS idx_concept_circle ON concepts(circle);
       CREATE INDEX IF NOT EXISTS idx_concept_kind ON concepts(circle, kind);
@@ -679,7 +785,9 @@ export class MonetCore {
         count INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         last_reinforced_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
-        scope TEXT NOT NULL DEFAULT 'default'
+        scope TEXT NOT NULL DEFAULT 'default',
+        legacy_count INTEGER NOT NULL DEFAULT 0,
+        sync_updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
       );
       CREATE INDEX IF NOT EXISTS idx_edge_src ON memory_edge(src_id, type);
       CREATE INDEX IF NOT EXISTS idx_edge_dst ON memory_edge(dst_id, type);
@@ -717,14 +825,82 @@ export class MonetCore {
         position INTEGER NOT NULL DEFAULT 0,
         promoted_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         promoted_by TEXT,
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        sync_revision INTEGER NOT NULL DEFAULT 1,
+        sync_writer TEXT,
+        deleted_at INTEGER,
         UNIQUE (concept_id, circle)
       );
       CREATE INDEX IF NOT EXISTS idx_first_block_circle ON first_block(circle, position);
+      CREATE TABLE IF NOT EXISTS sync_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        device_id TEXT NOT NULL,
+        last_mutation_at INTEGER NOT NULL,
+        applying_remote INTEGER NOT NULL DEFAULT 0,
+        closure_migrated INTEGER NOT NULL DEFAULT 0,
+        clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))
+      );
+      CREATE TABLE IF NOT EXISTS memory_edge_components (
+        src_id TEXT NOT NULL,
+        dst_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        writer_id TEXT NOT NULL,
+        count INTEGER NOT NULL CHECK (count >= 0),
+        weight REAL NOT NULL,
+        origin TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_reinforced_at INTEGER NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (src_id, dst_id, type, scope, writer_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_edge_components_updated ON memory_edge_components(updated_at);
+      CREATE TABLE IF NOT EXISTS concept_activity_components (
+        concept_id TEXT NOT NULL,
+        writer_id TEXT NOT NULL,
+        usefulness_count INTEGER NOT NULL DEFAULT 0 CHECK (usefulness_count >= 0),
+        usefulness_last_at INTEGER,
+        arousal_count INTEGER NOT NULL DEFAULT 0 CHECK (arousal_count >= 0),
+        arousal_last_at INTEGER,
+        revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (concept_id, writer_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_activity_components_updated ON concept_activity_components(updated_at);
+      CREATE TABLE IF NOT EXISTS legacy_sync_state (
+        origin_id TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        natural_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        adapted_revision INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (origin_id, table_name, natural_key)
+      );
     `);
   }
 
   /** Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
   private migrate(): void {
+    // `sync_meta` was introduced by v8. Keep migration resilient to a partially-created v8 store
+    // that has the table but predates the remote-application guard column.
+    const syncMetaCols = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
+    if (!syncMetaCols.some((c) => c.name === "applying_remote")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN applying_remote INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!syncMetaCols.some((c) => c.name === "closure_migrated")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN closure_migrated INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!syncMetaCols.some((c) => c.name === "clock_mode")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))`);
+    }
+    const closureNeedsMigration = (this.db.prepare(
+      `SELECT closure_migrated AS value FROM sync_meta WHERE singleton = 1`,
+    ).get() as { value: number }).value === 0;
+    if (closureNeedsMigration) {
+      const seed = Math.max(Date.now(), this.maxPersistedSyncTimestamp());
+      this.db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at, ?) WHERE singleton = 1`).run(seed);
+    }
     for (const table of ["observations", "concepts"]) {
       const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
       if (!cols.some((c) => c.name === "source_refs")) {
@@ -785,13 +961,21 @@ export class MonetCore {
     // tombstones at migration time (never before their legacy updated_at): a peer watermark can
     // legitimately be newer than the old row, but it must still receive this newly discovered
     // lifecycle event on its next incremental export.
-    const legacyTombstoneStamp = Date.now();
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO concept_tombstones (concept_id, retired_at)
-         SELECT id, MAX(updated_at, ?) FROM concepts WHERE status = 'retired'`,
-      )
-      .run(legacyTombstoneStamp);
+    const hasLegacyRetirement = this.db.prepare(
+      `SELECT 1 FROM concepts c
+        WHERE c.status = 'retired'
+          AND NOT EXISTS (SELECT 1 FROM concept_tombstones t WHERE t.concept_id = c.id)
+        LIMIT 1`,
+    ).get();
+    if (hasLegacyRetirement) {
+      const legacyTombstoneStamp = this.nextSyncTimestamp(Date.now());
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO concept_tombstones (concept_id, retired_at)
+           SELECT id, MAX(updated_at, ?) FROM concepts WHERE status = 'retired'`,
+        )
+        .run(legacyTombstoneStamp);
+    }
     // circle_aliases: stable name-resolution layer for circle renames and archive status.
     // from_name → to_name for active aliases (canonical rename); status='archived' marks hidden circles.
     this.db.exec(`
@@ -799,10 +983,24 @@ export class MonetCore {
         from_name  TEXT PRIMARY KEY,
         to_name    TEXT NOT NULL,
         status     TEXT NOT NULL DEFAULT 'active',
-        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        sync_revision INTEGER NOT NULL DEFAULT 1,
+        sync_writer TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_ca_to ON circle_aliases(to_name);
     `);
+    // upsertEdge() is v8 component-backed and graph migration may invoke it before the v8 sentinel
+    // block below, so materialize the legacy base column before any graph backfill runs.
+    const earlyEdgeCols = this.db.prepare(`PRAGMA table_info(memory_edge)`).all() as Array<{ name: string }>;
+    if (!earlyEdgeCols.some((c) => c.name === "legacy_count")) {
+      this.db.exec(`ALTER TABLE memory_edge ADD COLUMN legacy_count INTEGER NOT NULL DEFAULT 0`);
+      this.db.exec(`UPDATE memory_edge SET legacy_count = count`);
+    }
+    if (!earlyEdgeCols.some((c) => c.name === "sync_updated_at")) {
+      this.db.exec(`ALTER TABLE memory_edge ADD COLUMN sync_updated_at INTEGER`);
+      this.db.exec(`UPDATE memory_edge SET sync_updated_at = COALESCE(last_reinforced_at, created_at)`);
+    }
     // One-time graph backfill for pre-graph DBs (P2, Codex review): the graph tables exist but hold no
     // edges for concepts stored before the graph feature. Version-gated so it runs at most once, and only
     // when the graph is enabled — a graph-disabled open must NOT consume the upgrade slot (the next
@@ -838,29 +1036,35 @@ export class MonetCore {
     //     by saveWorkstream() remain NULL by design (excluded by kind != 'workstream' guard).
     //
     // Column-guard pattern: PRAGMA table_info, then ALTER only if missing (SQLite has no IF NOT EXISTS).
-    const conceptCols2 = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
-    if (!conceptCols2.some((c) => c.name === "last_confirmed_at")) {
+    const priorApplyingRemote = (this.db.prepare(`SELECT applying_remote AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value;
+    this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
+    try {
+      const conceptCols2 = this.db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
+      if (!conceptCols2.some((c) => c.name === "last_confirmed_at")) {
       // State A: columns missing — add AND backfill atomically in this branch. Independent of
       // graphEnabled and user_version. Workstream rows are excluded: they are NULL by design
       // (excluded from staleness consumers and merge paths), so stamping them would be incorrect.
-      this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_at INTEGER`);
-      this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
-    }
-    if (!conceptCols2.some((c) => c.name === "last_confirmed_session_id")) {
-      this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_session_id TEXT`);
-    }
-    const edgeCols = this.db.prepare(`PRAGMA table_info(memory_edge)`).all() as Array<{ name: string }>;
-    if (!edgeCols.some((c) => c.name === "dismissed_at")) {
-      this.db.exec(`ALTER TABLE memory_edge ADD COLUMN dismissed_at INTEGER`);
-    }
-    if (!edgeCols.some((c) => c.name === "dismissed_by")) {
-      this.db.exec(`ALTER TABLE memory_edge ADD COLUMN dismissed_by TEXT`);
-    }
+        this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_at INTEGER`);
+        this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
+      }
+      if (!conceptCols2.some((c) => c.name === "last_confirmed_session_id")) {
+        this.db.exec(`ALTER TABLE concepts ADD COLUMN last_confirmed_session_id TEXT`);
+      }
+      const edgeCols = this.db.prepare(`PRAGMA table_info(memory_edge)`).all() as Array<{ name: string }>;
+      if (!edgeCols.some((c) => c.name === "dismissed_at")) {
+        this.db.exec(`ALTER TABLE memory_edge ADD COLUMN dismissed_at INTEGER`);
+      }
+      if (!edgeCols.some((c) => c.name === "dismissed_by")) {
+        this.db.exec(`ALTER TABLE memory_edge ADD COLUMN dismissed_by TEXT`);
+      }
     // State B catch-up: columns exist but NULLs remain (stranded old-code state).
     // Runs after the column-guard so it is safe regardless of whether ALTER fired this open.
     // The WHERE-NULL predicate makes it a no-op for State C and D (no rows to update).
     // Excludes kind='workstream' — those rows are NULL by design.
-    this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
+      this.db.exec(`UPDATE concepts SET last_confirmed_at = updated_at WHERE last_confirmed_at IS NULL AND kind != 'workstream'`);
+    } finally {
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(priorApplyingRemote);
+    }
     // Version gate: bump to TEMPORAL_SCHEMA_VERSION once the graph backfill slot has been consumed.
     // Guards the graph-schema-version invariant; the temporal backfill itself is now independent
     // of this gate (handled in State A and B paths above).
@@ -943,6 +1147,240 @@ export class MonetCore {
     const versionAfterSource = this.db.pragma("user_version", { simple: true }) as number;
     if (versionAfterSource >= SOURCE_SCHEMA_VERSION && versionAfterSource < SOURCE_REGISTRY_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${SOURCE_REGISTRY_SCHEMA_VERSION}`);
+    }
+    this.ensureSyncClosureSchema();
+  }
+
+  /** v8: replay-safe row clocks and per-writer edge components. */
+  private ensureSyncClosureSchema(): void {
+    const addColumn = (table: string, name: string, definition: string): boolean => {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (cols.some((c) => c.name === name)) return false;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+      return true;
+    };
+
+    addColumn("concepts", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("concepts", "sync_writer", "TEXT");
+    addColumn("observations", "updated_at", "INTEGER");
+    addColumn("observations", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("observations", "sync_writer", "TEXT");
+    addColumn("circle_aliases", "updated_at", "INTEGER");
+    addColumn("circle_aliases", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("circle_aliases", "sync_writer", "TEXT");
+    addColumn("contradictions", "updated_at", "INTEGER");
+    addColumn("contradictions", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("contradictions", "sync_writer", "TEXT");
+    addColumn("first_block", "updated_at", "INTEGER");
+    addColumn("first_block", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("first_block", "sync_writer", "TEXT");
+    addColumn("first_block", "deleted_at", "INTEGER");
+    addColumn("sessions", "updated_at", "INTEGER");
+    addColumn("sessions", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("sessions", "sync_writer", "TEXT");
+    addColumn("sync_meta", "applying_remote", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("sync_meta", "closure_migrated", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("sync_meta", "clock_mode", "TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))");
+    addColumn("concept_tombstones", "updated_at", "INTEGER");
+    addColumn("concept_restorations", "updated_at", "INTEGER");
+    const addedLegacyCount = addColumn("memory_edge", "legacy_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("memory_edge", "sync_updated_at", "INTEGER");
+    if (addedLegacyCount) this.db.exec(`UPDATE memory_edge SET legacy_count = count`);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_edge_components (
+        src_id TEXT NOT NULL,
+        dst_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        writer_id TEXT NOT NULL,
+        count INTEGER NOT NULL CHECK (count >= 0),
+        weight REAL NOT NULL,
+        origin TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_reinforced_at INTEGER NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (src_id, dst_id, type, scope, writer_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_edge_components_updated ON memory_edge_components(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_concept_tombstones_updated ON concept_tombstones(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_concept_restorations_updated ON concept_restorations(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_memory_edge_sync_updated ON memory_edge(sync_updated_at);
+      CREATE TABLE IF NOT EXISTS concept_deletions (
+        concept_id TEXT PRIMARY KEY,
+        deleted_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        writer_id TEXT,
+        concept_kind TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_concept_deletions_updated ON concept_deletions(updated_at);
+      CREATE TABLE IF NOT EXISTS concept_activity_components (
+        concept_id TEXT NOT NULL,
+        writer_id TEXT NOT NULL,
+        usefulness_count INTEGER NOT NULL DEFAULT 0 CHECK (usefulness_count >= 0),
+        usefulness_last_at INTEGER,
+        arousal_count INTEGER NOT NULL DEFAULT 0 CHECK (arousal_count >= 0),
+        arousal_last_at INTEGER,
+        revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (concept_id, writer_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_activity_components_updated ON concept_activity_components(updated_at);
+      CREATE TABLE IF NOT EXISTS legacy_sync_state (
+        origin_id TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        natural_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        adapted_revision INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (origin_id, table_name, natural_key)
+      );
+    `);
+    addColumn("concept_deletions", "writer_id", "TEXT");
+    addColumn("concept_deletions", "concept_kind", "TEXT");
+    this.db.prepare(
+      `UPDATE concept_deletions SET writer_id = COALESCE(writer_id, ?),
+              concept_kind = COALESCE(concept_kind, 'native')`,
+    ).run(`legacy-local:${this.syncDeviceId}`);
+
+    const needsClosureMigration = (this.db.prepare(`SELECT closure_migrated AS value FROM sync_meta WHERE singleton = 1`).get() as { value: number }).value === 0;
+    // Reopening an already-migrated store is read-only with respect to the clock.
+    const stamp = needsClosureMigration ? this.nextSyncTimestamp() : this.syncExportedAt();
+    this.db.prepare(`UPDATE concepts SET sync_writer = ? WHERE sync_writer IS NULL`).run(this.syncDeviceId);
+    this.db.prepare(`UPDATE observations SET updated_at = COALESCE(updated_at, superseded_at, created_at), sync_writer = COALESCE(sync_writer, ?) WHERE updated_at IS NULL OR sync_writer IS NULL`).run(this.syncDeviceId);
+    this.db.prepare(`UPDATE circle_aliases SET updated_at = COALESCE(updated_at, created_at), sync_writer = COALESCE(sync_writer, ?) WHERE updated_at IS NULL OR sync_writer IS NULL`).run(this.syncDeviceId);
+    this.db.prepare(`UPDATE contradictions SET updated_at = COALESCE(updated_at, resolved_at, detected_at), sync_writer = COALESCE(sync_writer, ?) WHERE updated_at IS NULL OR sync_writer IS NULL`).run(this.syncDeviceId);
+    this.db.prepare(`UPDATE first_block SET updated_at = COALESCE(updated_at, promoted_at), sync_writer = COALESCE(sync_writer, ?) WHERE updated_at IS NULL OR sync_writer IS NULL`).run(this.syncDeviceId);
+    this.db.prepare(`UPDATE sessions SET updated_at = COALESCE(updated_at, ended_at, started_at), sync_writer = COALESCE(sync_writer, ?) WHERE updated_at IS NULL OR sync_writer IS NULL`).run(this.syncDeviceId);
+    this.db.prepare(`UPDATE concept_tombstones SET updated_at = MAX(COALESCE(updated_at, 0), retired_at)`).run();
+    this.db.prepare(`UPDATE concept_restorations SET updated_at = MAX(COALESCE(updated_at, 0), restored_at)`).run();
+    this.db.prepare(`UPDATE memory_edge SET sync_updated_at = COALESCE(sync_updated_at, dismissed_at, last_reinforced_at, created_at)`).run();
+    // Independent promotions created on different replicas must name the same logical row.
+    const legacyPins = this.db.prepare(`SELECT id, concept_id, circle FROM first_block`).all() as Array<{ id: string; concept_id: string; circle: string }>;
+    for (const pin of legacyPins) {
+      const deterministic = deterministicFirstBlockId(pin.concept_id, pin.circle);
+      if (pin.id !== deterministic) this.db.prepare(`UPDATE first_block SET id = ? WHERE id = ?`).run(deterministic, pin.id);
+    }
+    // A true v7 store may have mutable edits far older than a peer's current watermark. Give every
+    // v7 mutable row one monotonic migration stamp so the first v8 incremental export is complete.
+    if (needsClosureMigration) {
+      for (const table of ["concepts", "observations", "circle_aliases", "contradictions", "first_block", "sessions"] as const) {
+        this.db.prepare(`UPDATE ${table} SET updated_at = ?`).run(stamp);
+      }
+      this.db.prepare(`UPDATE concept_tombstones SET updated_at = ?`).run(stamp);
+      this.db.prepare(`UPDATE concept_restorations SET updated_at = ?`).run(stamp);
+      this.db.prepare(`UPDATE memory_edge SET sync_updated_at = ?`).run(stamp);
+      this.db.prepare(`UPDATE memory_edge_components SET updated_at = ?`).run(stamp);
+      this.db.prepare(`UPDATE concept_activity_components SET updated_at = ?`).run(stamp);
+      this.db.prepare(`UPDATE concept_deletions SET updated_at = ?`).run(stamp);
+    }
+    // Seed activity components for pre-component values exactly once.
+    const activityRows = this.db.prepare(`SELECT id, usefulness_score, usefulness_last_fetched_at, arousal_score, arousal_last_updated_at FROM concepts WHERE kind != 'source'`).all() as Array<{ id: string; usefulness_score: number; usefulness_last_fetched_at: number | null; arousal_score: number; arousal_last_updated_at: number | null }>;
+    for (const row of activityRows) {
+      if (row.usefulness_score === 0 && row.arousal_score === 0) continue;
+      if (this.db.prepare(`SELECT 1 FROM concept_activity_components WHERE concept_id = ? LIMIT 1`).get(row.id)) continue;
+      this.db.prepare(
+        `INSERT OR IGNORE INTO concept_activity_components
+           (concept_id, writer_id, usefulness_count, usefulness_last_at, arousal_count, arousal_last_at, revision, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+      ).run(row.id, `legacy:${this.syncDeviceId}`, row.usefulness_score, row.usefulness_last_fetched_at,
+        row.arousal_score, row.arousal_last_updated_at, stamp);
+    }
+    this.db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at, ?) WHERE singleton = 1`).run(stamp);
+    this.db.prepare(`UPDATE sync_meta SET closure_migrated = 1 WHERE singleton = 1`).run();
+
+    // Central mutation triggers keep every local write site in the row-version protocol. A graft
+    // supplies a different revision/writer explicitly, so the guarded UPDATE trigger does not fire.
+    const trigger = (table: string, key: string, semanticChange = "1"): void => {
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS sync_${table}_insert;
+        DROP TRIGGER IF EXISTS sync_${table}_update;
+        CREATE TRIGGER sync_${table}_insert AFTER INSERT ON ${table}
+        WHEN NEW.sync_writer IS NULL
+         AND (SELECT applying_remote FROM sync_meta WHERE singleton = 1) = 0
+        BEGIN
+          UPDATE sync_meta SET last_mutation_at = CASE clock_mode
+            WHEN 'logical' THEN last_mutation_at + 1
+            ELSE MAX(last_mutation_at + 1, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+          END WHERE singleton = 1;
+          UPDATE ${table}
+             SET sync_revision = MAX(sync_revision, 1),
+                 sync_writer = (SELECT device_id FROM sync_meta WHERE singleton = 1),
+                 updated_at = (SELECT last_mutation_at FROM sync_meta WHERE singleton = 1)
+           WHERE ${key} = NEW.${key};
+        END;
+        CREATE TRIGGER sync_${table}_update AFTER UPDATE ON ${table}
+        WHEN NEW.sync_revision = OLD.sync_revision
+         AND COALESCE(NEW.sync_writer, '') = COALESCE(OLD.sync_writer, '')
+         AND (SELECT applying_remote FROM sync_meta WHERE singleton = 1) = 0
+         AND (${semanticChange})
+        BEGIN
+          UPDATE sync_meta SET last_mutation_at = CASE clock_mode
+            WHEN 'logical' THEN last_mutation_at + 1
+            ELSE MAX(last_mutation_at + 1, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+          END WHERE singleton = 1;
+          UPDATE ${table}
+             SET sync_revision = OLD.sync_revision + 1,
+                 sync_writer = (SELECT device_id FROM sync_meta WHERE singleton = 1),
+                 updated_at = (SELECT last_mutation_at FROM sync_meta WHERE singleton = 1)
+           WHERE ${key} = NEW.${key};
+        END;
+      `);
+    };
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    // Activity counters/timestamps replicate through concept_activity_components. They must not
+    // also advance/export the mutable concept envelope or concurrent content can be overwritten by
+    // an activity-only row. `IS NOT` is SQLite's null-safe distinctness test.
+    const conceptSemanticChange = [
+      "slug", "title", "body", "kind", "status", "confidence", "version", "circle",
+      "embedding", "support_count", "dirty", "source_refs", "aliases", "last_confirmed_at",
+      "last_confirmed_session_id", "source_identity", "active_observation_id", "created_at",
+    ].map((column) => `NEW.${column} IS NOT OLD.${column}`).join(" OR ");
+    trigger("concepts", "id", conceptSemanticChange);
+    trigger("observations", "id");
+    trigger("circle_aliases", "from_name");
+    trigger("contradictions", "id");
+    trigger("first_block", "id");
+    trigger("sessions", "id");
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS sync_concept_activity_update;
+      CREATE TRIGGER sync_concept_activity_update
+      AFTER UPDATE OF usefulness_score, usefulness_last_fetched_at, arousal_score, arousal_last_updated_at ON concepts
+      WHEN (SELECT applying_remote FROM sync_meta WHERE singleton = 1) = 0
+       AND (NEW.usefulness_score > OLD.usefulness_score OR NEW.arousal_score > OLD.arousal_score)
+      BEGIN
+        UPDATE sync_meta SET last_mutation_at = CASE clock_mode
+          WHEN 'logical' THEN last_mutation_at + 1
+          ELSE MAX(last_mutation_at + 1, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+        END WHERE singleton = 1;
+        INSERT INTO concept_activity_components
+          (concept_id, writer_id, usefulness_count, usefulness_last_at, arousal_count, arousal_last_at, revision, updated_at)
+        VALUES (
+          NEW.id, (SELECT device_id FROM sync_meta WHERE singleton = 1),
+          MAX(0, NEW.usefulness_score - OLD.usefulness_score), NEW.usefulness_last_fetched_at,
+          MAX(0, NEW.arousal_score - OLD.arousal_score), NEW.arousal_last_updated_at,
+          1, (SELECT last_mutation_at FROM sync_meta WHERE singleton = 1)
+        )
+        ON CONFLICT(concept_id, writer_id) DO UPDATE SET
+          usefulness_count = usefulness_count + excluded.usefulness_count,
+          usefulness_last_at = CASE
+            WHEN usefulness_last_at IS NULL THEN excluded.usefulness_last_at
+            WHEN excluded.usefulness_last_at IS NULL THEN usefulness_last_at
+            ELSE MAX(usefulness_last_at, excluded.usefulness_last_at)
+          END,
+          arousal_count = arousal_count + excluded.arousal_count,
+          arousal_last_at = CASE
+            WHEN arousal_last_at IS NULL THEN excluded.arousal_last_at
+            WHEN excluded.arousal_last_at IS NULL THEN arousal_last_at
+            ELSE MAX(arousal_last_at, excluded.arousal_last_at)
+          END,
+          revision = revision + 1,
+          updated_at = excluded.updated_at;
+      END;
+    `);
+    if (version >= SOURCE_REGISTRY_SCHEMA_VERSION && version < SYNC_CLOSURE_SCHEMA_VERSION) {
+      this.db.pragma(`user_version = ${SYNC_CLOSURE_SCHEMA_VERSION}`);
     }
   }
 
@@ -1095,6 +1533,9 @@ export class MonetCore {
           };
         }
       }
+      // Keep the documented epoch-ms `since` contract even when this instance reuses a session
+      // after a long idle. In logical maintenance mode this is still only a persisted +1.
+      this.nextSyncTimestamp();
 
       // The pre-embed candidate scan is deliberately outside this transaction. Re-read the
       // participants here so a concurrent retirement cannot be revived by an ordinary store.
@@ -1583,10 +2024,11 @@ export class MonetCore {
     // Partial resolution (e.g. observations superseded but contradiction status not updated) would
     // leave data in an inconsistent disputed state with no path to recovery.
     return this.db.transaction((): Concept | { alreadyClosed: true; contradictionStatus: string } => {
+      const nowMs = Date.now();
       if (opts.decision === "dismiss") {
         this.db
-          .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`)
-          .run(opts.by ?? null, contradictionId);
+          .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = ?, resolved_by = ? WHERE id = ?`)
+          .run(nowMs, opts.by ?? null, contradictionId);
         // dismiss: do NOT refresh temporal fields (no new evidence confirms; the conflict is simply set aside)
       } else {
         const allIds = (
@@ -1597,8 +2039,7 @@ export class MonetCore {
 
         if (winnerObsId) {
           const supersede = this.db.prepare(`UPDATE observations SET superseded_by = ?, superseded_at = ? WHERE id = ?`);
-          const supersededAt = Date.now();
-          for (const loser of allIds.filter((oid) => oid !== winnerObsId)) supersede.run(winnerObsId, supersededAt, loser);
+          for (const loser of allIds.filter((oid) => oid !== winnerObsId)) supersede.run(winnerObsId, nowMs, loser);
           // First Block hook: winner supersedes losers → effective content changes even without an
           // explicit body. Invalidate so the user refreshes the pinned summary.
           // dismiss never reaches this branch; the hook is safe to fire unconditionally here.
@@ -1619,14 +2060,13 @@ export class MonetCore {
         }
         this.db
           .prepare(
-            `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, resolved_at = unixepoch() * 1000, resolved_by = ? WHERE id = ?`,
+            `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, resolved_at = ?, resolved_by = ? WHERE id = ?`,
           )
-          .run(winnerObsId, opts.by ?? null, contradictionId);
+          .run(winnerObsId, nowMs, opts.by ?? null, contradictionId);
         // accept-new / keep-current: a verdict is evidence that the concept's state is confirmed — refresh.
-        const now = Date.now();
         this.db
           .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
-          .run(now, resolveSessionId, conceptId);
+          .run(nowMs, resolveSessionId, conceptId);
         // Arousal +1: a real resolution (not dismiss) signals the concept is being actively mediated.
         this.db
           .prepare(
@@ -1635,19 +2075,12 @@ export class MonetCore {
                     arousal_last_updated_at = ?
               WHERE id = ?`,
           )
-          .run(now, conceptId);
+          .run(nowMs, conceptId);
       }
 
-      // Restore the concept once nothing is left open against it.
-      const open = this.db.prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`).get(conceptId) as {
-        n: number;
-      };
-      if (open.n === 0) {
-        const row = this.getRow(conceptId)!;
-        this.db
-          .prepare(`UPDATE concepts SET status = 'active', confidence = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
-          .run(Math.min(1, row.confidence + 0.2), conceptId);
-      }
+      // Every closure decision uses the same active-evidence projection as graft. This restores
+      // active/disputed status from the remaining open set and avoids a local-only confidence bump.
+      this.recomputeNativeConceptProjection(conceptId, this.nextSyncTimestamp());
       return toConcept(this.getRow(conceptId)!);
     })();
   }
@@ -1720,12 +2153,14 @@ export class MonetCore {
         if (successor.superseded_at !== null) throw new Error("successor observation is already superseded");
       }
 
+      const supersededAt = Date.now();
+      if (old.superseded_by === null && old.superseded_at === null) this.nextSyncTimestamp(supersededAt);
       const updated = this.db
         .prepare(
           `UPDATE observations SET superseded_by = ?, superseded_at = ?
             WHERE id = ? AND superseded_by IS NULL AND superseded_at IS NULL`,
         )
-        .run(newObservationId, Date.now(), oldObservationId);
+        .run(newObservationId, supersededAt, oldObservationId);
       if (updated.changes === 1) {
         // Terminal supersession of a source concept's ACTIVE observation leaves no current evidence
         // to read: null the pointer so refreshSourceConcept's CAS (and any other active_observation_id
@@ -1743,6 +2178,9 @@ export class MonetCore {
         // concept and this state is never left dangling in practice.
         if (newObservationId === null && oldConcept?.kind === "source" && oldConcept.active_observation_id === oldObservationId) {
           this.db.prepare(`UPDATE concepts SET active_observation_id = NULL WHERE id = ?`).run(old.concept_id);
+        }
+        if (oldConcept && oldConcept.kind !== "source") {
+          this.recomputeNativeConceptProjection(old.concept_id, this.nextSyncTimestamp());
         }
         return { oldObservationId, newObservationId, terminal: newObservationId === null, alreadySuperseded: false };
       }
@@ -1860,8 +2298,8 @@ export class MonetCore {
       // Retiring removes a concept from every public curation surface; an open contradiction can
       // no longer be mediated there, so close it explicitly rather than leaving an orphaned alert.
       this.db
-        .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000, resolved_by = 'retireConcept' WHERE concept_id = ? AND status = 'open'`)
-        .run(id);
+        .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = ?, resolved_by = 'retireConcept' WHERE concept_id = ? AND status = 'open'`)
+        .run(retiredAt, id);
       this.deleteFirstBlockEntry(id);
       this.unwindConceptGraph(id, row.circle);
       // dirty is NOT zeroed here: pending-synthesis state must survive a retire/restore round-trip.
@@ -1872,10 +2310,11 @@ export class MonetCore {
         .run(retiredAt, id);
       this.db
         .prepare(
-          `INSERT INTO concept_tombstones (concept_id, retired_at) VALUES (?, ?)
-           ON CONFLICT(concept_id) DO UPDATE SET retired_at = MAX(retired_at, excluded.retired_at)`,
+          `INSERT INTO concept_tombstones (concept_id, retired_at, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(concept_id) DO UPDATE SET retired_at = excluded.retired_at, updated_at = excluded.updated_at
+           WHERE excluded.retired_at > concept_tombstones.retired_at`,
         )
-        .run(id, retiredAt);
+        .run(id, retiredAt, this.nextSyncTimestamp());
       return toConcept(this.getRow(id)!);
     })();
     for (const [circle, conceptId] of this.lastConceptByCircle) if (conceptId === id) this.lastConceptByCircle.delete(circle);
@@ -1892,17 +2331,19 @@ export class MonetCore {
       const restoredAt = this.nextConceptLifecycleTimestamp(id);
       this.db
         .prepare(
-          `INSERT INTO concept_restorations (concept_id, restored_at) VALUES (?, ?)
-           ON CONFLICT(concept_id) DO UPDATE SET restored_at = MAX(restored_at, excluded.restored_at)`,
+          `INSERT INTO concept_restorations (concept_id, restored_at, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(concept_id) DO UPDATE SET restored_at = excluded.restored_at, updated_at = excluded.updated_at
+           WHERE excluded.restored_at > concept_restorations.restored_at`,
         )
-        .run(id, restoredAt);
+        .run(id, restoredAt, this.nextSyncTimestamp());
       this.db.prepare(`UPDATE concepts SET status = 'active', updated_at = ? WHERE id = ?`).run(restoredAt, id);
+      this.recomputeNativeConceptProjection(id, this.nextSyncTimestamp());
       this.rederiveConceptGraph(id, row.circle);
       return toConcept(this.getRow(id)!);
     })();
   }
 
-  /** Strictly order local retire/restore events even when they share one wall-clock millisecond. */
+  /** Strictly order local retire/restore events and keep legacy wall-clock watermarks safe. */
   private nextConceptLifecycleTimestamp(conceptId: string): number {
     const prior = this.db
       .prepare(
@@ -1913,7 +2354,7 @@ export class MonetCore {
          )`,
       )
       .get(conceptId, conceptId) as { ts: number | null };
-    return Math.max(Date.now(), (prior.ts ?? 0) + 1);
+    return this.nextSyncTimestamp(Math.max(Date.now(), (prior.ts ?? 0) + 1));
   }
 
   /**
@@ -2179,6 +2620,7 @@ export class MonetCore {
     let destConceptId: string;
 
     const result = this.db.transaction((): DetachResult => {
+      const contradictionClosureAt = Date.now();
       // 1. Destination: create or use existing.
       if (!destRow) {
         // Create from the first detached observation (by created_at order).
@@ -2295,9 +2737,9 @@ export class MonetCore {
                   // All prior evidence moved away; correcting obs stays — dispute dissolves.
                   this.db
                     .prepare(
-                      `UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000 WHERE id = ?`,
+                      `UPDATE contradictions SET status = 'dismissed', resolved_at = ? WHERE id = ?`,
                     )
-                    .run(contra.id);
+                    .run(contradictionClosureAt, contra.id);
                 }
                 // If some prior obs remain, leave the contradiction open (no action).
               }
@@ -2331,9 +2773,9 @@ export class MonetCore {
             // mark dismissed, do NOT supersede any observation).
             this.db
               .prepare(
-                `UPDATE contradictions SET status = 'dismissed', resolved_at = unixepoch() * 1000 WHERE id = ?`,
+                `UPDATE contradictions SET status = 'dismissed', resolved_at = ? WHERE id = ?`,
               )
-              .run(contra.id);
+              .run(contradictionClosureAt, contra.id);
           }
         }
 
@@ -2441,10 +2883,7 @@ export class MonetCore {
         // Graph must be unwound first; no rederive since the concept no longer exists.
         // First Block hook: source is deleted — remove its entry (referential integrity — no dangling row).
         // Mirrors mergeConceptInto's deleteFirstBlockEntry(src.id) before DELETE FROM concepts.
-        this.deleteFirstBlockEntry(sourceConceptId);
-        this.unwindConceptGraph(sourceConceptId, circle);
-        this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(sourceConceptId);
-        this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(sourceConceptId);
+        this.hardDeleteNativeConcept(sourceConceptId);
         sourceDeleted = true;
       } else {
         const remEmbs = remainingRows.map((o) => jsonToEmb(o.embedding));
@@ -2939,16 +3378,24 @@ export class MonetCore {
     const circle = rowA.circle;
     // Verify both ids are in the defaultCircle-resolved scope (mirrors circleOf gate used elsewhere).
     // circle is already the resolved circle from the row, not a user-supplied alias — no re-resolve needed.
-    const now = Date.now();
-    const result = this.db
-      .prepare(
-        `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?
-          WHERE scope = ? AND type = 'possible_duplicate_of'
-            AND dismissed_at IS NULL
-            AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))`,
-      )
-      .run(now, dismissedBy ?? null, circle, conceptAId, conceptBId, conceptBId, conceptAId);
-    return { dismissed: true, conceptAId, conceptBId, rowsUpdated: result.changes };
+    return this.db.transaction(() => {
+      const pending = this.db.prepare(
+        `SELECT 1 FROM memory_edge
+          WHERE scope = ? AND type = 'possible_duplicate_of' AND dismissed_at IS NULL
+            AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?)) LIMIT 1`,
+      ).get(circle, conceptAId, conceptBId, conceptBId, conceptAId);
+      if (!pending) return { dismissed: true as const, conceptAId, conceptBId, rowsUpdated: 0 };
+      const stamp = this.nextSyncTimestamp();
+      const result = this.db
+        .prepare(
+          `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?, sync_updated_at = ?
+            WHERE scope = ? AND type = 'possible_duplicate_of'
+              AND dismissed_at IS NULL
+              AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))`,
+        )
+        .run(stamp, dismissedBy ?? null, stamp, circle, conceptAId, conceptBId, conceptBId, conceptAId);
+      return { dismissed: true as const, conceptAId, conceptBId, rowsUpdated: result.changes };
+    })();
   }
 
   /**
@@ -3097,99 +3544,182 @@ export class MonetCore {
    * are scoped to the exported concept ids (no watermark column on those tables).
    */
   exportDelta(since: number): GraftPayload {
-    const concepts = this.db
-      .prepare(`SELECT * FROM concepts WHERE updated_at > ? AND kind != 'source' AND status != 'retired'`)
-      .all(since) as SyncConceptRow[];
+    return this.db.transaction((): GraftPayload => {
+      // The first read both captures the cursor and establishes SQLite's read snapshot. Every
+      // timestamped query is upper-bounded by that cursor, so a writer that commits while this
+      // export is scanning is necessarily left for the next delta instead of falling behind the
+      // returned watermark.
+      const cutoff = this.syncExportedAt();
+      const concepts = this.db
+        .prepare(`SELECT * FROM concepts WHERE updated_at >= ? AND updated_at <= ? AND kind != 'source' AND status != 'retired'`)
+        .all(since, cutoff) as SyncConceptRow[];
 
-    const observations = this.db
-      .prepare(
-        `SELECT o.* FROM observations o
-           JOIN concepts c ON c.id = o.concept_id
-          WHERE c.kind != 'source' AND c.status != 'retired'
-            AND (o.created_at > ? OR (o.superseded_at IS NOT NULL AND o.superseded_at > ?))`,
-      )
-      .all(since, since);
+      let observations = this.db
+        .prepare(
+          `SELECT o.* FROM observations o
+             JOIN concepts c ON c.id = o.concept_id
+            WHERE c.kind != 'source' AND c.status != 'retired'
+              AND o.updated_at >= ? AND o.updated_at <= ?`,
+        )
+        .all(since, cutoff);
 
-    const conceptRevisions = this.db
-      .prepare(`SELECT r.* FROM concept_revisions r JOIN concepts c ON c.id = r.concept_id WHERE r.created_at > ? AND c.kind != 'source' AND c.status != 'retired'`)
-      .all(since);
+      let conceptRevisions = this.db
+        .prepare(`SELECT r.* FROM concept_revisions r JOIN concepts c ON c.id = r.concept_id WHERE r.created_at >= ? AND r.created_at <= ? AND c.kind != 'source' AND c.status != 'retired'`)
+        .all(since, cutoff);
 
-    const contradictions = this.db
-      .prepare(
-        `SELECT k.* FROM contradictions k JOIN concepts c ON c.id = k.concept_id
-          WHERE c.kind != 'source' AND c.status != 'retired' AND (k.detected_at > ? OR (k.resolved_at IS NOT NULL AND k.resolved_at > ?))`,
-      )
-      .all(since, since);
+      let contradictions = this.db
+        .prepare(
+          `SELECT k.* FROM contradictions k JOIN concepts c ON c.id = k.concept_id
+            WHERE c.kind != 'source' AND c.status != 'retired'
+              AND k.updated_at >= ? AND k.updated_at <= ?`,
+        )
+        .all(since, cutoff);
 
-    const edges = this.db
-      .prepare(
-        `SELECT e.* FROM memory_edge e
-           JOIN concepts src ON src.id = e.src_id
-           JOIN concepts dst ON dst.id = e.dst_id
-          WHERE src.kind != 'source' AND dst.kind != 'source' AND src.status != 'retired' AND dst.status != 'retired'
-            AND (e.created_at > ? OR e.last_reinforced_at > ? OR (e.dismissed_at IS NOT NULL AND e.dismissed_at > ?))`,
-      )
-      .all(since, since, since);
+      const edges = this.db
+        .prepare(
+          `SELECT e.* FROM memory_edge e
+             JOIN concepts src ON src.id = e.src_id AND src.circle = e.scope
+             JOIN concepts dst ON dst.id = e.dst_id AND dst.circle = e.scope
+            WHERE src.kind NOT IN ('source', 'workstream') AND dst.kind NOT IN ('source', 'workstream')
+              AND src.status != 'retired' AND dst.status != 'retired'
+              AND e.sync_updated_at >= ? AND e.sync_updated_at <= ?`,
+        )
+        .all(since, cutoff);
 
-    const firstBlock = this.db
-      .prepare(`SELECT fb.* FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE fb.promoted_at > ? AND c.kind != 'source' AND c.status != 'retired'`)
-      .all(since);
+      const firstBlock = this.db
+        .prepare(`SELECT fb.* FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
+                   WHERE fb.updated_at >= ? AND fb.updated_at <= ?
+                     AND c.kind != 'source' AND c.status != 'retired'
+                     AND (fb.circle = c.circle OR fb.deleted_at IS NOT NULL)`)
+        .all(since, cutoff);
 
-    const tombstones = this.db
+      const tombstones = this.db
       // Lifecycle events replay at an equality boundary. Grafting is idempotent and chooses the
       // latest event, so >= avoids permanently missing an event in the caller watermark's ms.
       // kind != 'source': a source concept's lifecycle is connector-owned like everything else
       // about it — generic sync is intentionally not a connector authority boundary (see
       // assertGraftPayloadIsNativeOnly above), so its retirements/restorations never leave the machine.
-      .prepare(`SELECT t.concept_id AS concept_id, t.retired_at AS retired_at FROM concept_tombstones t JOIN concepts c ON c.id = t.concept_id WHERE t.retired_at >= ? AND c.kind != 'source'`)
-      .all(since);
-    const restorations = this.db
-      .prepare(`SELECT r.concept_id AS concept_id, r.restored_at AS restored_at FROM concept_restorations r JOIN concepts c ON c.id = r.concept_id WHERE r.restored_at >= ? AND c.kind != 'source'`)
-      .all(since);
+        .prepare(`SELECT t.concept_id AS concept_id, t.retired_at AS retired_at, t.updated_at AS updated_at FROM concept_tombstones t JOIN concepts c ON c.id = t.concept_id WHERE t.updated_at >= ? AND t.updated_at <= ? AND c.kind != 'source'`)
+        .all(since, cutoff);
+      const restorations = this.db
+        .prepare(`SELECT r.concept_id AS concept_id, r.restored_at AS restored_at, r.updated_at AS updated_at FROM concept_restorations r JOIN concepts c ON c.id = r.concept_id WHERE r.updated_at >= ? AND r.updated_at <= ? AND c.kind != 'source'`)
+        .all(since, cutoff);
+      const deletions = this.db
+        .prepare(
+          `SELECT d.* FROM concept_deletions d
+            WHERE d.updated_at >= ? AND d.updated_at <= ?
+              AND d.concept_kind = 'native' AND d.writer_id IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM concepts c WHERE c.id = d.concept_id AND c.kind = 'source')`,
+        )
+        .all(since, cutoff);
 
-    // circle_aliases: export all (tiny table; no reliable per-row watermark).
-    const circleAliases = this.db.prepare(`SELECT * FROM circle_aliases`).all();
+    // Any exported concept closes over its immutable evidence/revision ledger. Besides making a
+    // restoration self-contained, this gives an intermediary a relay-visible envelope for old
+    // immutable rows without rewriting their semantic creation timestamps.
+      const closureIds = [...new Set([
+        ...concepts.map((c) => c.id),
+        ...(restorations as Array<{ concept_id: string }>).map((r) => r.concept_id),
+      ])];
+      if (closureIds.length > 0) {
+        const ph = closureIds.map(() => "?").join(",");
+        const closureObs = this.db
+          .prepare(`SELECT o.* FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE o.concept_id IN (${ph}) AND c.kind != 'source'`)
+          .all(...closureIds);
+        const closureRevs = this.db
+          .prepare(`SELECT r.* FROM concept_revisions r JOIN concepts c ON c.id = r.concept_id WHERE r.concept_id IN (${ph}) AND c.kind != 'source'`)
+          .all(...closureIds);
+        const closureContradictions = this.db
+          .prepare(`SELECT k.* FROM contradictions k JOIN concepts c ON c.id = k.concept_id WHERE k.concept_id IN (${ph}) AND c.kind != 'source'`)
+          .all(...closureIds);
+        observations = uniqueRowsById([...observations, ...closureObs] as Array<{ id: string }>);
+        conceptRevisions = uniqueRowsById([...conceptRevisions, ...closureRevs] as Array<{ id: string }>);
+        contradictions = uniqueRowsById([...contradictions, ...closureContradictions] as Array<{ id: string }>);
+      }
 
-    const sessions = this.db
-      .prepare(`SELECT * FROM sessions WHERE started_at > ?`)
-      .all(since);
+      const circleAliases = this.db.prepare(`SELECT * FROM circle_aliases WHERE updated_at >= ? AND updated_at <= ?`).all(since, cutoff);
+
+      const sessions = this.db
+        .prepare(`SELECT * FROM sessions WHERE updated_at >= ? AND updated_at <= ?`)
+        .all(since, cutoff);
+      const edgeComponents = this.db
+        .prepare(
+          `SELECT ec.* FROM memory_edge_components ec
+             JOIN memory_edge e ON e.src_id = ec.src_id AND e.dst_id = ec.dst_id
+               AND e.type = ec.type AND e.scope = ec.scope AND e.dismissed_at IS NULL
+             JOIN concepts src ON src.id = ec.src_id AND src.circle = ec.scope
+             JOIN concepts dst ON dst.id = ec.dst_id AND dst.circle = ec.scope
+            WHERE src.kind NOT IN ('source', 'workstream') AND dst.kind NOT IN ('source', 'workstream')
+              AND src.status != 'retired' AND dst.status != 'retired'
+              AND ec.updated_at >= ? AND ec.updated_at <= ?`,
+        )
+        .all(since, cutoff);
+      let conceptActivity = this.db
+        .prepare(
+          `SELECT a.* FROM concept_activity_components a
+             JOIN concepts c ON c.id = a.concept_id
+            WHERE c.kind != 'source' AND c.status != 'retired'
+              AND a.updated_at >= ? AND a.updated_at <= ?`,
+        )
+        .all(since, cutoff);
+      if (closureIds.length > 0) {
+        const ph = closureIds.map(() => "?").join(",");
+        const closureActivity = this.db.prepare(
+          `SELECT a.* FROM concept_activity_components a
+             JOIN concepts c ON c.id = a.concept_id
+            WHERE a.concept_id IN (${ph}) AND c.kind != 'source'`,
+        ).all(...closureIds) as Array<{ concept_id: string; writer_id: string }>;
+        const byKey = new Map<string, unknown>();
+        for (const row of [...conceptActivity, ...closureActivity] as Array<{ concept_id: string; writer_id: string }>) {
+          byKey.set(`${row.concept_id}\0${row.writer_id}`, row);
+        }
+        conceptActivity = [...byKey.values()];
+      }
 
     // entities + concept_entities: no timestamp columns; scope to exported concept ids.
-    const exportedIds = concepts.map((c) => c.id);
-    let conceptEntities: unknown[] = [];
-    let entities: unknown[] = [];
-    if (exportedIds.length > 0) {
-      const ph = exportedIds.map(() => "?").join(",");
-      conceptEntities = this.db.prepare(`SELECT * FROM concept_entities WHERE concept_id IN (${ph})`).all(...exportedIds);
+      const exportedIds = concepts.map((c) => c.id);
+      let conceptEntities: unknown[] = [];
+      const entities: unknown[] = [];
+      if (exportedIds.length > 0) {
+        const ph = exportedIds.map(() => "?").join(",");
+        conceptEntities = this.db.prepare(
+          `SELECT ce.* FROM concept_entities ce
+             JOIN concepts c ON c.id = ce.concept_id AND c.circle = ce.scope
+            WHERE ce.concept_id IN (${ph}) AND c.kind != 'source' AND c.status != 'retired'`,
+        ).all(...exportedIds);
       // Collect unique (key, scope) pairs referenced by those concept_entities rows.
-      const seen = new Set<string>();
-      for (const ce of conceptEntities as Array<{ entity_key: string; scope: string }>) {
-        const k = `${ce.entity_key}\x00${ce.scope}`;
-        if (seen.has(k)) continue;
-        seen.add(k);
-        const ent = this.db.prepare(`SELECT * FROM entities WHERE key = ? AND scope = ?`).get(ce.entity_key, ce.scope);
-        if (ent) entities.push(ent);
+        const seen = new Set<string>();
+        for (const ce of conceptEntities as Array<{ entity_key: string; scope: string }>) {
+          const k = `${ce.entity_key}\x00${ce.scope}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          const ent = this.db.prepare(`SELECT * FROM entities WHERE key = ? AND scope = ?`).get(ce.entity_key, ce.scope);
+          if (ent) entities.push(ent);
+        }
       }
-    }
 
-    return {
-      exportedAt: Date.now(),
-      since,
-      deviceId: this.agentId,
-      embedderModelId: this.embedderModelId,
-      concepts: concepts as GraftPayload["concepts"],
-      observations: observations as GraftPayload["observations"],
-      conceptRevisions: conceptRevisions as GraftPayload["conceptRevisions"],
-      contradictions: contradictions as GraftPayload["contradictions"],
-      edges: edges as GraftPayload["edges"],
-      firstBlock: firstBlock as GraftPayload["firstBlock"],
-      circleAliases: circleAliases as GraftPayload["circleAliases"],
-      entities: entities as GraftPayload["entities"],
-      conceptEntities: conceptEntities as GraftPayload["conceptEntities"],
-      tombstones: tombstones as GraftPayload["tombstones"],
-      restorations: restorations as GraftPayload["restorations"],
-      sessions: sessions as GraftPayload["sessions"],
-    };
+      return {
+        schemaVersion: SYNC_CLOSURE_SCHEMA_VERSION,
+        exportedAt: cutoff,
+        since,
+        deviceId: this.syncDeviceId,
+        embedderModelId: this.embedderModelId,
+        concepts: concepts as GraftPayload["concepts"],
+        observations: observations as GraftPayload["observations"],
+        conceptRevisions: conceptRevisions as GraftPayload["conceptRevisions"],
+        contradictions: contradictions as GraftPayload["contradictions"],
+        edges: edges as GraftPayload["edges"],
+        edgeComponents: edgeComponents as NonNullable<GraftPayload["edgeComponents"]>,
+        deletions: deletions as NonNullable<GraftPayload["deletions"]>,
+        conceptActivity: conceptActivity as NonNullable<GraftPayload["conceptActivity"]>,
+        firstBlock: firstBlock as GraftPayload["firstBlock"],
+        circleAliases: circleAliases as GraftPayload["circleAliases"],
+        entities: entities as GraftPayload["entities"],
+        conceptEntities: conceptEntities as GraftPayload["conceptEntities"],
+        tombstones: tombstones as GraftPayload["tombstones"],
+        restorations: restorations as GraftPayload["restorations"],
+        sessions: sessions as GraftPayload["sessions"],
+      };
+    })();
   }
 
   /** Generic engine sync is intentionally not a connector authority boundary. */
@@ -3204,19 +3734,70 @@ export class MonetCore {
     const localSourceIds = new Set(
       (this.db.prepare(`SELECT id FROM concepts WHERE kind = 'source'`).all() as Array<{ id: string }>).map((row) => row.id),
     );
-    if (localSourceIds.size === 0) return;
+    const localSourceObservationIds = new Set(
+      (this.db.prepare(
+        `SELECT o.id FROM observations o
+          LEFT JOIN concepts c ON c.id = o.concept_id
+         WHERE o.kind = 'source' OR c.kind = 'source'`,
+      ).all() as Array<{ id: string }>).map((row) => row.id),
+    );
     const touchesSource =
+      payload.concepts.some((row) => localSourceIds.has(row.id)) ||
       payload.observations.some((row) => row.concept_id !== null && localSourceIds.has(row.concept_id)) ||
+      payload.observations.some((row) => localSourceObservationIds.has(row.id) || (row.superseded_by !== null && localSourceObservationIds.has(row.superseded_by))) ||
+      payload.conceptRevisions.some((row) => row.trigger_observation_id !== null && localSourceObservationIds.has(row.trigger_observation_id)) ||
       payload.conceptRevisions.some((row) => localSourceIds.has(row.concept_id)) ||
-      payload.contradictions.some((row) => localSourceIds.has(row.concept_id)) ||
+      payload.contradictions.some((row) => localSourceIds.has(row.concept_id) ||
+        (row.observation_id !== null && localSourceObservationIds.has(row.observation_id)) ||
+        (row.resolution_obs_id !== null && localSourceObservationIds.has(row.resolution_obs_id))) ||
       payload.firstBlock.some((row) => localSourceIds.has(row.concept_id)) ||
       payload.conceptEntities.some((row) => localSourceIds.has(row.concept_id)) ||
       payload.edges.some((row) => localSourceIds.has(row.src_id) || localSourceIds.has(row.dst_id)) ||
+      (payload.edgeComponents ?? []).some((row) => localSourceIds.has(row.src_id) || localSourceIds.has(row.dst_id)) ||
+      (payload.conceptActivity ?? []).some((row) => localSourceIds.has(row.concept_id)) ||
+      (payload.deletions ?? []).some((row) => localSourceIds.has(row.concept_id)) ||
       // Lifecycle events are a backdoor too: a forged tombstone/restoration naming a local source
       // id would otherwise retire or resurrect a connector-owned concept through generic sync.
       (payload.tombstones ?? []).some((row) => localSourceIds.has(row.concept_id)) ||
       (payload.restorations ?? []).some((row) => localSourceIds.has(row.concept_id));
     if (touchesSource) throw new Error("graftRows cannot mutate source-owned concepts");
+
+    const isV8 = (payload.schemaVersion ?? 0) >= SYNC_CLOSURE_SCHEMA_VERSION;
+    for (const deletion of payload.deletions ?? []) {
+      const kind = (deletion as { concept_kind?: string }).concept_kind;
+      const writer = (deletion as { writer_id?: string }).writer_id;
+      if (isV8) {
+        if (kind !== "native" || !writer) throw new Error("graftRows requires explicit native deletion provenance");
+      } else {
+        const local = this.db.prepare(`SELECT kind FROM concepts WHERE id = ?`).get(deletion.concept_id) as { kind: string } | undefined;
+        if (!local || local.kind === "source") throw new Error("legacy graft deletion requires a locally known native concept");
+      }
+    }
+
+    // Edges are executable graph state, not inert references. Validate both endpoints even when
+    // this replica has never seen them: an incremental payload may rely on a local endpoint, but
+    // an unknown endpoint must be accompanied by a native, same-scope concept row. Retired native
+    // endpoints are allowed through preflight even when their current circle differs: the
+    // transactional tombstone/active checks harmlessly skip stale peer graph rows from before a
+    // move+retire without aborting unrelated payload changes.
+    const incomingConcepts = new Map(payload.concepts.map((row) => [row.id, row]));
+    const endpoint = (id: string): Pick<SyncConceptRow, "kind" | "status" | "circle"> | undefined => {
+      const local = this.db.prepare(`SELECT kind, status, circle FROM concepts WHERE id = ?`).get(id) as Pick<SyncConceptRow, "kind" | "status" | "circle"> | undefined;
+      return incomingConcepts.get(id) ?? local;
+    };
+    for (const edge of [...payload.edges, ...(payload.edgeComponents ?? [])]) {
+      for (const id of [edge.src_id, edge.dst_id]) {
+        const concept = endpoint(id);
+        if (!concept) throw new Error(`graftRows edge endpoint '${id}' is unknown`);
+        if (
+          concept.kind === "source" ||
+          concept.kind === "workstream" ||
+          (concept.status !== "retired" && concept.circle !== edge.scope)
+        ) {
+          throw new Error(`graftRows edge endpoint '${id}' is not a native concept in scope '${edge.scope}'`);
+        }
+      }
+    }
   }
 
   /**
@@ -3237,50 +3818,130 @@ export class MonetCore {
     }
     this.assertGraftPayloadIsNativeOnly(payload);
 
-    const tables = ["sessions", "circle_aliases", "tombstones", "restorations", "concepts", "observations", "concept_revisions", "contradictions", "memory_edge", "first_block", "entities", "concept_entities"] as const;
+    const tables = ["sessions", "circle_aliases", "tombstones", "restorations", "deletions", "concepts", "concept_activity", "observations", "concept_revisions", "contradictions", "memory_edge", "memory_edge_components", "first_block", "entities", "concept_entities"] as const;
     const inserted: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
     const skipped: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
-    const conceptsWithNewObs = new Set<string>();
+    const conceptsWithChangedBindings = new Set<string>();
+    const conceptsMarkedDirty = new Set<string>();
+    const conceptsNeedingProjection = new Set<string>();
+    const importedConceptProjections = new Map<string, {
+      supportCount: number;
+      embedding: string;
+      confidence: number;
+      status: string;
+      lastConfirmedAt: number | null;
+      lastConfirmedSessionId: string | null;
+      dirty: number;
+      summarySourceChanged: boolean;
+    }>();
     const now = Date.now();
+    const relayAt = this.nextSyncTimestamp();
+    const incomingMeta = (
+      row: { sync_revision?: number; sync_writer?: string | null },
+      table: string,
+      naturalKey: string,
+      localRevision = 0,
+    ): [number, string] => {
+      if ((payload.schemaVersion ?? 0) >= SYNC_CLOSURE_SCHEMA_VERSION) {
+        return [row.sync_revision ?? 0, row.sync_writer ?? payload.deviceId];
+      }
+      const fingerprint = stableFingerprint(row);
+      const state = this.db.prepare(
+        `SELECT fingerprint, adapted_revision FROM legacy_sync_state
+          WHERE origin_id = ? AND table_name = ? AND natural_key = ?`,
+      ).get(payload.deviceId, table, naturalKey) as { fingerprint: string; adapted_revision: number } | undefined;
+      if (state?.fingerprint === fingerprint) return [state.adapted_revision, `legacy:${payload.deviceId}`];
+      // Legacy rows carry no causal clock. Changed arrivals from one origin are adapted in receive
+      // order; identical replay is stable, but out-of-order legacy edits necessarily remain
+      // arrival-wins because v7 supplied no information from which to recover their true order.
+      const revision = Math.max(localRevision, state?.adapted_revision ?? 0) + 1;
+      this.db.prepare(
+        `INSERT INTO legacy_sync_state (origin_id, table_name, natural_key, fingerprint, adapted_revision, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(origin_id, table_name, natural_key) DO UPDATE SET
+           fingerprint = excluded.fingerprint, adapted_revision = excluded.adapted_revision,
+           updated_at = excluded.updated_at`,
+      ).run(payload.deviceId, table, naturalKey, fingerprint, revision, relayAt);
+      return [revision, `legacy:${payload.deviceId}`];
+    };
 
     const txn = this.db.transaction(() => {
-      // 1. sessions — INSERT OR IGNORE
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
+      // 1. sessions — complete deterministic row convergence
       for (const row of payload.sessions ?? []) {
+        const current = this.db.prepare(`SELECT sync_revision FROM sessions WHERE id = ?`).get(row.id) as { sync_revision: number } | undefined;
+        const [revision, writer] = incomingMeta(row, "sessions", row.id, current?.sync_revision);
         const r = this.db
           .prepare(
-            `INSERT OR IGNORE INTO sessions (id, agent_id, scope_context, started_at, ended_at, status, summary)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO sessions (id, agent_id, scope_context, started_at, ended_at, status, summary, updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               agent_id = excluded.agent_id, scope_context = excluded.scope_context,
+               started_at = excluded.started_at, ended_at = excluded.ended_at,
+               status = excluded.status, summary = excluded.summary,
+               updated_at = excluded.updated_at, sync_revision = excluded.sync_revision,
+               sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > sessions.sync_revision
+                OR (excluded.sync_revision = sessions.sync_revision AND excluded.sync_writer > COALESCE(sessions.sync_writer, ''))`,
           )
-          .run(row.id, row.agent_id, row.scope_context ?? null, row.started_at, row.ended_at ?? null, row.status, row.summary ?? null);
+          .run(row.id, row.agent_id, row.scope_context ?? null, row.started_at, row.ended_at ?? null, row.status, row.summary ?? null, relayAt, revision, writer);
         if (r.changes > 0) inserted.sessions++;
         else skipped.sessions++;
       }
 
-      // 2. circle_aliases — deactivations win
+      // 2. circle_aliases — complete deterministic row convergence
       for (const row of payload.circleAliases) {
+        const current = this.db.prepare(`SELECT sync_revision FROM circle_aliases WHERE from_name = ?`).get(row.from_name) as { sync_revision: number } | undefined;
+        const [revision, writer] = incomingMeta(row, "circle_aliases", row.from_name, current?.sync_revision);
         const r = this.db
           .prepare(
-            `INSERT INTO circle_aliases (from_name, to_name, status, created_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(from_name) DO UPDATE SET status = excluded.status`,
+            `INSERT INTO circle_aliases (from_name, to_name, status, created_at, updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(from_name) DO UPDATE SET
+               to_name = excluded.to_name, status = excluded.status,
+               created_at = excluded.created_at, updated_at = excluded.updated_at,
+               sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > circle_aliases.sync_revision
+                OR (excluded.sync_revision = circle_aliases.sync_revision AND excluded.sync_writer > COALESCE(circle_aliases.sync_writer, ''))`,
           )
-          .run(row.from_name, row.to_name, row.status, row.created_at);
+          .run(row.from_name, row.to_name, row.status, row.created_at, relayAt, revision, writer);
         // ON CONFLICT returns changes=1 for both insert and update paths in SQLite
         if (r.changes > 0) inserted.circle_aliases++;
         else skipped.circle_aliases++;
       }
 
-      // 3. lifecycle events — retain BOTH sides of the history, then choose the later event.
+      // 3. durable hard deletions dominate every stale row family forever.
+      for (const row of payload.deletions ?? []) {
+        const r = this.db.prepare(
+          `INSERT INTO concept_deletions (concept_id, deleted_at, updated_at, writer_id, concept_kind) VALUES (?, ?, ?, ?, 'native')
+           ON CONFLICT(concept_id) DO UPDATE SET
+             deleted_at = excluded.deleted_at, updated_at = excluded.updated_at,
+             writer_id = excluded.writer_id, concept_kind = excluded.concept_kind
+           WHERE excluded.deleted_at > concept_deletions.deleted_at`,
+        ).run(row.concept_id, row.deleted_at, relayAt,
+          row.writer_id ?? `legacy:${payload.deviceId}`);
+        if (r.changes > 0) inserted.deletions++;
+        else skipped.deletions++;
+        if (this.db.prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(row.concept_id)) {
+          this.hardDeleteNativeConcept(row.concept_id, false, row.deleted_at);
+        }
+      }
+      const isDeleted = (conceptId: string | null | undefined): boolean => !!conceptId && !!this.db
+        .prepare(`SELECT 1 FROM concept_deletions WHERE concept_id = ?`)
+        .get(conceptId);
+
+      // 4. lifecycle events — retain BOTH sides of the history, then choose the later event.
       // Processing both before evidence prevents an out-of-order stale delta from resurrecting a
       // retired concept while still allowing an explicit later restore to converge every replica.
       const lifecycleConceptIds = new Set<string>();
       for (const row of payload.tombstones ?? []) {
         const r = this.db
           .prepare(
-            `INSERT INTO concept_tombstones (concept_id, retired_at) VALUES (?, ?)
-             ON CONFLICT(concept_id) DO UPDATE SET retired_at = MAX(retired_at, excluded.retired_at)`,
+            `INSERT INTO concept_tombstones (concept_id, retired_at, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(concept_id) DO UPDATE SET retired_at = excluded.retired_at, updated_at = excluded.updated_at
+             WHERE excluded.retired_at > concept_tombstones.retired_at`,
         )
-        .run(row.concept_id, row.retired_at);
+        .run(row.concept_id, row.retired_at, relayAt);
         if (r.changes > 0) inserted.tombstones++;
         else skipped.tombstones++;
         lifecycleConceptIds.add(row.concept_id);
@@ -3288,10 +3949,11 @@ export class MonetCore {
       for (const row of payload.restorations ?? []) {
         const r = this.db
           .prepare(
-            `INSERT INTO concept_restorations (concept_id, restored_at) VALUES (?, ?)
-             ON CONFLICT(concept_id) DO UPDATE SET restored_at = MAX(restored_at, excluded.restored_at)`,
+            `INSERT INTO concept_restorations (concept_id, restored_at, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(concept_id) DO UPDATE SET restored_at = excluded.restored_at, updated_at = excluded.updated_at
+             WHERE excluded.restored_at > concept_restorations.restored_at`,
           )
-          .run(row.concept_id, row.restored_at);
+          .run(row.concept_id, row.restored_at, relayAt);
         if (r.changes > 0) inserted.restorations++;
         else skipped.restorations++;
         lifecycleConceptIds.add(row.concept_id);
@@ -3310,8 +3972,152 @@ export class MonetCore {
       };
       const isTombstoned = (conceptId: string | null | undefined): boolean => {
         if (!conceptId) return false;
+        if (isDeleted(conceptId)) return true;
         const { retiredAt, restoredAt } = lifecycle(conceptId);
         return retiredAt !== null && (restoredAt === null || retiredAt >= restoredAt);
+      };
+      const activeNativeConcept = (conceptId: string | null | undefined): { circle: string } | null => {
+        if (!conceptId || isTombstoned(conceptId)) return null;
+        const concept = this.db.prepare(
+          `SELECT circle, kind, status FROM concepts WHERE id = ?`,
+        ).get(conceptId) as { circle: string; kind: string; status: string } | undefined;
+        return concept && concept.kind !== "source" && concept.status !== "retired"
+          ? { circle: concept.circle }
+          : null;
+      };
+      const normalizeBoundObservationCircles = (conceptId: string, circle: string): number => this.db.prepare(
+        `UPDATE observations SET circle = ?, updated_at = ?
+          WHERE concept_id = ? AND circle IS NOT ?`,
+      ).run(circle, relayAt, conceptId, circle).changes;
+
+      type FirstBlockDbRow = {
+        id: string; concept_id: string; circle: string; summary: string; summary_dirty: number;
+        position: number; promoted_at: number; promoted_by: string | null; updated_at: number;
+        sync_revision: number; sync_writer: string | null; deleted_at: number | null;
+      };
+      const firstBlockSemanticKey = (row: FirstBlockDbRow): string => JSON.stringify([
+        row.summary,
+        row.summary_dirty,
+        row.position,
+        row.promoted_at,
+        row.promoted_by,
+        row.deleted_at,
+      ]);
+      const firstBlockWins = (left: FirstBlockDbRow, right: FirstBlockDbRow): FirstBlockDbRow => {
+        if (left.sync_revision !== right.sync_revision) return left.sync_revision > right.sync_revision ? left : right;
+        const leftWriter = left.sync_writer ?? "";
+        const rightWriter = right.sync_writer ?? "";
+        const leftDerived = leftWriter.startsWith("rehome:");
+        const rightDerived = rightWriter.startsWith("rehome:");
+        if (leftDerived !== rightDerived) return leftDerived ? right : left;
+        // Synthetic rehomes from different prior circles do not carry authoritative writer order.
+        // Resolve those equal-revision collisions semantically; real direct writers retain LWW.
+        if (!leftDerived && leftWriter !== rightWriter) return leftWriter > rightWriter ? left : right;
+        if ((left.deleted_at === null) !== (right.deleted_at === null)) return left.deleted_at !== null ? left : right;
+        const leftSemanticKey = firstBlockSemanticKey(left);
+        const rightSemanticKey = firstBlockSemanticKey(right);
+        if (leftSemanticKey !== rightSemanticKey) return leftSemanticKey > rightSemanticKey ? left : right;
+        if (leftWriter !== rightWriter) return leftWriter > rightWriter ? left : right;
+        // Ownership and relay timestamps are derived receiver-local state. On a semantic tie,
+        // preserve the first candidate (existing rows precede incoming) so replay is a no-op.
+        return left;
+      };
+      const insertFirstBlockRow = (row: FirstBlockDbRow): void => {
+        this.db.prepare(
+          `INSERT INTO first_block
+             (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by,
+              updated_at, sync_revision, sync_writer, deleted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(row.id, row.concept_id, row.circle, row.summary, row.summary_dirty, row.position,
+          row.promoted_at, row.promoted_by, row.updated_at, row.sync_revision, row.sync_writer,
+          row.deleted_at);
+      };
+      const mergeFirstBlockNaturalRow = (
+        incoming: FirstBlockDbRow,
+      ): { changed: boolean; incomingWon: boolean } => {
+        const existing = this.db.prepare(
+          `SELECT * FROM first_block WHERE concept_id = ? AND circle = ?`,
+        ).get(incoming.concept_id, incoming.circle) as FirstBlockDbRow | undefined;
+        if (!existing) {
+          insertFirstBlockRow(incoming);
+          return { changed: true, incomingWon: true };
+        }
+        const winner = firstBlockWins(existing, incoming);
+        if (winner === existing) return { changed: false, incomingWon: false };
+        this.db.prepare(`DELETE FROM first_block WHERE id = ?`).run(existing.id);
+        insertFirstBlockRow(incoming);
+        return { changed: true, incomingWon: true };
+      };
+      const rehomeFirstBlockWriter = (conceptId: string, originCircle: string): string =>
+        `rehome:${stableFingerprint([conceptId, originCircle])}`;
+      const normalizeFirstBlockOwnership = (conceptId: string, ownershipChanged = false): boolean => {
+        const concept = activeNativeConcept(conceptId);
+        if (!concept) return false;
+        const canonicalId = deterministicFirstBlockId(conceptId, concept.circle);
+        // First Block revisions are clocks for (concept_id, circle), not for concept_id globally.
+        // A canonical-circle row — active or tombstoned — is therefore authoritative without any
+        // comparison to historical rows from prior circles.
+        const canonical = this.db.prepare(
+          `SELECT * FROM first_block WHERE concept_id = ? AND circle = ?`,
+        ).get(conceptId, concept.circle) as FirstBlockDbRow | undefined;
+        if (canonical) {
+          // A row may have arrived while its circle was not yet the concept winner. Once the
+          // concept move lands, relay-stamp that already-converged natural-key row without
+          // manufacturing a new causal revision/writer.
+          if (ownershipChanged) {
+            this.db.prepare(`UPDATE first_block SET updated_at = ? WHERE id = ?`)
+              .run(relayAt, canonical.id);
+          }
+          // A derived rehome remains linked to its historical active row until the canonical key is
+          // edited/promoted/deleted directly. This lets equal-clock semantic collisions converge in
+          // the origin clock domain without treating the origin revision as a canonical revision.
+          const priorActive = this.db.prepare(
+            `SELECT * FROM first_block
+              WHERE concept_id = ? AND circle != ? AND deleted_at IS NULL
+              ORDER BY promoted_at DESC, circle DESC, id DESC`,
+          ).all(conceptId, concept.circle) as FirstBlockDbRow[];
+          const origin = priorActive.find(
+            (row) => canonical.sync_writer === rehomeFirstBlockWriter(conceptId, row.circle),
+          );
+          if (!origin) return false;
+          const derivedSummaryDirty = Math.max(canonical.summary_dirty, origin.summary_dirty);
+          const derivedChanged = canonical.summary !== origin.summary
+            || canonical.summary_dirty !== derivedSummaryDirty
+            || canonical.promoted_at !== origin.promoted_at
+            || canonical.promoted_by !== origin.promoted_by;
+          if (!derivedChanged) return false;
+          this.db.prepare(
+            `UPDATE first_block SET summary = ?, summary_dirty = ?, promoted_at = ?,
+                    promoted_by = ?, updated_at = ? WHERE id = ?`,
+          ).run(origin.summary, derivedSummaryDirty, origin.promoted_at, origin.promoted_by,
+            relayAt, canonical.id);
+          return true;
+        }
+        // A concept-only move still carries a receiver-local active pin forward. Tombstones remain
+        // in their historical circle and are never re-homed or compared across clock domains.
+        const prior = this.db.prepare(
+          `SELECT * FROM first_block
+            WHERE concept_id = ? AND circle != ? AND deleted_at IS NULL
+            ORDER BY promoted_at DESC, circle DESC, id DESC LIMIT 1`,
+        ).get(conceptId, concept.circle) as FirstBlockDbRow | undefined;
+        if (!prior) return false;
+        const { m: destMax } = this.db.prepare(
+          `SELECT COALESCE(MAX(fb.position), -1) AS m
+             FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
+            WHERE fb.circle = ? AND c.circle = fb.circle AND fb.deleted_at IS NULL`,
+        ).get(concept.circle) as { m: number };
+        const rehomed: FirstBlockDbRow = {
+          ...prior,
+          id: canonicalId,
+          circle: concept.circle,
+          position: destMax + 1,
+          updated_at: relayAt,
+          // Start the destination natural-key clock independently of the prior circle's revision.
+          sync_revision: 1,
+          sync_writer: rehomeFirstBlockWriter(conceptId, prior.circle),
+        };
+        insertFirstBlockRow(rehomed);
+        return true;
       };
       for (const conceptId of lifecycleConceptIds) {
         const { retiredAt, restoredAt } = lifecycle(conceptId);
@@ -3337,71 +4143,215 @@ export class MonetCore {
             .run(retiredAt, local.id);
         } else if (restoredAt !== null && local.status === "retired") {
           this.db.prepare(`UPDATE concepts SET status = 'active', updated_at = MAX(updated_at, ?) WHERE id = ?`).run(restoredAt, local.id);
-          this.rederiveConceptGraph(local.id, local.circle);
+          if ((payload.schemaVersion ?? 0) < SYNC_CLOSURE_SCHEMA_VERSION) this.rederiveConceptGraph(local.id, local.circle);
         }
       }
 
-      // 4. concepts — INSERT OR IGNORE (receiver's version wins; dirty-marking on new obs handles staleness)
+      const activityConcepts = new Set<string>();
+      // 4. concepts — complete deterministic row convergence
       for (const row of payload.concepts) {
-        if (isTombstoned(row.id)) {
+        if (isDeleted(row.id) || isTombstoned(row.id)) {
           skipped.concepts++;
           continue;
         }
+        const current = this.db.prepare(
+          `SELECT sync_revision, circle, title, body, source_refs, aliases,
+                  usefulness_last_fetched_at, arousal_last_updated_at
+             FROM concepts WHERE id = ?`,
+        ).get(row.id) as {
+          sync_revision: number; circle: string; title: string; body: string;
+          source_refs: string | null; aliases: string | null;
+          usefulness_last_fetched_at: number | null; arousal_last_updated_at: number | null;
+        } | undefined;
+        const [revision, writer] = incomingMeta(row, "concepts", row.id, current?.sync_revision);
         const r = this.db
           .prepare(
-            `INSERT OR IGNORE INTO concepts
+            `INSERT INTO concepts
                (id, slug, title, body, kind, status, confidence, version, circle, embedding,
                 support_count, dirty, updated_at, created_at, usefulness_score,
                 usefulness_last_fetched_at, arousal_score, arousal_last_updated_at,
-                source_refs, aliases, last_confirmed_at, last_confirmed_session_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                source_refs, aliases, last_confirmed_at, last_confirmed_session_id,
+                sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               slug = excluded.slug, title = excluded.title, body = excluded.body,
+               kind = excluded.kind, status = excluded.status, confidence = excluded.confidence,
+               version = excluded.version, circle = excluded.circle, embedding = excluded.embedding,
+               support_count = excluded.support_count, dirty = excluded.dirty,
+               updated_at = excluded.updated_at, created_at = excluded.created_at,
+               usefulness_last_fetched_at = CASE
+                 WHEN usefulness_last_fetched_at IS NULL THEN excluded.usefulness_last_fetched_at
+                 WHEN excluded.usefulness_last_fetched_at IS NULL THEN usefulness_last_fetched_at
+                 ELSE MAX(usefulness_last_fetched_at, excluded.usefulness_last_fetched_at)
+               END,
+               arousal_last_updated_at = CASE
+                 WHEN arousal_last_updated_at IS NULL THEN excluded.arousal_last_updated_at
+                 WHEN excluded.arousal_last_updated_at IS NULL THEN arousal_last_updated_at
+                 ELSE MAX(arousal_last_updated_at, excluded.arousal_last_updated_at)
+               END,
+               last_confirmed_at = excluded.last_confirmed_at,
+               last_confirmed_session_id = excluded.last_confirmed_session_id,
+               sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > concepts.sync_revision
+                OR (excluded.sync_revision = concepts.sync_revision AND excluded.sync_writer > COALESCE(concepts.sync_writer, ''))`,
           )
           .run(
             row.id, row.slug, row.title, row.body, row.kind, row.status, row.confidence,
             row.version, row.circle, row.embedding, row.support_count, row.dirty,
-            row.updated_at, row.created_at ?? now, row.usefulness_score,
+            relayAt, row.created_at ?? now, row.usefulness_score,
             row.usefulness_last_fetched_at ?? null, row.arousal_score,
             row.arousal_last_updated_at ?? null, row.source_refs ?? null,
             row.aliases ?? null, row.last_confirmed_at ?? null,
-            row.last_confirmed_session_id ?? null,
+            row.last_confirmed_session_id ?? null, revision, writer,
           );
         if (r.changes > 0) inserted.concepts++;
         else skipped.concepts++;
+        const unionJson = (left: string | null | undefined, right: string | null | undefined): string | null => {
+          const values = [...new Set([
+            ...(left ? (JSON.parse(left) as string[]) : []),
+            ...(right ? (JSON.parse(right) as string[]) : []),
+          ])].sort();
+          return values.length > 0 ? JSON.stringify(values) : null;
+        };
+        const mergedRefs = unionJson(current?.source_refs, row.source_refs);
+        const mergedAliases = unionJson(current?.aliases, row.aliases);
+        const mergedFetchedAt = Math.max(current?.usefulness_last_fetched_at ?? 0, row.usefulness_last_fetched_at ?? 0) || null;
+        const mergedArousalAt = Math.max(current?.arousal_last_updated_at ?? 0, row.arousal_last_updated_at ?? 0) || null;
+        const derivedChanged = current && (
+          mergedRefs !== current.source_refs || mergedAliases !== current.aliases ||
+          mergedFetchedAt !== current.usefulness_last_fetched_at || mergedArousalAt !== current.arousal_last_updated_at
+        );
+        if (!current || derivedChanged) {
+          this.db.prepare(
+            `UPDATE concepts SET source_refs = ?, aliases = ?, usefulness_last_fetched_at = ?,
+                    arousal_last_updated_at = ?, updated_at = ? WHERE id = ?`,
+          ).run(mergedRefs, mergedAliases, mergedFetchedAt, mergedArousalAt, relayAt, row.id);
+        }
+        if (r.changes > 0 && current && current.circle !== row.circle) {
+          this.unwindConceptGraph(row.id, current.circle);
+          if ((payload.schemaVersion ?? 0) < SYNC_CLOSURE_SCHEMA_VERSION) this.rederiveConceptGraph(row.id, row.circle);
+        }
+        const winner = this.db.prepare(`SELECT circle, kind, status FROM concepts WHERE id = ?`).get(row.id) as { circle: string; kind: string; status: string } | undefined;
+        if (r.changes > 0 && winner && winner.kind !== "source" && winner.kind !== "workstream" && winner.status !== "retired") {
+          importedConceptProjections.set(row.id, {
+            supportCount: row.support_count,
+            embedding: row.embedding,
+            confidence: row.confidence,
+            status: row.status,
+            lastConfirmedAt: row.last_confirmed_at ?? null,
+            lastConfirmedSessionId: row.last_confirmed_session_id ?? null,
+            dirty: row.dirty,
+            summarySourceChanged: !!current && (current.title !== row.title || current.body !== row.body),
+          });
+          conceptsNeedingProjection.add(row.id);
+        }
+        if (winner && winner.kind !== "source" && winner.status !== "retired") {
+          this.cleanupConceptMembershipScopes(row.id, winner.circle);
+          normalizeBoundObservationCircles(row.id, winner.circle);
+          normalizeFirstBlockOwnership(
+            row.id,
+            r.changes > 0 && !!current && current.circle !== winner.circle,
+          );
+        }
+        if ((payload.schemaVersion ?? 0) < SYNC_CLOSURE_SCHEMA_VERSION) {
+          const activity = this.db.prepare(
+            `INSERT INTO concept_activity_components
+               (concept_id, writer_id, usefulness_count, usefulness_last_at,
+                arousal_count, arousal_last_at, revision, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(concept_id, writer_id) DO UPDATE SET
+               usefulness_count = excluded.usefulness_count,
+               usefulness_last_at = excluded.usefulness_last_at,
+               arousal_count = excluded.arousal_count,
+               arousal_last_at = excluded.arousal_last_at,
+               revision = excluded.revision, updated_at = excluded.updated_at
+             WHERE excluded.revision > concept_activity_components.revision`,
+          ).run(row.id, `legacy:${payload.deviceId}`, Math.max(0, row.usefulness_score),
+            row.usefulness_last_fetched_at ?? null, Math.max(0, row.arousal_score),
+            row.arousal_last_updated_at ?? null, revision, relayAt);
+          if (activity.changes > 0) inserted.concept_activity++;
+          else skipped.concept_activity++;
+          activityConcepts.add(row.id);
+        }
       }
 
-      // 5. observations — INSERT OR IGNORE; terminal supersession may also update a row that
-      // already exists on this replica, so apply its monotonic state after the insert attempt.
+      for (const component of payload.conceptActivity ?? []) {
+        if (isTombstoned(component.concept_id)) {
+          skipped.concept_activity++;
+          continue;
+        }
+        const r = this.db.prepare(
+          `INSERT INTO concept_activity_components
+             (concept_id, writer_id, usefulness_count, usefulness_last_at,
+              arousal_count, arousal_last_at, revision, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(concept_id, writer_id) DO UPDATE SET
+             usefulness_count = excluded.usefulness_count,
+             usefulness_last_at = excluded.usefulness_last_at,
+             arousal_count = excluded.arousal_count,
+             arousal_last_at = excluded.arousal_last_at,
+             revision = excluded.revision, updated_at = excluded.updated_at
+           WHERE excluded.revision > concept_activity_components.revision`,
+        ).run(component.concept_id, component.writer_id, component.usefulness_count,
+          component.usefulness_last_at, component.arousal_count, component.arousal_last_at,
+          component.revision, relayAt);
+        if (r.changes > 0) inserted.concept_activity++;
+        else skipped.concept_activity++;
+        activityConcepts.add(component.concept_id);
+      }
+      for (const id of activityConcepts) this.materializeConceptActivity(id);
+
+      // 6. observations — immutable evidence with a versioned mutable binding/supersession shell.
       for (const row of payload.observations) {
-        if (isTombstoned(row.concept_id)) {
+        const incomingConcept = row.concept_id ? activeNativeConcept(row.concept_id) : null;
+        if (row.concept_id && !incomingConcept) {
           skipped.observations++;
           continue;
         }
+        const before = this.db.prepare(
+          `SELECT concept_id, circle, sync_revision FROM observations WHERE id = ?`,
+        ).get(row.id) as { concept_id: string | null; circle: string; sync_revision: number } | undefined;
+        const [revision, writer] = incomingMeta(row, "observations", row.id, before?.sync_revision);
         const r = this.db
           .prepare(
-            `INSERT OR IGNORE INTO observations
+            `INSERT INTO observations
                (id, content, embedding, kind, circle, concept_id, superseded_by, superseded_at,
-                session_id, author_agent_id, source_refs, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                session_id, author_agent_id, source_refs, created_at, updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               circle = excluded.circle, concept_id = excluded.concept_id,
+               superseded_by = excluded.superseded_by, superseded_at = excluded.superseded_at,
+               updated_at = excluded.updated_at, sync_revision = excluded.sync_revision,
+               sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > observations.sync_revision
+                OR (excluded.sync_revision = observations.sync_revision AND excluded.sync_writer > COALESCE(observations.sync_writer, ''))`,
           )
           .run(
-            row.id, row.content, row.embedding, row.kind, row.circle,
+            row.id, row.content, row.embedding, row.kind, incomingConcept?.circle ?? row.circle,
             row.concept_id ?? null, row.superseded_by ?? null,
             row.superseded_at ?? null, row.session_id ?? null, row.author_agent_id, row.source_refs ?? null,
-            row.created_at,
+            row.created_at, relayAt, revision, writer,
           );
+        const winning = this.db.prepare(
+          `SELECT concept_id, circle FROM observations WHERE id = ?`,
+        ).get(row.id) as { concept_id: string | null; circle: string } | undefined;
+        if (winning?.concept_id) {
+          const owner = activeNativeConcept(winning.concept_id);
+          if (owner && winning.circle !== owner.circle) {
+            this.db.prepare(`UPDATE observations SET circle = ?, updated_at = ? WHERE id = ?`)
+              .run(owner.circle, relayAt, row.id);
+          }
+        }
         if (r.changes > 0) {
           inserted.observations++;
-          if (row.concept_id) conceptsWithNewObs.add(row.concept_id);
+          if (before?.concept_id) conceptsNeedingProjection.add(before.concept_id);
+          if (winning?.concept_id) conceptsNeedingProjection.add(winning.concept_id);
+          if ((before?.concept_id ?? null) !== (winning?.concept_id ?? null)) {
+            if (before?.concept_id) conceptsWithChangedBindings.add(before.concept_id);
+            if (winning?.concept_id) conceptsWithChangedBindings.add(winning.concept_id);
+          }
         } else {
           skipped.observations++;
-        }
-        if (row.superseded_at !== null && row.superseded_at !== undefined) {
-          this.db
-            .prepare(
-              `UPDATE observations SET superseded_by = ?, superseded_at = ?
-                WHERE id = ? AND (superseded_at IS NULL OR superseded_at < ?)`,
-            )
-            .run(row.superseded_by ?? null, row.superseded_at, row.id, row.superseded_at);
         }
       }
 
@@ -3417,84 +4367,209 @@ export class MonetCore {
              VALUES (?, ?, ?, ?, ?, ?)`,
           )
           .run(row.id, row.concept_id, row.version, row.body, row.trigger_observation_id ?? null, row.created_at);
-        if (r.changes > 0) inserted.concept_revisions++;
-        else skipped.concept_revisions++;
+        if (r.changes > 0) {
+          inserted.concept_revisions++;
+          // Immutable revisions retain their semantic created_at, so relay visibility comes from
+          // the owning concept's envelope. Do not alter its winning row clock/writer.
+          this.db.prepare(
+            `UPDATE concepts SET updated_at = ?
+              WHERE id = ? AND kind != 'source' AND status != 'retired'`,
+          ).run(relayAt, row.concept_id);
+        } else skipped.concept_revisions++;
       }
 
-      // 7. contradictions — INSERT OR IGNORE
+      // 7. contradictions — complete deterministic row convergence
       for (const row of payload.contradictions) {
         if (isTombstoned(row.concept_id)) {
           skipped.contradictions++;
           continue;
         }
+        const current = this.db.prepare(`SELECT sync_revision FROM contradictions WHERE id = ?`).get(row.id) as { sync_revision: number } | undefined;
+        const [revision, writer] = incomingMeta(row, "contradictions", row.id, current?.sync_revision);
         const r = this.db
           .prepare(
-            `INSERT OR IGNORE INTO contradictions
+            `INSERT INTO contradictions
                (id, concept_id, observation_id, kind, status, detail,
-                resolution_obs_id, detected_at, resolved_at, resolved_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                resolution_obs_id, detected_at, resolved_at, resolved_by,
+                updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               concept_id = excluded.concept_id, observation_id = excluded.observation_id,
+               kind = excluded.kind, status = excluded.status, detail = excluded.detail,
+               resolution_obs_id = excluded.resolution_obs_id,
+               detected_at = excluded.detected_at, resolved_at = excluded.resolved_at,
+               resolved_by = excluded.resolved_by, updated_at = excluded.updated_at,
+               sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > contradictions.sync_revision
+                OR (excluded.sync_revision = contradictions.sync_revision AND excluded.sync_writer > COALESCE(contradictions.sync_writer, ''))`,
           )
           .run(
             row.id, row.concept_id, row.observation_id ?? null, row.kind, row.status, row.detail,
             row.resolution_obs_id ?? null, row.detected_at, row.resolved_at ?? null,
-            row.resolved_by ?? null,
+            row.resolved_by ?? null, relayAt, revision, writer,
           );
         if (r.changes > 0) inserted.contradictions++;
         else skipped.contradictions++;
+        if (r.changes > 0) conceptsNeedingProjection.add(row.concept_id);
       }
 
-      // 8. memory_edge — reinforce on conflict; dismissals win
+      // 8. memory_edge compatibility/state rows. v8 aggregates never contribute their total count
+      // to another v8 peer; only legacy_count + per-writer components do. Legacy payloads become a
+      // synthetic writer component keyed by payload.deviceId and merge by MAX(count). A v7
+      // intermediary necessarily collapses independent writers into one aggregate, so exact future
+      // per-writer convergence cannot be reconstructed after that downgrade; replay remains safe.
       for (const row of payload.edges) {
         if (isTombstoned(row.src_id) || isTombstoned(row.dst_id)) {
           skipped.memory_edge++;
           continue;
         }
         if (row.src_id === row.dst_id) continue; // guard (mirrors upsertEdge)
+        if (!this.isActiveGraphConcept(row.src_id, row.scope) || !this.isActiveGraphConcept(row.dst_id, row.scope)) {
+          skipped.memory_edge++;
+          continue;
+        }
+        const legacyBase = payload.schemaVersion && payload.schemaVersion >= SYNC_CLOSURE_SCHEMA_VERSION
+          ? (row.legacy_count ?? 0)
+          : 0;
         const r = this.db
           .prepare(
             `INSERT INTO memory_edge
                (id, src_id, src_type, dst_id, dst_type, type, weight, origin, count,
-                created_at, last_reinforced_at, scope, dismissed_at, dismissed_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               created_at, last_reinforced_at, scope, dismissed_at, dismissed_by, legacy_count,
+               sync_updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(src_id, dst_id, type, scope) DO UPDATE SET
                weight             = MAX(weight, excluded.weight),
-               count              = count + excluded.count,
                last_reinforced_at = MAX(last_reinforced_at, excluded.last_reinforced_at),
+               legacy_count       = MAX(legacy_count, excluded.legacy_count),
                dismissed_at       = CASE WHEN excluded.dismissed_at IS NOT NULL THEN excluded.dismissed_at ELSE dismissed_at END,
-               dismissed_by       = CASE WHEN excluded.dismissed_at IS NOT NULL THEN excluded.dismissed_by ELSE dismissed_by END`,
+               dismissed_by       = CASE WHEN excluded.dismissed_at IS NOT NULL THEN excluded.dismissed_by ELSE dismissed_by END,
+               sync_updated_at    = excluded.sync_updated_at
+             WHERE excluded.weight > memory_edge.weight
+                OR excluded.last_reinforced_at > memory_edge.last_reinforced_at
+                OR excluded.legacy_count > memory_edge.legacy_count
+                OR (excluded.dismissed_at IS NOT NULL AND
+                    (memory_edge.dismissed_at IS NULL OR excluded.dismissed_at > memory_edge.dismissed_at))`,
           )
           .run(
             row.id, row.src_id, row.src_type ?? "concept", row.dst_id, row.dst_type ?? "concept",
             row.type, row.weight, row.origin ?? "cheap", row.count,
             row.created_at, row.last_reinforced_at, row.scope,
-            row.dismissed_at ?? null, row.dismissed_by ?? null,
+            row.dismissed_at ?? null, row.dismissed_by ?? null, legacyBase, relayAt,
           );
         if (r.changes > 0) inserted.memory_edge++;
         else skipped.memory_edge++;
+
+        if (!payload.schemaVersion || payload.schemaVersion < SYNC_CLOSURE_SCHEMA_VERSION) {
+          const writerId = `legacy:${payload.deviceId}`;
+          const cr = this.db.prepare(
+            `INSERT INTO memory_edge_components
+               (src_id, dst_id, type, scope, writer_id, count, weight, origin,
+                created_at, last_reinforced_at, revision, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+             ON CONFLICT(src_id, dst_id, type, scope, writer_id) DO UPDATE SET
+               count = MAX(count, excluded.count), weight = MAX(weight, excluded.weight),
+               last_reinforced_at = MAX(last_reinforced_at, excluded.last_reinforced_at),
+               updated_at = MAX(updated_at, excluded.updated_at)
+             WHERE excluded.count > memory_edge_components.count
+                OR excluded.weight > memory_edge_components.weight
+                OR excluded.last_reinforced_at > memory_edge_components.last_reinforced_at`,
+          ).run(row.src_id, row.dst_id, row.type, row.scope, writerId, row.count, row.weight,
+            row.origin ?? "cheap", row.created_at, row.last_reinforced_at, relayAt);
+          if (cr.changes > 0) inserted.memory_edge_components++;
+          else skipped.memory_edge_components++;
+        }
       }
 
-      // 9. first_block — INSERT OR IGNORE (local curation wins)
+      for (const component of payload.edgeComponents ?? []) {
+        if (isTombstoned(component.src_id) || isTombstoned(component.dst_id)) {
+          skipped.memory_edge_components++;
+          continue;
+        }
+        if (!this.isActiveGraphConcept(component.src_id, component.scope) || !this.isActiveGraphConcept(component.dst_id, component.scope)) {
+          skipped.memory_edge_components++;
+          continue;
+        }
+        this.ensureMaterializedEdge(component.src_id, component.dst_id, component.type, component.scope,
+          component.weight, component.origin, component.created_at, component.last_reinforced_at);
+        const cr = this.db.prepare(
+          `INSERT INTO memory_edge_components
+             (src_id, dst_id, type, scope, writer_id, count, weight, origin,
+              created_at, last_reinforced_at, revision, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(src_id, dst_id, type, scope, writer_id) DO UPDATE SET
+             count = excluded.count, weight = excluded.weight, origin = excluded.origin,
+             created_at = excluded.created_at, last_reinforced_at = excluded.last_reinforced_at,
+             revision = excluded.revision, updated_at = excluded.updated_at
+           WHERE excluded.revision > memory_edge_components.revision`,
+        ).run(component.src_id, component.dst_id, component.type, component.scope,
+          component.writer_id, component.count, component.weight, component.origin,
+          component.created_at, component.last_reinforced_at, component.revision, relayAt);
+        if (cr.changes > 0) inserted.memory_edge_components++;
+        else skipped.memory_edge_components++;
+      }
+      const touchedEdges = new Set<string>();
+      for (const row of payload.edges) touchedEdges.add(`${row.src_id}\0${row.dst_id}\0${row.type}\0${row.scope}`);
+      for (const row of payload.edgeComponents ?? []) touchedEdges.add(`${row.src_id}\0${row.dst_id}\0${row.type}\0${row.scope}`);
+      for (const key of touchedEdges) {
+        const [src, dst, type, scope] = key.split("\0");
+        this.materializeEdge(src!, dst!, type!, scope!);
+      }
+
+      // 9. first_block — versioned convergence, including soft deletion
       for (const row of payload.firstBlock) {
-        if (isTombstoned(row.concept_id)) {
+        const concept = activeNativeConcept(row.concept_id);
+        if (!concept) {
           skipped.first_block++;
           continue;
         }
-        const r = this.db
-          .prepare(
-            `INSERT OR IGNORE INTO first_block
-               (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            row.id, row.concept_id, row.circle, row.summary, row.summary_dirty ?? 0,
-            row.position ?? 0, row.promoted_at, row.promoted_by ?? null,
-          );
-        if (r.changes > 0) inserted.first_block++;
+        const current = this.db.prepare(
+          `SELECT sync_revision FROM first_block WHERE concept_id = ? AND circle = ?`,
+        ).get(row.concept_id, row.circle) as { sync_revision: number } | undefined;
+        const [revision, writer] = incomingMeta(
+          row,
+          "first_block",
+          `${row.concept_id}\0${row.circle}`,
+          current?.sync_revision,
+        );
+        const incoming: FirstBlockDbRow = {
+          id: deterministicFirstBlockId(row.concept_id, row.circle),
+          concept_id: row.concept_id,
+          circle: row.circle,
+          summary: row.summary,
+          summary_dirty: row.summary_dirty ?? 0,
+          position: row.position ?? 0,
+          promoted_at: row.promoted_at,
+          promoted_by: row.promoted_by ?? null,
+          updated_at: relayAt,
+          sync_revision: revision,
+          sync_writer: writer,
+          deleted_at: row.deleted_at ?? null,
+        };
+        const merged = mergeFirstBlockNaturalRow(incoming);
+        normalizeFirstBlockOwnership(row.concept_id);
+        if (merged.changed && merged.incomingWon) inserted.first_block++;
         else skipped.first_block++;
       }
 
+      const validMemberships = new Set<string>();
+      for (const membership of payload.conceptEntities) {
+        const concept = this.db.prepare(`SELECT circle, kind, status FROM concepts WHERE id = ?`).get(membership.concept_id) as { circle: string; kind: string; status: string } | undefined;
+        if (concept && concept.kind !== "source" && concept.status !== "retired" && concept.circle === membership.scope) {
+          validMemberships.add(`${membership.concept_id}\0${membership.entity_key}\0${membership.scope}`);
+        }
+      }
+      const validEntityPairs = new Set([...validMemberships].map((key) => {
+        const [, entityKey, scope] = key.split("\0");
+        return `${entityKey}\0${scope}`;
+      }));
+
       // 10. entities — INSERT OR IGNORE (keep local df count)
       for (const row of payload.entities) {
+        if (!validEntityPairs.has(`${row.key}\0${row.scope}`)) {
+          skipped.entities++;
+          continue;
+        }
         const r = this.db
           .prepare(`INSERT OR IGNORE INTO entities (key, kind, surface, scope, df) VALUES (?, ?, ?, ?, ?)`)
           .run(row.key, row.kind, row.surface, row.scope, row.df);
@@ -3504,7 +4579,7 @@ export class MonetCore {
 
       // 11. concept_entities — INSERT OR IGNORE
       for (const row of payload.conceptEntities) {
-        if (isTombstoned(row.concept_id)) {
+        if (isTombstoned(row.concept_id) || !validMemberships.has(`${row.concept_id}\0${row.entity_key}\0${row.scope}`)) {
           skipped.concept_entities++;
           continue;
         }
@@ -3515,17 +4590,134 @@ export class MonetCore {
         else skipped.concept_entities++;
       }
 
-      // Mark dirty: concepts that gained ≥1 new observation need re-synthesis on next fetch.
-      for (const id of conceptsWithNewObs) {
-        this.db
-          .prepare(`UPDATE concepts SET dirty = 1, updated_at = ? WHERE id = ? AND kind != 'source'`)
-          .run(now, id);
+      for (const restored of payload.restorations ?? []) conceptsNeedingProjection.add(restored.concept_id);
+      for (const id of conceptsNeedingProjection) this.recomputeNativeConceptProjection(id, relayAt);
+      // A mutable concept envelope carries a sender-side projection, but the receiver may already
+      // hold additional evidence or contradictions whose shells legitimately lose replay LWW. Once
+      // every ledger row has converged, keep semantic envelope fields while deriving the read model
+      // from the receiver's complete union. A mismatch means the winning body cannot cover all
+      // receiver evidence, so schedule synthesis and invalidate only the canonical active pin.
+      for (const [id, imported] of importedConceptProjections) {
+        const derived = this.db.prepare(
+          `SELECT support_count, embedding, confidence, status, last_confirmed_at,
+                  last_confirmed_session_id, dirty
+             FROM concepts WHERE id = ? AND kind NOT IN ('source', 'workstream') AND status != 'retired'`,
+        ).get(id) as {
+          support_count: number; embedding: string; confidence: number; status: string;
+          last_confirmed_at: number | null; last_confirmed_session_id: string | null; dirty: number;
+        } | undefined;
+        if (!derived) continue;
+        const projectionDiffers = derived.support_count !== imported.supportCount
+          || derived.embedding !== imported.embedding
+          || derived.confidence !== imported.confidence
+          || derived.status !== imported.status
+          || derived.last_confirmed_at !== imported.lastConfirmedAt
+          || derived.last_confirmed_session_id !== imported.lastConfirmedSessionId;
+        const targetDirty = projectionDiffers ? 1 : imported.dirty;
+        if (derived.dirty !== targetDirty) {
+          this.db.prepare(`UPDATE concepts SET dirty = ?, updated_at = ? WHERE id = ?`)
+            .run(targetDirty, relayAt, id);
+        }
+        if (projectionDiffers || imported.summarySourceChanged) {
+          this.db.prepare(
+            `UPDATE first_block SET summary_dirty = 1, updated_at = ?
+              WHERE concept_id = ?
+                AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
+                AND deleted_at IS NULL AND summary_dirty != 1`,
+          ).run(relayAt, id);
+        }
       }
+      // Projection may legitimately clear `dirty` for an empty endpoint, so binding changes mark
+      // both winning non-source endpoints only after projection. Replay/losing shells never enter
+      // this set. Mirror local attach/detach invalidation for active First Block summaries.
+      for (const id of conceptsWithChangedBindings) {
+        const concept = activeNativeConcept(id);
+        if (!concept) continue;
+        const dirtied = this.db.prepare(
+          `UPDATE concepts SET dirty = 1, updated_at = ?
+            WHERE id = ? AND kind != 'source' AND status != 'retired'`,
+        ).run(relayAt, id);
+        if (dirtied.changes === 0) continue;
+        conceptsMarkedDirty.add(id);
+        this.db.prepare(
+          `UPDATE first_block
+              SET summary_dirty = 1, updated_at = ?
+            WHERE concept_id = ?
+              AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
+              AND deleted_at IS NULL AND summary_dirty != 1`,
+        ).run(relayAt, id);
+      }
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = 0 WHERE singleton = 1`).run();
     });
 
     txn();
 
-    return { inserted, skipped, conceptsMarkedDirty: [...conceptsWithNewObs] };
+    return { inserted, skipped, conceptsMarkedDirty: [...conceptsMarkedDirty] };
+  }
+
+  /** Rebuild deterministic native read-model metadata from the union of active evidence. */
+  private recomputeNativeConceptProjection(conceptId: string, relayAt: number): void {
+    const concept = this.getRow(conceptId);
+    if (!concept || concept.kind === "source" || concept.status === "retired") return;
+    const observations = this.db.prepare(
+      `SELECT id, embedding, session_id, created_at FROM observations
+        WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL ORDER BY id ASC`,
+    ).all(conceptId) as Array<{ id: string; embedding: string; session_id: string | null; created_at: number }>;
+    const contradictionStats = this.db.prepare(
+      `SELECT SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
+              SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved_count,
+              MAX(CASE WHEN status = 'resolved' THEN resolved_at END) AS last_resolved_at
+         FROM contradictions WHERE concept_id = ?`,
+    ).get(conceptId) as { open_count: number | null; resolved_count: number | null; last_resolved_at: number | null };
+    const hasOpen = (contradictionStats.open_count ?? 0) > 0;
+    if (observations.length === 0) {
+      this.db.prepare(
+        `UPDATE concepts SET support_count = 0, embedding = ?, confidence = 0,
+                status = CASE WHEN ? THEN 'disputed' ELSE 'active' END,
+                last_confirmed_at = NULL, last_confirmed_session_id = NULL,
+                dirty = 0, updated_at = ? WHERE id = ?`,
+      ).run(embToJson(new Float32Array(this.embedder.dim)), hasOpen ? 1 : 0, relayAt, conceptId);
+      return;
+    }
+
+    const vectors = observations.map((o) => jsonToEmb(o.embedding));
+    const centroid = new Float32Array(vectors[0]!.length);
+    for (let d = 0; d < centroid.length; d++) {
+      let sum = 0;
+      for (const vector of vectors) sum += vector[d] ?? 0;
+      centroid[d] = sum / vectors.length;
+    }
+    const sessions = new Set(observations.map((o) => o.session_id).filter((id): id is string => !!id));
+    const evidenceConfidence = Math.min(1, 0.6 + Math.max(0, sessions.size - 1) * 0.1 + (contradictionStats.resolved_count ?? 0) * 0.2);
+    const confidence = hasOpen ? Math.min(0.5, evidenceConfidence) : evidenceConfidence;
+    const latestObservation = [...observations]
+      .sort((a, b) => b.created_at - a.created_at || b.id.localeCompare(a.id))[0];
+    const activeSessionConfirmation = concept.last_confirmed_at !== null && concept.last_confirmed_session_id !== null &&
+      observations.some((observation) => observation.session_id === concept.last_confirmed_session_id &&
+        concept.last_confirmed_at! >= observation.created_at && concept.last_confirmed_at! - observation.created_at < 2000)
+      ? concept.last_confirmed_at
+      : 0;
+    const lastConfirmedAt = Math.max(
+      latestObservation?.created_at ?? 0,
+      contradictionStats.last_resolved_at ?? 0,
+      activeSessionConfirmation,
+    ) || null;
+    const resolutionSessionId = concept.last_confirmed_at === contradictionStats.last_resolved_at
+      ? concept.last_confirmed_session_id
+      : null;
+    const lastConfirmedSessionId = activeSessionConfirmation === lastConfirmedAt
+      ? concept.last_confirmed_session_id
+      : (latestObservation?.created_at ?? 0) >= (contradictionStats.last_resolved_at ?? 0)
+        ? latestObservation?.session_id ?? null
+        : resolutionSessionId;
+    this.db.prepare(
+      `UPDATE concepts SET support_count = ?, embedding = ?, confidence = ?,
+         status = CASE WHEN ? THEN 'disputed' ELSE 'active' END,
+         last_confirmed_at = ?, last_confirmed_session_id = ?,
+         updated_at = ?
+       WHERE id = ?`,
+    ).run(observations.length, embToJson(centroid), confidence, hasOpen ? 1 : 0,
+      lastConfirmedAt, lastConfirmedSessionId, relayAt, conceptId);
   }
 
   /**
@@ -3602,9 +4794,13 @@ export class MonetCore {
       const hasAlias = !!this.db.prepare(`SELECT 1 FROM circle_aliases WHERE from_name = ? OR to_name = ?`).get(from, from);
       if (!hasConcepts && !hasAlias) throw new Error(`circle not found: ${from}`);
 
+      const renamedConceptIds = (this.db.prepare(
+        `SELECT id FROM concepts WHERE circle = ? ORDER BY id`,
+      ).all(from) as Array<{ id: string }>).map((row) => row.id);
+
       const conceptsUpdated = (this.db.prepare(`UPDATE concepts SET circle = ? WHERE circle = ?`).run(to, from)).changes;
       const observationsUpdated = (this.db.prepare(`UPDATE observations SET circle = ? WHERE circle = ?`).run(to, from)).changes;
-      const edgesUpdated = (this.db.prepare(`UPDATE memory_edge SET scope = ? WHERE scope = ?`).run(to, from)).changes;
+      const edgesUpdated = this.moveEdgeScope(from, to);
       // entities: (key, scope) is a compound PK — a bulk UPDATE fails if `to` already has the same key
       // (e.g. when renaming circle-B into `canonical` after circle-A was already renamed there).
       // Merge: add from's df into any matching `to` row (upsert), then delete the from rows.
@@ -3644,24 +4840,51 @@ export class MonetCore {
         .run(from, to, to);
       // Flatten chains: any alias that pointed to `from` should now point to `to`.
       this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(to, from);
-      // first_block rows carry an explicit circle column that must follow the rename —
-      // getFirstBlock joins via c.circle but removeFromFirstBlock/reorderFirstBlock filter on
-      // fb.circle directly, so a stale fb.circle causes remove/reorder to miss the row and
-      // double-promote under the new circle name bypasses the UNIQUE(concept_id, circle) guard.
-      // When the destination already has pins, offset the moved rows' positions to append AFTER
-      // the destination's existing pins, preserving the source's relative order. (Finding B — Codex round-3)
-      const destMax = (this.db.prepare(
-        `SELECT COALESCE(MAX(position), -1) AS m FROM first_block WHERE circle = ?`
+      // First Block revisions are scoped to (concept_id, circle). Reconcile each renamed concept
+      // instead of bulk-updating A rows into B, which would collide with a future B row that arrived
+      // before the rename. Existing B rows are authoritative and only need a relay stamp. Otherwise
+      // seed B from A with a fresh destination clock and append active pins in A's relative order.
+      let destMax = (this.db.prepare(
+        `SELECT COALESCE(MAX(fb.position), -1) AS m
+           FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
+          WHERE fb.circle = ? AND c.circle = fb.circle AND fb.deleted_at IS NULL`
       ).get(to) as { m: number }).m;
-      const srcRows = this.db.prepare(
-        `SELECT concept_id FROM first_block WHERE circle = ? ORDER BY position ASC, concept_id ASC`
-      ).all(from) as Array<{ concept_id: string }>;
-      this.db.prepare(`UPDATE first_block SET circle = ? WHERE circle = ?`).run(to, from);
-      if (srcRows.length > 0) {
-        const updatePos = this.db.prepare(`UPDATE first_block SET position = ? WHERE concept_id = ? AND circle = ?`);
-        for (let i = 0; i < srcRows.length; i++) {
-          updatePos.run(destMax + 1 + i, srcRows[i]!.concept_id, to);
+      type RenameFirstBlockRow = {
+        id: string; concept_id: string; circle: string; summary: string; summary_dirty: number;
+        position: number; promoted_at: number; promoted_by: string | null;
+        sync_writer: string | null; deleted_at: number | null;
+      };
+      const sourceRows: RenameFirstBlockRow[] = [];
+      for (const conceptId of renamedConceptIds) {
+        const destination = this.db.prepare(
+          `SELECT id FROM first_block WHERE concept_id = ? AND circle = ?`,
+        ).get(conceptId, to) as { id: string } | undefined;
+        if (destination) {
+          this.relayStampFirstBlockEntry(destination.id);
+          continue;
         }
+        const source = this.db.prepare(
+          `SELECT id, concept_id, circle, summary, summary_dirty, position, promoted_at,
+                  promoted_by, sync_writer, deleted_at
+             FROM first_block WHERE concept_id = ? AND circle = ?`,
+        ).get(conceptId, from) as RenameFirstBlockRow | undefined;
+        if (source) sourceRows.push(source);
+      }
+      sourceRows.sort((left, right) => left.position - right.position || left.concept_id.localeCompare(right.concept_id));
+      const insertRenamedPin = this.db.prepare(
+        `INSERT INTO first_block
+           (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by,
+            updated_at, sync_revision, sync_writer, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      );
+      for (const source of sourceRows) {
+        const position = source.deleted_at === null ? ++destMax : source.position;
+        insertRenamedPin.run(
+          deterministicFirstBlockId(source.concept_id, to), source.concept_id, to,
+          source.summary, source.summary_dirty, position, source.promoted_at, source.promoted_by,
+          this.nextSyncTimestamp(),
+          `rehome:${stableFingerprint([source.concept_id, from])}`, source.deleted_at,
+        );
       }
       // Update in-memory lastConceptByCircle if the key matches `from`.
       const prev = this.lastConceptByCircle.get(from);
@@ -3723,10 +4946,7 @@ export class MonetCore {
             try {
               // This nested transaction is a savepoint under the outer immediate transaction.
               this.db.transaction(() => {
-                this.deleteFirstBlockEntry(row.id);
-                this.unwindConceptGraph(row.id, from);
-                this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(row.id);
-                this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(row.id);
+                this.hardDeleteNativeConcept(row.id);
               })();
             } catch (error) {
               throw new Error(`mergeCircle failed for workstream '${row.id}': ${error instanceof Error ? error.message : String(error)}`);
@@ -3864,7 +5084,8 @@ export class MonetCore {
                 c.status AS conceptStatus
            FROM first_block fb
            JOIN concepts c ON c.id = fb.concept_id
-          WHERE c.circle = ? AND c.status != 'retired'
+          WHERE c.circle = ? AND fb.circle = c.circle
+            AND c.status != 'retired' AND fb.deleted_at IS NULL
           ORDER BY fb.position ASC, fb.concept_id ASC`,
       )
       .all(circle) as Array<{
@@ -3883,12 +5104,31 @@ export class MonetCore {
 
   /** Mark the first_block entry for a concept as summary_dirty=1 (underlying concept changed). */
   private invalidateFirstBlockEntry(conceptId: string): void {
-    this.db.prepare(`UPDATE first_block SET summary_dirty = 1 WHERE concept_id = ?`).run(conceptId);
+    this.db.prepare(
+      `UPDATE first_block SET summary_dirty = 1
+        WHERE concept_id = ?
+          AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
+          AND deleted_at IS NULL`,
+    ).run(conceptId);
   }
 
-  /** Delete the first_block entry for a concept (concept is being deleted — referential integrity). */
+  /** Make an already-converged First Block row visible to the next incremental export. */
+  private relayStampFirstBlockEntry(id: string): void {
+    const relayAt = this.nextSyncTimestamp();
+    const { applying_remote: previous } = this.db.prepare(
+      `SELECT applying_remote FROM sync_meta WHERE singleton = 1`,
+    ).get() as { applying_remote: number };
+    this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
+    try {
+      this.db.prepare(`UPDATE first_block SET updated_at = ? WHERE id = ?`).run(relayAt, id);
+    } finally {
+      this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(previous);
+    }
+  }
+
+  /** Soft-delete the replicated First Block entry. */
   private deleteFirstBlockEntry(conceptId: string): void {
-    this.db.prepare(`DELETE FROM first_block WHERE concept_id = ?`).run(conceptId);
+    this.db.prepare(`UPDATE first_block SET deleted_at = ? WHERE concept_id = ? AND deleted_at IS NULL`).run(this.nextSyncTimestamp(), conceptId);
   }
 
   /**
@@ -3907,18 +5147,30 @@ export class MonetCore {
    * (Finding 2 — Codex PR-32)
    */
   private rehomeFirstBlockEntry(conceptId: string, toCircle: string): void {
+    // A future-circle row may have arrived before this local move. It is already authoritative for
+    // the destination natural key, so do not overwrite it with the current-circle pin.
+    const destination = this.db.prepare(
+      `SELECT id FROM first_block WHERE concept_id = ? AND circle = ? LIMIT 1`,
+    ).get(conceptId, toCircle) as { id: string } | undefined;
+    if (destination) {
+      this.relayStampFirstBlockEntry(destination.id);
+      return;
+    }
     // Only act if the concept actually has a pin.
     const row = this.db
-      .prepare(`SELECT id FROM first_block WHERE concept_id = ?`)
+      .prepare(`SELECT fb.id FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
+                 WHERE fb.concept_id = ? AND fb.circle = c.circle AND fb.deleted_at IS NULL`)
       .get(conceptId) as { id: string } | undefined;
     if (!row) return;
     // Find the highest position already in the destination circle so we can append after it.
     const { m: destMax } = this.db
-      .prepare(`SELECT COALESCE(MAX(position), -1) AS m FROM first_block WHERE circle = ?`)
+      .prepare(`SELECT COALESCE(MAX(fb.position), -1) AS m
+                  FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
+                 WHERE fb.circle = ? AND c.circle = fb.circle AND fb.deleted_at IS NULL`)
       .get(toCircle) as { m: number };
     this.db
-      .prepare(`UPDATE first_block SET circle = ?, position = ? WHERE concept_id = ?`)
-      .run(toCircle, destMax + 1, conceptId);
+      .prepare(`UPDATE first_block SET id = ?, circle = ?, position = ? WHERE id = ?`)
+      .run(deterministicFirstBlockId(conceptId, toCircle), toCircle, destMax + 1, row.id);
   }
 
   // ---- First Block: public surface (called by MCP tools) ------------------
@@ -3946,18 +5198,25 @@ export class MonetCore {
     if (concept.status === "retired") throw new Error("cannot pin a retired concept to the First Block");
     if (concept.circle !== circle) throw new Error(`concept ${conceptId} is in circle '${concept.circle}' not '${circle}'`);
 
-    const id = this.newId();
+    const id = deterministicFirstBlockId(conceptId, circle);
     const now = Date.now();
 
     return this.db.transaction(() => {
-      const maxPos = (this.db.prepare(`SELECT COALESCE(MAX(position), -1) AS m FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ?`).get(circle) as { m: number }).m;
+      const maxPos = (this.db.prepare(`SELECT COALESCE(MAX(fb.position), -1) AS m FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND fb.deleted_at IS NULL`).get(circle) as { m: number }).m;
       const position = maxPos + 1;
+      const existing = this.db.prepare(`SELECT id, deleted_at FROM first_block WHERE concept_id = ? AND circle = ?`).get(conceptId, circle) as { id: string; deleted_at: number | null } | undefined;
+      if (existing && existing.deleted_at === null) throw new Error(`concept ${conceptId} is already pinned in circle '${circle}'`);
+      const entryId = existing?.id ?? id;
       this.db
         .prepare(
           `INSERT INTO first_block (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by)
-           VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+           ON CONFLICT(concept_id, circle) DO UPDATE SET
+             summary = excluded.summary, summary_dirty = 0, position = excluded.position,
+             promoted_at = excluded.promoted_at, promoted_by = excluded.promoted_by,
+             deleted_at = NULL`,
         )
-        .run(id, conceptId, circle, summary, position, now, opts.promotedBy ?? null);
+        .run(entryId, conceptId, circle, summary, position, now, opts.promotedBy ?? null);
       // Boost usefulness — same columns getConcept writes, the ground-truth usefulness signal.
       this.db
         .prepare(
@@ -3966,15 +5225,20 @@ export class MonetCore {
         .run(FIRST_BLOCK_PROMOTION_USEFULNESS_BOOST, now, conceptId);
       // Total summary chars across the circle (cost feedback for the user).
       const totalRow = this.db
-        .prepare(`SELECT COALESCE(SUM(LENGTH(fb.summary)), 0) AS total FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ?`)
+        .prepare(`SELECT COALESCE(SUM(LENGTH(fb.summary)), 0) AS total FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND fb.deleted_at IS NULL`)
         .get(circle) as { total: number };
-      return { id, conceptId, summary, position, totalSummaryChars: totalRow.total };
+      return { id: entryId, conceptId, summary, position, totalSummaryChars: totalRow.total };
     })();
   }
 
   /** Remove a concept from the First Block. Does NOT touch the concept itself. */
   removeFromFirstBlock(conceptId: string, circle: string): { removed: boolean } {
-    const r = this.db.prepare(`DELETE FROM first_block WHERE concept_id = ? AND circle = ?`).run(conceptId, circle);
+    const r = this.db.prepare(
+      `UPDATE first_block SET deleted_at = ?
+        WHERE concept_id = ? AND circle = ?
+          AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
+          AND deleted_at IS NULL`,
+    ).run(this.nextSyncTimestamp(), conceptId, circle);
     return { removed: r.changes > 0 };
   }
 
@@ -3994,7 +5258,10 @@ export class MonetCore {
       // both of which are bugs the caller cannot detect without this guard.
       const pinned = (
         this.db
-          .prepare(`SELECT concept_id FROM first_block WHERE circle = ? ORDER BY position`)
+          .prepare(`SELECT fb.concept_id FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
+                     WHERE fb.circle = ? AND c.circle = fb.circle
+                       AND c.status != 'retired' AND fb.deleted_at IS NULL
+                     ORDER BY fb.position`)
           .all(circle) as Array<{ concept_id: string }>
       ).map((r) => r.concept_id);
 
@@ -4023,7 +5290,7 @@ export class MonetCore {
 
       for (let i = 0; i < orderedConceptIds.length; i++) {
         this.db
-          .prepare(`UPDATE first_block SET position = ? WHERE concept_id = ? AND circle = ?`)
+          .prepare(`UPDATE first_block SET position = ? WHERE concept_id = ? AND circle = ? AND deleted_at IS NULL`)
           .run(i, orderedConceptIds[i]!, circle);
       }
     })();
@@ -4042,7 +5309,10 @@ export class MonetCore {
       throw new Error(`summary exceeds ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars (got ${newSummary.length})`);
     }
     const r = this.db
-      .prepare(`UPDATE first_block SET summary = ?, summary_dirty = 0 WHERE concept_id = ? AND circle = ?`)
+      .prepare(`UPDATE first_block SET summary = ?, summary_dirty = 0
+                 WHERE concept_id = ? AND circle = ?
+                   AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
+                   AND deleted_at IS NULL`)
       .run(newSummary, conceptId, circle);
     if (r.changes === 0) return null;
     return { conceptId, summary: newSummary, summaryDirty: false };
@@ -4237,14 +5507,142 @@ export class MonetCore {
   private upsertEdge(src: string, dst: string, type: string, weight: number, origin: string, scope: string): void {
     if (src === dst) return;
     if (!this.isActiveGraphConcept(src, scope) || !this.isActiveGraphConcept(dst, scope)) return;
-    this.db
-      .prepare(
-        `INSERT INTO memory_edge (id, src_id, dst_id, type, weight, origin, scope)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(src_id, dst_id, type, scope)
-         DO UPDATE SET count = count + 1, weight = max(weight, excluded.weight), last_reinforced_at = unixepoch() * 1000`,
-      )
-      .run(this.newId(), src, dst, type, weight, origin, scope);
+    const now = this.nextSyncTimestamp();
+    this.ensureMaterializedEdge(src, dst, type, scope, weight, origin, now, now);
+    this.db.prepare(
+      `INSERT INTO memory_edge_components
+         (src_id, dst_id, type, scope, writer_id, count, weight, origin,
+          created_at, last_reinforced_at, revision, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, ?)
+       ON CONFLICT(src_id, dst_id, type, scope, writer_id) DO UPDATE SET
+         count = count + 1, weight = MAX(weight, excluded.weight),
+         last_reinforced_at = excluded.last_reinforced_at,
+         revision = revision + 1, updated_at = excluded.updated_at`,
+    ).run(src, dst, type, scope, this.syncDeviceId, weight, origin, now, now, now);
+    this.materializeEdge(src, dst, type, scope);
+    this.db.prepare(
+      `UPDATE memory_edge SET sync_updated_at = ?
+        WHERE src_id = ? AND dst_id = ? AND type = ? AND scope = ?`,
+    ).run(now, src, dst, type, scope);
+  }
+
+  /** Move aggregate and per-writer edge state together when a circle is renamed. */
+  private moveEdgeScope(from: string, to: string): number {
+    const rows = this.db.prepare(`SELECT * FROM memory_edge WHERE scope = ?`).all(from) as SyncEdgeRow[];
+    const components = this.db.prepare(`SELECT * FROM memory_edge_components WHERE scope = ?`).all(from) as SyncEdgeComponentRow[];
+    if (rows.length === 0 && components.length === 0) return 0;
+    const stamp = this.nextSyncTimestamp();
+    this.db.prepare(`DELETE FROM memory_edge_components WHERE scope = ?`).run(from);
+    this.db.prepare(`DELETE FROM memory_edge WHERE scope = ?`).run(from);
+    for (const row of rows) {
+      this.db.prepare(
+        `INSERT INTO memory_edge
+           (id, src_id, src_type, dst_id, dst_type, type, weight, origin, count,
+            created_at, last_reinforced_at, scope, dismissed_at, dismissed_by,
+            legacy_count, sync_updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(src_id, dst_id, type, scope) DO UPDATE SET
+           weight = MAX(weight, excluded.weight),
+           legacy_count = legacy_count + excluded.legacy_count,
+           created_at = MIN(created_at, excluded.created_at),
+           last_reinforced_at = MAX(last_reinforced_at, excluded.last_reinforced_at),
+           dismissed_by = CASE WHEN COALESCE(excluded.dismissed_at, 0) > COALESCE(dismissed_at, 0) THEN excluded.dismissed_by ELSE dismissed_by END,
+           dismissed_at = CASE
+             WHEN dismissed_at IS NULL THEN excluded.dismissed_at
+             WHEN excluded.dismissed_at IS NULL THEN dismissed_at
+             ELSE MAX(dismissed_at, excluded.dismissed_at)
+           END,
+           sync_updated_at = excluded.sync_updated_at`,
+      ).run(row.id, row.src_id, row.src_type, row.dst_id, row.dst_type, row.type, row.weight,
+        row.origin, row.count, row.created_at, row.last_reinforced_at, to,
+        row.dismissed_at, row.dismissed_by, row.legacy_count ?? 0, stamp);
+    }
+    for (const component of components) {
+      this.db.prepare(
+        `INSERT INTO memory_edge_components
+           (src_id, dst_id, type, scope, writer_id, count, weight, origin,
+            created_at, last_reinforced_at, revision, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(src_id, dst_id, type, scope, writer_id) DO UPDATE SET
+           count = count + excluded.count, weight = MAX(weight, excluded.weight),
+           created_at = MIN(created_at, excluded.created_at),
+           last_reinforced_at = MAX(last_reinforced_at, excluded.last_reinforced_at),
+           revision = MAX(revision, excluded.revision) + 1, updated_at = excluded.updated_at`,
+      ).run(component.src_id, component.dst_id, component.type, to, component.writer_id,
+        component.count, component.weight, component.origin, component.created_at,
+        component.last_reinforced_at, component.revision, stamp);
+    }
+    const keys = new Set([
+      ...rows.map((row) => `${row.src_id}\0${row.dst_id}\0${row.type}`),
+      ...components.map((row) => `${row.src_id}\0${row.dst_id}\0${row.type}`),
+    ]);
+    for (const key of keys) {
+      const [src, dst, type] = key.split("\0");
+      this.materializeEdge(src!, dst!, type!, to);
+    }
+    return rows.length;
+  }
+
+  private ensureMaterializedEdge(
+    src: string,
+    dst: string,
+    type: string,
+    scope: string,
+    weight: number,
+    origin: string,
+    createdAt: number,
+    reinforcedAt: number,
+  ): void {
+    this.db.prepare(
+      `INSERT OR IGNORE INTO memory_edge
+         (id, src_id, dst_id, type, weight, origin, count, created_at,
+         last_reinforced_at, scope, legacy_count, sync_updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?)`,
+    ).run(this.newId(), src, dst, type, weight, origin, createdAt, reinforcedAt, scope, reinforcedAt);
+  }
+
+  private materializeEdge(src: string, dst: string, type: string, scope: string): void {
+    const aggregate = this.db.prepare(
+      `SELECT COALESCE(SUM(count), 0) AS component_count,
+              MAX(weight) AS component_weight,
+              MIN(created_at) AS component_created_at,
+              MAX(last_reinforced_at) AS component_reinforced_at
+         FROM memory_edge_components
+        WHERE src_id = ? AND dst_id = ? AND type = ? AND scope = ?`,
+    ).get(src, dst, type, scope) as {
+      component_count: number;
+      component_weight: number | null;
+      component_created_at: number | null;
+      component_reinforced_at: number | null;
+    };
+    this.db.prepare(
+      `UPDATE memory_edge SET
+         count = legacy_count + ?,
+         weight = MAX(weight, COALESCE(?, weight)),
+         created_at = MIN(created_at, COALESCE(?, created_at)),
+         last_reinforced_at = MAX(last_reinforced_at, COALESCE(?, last_reinforced_at))
+       WHERE src_id = ? AND dst_id = ? AND type = ? AND scope = ?`,
+    ).run(aggregate.component_count, aggregate.component_weight, aggregate.component_created_at,
+      aggregate.component_reinforced_at, src, dst, type, scope);
+  }
+
+  private materializeConceptActivity(conceptId: string): void {
+    const aggregate = this.db.prepare(
+      `SELECT COALESCE(SUM(usefulness_count), 0) AS usefulness_score,
+              MAX(usefulness_last_at) AS usefulness_last_at,
+              COALESCE(SUM(arousal_count), 0) AS arousal_score,
+              MAX(arousal_last_at) AS arousal_last_at
+         FROM concept_activity_components WHERE concept_id = ?`,
+    ).get(conceptId) as {
+      usefulness_score: number; usefulness_last_at: number | null;
+      arousal_score: number; arousal_last_at: number | null;
+    };
+    this.db.prepare(
+      `UPDATE concepts SET usefulness_score = ?, usefulness_last_fetched_at = ?,
+              arousal_score = ?, arousal_last_updated_at = ?
+        WHERE id = ? AND kind != 'source'`,
+    ).run(aggregate.usefulness_score, aggregate.usefulness_last_at,
+      aggregate.arousal_score, aggregate.arousal_last_at, conceptId);
   }
 
   /** Graph construction and traversal are closed over active, same-circle concepts. */
@@ -4442,11 +5840,9 @@ export class MonetCore {
     //   target mutated → invalidate its summary so the user knows to refresh it.
     //   source deleted → remove its entry (referential integrity — no dangling row to a deleted concept).
     this.invalidateFirstBlockEntry(target.id);
-    this.deleteFirstBlockEntry(src.id);
-    // 4) Drop the source: its graph footprint in fromCircle, its revision history, then the row.
-    this.unwindConceptGraph(src.id, fromCircle);
-    this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(src.id);
-    this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(src.id);
+    // 4) Drop the source and publish a durable hard-deletion event so an out-of-order stale
+    // concept payload can never recreate the absorbed id on another replica.
+    this.hardDeleteNativeConcept(src.id);
     // 5) Re-derive the target over the absorbed evidence (idempotent; picks up any new entities/edges).
     //    Unconditional, mirroring the unconditional unwind above — see moveConcept's note.
     this.rederiveConceptGraph(target.id, toCircle);
@@ -4469,7 +5865,55 @@ export class MonetCore {
       this.db.prepare(`UPDATE entities SET df = df - 1 WHERE key = ? AND scope = ?`).run(key, circle);
       this.db.prepare(`DELETE FROM entities WHERE key = ? AND scope = ? AND df <= 0`).run(key, circle);
     }
+    this.db.prepare(`DELETE FROM memory_edge_components WHERE scope = ? AND (src_id = ? OR dst_id = ?)`).run(circle, conceptId, conceptId);
     this.db.prepare(`DELETE FROM memory_edge WHERE scope = ? AND (src_id = ? OR dst_id = ?)`).run(circle, conceptId, conceptId);
+  }
+
+  /** Remove entity memberships that no longer share the winning concept circle. */
+  private cleanupConceptMembershipScopes(conceptId: string, circle: string): void {
+    const stale = this.db.prepare(
+      `SELECT entity_key, scope FROM concept_entities WHERE concept_id = ? AND scope != ?`,
+    ).all(conceptId, circle) as Array<{ entity_key: string; scope: string }>;
+    for (const row of stale) {
+      this.db.prepare(`DELETE FROM concept_entities WHERE concept_id = ? AND entity_key = ? AND scope = ?`).run(conceptId, row.entity_key, row.scope);
+      this.db.prepare(`UPDATE entities SET df = MAX(0, df - 1) WHERE key = ? AND scope = ?`).run(row.entity_key, row.scope);
+      this.db.prepare(`DELETE FROM entities WHERE key = ? AND scope = ? AND df <= 0`).run(row.entity_key, row.scope);
+    }
+  }
+
+  /** Remove one native concept and leave a durable sync tombstone for the id. */
+  private hardDeleteNativeConcept(conceptId: string, replicate = true, deletedAt?: number): void {
+    const row = this.db.prepare(`SELECT kind FROM concepts WHERE id = ?`).get(conceptId) as { kind: string } | undefined;
+    if (row?.kind === "source") throw new Error("generic hard deletion cannot delete a source-owned concept");
+    const stamp = deletedAt ?? this.nextSyncTimestamp();
+    if (replicate) {
+      this.db.prepare(
+        `INSERT INTO concept_deletions (concept_id, deleted_at, updated_at, writer_id, concept_kind)
+         VALUES (?, ?, ?, ?, 'native')
+         ON CONFLICT(concept_id) DO UPDATE SET
+           deleted_at = MAX(deleted_at, excluded.deleted_at), updated_at = excluded.updated_at,
+           writer_id = excluded.writer_id, concept_kind = excluded.concept_kind`,
+      ).run(conceptId, stamp, stamp, this.syncDeviceId);
+    }
+    this.db.prepare(
+      `UPDATE first_block SET deleted_at = COALESCE(deleted_at, ?), updated_at = ?
+        WHERE concept_id = ?`,
+    ).run(stamp, stamp, conceptId);
+    const memberships = this.db.prepare(
+      `SELECT entity_key, scope FROM concept_entities WHERE concept_id = ?`,
+    ).all(conceptId) as Array<{ entity_key: string; scope: string }>;
+    for (const membership of memberships) {
+      this.db.prepare(`UPDATE entities SET df = MAX(0, df - 1) WHERE key = ? AND scope = ?`).run(membership.entity_key, membership.scope);
+      this.db.prepare(`DELETE FROM entities WHERE key = ? AND scope = ? AND df <= 0`).run(membership.entity_key, membership.scope);
+    }
+    this.db.prepare(`DELETE FROM concept_entities WHERE concept_id = ?`).run(conceptId);
+    this.db.prepare(`DELETE FROM memory_edge_components WHERE src_id = ? OR dst_id = ?`).run(conceptId, conceptId);
+    this.db.prepare(`DELETE FROM memory_edge WHERE src_id = ? OR dst_id = ?`).run(conceptId, conceptId);
+    this.db.prepare(`DELETE FROM concept_activity_components WHERE concept_id = ?`).run(conceptId);
+    this.db.prepare(`DELETE FROM contradictions WHERE concept_id = ?`).run(conceptId);
+    this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(conceptId);
+    this.db.prepare(`DELETE FROM observations WHERE concept_id = ?`).run(conceptId);
+    this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(conceptId);
   }
 
   /**
@@ -5020,9 +6464,14 @@ export class MonetCore {
   private ensureSession(): string {
     if (this.sessionId) return this.sessionId;
     const id = this.newId();
+    const now = Date.now();
+    this.nextSyncTimestamp(now);
     this.db
-      .prepare(`INSERT INTO sessions (id, agent_id, scope_context, status) VALUES (?, ?, ?, 'active')`)
-      .run(id, this.agentId, this.scopeContext);
+      .prepare(
+        `INSERT INTO sessions (id, agent_id, scope_context, status, started_at, updated_at)
+         VALUES (?, ?, ?, 'active', ?, ?)`,
+      )
+      .run(id, this.agentId, this.scopeContext, now, now);
     this.sessionId = id;
     return id;
   }
@@ -5094,6 +6543,21 @@ function workstreamTitle(p: WorkstreamPayload): string {
 function workstreamText(p: WorkstreamPayload): string {
   const parts = [...(p.openQuestions ?? []), ...(p.nextSteps ?? []), ...(p.decisions ?? []), ...(p.confirmedContext ?? [])];
   return parts.join(" ") || "workstream";
+}
+
+function uniqueRowsById<T extends { id: string }>(rows: T[]): T[] {
+  const byId = new Map<string, T>();
+  for (const row of rows) byId.set(row.id, row);
+  return [...byId.values()];
+}
+
+function deterministicFirstBlockId(conceptId: string, circle: string): string {
+  return `fb:${createHash("sha256").update(`${conceptId}\0${circle}`).digest("hex").slice(0, 32)}`;
+}
+
+function stableFingerprint(row: unknown): string {
+  const value = JSON.stringify(row, (key, item) => key === "updated_at" || key === "sync_revision" || key === "sync_writer" ? undefined : item);
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function toCard(r: ConceptRow, score: number, contradictions: number): SearchCard {

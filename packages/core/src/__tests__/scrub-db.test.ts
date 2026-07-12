@@ -72,6 +72,53 @@ function sha256File(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function readSyncMeta(path: string): { device_id: string; clock_mode: "wall" | "logical" } {
+  const db = new Database(path, { readonly: true });
+  try {
+    return db.prepare(`SELECT device_id, clock_mode FROM sync_meta WHERE singleton = 1`).get() as {
+      device_id: string;
+      clock_mode: "wall" | "logical";
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function downgradeToPreClockModeV8(path: string): string {
+  const db = new Database(path);
+  try {
+    const device = (db.prepare(`SELECT device_id FROM sync_meta WHERE singleton = 1`).get() as { device_id: string }).device_id;
+    const triggers = db.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'sync_%' ORDER BY name`,
+    ).all() as Array<{ name: string }>;
+    for (const trigger of triggers) db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+    db.exec(`ALTER TABLE sync_meta DROP COLUMN clock_mode`);
+    db.exec(`
+      CREATE TRIGGER sync_concepts_update AFTER UPDATE ON concepts
+      WHEN NEW.sync_revision = OLD.sync_revision
+       AND COALESCE(NEW.sync_writer, '') = COALESCE(OLD.sync_writer, '')
+       AND (SELECT applying_remote FROM sync_meta WHERE singleton = 1) = 0
+      BEGIN
+        UPDATE sync_meta
+           SET last_mutation_at = MAX(
+             last_mutation_at + 1,
+             CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+           )
+         WHERE singleton = 1;
+        UPDATE concepts
+           SET sync_revision = OLD.sync_revision + 1,
+               sync_writer = (SELECT device_id FROM sync_meta WHERE singleton = 1),
+               updated_at = (SELECT last_mutation_at FROM sync_meta WHERE singleton = 1)
+         WHERE id = NEW.id;
+      END;
+    `);
+    db.pragma("user_version = 8");
+    return device;
+  } finally {
+    db.close();
+  }
+}
+
 /**
  * Build a minimal, schema-correct fixture db at `path`: a real MonetCore-initialized store (so the
  * schema is never hand-duplicated — same precedent as materializeSampledDb in corpus-sample.ts),
@@ -2406,6 +2453,9 @@ describe("scrubSizeDb — copy-then-scrub, the full per-size operation", () => {
     scrubSizeDb(srcPath, dst2);
 
     expect(sha256File(dst1)).toBe(sha256File(dst2));
+    const sourceMeta = readSyncMeta(srcPath);
+    expect(readSyncMeta(dst1)).toEqual({ device_id: sourceMeta.device_id, clock_mode: "wall" });
+    expect(readSyncMeta(dst2)).toEqual({ device_id: sourceMeta.device_id, clock_mode: "wall" });
   });
 
   it("re-running scrubSizeDb against the SAME destination path overwrites cleanly (no stale mixed content)", async () => {
@@ -2420,6 +2470,56 @@ describe("scrubSizeDb — copy-then-scrub, the full per-size operation", () => {
     const secondHash = sha256File(dstPath);
 
     expect(secondHash).toBe(firstHash);
+    expect(readSyncMeta(dstPath)).toEqual({
+      device_id: readSyncMeta(srcPath).device_id,
+      clock_mode: "wall",
+    });
+  });
+
+  it("removes a failed scrub output instead of leaving a logical-mode database", async () => {
+    const dir = mkTmp("scrub-db-failed-clock-mode-");
+    const srcPath = join(dir, "src-monet.db");
+    const { conceptIds } = await buildFixtureDb(srcPath);
+    const srcDb = new Database(srcPath);
+    try {
+      srcDb.prepare(`UPDATE concepts SET circle = 'wrong-scope' WHERE id = ?`).run(conceptIds[0]);
+    } finally {
+      srcDb.close();
+    }
+    const dstPath = join(dir, "scrubbed", "monet.db");
+
+    expect(() => scrubSizeDb(srcPath, dstPath)).toThrow(/scope/i);
+    expect(existsSync(dstPath)).toBe(false);
+    expect(existsSync(`${dstPath}-wal`)).toBe(false);
+    expect(existsSync(`${dstPath}-shm`)).toBe(false);
+  });
+
+  it("rejects pre-clock_mode v8 wall-clock triggers and removes every attempted output", async () => {
+    const dir = mkTmp("scrub-db-legacy-v8-clock-");
+    const srcPath = join(dir, "src-monet.db");
+    await buildFixtureDb(srcPath);
+    const deviceId = downgradeToPreClockModeV8(srcPath);
+    const probe = new Database(srcPath, { readonly: true });
+    try {
+      expect(probe.pragma("user_version", { simple: true })).toBe(8);
+      expect((probe.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>).some(
+        (column) => column.name === "clock_mode",
+      )).toBe(false);
+      expect((probe.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'sync_concepts_update'`,
+      ).get() as { sql: string }).sql).toContain("julianday('now')");
+      expect((probe.prepare(`SELECT device_id FROM sync_meta WHERE singleton = 1`).get() as { device_id: string }).device_id).toBe(deviceId);
+    } finally {
+      probe.close();
+    }
+
+    for (const name of ["first", "second"]) {
+      const dstPath = join(dir, name, "monet.db");
+      expect(() => scrubSizeDb(srcPath, dstPath)).toThrow(/v8 sync clock is missing clock_mode/);
+      expect(existsSync(dstPath)).toBe(false);
+      expect(existsSync(`${dstPath}-wal`)).toBe(false);
+      expect(existsSync(`${dstPath}-shm`)).toBe(false);
+    }
   });
 
   it("a MonetCore opened on the scrubbed copy answers search()/gather() sanely, with sourceRefs parsing back to a clean array", async () => {

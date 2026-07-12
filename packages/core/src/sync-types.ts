@@ -34,6 +34,10 @@ export interface SyncConceptRow {
   aliases: string | null; // JSON string[]
   last_confirmed_at: number | null;
   last_confirmed_session_id: string | null;
+  /** v8 row-convergence clock. Missing on legacy payloads. */
+  sync_revision?: number;
+  /** Stable per-store writer id used to break equal-revision ties. */
+  sync_writer?: string | null;
 }
 
 export interface SyncObservationRow {
@@ -50,6 +54,10 @@ export interface SyncObservationRow {
   author_agent_id: string;
   source_refs: string | null; // JSON string[]
   created_at: number;
+  /** v8 mutable binding/supersession state clock. */
+  sync_revision?: number;
+  sync_writer?: string | null;
+  updated_at?: number;
 }
 
 export interface SyncRevisionRow {
@@ -72,6 +80,9 @@ export interface SyncContradictionRow {
   detected_at: number;
   resolved_at: number | null;
   resolved_by: string | null;
+  updated_at?: number;
+  sync_revision?: number;
+  sync_writer?: string | null;
 }
 
 export interface SyncEdgeRow {
@@ -89,6 +100,10 @@ export interface SyncEdgeRow {
   scope: string;
   dismissed_at: number | null;
   dismissed_by: string | null;
+  /** v8 unprovenanced pre-component count retained for backward-compatible migration. */
+  legacy_count?: number;
+  /** v8 relay watermark for mutable aggregate state such as dismissal. */
+  sync_updated_at?: number;
 }
 
 export interface SyncFirstBlockRow {
@@ -100,6 +115,10 @@ export interface SyncFirstBlockRow {
   position: number;
   promoted_at: number;
   promoted_by: string | null;
+  updated_at?: number;
+  sync_revision?: number;
+  sync_writer?: string | null;
+  deleted_at?: number | null;
 }
 
 export interface SyncCircleAliasRow {
@@ -107,6 +126,9 @@ export interface SyncCircleAliasRow {
   to_name: string;
   status: string;
   created_at: number;
+  updated_at?: number;
+  sync_revision?: number;
+  sync_writer?: string | null;
 }
 
 export interface SyncEntityRow {
@@ -131,26 +153,74 @@ export interface SyncSessionRow {
   ended_at: number | null;
   status: string;
   summary: string | null;
+  updated_at?: number;
+  sync_revision?: number;
+  sync_writer?: string | null;
+}
+
+/** v8 grow-only per-writer contribution to one materialized memory_edge row. */
+export interface SyncEdgeComponentRow {
+  src_id: string;
+  dst_id: string;
+  type: string;
+  scope: string;
+  writer_id: string;
+  count: number;
+  weight: number;
+  origin: string;
+  created_at: number;
+  last_reinforced_at: number;
+  revision: number;
+  updated_at: number;
+}
+
+/** Durable hard deletion; unlike retirement, this concept id can never be restored by sync. */
+export interface SyncConceptDeletionRow {
+  concept_id: string;
+  deleted_at: number;
+  updated_at: number;
+  /** Stable writer domain that authored the deletion. Required by v8 generic sync. */
+  writer_id: string;
+  /** Authority provenance. Generic sync accepts only explicit native deletions. */
+  concept_kind: "native";
+}
+
+/** Replay-safe per-writer activity contribution materialized onto a concept row. */
+export interface SyncConceptActivityRow {
+  concept_id: string;
+  writer_id: string;
+  usefulness_count: number;
+  usefulness_last_at: number | null;
+  arousal_count: number;
+  arousal_last_at: number | null;
+  revision: number;
+  updated_at: number;
 }
 
 /** Content-free lifecycle event: a replica must hide this concept and reject stale re-ingest. */
 export interface SyncConceptTombstoneRow {
   concept_id: string;
   retired_at: number;
+  /** Relay watermark; distinct from the semantic lifecycle time. */
+  updated_at?: number;
 }
 
 /** Later lifecycle event that un-tombstones a concept without erasing the retirement record. */
 export interface SyncConceptRestorationRow {
   concept_id: string;
   restored_at: number;
+  /** Relay watermark; distinct from the semantic lifecycle time. */
+  updated_at?: number;
 }
 
 // ---- the payload and result -----------------------------------------------
 
 export interface GraftPayload {
+  /** Payload protocol version. Absent means the legacy v7 aggregate-row protocol. */
+  schemaVersion?: number;
   /** Unix ms when the export was created on the source machine. */
   exportedAt: number;
-  /** Watermark: only rows modified after this epoch ms are included (0 = full export). */
+  /** Inclusive watermark: rows modified at or after this epoch ms are included (0 = full export). */
   since: number;
   /** Stable identifier for the source machine/agent. */
   deviceId: string;
@@ -161,6 +231,12 @@ export interface GraftPayload {
   conceptRevisions: SyncRevisionRow[];
   contradictions: SyncContradictionRow[];
   edges: SyncEdgeRow[];
+  /** v8 multi-writer edge contributions; aggregate `edges` remains for legacy consumers. */
+  edgeComponents?: SyncEdgeComponentRow[];
+  /** v8 hard-deletion events. */
+  deletions?: SyncConceptDeletionRow[];
+  /** v8 commutative activity inputs. */
+  conceptActivity?: SyncConceptActivityRow[];
   firstBlock: SyncFirstBlockRow[];
   circleAliases: SyncCircleAliasRow[];
   entities: SyncEntityRow[];
@@ -175,6 +251,6 @@ export interface GraftResult {
   inserted: Record<string, number>;
   /** Per-table count of rows that already existed and were skipped or merged. */
   skipped: Record<string, number>;
-  /** Concept ids that gained at least one new observation and were marked dirty=1 for re-synthesis. */
+  /** Active native endpoint ids whose winning observation binding changed and were marked dirty. */
   conceptsMarkedDirty: string[];
 }
