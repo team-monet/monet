@@ -69,6 +69,10 @@ export interface SourceSyncCorePort {
 interface RuntimeOptions extends RepoMdSyncOptions {
   sourceStorageDir: string;
   idGen?: () => string;
+  /** Connector authorization/lifecycle fence, run inside the lock before any recovery or mutation. */
+  preflight?: () => void;
+  /** Public connector hook for a fully validated unchanged active publication. */
+  onNoopVerified?: () => void;
   materializer?: Partial<RepoMdMaterializerOptions>;
   scan?: typeof scanSourceSnapshot;
 }
@@ -272,6 +276,7 @@ export async function syncRepoMdSource(
 ): Promise<RepoMdSyncResult> {
   const mat = materializerOptions(options);
   return withRepoMdMaterializerLock(sourceId, mat, async () => {
+    options.preflight?.();
     let source = requireRepoLineage(core, sourceId);
     let run = core.resumeSourceRun(sourceId);
 
@@ -310,6 +315,7 @@ export async function syncRepoMdSource(
       const begun = core.beginSourceRun({ sourceId, snapshotId: pinned.snapshotId });
       if (begun.kind === "noop") {
         pointRepoMdCurrent(source.id, pinned.snapshotId, pinned.configHash, mat);
+        options.onNoopVerified?.();
         return { sourceId, snapshotId: pinned.snapshotId, runId: null, status: "noop", diagnostics: [] };
       }
       run = begun.run;

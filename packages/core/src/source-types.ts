@@ -126,6 +126,39 @@ export interface SourceAuthorizationContext {
   projectId: string;
 }
 
+/** Trusted connector-facing projection. Access policy and repository roots are never exposed. */
+export interface ConnectorSourceSummary {
+  id: string;
+  type: SourceType;
+  name: string;
+  branch?: string;
+  refresh: SourceRefreshPolicy;
+}
+
+export interface ConnectorSourceStatus {
+  id: string;
+  type: SourceType;
+  branch?: string;
+  lastAttemptAt?: number;
+  lastSyncResult: "success" | "failed" | "partial" | "never";
+  lastSuccessfulSyncAt?: number;
+  indexedRevision?: string;
+  freshness: "fresh" | "stale" | "unknown";
+  filesIndexed: number;
+  chunksIndexed: number;
+  dirtyFiles: number;
+  lastError?: string;
+}
+
+export interface ConnectorSourcePath {
+  sourceId: string;
+  type: SourceType;
+  path: string;
+  snapshotPath: string;
+  revision: string;
+  guidance: string;
+}
+
 /** Exact config/fence tuple a future sync planner must capture before doing work. */
 export interface SourceRunFence {
   sourceId: string;

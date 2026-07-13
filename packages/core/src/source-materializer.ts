@@ -2,7 +2,7 @@ import { execFile as nodeExecFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import {
-  chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync,
+  chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, readSync,
   readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { constants } from "node:fs";
@@ -82,19 +82,22 @@ function realDirectory(path: string, label: string, create: boolean): string | n
   return realpathSync.native(path);
 }
 
-function managedRepoRoot(storageDir: string): string {
+function managedRepoRoot(storageDir: string, create = true): string | null {
   const configuredBase = resolve(storageDir);
-  mkdirSync(configuredBase, { recursive: true, mode: 0o700 });
-  const base = realDirectory(configuredBase, "managed source storage base", false)!;
+  if (create) mkdirSync(configuredBase, { recursive: true, mode: 0o700 });
+  const base = realDirectory(configuredBase, "managed source storage base", false);
+  if (base === null) return null;
   const repoPath = join(base, "repo-md");
-  const repo = realDirectory(repoPath, "managed repo-md root", true)!;
+  const repo = realDirectory(repoPath, "managed repo-md root", create);
+  if (repo === null) return null;
   if (repo !== join(base, "repo-md") || !contained(base, repo)) throw new Error("managed repo-md root canonical path mismatch");
   return repo;
 }
 
 function sourceRoot(sourceId: string, storageDir: string, create = true): string | null {
   requireSourceId(sourceId);
-  const repo = managedRepoRoot(storageDir);
+  const repo = managedRepoRoot(storageDir, create);
+  if (repo === null) return null;
   const expected = join(repo, sourceId);
   const source = realDirectory(expected, "managed repo-md source root", create);
   if (source !== null && (source !== expected || dirname(source) !== repo || relative(repo, source) !== sourceId)) {
@@ -265,7 +268,7 @@ export async function withRepoMdMaterializerLock<T>(
   const token = (options.token ?? randomUUID)();
   const staleMs = options.lockStaleMs ?? 5 * 60_000;
   requireSourceId(sourceId);
-  const repo = managedRepoRoot(options.sourceStorageDir);
+  const repo = managedRepoRoot(options.sourceStorageDir)!;
   // Validate an existing source root before even acquiring its sibling lock.
   sourceRoot(sourceId, options.sourceStorageDir, false);
   // The lock is a sibling of the source root so removal can quarantine the whole root atomically.
@@ -397,6 +400,33 @@ function validateSealedSnapshot(snapshotPath: string, sidecarPath: string, snaps
   return marker;
 }
 
+/** Validate the exact sealed active variant and stable pointer without repairing either. */
+export function validateRepoMdPublishedPath(
+  sourceId: string,
+  snapshotId: string,
+  configHash: string,
+  sourceStorageDir: string,
+): { path: string; snapshotPath: string } {
+  const root = sourceRoot(sourceId, sourceStorageDir, false);
+  if (!root) throw new Error("published source snapshot is unavailable");
+  const snapshots = join(root, "snapshots");
+  const snapshotsReal = realpathSync.native(snapshots);
+  if (snapshotsReal !== snapshots) throw new Error("published source snapshots directory is not canonical");
+  const snapshotPath = join(snapshots, variantName(snapshotId, configHash));
+  validateSealedSnapshot(snapshotPath, `${snapshotPath}.complete.json`, snapshotId, configHash);
+  const snapshotReal = realpathSync.native(snapshotPath);
+  if (snapshotReal !== snapshotPath || dirname(snapshotReal) !== snapshotsReal) {
+    throw new Error("published source snapshot escapes managed storage");
+  }
+  const current = join(root, "current");
+  const currentEntry = lstatSync(current);
+  if (!currentEntry.isSymbolicLink()) throw new Error("published source current pointer is not a symlink");
+  if (readlinkSync(current) !== relative(root, snapshotPath) || realpathSync.native(current) !== snapshotReal) {
+    throw new Error("published source current pointer does not match the active snapshot");
+  }
+  return { path: current, snapshotPath };
+}
+
 function sealSnapshot(tree: string): void {
   const seal = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -457,7 +487,7 @@ export function revokeRepoMdCurrent(sourceId: string, sourceStorageDir: string):
 /** Remove only recognizable Monet-owned artifacts beneath the hashed source storage root. */
 export function removeRepoMdMaterializations(sourceId: string, sourceStorageDir: string): void {
   requireSourceId(sourceId);
-  const repo = managedRepoRoot(sourceStorageDir);
+  const repo = managedRepoRoot(sourceStorageDir)!;
   const quarantinePattern = new RegExp(`^\\.remove-${sourceId}-[A-Za-z0-9-]+$`);
   const quarantines = readdirSync(repo).filter((name) => quarantinePattern.test(name));
   if (quarantines.length > 1) throw new Error("multiple managed repo-md removal quarantines exist");

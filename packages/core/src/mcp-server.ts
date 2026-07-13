@@ -13,6 +13,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore, FIRST_BLOCK_SUMMARY_MAX_CHARS } from "./engine";
 import type { MergeConceptResult } from "./engine";
+import type { SourceAuthorizationContext } from "./source-types";
+import { sanitizeSourceError } from "./source-errors";
 
 /**
  * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions`
@@ -310,6 +312,8 @@ type CircleListResponse = {
 export interface RegisterMonetCoreToolsOpts {
   autoPrewarm?: boolean;
   checkpointNudge?: boolean;
+  /** Host-injected identity; never accepted from tool arguments. */
+  sourceAuthorizationContext?: Readonly<SourceAuthorizationContext>;
 }
 
 /**
@@ -323,6 +327,9 @@ export function registerMonetCoreTools(
 ): McpServer {
   const autoPrewarm = opts?.autoPrewarm ?? true;
   const checkpointNudge = opts?.checkpointNudge ?? true;
+  const sourceAuthorizationContext = opts?.sourceAuthorizationContext
+    ? Object.freeze({ ...opts.sourceAuthorizationContext })
+    : undefined;
 
   // --- lifecycle closure state ---
   // Auto-prewarm: one-shot per server process.
@@ -1239,6 +1246,50 @@ export function registerMonetCoreTools(
   );
 
   server.tool(
+    "source_list",
+    "List knowledge sources authorized for this host runtime. Access identity is bound by the server and cannot be supplied as tool arguments.",
+    {},
+    async () => {
+      const capturedBlock = capturePrewarmSnapshot(scope());
+      try { return readOk({ sources: core.listConnectorSources(sourceAuthorizationContext) }, "source_list", capturedBlock); }
+      catch (e) { return err(`source_list failed: ${sanitizeSourceError(e)}`); }
+    },
+  );
+
+  server.tool(
+    "source_status",
+    "Return active published status for one authorized source. Counts never include partial or unpublished runs.",
+    { sourceId: z.string().min(1) },
+    async ({ sourceId }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope());
+      try { return readOk(core.sourceStatus(sourceId, sourceAuthorizationContext), "source_status", capturedBlock); }
+      catch (e) { return err(`source_status failed: ${sanitizeSourceError(e)}`); }
+    },
+  );
+
+  server.tool(
+    "source_path",
+    "Return the sealed read-only path for the exact active indexed repo-md snapshot. Never returns the working tree.",
+    { sourceId: z.string().min(1) },
+    async ({ sourceId }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope());
+      try { return readOk(core.sourcePath(sourceId, sourceAuthorizationContext), "source_path", capturedBlock); }
+      catch (e) { return err(`source_path failed: ${sanitizeSourceError(e)}`); }
+    },
+  );
+
+  server.tool(
+    "source_sync",
+    "Synchronize one authorized active source. repo-md is supported; git-md is rejected until its materializer is available.",
+    { sourceId: z.string().min(1) },
+    async ({ sourceId }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope());
+      try { return mutOk(await core.syncSource(sourceId, sourceAuthorizationContext), "source_sync", false, capturedBlock); }
+      catch (e) { return err(`source_sync failed: ${sanitizeSourceError(e)}`); }
+    },
+  );
+
+  server.tool(
     "agent_context",
     "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
     { circle: z.string().optional() },
@@ -1288,9 +1339,12 @@ export function registerMonetCoreTools(
  * MONET_NO_CHECKPOINT_NUDGE=1 → checkpointNudge:false
  */
 export function deriveOptsFromEnv(env: NodeJS.ProcessEnv = process.env): RegisterMonetCoreToolsOpts {
+  const callerId = env.MONET_CALLER_ID;
+  const projectId = env.MONET_PROJECT_ID;
   return {
     autoPrewarm: env.MONET_NO_AUTOPREWARM !== "1",
     checkpointNudge: env.MONET_NO_CHECKPOINT_NUDGE !== "1",
+    ...(callerId && projectId ? { sourceAuthorizationContext: { callerId, projectId } } : {}),
   };
 }
 

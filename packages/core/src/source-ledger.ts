@@ -18,6 +18,7 @@ import {
   sourceHeadingIdentityKey,
 } from "./source-chunker";
 import type { SourceChunkMetadata } from "./source-chunker";
+import { sanitizeSourceError } from "./source-errors";
 import type {
   BeginSourceRunInput,
   BeginSourceRunResult,
@@ -62,6 +63,22 @@ interface DurableSourceReceipt extends RawSourceOperation {
 interface OperationOwnership {
   authorized: boolean;
   hasActiveOwner: boolean;
+}
+
+export interface SourcePublicationView {
+  run: SourceSyncRun;
+  filesIndexed: number;
+  chunksIndexed: number;
+}
+
+export interface SourceAttemptView {
+  latest: SourceSyncRun | null;
+  lastResult: SourceSyncRun | null;
+  lastSuccess: SourceSyncRun | null;
+  latestVerificationAt: number | null;
+  latestVerificationRunCount: number | null;
+  runCount: number;
+  dirtyFiles: number;
 }
 
 const requireString = (value: unknown, field: string): string => {
@@ -142,10 +159,12 @@ function rowToRun(row: RunRow): SourceSyncRun {
 export class SourceLedger {
   private readonly idGen: () => string;
   private readonly now: () => number;
+  /** Test-only concurrency seam; production leaves this undefined. */
+  private attemptReadFault?: () => void;
 
   constructor(private readonly db: StoragePort, options: SourceLedgerOptions = {}) {
     this.idGen = options.idGen ?? randomUUID;
-    this.now = options.now ?? Date.now;
+    this.now = options.now ?? (() => Date.now());
   }
 
   ensureSchema(): void {
@@ -176,6 +195,17 @@ export class SourceLedger {
       CREATE UNIQUE INDEX IF NOT EXISTS uq_source_sync_runs_live
         ON source_sync_runs(source_id) WHERE state IN ('scanning','staging','activating','cleaning');
       CREATE INDEX IF NOT EXISTS idx_source_sync_runs_source_created ON source_sync_runs(source_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS source_verification_checks (
+        source_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        ingest_config_hash TEXT NOT NULL,
+        config_version INTEGER NOT NULL,
+        lease_fence INTEGER NOT NULL,
+        observed_run_count INTEGER NOT NULL,
+        checked_at INTEGER NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS source_snapshots (
         source_id TEXT NOT NULL,
@@ -303,6 +333,94 @@ export class SourceLedger {
       CREATE INDEX IF NOT EXISTS idx_source_removal_items_pending
         ON source_removal_items(source_id,acknowledged_at,id);
     `);
+    // Reconcile every surviving verification layout under this enclosing IMMEDIATE transaction.
+    // A prior non-atomic migrator could leave legacy alone, an auto-created current beside legacy,
+    // or both populated. Read and validate all copies before replacing either one.
+    {
+      type VerificationMigrationRow = {
+        source_id: string; run_id: string; snapshot_id: string; ingest_config_hash: string;
+        config_version: number; lease_fence: number; observed_run_count: number; checked_at: number;
+      };
+      const tableExists = (name: string): boolean => !!this.db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`,
+      ).get(name);
+      const required = ["source_id", "run_id", "snapshot_id", "ingest_config_hash", "config_version", "lease_fence", "observed_run_count", "checked_at"];
+      const layouts: Array<{ table: string; target: boolean }> = [];
+      for (const table of ["source_verification_checks", "source_verification_checks_legacy", "source_verification_checks_rebuild"]) {
+        if (!tableExists(table)) continue;
+        const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string; type: string; pk: number }>;
+        const names = columns.map((column) => column.name);
+        const target = names.length === required.length && required.every((name) => names.includes(name))
+          && columns.find((column) => column.name === "source_id")?.pk === 1;
+        const legacy = names.length === required.length + 1 && names.includes("id")
+          && required.every((name) => names.includes(name))
+          && columns.find((column) => column.name === "id")?.pk === 1;
+        if (!target && !legacy) throw new Error(`source verification migration found incompatible schema in ${table}`);
+        if (columns.some((column) => column.type.toUpperCase() !== (required.slice(0, 4).includes(column.name) || column.name === "id" ? "TEXT" : "INTEGER"))) {
+          throw new Error(`source verification migration found incompatible column types in ${table}`);
+        }
+        layouts.push({ table, target });
+      }
+      const candidates: VerificationMigrationRow[] = [];
+      for (const { table } of layouts) {
+        for (const raw of this.db.prepare(`SELECT ${required.join(",")} FROM ${table}`).all() as Array<Record<string, unknown>>) {
+          if (required.slice(0, 4).some((field) => typeof raw[field] !== "string" || (raw[field] as string).length === 0)
+              || !Number.isSafeInteger(raw.config_version) || (raw.config_version as number) < 1
+              || !Number.isSafeInteger(raw.lease_fence) || (raw.lease_fence as number) < 1
+              || !Number.isSafeInteger(raw.observed_run_count) || (raw.observed_run_count as number) < 0
+              || !Number.isSafeInteger(raw.checked_at) || (raw.checked_at as number) < 0) {
+            throw new Error(`source verification migration found corrupt row in ${table}`);
+          }
+          candidates.push(raw as unknown as VerificationMigrationRow);
+        }
+      }
+      const bySource = new Map<string, VerificationMigrationRow>();
+      const payload = (row: VerificationMigrationRow): string => canonicalJson(row);
+      for (const row of candidates) {
+        const valid = this.db.prepare(`SELECT 1 FROM knowledge_sources source
+          JOIN source_sync_runs run ON run.id=source.active_run_id AND run.source_id=source.id
+          JOIN source_snapshots snapshot ON snapshot.run_id=run.id AND snapshot.source_id=source.id
+          WHERE source.id=? AND source.lifecycle='active' AND source.active_run_id=? AND source.active_snapshot_id=?
+            AND source.active_ingest_config_hash=? AND source.applied_config_version=?
+            AND ? <= source.lease_fence
+            AND ? <= (SELECT COUNT(*) FROM source_sync_runs counted WHERE counted.source_id=source.id)
+            AND run.result='success' AND run.state IN ('published','cleaning','cleaned') AND snapshot.state='active'
+            AND NOT EXISTS (SELECT 1 FROM source_removals removal WHERE removal.source_id=source.id AND removal.state='complete')`
+        ).get(row.source_id, row.run_id, row.snapshot_id, row.ingest_config_hash, row.config_version, row.lease_fence, row.observed_run_count);
+        if (!valid) continue;
+        const prior = bySource.get(row.source_id);
+        if (!prior || row.checked_at > prior.checked_at) bySource.set(row.source_id, row);
+        else if (row.checked_at === prior.checked_at && payload(row) !== payload(prior)) {
+          throw new Error(`source verification migration collision for source '${row.source_id}' at ${row.checked_at}`);
+        }
+      }
+      const needsRebuild = layouts.some((layout) => layout.table !== "source_verification_checks" || !layout.target);
+      if (needsRebuild) {
+        this.db.exec(`
+          DROP TABLE IF EXISTS source_verification_checks_rebuild;
+          CREATE TABLE source_verification_checks_rebuild (
+            source_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,
+            ingest_config_hash TEXT NOT NULL,config_version INTEGER NOT NULL,lease_fence INTEGER NOT NULL,
+            observed_run_count INTEGER NOT NULL,checked_at INTEGER NOT NULL
+          );
+        `);
+        const insert = this.db.prepare(`INSERT INTO source_verification_checks_rebuild VALUES (?,?,?,?,?,?,?,?)`);
+        for (const row of [...bySource.values()].sort((a, b) => compareUtf8(a.source_id, b.source_id))) {
+          insert.run(row.source_id, row.run_id, row.snapshot_id, row.ingest_config_hash,
+            row.config_version, row.lease_fence, row.observed_run_count, row.checked_at);
+        }
+        this.db.exec(`
+          DROP INDEX IF EXISTS idx_source_verification_checks_source_time;
+          DROP TABLE source_verification_checks;
+          DROP TABLE IF EXISTS source_verification_checks_legacy;
+          ALTER TABLE source_verification_checks_rebuild RENAME TO source_verification_checks;
+        `);
+      } else {
+        // Even target-layout databases may retain a row for a source removed by an older release.
+        this.db.prepare(`DELETE FROM source_verification_checks WHERE source_id NOT IN (${[...bySource.keys()].map(() => "?").join(",") || "SELECT '' WHERE 0"})`)
+          .run(...bySource.keys());
+      }
+    }
     const emptyMetadata = canonicalJson({ tags: [], scope: null, frontmatter: {} });
     for (const table of ["source_staged_chunks", "source_chunks"]) {
       const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
@@ -630,9 +748,10 @@ export class SourceLedger {
   abortRun(runId: string, result: "failed" | "partial", reason?: string): SourceSyncRun {
     return this.db.immediateTransaction(() => {
       if (result !== "failed" && result !== "partial") throw new Error("aborted run result must be failed or partial");
+      const safeReason = reason === undefined ? null : sanitizeSourceError(reason);
       const run = this.requireRun(runId);
       if (run.state === "aborted") {
-        if (run.result !== result || run.reason !== (reason ?? null)) throw new Error("abort conflicts with the recorded result");
+        if (run.result !== result || run.reason !== safeReason) throw new Error("abort conflicts with the recorded result");
         this.ensureOrphanCleanup(run);
         return run;
       }
@@ -640,7 +759,7 @@ export class SourceLedger {
       if (result === "partial" && run.complete) throw new Error("partial result requires a partial manifest/run");
       const now = this.now();
       this.ensureOrphanCleanup(run, now);
-      this.db.prepare(`UPDATE source_sync_runs SET state='aborted',result=?,reason=?,updated_at=?,finished_at=? WHERE id=?`).run(result, reason ?? null, now, now, run.id);
+      this.db.prepare(`UPDATE source_sync_runs SET state='aborted',result=?,reason=?,updated_at=?,finished_at=? WHERE id=?`).run(result, safeReason, now, now, run.id);
       this.db.prepare(`UPDATE source_snapshots SET state='aborted' WHERE run_id=?`).run(run.id);
       return this.requireRun(run.id);
     })();
@@ -703,6 +822,87 @@ export class SourceLedger {
 
   listRuns(sourceId: string): SourceSyncRun[] {
     return (this.db.prepare(`SELECT * FROM source_sync_runs WHERE source_id=? ORDER BY created_at,id`).all(sourceId) as RunRow[]).map(rowToRun);
+  }
+
+  /** Read-only validation of the registry's exact active publication tuple. */
+  activePublication(sourceId: string, runId: string, snapshotId: string, ingestConfigHash: string): SourcePublicationView {
+    const run = this.getRun(runId);
+    if (!run || run.sourceId !== sourceId || run.snapshotId !== snapshotId
+        || run.ingestConfigHash !== ingestConfigHash || run.result !== "success"
+        || !(run.state === "published" || run.state === "cleaning" || run.state === "cleaned")) {
+      throw new Error("source active publication ledger tuple is inconsistent");
+    }
+    const snapshot = this.db.prepare(
+      `SELECT state FROM source_snapshots WHERE source_id=? AND run_id=? AND snapshot_id=? AND ingest_config_hash=?`,
+    ).get(sourceId, runId, snapshotId, ingestConfigHash) as { state: string } | undefined;
+    if (!snapshot || snapshot.state !== "active") throw new Error("source active snapshot is not published");
+    const files = this.db.prepare(`SELECT COUNT(*) AS count FROM source_files WHERE source_id=? AND run_id=? AND snapshot_id=?`).get(sourceId, runId, snapshotId) as { count: number };
+    const chunks = this.db.prepare(`SELECT COUNT(*) AS count FROM source_chunks WHERE source_id=? AND run_id=? AND snapshot_id=? AND lifecycle='active'`).get(sourceId, runId, snapshotId) as { count: number };
+    return { run, filesIndexed: files.count, chunksIndexed: chunks.count };
+  }
+
+  /** Record a successful unchanged-source verification only while the exact publication fence is still current. */
+  recordVerification(input: {
+    sourceId: string; runId: string; snapshotId: string; ingestConfigHash: string;
+    configVersion: number; leaseFence: number;
+  }): number {
+    return this.db.immediateTransaction(() => {
+      const row = this.db.prepare(`SELECT source.lifecycle,source.config_version,source.lease_fence,
+          source.active_run_id,source.active_snapshot_id,source.active_ingest_config_hash,
+          run.state AS run_state,run.result AS run_result,snapshot.state AS snapshot_state
+        FROM knowledge_sources source
+        JOIN source_sync_runs run ON run.id=source.active_run_id AND run.source_id=source.id
+        JOIN source_snapshots snapshot ON snapshot.run_id=run.id AND snapshot.source_id=source.id
+        WHERE source.id=?`).get(input.sourceId) as Record<string, unknown> | undefined;
+      if (!row || row.lifecycle !== "active" || row.config_version !== input.configVersion
+          || row.lease_fence !== input.leaseFence || row.active_run_id !== input.runId
+          || row.active_snapshot_id !== input.snapshotId || row.active_ingest_config_hash !== input.ingestConfigHash
+          || row.run_result !== "success" || !(row.run_state === "published" || row.run_state === "cleaning" || row.run_state === "cleaned")
+          || row.snapshot_state !== "active") throw new Error("source verification publication fence is stale");
+      const checkedAt = this.now();
+      const observed = this.db.prepare(`SELECT COUNT(*) AS count FROM source_sync_runs WHERE source_id=?`).get(input.sourceId) as { count: number };
+      this.db.prepare(`INSERT INTO source_verification_checks
+        (source_id,run_id,snapshot_id,ingest_config_hash,config_version,lease_fence,observed_run_count,checked_at)
+        VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET
+          run_id=excluded.run_id,snapshot_id=excluded.snapshot_id,ingest_config_hash=excluded.ingest_config_hash,
+          config_version=excluded.config_version,lease_fence=excluded.lease_fence,
+          observed_run_count=excluded.observed_run_count,checked_at=excluded.checked_at`).run(input.sourceId, input.runId, input.snapshotId,
+          input.ingestConfigHash, input.configVersion, input.leaseFence, observed.count, checkedAt);
+      return checkedAt;
+    })();
+  }
+
+  /** Attempt metadata plus a conservative dirty count from only the latest complete staged manifest. */
+  attemptView(sourceId: string, activeRunId: string | null): SourceAttemptView {
+    return this.db.transaction(() => {
+    const runs = this.listRuns(sourceId);
+    this.attemptReadFault?.();
+    const latest = runs.at(-1) ?? null;
+    const lastResult = [...runs].reverse().find((run) => run.result !== null) ?? null;
+    const lastSuccess = [...runs].reverse().find((run) => run.result === "success" && run.publishedAt !== null) ?? null;
+    const complete = [...runs].reverse().find((run) => run.complete) ?? null;
+    const verification = this.db.prepare(`SELECT checked_at,observed_run_count FROM source_verification_checks
+      WHERE source_id=?`).get(sourceId) as { checked_at: number; observed_run_count: number } | undefined;
+    let dirtyFiles = 0;
+    if (complete && activeRunId && complete.id !== activeRunId) {
+      const row = this.db.prepare(`SELECT COUNT(DISTINCT relative_path) AS count FROM (
+        SELECT relative_path FROM (
+          SELECT relative_path,content_hash FROM source_staged_files WHERE run_id=?
+          EXCEPT SELECT relative_path,content_hash FROM source_files WHERE run_id=?
+        )
+        UNION
+        SELECT relative_path FROM (
+          SELECT relative_path,content_hash FROM source_files WHERE run_id=?
+          EXCEPT SELECT relative_path,content_hash FROM source_staged_files WHERE run_id=?
+        )
+      )`).get(complete.id, activeRunId, activeRunId, complete.id) as { count: number };
+      dirtyFiles = row.count;
+    }
+    return {
+      latest, lastResult, lastSuccess, latestVerificationAt: verification?.checked_at ?? null,
+      latestVerificationRunCount: verification?.observed_run_count ?? null, runCount: runs.length, dirtyFiles,
+    };
+    })();
   }
 
   resumeRun(sourceId: string): SourceSyncRun | null {
@@ -836,7 +1036,10 @@ export class SourceLedger {
     return this.db.immediateTransaction(() => {
       const removal = this.getRemoval(sourceId);
       if (!removal) throw new Error("source removal has not begun");
-      if (removal.state === "complete") return removal;
+      if (removal.state === "complete") {
+        this.db.prepare(`DELETE FROM source_verification_checks WHERE source_id=?`).run(sourceId);
+        return removal;
+      }
       if (removal.state !== "files-revoked") throw new Error("source removal files have not been revoked");
       const source = this.db.prepare(`SELECT lifecycle FROM knowledge_sources WHERE id=?`).get(sourceId) as { lifecycle: string } | undefined;
       if (!source || source.lifecycle !== "tombstoned") throw new Error("source removal lineage is no longer tombstoned");
@@ -851,6 +1054,7 @@ export class SourceLedger {
       this.db.prepare(`UPDATE knowledge_sources SET active_run_id=NULL,active_snapshot_id=NULL,
         active_ingest_config_hash=NULL,applied_config_version=NULL,updated_at=? WHERE id=? AND lifecycle='tombstoned'`).run(now, sourceId);
       this.db.prepare(`UPDATE source_removals SET state='complete',updated_at=?,completed_at=? WHERE source_id=?`).run(now, now, sourceId);
+      this.db.prepare(`DELETE FROM source_verification_checks WHERE source_id=?`).run(sourceId);
       return this.getRemoval(sourceId)!;
     })();
   }
