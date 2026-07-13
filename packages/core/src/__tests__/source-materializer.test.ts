@@ -4,13 +4,21 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  extractGitArchive, materializeRepoMdHead, pointRepoMdCurrent,
+  detectRepoMdRenames, extractGitArchive, materializeRepoMdHead, pointRepoMdCurrent,
   withRepoMdMaterializerLock,
 } from "../source-materializer";
 import type { KnowledgeSource } from "../source-types";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function renameDiffExec(output: Buffer | string, error?: Error): typeof import("node:child_process").execFile {
+  return ((...args: unknown[]) => {
+    const callback = args.at(-1) as (error: Error | null, stdout: Buffer, stderr: Buffer) => void;
+    callback(error ?? null, Buffer.isBuffer(output) ? output : Buffer.from(output), Buffer.alloc(0));
+    return {};
+  }) as unknown as typeof import("node:child_process").execFile;
 }
 
 function fixture(): { root: string; repo: string; storage: string; source: KnowledgeSource; cleanup: () => void } {
@@ -61,6 +69,39 @@ function tarEntry(name: string, type: string, body = Buffer.alloc(0), link = "")
 }
 
 describe("repo-md committed-HEAD materializer", () => {
+  it("parses bounded NUL-framed rename evidence and preserves literal path characters", async () => {
+    const oldOid = "a".repeat(40); const newOid = "b".repeat(40);
+    const from = "docs/old name-[x].md"; const to = "docs/new name-$x.md";
+    const result = await detectRepoMdRenames("/tmp", oldOid, newOid, new Set([from]), new Set([to]), {
+      execFile: renameDiffExec(Buffer.from(`R087\0${from}\0${to}\0`)),
+    });
+    expect([...result]).toEqual([[from, to]]);
+  });
+
+  it("fails closed on malformed, duplicate, copy, oversized, and nonselected rename evidence", async () => {
+    const oldOid = "a".repeat(40); const newOid = "b".repeat(40);
+    const selectedOld = new Set(["a.md", "b.md"]); const selectedNew = new Set(["x.md", "y.md"]);
+    for (const output of [
+      "R100\0a.md\0x.md", // missing terminal NUL
+      "R100\0a.md\0x.md\0R099\0a.md\0y.md\0", // duplicate source
+      "R100\0a.md\0x.md\0R099\0b.md\0x.md\0", // duplicate destination
+      "Rbad\0a.md\0x.md\0",
+    ]) {
+      expect(await detectRepoMdRenames("/tmp", oldOid, newOid, selectedOld, selectedNew, {
+        execFile: renameDiffExec(output),
+      })).toEqual(new Map());
+    }
+    expect(await detectRepoMdRenames("/tmp", oldOid, newOid, selectedOld, selectedNew, {
+      execFile: renameDiffExec("C100\0a.md\0x.md\0"),
+    })).toEqual(new Map());
+    expect(await detectRepoMdRenames("/tmp", oldOid, newOid, selectedOld, selectedNew, {
+      execFile: renameDiffExec("R100\0other.md\0x.md\0"),
+    })).toEqual(new Map());
+    expect(await detectRepoMdRenames("/tmp", oldOid, newOid, selectedOld, selectedNew, {
+      execFile: renameDiffExec("R100\0a.md\0x.md\0"), maxOutputBytes: 4,
+    })).toEqual(new Map());
+  });
+
   it("pins exact committed HEAD and excludes dirty worktree bytes", async () => {
     const f = fixture();
     try {

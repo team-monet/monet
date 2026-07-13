@@ -17,6 +17,12 @@ const DIGEST_RE = /^[0-9a-f]{64}$/;
 const CONFIG_HASH_RE = /^monet-src-ingest-config\/v1:sha256:[0-9a-f]{64}$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const IO_CHUNK = 64 * 1024;
+/** Rename evidence is advisory and deliberately much smaller than tree materialization output. */
+const MAX_RENAME_DIFF_BYTES = 1024 * 1024;
+/** Fixed so binding identity does not depend on a caller's Git configuration. */
+export const REPO_MD_RENAME_SIMILARITY = 50;
+/** Bound Git's quadratic rename candidate search; excess candidates produce no rename proof. */
+export const REPO_MD_RENAME_LIMIT = 1000;
 
 export type RepoMdMaterializerFaultPoint =
   | "after-lock" | "after-archive" | "before-snapshot-rename" | "after-snapshot-rename"
@@ -242,7 +248,85 @@ export function extractGitArchive(
 
 async function runGit(execFile: typeof nodeExecFile, args: string[], cwd: string, maxBuffer = 4 * 1024 * 1024): Promise<string> {
   const result = await promisify(execFile)("git", args, { cwd, encoding: "utf8", maxBuffer });
-  return String(result.stdout).trim();
+  const stdout = typeof result === "object" && result !== null && "stdout" in result ? result.stdout : result;
+  return String(stdout).trim();
+}
+
+function splitNulRecords(output: Buffer): string[] | null {
+  if (output.length === 0) return [];
+  if (output[output.length - 1] !== 0) return null;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const records: string[] = [];
+  let start = 0;
+  try {
+    for (let index = 0; index < output.length; index += 1) {
+      if (output[index] !== 0) continue;
+      const value = decoder.decode(output.subarray(start, index));
+      if (value.length === 0) return null;
+      records.push(value);
+      start = index + 1;
+    }
+  } catch { return null; }
+  return records;
+}
+
+/**
+ * Return only selected, globally one-to-one Git rename proofs. Any malformed,
+ * conflicting, or over-budget evidence disables Git inference for the run; the
+ * sync planner then safely falls back to content proof or ordinary delete+add.
+ */
+export async function detectRepoMdRenames(
+  repositoryRoot: string,
+  priorSnapshotId: string,
+  nextSnapshotId: string,
+  oldSelectedPaths: ReadonlySet<string>,
+  newSelectedPaths: ReadonlySet<string>,
+  options: { execFile?: typeof nodeExecFile; maxOutputBytes?: number } = {},
+): Promise<Map<string, string>> {
+  if (!OID_RE.test(priorSnapshotId) || !OID_RE.test(nextSnapshotId)) return new Map();
+  const maxBuffer = options.maxOutputBytes ?? MAX_RENAME_DIFF_BYTES;
+  if (!Number.isSafeInteger(maxBuffer) || maxBuffer < 1 || maxBuffer > MAX_RENAME_DIFF_BYTES) return new Map();
+  const execFile = options.execFile ?? nodeExecFile;
+  let output: Buffer;
+  try {
+    output = await new Promise<Buffer>((resolveOutput, reject) => {
+      execFile("git", [
+        "--no-pager", "diff", "--no-ext-diff", "--name-status", "-z",
+        "--no-textconv", `--find-renames=${REPO_MD_RENAME_SIMILARITY}%`, `-l${REPO_MD_RENAME_LIMIT}`,
+        priorSnapshotId, nextSnapshotId, "--",
+      ], { cwd: repositoryRoot, encoding: null, maxBuffer }, (error, stdout) => {
+        if (error) reject(error);
+        else resolveOutput(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
+      });
+    });
+  } catch { return new Map(); }
+  if (output.length > maxBuffer) return new Map();
+  const records = splitNulRecords(output);
+  if (records === null) return new Map();
+  const result = new Map<string, string>();
+  const destinations = new Set<string>();
+  let index = 0;
+  while (index < records.length) {
+    const status = records[index++]!;
+    if (/^[RC]\d{1,3}$/.test(status)) {
+      if (index + 1 >= records.length) return new Map();
+      const from = records[index++]!;
+      const to = records[index++]!;
+      // Copy evidence never authorizes identity carry. Consume it only to keep framing exact.
+      if (status.startsWith("C")) continue;
+      const score = Number(status.slice(1));
+      if (score < REPO_MD_RENAME_SIMILARITY || score > 100) return new Map();
+      // A rename crossing the selected boundary is irrelevant to this complete manifest.
+      if (!oldSelectedPaths.has(from) || !newSelectedPaths.has(to)) continue;
+      if (result.has(from) || destinations.has(to)) return new Map();
+      result.set(from, to);
+      destinations.add(to);
+      continue;
+    }
+    if (!/^[AMDTUXB]$/.test(status) || index >= records.length) return new Map();
+    index += 1;
+  }
+  return result;
 }
 
 function lockOwner(lock: string): { token: string; heartbeatAt: number; pid: number; host: string } | null {

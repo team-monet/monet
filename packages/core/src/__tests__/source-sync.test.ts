@@ -1,14 +1,25 @@
-import { execFileSync } from "node:child_process";
+import { execFile as nodeExecFile, execFileSync } from "node:child_process";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { MonetCore } from "../engine";
+import { syncRepoMdSource as runRepoMdSync } from "../source-sync";
 import type { RepoMdSyncFaultPoint } from "../source-sync";
 import type { StoragePort } from "../storage";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function noRenameDiffExec(): typeof nodeExecFile {
+  return ((file: string, args: readonly string[], options: object, callback: (...args: unknown[]) => void) => {
+    if (file === "git" && args.includes("diff")) {
+      callback(null, Buffer.alloc(0), Buffer.alloc(0));
+      return {};
+    }
+    return nodeExecFile(file, [...args], options, callback as never);
+  }) as unknown as typeof nodeExecFile;
 }
 
 function makeWritable(path: string): void {
@@ -54,6 +65,256 @@ function rawConcept(core: MonetCore, conceptId: string): { body: string; status:
 }
 
 describe("repo-md committed-HEAD sync", () => {
+  it("carries binding identity across committed file renames and back while refreshing provenance", async () => {
+    const f = fixture("rename-stability");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const firstResult = await f.core.syncRepoMdSource("repo-source");
+      const first = f.core.listSourceChunks(firstResult.runId!, true)[0]!;
+
+      git(f.repo, "mv", "README.md", "GUIDE.md");
+      git(f.repo, "add", "GUIDE.md"); git(f.repo, "commit", "-m", "rename guide");
+      const secondResult = await f.core.syncRepoMdSource("repo-source");
+      const second = f.core.listSourceChunks(secondResult.runId!, true)[0]!;
+      expect(second).toMatchObject({
+        bindingId: first.bindingId,
+        conceptId: first.conceptId,
+        bindingGeneration: first.bindingGeneration + 1,
+        relativePath: "GUIDE.md",
+        sourceRef: "source://repo-source/GUIDE.md#intro~1",
+      });
+      expect(second.operationId).not.toBe(first.operationId);
+      expect(second.predecessorObservationId).toBe(first.observationId);
+      expect(f.core.listSourceCleanupItems(secondResult.runId!).some((item) => item.kind === "retire-absent")).toBe(false);
+
+      git(f.repo, "mv", "GUIDE.md", "README.md");
+      git(f.repo, "commit", "-m", "rename guide back");
+      const thirdResult = await f.core.syncRepoMdSource("repo-source");
+      const third = f.core.listSourceChunks(thirdResult.runId!, true)[0]!;
+      expect(third).toMatchObject({
+        bindingId: first.bindingId,
+        conceptId: first.conceptId,
+        bindingGeneration: second.bindingGeneration + 1,
+        relativePath: "README.md",
+      });
+      expect(new Set([first.operationId, second.operationId, third.operationId])).toHaveLength(3);
+    } finally { f.cleanup(); }
+  });
+
+  it("does not carry a binding when a moved file's heading identity changes", async () => {
+    const f = fixture("rename-heading-change");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const firstResult = await f.core.syncRepoMdSource("repo-source");
+      const first = f.core.listSourceChunks(firstResult.runId!, true)[0]!;
+      git(f.repo, "mv", "README.md", "GUIDE.md");
+      writeFileSync(join(f.repo, "GUIDE.md"), "# Different\n\ninitial committed body\n");
+      git(f.repo, "add", "GUIDE.md"); git(f.repo, "commit", "-m", "rename with structure change");
+      const secondResult = await f.core.syncRepoMdSource("repo-source");
+      const second = f.core.listSourceChunks(secondResult.runId!, true)[0]!;
+      expect(second.bindingId).not.toBe(first.bindingId);
+      expect(second.conceptId).not.toBe(first.conceptId);
+      expect(f.core.listSourceCleanupItems(secondResult.runId!)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "retire-absent", bindingId: first.bindingId }),
+      ]));
+    } finally { f.cleanup(); }
+  });
+
+  it("carries matching chunks through a Git-proven rename with a body edit and preserves staged proof on resume", async () => {
+    const f = fixture("rename-edited-multichunk-resume");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const longBody = "stable line for rename similarity\n".repeat(80);
+      f.commit(`# One\n\n${longBody}\n# Two\n\n${longBody}`, "large two-section source");
+      const firstResult = await f.core.syncRepoMdSource("repo-source");
+      const first = f.core.listSourceChunks(firstResult.runId!, true);
+      expect(first).toHaveLength(2);
+      git(f.repo, "mv", "README.md", "GUIDE.md");
+      writeFileSync(join(f.repo, "GUIDE.md"), `# One\n\n${longBody}\n# Two\n\n${longBody}edited tail\n`);
+      git(f.repo, "add", "GUIDE.md"); git(f.repo, "commit", "-m", "rename and edit multi-section source");
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-stage" && !fired) { fired = true; throw new Error("stage crash"); } },
+      })).rejects.toThrow("stage crash");
+      const stagedRun = f.core.resumeSourceRun("repo-source")!;
+      const stagedBindings = f.core.listSourceChunks(stagedRun.id).map((chunk) => chunk.bindingId).sort();
+      expect(stagedBindings).toEqual(first.map((chunk) => chunk.bindingId).sort());
+      expect(f.core.sourceStatus("repo-source", { callerId: "caller", projectId: "project" }).dirtyFiles).toBe(2);
+      expect((await f.core.syncRepoMdSource("repo-source")).runId).toBe(stagedRun.id);
+      const published = f.core.listSourceChunks(stagedRun.id, true);
+      expect(published.map((chunk) => chunk.bindingId).sort()).toEqual(stagedBindings);
+      expect(published.every((chunk) => chunk.relativePath === "GUIDE.md")).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  it("uses unique whole-file content only as a compatible fallback and rejects ambiguous copies", async () => {
+    const f = fixture("rename-content-fallback");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const firstResult = await f.core.syncRepoMdSource("repo-source");
+      const first = f.core.listSourceChunks(firstResult.runId!, true)[0]!;
+      git(f.repo, "mv", "README.md", "GUIDE.md"); git(f.repo, "commit", "-m", "fallback rename");
+      const fallback = await runRepoMdSync(f.core, "repo-source", {
+        sourceStorageDir: f.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      expect(f.core.listSourceChunks(fallback.runId!, true)[0]!.bindingId).toBe(first.bindingId);
+
+      // Retaining the old path while adding an identical copy cannot move its exact binding.
+      writeFileSync(join(f.repo, "COPY.md"), readFileSync(join(f.repo, "GUIDE.md")));
+      git(f.repo, "add", "COPY.md"); git(f.repo, "commit", "-m", "copy source");
+      const copied = await runRepoMdSync(f.core, "repo-source", {
+        sourceStorageDir: f.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      const copiedChunks = f.core.listSourceChunks(copied.runId!, true);
+      expect(copiedChunks.find((chunk) => chunk.relativePath === "GUIDE.md")!.bindingId).toBe(first.bindingId);
+      expect(copiedChunks.find((chunk) => chunk.relativePath === "COPY.md")!.bindingId).not.toBe(first.bindingId);
+    } finally { f.cleanup(); }
+  });
+
+  it("requires content fallback uniqueness across both complete selected manifests", async () => {
+    const retainedPrior = fixture("rename-global-prior-duplicate");
+    try {
+      retainedPrior.core.updateSource("repo-source", { include: ["*.md"] });
+      const content = readFileSync(join(retainedPrior.repo, "README.md"));
+      writeFileSync(join(retainedPrior.repo, "B.md"), content);
+      git(retainedPrior.repo, "add", "B.md"); git(retainedPrior.repo, "commit", "-m", "prior duplicate");
+      const firstResult = await retainedPrior.core.syncRepoMdSource("repo-source");
+      const first = retainedPrior.core.listSourceChunks(firstResult.runId!, true);
+      const oldId = first.find((chunk) => chunk.relativePath === "README.md")!.bindingId;
+      const retainedId = first.find((chunk) => chunk.relativePath === "B.md")!.bindingId;
+      unlinkSync(join(retainedPrior.repo, "README.md")); writeFileSync(join(retainedPrior.repo, "C.md"), content);
+      git(retainedPrior.repo, "add", "-A"); git(retainedPrior.repo, "commit", "-m", "delete one duplicate and add another");
+      const next = await runRepoMdSync(retainedPrior.core, "repo-source", {
+        sourceStorageDir: retainedPrior.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      const chunks = retainedPrior.core.listSourceChunks(next.runId!, true);
+      expect(chunks.find((chunk) => chunk.relativePath === "B.md")!.bindingId).toBe(retainedId);
+      expect(chunks.find((chunk) => chunk.relativePath === "C.md")!.bindingId).not.toBe(oldId);
+    } finally { retainedPrior.cleanup(); }
+
+    const retainedNext = fixture("rename-global-next-duplicate");
+    try {
+      retainedNext.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(retainedNext.repo, "B.md"), "# Other\n\ndifferent bytes\n");
+      git(retainedNext.repo, "add", "B.md"); git(retainedNext.repo, "commit", "-m", "distinct retained file");
+      const firstResult = await retainedNext.core.syncRepoMdSource("repo-source");
+      const first = retainedNext.core.listSourceChunks(firstResult.runId!, true);
+      const oldId = first.find((chunk) => chunk.relativePath === "README.md")!.bindingId;
+      const content = readFileSync(join(retainedNext.repo, "README.md"));
+      unlinkSync(join(retainedNext.repo, "README.md"));
+      writeFileSync(join(retainedNext.repo, "B.md"), content); writeFileSync(join(retainedNext.repo, "C.md"), content);
+      git(retainedNext.repo, "add", "-A"); git(retainedNext.repo, "commit", "-m", "new-side retained duplicate");
+      const next = await runRepoMdSync(retainedNext.core, "repo-source", {
+        sourceStorageDir: retainedNext.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      expect(retainedNext.core.listSourceChunks(next.runId!, true).every((chunk) => chunk.bindingId !== oldId)).toBe(true);
+    } finally { retainedNext.cleanup(); }
+  });
+
+  it("keeps unique content fallback beside a case-different retained file and lets Git proof win over duplicate hashes", async () => {
+    const unique = fixture("rename-global-case-distinct");
+    try {
+      unique.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(unique.repo, "B.md"), "# Intro\n\nINITIAL COMMITTED BODY\n");
+      git(unique.repo, "add", "B.md"); git(unique.repo, "commit", "-m", "case-distinct retained source");
+      const firstResult = await unique.core.syncRepoMdSource("repo-source");
+      const first = unique.core.listSourceChunks(firstResult.runId!, true);
+      const movedId = first.find((chunk) => chunk.relativePath === "README.md")!.bindingId;
+      const retainedId = first.find((chunk) => chunk.relativePath === "B.md")!.bindingId;
+      git(unique.repo, "mv", "README.md", "C.md"); git(unique.repo, "commit", "-m", "unique fallback move");
+      const next = await runRepoMdSync(unique.core, "repo-source", {
+        sourceStorageDir: unique.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      const chunks = unique.core.listSourceChunks(next.runId!, true);
+      expect(chunks.find((chunk) => chunk.relativePath === "C.md")!.bindingId).toBe(movedId);
+      expect(chunks.find((chunk) => chunk.relativePath === "B.md")!.bindingId).toBe(retainedId);
+    } finally { unique.cleanup(); }
+
+    const gitProof = fixture("rename-git-over-duplicate-hash");
+    try {
+      gitProof.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(gitProof.repo, "B.md"), readFileSync(join(gitProof.repo, "README.md")));
+      git(gitProof.repo, "add", "B.md"); git(gitProof.repo, "commit", "-m", "duplicate before git move");
+      const firstResult = await gitProof.core.syncRepoMdSource("repo-source");
+      const first = gitProof.core.listSourceChunks(firstResult.runId!, true);
+      const movedId = first.find((chunk) => chunk.relativePath === "README.md")!.bindingId;
+      const retainedId = first.find((chunk) => chunk.relativePath === "B.md")!.bindingId;
+      git(gitProof.repo, "mv", "README.md", "C.md"); git(gitProof.repo, "commit", "-m", "git-proven duplicate move");
+      const next = await gitProof.core.syncRepoMdSource("repo-source");
+      const chunks = gitProof.core.listSourceChunks(next.runId!, true);
+      expect(chunks.find((chunk) => chunk.relativePath === "C.md")!.bindingId).toBe(movedId);
+      expect(chunks.find((chunk) => chunk.relativePath === "B.md")!.bindingId).toBe(retainedId);
+    } finally { gitProof.cleanup(); }
+  });
+
+  it("disables fallback on config drift and all changed-identity carry on parser incompatibility", async () => {
+    const config = fixture("rename-config-incompatible");
+    try {
+      config.core.updateSource("repo-source", { include: ["*.md"] });
+      const firstResult = await config.core.syncRepoMdSource("repo-source");
+      const first = config.core.listSourceChunks(firstResult.runId!, true)[0]!;
+      git(config.repo, "mv", "README.md", "GUIDE.md"); git(config.repo, "commit", "-m", "config rename");
+      config.core.updateSource("repo-source", { exclude: ["NEVER.md"] });
+      const changed = await runRepoMdSync(config.core, "repo-source", {
+        sourceStorageDir: config.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      expect(config.core.listSourceChunks(changed.runId!, true)[0]!.bindingId).not.toBe(first.bindingId);
+    } finally { config.cleanup(); }
+
+    const parser = fixture("rename-parser-incompatible");
+    try {
+      parser.core.updateSource("repo-source", { include: ["*.md"] });
+      const firstResult = await parser.core.syncRepoMdSource("repo-source");
+      const first = parser.core.listSourceChunks(firstResult.runId!, true)[0]!;
+      const db = (parser.core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_sync_runs SET scan_config_version='legacy/incompatible' WHERE id=?`).run(firstResult.runId!);
+      git(parser.repo, "mv", "README.md", "GUIDE.md"); git(parser.repo, "commit", "-m", "parser rename");
+      const changed = await parser.core.syncRepoMdSource("repo-source");
+      expect(parser.core.listSourceChunks(changed.runId!, true)[0]!.bindingId).not.toBe(first.bindingId);
+    } finally { parser.cleanup(); }
+  });
+
+  it("rejects one-to-many, many-to-one, and many-to-many duplicate-content fallback", async () => {
+    const f = fixture("rename-content-ambiguity");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const firstResult = await f.core.syncRepoMdSource("repo-source");
+      const firstId = f.core.listSourceChunks(firstResult.runId!, true)[0]!.bindingId;
+      const content = readFileSync(join(f.repo, "README.md"));
+      unlinkSync(join(f.repo, "README.md"));
+      writeFileSync(join(f.repo, "A.md"), content); writeFileSync(join(f.repo, "B.md"), content);
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "one to two duplicate files");
+      const oneToTwo = await runRepoMdSync(f.core, "repo-source", {
+        sourceStorageDir: f.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      const pair = f.core.listSourceChunks(oneToTwo.runId!, true);
+      expect(pair.every((chunk) => chunk.bindingId !== firstId)).toBe(true);
+
+      unlinkSync(join(f.repo, "A.md")); unlinkSync(join(f.repo, "B.md")); writeFileSync(join(f.repo, "C.md"), content);
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "two to one duplicate file");
+      const twoToOne = await runRepoMdSync(f.core, "repo-source", {
+        sourceStorageDir: f.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      const singleId = f.core.listSourceChunks(twoToOne.runId!, true)[0]!.bindingId;
+      expect(pair.some((chunk) => chunk.bindingId === singleId)).toBe(false);
+
+      unlinkSync(join(f.repo, "C.md"));
+      for (const name of ["D.md", "E.md"]) writeFileSync(join(f.repo, name), content);
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "prepare many side");
+      const prepared = await runRepoMdSync(f.core, "repo-source", {
+        sourceStorageDir: f.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      const beforeMany = f.core.listSourceChunks(prepared.runId!, true).map((chunk) => chunk.bindingId);
+      unlinkSync(join(f.repo, "D.md")); unlinkSync(join(f.repo, "E.md"));
+      for (const name of ["F.md", "G.md"]) writeFileSync(join(f.repo, name), content);
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "many to many duplicate files");
+      const many = await runRepoMdSync(f.core, "repo-source", {
+        sourceStorageDir: f.storage, materializer: { execFile: noRenameDiffExec() },
+      });
+      expect(f.core.listSourceChunks(many.runId!, true).every((chunk) => !beforeMany.includes(chunk.bindingId))).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
   it("rejects a symlinked managed source root without touching its victim", async () => {
     const f = fixture("symlink-source-root");
     try {

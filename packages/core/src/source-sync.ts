@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { IngestResult, SourceConceptRollbackResult } from "./engine";
 import {
-  materializeRepoMdCommit, materializeRepoMdHead, pointRepoMdCurrent, removeRepoMdMaterializations,
+  detectRepoMdRenames, materializeRepoMdCommit, materializeRepoMdHead, pointRepoMdCurrent, removeRepoMdMaterializations,
   repoMdSnapshotPath, revokeRepoMdCurrent,
   withRepoMdMaterializerLock,
 } from "./source-materializer";
@@ -104,17 +104,80 @@ function materializerOptions(options: RuntimeOptions): RepoMdMaterializerOptions
   };
 }
 
-function planManifest(
+const fileRelativeKey = (chunk: Pick<SourceChunkRecord, "headingPath" | "occurrence" | "segmentIndex">): string =>
+  JSON.stringify([chunk.headingPath, chunk.occurrence, chunk.segmentIndex]);
+
+async function planManifest(
   core: SourceSyncCorePort,
   source: KnowledgeSource,
   run: SourceSyncRun,
   scan: SourceScanResult,
   idGen: () => string,
-): StageSourceManifestInput {
+  repositoryRoot: string,
+  execFile: RepoMdMaterializerOptions["execFile"],
+): Promise<StageSourceManifestInput> {
   const active = source.activeRunId ? core.listSourceChunks(source.activeRunId, true) : [];
-  const byIdentity = new Map(active.filter((chunk) => chunk.lifecycle === "active").map((chunk) => [naturalKey(chunk), chunk]));
+  const activeChunks = active.filter((chunk) => chunk.lifecycle === "active");
+  const byIdentity = new Map(activeChunks.map((chunk) => [naturalKey(chunk), chunk]));
+  const consumed = new Set<string>();
+  const priorRun = source.activeRunId ? core.getSourceRun(source.activeRunId) : null;
+  const priorFiles = source.activeRunId ? core.listSourceFiles(source.activeRunId, true) : [];
+  const priorPaths = new Set(priorFiles.map((file) => file.relativePath));
+  const nextPaths = new Set(scan.files.map((file) => file.relativePath));
+  const deletedPaths = new Set([...priorPaths].filter((path) => !nextPaths.has(path)));
+  const addedPaths = new Set([...nextPaths].filter((path) => !priorPaths.has(path)));
+  const movedToFrom = new Map<string, string>();
+  if (priorRun && priorRun.scanConfigVersion === run.scanConfigVersion && deletedPaths.size && addedPaths.size) {
+    const gitMoves = await detectRepoMdRenames(
+      repositoryRoot, priorRun.snapshotId, run.snapshotId, priorPaths, nextPaths, { execFile },
+    );
+    const usedOld = new Set<string>();
+    const usedNew = new Set<string>();
+    for (const [from, to] of gitMoves) {
+      if (!deletedPaths.has(from) || !addedPaths.has(to) || usedOld.has(from) || usedNew.has(to)) continue;
+      movedToFrom.set(to, from); usedOld.add(from); usedNew.add(to);
+    }
+    // Content proof is intentionally stricter and is disabled by any effective ingest-config change.
+    if (priorRun.ingestConfigHash === run.ingestConfigHash) {
+      const oldByHash = new Map<string, Array<{ relativePath: string }>>();
+      const newByHash = new Map<string, Array<{ relativePath: string }>>();
+      // Uniqueness is global across both complete selected manifests. Restricting
+      // this count to their deleted/added subsets would falsely move one member
+      // of a duplicate family while an identical retained file still exists.
+      for (const file of priorFiles) {
+        const list = oldByHash.get(file.contentHash) ?? []; list.push(file); oldByHash.set(file.contentHash, list);
+      }
+      for (const file of scan.files) {
+        const list = newByHash.get(file.contentHash) ?? []; list.push(file); newByHash.set(file.contentHash, list);
+      }
+      for (const [hash, oldFiles] of oldByHash) {
+        const newFiles = newByHash.get(hash) ?? [];
+        const oldPath = oldFiles[0]?.relativePath;
+        const newPath = newFiles[0]?.relativePath;
+        if (oldFiles.length === 1 && newFiles.length === 1 && oldPath && newPath
+            && deletedPaths.has(oldPath) && addedPaths.has(newPath)
+            && !usedOld.has(oldPath) && !usedNew.has(newPath)) {
+          movedToFrom.set(newPath, oldPath);
+        }
+      }
+    }
+  }
+  const movedChunk = new Map<string, SourceChunkRecord>();
+  for (const prior of activeChunks) movedChunk.set(JSON.stringify([prior.relativePath, fileRelativeKey(prior)]), prior);
   const chunks = scan.chunks.map((chunk) => {
-    const prior = byIdentity.get(naturalKey(chunk));
+    let prior = byIdentity.get(naturalKey(chunk));
+    let changedIdentity = false;
+    if (prior && !consumed.has(prior.bindingId)) consumed.add(prior.bindingId);
+    else {
+      prior = undefined;
+      const oldPath = movedToFrom.get(chunk.relativePath);
+      const candidate = oldPath ? movedChunk.get(JSON.stringify([oldPath, fileRelativeKey(chunk)])) : undefined;
+      if (candidate && !consumed.has(candidate.bindingId)) {
+        prior = candidate;
+        changedIdentity = true;
+        consumed.add(candidate.bindingId);
+      }
+    }
     const bindingId = prior?.bindingId ?? idGen();
     const bindingGeneration = core.nextSourceBindingGeneration(source.id, bindingId);
     return {
@@ -130,6 +193,7 @@ function planManifest(
       metadata: chunk.metadata,
       sourceRef: `source://${source.id}/${chunk.sourceRef}`,
       content: chunk.body,
+      ...(changedIdentity && prior ? { bindingIdHint: { bindingId: prior.bindingId, priorRunId: prior.runId } } : {}),
     };
   });
   return { runId: run.id, scanStatus: "complete", manifestHash: scan.manifestHash, files: scan.files, chunks };
@@ -325,13 +389,16 @@ export async function syncRepoMdSource(
     const runConfigHash = computeSourceIngestConfigHash(run.effectiveConfig);
     const snapshotPath = repoMdSnapshotPath(source.id, run.snapshotId, runConfigHash, options.sourceStorageDir);
     if (run.state === "scanning") {
-      await materializeRepoMdCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
+      const materialized = await materializeRepoMdCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
       const scanned = (options.scan ?? scanSourceSnapshot)({ root: snapshotPath, config: run.effectiveConfig });
       if (!scanned.publishable || scanned.status === "partial") {
         core.abortSourceRun(run.id, "partial", JSON.stringify(scanned.diagnostics));
         return { sourceId, snapshotId: run.snapshotId, runId: run.id, status: "partial", diagnostics: scanned.diagnostics };
       }
-      core.stageSourceManifest(planManifest(core, source, run, scanned, options.idGen ?? randomUUID));
+      core.stageSourceManifest(await planManifest(
+        core, source, run, scanned, options.idGen ?? randomUUID,
+        materialized.repositoryRoot, mat.execFile,
+      ));
       options.fault?.("after-stage");
       run = core.getSourceRun(run.id)!;
     }
