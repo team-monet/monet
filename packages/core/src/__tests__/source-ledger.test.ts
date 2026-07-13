@@ -651,6 +651,46 @@ describe("source ledger publication kernel", () => {
     }
   });
 
+  it("authorizes exact orphan compensation for a tombstoned lineage while preserving the removed fence", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      core.createSource(sourceInput("source-a", "/tmp/source-ledger-removed-rollback"));
+      const first = core.beginSourceRun({ sourceId: "source-a", snapshotId: "first" });
+      if (first.kind !== "started") throw new Error("expected first run");
+      const firstManifest = manifestWithContent(first.run, 1, "Published predecessor.");
+      core.stageSourceManifest(firstManifest);
+      const published = await materialize(core, first.run, firstManifest);
+      core.publishSourceRun({ runId: first.run.id, activationToken: core.beginSourceActivation(first.run.id) });
+
+      const second = core.beginSourceRun({ sourceId: "source-a", snapshotId: "second" });
+      if (second.kind !== "started") throw new Error("expected second run");
+      const secondManifest = manifestWithContent(second.run, 2, "Removed successor.");
+      core.stageSourceManifest(secondManifest);
+      const successor = await materialize(core, second.run, secondManifest, "committed");
+      const removed = core.removeSource("source-a")!;
+      expect(removed.lifecycle).toBe("tombstoned");
+      expect(removed.leaseFence).toBe(second.run.leaseFence + 1);
+      expect(() => core.beginSourceActivation(second.run.id)).toThrow(/fence is stale/);
+      expect(core.abortSourceRun(second.run.id, "failed", "removed during refresh").state).toBe("aborted");
+      const [cleanup] = core.listSourceCleanupItems(second.run.id);
+      expect(cleanup).toMatchObject({
+        kind: "reconcile-orphan", conceptId: published.stored.conceptId,
+        observationId: successor.stored.observationId, predecessorObservationId: published.stored.observationId,
+      });
+      expect(() => core.acknowledgeSourceCleanup(cleanup.id)).toThrow(/terminally superseded/);
+      await expect(core.rollbackSourceRunBinding(first.run.id, "binding-1")).rejects.toThrow(/no durable authorized/);
+      expect(await core.rollbackSourceRunBinding(second.run.id, "binding-1")).toMatchObject({
+        replayed: false, concept: { id: published.stored.conceptId, body: "Published predecessor." },
+      });
+      expect(core.acknowledgeSourceCleanup(cleanup.id).acknowledgedAt).not.toBeNull();
+      expect(core.getSource("source-a", { includeTombstoned: true })).toMatchObject({
+        lifecycle: "tombstoned", leaseFence: removed.leaseFence, activeRunId: first.run.id,
+      });
+    } finally {
+      core.close();
+    }
+  });
+
   it("rejects malformed durable source operations, then quarantines them on abort", async () => {
     for (const mismatch of ["content", "circle", "extra-ref", "duplicate-ref"] as const) {
       const core = new MonetCore(":memory:");
@@ -1213,7 +1253,7 @@ describe("source ledger schema migration", () => {
       const first = new MonetCore(path);
       const db = (first as unknown as { db: StoragePort }).db;
       // Simulate a real v8 store: the registry exists, but none of the v9 ledger tables do.
-      for (const table of ["source_cleanup_items", "source_chunks", "source_staged_chunks", "source_files", "source_staged_files", "source_snapshots", "source_sync_runs"]) {
+      for (const table of ["source_removal_items", "source_removals", "source_cleanup_items", "source_chunks", "source_staged_chunks", "source_files", "source_staged_files", "source_snapshots", "source_sync_runs"]) {
         db.exec(`DROP TABLE ${table}`);
       }
       db.pragma("user_version = 8");
@@ -1222,7 +1262,7 @@ describe("source ledger schema migration", () => {
       const migrated = new MonetCore(path);
       const migratedDb = (migrated as unknown as { db: StoragePort }).db;
       expect(migratedDb.pragma("user_version", { simple: true })).toBe(9);
-      for (const table of ["source_sync_runs", "source_snapshots", "source_staged_files", "source_files", "source_staged_chunks", "source_chunks", "source_cleanup_items"]) {
+      for (const table of ["source_sync_runs", "source_snapshots", "source_staged_files", "source_files", "source_staged_chunks", "source_chunks", "source_cleanup_items", "source_removals", "source_removal_items"]) {
         expect(migratedDb.prepare(`PRAGMA table_info(${table})`).all()).not.toEqual([]);
       }
       for (const table of ["source_staged_chunks", "source_chunks"]) {

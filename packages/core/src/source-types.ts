@@ -251,3 +251,24 @@ export interface SourceCleanupItem {
   createdAt: number;
   acknowledgedAt: number | null;
 }
+
+export interface SourceRemoval {
+  sourceId: string;
+  runId: string | null;
+  snapshotId: string | null;
+  ingestConfigHash: string | null;
+  state: "retiring" | "files-revoked" | "complete";
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}
+
+export interface SourceRemovalItem {
+  id: string;
+  sourceId: string;
+  runId: string;
+  bindingId: string;
+  conceptId: string;
+  observationId: string;
+  acknowledgedAt: number | null;
+}

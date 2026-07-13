@@ -16,9 +16,13 @@
  * `body`, reachable via `getConcept` (fetch).
  */
 import { createHash, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { StoragePort, BetterSqlitePort } from "./storage";
 import { SourceRegistry } from "./source-registry";
 import { SourceLedger } from "./source-ledger";
+import { syncRepoMdSource as runRepoMdSync } from "./source-sync";
+import type { RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
 import type {
   BeginSourceRunInput,
   BeginSourceRunResult,
@@ -32,6 +36,8 @@ import type {
   SourceChunkRecord,
   SourceCleanupItem,
   SourceFileRecord,
+  SourceRemoval,
+  SourceRemovalItem,
   SourceSyncRun,
   StageSourceManifestInput,
   UpdateSourceInput,
@@ -550,6 +556,7 @@ export class MonetCore {
   private newId: () => string;
   private sourceRegistry: SourceRegistry;
   private sourceLedger: SourceLedger;
+  private sourceStorageDir: string;
   /** Stable store identity for sync; unlike agentId this is persisted and never defaults globally. */
   private syncDeviceId = "";
   /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
@@ -572,6 +579,7 @@ export class MonetCore {
     this.tauAmbiguous = opts.tauAmbiguous ?? this.embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
+    this.sourceStorageDir = resolve(opts.sourceStorageDir ?? resolve(homedir(), ".monet", "sources"));
     this.sourceRegistry = new SourceRegistry(this.db, {
       idGen: this.newId,
       sourceStorageDir: opts.sourceStorageDir,
@@ -2237,6 +2245,10 @@ export class MonetCore {
     if (!initial.source_identity || !initial.active_observation_id) {
       throw new Error("source concept is missing canonical identity or active observation state");
     }
+    if (initial.active_observation_id === observationId) {
+      if (this.isExactSourceRefreshReplay(initial, observationId, expectedActiveObservationId)) return toConcept(initial);
+      throw new Error("source refresh active observation topology is not an exact replay");
+    }
     if (initial.active_observation_id !== expectedActiveObservationId) {
       throw new Error("source refresh active observation compare-and-swap failed");
     }
@@ -2247,6 +2259,10 @@ export class MonetCore {
       const row = this.getRow(conceptId);
       if (!row || row.kind !== "source") throw new Error("source concept disappeared during refresh");
       if (row.status !== "active") throw new Error("cannot refresh a non-active source concept");
+      if (row.active_observation_id === observationId) {
+        if (this.isExactSourceRefreshReplay(row, observationId, expectedActiveObservationId)) return toConcept(row);
+        throw new Error("source refresh active observation topology is not an exact replay");
+      }
       if (!row.source_identity || row.active_observation_id !== expectedActiveObservationId) {
         throw new Error("source refresh active observation compare-and-swap failed");
       }
@@ -2279,6 +2295,27 @@ export class MonetCore {
       this.rederiveConceptGraph(conceptId, row.circle);
       return toConcept(this.getRow(conceptId)!);
     })();
+  }
+
+  /** Exact crash-window replay: refresh committed, but the ledger receipt did not advance. */
+  private isExactSourceRefreshReplay(row: ConceptRow, successorId: string, predecessorId: string): boolean {
+    if (row.kind !== "source" || row.status !== "active" || !row.source_identity
+        || row.active_observation_id !== successorId || successorId === predecessorId) return false;
+    const observations = this.db.prepare(
+      `SELECT id,concept_id,kind,source_refs,superseded_by,superseded_at
+         FROM observations WHERE id IN (?,?)`,
+    ).all(successorId, predecessorId) as Array<{
+      id: string; concept_id: string | null; kind: string; source_refs: string | null;
+      superseded_by: string | null; superseded_at: number | null;
+    }>;
+    const successor = observations.find((observation) => observation.id === successorId);
+    const predecessor = observations.find((observation) => observation.id === predecessorId);
+    const owns = (observation: typeof successor): boolean => !!observation
+      && observation.concept_id === row.id && observation.kind === "source"
+      && canonicalSourceIdentityFromJson(observation.source_refs) === row.source_identity;
+    return owns(successor) && owns(predecessor)
+      && successor!.superseded_by === null && successor!.superseded_at === null
+      && predecessor!.superseded_by === successorId && predecessor!.superseded_at !== null;
   }
 
   /**
@@ -3742,6 +3779,30 @@ export class MonetCore {
     return this.sourceLedger.resumeRun(sourceId);
   }
 
+  beginSourceRemoval(sourceId: string): SourceRemoval {
+    return this.sourceLedger.beginRemoval(sourceId);
+  }
+
+  getSourceRemoval(sourceId: string): SourceRemoval | null {
+    return this.sourceLedger.getRemoval(sourceId);
+  }
+
+  listSourceRemovalItems(sourceId: string): SourceRemovalItem[] {
+    return this.sourceLedger.listRemovalItems(sourceId);
+  }
+
+  acknowledgeSourceRemovalItem(itemId: string): SourceRemovalItem {
+    return this.sourceLedger.acknowledgeRemovalItem(itemId);
+  }
+
+  markSourceRemovalFilesRevoked(sourceId: string): SourceRemoval {
+    return this.sourceLedger.markRemovalFilesRevoked(sourceId);
+  }
+
+  completeSourceRemoval(sourceId: string): SourceRemoval {
+    return this.sourceLedger.completeRemoval(sourceId);
+  }
+
   listSourceFiles(runId: string, published = false): SourceFileRecord[] {
     return this.sourceLedger.listFiles(runId, published);
   }
@@ -3756,6 +3817,15 @@ export class MonetCore {
 
   nextSourceBindingGeneration(sourceId: string, bindingId: string): number {
     return this.sourceLedger.nextBindingGeneration(sourceId, bindingId);
+  }
+
+  /** Connector-only committed-HEAD ingestion for registered repo-md sources. */
+  async syncRepoMdSource(sourceId: string, options: RepoMdSyncOptions = {}): Promise<RepoMdSyncResult> {
+    return runRepoMdSync(this, sourceId, {
+      ...options,
+      sourceStorageDir: this.sourceStorageDir,
+      idGen: this.newId,
+    });
   }
 
   // ---- sync: engine primitives (slice 1a) ----------------------------------

@@ -28,6 +28,8 @@ import type {
   SourceFileRecord,
   SourceManifestChunkInput,
   SourceManifestFileInput,
+  SourceRemoval,
+  SourceRemovalItem,
   SourceSyncRun,
   SourceSyncRunResult,
   StageSourceManifestInput,
@@ -277,6 +279,29 @@ export class SourceLedger {
         UNIQUE (run_id, binding_id)
       );
       CREATE INDEX IF NOT EXISTS idx_source_cleanup_run ON source_cleanup_items(run_id, acknowledged_at, id);
+
+      CREATE TABLE IF NOT EXISTS source_removals (
+        source_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        snapshot_id TEXT,
+        ingest_config_hash TEXT,
+        state TEXT NOT NULL CHECK (state IN ('retiring','files-revoked','complete')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS source_removal_items (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        concept_id TEXT NOT NULL,
+        observation_id TEXT NOT NULL,
+        acknowledged_at INTEGER,
+        UNIQUE (source_id,binding_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_removal_items_pending
+        ON source_removal_items(source_id,acknowledged_at,id);
     `);
     const emptyMetadata = canonicalJson({ tags: [], scope: null, frontmatter: {} });
     for (const table of ["source_staged_chunks", "source_chunks"]) {
@@ -687,6 +712,147 @@ export class SourceLedger {
         AND item.kind IN ('reconcile-orphan','quarantine-non-authorizing') AND item.acknowledged_at IS NULL))
     ) ORDER BY created_at DESC,id DESC LIMIT 1`).get(sourceId) as RunRow | undefined;
     return row ? rowToRun(row) : null;
+  }
+
+  beginRemoval(sourceId: string): SourceRemoval {
+    return this.db.immediateTransaction(() => {
+      const source = this.db.prepare(`SELECT id,lifecycle,active_run_id,active_snapshot_id,active_ingest_config_hash
+        FROM knowledge_sources WHERE id=?`).get(sourceId) as {
+          id: string; lifecycle: string; active_run_id: string | null;
+          active_snapshot_id: string | null; active_ingest_config_hash: string | null;
+        } | undefined;
+      if (!source || source.lifecycle !== "tombstoned") throw new Error("source removal requires a tombstoned lineage");
+      const existing = this.getRemoval(sourceId);
+      if (existing) return existing;
+      if (source.active_run_id) {
+        const snapshot = this.db.prepare(`SELECT snapshot_id,ingest_config_hash,state FROM source_snapshots WHERE run_id=? AND source_id=?`)
+          .get(source.active_run_id, sourceId) as { snapshot_id: string; ingest_config_hash: string; state: string } | undefined;
+        if (!snapshot || snapshot.state !== "active" || snapshot.snapshot_id !== source.active_snapshot_id
+            || snapshot.ingest_config_hash !== source.active_ingest_config_hash) {
+          throw new Error("tombstoned source active publication metadata is inconsistent");
+        }
+      } else if (source.active_snapshot_id !== null || source.active_ingest_config_hash !== null) {
+        throw new Error("tombstoned source has partial active publication metadata");
+      }
+      const now = this.now();
+      this.db.prepare(`INSERT INTO source_removals
+        (source_id,run_id,snapshot_id,ingest_config_hash,state,created_at,updated_at)
+        VALUES (?,?,?,?, 'retiring',?,?)`).run(
+        sourceId, source.active_run_id, source.active_snapshot_id, source.active_ingest_config_hash, now, now,
+      );
+      if (source.active_run_id) {
+        const chunks = this.db.prepare(`SELECT chunk.binding_id,chunk.concept_id,chunk.observation_id,chunk.source_ref,
+            concept.kind AS concept_kind,concept.status AS concept_status,concept.source_identity,concept.active_observation_id,
+            observation.concept_id AS observation_concept,observation.kind AS observation_kind,
+            observation.source_refs AS observation_refs,observation.superseded_by,observation.superseded_at
+          FROM source_chunks chunk
+          LEFT JOIN concepts concept ON concept.id=chunk.concept_id
+          LEFT JOIN observations observation ON observation.id=chunk.observation_id
+          WHERE chunk.source_id=? AND chunk.run_id=? AND chunk.lifecycle='active' ORDER BY chunk.binding_id`).all(sourceId, source.active_run_id) as Array<{
+            binding_id: string; concept_id: string | null; observation_id: string | null; source_ref: string;
+            concept_kind: string | null; concept_status: string | null; source_identity: string | null; active_observation_id: string | null;
+            observation_concept: string | null; observation_kind: string | null; observation_refs: string | null;
+            superseded_by: string | null; superseded_at: number | null;
+          }>;
+        for (const chunk of chunks) {
+          if (!chunk.concept_id || !chunk.observation_id) throw new Error("active source binding lacks exact engine evidence");
+          const refs = parseStringArray(chunk.observation_refs, "source removal observation refs");
+          if (chunk.concept_kind !== "source" || chunk.concept_status !== "active"
+              || chunk.source_identity !== `source://${sourceId}` || chunk.active_observation_id !== chunk.observation_id
+              || chunk.observation_concept !== chunk.concept_id || chunk.observation_kind !== "source"
+              || refs.length !== 1 || refs[0] !== chunk.source_ref || !chunk.source_ref.startsWith(`source://${sourceId}/`)
+              || chunk.superseded_by !== null || chunk.superseded_at !== null) {
+            throw new Error("active source binding does not exactly own its published engine evidence");
+          }
+          this.db.prepare(`INSERT INTO source_removal_items
+            (id,source_id,run_id,binding_id,concept_id,observation_id) VALUES (?,?,?,?,?,?)`).run(
+            this.idGen(), sourceId, source.active_run_id, chunk.binding_id, chunk.concept_id, chunk.observation_id,
+          );
+        }
+      }
+      return this.getRemoval(sourceId)!;
+    })();
+  }
+
+  getRemoval(sourceId: string): SourceRemoval | null {
+    const row = this.db.prepare(`SELECT * FROM source_removals WHERE source_id=?`).get(sourceId) as Record<string, unknown> | undefined;
+    return row ? this.removalRow(row) : null;
+  }
+
+  listRemovalItems(sourceId: string): SourceRemovalItem[] {
+    return (this.db.prepare(`SELECT * FROM source_removal_items WHERE source_id=? ORDER BY id`).all(sourceId) as Array<Record<string, unknown>>)
+      .map((row) => this.removalItemRow(row));
+  }
+
+  acknowledgeRemovalItem(itemId: string): SourceRemovalItem {
+    return this.db.immediateTransaction(() => {
+      const item = this.db.prepare(`SELECT item.*,removal.state AS removal_state,source.lifecycle,
+          chunk.source_id AS chunk_source,chunk.run_id AS chunk_run,chunk.binding_id AS chunk_binding,
+          chunk.concept_id AS chunk_concept,chunk.observation_id AS chunk_observation,chunk.lifecycle AS chunk_lifecycle
+        FROM source_removal_items item
+        JOIN source_removals removal ON removal.source_id=item.source_id
+        JOIN knowledge_sources source ON source.id=item.source_id
+        JOIN source_chunks chunk ON chunk.run_id=item.run_id AND chunk.binding_id=item.binding_id
+        WHERE item.id=?`).get(itemId) as Record<string, unknown> | undefined;
+      if (!item) throw new Error("source removal item not found or has no exact published binding");
+      if (item.lifecycle !== "tombstoned" || item.removal_state !== "retiring") throw new Error("source removal authorization is not active");
+      if (item.acknowledged_at === null) {
+        if (item.chunk_source !== item.source_id || item.chunk_run !== item.run_id || item.chunk_binding !== item.binding_id
+            || item.chunk_concept !== item.concept_id || item.chunk_observation !== item.observation_id
+            || item.chunk_lifecycle !== "active") throw new Error("source removal binding authorization is stale");
+        const observation = this.db.prepare(`SELECT concept_id,superseded_by,superseded_at FROM observations WHERE id=?`)
+          .get(item.observation_id) as { concept_id: string | null; superseded_by: string | null; superseded_at: number | null } | undefined;
+        const concept = this.db.prepare(`SELECT kind,status,active_observation_id,source_identity FROM concepts WHERE id=?`)
+          .get(item.concept_id) as { kind: string; status: string; active_observation_id: string | null; source_identity: string | null } | undefined;
+        if (!observation || observation.concept_id !== item.concept_id || observation.superseded_by !== null || observation.superseded_at === null
+            || !concept || concept.kind !== "source" || concept.status !== "retired" || concept.active_observation_id !== null
+            || concept.source_identity !== `source://${item.source_id}`) {
+          throw new Error("source removal evidence is not terminally retired");
+        }
+        const now = this.now();
+        this.db.prepare(`UPDATE source_chunks SET lifecycle='deleted' WHERE run_id=? AND binding_id=? AND lifecycle='active'`)
+          .run(item.run_id, item.binding_id);
+        this.db.prepare(`UPDATE source_removal_items SET acknowledged_at=? WHERE id=?`).run(now, itemId);
+        this.db.prepare(`UPDATE source_removals SET updated_at=? WHERE source_id=?`).run(now, item.source_id);
+      }
+      return this.removalItemRow(this.db.prepare(`SELECT * FROM source_removal_items WHERE id=?`).get(itemId) as Record<string, unknown>);
+    })();
+  }
+
+  markRemovalFilesRevoked(sourceId: string): SourceRemoval {
+    return this.db.immediateTransaction(() => {
+      const removal = this.getRemoval(sourceId);
+      if (!removal) throw new Error("source removal has not begun");
+      if (removal.state === "complete" || removal.state === "files-revoked") return removal;
+      const pending = this.db.prepare(`SELECT COUNT(*) AS count FROM source_removal_items WHERE source_id=? AND acknowledged_at IS NULL`)
+        .get(sourceId) as { count: number };
+      if (pending.count !== 0) throw new Error("source removal still has active evidence");
+      this.db.prepare(`UPDATE source_removals SET state='files-revoked',updated_at=? WHERE source_id=?`).run(this.now(), sourceId);
+      return this.getRemoval(sourceId)!;
+    })();
+  }
+
+  completeRemoval(sourceId: string): SourceRemoval {
+    return this.db.immediateTransaction(() => {
+      const removal = this.getRemoval(sourceId);
+      if (!removal) throw new Error("source removal has not begun");
+      if (removal.state === "complete") return removal;
+      if (removal.state !== "files-revoked") throw new Error("source removal files have not been revoked");
+      const source = this.db.prepare(`SELECT lifecycle FROM knowledge_sources WHERE id=?`).get(sourceId) as { lifecycle: string } | undefined;
+      if (!source || source.lifecycle !== "tombstoned") throw new Error("source removal lineage is no longer tombstoned");
+      const pending = this.db.prepare(`SELECT COUNT(*) AS count FROM source_removal_items WHERE source_id=? AND acknowledged_at IS NULL`)
+        .get(sourceId) as { count: number };
+      if (pending.count !== 0) throw new Error("source removal still has active evidence");
+      const now = this.now();
+      if (removal.runId) {
+        this.db.prepare(`UPDATE source_snapshots SET state='superseded',superseded_at=? WHERE run_id=? AND state='active'`)
+          .run(now, removal.runId);
+      }
+      this.db.prepare(`UPDATE knowledge_sources SET active_run_id=NULL,active_snapshot_id=NULL,
+        active_ingest_config_hash=NULL,applied_config_version=NULL,updated_at=? WHERE id=? AND lifecycle='tombstoned'`).run(now, sourceId);
+      this.db.prepare(`UPDATE source_removals SET state='complete',updated_at=?,completed_at=? WHERE source_id=?`).run(now, now, sourceId);
+      return this.getRemoval(sourceId)!;
+    })();
   }
 
   listFiles(runOrOptions: string | { runId: string; published?: boolean }, published = false): SourceFileRecord[] {
@@ -1107,5 +1273,23 @@ export class SourceLedger {
       conceptId: (row.concept_id as string | null) ?? null, observationId: (row.observation_id as string | null) ?? null,
       predecessorObservationId: (row.predecessor_observation_id as string | null) ?? null,
       createdAt: row.created_at as number, acknowledgedAt: (row.acknowledged_at as number | null) ?? null };
+  }
+
+  private removalRow(row: Record<string, unknown>): SourceRemoval {
+    return {
+      sourceId: row.source_id as string, runId: (row.run_id as string | null) ?? null,
+      snapshotId: (row.snapshot_id as string | null) ?? null,
+      ingestConfigHash: (row.ingest_config_hash as string | null) ?? null,
+      state: row.state as SourceRemoval["state"], createdAt: row.created_at as number,
+      updatedAt: row.updated_at as number, completedAt: (row.completed_at as number | null) ?? null,
+    };
+  }
+
+  private removalItemRow(row: Record<string, unknown>): SourceRemovalItem {
+    return {
+      id: row.id as string, sourceId: row.source_id as string, runId: row.run_id as string,
+      bindingId: row.binding_id as string, conceptId: row.concept_id as string,
+      observationId: row.observation_id as string, acknowledgedAt: (row.acknowledged_at as number | null) ?? null,
+    };
   }
 }

@@ -291,6 +291,36 @@ describe("source-pipeline core prerequisites", () => {
     }
   });
 
+  it("replays only an exact already-committed source refresh topology", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    try {
+      const predecessor = await core.storeSource("Replay predecessor.", {
+        sourceRefs: [sourceRef], operationId: "source-a:binding-replay:fingerprint-a:snapshot-a",
+      });
+      const successor = await core.storeSource("Replay successor.", {
+        attachTo: predecessor.conceptId, sourceRefs: [sourceRef],
+        operationId: "source-a:binding-replay:fingerprint-b:snapshot-b",
+      });
+      const activated = await core.refreshSourceConcept(
+        predecessor.conceptId, successor.observationId, predecessor.observationId,
+      );
+      const replay = await core.refreshSourceConcept(
+        predecessor.conceptId, successor.observationId, predecessor.observationId,
+      );
+      expect(replay).toEqual(activated);
+
+      core
+        // @ts-expect-error test-only crash-topology corruption
+        .db.prepare(`UPDATE observations SET superseded_by=NULL,superseded_at=NULL WHERE id=?`)
+        .run(predecessor.observationId);
+      await expect(core.refreshSourceConcept(
+        predecessor.conceptId, successor.observationId, predecessor.observationId,
+      )).rejects.toThrow(/exact replay/);
+    } finally {
+      core.close();
+    }
+  });
+
   it("supports terminal deletion, retirement, and restoration without stale retrieval", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     try {

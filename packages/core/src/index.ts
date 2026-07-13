@@ -52,6 +52,7 @@ export {
   sourceHeadingIdentityKey,
   sourceHeadingAnchor,
 } from "./source-chunker";
+export type { RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
 export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";
 export type {
   EffectiveSourceScanConfig,
@@ -105,6 +106,8 @@ export type {
   SourceFileRecord,
   SourceChunkRecord,
   SourceCleanupItem,
+  SourceRemoval,
+  SourceRemovalItem,
 } from "./source-types";
 export { renderOverview } from "./render-overview";
 export { extractEntities } from "./extract-entities";
