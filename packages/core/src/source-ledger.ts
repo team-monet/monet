@@ -29,12 +29,16 @@ import type {
   SourceFileRecord,
   SourceManifestChunkInput,
   SourceManifestFileInput,
+  SourcePublishedManifest,
   SourceRemoval,
   SourceRemovalItem,
   SourceSyncRun,
   SourceSyncRunResult,
   StageSourceManifestInput,
 } from "./source-types";
+
+/** Active sources retain only the newest immutable attempt receipts. */
+export const SOURCE_ATTEMPT_EVENT_RETENTION = 128;
 
 interface SourceLedgerOptions {
   idGen?: () => string;
@@ -79,6 +83,12 @@ export interface SourceAttemptView {
   latestVerificationRunCount: number | null;
   runCount: number;
   dirtyFiles: number;
+  prePinFailure: { attemptedAt: number; reason: string } | null;
+  latestAttempt: {
+    sequence: number; kind: "run" | "verification" | "pre-pin-failure" | "invocation"; runId: string | null; attemptedAt: number;
+    runResult: SourceSyncRunResult | null; runReason: string | null; invocationResult: SourceSyncRunResult | null;
+    failureReason: string | null; configVersion: number | null; leaseFence: number | null;
+  } | null;
 }
 
 const requireString = (value: unknown, field: string): string => {
@@ -161,6 +171,8 @@ export class SourceLedger {
   private readonly now: () => number;
   /** Test-only concurrency seam; production leaves this undefined. */
   private attemptReadFault?: () => void;
+  /** Test-only seam immediately after BEGIN IMMEDIATE and before the source fence read. */
+  private beginRunFault?: () => void;
 
   constructor(private readonly db: StoragePort, options: SourceLedgerOptions = {}) {
     this.idGen = options.idGen ?? randomUUID;
@@ -192,6 +204,28 @@ export class SourceLedger {
         published_at INTEGER,
         finished_at INTEGER
       );
+      CREATE TABLE IF NOT EXISTS source_pre_pin_attempts (
+        source_id TEXT PRIMARY KEY,
+        attempted_at INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        config_version INTEGER NOT NULL,
+        lease_fence INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS source_attempt_events (
+        source_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        kind TEXT NOT NULL CHECK (kind IN ('run','verification','pre-pin-failure','invocation')),
+        ref_id TEXT NOT NULL,
+        run_id TEXT,
+        attempted_at INTEGER NOT NULL,
+        failure_reason TEXT,
+        invocation_result TEXT CHECK (invocation_result IS NULL OR invocation_result IN ('success','failed','partial')),
+        config_version INTEGER,
+        lease_fence INTEGER,
+        PRIMARY KEY (source_id, sequence),
+        UNIQUE (source_id, kind, ref_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_attempt_events_latest ON source_attempt_events(source_id,sequence DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_source_sync_runs_live
         ON source_sync_runs(source_id) WHERE state IN ('scanning','staging','activating','cleaning');
       CREATE INDEX IF NOT EXISTS idx_source_sync_runs_source_created ON source_sync_runs(source_id, created_at, id);
@@ -333,6 +367,47 @@ export class SourceLedger {
       CREATE INDEX IF NOT EXISTS idx_source_removal_items_pending
         ON source_removal_items(source_id,acknowledged_at,id);
     `);
+    let attemptEventColumns = this.db.prepare(`PRAGMA table_info(source_attempt_events)`).all() as Array<{ name: string }>;
+    const attemptEventSchema = this.db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='source_attempt_events'`,
+    ).get() as { sql: string };
+    const attemptEventSql = attemptEventSchema.sql;
+    if (!attemptEventSql.includes("'invocation'")
+        || !["failure_reason", "invocation_result", "config_version", "lease_fence"]
+          .every((name) => attemptEventColumns.some((column) => column.name === name))) {
+      const names = new Set(attemptEventColumns.map((column) => column.name));
+      this.db.exec(`DROP INDEX IF EXISTS idx_source_attempt_events_latest;
+        ALTER TABLE source_attempt_events RENAME TO source_attempt_events_legacy;
+        CREATE TABLE source_attempt_events (
+          source_id TEXT NOT NULL,sequence INTEGER NOT NULL CHECK (sequence > 0),
+          kind TEXT NOT NULL CHECK (kind IN ('run','verification','pre-pin-failure','invocation')),
+          ref_id TEXT NOT NULL,run_id TEXT,attempted_at INTEGER NOT NULL,failure_reason TEXT,
+          invocation_result TEXT CHECK (invocation_result IS NULL OR invocation_result IN ('success','failed','partial')),
+          config_version INTEGER,lease_fence INTEGER,
+          PRIMARY KEY (source_id,sequence),UNIQUE (source_id,kind,ref_id)
+        );`);
+      const optional = (name: string): string => names.has(name) ? name : `NULL AS ${name}`;
+      this.db.exec(`INSERT INTO source_attempt_events
+        (source_id,sequence,kind,ref_id,run_id,attempted_at,failure_reason,invocation_result,config_version,lease_fence)
+        SELECT source_id,sequence,kind,ref_id,run_id,attempted_at,${optional("failure_reason")},
+          ${optional("invocation_result")},${optional("config_version")},${optional("lease_fence")}
+        FROM source_attempt_events_legacy;
+        DROP TABLE source_attempt_events_legacy;
+        CREATE INDEX idx_source_attempt_events_latest ON source_attempt_events(source_id,sequence DESC);`);
+      attemptEventColumns = this.db.prepare(`PRAGMA table_info(source_attempt_events)`).all() as Array<{ name: string }>;
+    }
+    // An interrupted upgrade may have sequenced failure events from the pre-payload
+    // schema. Only the exact durable failure receipt may hydrate an event; older
+    // same-source failures stay null rather than inheriting a newer reason.
+    this.db.prepare(`UPDATE source_attempt_events AS event SET failure_reason=(
+        SELECT attempt.reason FROM source_pre_pin_attempts attempt
+        WHERE attempt.source_id=event.source_id AND attempt.attempted_at=event.attempted_at
+      ) WHERE event.kind='pre-pin-failure' AND event.failure_reason IS NULL
+        AND event.sequence=(SELECT MAX(candidate.sequence) FROM source_attempt_events candidate
+          WHERE candidate.source_id=event.source_id AND candidate.kind='pre-pin-failure'
+            AND candidate.attempted_at=event.attempted_at)
+        AND EXISTS (SELECT 1 FROM source_pre_pin_attempts attempt
+          WHERE attempt.source_id=event.source_id AND attempt.attempted_at=event.attempted_at)`).run();
     // Reconcile every surviving verification layout under this enclosing IMMEDIATE transaction.
     // A prior non-atomic migrator could leave legacy alone, an auto-created current beside legacy,
     // or both populated. Read and validate all copies before replacing either one.
@@ -522,15 +597,107 @@ export class SourceLedger {
       CREATE UNIQUE INDEX IF NOT EXISTS uq_source_chunks_active_observation
         ON source_chunks(source_id, observation_id) WHERE lifecycle='active' AND observation_id IS NOT NULL;
     `);
+    // Crash-safe legacy repair: sources with no sequenced events are assigned a
+    // deterministic order from their durable attempt records. New writes always
+    // append in the same transaction as the corresponding attempt.
+    for (const source of this.db.prepare(`SELECT source.id FROM knowledge_sources source
+      WHERE source.lifecycle='active'
+        AND NOT EXISTS (SELECT 1 FROM source_removals removal
+          WHERE removal.source_id=source.id AND removal.state='complete')
+      ORDER BY source.id`).all() as Array<{ id: string }>) {
+      const exists = this.db.prepare(`SELECT 1 FROM source_attempt_events WHERE source_id=? LIMIT 1`).get(source.id);
+      if (exists) continue;
+      const legacy: Array<{
+        kind: "run" | "verification" | "pre-pin-failure"; ref: string; runId: string | null; at: number; reason?: string;
+        configVersion: number; leaseFence: number;
+      }> = [];
+      const runs = this.db.prepare(`SELECT id,created_at,config_version,lease_fence FROM source_sync_runs
+        WHERE source_id=? ORDER BY rowid,id`).all(source.id) as Array<{
+          id: string; created_at: number; config_version: number; lease_fence: number;
+        }>;
+      const verification = this.db.prepare(`SELECT run_id,checked_at,observed_run_count,config_version,lease_fence
+        FROM source_verification_checks WHERE source_id=?`).get(source.id) as {
+          run_id: string; checked_at: number; observed_run_count: number; config_version: number; lease_fence: number;
+        } | undefined;
+      // Clocks are advisory only. The durable observed count is the causal fence:
+      // exactly that many runs precede verification and every later run follows it.
+      const observed = verification ? Math.min(verification.observed_run_count, runs.length) : runs.length;
+      const runEvent = (run: typeof runs[number]) => ({
+        kind: "run" as const, ref: run.id, runId: run.id, at: run.created_at,
+        configVersion: run.config_version, leaseFence: run.lease_fence,
+      });
+      legacy.push(...runs.slice(0, observed).map(runEvent));
+      if (verification) legacy.push({
+        kind: "verification", ref: `legacy:${verification.run_id}`, runId: verification.run_id,
+        at: verification.checked_at, configVersion: verification.config_version, leaseFence: verification.lease_fence,
+      });
+      legacy.push(...runs.slice(observed).map(runEvent));
+      const failure = this.db.prepare(`SELECT attempted_at,reason,config_version,lease_fence FROM source_pre_pin_attempts WHERE source_id=?`).get(source.id) as
+        { attempted_at: number; reason: string; config_version: number; lease_fence: number } | undefined;
+      if (failure) {
+        const event = {
+          kind: "pre-pin-failure" as const, ref: "legacy", runId: null, at: failure.attempted_at, reason: failure.reason,
+          configVersion: failure.config_version, leaseFence: failure.lease_fence,
+        };
+        // Insert non-run evidence by its clock without disturbing the causal
+        // run/verification spine. Equal clocks use stable kind/ref byte order.
+        const index = legacy.findIndex((candidate) => candidate.at > event.at
+          || (candidate.at === event.at && (compareUtf8(candidate.kind, event.kind) > 0
+            || (candidate.kind === event.kind && compareUtf8(candidate.ref, event.ref) > 0))));
+        legacy.splice(index < 0 ? legacy.length : index, 0, event);
+      }
+      const insertAttempt = this.db.prepare(`INSERT INTO source_attempt_events
+        (source_id,sequence,kind,ref_id,run_id,attempted_at,failure_reason,invocation_result,config_version,lease_fence)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`);
+      legacy.forEach((event, index) => insertAttempt.run(
+        source.id, index + 1, event.kind, event.ref, event.runId, event.at, event.reason ?? null,
+        null, event.configVersion, event.leaseFence,
+      ));
+    }
+    this.db.prepare(`DELETE FROM source_attempt_events WHERE (source_id,sequence) IN (
+      SELECT source_id,sequence FROM (
+        SELECT source_id,sequence,ROW_NUMBER() OVER (PARTITION BY source_id ORDER BY sequence DESC) AS retained_rank
+        FROM source_attempt_events
+      ) WHERE retained_rank > ?
+    )`).run(SOURCE_ATTEMPT_EVENT_RETENTION);
     })();
+  }
+
+  private compactAttempts(sourceId: string): void {
+    this.db.prepare(`DELETE FROM source_attempt_events WHERE source_id=? AND sequence < COALESCE((
+      SELECT sequence FROM source_attempt_events WHERE source_id=? ORDER BY sequence DESC LIMIT 1 OFFSET ?
+    ),0)`).run(sourceId, sourceId, SOURCE_ATTEMPT_EVENT_RETENTION - 1);
+  }
+
+  private appendAttempt(
+    sourceId: string, kind: "run" | "verification" | "pre-pin-failure" | "invocation",
+    refId: string, runId: string | null, attemptedAt: number, failureReason: string | null = null,
+    invocationResult: SourceSyncRunResult | null = null, configVersion: number | null = null, leaseFence: number | null = null,
+  ): number {
+    const row = this.db.prepare(`SELECT COALESCE(MAX(sequence),0)+1 AS sequence FROM source_attempt_events WHERE source_id=?`).get(sourceId) as { sequence: number };
+    this.db.prepare(`INSERT INTO source_attempt_events
+      (source_id,sequence,kind,ref_id,run_id,attempted_at,failure_reason,invocation_result,config_version,lease_fence)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(sourceId, row.sequence, kind, refId, runId, attemptedAt, failureReason, invocationResult, configVersion, leaseFence);
+    this.compactAttempts(sourceId);
+    return row.sequence;
   }
 
   beginRun(input: BeginSourceRunInput): BeginSourceRunResult {
     return this.db.immediateTransaction((): BeginSourceRunResult => {
       const sourceId = requireString(input.sourceId, "sourceId");
       const snapshotId = requireString(input.snapshotId, "snapshotId");
+      const hasExpectedConfig = input.expectedConfigVersion !== undefined;
+      const hasExpectedLease = input.expectedLeaseFence !== undefined;
+      if (hasExpectedConfig !== hasExpectedLease) throw new Error("source run fence must include both configVersion and leaseFence");
+      const expectedConfigVersion = hasExpectedConfig ? requireInteger(input.expectedConfigVersion, "expectedConfigVersion", 1) : null;
+      const expectedLeaseFence = hasExpectedLease ? requireInteger(input.expectedLeaseFence, "expectedLeaseFence", 1) : null;
+      this.beginRunFault?.();
       const source = this.db.prepare(`SELECT * FROM knowledge_sources WHERE id = ?`).get(sourceId) as SourceRow | undefined;
       if (!source || source.lifecycle !== "active") throw new Error("source not found or tombstoned");
+      if (expectedConfigVersion !== null && (source.config_version !== expectedConfigVersion || source.lease_fence !== expectedLeaseFence)) {
+        throw new Error("source run fence is stale");
+      }
       const pendingReconciliation = this.db.prepare(`SELECT run.id FROM source_sync_runs run
         WHERE run.source_id=? AND run.state='aborted' AND EXISTS (
           SELECT 1 FROM source_cleanup_items item WHERE item.run_id=run.id
@@ -571,6 +738,8 @@ export class SourceLedger {
         (source_id,snapshot_id,config_version,run_id,ingest_config_hash,state,created_at) VALUES (?,?,?,?,?,'staged',?)`).run(
         sourceId, snapshotId, configVersion, id, ingestConfigHash, now,
       );
+      this.appendAttempt(sourceId, "run", id, id, now, null, null, configVersion, leaseFence);
+      this.db.prepare(`DELETE FROM source_pre_pin_attempts WHERE source_id=?`).run(sourceId);
       return { kind: "started", run: this.getRun(id)! };
     })();
   }
@@ -841,6 +1010,23 @@ export class SourceLedger {
     return { run, filesIndexed: files.count, chunksIndexed: chunks.count };
   }
 
+  /** Exact published file manifest used to authenticate offline active-pointer repair. */
+  publishedManifest(sourceId: string, runId: string, snapshotId: string, ingestConfigHash: string): SourcePublishedManifest {
+    const publication = this.activePublication(sourceId, runId, snapshotId, ingestConfigHash);
+    if (!publication.run.manifestHash) throw new Error("source active publication has no durable manifest hash");
+    const files = this.listFiles({ runId, published: true }).map(
+      ({ sourceId: _sourceId, runId: _runId, snapshotId: _snapshotId, configVersion: _configVersion, ...file }) => file,
+    );
+    if (computeSourceManifestHash(files) !== publication.run.manifestHash) {
+      throw new Error("source active publication file manifest is corrupt");
+    }
+    return {
+      sourceId, runId, snapshotId, ingestConfigHash,
+      configVersion: publication.run.configVersion, leaseFence: publication.run.leaseFence,
+      manifestHash: publication.run.manifestHash, files,
+    };
+  }
+
   /** Record a successful unchanged-source verification only while the exact publication fence is still current. */
   recordVerification(input: {
     sourceId: string; runId: string; snapshotId: string; ingestConfigHash: string;
@@ -868,7 +1054,63 @@ export class SourceLedger {
           config_version=excluded.config_version,lease_fence=excluded.lease_fence,
           observed_run_count=excluded.observed_run_count,checked_at=excluded.checked_at`).run(input.sourceId, input.runId, input.snapshotId,
           input.ingestConfigHash, input.configVersion, input.leaseFence, observed.count, checkedAt);
+      const next = this.db.prepare(`SELECT COALESCE(MAX(sequence),0)+1 AS sequence FROM source_attempt_events WHERE source_id=?`).get(input.sourceId) as { sequence: number };
+      this.appendAttempt(input.sourceId, "verification", `${input.runId}:${next.sequence}`, input.runId, checkedAt,
+        null, null, input.configVersion, input.leaseFence);
+      this.db.prepare(`DELETE FROM source_pre_pin_attempts WHERE source_id=?`).run(input.sourceId);
       return checkedAt;
+    })();
+  }
+
+  recordPrePinFailure(input: { sourceId: string; reason: string; configVersion: number; leaseFence: number }): number {
+    const safeReason = sanitizeSourceError(input.reason);
+    return this.db.immediateTransaction(() => {
+      const source = this.db.prepare(`SELECT config_version,lease_fence,lifecycle FROM knowledge_sources WHERE id=?`).get(input.sourceId) as
+        | { config_version: number; lease_fence: number; lifecycle: string }
+        | undefined;
+      if (!source || source.lifecycle !== "active" || source.config_version !== input.configVersion || source.lease_fence !== input.leaseFence) {
+        throw new Error("source pre-pin attempt fence is stale");
+      }
+      const attemptedAt = this.now();
+      this.db.prepare(`INSERT INTO source_pre_pin_attempts(source_id,attempted_at,reason,config_version,lease_fence)
+        VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET attempted_at=excluded.attempted_at,reason=excluded.reason,
+        config_version=excluded.config_version,lease_fence=excluded.lease_fence`)
+        .run(input.sourceId, attemptedAt, safeReason, source.config_version, source.lease_fence);
+      const next = this.db.prepare(`SELECT COALESCE(MAX(sequence),0)+1 AS sequence FROM source_attempt_events WHERE source_id=?`).get(input.sourceId) as { sequence: number };
+      this.appendAttempt(input.sourceId, "pre-pin-failure", `failure:${next.sequence}`, null, attemptedAt, safeReason,
+        null, input.configVersion, input.leaseFence);
+      return attemptedAt;
+    })();
+  }
+
+  /** Immutable invocation outcome for a retry of an already-durable run. */
+  recordRunInvocation(input: {
+    sourceId: string; runId: string; result: "success" | "failed" | "partial";
+    reason?: string; configVersion: number; leaseFence: number;
+  }): number {
+    return this.db.immediateTransaction(() => {
+      const authority = this.db.prepare(`SELECT source.lifecycle,removal.state AS removal_state
+        FROM knowledge_sources source
+        LEFT JOIN source_removals removal ON removal.source_id=source.id
+        WHERE source.id=?`).get(input.sourceId) as { lifecycle: string; removal_state: string | null } | undefined;
+      if (authority?.lifecycle === "tombstoned" && authority.removal_state === "complete") {
+        throw new Error("source run invocation is closed by completed removal");
+      }
+      const run = this.requireRun(input.runId);
+      if (run.sourceId !== input.sourceId
+          || run.configVersion !== input.configVersion || run.leaseFence !== input.leaseFence) {
+        throw new Error("source run invocation fence is stale");
+      }
+      const attemptedAt = this.now();
+      const reason = input.result === "failed"
+        ? sanitizeSourceError(input.reason ?? run.reason ?? "source sync invocation failed")
+        : null;
+      const next = this.db.prepare(`SELECT COALESCE(MAX(sequence),0)+1 AS sequence FROM source_attempt_events WHERE source_id=?`)
+        .get(input.sourceId) as { sequence: number };
+      this.appendAttempt(input.sourceId, "invocation", `${input.runId}:${next.sequence}`, input.runId, attemptedAt, reason,
+        input.result, input.configVersion, input.leaseFence);
+      if (input.result !== "failed") this.db.prepare(`DELETE FROM source_pre_pin_attempts WHERE source_id=?`).run(input.sourceId);
+      return attemptedAt;
     })();
   }
 
@@ -883,6 +1125,17 @@ export class SourceLedger {
     const complete = [...runs].reverse().find((run) => run.complete) ?? null;
     const verification = this.db.prepare(`SELECT checked_at,observed_run_count FROM source_verification_checks
       WHERE source_id=?`).get(sourceId) as { checked_at: number; observed_run_count: number } | undefined;
+    const prePin = this.db.prepare(`SELECT attempted_at,reason FROM source_pre_pin_attempts WHERE source_id=?`).get(sourceId) as
+      | { attempted_at: number; reason: string }
+      | undefined;
+    const latestAttempt = this.db.prepare(`SELECT event.sequence,event.kind,event.run_id,event.attempted_at,event.failure_reason,
+        event.invocation_result,event.config_version,event.lease_fence,run.result AS run_result,run.reason AS run_reason
+      FROM source_attempt_events event LEFT JOIN source_sync_runs run ON run.id=event.run_id AND run.source_id=event.source_id
+      WHERE event.source_id=? ORDER BY event.sequence DESC LIMIT 1`).get(sourceId) as
+      | { sequence: number; kind: "run" | "verification" | "pre-pin-failure" | "invocation"; run_id: string | null;
+          attempted_at: number; failure_reason: string | null; invocation_result: SourceSyncRunResult | null;
+          config_version: number | null; lease_fence: number | null; run_result: SourceSyncRunResult | null; run_reason: string | null }
+      | undefined;
     let dirtyFiles = 0;
     if (complete && activeRunId && complete.id !== activeRunId) {
       const row = this.db.prepare(`SELECT COUNT(DISTINCT relative_path) AS count FROM (
@@ -901,6 +1154,14 @@ export class SourceLedger {
     return {
       latest, lastResult, lastSuccess, latestVerificationAt: verification?.checked_at ?? null,
       latestVerificationRunCount: verification?.observed_run_count ?? null, runCount: runs.length, dirtyFiles,
+      prePinFailure: prePin ? { attemptedAt: prePin.attempted_at, reason: prePin.reason } : null,
+      latestAttempt: latestAttempt ? {
+        sequence: latestAttempt.sequence, kind: latestAttempt.kind, runId: latestAttempt.run_id, attemptedAt: latestAttempt.attempted_at,
+        runResult: latestAttempt.run_result, runReason: latestAttempt.run_reason, invocationResult: latestAttempt.invocation_result,
+        configVersion: latestAttempt.config_version, leaseFence: latestAttempt.lease_fence,
+        failureReason: latestAttempt.failure_reason
+          ?? (prePin?.attempted_at === latestAttempt.attempted_at ? prePin.reason : null),
+      } : null,
     };
     })();
   }
@@ -1038,6 +1299,8 @@ export class SourceLedger {
       if (!removal) throw new Error("source removal has not begun");
       if (removal.state === "complete") {
         this.db.prepare(`DELETE FROM source_verification_checks WHERE source_id=?`).run(sourceId);
+        this.db.prepare(`DELETE FROM source_pre_pin_attempts WHERE source_id=?`).run(sourceId);
+        this.db.prepare(`DELETE FROM source_attempt_events WHERE source_id=?`).run(sourceId);
         return removal;
       }
       if (removal.state !== "files-revoked") throw new Error("source removal files have not been revoked");
@@ -1055,6 +1318,8 @@ export class SourceLedger {
         active_ingest_config_hash=NULL,applied_config_version=NULL,updated_at=? WHERE id=? AND lifecycle='tombstoned'`).run(now, sourceId);
       this.db.prepare(`UPDATE source_removals SET state='complete',updated_at=?,completed_at=? WHERE source_id=?`).run(now, now, sourceId);
       this.db.prepare(`DELETE FROM source_verification_checks WHERE source_id=?`).run(sourceId);
+      this.db.prepare(`DELETE FROM source_pre_pin_attempts WHERE source_id=?`).run(sourceId);
+      this.db.prepare(`DELETE FROM source_attempt_events WHERE source_id=?`).run(sourceId);
       return this.getRemoval(sourceId)!;
     })();
   }

@@ -1,3 +1,6 @@
+/** Durable and connector-visible source errors have a strict storage/display bound. */
+export const SOURCE_ERROR_MAX_LENGTH = 1024;
+
 /** Remove credentials, secret-shaped values, query secrets, and machine-local paths from source errors. */
 export function sanitizeSourceError(value: unknown): string {
   const input = value instanceof Error ? value.message : String(value);
@@ -12,5 +15,6 @@ export function sanitizeSourceError(value: unknown): string {
     // Unquoted paths with spaces have no reliable lexical terminator. Source errors favor
     // confidentiality over detail, so redact the remainder of that line atomically.
     .replace(/(^|[\s(=:])\/(?!\/).*$/gm, "$1[local-path]")
-    .replace(/(^|[\s(=:])(?:[A-Za-z]:\\|\\\\).*$/gm, "$1[local-path]");
+    .replace(/(^|[\s(=:])(?:[A-Za-z]:\\|\\\\).*$/gm, "$1[local-path]")
+    .slice(0, SOURCE_ERROR_MAX_LENGTH);
 }

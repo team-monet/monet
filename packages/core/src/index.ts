@@ -52,7 +52,9 @@ export {
   sourceHeadingIdentityKey,
   sourceHeadingAnchor,
 } from "./source-chunker";
-export type { RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
+export type { GitMdSyncOptions, GitMdSyncResult, RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
+export type { GitCredential, GitCredentialProvider, GitCredentialRequest, RemoteGitOptions } from "./source-git";
+export { runRemoteGit } from "./source-git";
 export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";
 export type {
   EffectiveSourceScanConfig,

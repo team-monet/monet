@@ -1,24 +1,35 @@
-import { execFile as nodeExecFile } from "node:child_process";
+import { execFile as nodeExecFile, spawn as nodeSpawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
+import { performance } from "node:perf_hooks";
 import {
-  chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, readSync,
+  accessSync, chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, readSync,
   readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { constants } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
-import { computeSourceIngestConfigHash, effectiveSourceScanConfig, matchesSourceGlob } from "./source-scanner";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { computeSourceIngestConfigHash, computeSourceManifestHash, effectiveSourceScanConfig, matchesSourceGlob } from "./source-scanner";
 import type { EffectiveSourceScanConfig } from "./source-scanner";
-import type { KnowledgeSource } from "./source-types";
+import { managedGitEnvironment, validateManagedGitInvocation, validateManagedGitRepository } from "./source-git";
+import {
+  assertManagedDirectoryTrust, freezeSameDeviceTree, removeFrozenSameDeviceTree, revalidateSameDeviceTree,
+} from "./source-safe-remove";
+import type { FrozenSameDeviceTree, SafeTreeOps } from "./source-safe-remove";
+import type { KnowledgeSource, SourcePublishedManifest } from "./source-types";
 
 const OID_RE = /^[0-9a-f]{40,64}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
 const CONFIG_HASH_RE = /^monet-src-ingest-config\/v1:sha256:[0-9a-f]{64}$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const IO_CHUNK = 64 * 1024;
+const MAX_SNAPSHOT_MARKER_BYTES = 32 * 1024 * 1024;
 /** Rename evidence is advisory and deliberately much smaller than tree materialization output. */
 const MAX_RENAME_DIFF_BYTES = 1024 * 1024;
+const DEFAULT_LOCAL_GIT_TIMEOUT_MS = 120_000;
+const MAX_LOCAL_GIT_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_GIT_MATERIALIZATION_DEADLINE_MS = 5 * 60_000;
+const MAX_GIT_MATERIALIZATION_DEADLINE_MS = 10 * 60_000;
+const LEGACY_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 /** Fixed so binding identity does not depend on a caller's Git configuration. */
 export const REPO_MD_RENAME_SIMILARITY = 50;
 /** Bound Git's quadratic rename candidate search; excess candidates produce no rename proof. */
@@ -36,6 +47,21 @@ export interface RepoMdMaterializerOptions {
   now?: () => number;
   token?: () => string;
   execFile?: typeof nodeExecFile;
+  spawn?: typeof nodeSpawn;
+  /** Hard bound for every Git command that reads a managed git-md repository. */
+  localGitTimeoutMs?: number;
+  /** Aggregate wall-clock bound across all Git validation and blob extraction. */
+  materializationDeadlineMs?: number;
+  /** Injectable monotonic clock; wall-clock changes never extend the aggregate deadline. */
+  monotonicNow?: () => number;
+  /** Test seam for recursive device-boundary validation and deletion. */
+  safeTreeOps?: SafeTreeOps;
+  /** Test seam for directory durability barriers. */
+  fsyncPath?: (path: string) => void;
+  /** Optional already-trusted executable; otherwise Git is resolved and pinned once per operation. */
+  gitExecutable?: string;
+  /** Exact per-source lock ownership fence, checked immediately before managed mutations. */
+  assertOwnership?: () => void;
   fault?: (point: RepoMdMaterializerFaultPoint) => void;
 }
 
@@ -53,8 +79,12 @@ interface SnapshotMarker {
   snapshotId: string;
   configHash: string;
   variant: string;
-  files: Array<{ path: string; size: number; sha256: string }>;
+  files: Array<{ path: string; size: number; sha256: string; mode?: "100644" | "100755" }>;
 }
+
+interface FrozenManagedDirectory { path: string; dev: number; ino: number }
+interface FrozenSnapshotsDirectory { root: FrozenManagedDirectory; snapshots: FrozenManagedDirectory }
+type SourcePathIdentity = Pick<KnowledgeSource, "id" | "type"> & Partial<Pick<KnowledgeSource, "activeRunId">>;
 
 function contained(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
@@ -72,44 +102,138 @@ function requireSourceId(sourceId: string): void {
   if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(sourceId)) throw new Error("invalid source id for materialization");
 }
 
-function realDirectory(path: string, label: string, create: boolean): string | null {
+function requireArtifactToken(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(value)) {
+    throw new Error("materializer token must be a nonempty separator-free identifier");
+  }
+  return value;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+type SiblingArtifactKind = "clone" | "corrupt" | "repo" | "remove";
+
+function siblingArtifactName(kind: SiblingArtifactKind, sourceId: string, token: string): string {
+  return `.${kind}.${sourceId}.${token}`;
+}
+
+function siblingArtifactOwnership(name: string, kind: SiblingArtifactKind, sourceId: string): "owned" | "ambiguous" | "foreign" {
+  const current = new RegExp(`^\\.${kind}\\.${escapeRegExp(sourceId)}\\.[A-Za-z0-9][A-Za-z0-9-]{0,127}$`);
+  if (current.test(name)) return "owned";
+  const legacy = new RegExp(`^\\.${kind}-(.+)-(${LEGACY_UUID})$`, "i").exec(name);
+  if (legacy) return legacy[1] === sourceId ? "owned" : "foreign";
+  return name.startsWith(`.${kind}-${sourceId}-`) ? "ambiguous" : "foreign";
+}
+
+function realDirectory(
+  path: string, label: string, create: boolean, beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {}, privateRoot = false,
+): string | null {
   let entry;
-  try { entry = lstatSync(path); } catch (error) {
+  try { entry = (safeTreeOps.lstat ?? lstatSync)(path); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
-    try { mkdirSync(path, { mode: 0o700 }); } catch (mkdirError) {
+    try { beforeMutation(); mkdirSync(path, { mode: 0o700 }); } catch (mkdirError) {
       if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
     }
-    entry = lstatSync(path);
+    entry = (safeTreeOps.lstat ?? lstatSync)(path);
   }
   if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`${label} is not a real directory`);
+  assertManagedDirectoryTrust(path, label, safeTreeOps, privateRoot);
   return realpathSync.native(path);
 }
 
-function managedRepoRoot(storageDir: string, create = true): string | null {
+function managedTypeRoot(
+  type: "repo-md" | "git-md", storageDir: string, create = true, beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {},
+): string | null {
   const configuredBase = resolve(storageDir);
-  if (create) mkdirSync(configuredBase, { recursive: true, mode: 0o700 });
-  const base = realDirectory(configuredBase, "managed source storage base", false);
+  if (create) { beforeMutation(); mkdirSync(configuredBase, { recursive: true, mode: 0o700 }); }
+  const base = realDirectory(configuredBase, "managed source storage base", false, beforeMutation, safeTreeOps);
   if (base === null) return null;
-  const repoPath = join(base, "repo-md");
-  const repo = realDirectory(repoPath, "managed repo-md root", create);
+  const repoPath = join(base, type);
+  const repo = realDirectory(repoPath, `managed ${type} root`, create, beforeMutation, safeTreeOps);
   if (repo === null) return null;
-  if (repo !== join(base, "repo-md") || !contained(base, repo)) throw new Error("managed repo-md root canonical path mismatch");
+  if (repo !== join(base, type) || !contained(base, repo)) throw new Error(`managed ${type} root canonical path mismatch`);
   return repo;
 }
 
+function managedRepoRoot(storageDir: string, create = true): string | null {
+  return managedTypeRoot("repo-md", storageDir, create);
+}
+
 function sourceRoot(sourceId: string, storageDir: string, create = true): string | null {
+  return typedSourceRoot("repo-md", sourceId, storageDir, create);
+}
+
+function typedSourceRoot(
+  type: "repo-md" | "git-md", sourceId: string, storageDir: string, create = true,
+  beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {},
+): string | null {
   requireSourceId(sourceId);
-  const repo = managedRepoRoot(storageDir, create);
+  const repo = managedTypeRoot(type, storageDir, create, beforeMutation, safeTreeOps);
   if (repo === null) return null;
   const expected = join(repo, sourceId);
-  const source = realDirectory(expected, "managed repo-md source root", create);
+  const source = realDirectory(expected, `managed ${type} source root`, create, beforeMutation, safeTreeOps, true);
   if (source !== null && (source !== expected || dirname(source) !== repo || relative(repo, source) !== sourceId)) {
-    throw new Error("managed repo-md source root canonical path mismatch");
+    throw new Error(`managed ${type} source root canonical path mismatch`);
   }
   return source;
+}
+
+function freezeManagedDirectory(
+  parent: string, path: string, label: string, safeTreeOps: SafeTreeOps = {},
+): FrozenManagedDirectory {
+  const entry = assertManagedDirectoryTrust(path, label, safeTreeOps, true);
+  if (!entry.isDirectory() || entry.isSymbolicLink() || realpathSync.native(path) !== path
+      || dirname(path) !== parent || !contained(parent, path)) throw new Error(`${label} is not a canonical real direct-child directory`);
+  return { path, dev: entry.dev, ino: entry.ino };
+}
+
+function revalidateManagedDirectory(
+  parent: string, frozen: FrozenManagedDirectory, label: string, safeTreeOps: SafeTreeOps = {},
+): void {
+  const current = freezeManagedDirectory(parent, frozen.path, label, safeTreeOps);
+  if (current.dev !== frozen.dev || current.ino !== frozen.ino) throw new Error(`${label} changed after preflight`);
+}
+
+/** Create snapshots only beneath a frozen source root, then freeze its exact inode for all later use. */
+function freezeSnapshotsDirectory(
+  root: string, create: boolean, beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {},
+): FrozenSnapshotsDirectory | null {
+  const rootParent = dirname(root);
+  const frozenRoot = freezeManagedDirectory(rootParent, root, "managed source root", safeTreeOps);
+  const snapshots = join(root, "snapshots");
+  try {
+    const frozen = freezeManagedDirectory(root, snapshots, "managed source snapshots root", safeTreeOps);
+    if (frozen.dev !== frozenRoot.dev) throw new Error("managed source snapshots root crosses a filesystem boundary");
+    revalidateManagedDirectory(rootParent, frozenRoot, "managed source root", safeTreeOps);
+    return { root: frozenRoot, snapshots: frozen };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    revalidateManagedDirectory(rootParent, frozenRoot, "managed source root", safeTreeOps);
+    try { beforeMutation(); mkdirSync(snapshots, { mode: 0o700 }); } catch (mkdirError) {
+      if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+    }
+    revalidateManagedDirectory(rootParent, frozenRoot, "managed source root", safeTreeOps);
+    const frozenSnapshots = freezeManagedDirectory(root, snapshots, "managed source snapshots root", safeTreeOps);
+    if (frozenSnapshots.dev !== frozenRoot.dev) throw new Error("managed source snapshots root crosses a filesystem boundary");
+    return { root: frozenRoot, snapshots: frozenSnapshots };
+  }
+}
+
+function revalidateSnapshotsDirectory(frozen: FrozenSnapshotsDirectory, safeTreeOps: SafeTreeOps = {}): void {
+  revalidateManagedDirectory(dirname(frozen.root.path), frozen.root, "managed source root", safeTreeOps);
+  revalidateManagedDirectory(frozen.root.path, frozen.snapshots, "managed source snapshots root", safeTreeOps);
 }
 
 function parseOctal(field: Buffer, label: string): number {
@@ -178,6 +302,7 @@ export function extractGitArchive(
   destination: string,
   expectedEntries?: readonly TreeEntry[],
   maxArchiveBytes = 64 * 1024 * 1024,
+  beforeMutation: () => void = () => undefined,
 ): Array<{ path: string; size: number; sha256: string }> {
   const archiveSize = statSync(tarPath).size;
   if (archiveSize > maxArchiveBytes) throw new Error("git archive exceeds the materialization byte limit");
@@ -214,12 +339,15 @@ export function extractGitArchive(
       const target = resolve(destination, archivePath);
       if (!contained(destination, target)) throw new Error("git archive extraction escaped destination");
       if (type === "5") {
+        beforeMutation();
         mkdirSync(target, { recursive: true, mode: 0o700 });
       } else if (type === "0") {
         const entry = expected.get(archivePath);
         if (enforceExpected && (!entry || entry.size !== size)) throw new Error("git archive contains an unexpected or size-mismatched file");
         if (extracted.has(archivePath)) throw new Error("git archive contains a duplicate file");
+        beforeMutation();
         mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+        beforeMutation();
         const output = openSync(target, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
         const hash = createHash("sha256");
         let consumed = 0;
@@ -227,10 +355,12 @@ export function extractGitArchive(
           while (consumed < size) {
             const length = Math.min(IO_CHUNK, size - consumed);
             const chunk = readExactly(fd, dataStart + consumed, length);
+            beforeMutation();
             writeSync(output, chunk);
             hash.update(chunk);
             consumed += length;
           }
+          beforeMutation();
           fsyncSync(output);
         } finally { closeSync(output); }
         extracted.set(archivePath, { path: archivePath, size, sha256: hash.digest("hex") });
@@ -246,10 +376,192 @@ export function extractGitArchive(
   return [...extracted.values()].sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
 }
 
-async function runGit(execFile: typeof nodeExecFile, args: string[], cwd: string, maxBuffer = 4 * 1024 * 1024): Promise<string> {
-  const result = await promisify(execFile)("git", args, { cwd, encoding: "utf8", maxBuffer });
-  const stdout = typeof result === "object" && result !== null && "stdout" in result ? result.stdout : result;
-  return String(stdout).trim();
+function boundedLocalGitTimeout(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_LOCAL_GIT_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > MAX_LOCAL_GIT_TIMEOUT_MS) {
+    throw new Error("invalid local Git timeout");
+  }
+  return timeout;
+}
+
+function resolvePinnedGitExecutable(configured?: string): string {
+  const candidates = configured === undefined
+    ? (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((directory) => join(directory, "git"))
+    : [configured];
+  for (const candidate of candidates) {
+    if (!isAbsolute(candidate)) continue;
+    try {
+      accessSync(candidate, constants.X_OK);
+      const pinned = realpathSync.native(candidate);
+      const entry = lstatSync(pinned);
+      if (entry.isFile() && !entry.isSymbolicLink()) return pinned;
+    } catch { /* continue */ }
+  }
+  throw new Error("trusted Git executable is unavailable");
+}
+
+async function runGit(
+  execFile: typeof nodeExecFile,
+  args: string[],
+  cwd: string,
+  maxBuffer = 4 * 1024 * 1024,
+  local?: { timeoutMs: number; executable: string },
+  assertOwnership: () => void = () => undefined,
+): Promise<string> {
+  try {
+    const explicitGitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);
+    const result = await new Promise<string>((resolveOutput, reject) => {
+      let child: ReturnType<typeof nodeExecFile> | undefined;
+      let ownershipError: Error | null = null;
+      const monitor = setInterval(() => {
+        try { assertOwnership(); } catch (error) {
+          ownershipError = error instanceof Error ? error : new Error(String(error));
+          child?.kill("SIGKILL");
+        }
+      }, 10);
+      monitor.unref();
+      try { assertOwnership(); } catch (error) { clearInterval(monitor); reject(error); return; }
+      child = execFile(local?.executable ?? "git", args, {
+        cwd, encoding: "utf8", maxBuffer,
+        env: managedGitEnvironment(local ? { GIT_COMMON_DIR: explicitGitDir ?? cwd } : {}),
+        ...(local ? { timeout: local.timeoutMs, killSignal: "SIGKILL" as const, windowsHide: true } : {}),
+      }, (error, stdout) => {
+        clearInterval(monitor);
+        if (ownershipError) reject(ownershipError);
+        else if (error) reject(error);
+        else resolveOutput(String(stdout));
+      });
+    });
+    return result.trim();
+  } catch (error) {
+    try { assertOwnership(); } catch (ownershipError) { throw ownershipError; }
+    if (!local) throw error;
+    const command = args.find((arg) => ["fsck", "rev-parse", "ls-tree", "cat-file", "diff"].includes(arg)) ?? "command";
+    const detail = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+    if (detail.killed || detail.signal === "SIGKILL" || /timed out|timeout/i.test(detail.message ?? "")) {
+      throw new Error(`managed git-md ${command} timed out`);
+    }
+    throw new Error(`managed git-md ${command} failed`);
+  }
+}
+
+async function runGitBuffer(
+  execFile: typeof nodeExecFile,
+  args: string[],
+  cwd: string,
+  maxBuffer: number,
+  local: { timeoutMs: number; executable: string },
+  assertOwnership: () => void = () => undefined,
+): Promise<Buffer> {
+  try {
+    return await new Promise<Buffer>((resolveOutput, reject) => {
+      const explicitGitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);
+      let child: ReturnType<typeof nodeExecFile> | undefined;
+      let ownershipError: Error | null = null;
+      const monitor = setInterval(() => {
+        try { assertOwnership(); } catch (error) {
+          ownershipError = error instanceof Error ? error : new Error(String(error));
+          child?.kill("SIGKILL");
+        }
+      }, 10);
+      monitor.unref();
+      try { assertOwnership(); } catch (error) { clearInterval(monitor); reject(error); return; }
+      child = execFile(local.executable, args, {
+        cwd, encoding: null, maxBuffer, env: managedGitEnvironment({ GIT_COMMON_DIR: explicitGitDir ?? cwd }),
+        timeout: local.timeoutMs, killSignal: "SIGKILL", windowsHide: true,
+      }, (error, stdout, stderr) => {
+        clearInterval(monitor);
+        if (ownershipError) reject(ownershipError);
+        else if (error) reject(Object.assign(error, { stdout, stderr }));
+        else resolveOutput(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
+      });
+    });
+  } catch (error) {
+    try { assertOwnership(); } catch (ownershipError) { throw ownershipError; }
+    const command = args.find((arg) => ["fsck", "rev-parse", "ls-tree", "cat-file", "diff"].includes(arg)) ?? "command";
+    const detail = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+    if (detail.killed || detail.signal === "SIGKILL" || /timed out|timeout/i.test(detail.message ?? "")) {
+      throw new Error(`managed git-md ${command} timed out`);
+    }
+    throw new Error(`managed git-md ${command} failed`);
+  }
+}
+
+interface GitMaterializationDeadline {
+  check(): void;
+  command(localTimeoutMs: number): { timeoutMs: number; aggregateLimited: boolean };
+}
+
+function gitMaterializationDeadline(configured?: number, monotonicNow: () => number = () => performance.now()): GitMaterializationDeadline {
+  const duration = configured ?? DEFAULT_GIT_MATERIALIZATION_DEADLINE_MS;
+  if (!Number.isSafeInteger(duration) || duration < 1 || duration > MAX_GIT_MATERIALIZATION_DEADLINE_MS) {
+    throw new Error("invalid git-md materialization deadline");
+  }
+  const startedAt = monotonicNow();
+  if (!Number.isFinite(startedAt)) throw new Error("invalid git-md monotonic clock");
+  const expiresAt = startedAt + duration;
+  const remaining = (): number => {
+    const current = monotonicNow();
+    if (!Number.isFinite(current)) throw new Error("invalid git-md monotonic clock");
+    return expiresAt - current;
+  };
+  const check = (): void => {
+    if (remaining() <= 0) throw new Error("managed git-md materialization deadline exceeded");
+  };
+  return {
+    check,
+    command(localTimeoutMs) {
+      check();
+      const left = remaining();
+      return { timeoutMs: Math.max(1, Math.min(localTimeoutMs, left)), aggregateLimited: left <= localTimeoutMs };
+    },
+  };
+}
+
+async function runGitBeforeDeadline(
+  execFile: typeof nodeExecFile,
+  args: string[],
+  cwd: string,
+  maxBuffer: number | undefined,
+  local: { timeoutMs: number; executable: string },
+  deadline: GitMaterializationDeadline,
+  assertOwnership: () => void,
+): Promise<string> {
+  const command = deadline.command(local.timeoutMs);
+  try {
+    const output = await runGit(execFile, args, cwd, maxBuffer, { ...local, timeoutMs: command.timeoutMs }, assertOwnership);
+    deadline.check();
+    return output;
+  } catch (error) {
+    if (command.aggregateLimited && error instanceof Error && /timed out/.test(error.message)) {
+      throw new Error("managed git-md materialization deadline exceeded");
+    }
+    deadline.check();
+    throw error;
+  }
+}
+
+async function runGitBufferBeforeDeadline(
+  execFile: typeof nodeExecFile,
+  args: string[],
+  cwd: string,
+  maxBuffer: number,
+  local: { timeoutMs: number; executable: string },
+  deadline: GitMaterializationDeadline,
+  assertOwnership: () => void,
+): Promise<Buffer> {
+  const command = deadline.command(local.timeoutMs);
+  try {
+    const output = await runGitBuffer(execFile, args, cwd, maxBuffer, { ...local, timeoutMs: command.timeoutMs }, assertOwnership);
+    deadline.check();
+    return output;
+  } catch (error) {
+    if (command.aggregateLimited && error instanceof Error && /timed out/.test(error.message)) {
+      throw new Error("managed git-md materialization deadline exceeded");
+    }
+    deadline.check();
+    throw error;
+  }
 }
 
 function splitNulRecords(output: Buffer): string[] | null {
@@ -281,20 +593,32 @@ export async function detectRepoMdRenames(
   nextSnapshotId: string,
   oldSelectedPaths: ReadonlySet<string>,
   newSelectedPaths: ReadonlySet<string>,
-  options: { execFile?: typeof nodeExecFile; maxOutputBytes?: number } = {},
+  options: {
+    execFile?: typeof nodeExecFile; maxOutputBytes?: number; timeoutMs?: number; gitExecutable?: string;
+  } = {},
 ): Promise<Map<string, string>> {
   if (!OID_RE.test(priorSnapshotId) || !OID_RE.test(nextSnapshotId)) return new Map();
   const maxBuffer = options.maxOutputBytes ?? MAX_RENAME_DIFF_BYTES;
   if (!Number.isSafeInteger(maxBuffer) || maxBuffer < 1 || maxBuffer > MAX_RENAME_DIFF_BYTES) return new Map();
   const execFile = options.execFile ?? nodeExecFile;
+  const executable = options.timeoutMs === undefined
+    ? (options.gitExecutable ?? "git")
+    : resolvePinnedGitExecutable(options.gitExecutable);
   let output: Buffer;
   try {
+    if (options.timeoutMs !== undefined) validateManagedGitInvocation(repositoryRoot);
     output = await new Promise<Buffer>((resolveOutput, reject) => {
-      execFile("git", [
+      execFile(executable, [
         "--no-pager", "diff", "--no-ext-diff", "--name-status", "-z",
         "--no-textconv", `--find-renames=${REPO_MD_RENAME_SIMILARITY}%`, `-l${REPO_MD_RENAME_LIMIT}`,
         priorSnapshotId, nextSnapshotId, "--",
-      ], { cwd: repositoryRoot, encoding: null, maxBuffer }, (error, stdout) => {
+      ], {
+        cwd: repositoryRoot, encoding: null, maxBuffer,
+        env: managedGitEnvironment(options.timeoutMs === undefined ? {} : { GIT_COMMON_DIR: repositoryRoot }),
+        ...(options.timeoutMs === undefined ? {} : {
+          timeout: boundedLocalGitTimeout(options.timeoutMs), killSignal: "SIGKILL" as const, windowsHide: true,
+        }),
+      }, (error, stdout) => {
         if (error) reject(error);
         else resolveOutput(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
       });
@@ -346,27 +670,63 @@ function processIsLive(owner: { pid: number; host: string }): boolean {
 export async function withRepoMdMaterializerLock<T>(
   sourceId: string,
   options: RepoMdMaterializerOptions,
-  work: () => Promise<T>,
+  work: (guard: SourceMaterializerLockGuard) => Promise<T>,
+): Promise<T> {
+  return withTypedMaterializerLock("repo-md", sourceId, options, work);
+}
+
+export async function withGitMdMaterializerLock<T>(
+  sourceId: string,
+  options: RepoMdMaterializerOptions,
+  work: (guard: SourceMaterializerLockGuard) => Promise<T>,
+): Promise<T> {
+  return withTypedMaterializerLock("git-md", sourceId, options, work);
+}
+
+async function withTypedMaterializerLock<T>(
+  type: "repo-md" | "git-md",
+  sourceId: string,
+  options: RepoMdMaterializerOptions,
+  work: (guard: SourceMaterializerLockGuard) => Promise<T>,
 ): Promise<T> {
   const now = options.now ?? Date.now;
-  const token = (options.token ?? randomUUID)();
+  const token = requireArtifactToken((options.token ?? randomUUID)());
   const staleMs = options.lockStaleMs ?? 5 * 60_000;
   requireSourceId(sourceId);
-  const repo = managedRepoRoot(options.sourceStorageDir)!;
+  const repo = managedTypeRoot(type, options.sourceStorageDir, true, () => undefined, options.safeTreeOps)!;
   // Validate an existing source root before even acquiring its sibling lock.
-  sourceRoot(sourceId, options.sourceStorageDir, false);
+  typedSourceRoot(type, sourceId, options.sourceStorageDir, false, () => undefined, options.safeTreeOps);
   // The lock is a sibling of the source root so removal can quarantine the whole root atomically.
   const lock = join(repo, `.lock-${sourceId}`);
+  const freezeLockTree = (path: string): FrozenSameDeviceTree => {
+    const label = `${type} materializer lock tree`;
+    const frozen = freezeSameDeviceTree(path, label, options.safeTreeOps);
+    for (const [index, node] of frozen.nodes.entries()) {
+      if (node.dev !== frozen.rootDev) throw new Error(`${label} crosses a filesystem boundary`);
+      if (index === 0) {
+        if (!node.directory) throw new Error(`${label} root is unsafe`);
+        continue;
+      }
+      const name = relative(path, node.path);
+      if (name.includes(sep) || !node.regularFile || node.symbolicLink || node.nlink !== 1
+          || (name !== "owner.json" && !/^\.owner-[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(name))) {
+        throw new Error(`${label} contains an unsafe node`);
+      }
+    }
+    return frozen;
+  };
   const validateLock = (): void => {
-    const entry = lstatSync(lock);
+    const entry = assertManagedDirectoryTrust(lock, `${type} materializer lock`, options.safeTreeOps, true);
     const canonical = realpathSync.native(lock);
     if (!entry.isDirectory() || entry.isSymbolicLink() || canonical !== lock || dirname(canonical) !== repo) {
-      throw new Error("repo-md materializer lock is not a real managed directory");
+      throw new Error(`${type} materializer lock is not a real managed directory`);
     }
   };
-  const writeOwner = (): void => {
+  const writeOwner = (beforeMutation: () => void = () => undefined): void => {
     const temporary = join(lock, `.owner-${token}`);
+    beforeMutation();
     writeFileSync(temporary, JSON.stringify({ token, heartbeatAt: now(), pid: process.pid, host: hostname() }), { flag: "wx", mode: 0o600 });
+    beforeMutation();
     renameSync(temporary, join(lock, "owner.json"));
   };
   const acquire = (): void => {
@@ -374,33 +734,66 @@ export async function withRepoMdMaterializerLock<T>(
       validateLock();
       const owner = lockOwner(lock);
       const heartbeat = owner?.heartbeatAt ?? lstatSync(lock).mtimeMs;
-      if ((owner && processIsLive(owner)) || now() - heartbeat <= staleMs) throw new Error("repo-md source materializer is locked");
+      if ((owner && processIsLive(owner)) || now() - heartbeat <= staleMs) throw new Error(`${type} source materializer is locked`);
       const stale = `${lock}.stale-${token}`;
+      const frozenLock = freezeLockTree(lock);
+      revalidateSameDeviceTree(frozenLock, `${type} materializer lock tree`, options.safeTreeOps);
       try { renameSync(lock, stale); } catch { throw new Error("repo-md source materializer lock changed during stale takeover"); }
-      rmSync(stale, { recursive: true, force: true });
+      const frozenStale = freezeLockTree(stale);
+      removeFrozenSameDeviceTree(frozenStale, `${type} materializer lock tree`, () => undefined,
+        { ops: options.safeTreeOps });
       mkdirSync(lock, { mode: 0o700 });
       writeOwner();
     }
   };
   acquire();
+  const acquiredEntry = assertManagedDirectoryTrust(lock, `${type} materializer lock`, options.safeTreeOps, true);
   let lostOwnership: Error | null = null;
+  const assertOwnership = (): void => {
+    if (lostOwnership) throw lostOwnership;
+    try {
+      const current = assertManagedDirectoryTrust(lock, `${type} materializer lock`, options.safeTreeOps, true);
+      if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== acquiredEntry.dev
+          || current.ino !== acquiredEntry.ino || realpathSync.native(lock) !== lock
+          || lockOwner(lock)?.token !== token) {
+        throw new Error(`${type} materializer lock ownership was lost`);
+      }
+    } catch (error) {
+      lostOwnership = error instanceof Error && /ownership was lost/.test(error.message)
+        ? error : new Error(`${type} materializer lock ownership was lost`);
+      throw lostOwnership;
+    }
+  };
   const heartbeat = setInterval(() => {
     try {
-      if (lockOwner(lock)?.token !== token) throw new Error("repo-md materializer lock ownership was lost");
-      writeOwner();
+      assertOwnership();
+      writeOwner(assertOwnership);
     } catch (error) { lostOwnership = error instanceof Error ? error : new Error(String(error)); }
   }, Math.max(10, Math.floor(staleMs / 3)));
   heartbeat.unref();
   try {
     options.fault?.("after-lock");
-    const result = await work();
-    if (lostOwnership) throw lostOwnership;
+    const result = await work({ assertOwnership });
+    assertOwnership();
     return result;
+  } catch (error) {
+    if (lostOwnership) throw lostOwnership;
+    throw error;
   } finally {
     clearInterval(heartbeat);
-    if (lockOwner(lock)?.token === token) rmSync(lock, { recursive: true, force: true });
+    try {
+      assertOwnership();
+      const frozenLock = freezeLockTree(lock);
+      removeFrozenSameDeviceTree(frozenLock, `${type} materializer lock tree`, assertOwnership,
+        { ops: options.safeTreeOps, check: assertOwnership });
+    } catch (error) {
+      // A displaced owner must never remove the replacement owner's lock directory.
+      if (!lostOwnership) throw error;
+    }
   }
 }
+
+export interface SourceMaterializerLockGuard { assertOwnership(): void }
 
 function variantName(snapshotId: string, configHash: string): string {
   if (!OID_RE.test(snapshotId)) throw new Error("invalid committed snapshot OID");
@@ -409,20 +802,35 @@ function variantName(snapshotId: string, configHash: string): string {
 }
 
 export function repoMdSnapshotPath(sourceId: string, snapshotId: string, configHash: string, sourceStorageDir: string): string {
-  return join(sourceRoot(sourceId, sourceStorageDir)!, "snapshots", variantName(snapshotId, configHash));
+  const root = sourceRoot(sourceId, sourceStorageDir)!;
+  const frozen = freezeSnapshotsDirectory(root, true)!;
+  revalidateSnapshotsDirectory(frozen);
+  return join(frozen.snapshots.path, variantName(snapshotId, configHash));
+}
+
+export function sourceSnapshotPath(
+  source: Pick<KnowledgeSource, "id" | "type">, snapshotId: string, configHash: string, sourceStorageDir: string,
+  beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {},
+): string {
+  const root = typedSourceRoot(source.type, source.id, sourceStorageDir, true, beforeMutation, safeTreeOps)!;
+  const frozen = freezeSnapshotsDirectory(root, true, beforeMutation, safeTreeOps)!;
+  revalidateSnapshotsDirectory(frozen, safeTreeOps);
+  return join(frozen.snapshots.path, variantName(snapshotId, configHash));
 }
 
 function repoMdSnapshotSidecarPath(sourceId: string, snapshotId: string, configHash: string, sourceStorageDir: string): string {
   return `${repoMdSnapshotPath(sourceId, snapshotId, configHash, sourceStorageDir)}.complete.json`;
 }
 
-function hashFile(path: string): { size: number; sha256: string } {
+function hashFile(path: string, check: () => void = () => undefined): { size: number; sha256: string } {
   const fd = openSync(path, constants.O_RDONLY);
   const hash = createHash("sha256");
   let size = 0;
   const buffer = Buffer.alloc(IO_CHUNK);
   try {
     for (;;) {
+      check();
       const count = readSync(fd, buffer, 0, buffer.length, null);
       if (count === 0) break;
       hash.update(buffer.subarray(0, count));
@@ -437,14 +845,53 @@ function fsyncPath(path: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-function validateSealedSnapshot(snapshotPath: string, sidecarPath: string, snapshotId: string, configHash: string): SnapshotMarker {
+function durableFsync(options: Pick<RepoMdMaterializerOptions, "fsyncPath">, path: string): void {
+  (options.fsyncPath ?? fsyncPath)(path);
+}
+
+function durableSnapshotParents(options: RepoMdMaterializerOptions, root: string, beforeMutation: () => void): void {
+  // Persist both the snapshots entry within the source root and a newly-created
+  // source-root entry within its type root before the ledger can publish it.
+  beforeMutation();
+  durableFsync(options, root);
+  beforeMutation();
+  durableFsync(options, dirname(root));
+}
+
+function readFileWithChecks(path: string, check: () => void, maximumBytes: number): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const buffer = Buffer.alloc(IO_CHUNK);
+  try {
+    for (;;) {
+      check();
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      total += count;
+      if (total > maximumBytes) throw new Error("existing source snapshot marker exceeds its byte limit");
+      chunks.push(Buffer.from(buffer.subarray(0, count)));
+    }
+  } finally { closeSync(fd); }
+  check();
+  return Buffer.concat(chunks, total).toString("utf8");
+}
+
+function validateSealedSnapshot(
+  snapshotPath: string, sidecarPath: string, snapshotId: string, configHash: string,
+  check: () => void = () => undefined,
+): SnapshotMarker {
+  check();
   const root = lstatSync(snapshotPath);
-  if (!root.isDirectory() || root.isSymbolicLink() || (root.mode & 0o222) !== 0) throw new Error("existing source snapshot is not a sealed Monet directory");
+  if (!root.isDirectory() || root.isSymbolicLink() || realpathSync.native(snapshotPath) !== snapshotPath
+      || (root.mode & 0o222) !== 0) throw new Error("existing source snapshot is not a sealed Monet directory");
+  const rootDev = root.dev;
   const sidecar = lstatSync(sidecarPath);
-  if (!sidecar.isFile() || sidecar.isSymbolicLink() || (sidecar.mode & 0o222) !== 0) {
+  if (!sidecar.isFile() || sidecar.isSymbolicLink() || sidecar.nlink !== 1 || (sidecar.mode & 0o222) !== 0) {
     throw new Error("existing source snapshot completion sidecar is not sealed");
   }
-  const marker = JSON.parse(readFileSync(sidecarPath, "utf8")) as SnapshotMarker;
+  if (sidecar.size > MAX_SNAPSHOT_MARKER_BYTES) throw new Error("existing source snapshot marker exceeds its byte limit");
+  const marker = JSON.parse(readFileWithChecks(sidecarPath, check, MAX_SNAPSHOT_MARKER_BYTES)) as SnapshotMarker;
   if (marker.version !== 2 || marker.snapshotId !== snapshotId || marker.configHash !== configHash
       || marker.variant !== variantName(snapshotId, configHash) || !Array.isArray(marker.files)) {
     throw new Error("existing source snapshot marker does not match its OID/configuration");
@@ -452,6 +899,7 @@ function validateSealedSnapshot(snapshotPath: string, sidecarPath: string, snaps
   const expected = new Map<string, SnapshotMarker["files"][number]>();
   const expectedDirectories = new Set<string>();
   for (const file of marker.files) {
+    check();
     const path = validateArchivePath(file.path);
     if (path !== file.path || expected.has(path) || !Number.isSafeInteger(file.size) || file.size < 0
         || !DIGEST_RE.test(file.sha256)) throw new Error("existing source snapshot marker manifest is invalid");
@@ -462,25 +910,103 @@ function validateSealedSnapshot(snapshotPath: string, sidecarPath: string, snaps
     }
   }
   const walk = (directory: string, relativeDirectory: string): void => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    check();
+    const children = readdirSync(directory, { withFileTypes: true });
+    check();
+    for (const entry of children) {
+      check();
       const rel = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
       const absolute = join(directory, entry.name);
       const stats = lstatSync(absolute);
       if (stats.isSymbolicLink() || (stats.mode & 0o222) !== 0) throw new Error("existing source snapshot is not sealed");
       if (entry.isDirectory()) {
+        if (stats.dev !== rootDev) throw new Error("existing source snapshot crosses a filesystem boundary");
         if (!expectedDirectories.has(rel)) throw new Error("existing source snapshot contains an unexpected directory");
         walk(absolute, rel);
       }
       else if (entry.isFile()) {
         const wanted = expected.get(rel);
-        const actual = hashFile(absolute);
-        if (!wanted || wanted.size !== actual.size || wanted.sha256 !== actual.sha256) throw new Error("existing source snapshot content was tampered");
+        const actual = hashFile(absolute, check);
+        if (stats.nlink !== 1 || !wanted || wanted.size !== actual.size || wanted.sha256 !== actual.sha256) {
+          throw new Error("existing source snapshot content was tampered");
+        }
         expected.delete(rel);
       } else if (!entry.isFile()) throw new Error("existing source snapshot contains an unsupported node");
     }
   };
   walk(snapshotPath, "");
   if (expected.size !== 0) throw new Error("existing source snapshot is incomplete");
+  return marker;
+}
+
+function hashFileGitProof(
+  path: string, oidLength: number, check: () => void = () => undefined,
+): { size: number; sha256: string; oid: string } {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const bytes = statSync(path).size;
+  const content = createHash("sha256");
+  const object = createHash(oidLength === 64 ? "sha256" : "sha1");
+  object.update(`blob ${bytes}\0`);
+  const buffer = Buffer.alloc(IO_CHUNK);
+  let size = 0;
+  try {
+    for (;;) {
+      check();
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      const chunk = buffer.subarray(0, count);
+      content.update(chunk); object.update(chunk); size += count;
+    }
+  } finally { closeSync(fd); }
+  return { size, sha256: content.digest("hex"), oid: object.digest("hex") };
+}
+
+function validateSealedSnapshotAgainstGit(
+  snapshotPath: string, marker: SnapshotMarker, entries: readonly TreeEntry[], check: () => void = () => undefined,
+): void {
+  if (marker.files.length !== entries.length) throw new Error("cached git-md snapshot does not match the selected Git manifest");
+  const byPath = new Map(marker.files.map((file) => [file.path, file]));
+  for (const entry of entries) {
+    check();
+    const cached = byPath.get(entry.path);
+    if (!cached || cached.mode !== entry.mode || cached.size !== entry.size) {
+      throw new Error("cached git-md snapshot path, mode, or size does not match Git");
+    }
+    const proof = hashFileGitProof(join(snapshotPath, entry.path), entry.oid.length, check);
+    if (proof.size !== entry.size || proof.sha256 !== cached.sha256 || proof.oid !== entry.oid) {
+      throw new Error("cached git-md snapshot content does not match its Git blob");
+    }
+    byPath.delete(entry.path);
+  }
+  if (byPath.size !== 0) throw new Error("cached git-md snapshot contains paths absent from Git");
+}
+
+function validateSealedSnapshotAgainstLedger(
+  snapshotPath: string, sidecarPath: string, snapshotId: string, configHash: string,
+  publication: SourcePublishedManifest, check: () => void = () => undefined,
+): SnapshotMarker {
+  check();
+  if (publication.snapshotId !== snapshotId || publication.ingestConfigHash !== configHash) {
+    throw new Error("published ledger manifest does not match the active snapshot/configuration");
+  }
+  const marker = validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, configHash, check);
+  const expected = new Map(publication.files.map((file) => [file.relativePath, file]));
+  if (expected.size !== publication.files.length || marker.files.length !== publication.files.length) {
+    throw new Error("sealed git-md snapshot does not match the durable ledger path set");
+  }
+  const observed = marker.files.map((file) => {
+    check();
+    const ledger = expected.get(file.path);
+    const actualContentHash = `monet-src-content/v1:sha256:${file.sha256}`;
+    if (!ledger || ledger.byteLength !== file.size || ledger.contentHash !== actualContentHash) {
+      throw new Error("sealed git-md snapshot content does not match the durable ledger");
+    }
+    expected.delete(file.path);
+    return { relativePath: file.path, type: "file" as const, contentHash: actualContentHash, byteLength: file.size };
+  });
+  if (expected.size !== 0 || computeSourceManifestHash(observed) !== publication.manifestHash) {
+    throw new Error("sealed git-md snapshot manifest hash does not match the durable ledger");
+  }
   return marker;
 }
 
@@ -511,28 +1037,74 @@ export function validateRepoMdPublishedPath(
   return { path: current, snapshotPath };
 }
 
-function sealSnapshot(tree: string): void {
+export function validateSourcePublishedPath(
+  source: SourcePathIdentity,
+  snapshotId: string,
+  configHash: string,
+  sourceStorageDir: string,
+  publication?: SourcePublishedManifest,
+  check: () => void = () => undefined,
+): { path: string; snapshotPath: string } {
+  check();
+  const root = typedSourceRoot(source.type, source.id, sourceStorageDir, false);
+  if (!root) throw new Error("published source snapshot is unavailable");
+  const frozen = freezeSnapshotsDirectory(root, false);
+  if (!frozen) throw new Error("published source snapshots directory is unavailable");
+  check();
+  revalidateSnapshotsDirectory(frozen);
+  const snapshots = frozen.snapshots.path;
+  const snapshotsReal = snapshots;
+  const snapshotPath = join(snapshots, variantName(snapshotId, configHash));
+  if (publication) {
+    if (source.activeRunId && publication.runId !== source.activeRunId) throw new Error("published ledger manifest run fence is stale");
+    validateSealedSnapshotAgainstLedger(snapshotPath, `${snapshotPath}.complete.json`, snapshotId, configHash, publication, check);
+  }
+  else validateSealedSnapshot(snapshotPath, `${snapshotPath}.complete.json`, snapshotId, configHash, check);
+  check();
+  const snapshotReal = realpathSync.native(snapshotPath);
+  if (snapshotReal !== snapshotPath || dirname(snapshotReal) !== snapshotsReal) throw new Error("published source snapshot escapes managed storage");
+  const current = join(root, "current");
+  check();
+  revalidateSnapshotsDirectory(frozen);
+  if (!lstatSync(current).isSymbolicLink() || readlinkSync(current) !== relative(root, snapshotPath)
+      || realpathSync.native(current) !== snapshotReal) throw new Error("published source current pointer does not match the active snapshot");
+  check();
+  return { path: current, snapshotPath };
+}
+
+function sealSnapshot(
+  tree: string, beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {}, check: () => void = () => undefined,
+): void {
+  const frozen = freezeSameDeviceTree(tree, "managed source snapshot staging tree", safeTreeOps, check);
+  revalidateSameDeviceTree(frozen, "managed source snapshot staging tree", safeTreeOps, check);
   const seal = (directory: string): void => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    check();
+    const children = readdirSync(directory, { withFileTypes: true });
+    check();
+    for (const entry of children) {
+      check();
       const absolute = join(directory, entry.name);
       if (entry.isDirectory()) seal(absolute);
-      else { chmodSync(absolute, 0o400); fsyncPath(absolute); }
+      else { beforeMutation(); chmodSync(absolute, 0o400); fsyncPath(absolute); }
     }
+    beforeMutation();
     chmodSync(directory, 0o500);
     fsyncPath(directory);
   };
   seal(tree);
 }
 
-function makeTreeWritable(path: string): void {
+function removeManagedTree(
+  path: string, label: string, beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {}, check: () => void = () => undefined,
+): void {
   try {
-    const stats = lstatSync(path);
-    // Unlink permission comes from the parent directory. Never chmod leaves: a regular
-    // file may be a hardlink whose inode/mode is shared with data outside managed storage.
-    if (stats.isSymbolicLink() || !stats.isDirectory()) return;
-    chmodSync(path, 0o700);
-    for (const entry of readdirSync(path)) makeTreeWritable(join(path, entry));
-  } catch { /* cleanup is best-effort and scoped only to the unique temporary path */ }
+    const frozen = freezeSameDeviceTree(path, label, safeTreeOps, check);
+    removeFrozenSameDeviceTree(frozen, label, beforeMutation, { writable: true, ops: safeTreeOps, check });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 export function pointRepoMdCurrent(
@@ -541,27 +1113,81 @@ export function pointRepoMdCurrent(
   configHash: string,
   options: RepoMdMaterializerOptions,
 ): string {
-  const root = sourceRoot(sourceId, options.sourceStorageDir);
-  const snapshot = repoMdSnapshotPath(sourceId, snapshotId, configHash, options.sourceStorageDir);
-  const sidecar = repoMdSnapshotSidecarPath(sourceId, snapshotId, configHash, options.sourceStorageDir);
-  validateSealedSnapshot(snapshot, sidecar, snapshotId, configHash);
-  const current = join(root!, "current");
-  const temporary = join(root!, `.current-${(options.token ?? randomUUID)()}`);
+  return pointSourceCurrent({ id: sourceId, type: "repo-md" }, snapshotId, configHash, options);
+}
+
+export function pointSourceCurrent(
+  source: SourcePathIdentity,
+  snapshotId: string,
+  configHash: string,
+  options: RepoMdMaterializerOptions,
+  publication?: SourcePublishedManifest,
+): string {
+  const beforeMutation = options.assertOwnership ?? (() => undefined);
+  const safeTreeOps = options.safeTreeOps ?? {};
+  const root = typedSourceRoot(source.type, source.id, options.sourceStorageDir, true, beforeMutation, safeTreeOps)!;
+  const frozen = freezeSnapshotsDirectory(root, false, beforeMutation, safeTreeOps);
+  if (!frozen) throw new Error("published source snapshots directory is unavailable");
+  const revalidate = (): void => revalidateSnapshotsDirectory(frozen, safeTreeOps);
+  revalidate();
+  const snapshot = join(frozen.snapshots.path, variantName(snapshotId, configHash));
+  if (publication) {
+    if (publication.sourceId !== source.id) throw new Error("published ledger manifest belongs to a different source");
+    if (source.activeRunId && publication.runId !== source.activeRunId) throw new Error("published ledger manifest run fence is stale");
+    validateSealedSnapshotAgainstLedger(snapshot, `${snapshot}.complete.json`, snapshotId, configHash, publication);
+  } else validateSealedSnapshot(snapshot, `${snapshot}.complete.json`, snapshotId, configHash);
+  const current = join(root, "current");
+  for (const name of readdirSync(root)) {
+    if (!/^\.current-[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(name)) continue;
+    const stale = join(root, name);
+    const entry = lstatSync(stale);
+    const target = entry.isSymbolicLink() ? readlinkSync(stale) : "";
+    if (!entry.isSymbolicLink() || !target.startsWith(`snapshots${sep}`) || isAbsolute(target)) {
+      throw new Error("managed source current staging pointer is poisoned");
+    }
+    beforeMutation();
+    rmSync(stale);
+  }
+  const temporary = join(root, `.current-${requireArtifactToken((options.token ?? randomUUID)())}`);
+  revalidate();
   options.fault?.("before-current-swap");
-  symlinkSync(relative(root!, snapshot), temporary, "dir");
-  try { renameSync(temporary, current); } catch (error) { rmSync(temporary, { force: true }); throw error; }
+  revalidate();
+  beforeMutation();
+  symlinkSync(relative(root, snapshot), temporary, "dir");
+  try {
+    revalidate();
+    if (publication) validateSealedSnapshotAgainstLedger(snapshot, `${snapshot}.complete.json`, snapshotId, configHash, publication);
+    revalidate();
+    beforeMutation();
+    renameSync(temporary, current);
+    // The pointer is not published to callers until its directory entry is durable.
+    beforeMutation();
+    durableFsync(options, root);
+  } catch (error) { beforeMutation(); rmSync(temporary, { force: true }); throw error; }
   options.fault?.("after-current-swap");
   return current;
 }
 
 export function revokeRepoMdCurrent(sourceId: string, sourceStorageDir: string): void {
-  const root = sourceRoot(sourceId, sourceStorageDir, false);
+  revokeSourceCurrent({ id: sourceId, type: "repo-md" }, sourceStorageDir);
+}
+
+export function revokeSourceCurrent(
+  source: Pick<KnowledgeSource, "id" | "type">, sourceStorageDir: string, beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {},
+): void {
+  const root = typedSourceRoot(source.type, source.id, sourceStorageDir, false, beforeMutation, safeTreeOps);
   if (!root) return;
+  const frozen = freezeSnapshotsDirectory(root, false, beforeMutation, safeTreeOps);
+  if (frozen) revalidateSnapshotsDirectory(frozen, safeTreeOps);
   const current = join(root, "current");
   try {
     const entry = lstatSync(current);
-    if (!entry.isSymbolicLink()) throw new Error("managed repo-md current pointer is not a symlink");
+    if (!entry.isSymbolicLink()) throw new Error(`managed ${source.type} current pointer is not a symlink`);
+    if (frozen) revalidateSnapshotsDirectory(frozen, safeTreeOps);
+    beforeMutation();
     rmSync(current);
+    beforeMutation();
     fsyncPath(root);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -570,26 +1196,54 @@ export function revokeRepoMdCurrent(sourceId: string, sourceStorageDir: string):
 
 /** Remove only recognizable Monet-owned artifacts beneath the hashed source storage root. */
 export function removeRepoMdMaterializations(sourceId: string, sourceStorageDir: string): void {
-  requireSourceId(sourceId);
-  const repo = managedRepoRoot(sourceStorageDir)!;
-  const quarantinePattern = new RegExp(`^\\.remove-${sourceId}-[A-Za-z0-9-]+$`);
-  const quarantines = readdirSync(repo).filter((name) => quarantinePattern.test(name));
-  if (quarantines.length > 1) throw new Error("multiple managed repo-md removal quarantines exist");
-  let quarantine = quarantines[0] ? join(repo, quarantines[0]) : null;
-  const root = sourceRoot(sourceId, sourceStorageDir, false);
-  if (root && quarantine) throw new Error("managed repo-md source root and removal quarantine both exist");
-  if (root) {
-    revokeRepoMdCurrent(sourceId, sourceStorageDir);
-    quarantine = join(repo, `.remove-${sourceId}-${randomUUID()}`);
-    renameSync(root, quarantine);
-    fsyncPath(repo);
+  removeSourceMaterializations({ id: sourceId, type: "repo-md" }, sourceStorageDir);
+}
+
+interface FrozenRemovalDirectory {
+  path: string;
+  dev: number;
+  ino: number;
+  tree: FrozenSameDeviceTree;
+}
+
+function freezeRemovalDirectory(
+  repo: string, path: string, label: string, safeTreeOps: SafeTreeOps = {},
+): FrozenRemovalDirectory {
+  const entry = assertManagedDirectoryTrust(path, label, safeTreeOps, true);
+  if (!entry.isDirectory() || entry.isSymbolicLink() || realpathSync.native(path) !== path
+      || dirname(path) !== repo || !contained(repo, path)) {
+    const requirement = label === "managed source removal quarantine"
+      ? "not a real direct-child directory"
+      : "not a recognized real direct-child directory";
+    throw new Error(`${label} is ${requirement}`);
   }
-  if (!quarantine) return;
-  const quarantineEntry = lstatSync(quarantine);
-  const canonicalQuarantine = realpathSync.native(quarantine);
-  if (!quarantineEntry.isDirectory() || quarantineEntry.isSymbolicLink() || dirname(canonicalQuarantine) !== repo
-      || canonicalQuarantine !== quarantine) throw new Error("managed repo-md removal quarantine is not a real direct child");
-  const removalRoot = quarantine;
+  return { path, dev: entry.dev, ino: entry.ino, tree: freezeSameDeviceTree(path, label, safeTreeOps) };
+}
+
+function revalidateRemovalDirectory(
+  repo: string, frozen: FrozenRemovalDirectory, label: string, safeTreeOps: SafeTreeOps = {},
+): void {
+  const current = freezeRemovalDirectory(repo, frozen.path, label, safeTreeOps);
+  if (current.dev !== frozen.dev || current.ino !== frozen.ino) throw new Error(`${label} changed during removal`);
+  revalidateSameDeviceTree(frozen.tree, label, safeTreeOps);
+}
+
+function validateRemovalTree(path: string, root: string, rootDev: number): void {
+  const entry = lstatSync(path);
+  if (entry.isSymbolicLink()) return; // A recognized leaf link is unlinked, never followed.
+  if (entry.isDirectory()) {
+    if (entry.dev !== rootDev) throw new Error("managed source removal tree crosses a filesystem boundary");
+    if (realpathSync.native(path) !== path || !contained(root, path)) throw new Error("managed source removal tree escapes its quarantine");
+    for (const child of readdirSync(path)) validateRemovalTree(join(path, child), root, rootDev);
+    return;
+  }
+  if (!entry.isFile()) throw new Error("managed source removal tree contains an unsupported node");
+}
+
+function validateRemovalRootContents(
+  removalRoot: string, sourceType: "repo-md" | "git-md", allowCurrent: boolean, safeTreeOps: SafeTreeOps = {},
+): void {
+  const rootDev = lstatSync(removalRoot).dev;
   const variant = "[0-9a-f]{40,64}-[0-9a-f]{64}";
   const finalTree = new RegExp(`^${variant}$`);
   const finalSidecar = new RegExp(`^${variant}\\.complete\\.json$`);
@@ -597,44 +1251,131 @@ export function removeRepoMdMaterializations(sourceId: string, sourceStorageDir:
   const temporarySidecar = new RegExp(`^\\.complete-${variant}-[A-Za-z0-9-]+\\.json$`);
   const snapshots = join(removalRoot, "snapshots");
   try {
-    const snapshotsEntry = lstatSync(snapshots);
-    if (!snapshotsEntry.isDirectory() || snapshotsEntry.isSymbolicLink()) {
-      throw new Error("managed repo-md snapshots root is not a real directory");
-    }
+    const snapshotsEntry = assertManagedDirectoryTrust(snapshots, "managed source snapshots root", safeTreeOps, true);
+    if (!snapshotsEntry.isDirectory() || snapshotsEntry.isSymbolicLink() || realpathSync.native(snapshots) !== snapshots
+        || !contained(removalRoot, snapshots)) throw new Error("managed source snapshots root is not a canonical real directory");
     for (const entry of readdirSync(snapshots, { withFileTypes: true })) {
       const recognizedTree = finalTree.test(entry.name) || temporaryTree.test(entry.name);
       const recognizedSidecar = finalSidecar.test(entry.name) || temporarySidecar.test(entry.name);
       if ((!recognizedTree && !recognizedSidecar) || (recognizedTree && !entry.isDirectory() && !entry.isSymbolicLink())
           || (recognizedSidecar && !entry.isFile() && !entry.isSymbolicLink())) {
-        throw new Error(`unrecognized node in managed repo-md snapshots: ${entry.name}`);
+        throw new Error(`unrecognized node in managed source snapshots: ${entry.name}`);
       }
-      const path = join(snapshots, entry.name);
-      if (entry.isDirectory()) makeTreeWritable(path);
-      rmSync(path, { recursive: entry.isDirectory(), force: true });
+      validateRemovalTree(join(snapshots, entry.name), removalRoot, rootDev);
     }
-    rmSync(snapshots, { recursive: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  try {
-    for (const entry of readdirSync(removalRoot, { withFileTypes: true })) {
-      const materializeTemp = /^\.materialize-[0-9a-f]{40,64}-[A-Za-z0-9-]+$/.test(entry.name);
-      const currentTemp = /^\.current-[A-Za-z0-9-]+$/.test(entry.name);
-      if ((!materializeTemp && !currentTemp)
-          || (materializeTemp && !entry.isDirectory() && !entry.isSymbolicLink())
-          || (currentTemp && !entry.isFile() && !entry.isSymbolicLink())) {
-        throw new Error(`unrecognized node in managed repo-md source root: ${entry.name}`);
-      }
-      const path = join(removalRoot, entry.name);
-      if (entry.isDirectory()) makeTreeWritable(path);
-      rmSync(path, { recursive: entry.isDirectory(), force: true });
+  for (const entry of readdirSync(removalRoot, { withFileTypes: true })) {
+    if (entry.name === "snapshots") continue;
+    const materializeTemp = /^\.materialize-[0-9a-f]{40,64}-[A-Za-z0-9-]+$/.test(entry.name);
+    const currentTemp = /^\.current-[A-Za-z0-9-]+$/.test(entry.name);
+    const current = allowCurrent && entry.name === "current";
+    const bareRepository = sourceType === "git-md" && entry.name === "repository.git";
+    if ((!materializeTemp && !currentTemp && !current && !bareRepository)
+        || (materializeTemp && !entry.isDirectory() && !entry.isSymbolicLink())
+        || ((currentTemp || current) && !entry.isSymbolicLink())
+        || (bareRepository && !entry.isDirectory() && !entry.isSymbolicLink())) {
+      throw new Error(`unrecognized node in managed ${sourceType} source root: ${entry.name}`);
     }
-    fsyncPath(removalRoot);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (bareRepository && entry.isDirectory()) {
+      assertManagedDirectoryTrust(join(removalRoot, entry.name), "managed git-md repository", safeTreeOps, true);
+    }
+    validateRemovalTree(join(removalRoot, entry.name), removalRoot, rootDev);
   }
-  rmSync(removalRoot, { recursive: true });
-  fsyncPath(repo);
+}
+
+function preflightSourceMaterializationRemoval(
+  source: Pick<KnowledgeSource, "id" | "type">, sourceStorageDir: string, safeTreeOps: SafeTreeOps = {},
+): {
+  repo: string;
+  auxiliary: FrozenRemovalDirectory[];
+  quarantines: FrozenRemovalDirectory[];
+  root: string | null;
+  frozenRoot: FrozenRemovalDirectory | null;
+} {
+  const sourceId = source.id;
+  requireSourceId(sourceId);
+  const repo = managedTypeRoot(source.type, sourceStorageDir, true, () => undefined, safeTreeOps)!;
+  const auxiliary: FrozenRemovalDirectory[] = [];
+  const quarantines: FrozenRemovalDirectory[] = [];
+  // Phase one is deliberately exhaustive: no owned artifact is touched until
+  // every current/legacy name and every removal root has been classified and
+  // validated.
+  for (const name of readdirSync(repo)) {
+    const auxiliaryOwnership = source.type === "git-md"
+      ? (["clone", "corrupt", "repo"] as const).map((kind) => siblingArtifactOwnership(name, kind, sourceId))
+      : [];
+    const removalOwnership = siblingArtifactOwnership(name, "remove", sourceId);
+    if (auxiliaryOwnership.includes("ambiguous")) throw new Error("managed git-md legacy artifact ownership is ambiguous");
+    if (removalOwnership === "ambiguous") throw new Error("managed source legacy removal ownership is ambiguous");
+    if (auxiliaryOwnership.includes("owned")) {
+      auxiliary.push(freezeRemovalDirectory(repo, join(repo, name), "managed git-md quarantine", safeTreeOps));
+    }
+    if (removalOwnership === "owned") {
+      const frozen = freezeRemovalDirectory(repo, join(repo, name), "managed source removal quarantine", safeTreeOps);
+      validateRemovalRootContents(frozen.path, source.type, true, safeTreeOps);
+      quarantines.push(frozen);
+    }
+  }
+  const root = typedSourceRoot(source.type, sourceId, sourceStorageDir, false, () => undefined, safeTreeOps);
+  const frozenRoot = root ? freezeRemovalDirectory(repo, root, `managed ${source.type} source root`, safeTreeOps) : null;
+  if (root) validateRemovalRootContents(root, source.type, true, safeTreeOps);
+
+  return { repo, auxiliary, quarantines, root, frozenRoot };
+}
+
+/** Read-only exhaustive removal validation used before the coordinator revokes current. */
+export function validateSourceMaterializationRemoval(
+  source: Pick<KnowledgeSource, "id" | "type">,
+  sourceStorageDir: string,
+  safeTreeOps: SafeTreeOps = {},
+): void {
+  const { repo, auxiliary, quarantines, frozenRoot } = preflightSourceMaterializationRemoval(source, sourceStorageDir, safeTreeOps);
+  for (const frozen of auxiliary) revalidateRemovalDirectory(repo, frozen, "managed git-md quarantine", safeTreeOps);
+  for (const frozen of quarantines) revalidateRemovalDirectory(repo, frozen, "managed source removal quarantine", safeTreeOps);
+  if (frozenRoot) revalidateRemovalDirectory(repo, frozenRoot, `managed ${source.type} source root`, safeTreeOps);
+}
+
+export function removeSourceMaterializations(
+  source: Pick<KnowledgeSource, "id" | "type">, sourceStorageDir: string, beforeMutation: () => void = () => undefined,
+  safeTreeOps: SafeTreeOps = {},
+): void {
+  const sourceId = source.id;
+  const { repo, auxiliary, quarantines, root, frozenRoot } = preflightSourceMaterializationRemoval(source, sourceStorageDir, safeTreeOps);
+
+  // Revalidate the entire frozen set once more at the mutation boundary, then
+  // each directory immediately before its own rename/removal.
+  for (const frozen of [...auxiliary, ...quarantines]) {
+    revalidateRemovalDirectory(repo, frozen, "managed source quarantine", safeTreeOps);
+  }
+  if (frozenRoot) revalidateRemovalDirectory(repo, frozenRoot, `managed ${source.type} source root`, safeTreeOps);
+
+  for (const frozen of auxiliary) {
+    revalidateRemovalDirectory(repo, frozen, "managed git-md quarantine", safeTreeOps);
+    removeFrozenSameDeviceTree(frozen.tree, "managed git-md quarantine", beforeMutation, { writable: true, ops: safeTreeOps });
+    beforeMutation();
+    (safeTreeOps.fsyncPath ?? fsyncPath)(repo);
+  }
+  if (root) {
+    const quarantine = join(repo, siblingArtifactName("remove", sourceId, randomUUID()));
+    revalidateRemovalDirectory(repo, frozenRoot!, `managed ${source.type} source root`, safeTreeOps);
+    beforeMutation();
+    renameSync(root, quarantine);
+    beforeMutation();
+    (safeTreeOps.fsyncPath ?? fsyncPath)(repo);
+    const frozen = freezeRemovalDirectory(repo, quarantine, "managed source removal quarantine", safeTreeOps);
+    validateRemovalRootContents(frozen.path, source.type, true, safeTreeOps);
+    quarantines.push(frozen);
+  }
+  for (const frozen of quarantines) {
+    revalidateRemovalDirectory(repo, frozen, "managed source removal quarantine", safeTreeOps);
+    validateRemovalRootContents(frozen.path, source.type, true, safeTreeOps);
+    removeFrozenSameDeviceTree(frozen.tree, "managed source removal quarantine", beforeMutation,
+      { writable: true, ops: safeTreeOps });
+    beforeMutation();
+    (safeTreeOps.fsyncPath ?? fsyncPath)(repo);
+  }
 }
 
 export async function materializeRepoMdHead(source: KnowledgeSource, options: RepoMdMaterializerOptions): Promise<RepoMdMaterialization> {
@@ -658,25 +1399,72 @@ export async function materializeRepoMdCommit(source: KnowledgeSource, snapshotI
   return materializeRepoMdCommitAtRoot(source, snapshotId, top, options, execFile);
 }
 
+/** Materialize an exact commit from Monet's validated bare git-md repository. */
+export async function materializeGitMdCommit(source: KnowledgeSource, snapshotId: string, options: RepoMdMaterializerOptions): Promise<RepoMdMaterialization> {
+  if (source.type !== "git-md" || source.lifecycle !== "active") throw new Error("git-md materialization requires an active git-md source");
+  if (!OID_RE.test(snapshotId)) throw new Error("invalid committed snapshot OID");
+  const execFile = options.execFile ?? nodeExecFile;
+  if (dirname(source.localPath) !== typedSourceRoot("git-md", source.id, options.sourceStorageDir, false, () => undefined, options.safeTreeOps)) {
+    throw new Error("registered git-md repository escapes its managed source root");
+  }
+  return materializeRepoMdCommitAtRoot(source, snapshotId, source.localPath, options, execFile);
+}
+
 async function enumerateSelectedTree(
   source: KnowledgeSource,
   snapshotId: string,
   top: string,
   options: RepoMdMaterializerOptions,
   execFile: typeof nodeExecFile,
+  localGit?: { timeoutMs: number; executable: string },
+  deadline?: GitMaterializationDeadline,
 ): Promise<{ config: EffectiveSourceScanConfig; entries: TreeEntry[] }> {
   const config = options.config ?? effectiveSourceScanConfig({ autoDetect: source.autoDetect, include: source.include, exclude: source.exclude });
   const listingLimit = Math.min(32 * 1024 * 1024, Math.max(1024 * 1024, config.limits.maxEntries * 512));
-  const listing = await runGit(execFile, ["ls-tree", "-r", "-t", "-z", "--long", snapshotId], top, listingLimit);
-  const records = listing.split("\0").filter(Boolean);
+  const args = ["ls-tree", "-r", "-t", "-z", "--long", snapshotId];
+  const records: Array<{ metadata: string; path: string }> = [];
+  if (localGit && deadline) {
+    validateManagedGitInvocation(top);
+    const listing = await runGitBufferBeforeDeadline(
+      execFile, args, top, listingLimit, localGit, deadline, options.assertOwnership ?? (() => undefined),
+    );
+    if (listing.length > 0 && listing[listing.length - 1] !== 0) throw new Error("cannot parse pinned Git tree entry");
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let start = 0;
+    for (let index = 0; index < listing.length; index += 1) {
+      if (listing[index] !== 0) continue;
+      const record = listing.subarray(start, index);
+      const tab = record.indexOf(0x09);
+      if (tab < 1 || tab === record.length - 1) throw new Error("cannot parse pinned Git tree entry");
+      let metadata: string;
+      let path: string;
+      try {
+        metadata = decoder.decode(record.subarray(0, tab));
+        path = decoder.decode(record.subarray(tab + 1));
+      } catch {
+        throw new Error("pinned Git tree contains an invalid UTF-8 pathname");
+      }
+      records.push({ metadata, path });
+      start = index + 1;
+    }
+  } else {
+    const listing = await runGit(execFile, args, top, listingLimit, localGit);
+    records.push(...listing.split("\0").filter(Boolean).map((record) => {
+      const tab = record.indexOf("\t");
+      if (tab < 1 || tab === record.length - 1) throw new Error("cannot parse pinned Git tree entry");
+      return { metadata: record.slice(0, tab), path: record.slice(tab + 1) };
+    }));
+  }
   if (records.length > config.limits.maxEntries) throw new Error("pinned Git tree exceeds the materialization entry limit");
   const entries: TreeEntry[] = [];
   let totalBytes = 0;
   for (const record of records) {
-    const match = /^(\d+) (\w+) ([0-9a-f]+)\s+([0-9-]+)\t([\s\S]+)$/.exec(record);
+    options.assertOwnership?.();
+    deadline?.check();
+    const match = /^(\d+) (\w+) ([0-9a-f]+)\s+([0-9-]+)$/.exec(record.metadata);
     if (!match) throw new Error("cannot parse pinned Git tree entry");
-    const [, mode, type, oid, sizeText, rawPath] = match;
-    const path = validateArchivePath(rawPath!);
+    const [, mode, type, oid, sizeText] = match;
+    const path = validateArchivePath(record.path);
     if (type === "tree") continue;
     const selected = config.include.some((pattern) => matchesSourceGlob(pattern, path))
       && !config.exclude.some((pattern) => matchesSourceGlob(pattern, path));
@@ -693,6 +1481,212 @@ async function enumerateSelectedTree(
   return { config, entries };
 }
 
+async function streamExactGitBlob(
+  spawn: typeof nodeSpawn,
+  executable: string,
+  timeoutMs: number,
+  repository: string,
+  entry: TreeEntry,
+  target: string,
+  deadline: GitMaterializationDeadline,
+  beforeMutation: () => void,
+): Promise<{ size: number; sha256: string }> {
+  beforeMutation();
+  const fd = openSync(target, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  const hash = createHash("sha256");
+  const objectHash = createHash(entry.oid.length === 64 ? "sha256" : "sha1");
+  objectHash.update(`blob ${entry.size}\0`);
+  let size = 0;
+  let failure: Error | null = null;
+  try {
+    validateManagedGitInvocation(repository);
+    const command = deadline.command(timeoutMs);
+    const child = spawn(executable, [`--git-dir=${repository}`, "cat-file", "blob", entry.oid], {
+      cwd: dirname(repository), env: managedGitEnvironment({ GIT_COMMON_DIR: repository }),
+      stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    });
+    if (!child.stdout || !child.stderr) throw new Error("Git blob extraction did not provide bounded pipes");
+    const timeout = setTimeout(() => {
+      failure = new Error(command.aggregateLimited
+        ? "managed git-md materialization deadline exceeded"
+        : "Git blob extraction timed out");
+      child.kill("SIGKILL");
+    }, command.timeoutMs);
+    timeout.unref();
+    const ownershipMonitor = setInterval(() => {
+      if (failure) return;
+      try { beforeMutation(); } catch (error) {
+        failure = error instanceof Error ? error : new Error(String(error));
+        child.kill("SIGKILL");
+      }
+    }, 10);
+    ownershipMonitor.unref();
+    // Drain but never reflect repository-controlled stderr into a caller-facing error.
+    child.stderr.resume();
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (failure) return;
+      try { deadline.check(); } catch (error) {
+        failure = error as Error;
+        child.kill("SIGKILL");
+        return;
+      }
+      if (size + chunk.length > entry.size) {
+        failure = new Error("pinned Git blob exceeded its enumerated size during extraction");
+        child.kill("SIGKILL");
+        return;
+      }
+      try {
+        let offset = 0;
+        while (offset < chunk.length) { beforeMutation(); offset += writeSync(fd, chunk, offset, chunk.length - offset); }
+        hash.update(chunk);
+        objectHash.update(chunk);
+        size += chunk.length;
+      } catch (error) {
+        failure = error instanceof Error ? error : new Error(String(error));
+        child.kill("SIGKILL");
+      }
+    });
+    await new Promise<void>((resolveDone, reject) => {
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        clearInterval(ownershipMonitor);
+        reject(error);
+      });
+      child.once("close", (code, signal) => {
+        clearTimeout(timeout);
+        clearInterval(ownershipMonitor);
+        if (failure) reject(failure);
+        else if (code !== 0) reject(new Error(`managed git-md cat-file failed (${signal ?? code})`));
+        else resolveDone();
+      });
+    });
+    if (size !== entry.size) throw new Error("pinned Git blob size changed during extraction");
+    if (objectHash.digest("hex") !== entry.oid) throw new Error("pinned Git blob object hash mismatch");
+    beforeMutation();
+    fsyncSync(fd);
+    deadline.check();
+    return { size, sha256: hash.digest("hex") };
+  } finally { closeSync(fd); }
+}
+
+async function materializeGitBlobs(
+  spawn: typeof nodeSpawn,
+  executable: string,
+  timeoutMs: number,
+  repository: string,
+  destination: string,
+  entries: readonly TreeEntry[],
+  deadline: GitMaterializationDeadline,
+  beforeMutation: () => void,
+): Promise<SnapshotMarker["files"]> {
+  const files: SnapshotMarker["files"] = [];
+  for (const entry of entries) {
+    deadline.check();
+    const target = resolve(destination, entry.path);
+    if (!contained(destination, target)) throw new Error("pinned Git blob extraction escaped destination");
+    const parent = dirname(target);
+    beforeMutation();
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    if (!contained(destination, realpathSync.native(parent))) throw new Error("pinned Git blob parent escaped destination");
+    beforeMutation();
+    const streamed = await streamExactGitBlob(spawn, executable, timeoutMs, repository, entry, target, deadline, beforeMutation);
+    files.push({ path: entry.path, ...streamed });
+  }
+  return files;
+}
+
+interface FrozenStagingLeaf { path: string; dev: number; ino: number }
+
+function freezeStagingLeaf(path: string, label: string): FrozenStagingLeaf {
+  const entry = lstatSync(path);
+  if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1) throw new Error(`${label} is not a safe regular file`);
+  return { path, dev: entry.dev, ino: entry.ino };
+}
+
+function removeFrozenStagingLeaf(
+  frozen: FrozenStagingLeaf, label: string, beforeMutation: () => void, check: () => void,
+): void {
+  check();
+  const current = lstatSync(frozen.path);
+  if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1
+      || current.dev !== frozen.dev || current.ino !== frozen.ino) throw new Error(`${label} changed after preflight`);
+  beforeMutation();
+  rmSync(frozen.path);
+}
+
+function sweepOwnedMaterializationStaging(
+  sourceType: "repo-md" | "git-md",
+  root: string,
+  snapshotsPath: string,
+  frozenSnapshots: FrozenSnapshotsDirectory,
+  beforeMutation: () => void,
+  safeTreeOps: SafeTreeOps,
+  check: () => void,
+): void {
+  const variant = "[0-9a-f]{40,64}-[0-9a-f]{64}";
+  const temporaryTree = new RegExp(`^\\.tree-${variant}-[A-Za-z0-9][A-Za-z0-9-]{0,127}$`);
+  const temporarySidecar = new RegExp(`^\\.complete-${variant}-[A-Za-z0-9][A-Za-z0-9-]{0,127}\\.json$`);
+  const finalTree = new RegExp(`^${variant}$`);
+  const finalSidecar = new RegExp(`^${variant}\\.complete\\.json$`);
+  const materialize = /^\.materialize-[0-9a-f]{40,64}-[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
+  const trees: FrozenSameDeviceTree[] = [];
+  const leaves: FrozenStagingLeaf[] = [];
+
+  // Exhaustively classify and freeze before the first mutation. Prefix
+  // collisions are ambiguous, so they fail closed and leave every artifact.
+  const snapshotEntries = readdirSync(snapshotsPath, { withFileTypes: true });
+  check();
+  for (const entry of snapshotEntries) {
+    check();
+    const path = join(snapshotsPath, entry.name);
+    if (temporaryTree.test(entry.name)) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("managed source temporary tree is unsafe");
+      trees.push(freezeSameDeviceTree(path, "managed source temporary tree", safeTreeOps, check));
+    } else if (temporarySidecar.test(entry.name)) {
+      leaves.push(freezeStagingLeaf(path, "managed source temporary completion sidecar"));
+    } else if (entry.name.startsWith(".tree-") || entry.name.startsWith(".complete-")) {
+      throw new Error("managed source staging artifact ownership is ambiguous");
+    } else if (finalTree.test(entry.name)) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("managed source sealed variant is unsafe");
+    } else if (finalSidecar.test(entry.name)) {
+      freezeStagingLeaf(path, "managed source sealed completion sidecar");
+    } else {
+      throw new Error(`unrecognized node in managed source snapshots: ${entry.name}`);
+    }
+  }
+  const rootEntries = readdirSync(root, { withFileTypes: true });
+  check();
+  for (const entry of rootEntries) {
+    check();
+    const path = join(root, entry.name);
+    if (entry.name === "snapshots") {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("managed source snapshots root is unsafe");
+    } else if (entry.name === "repository.git" && sourceType === "git-md") {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("managed git-md repository is unsafe");
+    } else if (entry.name === "current" || /^\.current-[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(entry.name)) {
+      if (!entry.isSymbolicLink()) throw new Error("managed source current pointer is unsafe");
+    } else if (materialize.test(entry.name)) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("managed source materialization staging tree is unsafe");
+      trees.push(freezeSameDeviceTree(path, "managed source materialization staging tree", safeTreeOps, check));
+    } else if (entry.name.startsWith(".materialize-")) {
+      throw new Error("managed source materialization artifact ownership is ambiguous");
+    } else {
+      throw new Error(`unrecognized node in managed source root: ${entry.name}`);
+    }
+  }
+  revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+  for (const tree of trees) revalidateSameDeviceTree(tree, "managed source staging tree", safeTreeOps, check);
+  for (const tree of trees) {
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    removeFrozenSameDeviceTree(tree, "managed source staging tree", beforeMutation,
+      { writable: true, ops: safeTreeOps, check });
+  }
+  for (const leaf of leaves) {
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    removeFrozenStagingLeaf(leaf, "managed source staging sidecar", beforeMutation, check);
+  }
+}
+
 async function materializeRepoMdCommitAtRoot(
   source: KnowledgeSource,
   snapshotId: string,
@@ -700,85 +1694,159 @@ async function materializeRepoMdCommitAtRoot(
   options: RepoMdMaterializerOptions,
   execFile: typeof nodeExecFile,
 ): Promise<RepoMdMaterialization> {
-  const root = sourceRoot(source.id, options.sourceStorageDir)!;
+  const beforeMutation = options.assertOwnership ?? (() => undefined);
+  const deadline = source.type === "git-md"
+    ? gitMaterializationDeadline(options.materializationDeadlineMs, options.monotonicNow)
+    : undefined;
+  const check = deadline?.check ?? (() => undefined);
+  const safeTreeOps = options.safeTreeOps ?? {};
+  check();
+  beforeMutation();
+  const root = typedSourceRoot(source.type, source.id, options.sourceStorageDir, true, beforeMutation, safeTreeOps)!;
   const desiredConfig = options.config ?? effectiveSourceScanConfig({ autoDetect: source.autoDetect, include: source.include, exclude: source.exclude });
   const desiredConfigHash = computeSourceIngestConfigHash(desiredConfig);
-  const snapshotPath = repoMdSnapshotPath(source.id, snapshotId, desiredConfigHash, options.sourceStorageDir);
-  const sidecarPath = repoMdSnapshotSidecarPath(source.id, snapshotId, desiredConfigHash, options.sourceStorageDir);
-  const snapshotsPath = join(root, "snapshots");
-  mkdirSync(snapshotsPath, { recursive: true, mode: 0o700 });
+  const frozenSnapshots = freezeSnapshotsDirectory(root, true, beforeMutation, safeTreeOps)!;
+  revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+  const snapshotsPath = frozenSnapshots.snapshots.path;
+  const snapshotPath = join(snapshotsPath, variantName(snapshotId, desiredConfigHash));
+  const sidecarPath = `${snapshotPath}.complete.json`;
   const variant = variantName(snapshotId, desiredConfigHash);
-  for (const name of readdirSync(snapshotsPath)) {
-    if (name.startsWith(`.tree-${variant}-`)) {
-      const staleTree = join(snapshotsPath, name);
-      makeTreeWritable(staleTree);
-      rmSync(staleTree, { recursive: true, force: true });
-    } else if (name.startsWith(`.complete-${variant}-`)) {
-      rmSync(join(snapshotsPath, name), { force: true });
+  revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+  sweepOwnedMaterializationStaging(source.type, root, snapshotsPath, frozenSnapshots, beforeMutation, safeTreeOps, check);
+  if (source.type === "repo-md") {
+    try {
+      validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash);
+      durableSnapshotParents(options, root, beforeMutation);
+      return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
-  try {
-    validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash);
-    return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const treeExists = pathEntryExists(snapshotPath);
-    const sidecarExists = pathEntryExists(sidecarPath);
-    if (treeExists && sidecarExists) throw error;
-    if (treeExists) { makeTreeWritable(snapshotPath); rmSync(snapshotPath, { recursive: true, force: true }); }
-    if (sidecarExists) rmSync(sidecarPath, { force: true });
+  const treeExists = pathEntryExists(snapshotPath);
+  const sidecarExists = pathEntryExists(sidecarPath);
+  if (treeExists !== sidecarExists) {
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    if (treeExists) {
+      removeManagedTree(snapshotPath, "incomplete managed source snapshot",
+        () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, safeTreeOps, check);
+    }
+    if (sidecarExists) { revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); beforeMutation(); rmSync(sidecarPath, { force: true }); }
   }
-  const { config, entries } = await enumerateSelectedTree(source, snapshotId, top, { ...options, config: desiredConfig }, execFile);
-  const totalBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
+  const localGit = source.type === "git-md" ? {
+    timeoutMs: boundedLocalGitTimeout(options.localGitTimeoutMs),
+    executable: resolvePinnedGitExecutable(options.gitExecutable),
+  } : undefined;
+  if (source.type === "git-md") {
+    deadline!.check();
+    const registered = realpathSync.native(source.localPath);
+    if (registered !== source.localPath || dirname(registered) !== root) throw new Error("registered git-md repository escapes its managed source root");
+    if (lstatSync(registered).dev !== lstatSync(root).dev) throw new Error("registered git-md repository crosses a filesystem boundary");
+    validateManagedGitRepository(registered, deadline!.check);
+    deadline!.check();
+    await runGitBeforeDeadline(execFile, [`--git-dir=${registered}`, "fsck", "--strict", "--full", "--no-reflogs", snapshotId],
+      dirname(registered), 16 * 1024 * 1024, localGit!, deadline!, beforeMutation);
+    validateManagedGitInvocation(registered);
+    const bare = await runGitBeforeDeadline(execFile, ["rev-parse", "--is-bare-repository"], registered, undefined, localGit!, deadline!, beforeMutation);
+    if (bare !== "true") throw new Error("registered git-md repository is not bare");
+    validateManagedGitInvocation(registered);
+    const verified = (await runGitBeforeDeadline(execFile, ["rev-parse", "--verify", `${snapshotId}^{commit}`],
+      registered, undefined, localGit!, deadline!, beforeMutation)).toLowerCase();
+    if (verified !== snapshotId) throw new Error("pinned git-md commit is unavailable or changed");
+    top = registered;
+  }
+  const { config, entries } = await enumerateSelectedTree(source, snapshotId, top, { ...options, config: desiredConfig }, execFile, localGit, deadline);
+  if (source.type === "git-md" && treeExists && sidecarExists) {
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    const marker = validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash, deadline!.check);
+    validateSealedSnapshotAgainstGit(snapshotPath, marker, entries, deadline!.check);
+    deadline!.check();
+    durableSnapshotParents(options, root, beforeMutation);
+    return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top };
+  }
+  let totalBytes = 0;
+  let pathArgBytes = 0;
+  for (const entry of entries) {
+    check();
+    totalBytes += entry.size;
+    pathArgBytes += Buffer.byteLength(entry.path) + 1;
+  }
   const maxArchiveBytes = options.maxArchiveBytes ?? Math.min(
     Number.MAX_SAFE_INTEGER,
     totalBytes + entries.length * 4096 + 2 * 1024 * 1024,
   );
-  const pathArgBytes = entries.reduce((sum, entry) => sum + Buffer.byteLength(entry.path) + 1, 0);
-  if (pathArgBytes > 512 * 1024) throw new Error("selected Git paths exceed the bounded archive argument limit");
-  const token = (options.token ?? randomUUID)();
-  const temporary = join(root, `.materialize-${snapshotId}-${token}`);
+  if (source.type === "repo-md" && pathArgBytes > 512 * 1024) throw new Error("selected Git paths exceed the bounded archive argument limit");
+  if (source.type === "git-md" && totalBytes > maxArchiveBytes) throw new Error("selected Git blobs exceed the materialization byte limit");
+  const token = requireArtifactToken((options.token ?? randomUUID)());
+  const temporary = source.type === "repo-md" ? join(root, `.materialize-${snapshotId}-${token}`) : null;
   // macOS refuses to move a non-writable directory between parents; stage beside the
   // final variant so the already-sealed root can still be atomically renamed in place.
   const tree = join(snapshotsPath, `.tree-${variant}-${token}`);
-  const archive = join(temporary, "archive.tar");
+  const archive = temporary ? join(temporary, "archive.tar") : null;
   const temporarySidecar = join(snapshotsPath, `.complete-${variant}-${token}.json`);
-  mkdirSync(temporary, { recursive: true, mode: 0o700 });
-  mkdirSync(tree, { recursive: true, mode: 0o700 });
+  revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+  beforeMutation();
+  if (temporary) mkdirSync(temporary, { mode: 0o700 });
+  revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+  beforeMutation();
+  mkdirSync(tree, { mode: 0o700 });
   try {
     let files: SnapshotMarker["files"] = [];
     if (entries.length > 0) {
-      await runGit(execFile, ["--literal-pathspecs", "archive", "--format=tar", `--output=${archive}`, snapshotId, "--", ...entries.map((entry) => entry.path)], top);
-      if (statSync(archive).size > maxArchiveBytes) throw new Error("git archive exceeds the materialization byte limit");
+      if (source.type === "git-md") files = (await materializeGitBlobs(
+        options.spawn ?? nodeSpawn, localGit!.executable, localGit!.timeoutMs, top, tree, entries, deadline!,
+        () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); },
+      )).map((file, index) => ({ ...file, mode: entries[index]!.mode as "100644" | "100755" }));
+      else {
+        await runGit(execFile, ["--literal-pathspecs", "archive", "--format=tar", `--output=${archive!}`, snapshotId, "--", ...entries.map((entry) => entry.path)], top);
+        if (statSync(archive!).size > maxArchiveBytes) throw new Error("git archive exceeds the materialization byte limit");
+        files = extractGitArchive(archive!, tree, entries, maxArchiveBytes, beforeMutation);
+      }
       options.fault?.("after-archive");
-      files = extractGitArchive(archive, tree, entries, maxArchiveBytes);
     }
     const marker: SnapshotMarker = {
       version: 2, snapshotId, configHash: computeSourceIngestConfigHash(config),
       variant: variantName(snapshotId, desiredConfigHash), files,
     };
-    sealSnapshot(tree);
+    deadline?.check();
+    sealSnapshot(tree, () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, safeTreeOps, check);
+    deadline?.check();
     options.fault?.("before-snapshot-rename");
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    beforeMutation();
     renameSync(tree, snapshotPath);
+    beforeMutation();
     fsyncPath(snapshotsPath);
     options.fault?.("after-snapshot-rename");
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    beforeMutation();
     const sidecarFd = openSync(temporarySidecar, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
     try {
+      beforeMutation();
       writeSync(sidecarFd, JSON.stringify(marker));
+      beforeMutation();
       chmodSync(temporarySidecar, 0o400);
+      beforeMutation();
       fsyncSync(sidecarFd);
     } finally { closeSync(sidecarFd); }
     options.fault?.("before-sidecar-rename");
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    beforeMutation();
     renameSync(temporarySidecar, sidecarPath);
+    beforeMutation();
     fsyncPath(snapshotsPath);
     options.fault?.("after-sidecar-rename");
-    validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash);
+    validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash, check);
+    deadline?.check();
+    durableSnapshotParents(options, root, beforeMutation);
     return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top };
   } finally {
-    makeTreeWritable(tree);
-    rmSync(tree, { recursive: true, force: true });
-    makeTreeWritable(temporary);
-    rmSync(temporary, { recursive: true, force: true });
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    removeManagedTree(tree, "managed source temporary snapshot",
+      () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, safeTreeOps);
+    if (temporary) removeManagedTree(temporary, "managed source materialization staging",
+      () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, safeTreeOps);
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    beforeMutation();
     rmSync(temporarySidecar, { force: true });
   }
 }

@@ -469,6 +469,17 @@ export class SourceRegistry {
     for (const row of rows) {
       this.db.prepare(`UPDATE knowledge_sources SET local_path_key = ? WHERE id = ?`).run(localPathOwnershipKey(row.local_path), row.id);
     }
+    const gitRows = this.db.prepare(`SELECT id, local_path FROM knowledge_sources WHERE type = 'git-md'`).all() as Array<{ id: string; local_path: string }>;
+    for (const row of gitRows) {
+      const legacy = resolve(this.sourceStorageDir, row.id);
+      const allocated = resolve(this.sourceStorageDir, "git-md", row.id, "repository.git");
+      if (row.local_path === allocated) continue;
+      if (row.local_path !== legacy || existsSync(legacy) || existsSync(allocated)) {
+        throw new Error("git-md allocator migration is ambiguous or contains unsupported filesystem content");
+      }
+      this.db.prepare(`UPDATE knowledge_sources SET local_path = ?, local_path_key = ? WHERE id = ?`)
+        .run(allocated, localPathOwnershipKey(allocated), row.id);
+    }
     // v7 is not yet shipped: replace the first-round all-history path index with active ownership.
     this.db.exec(`
       DROP INDEX IF EXISTS uq_knowledge_sources_local_path;
@@ -572,7 +583,7 @@ export class SourceRegistry {
     if (writeBack === "pull-request" && remote.host !== "github.com") {
       throw new Error("pull-request writeBack is supported only for git-md GitHub sources");
     }
-    const localPath = existingGitLocalPath ?? resolve(this.sourceStorageDir, id);
+    const localPath = existingGitLocalPath ?? resolve(this.sourceStorageDir, "git-md", id, "repository.git");
     if (localPath !== this.sourceStorageDir && !localPath.startsWith(`${this.sourceStorageDir}${sep}`)) {
       throw new Error("allocated source localPath escapes the Monet source directory");
     }

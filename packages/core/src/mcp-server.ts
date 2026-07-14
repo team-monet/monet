@@ -1269,7 +1269,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "source_path",
-    "Return the sealed read-only path for the exact active indexed repo-md snapshot. Never returns the working tree.",
+    "Return the sealed read-only path for the exact active indexed repo-md or git-md snapshot. Never returns a working tree or bare repository.",
     { sourceId: z.string().min(1) },
     async ({ sourceId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope());
@@ -1280,7 +1280,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "source_sync",
-    "Synchronize one authorized active source. repo-md is supported; git-md is rejected until its materializer is available.",
+    "Synchronize one authorized active repo-md or git-md source. Remote git-md sync is noninteractive and pins one configured branch.",
     { sourceId: z.string().min(1) },
     async ({ sourceId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope());

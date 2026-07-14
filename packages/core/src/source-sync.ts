@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { IngestResult, SourceConceptRollbackResult } from "./engine";
 import {
-  detectRepoMdRenames, materializeRepoMdCommit, materializeRepoMdHead, pointRepoMdCurrent, removeRepoMdMaterializations,
-  repoMdSnapshotPath, revokeRepoMdCurrent,
-  withRepoMdMaterializerLock,
+  detectRepoMdRenames, materializeGitMdCommit, materializeRepoMdCommit, materializeRepoMdHead, pointSourceCurrent,
+  removeSourceMaterializations, sourceSnapshotPath, revokeSourceCurrent, validateSourceMaterializationRemoval, validateSourcePublishedPath,
+  withGitMdMaterializerLock, withRepoMdMaterializerLock,
 } from "./source-materializer";
 import type { RepoMdMaterializerOptions } from "./source-materializer";
+import { syncManagedGitRepository, validateManagedGitRepository } from "./source-git";
+import type { RemoteGitOptions } from "./source-git";
 import { computeSourceOperationId } from "./source-chunker";
 import { computeSourceIngestConfigHash, scanSourceSnapshot } from "./source-scanner";
 import type { SourceScanDiagnostic, SourceScanResult } from "./source-scanner";
@@ -14,17 +16,22 @@ import type {
   RecordSourceBindingReceiptInput, SourceChunkRecord, SourceCleanupItem, SourceFileRecord,
   SourceSyncRun, StageSourceManifestInput,
   SourceRemoval, SourceRemovalItem,
+  SourcePublishedManifest,
 } from "./source-types";
 
 export type RepoMdSyncFaultPoint =
   | "after-pin" | "after-begin" | "after-stage" | "after-store" | "after-engine-written"
   | "after-refresh" | "after-committed" | "after-activation" | "after-publish" | "after-current" | "after-cleanup"
+  | "after-noop-verification"
   | "after-remove-current" | "after-remove-item" | "after-remove-snapshots"
   | "before-remove-complete" | "after-remove-complete";
+
+type CallerMaterializerOptions = Omit<Partial<RepoMdMaterializerOptions>, "sourceStorageDir" | "config" | "lockStaleMs" | "now" | "assertOwnership">;
 
 export interface RepoMdSyncOptions {
   lockStaleMs?: number;
   fault?: (point: RepoMdSyncFaultPoint) => void;
+  materializer?: CallerMaterializerOptions;
 }
 
 export interface RepoMdSyncResult {
@@ -64,6 +71,17 @@ export interface SourceSyncCorePort {
   acknowledgeSourceRemovalItem(itemId: string): SourceRemovalItem;
   markSourceRemovalFilesRevoked(sourceId: string): SourceRemoval;
   completeSourceRemoval(sourceId: string): SourceRemoval;
+  recordSourcePrePinFailure(input: { sourceId: string; reason: string; configVersion: number; leaseFence: number }): number;
+  recordSourceRunInvocation(input: {
+    sourceId: string; runId: string; result: "success" | "failed" | "partial";
+    reason?: string; configVersion: number; leaseFence: number;
+  }): number;
+  recordSourceVerification(input: {
+    sourceId: string; runId: string; snapshotId: string; ingestConfigHash: string;
+    configVersion: number; leaseFence: number;
+  }): number;
+  validateSourceActivePublication(sourceId: string, runId: string, snapshotId: string, ingestConfigHash: string): void;
+  getSourcePublishedManifest(sourceId: string, runId: string, snapshotId: string, ingestConfigHash: string): SourcePublishedManifest;
 }
 
 interface RuntimeOptions extends RepoMdSyncOptions {
@@ -71,36 +89,131 @@ interface RuntimeOptions extends RepoMdSyncOptions {
   idGen?: () => string;
   /** Connector authorization/lifecycle fence, run inside the lock before any recovery or mutation. */
   preflight?: () => void;
-  /** Public connector hook for a fully validated unchanged active publication. */
-  onNoopVerified?: () => void;
-  materializer?: Partial<RepoMdMaterializerOptions>;
   scan?: typeof scanSourceSnapshot;
+  remoteGit?: RemoteGitOptions;
+  /** Internal exact source-lock fence; never caller-controlled. */
+  assertOwnership?: () => void;
+}
+
+function assertRuntimeOwnership(options: RuntimeOptions): void {
+  options.assertOwnership?.();
 }
 
 const naturalKey = (chunk: Pick<SourceChunkRecord, "relativePath" | "headingPath" | "occurrence" | "segmentIndex">): string =>
   JSON.stringify([chunk.relativePath, chunk.headingPath, chunk.occurrence, chunk.segmentIndex]);
 
-function requireRepoLineage(core: SourceSyncCorePort, sourceId: string): KnowledgeSource {
+function requireSourceLineage(core: SourceSyncCorePort, sourceId: string, type: KnowledgeSource["type"]): KnowledgeSource {
   const source = core.getSource(sourceId, { includeTombstoned: true });
-  if (!source || source.type !== "repo-md") {
-    throw new Error("syncRepoMdSource requires a registered repo-md source lineage");
+  if (!source || source.type !== type) {
+    throw new Error(`sync${type === "git-md" ? "Git" : "Repo"}MdSource requires a registered ${type} source lineage`);
   }
   return source;
 }
 
-function requireActiveRepoSource(core: SourceSyncCorePort, sourceId: string): KnowledgeSource {
-  const source = requireRepoLineage(core, sourceId);
+function requireActiveSource(core: SourceSyncCorePort, sourceId: string, type: KnowledgeSource["type"]): KnowledgeSource {
+  const source = requireSourceLineage(core, sourceId, type);
   if (source.lifecycle !== "active") {
-    throw new Error("syncRepoMdSource requires an active registered repo-md source");
+    throw new Error(`sync${type === "git-md" ? "Git" : "Repo"}MdSource requires an active registered ${type} source`);
   }
   return source;
+}
+
+function gitMdSourceSignature(source: KnowledgeSource): string {
+  return JSON.stringify({
+    type: source.type, lifecycle: source.lifecycle, remoteUrl: source.remoteUrl, branch: source.branch,
+    transport: source.transport, localPath: source.localPath, configVersion: source.configVersion,
+    leaseFence: source.leaseFence, autoDetect: source.autoDetect, include: source.include, exclude: source.exclude,
+    repoMappings: source.repoMappings,
+  });
+}
+
+function requireUnchangedGitMdSource(core: SourceSyncCorePort, sourceId: string, expected: string): KnowledgeSource {
+  const current = requireActiveSource(core, sourceId, "git-md");
+  if (gitMdSourceSignature(current) !== expected) throw new Error("git-md source changed during remote synchronization");
+  return current;
+}
+
+function requireExactActivePublication(
+  core: SourceSyncCorePort,
+  source: KnowledgeSource,
+  expectedSignature: string,
+): KnowledgeSource {
+  const current = requireUnchangedGitMdSource(core, source.id, expectedSignature);
+  if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash
+      || current.activeRunId !== source.activeRunId || current.activeSnapshotId !== source.activeSnapshotId
+      || current.activeIngestConfigHash !== source.activeIngestConfigHash) {
+    throw new Error("git-md active publication changed during local recovery");
+  }
+  core.validateSourceActivePublication(
+    current.id, current.activeRunId, current.activeSnapshotId, current.activeIngestConfigHash,
+  );
+  return current;
+}
+
+function activePublishedManifest(core: SourceSyncCorePort, source: KnowledgeSource): SourcePublishedManifest {
+  if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash) {
+    throw new Error("git-md active publication metadata is incomplete");
+  }
+  return core.getSourcePublishedManifest(
+    source.id, source.activeRunId, source.activeSnapshotId, source.activeIngestConfigHash,
+  );
+}
+
+/** Restore only the stable pointer from an already-published sealed variant, before any remote work. */
+function repairGitMdActivePublication(
+  core: SourceSyncCorePort,
+  source: KnowledgeSource,
+  options: RuntimeOptions,
+  materializer: RepoMdMaterializerOptions,
+): KnowledgeSource {
+  if (!source.activeRunId && !source.activeSnapshotId && !source.activeIngestConfigHash) return source;
+  if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash) {
+    throw new Error("git-md active publication metadata is incomplete");
+  }
+  const expectedSignature = gitMdSourceSignature(source);
+  requireExactActivePublication(core, source, expectedSignature);
+  const revalidate = (): void => {
+    options.preflight?.();
+    requireExactActivePublication(core, source, expectedSignature);
+  };
+  let publishedPathValid = false;
+  const publication = activePublishedManifest(core, source);
+  try {
+    validateSourcePublishedPath(source, source.activeSnapshotId, source.activeIngestConfigHash, options.sourceStorageDir, publication);
+    publishedPathValid = true;
+  } catch { /* The sealed variant is revalidated below before any pointer repair. */ }
+  if (!publishedPathValid) {
+    pointSourceCurrent(source, source.activeSnapshotId, source.activeIngestConfigHash, {
+      ...materializer,
+      fault: (point) => {
+        materializer.fault?.(point);
+        revalidate();
+      },
+    }, publication);
+  }
+  revalidate();
+  validateSourcePublishedPath(source, source.activeSnapshotId, source.activeIngestConfigHash, options.sourceStorageDir, publication);
+  revalidate();
+  validateSourcePublishedPath(source, source.activeSnapshotId, source.activeIngestConfigHash, options.sourceStorageDir, publication);
+  return requireExactActivePublication(core, source, expectedSignature);
+}
+
+async function materializeCommit(source: KnowledgeSource, snapshotId: string, options: RepoMdMaterializerOptions) {
+  return source.type === "git-md"
+    ? materializeGitMdCommit(source, snapshotId, options)
+    : materializeRepoMdCommit(source, snapshotId, options);
 }
 
 function materializerOptions(options: RuntimeOptions): RepoMdMaterializerOptions {
+  const {
+    sourceStorageDir: _callerStorage, config: _callerConfig, lockStaleMs: _callerLock,
+    now: _callerClock, ...caller
+  } = (options.materializer ?? {}) as Partial<RepoMdMaterializerOptions>;
   return {
+    ...caller,
     sourceStorageDir: options.sourceStorageDir,
     lockStaleMs: options.lockStaleMs,
-    ...options.materializer,
+    ...(options.assertOwnership ? { assertOwnership: options.assertOwnership } : {}),
   };
 }
 
@@ -114,7 +227,7 @@ async function planManifest(
   scan: SourceScanResult,
   idGen: () => string,
   repositoryRoot: string,
-  execFile: RepoMdMaterializerOptions["execFile"],
+  materializer: Pick<RepoMdMaterializerOptions, "execFile" | "localGitTimeoutMs" | "gitExecutable">,
 ): Promise<StageSourceManifestInput> {
   const active = source.activeRunId ? core.listSourceChunks(source.activeRunId, true) : [];
   const activeChunks = active.filter((chunk) => chunk.lifecycle === "active");
@@ -128,9 +241,24 @@ async function planManifest(
   const addedPaths = new Set([...nextPaths].filter((path) => !priorPaths.has(path)));
   const movedToFrom = new Map<string, string>();
   if (priorRun && priorRun.scanConfigVersion === run.scanConfigVersion && deletedPaths.size && addedPaths.size) {
-    const gitMoves = await detectRepoMdRenames(
-      repositoryRoot, priorRun.snapshotId, run.snapshotId, priorPaths, nextPaths, { execFile },
-    );
+    // Git rename evidence is advisory. A resumed run may outlive replacement of
+    // its managed repository; publication must still converge using the durable
+    // manifests instead of wedging on unavailable/poisoned diff evidence.
+    let gitMoves = new Map<string, string>();
+    try {
+      if (source.type === "git-md") validateManagedGitRepository(repositoryRoot);
+      gitMoves = await detectRepoMdRenames(
+        repositoryRoot, priorRun.snapshotId, run.snapshotId, priorPaths, nextPaths, {
+          execFile: materializer.execFile,
+          ...(source.type === "git-md" ? {
+            timeoutMs: materializer.localGitTimeoutMs ?? 120_000,
+            gitExecutable: materializer.gitExecutable,
+          } : {}),
+        },
+      );
+    } catch {
+      gitMoves = new Map();
+    }
     const usedOld = new Set<string>();
     const usedNew = new Set<string>();
     for (const [from, to] of gitMoves) {
@@ -212,10 +340,12 @@ async function materializeStagedBindings(
     const prior = priorByBinding.get(staged.bindingId);
     if (staged.writeState === "intent" && prior && prior.ingestFingerprint === staged.ingestFingerprint
         && prior.contentHash === staged.contentHash && prior.sourceRef === staged.sourceRef) {
+      assertRuntimeOwnership(options);
       core.recordSourceBindingReceipt({ runId: run.id, bindingId: staged.bindingId, writeState: "skipped" });
       continue;
     }
     if (staged.writeState === "intent") {
+      assertRuntimeOwnership(options);
       const stored = await core.storeSource(staged.content, {
         circle: source.circle,
         sourceRefs: [staged.sourceRef],
@@ -223,6 +353,7 @@ async function materializeStagedBindings(
         ...(prior?.conceptId ? { attachTo: prior.conceptId } : { resolution: "forceNew" as const }),
       });
       options.fault?.("after-store");
+      assertRuntimeOwnership(options);
       staged = core.recordSourceBindingReceipt({
         runId: run.id, bindingId: staged.bindingId, conceptId: stored.conceptId,
         observationId: stored.observationId, predecessorObservationId: prior?.observationId ?? null,
@@ -232,9 +363,11 @@ async function materializeStagedBindings(
     }
     if (!staged.conceptId || !staged.observationId) throw new Error("staged source receipt is incomplete");
     if (staged.predecessorObservationId) {
+      assertRuntimeOwnership(options);
       await core.refreshSourceConcept(staged.conceptId, staged.observationId, staged.predecessorObservationId);
       options.fault?.("after-refresh");
     }
+    assertRuntimeOwnership(options);
     core.recordSourceBindingReceipt({ runId: run.id, bindingId: staged.bindingId, writeState: "committed" });
     options.fault?.("after-committed");
   }
@@ -250,9 +383,11 @@ async function reconcileExistingStagedBindings(
     if (staged.writeState !== "engine-written") continue;
     if (!staged.conceptId || !staged.observationId) throw new Error("engine-written source receipt is incomplete");
     if (staged.predecessorObservationId) {
+      assertRuntimeOwnership(options);
       await core.refreshSourceConcept(staged.conceptId, staged.observationId, staged.predecessorObservationId);
       options.fault?.("after-refresh");
     }
+    assertRuntimeOwnership(options);
     core.recordSourceBindingReceipt({ runId: run.id, bindingId: staged.bindingId, writeState: "committed" });
     options.fault?.("after-committed");
   }
@@ -263,20 +398,27 @@ async function drainCleanup(core: SourceSyncCorePort, run: SourceSyncRun, option
   for (const item of core.listSourceCleanupItems(run.id)) {
     if (item.acknowledgedAt !== null) continue;
     if (item.kind === "quarantine-non-authorizing") {
+      assertRuntimeOwnership(options);
       core.acknowledgeSourceCleanup(item.id);
     } else if (!item.conceptId || !item.observationId) {
       throw new Error("authorized source cleanup is missing engine evidence IDs");
     } else if (item.kind === "retire-absent" || item.predecessorObservationId === null) {
+      assertRuntimeOwnership(options);
       core.supersedeObservation(item.observationId, null);
+      assertRuntimeOwnership(options);
       core.retireConcept(item.conceptId);
+      assertRuntimeOwnership(options);
       core.acknowledgeSourceCleanup(item.id);
     } else {
       const staged = stagedByBinding.get(item.bindingId);
       if (staged?.writeState === "committed") {
+        assertRuntimeOwnership(options);
         await core.rollbackSourceRunBinding(run.id, item.bindingId);
       } else {
+        assertRuntimeOwnership(options);
         core.supersedeObservation(item.observationId, null);
       }
+      assertRuntimeOwnership(options);
       core.acknowledgeSourceCleanup(item.id);
     }
     options.fault?.("after-cleanup");
@@ -287,17 +429,67 @@ function isFenceError(error: unknown): boolean {
   return error instanceof Error && /fence is stale/.test(error.message);
 }
 
+function isRecoverableGitCommitAvailabilityError(error: unknown): boolean {
+  return error instanceof Error
+    && !/deadline|timed out|lock ownership|source changed/i.test(error.message)
+    && /managed git-md repository|fsck|rev-parse|commit is unavailable|unavailable or changed|ENOENT/i.test(error.message);
+}
+
+function recordGitMdPrePinFailure(
+  core: SourceSyncCorePort, source: KnowledgeSource, error: unknown, assertOwnership: () => void,
+): void {
+  try {
+    assertOwnership();
+    core.recordSourcePrePinFailure({
+      sourceId: source.id, reason: error instanceof Error ? error.message : String(error),
+      configVersion: source.configVersion, leaseFence: source.leaseFence,
+    });
+  } catch { /* A stale failure receipt must never mask the primary repair/fetch/fence failure. */ }
+}
+
+function verifyUnchangedPublication(
+  core: SourceSyncCorePort,
+  active: KnowledgeSource,
+  snapshotId: string,
+  options: RuntimeOptions,
+  materializer: RepoMdMaterializerOptions,
+  mutate: () => void,
+  onVerified: () => void = () => undefined,
+): RepoMdSyncResult {
+  if (!active.activeRunId || !active.activeSnapshotId || !active.activeIngestConfigHash) {
+    throw new Error("unchanged source is missing its active publication tuple");
+  }
+  const publication = active.type === "git-md" ? activePublishedManifest(core, active) : undefined;
+  pointSourceCurrent(active, active.activeSnapshotId, active.activeIngestConfigHash, materializer, publication);
+  options.preflight?.();
+  validateSourcePublishedPath(active, active.activeSnapshotId, active.activeIngestConfigHash, options.sourceStorageDir, publication);
+  options.preflight?.();
+  validateSourcePublishedPath(active, active.activeSnapshotId, active.activeIngestConfigHash, options.sourceStorageDir, publication);
+  mutate();
+  core.recordSourceVerification({
+    sourceId: active.id, runId: active.activeRunId, snapshotId: active.activeSnapshotId,
+    ingestConfigHash: active.activeIngestConfigHash,
+    configVersion: active.configVersion, leaseFence: active.leaseFence,
+  });
+  onVerified();
+  options.fault?.("after-noop-verification");
+  return { sourceId: active.id, snapshotId, runId: null, status: "noop", diagnostics: [] };
+}
+
 async function recoverRemovedRepoSource(
   core: SourceSyncCorePort,
   run: SourceSyncRun,
   options: RuntimeOptions,
 ): Promise<void> {
   if (run.state === "scanning") {
+    assertRuntimeOwnership(options);
     run = core.abortSourceRun(run.id, "failed", "source lifecycle is no longer active");
   } else if (run.state === "staging") {
     await reconcileExistingStagedBindings(core, run, options);
+    assertRuntimeOwnership(options);
     run = core.abortSourceRun(run.id, "failed", "source lifecycle is no longer active");
   } else if (run.state === "activating") {
+    assertRuntimeOwnership(options);
     run = core.abortSourceRun(run.id, "failed", "source lifecycle is no longer active");
   }
   if (run.state === "aborted" || run.state === "cleaning") await drainCleanup(core, run, options);
@@ -308,21 +500,30 @@ async function removeTombstonedRepoSource(
   source: KnowledgeSource,
   options: RuntimeOptions,
 ): Promise<RepoMdSyncResult> {
+  assertRuntimeOwnership(options);
+  // Reject every unsafe nested node before the ledger creates removal intent/items.
+  // Destructive cleanup repeats this preflight at its own mutation boundary.
+  validateSourceMaterializationRemoval(source, options.sourceStorageDir, options.materializer?.safeTreeOps);
   let removal = core.beginSourceRemoval(source.id);
   if (removal.state !== "complete") {
-    revokeRepoMdCurrent(source.id, options.sourceStorageDir);
+    revokeSourceCurrent(source, options.sourceStorageDir, assertRuntimeOwnership.bind(null, options), options.materializer?.safeTreeOps);
     options.fault?.("after-remove-current");
     for (const item of core.listSourceRemovalItems(source.id)) {
       if (item.acknowledgedAt !== null) continue;
+      assertRuntimeOwnership(options);
       core.supersedeObservation(item.observationId, null);
+      assertRuntimeOwnership(options);
       core.retireConcept(item.conceptId);
+      assertRuntimeOwnership(options);
       core.acknowledgeSourceRemovalItem(item.id);
       options.fault?.("after-remove-item");
     }
-    removeRepoMdMaterializations(source.id, options.sourceStorageDir);
+    removeSourceMaterializations(source, options.sourceStorageDir, assertRuntimeOwnership.bind(null, options), options.materializer?.safeTreeOps);
     options.fault?.("after-remove-snapshots");
+    assertRuntimeOwnership(options);
     removal = core.markSourceRemovalFilesRevoked(source.id);
     options.fault?.("before-remove-complete");
+    assertRuntimeOwnership(options);
     removal = core.completeSourceRemoval(source.id);
     options.fault?.("after-remove-complete");
   }
@@ -338,81 +539,195 @@ export async function syncRepoMdSource(
   sourceId: string,
   options: RuntimeOptions,
 ): Promise<RepoMdSyncResult> {
+  return syncSource(core, sourceId, options, "repo-md");
+}
+
+export type GitMdSyncOptions = RepoMdSyncOptions & { remoteGit?: RemoteGitOptions };
+export type GitMdSyncResult = RepoMdSyncResult;
+
+export async function syncGitMdSource(
+  core: SourceSyncCorePort,
+  sourceId: string,
+  options: RuntimeOptions,
+): Promise<GitMdSyncResult> {
+  return syncSource(core, sourceId, options, "git-md");
+}
+
+async function syncSource(
+  core: SourceSyncCorePort,
+  sourceId: string,
+  options: RuntimeOptions,
+  type: KnowledgeSource["type"],
+): Promise<RepoMdSyncResult> {
   const mat = materializerOptions(options);
-  return withRepoMdMaterializerLock(sourceId, mat, async () => {
-    options.preflight?.();
-    let source = requireRepoLineage(core, sourceId);
+  const withLock = type === "git-md" ? withGitMdMaterializerLock : withRepoMdMaterializerLock;
+  return withLock(sourceId, mat, async ({ assertOwnership }) => {
+    let authorizedGitMdSignature: string | null = null;
+    const assertAuthorizedOwnership = (): void => {
+      assertOwnership();
+      options.preflight?.();
+      if (type === "git-md" && authorizedGitMdSignature !== null) {
+        requireUnchangedGitMdSource(core, sourceId, authorizedGitMdSignature);
+      }
+    };
+    mat.assertOwnership = assertAuthorizedOwnership;
+    const mutate = assertAuthorizedOwnership;
+    const guardedOptions: RuntimeOptions = { ...options, assertOwnership: assertAuthorizedOwnership };
+    assertAuthorizedOwnership();
+    let source = requireSourceLineage(core, sourceId, type);
     let run = core.resumeSourceRun(sourceId);
+    let invocationRun = run;
+    let invocationVerified = false;
+
+    const execute = async (): Promise<RepoMdSyncResult> => {
 
     if (source.lifecycle !== "active") {
-      if (run) await recoverRemovedRepoSource(core, run, options);
+      if (run) await recoverRemovedRepoSource(core, run, guardedOptions);
       const stillResumable = core.resumeSourceRun(sourceId);
       if (stillResumable) throw new Error("tombstoned source recovery did not converge its resumable run");
-      return removeTombstonedRepoSource(core, source, options);
+      return removeTombstonedRepoSource(core, source, guardedOptions);
+    }
+    if (type === "git-md") authorizedGitMdSignature = gitMdSourceSignature(source);
+    assertAuthorizedOwnership();
+
+    if (type === "git-md") {
+      try { source = repairGitMdActivePublication(core, source, guardedOptions, mat); }
+      catch (error) {
+        recordGitMdPrePinFailure(core, source, error, mutate);
+        throw error;
+      }
     }
 
     if (run?.state === "aborted") {
-      await drainCleanup(core, run, options);
+      await drainCleanup(core, run, guardedOptions);
       run = core.resumeSourceRun(sourceId);
     }
     if (run?.state === "cleaning") {
-      source = requireActiveRepoSource(core, sourceId);
+      source = requireActiveSource(core, sourceId, type);
       if (source.activeSnapshotId) {
-        await materializeRepoMdCommit(source, source.activeSnapshotId, { ...mat, config: run.effectiveConfig });
-        pointRepoMdCurrent(source.id, source.activeSnapshotId, computeSourceIngestConfigHash(run.effectiveConfig), mat);
+        if (type !== "git-md") await materializeCommit(source, source.activeSnapshotId, { ...mat, config: run.effectiveConfig });
+        pointSourceCurrent(source, source.activeSnapshotId, computeSourceIngestConfigHash(run.effectiveConfig), mat,
+          type === "git-md" ? activePublishedManifest(core, source) : undefined);
       }
-      await drainCleanup(core, run, options);
+      await drainCleanup(core, run, guardedOptions);
       return { sourceId, snapshotId: source.activeSnapshotId, runId: run.id, status: "published", diagnostics: [] };
     }
 
-    source = requireActiveRepoSource(core, sourceId);
-    if (source.activeSnapshotId) {
+    source = requireActiveSource(core, sourceId, type);
+    if (source.activeSnapshotId && type !== "git-md") {
       const activeRun = source.activeRunId ? core.getSourceRun(source.activeRunId) : null;
       if (!activeRun) throw new Error("active repo-md source is missing its published run");
-      await materializeRepoMdCommit(source, source.activeSnapshotId, { ...mat, config: activeRun.effectiveConfig });
-      pointRepoMdCurrent(source.id, source.activeSnapshotId, computeSourceIngestConfigHash(activeRun.effectiveConfig), mat);
+      await materializeCommit(source, source.activeSnapshotId, { ...mat, config: activeRun.effectiveConfig });
+      pointSourceCurrent(source, source.activeSnapshotId, computeSourceIngestConfigHash(activeRun.effectiveConfig), mat);
     }
 
     if (!run) {
-      const pinned = await materializeRepoMdHead(source, mat);
+      let pinned;
+      let gitMdFence: string | null = null;
+      if (type === "git-md") {
+        gitMdFence = gitMdSourceSignature(source);
+        try {
+          const oid = await syncManagedGitRepository(source, options.sourceStorageDir, options.remoteGit, () => {
+            options.preflight?.();
+            requireUnchangedGitMdSource(core, sourceId, gitMdFence!);
+          }, assertAuthorizedOwnership);
+          assertAuthorizedOwnership();
+          source = requireUnchangedGitMdSource(core, sourceId, gitMdFence);
+          pinned = await materializeGitMdCommit(source, oid, mat);
+        } catch (error) {
+          recordGitMdPrePinFailure(core, source, error, mutate);
+          throw error;
+        }
+      } else pinned = await materializeRepoMdHead(source, mat);
+      options.preflight?.();
+      if (gitMdFence) source = requireUnchangedGitMdSource(core, sourceId, gitMdFence);
       options.fault?.("after-pin");
-      const begun = core.beginSourceRun({ sourceId, snapshotId: pinned.snapshotId });
+      mutate();
+      const begun = core.beginSourceRun({
+        sourceId, snapshotId: pinned.snapshotId,
+        ...(type === "git-md" ? {
+          expectedConfigVersion: source.configVersion,
+          expectedLeaseFence: source.leaseFence,
+        } : {}),
+      });
       if (begun.kind === "noop") {
-        pointRepoMdCurrent(source.id, pinned.snapshotId, pinned.configHash, mat);
-        options.onNoopVerified?.();
-        return { sourceId, snapshotId: pinned.snapshotId, runId: null, status: "noop", diagnostics: [] };
+        return verifyUnchangedPublication(core, begun.source, pinned.snapshotId, options, mat, mutate);
       }
       run = begun.run;
+      invocationRun = run;
       options.fault?.("after-begin");
     }
 
-    const runConfigHash = computeSourceIngestConfigHash(run.effectiveConfig);
-    const snapshotPath = repoMdSnapshotPath(source.id, run.snapshotId, runConfigHash, options.sourceStorageDir);
+    let runConfigHash = computeSourceIngestConfigHash(run.effectiveConfig);
+    mutate();
+    let snapshotPath = sourceSnapshotPath(source, run.snapshotId, runConfigHash, options.sourceStorageDir, mutate, mat.safeTreeOps);
     if (run.state === "scanning") {
-      const materialized = await materializeRepoMdCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
+      let materialized;
+      try {
+        materialized = await materializeCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
+      } catch (error) {
+        const writeFree = core.listSourceFiles(run.id).length === 0 && core.listSourceChunks(run.id).length === 0;
+        if (type !== "git-md" || !writeFree || !isRecoverableGitCommitAvailabilityError(error)) throw error;
+        const fence = gitMdSourceSignature(source);
+        const recoveredOid = await syncManagedGitRepository(source, options.sourceStorageDir, options.remoteGit, () => {
+          options.preflight?.(); requireUnchangedGitMdSource(core, sourceId, fence);
+        }, assertAuthorizedOwnership);
+        assertAuthorizedOwnership();
+        source = requireUnchangedGitMdSource(core, sourceId, fence);
+        try {
+          // A normal branch fetch may make the old pinned commit reachable
+          // again. Preserve the durable run whenever that exact commit exists.
+          materialized = await materializeCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
+        } catch (retryError) {
+          const stillWriteFree = core.listSourceFiles(run.id).length === 0 && core.listSourceChunks(run.id).length === 0;
+          if (!stillWriteFree || recoveredOid === run.snapshotId || !isRecoverableGitCommitAvailabilityError(retryError)) throw retryError;
+          mutate();
+          core.abortSourceRun(run.id, "failed", "pinned git-md commit is unavailable after hardened refetch");
+          mutate();
+          const replacement = core.beginSourceRun({
+            sourceId, snapshotId: recoveredOid, expectedConfigVersion: source.configVersion, expectedLeaseFence: source.leaseFence,
+          });
+          if (replacement.kind === "noop") {
+            return verifyUnchangedPublication(core, replacement.source, recoveredOid, options, mat, mutate, () => {
+              invocationVerified = true;
+            });
+          }
+          run = replacement.run;
+          invocationRun = run;
+          runConfigHash = computeSourceIngestConfigHash(run.effectiveConfig);
+          mutate();
+          snapshotPath = sourceSnapshotPath(source, run.snapshotId, runConfigHash, options.sourceStorageDir, mutate, mat.safeTreeOps);
+          materialized = await materializeCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
+        }
+      }
       const scanned = (options.scan ?? scanSourceSnapshot)({ root: snapshotPath, config: run.effectiveConfig });
       if (!scanned.publishable || scanned.status === "partial") {
+        mutate();
         core.abortSourceRun(run.id, "partial", JSON.stringify(scanned.diagnostics));
         return { sourceId, snapshotId: run.snapshotId, runId: run.id, status: "partial", diagnostics: scanned.diagnostics };
       }
-      core.stageSourceManifest(await planManifest(
+      const planned = await planManifest(
         core, source, run, scanned, options.idGen ?? randomUUID,
-        materialized.repositoryRoot, mat.execFile,
-      ));
+        materialized.repositoryRoot, mat,
+      );
+      mutate();
+      core.stageSourceManifest(planned);
       options.fault?.("after-stage");
       run = core.getSourceRun(run.id)!;
     }
 
     if (run.state === "staging") {
-      await materializeStagedBindings(core, source, run, options);
+      await materializeStagedBindings(core, source, run, guardedOptions);
       try {
+        mutate();
         core.beginSourceActivation(run.id);
       } catch (error) {
         if (!isFenceError(error)) throw error;
         // Every intent/engine-written row is converged before abort so cleanup authorization is exact.
-        await materializeStagedBindings(core, source, run, options);
+        await materializeStagedBindings(core, source, run, guardedOptions);
+        mutate();
         const aborted = core.abortSourceRun(run.id, "failed", "source run fence is stale");
-        await drainCleanup(core, aborted, options);
+        await drainCleanup(core, aborted, guardedOptions);
         return { sourceId, snapshotId: run.snapshotId, runId: run.id, status: "aborted", diagnostics: [] };
       }
       run = core.getSourceRun(run.id)!;
@@ -421,20 +736,63 @@ export async function syncRepoMdSource(
 
     if (run.state === "activating") {
       try {
+        mutate();
         core.publishSourceRun({ runId: run.id, activationToken: run.activationToken! });
       } catch (error) {
         if (!isFenceError(error)) throw error;
+        mutate();
         const aborted = core.abortSourceRun(run.id, "failed", "source run fence is stale");
-        await drainCleanup(core, aborted, options);
+        await drainCleanup(core, aborted, guardedOptions);
         return { sourceId, snapshotId: run.snapshotId, runId: run.id, status: "aborted", diagnostics: [] };
       }
-      pointRepoMdCurrent(source.id, run.snapshotId, runConfigHash, mat);
       options.fault?.("after-publish");
+      source = requireActiveSource(core, sourceId, type);
+      const publishedManifest = type === "git-md" ? activePublishedManifest(core, source) : undefined;
+      if (type === "git-md") {
+        if (source.activeRunId !== run.id || source.activeSnapshotId !== run.snapshotId
+            || source.activeIngestConfigHash !== runConfigHash) throw new Error("git-md publication changed after durable publish");
+        core.validateSourceActivePublication(source.id, run.id, run.snapshotId, runConfigHash);
+      }
+      pointSourceCurrent(source, run.snapshotId, runConfigHash, mat, publishedManifest);
+      validateSourcePublishedPath(source, run.snapshotId, runConfigHash, options.sourceStorageDir, publishedManifest);
       run = core.getSourceRun(run.id)!;
     }
-    if (run.state === "cleaning") await drainCleanup(core, run, options);
-    pointRepoMdCurrent(source.id, run.snapshotId, runConfigHash, mat);
+    if (run.state === "cleaning") await drainCleanup(core, run, guardedOptions);
+    source = requireActiveSource(core, sourceId, type);
+    const finalPublication = type === "git-md" ? activePublishedManifest(core, source) : undefined;
+    if (type === "git-md") core.validateSourceActivePublication(source.id, run.id, run.snapshotId, runConfigHash);
+    pointSourceCurrent(source, run.snapshotId, runConfigHash, mat, finalPublication);
+    validateSourcePublishedPath(source, run.snapshotId, runConfigHash, options.sourceStorageDir, finalPublication);
     options.fault?.("after-current");
     return { sourceId, snapshotId: run.snapshotId, runId: run.id, status: "published", diagnostics: [] };
+    };
+
+    try {
+      const result = await execute();
+      if (invocationRun && result.status !== "removed") {
+        const outcomeRun = core.getSourceRun(invocationRun.id) ?? invocationRun;
+        const invocationResult = result.status === "published" || result.status === "noop" ? "success"
+          : result.status === "partial" ? "partial" : "failed";
+        core.recordSourceRunInvocation({
+          sourceId, runId: outcomeRun.id, result: invocationResult,
+          ...(invocationResult === "failed" && outcomeRun.reason ? { reason: outcomeRun.reason } : {}),
+          configVersion: outcomeRun.configVersion, leaseFence: outcomeRun.leaseFence,
+        });
+      }
+      return result;
+    } catch (error) {
+      // Removal completion is authoritative: it purges attempt state, and a
+      // post-completion fault must not resurrect a receipt for the retained run.
+      if (invocationRun && !invocationVerified && core.getSourceRemoval(sourceId)?.state !== "complete") {
+        try {
+          core.recordSourceRunInvocation({
+            sourceId, runId: invocationRun.id, result: "failed",
+            reason: error instanceof Error ? error.message : String(error),
+            configVersion: invocationRun.configVersion, leaseFence: invocationRun.leaseFence,
+          });
+        } catch { /* A corrupt/missing durable run receipt must never mask the primary failure. */ }
+      }
+      throw error;
+    }
   });
 }

@@ -197,6 +197,10 @@ export interface SourceSyncRun {
 export interface BeginSourceRunInput {
   sourceId: string;
   snapshotId: string;
+  /** Required by remote pipelines to close the pin-to-ledger concurrency gap atomically. */
+  expectedConfigVersion?: number;
+  /** Required by remote pipelines to close the pin-to-ledger concurrency gap atomically. */
+  expectedLeaseFence?: number;
 }
 
 export type BeginSourceRunResult =
@@ -208,6 +212,18 @@ export interface SourceManifestFileInput {
   type: "file";
   contentHash: string;
   byteLength: number;
+}
+
+/** Independent durable proof for an already-published sealed source tree. */
+export interface SourcePublishedManifest {
+  sourceId: string;
+  runId: string;
+  snapshotId: string;
+  ingestConfigHash: string;
+  configVersion: number;
+  leaseFence: number;
+  manifestHash: string;
+  files: SourceManifestFileInput[];
 }
 
 export interface SourceManifestChunkInput {

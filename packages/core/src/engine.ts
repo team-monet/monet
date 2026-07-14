@@ -21,10 +21,11 @@ import { resolve } from "node:path";
 import { StoragePort, BetterSqlitePort } from "./storage";
 import { SourceRegistry } from "./source-registry";
 import { SourceLedger } from "./source-ledger";
-import { syncRepoMdSource as runRepoMdSync } from "./source-sync";
-import { validateRepoMdPublishedPath } from "./source-materializer";
+import { syncGitMdSource as runGitMdSync, syncRepoMdSource as runRepoMdSync } from "./source-sync";
+import { validateSourcePublishedPath } from "./source-materializer";
 import { sanitizeSourceError } from "./source-errors";
-import type { RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
+import type { RemoteGitOptions } from "./source-git";
+import type { GitMdSyncOptions, GitMdSyncResult, RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
 import type {
   BeginSourceRunInput,
   BeginSourceRunResult,
@@ -43,6 +44,7 @@ import type {
   SourceFileRecord,
   SourceRemoval,
   SourceRemovalItem,
+  SourcePublishedManifest,
   SourceSyncRun,
   StageSourceManifestInput,
   UpdateSourceInput,
@@ -471,8 +473,12 @@ export interface MonetCoreOptions {
   graph?: Partial<GraphParams>;
   /** Min cosine for a `related` edge. Default: embedder-bound (0.45 MiniLM / 0.40 lexical). */
   edgeSimMin?: number;
-  /** Monet-owned base directory returned for git-md checkouts. The registry never creates or deletes it. */
+  /** Monet-owned base directory for managed source repositories and sealed snapshots. */
   sourceStorageDir?: string;
+  /** Runtime-only remote Git execution and credential seams for managed git-md sources. */
+  sourceGit?: RemoteGitOptions;
+  /** Deterministic test seam invoked throughout the final exhaustive source_path validation. */
+  sourcePathValidationCheck?: () => void;
 }
 
 interface ConceptRow {
@@ -562,6 +568,8 @@ export class MonetCore {
   private sourceRegistry: SourceRegistry;
   private sourceLedger: SourceLedger;
   private sourceStorageDir: string;
+  private sourceGit: RemoteGitOptions;
+  private sourcePathValidationCheck: () => void;
   /** Stable store identity for sync; unlike agentId this is persisted and never defaults globally. */
   private syncDeviceId = "";
   /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
@@ -585,6 +593,8 @@ export class MonetCore {
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.sourceStorageDir = resolve(opts.sourceStorageDir ?? resolve(homedir(), ".monet", "sources"));
+    this.sourceGit = opts.sourceGit ?? {};
+    this.sourcePathValidationCheck = opts.sourcePathValidationCheck ?? (() => undefined);
     this.sourceRegistry = new SourceRegistry(this.db, {
       idGen: this.newId,
       sourceStorageDir: opts.sourceStorageDir,
@@ -3787,10 +3797,16 @@ export class MonetCore {
       filesIndexed = active.filesIndexed;
       chunksIndexed = active.chunksIndexed;
     }
-    const verificationWins = attempt.latestVerificationAt !== null
-      && attempt.latestVerificationRunCount === attempt.runCount;
-    const latestResult = verificationWins ? "success" : (attempt.lastResult?.result ?? "never");
-    const lastAttemptAt = Math.max(attempt.latest?.createdAt ?? -1, attempt.latestVerificationAt ?? -1);
+    const verificationWins = attempt.latestAttempt?.kind === "verification"
+      && attempt.latestVerificationAt !== null && attempt.latestVerificationRunCount === attempt.runCount;
+    const prePinWins = attempt.latestAttempt?.kind === "pre-pin-failure";
+    const invocationWins = attempt.latestAttempt?.kind === "invocation";
+    const latestResult = prePinWins ? "failed" : verificationWins ? "success"
+      : invocationWins ? (attempt.latestAttempt?.invocationResult ?? "failed")
+      : attempt.latestAttempt?.kind === "run" && attempt.latestAttempt.failureReason ? "failed"
+      : attempt.latestAttempt?.kind === "run" ? (attempt.latestAttempt.runResult ?? attempt.lastResult?.result ?? "never")
+      : (attempt.lastResult?.result ?? "never");
+    const lastAttemptAt = attempt.latestAttempt?.attemptedAt ?? -1;
     const lastSuccessfulSyncAt = Math.max(attempt.lastSuccess?.publishedAt ?? -1, attempt.latestVerificationAt ?? -1);
     const thresholdSeconds = source.refresh.mode === "manual"
       ? 86_400
@@ -3813,24 +3829,57 @@ export class MonetCore {
       ...(lastSuccessfulSyncAt >= 0 ? { lastSuccessfulSyncAt } : {}),
       ...(source.activeSnapshotId ? { indexedRevision: source.activeSnapshotId } : {}),
       freshness, filesIndexed, chunksIndexed, dirtyFiles: attempt.dirtyFiles,
-      ...(!verificationWins && attempt.lastResult?.reason ? { lastError: sanitizeSourceError(attempt.lastResult.reason) } : {}),
+      ...(prePinWins ? { lastError: sanitizeSourceError(attempt.latestAttempt?.failureReason ?? "source pre-pin attempt failed") }
+        : invocationWins && attempt.latestAttempt?.invocationResult === "failed"
+          ? { lastError: sanitizeSourceError(attempt.latestAttempt.failureReason ?? "source sync invocation failed") }
+        : !verificationWins && attempt.latestAttempt?.kind === "run" && (attempt.latestAttempt.failureReason || attempt.latestAttempt.runReason)
+          ? { lastError: sanitizeSourceError(attempt.latestAttempt.failureReason ?? attempt.latestAttempt.runReason!) }
+          : !verificationWins && !invocationWins && attempt.lastResult?.reason
+            ? { lastError: sanitizeSourceError(attempt.lastResult.reason) } : {}),
     };
   }
 
   sourcePath(sourceId: string, context?: SourceAuthorizationContext): ConnectorSourcePath {
-    const source = this.requireAuthorizedActiveSource(sourceId, context);
-    if (source.type !== "repo-md") throw new Error("source_path does not yet support git-md sources");
+    const trusted = this.requireConnectorContext(context);
+    // Freeze the identity values once so a mutable caller-owned context cannot switch identities
+    // between the initial authorization and either post-validation authorization fence.
+    const runtimeContext = Object.freeze({ callerId: trusted.callerId, projectId: trusted.projectId });
+    const source = this.requireAuthorizedActiveSource(sourceId, runtimeContext);
     if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash) {
       throw new Error("source has no published snapshot");
     }
-    this.sourceLedger.activePublication(source.id, source.activeRunId, source.activeSnapshotId, source.activeIngestConfigHash);
-    validateRepoMdPublishedPath(source.id, source.activeSnapshotId, source.activeIngestConfigHash, this.sourceStorageDir);
-    const current = this.requireAuthorizedActiveSource(sourceId, context);
-    if (current.leaseFence !== source.leaseFence || current.lifecycle !== source.lifecycle
-        || current.activeRunId !== source.activeRunId || current.activeSnapshotId !== source.activeSnapshotId
-        || current.activeIngestConfigHash !== source.activeIngestConfigHash) throw new Error("source changed during operation");
-    this.sourceLedger.activePublication(current.id, current.activeRunId!, current.activeSnapshotId!, current.activeIngestConfigHash!);
-    const finalPaths = validateRepoMdPublishedPath(current.id, current.activeSnapshotId!, current.activeIngestConfigHash!, this.sourceStorageDir);
+    const sameSourcePathFence = (candidate: KnowledgeSource): boolean => candidate.type === source.type
+      && candidate.lifecycle === source.lifecycle && candidate.configVersion === source.configVersion
+      && candidate.leaseFence === source.leaseFence && candidate.appliedConfigVersion === source.appliedConfigVersion
+      && candidate.activeRunId === source.activeRunId && candidate.activeSnapshotId === source.activeSnapshotId
+      && candidate.activeIngestConfigHash === source.activeIngestConfigHash
+      && candidate.access.allowedCallerIds.length === source.access.allowedCallerIds.length
+      && candidate.access.allowedCallerIds.every((id, index) => id === source.access.allowedCallerIds[index])
+      && candidate.access.allowedProjectIds.length === source.access.allowedProjectIds.length
+      && candidate.access.allowedProjectIds.every((id, index) => id === source.access.allowedProjectIds[index]);
+    const samePublishedManifestFence = (candidate: SourcePublishedManifest, expected: SourcePublishedManifest): boolean =>
+      candidate.sourceId === expected.sourceId && candidate.runId === expected.runId
+      && candidate.snapshotId === expected.snapshotId && candidate.ingestConfigHash === expected.ingestConfigHash
+      && candidate.configVersion === expected.configVersion && candidate.leaseFence === expected.leaseFence
+      && candidate.manifestHash === expected.manifestHash;
+    const publication = this.sourceLedger.publishedManifest(source.id, source.activeRunId, source.activeSnapshotId, source.activeIngestConfigHash);
+    validateSourcePublishedPath(source, source.activeSnapshotId, source.activeIngestConfigHash, this.sourceStorageDir, publication);
+    const current = this.requireAuthorizedActiveSource(sourceId, runtimeContext);
+    if (!sameSourcePathFence(current)) throw new Error("source changed during operation");
+    const finalPublication = this.sourceLedger.publishedManifest(current.id, current.activeRunId!, current.activeSnapshotId!, current.activeIngestConfigHash!);
+    if (!samePublishedManifestFence(finalPublication, publication)) throw new Error("source changed during operation");
+    const finalPaths = validateSourcePublishedPath(
+      current, current.activeSnapshotId!, current.activeIngestConfigHash!, this.sourceStorageDir,
+      finalPublication, this.sourcePathValidationCheck,
+    );
+    // The exhaustive filesystem walk above is intentionally followed by authorization first.
+    // A revoked or removed source therefore retains the same non-disclosing connector failure.
+    const settled = this.requireAuthorizedActiveSource(sourceId, runtimeContext);
+    if (!sameSourcePathFence(settled)) throw new Error("source changed during operation");
+    const settledPublication = this.sourceLedger.publishedManifest(
+      settled.id, settled.activeRunId!, settled.activeSnapshotId!, settled.activeIngestConfigHash!,
+    );
+    if (!samePublishedManifestFence(settledPublication, publication)) throw new Error("source changed during operation");
     return {
       sourceId: source.id, type: source.type, path: finalPaths.path, snapshotPath: finalPaths.snapshotPath,
       revision: source.activeSnapshotId,
@@ -3841,33 +3890,20 @@ export class MonetCore {
   /** Public connector dispatch. Tombstones fail before the privileged internal recovery path. */
   async syncSource(sourceId: string, context?: SourceAuthorizationContext): Promise<RepoMdSyncResult> {
     const source = this.requireAuthorizedActiveSource(sourceId, context);
-    if (source.type !== "repo-md") throw new Error("source_sync does not yet support git-md sources");
     const preflight = (): void => {
       const current = this.requireAuthorizedActiveSource(sourceId, context);
-      if (current.type !== "repo-md" || current.leaseFence !== source.leaseFence
+      if (current.type !== source.type || current.leaseFence !== source.leaseFence
           || current.configVersion !== source.configVersion || current.lifecycle !== "active") {
         throw new Error("source changed before sync began");
       }
     };
     preflight();
-    return runRepoMdSync(this, sourceId, {
+    const runner = source.type === "git-md" ? runGitMdSync : runRepoMdSync;
+    return runner(this, sourceId, {
       sourceStorageDir: this.sourceStorageDir,
+      ...(source.type === "git-md" ? { remoteGit: this.sourceGit } : {}),
       idGen: this.newId,
       preflight,
-      onNoopVerified: () => {
-        if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash) {
-          throw new Error("unchanged source is missing its active publication tuple");
-        }
-        preflight();
-        this.sourceLedger.activePublication(source.id, source.activeRunId, source.activeSnapshotId, source.activeIngestConfigHash);
-        validateRepoMdPublishedPath(source.id, source.activeSnapshotId, source.activeIngestConfigHash, this.sourceStorageDir);
-        preflight();
-        validateRepoMdPublishedPath(source.id, source.activeSnapshotId, source.activeIngestConfigHash, this.sourceStorageDir);
-        this.sourceLedger.recordVerification({
-          sourceId: source.id, runId: source.activeRunId, snapshotId: source.activeSnapshotId,
-          ingestConfigHash: source.activeIngestConfigHash, configVersion: source.configVersion, leaseFence: source.leaseFence,
-        });
-      },
     });
   }
 
@@ -3935,6 +3971,32 @@ export class MonetCore {
     return this.sourceLedger.completeRemoval(sourceId);
   }
 
+  recordSourcePrePinFailure(input: { sourceId: string; reason: string; configVersion: number; leaseFence: number }): number {
+    return this.sourceLedger.recordPrePinFailure(input);
+  }
+
+  recordSourceRunInvocation(input: {
+    sourceId: string; runId: string; result: "success" | "failed" | "partial";
+    reason?: string; configVersion: number; leaseFence: number;
+  }): number {
+    return this.sourceLedger.recordRunInvocation(input);
+  }
+
+  recordSourceVerification(input: {
+    sourceId: string; runId: string; snapshotId: string; ingestConfigHash: string;
+    configVersion: number; leaseFence: number;
+  }): number {
+    return this.sourceLedger.recordVerification(input);
+  }
+
+  validateSourceActivePublication(sourceId: string, runId: string, snapshotId: string, ingestConfigHash: string): void {
+    this.sourceLedger.activePublication(sourceId, runId, snapshotId, ingestConfigHash);
+  }
+
+  getSourcePublishedManifest(sourceId: string, runId: string, snapshotId: string, ingestConfigHash: string): import("./source-types").SourcePublishedManifest {
+    return this.sourceLedger.publishedManifest(sourceId, runId, snapshotId, ingestConfigHash);
+  }
+
   listSourceFiles(runId: string, published = false): SourceFileRecord[] {
     return this.sourceLedger.listFiles(runId, published);
   }
@@ -3957,6 +4019,16 @@ export class MonetCore {
       ...options,
       sourceStorageDir: this.sourceStorageDir,
       idGen: this.newId,
+    });
+  }
+
+  /** Privileged managed clone/fetch ingestion for registered git-md sources. */
+  async syncGitMdSource(sourceId: string, options: GitMdSyncOptions = {}): Promise<GitMdSyncResult> {
+    return runGitMdSync(this, sourceId, {
+      ...options,
+      sourceStorageDir: this.sourceStorageDir,
+      idGen: this.newId,
+      remoteGit: { ...this.sourceGit, ...options.remoteGit },
     });
   }
 

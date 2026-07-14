@@ -24,7 +24,11 @@ function makeWritable(path: string): void {
   } catch { /* cleanup */ }
 }
 
-function fixture(label: string, refresh: { mode: "manual" } | { mode: "interval"; intervalSeconds: number } = { mode: "manual" }) {
+function fixture(
+  label: string,
+  refresh: { mode: "manual" } | { mode: "interval"; intervalSeconds: number } = { mode: "manual" },
+  sourcePathValidationCheck?: () => void,
+) {
   const root = mkdtempSync(join(tmpdir(), `monet-source-connector-${label}-`));
   const repo = join(root, "repo");
   const storage = join(root, "managed");
@@ -33,7 +37,7 @@ function fixture(label: string, refresh: { mode: "manual" } | { mode: "interval"
   git(repo, "config", "user.name", "Test");
   writeFileSync(join(repo, "README.md"), "# Intro\n\nbody\n");
   git(repo, "add", "README.md"); git(repo, "commit", "-m", "initial");
-  const core = new MonetCore(join(root, "monet.db"), { sourceStorageDir: storage });
+  const core = new MonetCore(join(root, "monet.db"), { sourceStorageDir: storage, sourcePathValidationCheck });
   core.createSource({
     id: "repo-source", type: "repo-md", name: "repo", localPath: repo, circle: "repo",
     include: ["README.md"], exclude: [], autoDetect: false,
@@ -78,6 +82,9 @@ describe("authorized source connector surface", () => {
       const after = f.core.sourceStatus("repo-source", auth, latestVerification);
       expect(after).toMatchObject({ freshness: "fresh", lastAttemptAt: latestVerification, lastSuccessfulSyncAt: latestVerification });
       expect(f.core.listSourceRuns("repo-source")).toHaveLength(runCount);
+      const attemptsAfterNoop = (f.core as unknown as { db: { prepare: (sql: string) => { get: (...args: unknown[]) => { count: number } } } }).db
+        .prepare("SELECT COUNT(*) AS count FROM source_attempt_events WHERE source_id='repo-source'").get().count;
+      expect(attemptsAfterNoop).toBe(3); // run creation + successful invocation + verification
       if (_label === "manual") {
         for (let index = 1; index <= 8; index += 1) {
           latestVerification = staleNow + index;
@@ -166,7 +173,7 @@ describe("authorized source connector surface", () => {
         fault: (point) => { if (point === "after-stage") throw new Error("pause after complete scan"); },
       })).rejects.toThrow(/pause after complete scan/);
       const staged = f.core.sourceStatus("repo-source", auth);
-      expect(staged).toMatchObject({ lastSyncResult: "partial", filesIndexed: 1, dirtyFiles: 1 });
+      expect(staged).toMatchObject({ lastSyncResult: "failed", filesIndexed: 1, dirtyFiles: 1, lastError: "pause after complete scan" });
     } finally { f.cleanup(); }
   });
 
@@ -195,22 +202,52 @@ describe("authorized source connector surface", () => {
     } finally { f.cleanup(); }
   });
 
-  it("clearly rejects an authorized git-md source", async () => {
+  it("keeps an unsynced authorized git-md source path closed", () => {
     const f = fixture("git");
     try {
       f.core.updateSource("denied-source", { access: { allowedCallerIds: [auth.callerId], allowedProjectIds: [auth.projectId] } });
-      await expect(f.core.syncSource("denied-source", auth)).rejects.toThrow(/does not yet support git-md/);
+      expect(() => f.core.sourcePath("denied-source", auth)).toThrow(/no published snapshot/);
     } finally { f.cleanup(); }
   });
 
-  it("rechecks runtime authorization after path validation", async () => {
-    const f = fixture("race");
+  it("fails closed when repo-md authorization, configuration, or removal changes during exhaustive path validation", async () => {
+    let duringValidation = () => undefined;
+    const f = fixture("path-toctou", { mode: "manual" }, () => duringValidation());
     try {
       await f.core.syncSource("repo-source", auth);
-      const registry = (f.core as unknown as { sourceRegistry: { authorizeSource: (...args: unknown[]) => boolean } }).sourceRegistry;
-      const original = registry.authorizeSource.bind(registry);
-      let calls = 0;
-      registry.authorizeSource = (...args: unknown[]) => ++calls === 1 ? original(...args) : false;
+      const exact = f.core.sourcePath("repo-source", auth);
+      let unchangedChecks = 0;
+      duringValidation = () => { unchangedChecks += 1; };
+      expect(f.core.sourcePath("repo-source", auth)).toEqual(exact);
+      expect(unchangedChecks).toBeGreaterThan(1);
+
+      let changed = false;
+      duringValidation = () => {
+        if (changed) return;
+        changed = true;
+        f.core.updateSource("repo-source", { name: "changed during validation" });
+      };
+      expect(() => f.core.sourcePath("repo-source", auth)).toThrow("source changed during operation");
+
+      let revoked = false;
+      duringValidation = () => {
+        if (revoked) return;
+        revoked = true;
+        f.core.updateSource("repo-source", {
+          access: { allowedCallerIds: ["other"], allowedProjectIds: [auth.projectId] },
+        });
+      };
+      expect(() => f.core.sourcePath("repo-source", auth)).toThrow("source is unavailable");
+
+      f.core.updateSource("repo-source", {
+        access: { allowedCallerIds: [auth.callerId], allowedProjectIds: [auth.projectId] },
+      });
+      let removed = false;
+      duringValidation = () => {
+        if (removed) return;
+        removed = true;
+        f.core.removeSource("repo-source");
+      };
       expect(() => f.core.sourcePath("repo-source", auth)).toThrow("source is unavailable");
     } finally { f.cleanup(); }
   });

@@ -1168,6 +1168,98 @@ describe("source ledger publication kernel", () => {
 });
 
 describe("source ledger schema migration", () => {
+  it("backfills verification by observed run count despite backward and equal clocks", () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-source-attempt-causal-migrate-"));
+    const path = join(dir, "monet.db");
+    try {
+      const first = new MonetCore(path);
+      first.createSource(sourceInput("source-a", join(dir, "repo")));
+      const publishEmpty = (snapshotId: string): SourceSyncRun => {
+        const begun = first.beginSourceRun({ sourceId: "source-a", snapshotId });
+        if (begun.kind !== "started") throw new Error("expected run");
+        first.stageSourceManifest(manifest(begun.run, { files: [], chunks: [] }));
+        return first.publishSourceRun({ runId: begun.run.id, activationToken: first.beginSourceActivation(begun.run.id) });
+      };
+      const run1 = publishEmpty("snap-1");
+      first.updateSource("source-a", { include: ["README.md"] });
+      const run2 = publishEmpty("snap-2");
+      const active = first.getSource("source-a")!;
+      first.recordSourceVerification({
+        sourceId: active.id, runId: run2.id, snapshotId: run2.snapshotId, ingestConfigHash: run2.ingestConfigHash,
+        configVersion: active.configVersion, leaseFence: active.leaseFence,
+      });
+      first.updateSource("source-a", { include: ["AGENTS.md"] });
+      const begun3 = first.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-3" });
+      if (begun3.kind !== "started") throw new Error("expected third run");
+      const run3 = first.abortSourceRun(begun3.run.id, "failed", "newest durable run failed");
+      const current = first.getSource("source-a")!;
+      first.recordSourcePrePinFailure({
+        sourceId: current.id, reason: "legacy pre-pin", configVersion: current.configVersion, leaseFence: current.leaseFence,
+      });
+
+      const db = (first as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_sync_runs SET created_at=CASE id WHEN ? THEN 300 WHEN ? THEN 300 ELSE 100 END
+        WHERE source_id='source-a'`).run(run1.id, run2.id);
+      db.prepare(`UPDATE source_verification_checks SET checked_at=50 WHERE source_id='source-a'`).run();
+      db.prepare(`UPDATE source_pre_pin_attempts SET attempted_at=75 WHERE source_id='source-a'`).run();
+      db.prepare(`DELETE FROM source_attempt_events WHERE source_id='source-a'`).run();
+      first.close();
+
+      for (let reopen = 0; reopen < 2; reopen += 1) {
+        const core = new MonetCore(path);
+        const reopened = (core as unknown as { db: StoragePort }).db;
+        expect(reopened.prepare(`SELECT kind,run_id,attempted_at FROM source_attempt_events
+          WHERE source_id='source-a' ORDER BY sequence`).all()).toEqual([
+          { kind: "pre-pin-failure", run_id: null, attempted_at: 75 },
+          { kind: "run", run_id: run1.id, attempted_at: 300 },
+          { kind: "run", run_id: run2.id, attempted_at: 300 },
+          { kind: "verification", run_id: run2.id, attempted_at: 50 },
+          { kind: "run", run_id: run3.id, attempted_at: 100 },
+        ]);
+        expect(core.sourceStatus("source-a", { callerId: "caller", projectId: "project" })).toMatchObject({
+          indexedRevision: "snap-2", lastSyncResult: "failed", lastError: "newest durable run failed",
+        });
+        core.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("hydrates only the newest same-millisecond legacy pre-pin failure event", () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-source-attempt-payload-migrate-"));
+    const path = join(dir, "monet.db");
+    try {
+      const first = new MonetCore(path);
+      first.createSource(sourceInput("source-a", join(dir, "repo")));
+      const db = (first as unknown as { db: StoragePort }).db;
+      db.exec(`
+        INSERT INTO source_attempt_events(source_id,sequence,kind,ref_id,attempted_at,failure_reason)
+          VALUES ('source-a',1,'pre-pin-failure','legacy-1',1234,NULL),
+                 ('source-a',2,'pre-pin-failure','legacy-2',1234,NULL);
+        INSERT INTO source_pre_pin_attempts(source_id,attempted_at,reason,config_version,lease_fence)
+          VALUES ('source-a',1234,'newest durable reason',1,1);
+        ALTER TABLE source_attempt_events DROP COLUMN failure_reason;
+      `);
+      first.close();
+
+      for (let reopen = 0; reopen < 2; reopen += 1) {
+        const core = new MonetCore(path);
+        const reopened = (core as unknown as { db: StoragePort }).db;
+        expect(reopened.prepare(`
+          SELECT sequence,failure_reason FROM source_attempt_events
+          WHERE source_id='source-a' ORDER BY sequence
+        `).all()).toEqual([
+          { sequence: 1, failure_reason: null },
+          { sequence: 2, failure_reason: "newest durable reason" },
+        ]);
+        core.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("creates every v9 receipt/cleanup index on fresh and current-schema reopen", () => {
     const expected = [
       "idx_source_cleanup_run",
@@ -1241,6 +1333,53 @@ describe("source ledger schema migration", () => {
       const again = new MonetCore(path);
       expect(((again as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(9);
       again.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not backfill attempt events for a completely removed source on reopen", () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-source-removed-attempts-"));
+    const path = join(dir, "monet.db");
+    const auth = { callerId: "caller", projectId: "project" };
+    try {
+      const first = new MonetCore(path);
+      first.createSource(sourceInput("removed-source", join(dir, "repo")));
+      const begun = first.beginSourceRun({ sourceId: "removed-source", snapshotId: "retained-snapshot" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+      first.abortSourceRun(begun.run.id, "failed", "retained failed run");
+      first.removeSource("removed-source");
+      first.beginSourceRemoval("removed-source");
+      first.markSourceRemovalFilesRevoked("removed-source");
+      expect(first.recordSourceRunInvocation({
+        sourceId: "removed-source", runId: begun.run.id, result: "failed", reason: "failure before removal completion",
+        configVersion: begun.run.configVersion, leaseFence: begun.run.leaseFence,
+      })).toEqual(expect.any(Number));
+      first.completeSourceRemoval("removed-source");
+      const firstDb = (first as unknown as { db: StoragePort }).db;
+      expect(firstDb.prepare(`SELECT COUNT(*) AS count FROM source_sync_runs WHERE source_id=?`).get("removed-source")).toEqual({ count: 1 });
+      expect(firstDb.prepare(`SELECT COUNT(*) AS count FROM source_attempt_events WHERE source_id=?`).get("removed-source")).toEqual({ count: 0 });
+      expect(() => first.recordSourceRunInvocation({
+        sourceId: "removed-source", runId: begun.run.id, result: "failed", reason: "late retained-run receipt",
+        configVersion: begun.run.configVersion, leaseFence: begun.run.leaseFence,
+      })).toThrow("source run invocation is closed by completed removal");
+      for (const table of ["source_attempt_events", "source_pre_pin_attempts", "source_verification_checks"]) {
+        expect(firstDb.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE source_id=?`).get("removed-source")).toEqual({ count: 0 });
+      }
+      first.close();
+
+      for (let reopen = 0; reopen < 2; reopen += 1) {
+        const core = new MonetCore(path);
+        const db = (core as unknown as { db: StoragePort }).db;
+        for (const table of ["source_attempt_events", "source_pre_pin_attempts", "source_verification_checks"]) {
+          expect(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE source_id=?`).get("removed-source")).toEqual({ count: 0 });
+        }
+        expect(core.completeSourceRemoval("removed-source").state).toBe("complete");
+        expect(core.getSource("removed-source")).toBeNull();
+        expect(core.getSource("removed-source", { includeTombstoned: true })).toMatchObject({ lifecycle: "tombstoned" });
+        expect(() => core.sourceStatus("removed-source", auth)).toThrow("source is unavailable");
+        core.close();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -43,6 +43,27 @@ function gitInput(overrides: Partial<CreateGitMdSource> = {}): CreateGitMdSource
 }
 
 describe("source registry schema and persistence", () => {
+  it("migrates only an empty unsupported-era git allocator path and rejects filesystem ambiguity", () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-git-allocator-migrate-"));
+    const dbPath = join(dir, "monet.db");
+    const storage = join(dir, "sources");
+    try {
+      const core = new MonetCore(dbPath, { sourceStorageDir: storage });
+      const source = core.createSource(gitInput());
+      const oldPath = join(realpathSync.native(dir), "sources", source.id);
+      const db = (core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE knowledge_sources SET local_path=?,local_path_key=? WHERE id=?`).run(oldPath, oldPath, source.id);
+      core.close();
+      const migrated = new MonetCore(dbPath, { sourceStorageDir: storage });
+      expect(migrated.getSource(source.id)?.localPath).toBe(join(realpathSync.native(dir), "sources", "git-md", source.id, "repository.git"));
+      const migratedDb = (migrated as unknown as { db: StoragePort }).db;
+      migratedDb.prepare(`UPDATE knowledge_sources SET local_path=?,local_path_key=? WHERE id=?`).run(oldPath, oldPath, source.id);
+      migrated.close();
+      mkdirSync(oldPath, { recursive: true });
+      expect(() => new MonetCore(dbPath, { sourceStorageDir: storage })).toThrow(/allocator migration.*ambiguous|filesystem content/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it("migrates a v6 database through the v9 source-ledger schema and reopens idempotently", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-registry-migrate-"));
     const dbPath = join(dir, "monet.db");
@@ -119,7 +140,7 @@ describe("source registry schema and persistence", () => {
       expect(git).toMatchObject({
         repositoryIdentity: "github.com/acme/docs",
         remoteUrl: "https://github.com/acme/docs",
-        localPath: join(canonicalDir, "managed-sources", "git-source"),
+        localPath: join(canonicalDir, "managed-sources", "git-md", "git-source", "repository.git"),
         branch: "main",
         transport: { allowedUrlSchemes: ["https"], allowedHosts: ["github.com"] },
       });

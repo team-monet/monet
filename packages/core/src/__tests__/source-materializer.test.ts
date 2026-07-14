@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   detectRepoMdRenames, extractGitArchive, materializeRepoMdHead, pointRepoMdCurrent,
@@ -100,6 +100,24 @@ describe("repo-md committed-HEAD materializer", () => {
     expect(await detectRepoMdRenames("/tmp", oldOid, newOid, selectedOld, selectedNew, {
       execFile: renameDiffExec("R100\0a.md\0x.md\0"), maxOutputBytes: 4,
     })).toEqual(new Map());
+  });
+
+  it("bounds managed rename diff execution as well as its output", async () => {
+    const oldOid = "a".repeat(40); const newOid = "b".repeat(40);
+    const trustedGitCandidate = (process.env.PATH ?? "").split(delimiter)
+      .map((directory) => join(directory, "git")).find(existsSync);
+    if (!trustedGitCandidate) throw new Error("test requires Git");
+    const trustedGit = realpathSync.native(trustedGitCandidate);
+    const fake = ((file: string, args: readonly string[], options: Record<string, unknown>, callback: Function) => {
+      expect(file).toBe(trustedGit);
+      expect(args).toContain("diff");
+      expect(options).toMatchObject({ timeout: 37, killSignal: "SIGKILL", maxBuffer: 1024 });
+      callback(Object.assign(new Error("attacker-controlled stderr"), { killed: true, signal: "SIGKILL" }), Buffer.alloc(0), Buffer.alloc(0));
+      return {};
+    }) as unknown as typeof import("node:child_process").execFile;
+    await expect(detectRepoMdRenames("/tmp", oldOid, newOid, new Set(["a.md"]), new Set(["b.md"]), {
+      execFile: fake, timeoutMs: 37, maxOutputBytes: 1024, gitExecutable: trustedGit,
+    })).resolves.toEqual(new Map());
   });
 
   it("pins exact committed HEAD and excludes dirty worktree bytes", async () => {
@@ -308,6 +326,93 @@ describe("repo-md committed-HEAD materializer", () => {
     } finally { f.cleanup(); }
   });
 
+  it("orders snapshot and current directory durability barriers before publication faults", async () => {
+    const f = fixture();
+    try {
+      const barriers: string[] = [];
+      const first = await materializeRepoMdHead(f.source, {
+        sourceStorageDir: f.storage, fsyncPath: (path) => barriers.push(path),
+      });
+      const sourceRoot = realpathSync.native(join(f.storage, "repo-md", f.source.id));
+      expect(barriers.slice(-2)).toEqual([sourceRoot, dirname(sourceRoot)]);
+      pointRepoMdCurrent(f.source.id, first.snapshotId, first.configHash, { sourceStorageDir: f.storage });
+
+      writeFileSync(join(f.repo, "README.md"), "second durable bytes\n");
+      git(f.repo, "add", "README.md"); git(f.repo, "commit", "-m", "second durable");
+      const second = await materializeRepoMdHead(f.source, { sourceStorageDir: f.storage });
+      const currentBarriers: string[] = [];
+      expect(() => pointRepoMdCurrent(f.source.id, second.snapshotId, second.configHash, {
+        sourceStorageDir: f.storage,
+        fsyncPath: (path) => currentBarriers.push(path),
+        fault: (point) => { if (point === "after-current-swap") throw new Error("crash after durable current"); },
+      })).toThrow(/crash after durable current/);
+      expect(currentBarriers).toEqual([sourceRoot]);
+      expect(resolve(dirname(second.currentPath), readlinkSync(second.currentPath))).toBe(second.snapshotPath);
+
+      // Offline reopen/repair is idempotent and does not need the source Git repository.
+      rmSync(f.repo, { recursive: true, force: true });
+      expect(pointRepoMdCurrent(f.source.id, second.snapshotId, second.configHash, {
+        sourceStorageDir: f.storage,
+      })).toBe(second.currentPath);
+    } finally { f.cleanup(); }
+  });
+
+  it("fails stale takeover and normal release closed on a substituted lock-tree device", async () => {
+    const forgedDeviceOps = (target: string, removals: { count: number }) => ({
+      lstat: ((path: Parameters<typeof lstatSync>[0]) => {
+        const entry = lstatSync(path);
+        if (String(path) !== target) return entry;
+        const forged = Object.create(entry) as ReturnType<typeof lstatSync>;
+        Object.defineProperty(forged, "dev", { value: entry.dev + 1 });
+        return forged;
+      }) as typeof lstatSync,
+      readdir: readdirSync,
+      rm: ((path: Parameters<typeof rmSync>[0], options?: Parameters<typeof rmSync>[1]) => {
+        removals.count += 1; rmSync(path, options);
+      }) as typeof rmSync,
+    });
+
+    // Stale takeover validates the complete tree before renaming or unlinking it.
+    {
+      const f = fixture();
+      try {
+        mkdirSync(join(f.storage, "repo-md"), { recursive: true });
+        const lock = join(realpathSync.native(join(f.storage, "repo-md")), `.lock-${f.source.id}`);
+        const mounted = join(lock, "mounted");
+        mkdirSync(mounted, { recursive: true }); chmodSync(lock, 0o700); writeFileSync(join(mounted, "keep"), "victim");
+        writeFileSync(join(lock, "owner.json"), JSON.stringify({ token: "dead", heartbeatAt: 0, pid: 999999, host: hostname() }));
+        const removals = { count: 0 };
+        await expect(withRepoMdMaterializerLock(f.source.id, {
+          sourceStorageDir: f.storage, now: () => 1000, lockStaleMs: 10,
+          safeTreeOps: forgedDeviceOps(realpathSync.native(mounted), removals),
+        }, async () => undefined)).rejects.toThrow(/filesystem boundary/);
+        expect(removals.count).toBe(0);
+        expect(readFileSync(join(mounted, "keep"), "utf8")).toBe("victim");
+        expect(existsSync(lock)).toBe(true);
+      } finally { f.cleanup(); }
+    }
+
+    // A held lock is likewise not falsely released when its tree changes device.
+    {
+      const f = fixture();
+      try {
+        mkdirSync(join(f.storage, "repo-md"), { recursive: true });
+        const lock = join(realpathSync.native(join(f.storage, "repo-md")), `.lock-${f.source.id}`);
+        const mounted = join(lock, "mounted");
+        const removals = { count: 0 };
+        await expect(withRepoMdMaterializerLock(f.source.id, {
+          sourceStorageDir: f.storage,
+          safeTreeOps: forgedDeviceOps(mounted, removals),
+        }, async () => {
+          mkdirSync(mounted); writeFileSync(join(mounted, "keep"), "victim");
+        })).rejects.toThrow(/filesystem boundary/);
+        expect(removals.count).toBe(0);
+        expect(readFileSync(join(mounted, "keep"), "utf8")).toBe("victim");
+        expect(existsSync(lock)).toBe(true);
+      } finally { f.cleanup(); }
+    }
+  });
+
   it("rejects archive traversal, symlink, hardlink, and device entries", () => {
     const f = fixture();
     try {
@@ -339,7 +444,7 @@ describe("repo-md committed-HEAD materializer", () => {
       await expect(withRepoMdMaterializerLock(f.source.id, { sourceStorageDir: f.storage, now: () => now, lockStaleMs: 10 }, async () => undefined)).rejects.toThrow(/locked/);
       release(); await first;
       const lock = liveLock;
-      mkdirSync(lock, { recursive: true });
+      mkdirSync(lock, { recursive: true, mode: 0o700 }); chmodSync(lock, 0o700);
       writeFileSync(join(lock, "owner.json"), JSON.stringify({ token: "dead-owner", heartbeatAt: 0, pid: 999999, host: hostname() }));
       await expect(withRepoMdMaterializerLock(f.source.id, {
         sourceStorageDir: f.storage, now: () => now, lockStaleMs: 10,

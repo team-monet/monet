@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { MonetCore } from "../engine";
 import { syncRepoMdSource as runRepoMdSync } from "../source-sync";
-import type { RepoMdSyncFaultPoint } from "../source-sync";
+import type { RepoMdSyncFaultPoint, RepoMdSyncOptions } from "../source-sync";
 import type { StoragePort } from "../storage";
 
 function git(cwd: string, ...args: string[]): string {
@@ -64,7 +64,34 @@ function rawConcept(core: MonetCore, conceptId: string): { body: string; status:
   return db.prepare(`SELECT body,status,active_observation_id FROM concepts WHERE id=?`).get(conceptId) as ReturnType<typeof rawConcept>;
 }
 
+function sourceAttemptState(core: MonetCore, sourceId: string) {
+  const db = (core as unknown as { db: StoragePort }).db;
+  const count = (table: string) => (db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE source_id=?`).get(sourceId) as { count: number }).count;
+  return {
+    attempts: count("source_attempt_events"),
+    prePin: count("source_pre_pin_attempts"),
+    verification: count("source_verification_checks"),
+  };
+}
+
 describe("repo-md committed-HEAD sync", () => {
+  it("keeps engine-owned repo storage, config, and lock clock authoritative", async () => {
+    const f = fixture("trusted-materializer");
+    try {
+      const alternate = join(f.root, "alternate-managed");
+      const forged = {
+        sourceStorageDir: alternate,
+        config: { include: ["missing.md"], exclude: [], limits: {} },
+        lockStaleMs: 1,
+        now: () => Number.MAX_SAFE_INTEGER,
+      } as unknown as NonNullable<RepoMdSyncOptions["materializer"]>;
+      await expect(f.core.syncRepoMdSource("repo-source", { materializer: forged })).resolves.toMatchObject({ status: "published" });
+      expect(existsSync(alternate)).toBe(false);
+      const path = f.core.sourcePath("repo-source", { callerId: "caller", projectId: "project" }).path;
+      expect(readFileSync(join(path, "README.md"), "utf8")).toContain("initial committed body");
+    } finally { f.cleanup(); }
+  });
+
   it("carries binding identity across committed file renames and back while refreshing provenance", async () => {
     const f = fixture("rename-stability");
     try {
@@ -584,6 +611,54 @@ describe("repo-md committed-HEAD sync", () => {
       expect(existsSync(join(f.storage, "repo-md", "repo-source", "snapshots"))).toBe(false);
       expect(readFileSync(join(f.repo, "README.md"), "utf8")).toBe(readme);
       expect(readFileSync(join(f.repo, "SECOND.md"), "utf8")).toBe(second);
+    } finally {
+      if (core !== f.core) { try { core.close(); } catch { /* test cleanup */ } }
+      f.cleanup();
+    }
+  });
+
+  it("never resurrects attempt state when a resumable run faults after removal completion", async () => {
+    const f = fixture("removed-attempt-resurrection");
+    let core = f.core;
+    try {
+      await core.syncRepoMdSource("repo-source");
+      f.commit("# Intro\n\nresumable before removal\n", "resumable before removal");
+      let beginFault = false;
+      await expect(core.syncRepoMdSource("repo-source", {
+        fault: (point) => {
+          if (point === "after-begin" && !beginFault) {
+            beginFault = true;
+            throw new Error("leave resumable run");
+          }
+        },
+      })).rejects.toThrow("leave resumable run");
+      const resumable = core.resumeSourceRun("repo-source")!;
+      expect(resumable.state).toBe("scanning");
+      expect(sourceAttemptState(core, "repo-source").attempts).toBeGreaterThan(0);
+
+      core.removeSource("repo-source");
+      let completeFault = false;
+      await expect(core.syncRepoMdSource("repo-source", {
+        fault: (point) => {
+          if (point === "after-remove-complete" && !completeFault) {
+            completeFault = true;
+            throw new Error("primary after-remove-complete fault");
+          }
+        },
+      })).rejects.toThrow("primary after-remove-complete fault");
+      expect(core.getSourceRemoval("repo-source")!.state).toBe("complete");
+      expect(sourceAttemptState(core, "repo-source")).toEqual({ attempts: 0, prePin: 0, verification: 0 });
+
+      for (let reopen = 0; reopen < 2; reopen += 1) {
+        core.close();
+        core = new MonetCore(f.db, { sourceStorageDir: f.storage });
+        expect(core.getSourceRemoval("repo-source")!.state).toBe("complete");
+        expect(sourceAttemptState(core, "repo-source")).toEqual({ attempts: 0, prePin: 0, verification: 0 });
+      }
+      expect(await core.syncRepoMdSource("repo-source")).toMatchObject({ status: "removed" });
+      expect(core.completeSourceRemoval("repo-source").state).toBe("complete");
+      expect(sourceAttemptState(core, "repo-source")).toEqual({ attempts: 0, prePin: 0, verification: 0 });
+      expect(core.getSourceRun(resumable.id)).toMatchObject({ state: "aborted" });
     } finally {
       if (core !== f.core) { try { core.close(); } catch { /* test cleanup */ } }
       f.cleanup();
