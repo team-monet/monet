@@ -93,6 +93,29 @@ interface RuntimeOptions extends RepoMdSyncOptions {
   remoteGit?: RemoteGitOptions;
   /** Internal exact source-lock fence; never caller-controlled. */
   assertOwnership?: () => void;
+  /** Scheduler-only admission, evaluated after acquiring the exact per-source lock. */
+  scheduledAdmission?: (source: KnowledgeSource, resumable: SourceSyncRun | null) => boolean;
+  scheduledFence?: { configVersion: number; leaseFence: number };
+  /** Nonthrowing scheduler-lease assertion supplied only by privileged maintenance dispatch. */
+  scheduledAssertLeaseOwner?: () => boolean;
+}
+
+const SCHEDULED_SYNC_SKIPPED = Symbol("scheduled-sync-skipped");
+type InternalSyncResult = RepoMdSyncResult | typeof SCHEDULED_SYNC_SKIPPED;
+
+class SourceSchedulerLeaseLostError extends Error {
+  constructor() { super("source scheduler lease ownership was lost"); }
+}
+
+function assertScheduledLease(options: RuntimeOptions): void {
+  if (!options.scheduledAssertLeaseOwner) return;
+  let owned = false;
+  try { owned = options.scheduledAssertLeaseOwner(); } catch { owned = false; }
+  if (!owned) throw new SourceSchedulerLeaseLostError();
+}
+
+function isSchedulerLeaseLost(error: unknown): boolean {
+  return error instanceof SourceSchedulerLeaseLostError;
 }
 
 function assertRuntimeOwnership(options: RuntimeOptions): void {
@@ -435,7 +458,7 @@ function isRecoverableGitCommitAvailabilityError(error: unknown): boolean {
     && /managed git-md repository|fsck|rev-parse|commit is unavailable|unavailable or changed|ENOENT/i.test(error.message);
 }
 
-function recordGitMdPrePinFailure(
+function recordPrePinFailure(
   core: SourceSyncCorePort, source: KnowledgeSource, error: unknown, assertOwnership: () => void,
 ): void {
   try {
@@ -539,7 +562,9 @@ export async function syncRepoMdSource(
   sourceId: string,
   options: RuntimeOptions,
 ): Promise<RepoMdSyncResult> {
-  return syncSource(core, sourceId, options, "repo-md");
+  const result = await syncSource(core, sourceId, options, "repo-md");
+  if (result === SCHEDULED_SYNC_SKIPPED) throw new Error("scheduled admission is unavailable on public source sync");
+  return result;
 }
 
 export type GitMdSyncOptions = RepoMdSyncOptions & { remoteGit?: RemoteGitOptions };
@@ -550,7 +575,37 @@ export async function syncGitMdSource(
   sourceId: string,
   options: RuntimeOptions,
 ): Promise<GitMdSyncResult> {
-  return syncSource(core, sourceId, options, "git-md");
+  const result = await syncSource(core, sourceId, options, "git-md");
+  if (result === SCHEDULED_SYNC_SKIPPED) throw new Error("scheduled admission is unavailable on public source sync");
+  return result;
+}
+
+export async function syncScheduledRepoMdSource(
+  core: SourceSyncCorePort,
+  sourceId: string,
+  options: RuntimeOptions,
+): Promise<RepoMdSyncResult | null> {
+  try {
+    const result = await syncSource(core, sourceId, options, "repo-md");
+    return result === SCHEDULED_SYNC_SKIPPED ? null : result;
+  } catch (error) {
+    if (isSchedulerLeaseLost(error)) return null;
+    throw error;
+  }
+}
+
+export async function syncScheduledGitMdSource(
+  core: SourceSyncCorePort,
+  sourceId: string,
+  options: RuntimeOptions,
+): Promise<RepoMdSyncResult | null> {
+  try {
+    const result = await syncSource(core, sourceId, options, "git-md");
+    return result === SCHEDULED_SYNC_SKIPPED ? null : result;
+  } catch (error) {
+    if (isSchedulerLeaseLost(error)) return null;
+    throw error;
+  }
 }
 
 async function syncSource(
@@ -558,13 +613,20 @@ async function syncSource(
   sourceId: string,
   options: RuntimeOptions,
   type: KnowledgeSource["type"],
-): Promise<RepoMdSyncResult> {
+): Promise<InternalSyncResult> {
   const mat = materializerOptions(options);
   const withLock = type === "git-md" ? withGitMdMaterializerLock : withRepoMdMaterializerLock;
-  return withLock(sourceId, mat, async ({ assertOwnership }) => {
+  let durableRunObserved = false;
+  let durableSuccessObserved = false;
+  let prePinFailureRecorded = false;
+  let coordinatorEntered = false;
+  try {
+  return await withLock(sourceId, mat, async ({ assertOwnership }) => {
+    coordinatorEntered = true;
     let authorizedGitMdSignature: string | null = null;
     const assertAuthorizedOwnership = (): void => {
       assertOwnership();
+      assertScheduledLease(options);
       options.preflight?.();
       if (type === "git-md" && authorizedGitMdSignature !== null) {
         requireUnchangedGitMdSource(core, sourceId, authorizedGitMdSignature);
@@ -576,8 +638,19 @@ async function syncSource(
     assertAuthorizedOwnership();
     let source = requireSourceLineage(core, sourceId, type);
     let run = core.resumeSourceRun(sourceId);
+    durableRunObserved = run !== null;
     let invocationRun = run;
     let invocationVerified = false;
+    const recordCurrentPrePinFailure = (error: unknown): void => {
+      if (prePinFailureRecorded) return;
+      recordPrePinFailure(core, source, error, mutate);
+      prePinFailureRecorded = true;
+    };
+
+    if (options.scheduledAdmission) {
+      assertScheduledLease(options);
+      if (!options.scheduledAdmission(source, run)) return SCHEDULED_SYNC_SKIPPED;
+    }
 
     const execute = async (): Promise<RepoMdSyncResult> => {
 
@@ -593,7 +666,7 @@ async function syncSource(
     if (type === "git-md") {
       try { source = repairGitMdActivePublication(core, source, guardedOptions, mat); }
       catch (error) {
-        recordGitMdPrePinFailure(core, source, error, mutate);
+        recordCurrentPrePinFailure(error);
         throw error;
       }
     }
@@ -622,40 +695,47 @@ async function syncSource(
     }
 
     if (!run) {
-      let pinned;
-      let gitMdFence: string | null = null;
-      if (type === "git-md") {
-        gitMdFence = gitMdSourceSignature(source);
-        try {
-          const oid = await syncManagedGitRepository(source, options.sourceStorageDir, options.remoteGit, () => {
-            options.preflight?.();
-            requireUnchangedGitMdSource(core, sourceId, gitMdFence!);
-          }, assertAuthorizedOwnership);
-          assertAuthorizedOwnership();
-          source = requireUnchangedGitMdSource(core, sourceId, gitMdFence);
-          pinned = await materializeGitMdCommit(source, oid, mat);
-        } catch (error) {
-          recordGitMdPrePinFailure(core, source, error, mutate);
-          throw error;
-        }
-      } else pinned = await materializeRepoMdHead(source, mat);
-      options.preflight?.();
-      if (gitMdFence) source = requireUnchangedGitMdSource(core, sourceId, gitMdFence);
-      options.fault?.("after-pin");
-      mutate();
-      const begun = core.beginSourceRun({
-        sourceId, snapshotId: pinned.snapshotId,
-        ...(type === "git-md" ? {
+      try {
+        let pinned;
+        let gitMdFence: string | null = null;
+        if (type === "git-md") {
+          gitMdFence = gitMdSourceSignature(source);
+          try {
+            const oid = await syncManagedGitRepository(source, options.sourceStorageDir, options.remoteGit, () => {
+              options.preflight?.();
+              requireUnchangedGitMdSource(core, sourceId, gitMdFence!);
+            }, assertAuthorizedOwnership);
+            assertAuthorizedOwnership();
+            source = requireUnchangedGitMdSource(core, sourceId, gitMdFence);
+            pinned = await materializeGitMdCommit(source, oid, mat);
+          } catch (error) {
+            recordCurrentPrePinFailure(error);
+            throw error;
+          }
+        } else pinned = await materializeRepoMdHead(source, mat);
+        options.preflight?.();
+        if (gitMdFence) source = requireUnchangedGitMdSource(core, sourceId, gitMdFence);
+        options.fault?.("after-pin");
+        mutate();
+        const begun = core.beginSourceRun({
+          sourceId, snapshotId: pinned.snapshotId,
           expectedConfigVersion: source.configVersion,
           expectedLeaseFence: source.leaseFence,
-        } : {}),
-      });
-      if (begun.kind === "noop") {
-        return verifyUnchangedPublication(core, begun.source, pinned.snapshotId, options, mat, mutate);
+        });
+        if (begun.kind === "noop") {
+          return verifyUnchangedPublication(core, begun.source, pinned.snapshotId, options, mat, mutate, () => {
+            invocationVerified = true; durableSuccessObserved = true;
+          });
+        }
+        run = begun.run;
+        durableRunObserved = true;
+        invocationRun = run;
+        options.fault?.("after-begin");
+      } catch (error) {
+        if (type === "repo-md" && !invocationRun && !durableRunObserved && !invocationVerified
+            && !isSchedulerLeaseLost(error)) recordCurrentPrePinFailure(error);
+        throw error;
       }
-      run = begun.run;
-      invocationRun = run;
-      options.fault?.("after-begin");
     }
 
     let runConfigHash = computeSourceIngestConfigHash(run.effectiveConfig);
@@ -689,10 +769,11 @@ async function syncSource(
           });
           if (replacement.kind === "noop") {
             return verifyUnchangedPublication(core, replacement.source, recoveredOid, options, mat, mutate, () => {
-              invocationVerified = true;
+              invocationVerified = true; durableSuccessObserved = true;
             });
           }
           run = replacement.run;
+          durableRunObserved = true;
           invocationRun = run;
           runConfigHash = computeSourceIngestConfigHash(run.effectiveConfig);
           mutate();
@@ -770,6 +851,7 @@ async function syncSource(
     try {
       const result = await execute();
       if (invocationRun && result.status !== "removed") {
+        assertScheduledLease(options);
         const outcomeRun = core.getSourceRun(invocationRun.id) ?? invocationRun;
         const invocationResult = result.status === "published" || result.status === "noop" ? "success"
           : result.status === "partial" ? "partial" : "failed";
@@ -781,10 +863,15 @@ async function syncSource(
       }
       return result;
     } catch (error) {
+      if (type === "repo-md" && !invocationRun && !invocationVerified && !isSchedulerLeaseLost(error)) {
+        recordCurrentPrePinFailure(error);
+      }
       // Removal completion is authoritative: it purges attempt state, and a
       // post-completion fault must not resurrect a receipt for the retained run.
-      if (invocationRun && !invocationVerified && core.getSourceRemoval(sourceId)?.state !== "complete") {
+      if (invocationRun && !invocationVerified && !isSchedulerLeaseLost(error)
+          && core.getSourceRemoval(sourceId)?.state !== "complete") {
         try {
+          assertScheduledLease(options);
           core.recordSourceRunInvocation({
             sourceId, runId: invocationRun.id, result: "failed",
             reason: error instanceof Error ? error.message : String(error),
@@ -795,4 +882,24 @@ async function syncSource(
       throw error;
     }
   });
+  } catch (error) {
+    // Lock/root failures can occur before the coordinator callback. The ledger's
+    // atomic current-fence check makes this receipt safe without mutation authority.
+    if (!isSchedulerLeaseLost(error) && !durableRunObserved && !durableSuccessObserved && !prePinFailureRecorded
+        && (!coordinatorEntered || type === "repo-md")) {
+      const current = core.getSource(sourceId, { includeTombstoned: true });
+      const scheduledFenceMatches = !options.scheduledFence || (current?.configVersion === options.scheduledFence.configVersion
+        && current.leaseFence === options.scheduledFence.leaseFence);
+      if (current?.type === type && current.lifecycle === "active" && scheduledFenceMatches) {
+        try {
+          assertScheduledLease(options);
+          core.recordSourcePrePinFailure({
+            sourceId, reason: error instanceof Error ? error.message : String(error),
+            configVersion: current.configVersion, leaseFence: current.leaseFence,
+          });
+        } catch { /* A stale fallback receipt must not mask the primary failure. */ }
+      }
+    }
+    throw error;
+  }
 }

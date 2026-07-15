@@ -125,7 +125,7 @@ describe("authorized source connector surface", () => {
   });
 
   it("reads runs, verification, and dirty state from one SQLite snapshot", async () => {
-    const f = fixture("status-snapshot");
+    const f = fixture("status-snapshot", { mode: "interval", intervalSeconds: 60 });
     let writer: MonetCore | null = null;
     try {
       await f.core.syncSource("repo-source", auth);
@@ -138,8 +138,13 @@ describe("authorized source connector surface", () => {
         if (begun.kind !== "started") throw new Error("expected concurrent run");
         writer!.abortSourceRun(begun.run.id, "failed", "concurrent failure");
       };
-      expect(f.core.sourceStatus("repo-source", auth).lastSyncResult).toBe("success");
-      expect(f.core.sourceStatus("repo-source", auth)).toMatchObject({ lastSyncResult: "failed", lastError: "concurrent failure" });
+      expect(f.core.sourceStatus("repo-source", auth)).toMatchObject({
+        lastSyncResult: "success", schedule: { state: "scheduled", consecutiveFailures: 0 },
+      });
+      expect(f.core.sourceStatus("repo-source", auth)).toMatchObject({
+        lastSyncResult: "failed", lastError: "concurrent failure",
+        schedule: { state: "backoff", consecutiveFailures: 1 },
+      });
     } finally { writer?.close(); f.cleanup(); }
   });
 

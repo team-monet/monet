@@ -9,12 +9,15 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore, FIRST_BLOCK_SUMMARY_MAX_CHARS } from "./engine";
 import type { MergeConceptResult } from "./engine";
 import type { SourceAuthorizationContext } from "./source-types";
 import { sanitizeSourceError } from "./source-errors";
+import { createSourceScheduler } from "./source-scheduler";
+import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-scheduler";
 
 /**
  * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions`
@@ -1371,7 +1374,52 @@ export function deriveOptsFromEnv(env: NodeJS.ProcessEnv = process.env): Registe
   };
 }
 
-export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServer> {
+export interface CreateMonetCoreMcpServerOptions {
+  /** Disable for embedded/test runtimes; production also honors MONET_NO_SOURCE_SCHEDULER=1. */
+  sourceScheduler?: false | SourceSchedulerOptions;
+  /** Deterministic lifecycle seam used by tests. */
+  sourceSchedulerFactory?: (core: MonetCore, options?: SourceSchedulerOptions) => SourceSchedulerHandle;
+}
+
+/** Attach only after transport connection. Exported as a deterministic lifecycle test seam. */
+export function attachSourceSchedulerLifecycle(
+  server: McpServer,
+  core: MonetCore,
+  options: CreateMonetCoreMcpServerOptions = {},
+  env: NodeJS.ProcessEnv = process.env,
+  transport?: Transport,
+): SourceSchedulerHandle | null {
+  const schedulerDisabled = options.sourceScheduler === false || env.MONET_NO_SOURCE_SCHEDULER === "1";
+  if (schedulerDisabled) return null;
+  const scheduler = (options.sourceSchedulerFactory ?? createSourceScheduler)(
+    core,
+    options.sourceScheduler || undefined,
+  );
+  const close = server.close.bind(server);
+  let stopPromise: Promise<void> | null = null;
+  const stopOnce = (): Promise<void> => {
+    stopPromise ??= scheduler.stop();
+    return stopPromise;
+  };
+  if (transport) {
+    const onclose = transport.onclose;
+    transport.onclose = () => {
+      try { onclose?.(); }
+      finally { void stopOnce().catch(() => undefined); }
+    };
+  }
+  server.close = async (): Promise<void> => {
+    await stopOnce();
+    await close();
+  };
+  scheduler.start();
+  return scheduler;
+}
+
+export async function createMonetCoreMcpServer(
+  core: MonetCore,
+  options: CreateMonetCoreMcpServerOptions = {},
+): Promise<McpServer> {
   const server = new McpServer(
     { name: "monet-core", version: "0.7.0" },
     {
@@ -1382,5 +1430,7 @@ export async function createMonetCoreMcpServer(core: MonetCore): Promise<McpServ
   registerMonetCoreTools(server, core, deriveOptsFromEnv());
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Connect completes first; start only queues the non-blocking zero-delay cycle.
+  attachSourceSchedulerLifecycle(server, core, options, process.env, transport);
   return server;
 }

@@ -91,9 +91,28 @@ export interface SourceAttemptView {
   } | null;
 }
 
+export interface SourceScheduleBasis {
+  attemptSequence: number;
+  latestTerminal: { sequence: number; attemptedAt: number; result: SourceSyncRunResult } | null;
+  consecutiveFailures: number;
+  resumable: boolean;
+  removalIncomplete: boolean;
+}
+
+export interface SourceStatusScheduleView {
+  attempt: SourceAttemptView;
+  scheduleBasis: SourceScheduleBasis;
+}
+
 const requireString = (value: unknown, field: string): string => {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${field} must be a nonempty string`);
   return value;
+};
+
+const requireSchedulerOwner = (value: unknown): string => {
+  const owner = requireString(value, "scheduler owner");
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(owner)) throw new Error("scheduler owner must be an opaque token");
+  return owner;
 };
 
 const requireInteger = (value: unknown, field: string, minimum = 0): number => {
@@ -226,6 +245,12 @@ export class SourceLedger {
         UNIQUE (source_id, kind, ref_id)
       );
       CREATE INDEX IF NOT EXISTS idx_source_attempt_events_latest ON source_attempt_events(source_id,sequence DESC);
+      CREATE TABLE IF NOT EXISTS source_scheduler_lease (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        owner TEXT NOT NULL,
+        renewed_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL CHECK (expires_at > renewed_at)
+      );
       CREATE UNIQUE INDEX IF NOT EXISTS uq_source_sync_runs_live
         ON source_sync_runs(source_id) WHERE state IN ('scanning','staging','activating','cleaning');
       CREATE INDEX IF NOT EXISTS idx_source_sync_runs_source_created ON source_sync_runs(source_id, created_at, id);
@@ -1114,9 +1139,105 @@ export class SourceLedger {
     })();
   }
 
+  /** Crash-safe schedule basis. Attempt events are authoritative; no parallel scheduler cursor exists. */
+  private scheduleBasisSnapshot(sourceId: string, configVersion: number, leaseFence: number): SourceScheduleBasis {
+      const rows = this.db.prepare(`SELECT event.sequence,event.kind,event.run_id,event.attempted_at,
+          event.invocation_result,event.config_version,event.lease_fence,
+          run.result AS run_result,run.published_at,run.finished_at
+        FROM source_attempt_events event
+        LEFT JOIN source_sync_runs run ON run.id=event.run_id AND run.source_id=event.source_id
+        WHERE event.source_id=? AND event.config_version=? AND event.lease_fence=?
+        ORDER BY event.sequence DESC`).all(sourceId, configVersion, leaseFence) as Array<{
+          sequence: number; kind: "run" | "verification" | "pre-pin-failure" | "invocation";
+          run_id: string | null; attempted_at: number; invocation_result: SourceSyncRunResult | null;
+          config_version: number; lease_fence: number; run_result: SourceSyncRunResult | null;
+          published_at: number | null; finished_at: number | null;
+        }>;
+      const seenRuns = new Set<string>();
+      const terminals: Array<{ sequence: number; attemptedAt: number; result: SourceSyncRunResult }> = [];
+      for (const row of rows) {
+        let result: SourceSyncRunResult | null = null;
+        let attemptedAt = row.attempted_at;
+        if (row.kind === "verification") result = "success";
+        else if (row.kind === "pre-pin-failure") result = "failed";
+        else if (row.kind === "invocation") {
+          result = row.invocation_result;
+          if (row.run_id) seenRuns.add(row.run_id);
+        } else if (row.run_id && !seenRuns.has(row.run_id) && row.run_result !== null) {
+          // A terminal run is the crash-safe fallback when the process died after the
+          // durable outcome but before appending its invocation receipt.
+          result = row.run_result;
+          attemptedAt = Math.max(attemptedAt, row.published_at ?? -1, row.finished_at ?? -1);
+          seenRuns.add(row.run_id);
+        }
+        if (result) terminals.push({ sequence: row.sequence, attemptedAt, result });
+      }
+      let consecutiveFailures = 0;
+      for (const terminal of terminals) {
+        if (terminal.result === "success") break;
+        consecutiveFailures += 1;
+      }
+      const resumable = this.resumeRun(sourceId) !== null;
+      const removal = this.db.prepare(`SELECT source.lifecycle,removal.state FROM knowledge_sources source
+        LEFT JOIN source_removals removal ON removal.source_id=source.id WHERE source.id=?`).get(sourceId) as
+        | { lifecycle: string; state: string | null }
+        | undefined;
+      return {
+        attemptSequence: rows[0]?.sequence ?? 0,
+        latestTerminal: terminals[0] ?? null,
+        consecutiveFailures,
+        resumable,
+        removalIncomplete: removal?.lifecycle === "tombstoned" && removal.state !== "complete",
+      };
+  }
+
+  scheduleBasis(sourceId: string, configVersion: number, leaseFence: number): SourceScheduleBasis {
+    return this.db.transaction(() => this.scheduleBasisSnapshot(sourceId, configVersion, leaseFence))();
+  }
+
+  acquireSchedulerLease(owner: string, now: number, leaseMs: number): boolean {
+    owner = requireSchedulerOwner(owner);
+    requireInteger(now, "scheduler clock");
+    requireInteger(leaseMs, "scheduler lease duration", 1);
+    if (!Number.isSafeInteger(now + leaseMs)) throw new Error("scheduler lease expiry is out of range");
+    return this.db.immediateTransaction(() => {
+      const current = this.db.prepare(`SELECT owner,expires_at FROM source_scheduler_lease WHERE singleton=1`).get() as
+        | { owner: string; expires_at: number }
+        | undefined;
+      if (current && current.owner !== owner && current.expires_at > now) return false;
+      this.db.prepare(`INSERT INTO source_scheduler_lease(singleton,owner,renewed_at,expires_at) VALUES(1,?,?,?)
+        ON CONFLICT(singleton) DO UPDATE SET owner=excluded.owner,renewed_at=excluded.renewed_at,expires_at=excluded.expires_at`)
+        .run(owner, now, now + leaseMs);
+      return true;
+    })();
+  }
+
+  renewSchedulerLease(owner: string, now: number, leaseMs: number): boolean {
+    owner = requireSchedulerOwner(owner);
+    requireInteger(now, "scheduler clock");
+    requireInteger(leaseMs, "scheduler lease duration", 1);
+    if (!Number.isSafeInteger(now + leaseMs)) throw new Error("scheduler lease expiry is out of range");
+    const result = this.db.prepare(`UPDATE source_scheduler_lease SET renewed_at=?,expires_at=?
+      WHERE singleton=1 AND owner=? AND expires_at>?`).run(now, now + leaseMs, owner, now);
+    return result.changes === 1;
+  }
+
+  assertSchedulerLease(owner: string, now: number): boolean {
+    owner = requireSchedulerOwner(owner);
+    requireInteger(now, "scheduler clock");
+    const current = this.db.prepare(`SELECT owner,expires_at FROM source_scheduler_lease WHERE singleton=1`).get() as
+      | { owner: string; expires_at: number }
+      | undefined;
+    return current?.owner === owner && current.expires_at > now;
+  }
+
+  releaseSchedulerLease(owner: string): boolean {
+    owner = requireSchedulerOwner(owner);
+    return this.db.prepare(`DELETE FROM source_scheduler_lease WHERE singleton=1 AND owner=?`).run(owner).changes === 1;
+  }
+
   /** Attempt metadata plus a conservative dirty count from only the latest complete staged manifest. */
-  attemptView(sourceId: string, activeRunId: string | null): SourceAttemptView {
-    return this.db.transaction(() => {
+  private attemptViewSnapshot(sourceId: string, activeRunId: string | null): SourceAttemptView {
     const runs = this.listRuns(sourceId);
     this.attemptReadFault?.();
     const latest = runs.at(-1) ?? null;
@@ -1163,7 +1284,22 @@ export class SourceLedger {
           ?? (prePin?.attempted_at === latestAttempt.attempted_at ? prePin.reason : null),
       } : null,
     };
-    })();
+  }
+
+  attemptView(sourceId: string, activeRunId: string | null): SourceAttemptView {
+    return this.db.transaction(() => this.attemptViewSnapshot(sourceId, activeRunId))();
+  }
+
+  statusScheduleView(
+    sourceId: string,
+    activeRunId: string | null,
+    configVersion: number,
+    leaseFence: number,
+  ): SourceStatusScheduleView {
+    return this.db.transaction(() => ({
+      attempt: this.attemptViewSnapshot(sourceId, activeRunId),
+      scheduleBasis: this.scheduleBasisSnapshot(sourceId, configVersion, leaseFence),
+    }))();
   }
 
   resumeRun(sourceId: string): SourceSyncRun | null {

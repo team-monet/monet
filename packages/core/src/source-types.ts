@@ -148,6 +148,16 @@ export interface ConnectorSourceStatus {
   chunksIndexed: number;
   dirtyFiles: number;
   lastError?: string;
+  schedule: SourceScheduleStatus;
+}
+
+export type SourceScheduleState = "manual" | "scheduled" | "due" | "backoff" | "recovering";
+
+/** Non-sensitive derived scheduling state. Lease owners and repository details are never projected. */
+export interface SourceScheduleStatus {
+  state: SourceScheduleState;
+  nextAttemptAt?: number;
+  consecutiveFailures: number;
 }
 
 export interface ConnectorSourcePath {

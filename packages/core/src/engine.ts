@@ -21,7 +21,15 @@ import { resolve } from "node:path";
 import { StoragePort, BetterSqlitePort } from "./storage";
 import { SourceRegistry } from "./source-registry";
 import { SourceLedger } from "./source-ledger";
-import { syncGitMdSource as runGitMdSync, syncRepoMdSource as runRepoMdSync } from "./source-sync";
+import type { SourceScheduleBasis } from "./source-ledger";
+import { planSourceDue } from "./source-scheduler";
+import type { SourceDuePlan } from "./source-scheduler";
+import {
+  syncGitMdSource as runGitMdSync,
+  syncRepoMdSource as runRepoMdSync,
+  syncScheduledGitMdSource as runScheduledGitMdSync,
+  syncScheduledRepoMdSource as runScheduledRepoMdSync,
+} from "./source-sync";
 import { validateSourcePublishedPath } from "./source-materializer";
 import { sanitizeSourceError } from "./source-errors";
 import type { RemoteGitOptions } from "./source-git";
@@ -484,6 +492,8 @@ export interface MonetCoreOptions {
   sourceGit?: RemoteGitOptions;
   /** Deterministic test seam invoked throughout the final exhaustive source_path validation. */
   sourcePathValidationCheck?: () => void;
+  /** Source-ledger/registry clock seam for deterministic scheduler and recovery tests. */
+  sourceClock?: () => number;
 }
 
 interface ConceptRow {
@@ -581,6 +591,7 @@ export class MonetCore {
   private sourceStorageDir: string;
   private sourceGit: RemoteGitOptions;
   private sourcePathValidationCheck: () => void;
+  private sourceClock: () => number;
   /** Stable store identity for sync; unlike agentId this is persisted and never defaults globally. */
   private syncDeviceId = "";
   /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
@@ -605,13 +616,15 @@ export class MonetCore {
     this.newId = opts.idGen ?? randomUUID;
     this.sourceStorageDir = resolve(opts.sourceStorageDir ?? resolve(homedir(), ".monet", "sources"));
     this.sourceGit = opts.sourceGit ?? {};
+    this.sourceClock = opts.sourceClock ?? (() => Date.now());
     this.sourcePathValidationCheck = opts.sourcePathValidationCheck ?? (() => undefined);
     this.sourceRegistry = new SourceRegistry(this.db, {
       idGen: this.newId,
       sourceStorageDir: opts.sourceStorageDir,
       canonicalizeCircle: (circle) => this.resolveCircle(circle),
+      now: this.sourceClock,
     });
-    this.sourceLedger = new SourceLedger(this.db, { idGen: this.newId });
+    this.sourceLedger = new SourceLedger(this.db, { idGen: this.newId, now: this.sourceClock });
     this.scopeContext = opts.scopeContext ?? null;
     this.defaultCircle = opts.defaultCircle ?? "default";
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -4103,7 +4116,10 @@ export class MonetCore {
 
   sourceStatus(sourceId: string, context?: SourceAuthorizationContext, now = Date.now()): ConnectorSourceStatus {
     const source = this.requireAuthorizedActiveSource(sourceId, context);
-    const attempt = this.sourceLedger.attemptView(source.id, source.activeRunId);
+    const statusView = this.sourceLedger.statusScheduleView(
+      source.id, source.activeRunId, source.configVersion, source.leaseFence,
+    );
+    const attempt = statusView.attempt;
     let filesIndexed = 0;
     let chunksIndexed = 0;
     if (source.activeRunId || source.activeSnapshotId || source.activeIngestConfigHash) {
@@ -4134,6 +4150,14 @@ export class MonetCore {
       : pendingConfig ? "stale"
       : latestResult !== "success" ? "stale"
       : lastSuccessfulSyncAt >= 0 && now - lastSuccessfulSyncAt <= thresholdSeconds * 1000 ? "fresh" : "stale";
+    const schedule = planSourceDue({
+      source,
+      basis: statusView.scheduleBasis,
+      now,
+      // Status has no process-lifecycle dependency. The source mutation clock is a stable
+      // conservative proxy for the startup spread and becomes immediately due once elapsed.
+      startupAt: source.updatedAt,
+    });
     // Recheck access and the publication/lifecycle fence after ledger reads.
     const current = this.requireAuthorizedActiveSource(sourceId, context);
     if (current.leaseFence !== source.leaseFence || current.configVersion !== source.configVersion
@@ -4146,6 +4170,11 @@ export class MonetCore {
       ...(lastSuccessfulSyncAt >= 0 ? { lastSuccessfulSyncAt } : {}),
       ...(source.activeSnapshotId ? { indexedRevision: source.activeSnapshotId } : {}),
       freshness, filesIndexed, chunksIndexed, dirtyFiles: attempt.dirtyFiles,
+      schedule: {
+        state: schedule.state,
+        ...(schedule.nextAttemptAt !== undefined ? { nextAttemptAt: schedule.nextAttemptAt } : {}),
+        consecutiveFailures: schedule.consecutiveFailures,
+      },
       ...(prePinWins ? { lastError: sanitizeSourceError(attempt.latestAttempt?.failureReason ?? "source pre-pin attempt failed") }
         : invocationWins && attempt.latestAttempt?.invocationResult === "failed"
           ? { lastError: sanitizeSourceError(attempt.latestAttempt.failureReason ?? "source sync invocation failed") }
@@ -4221,6 +4250,69 @@ export class MonetCore {
       ...(source.type === "git-md" ? { remoteGit: this.sourceGit } : {}),
       idGen: this.newId,
       preflight,
+    });
+  }
+
+  sourceScheduleBasis(sourceId: string, configVersion: number, leaseFence: number): SourceScheduleBasis {
+    return this.sourceLedger.scheduleBasis(sourceId, configVersion, leaseFence);
+  }
+
+  acquireSourceSchedulerLease(owner: string, now: number, leaseMs: number): boolean {
+    return this.sourceLedger.acquireSchedulerLease(owner, now, leaseMs);
+  }
+
+  renewSourceSchedulerLease(owner: string, now: number, leaseMs: number): boolean {
+    return this.sourceLedger.renewSchedulerLease(owner, now, leaseMs);
+  }
+
+  assertSourceSchedulerLease(owner: string, now: number): boolean {
+    return this.sourceLedger.assertSchedulerLease(owner, now);
+  }
+
+  releaseSourceSchedulerLease(owner: string): boolean {
+    return this.sourceLedger.releaseSchedulerLease(owner);
+  }
+
+  /** Privileged maintenance dispatch. Admission is repeated inside the source materializer lock. */
+  async syncScheduledSource(
+    plan: SourceDuePlan,
+    startupAt: number,
+    now: () => number,
+    assertLeaseOwner: () => boolean,
+  ): Promise<RepoMdSyncResult | null> {
+    const source = this.sourceRegistry.getSource(plan.sourceId, { includeTombstoned: true });
+    if (!source) throw new Error("scheduled source lineage is unavailable");
+    let admitted = false;
+    const preflight = (): void => {
+      if (!admitted) return;
+      const current = this.sourceRegistry.getSource(source.id, { includeTombstoned: true });
+      if (!current || current.type !== source.type || current.lifecycle !== source.lifecycle
+          || current.configVersion !== source.configVersion || current.leaseFence !== source.leaseFence) {
+        throw new Error("source changed during scheduled sync");
+      }
+    };
+    const runner = source.type === "git-md" ? runScheduledGitMdSync : runScheduledRepoMdSync;
+    return runner(this, source.id, {
+      sourceStorageDir: this.sourceStorageDir,
+      ...(source.type === "git-md" ? { remoteGit: this.sourceGit } : {}),
+      idGen: this.newId,
+      preflight,
+      scheduledAssertLeaseOwner: assertLeaseOwner,
+      scheduledFence: { configVersion: plan.configVersion, leaseFence: plan.leaseFence },
+      scheduledAdmission: (locked, resumable) => {
+        if (!assertLeaseOwner()) return false;
+        if (locked.configVersion !== plan.configVersion || locked.leaseFence !== plan.leaseFence) return false;
+        const authoritative = this.sourceRegistry.getSource(locked.id, { includeTombstoned: true });
+        if (!authoritative || authoritative.type !== locked.type || authoritative.lifecycle !== locked.lifecycle
+            || authoritative.configVersion !== locked.configVersion || authoritative.leaseFence !== locked.leaseFence) return false;
+        const basis = this.sourceLedger.scheduleBasis(locked.id, locked.configVersion, locked.leaseFence);
+        // The run read by the coordinator and the ledger view must agree before admission.
+        if ((resumable !== null) !== basis.resumable) return false;
+        const current = planSourceDue({ source: locked, basis, now: now(), startupAt });
+        admitted = current.due && current.recovery === plan.recovery
+          && current.attemptSequence === plan.attemptSequence;
+        return admitted;
+      },
     });
   }
 
