@@ -581,7 +581,7 @@ describe("source ledger publication kernel", () => {
       core.publishSourceRun({ runId: first.run.id, activationToken: core.beginSourceActivation(first.run.id) });
       expect(db.prepare(`SELECT 1 FROM memory_edge WHERE src_id=? AND dst_id=? AND type='supports'`).get(
         published.stored.conceptId, target.conceptId,
-      )).toBeDefined();
+      )).toBeUndefined();
 
       const second = core.beginSourceRun({ sourceId: "source-a", snapshotId: "second" });
       if (second.kind !== "started") throw new Error("expected second run");
@@ -631,8 +631,8 @@ describe("source ledger publication kernel", () => {
       expect(successorRow.superseded_at).not.toBeNull();
       expect(db.prepare(`SELECT 1 FROM memory_edge WHERE src_id=? AND dst_id=? AND type='supports'`).get(
         published.stored.conceptId, target.conceptId,
-      )).toBeDefined();
-      expect(db.prepare(`SELECT 1 FROM concept_entities WHERE concept_id=? LIMIT 1`).get(published.stored.conceptId)).toBeDefined();
+      )).toBeUndefined();
+      expect(db.prepare(`SELECT 1 FROM concept_entities WHERE concept_id=? LIMIT 1`).get(published.stored.conceptId)).toBeUndefined();
 
       const replay = await core.rollbackSourceRunBinding(second.run.id, "binding-1");
       expect(replay).toMatchObject({ replayed: true, concept: { id: published.stored.conceptId, body: firstManifest.chunks[0].content } });

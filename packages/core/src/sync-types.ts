@@ -31,6 +31,9 @@ export interface SyncConceptRow {
   arousal_score: number;
   arousal_last_updated_at: number | null;
   source_refs: string | null; // JSON string[]
+  /** Connector ownership markers. Generic sync accepts only rows where both are null/absent. */
+  source_identity?: string | null;
+  active_observation_id?: string | null;
   aliases: string | null; // JSON string[]
   last_confirmed_at: number | null;
   last_confirmed_session_id: string | null;

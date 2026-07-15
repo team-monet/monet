@@ -128,9 +128,13 @@ const FIRST_BLOCK_LIST_FULL_MAX_LIMIT = 40;
  * if the block + the first block alone exceeds the budget, the curation advisory notes it
  * rather than silently cutting entries.
  */
-function buildPrewarmBlock(core: MonetCore, circle: string): string {
-  const state = core.prewarm(circle);
-  const ov = core.overview(circle);
+function buildPrewarmBlock(
+  core: MonetCore,
+  circle: string,
+  sourceAuthorizationContext?: Readonly<SourceAuthorizationContext>,
+): string {
+  const state = core.prewarm(circle, { sourceAuthorizationContext });
+  const ov = core.overview(circle, { sourceAuthorizationContext });
 
   // === FIRST BLOCK (always-first, protected from truncation) ===
   // Only inject active entries; disputed entries are suppressed here and counted in curationAttention.
@@ -364,7 +368,7 @@ export function registerMonetCoreTools(
    */
   function capturePrewarmSnapshot(resolvedCircle: string): string | null {
     if (!autoPrewarm || prewarmed) return null;
-    const block = buildPrewarmBlock(core, resolvedCircle);
+    const block = buildPrewarmBlock(core, resolvedCircle, sourceAuthorizationContext);
     return block; // empty string = nothing to restore, but the snapshot was taken
   }
 
@@ -437,7 +441,7 @@ export function registerMonetCoreTools(
         // Fallback: no pre-captured block supplied (should not happen for well-formed callers).
         // Build inline as before so existing agent_context and legacy paths degrade gracefully.
         const resolvedCircle = scope();
-        const block = buildPrewarmBlock(core, resolvedCircle);
+        const block = buildPrewarmBlock(core, resolvedCircle, sourceAuthorizationContext);
         prewarmed = true;
         if (block.length > 0) {
           prewarmBlock = block;
@@ -568,7 +572,11 @@ export function registerMonetCoreTools(
       const capturedBlock = capturePrewarmSnapshot(circle !== undefined ? scope(circle) : scope());
       try {
         // When circle is omitted, search store-wide (circle: undefined); when provided, scope exactly.
-        const results = await core.search(query, { circle: circle !== undefined ? scope(circle) : undefined, limit });
+        const results = await core.search(query, {
+          circle: circle !== undefined ? scope(circle) : undefined,
+          limit,
+          sourceAuthorizationContext,
+        });
         const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
         return readOk({
           circle: circleLabel,
@@ -590,7 +598,7 @@ export function registerMonetCoreTools(
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         if (entity) return readOk({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) }, "memory_overview", capturedBlock);
-        const ov = core.overview(scope(circle));
+        const ov = core.overview(scope(circle), { sourceAuthorizationContext });
         return readOk({ ...ov, ...(ov.resolvedFrom !== undefined ? { resolvedFrom: ov.resolvedFrom } : {}) }, "memory_overview", capturedBlock);
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
@@ -620,12 +628,14 @@ export function registerMonetCoreTools(
           const i = cursor.indexOf(":");
           if (i > 0) parsed = { updatedAt: Number(cursor.slice(0, i)), id: cursor.slice(i + 1) };
         }
-        const memories = core.listMemories(scope(circle), { withProvenance, limit: lim, cursor: parsed });
+        const memories = core.listMemories(scope(circle), {
+          withProvenance, limit: lim, cursor: parsed, sourceAuthorizationContext,
+        });
         const last = memories[memories.length - 1];
         const nextCursor = memories.length === lim && last ? `${last.updatedAt}:${last.id}` : null;
         return readOk({
           circle: scope(circle),
-          total: core.conceptCount(scope(circle)), // current size — shrinks as you reassign out
+          total: core.conceptCount(scope(circle), sourceAuthorizationContext), // current size — shrinks as you reassign out
           count: memories.length,
           ...(nextCursor ? { nextCursor } : {}),
           memories,
@@ -652,7 +662,12 @@ export function registerMonetCoreTools(
       const capturedBlock = capturePrewarmSnapshot(circle !== undefined ? scope(circle) : scope());
       try {
         // When circle is omitted, gather store-wide (circle: undefined); when provided, scope exactly.
-        const r = await core.gather(intent, { circle: circle !== undefined ? scope(circle) : undefined, limit, depth: depth ? Number(depth) : undefined });
+        const r = await core.gather(intent, {
+          circle: circle !== undefined ? scope(circle) : undefined,
+          limit,
+          depth: depth ? Number(depth) : undefined,
+          sourceAuthorizationContext,
+        });
         const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
         return readOk({
           circle: circleLabel,
@@ -688,7 +703,7 @@ export function registerMonetCoreTools(
         // - homeCircle null → concept not found (id doesn't exist).
         // - caller provided circle explicitly → id must live in that circle (back-compat gate).
         // - caller omitted circle → look up store-wide; the response surfaces the home circle.
-        const homeCircle = core.circleOf(id);
+        const homeCircle = core.circleOf(id, sourceAuthorizationContext);
         if (homeCircle === null) return err(`concept not found: ${id}`);
         // Scope-gate: if the caller named a circle explicitly, the id must live there.
         // Check BEFORE taking the snapshot so a rejection never consumes the one-shot.
@@ -698,7 +713,12 @@ export function registerMonetCoreTools(
         const capturedBlock = capturePrewarmSnapshot(snapshotCircle);
         // pageSize=FETCH_MAX_OBS: the engine slices exactly one page newest-first from the offset,
         // so the MCP layer receives at most FETCH_MAX_OBS observations with no secondary cap needed.
-        const c = await core.getConcept(id, { synthesize: false, observationsOffset: observationsOffset ?? 0, pageSize: FETCH_MAX_OBS });
+        const c = await core.getConcept(id, {
+          synthesize: false,
+          observationsOffset: observationsOffset ?? 0,
+          pageSize: FETCH_MAX_OBS,
+          sourceAuthorizationContext,
+        });
         if (!c) return err(`concept not found: ${id}`);
         const total = c.totalObservations;
         const offset = c.observationsOffset;
@@ -1093,7 +1113,9 @@ export function registerMonetCoreTools(
           return mutOk(response, "memory_circle_manage", false, capturedBlock);
         }
         // list — read-only (enumerate circles)
-        const response: CircleListResponse = { circles: core.listCircles(undefined, { includeArchived: true }) };
+        const response: CircleListResponse = {
+          circles: core.listCircles(undefined, { includeArchived: true, sourceAuthorizationContext }),
+        };
         return readOk(response, "memory_circle_manage", capturedBlock);
       } catch (e) {
         return err(`circle_manage failed: ${msg(e)}`);
@@ -1295,12 +1317,13 @@ export function registerMonetCoreTools(
     { circle: z.string().optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);
-      const state = core.prewarm(resolvedCircle);
-      const ov = core.overview(resolvedCircle);
+      const state = core.prewarm(resolvedCircle, { sourceAuthorizationContext });
+      const ov = core.overview(resolvedCircle, { sourceAuthorizationContext });
       // buildCurationAdvisory uses the FULL firstBlock set (pre-filter) so that
       // firstBlockDisputed counts disputed entries even though they are excluded from injection.
       const advisory = buildCurationAdvisory(ov, state.firstBlock);
-      const others = core.listCircles(resolvedCircle).slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
+      const others = core.listCircles(resolvedCircle, { sourceAuthorizationContext })
+        .slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
 
       // Finding 5: exclude disputed entries from the injection payload (matching the rendered
       // auto-prewarm path). The curationAttention advisory above already counts them.
