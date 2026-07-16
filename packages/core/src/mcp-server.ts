@@ -338,6 +338,35 @@ export function registerMonetCoreTools(
     ? Object.freeze({ ...opts.sourceAuthorizationContext })
     : undefined;
 
+  // In-flight tool-call tracking (Codex P2 #2): wrap server.tool() ONCE, here, before any of the
+  // individual registrations below, so every handler (memory_*, source_*, ...) is tracked
+  // uniformly without touching each call site. getGracefulShutdown's run() awaits
+  // getInFlightTracker(server).quiesce() between server.close() and core.close(), so a
+  // long-running handler (e.g. source_sync) can't touch the database after a signal/EOF has
+  // closed it out from under it mid-call.
+  const inFlightTracker = getInFlightTracker(server);
+  const originalTool = server.tool.bind(server);
+  server.tool = ((...toolArgs: unknown[]) => {
+    const handler = toolArgs[toolArgs.length - 1] as (...handlerArgs: unknown[]) => unknown;
+    const trackedHandler = (...handlerArgs: unknown[]): unknown => {
+      inFlightTracker.increment();
+      let result: unknown;
+      try {
+        result = handler(...handlerArgs);
+      } catch (error) {
+        inFlightTracker.decrement();
+        throw error;
+      }
+      if (result instanceof Promise) {
+        return result.finally(() => inFlightTracker.decrement());
+      }
+      inFlightTracker.decrement();
+      return result;
+    };
+    const trackedArgs = [...toolArgs.slice(0, -1), trackedHandler];
+    return (originalTool as (...args: unknown[]) => unknown)(...trackedArgs);
+  }) as unknown as typeof server.tool;
+
   // --- lifecycle closure state ---
   // Auto-prewarm: one-shot per server process.
   let prewarmed = false;
@@ -1379,6 +1408,668 @@ export interface CreateMonetCoreMcpServerOptions {
   sourceScheduler?: false | SourceSchedulerOptions;
   /** Deterministic lifecycle seam used by tests. */
   sourceSchedulerFactory?: (core: MonetCore, options?: SourceSchedulerOptions) => SourceSchedulerHandle;
+  /**
+   * Disable the automatic SIGINT/SIGTERM graceful-shutdown handlers (default: installed).
+   * MUST be set to `false` on every instance but one when embedding multiple MonetCore/MCP
+   * server pairs in a single process — see installProcessShutdownHandlers.
+   */
+  processShutdownHandlers?: false;
+  /**
+   * Disable the automatic stdin-EOF graceful-shutdown listener (default: installed).
+   * Same multi-instance caveat as processShutdownHandlers — see installStdinEofShutdown.
+   */
+  stdinEofShutdown?: false;
+  /**
+   * Barrier options for the DEFENSIVE SECONDARY onclose path inside attachSourceSchedulerLifecycle
+   * (not the primary signal/stdin-EOF paths — see ProcessShutdownHandlersOptions.barrier /
+   * StdinEofShutdownOptions.barrier for those). Deterministic test seam only: lets a test inject
+   * fake setTimer/clearTimer to observe the redundant barrier created when a close chain
+   * synchronously re-invokes onclose (see the "double barrier" tests), without real timers.
+   */
+  onCloseBarrier?: ShutdownBarrierOptions;
+}
+
+/**
+ * Generous hard deadline for the transport-close shutdown barrier (see withShutdownBarrier).
+ * Normal drain is sub-second when the scheduler is idle (one microtask tick to the lease
+ * release) or bounded by a single in-flight sync cycle when busy. 30s comfortably covers a slow
+ * sync without materially eroding the fix: even a barrier that hits this ceiling still lets the
+ * replacement process pick up far sooner than the pre-fix worst case (lease TTL + wake cadence,
+ * ~120s at the defaults).
+ *
+ * Operational note: 30s EXCEEDS Docker's default `stop` grace period (10s) and many process
+ * managers' default SIGKILL-escalation windows. If an operator wants this barrier's bound to be
+ * what actually governs shutdown duration — rather than the platform SIGKILLing the process
+ * before the barrier gets a chance to finish or time out on its own — raise the container's/
+ * service's stop-timeout to at least 30s (e.g. `docker run --stop-timeout 30`, or the equivalent
+ * `stopSignal`/`terminationGracePeriodSeconds` setting for the deployment platform in use).
+ *
+ * LONG-SYNC CASE (Codex P2 #3 — confirmed real, disposition is deliberate, not a gap): normal
+ * git-md work can legitimately exceed this 30s bound — git operations default to a 120s timeout
+ * (DEFAULT_TIMEOUT_MS, source-git.ts:17) and repo-md materialization defaults to a 5-minute
+ * deadline (DEFAULT_GIT_MATERIALIZATION_DEADLINE_MS, source-materializer.ts:30). If a signal/EOF
+ * arrives mid-sync and the active cycle runs past this barrier, the barrier gives up and the
+ * caller proceeds (exits, or lets the process exit naturally) BEFORE scheduler.stop()'s
+ * `await cycle` (source-scheduler.ts:238) — and therefore the lease release — ever completes: the
+ * durable scheduler lease is left held until it expires on its own TTL. Three reasons this bound
+ * is not raised to cover it:
+ *   1. It would be moot in the deployment envelope this runs in. When the MCP client itself
+ *      initiates the disconnect, its own watchdog escalates stdin-EOF → SIGTERM at 2s → SIGKILL
+ *      at 4s (probe-proven) if the process hasn't already exited; when an operator/orchestrator
+ *      sends SIGTERM directly instead, Docker's default stop grace is 10s before SIGKILL. Either
+ *      way, a drain longer than single-digit seconds gets force-killed by the platform regardless
+ *      of what deadline this module picks.
+ *   2. Releasing the lease WITHOUT draining the active cycle would violate the ratified
+ *      drain-before-release invariant — scheduler stop() awaits the active cycle before releasing
+ *      (source-scheduler.ts:238-240) by design, precisely so a stale owner can never keep
+ *      mutating after losing the lease.
+ *   3. Beyond this bound, the designed fallback is crash-safe recovery, not a graceful drain:
+ *      durable fenced attempt receipts, staged-run supersession on the next attempt (a killed
+ *      sync's staged work is superseded on recovery; the prior published/active snapshot is left
+ *      untouched), and lease TTL + wake recovery — the SAME path a hard SIGKILL takes, black-box
+ *      probe-verified (a replacement acquires the lease ~156ms after expiry). An interrupted long
+ *      sync yields a failed/partial attempt and a retry — never corruption, never lost state.
+ * Net: graceful shutdown here is best-effort, sized for the overwhelmingly common case (an idle or
+ * short-cycle scheduler, which settles in milliseconds) — arbitrarily long in-progress work is the
+ * crash-safe path's job, exercised by the exact same recovery machinery a real crash would hit.
+ */
+export const SHUTDOWN_BARRIER_DEADLINE_MS = 30_000;
+
+export interface ShutdownBarrierOptions {
+  deadlineMs?: number;
+  /** Injectable seam for tests — defaults to the global setTimeout. */
+  setTimer?: typeof setTimeout;
+  /** Injectable seam for tests — defaults to the global clearTimeout. */
+  clearTimer?: typeof clearTimeout;
+}
+
+/**
+ * Keep the event loop alive with a REFERENCED timer until `work` settles or `deadlineMs`
+ * elapses, whichever comes first. Never rejects.
+ *
+ * Why this exists: none of this module's shutdown triggers are awaited by whatever invokes
+ * them — Node doesn't await stream ('end'/'close') or signal (SIGINT/SIGTERM) listener
+ * callbacks, and the MCP SDK doesn't await transport.onclose either. Without a referenced handle
+ * spanning the async shutdown work, Node's event loop can see no pending work and let the
+ * process exit mid-drain, before a scheduler's lease-release commits (confirmed by a live
+ * two-process restart probe: the prior process exited ~7ms after the peer closed, and its lease
+ * row was untouched). A plain referenced timer, held until `work` settles, closes that gap
+ * without requiring the caller to await anything.
+ *
+ * Bounded by `deadlineMs` so a stuck drain (e.g. a wedged network sync) cannot hold the process
+ * open forever — past the deadline this simply stops waiting; the underlying `work` keeps
+ * running in the background, this only stops blocking the caller on it.
+ *
+ * Exported as a deterministic test seam: pass fake setTimer/clearTimer to observe/control the
+ * barrier handle without real timers.
+ */
+export function withShutdownBarrier(work: Promise<unknown>, options: ShutdownBarrierOptions = {}): Promise<void> {
+  const deadlineMs = options.deadlineMs ?? SHUTDOWN_BARRIER_DEADLINE_MS;
+  const setTimer = options.setTimer ?? setTimeout;
+  const clearTimer = options.clearTimer ?? clearTimeout;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimer(barrier);
+      resolve();
+    };
+    // Deliberately never .unref()'d: its only job is to keep the loop alive. Cleared the moment
+    // `work` settles; if that never happens, it fires on its own at the deadline.
+    const barrier = setTimer(finish, deadlineMs);
+    work.then(finish, finish);
+  });
+}
+
+export type ShutdownSignal = "SIGINT" | "SIGTERM";
+
+/**
+ * Conventional POSIX exit codes for signal-terminated processes (128 + signal number) — so a
+ * caller inspecting this process's exit code sees the same convention a shell reports for a
+ * process a signal terminated.
+ */
+const SIGNAL_EXIT_CODE: Record<ShutdownSignal, number> = { SIGINT: 130, SIGTERM: 143 };
+
+/** Minimal process surface this seam needs. Real `process` satisfies it; tests inject a fake. */
+export interface ShutdownSignalProcess {
+  on(event: ShutdownSignal, listener: () => void): unknown;
+  /** Detach path (Review Major 2): removes the listener installed via `on`. */
+  off(event: ShutdownSignal, listener: () => void): unknown;
+  exit(code?: number): void;
+}
+
+/**
+ * Default bound for draining in-flight MCP tool calls before core.close() (Codex P2 #2): a
+ * long-running handler (e.g. source_sync) must not touch the database after it's been closed out
+ * from under it by a signal/EOF that arrived mid-call. Comfortably inside the 30s shutdown
+ * barrier (SHUTDOWN_BARRIER_DEADLINE_MS), so even a wedged handler leaves room for the overall
+ * shutdown to still finish within that outer bound.
+ *
+ * LONG-SYNC CASE (Codex P2 #4 — confirmed real, same disposition as SHUTDOWN_BARRIER_DEADLINE_MS's
+ * long-sync case; see its JSDoc for the full platform-envelope reasoning): a legitimately long
+ * source_sync tool call — git ops default to a 120s timeout (source-git.ts:17), materialization to
+ * a 5-minute deadline (source-materializer.ts:30) — can still be in flight when this 10s bound
+ * elapses. When it is, core.close() proceeds anyway (see getGracefulShutdown's run()), and the
+ * handler's next database touch after resuming from its current await fails against the closed
+ * connection. This is not a new, worse failure mode: it is the SAME recoverable "failed attempt"
+ * any crash mid-sync already produces (fenced attempt receipts + staged-run supersession + a retry
+ * on the next scheduler wake), and SQLite's WAL mode (storage.ts, `journal_mode = WAL`) plus the
+ * durable run ledger mean this can never corrupt the database or lose the prior active state,
+ * closed connection or not. Raising this bound to cover a multi-minute sync would be moot for the
+ * same reason it's moot for the outer shutdown barrier — the platform (MCP client SIGKILL
+ * escalation, container stop grace) force-kills the process on a much shorter timeline regardless.
+ */
+export const IN_FLIGHT_QUIESCE_DEADLINE_MS = 10_000;
+
+export interface QuiesceOptions {
+  timeoutMs?: number;
+  /** Injectable seam for tests — defaults to the global setTimeout. */
+  setTimer?: typeof setTimeout;
+  /** Injectable seam for tests — defaults to the global clearTimeout. */
+  clearTimer?: typeof clearTimeout;
+}
+
+export interface InFlightTracker {
+  /** Mark one MCP tool call as started. */
+  increment(): void;
+  /** Mark one MCP tool call as finished. */
+  decrement(): void;
+  /** Current in-flight count. */
+  readonly count: number;
+  /**
+   * Resolve once the in-flight count reaches zero, or `options.timeoutMs` elapses (default
+   * IN_FLIGHT_QUIESCE_DEADLINE_MS), whichever comes first. Zero in-flight calls resolves
+   * immediately — no timer, no added latency on the happy path.
+   */
+  quiesce(options?: QuiesceOptions): Promise<void>;
+}
+
+interface InFlightState {
+  count: number;
+  onIdle: Array<() => void>;
+}
+
+/**
+ * Keyed by `server`, mirroring gracefulShutdownByServer. registerMonetCoreTools wraps every tool
+ * handler to increment/decrement this; getGracefulShutdown's run() awaits `quiesce()` between
+ * server.close() and core.close() (Codex P2 #2).
+ */
+const inFlightByServer = new WeakMap<McpServer, InFlightState>();
+
+/**
+ * Get (or create) the in-flight MCP tool-call tracker for `server`.
+ *
+ * Exported as a deterministic test seam: call increment()/decrement() directly to simulate a
+ * long-running or wedged tool handler without a real McpServer/transport/tool-call round-trip.
+ */
+export function getInFlightTracker(server: McpServer): InFlightTracker {
+  let state = inFlightByServer.get(server);
+  if (!state) {
+    state = { count: 0, onIdle: [] };
+    inFlightByServer.set(server, state);
+  }
+  const sharedState = state;
+  return {
+    increment(): void {
+      sharedState.count += 1;
+    },
+    decrement(): void {
+      sharedState.count -= 1;
+      if (sharedState.count === 0) {
+        const waiters = sharedState.onIdle;
+        sharedState.onIdle = [];
+        for (const resolve of waiters) resolve();
+      }
+    },
+    get count(): number {
+      return sharedState.count;
+    },
+    quiesce(options: QuiesceOptions = {}): Promise<void> {
+      if (sharedState.count === 0) return Promise.resolve(); // fast path — no timer, no latency
+      const timeoutMs = options.timeoutMs ?? IN_FLIGHT_QUIESCE_DEADLINE_MS;
+      const setTimer = options.setTimer ?? setTimeout;
+      const clearTimer = options.clearTimer ?? clearTimeout;
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (): void => {
+          if (settled) return;
+          settled = true;
+          clearTimer(timer);
+          sharedState.onIdle = sharedState.onIdle.filter((cb) => cb !== finish);
+          resolve();
+        };
+        sharedState.onIdle.push(finish);
+        // Referenced (never .unref()'d), matching withShutdownBarrier's convention — defense in
+        // depth even though every current caller already wraps run() in its own outer barrier.
+        const timer = setTimer(finish, timeoutMs);
+      });
+    },
+  };
+}
+
+export interface ProcessShutdownHandlersOptions {
+  /** Injectable seam for tests — defaults to the real Node `process`. */
+  proc?: ShutdownSignalProcess;
+  /** Forwarded to withShutdownBarrier for the graceful-shutdown wait. */
+  barrier?: ShutdownBarrierOptions;
+  /** Forwarded to the shared shutdown's in-flight tool-call quiesce wait (Codex P2 #2) — see
+   *  getGracefulShutdown / getInFlightTracker. */
+  quiesce?: QuiesceOptions;
+}
+
+interface GracefulShutdownEntry {
+  core: MonetCore;
+  promise: Promise<void> | null;
+  /** Guards settleEntry against running twice: once run()'s own drain settles it, a LATER
+   *  explicit server.close() (see settleGracefulShutdownOnExplicitClose) must not re-fire it —
+   *  and vice versa if the explicit-close settle wins the race. */
+  settled: boolean;
+  /** Every installer sharing this server registers its own detach here at INSTALL time (not at
+   *  trigger time) — see getGracefulShutdown's JSDoc for why that distinction is load-bearing. */
+  onSettledCallbacks: Array<() => void>;
+}
+
+/**
+ * Keyed by `server` (NOT by the (server, core) pair — a given McpServer is paired with exactly
+ * one MonetCore for its whole lifetime; see the mismatch guard below). Deleted once the shutdown
+ * for that server settles, so a later fresh install on the same server object genuinely re-runs
+ * server.close()/core.close() rather than reusing a resolved memo forever (this also closes the
+ * latent "memo never cleared" gap the audit flagged).
+ */
+const gracefulShutdownByServer = new WeakMap<McpServer, GracefulShutdownEntry>();
+
+/**
+ * Run every registered onSettled callback for `entry` exactly once, then remove `entry` from
+ * gracefulShutdownByServer. Shared by two callers: run()'s own finally (the trigger-driven path,
+ * which closes core first) and settleGracefulShutdownOnExplicitClose (the explicit-close path,
+ * which does NOT close core — see its JSDoc). The `settled` guard is what makes calling this from
+ * BOTH paths safe regardless of which one gets there first (Codex P2 #1).
+ */
+function settleEntry(server: McpServer, entry: GracefulShutdownEntry): void {
+  if (entry.settled) return;
+  entry.settled = true;
+  for (const cb of entry.onSettledCallbacks) {
+    try { cb(); } catch { /* a detach callback must never block shutdown completion */ }
+  }
+  gracefulShutdownByServer.delete(server);
+}
+
+export interface GracefulShutdown {
+  /**
+   * Runs server.close() then — after draining in-flight MCP tool calls (Codex P2 #2; see
+   * getInFlightTracker) — core.close(), memoized: call it as many times and from as many
+   * installers as you like, only the first call's work actually executes. `quiesce` is forwarded
+   * to that drain wait and only takes effect on whichever call actually starts the work
+   * (memoization applies to everything, including which caller's options are used).
+   */
+  run(quiesce?: QuiesceOptions): Promise<void>;
+  /**
+   * Register a callback to run once the shared shutdown settles — regardless of WHICH installer
+   * (or trigger) actually called `run()` first, or even whether it settled via `run()` at all (an
+   * explicit server.close() with no trigger ever firing also settles it — see
+   * settleGracefulShutdownOnExplicitClose, Codex P2 #1). Register this ONCE, at install time, not
+   * inside a trigger handler: an installer that shares this server but never itself triggers the
+   * shutdown (e.g. pair 1 shuts down via stdin EOF only; its SIGINT/SIGTERM installer never
+   * fires) still needs its OWN detach to run when the OTHER installer's trigger (or an explicit
+   * close) settles the shared work — otherwise that installer's guard
+   * (installedShutdownProcs / installedEofStreams) never clears, and a later fresh install on the
+   * same proc/stdin silently no-ops (Review round-3 Required 1 — the cross-installer detach hole,
+   * reproduced and fixed).
+   */
+  onSettled(cb: () => void): void;
+}
+
+/**
+ * Get (or create) the shared graceful-shutdown coordinator for `server`. Running it drains the
+ * scheduler and releases its lease (server.close() — see attachSourceSchedulerLifecycle), waits
+ * for in-flight MCP tool calls to quiesce (getInFlightTracker — Codex P2 #2: a long-running
+ * handler like source_sync must not touch the database after it's been closed out from under it),
+ * then closes the database (core.close(), in a `finally` so a rejecting server.close() still
+ * closes it — audit nit). Memoized so every trigger that shares this `server` — the SIGINT/SIGTERM
+ * handler, the stdin-EOF listener, or a future caller — converges on exactly ONE execution,
+ * however many of them fire and in whatever order (race-safe).
+ *
+ * FAILS FAST on a mismatched pairing: a given `server` must be paired with exactly one `core` for
+ * its whole lifetime. Calling this a second time for the same `server` with a DIFFERENT `core`
+ * throws immediately (Review round-3 Required 2) rather than silently keeping the first core —
+ * the second core's close() would otherwise never run. This is a wiring-bug guard, not a
+ * supported multi-instance pattern: createMonetCoreMcpServer always creates a fresh `server` per
+ * call, so this can only fire if something calls the installers directly with a stale `server`.
+ *
+ * EXPLICIT-CLOSE SETTLEMENT (Codex P2 #1): if NOTHING ever calls `run()` — e.g. an embedded host
+ * or test calls `await server.close()` directly, without a signal or stdin EOF ever firing — the
+ * onSettled callbacks would otherwise never run, leaving every installer's real process/stdin
+ * listeners registered against this now-closed server/core forever, with their guards
+ * (installedShutdownProcs/installedEofStreams) permanently stuck "installed" — silently skipping
+ * a later, correctly-paired install attempt on the same proc/stdin. See
+ * settleGracefulShutdownOnExplicitClose, which createMonetCoreMcpServer wires automatically so an
+ * explicit close ALSO settles this coordinator (without closing core — the explicit caller owns
+ * that lifecycle themselves).
+ *
+ * PLATFORM ENVELOPE (Codex P2 #3/#4): graceful shutdown here is best-effort within the platform's
+ * kill envelope (MCP client SIGTERM/SIGKILL escalation, container/orchestrator stop grace) — see
+ * SHUTDOWN_BARRIER_DEADLINE_MS and IN_FLIGHT_QUIESCE_DEADLINE_MS for the specifics. Beyond that
+ * envelope, crash-safe recovery (fenced receipts, staged-run supersession, lease TTL + wake) is
+ * the designed fallback, not an accident.
+ */
+function getGracefulShutdown(server: McpServer, core: MonetCore): GracefulShutdown {
+  let entry = gracefulShutdownByServer.get(server);
+  if (entry && entry.core !== core) {
+    throw new Error(
+      "getGracefulShutdown: this McpServer is already paired with a different MonetCore instance. " +
+      "A server must be installed with exactly one core for its whole lifetime — installing " +
+      "shutdown handlers for the same server with a second, different core is a wiring bug (the " +
+      "second core's close() would never run). Reuse the SAME core for every installer sharing " +
+      "this server, or create a fresh server for the new core.",
+    );
+  }
+  if (!entry) {
+    entry = { core, promise: null, settled: false, onSettledCallbacks: [] };
+    gracefulShutdownByServer.set(server, entry);
+  }
+  const sharedEntry = entry;
+  return {
+    onSettled(cb: () => void): void {
+      sharedEntry.onSettledCallbacks.push(cb);
+    },
+    run(quiesce?: QuiesceOptions): Promise<void> {
+      sharedEntry.promise ??= (async () => {
+        try {
+          await server.close();
+        } finally {
+          // Bounded drain of in-flight MCP tool calls BEFORE the database closes underneath them
+          // (Codex P2 #2). Zero in-flight calls resolves immediately — no added latency.
+          await getInFlightTracker(server).quiesce(quiesce);
+          try {
+            core.close();
+          } finally {
+            settleEntry(server, sharedEntry);
+          }
+        }
+      })();
+      return sharedEntry.promise;
+    },
+  };
+}
+
+/**
+ * Settle `server`'s shared graceful-shutdown coordinator RIGHT NOW if nothing has triggered
+ * `run()` yet — firing every installer's onSettled detach and dropping the WeakMap entry, WITHOUT
+ * closing core (the caller still owns core's lifecycle on every non-trigger-driven settle path).
+ *
+ * No-ops if there's no coordinator entry for `server` at all (no installer was ever called for
+ * it), or if `run()` is already in flight or already settled (`entry.promise` is set either way —
+ * defers entirely to that run()'s own settle, so this can never fire early mid-drain or
+ * double-fire the onSettled callbacks).
+ *
+ * The shared core of BOTH non-trigger-driven members of the settle family:
+ * settleGracefulShutdownOnExplicitClose (wraps server.close()) and
+ * settleGracefulShutdownOnStartupFailure (called directly from a failed
+ * createMonetCoreMcpServer() startup). See getGracefulShutdown's JSDoc for the full three-member
+ * settle family (trigger, explicit-close, startup-failure).
+ */
+function settleGracefulShutdownIfUntriggered(server: McpServer): void {
+  const entry = gracefulShutdownByServer.get(server);
+  if (entry && !entry.promise) settleEntry(server, entry);
+}
+
+/**
+ * Make an explicit `server.close()` ALSO settle its shared graceful-shutdown coordinator (Codex
+ * P2 #1) when nothing else ever triggered it — i.e. when an embedder or test calls server.close()
+ * directly, without going through the SIGINT/SIGTERM or stdin-EOF paths.
+ *
+ * Without this, an explicit close never runs getGracefulShutdown's onSettled callbacks (each
+ * installer's detach), so the real process/stdin keep the SIGINT/SIGTERM/'end'/'close' listeners
+ * registered against the now-closed server/core, and installedShutdownProcs/installedEofStreams
+ * stay marked "installed" forever — a later factory call for a FRESH server/core on the same
+ * proc/stdin silently skips installing anything, and a subsequent real signal/EOF targets the
+ * STALE server/core instead of the new one.
+ *
+ * Deliberately does NOT call core.close(): an explicit server.close() caller owns the core's
+ * lifecycle themselves (this only detaches/cleans up the shutdown-coordination wiring). Contrast
+ * with the SIGINT/SIGTERM/stdin-EOF paths, which DO close core as part of getGracefulShutdown's
+ * run().
+ *
+ * Race-safe against a trigger-driven run() already in flight (or already settled) — see
+ * settleGracefulShutdownIfUntriggered.
+ *
+ * Must be installed AFTER attachSourceSchedulerLifecycle so this wrapper is OUTERMOST: it
+ * captures whatever `server.close` currently is (bound once) and wraps it, so it needs to wrap
+ * the fully-assembled close chain, not be wrapped BY a later patch.
+ *
+ * Exported as a deterministic test seam — call it directly, mirroring how createMonetCoreMcpServer
+ * wires it, to test the explicit-close settlement without a real McpServer/transport.
+ */
+export function settleGracefulShutdownOnExplicitClose(server: McpServer): void {
+  const prevClose = server.close.bind(server);
+  server.close = async (): Promise<void> => {
+    try {
+      await prevClose();
+    } finally {
+      settleGracefulShutdownIfUntriggered(server);
+    }
+  };
+}
+
+/**
+ * Settle `server`'s shared graceful-shutdown coordinator after a FAILED createMonetCoreMcpServer
+ * startup (Codex pass-3 P2 — the third settle-family member): if `server.connect()` or any step
+ * after the installers rejects, the installers already ran and registered real process/stdin
+ * listeners, but the server is never returned to the caller and nothing will ever trigger run()
+ * for it (attachSourceSchedulerLifecycle and settleGracefulShutdownOnExplicitClose never got to
+ * run either, since both come after connect()).
+ *
+ * Without this, those listeners and their guards (installedShutdownProcs/installedEofStreams)
+ * would stay stuck "installed" against the failed, abandoned server/core forever — a caller
+ * retrying with a fresh createMonetCoreMcpServer() call would silently skip installing anything
+ * on the same proc/stdin, and a later real signal/EOF would target the failed server/core instead
+ * of the retry.
+ *
+ * Deliberately does NOT call core.close(): the caller constructed `core` and owns its lifecycle on
+ * the failure path, exactly like the explicit-close settlement.
+ *
+ * Race-safe against a trigger-driven run() already in flight or already settled — see
+ * settleGracefulShutdownIfUntriggered (in the practically-impossible case a signal/EOF fired and
+ * triggered run() in the sub-millisecond window before the failure, this defers to run()'s own
+ * settle rather than double-firing).
+ *
+ * Exported as a deterministic test seam: call it directly (mirroring createMonetCoreMcpServer's
+ * own catch block) with the exported installers on fakes, to test startup-failure cleanup without
+ * a real transport/connect failure.
+ */
+export function settleGracefulShutdownOnStartupFailure(server: McpServer): void {
+  settleGracefulShutdownIfUntriggered(server);
+}
+
+/**
+ * Processes that already have SIGINT/SIGTERM handlers installed via installProcessShutdownHandlers.
+ * Guards against duplicate listeners (and duplicate exit races) when the SAME proc is passed to
+ * a second install call — e.g. a second createMonetCoreMcpServer() in one process defaulting to
+ * the same real `process`. Cleared on detach so a fresh install on the same proc works again.
+ */
+const installedShutdownProcs = new WeakSet<ShutdownSignalProcess>();
+
+/**
+ * Install SIGINT/SIGTERM handlers that run a full graceful shutdown — `server.close()` then
+ * `core.close()` (see getGracefulShutdown) — then exit with the conventional 128+signal code.
+ *
+ * Double-signal policy: a signal received while an earlier signal's shutdown is still in flight
+ * forces an immediate exit instead of waiting a second time — the standard "press Ctrl-C again
+ * to force quit" convention. This also makes the handlers idempotent: repeated signals never
+ * restart or duplicate the graceful sequence.
+ *
+ * Idempotency guard: calling this a second time with the SAME `proc` (the default `proc` is the
+ * real singleton `process`, so this is what happens if `createMonetCoreMcpServer` runs more than
+ * once in a process with default options) is a no-op — no duplicate listeners are installed.
+ * MULTI-INSTANCE WARNING: this means a second (or third, ...) MonetCore/MCP server pair embedded
+ * in the same process gets NO signal-triggered shutdown of its own from this call — on a real
+ * signal, only the FIRST-installed pair's handler runs, and since it calls the real
+ * `process.exit()` (which terminates immediately), any OTHER pairs' drains are abandoned exactly
+ * like the original bug this module fixes. If you embed multiple pairs in one process, pass
+ * `processShutdownHandlers: false` to createMonetCoreMcpServer for all but (at most) one of them
+ * and own the coordinated signal policy yourself (e.g. one top-level handler that awaits every
+ * pair's `server.close()` before exiting).
+ *
+ * Detach: this installer's `detach` is registered via the shared getGracefulShutdown's
+ * `onSettled` at INSTALL time, so it runs whenever the shutdown shared with this (server, core)
+ * pair settles — whether THIS installer's own signal triggered it, or a sibling installer on the
+ * SAME pair did (e.g. installStdinEofShutdown on the same server/core). That coordination is
+ * what lets a later fresh install on the same `proc` work again even if this installer's own
+ * signal never fired. The double-signal path also detaches immediately/synchronously (before the
+ * shared shutdown has necessarily settled) — safe because `off` is idempotent, so the later
+ * onSettled-driven detach is a harmless no-op when it eventually runs too.
+ *
+ * Exported as a deterministic test seam: pass a fake `proc` to drive it without sending real OS
+ * signals to the process running the tests.
+ */
+export function installProcessShutdownHandlers(
+  server: McpServer,
+  core: MonetCore,
+  options: ProcessShutdownHandlersOptions = {},
+): void {
+  const proc = options.proc ?? (process as unknown as ShutdownSignalProcess);
+  if (installedShutdownProcs.has(proc)) return; // idempotency guard — see JSDoc
+  // Validate/create the shared shutdown BEFORE marking `proc` installed. getGracefulShutdown can
+  // throw on a mismatched core (see its JSDoc) — if that throw happened AFTER the WeakSet add,
+  // `proc` would be stuck "installed" forever with no listeners and no onSettled detach ever
+  // registered, silently no-op'ing every subsequent (even correctly-paired) retry on this proc.
+  const shutdown = getGracefulShutdown(server, core);
+  installedShutdownProcs.add(proc);
+
+  let shuttingDown = false;
+  let exited = false;
+  // Guards against a redundant second proc.exit() call once the ORIGINAL (now-abandoned)
+  // graceful sequence eventually settles in the background after a forced double-signal exit.
+  // With the real process.exit() this never matters (it terminates immediately, nothing after
+  // it runs) — but proc is an injectable seam, and a caller-supplied exit() is not guaranteed to
+  // be equally final, so this keeps the "exactly one exit" contract true either way.
+  const exitOnce = (signal: ShutdownSignal): void => {
+    if (exited) return;
+    exited = true;
+    proc.exit(SIGNAL_EXIT_CODE[signal]);
+  };
+  const detach = (): void => {
+    proc.off("SIGINT", onSigint);
+    proc.off("SIGTERM", onSigterm);
+    installedShutdownProcs.delete(proc);
+  };
+  // Registered at INSTALL time (not inside handle()) so it still runs even if this installer's
+  // own signal never fires — e.g. the shared pair shuts down via stdin EOF only.
+  shutdown.onSettled(detach);
+  const handle = (signal: ShutdownSignal): void => {
+    if (shuttingDown) {
+      // Double-signal policy: stop waiting, exit now. Detaching early here is safe — the
+      // onSettled-driven detach() above will also fire later; off() tolerates an already-removed
+      // listener.
+      detach();
+      exitOnce(signal);
+      return;
+    }
+    shuttingDown = true;
+    void withShutdownBarrier(shutdown.run(options.quiesce), options.barrier).then(() => exitOnce(signal));
+  };
+  const onSigint = (): void => handle("SIGINT");
+  const onSigterm = (): void => handle("SIGTERM");
+  proc.on("SIGINT", onSigint);
+  proc.on("SIGTERM", onSigterm);
+}
+
+/** Minimal stdin-like stream surface this seam needs. Real `process.stdin` satisfies it. */
+export interface EofStream {
+  on(event: "end" | "close", listener: () => void): unknown;
+  /** Detach path: removes the listener installed via `on`. */
+  off(event: "end" | "close", listener: () => void): unknown;
+}
+
+export interface StdinEofShutdownOptions {
+  /** Injectable seam for tests — defaults to the real Node `process.stdin`. */
+  stdin?: EofStream;
+  /** Forwarded to withShutdownBarrier for the graceful-shutdown wait. */
+  barrier?: ShutdownBarrierOptions;
+  /** Forwarded to the shared shutdown's in-flight tool-call quiesce wait (Codex P2 #2) — see
+   *  getGracefulShutdown / getInFlightTracker. */
+  quiesce?: QuiesceOptions;
+}
+
+/** Streams that already have an EOF shutdown listener installed — same guard shape as installedShutdownProcs. */
+const installedEofStreams = new WeakSet<EofStream>();
+
+/**
+ * Listen for stdin EOF — 'end' or 'close', whichever fires first — and trigger the SAME
+ * memoized graceful shutdown as the signal path (see getGracefulShutdown), then let the process
+ * exit naturally. No explicit process.exit() here: a plain stdin EOF is not a signal, so the
+ * 128+signal convention doesn't apply — once the barrier-wrapped shutdown settles, nothing else
+ * should be keeping the event loop alive, and the process exits on its own (code 0).
+ *
+ * No forced-exit escalation of its own: unlike the signal path's double-signal policy, EOF never
+ * force-exits — a plain stdin EOF is a one-time event, not a repeated operator-intent signal like
+ * "I pressed Ctrl-C again because you're not responding." Past the barrier's deadline, this path
+ * relies on the process exiting naturally on its own, or on an operator/process-manager's own
+ * SIGTERM→SIGKILL escalation (or the co-installed signal handlers, if this process also received
+ * one) to actually terminate it.
+ *
+ * Natural-exit assumption: this depends on the drain leaving no OTHER referenced handle behind —
+ * e.g. a wedged git subprocess spawned by an in-flight sync would itself keep the event loop
+ * alive past this barrier's deadline. That case is backstopped by the co-installed SIGINT/SIGTERM
+ * handlers and by the MCP client's own 2s/4s SIGTERM/SIGKILL escalation if the process is still
+ * alive when the client notices — this listener is the fast path for the common case, not the
+ * only possible path to termination.
+ *
+ * THIS IS THE REAL GRACEFUL-DISCONNECT HOOK for the stdio transport, not transport.onclose. A
+ * live two-process restart probe proved the MCP SDK's StdioServerTransport never reacts to a
+ * plain stdin EOF — it only listens for 'data'/'error', so it never calls transport.close(), so
+ * onclose (see attachSourceSchedulerLifecycle) never fires — and the client's own escalation to
+ * SIGTERM/SIGKILL (2s/4s) arrives far too late, because the child has already exited from
+ * natural event-loop drain (scheduler wakes are unref'd) within milliseconds. onclose remains
+ * wired as a defensive secondary path for transports that DO call it, but for the stdio case
+ * this listener is what actually fires on a graceful client disconnect.
+ *
+ * Idempotency guard: identical shape to installProcessShutdownHandlers (see its JSDoc) — a second
+ * install on the same `stdin` (the default is the singleton `process.stdin`) is a no-op, and a
+ * second MonetCore/MCP server pair embedded in one process needs `stdinEofShutdown: false` plus
+ * its own coordinated handling.
+ *
+ * Detach: this installer's `detach` is registered via the shared getGracefulShutdown's
+ * `onSettled` at INSTALL time, so it runs whenever the shutdown shared with this (server, core)
+ * pair settles — whether THIS installer's own EOF triggered it, or a sibling installer on the
+ * SAME pair did (e.g. installProcessShutdownHandlers on the same server/core). That coordination
+ * is what lets a later fresh install on the same `stdin` work again even if this installer's own
+ * EOF never fired.
+ *
+ * Exported as a deterministic test seam: pass a fake `stdin` to drive it without a real stream.
+ */
+export function installStdinEofShutdown(
+  server: McpServer,
+  core: MonetCore,
+  options: StdinEofShutdownOptions = {},
+): void {
+  const stdin = options.stdin ?? (process.stdin as unknown as EofStream);
+  if (installedEofStreams.has(stdin)) return; // idempotency guard — see JSDoc
+  // Validate/create the shared shutdown BEFORE marking `stdin` installed — same reasoning as
+  // installProcessShutdownHandlers: a mismatched-core throw here must not leave `stdin` stuck
+  // "installed" with no listeners and no onSettled detach ever registered.
+  const shutdown = getGracefulShutdown(server, core);
+  installedEofStreams.add(stdin);
+
+  let triggered = false;
+  const detach = (): void => {
+    stdin.off("end", onEnd);
+    stdin.off("close", onClose);
+    installedEofStreams.delete(stdin);
+  };
+  // Registered at INSTALL time (not inside trigger()) so it still runs even if this installer's
+  // own EOF never fires — e.g. the shared pair shuts down via a signal only.
+  shutdown.onSettled(detach);
+  const trigger = (): void => {
+    if (triggered) return;
+    triggered = true;
+    void withShutdownBarrier(shutdown.run(options.quiesce), options.barrier);
+  };
+  const onEnd = (): void => trigger();
+  const onClose = (): void => trigger();
+  stdin.on("end", onEnd);
+  stdin.on("close", onClose);
 }
 
 /** Attach only after transport connection. Exported as a deterministic lifecycle test seam. */
@@ -1402,10 +2093,22 @@ export function attachSourceSchedulerLifecycle(
     return stopPromise;
   };
   if (transport) {
+    // DEFENSIVE SECONDARY PATH — NOT the primary graceful-disconnect hook. A live two-process
+    // restart probe proved the MCP SDK's StdioServerTransport never calls transport.close() (and
+    // so never invokes onclose) in reaction to a plain stdin EOF — it only listens for
+    // 'data'/'error' on stdin. This wiring only fires for transports that DO call onclose
+    // themselves (an explicit transport.close(), a non-stdio transport with its own EOF
+    // handling, or the SDK's own re-entrant close chain — see the "double barrier" test). For the
+    // real stdio graceful-disconnect case, see installStdinEofShutdown, wired directly on
+    // process.stdin inside createMonetCoreMcpServer.
     const onclose = transport.onclose;
     transport.onclose = () => {
       try { onclose?.(); }
-      finally { void stopOnce().catch(() => undefined); }
+      // stopOnce() is fire-and-forget from the SDK's perspective (onclose isn't awaited), so the
+      // barrier keeps the event loop alive until drain + lease release commit (or the deadline).
+      // options.onCloseBarrier is a deterministic test seam only (see its own JSDoc) — omitted in
+      // production, where withShutdownBarrier falls back to real timers.
+      finally { void withShutdownBarrier(stopOnce(), options.onCloseBarrier); }
     };
   }
   server.close = async (): Promise<void> => {
@@ -1416,6 +2119,16 @@ export function attachSourceSchedulerLifecycle(
   return scheduler;
 }
 
+/**
+ * Create and connect the monet-core MCP server, with graceful shutdown wired in by default.
+ *
+ * The shutdown coordinator (getGracefulShutdown) settles through exactly three paths, together
+ * covering every way this factory's server can stop existing: a real trigger (SIGINT/SIGTERM or
+ * stdin EOF — run()'s own finally, which also closes core), an explicit server.close() with no
+ * trigger ever firing (settleGracefulShutdownOnExplicitClose), and this factory's OWN startup
+ * failing after the installers already ran (settleGracefulShutdownOnStartupFailure, below). All
+ * three are safe to race against each other (see settleGracefulShutdownIfUntriggered).
+ */
 export async function createMonetCoreMcpServer(
   core: MonetCore,
   options: CreateMonetCoreMcpServerOptions = {},
@@ -1428,9 +2141,39 @@ export async function createMonetCoreMcpServer(
     },
   );
   registerMonetCoreTools(server, core, deriveOptsFromEnv());
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  // Connect completes first; start only queues the non-blocking zero-delay cycle.
-  attachSourceSchedulerLifecycle(server, core, options, process.env, transport);
+  // Executable-owned graceful shutdown: every process embedding this server gets SIGINT/SIGTERM
+  // and stdin-EOF handling "for free" through this one API — no per-entry-point wiring required.
+  // Installed BEFORE connect() (not after) so a signal or stdin EOF arriving during a stuck or
+  // slow connect() still triggers a real shutdown attempt instead of Node's abrupt default
+  // disposition. Crash-safe at any point relative to connect(): both installers call
+  // server.close() by dynamic property lookup at the moment they actually fire, not a reference
+  // captured now, so whichever close behavior attachSourceSchedulerLifecycle has (or hasn't yet)
+  // wired in below is what runs. One narrow, purely theoretical gap: a signal that runs fully
+  // synchronously to the point of calling getGracefulShutdown's run() inside the sub-millisecond
+  // window between this line and attachSourceSchedulerLifecycle's call below would memoize the
+  // pre-scheduler close — negligible in practice, since neither the scheduler nor any lease
+  // exists yet at that point to lose (comment only; not worth the complexity of closing it).
+  if (options.processShutdownHandlers !== false) installProcessShutdownHandlers(server, core);
+  if (options.stdinEofShutdown !== false) installStdinEofShutdown(server, core);
+  try {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    // Connect completes first; start only queues the non-blocking zero-delay cycle.
+    attachSourceSchedulerLifecycle(server, core, options, process.env, transport);
+    // Explicit server.close() (an embedded host managing its own lifecycle, or a test) must ALSO
+    // settle the shared shutdown coordinator even if no signal/EOF trigger ever fires — see
+    // settleGracefulShutdownOnExplicitClose (Codex P2 #1). Installed LAST/outermost, after
+    // attachSourceSchedulerLifecycle's own close patch, so it wraps the fully-assembled close chain.
+    settleGracefulShutdownOnExplicitClose(server);
+  } catch (error) {
+    // Startup failed (e.g. transport.connect() rejected) after the installers above already
+    // registered real process/stdin listeners for this now-abandoned server — settle the
+    // coordinator so those listeners detach and their guards clear (Codex pass-3 P2, the third
+    // settle-family member: see settleGracefulShutdownOnStartupFailure). The caller constructed
+    // `core` and still owns it; this never touches it. Rethrow unchanged — this is cleanup, not
+    // error handling.
+    settleGracefulShutdownOnStartupFailure(server);
+    throw error;
+  }
   return server;
 }
