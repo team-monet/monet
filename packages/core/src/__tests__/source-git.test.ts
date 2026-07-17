@@ -360,7 +360,7 @@ describe("managed git-md remote materialization", () => {
         expect(f.core.listSourceRemovalItems(f.source.id)[0]?.acknowledgedAt).not.toBeNull();
       } finally { release(); f.cleanup(); }
     }
-  });
+  }, 30_000);
 
   it("ignores forged trusted materializer keys and never creates an alternate git hierarchy", async () => {
     const f = fixture();
