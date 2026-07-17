@@ -49,10 +49,13 @@ let ENTITIES = null;     // /api/entities payload (lazy)
 // prior Refresh cannot overwrite a freshly-invalidated cache.
 let _entitiesGen = 0;
 let FIRST_BLOCK = null;  // /api/firstblock payload (lazy, invalidated on Refresh)
+let SOURCES = null;      // /api/sources payload (lazy, invalidated on Refresh)
 // Generation counter — incremented when Refresh clears the FIRST_BLOCK cache.
 // Mirrors _entitiesGen: a stale in-flight response is discarded rather than
 // repopulating a cache that was intentionally cleared by Refresh.
 let _firstBlockGen = 0;
+// Mirrors _firstBlockGen for the SOURCES cache.
+let _sourcesGen = 0;
 
 const state = {
   circle: 'all',
@@ -220,6 +223,26 @@ function fmtRelTime(ms) {
   const days = Math.floor(h / 24);
   if (days < 30) return `${days}d ago`;
   return fmtDate(ms);
+}
+
+function fmtUntil(ms) {
+  if (!ms) return '—';
+  const diff = ms - Date.now();
+  if (diff <= 0) return 'due now';
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return 'in <1m';
+  if (m < 60) return `in ${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `in ${h}h`;
+  return fmtDate(ms);
+}
+
+function fmtInterval(seconds) {
+  if (!seconds) return '';
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
 }
 
 function escHtml(s) {
@@ -433,6 +456,19 @@ async function fetchFirstBlock() {
   if (_firstBlockGen !== gen) return { rows: [] }; // stale — discard
   FIRST_BLOCK = data;
   return FIRST_BLOCK;
+}
+
+async function fetchSources() {
+  if (SOURCES) return SOURCES;
+  // Generation guard — mirrors fetchFirstBlock: a delayed response from before a
+  // Refresh must not repopulate the cache Refresh just cleared.
+  const gen = _sourcesGen;
+  const r = await fetch('/api/sources');
+  if (!r.ok) throw new Error(`/api/sources returned ${r.status}`);
+  const data = await r.json();
+  if (_sourcesGen !== gen) return { sources: [] }; // stale — discard
+  SOURCES = data;
+  return SOURCES;
 }
 
 // ── Top bar & stat bar ───────────────────────────────────────────────────────
@@ -3120,6 +3156,155 @@ async function renderFirstBlock() {
   }
 }
 
+// ── Sources view ─────────────────────────────────────────────────────────────
+
+const SOURCE_STATUS_META = {
+  'active':               { cls: 'ok',   label: 'active' },
+  'pending-initial-sync': { cls: 'warn', label: 'pending initial sync' },
+  'pending-replacement':  { cls: 'warn', label: 'pending replacement' },
+  'tombstoned':           { cls: 'dim',  label: 'tombstoned' },
+};
+
+const SOURCE_ATTEMPT_KIND_LABEL = {
+  'run': 'sync',
+  'invocation': 'invoked sync',
+  'verification': 'verification',
+  'pre-pin-failure': 'sync attempt',
+};
+
+function sourceAttemptIcon(a) {
+  if (a.kind === 'verification') return '<span class="att-icon muted">⊙</span>';
+  if (a.result === 'success') return '<span class="att-icon ok">✓</span>';
+  if (a.result === 'failed') return '<span class="att-icon danger">✕</span>';
+  if (a.result === 'partial') return '<span class="att-icon warn">◐</span>';
+  return '<span class="att-icon muted">…</span>'; // run still in flight
+}
+
+function sourceLocation(src) {
+  if (src.remoteUrl) return src.branch ? `${src.remoteUrl} #${src.branch}` : src.remoteUrl;
+  return src.localPath || '';
+}
+
+function sourceScheduleText(src) {
+  const sch = src.schedule || {};
+  if (sch.state === 'syncing') {
+    return `<span class="src-sched-live">syncing — ${escHtml(src.liveRunState || '')}…</span>`;
+  }
+  if (sch.state === 'manual') return 'manual';
+  const every = src.refreshIntervalSeconds ? `every ${fmtInterval(src.refreshIntervalSeconds)}` : '';
+  if (sch.state === 'backoff') {
+    return `${every} · <span class="src-sched-warn">retry ~${escHtml(fmtUntil(sch.nextAttemptAt))}` +
+      ` (${sch.consecutiveFailures} failed)</span>`;
+  }
+  // 'scheduled' / 'due' — nextAttemptAt is approximate (engine adds jitter)
+  return `${every} · next ~${escHtml(fmtUntil(sch.nextAttemptAt))}`;
+}
+
+async function renderSources() {
+  const el = document.getElementById('sources-view');
+  if (!el) return;
+
+  const gen = _sourcesGen;
+  let data;
+  try {
+    data = await fetchSources();
+  } catch (err) {
+    el.innerHTML = `<div style="padding:24px 16px;color:var(--danger);font-size:13px">Failed to load sources: ${escHtml(err.message)}</div>`;
+    return;
+  }
+  if (gen !== _sourcesGen) return; // stale — a newer Refresh superseded this; don't render
+
+  let sources = data.sources || [];
+
+  if (!sources.length) {
+    el.innerHTML = '<div style="padding:24px 16px;color:var(--text-muted);font-size:13px">No knowledge sources registered. Add one with <code>monet source add</code>.</div>';
+    return;
+  }
+
+  // Filter by current circle selection when not "all"
+  if (state.circle !== 'all') {
+    sources = sources.filter(s => {
+      const canon = canonicalCircle(s.circle);
+      return canon === state.circle || s.circle === state.circle;
+    });
+  }
+
+  // Filter by search text (name, circle, location)
+  const q = (state.search || '').trim().toLowerCase();
+  if (q) {
+    sources = sources.filter(s =>
+      String(s.name || '').toLowerCase().includes(q) ||
+      String(s.circle || '').toLowerCase().includes(q) ||
+      sourceLocation(s).toLowerCase().includes(q));
+  }
+
+  if (!sources.length) {
+    el.innerHTML = '<div style="padding:24px 16px;color:var(--text-muted);font-size:13px">No sources match the current circle/search.</div>';
+    return;
+  }
+
+  el.innerHTML = '';
+  for (const src of sources) {
+    const meta = SOURCE_STATUS_META[src.status] || { cls: 'dim', label: src.status };
+    const counts = src.publishedFileCount != null
+      ? `${src.publishedFileCount} files · ${src.publishedChunkCount} chunks`
+      : '';
+
+    const sec = document.createElement('div');
+    sec.className = 'health-section';
+    sec.innerHTML = `
+      <div class="health-section-hdr">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
+          ${src.type === 'git-md'
+            ? '<circle cx="4" cy="4" r="2"/><circle cx="4" cy="12" r="2"/><circle cx="12" cy="8" r="2"/><path d="M4 6v4M6 4h2a2 2 0 0 1 2 2v0"/>'
+            : '<path d="M1.5 4.5a1 1 0 0 1 1-1h3l1.5 2h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1z"/>'}
+        </svg>
+        ${escHtml(src.name)}
+        <span class="src-type">${escHtml(src.type)}</span>
+        <span class="src-status ${meta.cls}">${escHtml(meta.label)}</span>
+        <span class="src-hdr-right">${escHtml(src.circle)}${counts ? ' · ' + escHtml(counts) : ''}</span>
+      </div>
+      <div class="src-meta">
+        <div class="src-meta-cell">
+          <div class="src-meta-lbl">Location</div>
+          <div class="src-meta-val mono" title="${escHtml(sourceLocation(src))}">${escHtml(sourceLocation(src))}</div>
+        </div>
+        <div class="src-meta-cell">
+          <div class="src-meta-lbl">Last successful sync</div>
+          <div class="src-meta-val">${src.lastSuccessAt ? escHtml(fmtRelTime(src.lastSuccessAt)) : 'never'}</div>
+        </div>
+        <div class="src-meta-cell">
+          <div class="src-meta-lbl">Refresh</div>
+          <div class="src-meta-val">${sourceScheduleText(src)}</div>
+        </div>
+      </div>
+      <div class="health-items">
+        ${!src.attempts.length ? '<div style="padding:14px 16px;color:var(--text-muted);font-size:12px">No sync attempts yet</div>' :
+          src.attempts.map(a => {
+            const kindLbl = SOURCE_ATTEMPT_KIND_LABEL[a.kind] || a.kind;
+            const outcome = a.kind === 'verification' ? 'checked'
+              : a.result ? escHtml(a.result)
+              : a.runState ? escHtml(a.runState) + '…' : 'pending';
+            const detail = a.reason ? ` — ${escHtml(String(a.reason).slice(0, 140))}` : '';
+            const cnt = (a.kind === 'run' && a.result === 'success' && a.fileCount != null)
+              ? `<span class="att-cnt">${a.fileCount}f · ${a.chunkCount}c</span>` : '';
+            return `
+              <div class="health-item src-attempt">
+                <div class="h-icon">${sourceAttemptIcon(a)}</div>
+                <div style="min-width:0">
+                  <div class="h-title">${escHtml(kindLbl)} · ${outcome}<span class="src-attempt-detail">${detail}</span></div>
+                  <div class="h-meta">${escHtml(fmtRelTime(a.attemptedAt))}</div>
+                </div>
+                ${cnt}
+              </div>
+            `;
+          }).join('')}
+      </div>
+    `;
+    el.appendChild(sec);
+  }
+}
+
 // ── Tab switching ────────────────────────────────────────────────────────────
 
 function switchTab(tab) {
@@ -3136,6 +3321,8 @@ function switchTab(tab) {
     renderEntitiesTable();
   } else if (tab === 'timeline') {
     setTimeout(renderTimeline, 50); // let layout settle
+  } else if (tab === 'sources') {
+    renderSources();
   } else if (tab === 'health') {
     renderHealth();
   } else if (tab === 'firstblock') {
@@ -3153,6 +3340,7 @@ function rerenderActiveView() {
   if (state.activeTab === 'concepts') renderConceptsTable();
   else if (state.activeTab === 'entities') renderEntitiesTable();
   else if (state.activeTab === 'timeline') renderTimeline();
+  else if (state.activeTab === 'sources') renderSources();
   else if (state.activeTab === 'health') renderHealth();
   else if (state.activeTab === 'firstblock') renderFirstBlock();
   // 'graph' tab: canvas is kept current by redrawGraph(); nothing more to do here.
@@ -3356,6 +3544,9 @@ async function init() {
       // mirroring the entities refresh race fix above.
       FIRST_BLOCK = null;
       _firstBlockGen++;
+      // Same for the sources cache.
+      SOURCES = null;
+      _sourcesGen++;
       // If the entity overlay is on, refetch entities BEFORE redrawing so the
       // overlay survives a Refresh.  buildGraph checks `state.entityOverlay && ENTITIES`
       // and silently skips entity nodes when ENTITIES is null — which is the window

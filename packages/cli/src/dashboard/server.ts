@@ -245,6 +245,63 @@ const SQL = {
     FROM concept_entities
   `,
 
+  // Knowledge-source registry. The tables may not exist in stores not yet
+  // migrated by an engine with the source pipeline; the caller guards with an
+  // existence check before running these queries.
+  sources: `
+    SELECT id, type, name, remote_url, local_path, branch,
+           circle, auto_detect, refresh_mode, refresh_interval_seconds,
+           config_version, applied_config_version, active_run_id,
+           lease_fence, lifecycle, created_at, updated_at, tombstoned_at
+    FROM knowledge_sources
+    ORDER BY created_at ASC, id ASC
+  `,
+
+  // The run each source currently has published (registry pin → run row).
+  sourceActiveRuns: `
+    SELECT r.id, r.source_id, r.state, r.result, r.file_count, r.chunk_count,
+           r.published_at, r.finished_at, r.created_at
+    FROM source_sync_runs r
+    JOIN knowledge_sources s ON s.active_run_id = r.id
+  `,
+
+  // Durable success marker per source: latest published_at among successful runs.
+  sourceLastSuccess: `
+    SELECT source_id, MAX(published_at) AS last_success_at
+    FROM source_sync_runs
+    WHERE result = 'success' AND published_at IS NOT NULL
+    GROUP BY source_id
+  `,
+
+  // At most one live (non-terminal) run per source — enforced by
+  // uq_source_sync_runs_live in the engine schema.
+  sourceLiveRuns: `
+    SELECT id, source_id, state, created_at, updated_at
+    FROM source_sync_runs
+    WHERE state IN ('scanning','staging','activating','cleaning')
+  `,
+
+  // Immutable attempt receipts joined to their run rows — the same shape as the
+  // engine's scheduleBasisSnapshot query (source-ledger). The window matches the
+  // engine's per-source event retention (128) so streak math sees everything the
+  // engine sees; the display list is sliced to 20 afterwards in JS.
+  sourceAttemptEvents: `
+    SELECT e.source_id, e.sequence, e.kind, e.run_id, e.attempted_at,
+           e.failure_reason, e.invocation_result, e.config_version, e.lease_fence,
+           r.state AS run_state, r.result AS run_result, r.reason AS run_reason,
+           r.file_count AS run_file_count, r.chunk_count AS run_chunk_count,
+           r.published_at AS run_published_at, r.finished_at AS run_finished_at
+    FROM (
+      SELECT ev.*, ROW_NUMBER() OVER (
+        PARTITION BY source_id ORDER BY sequence DESC
+      ) AS rn
+      FROM source_attempt_events ev
+    ) e
+    LEFT JOIN source_sync_runs r ON r.id = e.run_id AND r.source_id = e.source_id
+    WHERE e.rn <= 128
+    ORDER BY e.source_id, e.sequence DESC
+  `,
+
   // first_block rows joined to their concept for title + status.
   // The table may not exist in stores not yet migrated by the new engine;
   // the caller guards with an existence check before running this query.
@@ -435,6 +492,262 @@ async function handleFirstBlock(circle: string | null): Promise<unknown> {
   }
 }
 
+// ── Sources ──────────────────────────────────────────────────────────────────
+
+/**
+ * Registry status derivation — mirrors deriveStatus() in monet-core's
+ * source-registry (the status is not a stored column). One deliberate
+ * divergence: a corrupt applied>config row displays as pending-replacement
+ * instead of throwing — a read-only view must not 500 on a corrupt store.
+ */
+export function deriveSourceStatus(row: {
+  lifecycle: string;
+  config_version: number;
+  applied_config_version: number | null;
+}): string {
+  if (row.lifecycle === "tombstoned") return "tombstoned";
+  if (row.applied_config_version == null) return "pending-initial-sync";
+  if (row.applied_config_version === row.config_version) return "active";
+  return "pending-replacement";
+}
+
+/** Failure backoff — mirrors cappedBackoff() in monet-core's source-scheduler. */
+export function sourceBackoffMs(intervalMs: number, streak: number): number {
+  let value = 30_000;
+  for (let i = 1; i < streak && value < intervalMs; i += 1) value = Math.min(intervalMs, value * 2);
+  return Math.min(intervalMs, value);
+}
+
+export interface SourceAttemptOutcome {
+  attemptedAt: number;
+  result: string | null;
+}
+
+/** The event-row shape terminalOutcomes consumes (attempt event + joined run). */
+export interface SourceAttemptEventRow {
+  kind: string;
+  runId: string | null;
+  attemptedAt: number;
+  invocationResult: string | null;
+  configVersion: number | null;
+  leaseFence: number | null;
+  runResult: string | null;
+  runPublishedAt: number | null;
+  runFinishedAt: number | null;
+}
+
+/**
+ * Terminal-outcome projection — mirrors the engine's scheduleBasisSnapshot loop
+ * (source-ledger) over fence-scoped events, newest first:
+ *   - events outside the source's CURRENT config_version/lease_fence are
+ *     ignored (a config update bumps both and resets the failure streak);
+ *   - verification counts as success (it breaks a failure streak);
+ *   - pre-pin-failure counts as failed;
+ *   - invocation carries its own result and always marks its run seen;
+ *   - a run event counts only if not already covered by its invocation receipt,
+ *     anchored at max(attempted_at, published_at, finished_at).
+ */
+export function terminalOutcomes(
+  events: SourceAttemptEventRow[], // newest first
+  configVersion: number,
+  leaseFence: number,
+): SourceAttemptOutcome[] {
+  const seenRuns = new Set<string>();
+  const terminals: SourceAttemptOutcome[] = [];
+  for (const row of events) {
+    if (row.configVersion !== configVersion || row.leaseFence !== leaseFence) continue;
+    let result: string | null = null;
+    let attemptedAt = row.attemptedAt;
+    if (row.kind === "verification") result = "success";
+    else if (row.kind === "pre-pin-failure") result = "failed";
+    else if (row.kind === "invocation") {
+      result = row.invocationResult;
+      if (row.runId) seenRuns.add(row.runId);
+    } else if (row.runId && !seenRuns.has(row.runId) && row.runResult !== null) {
+      result = row.runResult;
+      attemptedAt = Math.max(attemptedAt, row.runPublishedAt ?? -1, row.runFinishedAt ?? -1);
+      seenRuns.add(row.runId);
+    }
+    if (result) terminals.push({ attemptedAt, result });
+  }
+  return terminals;
+}
+
+/**
+ * Approximate the engine scheduler's next-attempt plan from durable state only.
+ * The engine adds a deterministic jitter (≤30s or 10% of the interval) and a
+ * recovery branch driven by ledger internals; this read-only view anchors on the
+ * latest terminal attempt and skips the jitter, so nextAttemptAt is approximate.
+ */
+export function computeSourceSchedule(
+  src: { lifecycle: string; refresh_mode: string; refresh_interval_seconds: number | null },
+  outcomes: SourceAttemptOutcome[], // newest first, terminal outcomes only
+  hasLiveRun: boolean,
+  now: number,
+): { state: string; nextAttemptAt: number | null; consecutiveFailures: number } {
+  if (hasLiveRun) return { state: "syncing", nextAttemptAt: null, consecutiveFailures: 0 };
+  if (src.lifecycle !== "active" || src.refresh_mode !== "interval" || !src.refresh_interval_seconds) {
+    return { state: "manual", nextAttemptAt: null, consecutiveFailures: 0 };
+  }
+  const intervalMs = src.refresh_interval_seconds * 1000;
+  if (outcomes.length === 0) {
+    // Never attempted: the engine schedules the initial sync within a short
+    // startup spread, so "due" is the honest display state.
+    return { state: "due", nextAttemptAt: now, consecutiveFailures: 0 };
+  }
+  const latest = outcomes[0];
+  let failures = 0;
+  for (const o of outcomes) {
+    if (o.result !== "success") failures += 1;
+    else break;
+  }
+  const failed = latest.result !== "success";
+  const delay = failed ? sourceBackoffMs(intervalMs, Math.max(1, failures)) : intervalMs;
+  const nextAttemptAt = latest.attemptedAt + delay;
+  const state = nextAttemptAt <= now ? "due" : failed ? "backoff" : "scheduled";
+  return { state, nextAttemptAt, consecutiveFailures: failures };
+}
+
+async function handleSources(): Promise<unknown> {
+  if (!fs.existsSync(getDbPath())) return { sources: [], generatedAt: Date.now() };
+  const snap = await makeSnapshot();
+  try {
+    // Stores written by engines without the source pipeline lack these tables;
+    // return an empty payload rather than a 500 (mirrors the first_block guard).
+    // The ledger tables can also be missing INDEPENDENTLY of the registry
+    // (registry-only stores from older engines): still list registered sources
+    // and treat run/attempt data as empty rather than hiding the registry.
+    const db = new Database(snap, { readonly: true });
+    const present = new Set<string>();
+    try {
+      const rows = db.prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type='table' AND name IN ('knowledge_sources','source_sync_runs','source_attempt_events')`
+      ).all() as Array<{ name: string }>;
+      for (const r of rows) present.add(r.name);
+    } finally {
+      db.close();
+    }
+    if (!present.has("knowledge_sources")) return { sources: [], generatedAt: Date.now() };
+    const hasRuns   = present.has("source_sync_runs");
+    const hasEvents = present.has("source_attempt_events");
+
+    const sources       = querySnap(snap, SQL.sources);
+    const activeRuns    = hasRuns ? querySnap(snap, SQL.sourceActiveRuns) : [];
+    const lastSuccess   = hasRuns ? querySnap(snap, SQL.sourceLastSuccess) : [];
+    const liveRuns      = hasRuns ? querySnap(snap, SQL.sourceLiveRuns) : [];
+    const attemptEvents = (hasEvents && hasRuns) ? querySnap(snap, SQL.sourceAttemptEvents) : [];
+
+    const activeBySource: Record<string, Record<string, unknown>> = {};
+    for (const r of activeRuns) activeBySource[r["source_id"] as string] = r;
+    const successBySource: Record<string, number> = {};
+    for (const r of lastSuccess) successBySource[r["source_id"] as string] = r["last_success_at"] as number;
+    const liveBySource: Record<string, Record<string, unknown>> = {};
+    for (const r of liveRuns) liveBySource[r["source_id"] as string] = r;
+    const eventsBySource: Record<string, Record<string, unknown>[]> = {};
+    for (const e of attemptEvents) {
+      const sid = e["source_id"] as string;
+      (eventsBySource[sid] ||= []).push(e);
+    }
+
+    const now = Date.now();
+    const out = sources.map((s) => {
+      const sid = s["id"] as string;
+      const active = activeBySource[sid] || null;
+      const live = liveBySource[sid] || null;
+      const events = eventsBySource[sid] || [];
+
+      const eventRows: SourceAttemptEventRow[] = events.map((e) => ({
+        kind: e["kind"] as string,
+        runId: (e["run_id"] as string | null) ?? null,
+        attemptedAt: e["attempted_at"] as number,
+        invocationResult: (e["invocation_result"] as string | null) ?? null,
+        configVersion: (e["config_version"] as number | null) ?? null,
+        leaseFence: (e["lease_fence"] as number | null) ?? null,
+        runResult: (e["run_result"] as string | null) ?? null,
+        runPublishedAt: (e["run_published_at"] as number | null) ?? null,
+        runFinishedAt: (e["run_finished_at"] as number | null) ?? null,
+      }));
+
+      const outcomes = terminalOutcomes(
+        eventRows,
+        s["config_version"] as number,
+        s["lease_fence"] as number,
+      );
+
+      // Display rows for the 20 newest events; run-backed rows resolve result,
+      // reason, and counts through the joined run columns.
+      const attempts = events.slice(0, 20).map((e) => {
+        const kind = e["kind"] as string;
+        let result: string | null = null;
+        let reason: string | null = (e["failure_reason"] as string | null) ?? null;
+        if (kind === "run") {
+          result = (e["run_result"] as string | null) ?? null;
+          reason = reason ?? ((e["run_reason"] as string | null) ?? null);
+        } else if (kind === "invocation") {
+          result = (e["invocation_result"] as string | null) ?? null;
+        } else if (kind === "pre-pin-failure") {
+          result = "failed";
+        }
+        return {
+          sequence: e["sequence"] as number,
+          kind,
+          attemptedAt: e["attempted_at"] as number,
+          result,
+          reason,
+          runState: (e["run_state"] as string | null) ?? null,
+          fileCount: (e["run_file_count"] as number | null) ?? null,
+          chunkCount: (e["run_chunk_count"] as number | null) ?? null,
+        };
+      });
+
+      const schedule = computeSourceSchedule(
+        {
+          lifecycle: s["lifecycle"] as string,
+          refresh_mode: s["refresh_mode"] as string,
+          refresh_interval_seconds: s["refresh_interval_seconds"] as number | null,
+        },
+        outcomes,
+        live != null,
+        now,
+      );
+
+      return {
+        id: sid,
+        type: s["type"],
+        name: s["name"],
+        circle: s["circle"],
+        status: deriveSourceStatus({
+          lifecycle: s["lifecycle"] as string,
+          config_version: s["config_version"] as number,
+          applied_config_version: s["applied_config_version"] as number | null,
+        }),
+        lifecycle: s["lifecycle"],
+        remoteUrl: s["remote_url"],
+        localPath: s["local_path"],
+        branch: s["branch"],
+        autoDetect: s["auto_detect"] === 1,
+        refreshMode: s["refresh_mode"],
+        refreshIntervalSeconds: s["refresh_interval_seconds"],
+        createdAt: s["created_at"],
+        updatedAt: s["updated_at"],
+        tombstonedAt: s["tombstoned_at"],
+        lastSuccessAt: successBySource[sid] ?? null,
+        publishedAt: (active?.["published_at"] as number | null) ?? null,
+        publishedFileCount: (active?.["file_count"] as number | null) ?? null,
+        publishedChunkCount: (active?.["chunk_count"] as number | null) ?? null,
+        liveRunState: (live?.["state"] as string | null) ?? null,
+        schedule,
+        attempts,
+      };
+    });
+
+    return { sources: out, generatedAt: now };
+  } finally {
+    try { fs.unlinkSync(snap); } catch { /* ignore */ }
+  }
+}
+
 // ── Static file serving ──────────────────────────────────────────────────────
 
 const MIME: Record<string, string> = {
@@ -521,6 +834,13 @@ export function startDashboard(port: number): void {
 
       if (pathname === "/api/entities") {
         const data = await handleEntities();
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(data));
+        return;
+      }
+
+      if (pathname === "/api/sources") {
+        const data = await handleSources();
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(data));
         return;

@@ -142,7 +142,9 @@ describe("source CLI", () => {
       transport: { allowedUrlSchemes: ["https"], allowedHosts: ["github.com"] },
       status: "pending-initial-sync",
     });
-    expect(source.localPath).toBe(join(realpathSync.native(join(dir, "store")), "sources", source.id));
+    expect(source.localPath).toBe(
+      join(realpathSync.native(join(dir, "store")), "sources", "git-md", source.id, "repository.git"),
+    );
     expect(existsSync(source.localPath)).toBe(false);
     expect(closeCount).toBe(1);
   });
