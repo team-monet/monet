@@ -706,9 +706,12 @@ td {
   gap: 8px;
   padding: 8px 16px;
   border-bottom: 1px solid rgba(255,255,255,0.03);
-  cursor: pointer;
+  /* Only the two [data-role] halves are click targets (src vs dst) — the row itself must not
+     advertise a pointer over the separator/weight/padding dead zones. */
+  cursor: default;
   transition: background var(--trans);
 }
+.dup-pair [data-role] { cursor: pointer; }
 .dup-pair:last-child { border-bottom: none; }
 .dup-pair:hover { background: var(--glass); }
 .dup-pair .dp-title { font-size: 12px; font-weight: 500; }

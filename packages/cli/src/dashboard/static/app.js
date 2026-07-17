@@ -2886,6 +2886,13 @@ function renderTimeline() {
     });
     list.appendChild(div);
   }
+
+  if (sorted.length > 80) {
+    const footer = document.createElement('div');
+    footer.style.cssText = 'padding:24px 16px;color:var(--text-muted);font-size:13px';
+    footer.textContent = `showing 80 of ${sorted.length} — refine filters to narrow`;
+    list.appendChild(footer);
+  }
 }
 
 // ── Health view ──────────────────────────────────────────────────────────────
@@ -2926,6 +2933,9 @@ function renderHealth() {
       </div>
     `;
     el.appendChild(sec);
+    sec.querySelectorAll('.health-item').forEach(item => {
+      item.addEventListener('click', () => selectConcept(item.dataset.id));
+    });
   }
 
   // Possible duplicates
@@ -2946,7 +2956,7 @@ function renderHealth() {
             const dst = maps.byId[e.dst_id];
             return `
               <div class="dup-pair" data-src="${escHtml(e.src_id)}" data-dst="${escHtml(e.dst_id)}">
-                <div>
+                <div data-role="src">
                   <div class="dp-title">
                     <span class="dot kind-dot-inline" style="background:${kindColor(src ? src.kind : 'unknown')}"></span>
                     ${escHtml(src ? src.title : e.src_id)}
@@ -2954,7 +2964,7 @@ function renderHealth() {
                   <div style="font-size:10.5px;color:var(--text-muted);margin-top:1px">${src ? escHtml(canonicalCircle(src.circle)) : ''}</div>
                 </div>
                 <div class="dp-sep">≈</div>
-                <div>
+                <div data-role="dst">
                   <div class="dp-title">
                     <span class="dot kind-dot-inline" style="background:${kindColor(dst ? dst.kind : 'unknown')}"></span>
                     ${escHtml(dst ? dst.title : e.dst_id)}
@@ -2970,7 +2980,10 @@ function renderHealth() {
     el.appendChild(sec);
 
     sec.querySelectorAll('.dup-pair').forEach(row => {
-      row.addEventListener('click', () => selectConcept(row.dataset.src));
+      row.querySelectorAll('[data-role]').forEach(side => {
+        const targetId = side.dataset.role === 'dst' ? row.dataset.dst : row.dataset.src;
+        side.addEventListener('click', () => selectConcept(targetId));
+      });
     });
   }
 
@@ -3058,6 +3071,7 @@ function renderHealth() {
               </div>
             </div>
           `).join('')}
+        ${lowConf.length > 15 ? `<div style="padding:8px 16px;font-size:11px;color:var(--text-muted)">…and ${lowConf.length - 15} more</div>` : ''}
       </div>
     `;
     el.appendChild(sec);
