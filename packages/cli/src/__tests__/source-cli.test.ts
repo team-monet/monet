@@ -43,6 +43,8 @@ describe("source CLI", () => {
         };
       },
       deriveCircle: vi.fn(() => "derived-project-circle"),
+      deriveCallerId: vi.fn(() => "test-caller"),
+      deriveProjectId: vi.fn(() => "test-project-id"),
       projectDir: () => projectDir,
     };
   });
@@ -90,6 +92,7 @@ describe("source CLI", () => {
     expect(output).toContain("Status: pending-initial-sync");
     expect(output).toContain(`Local path: ${canonicalProjectDir}`);
     expect(output).toContain("Content sync: not run");
+    expect(output).toContain("Server identity: caller test-caller · project test-project-id");
     const source = inspect((core) => core.listSources()[0]);
     expect(source).toMatchObject({
       type: "repo-md",
@@ -100,6 +103,9 @@ describe("source CLI", () => {
       include: ["README.md", "docs/**/*.md"],
     });
     expect(dependencies.deriveCircle).toHaveBeenCalledWith(canonicalProjectDir);
+    // The server identity is derived from the INVOCATION project dir (dependencies.projectDir()),
+    // not the repo-md source's own root — those two can differ (e.g. a custom --path).
+    expect(dependencies.deriveProjectId).toHaveBeenCalledWith(projectDir);
     expect(closeCount).toBe(1);
   });
 
@@ -199,6 +205,31 @@ describe("source CLI", () => {
       configVersion: 2,
     });
     expect(closeCount).toBe(5);
+  });
+
+  it("show prints the server identity alongside the ACLs it must be compared against, but --json and --path-only stay exact", async () => {
+    await run([
+      "source", "add", "Project docs", "--type", "repo-md",
+      "--allow-caller", "caller-a", "--allow-project", "project-a",
+    ]);
+    const created = inspect((core) => core.listSources()[0]);
+
+    const plain = await run(["source", "show", created.id]);
+    expect(plain).toContain("Server identity: caller test-caller · project test-project-id");
+    expect(plain).toContain("Callers:    caller-a");
+    expect(plain).toContain("Projects:   project-a");
+    expect(dependencies.deriveProjectId).toHaveBeenCalledWith(projectDir);
+
+    // --json is a documented "stable JSON" contract (see README) — must stay exactly the
+    // KnowledgeSource object, with no identity line mixed in.
+    const json = await run(["source", "show", created.id, "--json"]);
+    expect(json).toBe(`${JSON.stringify(created, null, 2)}\n`);
+    expect(json).not.toContain("Server identity");
+
+    // --path-only is documented to print exactly the absolute local path — same guarantee.
+    const pathOnly = await run(["source", "show", created.id, "--path-only"]);
+    expect(pathOnly).toBe(`${realpathSync.native(projectDir)}\n`);
+    expect(pathOnly).not.toContain("Server identity");
   });
 
   it("rejects empty updates, closes on errors, and tombstones without deleting repo paths", async () => {

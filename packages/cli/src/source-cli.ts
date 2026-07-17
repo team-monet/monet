@@ -21,6 +21,14 @@ export interface SourceCliDependencies {
   openCore(storageDir?: string): SourceCore;
   deriveCircle(projectDir: string): string;
   projectDir(): string;
+  /**
+   * Source-authorization identity THIS machine's server will present when it calls `source_*`
+   * tools — distinct from `deriveCircle` (memory-partition slug). Used to surface, at
+   * registration time, the caller/project values an operator's `--allow-caller`/`--allow-project`
+   * ACLs must actually match (see circle.ts's deriveCallerId/deriveProjectId).
+   */
+  deriveCallerId(): string;
+  deriveProjectId(projectDir: string): string;
 }
 
 export class SourceCliError extends Error {
@@ -100,7 +108,17 @@ function resolveRepoRoot(projectDir: string, configuredPath: string | undefined)
   return existsSync(resolved) ? realpathSync.native(resolved) : resolved;
 }
 
-function printSource(source: KnowledgeSource): void {
+/** The caller/project identity THIS machine's server will actually present — see printSource. */
+interface ServerIdentity {
+  callerId: string;
+  projectId: string;
+}
+
+function formatServerIdentity(identity: ServerIdentity): string {
+  return `Server identity: caller ${identity.callerId} · project ${identity.projectId}`;
+}
+
+function printSource(source: KnowledgeSource, identity: ServerIdentity): void {
   console.log(`Source:     ${source.id}`);
   console.log(`Name:       ${source.name}`);
   console.log(`Type:       ${source.type}`);
@@ -109,6 +127,9 @@ function printSource(source: KnowledgeSource): void {
   console.log(`Local path: ${source.localPath}`);
   if (source.remoteUrl !== undefined) console.log(`Remote:     ${source.remoteUrl}`);
   if (source.branch !== undefined) console.log(`Branch:     ${source.branch}`);
+  // Printed right before the ACL lists it must be compared against: this is what the server
+  // actually presents, Callers/Projects below are what it's allowed to be.
+  console.log(formatServerIdentity(identity));
   console.log(`Callers:    ${source.access.allowedCallerIds.join(", ")}`);
   console.log(`Projects:   ${source.access.allowedProjectIds.join(", ")}`);
   console.log(`Include:    ${source.include.join(", ") || "(all Markdown paths)"}`);
@@ -270,6 +291,12 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
     console.log(`Status: ${created.status}`);
     console.log(`Local path: ${created.localPath}`);
     console.log("Content sync: not run");
+    // The ACLs above are only useful if the operator knows what THIS server actually presents —
+    // surface it so --allow-caller/--allow-project can be checked against reality, not guesswork.
+    console.log(formatServerIdentity({
+      callerId: dependencies.deriveCallerId(),
+      projectId: dependencies.deriveProjectId(projectDir),
+    }));
   }));
 
   source
@@ -296,7 +323,13 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
         if (registered === null) throw new SourceCliError(`source not found: ${sourceId}`);
         if (options.pathOnly) console.log(registered.localPath);
         else if (options.json) printJson(registered);
-        else printSource(registered);
+        else {
+          const projectDir = path.resolve(dependencies.projectDir());
+          printSource(registered, {
+            callerId: dependencies.deriveCallerId(),
+            projectId: dependencies.deriveProjectId(projectDir),
+          });
+        }
       }),
     );
 

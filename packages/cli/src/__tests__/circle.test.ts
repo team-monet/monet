@@ -4,8 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
-import { deriveCircle, canonicalRemoteKey, defaultNameFromRemote } from "../circle";
-import { MonetCore } from "@team-monet/core";
+import {
+  deriveCircle,
+  canonicalRemoteKey,
+  defaultNameFromRemote,
+  deriveCallerId,
+  deriveProjectId,
+  DEFAULT_CALLER_ID,
+} from "../circle";
+import { MonetCore, deriveCircle as coreDeriveCircle } from "@team-monet/core";
 
 // A self-contained temp HOME so getDbPath() resolves under it, never touching the real ~/.monet.
 let tmpHome: string;
@@ -524,5 +531,111 @@ describe("deriveCircle — end-to-end with the engine (invariants)", () => {
     expect(circle).toBe("github.com-acme-fixtures"); // from remote, NOT the folder slug
     // The folder-hash for this temp path would be sc-<hash>; confirm we did NOT return that.
     expect(circle).not.toMatch(/-[0-9a-f]{8}$/);
+  });
+});
+
+describe("deriveCallerId / deriveProjectId — source-authorization context", () => {
+  // Distinct from the outer beforeEach/afterEach (which manages HOME/MONET_STORAGE_DIR/
+  // MONET_CIRCLE) — these tests only touch MONET_CALLER_ID/MONET_PROJECT_ID, saved/restored
+  // independently so a real value in the ambient environment is never leaked or clobbered.
+  let savedCallerId: string | undefined;
+  let savedProjectId: string | undefined;
+
+  beforeEach(() => {
+    savedCallerId = process.env.MONET_CALLER_ID;
+    savedProjectId = process.env.MONET_PROJECT_ID;
+    delete process.env.MONET_CALLER_ID;
+    delete process.env.MONET_PROJECT_ID;
+  });
+
+  afterEach(() => {
+    if (savedCallerId !== undefined) process.env.MONET_CALLER_ID = savedCallerId;
+    else delete process.env.MONET_CALLER_ID;
+    if (savedProjectId !== undefined) process.env.MONET_PROJECT_ID = savedProjectId;
+    else delete process.env.MONET_PROJECT_ID;
+  });
+
+  describe("deriveCallerId", () => {
+    it("defaults to DEFAULT_CALLER_ID ('local-agent') when MONET_CALLER_ID is unset", () => {
+      expect(deriveCallerId()).toBe(DEFAULT_CALLER_ID);
+      expect(deriveCallerId()).toBe("local-agent");
+    });
+
+    it("a non-blank MONET_CALLER_ID override wins", () => {
+      process.env.MONET_CALLER_ID = "ci-runner";
+      expect(deriveCallerId()).toBe("ci-runner");
+    });
+
+    it("a blank/whitespace-only MONET_CALLER_ID falls back to the default, not the blank value", () => {
+      process.env.MONET_CALLER_ID = "   ";
+      expect(deriveCallerId()).toBe(DEFAULT_CALLER_ID);
+    });
+
+    it("trims surrounding whitespace from a non-blank override", () => {
+      process.env.MONET_CALLER_ID = "  ci-runner  ";
+      expect(deriveCallerId()).toBe("ci-runner");
+    });
+  });
+
+  describe("deriveProjectId", () => {
+    it("git remote present → the exact canonicalRemoteKey slash form (host/owner/repo)", () => {
+      const repo = makeRepo("git@github.com:team-monet/monet-core.git", "projectid-remote");
+      expect(deriveProjectId(repo)).toBe("github.com/team-monet/monet-core");
+      // Must match canonicalRemoteKey directly — this is the contract --allow-project relies on.
+      expect(deriveProjectId(repo)).toBe(canonicalRemoteKey("git@github.com:team-monet/monet-core.git"));
+    });
+
+    it("HTTPS and SSH remotes of the same repo derive the same projectId (parity with canonicalRemoteKey)", () => {
+      const sshRepo = makeRepo("git@github.com:acme/widgets.git", "projectid-ssh");
+      const httpsRepo = makeRepo("https://github.com/acme/widgets", "projectid-https");
+      expect(deriveProjectId(sshRepo)).toBe("github.com/acme/widgets");
+      expect(deriveProjectId(httpsRepo)).toBe("github.com/acme/widgets");
+    });
+
+    it("non-git temp dir → the identical folder-hash form the core's deriveCircle produces", () => {
+      const plain = mkdtempSync(join(tmpdir(), "projectid-plain-"));
+      expect(deriveProjectId(plain)).toBe(coreDeriveCircle(plain));
+      expect(deriveProjectId(plain)).toMatch(/-[0-9a-f]{8}$/);
+    });
+
+    it("git repo without an origin remote → folder-hash fallback (no throw), matching core deriveCircle", () => {
+      const repo = makeRepo(null, "projectid-noremote");
+      expect(deriveProjectId(repo)).toBe(coreDeriveCircle(repo));
+      expect(deriveProjectId(repo)).toMatch(/-[0-9a-f]{8}$/);
+    });
+
+    it("MONET_PROJECT_ID override wins outright, even with a remote present", () => {
+      const repo = makeRepo("git@github.com:team-monet/monet-core.git", "projectid-override");
+      process.env.MONET_PROJECT_ID = "forced-project-id";
+      expect(deriveProjectId(repo)).toBe("forced-project-id");
+    });
+
+    it("whitespace is trimmed from a non-blank MONET_PROJECT_ID override", () => {
+      process.env.MONET_PROJECT_ID = "  forced-project-id  ";
+      expect(deriveProjectId("/irrelevant/unused/path")).toBe("forced-project-id");
+    });
+
+    it("a blank/whitespace-only MONET_PROJECT_ID override falls through to remote resolution, not the blank value", () => {
+      const repo = makeRepo("git@github.com:team-monet/monet-core.git", "projectid-blank-override");
+      process.env.MONET_PROJECT_ID = "   ";
+      expect(deriveProjectId(repo)).toBe("github.com/team-monet/monet-core");
+    });
+
+    it("is side-effect-free: never opens the remote_circle_map store, unlike deriveCircle", () => {
+      // deriveCircle opens/creates the remote_circle_map SQLite store on every call, even on
+      // the no-remote path. deriveProjectId's fallback deliberately calls the engine's pure
+      // deriveFolderCircle instead specifically to avoid that I/O — prove the table is never
+      // created by deriveProjectId alone (this test's beforeEach never calls deriveCircle).
+      const repo = makeRepo("git@github.com:some-org/some-repo-nostore.git", "projectid-nostore");
+      deriveProjectId(repo);
+      const plain = mkdtempSync(join(tmpdir(), "projectid-nostore-plain-"));
+      deriveProjectId(plain);
+      const db = openStore();
+      const hasTable = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='remote_circle_map'")
+        .get() as { name: string } | undefined;
+      db.close();
+      expect(hasTable).toBeUndefined();
+    });
   });
 });

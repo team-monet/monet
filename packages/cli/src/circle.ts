@@ -380,3 +380,72 @@ export function defaultNameFromRemote(remote: string): string {
     : key.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   return slug || "project";
 }
+
+/**
+ * ── Source-authorization context (caller ID / project ID) ──────────────────────────────────
+ *
+ * A DISTINCT concern from circle derivation above. `@team-monet/core`'s
+ * `createMonetCoreMcpServer` reads its source-authorization context ONLY from the
+ * `MONET_CALLER_ID` / `MONET_PROJECT_ID` env vars (see `deriveOptsFromEnv` in the core's
+ * `mcp-server.ts`) — `CreateMonetCoreMcpServerOptions` has no options-object seam for it.
+ * Without BOTH vars set, `sourceAuthorizationContext` stays undefined and every `source_*` tool
+ * fails closed with "trusted source authorization context is unavailable" (engine.ts), even for
+ * sources registered with ACLs that would otherwise permit this caller/project. src/index.ts and
+ * src/cli.ts's `start` action wire these in by UNCONDITIONALLY assigning
+ * `process.env.MONET_CALLER_ID = deriveCallerId()` / `process.env.MONET_PROJECT_ID =
+ * deriveProjectId(projectDir)` before constructing the server. deriveCallerId/deriveProjectId
+ * already implement the full precedence (a non-blank override wins, TRIMMED; blank/unset falls
+ * back to the derived default), so reassigning process.env through them also NORMALIZES a
+ * whitespace-padded operator override (e.g. `" codex "`) in place — @team-monet/core's
+ * `deriveOptsFromEnv` reads these env vars verbatim with no trimming of its own, so leaving a
+ * padded value raw would make every ACL comparison miss.
+ */
+
+/**
+ * Default caller ID when MONET_CALLER_ID is unset. This is a CONVENTION matching
+ * `monet source add --allow-caller local-agent` (the default ACL an operator would grant a
+ * local, unauthenticated agent) — not an engine contract. The engine treats callerId as an
+ * opaque string.
+ */
+export const DEFAULT_CALLER_ID = "local-agent";
+
+/**
+ * Resolve the caller ID for source authorization. `MONET_CALLER_ID` override wins if non-blank
+ * (trimmed); otherwise `DEFAULT_CALLER_ID`. Never throws.
+ */
+export function deriveCallerId(): string {
+  const override = process.env.MONET_CALLER_ID;
+  return override && override.trim() ? override.trim() : DEFAULT_CALLER_ID;
+}
+
+/**
+ * Source-authorization projectId — DISTINCT from deriveCircle's memory-partition slug above.
+ * Resolution order:
+ *   1. `MONET_PROJECT_ID` env override (explicit force), if non-blank (trimmed).
+ *   2. Git remote present → `canonicalRemoteKey`'s slash form (host/owner/repo, e.g.
+ *      `github.com/team-monet/monet-core`), matching how `--allow-project` values are written
+ *      (see source-cli.ts's `--allow-project`).
+ *   3. No remote → the same folder-hash form deriveCircle produces for pathless dirs (e.g.
+ *      `code-6849de25` for `/Users/dev/code`).
+ *
+ * The no-remote fallback deliberately calls the engine's pure `deriveFolderCircle` rather than
+ * THIS file's `deriveCircle`: `deriveCircle` opens (and, on a fresh store, creates the schema
+ * for) the `remote_circle_map` SQLite store on every call — including the no-remote path — which
+ * is I/O this derivation doesn't need for a value that's a pure function of the path. Both
+ * ultimately produce the identical string on the no-remote path (deriveCircle's own no-remote
+ * branch returns `deriveFolderCircle(projectDir)` directly), so using the pure function here
+ * changes no output, only removes the unnecessary store I/O.
+ *
+ * Never throws — any git failure degrades to the folder-hash fallback.
+ */
+export function deriveProjectId(projectDir: string): string {
+  const override = process.env.MONET_PROJECT_ID;
+  if (override && override.trim()) return override.trim();
+  try {
+    const remote = getOriginRemote(projectDir);
+    if (remote) return canonicalRemoteKey(remote);
+  } catch {
+    // fall through to folder-hash
+  }
+  return deriveFolderCircle(projectDir);
+}

@@ -52,14 +52,14 @@ monet source add "Project docs" \
   --type repo-md \
   --include "README.md" --include "docs/**/*.md" \
   --exclude "vendor/**" \
-  --allow-caller codex --allow-project my-project
+  --allow-caller local-agent --allow-project github.com/team-monet/monet-client
 
 # Register a remote repository. Monet allocates the local path but does not clone it.
 monet source add "Shared docs" \
   --type git-md --circle shared-docs \
   --remote https://github.com/acme/docs.git --branch main \
   --allow-scheme https --allow-host github.com \
-  --allow-caller codex --allow-project my-project
+  --allow-caller local-agent --allow-project github.com/team-monet/monet-client
 
 monet source list
 monet source list --json
@@ -68,6 +68,8 @@ monet source show <source-id> --path-only
 monet source update <source-id> --include "handbook/**/*.md" --clear-excludes
 monet source remove <source-id> --yes
 ```
+
+`--allow-caller`/`--allow-project` must match the identity your server actually presents, not an arbitrary label: `local-agent` is the default caller ID (`--allow-caller codex` grants an ID no server ever presents unless `MONET_CALLER_ID=codex` is set), and the project ID defaults to `host/org/repo` derived from the invocation directory's git remote (`github.com/team-monet/monet-client` above, for this repo). Both `monet source add` and `monet source show` print the exact caller/project identity your running server will present, and either default can be overridden with the `MONET_CALLER_ID` / `MONET_PROJECT_ID` env vars.
 
 `source update` changes mutable registry configuration only: name, include/exclude patterns, ACLs, Git transport policy, write-back policy, refresh policy, and auto-detection preference. Source identity (type, circle, repository/root, remote, and branch) is immutable; remove and add a new source to change it. Removal creates a tombstone and never deletes the registered local path.
 

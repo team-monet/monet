@@ -4,9 +4,10 @@ import path from "node:path";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
-import { ensureMonetDir, getDbPath } from "./db/index.js";
-import { deriveCircle } from "./circle.js";
+import { ensureMonetDir, getDbPath, getMonetDir } from "./db/index.js";
+import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { registerSourceCommands, SourceCliError } from "./source-cli.js";
+import { generateAgentConfig, toYaml } from "./config-cli.js";
 
 // Read version from package.json so it can never drift from the published version.
 // esbuild inlines the import.meta.url-relative path at bundle time; the bundled
@@ -15,6 +16,15 @@ const _require = createRequire(import.meta.url);
 const { version } = _require("../package.json") as { version: string };
 
 const program = new Command();
+
+// Resolve the project directory this invocation is serving. Prefer an explicit override over
+// cwd — a host may spawn `monet` from elsewhere (Claude Code sets CLAUDE_PROJECT_DIR for stdio
+// MCP servers and documents that servers shouldn't rely on cwd). Shared by the `start` action,
+// the `config` command (so a generated config pins the project the config was made for — see
+// config-cli.ts), and the source commands.
+function resolveProjectDir(): string {
+  return path.resolve(process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd());
+}
 
 program
   .name("monet")
@@ -34,8 +44,18 @@ program
     // into its own circle. A host may spawn this stdio server from a cwd that isn't the user's
     // repo — Claude Code sets CLAUDE_PROJECT_DIR and documents that servers shouldn't rely on cwd
     // — so prefer an explicit project dir, then fall back to cwd.
-    const projectDir = process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    const projectDir = resolveProjectDir();
     const circle = deriveCircle(projectDir);
+    // See src/index.ts / src/circle.ts: @team-monet/core only picks up source-authorization
+    // context from these two env vars (no options-object seam), so every entry point that
+    // constructs the server must set them before createMonetCoreMcpServer runs. Assign
+    // UNCONDITIONALLY (not setIfBlank/??=): deriveCallerId/deriveProjectId already implement the
+    // full precedence (non-blank override wins, TRIMMED; blank/unset → derived default), so
+    // reassigning here also normalizes a whitespace-padded operator override in place instead of
+    // leaving it raw for @team-monet/core's deriveOptsFromEnv (which does not trim) to deny every
+    // ACL match against.
+    process.env.MONET_CALLER_ID = deriveCallerId();
+    process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
     const core = new MonetCore(getDbPath(), {
       embedder: await createLocalEmbedder(),
       scopeContext: projectDir,
@@ -78,7 +98,18 @@ program
   .option("-o, --output <file>", "Output file path")
   .option("--yaml", "Output YAML format (for Hermes)", false)
   .action(async (options) => {
-    const config = generateAgentConfig(options.agent);
+    // Propagate any explicit auth-identity overrides active right now into the emitted config,
+    // so a host launched from it presents the same identity (see config-cli.ts).
+    const callerIdOverride = process.env.MONET_CALLER_ID?.trim();
+    const projectIdOverride = process.env.MONET_PROJECT_ID?.trim();
+    // getMonetDir() is the same resolution the server and source CLI use — the emitted config
+    // must point at the store sources are actually registered in (see config-cli.ts).
+    // path.resolve: a RELATIVE MONET_STORAGE_DIR override comes back verbatim from getMonetDir()
+    // and would otherwise re-resolve against whatever cwd the launching host spawns from.
+    const config = generateAgentConfig(options.agent, resolveProjectDir(), path.resolve(getMonetDir()), {
+      ...(callerIdOverride ? { callerId: callerIdOverride } : {}),
+      ...(projectIdOverride ? { projectId: projectIdOverride } : {}),
+    });
 
     if (options.output) {
       if (options.yaml) {
@@ -95,52 +126,6 @@ program
       }
     }
   });
-
-// YAML helper for Hermes
-function toYaml(obj: Record<string, unknown>, indent = 0): string {
-  const spaces = " ".repeat(indent);
-  let result = "";
-  for (const [key, value] of Object.entries(obj)) {
-    if (value === null || value === undefined) {
-      result += `${spaces}${key}: null\n`;
-    } else if (Array.isArray(value)) {
-      result += `${spaces}${key}:\n`;
-      for (const item of value) {
-        if (typeof item === "object" && item !== null) {
-          result += toYaml(item as Record<string, unknown>, indent + 2);
-        } else {
-          result += `${spaces}  - ${item}\n`;
-        }
-      }
-    } else if (typeof value === "object") {
-      result += `${spaces}${key}:\n${toYaml(value as Record<string, unknown>, indent + 2)}`;
-    } else {
-      result += `${spaces}${key}: ${value}\n`;
-    }
-  }
-  return result;
-}
-
-// Generate MCP configuration for different agents
-function generateAgentConfig(agentType: string): Record<string, unknown> {
-  const env = { MONET_STORAGE_DIR: path.resolve(process.cwd(), ".monet") };
-  // Use the globally-installed `monet` bin (npm i -g @team-monet/monet) so the
-  // config is portable regardless of where the package is installed.
-  const server = { command: "monet", args: ["start"], env };
-
-  switch (agentType) {
-    case "claude-code":
-      return { mcpServers: { monet: server } };
-    case "cursor":
-      return { mcp_servers: { Monet: server } };
-    case "hermes":
-      return { mcp_servers: { monet: server } };
-    case "openclaw":
-      return server;
-    default:
-      return server;
-  }
-}
 
 program
   .command("dashboard")
@@ -168,9 +153,9 @@ registerSourceCommands(program, {
     return new MonetCore(getDbPath(), { sourceStorageDir: path.join(monetDir, "sources") });
   },
   deriveCircle,
-  projectDir() {
-    return path.resolve(process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd());
-  },
+  deriveCallerId,
+  deriveProjectId,
+  projectDir: resolveProjectDir,
 });
 
 void program.parseAsync().catch((error: unknown) => {
