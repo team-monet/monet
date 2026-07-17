@@ -140,27 +140,70 @@ function querySnap(snapPath: string, sql: string): Record<string, unknown>[] {
 
 // ── SQL Definitions ──────────────────────────────────────────────────────────
 
-const SQL = {
+// Marker union that classifies a concept row as raw ingested "source" content
+// (e.g. an Obsidian vault chunk) rather than a synthesized concept.
+// Established rule (engine cold audit): kind alone is NOT reliable as the sole
+// signal, so source_identity / active_observation_id must also be checked —
+// classify by the full union, never kind alone.
+//
+// Per John's no-hiding ruling, source rows are NOT excluded from any query
+// below — concepts/observations/edges/graph all include them as first-class
+// rows, same as any other concept (this constant previously drove a WHERE NOT
+// / NOT EXISTS filter on concepts/observations/edges; that filtering has been
+// removed). SOURCE_MARKER's only remaining consumer is SQL.counts.sourceConcepts,
+// which powers the honest header split ("N concepts · M from sources") so the
+// UI is explicit about how much of the total is raw source content — a
+// disclosure, not an exclusion.
+//
+// This is a deliberate interim, not the end state: an upcoming engine reshape
+// (file=concept) will shrink the store to ~640 concepts and collapse the
+// source/native distinction at the row level, making this marker (and the
+// split it powers) moot. Until then, GRAPH_NODE_LIMIT in app.js is the only
+// scale guard on the graph — a visible, neutral rendering cap, not a content
+// filter.
+const SOURCE_MARKER = `(c.kind = 'source' OR c.source_identity IS NOT NULL OR c.active_observation_id IS NOT NULL)`;
+
+// Exported so dashboard-source-marker.test.ts can run the real query strings
+// against a seeded test DB, rather than testing a parallel reimplementation of
+// the marker-union logic that could silently drift from what actually runs.
+export const SQL = {
+  // Full concepts table — every row, including raw ingested "source" content
+  // (e.g. Obsidian vault chunks). This is also the array that becomes graph
+  // nodes AND the Concepts tab's rows: per John's no-hiding ruling, source rows
+  // are first-class visible in both, not routed to a separate view. Scale is
+  // bounded client-side (GRAPH_NODE_LIMIT on the Graph tab, simple pagination
+  // on the Concepts tab if needed) rather than by excluding rows here.
   concepts: `
     SELECT id, slug, title, kind, status, confidence, circle,
            support_count, version, dirty, usefulness_score,
            created_at, updated_at, last_confirmed_at, source_refs, aliases, body
-    FROM concepts
+    FROM concepts c
     ORDER BY updated_at DESC
   `,
 
+  // Full observations table — every row, including observations belonging to
+  // source concepts (the chunk text itself). No longer filtered by kind='source'
+  // or by parent-concept marker per John's no-hiding ruling; see SOURCE_MARKER
+  // above.
   observations: `
     SELECT id, content, kind, circle, concept_id, session_id,
            author_agent_id, created_at, source_refs
-    FROM observations
+    FROM observations o
     ORDER BY created_at DESC
   `,
 
+  // Full edge table, still excluding dismissed edges (unrelated to source
+  // visibility — dismissal is a separate, deliberate user action). Previously
+  // also excluded edges touching a source concept on either end; per John's
+  // no-hiding ruling that filter is removed. In the audited store the engine
+  // never links source/chunk concepts into the graph anyway (0 of 39,196 live
+  // edges touch a source concept), so this is a no-op on today's data and a
+  // correctness fix for whenever that invariant stops holding.
   edges: `
     SELECT id, src_id, dst_id, type, weight, origin, count, scope,
            created_at, last_reinforced_at
-    FROM memory_edge
-    WHERE dismissed_at IS NULL
+    FROM memory_edge e
+    WHERE e.dismissed_at IS NULL
     ORDER BY weight DESC
   `,
 
@@ -185,9 +228,43 @@ const SQL = {
 
   aliases: `SELECT from_name, to_name, status FROM circle_aliases`,
 
+  // Aggregate counts across the FULL store (never filtered) so the header stat
+  // bar's honest split ("N concepts · M from sources") stays accurate. This is
+  // SOURCE_MARKER's only remaining consumer post no-hiding ruling — a
+  // disclosure of composition, not a basis for excluding rows elsewhere.
+  // NOTE: references c.source_identity / c.active_observation_id via
+  // SOURCE_MARKER, which don't exist on stores predating the source-ingestion
+  // schema. handleGraph() checks conceptsHasSourceColumns() before running
+  // this and falls back to countsLegacy below when they're absent.
   counts: `
     SELECT
       (SELECT COUNT(*) FROM concepts) as concepts,
+      (SELECT COUNT(*) FROM concepts c WHERE ${SOURCE_MARKER}) as sourceConcepts,
+      (SELECT COUNT(*) FROM observations) as observations,
+      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NULL) as edgesLive,
+      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NOT NULL) as edgesDismissed,
+      (SELECT COUNT(*) FROM entities) as entities,
+      (SELECT COUNT(*) FROM sessions) as sessions,
+      (SELECT COUNT(*) FROM contradictions WHERE status='open') as contradictionsOpen,
+      (SELECT COUNT(*) FROM contradictions WHERE status='resolved') as contradictionsResolved,
+      (SELECT COUNT(*) FROM concepts WHERE status='disputed') as disputed,
+      (SELECT COUNT(*) FROM concepts WHERE dirty=1) as dirty,
+      (SELECT COUNT(*) FROM memory_edge WHERE type='possible_duplicate_of' AND dismissed_at IS NULL) as possibleDuplicatePairs
+  `,
+
+  // Legacy-schema fallback for stores created before the source-ingestion
+  // columns (source_identity / active_observation_id) existed on concepts —
+  // the full SOURCE_MARKER union in `counts` above throws "no such column" on
+  // them, which was breaking /api/graph entirely for those stores (findings
+  // review). sourceConcepts here uses kind='source' alone: the only marker
+  // such a store CAN carry (kind always exists; the other two columns don't
+  // on this schema, and NOT their absence being silently miscounted as 0 —
+  // kind-only is what these rows' actual data supports, not an approximation).
+  // Otherwise identical to `counts`. Selected by conceptsHasSourceColumns().
+  countsLegacy: `
+    SELECT
+      (SELECT COUNT(*) FROM concepts) as concepts,
+      (SELECT COUNT(*) FROM concepts WHERE kind = 'source') as sourceConcepts,
       (SELECT COUNT(*) FROM observations) as observations,
       (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NULL) as edgesLive,
       (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NOT NULL) as edgesDismissed,
@@ -208,14 +285,24 @@ const SQL = {
     FROM concepts
   `,
 
-  circles: `
-    SELECT
-      c.circle as name,
-      COUNT(DISTINCT c.id) as conceptCount,
-      COUNT(DISTINCT o.id) as observationCount
-    FROM concepts c
-    LEFT JOIN observations o ON o.circle = c.circle
-    GROUP BY c.circle
+  // Split into two independent GROUP BYs (mirroring the circleEdges/circleEntities
+  // pattern just below) rather than one query that LEFT JOINs concepts to
+  // observations ON circle. circle is low-cardinality (~16 distinct values), so
+  // that join produces a conceptsInCircle x observationsInCircle cross-product
+  // per circle before COUNT(DISTINCT) dedupes it back down — measured at ~2.1s
+  // of a ~2.6s total /api/graph response on the live store (3,278 concepts /
+  // 4,535 observations), the single largest server-side cost by far. Same
+  // output, computed the cheap way.
+  circleConcepts: `
+    SELECT circle as name, COUNT(*) as conceptCount
+    FROM concepts
+    GROUP BY circle
+  `,
+
+  circleObservations: `
+    SELECT circle as scope, COUNT(*) as observationCount
+    FROM observations
+    GROUP BY circle
   `,
 
   circleEdges: `
@@ -320,6 +407,24 @@ const SQL = {
   `,
 } as const;
 
+/**
+ * Column-presence guard for SOURCE_MARKER. Stores created before the
+ * source-ingestion schema lack source_identity / active_observation_id on
+ * concepts; running SQL.counts (which references both via SOURCE_MARKER)
+ * against such a store throws "no such column", which was breaking
+ * /api/graph entirely for legacy stores. handleGraph() calls this to pick
+ * SQL.counts (full marker) vs SQL.countsLegacy (kind-only) -- mirrors the
+ * sqlite_master table-existence guards in handleFirstBlock/handleSources,
+ * which exist for the identical reason (older stores predate newer schema).
+ * Exported so it can be unit-tested directly against both schema shapes
+ * rather than only indirectly through handleGraph().
+ */
+export function conceptsHasSourceColumns(db: InstanceType<typeof Database>): boolean {
+  const cols = db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
+  const names = new Set(cols.map((c) => c.name));
+  return names.has("source_identity") && names.has("active_observation_id");
+}
+
 // ── API handlers ─────────────────────────────────────────────────────────────
 
 /** Empty-but-valid graph payload for a fresh/empty store directory. */
@@ -327,7 +432,7 @@ function emptyGraphPayload(): unknown {
   return {
     generatedAt: Date.now(),
     counts: {
-      concepts: 0, observations: 0, edgesLive: 0, edgesDismissed: 0,
+      concepts: 0, sourceConcepts: 0, observations: 0, edgesLive: 0, edgesDismissed: 0,
       entities: 0, sessions: 0, contradictionsOpen: 0, contradictionsResolved: 0,
       disputed: 0, dirty: 0, possibleDuplicatePairs: 0,
     },
@@ -348,9 +453,20 @@ async function handleGraph(): Promise<unknown> {
     const sessions           = querySnap(snap, SQL.sessions);
     const revisionsCount     = querySnap(snap, SQL.revisionsCount);
     const aliases            = querySnap(snap, SQL.aliases);
-    const [counts]           = querySnap(snap, SQL.counts) as [Record<string, number>];
+
+    // Detect legacy schema (pre-source-ingestion) before running SQL.counts --
+    // see conceptsHasSourceColumns() and SQL.countsLegacy above for why.
+    const colsDb = new Database(snap, { readonly: true });
+    let hasSourceColumns: boolean;
+    try {
+      hasSourceColumns = conceptsHasSourceColumns(colsDb);
+    } finally {
+      colsDb.close();
+    }
+    const [counts]           = querySnap(snap, hasSourceColumns ? SQL.counts : SQL.countsLegacy) as [Record<string, number>];
     const [health]           = querySnap(snap, SQL.health) as [Record<string, number | null>];
-    const circlesRaw         = querySnap(snap, SQL.circles) as Array<Record<string, unknown>>;
+    const circleConceptsRaw     = querySnap(snap, SQL.circleConcepts) as Array<{ name: string; conceptCount: number }>;
+    const circleObservationsRaw = querySnap(snap, SQL.circleObservations) as Array<{ scope: string; observationCount: number }>;
     const circleEdgesRaw     = querySnap(snap, SQL.circleEdges) as Array<{ scope: string; edgeCount: number }>;
     const circleEntitiesRaw  = querySnap(snap, SQL.circleEntities) as Array<{ scope: string; key: string }>;
 
@@ -361,6 +477,9 @@ async function handleGraph(): Promise<unknown> {
 
     const edgesByScope: Record<string, number> = {};
     for (const r of circleEdgesRaw) edgesByScope[r.scope] = r.edgeCount;
+
+    const observationsByScope: Record<string, number> = {};
+    for (const r of circleObservationsRaw) observationsByScope[r.scope] = r.observationCount;
 
     // Build per-canonical-circle Sets of entity keys so that a key present under
     // both a raw scope and its alias target is counted exactly once.
@@ -382,19 +501,19 @@ async function handleGraph(): Promise<unknown> {
       edgeCount: number;
       entityCount: number;
     }> = {};
-    for (const c of circlesRaw) {
-      const rawName = c["name"] as string;
+    for (const c of circleConceptsRaw) {
+      const rawName = c.name;
       const canon = aliasMap[rawName] || rawName;
       if (circlesByCanon[canon]) {
-        circlesByCanon[canon].conceptCount     += (c["conceptCount"] as number) || 0;
-        circlesByCanon[canon].observationCount += (c["observationCount"] as number) || 0;
+        circlesByCanon[canon].conceptCount     += c.conceptCount || 0;
+        circlesByCanon[canon].observationCount += observationsByScope[rawName] || 0;
         circlesByCanon[canon].edgeCount        += edgesByScope[rawName] || 0;
         // entityCount is set once from the canonical Set; no per-raw accumulation needed.
       } else {
         circlesByCanon[canon] = {
           canonicalName:     canon,
-          conceptCount:      (c["conceptCount"] as number) || 0,
-          observationCount:  (c["observationCount"] as number) || 0,
+          conceptCount:      c.conceptCount || 0,
+          observationCount:  observationsByScope[rawName] || 0,
           edgeCount:         edgesByScope[rawName] || 0,
           entityCount:       entityKeysByCanon[canon]?.size ?? 0,
         };
@@ -409,6 +528,7 @@ async function handleGraph(): Promise<unknown> {
       generatedAt: Date.now(),
       counts: {
         concepts: counts["concepts"],
+        sourceConcepts: counts["sourceConcepts"],
         observations: counts["observations"],
         edgesLive: counts["edgesLive"],
         edgesDismissed: counts["edgesDismissed"],

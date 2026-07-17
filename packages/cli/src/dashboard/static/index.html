@@ -144,9 +144,27 @@
           <canvas id="graph-canvas"></canvas>
           <div id="graph-overlay"></div>
           <button id="reset-layout-btn" title="Clear all pins and saved positions for this circle; re-run layout">Reset layout</button>
+          <!-- Shown instead of running the force layout when the filtered node count
+               exceeds GRAPH_NODE_LIMIT=800 (app.js, see its comment for the measured
+               n^2 math behind that number) -- the O(n^2) physics is only safe to
+               auto-run up to a few hundred nodes. Per John's no-hiding ruling source
+               rows are included in this count (not excluded), so the full store or a
+               large single circle (e.g. obsidian-vault) hits this cap by default. This
+               is a rendering interlock, not a content filter -- nothing is hidden, the
+               guard just declines to auto-draw at an unsafe scale; filtering to a
+               smaller circle renders normally. -->
+          <div id="graph-guard" class="graph-guard hidden">
+            <div class="graph-guard-msg">
+              <div class="graph-guard-title"><span id="graph-guard-count"></span> concepts match</div>
+              <div class="graph-guard-sub">Rendering caps at <span id="graph-guard-limit"></span> nodes — nothing is hidden, filter to a circle to draw the graph.</div>
+            </div>
+          </div>
         </div>
 
         <!-- Concepts view -->
+        <!-- Renders every concept row, source rows included (no-hiding ruling) --
+             measured at ~60-100ms for the full ~3,460-row store, so no note/banner
+             and no pagination; see renderConceptsTable() in app.js. -->
         <div id="concepts-view" class="view">
           <div class="table-wrap">
             <table id="concepts-table">

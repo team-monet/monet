@@ -495,8 +495,16 @@ function renderStatBar() {
   const bar = document.getElementById('statbar');
   const c = DATA.counts;
   const h = DATA.health;
+  // Total count includes ALL concepts (native + source/vault-chunk rows) — and
+  // so do the graph/table views themselves now (per John's no-hiding ruling,
+  // source rows are first-class visible, not excluded). This label keeps the
+  // split visible anyway: it's a useful breakdown of what's IN that total, a
+  // disclosure rather than a hint that something's hidden from view.
+  const conceptsLbl = c.sourceConcepts > 0
+    ? `concepts · ${c.sourceConcepts.toLocaleString()} from sources`
+    : 'concepts';
   const chips = [
-    { val: c.concepts, lbl: 'concepts', cls: '' },
+    { val: c.concepts, lbl: conceptsLbl, cls: '' },
     { val: c.observations, lbl: 'observations', cls: '' },
     { val: c.edgesLive, lbl: 'live edges', cls: '' },
     { val: c.entities, lbl: 'entities', cls: '' },
@@ -600,6 +608,31 @@ function onCircleChange() {
 }
 
 // ── Graph simulation ─────────────────────────────────────────────────────────
+
+// stepSim()'s charge/collision passes are O(n^2) over the filtered concept
+// nodes, run synchronously (headless pre-settle, ~458 ticks) before first paint.
+// Per John's no-hiding ruling /api/graph no longer excludes source/chunk
+// concepts, so the default "All" view (and any large single circle, e.g.
+// obsidian-vault) can sit at full store scale (thousands of concepts) -- well
+// past where auto-running the O(n^2) physics is safe. Past this many filtered
+// nodes, skip the simulation and prompt for a narrower view instead of
+// freezing the tab. This is a rendering interlock, not a content filter:
+// nothing is hidden, the guard just declines to auto-draw at a scale that
+// isn't safe to auto-simulate yet -- filtering to a smaller circle renders
+// normally (see #graph-guard in index.html for the prompt shown while capped).
+//
+// The threshold itself (review finding): fit t = k*n^2 to the two REAL
+// measurements in this branch's benchmark (commit 2ed5ebb) -- n=3278 -> 96s
+// and n=435 -> 1.57s -- giving k ~= 8.3e-6 to 8.9e-6 s/node^2 depending on
+// which point you anchor to. At the previous cap of 1500 that's ~19-20s of
+// frozen synchronous main-thread work before the guard even mattered, clearly
+// unsafe. At 800 it's ~5.3-5.7s worst case -- the number Codex's review
+// recommended and what this cap is now set to. 800 also stays comfortably
+// (25%) above the ~640-concept full store the upcoming engine reshape
+// (file=concept) will produce, where "All" must still auto-render: k*640^2 ~=
+// 3.4-3.7s, well within the cap. Re-derive this if the physics loop itself
+// changes -- these numbers are k*n^2, not a property of GRAPH_NODE_LIMIT.
+const GRAPH_NODE_LIMIT = 800;
 
 const SIM = {
   nodes: [],
@@ -1022,11 +1055,17 @@ function initSim(nodes, edges, entityNodes, entityEdges, frozenRestore = false) 
     scheduleSave();
 
     // Log settle stats to console for verification (paint count should be 0).
+    // elapsedMs is wall-clock since navigation start (performance.now()) through
+    // this synchronous settle -- the number that actually matters for the
+    // "dashboard takes N to open" class of regression this guards against
+    // (node count scale collapse), independent of node/edge count so it stays
+    // meaningful if that ever changes again.
     console.log(
       '[monet-graph] headless pre-settle complete:',
       iter + ' iters,',
       'alpha=' + SIM.alpha.toFixed(6) + ',',
-      'paintsDuringPresettle=' + SIM.paintsDuringPresettle
+      'paintsDuringPresettle=' + SIM.paintsDuringPresettle + ',',
+      'elapsedMs=' + performance.now().toFixed(1)
     );
 
     // Start the perpetual render loop — draws the static settled graph.
@@ -2119,6 +2158,30 @@ let _nodePositionsCircle = null;
 // dense layout don't start so close together that charge forces explode.
 function buildGraph(scatter = false) {
   const concepts = getFilteredConcepts();
+
+  const guardEl = document.getElementById('graph-guard');
+  if (concepts.length > GRAPH_NODE_LIMIT) {
+    // Too many nodes to safely auto-simulate -- skip stepSim() entirely (no
+    // partial/best-effort run) and show the guard prompt instead of freezing.
+    // The prompt states both numbers (matched count AND the cap) so it reads
+    // as a visible performance interlock, not a vague "too much data" wall.
+    if (guardEl) {
+      const countEl = document.getElementById('graph-guard-count');
+      if (countEl) countEl.textContent = concepts.length.toLocaleString();
+      const limitEl = document.getElementById('graph-guard-limit');
+      if (limitEl) limitEl.textContent = GRAPH_NODE_LIMIT.toLocaleString();
+      guardEl.classList.remove('hidden');
+    }
+    SIM.nodes = [];
+    SIM.edges = [];
+    SIM.entityNodes = [];
+    SIM.entityEdges = [];
+    SIM.running = false;
+    if (SIM.rafId) { cancelAnimationFrame(SIM.rafId); SIM.rafId = null; }
+    return;
+  }
+  if (guardEl) guardEl.classList.add('hidden');
+
   const nodeIds = new Set(concepts.map(c => c.id));
   const edges = getFilteredEdges([...nodeIds]);
   const degMap = degreeCounts();
@@ -2662,6 +2725,10 @@ function appendEntitySection(scroll, conceptId, placeholder) {
 // ── Concepts table view ──────────────────────────────────────────────────────
 
 function renderConceptsTable() {
+  // /api/graph (and therefore this table) includes every concept row, source
+  // rows included -- per John's no-hiding ruling there is no separate/excluded
+  // subset to disclose here. The header stat bar's "N concepts · M from
+  // sources" split already discloses composition.
   const concepts = getFilteredConcepts();
   const degMap = degreeCounts();
   const { col, dir } = state.conceptSort;
