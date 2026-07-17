@@ -38,6 +38,15 @@
       "description": "Use PROACTIVELY for architecture and planning under constraints: assess feasibility, risks, and the approach before implementation. Does not write code."
     },
     {
+      "name": "mechanic",
+      "role": "small mechanical changes",
+      "mode": "subagent",
+      "prompt": "agents/mechanic.md",
+      "touchesMonet": false,
+      "model": "haiku",
+      "description": "Use PROACTIVELY for small, mechanical, low-risk changes: docs, comments, copy, config values, renames, single-file or tightly-scoped few-file diffs that don't need architectural judgment. Escalate to developer for anything bigger."
+    },
+    {
       "name": "developer",
       "role": "implementation",
       "mode": "subagent",
