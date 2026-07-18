@@ -8,8 +8,11 @@ import {
 import type { RepoMdMaterializerOptions } from "./source-materializer";
 import { syncManagedGitRepository, validateManagedGitRepository } from "./source-git";
 import type { RemoteGitOptions } from "./source-git";
-import { computeSourceIngestFingerprint, computeSourceOperationId, sourceHeadingAnchor } from "./source-chunker";
-import { computeSourceIngestConfigHash, computeSourceManifestHash, matchesSourceGlob, scanSourceSnapshot } from "./source-scanner";
+import {
+  computeSourceIngestFingerprint, computeSourceOperationId, computeSourceRefOccurrences, sourceHeadingAnchor, sourceHeadingIdentityKey,
+  deriveSourceFileTitle, SOURCE_CHUNKER_VERSION,
+} from "./source-chunker";
+import { computeSourceIngestConfigHash, computeSourceManifestHash, matchesSourceGlob, scanSourceSnapshot, SOURCE_SCANNER_VERSION } from "./source-scanner";
 import type { SourceScanDiagnostic, SourceScanResult } from "./source-scanner";
 import type {
   BeginSourceRunInput, BeginSourceRunResult, KnowledgeSource, PublishSourceRunInput,
@@ -26,7 +29,8 @@ export type RepoMdSyncFaultPoint =
   | "after-refresh" | "after-committed" | "after-activation" | "after-publish" | "after-current" | "after-cleanup"
   | "after-noop-verification"
   | "after-remove-current" | "after-remove-item" | "after-remove-snapshots"
-  | "before-remove-complete" | "after-remove-complete";
+  | "before-remove-complete" | "after-remove-complete"
+  | "after-recompute";
 
 type CallerMaterializerOptions = Omit<Partial<RepoMdMaterializerOptions>, "sourceStorageDir" | "config" | "lockStaleMs" | "now" | "assertOwnership">;
 
@@ -63,7 +67,33 @@ export interface SourceSyncCorePort {
     circle: string; sourceRefs: string[]; operationId: string;
     resolution?: "forceNew"; attachTo?: string;
   }): Promise<IngestResult>;
-  refreshSourceConcept(conceptId: string, observationId: string, expectedActiveObservationId: string): Promise<unknown>;
+  /** File=concept (ratified, Phase 1): supersedes ONE chunk's observation pair. Replaces the
+   *  retired refreshSourceConcept (a concept-level active-observation-pointer swap that only
+   *  ever worked because a source concept had exactly one observation). */
+  supersedeSourceChunkObservation(conceptId: string, observationId: string, expectedPredecessorObservationId: string): Promise<void>;
+  /** REVIEW FIX (round 4, Codex thread 6): plain read — which concept owns this observation right
+   *  now, or null if it doesn't exist. Lets reconcileExistingStagedBindings detect a cross-concept
+   *  predecessor during tombstoned-source removal recovery without needing a priorActiveByBinding
+   *  map threaded in. */
+  observationConceptId(observationId: string): string | null;
+  /** REVIEW FIX (round 5, Codex thread R5-2): every chunk's binding_id for one run, in rowid
+   *  (physical insertion) order — see the engine method's own docstring for why
+   *  planCarryForwardManifest needs this to re-sequence a pre-document_sequence store's carried
+   *  chunks. */
+  sourceChunkInsertOrder(runId: string): string[];
+  /** File=concept (ratified, Phase 1), item 4: recomputes a file concept's title/body/embedding
+   *  from its currently active chunk observations. Call ONLY after the run has durably
+   *  published — see the engine method's own docstring for why pre-publish would leak. */
+  recomputeSourceConceptBody(conceptId: string): Promise<void>;
+  /** File=concept (ratified, Phase 1): does this concept still have ANY active chunk under it
+   *  (this source, any file)? Drives retire-absent's conditional retirement (item 5: "file
+   *  deleted -> concept retired", NOT "chunk deleted -> concept retired") — a concept is only
+   *  fully retired once its LAST chunk goes, not its first. */
+  hasActiveSourceChunks(conceptId: string): boolean;
+  /** REVIEW FIX (BLOCKER): every concept this source has durably touched but not yet recomputed
+   *  for — see recomputeSourceConceptBody's own docstring (engine.ts) for the durable half of
+   *  this mechanism. Swept at the start of every sync (sweepPendingRecomputes, below). */
+  listPendingRecomputeConcepts(sourceId: string): string[];
   rollbackSourceRunBinding(runId: string, bindingId: string): Promise<SourceConceptRollbackResult>;
   supersedeObservation(observationId: string, successor?: string | null): unknown;
   retireConcept(conceptId: string): unknown;
@@ -398,6 +428,7 @@ async function planManifest(
       headingPath: [...chunk.headingPath],
       occurrence: chunk.occurrence,
       segmentIndex: chunk.segmentIndex,
+      documentSequence: chunk.documentSequence,
       contentHash: chunk.contentHash,
       ingestFingerprint: chunk.ingestFingerprint,
       metadata: chunk.metadata,
@@ -458,14 +489,75 @@ async function planManifest(
   ].sort((a, b) => compareUtf8(a.outputPath, b.outputPath));
   const carriedFiles: SourceManifestFileInput[] = [];
   const carriedChunks: SourceManifestChunkInput[] = [];
+  // REVIEW FIX (round 5, Codex thread R5-2): lazily computed once, only if some carried file's
+  // document_sequence values turn out tied (the pre-document_sequence-column backfill signature —
+  // see below and sourceChunkInsertOrder's own docstring). Most carries never need this at all (a
+  // store that has always run under document_sequence never has duplicates within one file), so
+  // this stays a no-op query in the common case.
+  let insertOrderIndex: Map<string, number> | undefined;
+  const insertOrderIndexFor = (): Map<string, number> => {
+    if (!insertOrderIndex) {
+      const order = priorRun ? core.sourceChunkInsertOrder(priorRun.id) : [];
+      insertOrderIndex = new Map(order.map((bindingId, index) => [bindingId, index]));
+    }
+    return insertOrderIndex;
+  };
   for (const { outputPath, priorPath } of carrySources) {
     const priorFile = priorByPath.get(priorPath);
     if (!priorFile) continue;
+    // REVIEW FIX (round 5, Codex thread R5-1): a store that predates the title column backfills
+    // every existing source_files/source_staged_files row to title='' (schema-upgrade default,
+    // source-ledger.ts's ensureSchema). If one of those pre-upgrade files is skip-diagnosed (not
+    // successfully re-scanned) on its FIRST sync after the upgrade, priorFile here is that exact
+    // backfilled row — carrying its title verbatim pushes '' into carriedFiles, and
+    // requireString(file.title, "file.title") in validateManifest (source-ledger.ts) rejects an
+    // empty string, hard-failing the carry that exists specifically to PRESERVE this file's prior
+    // publication. Falls back the same way a fresh scan would for a file with no frontmatter
+    // title: deriveSourceFileTitle's own outputPath-basename derivation. Real-store-live: this
+    // reshape's own migration hits exactly this shape on any pre-upgrade store with even one
+    // transiently-unreadable file on its first post-upgrade sync.
+    const carriedTitle = priorFile.title.trim().length > 0 ? priorFile.title : deriveSourceFileTitle(null, outputPath);
     carriedFiles.push({
       relativePath: outputPath, type: priorFile.type,
-      contentHash: priorFile.contentHash, byteLength: priorFile.byteLength,
+      contentHash: priorFile.contentHash, byteLength: priorFile.byteLength, title: carriedTitle,
     });
-    for (const chunk of activeChunks.filter((candidate) => candidate.relativePath === priorPath)) {
+    const filesChunks = activeChunks.filter((candidate) => candidate.relativePath === priorPath);
+    // REVIEW FIX (round 5, Codex thread R5-2): a store that predates the document_sequence column
+    // backfills every existing chunk row to document_sequence=1 (schema-upgrade default,
+    // source-ledger.ts's ensureSchema). If this file's carried chunks are all (or partly) tied at
+    // that placeholder, recomputeSourceConceptBody's `ORDER BY document_sequence` sees an
+    // all-or-partly-tied sort key for a multi-heading file and falls back to SQLite's own
+    // tie-break (a lexicographic heading-path sort, NOT document order) — reordering the
+    // reconstructed body away from how the sections actually appeared in the file. Detected here
+    // by duplicate document_sequence values WITHIN this one file's own carried chunk set — a
+    // genuinely fresh chunking pass (chunkSourceText, source-chunker.ts) never produces those,
+    // since it assigns them as a strictly increasing per-file emission counter. Re-sequenced from
+    // insertion (rowid) order instead when tied — the closest available proxy for original
+    // document order (see sourceChunkInsertOrder's own docstring for why).
+    const hasTiedDocumentSequence = new Set(filesChunks.map((chunk) => chunk.documentSequence)).size < filesChunks.length;
+    const resequencedDocumentSequence = hasTiedDocumentSequence
+      ? new Map(
+          [...filesChunks]
+            .sort((a, b) => (insertOrderIndexFor().get(a.bindingId) ?? 0) - (insertOrderIndexFor().get(b.bindingId) ?? 0))
+            .map((chunk, index) => [chunk.bindingId, index + 1] as const),
+        )
+      : undefined;
+    // REVIEW FIX (MINOR): the minimum-chunk merge pass (item 8) can leave a heading-anchor group's
+    // raw occurrence values sparse — an earlier occurrence merged forward into a later one (see
+    // mergeUndersizedSections, source-chunker.ts) drops that number entirely, so a group that used
+    // to be {1,2,3} can now surface as {2,3}. computeSourceRefOccurrences' canonical rank is always
+    // DENSE (1,2,3... by sorted order WITHIN the group, source-chunker.ts), so it no longer equals
+    // the raw occurrence column once a group has a gap. Recomputed here, per file, over exactly the
+    // chunks staged for THAT file (never scan.files — a carried file's chunks are the ONLY chunks
+    // validateManifest will ever see at this outputPath, by construction of carrySources above) —
+    // the same computation validateManifest (source-ledger.ts) independently repeats and checks
+    // sourceRef's trailing number against. Using the raw occurrence value directly here instead
+    // used to throw "chunk.sourceRef occurrence does not match its canonical heading identity" the
+    // instant a renamed carry's group had ever lost an earlier occurrence to the merge pass.
+    const canonicalRanks = computeSourceRefOccurrences(
+      filesChunks.map((chunk) => ({ relativePath: outputPath, headingPath: chunk.headingPath, occurrence: chunk.occurrence })),
+    );
+    for (const chunk of filesChunks) {
       const bindingGeneration = core.nextSourceBindingGeneration(source.id, chunk.bindingId);
       // BLOCKER 6 FIX: always recompute under the CURRENT run's ingestConfigHash rather than
       // reusing the prior chunk's fingerprint verbatim. This reproduces the identical value when
@@ -478,6 +570,9 @@ async function planManifest(
         contentHash: chunk.contentHash, headingPath: chunk.headingPath,
         metadata: chunk.metadata, ingestConfigHash: run.ingestConfigHash,
       });
+      const canonicalRank = canonicalRanks.get(
+        sourceHeadingIdentityKey({ relativePath: outputPath, headingPath: chunk.headingPath, occurrence: chunk.occurrence }),
+      )!;
       carriedChunks.push({
         bindingId: chunk.bindingId,
         bindingGeneration,
@@ -486,15 +581,17 @@ async function planManifest(
         headingPath: [...chunk.headingPath],
         occurrence: chunk.occurrence,
         segmentIndex: chunk.segmentIndex,
+        documentSequence: resequencedDocumentSequence?.get(chunk.bindingId) ?? chunk.documentSequence,
         contentHash: chunk.contentHash,
         ingestFingerprint: carriedIngestFingerprint,
         metadata: chunk.metadata,
         // Unchanged path: the stored sourceRef is still exactly correct. Renamed path: sourceRef
-        // is a canonical function of (sourceId, relativePath, headingPath, occurrence) — see
-        // requireCanonicalSourceRef — so it must be rebuilt against the NEW path or staging throws.
+        // is a canonical function of (sourceId, relativePath, headingPath, CANONICAL RANK — never
+        // the raw occurrence column, see above) — see requireCanonicalSourceRef — so it must be
+        // rebuilt against the new path or staging throws.
         sourceRef: outputPath === priorPath ? chunk.sourceRef
           : `source://${source.id}/${outputPath.split("/").map((segment) => encodeURIComponent(segment)).join("/")}` +
-            `#${encodeURIComponent(sourceHeadingAnchor(chunk.headingPath))}~${chunk.occurrence}`,
+            `#${encodeURIComponent(sourceHeadingAnchor(chunk.headingPath))}~${canonicalRank}`,
         content: chunk.content,
         // A renamed carry changes this binding's natural identity (relativePath) exactly like a
         // fresh rename match above — validateBindingProof requires the same proof of an authorized
@@ -518,23 +615,89 @@ async function materializeStagedBindings(
   options: RuntimeOptions,
 ): Promise<void> {
   const active = source.activeRunId ? core.listSourceChunks(source.activeRunId, true) : [];
-  const priorByBinding = new Map(active.filter((chunk) => chunk.lifecycle === "active").map((chunk) => [chunk.bindingId, chunk]));
-  for (let staged of core.listSourceChunks(run.id)) {
+  const priorActiveByBinding = new Map(active.filter((chunk) => chunk.lifecycle === "active").map((chunk) => [chunk.bindingId, chunk]));
+  // FILE=CONCEPT (ratified, Phase 1), item 5: same-path fallback for an existing file whose
+  // entire chunk structure changed at an UNCHANGED path — no individual chunk's bindingId
+  // survives the natural-key match in that shape, but the file itself is not new.
+  const priorFileConceptByPath = new Map<string, string>();
+  for (const chunk of priorActiveByBinding.values()) {
+    if (chunk.conceptId) priorFileConceptByPath.set(chunk.relativePath, chunk.conceptId);
+  }
+  const stagedChunks = core.listSourceChunks(run.id);
+
+  // Resolve/create the file concept ONCE per file (per CURRENT relativePath in this run), from
+  // ALL of that file's staged chunks together, upfront — never from just the first chunk the
+  // write loop below happens to reach. Iteration order must never matter: a partially-
+  // restructured rename (some chunks carry their bindingId forward via the ledger's own carry-
+  // forward, others don't because their heading/segment position also changed) would otherwise
+  // risk landing different chunks of the SAME file on two different concepts depending on which
+  // one the loop hit first.
+  // REVIEW FIX (round 4, Codex thread 3, decision + documentation, no code change): this map is
+  // built from stagedChunks alone, so a valid file that emits zero chunks (frontmatter-only — the
+  // chunker legitimately supports that shape) never gets an entry here, and therefore never gets a
+  // fileConceptThisRun target or a source concept at all — it is still recorded faithfully in
+  // source_files (publishRun) for provenance/audit, just never promoted into the concept/observation
+  // layer. Deliberate, not an oversight: this substrate models CONTENT (memory_list/memory_fetch
+  // surface concepts built from chunk text), and a chunkless file has no content to build one from
+  // — minting an empty-outline concept for it would add a schema/write-path surface (a durable
+  // per-(source,relativePath) concept pointer with no chunk to anchor it, needing its own carry-
+  // forward-on-rename and orphan-retirement-on-delete handling, mirroring source_chunks' own for a
+  // case that carries no actual evidence) for a file whose entire reason to exist in this system is
+  // to have none. If a frontmatter field's VALUE ever needs to be memorable, that is future work for
+  // the chunker/scanner to surface as real chunk content, not a reason to synthesize a concept here.
+  const stagedByPath = new Map<string, SourceChunkRecord[]>();
+  for (const chunk of stagedChunks) {
+    const list = stagedByPath.get(chunk.relativePath);
+    if (list) list.push(chunk); else stagedByPath.set(chunk.relativePath, [chunk]);
+  }
+  const fileConceptThisRun = new Map<string, string>();
+  for (const [relativePath, chunksOfFile] of stagedByPath) {
+    // Prefer whatever a PRIOR PARTIAL attempt of this exact run already resolved (resume safety:
+    // a crash between committing this file's chunk #1 and its chunk #2 must not mint a second
+    // concept for chunk #2 on retry).
+    const resumed = chunksOfFile.find((chunk) => chunk.writeState !== "intent" && chunk.conceptId)?.conceptId;
+    // bindingId continuity (rename-aware, via the ledger's own carry-forward) — scored across
+    // EVERY chunk of the file, not just one.
+    const viaBinding = chunksOfFile
+      .map((chunk) => priorActiveByBinding.get(chunk.bindingId)?.conceptId)
+      .find((id): id is string => !!id);
+    const resolved = resumed ?? viaBinding ?? priorFileConceptByPath.get(relativePath);
+    if (resolved) fileConceptThisRun.set(relativePath, resolved);
+  }
+
+  for (let staged of stagedChunks) {
     if (staged.writeState === "skipped" || staged.writeState === "committed") continue;
-    const prior = priorByBinding.get(staged.bindingId);
+    const prior = priorActiveByBinding.get(staged.bindingId);
+    // REVIEW FIX (round 4, Codex thread 8): the unchanged-content fast path must also agree with
+    // fileConceptThisRun's resolved target for this file — otherwise a chunk that already sits
+    // under the RIGHT concept skips as before, but a chunk whose unchanged content still lives on a
+    // non-winning LEGACY per-chunk concept (a file mid-consolidation, some siblings already healed
+    // to the winning concept in a prior run, this one never touched since) would keep skipping
+    // forever, since "content unchanged" alone said nothing about which concept it's parked under.
+    // Falls through to the "intent" branch below on a mismatch, which already has the cross-concept
+    // handling (terminal supersession of the old concept's observation) this healing needs — same
+    // shape as an ordinary content change, just re-attaching identical content to the correct concept.
+    const resolvedConceptId = fileConceptThisRun.get(staged.relativePath);
     if (staged.writeState === "intent" && prior && prior.ingestFingerprint === staged.ingestFingerprint
-        && prior.contentHash === staged.contentHash && prior.sourceRef === staged.sourceRef) {
+        && prior.contentHash === staged.contentHash && prior.sourceRef === staged.sourceRef
+        && (!resolvedConceptId || prior.conceptId === resolvedConceptId)) {
       assertRuntimeOwnership(options);
       core.recordSourceBindingReceipt({ runId: run.id, bindingId: staged.bindingId, writeState: "skipped" });
       continue;
     }
     if (staged.writeState === "intent") {
       assertRuntimeOwnership(options);
+      // Every chunk of a brand-new (never-before-seen) file resolves to nothing above — the
+      // FIRST one processed creates the concept via forceNew, below, then seeds
+      // fileConceptThisRun so every later chunk of the SAME file (guaranteed to be processed
+      // consecutively — listSourceChunks orders by relative_path) attaches to it instead of
+      // minting one of its own.
+      const attachTo = fileConceptThisRun.get(staged.relativePath);
       const stored = await core.storeSource(staged.content, {
         circle: source.circle,
         sourceRefs: [staged.sourceRef],
         operationId: staged.operationId,
-        ...(prior?.conceptId ? { attachTo: prior.conceptId } : { resolution: "forceNew" as const }),
+        ...(attachTo ? { attachTo } : { resolution: "forceNew" as const }),
       });
       options.fault?.("after-store");
       assertRuntimeOwnership(options);
@@ -544,12 +707,33 @@ async function materializeStagedBindings(
         writeState: "engine-written",
       });
       options.fault?.("after-engine-written");
+      fileConceptThisRun.set(staged.relativePath, staged.conceptId!);
     }
     if (!staged.conceptId || !staged.observationId) throw new Error("staged source receipt is incomplete");
     if (staged.predecessorObservationId) {
-      assertRuntimeOwnership(options);
-      await core.refreshSourceConcept(staged.conceptId, staged.observationId, staged.predecessorObservationId);
-      options.fault?.("after-refresh");
+      // FILE=CONCEPT (ratified, Phase 1): this binding's predecessor observation can live under a
+      // DIFFERENT concept than the one it just wrote to — most commonly the one-time migration off
+      // the old one-concept-per-chunk model, where fileConceptThisRun resolved this file's
+      // consolidated target concept from a SIBLING binding, not this one's own prior concept.
+      // supersedeSourceChunkObservation is a same-concept CAS (requireOwned rejects a predecessor
+      // under a different concept than its successor) — there is no such pair here, and it throws.
+      //
+      // REVIEW FIX (round 5, Codex thread R5-4): the cross-concept predecessor is deliberately left
+      // COMPLETELY UNTOUCHED here — not terminally superseded, not superseded with any successor.
+      // publishRun (source-ledger.ts) retires it instead, in the SAME transaction that actually
+      // advances active_run_id. Retiring it here, mid-materialize, well before this run durably
+      // publishes, made the old concept's still-genuinely-published content invisible to every
+      // authorized read (queryAuthorizedSourcePublications joins against source.active_run_id,
+      // which is still the OLD run for the entire staging window) — see publishRun's own comment
+      // for the full reasoning. The old concept becomes an orphan once its last chunk supersedes
+      // this way (zero active source_chunks rows) — a separate one-time sweep retires it (never
+      // automatic here: that decision needs a store-wide "is this concept's LAST chunk really
+      // gone" check, not a per-binding one).
+      if (!prior || prior.conceptId === staged.conceptId) {
+        assertRuntimeOwnership(options);
+        await core.supersedeSourceChunkObservation(staged.conceptId, staged.observationId, staged.predecessorObservationId);
+        options.fault?.("after-refresh");
+      }
     }
     assertRuntimeOwnership(options);
     core.recordSourceBindingReceipt({ runId: run.id, bindingId: staged.bindingId, writeState: "committed" });
@@ -557,7 +741,96 @@ async function materializeStagedBindings(
   }
 }
 
+/**
+ * FILE=CONCEPT (ratified, Phase 1), item 4. Recomputes title/body/embedding for every file
+ * concept this run actually wrote NEW evidence for — derived from the run's own DURABLE
+ * published chunk records (write_state='committed'), never from in-memory state accumulated
+ * during materializeStagedBindings, so this is safe to call on every reach of "this run is
+ * published" regardless of whether that happened in this exact invocation or a prior one before
+ * a crash (recomputeSourceConceptBody is itself idempotent — re-deriving from the CURRENT active
+ * chunk set every time — so a redundant call here is a no-op cost, never a correctness risk).
+ * 'skipped' chunks are excluded deliberately: an unchanged file's body is already correct, and
+ * re-embedding it on every routine sync is exactly the per-chunk cost item 6 retires.
+ *
+ * This resume-safety claim is only as true as every call site that reaches "published" actually
+ * calling it — REVIEW FIX (BLOCKER): one early-return resume path didn't (the still-cleaning fast
+ * path in syncSource, below), and a crash between a durable publish and this very call could
+ * strand a concept on a run that's no longer resumable at all (publishRun collapses
+ * published->cleaning->cleaned in ONE transaction whenever a run has zero cleanup items — the
+ * common case). sweepPendingRecomputes (below), backed by the durable source_recompute_pending
+ * table publishRun writes in that same transaction, is what makes the claim true unconditionally:
+ * every call site that can reach "published" without calling this function directly is still
+ * covered by the sweep running at the very start of the next sync, noop or not.
+ */
+async function recomputeTouchedSourceConcepts(core: SourceSyncCorePort, run: SourceSyncRun, options: RuntimeOptions): Promise<void> {
+  const published = core.listSourceChunks(run.id, true);
+  const touched = new Set(
+    published.filter((chunk) => chunk.writeState === "committed" && chunk.conceptId).map((chunk) => chunk.conceptId!),
+  );
+  // REVIEW FIX (round 4, Codex thread 2/(a)): a retire-absent cleanup item means this run removed
+  // a section with no successor chunk of its own — the committed-chunk filter above never sees it
+  // (publishRun's touchedConcepts, source-ledger.ts, has the identical gap, which is why it now
+  // ALSO marks these concepts source_recompute_pending in the same transaction as the cleanup item
+  // — see that method). Without this, a file that ONLY loses a section — its other sections
+  // unchanged, hence 'skipped' — would still heal eventually (the durable pending marker is swept
+  // at the start of the NEXT sync regardless), but only after an entire extra sync cycle, while
+  // THIS run's own result and every read in between kept serving the stale, pre-deletion body.
+  // Recomputing it here closes that gap immediately, in the same run that did the deleting — safe
+  // to call even when drainCleanup (which always runs before this, both call sites) already
+  // retired the concept outright (its last chunk gone): recomputeSourceConceptBody's own first
+  // check (status!=='active') no-ops and clears the pending row either way.
+  for (const item of core.listSourceCleanupItems(run.id)) {
+    if (item.kind === "retire-absent" && item.conceptId) touched.add(item.conceptId);
+  }
+  for (const conceptId of touched) {
+    assertRuntimeOwnership(options);
+    await core.recomputeSourceConceptBody(conceptId);
+  }
+}
+
+/**
+ * REVIEW FIX (BLOCKER): the durable half of the recompute resume-safety guarantee. Sweeps every
+ * concept this source has durably touched (publishRun, in the same transaction as the chunk
+ * write) but not yet recomputed for — self-healing a concept stranded by ANY crash between a
+ * durable publish and its recompute, including ones that leave the run itself unresumable (see
+ * recomputeTouchedSourceConcepts' docstring). Called unconditionally at the start of every sync,
+ * before any state-based dispatch, so even a noop invocation (nothing changed on disk) still
+ * heals a concept a PRIOR crashed invocation stranded.
+ */
+async function sweepPendingRecomputes(core: SourceSyncCorePort, sourceId: string, options: RuntimeOptions): Promise<void> {
+  for (const conceptId of core.listPendingRecomputeConcepts(sourceId)) {
+    assertRuntimeOwnership(options);
+    await core.recomputeSourceConceptBody(conceptId);
+    options.fault?.("after-recompute");
+  }
+}
+
 /** Tombstoned recovery may converge existing writes, but must never create new evidence. */
+/**
+ * REVIEW FIX (round 4, Codex thread 6; revised round 5, Codex thread R5-6): mirror
+ * materializeStagedBindings' own cross-concept branch (above). During the legacy consolidation
+ * path, an engine-written binding's successor can land under the WINNING file concept while
+ * predecessorObservationId still belongs to the OLD per-chunk concept fileConceptThisRun didn't
+ * pick for this file. supersedeSourceChunkObservation is a same-concept CAS (requireOwned rejects
+ * a predecessor under a different concept than its successor) and throws in that shape — which
+ * would wedge tombstoned-source removal recovery on exactly the binding it exists to unblock.
+ * observationConceptId is a plain read with no ledger/run coupling, so this stays independent of
+ * source.activeRunId/priorActiveByBinding (this function, unlike materializeStagedBindings, has
+ * no `source` in scope).
+ *
+ * ROUND 5 REVISION: a cross-concept predecessor is now left COMPLETELY UNTOUCHED here (round 4
+ * terminally superseded it inline, then had to thread an in-memory deferredChunkSupersessions
+ * list through recoverRemovedRepoSource to flip its chunk row afterward — R5-6 found a genuine
+ * crash window in that: a process death after drainCleanup acknowledges its cleanup items but
+ * before that in-memory list is applied loses it for good, leaving a chunk permanently pointing
+ * at a dead observation with no durable record left to heal it, wedging every future removal
+ * attempt on this source). This run never publishes (recoverRemovedRepoSource always aborts a
+ * "staging" run right after this function returns) — the predecessor belongs to the PRIOR, still-
+ * active run and is entirely unrelated to this abandoned attempt: it is correctly retired (or
+ * not) by removeTombstonedRepoSource's own removal-item enumeration over source.active_run_id,
+ * independently of whatever this run tried to do. Nothing here needs to be durable because
+ * nothing here needs to happen at all.
+ */
 async function reconcileExistingStagedBindings(
   core: SourceSyncCorePort,
   run: SourceSyncRun,
@@ -567,9 +840,13 @@ async function reconcileExistingStagedBindings(
     if (staged.writeState !== "engine-written") continue;
     if (!staged.conceptId || !staged.observationId) throw new Error("engine-written source receipt is incomplete");
     if (staged.predecessorObservationId) {
-      assertRuntimeOwnership(options);
-      await core.refreshSourceConcept(staged.conceptId, staged.observationId, staged.predecessorObservationId);
-      options.fault?.("after-refresh");
+      const predecessorConceptId = core.observationConceptId(staged.predecessorObservationId);
+      const crossConcept = predecessorConceptId !== null && predecessorConceptId !== staged.conceptId;
+      if (!crossConcept) {
+        assertRuntimeOwnership(options);
+        await core.supersedeSourceChunkObservation(staged.conceptId, staged.observationId, staged.predecessorObservationId);
+        options.fault?.("after-refresh");
+      }
     }
     assertRuntimeOwnership(options);
     core.recordSourceBindingReceipt({ runId: run.id, bindingId: staged.bindingId, writeState: "committed" });
@@ -589,13 +866,35 @@ async function drainCleanup(core: SourceSyncCorePort, run: SourceSyncRun, option
     } else if (item.kind === "retire-absent" || item.predecessorObservationId === null) {
       assertRuntimeOwnership(options);
       core.supersedeObservation(item.observationId, null);
+      // FILE=CONCEPT (ratified, Phase 1), item 5: "file deleted -> concept retired", NOT "chunk
+      // deleted -> concept retired". A retire-absent item fires per REMOVED CHUNK, but under
+      // file=concept many chunks share one file concept — only retire it once none of its
+      // siblings are still active (the whole file is gone), never on the first chunk to vanish
+      // out of a file that otherwise still exists. publishSourceRun already demoted every prior
+      // chunk and inserted only this run's surviving ones as active before any cleanup item is
+      // even created, so this reflects the file's FINAL state, not a mid-drain snapshot.
       assertRuntimeOwnership(options);
-      core.retireConcept(item.conceptId);
+      if (!core.hasActiveSourceChunks(item.conceptId)) core.retireConcept(item.conceptId);
       assertRuntimeOwnership(options);
       core.acknowledgeSourceCleanup(item.id);
     } else {
       const staged = stagedByBinding.get(item.bindingId);
-      if (staged?.writeState === "committed") {
+      // REVIEW FIX (round 4, Codex thread 6, continued): rollbackSourceRunBinding's own
+      // authorization requires the predecessor to belong to the SAME concept as the just-
+      // committed successor (a true "undo," restoring the predecessor to active under ITS OWN
+      // concept) — see that method. The identical legacy-consolidation shape
+      // reconcileExistingStagedBindings (above) now handles for the CAS call has no coherent
+      // "rollback" here either: there is no single concept that is simultaneously the restored
+      // predecessor's home and the just-committed successor's home, so rollbackSourceRunBinding
+      // would throw on it (pre-fix, this reopened the exact wedge fixing the CAS call alone
+      // still left: reconcileExistingStagedBindings converges the binding to 'committed', which
+      // is precisely what routes it into THIS branch). Treat a cross-concept predecessor as the
+      // terminal case instead, same as an uncommitted binding — the successor observation is
+      // authorized dead evidence at this point (the run is being aborted/the source removed),
+      // not something with a well-defined concept to reinstate.
+      const predecessorConceptId = core.observationConceptId(item.predecessorObservationId);
+      const crossConcept = predecessorConceptId !== null && predecessorConceptId !== item.conceptId;
+      if (staged?.writeState === "committed" && !crossConcept) {
         assertRuntimeOwnership(options);
         await core.rollbackSourceRunBinding(run.id, item.bindingId);
       } else {
@@ -816,6 +1115,33 @@ async function syncSource(
       }
     }
     let run = core.resumeSourceRun(sourceId);
+    // REVIEW FIX (round 4, Codex thread 15): resumeSourceRun hands back ANY nonterminal run for
+    // this source with no version check — a run created under an OLDER SOURCE_SCANNER_VERSION/
+    // SOURCE_CHUNKER_VERSION (a live "scanning" run when the process restarts under upgraded
+    // code, the exact case Codex flagged) gets handed straight back to this function, which then
+    // re-scans and re-stages under the CURRENT (newer) chunker. Verified empirically: a
+    // "scanning" run whose persisted ingestConfigHash was computed under an older
+    // SOURCE_CHUNKER_VERSION (computeSourceIngestConfigHash folds the chunker version directly
+    // into that hash, source-scanner.ts) makes EVERY subsequent stageManifest call throw
+    // "chunk.ingestFingerprint does not match chunk content, heading, metadata, and ingest
+    // config" — resumeSourceRun keeps handing the SAME stuck run back on every retry, so this
+    // wedges the source permanently, not just once. Scoped to "scanning" specifically: it is the
+    // one state that actually RE-DERIVES fingerprints against the current chunker on resume (this
+    // is the confirmed, reproduced failure); "staging"/"activating"/"cleaning" continue from
+    // ALREADY-staged rows without recomputing anything, so they neither hit this exact throw nor
+    // benefit from being aborted here — and abortRun's own state guard rejects "cleaning" outright
+    // (a run that reached "cleaning" already published; there is nothing to abort). A version-
+    // stale "scanning" run is aborted here instead of resumed — the SAME machinery (abortRun's
+    // ensureOrphanCleanup, drainCleanup below) that already reconciles any other reason a run gets
+    // aborted mid-flight, so any evidence it wrote (none yet possible in "scanning" — staging
+    // hasn't started) heals the same way. Aborting frees resumeSourceRun to return null next
+    // time, letting the normal "nothing to resume" path start a genuinely FRESH run under the
+    // current version.
+    if (run !== null && run.state === "scanning" && run.scanConfigVersion !== `${SOURCE_SCANNER_VERSION}/${SOURCE_CHUNKER_VERSION}`) {
+      assertAuthorizedOwnership();
+      core.abortSourceRun(run.id, "failed", "source scan/chunker version changed since this run began");
+      run = null;
+    }
     durableRunObserved = run !== null;
     let invocationRun = run;
     let invocationVerified = false;
@@ -827,6 +1153,19 @@ async function syncSource(
 
     if (options.scheduledAdmission) {
       assertScheduledLease(options);
+      // REVIEW FIX (round 4, Codex thread 12): sweep BEFORE admission can return early — a
+      // scheduled source that published successfully and then crashed (or lost its lease) before
+      // recomputeTouchedSourceConcepts ran is "not due" by every scheduling signal (it just
+      // synced), so admission would skip it every subsequent pass while its file concept sits on
+      // the placeholder/stale body sweepPendingRecomputes exists to heal — see that function's own
+      // docstring and queryAuthorizedSourcePublications' pending-row read gate (engine.ts), which
+      // now depends on this sweep actually running promptly rather than only eventually. Only for
+      // an active source (mirrors the lifecycle!=='active' branch inside execute(), below, which
+      // the ordinary in-execute() sweep call implicitly runs after already). Duplicates that later
+      // call for the non-admission-skipped path — both are idempotent no-ops once a concept's
+      // pending row is cleared, so running it twice on one invocation costs one extra no-op query
+      // per source, never a correctness risk.
+      if (source.lifecycle === "active") await sweepPendingRecomputes(core, sourceId, guardedOptions);
       if (!options.scheduledAdmission(source, run)) return SCHEDULED_SYNC_SKIPPED;
     }
 
@@ -848,6 +1187,11 @@ async function syncSource(
     }
     if (type === "git-md") authorizedGitMdSignature = gitMdSourceSignature(source);
     assertAuthorizedOwnership();
+
+    // REVIEW FIX (BLOCKER): unconditional, before any state-based dispatch below (including the
+    // noop path a crashed-after-publish run resolves to on its very next sync) — see
+    // sweepPendingRecomputes' own docstring.
+    await sweepPendingRecomputes(core, sourceId, guardedOptions);
 
     if (type === "git-md") {
       try { source = repairGitMdActivePublication(core, source, guardedOptions, mat); }
@@ -876,6 +1220,12 @@ async function syncSource(
           type === "git-md" ? activePublishedManifest(core, source) : undefined);
       }
       await drainCleanup(core, run, guardedOptions);
+      // REVIEW FIX (BLOCKER): this is a resume of an ALREADY-published run — a PR#49-era fast path
+      // that predates recomputeTouchedSourceConcepts and returned "published" without ever calling
+      // it. Fixed directly here (immediate, not deferred to the next sync's sweep) — the durable
+      // sweep above is the backstop if THIS call is itself interrupted, not a substitute for it.
+      await recomputeTouchedSourceConcepts(core, run, guardedOptions);
+      options.fault?.("after-recompute");
       return { sourceId, snapshotId: source.activeSnapshotId, runId: run.id, status: "published", diagnostics: [] };
     }
 
@@ -1121,6 +1471,11 @@ async function syncSource(
       run = core.getSourceRun(run.id)!;
     }
     if (run.state === "cleaning") await drainCleanup(core, run, guardedOptions);
+    // FILE=CONCEPT (ratified, Phase 1), item 4: strictly post-publish, on every path that
+    // reaches "this run is published" (fresh or resumed) — see recomputeTouchedSourceConcepts'
+    // own docstring for why pre-publish would leak and why a redundant call here is safe.
+    await recomputeTouchedSourceConcepts(core, run, guardedOptions);
+    options.fault?.("after-recompute");
     source = requireActiveSource(core, sourceId, type);
     const finalPublication = type === "git-md" ? activePublishedManifest(core, source) : undefined;
     if (type === "git-md") core.validateSourceActivePublication(source.id, run.id, run.snapshotId, runConfigHash);

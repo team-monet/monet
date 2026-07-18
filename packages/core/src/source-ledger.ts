@@ -64,9 +64,11 @@ interface RawSourceOperation {
   action: string;
 }
 
-interface DurableSourceReceipt extends RawSourceOperation {
-  activeObservationId: string | null;
-}
+// File=concept (ratified, Phase 1): a fully-validated raw operation. Previously carried
+// activeObservationId too (validateEngineReceipt's committed-state fence) — removed along with
+// that fence, since a file concept's active_observation_id no longer identifies "the" current
+// observation once a concept legitimately holds many simultaneously-active ones.
+type DurableSourceReceipt = RawSourceOperation;
 
 interface OperationOwnership {
   authorized: boolean;
@@ -295,6 +297,7 @@ export class SourceLedger {
         type TEXT NOT NULL CHECK (type = 'file'),
         content_hash TEXT NOT NULL,
         byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+        title TEXT NOT NULL,
         PRIMARY KEY (run_id, relative_path)
       );
       CREATE TABLE IF NOT EXISTS source_files (
@@ -306,6 +309,7 @@ export class SourceLedger {
         type TEXT NOT NULL CHECK (type = 'file'),
         content_hash TEXT NOT NULL,
         byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+        title TEXT NOT NULL,
         PRIMARY KEY (run_id, relative_path)
       );
       CREATE INDEX IF NOT EXISTS idx_source_files_source_snapshot ON source_files(source_id, snapshot_id, config_version);
@@ -331,6 +335,7 @@ export class SourceLedger {
         heading_path_json TEXT NOT NULL,
         occurrence INTEGER NOT NULL CHECK (occurrence >= 1),
         segment_index INTEGER NOT NULL CHECK (segment_index >= 1),
+        document_sequence INTEGER NOT NULL CHECK (document_sequence >= 1),
         content_hash TEXT NOT NULL,
         ingest_fingerprint TEXT NOT NULL,
         metadata_json TEXT NOT NULL,
@@ -356,6 +361,7 @@ export class SourceLedger {
         heading_path_json TEXT NOT NULL,
         occurrence INTEGER NOT NULL CHECK (occurrence >= 1),
         segment_index INTEGER NOT NULL CHECK (segment_index >= 1),
+        document_sequence INTEGER NOT NULL CHECK (document_sequence >= 1),
         content_hash TEXT NOT NULL,
         ingest_fingerprint TEXT NOT NULL,
         metadata_json TEXT NOT NULL,
@@ -638,15 +644,69 @@ export class SourceLedger {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_source_cleanup_run
         ON source_cleanup_items(run_id, acknowledged_at, id);
-      CREATE UNIQUE INDEX IF NOT EXISTS uq_source_staged_chunks_concept
-        ON source_staged_chunks(run_id, concept_id) WHERE concept_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS uq_source_staged_chunks_observation
         ON source_staged_chunks(run_id, observation_id) WHERE observation_id IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS uq_source_chunks_active_concept
-        ON source_chunks(source_id, concept_id) WHERE lifecycle='active' AND concept_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS uq_source_chunks_active_observation
         ON source_chunks(source_id, observation_id) WHERE lifecycle='active' AND observation_id IS NOT NULL;
     `);
+    // FILE=CONCEPT (ratified, Phase 1): uq_source_staged_chunks_concept (run_id, concept_id) and
+    // uq_source_chunks_active_concept (source_id, concept_id) both encoded the retired one-chunk-
+    // one-concept invariant — "at most one [staged | active] chunk may reference this concept".
+    // Under file=concept, every chunk of one file legitimately shares its file concept, so both
+    // are DROPPED outright rather than narrowed. The staged table needs no replacement: its
+    // pre-existing UNIQUE(run_id, relative_path, heading_path_json, occurrence, segment_index)
+    // already guarantees natural-key-slot uniqueness per run, which transitively guarantees
+    // per-(concept, natural-key-slot) uniqueness too (recordBindingReceipt's collision check,
+    // below, carries the adapted "a concept must not span two DIFFERENT files" protection forward
+    // at the application layer). The active table's replacement is physical, not just applied:
+    // uniqueness moves from "one active chunk per concept" to "one active chunk per (concept,
+    // natural-key-slot)" — at most one active chunk under a given file concept may claim a given
+    // slot, which is exactly the invariant appendOrCreateSourceObservation's supersession relies on.
+    this.db.exec(`
+      DROP INDEX IF EXISTS uq_source_staged_chunks_concept;
+      DROP INDEX IF EXISTS uq_source_chunks_active_concept;
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_source_chunks_active_concept_slot
+        ON source_chunks(concept_id, relative_path, heading_path_json, occurrence, segment_index)
+        WHERE lifecycle='active' AND concept_id IS NOT NULL;
+    `);
+    // FILE=CONCEPT (ratified, Phase 1) REVIEW FIX (BLOCKER): recompute used to run only inside the
+    // main publish flow's own invocation — every early-return resume path (the "still cleaning"
+    // fast path below, and the atomic published->cleaning->cleaned collapse publishRun performs in
+    // one transaction whenever a run has zero cleanup items) could durably commit a file's chunks
+    // and then never recompute its concept, stranding it forever at its create-time placeholder
+    // (body='', zero-vector embedding) or a stale prior body — fully authorized and visible, no
+    // crash observable to retry against, because the run itself is no longer resumable. Durable,
+    // crash-safe tracking closes this: publishRun marks every concept it durably touched pending
+    // in THIS SAME transaction; recomputeSourceConceptBody clears its own entry only once its own
+    // write transaction commits; syncSource sweeps every pending concept for a source at the START
+    // of every sync (source-sync.ts), including a noop path, so a stranded concept self-heals on
+    // the very next sync regardless of which resume path (or lack of one) stranded it.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS source_recompute_pending (
+        concept_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_recompute_pending_source ON source_recompute_pending(source_id);
+    `);
+    // Column-guards for stores that created these tables before file=concept (Phase 1). New
+    // columns get a harmless placeholder default: every such existing row predates the
+    // SOURCE_CHUNKER_VERSION v2→v3 bump (forces a total re-chunk), so it is superseded by the very
+    // next successful sync regardless of what placeholder it carries in the meantime — title is
+    // never read from this table for display (authorizedSourceProjections projects concept.title
+    // directly), and document_sequence only orders a concept body recompute over CURRENTLY ACTIVE
+    // chunks, which a legacy chunk-per-concept row never participates in as a file's sibling chunk.
+    for (const table of ["source_staged_files", "source_files"] as const) {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "title")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN title TEXT NOT NULL DEFAULT ''`);
+    }
+    for (const table of ["source_staged_chunks", "source_chunks"] as const) {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "document_sequence")) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN document_sequence INTEGER NOT NULL DEFAULT 1`);
+      }
+    }
     // Crash-safe legacy repair: sources with no sequenced events are assigned a
     // deterministic order from their durable attempt records. New writes always
     // append in the same transaction as the corresponding attempt.
@@ -812,16 +872,16 @@ export class SourceLedger {
       }
       const now = this.now();
       for (const file of input.files) {
-        this.db.prepare(`INSERT INTO source_staged_files (run_id,relative_path,type,content_hash,byte_length) VALUES (?,?,?,?,?)`).run(
-          run.id, file.relativePath, file.type, file.contentHash, file.byteLength,
+        this.db.prepare(`INSERT INTO source_staged_files (run_id,relative_path,type,content_hash,byte_length,title) VALUES (?,?,?,?,?,?)`).run(
+          run.id, file.relativePath, file.type, file.contentHash, file.byteLength, file.title,
         );
       }
       for (const chunk of input.chunks) {
         this.db.prepare(`INSERT INTO source_staged_chunks
-          (run_id,binding_id,binding_generation,operation_id,relative_path,heading_path_json,occurrence,segment_index,content_hash,ingest_fingerprint,metadata_json,source_ref,content)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          (run_id,binding_id,binding_generation,operation_id,relative_path,heading_path_json,occurrence,segment_index,document_sequence,content_hash,ingest_fingerprint,metadata_json,source_ref,content)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
           run.id, chunk.bindingId, chunk.bindingGeneration, chunk.operationId, chunk.relativePath, JSON.stringify(chunk.headingPath), chunk.occurrence,
-          chunk.segmentIndex, chunk.contentHash, chunk.ingestFingerprint,
+          chunk.segmentIndex, chunk.documentSequence, chunk.contentHash, chunk.ingestFingerprint,
           canonicalJson(canonicalizeSourceChunkMetadata(chunk.metadata)), chunk.sourceRef, chunk.content,
         );
       }
@@ -881,10 +941,15 @@ export class SourceLedger {
         requireString(next.concept, "conceptId");
         requireString(next.observation, "observationId");
         if (next.predecessor !== null) requireString(next.predecessor, "predecessorObservationId");
-        this.validateEngineReceipt(run, existing, next, input.writeState);
+        this.validateEngineReceipt(run, existing, next);
+        // FILE=CONCEPT (ratified, Phase 1): many bindings in this run legitimately share a
+        // concept_id now (every chunk of one file shares its file concept), so a concept_id match
+        // alone is no longer a collision — only a concept_id claimed by a DIFFERENT file's binding
+        // is (a concept must never span two files). observation_id stays strictly 1:1 per binding,
+        // unchanged: an observation is still exactly one chunk's evidence.
         const collision = this.db.prepare(`SELECT binding_id FROM source_staged_chunks
-          WHERE run_id=? AND binding_id<>? AND (concept_id=? OR observation_id=?) LIMIT 1`).get(
-          run.id, input.bindingId, next.concept, next.observation,
+          WHERE run_id=? AND binding_id<>? AND (observation_id=? OR (concept_id=? AND relative_path<>?)) LIMIT 1`).get(
+          run.id, input.bindingId, next.observation, next.concept, existing.relative_path as string,
         ) as { binding_id: string } | undefined;
         if (collision) throw new Error(`binding receipt collides with staged binding ${collision.binding_id}`);
       }
@@ -936,14 +1001,68 @@ export class SourceLedger {
       const priorRunId = source.active_run_id;
       this.revalidateReceiptsForPublication(run);
       const now = this.now();
-      this.db.prepare(`INSERT INTO source_files SELECT ?,run_id,?, ?,relative_path,type,content_hash,byte_length FROM source_staged_files WHERE run_id=?`).run(
+      this.db.prepare(`INSERT INTO source_files SELECT ?,run_id,?, ?,relative_path,type,content_hash,byte_length,title FROM source_staged_files WHERE run_id=?`).run(
         run.sourceId, run.snapshotId, run.configVersion, run.id,
       );
       if (priorRunId) this.db.prepare(`UPDATE source_chunks SET lifecycle='superseded' WHERE run_id=? AND lifecycle='active'`).run(priorRunId);
+      // REVIEW FIX (round 5, Codex thread R5-2, continued): explicit ORDER BY document_sequence on
+      // the bulk copy's OWN source SELECT — without it, SQLite gives no ordering guarantee for an
+      // unordered SELECT, so the ROWID this run's chunks land on in source_chunks (and therefore
+      // sourceChunkInsertOrder's own "insertion order" proxy, engine.ts) is not reliably related to
+      // document_sequence even when every staged row already has a correct, distinct value. A
+      // fresh sync's staged document_sequence values are already correct and distinct (assigned by
+      // the chunker itself), so this ordering is free to add and makes rowid a trustworthy stand-in
+      // for document order on every run from here forward — closing the actual non-determinism a
+      // later carry-forward's re-sequencing (planManifest, source-sync.ts) depends on.
       this.db.prepare(`INSERT INTO source_chunks
-        (source_id,run_id,snapshot_id,config_version,binding_id,binding_generation,operation_id,relative_path,heading_path_json,occurrence,segment_index,content_hash,ingest_fingerprint,metadata_json,source_ref,content,concept_id,observation_id,predecessor_observation_id,write_state)
-        SELECT ?,run_id,?, ?,binding_id,binding_generation,operation_id,relative_path,heading_path_json,occurrence,segment_index,content_hash,ingest_fingerprint,metadata_json,source_ref,content,concept_id,observation_id,predecessor_observation_id,write_state
-        FROM source_staged_chunks WHERE run_id=?`).run(run.sourceId, run.snapshotId, run.configVersion, run.id);
+        (source_id,run_id,snapshot_id,config_version,binding_id,binding_generation,operation_id,relative_path,heading_path_json,occurrence,segment_index,document_sequence,content_hash,ingest_fingerprint,metadata_json,source_ref,content,concept_id,observation_id,predecessor_observation_id,write_state)
+        SELECT ?,run_id,?, ?,binding_id,binding_generation,operation_id,relative_path,heading_path_json,occurrence,segment_index,document_sequence,content_hash,ingest_fingerprint,metadata_json,source_ref,content,concept_id,observation_id,predecessor_observation_id,write_state
+        FROM source_staged_chunks WHERE run_id=? ORDER BY document_sequence`).run(run.sourceId, run.snapshotId, run.configVersion, run.id);
+      // REVIEW FIX (round 5, Codex thread R5-4): a legacy-consolidation predecessor (its observation
+      // belongs to a DIFFERENT concept than the chunk that just superseded it — the same shape
+      // reconcileExistingStagedBindings' own cross-concept branch, below, leaves untouched)
+      // terminally retires HERE, at publish, in the SAME transaction that actually advances
+      // active_run_id — never earlier. materializeStagedBindings (source-sync.ts) used to call this
+      // eagerly, mid-materialize, well BEFORE this run durably published — but
+      // queryAuthorizedSourcePublications (engine.ts) joins against source.active_run_id, which is
+      // STILL the OLD run for the entire staging window, so eagerly killing the old concept's only
+      // observation made its still-genuinely-published content invisible to every authorized read
+      // (or, if this run then aborted, invisible forever) while the winning concept's own content
+      // was not yet durably published either — a visibility GAP where neither copy was readable.
+      // Deferring to here closes it: the predecessor stays fully live and readable for the entire
+      // staging window, and only stops being "the active publication" at the exact moment this
+      // transaction makes that true. The predecessor's own CHUNK row needs no separate handling —
+      // it is already part of priorRunId's chunk set, so the bulk lifecycle sweep above flips it
+      // the same as every other superseded chunk, in the same transaction.
+      if (priorRunId) {
+        const crossConceptPredecessors = this.db.prepare(
+          `SELECT DISTINCT chunk.predecessor_observation_id AS id
+             FROM source_chunks chunk
+             JOIN observations predecessor ON predecessor.id = chunk.predecessor_observation_id
+            WHERE chunk.run_id=? AND chunk.write_state='committed' AND chunk.predecessor_observation_id IS NOT NULL
+              AND predecessor.concept_id IS NOT NULL AND predecessor.concept_id != chunk.concept_id`,
+        ).all(run.id) as Array<{ id: string }>;
+        for (const { id } of crossConceptPredecessors) {
+          this.db.prepare(
+            `UPDATE observations SET superseded_by=NULL, superseded_at=? WHERE id=? AND superseded_by IS NULL AND superseded_at IS NULL`,
+          ).run(now, id);
+        }
+      }
+      // REVIEW FIX (BLOCKER): mark every concept this run durably wrote NEW evidence for as
+      // needs-recompute, in this SAME transaction as the chunk insert above — so the marker is as
+      // durable as the evidence it describes. 'skipped' chunks are excluded (mirrors
+      // recomputeTouchedSourceConcepts' own filter, source-sync.ts): an unchanged file's body is
+      // already correct, nothing to recompute. recomputeSourceConceptBody deletes its own row once
+      // its own write transaction actually commits — see that method for the other half.
+      const touchedConcepts = this.db.prepare(
+        `SELECT DISTINCT concept_id FROM source_chunks WHERE run_id=? AND write_state='committed' AND concept_id IS NOT NULL`,
+      ).all(run.id) as Array<{ concept_id: string }>;
+      for (const { concept_id } of touchedConcepts) {
+        this.db.prepare(
+          `INSERT INTO source_recompute_pending (concept_id, source_id, run_id, created_at) VALUES (?,?,?,?)
+           ON CONFLICT(concept_id) DO UPDATE SET source_id=excluded.source_id, run_id=excluded.run_id, created_at=excluded.created_at`,
+        ).run(concept_id, run.sourceId, run.id, now);
+      }
       this.db.prepare(`UPDATE source_snapshots SET state='superseded', superseded_at=? WHERE source_id=? AND state='active'`).run(now, run.sourceId);
       this.db.prepare(`UPDATE source_snapshots SET state='active', published_at=? WHERE run_id=?`).run(now, run.id);
       this.db.prepare(`UPDATE knowledge_sources SET active_run_id=?,active_snapshot_id=?,active_ingest_config_hash=?,applied_config_version=?,updated_at=? WHERE id=?`).run(
@@ -957,6 +1076,23 @@ export class SourceLedger {
           this.db.prepare(`INSERT INTO source_cleanup_items (id,source_id,run_id,target_run_id,kind,binding_id,operation_id,concept_id,observation_id,predecessor_observation_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
             this.idGen(), run.sourceId, run.id, priorRunId, "retire-absent", item.binding_id, item.operation_id, item.concept_id, item.observation_id, item.predecessor_observation_id, now,
           );
+          // REVIEW FIX (round 4, Codex thread 2/(a)): a retire-absent item means this chunk's
+          // SECTION was deleted from the file (or the whole file vanished) with no successor chunk
+          // in this run at all — it never appears in touchedConcepts above (that query only sees
+          // run_id=? THIS run's own committed chunks, and a pure deletion writes none). If the
+          // file's other sections are unchanged they stay 'skipped', so without this the concept's
+          // stored body/embedding silently keeps including a section that source_chunks no longer
+          // has active the moment drainCleanup supersedes this observation (source-sync.ts). Marked
+          // in the SAME transaction as the cleanup item and the chunk-lifecycle flip above, exactly
+          // like touchedConcepts — a concept whose LAST chunk just vanished (about to be retired by
+          // drainCleanup) still gets marked harmlessly: recomputeSourceConceptBody's own first check
+          // (status!=='active') clears the row as a no-op once it eventually runs.
+          if (item.concept_id) {
+            this.db.prepare(
+              `INSERT INTO source_recompute_pending (concept_id, source_id, run_id, created_at) VALUES (?,?,?,?)
+               ON CONFLICT(concept_id) DO UPDATE SET source_id=excluded.source_id, run_id=excluded.run_id, created_at=excluded.created_at`,
+            ).run(item.concept_id, run.sourceId, run.id, now);
+          }
         }
       }
       this.db.prepare(`UPDATE source_sync_runs SET state='published',result='success',published_at=?,updated_at=? WHERE id=?`).run(now, now, run.id);
@@ -1016,16 +1152,53 @@ export class SourceLedger {
             ? item.predecessor_observation_id
             : null;
           if (item.kind === "retire-absent" || predecessor === null) {
-            if (concept.status !== "retired" || concept.active_observation_id !== null) {
+            // FILE=CONCEPT (ratified, Phase 1): a retire-absent chunk's concept is only required
+            // to be fully retired when NO other active chunk survives under it — item 5, "file
+            // deleted -> concept retired" (NOT "chunk deleted -> concept retired"). When siblings
+            // survive, the concept legitimately stays active; this one observation's terminal
+            // supersession (already checked above) is the only required effect.
+            const hasSurvivingChunks = this.db.prepare(
+              `SELECT 1 FROM source_chunks WHERE concept_id=? AND lifecycle='active' LIMIT 1`,
+            ).get(item.concept_id);
+            if (hasSurvivingChunks) {
+              if (concept.status !== "active") {
+                throw new Error("authorized cleanup source concept with surviving evidence must stay active");
+              }
+            } else if (concept.status !== "retired" || concept.active_observation_id !== null) {
               throw new Error("authorized cleanup source concept is not retired with a null active pointer");
             }
           } else {
             const prior = this.db.prepare(`SELECT concept_id,superseded_at FROM observations WHERE id=?`).get(predecessor) as
               | { concept_id: string | null; superseded_at: number | null }
               | undefined;
-            if (concept.status === "retired" || concept.active_observation_id !== predecessor
-                || !prior || prior.concept_id !== item.concept_id || prior.superseded_at !== null) {
-              throw new Error("orphan cleanup did not preserve the active predecessor projection");
+            if (!prior) throw new Error("orphan cleanup did not preserve the active predecessor projection");
+            if (prior.concept_id === item.concept_id) {
+              // FILE=CONCEPT (ratified, Phase 1): reconcile-orphan no longer fences on
+              // active_observation_id (see rollbackSourceRunBinding) — the predecessor observation
+              // being live/unsuperseded again IS the compensation; the concept itself is never
+              // mutated by rollback any more.
+              if (concept.status === "retired" || prior.superseded_at !== null) {
+                throw new Error("orphan cleanup did not preserve the active predecessor projection");
+              }
+            } else {
+              // REVIEW FIX (round 5, Codex thread R5-6, revised from round 4 thread 6): a
+              // predecessor under a DIFFERENT concept than item.concept_id — the legacy-
+              // consolidation shape reconcileExistingStagedBindings and drainCleanup's own
+              // rollback-vs-terminal branch (source-sync.ts) both special-case now — has no
+              // coherent rollback: there is no single concept that is simultaneously the restored
+              // predecessor's home and the just-committed successor's home. Round 4 had
+              // reconcileExistingStagedBindings terminally supersede this predecessor eagerly and
+              // expected it dead here; round 5 found that eager supersession itself unsafe (it
+              // fired well before this run's own successor was durably anything, and moving the
+              // compensating chunk-lifecycle flip to a later, in-memory-only step left a real
+              // crash window with no durable record to heal from). reconcileExistingStagedBindings
+              // now leaves a cross-concept predecessor COMPLETELY untouched — it belongs to the
+              // PRIOR, still-active run and is retired independently (or not) by
+              // removeTombstonedRepoSource's own removal-item enumeration — so it is expected to
+              // still be fully live here, exactly as it was before this run ever touched it.
+              if (prior.superseded_at !== null) {
+                throw new Error("orphan cleanup unexpectedly touched a cross-concept predecessor that should have been left alone");
+              }
             }
           }
         }
@@ -1371,7 +1544,7 @@ export class SourceLedger {
       );
       if (source.active_run_id) {
         const chunks = this.db.prepare(`SELECT chunk.binding_id,chunk.concept_id,chunk.observation_id,chunk.source_ref,
-            concept.kind AS concept_kind,concept.status AS concept_status,concept.source_identity,concept.active_observation_id,
+            concept.kind AS concept_kind,concept.status AS concept_status,concept.source_identity,
             observation.concept_id AS observation_concept,observation.kind AS observation_kind,
             observation.source_refs AS observation_refs,observation.superseded_by,observation.superseded_at
           FROM source_chunks chunk
@@ -1379,15 +1552,18 @@ export class SourceLedger {
           LEFT JOIN observations observation ON observation.id=chunk.observation_id
           WHERE chunk.source_id=? AND chunk.run_id=? AND chunk.lifecycle='active' ORDER BY chunk.binding_id`).all(sourceId, source.active_run_id) as Array<{
             binding_id: string; concept_id: string | null; observation_id: string | null; source_ref: string;
-            concept_kind: string | null; concept_status: string | null; source_identity: string | null; active_observation_id: string | null;
+            concept_kind: string | null; concept_status: string | null; source_identity: string | null;
             observation_concept: string | null; observation_kind: string | null; observation_refs: string | null;
             superseded_by: string | null; superseded_at: number | null;
           }>;
         for (const chunk of chunks) {
           if (!chunk.concept_id || !chunk.observation_id) throw new Error("active source binding lacks exact engine evidence");
           const refs = parseStringArray(chunk.observation_refs, "source removal observation refs");
+          // FILE=CONCEPT (ratified, Phase 1): dropped the active_observation_id===observation_id
+          // fence — every chunk of a multi-chunk file is an equally valid, independently "active"
+          // binding of its concept; only ONE of them could ever match a vestigial single pointer.
           if (chunk.concept_kind !== "source" || chunk.concept_status !== "active"
-              || chunk.source_identity !== `source://${sourceId}` || chunk.active_observation_id !== chunk.observation_id
+              || chunk.source_identity !== `source://${sourceId}`
               || chunk.observation_concept !== chunk.concept_id || chunk.observation_kind !== "source"
               || refs.length !== 1 || refs[0] !== chunk.source_ref || !chunk.source_ref.startsWith(`source://${sourceId}/`)
               || chunk.superseded_by !== null || chunk.superseded_at !== null) {
@@ -1498,7 +1674,11 @@ export class SourceLedger {
     const run = this.requireRun(runId);
     const table = usePublished ? "source_files" : "source_staged_files";
     const rows = this.db.prepare(`SELECT * FROM ${table} WHERE run_id=? ORDER BY relative_path`).all(runId) as Array<Record<string, unknown>>;
-    return rows.map((row) => ({ sourceId: run.sourceId, runId, snapshotId: run.snapshotId, configVersion: run.configVersion, relativePath: row.relative_path as string, type: "file", contentHash: row.content_hash as string, byteLength: row.byte_length as number }));
+    return rows.map((row) => ({
+      sourceId: run.sourceId, runId, snapshotId: run.snapshotId, configVersion: run.configVersion,
+      relativePath: row.relative_path as string, type: "file", contentHash: row.content_hash as string,
+      byteLength: row.byte_length as number, title: row.title as string,
+    }));
   }
 
   listChunks(runOrOptions: string | { runId: string; published?: boolean }, published = false): SourceChunkRecord[] {
@@ -1555,20 +1735,23 @@ export class SourceLedger {
     }
   }
 
+  // FILE=CONCEPT (ratified, Phase 1): no longer takes a writeState parameter — the "committed
+  // implies THE engine concept's active observation" fence it used to add for writeState
+  // 'committed' depended on active_observation_id identifying a concept's sole current
+  // observation, which is no longer true once a concept legitimately holds many simultaneously-
+  // active ones. What remains (this observation exists, is live/unsuperseded, and matches the
+  // receipt's concept/observation/predecessor triple) is already fully enforced below and inside
+  // validateDurableEngineReceipt regardless of writeState.
   private validateEngineReceipt(
     run: SourceSyncRun,
     staged: Record<string, unknown>,
     receipt: { concept: unknown; observation: unknown; predecessor: unknown },
-    writeState: "engine-written" | "committed",
   ): void {
     const operation = this.validateDurableEngineReceipt(run, staged);
     if (!operation) throw new Error("binding receipt has no matching durable engine operation");
     if (operation.conceptId !== receipt.concept || operation.observationId !== receipt.observation ||
         operation.predecessorObservationId !== receipt.predecessor) {
       throw new Error("binding receipt does not match its source-domain engine operation and predecessor");
-    }
-    if (writeState === "committed" && operation.activeObservationId !== receipt.observation) {
-      throw new Error("committed binding receipt is not the engine concept's active observation");
     }
   }
 
@@ -1581,7 +1764,7 @@ export class SourceLedger {
           concept: staged.concept_id,
           observation: staged.observation_id,
           predecessor: staged.predecessor_observation_id,
-        }, "committed");
+        });
         continue;
       }
       if (staged.write_state !== "skipped") throw new Error("publication contains a non-final binding receipt");
@@ -1590,7 +1773,7 @@ export class SourceLedger {
                 old.relative_path,old.heading_path_json,old.occurrence,old.segment_index,old.content_hash,
                 old.ingest_fingerprint,old.metadata_json,old.source_ref,old.content,
                 concept.kind AS concept_kind,concept.status AS concept_status,concept.circle AS concept_circle,
-                concept.source_identity,concept.active_observation_id,
+                concept.source_identity,
                 observation.kind AS observation_kind,observation.circle AS observation_circle,
                 observation.content AS observation_content,observation.source_refs,
                 observation.superseded_by,observation.superseded_at
@@ -1600,6 +1783,11 @@ export class SourceLedger {
            JOIN observations observation ON observation.id=old.observation_id AND observation.concept_id=old.concept_id
           WHERE source.id=?`,
       ).get(staged.binding_id, run.sourceId) as Record<string, unknown> | undefined;
+      // FILE=CONCEPT (ratified, Phase 1): dropped the active_observation_id === staged.observation_id
+      // fence — a file concept legitimately holds many simultaneously-active observations, so no
+      // single one of them is required to match a vestigial concept-level pointer any more. Every
+      // OTHER check here (identity, content, provenance, liveness) is per-OBSERVATION and stays
+      // exactly as strict as before.
       if (!current || current.concept_id !== staged.concept_id || current.observation_id !== staged.observation_id
           || current.predecessor_observation_id !== staged.predecessor_observation_id
           || current.relative_path !== staged.relative_path || current.heading_path_json !== staged.heading_path_json
@@ -1607,7 +1795,7 @@ export class SourceLedger {
           || current.content_hash !== staged.content_hash || current.ingest_fingerprint !== staged.ingest_fingerprint
           || current.metadata_json !== staged.metadata_json || current.source_ref !== staged.source_ref
           || current.content !== staged.content || current.concept_kind !== "source" || current.concept_status !== "active"
-          || current.source_identity !== `source://${run.sourceId}` || current.active_observation_id !== staged.observation_id
+          || current.source_identity !== `source://${run.sourceId}`
           || current.concept_circle !== current.source_circle || current.observation_circle !== current.source_circle
           || current.observation_kind !== "source" || current.observation_content !== staged.content
           || current.superseded_by !== null || current.superseded_at !== null) {
@@ -1644,13 +1832,56 @@ export class SourceLedger {
   private classifyOperationOwnership(run: SourceSyncRun, staged: Record<string, unknown>, raw: RawSourceOperation): OperationOwnership {
     const concept = this.db.prepare(`SELECT source_identity FROM concepts WHERE id=?`).get(raw.conceptId) as
       { source_identity: string | null } | undefined;
-    const owners = this.db.prepare(`SELECT source_id,binding_id FROM source_chunks
-      WHERE lifecycle='active' AND (concept_id=? OR observation_id=?)`).all(raw.conceptId, raw.observationId) as
+    // FILE=CONCEPT (ratified, Phase 1): many active chunks now legitimately share a concept_id —
+    // every chunk of one file shares its file concept — so concept ownership is judged at the
+    // SOURCE level for PUBLISHED (cross-run) owners, not this exact binding (the old per-binding
+    // check), PLUS a proven-lineage requirement in place of the exact relative_path fence a rename
+    // in-progress would otherwise trip: the PRIOR run's still-active chunk can legitimately sit at
+    // the OLD path while THIS run's staged chunk (same concept, same file) already reflects the
+    // NEW one. A staged chunk proves it belongs to an existing concept's file lineage by matching
+    // EITHER (a) its own binding_id against one of the concept's active owners (a continuing or
+    // renamed binding — the carried bindingId IS the proof), OR (b) its relative_path against one
+    // of them (a brand-new section landing on an file that did not rename this run). Neither
+    // match is required when the concept has no active owners yet (brand new). Cross-file safety
+    // is also reinforced same-run: every staged sibling of this concept in THIS run (not yet
+    // published) must share the exact same relative_path — because every chunk in one run is
+    // grouped by its own relative_path before any receipt is recorded, two staged siblings of the
+    // same concept in the same run can never legitimately differ, so this fence is always exact,
+    // never a rename false-positive. A sibling chunk of the SAME file already written EARLIER IN
+    // THIS SAME RUN (staged, not yet published) is an equally valid owner — the second-and-later
+    // chunk of a brand-new file always attaches to a concept with zero PUBLISHED owners yet,
+    // because its file concept was only just created a few iterations ago in this same staging
+    // pass. Observation ownership stays strict 1:1 per binding, unchanged: an observation is
+    // still exactly one chunk's evidence.
+    //
+    // KNOWN NARROW GAP (accepted, not closed): a file renamed AND given a brand-new section in
+    // the exact same sync can have that new section's receipt validated before any of the
+    // renamed-continuing siblings have recorded their own (same-run) receipt yet — at that
+    // instant neither the binding_id nor relative_path match fires. Rare (simultaneous rename +
+    // structural addition) and fails loud (a rejected sync, retryable), never silent corruption.
+    const conceptOwners = this.db.prepare(`SELECT source_id,binding_id,relative_path FROM source_chunks
+      WHERE lifecycle='active' AND concept_id=?`).all(raw.conceptId) as
+      Array<{ source_id: string; binding_id: string; relative_path: string }>;
+    const stagedConceptOwners = this.db.prepare(`SELECT relative_path FROM source_staged_chunks
+      WHERE run_id=? AND binding_id<>? AND concept_id=? AND write_state<>'intent'`).all(
+      run.id, staged.binding_id, raw.conceptId,
+    ) as Array<{ relative_path: string }>;
+    const observationOwners = this.db.prepare(`SELECT source_id,binding_id FROM source_chunks
+      WHERE lifecycle='active' AND observation_id=?`).all(raw.observationId) as
       Array<{ source_id: string; binding_id: string }>;
     const expectedAuthority = `source://${run.sourceId}`;
     const authorityMatches = sourceIdentityAuthority(concept?.source_identity) === expectedAuthority;
-    const ownersMatch = owners.every((owner) => owner.source_id === run.sourceId && owner.binding_id === staged.binding_id);
-    return { authorized: authorityMatches && ownersMatch, hasActiveOwner: owners.length > 0 };
+    const provenLineage = conceptOwners.length === 0
+      || conceptOwners.some((owner) => owner.binding_id === staged.binding_id || owner.relative_path === staged.relative_path)
+      || stagedConceptOwners.some((owner) => owner.relative_path === staged.relative_path);
+    const conceptOwnersMatch = conceptOwners.every((owner) => owner.source_id === run.sourceId)
+      && stagedConceptOwners.every((owner) => owner.relative_path === staged.relative_path)
+      && provenLineage;
+    const observationOwnersMatch = observationOwners.every((owner) => owner.source_id === run.sourceId && owner.binding_id === staged.binding_id);
+    return {
+      authorized: authorityMatches && conceptOwnersMatch && observationOwnersMatch,
+      hasActiveOwner: conceptOwners.length > 0 || stagedConceptOwners.length > 0 || observationOwners.length > 0,
+    };
   }
 
   private validateDurableEngineReceipt(run: SourceSyncRun, staged: Record<string, unknown>): DurableSourceReceipt | null {
@@ -1662,7 +1893,7 @@ export class SourceLedger {
       throw new Error("a new binding must use an unowned newly created source concept and observation");
     }
     const operation = this.db.prepare(`SELECT source.circle AS source_circle,
-        concept.kind AS concept_kind,concept.status AS concept_status,concept.source_identity,concept.active_observation_id,concept.circle AS concept_circle,
+        concept.kind AS concept_kind,concept.status AS concept_status,concept.source_identity,concept.circle AS concept_circle,
         observation.kind AS observation_kind,observation.source_refs,observation.superseded_by,observation.superseded_at,
         observation.content AS observation_content,observation.circle AS observation_circle
       FROM knowledge_sources source
@@ -1670,7 +1901,7 @@ export class SourceLedger {
       LEFT JOIN observations observation ON observation.id=? AND observation.concept_id=?
       WHERE source.id=?`).get(raw.conceptId, raw.observationId, raw.conceptId, run.sourceId) as {
         source_circle: string;
-        concept_kind: string | null; concept_status: string | null; source_identity: string | null; active_observation_id: string | null; concept_circle: string | null;
+        concept_kind: string | null; concept_status: string | null; source_identity: string | null; concept_circle: string | null;
         observation_kind: string | null; source_refs: string | null; superseded_by: string | null; superseded_at: number | null;
         observation_content: string | null; observation_circle: string | null;
       } | undefined;
@@ -1694,14 +1925,21 @@ export class SourceLedger {
       WHERE source_id=? AND binding_id=? AND lifecycle='active'`).get(run.sourceId, staged.binding_id) as
       { concept_id: string | null; observation_id: string | null } | undefined;
     if (prior) {
-      if (!prior.concept_id || !prior.observation_id || prior.concept_id !== raw.conceptId || prior.observation_id === raw.observationId) {
+      // FILE=CONCEPT (ratified, Phase 1): a binding's target concept is no longer required to
+      // stay the SAME across syncs — dropped the `prior.concept_id !== raw.conceptId` arm this
+      // check used to carry. That equality was sound under the old one-concept-per-chunk model
+      // (a binding's concept was permanent by construction) but is exactly what the one-time
+      // migration off it needs to violate: fileConceptThisRun (source-sync.ts) deliberately
+      // reattaches a surviving binding onto a DIFFERENT, consolidating file concept. That
+      // reattachment is already authorized above (classifyOperationOwnership's provenLineage
+      // check, same relativePath) — this check's remaining job is narrower: the prior row must be
+      // well-formed, and a genuine new write must never reuse its predecessor's exact observation
+      // id (anti-replay), regardless of which concept either one belongs to.
+      if (!prior.concept_id || !prior.observation_id || prior.observation_id === raw.observationId) {
         throw new Error("durable engine receipt does not advance its exact active predecessor");
       }
     }
-    return {
-      ...raw,
-      activeObservationId: operation.active_observation_id,
-    };
+    return { ...raw };
   }
 
   private ensureOrphanCleanup(run: SourceSyncRun, at = this.now()): void {
@@ -1823,6 +2061,7 @@ export class SourceLedger {
     let totalBytes = 0;
     for (const file of files) {
       requireSourceRelativePath(file.relativePath, "file.relativePath"); requireString(file.contentHash, "file.contentHash");
+      requireString(file.title, "file.title");
       if (file.type !== "file") throw new Error("manifest file type must be file");
       requireInteger(file.byteLength, "file.byteLength");
       if (file.byteLength > run.effectiveConfig.limits.maxFileBytes) throw new Error("manifest file exceeds the run maxFileBytes limit");
@@ -1867,6 +2106,7 @@ export class SourceLedger {
       if (!Array.isArray(chunk.headingPath) || chunk.headingPath.some((part) => typeof part !== "string")) throw new Error("chunk.headingPath must be a string array");
       requireInteger(chunk.bindingGeneration, "chunk.bindingGeneration", 1);
       requireInteger(chunk.occurrence, "chunk.occurrence", 1); requireInteger(chunk.segmentIndex, "chunk.segmentIndex", 1);
+      requireInteger(chunk.documentSequence, "chunk.documentSequence", 1);
       if (typeof chunk.content !== "string") throw new Error("chunk.content must be a string");
       if (Buffer.byteLength(chunk.content, "utf8") > run.effectiveConfig.limits.maxChunkBytes) {
         throw new Error("chunk.content exceeds the run maxChunkBytes limit");
@@ -1939,6 +2179,7 @@ export class SourceLedger {
       bindingId: row.binding_id as string, bindingGeneration: row.binding_generation as number,
       operationId: row.operation_id as string, relativePath: row.relative_path as string,
       headingPath: JSON.parse(row.heading_path_json as string), occurrence: row.occurrence as number, segmentIndex: row.segment_index as number,
+      documentSequence: row.document_sequence as number,
       contentHash: row.content_hash as string, ingestFingerprint: row.ingest_fingerprint as string,
       metadata: JSON.parse(row.metadata_json as string) as SourceChunkMetadata, sourceRef: row.source_ref as string,
       content: row.content as string, conceptId: (row.concept_id as string | null) ?? null, observationId: (row.observation_id as string | null) ?? null,

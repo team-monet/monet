@@ -28,7 +28,11 @@ function basePayload(overrides: Partial<GraftPayload> = {}): GraftPayload {
     exportedAt: Date.now(),
     since: 0,
     deviceId: "machine-a",
-    embedderModelId: "hashing:dim=256",
+    // REVIEW FIX (round 4, Codex thread 14): derived from the SAME provider freshCore's default
+    // embedder uses, not a hardcoded literal — HashingEmbeddingProvider's modelId now carries a
+    // tokenizer version segment, so a copy-pasted string here would silently drift out of sync
+    // the next time that version bumps.
+    embedderModelId: new HashingEmbeddingProvider().modelId,
     observations: [],
     concepts: [],
     conceptRevisions: [],
@@ -653,6 +657,21 @@ describe("embedder mismatch rejection", () => {
   it("graftRows with wrong embedderModelId throws EmbedderMismatchError", () => {
     const dst = freshCore();
     const payload = basePayload({ embedderModelId: "Xenova/all-MiniLM-L6-v2" });
+
+    expect(() => dst.graftRows(payload)).toThrow(EmbedderMismatchError);
+    expect(() => dst.graftRows(payload)).toThrow(/incompatible vector spaces/i);
+
+    dst.close();
+  });
+
+  it("rejects a graft from a pre-tokenizer-bump hashing store, even though dim matches (round 4, Codex thread 14)", () => {
+    // Before HASHING_TOKENIZER_VERSION existed, every HashingEmbeddingProvider advertised
+    // "hashing:dim=256" regardless of tokenizer — this literal is exactly what the OLD
+    // (ASCII-only-tokenizer) provider produced, standing in for a store that predates the
+    // Unicode-tokenizer bump (item 9). The fix must tell these apart even though `dim` alone is
+    // identical: old-tokenizer and new-tokenizer hashing vectors are NOT the same space.
+    const dst = freshCore();
+    const payload = basePayload({ embedderModelId: "hashing:dim=256" });
 
     expect(() => dst.graftRows(payload)).toThrow(EmbedderMismatchError);
     expect(() => dst.graftRows(payload)).toThrow(/incompatible vector spaces/i);

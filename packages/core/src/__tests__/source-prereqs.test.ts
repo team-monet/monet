@@ -116,9 +116,24 @@ describe("source-pipeline core prerequisites", () => {
       });
       // Generic fetch remains fenced both before and after the connector commits its read model.
       expect(await core.getConcept(first.conceptId, { synthesize: false })).toBeNull();
-      const refreshed = await core.refreshSourceConcept(first.conceptId, second.observationId, first.observationId);
-      expect(refreshed.body).toBe("Version two: refreshed source-backed content.");
-      expect(refreshed.title).toBe("Version two: refreshed source-backed content");
+      // File=concept (Phase 1): supersedeSourceChunkObservation only flips the observation pair —
+      // the concept's own title/body/embedding are recomputeSourceConceptBody's job, strictly
+      // post-publish (item 4), driven from the LEDGER's active chunk set (source_chunks). This
+      // low-level unit test never runs a ledger publish (no registered source run at all), so
+      // there is nothing for recomputeSourceConceptBody to read — exactly as a genuinely
+      // unpublished concept should behave. What IS verified at this level is the observation-pair
+      // supersession itself, directly.
+      await core.supersedeSourceChunkObservation(first.conceptId, second.observationId, first.observationId);
+      const observations = core
+        // @ts-expect-error test-only raw observation-state assertion
+        .db.prepare(`SELECT id, superseded_by, superseded_at FROM observations WHERE id IN (?, ?)`)
+        .all(first.observationId, second.observationId) as Array<{ id: string; superseded_by: string | null; superseded_at: number | null }>;
+      const firstObs = observations.find((o) => o.id === first.observationId)!;
+      const secondObs = observations.find((o) => o.id === second.observationId)!;
+      expect(firstObs.superseded_by).toBe(second.observationId);
+      expect(firstObs.superseded_at).not.toBeNull();
+      expect(secondObs.superseded_by).toBeNull();
+      expect(secondObs.superseded_at).toBeNull();
       expect(await core.getConcept(first.conceptId, { synthesize: false })).toBeNull();
 
       await expect(core.store("Native evidence.", { attachTo: first.conceptId })).rejects.toThrow("source concept");
@@ -193,7 +208,8 @@ describe("source-pipeline core prerequisites", () => {
         sourceRefs: [sourceRef],
         operationId: "source-a:binding-a:fingerprint-v2:snapshot-v2",
       });
-      await core.refreshSourceConcept(source.conceptId, successor.observationId, source.observationId);
+      await core.supersedeSourceChunkObservation(source.conceptId, successor.observationId, source.observationId);
+      await core.recomputeSourceConceptBody(source.conceptId);
       expect(core.edges({ circle: "default", type: "supports" }).some((e) => e.srcId === source.conceptId && e.dstId === target.conceptId)).toBe(false);
     } finally {
       core.close();
@@ -229,7 +245,7 @@ describe("source-pipeline core prerequisites", () => {
         // @ts-expect-error test-only source-ledger identity corruption
         .db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`)
         .run(sourceA.conceptId, sourceB.observationId);
-      await expect(core.refreshSourceConcept(sourceA.conceptId, sourceB.observationId, sourceA.observationId))
+      await expect(core.supersedeSourceChunkObservation(sourceA.conceptId, sourceB.observationId, sourceA.observationId))
         .rejects.toThrow("identity does not match");
     } finally {
       core.close();
@@ -253,15 +269,29 @@ describe("source-pipeline core prerequisites", () => {
         sourceRefs: [sourceRef],
         operationId: "source-a:binding-a:fingerprint-a2:snapshot-a2",
       });
-      const refreshed = await core.refreshSourceConcept(a.conceptId, aAgain.observationId, a.observationId);
-      expect(refreshed.body).toBe("Version A.");
-      await expect(core.refreshSourceConcept(a.conceptId, b.observationId, a.observationId)).rejects.toThrow("compare-and-swap failed");
+      // File=concept (Phase 1): body verification is recomputeSourceConceptBody's job now, driven
+      // from the ledger's active chunk set (source_chunks) — this low-level unit test has no
+      // registered source run to populate it, so it verifies the real compensation directly: the
+      // observation-pair state (a superseded by aAgain).
+      await core.supersedeSourceChunkObservation(a.conceptId, aAgain.observationId, a.observationId);
+      const refreshedObs = core
+        // @ts-expect-error test-only raw observation-state assertion
+        .db.prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`).get(a.observationId) as
+        { superseded_by: string | null; superseded_at: number | null };
+      expect(refreshedObs.superseded_by).toBe(aAgain.observationId);
+      expect(refreshedObs.superseded_at).not.toBeNull();
+      await expect(core.supersedeSourceChunkObservation(a.conceptId, b.observationId, a.observationId)).rejects.toThrow("compare-and-swap failed");
     } finally {
       core.close();
     }
   });
 
-  it("uses the active-observation CAS so delayed B cannot replace activated C", async () => {
+  it("uses the observation-pair CAS so delayed B cannot replace activated C", async () => {
+    // File=concept (Phase 1): there is no concept-level active_observation_id CAS any more (a
+    // file concept legitimately holds many simultaneously-active observations) — the safety
+    // property this test protects is now observation-pair-scoped: once A's predecessor slot has
+    // been claimed by C, a delayed B naming the SAME stale predecessor must fail, and C's own
+    // evidence must stay exactly as activated (live, unsuperseded).
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     try {
       const a = await core.storeSource("Version A.", {
@@ -278,20 +308,38 @@ describe("source-pipeline core prerequisites", () => {
         sourceRefs: [sourceRef],
         operationId: "source-a:binding-cas:fingerprint-c:snapshot-c",
       });
-      const activated = await core.refreshSourceConcept(a.conceptId, c.observationId, a.observationId);
-      expect(activated.body).toBe("Version C.");
-      await expect(core.refreshSourceConcept(a.conceptId, b.observationId, a.observationId))
+      // File=concept (Phase 1): body verification is recomputeSourceConceptBody's job now, driven
+      // from the ledger's active chunk set — this low-level unit test has no registered source
+      // run to populate it, so the observation-pair state below is the real assertion.
+      await core.supersedeSourceChunkObservation(a.conceptId, c.observationId, a.observationId);
+      await expect(core.supersedeSourceChunkObservation(a.conceptId, b.observationId, a.observationId))
         .rejects.toThrow("compare-and-swap failed");
-      const row = core
-        // @ts-expect-error test-only active-pointer assertion
-        .db.prepare(`SELECT active_observation_id FROM concepts WHERE id = ?`).get(a.conceptId) as { active_observation_id: string };
-      expect(row.active_observation_id).toBe(c.observationId);
+      const observations = core
+        // @ts-expect-error test-only raw observation-state assertion
+        .db.prepare(`SELECT id, superseded_by, superseded_at FROM observations WHERE id IN (?, ?)`)
+        .all(a.observationId, c.observationId) as Array<{ id: string; superseded_by: string | null; superseded_at: number | null }>;
+      const aRow = observations.find((o) => o.id === a.observationId)!;
+      const cRow = observations.find((o) => o.id === c.observationId)!;
+      expect(aRow.superseded_by).toBe(c.observationId);
+      expect(aRow.superseded_at).not.toBeNull();
+      expect(cRow.superseded_by).toBeNull();
+      expect(cRow.superseded_at).toBeNull();
     } finally {
       core.close();
     }
   });
 
-  it("replays only an exact already-committed source refresh topology", async () => {
+  it("replays an exact already-committed source supersession idempotently", async () => {
+    // File=concept (Phase 1): supersedeSourceChunkObservation's replay check is purely
+    // observation-pair-scoped now (no concept-level active_observation_id topology to compare —
+    // see the method's own docstring). A genuine crash-window replay (identical args, nothing
+    // else changed) must be a silent no-op; this also documents the one deliberate simplification
+    // versus the old CAS: because there is no concept-level pointer to protect any more, directly
+    // corrupting an observation's own bookkeeping back to "live" is no longer distinguishable from
+    // a fresh predecessor, so a retry in that exact shape just re-applies (and correctly
+    // reconverges) rather than rejecting — a narrower guarantee than before, but the one thing
+    // that actually mattered (never silently overwriting a DIFFERENT successor's claim) still
+    // holds, proven separately above ("uses the observation-pair CAS...").
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     try {
       const predecessor = await core.storeSource("Replay predecessor.", {
@@ -301,21 +349,22 @@ describe("source-pipeline core prerequisites", () => {
         attachTo: predecessor.conceptId, sourceRefs: [sourceRef],
         operationId: "source-a:binding-replay:fingerprint-b:snapshot-b",
       });
-      const activated = await core.refreshSourceConcept(
+      await core.supersedeSourceChunkObservation(
         predecessor.conceptId, successor.observationId, predecessor.observationId,
       );
-      const replay = await core.refreshSourceConcept(
+      const afterFirst = core
+        // @ts-expect-error test-only raw observation-state assertion
+        .db.prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`)
+        .get(predecessor.observationId) as { superseded_by: string | null; superseded_at: number | null };
+      // Exact replay (identical args, nothing else changed) is a silent no-op.
+      await core.supersedeSourceChunkObservation(
         predecessor.conceptId, successor.observationId, predecessor.observationId,
       );
-      expect(replay).toEqual(activated);
-
-      core
-        // @ts-expect-error test-only crash-topology corruption
-        .db.prepare(`UPDATE observations SET superseded_by=NULL,superseded_at=NULL WHERE id=?`)
-        .run(predecessor.observationId);
-      await expect(core.refreshSourceConcept(
-        predecessor.conceptId, successor.observationId, predecessor.observationId,
-      )).rejects.toThrow(/exact replay/);
+      const afterReplay = core
+        // @ts-expect-error test-only raw observation-state assertion
+        .db.prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`)
+        .get(predecessor.observationId) as { superseded_by: string | null; superseded_at: number | null };
+      expect(afterReplay).toEqual(afterFirst);
     } finally {
       core.close();
     }
@@ -341,7 +390,7 @@ describe("source-pipeline core prerequisites", () => {
 
       const retired = core.retireConcept(source.conceptId)!;
       expect(retired.status).toBe("retired");
-      await expect(core.refreshSourceConcept(source.conceptId, source.observationId, source.observationId)).rejects.toThrow("non-active source concept");
+      await expect(core.supersedeSourceChunkObservation(source.conceptId, source.observationId, source.observationId)).rejects.toThrow("non-active source concept");
       expect((await core.search("retire source retrieval")).map((c) => c.id)).not.toContain(source.conceptId);
       expect((await core.gather("retire source retrieval")).ranked.map((c) => c.id)).not.toContain(source.conceptId);
       expect(core.prewarm().topConcepts.map((c) => c.id)).not.toContain(source.conceptId);
@@ -376,7 +425,7 @@ describe("source-pipeline core prerequisites", () => {
     }
   });
 
-  it("documents the husk contract: a terminally-superseded source concept is unrefreshable until retireConcept cleans it up", async () => {
+  it("documents the husk contract: a terminally-superseded source observation cannot be reused, and new evidence does not revive the vestigial pointer", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     try {
       const source = await core.storeSource("Content to be deleted upstream.", {
@@ -385,11 +434,16 @@ describe("source-pipeline core prerequisites", () => {
       });
       core.supersedeObservation(source.observationId, null);
 
-      // refreshSourceConcept rejects outright: no active observation left to CAS against.
-      await expect(core.refreshSourceConcept(source.conceptId, source.observationId, source.observationId))
-        .rejects.toThrow("missing canonical identity or active observation state");
+      // File=concept (Phase 1): supersedeSourceChunkObservation rejects outright — the
+      // observation itself is already terminally superseded, so it cannot serve as either the
+      // successor or the predecessor of a fresh supersession.
+      await expect(core.supersedeSourceChunkObservation(source.conceptId, source.observationId, source.observationId))
+        .rejects.toThrow("already superseded");
 
-      // appendSourceObservation (new evidence attached via attachTo) does not revive the pointer.
+      // storeSourceChunk's attachTo path (new evidence attached to the still-active concept) does
+      // not touch active_observation_id — it is permanently vestigial once set at creation, never
+      // revived or reused by any write path (see classifyOperationOwnership/rollbackSourceRunBinding
+      // in source-ledger.ts for why it can no longer mean "the" current observation).
       await core.storeSource("New evidence arriving after the chunk was deleted.", {
         attachTo: source.conceptId,
         sourceRefs: [sourceRef],
@@ -408,7 +462,7 @@ describe("source-pipeline core prerequisites", () => {
     }
   });
 
-  it("rejects a successor replacement on a source observation — activation stays refreshSourceConcept's job", async () => {
+  it("rejects a successor replacement on a source observation — activation stays supersedeSourceChunkObservation's job", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     try {
       const first = await core.storeSource("Version one.", {
@@ -421,7 +475,7 @@ describe("source-pipeline core prerequisites", () => {
         operationId: "source-a:binding-a:fingerprint-v2:snapshot-v2",
       });
       expect(() => core.supersedeObservation(first.observationId, second.observationId))
-        .toThrow("source observations are superseded only by refreshSourceConcept activation");
+        .toThrow("source observations are superseded only by supersedeSourceChunkObservation activation");
     } finally {
       core.close();
     }

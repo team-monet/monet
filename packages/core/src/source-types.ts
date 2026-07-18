@@ -226,6 +226,13 @@ export interface SourceManifestFileInput {
   type: "file";
   contentHash: string;
   byteLength: number;
+  /**
+   * File=concept (ratified): the file's display title — frontmatter `title:` if present and
+   * non-blank, else the filename minus its extension (deriveSourceFileTitle, source-chunker.ts).
+   * Not part of computeSourceManifestHash (relativePath/type/contentHash only), so a title-only
+   * frontmatter edit is a content change the chunker/hash already reflects independently.
+   */
+  title: string;
 }
 
 /** Independent durable proof for an already-published sealed source tree. */
@@ -249,6 +256,9 @@ export interface SourceManifestChunkInput {
   headingPath: string[];
   occurrence: number;
   segmentIndex: number;
+  /** One-based emission order across the whole file, post-merge (source-chunker.ts). The file
+   *  concept's body reconstruction sorts its active chunk observations by this key. */
+  documentSequence: number;
   contentHash: string;
   ingestFingerprint: string;
   metadata: SourceChunkMetadata;

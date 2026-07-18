@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
 import { extractEntities, singularize } from "../extract-entities";
+import type { EmbeddingProvider } from "../embedding";
 
 describe("extractEntities", () => {
   it("pulls structural entities: identifiers, libs, paths, error codes", () => {
@@ -245,6 +246,82 @@ describe("codex-review fixes", () => {
       upgraded.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("rederiveNativeConceptGraph (cold-audit fix, MAJOR — model-swap graph consistency)", () => {
+  const pairKey = (x: string, y: string): string => [x, y].sort().join("~");
+  const relatedPairs = (core: MonetCore): Set<string> =>
+    new Set(core.edges({ type: "related" }).map((e) => pairKey(e.srcId, e.dstId)));
+
+  it("rebuilds related edges from the CURRENT embedding — reembedConcept alone leaves them stale, and the rebuild is deterministic", async () => {
+    // Fully controlled 2D vector space, keyed by (text, phase) so the SAME concept's body can
+    // legitimately answer differently at "old model" store-time vs "new model" reembedConcept-time
+    // — mirrors the migration script's own two-phase flow (embed everything under the old model,
+    // migrate, embed everything again under the new one) without needing a real second model.
+    let phase: "old" | "new" = "old";
+    const vectors: Record<string, Record<"old" | "new", [number, number]>> = {
+      "concept A body": { old: [1, 0], new: [1, 0] },
+      // B: related to A under the OLD model (cos ≈ 0.71, inside [edgeSimMin, tauAttach)),
+      // unrelated under the NEW one (orthogonal, cos = 0).
+      "concept B body": { old: [1, 1], new: [0, 1] },
+      // C: unrelated to A under the OLD model (opposite, cos = -1), related under the NEW one
+      // (cos ≈ 0.6, inside the same band) — proves the rebuild creates fresh edges, not just
+      // removes stale ones.
+      "concept C body": { old: [-1, 0], new: [0.6, 0.8] },
+    };
+    const embedder: EmbeddingProvider = {
+      dim: 2,
+      modelId: "edges-test-controlled",
+      embed: (text) => {
+        const [x, y] = vectors[text][phase];
+        const norm = Math.sqrt(x * x + y * y) || 1;
+        return new Float32Array([x / norm, y / norm]);
+      },
+    };
+    const core = new MonetCore(":memory:", { embedder, tauAttach: 0.95, tauAmbiguous: 0.85, edgeSimMin: 0.5, graphEnabled: true });
+    try {
+      const a = await core.store("concept A body", { resolution: "forceNew" });
+      const b = await core.store("concept B body", { resolution: "forceNew" });
+      const c = await core.store("concept C body", { resolution: "forceNew" });
+
+      // Sanity: under the OLD model, store()'s own write-time derivation already relates A-B, not A-C.
+      const beforeReembed = relatedPairs(core);
+      expect(beforeReembed.has(pairKey(a.conceptId, b.conceptId))).toBe(true);
+      expect(beforeReembed.has(pairKey(a.conceptId, c.conceptId))).toBe(false);
+
+      // Re-embed all three under the "new model" (mirrors the migration script's step 3).
+      phase = "new";
+      for (const id of [a.conceptId, b.conceptId, c.conceptId]) expect(await core.reembedConcept(id)).toBe(true);
+      // reembedConcept alone must NOT touch the graph — the stale A-B edge is still exactly there.
+      expect(relatedPairs(core)).toEqual(beforeReembed);
+
+      // Rebuild the graph for every re-embedded concept (mirrors the migration script's step 4) —
+      // must run only once every concept is already under the new model (all three re-embedded
+      // above) or this would score new-model A against still-old-model neighbors.
+      for (const id of [a.conceptId, b.conceptId, c.conceptId]) expect(core.rederiveNativeConceptGraph(id)).toBe(true);
+      const afterRebuild = relatedPairs(core);
+      expect(afterRebuild.has(pairKey(a.conceptId, b.conceptId))).toBe(false); // stale edge gone
+      expect(afterRebuild.has(pairKey(a.conceptId, c.conceptId))).toBe(true); // fresh edge created
+
+      // Determinism: rebuilding again from the same, now-settled state reproduces the identical edge set.
+      for (const id of [a.conceptId, b.conceptId, c.conceptId]) core.rederiveNativeConceptGraph(id);
+      expect(relatedPairs(core)).toEqual(afterRebuild);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("is a no-op for a retired or nonexistent concept, never leaving one mid-unwound", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      const stored = await core.store("some native concept to retire", { resolution: "forceNew" });
+      core.retireConcept(stored.conceptId);
+      expect(core.rederiveNativeConceptGraph(stored.conceptId)).toBe(false);
+      expect(core.rederiveNativeConceptGraph("does-not-exist")).toBe(false);
+    } finally {
+      core.close();
     }
   });
 });

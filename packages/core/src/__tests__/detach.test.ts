@@ -9,7 +9,9 @@
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
 import { BetterSqlitePort } from "../storage";
+import type { StoragePort } from "../storage";
 import { cosine } from "../embedding";
+import type { EmbeddingProvider } from "../embedding";
 
 /** Force all stores into separate concepts (no dedup interference). */
 function core(): MonetCore {
@@ -1126,5 +1128,53 @@ describe("detach — review-F2: possible_duplicate_of edge preservation", () => 
     )).toBe(false);
 
     c.close();
+  });
+});
+
+describe("detach — reembedConceptObservations closes the stale-vector reintroduction gap (round 4, Codex thread 11)", () => {
+  it("after a migration re-embeds a concept AND its observations, detach()'s new-concept path carries the NEW model's vector, not the old one", async () => {
+    // Two embedders producing DISTINGUISHABLE, fixed vectors — standing in for an old-model vs
+    // new-model swap (embedding-onnx.ts's default change) without depending on a real ONNX model.
+    const oldEmbedder: EmbeddingProvider = { dim: 4, modelId: "old-model", embed: async () => new Float32Array([1, 0, 0, 0]) };
+    const newEmbedder: EmbeddingProvider = { dim: 4, modelId: "new-model", embed: async () => new Float32Array([0, 1, 0, 0]) };
+
+    const c = new MonetCore(":memory:", { embedder: oldEmbedder, tauAttach: 1.1, tauAmbiguous: 1.1 });
+    try {
+      const a = await c.store("First fact under the old model.");
+      await c.store("Second fact under the old model.", { attachTo: a.conceptId });
+      const db = (c as unknown as { db: StoragePort }).db;
+      const beforeObs = db.prepare(`SELECT id,embedding FROM observations WHERE concept_id=?`).all(a.conceptId) as Array<{ id: string; embedding: string }>;
+      expect(beforeObs).toHaveLength(2);
+      for (const row of beforeObs) expect(JSON.parse(row.embedding)).toEqual([1, 0, 0, 0]);
+
+      // Simulate the migration script's model swap: a fresh MonetCore construction under the new
+      // embedder would be the real-world equivalent, but reembedConcept/reembedConceptObservations
+      // are instance methods keyed off `this.embedder` — swap it in place, matching how the
+      // migration script's own single long-lived embedder instance works.
+      (c as unknown as { embedder: EmbeddingProvider }).embedder = newEmbedder;
+      expect(await c.reembedConcept(a.conceptId)).toBe(true);
+      const touched = await c.reembedConceptObservations(a.conceptId);
+      expect(touched).toBe(2);
+
+      // Both the concept's own row AND every observation now carry the NEW model's vector.
+      const conceptRow = db.prepare(`SELECT embedding FROM concepts WHERE id=?`).get(a.conceptId) as { embedding: string };
+      expect(JSON.parse(conceptRow.embedding)).toEqual([0, 1, 0, 0]);
+      const afterObs = db.prepare(`SELECT id,embedding FROM observations WHERE concept_id=?`).all(a.conceptId) as Array<{ id: string; embedding: string }>;
+      for (const row of afterObs) expect(JSON.parse(row.embedding)).toEqual([0, 1, 0, 0]);
+
+      // THE REGRESSION: detach() (an ordinary, frequently-hit native-concept operation, unrelated
+      // to migration) creates its new destination concept directly from a MOVED observation's OWN
+      // embedding (engine.ts). Pre-fix, that observation's embedding was still [1,0,0,0] (the OLD
+      // model) even though this concept's own row had already been migrated to [0,1,0,0] — so the
+      // split would silently reintroduce an old-model vector into concepts.embedding, reopening
+      // the incompatible-space comparison the migration exists to close.
+      const obsId = beforeObs[0]!.id;
+      const result = await c.detach(a.conceptId, [obsId]);
+      expect(result.destAction).toBe("created");
+      const destRow = db.prepare(`SELECT embedding FROM concepts WHERE id=?`).get(result.destConceptId) as { embedding: string };
+      expect(JSON.parse(destRow.embedding)).toEqual([0, 1, 0, 0]);
+    } finally {
+      c.close();
+    }
   });
 });

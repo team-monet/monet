@@ -66,6 +66,27 @@ function rawConcept(core: MonetCore, conceptId: string): { body: string; status:
   return db.prepare(`SELECT body,status,active_observation_id FROM concepts WHERE id=?`).get(conceptId) as ReturnType<typeof rawConcept>;
 }
 
+/** Full concept-row read for recompute regression tests (review fix, BLOCKER): title/body/embedding
+ *  as they actually sit in the concepts table, not the ledger's own (always-correct) copy of chunk
+ *  content — this is what the reviewer's "assert on the concept row, not ledger chunks" tests need. */
+function rawConceptFull(core: MonetCore, conceptId: string): { title: string; body: string; embedding: string; status: string } {
+  const db = (core as unknown as { db: StoragePort }).db;
+  return db.prepare(`SELECT title,body,embedding,status FROM concepts WHERE id=?`).get(conceptId) as ReturnType<typeof rawConceptFull>;
+}
+
+/** True iff the embedding is the create-time all-zero placeholder (storeSourceChunk, engine.ts) —
+ *  i.e. recompute never actually ran for this concept. */
+function isPlaceholderEmbedding(embeddingJson: string): boolean {
+  const vector = JSON.parse(embeddingJson) as number[];
+  return vector.every((component) => component === 0);
+}
+
+function pendingRecomputeConceptIds(core: MonetCore, sourceId: string): string[] {
+  const db = (core as unknown as { db: StoragePort }).db;
+  return (db.prepare(`SELECT concept_id FROM source_recompute_pending WHERE source_id=?`).all(sourceId) as Array<{ concept_id: string }>)
+    .map((row) => row.concept_id);
+}
+
 function sourceAttemptState(core: MonetCore, sourceId: string) {
   const db = (core as unknown as { db: StoragePort }).db;
   const count = (table: string) => (db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE source_id=?`).get(sourceId) as { count: number }).count;
@@ -164,6 +185,161 @@ describe("repo-md committed-HEAD sync", () => {
       expect(f.core.listSourceCleanupItems(secondResult.runId!)).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "retire-absent", bindingId: first.bindingId }),
       ]));
+    } finally { f.cleanup(); }
+  });
+
+  it("resolves one target concept for a renamed multi-heading file when the same run also adds and drops a heading (item 5, fileConceptThisRun upfront resolution)", async () => {
+    const f = fixture("rename-restructure-same-run");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      // "One" dominates the file's bytes (~97%) so Git's default 50% rename-similarity threshold
+      // reliably fires even though "Two" is dropped and "Three" is new in the same commit.
+      const stableBig = "stable line for rename similarity\n".repeat(200);
+      const smallSection = "y".repeat(220);
+      f.commit(`# One\n\n${stableBig}\n# Two\n\n${smallSection}`, "two-section source");
+      const firstResult = await f.core.syncRepoMdSource("repo-source");
+      const first = f.core.listSourceChunks(firstResult.runId!, true);
+      expect(first).toHaveLength(2);
+      const firstOne = first.find((chunk) => chunk.headingPath[0] === "One")!;
+      const firstTwo = first.find((chunk) => chunk.headingPath[0] === "Two")!;
+      // file=concept: two headings of one file already share one concept before the rename.
+      expect(firstOne.conceptId).toBe(firstTwo.conceptId);
+
+      git(f.repo, "mv", "README.md", "GUIDE.md");
+      writeFileSync(join(f.repo, "GUIDE.md"), `# One\n\n${stableBig}\n# Three\n\n${smallSection}new`);
+      git(f.repo, "add", "GUIDE.md"); git(f.repo, "commit", "-m", "rename and restructure in one run");
+      const secondResult = await f.core.syncRepoMdSource("repo-source");
+      const second = f.core.listSourceChunks(secondResult.runId!, true);
+      expect(second).toHaveLength(2);
+      const secondOne = second.find((chunk) => chunk.headingPath[0] === "One")!;
+      const secondThree = second.find((chunk) => chunk.headingPath[0] === "Three")!;
+
+      // "One" is Git-proven unchanged content: its binding and concept both carry across the rename.
+      expect(secondOne.bindingId).toBe(firstOne.bindingId);
+      expect(secondOne.conceptId).toBe(firstOne.conceptId);
+      expect(secondOne.relativePath).toBe("GUIDE.md");
+
+      // "Three" is a brand-new heading with no binding history of its own, staged in the SAME run
+      // as "One"'s carry-forward. It must still resolve to "One"'s (carried) concept, not mint a
+      // separate one — proof that fileConceptThisRun resolves a file's target concept from its
+      // whole staged chunk set upfront, so a sibling's carried identity is visible even to a chunk
+      // that individually has neither a viaBinding match nor any prior-run history.
+      expect(secondThree.bindingId).not.toBe(firstTwo.bindingId);
+      expect(secondThree.conceptId).toBe(firstOne.conceptId);
+      expect(secondThree.relativePath).toBe("GUIDE.md");
+
+      // "Two" is gone: retired via retire-absent, without disturbing the surviving concept.
+      expect(f.core.listSourceCleanupItems(secondResult.runId!)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "retire-absent", bindingId: firstTwo.bindingId }),
+      ]));
+      const body = rawConcept(f.core, firstOne.conceptId!).body;
+      expect(body).toContain("new");
+      expect(body).toContain(stableBig.trim());
+    } finally { f.cleanup(); }
+  });
+
+  it("heals a pre-migration split (two headings of one file on two separate legacy concepts) on the next real sync (item 5, legacy-consolidation regression)", async () => {
+    // Reproduces the exact shape of the historical one-concept-per-chunk store: before file=concept
+    // existed, two headings of ONE file could legitimately sit on two DIFFERENT `kind:source`
+    // concepts. That state can't be reached through today's syncRepoMdSource (fileConceptThisRun
+    // always consolidates from the first sync onward) — so this test builds a real, fully
+    // consolidated two-heading file first, then hand-splits it back apart at the row level to
+    // stand in for the pre-migration starting state, then proves a REAL next sync heals it: this
+    // caught a genuine bug (a store-wide dry-run against real accumulated data hit it first) where
+    // (a) source-ledger.ts's validateDurableEngineReceipt rejected a binding whose new concept
+    // differed from its own last-known concept, and (b) materializeStagedBindings always paired a
+    // predecessor observation through supersedeSourceChunkObservation's same-concept CAS even when
+    // the predecessor's own concept was about to be abandoned in favor of a sibling's.
+    const f = fixture("legacy-split-heal");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const bigOne = "content unique to heading one\n".repeat(80);
+      const bigTwo = "content unique to heading two\n".repeat(80);
+      f.commit(`# One\n\n${bigOne}\n# Two\n\n${bigTwo}`, "two-section source");
+      const firstResult = await f.core.syncRepoMdSource("repo-source");
+      const first = f.core.listSourceChunks(firstResult.runId!, true);
+      expect(first).toHaveLength(2);
+      const one = first.find((chunk) => chunk.headingPath[0] === "One")!;
+      const two = first.find((chunk) => chunk.headingPath[0] === "Two")!;
+      const consolidatedConceptId = one.conceptId!;
+      expect(two.conceptId).toBe(consolidatedConceptId); // file=concept: already unified today
+
+      // Hand-split: clone the concept row under a new id ("legacy concept B"), then repoint
+      // "Two"'s currently active chunk row and its observation onto it — simulating a store that
+      // predates file=concept, where "Two" never shared "One"'s concept in the first place.
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      const legacyId = "legacy-concept-b";
+      const original = db.prepare(`SELECT * FROM concepts WHERE id=?`).get(consolidatedConceptId) as Record<string, unknown>;
+      const columns = Object.keys(original);
+      db.prepare(
+        `INSERT INTO concepts (${columns.join(",")}) VALUES (${columns.map((c) => `@${c}`).join(",")})`,
+      ).run({ ...original, id: legacyId });
+      db.prepare(`UPDATE source_chunks SET concept_id=? WHERE run_id=? AND binding_id=?`).run(legacyId, firstResult.runId, two.bindingId);
+      db.prepare(`UPDATE observations SET concept_id=? WHERE id=?`).run(legacyId, two.observationId);
+      expect(f.core.hasActiveSourceChunks(legacyId)).toBe(true);
+      expect(f.core.hasActiveSourceChunks(consolidatedConceptId)).toBe(true); // "One" is still there
+
+      // A real next sync: only "Two"'s content changes, so "One" stays untouched (skipped) while
+      // "Two" goes through the real intent/write/supersede path — exactly the shape that crashed.
+      f.commit(`# One\n\n${bigOne}\n# Two\n\n${bigTwo}edited`, "edit heading two only");
+      const secondResult = await f.core.syncRepoMdSource("repo-source");
+      expect(secondResult.status).toBe("published");
+      const second = f.core.listSourceChunks(secondResult.runId!, true);
+      expect(second).toHaveLength(2);
+      const secondOne = second.find((chunk) => chunk.headingPath[0] === "One")!;
+      const secondTwo = second.find((chunk) => chunk.headingPath[0] === "Two")!;
+
+      // Both headings converge back onto the ORIGINAL (surviving, unchanged) concept — never the
+      // legacy split-off one, and never a freshly minted third concept.
+      expect(secondOne.conceptId).toBe(consolidatedConceptId);
+      expect(secondTwo.conceptId).toBe(consolidatedConceptId);
+
+      // The legacy concept is now a genuine orphan: zero active chunks, ready for a one-time sweep
+      // to retire it (never automatically retired mid-sync — that decision needs the store-wide
+      // "is this concept's last chunk really gone" check the migration script performs).
+      expect(f.core.hasActiveSourceChunks(legacyId)).toBe(false);
+      expect(f.core.hasActiveSourceChunks(consolidatedConceptId)).toBe(true);
+
+      const body = rawConcept(f.core, consolidatedConceptId).body;
+      expect(body).toContain(bigOne.trim());
+      expect(body).toContain(bigTwo);
+      expect(body).toContain("edited");
+    } finally { f.cleanup(); }
+  });
+
+  it("stores an observation's content byte-exact, including trailing spaces a full trim would remove (storeSourceChunk regression)", async () => {
+    // A store-wide dry-run against real accumulated data (a copy-pasted chat transcript, in
+    // particular) hit this: source-chunker.ts's segmentSection strips trailing BLANK LINES and a
+    // trailing newline run, but deliberately nothing narrower — trailing spaces on an otherwise
+    // real last line survive into the chunk's content. storeSourceChunk (engine.ts) used to store
+    // content.trim() for the observation row, silently dropping those spaces — divergent from the
+    // exact bytes source-ledger.ts staged and hashed, which source-ledger.ts's
+    // validateDurableEngineReceipt then rejected as "observation content does not match the staged
+    // normalized content". This proves a section with meaningful trailing whitespace survives a
+    // real sync intact, byte-for-byte, in the actual observations row (not just the ledger's own
+    // copy — recomputeSourceConceptBody reads from source_chunks, which was never affected; this
+    // guards the observation row specifically).
+    const f = fixture("trailing-whitespace-content");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const filler = "padding line to clear the minimum-chunk merge floor\n".repeat(6);
+      // Three trailing spaces after "here", before EOF — no trailing newline, so segmentSection's
+      // trailing-newline strip cannot remove them either.
+      f.commit(`# Notes\n\n${filler}\nsome content here   `, "trailing whitespace in last line");
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("published");
+      const chunks = f.core.listSourceChunks(result.runId!, true);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0].content.endsWith("some content here   ")).toBe(true);
+
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      const observation = db.prepare(`SELECT content FROM observations WHERE id=?`).get(chunks[0].observationId) as { content: string };
+      // The observation's OWN stored content — not just the ledger's copy — must be byte-exact.
+      expect(observation.content).toBe(chunks[0].content);
+      expect(observation.content.endsWith("some content here   ")).toBe(true);
+
+      const body = rawConcept(f.core, chunks[0].conceptId!).body;
+      expect(body.endsWith("some content here   ")).toBe(true);
     } finally { f.cleanup(); }
   });
 
@@ -521,6 +697,181 @@ describe("repo-md committed-HEAD sync", () => {
     });
   }
 
+  it("recovers an engine-written binding whose predecessor belongs to a DIFFERENT concept during removal recovery (round 4, Codex thread 6)", async () => {
+    // Mirrors materializeStagedBindings' own cross-concept branch (the legacy-split-heal test
+    // above), but for reconcileExistingStagedBindings — the parallel path removal recovery takes
+    // for a binding stranded in "engine-written" state. Pre-fix this called the same-concept CAS
+    // (supersedeSourceChunkObservation) unconditionally, which throws when the predecessor
+    // belongs to a different concept than the just-written successor — wedging removal on exactly
+    // the binding recovery exists to unblock.
+    const f = fixture("removed-cross-concept-predecessor");
+    try {
+      // Each section body must clear MIN_SOURCE_SECTION_BYTES (200) or the minimum-chunk merge
+      // pass folds Alpha and Zulu into one chunk and this test's two-chunks premise breaks.
+      const alphaBody = "alpha padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const zuluBody = "zulu padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const zuluBodyEdited = "zulu EDITED padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      f.commit(`# Alpha\n\n${alphaBody}\n\n# Zulu\n\n${zuluBody}\n`, "two sections");
+      await f.core.syncRepoMdSource("repo-source");
+      const activeBefore = f.core.getSource("repo-source")!;
+      const chunksBefore = f.core.listSourceChunks(activeBefore.activeRunId!, true);
+      const alpha = chunksBefore.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Alpha"]))!;
+      const zulu = chunksBefore.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Zulu"]))!;
+      expect(alpha.conceptId).toBe(zulu.conceptId); // sanity: file=concept, one concept for both
+
+      // Simulate a legacy (pre-consolidation) shape: Zulu's chunk sits on its own separate concept.
+      const legacy = await f.core.storeSource("legacy standalone chunk content", {
+        circle: "repo", sourceRefs: [zulu.sourceRef], resolution: "forceNew",
+      });
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_chunks SET concept_id = ? WHERE run_id = ? AND binding_id = ?`)
+        .run(legacy.conceptId, activeBefore.activeRunId, zulu.bindingId);
+      db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(legacy.conceptId, zulu.observationId);
+
+      // Change ONLY Zulu's content — Alpha stays byte-identical and sorts first, so
+      // fileConceptThisRun resolves via Alpha's own prior (the ORIGINAL concept). Zulu's binding
+      // then engine-writes its successor under the ORIGINAL concept while its OWN predecessor
+      // observation (moved above) still belongs to the legacy concept — the exact cross-concept
+      // shape. Faulting right after "after-engine-written" strands it there, before the
+      // supersession call (whichever branch) would normally run.
+      f.commit(`# Alpha\n\n${alphaBody}\n\n# Zulu\n\n${zuluBodyEdited}\n`, "edit zulu only");
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-engine-written" && !fired) { fired = true; throw new Error("crash before refresh"); } },
+      })).rejects.toThrow("crash before refresh");
+      const stranded = f.core.resumeSourceRun("repo-source")!;
+      expect(stranded.state).toBe("staging");
+      const strandedZulu = f.core.listSourceChunks(stranded.id).find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Zulu"]))!;
+      expect(strandedZulu.writeState).toBe("engine-written");
+      expect(strandedZulu.conceptId).toBe(alpha.conceptId); // wrote to the ORIGINAL/winning concept
+      expect(strandedZulu.predecessorObservationId).toBe(zulu.observationId); // predecessor still on the LEGACY concept
+
+      // Tombstone the source while stuck mid-staging — recovery must reconcile this binding, not
+      // throw and wedge removal.
+      expect(f.core.removeSource("repo-source")!.lifecycle).toBe("tombstoned");
+      const recovered = await f.core.syncRepoMdSource("repo-source");
+      expect(recovered).toMatchObject({ status: "removed" });
+      expect(f.core.resumeSourceRun("repo-source")).toBeNull();
+      expect(rawConcept(f.core, alpha.conceptId!)).toMatchObject({ status: "retired" });
+    } finally { f.cleanup(); }
+  });
+
+  it("keeps a legacy predecessor's content authorized-readable through the entire staging window of its own consolidation (round 5, Codex thread R5-4)", async () => {
+    // The exact gap: materializeStagedBindings used to terminally supersede a cross-concept
+    // predecessor's observation EAGERLY, mid-materialize — well before this run durably publishes
+    // (source.active_run_id still points at the PRIOR run for the entire staging window).
+    // queryAuthorizedSourcePublications joins against source.active_run_id, so an eagerly-killed
+    // predecessor's still-genuinely-published content went invisible to every authorized read
+    // (memory_fetch/search/gather) for as long as staging took — permanently if the run then
+    // aborted before publishing. Fixed by deferring the retirement to publishRun itself (the
+    // transaction that actually advances active_run_id) instead of doing it at materialize time.
+    const f = fixture("legacy-predecessor-visibility");
+    try {
+      const alphaBody = "alpha padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const zuluBody = "zulu padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const zuluBodyEdited = "zulu EDITED padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      f.commit(`# Alpha\n\n${alphaBody}\n\n# Zulu\n\n${zuluBody}\n`, "two sections");
+      await f.core.syncRepoMdSource("repo-source");
+      const activeBefore = f.core.getSource("repo-source")!;
+      const chunksBefore = f.core.listSourceChunks(activeBefore.activeRunId!, true);
+      const zulu = chunksBefore.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Zulu"]))!;
+
+      const legacy = await f.core.storeSource("legacy standalone chunk content", {
+        circle: "repo-source", sourceRefs: [zulu.sourceRef], resolution: "forceNew",
+      });
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_chunks SET concept_id = ? WHERE run_id = ? AND binding_id = ?`)
+        .run(legacy.conceptId, activeBefore.activeRunId, zulu.bindingId);
+      db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(legacy.conceptId, zulu.observationId);
+      // Sanity: authorized before the consolidating sync even starts.
+      expect(await f.core.getConcept(legacy.conceptId, { sourceAuthorizationContext: { callerId: "caller", projectId: "project" } })).not.toBeNull();
+
+      // A THIRD sync edits Zulu only, resolving fileConceptThisRun via Alpha's own (unchanged,
+      // sorts-first) prior concept — the winning target — while Zulu's predecessor observation
+      // (moved above) still belongs to the legacy concept. Fault right after materialize commits
+      // this exact binding — pre-fix, this is the EXACT point the predecessor used to die.
+      f.commit(`# Alpha\n\n${alphaBody}\n\n# Zulu\n\n${zuluBodyEdited}\n`, "edit zulu only");
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-committed" && !fired) { fired = true; throw new Error("crash after materialize commits zulu"); } },
+      })).rejects.toThrow("crash after materialize commits zulu");
+
+      // The run has NOT published — source.active_run_id is still the FIRST run.
+      const stillStaging = f.core.getSource("repo-source")!;
+      expect(stillStaging.activeRunId).toBe(activeBefore.activeRunId);
+      const resumable = f.core.resumeSourceRun("repo-source")!;
+      expect(resumable.state).toBe("staging");
+
+      // THE KEY ASSERTION: the legacy concept's content is STILL authorized-readable — not a
+      // visibility gap where neither the old nor the new copy is readable.
+      expect(await f.core.getConcept(legacy.conceptId, { sourceAuthorizationContext: { callerId: "caller", projectId: "project" } })).not.toBeNull();
+      expect((await f.core.search("legacy standalone", { circle: "repo-source", sourceAuthorizationContext: { callerId: "caller", projectId: "project" } })).map((r) => r.id)).toContain(legacy.conceptId);
+
+      // Resuming and letting it publish converges cleanly: the legacy concept's chunk is no
+      // longer active (publishRun's own bulk sweep + the new cross-concept retirement both fire
+      // atomically in the SAME transaction that advances active_run_id).
+      const recovered = await f.core.syncRepoMdSource("repo-source");
+      expect(recovered.status).toBe("published");
+      expect(f.core.hasActiveSourceChunks(legacy.conceptId)).toBe(false);
+    } finally { f.cleanup(); }
+  });
+
+  it("recovers cleanly from a crash mid-drain during tombstoned removal of a cross-concept binding, without a durable half-applied state (round 5, Codex thread R5-6)", async () => {
+    // Round 4's fix deferred the cross-concept predecessor's chunk-lifecycle flip to an in-memory
+    // list applied AFTER drainCleanup finished — a crash between drainCleanup acknowledging its
+    // cleanup items and that list being applied lost the list for good, leaving a chunk
+    // permanently pointing at a dead observation with nothing durable left to heal it, wedging
+    // every future removal attempt (beginRemoval's exact-ownership check would throw forever).
+    // Round 5 closes this by never creating anything that needs a durable-vs-in-memory distinction
+    // in the first place: a cross-concept predecessor during removal recovery is left completely
+    // untouched (see reconcileExistingStagedBindings' own docstring) — there is nothing to lose.
+    const f = fixture("removed-cross-concept-crash-mid-drain");
+    try {
+      const alphaBody = "alpha padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const zuluBody = "zulu padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const zuluBodyEdited = "zulu EDITED padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      f.commit(`# Alpha\n\n${alphaBody}\n\n# Zulu\n\n${zuluBody}\n`, "two sections");
+      await f.core.syncRepoMdSource("repo-source");
+      const activeBefore = f.core.getSource("repo-source")!;
+      const chunksBefore = f.core.listSourceChunks(activeBefore.activeRunId!, true);
+      const alpha = chunksBefore.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Alpha"]))!;
+      const zulu = chunksBefore.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Zulu"]))!;
+
+      const legacy = await f.core.storeSource("legacy standalone chunk content", {
+        circle: "repo-source", sourceRefs: [zulu.sourceRef], resolution: "forceNew",
+      });
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_chunks SET concept_id = ? WHERE run_id = ? AND binding_id = ?`)
+        .run(legacy.conceptId, activeBefore.activeRunId, zulu.bindingId);
+      db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(legacy.conceptId, zulu.observationId);
+
+      f.commit(`# Alpha\n\n${alphaBody}\n\n# Zulu\n\n${zuluBodyEdited}\n`, "edit zulu only");
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-engine-written" && !fired) { fired = true; throw new Error("crash before refresh"); } },
+      })).rejects.toThrow("crash before refresh");
+      expect(f.core.resumeSourceRun("repo-source")!.state).toBe("staging");
+
+      // Tombstone, then crash a SECOND time — this time mid-drainCleanup, right after its cleanup
+      // item(s) are acknowledged (the exact crash window R5-6 named: after ack, before whatever
+      // would apply the compensating chunk-lifecycle flip).
+      expect(f.core.removeSource("repo-source")!.lifecycle).toBe("tombstoned");
+      let firedDrain = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-cleanup" && !firedDrain) { firedDrain = true; throw new Error("crash mid-drain"); } },
+      })).rejects.toThrow("crash mid-drain");
+
+      // The run is left in whatever state drainCleanup's own crash-recovery already guarantees —
+      // the load-bearing assertion is what happens NEXT: a third attempt must fully converge, not
+      // wedge on a stale (chunk, observation) inconsistency beginRemoval would reject forever.
+      const recovered = await f.core.syncRepoMdSource("repo-source");
+      expect(recovered).toMatchObject({ status: "removed" });
+      expect(f.core.resumeSourceRun("repo-source")).toBeNull();
+      expect(rawConcept(f.core, alpha.conceptId!)).toMatchObject({ status: "retired" });
+      expect(rawConcept(f.core, legacy.conceptId)).toMatchObject({ status: "retired" });
+    } finally { f.cleanup(); }
+  });
+
   it("aborts a removed scanning run without scanning or creating evidence", async () => {
     const f = fixture("removed-scanning");
     try {
@@ -793,6 +1144,74 @@ describe("repo-md committed-HEAD sync", () => {
     } finally { f.cleanup(); }
   });
 
+  it("carries a pre-upgrade file forward with a derived title and document-order-correct chunk sequence (round 5, Codex threads R5-1, R5-2)", async () => {
+    // Shared fixture for both threads: a store that predates the title/document_sequence columns
+    // backfills every existing source_files/source_chunks row to title='' / document_sequence=1
+    // (schema-upgrade defaults, source-ledger.ts's ensureSchema) — simulated here directly, since
+    // reproducing an ACTUAL pre-upgrade schema would mean running old code. If one of those
+    // pre-upgrade files is skip-diagnosed on its first sync after the upgrade, planManifest's
+    // carry-forward path picks up those exact backfilled placeholder values verbatim — but the
+    // skip must be one the materializer's OWN pre-seal carry-forward cannot rescue (it copies
+    // bytes from the prior snapshot at the SAME path, which would let the scanner re-scan it
+    // fresh and never actually reach planManifest's carriedFiles/carriedChunks at all). A rename
+    // whose DESTINATION is corrupted (same technique as the existing "blocker 2 regression" test)
+    // has no same-path prior snapshot to rescue from, so it genuinely stays skip-diagnosed.
+    // Sections are named in REVERSE alphabetical document order (Zebra before Apple) specifically
+    // so a lexicographic tie-break (what an all-tied document_sequence falls back to) would
+    // visibly reorder the reconstructed body relative to the real document order — a same-order
+    // pair could pass by coincidence even with the bug present.
+    const f = fixture("pre-upgrade-carry");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const zebraBody = "zebra padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const appleBody = "apple padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      f.commit(`# Zebra\n\n${zebraBody}\n\n# Apple\n\n${appleBody}\n`, "two sections, reverse-alphabetical document order");
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const conceptId = f.core.listSourceChunks(first.runId!, true)[0]!.conceptId!;
+      const before = rawConcept(f.core, conceptId).body;
+      // Sanity: real document order is Zebra-then-Apple, and it differs from the lexicographic
+      // (Apple-before-Zebra) order this test is designed to catch a regression toward.
+      expect(before.indexOf("zebra padding")).toBeLessThan(before.indexOf("apple padding"));
+
+      // Simulate the pre-upgrade backfill directly on this run's own rows.
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_files SET title='' WHERE run_id=?`).run(first.runId);
+      db.prepare(`UPDATE source_chunks SET document_sequence=1 WHERE run_id=?`).run(first.runId);
+
+      // Rename README.md -> NEW.md and, in the SAME commit, append one invalid UTF-8 byte: the
+      // destination never reaches scan.files (it's skip-diagnosed, not scanned) and has no
+      // same-path prior snapshot for the materializer to rescue from, so it genuinely stays
+      // skip-diagnosed — the ONLY path to a valid next publication is carry-forward picking up
+      // the backfilled placeholder rows directly.
+      const original = readFileSync(join(f.repo, "README.md"));
+      git(f.repo, "mv", "README.md", "NEW.md");
+      writeFileSync(join(f.repo, "NEW.md"), Buffer.concat([original, Buffer.from([0x80])]));
+      git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "rename into invalid utf-8");
+
+      // REVIEW FIX (round 5, Codex thread R5-1): pre-fix, this threw "file.title must be a
+      // nonempty string" — carrying the backfilled '' title verbatim into validateManifest.
+      const carried = await f.core.syncRepoMdSource("repo-source");
+      expect(carried.status).toBe("published");
+      expect(f.core.listSourceSkippedFiles(carried.runId!).map((row) => row.relativePath)).toEqual(["NEW.md"]);
+      const carriedFile = db.prepare(`SELECT title FROM source_files WHERE run_id=? AND relative_path='NEW.md'`).get(carried.runId) as { title: string };
+      expect(carriedFile.title.length).toBeGreaterThan(0);
+      expect(carriedFile.title).toBe("NEW"); // deriveSourceFileTitle's own basename fallback
+
+      // REVIEW FIX (round 5, Codex thread R5-2): the carried chunks all carry document_sequence=1
+      // verbatim pre-fix — recomputeSourceConceptBody's ORDER BY document_sequence then ties, and
+      // SQLite's own fallback tie-break reorders the two sections away from document order.
+      // Recompute is forced directly here since these carried chunks are otherwise 'skipped'
+      // (unchanged content) and would not trigger recomputeTouchedSourceConcepts on their own —
+      // the load-bearing claim is about the PERSISTED, carried document_sequence values
+      // themselves, independent of when a recompute happens to run.
+      await f.core.recomputeSourceConceptBody(conceptId);
+      const after = rawConcept(f.core, conceptId).body;
+      expect(after).toContain("zebra padding");
+      expect(after).toContain("apple padding");
+      expect(after.indexOf("zebra padding")).toBeLessThan(after.indexOf("apple padding"));
+    } finally { f.cleanup(); }
+  });
+
   it("aborts tree-level partial scans without writes or inferred deletion (gate regression)", async () => {
     const f = fixture("tree-partial");
     try {
@@ -966,6 +1385,62 @@ describe("repo-md committed-HEAD sync", () => {
       expect(healedChunk.conceptId).toBe(active.conceptId);
       expect(healedChunk.predecessorObservationId).toBe(carried!.observationId);
       expect(rawConcept(f.core, active.conceptId!).body).toContain("healed after rename");
+    } finally { f.cleanup(); }
+  });
+
+  it("rebuilds a renamed carry's sourceRef from the recomputed canonical rank, not a gapped raw occurrence (review fix, MINOR)", async () => {
+    // The minimum-chunk merge pass (item 8) can leave a heading-anchor group's raw occurrence
+    // values sparse: three "Notes" sections (occurrence 1/2/3), the first undersized, merges
+    // FORWARD into the second (mergeUndersizedSections, source-chunker.ts) — the surviving group
+    // is occurrence {2,3}, not {1,2,3}. computeSourceRefOccurrences' canonical rank is always
+    // DENSE by sorted order within the group (source-chunker.ts), so it renumbers this gapped
+    // group to ranks {1,2} — no longer equal to the raw occurrence column. A renamed carry (case
+    // (c): the destination is itself skip-diagnosed this run, so it never reaches scan.files and
+    // must be carried under its new path) used to rebuild sourceRef straight from the raw
+    // occurrence value, which validateManifest's own independent canonical-rank recomputation
+    // (source-ledger.ts) then rejected as a mismatch.
+    const f = fixture("renamed-carry-gapped-occurrence");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const big2 = "second Notes section content padded well past the merge floor\n".repeat(5);
+      const big3 = "third Notes section content padded well past the merge floor\n".repeat(5);
+      f.commit(`# Notes\ntiny\n# Notes\n${big2}\n# Notes\n${big3}`, "three Notes sections, first undersized");
+      const initial = await f.core.syncRepoMdSource("repo-source");
+      expect(initial.status).toBe("published");
+      const firstChunks = f.core.listSourceChunks(initial.runId!, true);
+      // Confirms the merge pass actually produced the gapped shape this test exercises: two
+      // surviving "Notes" chunks, canonical-ranked {1,2} on the FIRST (non-carry) publish already.
+      expect(firstChunks).toHaveLength(2);
+      const sortedFirst = [...firstChunks].sort((a, b) => a.sourceRef.localeCompare(b.sourceRef));
+      expect(sortedFirst.map((chunk) => chunk.sourceRef)).toEqual([
+        "source://repo-source/README.md#notes~1", "source://repo-source/README.md#notes~2",
+      ]);
+      const firstConceptId = firstChunks[0]!.conceptId!;
+
+      // Rename into a skip (blocker 2 shape): the destination never reaches scan.files, so it must
+      // be carried, exercising the sourceRef-rebuild code this test targets.
+      const original = readFileSync(join(f.repo, "README.md"));
+      git(f.repo, "mv", "README.md", "NEW.md");
+      writeFileSync(join(f.repo, "NEW.md"), Buffer.concat([original, Buffer.from([0x80])]));
+      git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "rename into invalid utf-8");
+
+      const renamed = await f.core.syncRepoMdSource("repo-source");
+      // Pre-fix, this threw "chunk.sourceRef occurrence does not match its canonical heading
+      // identity" the instant staging tried to rebuild these refs from the raw (gapped) occurrence.
+      expect(renamed.status).toBe("published");
+      const carriedChunks = f.core.listSourceChunks(renamed.runId!, true);
+      expect(carriedChunks).toHaveLength(2);
+      expect(carriedChunks.every((chunk) => chunk.relativePath === "NEW.md")).toBe(true);
+      expect(carriedChunks.every((chunk) => chunk.conceptId === firstConceptId)).toBe(true);
+      const sortedCarried = [...carriedChunks].sort((a, b) => a.sourceRef.localeCompare(b.sourceRef));
+      // The canonical rank survives the rename intact — {1,2}, never the raw {2,3} occurrence.
+      expect(sortedCarried.map((chunk) => chunk.sourceRef)).toEqual([
+        "source://repo-source/NEW.md#notes~1", "source://repo-source/NEW.md#notes~2",
+      ]);
+      const body = rawConcept(f.core, firstConceptId).body;
+      expect(body).toContain("tiny");
+      expect(body).toContain(big2.trim());
+      expect(body).toContain(big3.trim());
     } finally { f.cleanup(); }
   });
 
@@ -1522,7 +1997,16 @@ describe("repo-md committed-HEAD sync", () => {
     } finally { f.cleanup(); }
   });
 
-  for (const point of ["after-store", "after-engine-written", "after-refresh", "after-committed", "after-publish", "after-current"] as RepoMdSyncFaultPoint[]) {
+  for (const point of [
+    "after-store", "after-engine-written", "after-refresh", "after-committed", "after-publish", "after-current",
+    // REVIEW FIX (BLOCKER): "after-publish" already lands exactly in the crash window the review
+    // found (a durable publish committed, recompute not yet run) — "after-recompute" additionally
+    // proves recovery is clean when the crash happens just past a successful recompute. Both now
+    // get the concept-row assertions below, which is what actually exercises the fix: the
+    // pre-existing ledger-chunk assertion alone was blind to this bug (the ledger's own copy of
+    // chunk content was always correct — only the concept row could go stale/empty).
+    "after-recompute",
+  ] as RepoMdSyncFaultPoint[]) {
     it(`resumes exactly after ${point}`, async () => {
       const f = fixture(point);
       try {
@@ -1540,10 +2024,235 @@ describe("repo-md committed-HEAD sync", () => {
         expect(resolve(dirname(current), readlinkSync(current))).toBe(join(
           f.storage, "repo-md", "repo-source", "snapshots", `${source.activeSnapshotId!}-${source.activeIngestConfigHash!.slice(-64)}`,
         ));
-        expect(f.core.listSourceChunks(source.activeRunId!, true)[0]!.content).toContain(`${point} body`);
+        const chunk = f.core.listSourceChunks(source.activeRunId!, true)[0]!;
+        expect(chunk.content).toContain(`${point} body`);
+        // REVIEW FIX (BLOCKER): the concept row itself, not just the ledger's own copy of the
+        // content — this is what a stranded concept (recompute skipped past its crash-fenced
+        // envelope) would fail on: empty/stale body, placeholder title, all-zero embedding.
+        const concept = rawConceptFull(f.core, chunk.conceptId!);
+        expect(concept.status).toBe("active");
+        expect(concept.body).toContain(`${point} body`);
+        expect(concept.title).toBe("README");
+        expect(isPlaceholderEmbedding(concept.embedding)).toBe(false);
+        expect(pendingRecomputeConceptIds(f.core, "repo-source")).toEqual([]);
       } finally { f.cleanup(); }
     });
   }
+
+  it("aborts a version-stale 'scanning' run instead of wedging on every retry (round 4, Codex thread 15)", async () => {
+    // A live "scanning" run whose scanConfigVersion/ingestConfigHash were persisted under an
+    // OLDER SOURCE_SCANNER_VERSION/SOURCE_CHUNKER_VERSION than what's currently live — the exact
+    // shape of a process restarting under upgraded code with a run still in flight. Simulated by
+    // stranding a real "scanning" run, then rewriting BOTH persisted fields together (computing
+    // just one and leaving the other consistent with the CURRENT version is not a real state a
+    // version bump would ever produce). Pre-fix, this reproduced Codex's claim exactly: EVERY
+    // subsequent sync attempt threw "chunk.ingestFingerprint does not match chunk content,
+    // heading, metadata, and ingest config" — resumeSourceRun keeps handing back the SAME stuck
+    // run, so nothing ever recovers.
+    const f = fixture("version-stale-scanning-resume");
+    try {
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-begin" && !fired) { fired = true; throw new Error("stranded mid-scan"); } },
+      })).rejects.toThrow("stranded mid-scan");
+      const stranded = f.core.resumeSourceRun("repo-source")!;
+      expect(stranded.state).toBe("scanning");
+
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      const staleVersion = "OLD-SCANNER-v1/OLD-CHUNKER-v2";
+      const staleHash = `monet-src-ingest-config/v1:sha256:${"0".repeat(64)}`;
+      db.prepare(`UPDATE source_sync_runs SET scan_config_version=?, ingest_config_hash=? WHERE id=?`).run(staleVersion, staleHash, stranded.id);
+      db.prepare(`UPDATE source_snapshots SET ingest_config_hash=? WHERE run_id=?`).run(staleHash, stranded.id);
+
+      // The fix: this resolves cleanly on the very next attempt (the stale run is aborted and a
+      // fresh one takes over), not just "eventually" after repeated failures.
+      const recovered = await f.core.syncRepoMdSource("repo-source");
+      expect(recovered.status).toBe("published");
+      expect(recovered.runId).not.toBe(stranded.id); // a genuinely NEW run, not the stale one continued
+
+      // A second, later sync sees a healthy steady state — no wedge, no repeated failure.
+      const again = await f.core.syncRepoMdSource("repo-source");
+      expect(again.status).toBe("noop");
+
+      // The stale run is durably retired, not silently forgotten or left resumable.
+      expect(f.core.getSourceRun(stranded.id)).toMatchObject({ state: "aborted", result: "failed" });
+      expect(f.core.resumeSourceRun("repo-source")).toBeNull();
+    } finally { f.cleanup(); }
+  });
+
+  it("never strands a brand-new file's concept at its create-time placeholder when the run collapses straight to cleaned (item 4/BLOCKER)", async () => {
+    // The deep case, precisely: a zero-cleanup-items run (nothing to delete — this is the
+    // source's first-ever content) collapses published->cleaning->cleaned in ONE ledger
+    // transaction (publishRun) — durably unresumable the instant that transaction commits. A
+    // crash between "after-publish" and recompute leaves the run itself with nothing to resume:
+    // the next sync is a noop (the snapshot on disk hasn't changed), and pre-fix nothing would
+    // ever call recomputeSourceConceptBody again — the concept was stranded forever at its
+    // create-time placeholder (body='', all-zero embedding, content-derived placeholder title),
+    // fully authorized and visible. Only the durable pending-recompute sweep (run unconditionally
+    // at the start of every sync, including this noop one) can heal it.
+    const f = fixture("brand-new-file-crash");
+    try {
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-publish" && !fired) { fired = true; throw new Error("crash before recompute"); } },
+      })).rejects.toThrow("crash before recompute");
+
+      const source = f.core.getSource("repo-source")!;
+      expect(source.activeRunId).not.toBeNull(); // the publish itself DID durably commit
+      const chunk = f.core.listSourceChunks(source.activeRunId!, true)[0]!;
+      expect(chunk.conceptId).not.toBeNull();
+      expect(pendingRecomputeConceptIds(f.core, "repo-source")).toContain(chunk.conceptId);
+      // Pre-fix, this is exactly where the bug lived: the run is no longer resumable at all.
+      expect(f.core.resumeSourceRun("repo-source")).toBeNull();
+
+      const recovered = await f.core.syncRepoMdSource("repo-source");
+      // Confirms this exercises the exact seam the review found: nothing to resume, nothing
+      // changed on disk — a plain noop, not a "published" resume path with its own recompute call.
+      expect(recovered.status).toBe("noop");
+      const concept = rawConceptFull(f.core, chunk.conceptId!);
+      expect(concept.status).toBe("active");
+      expect(concept.body).not.toBe("");
+      expect(concept.body).toContain("initial committed body");
+      expect(concept.title).toBe("README");
+      expect(isPlaceholderEmbedding(concept.embedding)).toBe(false);
+      expect(pendingRecomputeConceptIds(f.core, "repo-source")).toEqual([]);
+    } finally { f.cleanup(); }
+  });
+
+  it("recomputes a survivor's concept on resuming an already-published, still-cleaning run (cleaning-resume branch, item 4/BLOCKER)", async () => {
+    // The other named case, precisely: a run with cleanup items stays 'cleaning' (not auto-
+    // advanced to 'cleaned') until EVERY item is acknowledged, so it IS still resumable if a
+    // crash lands mid-drain — but the PR#49-era fast path that resumes it (source-sync.ts,
+    // "if (run?.state === 'cleaning')") predates recomputeTouchedSourceConcepts and returned
+    // "published" without ever calling it. Two deletions (two cleanup items) so the crash can
+    // land after the first item's acknowledgement but before the second's, leaving the run
+    // genuinely still 'cleaning' (not collapsed to 'cleaned') on resume — this is what actually
+    // reaches the fixed branch, not just the general sweep (that path is covered by the
+    // brand-new-file and parameterized-loop tests above).
+    const f = fixture("cleaning-resume-crash");
+    try {
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nfile a body\n");
+      writeFileSync(join(f.repo, "B.md"), "# B\n\nfile b body\n");
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      git(f.repo, "add", "A.md", "B.md"); git(f.repo, "commit", "-m", "add A and B");
+      await f.core.syncRepoMdSource("repo-source");
+
+      unlinkSync(join(f.repo, "A.md"));
+      unlinkSync(join(f.repo, "B.md"));
+      writeFileSync(join(f.repo, "README.md"), "# Intro\n\nedited survivor body\n");
+      git(f.repo, "add", "-u"); git(f.repo, "commit", "-m", "delete A and B, edit README");
+
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-cleanup" && !fired) { fired = true; throw new Error("crash mid-drain"); } },
+      })).rejects.toThrow("crash mid-drain");
+
+      // Confirms the crash landed where intended: still resumable, still mid-cleanup.
+      const stuck = f.core.resumeSourceRun("repo-source");
+      expect(stuck?.state).toBe("cleaning");
+
+      const recovered = await f.core.syncRepoMdSource("repo-source");
+      expect(recovered.status).toBe("published");
+      const source = f.core.getSource("repo-source")!;
+      const survivor = f.core.listSourceChunks(source.activeRunId!, true).find((chunk) => chunk.relativePath === "README.md")!;
+      const concept = rawConceptFull(f.core, survivor.conceptId!);
+      expect(concept.status).toBe("active");
+      expect(concept.body).toContain("edited survivor body");
+      expect(isPlaceholderEmbedding(concept.embedding)).toBe(false);
+      expect(pendingRecomputeConceptIds(f.core, "repo-source")).toEqual([]);
+      expect(f.core.listSourceCleanupItems(source.activeRunId!).every((item) => item.acknowledgedAt !== null)).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  it("recomputes a file's concept when it ONLY loses a section, with its other sections unchanged (round 4, Codex thread 2/(a))", async () => {
+    // The gap precisely: publishRun's touchedConcepts (source-ledger.ts) and
+    // recomputeTouchedSourceConcepts (above) both key off write_state='committed' chunks. A
+    // section deletion with the file's OTHER sections byte-identical produces ZERO committed
+    // chunks this run — the survivor takes the 'skipped' fast path, and the deleted section is
+    // handled only by a retire-absent cleanup item, which neither of those committed-chunk
+    // filters ever sees. Without marking the concept pending from the cleanup item too, its
+    // stored body/embedding would keep including the deleted section forever.
+    const f = fixture("deletion-only-recompute");
+    try {
+      // Each section body must clear MIN_SOURCE_SECTION_BYTES (200) or the minimum-chunk merge
+      // pass (source-chunker.ts) folds them into ONE chunk before either section ever gets its
+      // own writeState to skip or change independently.
+      const sectionABody = "section a padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const sectionBBody = "section b padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      f.commit(`# A\n\n${sectionABody}\n\n# B\n\n${sectionBBody}\n`, "two sections");
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const conceptId = f.core.listSourceChunks(first.runId!, true)[0]!.conceptId!;
+      const before = rawConceptFull(f.core, conceptId);
+      expect(before.body).toContain("section a padding");
+      expect(before.body).toContain("section b padding");
+
+      // Remove section B only — section A's bytes are unchanged, so its chunk takes the
+      // 'skipped' fast path this run; the only ledger evidence of B's removal is a cleanup item.
+      f.commit(`# A\n\n${sectionABody}\n`, "remove section b");
+      const second = await f.core.syncRepoMdSource("repo-source");
+      expect(second.status).toBe("published");
+
+      // Confirm this actually exercises the gap: section A's surviving chunk really did skip.
+      const survivorChunk = f.core.listSourceChunks(second.runId!, true).find((c) => c.relativePath === "README.md")!;
+      expect(survivorChunk.writeState).toBe("skipped");
+      expect(f.core.listSourceCleanupItems(second.runId!).some((item) => item.kind === "retire-absent")).toBe(true);
+
+      const after = rawConceptFull(f.core, conceptId);
+      expect(after.body).toContain("section a padding");
+      expect(after.body).not.toContain("section b padding");
+      expect(pendingRecomputeConceptIds(f.core, "repo-source")).toEqual([]);
+    } finally { f.cleanup(); }
+  });
+
+  it("heals an unchanged chunk parked on a non-winning legacy concept onto the file's resolved concept (round 4, Codex thread 8)", async () => {
+    // Simulates a file mid-consolidation off the old one-chunk-per-concept shape: section Zulu's
+    // ledger row is manually parked on a SEPARATE ("legacy") concept, as if migration/prior
+    // history had left it there while the rest of the file already lives on the winning concept.
+    // A sync where Zulu's OWN content is unchanged must still heal it onto the resolved concept —
+    // "content unchanged" alone must not be read as "already on the right concept".
+    const f = fixture("legacy-split-heal");
+    try {
+      // Each section body must clear MIN_SOURCE_SECTION_BYTES (200) in EVERY commit below, or the
+      // minimum-chunk merge pass (source-chunker.ts) folds Alpha and Zulu into one combined chunk
+      // and this test's two-independent-chunks premise breaks.
+      const alphaBody = "alpha padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const alphaBodyEdited = "alpha EDITED padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      const zuluBody = "zulu padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
+      f.commit(`# Alpha\n\n${alphaBody}\n\n# Zulu\n\n${zuluBody}\n`, "two sections");
+      await f.core.syncRepoMdSource("repo-source");
+      const activeBefore = f.core.getSource("repo-source")!;
+      const chunksBefore = f.core.listSourceChunks(activeBefore.activeRunId!, true);
+      const alpha = chunksBefore.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Alpha"]))!;
+      const zulu = chunksBefore.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Zulu"]))!;
+      expect(alpha.conceptId).toBe(zulu.conceptId); // sanity: file=concept, one concept for both
+
+      const legacy = await f.core.storeSource("legacy standalone chunk content", {
+        circle: "repo", sourceRefs: [zulu.sourceRef], resolution: "forceNew",
+      });
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_chunks SET concept_id = ? WHERE run_id = ? AND binding_id = ?`)
+        .run(legacy.conceptId, activeBefore.activeRunId, zulu.bindingId);
+      db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(legacy.conceptId, zulu.observationId);
+
+      // A THIRD sync where Alpha's content CHANGES (guarantees a rescan, and — since Alpha sorts
+      // before Zulu in listSourceChunks' relative_path,heading_path_json ordering — guarantees
+      // fileConceptThisRun resolves via Alpha's own prior concept, the ORIGINAL one) while Zulu's
+      // bytes stay identical to what they were before the manual move above.
+      f.commit(`# Alpha\n\n${alphaBodyEdited}\n\n# Zulu\n\n${zuluBody}\n`, "edit alpha only");
+      const third = await f.core.syncRepoMdSource("repo-source");
+      expect(third.status).toBe("published");
+
+      const chunksAfter = f.core.listSourceChunks(third.runId!, true);
+      const healedAlpha = chunksAfter.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Alpha"]))!;
+      const healedZulu = chunksAfter.find((c) => JSON.stringify(c.headingPath) === JSON.stringify(["Zulu"]))!;
+      expect(healedAlpha.conceptId).toBe(alpha.conceptId); // Alpha never left the original concept
+      // The bug: Zulu's unchanged content used to skip in place on the legacy concept forever.
+      // The fix: it heals onto the SAME concept as the rest of the file.
+      expect(healedZulu.conceptId).toBe(healedAlpha.conceptId);
+      expect(healedZulu.conceptId).not.toBe(legacy.conceptId);
+      expect(f.core.hasActiveSourceChunks(legacy.conceptId)).toBe(false);
+    } finally { f.cleanup(); }
+  });
 
   it("resumes after the final deletion-cleanup acknowledgement boundary", async () => {
     const f = fixture("cleanup-crash");

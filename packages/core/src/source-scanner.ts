@@ -16,6 +16,7 @@ import {
   chunkSourceText,
   classifySourceFileContent,
   computeSourceContentHash,
+  deriveSourceFileTitle,
   hashSourceDomain,
   type SourceChunk,
   type SourceChunkDiagnostic,
@@ -111,6 +112,8 @@ export interface SourceScanFile {
   type: "file";
   contentHash: string;
   byteLength: number;
+  /** File=concept display title (deriveSourceFileTitle, source-chunker.ts). */
+  title: string;
 }
 
 export type SourceScanDiagnosticCode =
@@ -434,7 +437,7 @@ export function computeSourceIngestConfigHash(config: EffectiveSourceScanConfig)
   ]);
 }
 
-export function computeSourceManifestHash(files: readonly SourceScanFile[]): string {
+export function computeSourceManifestHash(files: readonly Pick<SourceScanFile, "relativePath" | "type" | "contentHash">[]): string {
   const canonicalFiles = [...files].sort((a, b) => compareUtf8(a.relativePath, b.relativePath));
   return hashSourceDomain(
     MANIFEST_HASH_DOMAIN,
@@ -626,7 +629,10 @@ export function scanSourceSnapshot(input: ScanSourceSnapshotInput): SourceScanRe
       if (chunked.diagnostics.some((diagnostic) => diagnostic.code === "parse-time-exceeded")) stopped = true;
       return;
     }
-    files.push({ relativePath, type: "file", contentHash, byteLength: read.bytes.length });
+    files.push({
+      relativePath, type: "file", contentHash, byteLength: read.bytes.length,
+      title: deriveSourceFileTitle(chunked.frontmatterTitle, relativePath),
+    });
     for (const chunk of chunked.chunks) chunks.push(chunk);
     stopForDeadline(relativePath);
   };

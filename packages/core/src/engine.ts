@@ -85,6 +85,13 @@ const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
 const SEED_K = 10; // gather seed-set size
 const RRF_K = 60; // RRF constant for seed fusion
+// REVIEW FIX (round 4, Codex thread 13): a source concept's source_refs holds one entry per active
+// chunk — hundreds/thousands for a large file — so gather()'s cards must cap it the same way
+// memory_fetch's outline caps entries (mcp-server.ts's FETCH_OUTLINE_MAX_ENTRIES / size-fit loop),
+// else one huge source card can push ok()'s serialized memory_gather payload past its result-size
+// ceiling and get truncated mid-JSON. First N + a total count preserves "how many" without paying
+// for "all of them" in every gather response.
+const SOURCE_REFS_CARD_CAP = 20;
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
 const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
 const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
@@ -101,6 +108,13 @@ const SOURCE_SCHEMA_VERSION = 6; // PRAGMA user_version gate for source-concept 
 const SOURCE_REGISTRY_SCHEMA_VERSION = 7; // PRAGMA user_version gate for the durable knowledge_sources registry
 const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
 const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/activation ledger
+// PRAGMA user_version gate for the file=concept reshape (Phase 1, ratified): the
+// uq_source_chunks_active_concept -> uq_source_chunks_active_concept_slot index swap and the
+// document_sequence/title columns on the chunk/file ledger tables (SourceLedger.ensureSchema).
+// The ticket that authorized this migration named "SOURCE_SCHEMA_VERSION 6→7", but 7 is already
+// SOURCE_REGISTRY_SCHEMA_VERSION (a prior, unrelated migration) — reusing it would corrupt that
+// gate, so this is the next free sequential slot after SOURCE_LEDGER_SCHEMA_VERSION instead.
+const SOURCE_FILE_CONCEPT_SCHEMA_VERSION = 10;
 export const FIRST_BLOCK_SUMMARY_MAX_CHARS = 800; // hard cap on a first_block summary (cost signal)
 
 /**
@@ -208,6 +222,18 @@ export type SourceStoreOpts = Omit<StoreOpts, "kind">;
 export interface ObservationEntry {
   id: string;
   content: string;
+}
+
+/**
+ * File=concept (ratified, Phase 1), Ruling 9. One active chunk under a source concept, as
+ * returned by getConcept's outline — structure and position, not content. observationId is
+ * needed to call memory_detach on a specific chunk.
+ */
+export interface SourceOutlineEntry {
+  headingPath: string[];
+  occurrence: number;
+  segmentIndex: number;
+  observationId: string;
 }
 
 /** A near-duplicate pair surfaced at store time (possible_duplicate_of edge). */
@@ -320,7 +346,10 @@ export interface PrewarmState {
 export interface GatherCard extends SearchCard {
   /** True if this concept matched the intent directly (a seed); false if reached via the graph. */
   viaSeed: boolean;
+  /** Capped to SOURCE_REFS_CARD_CAP entries — see sourceRefsTotal when the real count is larger. */
   sourceRefs?: string[];
+  /** Present only when sourceRefs was capped: the TRUE total ref count before capping. */
+  sourceRefsTotal?: number;
 }
 
 /** What gather(intent) returns: the seed set, the ranked gathered set, and why it stopped. */
@@ -527,10 +556,12 @@ interface ConceptRow {
   sync_writer: string | null;
 }
 
+// FILE=CONCEPT (ratified, Phase 1): no longer carries observationId/observationContent — a file
+// concept legitimately holds many simultaneously-active observations now, so there is no single
+// representative one to name here. getConcept's connector-owned branch builds its own outline
+// (heading map + observation index) directly, alongside this projection.
 interface AuthorizedSourceProjection {
   row: ConceptRow;
-  observationId: string;
-  observationContent: string;
 }
 
 interface ContradictionRow {
@@ -643,6 +674,13 @@ export class MonetCore {
     const versionAfterLedger = this.db.pragma("user_version", { simple: true }) as number;
     if (versionAfterLedger >= SYNC_CLOSURE_SCHEMA_VERSION && versionAfterLedger < SOURCE_LEDGER_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${SOURCE_LEDGER_SCHEMA_VERSION}`);
+    }
+    // SOURCE_FILE_CONCEPT_SCHEMA_VERSION = 10: no additional work beyond what SourceLedger.ensureSchema()
+    // already did idempotently above (column-guards + the index swap). Pure sentinel, same pattern
+    // as every version gate above it.
+    const versionAfterSourceLedger = this.db.pragma("user_version", { simple: true }) as number;
+    if (versionAfterSourceLedger >= SOURCE_LEDGER_SCHEMA_VERSION && versionAfterSourceLedger < SOURCE_FILE_CONCEPT_SCHEMA_VERSION) {
+      this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
     }
   }
 
@@ -1569,6 +1607,16 @@ export class MonetCore {
       if (targetStatus.status === "retired") throw new Error("cannot attach to a retired concept");
     }
 
+    // FILE=CONCEPT (ratified, Phase 1): source ingestion never used the generic dedup/graph/
+    // contradiction machinery below anyway (resolution is always explicit — attachTo or forceNew,
+    // never score-based) and item 6 retires per-chunk embedding entirely, so it branches out here
+    // into its own leaner, dedicated write path rather than falling through the embed/bestMatches/
+    // transaction below. Everything validated above this point (circle, idempotency fast path,
+    // resolution/attachTo mutual exclusivity, attachTo target pre-check) is still fully reused.
+    if (sourceConnector) {
+      return this.storeSourceChunk(content, opts as SourceStoreOpts, sourceIdentity!, receiptExpectation);
+    }
+
     // OUTSIDE the transaction: async embedding computation and read-only dedup scan.
     const emb = await this.embedder.embed(content);
     // ONE cosine scan serves both dedup (argmax) and `related` edge derivation (top-M) — no extra cost.
@@ -1642,10 +1690,9 @@ export class MonetCore {
       let nearMatchScore: number | undefined;
 
       if (opts.attachTo) {
-        // Direct attach: bypass scoring, land on named concept.
-        row = attachTarget!.kind === "source"
-          ? this.appendSourceObservation(attachTarget!)
-          : this.attach(attachTarget!, content, emb, sessionId, obsId);
+        // Direct attach: bypass scoring, land on named concept. (sourceConnector calls never reach
+        // here — storeInternal returns via storeSourceChunk before this transaction opens.)
+        row = this.attach(attachTarget!, content, emb, sessionId, obsId);
         action = "attached";
       } else if (opts.resolution === "forceNew") {
         // Always create a new concept regardless of similarity.
@@ -1839,9 +1886,27 @@ export class MonetCore {
    */
   async getConcept(
     id: string,
-    opts: { synthesize?: boolean; observationsOffset?: number; pageSize?: number } & SourceAwareReadOptions = {},
+    opts: {
+      synthesize?: boolean; observationsOffset?: number; pageSize?: number;
+      /** File=concept (ratified, Phase 1), Ruling 9: source concepts omit `body` by default (it
+       *  can run to the whole file) — pass true to include it. Ignored for native concepts,
+       *  which always include body. */
+      includeBody?: boolean;
+    } & SourceAwareReadOptions = {},
   ): Promise<
-    (Concept & { observations: ObservationEntry[]; totalObservations: number; observationsOffset: number; revisions: number; synthesizedNow: boolean; needsSynthesis: boolean }) | null
+    (Concept & {
+      observations: ObservationEntry[]; totalObservations: number; observationsOffset: number; revisions: number;
+      synthesizedNow: boolean; needsSynthesis: boolean;
+      /** Source concepts only (Ruling 9): the file's path within its source and the source's id
+       *  (pass to the `source_path` tool/sourcePath() for the on-disk location — "grep the path
+       *  for detail" rather than reading the full body through fetch). */
+      sourcePath?: string; sourceId?: string;
+      /** Source concepts only (Ruling 9): every active chunk's heading position + observation id,
+       *  in document order — the structure, not the content. */
+      outline?: SourceOutlineEntry[];
+      /** Source concepts only, set whenever `body` was omitted (the default — see includeBody). */
+      bodyOmitted?: boolean;
+    }) | null
   > {
     let row = this.getRow(id);
     if (!row) return null;
@@ -1850,18 +1915,31 @@ export class MonetCore {
     if (isConnectorOwnedRow(row)) {
       const projection = this.authorizedSourceProjection(id, opts.sourceAuthorizationContext);
       if (!projection) return null;
-      const observationsOffset = opts.observationsOffset ?? 0;
-      const observations = observationsOffset === 0
-        ? [{ id: projection.observationId, content: projection.observationContent }]
-        : [];
+      const outlineRows = this.db
+        .prepare(
+          `SELECT relative_path, heading_path_json, occurrence, segment_index, observation_id
+             FROM source_chunks WHERE concept_id = ? AND lifecycle = 'active' ORDER BY document_sequence`,
+        )
+        .all(id) as Array<{ relative_path: string; heading_path_json: string; occurrence: number; segment_index: number; observation_id: string }>;
+      const outline: SourceOutlineEntry[] = outlineRows.map((chunk) => ({
+        headingPath: JSON.parse(chunk.heading_path_json) as string[],
+        occurrence: chunk.occurrence,
+        segmentIndex: chunk.segment_index,
+        observationId: chunk.observation_id,
+      }));
+      const includeBody = opts.includeBody ?? false;
       return {
         ...toConcept(projection.row),
-        observations,
-        totalObservations: 1,
-        observationsOffset,
+        ...(includeBody ? {} : { body: "", bodyOmitted: true }),
+        observations: [],
+        totalObservations: outline.length,
+        observationsOffset: 0,
         revisions: 0,
         synthesizedNow: false,
         needsSynthesis: false,
+        sourcePath: outlineRows[0]?.relative_path,
+        sourceId: projection.row.source_identity?.replace(/^source:\/\//, ""),
+        outline,
       };
     }
     if (row.status === "retired") return null;
@@ -2246,13 +2324,12 @@ export class MonetCore {
       if (!old) throw new Error(`observation not found: ${oldObservationId}`);
       if (!old.concept_id) throw new Error(`observation is not attached to a concept: ${oldObservationId}`);
       const oldConcept = this.getRow(old.concept_id);
-      // Source observations carry the canonical evidence refreshSourceConcept activates via its own
-      // compare-and-swap, so a SUCCESSOR replacement must go through that path (it keeps body/title/
-      // embedding in sync with the newly-activated observation). Terminal (successor-less) supersession
-      // has no representation to activate — it just records the evidence as gone (deleted-chunk flow,
-      // P0) — so it is let through here.
+      // Source observations carry the canonical evidence supersedeSourceChunkObservation activates
+      // via its own compare-and-swap, so a SUCCESSOR replacement must go through that path. Terminal
+      // (successor-less) supersession has no representation to activate — it just records the
+      // evidence as gone (deleted-chunk flow, P0) — so it is let through here.
       if (isConnectorOwnedRow(oldConcept) && newObservationId !== null) {
-        throw new Error("source observations are superseded only by refreshSourceConcept activation");
+        throw new Error("source observations are superseded only by supersedeSourceChunkObservation activation");
       }
       if (newObservationId === oldObservationId) throw new Error("an observation cannot supersede itself");
 
@@ -2274,20 +2351,20 @@ export class MonetCore {
         )
         .run(newObservationId, supersededAt, oldObservationId);
       if (updated.changes === 1) {
-        // Terminal supersession of a source concept's ACTIVE observation leaves no current evidence
-        // to read: null the pointer so refreshSourceConcept's CAS (and any other active_observation_id
-        // reader) sees "no live representation" rather than a dangling pointer at a now-superseded row.
-        // Concept-level retirement (status flip, graph unwind, tombstone) stays retireConcept's own
-        // job — the caller decides whether a chunk deletion should also retire the concept.
-        //
-        // HARD CONTRACT: once nulled, nothing repopulates this pointer short of retireConcept.
-        // refreshSourceConcept rejects a NULL active_observation_id outright (its "missing canonical
-        // identity or active observation state" guard, above), and appendSourceObservation — new
-        // evidence attached via attachTo — only bumps support_count; it never touches
-        // active_observation_id. So a terminally-superseded source concept is permanently
-        // unrefreshable: the caller MUST retire it in the same cleanup step that deleted its
-        // evidence. P0's chunk↔concept mapping is 1:1, so a chunk deletion always retires its
-        // concept and this state is never left dangling in practice.
+        // REVIEW FIX (MINOR, comment/clarity only — the reviewer verified this conditional is
+        // functionally inert; the code below is unchanged): terminal supersession of ONE binding's
+        // evidence used to imply "no current evidence for this concept at all" under the retired
+        // one-concept-per-chunk model, when this nulling was the only thing that mattered. Under
+        // file=concept it does not — a concept can hold many simultaneously-active chunks, and a
+        // single binding's terminal supersession (this call) says nothing about the concept's
+        // OTHER chunks. Whether this specific nulling fires or not is never observable: every
+        // native-exclusion query in this file gates on `kind != 'source'` (or the equivalent
+        // `isConnectorOwnedRow` OR), which already, independently, excludes a source concept
+        // regardless of active_observation_id — and acknowledgeCleanup's own "retired implies a
+        // null pointer" invariant is satisfied by retireConcept's own UNCONDITIONAL null-out on
+        // every full retirement (see that method's own comment), never by this narrower one having
+        // already run first. Left in place as a harmless, no-longer-load-bearing legacy write
+        // rather than removed, since deleting it changes nothing either way.
         if (newObservationId === null && oldConcept?.kind === "source" && oldConcept.active_observation_id === oldObservationId) {
           this.db.prepare(`UPDATE concepts SET active_observation_id = NULL WHERE id = ?`).run(old.concept_id);
         }
@@ -2310,100 +2387,404 @@ export class MonetCore {
   }
 
   /**
-   * Connector-only source read-model refresh. Source evidence stays append-only; this replaces
-   * only the mutable concept representation from an exact current ledger observation. Content is
-   * never caller-supplied here: that would allow a delayed source worker to overwrite a newer
-   * active representation without a durable evidence record.
+   * FILE=CONCEPT (ratified, Phase 1) supersession — replaces refreshSourceConcept (which swapped
+   * a concept-level active_observation_id pointer, a model that only ever worked because a source
+   * concept had exactly one observation). Supersedes ONE chunk's predecessor observation with its
+   * successor: both must already exist and belong to `conceptId`. An identity-aware compare-and-
+   * swap keyed on the ledger's own bindingId->predecessor tracking (source-sync.ts's
+   * materializeStagedBindings), never content-dedup, never blend, never created_at-ordering — the
+   * changed chunk's new observation REPLACES the old one, exactly (supersedeObservation semantics,
+   * scoped to this one binding's evidence pair).
+   *
+   * Does NOT touch the concept's own title/body/embedding/active_observation_id: a file concept
+   * legitimately holds many simultaneously-active observations now, so no single supersession is
+   * "the" concept's refresh any more — that is recomputeSourceConceptBody's job, holistic and
+   * strictly post-publish (item 4; see its own docstring for why pre-publish would leak).
    */
-  async refreshSourceConcept(
+  async supersedeSourceChunkObservation(
     conceptId: string,
     observationId: string,
-    expectedActiveObservationId: string,
-  ): Promise<Concept> {
-    const initial = this.getRow(conceptId);
-    if (!initial) throw new Error(`concept not found: ${conceptId}`);
-    if (initial.kind !== "source") throw new Error("refreshSourceConcept requires a source concept");
-    if (initial.status !== "active") throw new Error("cannot refresh a non-active source concept");
-    if (!initial.source_identity || !initial.active_observation_id) {
-      throw new Error("source concept is missing canonical identity or active observation state");
-    }
-    if (initial.active_observation_id === observationId) {
-      if (this.isExactSourceRefreshReplay(initial, observationId, expectedActiveObservationId)) return toConcept(initial);
-      throw new Error("source refresh active observation topology is not an exact replay");
-    }
-    if (initial.active_observation_id !== expectedActiveObservationId) {
-      throw new Error("source refresh active observation compare-and-swap failed");
-    }
-    const initialObservation = this.currentSourceObservation(conceptId, observationId, initial.source_identity);
-    const body = initialObservation.content.trim();
-    const embedding = await this.embedder.embed(initialObservation.content);
-    return this.db.transaction((): Concept => {
-      const row = this.getRow(conceptId);
-      if (!row || row.kind !== "source") throw new Error("source concept disappeared during refresh");
-      if (row.status !== "active") throw new Error("cannot refresh a non-active source concept");
-      if (row.active_observation_id === observationId) {
-        if (this.isExactSourceRefreshReplay(row, observationId, expectedActiveObservationId)) return toConcept(row);
-        throw new Error("source refresh active observation topology is not an exact replay");
+    expectedPredecessorObservationId: string,
+  ): Promise<void> {
+    return this.db.transaction((): void => {
+      const concept = this.getRow(conceptId);
+      if (!concept) throw new Error(`concept not found: ${conceptId}`);
+      if (concept.kind !== "source") throw new Error("supersedeSourceChunkObservation requires a source concept");
+      if (concept.status !== "active") throw new Error("cannot supersede evidence on a non-active source concept");
+      if (!concept.source_identity) throw new Error("source concept is missing canonical identity");
+      const readObservation = (id: string) => this.db
+        .prepare(`SELECT id, concept_id, kind, source_refs, superseded_by, superseded_at FROM observations WHERE id = ?`)
+        .get(id) as
+        | { id: string; concept_id: string | null; kind: string; source_refs: string | null; superseded_by: string | null; superseded_at: number | null }
+        | undefined;
+      const requireOwned = (
+        observation: ReturnType<typeof readObservation>, label: string,
+      ): NonNullable<ReturnType<typeof readObservation>> => {
+        if (!observation || observation.concept_id !== conceptId) {
+          throw new Error(`supersedeSourceChunkObservation ${label} does not belong to this concept`);
+        }
+        if (observation.kind !== "source" || canonicalSourceIdentityFromJson(observation.source_refs) !== concept.source_identity) {
+          throw new Error(`supersedeSourceChunkObservation ${label} identity does not match the source concept`);
+        }
+        return observation;
+      };
+      const successor = requireOwned(readObservation(observationId), "successor");
+      const predecessor = requireOwned(readObservation(expectedPredecessorObservationId), "predecessor");
+      // Exact crash-window replay: this supersession already committed, but the ledger receipt
+      // did not advance before a crash/fence loss. Succeed silently, matching supersedeObservation's
+      // own idempotent-replay contract.
+      if (successor.superseded_by === null && successor.superseded_at === null
+          && predecessor.superseded_by === observationId && predecessor.superseded_at !== null) {
+        return;
       }
-      if (!row.source_identity || row.active_observation_id !== expectedActiveObservationId) {
-        throw new Error("source refresh active observation compare-and-swap failed");
+      if (successor.superseded_by !== null || successor.superseded_at !== null) {
+        throw new Error("supersedeSourceChunkObservation successor is already superseded");
       }
-      // Revalidate after the asynchronous embedding call. A source may have advanced while this
-      // worker was embedding; in particular this rejects a delayed B after C has activated.
-      this.currentSourceObservation(conceptId, observationId, row.source_identity);
-      this.currentSourceObservation(conceptId, expectedActiveObservationId, row.source_identity);
-      if (observationId === expectedActiveObservationId) {
-        throw new Error("source refresh successor must differ from the active observation");
-      }
-      const version = row.version + 1;
-      const title = firstLine(body) || row.title;
-      this.unwindConceptGraph(conceptId, row.circle);
-      const activated = this.db
-        .prepare(
-          `UPDATE concepts SET title = ?, body = ?, embedding = ?, version = ?, dirty = 0,
-                  active_observation_id = ?, updated_at = unixepoch() * 1000
-            WHERE id = ? AND active_observation_id = ? AND status = 'active'`,
-        )
-        .run(title, body, embToJson(embedding), version, observationId, conceptId, expectedActiveObservationId);
-      if (activated.changes !== 1) throw new Error("source refresh active observation compare-and-swap failed");
       const superseded = this.db
         .prepare(
           `UPDATE observations SET superseded_by = ?, superseded_at = ?
             WHERE id = ? AND concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL`,
         )
-        .run(observationId, Date.now(), expectedActiveObservationId, conceptId);
-      if (superseded.changes !== 1) throw new Error("source refresh predecessor is no longer current");
-      this.writeRevision(conceptId, version, body);
-      this.rederiveConceptGraph(conceptId, row.circle);
-      return toConcept(this.getRow(conceptId)!);
+        .run(observationId, Date.now(), expectedPredecessorObservationId, conceptId);
+      if (superseded.changes !== 1) throw new Error("supersedeSourceChunkObservation predecessor compare-and-swap failed: no longer current");
     })();
   }
 
-  /** Exact crash-window replay: refresh committed, but the ledger receipt did not advance. */
-  private isExactSourceRefreshReplay(row: ConceptRow, successorId: string, predecessorId: string): boolean {
-    if (row.kind !== "source" || row.status !== "active" || !row.source_identity
-        || row.active_observation_id !== successorId || successorId === predecessorId) return false;
-    const observations = this.db.prepare(
-      `SELECT id,concept_id,kind,source_refs,superseded_by,superseded_at
-         FROM observations WHERE id IN (?,?)`,
-    ).all(successorId, predecessorId) as Array<{
-      id: string; concept_id: string | null; kind: string; source_refs: string | null;
-      superseded_by: string | null; superseded_at: number | null;
-    }>;
-    const successor = observations.find((observation) => observation.id === successorId);
-    const predecessor = observations.find((observation) => observation.id === predecessorId);
-    const owns = (observation: typeof successor): boolean => !!observation
-      && observation.concept_id === row.id && observation.kind === "source"
-      && canonicalSourceIdentityFromJson(observation.source_refs) === row.source_identity;
-    return owns(successor) && owns(predecessor)
-      && successor!.superseded_by === null && successor!.superseded_at === null
-      && predecessor!.superseded_by === successorId && predecessor!.superseded_at !== null;
+  /**
+   * FILE=CONCEPT (ratified, Phase 1), item 4. Recomputes a file concept's title/body/embedding
+   * from its CURRENTLY ACTIVE chunk observations, in document order (document_sequence — heading
+   * occurrence/segment order alone cannot recover cross-heading order across DIFFERENT headings;
+   * see SourceChunk's own docstring, source-chunker.ts). The concept embedding is a FRESH re-embed
+   * of the recomputed body — never a running blend — so there is no drift and every supersession
+   * is exactly correct, never an average of stale and current evidence.
+   *
+   * MUST be called only once the run that touched this concept has DURABLY PUBLISHED, never
+   * mid-staging: recomputing pre-publish would let a reader observe either a not-yet-durable body
+   * (never actually published, if the run later aborts) or a body reflecting some-but-not-all of
+   * the file's chunks (if this file's own staging isn't complete yet) — both are exactly the
+   * "cannot leak historical/partial state" guarantee authorizedSourceProjections exists to
+   * uphold. Post-publish, source_chunks already reflects ONLY the file's final, complete,
+   * currently-active chunk set for the newly-published run, so there is no such window.
+   */
+  /**
+   * Chunk-set identity fingerprint for the CAS below: (count, max rowid) of a concept's currently
+   * active chunks. source_chunks rows are never mutated in place while active — a content change
+   * always supersedes the old row and inserts a fresh one — so ANY mutation to the active set
+   * (add, remove, or replace) changes at least one of these two cheap aggregates: an addition or
+   * replacement raises max(rowid) (a fresh insert always gets a higher rowid than anything
+   * before it), a removal with no replacement lowers count. Sufficient to detect staleness without
+   * hashing or re-reading full chunk content.
+   */
+  private sourceChunkSetFingerprint(conceptId: string): { cnt: number; maxRowid: number } {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS cnt, COALESCE(MAX(rowid), 0) AS max_rowid FROM source_chunks WHERE concept_id = ? AND lifecycle = 'active'`)
+      .get(conceptId) as { cnt: number; max_rowid: number };
+    return { cnt: row.cnt, maxRowid: row.max_rowid };
+  }
+
+  async recomputeSourceConceptBody(conceptId: string): Promise<void> {
+    const initial = this.getRow(conceptId);
+    if (!initial) throw new Error(`concept not found: ${conceptId}`);
+    if (initial.kind !== "source") throw new Error("recomputeSourceConceptBody requires a source concept");
+    // Cheap early-out BEFORE the expensive gather+embed below: a caller may batch-recompute every
+    // concept a run touched without first filtering out ones a full-file retirement (drainCleanup)
+    // already retired this same run — that is the common case, not an edge case, so it must be cheap.
+    if (initial.status !== "active") {
+      // REVIEW FIX (BLOCKER): a retired concept is never recomputed again by design — clear any
+      // stale pending marker so the sweep (source-sync.ts) doesn't keep retrying it forever.
+      this.db.prepare(`DELETE FROM source_recompute_pending WHERE concept_id = ?`).run(conceptId);
+      return;
+    }
+    // REVIEW FIX (IMPORTANT): recomputeSourceConceptBody has no CAS against the state it gathered,
+    // unlike supersedeSourceChunkObservation's own observation-pair CAS. embed() is async and runs
+    // OUTSIDE any transaction (SQLite transactions must be synchronous), so the active chunk set
+    // can legitimately change between the gather below and the write transaction — a concurrent
+    // recompute of the same concept, or a new chunk write landing mid-flight. Bounded retry: gather
+    // + embed + write, re-checking a cheap chunk-set fingerprint inside the write transaction; a
+    // mismatch means the read was stale, so the write is skipped and the whole gather repeats
+    // against the now-current state rather than persisting content that raced its own inputs. In
+    // practice this races only under losing the materializer's single-writer file lock — the retry
+    // makes the method correct on its own, not just correct because of an external invariant.
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const fingerprint = this.sourceChunkSetFingerprint(conceptId);
+      const active = this.db
+        .prepare(`SELECT run_id, relative_path, heading_path_json, occurrence, content, source_ref FROM source_chunks WHERE concept_id = ? AND lifecycle = 'active' ORDER BY document_sequence`)
+        .all(conceptId) as Array<{ run_id: string; relative_path: string; heading_path_json: string; occurrence: number; content: string; source_ref: string }>;
+      // REVIEW FIX (round 4, Codex thread 9): a section larger than maxChunkBytes is split across
+      // multiple segmentIndex chunks by the chunker (segmentSection, source-chunker.ts), which
+      // strips each segment's OWN trailing newline(s) before storing it (so a segment boundary can
+      // be told apart from a chunk's real trailing whitespace). Joining EVERY active chunk with
+      // "\n\n" unconditionally — as if every boundary were a section break — inserted an artificial
+      // blank paragraph INSIDE one continuous oversized section. document_sequence keeps one
+      // section's split segments strictly consecutive (chunkSourceText assigns them in a single
+      // inner loop, before moving to the next section; publishRun re-derives fresh, mutually
+      // comparable document_sequence values for a file's WHOLE active chunk set every run — see
+      // that method), so grouping by consecutive (relativePath, headingPath, occurrence) identity
+      // exactly recovers "same section, next segment" vs "next section" without needing
+      // segmentIndex itself. Same-section segments rejoin with a single "\n" — restoring the ONE
+      // newline segmentSection's own trim stripped, not the "\n\n" a genuine section break gets.
+      //
+      // KNOWN NARROW GAP (round 5, Codex thread R5-3, accepted, not closed): the single "\n" above
+      // is correct for the OVERWHELMINGLY common split shape — segmentSection/splitNonFenceUnit
+      // (source-chunker.ts) breaks at LINE boundaries, so the boundary it stripped really was a
+      // real newline. It is wrong for the much narrower case where ONE LINE (no embedded newline
+      // at all) itself exceeds maxChunkBytes: splitNonFenceUnit then calls splitUtf8, which slices
+      // that single line at an arbitrary CODEPOINT boundary — no newline was ever stripped there,
+      // so this "\n" inserts a line break the source never had. Verified directly against
+      // splitUtf8's own implementation: it is only ever reached when
+      // Buffer.byteLength(line, "utf8") > maxBytes for a single regex-matched line (32 768 bytes
+      // by default) — i.e. this narrower bug requires a single unbroken line of that length, a
+      // materially rarer shape than "a section over maxChunkBytes" (thread 9's fix above, which
+      // this gap does not regress). Closing it correctly needs boundary metadata the chunker does
+      // not currently persist — whether EACH split point was a line boundary (join with "\n") or
+      // mid-line (join with "") — which is a chunker + storage change, not a one-line fix here;
+      // scoped out of this round rather than risking a rushed, unverified metadata change.
+      const sectionKey = (c: { relative_path: string; heading_path_json: string; occurrence: number }): string =>
+        `${c.relative_path}\0${c.heading_path_json}\0${c.occurrence}`;
+      const bodyParts: string[] = [];
+      let currentSectionKey: string | undefined;
+      for (const chunk of active) {
+        const key = sectionKey(chunk);
+        if (key === currentSectionKey) {
+          bodyParts[bodyParts.length - 1] += "\n" + chunk.content;
+        } else {
+          bodyParts.push(chunk.content);
+          currentSectionKey = key;
+        }
+      }
+      const body = bodyParts.join("\n\n");
+      const fileTitle = active[0]
+        ? (this.db.prepare(`SELECT title FROM source_files WHERE run_id = ? AND relative_path = ?`)
+            .get(active[0].run_id, active[0].relative_path) as { title: string } | undefined)?.title
+        : undefined;
+      // Fresh union of every currently active chunk's own sourceRef — never a monotonic
+      // accumulation (unlike the old per-chunk-concept storeInternal ref-merge this replaces): a
+      // section that's no longer active must not leave a stale return-to-source pointer behind.
+      const sourceRefsJson = JSON.stringify([...new Set(active.map((chunk) => chunk.source_ref))]);
+      const embedding = await this.embedder.embed(body);
+      const applied = this.db.transaction((): boolean => {
+        const row = this.getRow(conceptId);
+        if (!row) throw new Error(`concept not found: ${conceptId}`);
+        if (row.kind !== "source") throw new Error("recomputeSourceConceptBody requires a source concept");
+        // A racing full-file retirement (every chunk gone) between the gather above and this
+        // transaction leaves nothing to project — leave the (already-retired) concept alone rather
+        // than reviving it, and clear its pending marker (see the early-out above).
+        if (row.status !== "active") {
+          this.db.prepare(`DELETE FROM source_recompute_pending WHERE concept_id = ?`).run(conceptId);
+          return true;
+        }
+        const current = this.sourceChunkSetFingerprint(conceptId);
+        if (current.cnt !== fingerprint.cnt || current.maxRowid !== fingerprint.maxRowid) {
+          return false; // stale read — caller retries against the current state
+        }
+        const title = fileTitle || row.title;
+        const version = row.version + 1;
+        const now = Date.now();
+        this.unwindConceptGraph(conceptId, row.circle);
+        // last_confirmed_at is stamped here (not left frozen at creation, and not overridden at
+        // projection time the way the old single-observation authorizedSourceProjections did) —
+        // this recompute IS the confirmation event for a file concept now.
+        //
+        // REVIEW FIX (round 4, Codex thread 7): support_count is normalized to the ACTIVE chunk
+        // count on every recompute, mirroring recomputeNativeConceptProjection's own semantic for
+        // native concepts (support_count = count of non-superseded observations feeding the current
+        // projection). storeSourceChunk's attach branch increments it per NEW chunk write
+        // unconditionally, so left untouched here it only ever grows — a file edited repeatedly, or
+        // one that loses sections over time, would report an ever-inflating count that mixes in
+        // superseded historical chunks instead of reflecting what the current body is actually
+        // built from. support_count feeds real ranking signal (nodeMeta's log1p(support) term,
+        // livingModelCard/SearchCard display, cluster-member selection) so leaving a 130-chunk
+        // file's count to climb past 130 on every edit would keep distorting all three.
+        this.db
+          .prepare(
+            `UPDATE concepts SET title = ?, slug = ?, body = ?, embedding = ?, source_refs = ?, support_count = ?, version = ?, dirty = 0,
+                    updated_at = ?, last_confirmed_at = ? WHERE id = ?`,
+          )
+          .run(title, slugify(title), body, embToJson(embedding), sourceRefsJson, active.length, version, now, now, conceptId);
+        this.writeRevision(conceptId, version, body);
+        this.rederiveConceptGraph(conceptId, row.circle);
+        // REVIEW FIX (BLOCKER): clear the pending-recompute marker in the SAME transaction as the
+        // write it describes — durably atomic with the recompute it clears for.
+        this.db.prepare(`DELETE FROM source_recompute_pending WHERE concept_id = ?`).run(conceptId);
+        return true;
+      })();
+      if (applied) return;
+    }
+    throw new Error(`recomputeSourceConceptBody: active chunk set for ${conceptId} kept changing across ${MAX_ATTEMPTS} attempts`);
+  }
+
+  /** File=concept (ratified, Phase 1) REVIEW FIX (BLOCKER): every concept a source has durably
+   *  touched but not yet recomputed for — a durable resume queue swept at the start of every sync
+   *  (source-sync.ts) so a concept stranded by any crash between publish and recompute self-heals
+   *  on the next sync, including a noop one. */
+  listPendingRecomputeConcepts(sourceId: string): string[] {
+    return (this.db.prepare(`SELECT concept_id FROM source_recompute_pending WHERE source_id = ?`).all(sourceId) as Array<{ concept_id: string }>)
+      .map((row) => row.concept_id);
+  }
+
+  /**
+   * REVIEW FIX (MAJOR): every native concept id an embedding-model swap needs to re-embed
+   * (kind != 'workstream', not source-owned, not retired). COLD-AUDIT FIX: this is a deliberate
+   * strict SUPERSET of search()'s own native-row filter, not an exact match — it omits search()'s
+   * `active_observation_id IS NULL` conjunct. Over-covering here is safe (re-embedding a row that
+   * search() would never have surfaced anyway is wasted work, never wrong work); under-covering
+   * would not be (silently skipping a concept a future search()/gather() call COULD surface would
+   * leave it stranded under the old model, exactly the bug this migration step exists to close).
+   * Workstreams are identity-upserted state, never embedding-compared (see search()'s own comment);
+   * source concepts have their own embedder — recomputeSourceConceptBody, not this.
+   *
+   * ORDER BY id (found during dry-run determinism verification): a caller that feeds this id list
+   * into a BULK rederiveNativeConceptGraph pass processes concepts one at a time, and the entity
+   * hub gate inside deriveEntityEdges (isHubDf) is a "current df/n at the moment THIS concept is
+   * processed" check — genuinely order-sensitive across a run, by the SAME pre-existing design the
+   * hub-edge-filter tests document (frozen-df flip-flop). A stable, repeatable row order is what
+   * makes a full-store bulk rebuild reproducible run-to-run; an unordered SELECT is not guaranteed
+   * stable across two executions even against byte-identical data.
+   */
+  listNativeConceptIds(): string[] {
+    return (this.db.prepare(`SELECT id FROM concepts WHERE kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND status != 'retired' ORDER BY id`).all() as Array<{ id: string }>)
+      .map((row) => row.id);
+  }
+
+  /**
+   * REVIEW FIX (MAJOR): re-embeds one native concept's CURRENT body in place, with this instance's
+   * embedder — nothing else about the row changes (title/support_count/etc. untouched). Used by
+   * the migration script's native re-embed pass so an embedder swap leaves the WHOLE store under
+   * one model, not just the source concepts a re-sync happens to touch. Idempotent (a deterministic
+   * embedder re-embedding the same body always produces the same vector) and safe to call on a
+   * concept id that no longer exists (returns false, no-op) for a caller iterating a list gathered
+   * moments earlier.
+   *
+   * COLD-AUDIT FIX: deliberately does NOT touch this concept's stored similarity graph
+   * (related/about edges) — see rederiveNativeConceptGraph, below, for why that has to be a
+   * SEPARATE, later pass over every re-embedded concept, never folded into this one.
+   */
+  async reembedConcept(conceptId: string): Promise<boolean> {
+    const row = this.getRow(conceptId);
+    if (!row) return false;
+    const embedding = await this.embedder.embed(row.body);
+    this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`).run(embToJson(embedding), conceptId);
+    return true;
+  }
+
+  /**
+   * REVIEW FIX (round 4, Codex thread 11): re-embeds every observation belonging to one native
+   * concept — reembedConcept above only ever touched concepts.embedding, but two ordinary,
+   * frequently-hit native-concept paths derive a concept's embedding FROM its observations'
+   * embeddings: recomputeNativeConceptProjection centroids every non-superseded observation, and
+   * detach() uses a moved observation's own embedding directly (new-destination case) or blends it
+   * in one at a time via attach() (existing-destination case). Left un-migrated, ANY of those —
+   * routine contradiction resolution, a dirty-concept sweep, or an ordinary memory_detach split —
+   * would silently pull an old-model vector straight back into concepts.embedding even after the
+   * migration script's native re-embed pass (reembedConcept, above) already moved that same
+   * concept's OWN row to the new model, reopening exactly the incompatible-space comparison the
+   * migration exists to close.
+   *
+   * Scoped to native concepts only (mirrors listNativeConceptIds' own exclusions): a source
+   * chunk's observation embedding is always a placeholder zero-vector (storeSourceChunk) —
+   * recomputeSourceConceptBody derives a source concept's embedding straight from its body text,
+   * never from observations.embedding — so re-embedding one would be pure waste, not a fix.
+   *
+   * Deliberately un-filtered by supersession: detach()'s own read of a native concept's
+   * observations (srcObsRows) is itself unfiltered by superseded_by/superseded_at, so a superseded
+   * observation's embedding can still be read and written back into a concept's vector via that
+   * path. Re-embedding only the active subset would leave that same gap half-closed.
+   *
+   * No CAS/fingerprint retry (unlike recomputeSourceConceptBody): this exists for the one-shot
+   * migration script, which runs single-pass, not for the live concurrent-write path — the same
+   * accepted risk envelope reembedConcept itself already operates under (no CAS against a
+   * concurrent body edit either).
+   */
+  async reembedConceptObservations(conceptId: string): Promise<number> {
+    const row = this.getRow(conceptId);
+    if (!row || isConnectorOwnedRow(row)) return 0;
+    const rows = this.db.prepare(`SELECT id, content FROM observations WHERE concept_id = ?`).all(conceptId) as Array<{ id: string; content: string }>;
+    if (rows.length === 0) return 0;
+    const embedded = await Promise.all(rows.map(async (r) => ({ id: r.id, embedding: await this.embedder.embed(r.content) })));
+    this.db.transaction((): void => {
+      for (const e of embedded) {
+        this.db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(embToJson(e.embedding), e.id);
+      }
+    })();
+    return embedded.length;
+  }
+
+  /**
+   * COLD-AUDIT FIX (MAJOR): rebuilds one native concept's stored similarity graph (related/about
+   * edges, memory_edge(_components) + concept_entities/entities df) from its CURRENT embedding and
+   * body — the unwind+rederive pair recomputeSourceConceptBody already uses for the same reason
+   * (a body/embedding change invalidates a concept's own edges, not just its row).
+   *
+   * reembedConcept deliberately never calls this itself: rederiveConceptGraph's neighbor search
+   * (bestMatches, scored against every OTHER concept's CURRENT embedding) is only meaningful once
+   * the whole comparison set is under the SAME model. Called mid-loop — while sibling concepts
+   * still carry their pre-swap embedding — it would score this concept's NEW vector against
+   * neighbors' OLD vectors, two incompatible spaces, and persist garbage "related" edges. Callers
+   * (the migration script) MUST re-embed every native concept first in one pass, then call this for
+   * every one of them in a completely separate, later pass, once the whole store shares one model.
+   *
+   * Transaction-wrapped so a crash never leaves a concept mid-unwound (edges removed, not yet
+   * rebuilt) — matches reassignCircle/recomputeSourceConceptBody's own convention for this pair.
+   * Mirrors rederiveConceptGraph's own guard: a no-op (false) for a missing, connector-owned, or
+   * retired concept, since rederiveConceptGraph would silently skip rebuilding on any of those and
+   * unwind must never run without its paired rederive.
+   */
+  rederiveNativeConceptGraph(conceptId: string): boolean {
+    return this.db.transaction((): boolean => {
+      const row = this.getRow(conceptId);
+      if (!row || isConnectorOwnedRow(row) || row.status === "retired") return false;
+      this.unwindConceptGraph(conceptId, row.circle);
+      this.rederiveConceptGraph(conceptId, row.circle);
+      return true;
+    })();
+  }
+
+  /** File=concept (ratified, Phase 1): does this concept still have any active chunk under it? */
+  hasActiveSourceChunks(conceptId: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM source_chunks WHERE concept_id = ? AND lifecycle = 'active' LIMIT 1`).get(conceptId);
+  }
+
+  /**
+   * REVIEW FIX (round 4, Codex thread 6): plain read — which concept currently owns this
+   * observation, or null if the row doesn't exist. Lets reconcileExistingStagedBindings
+   * (source-sync.ts) detect a cross-concept predecessor during tombstoned-source removal recovery
+   * without needing source.activeRunId/a priorActiveByBinding map threaded in — unlike
+   * materializeStagedBindings' own cross-concept check (which reads the ledger's own
+   * source_chunks.concept_id for the prior ACTIVE chunk), this reads observations.concept_id
+   * directly, so it stays correct even for a predecessor that is no longer an active chunk.
+   */
+  observationConceptId(observationId: string): string | null {
+    const row = this.db.prepare(`SELECT concept_id FROM observations WHERE id = ?`).get(observationId) as { concept_id: string | null } | undefined;
+    return row?.concept_id ?? null;
+  }
+
+  /**
+   * REVIEW FIX (round 5, Codex thread R5-2): every chunk's own binding_id, for one run, in SQLite
+   * rowid (physical insertion) order — the closest available proxy for "the order this run's
+   * chunker actually emitted these" when document_sequence itself cannot be trusted. A store that
+   * predates the document_sequence column backfills every existing row to document_sequence=1
+   * (schema-upgrade default, source-ledger.ts's ensureSchema); carrying such a row forward
+   * verbatim (planCarryForwardManifest, source-sync.ts) means recomputeSourceConceptBody's
+   * `ORDER BY document_sequence` sees an all-tied sort key for a multi-heading file and falls back
+   * to SQLite's own tie-break (a lexicographic heading-path sort, NOT document order) — reordering
+   * the reconstructed body. Rowid is a reasonable stand-in because chunk rows for one run are
+   * always bulk-inserted in one INSERT ... SELECT (publishRun) sourced from the manifest's own
+   * chunk array, which — for the ordinary case this fixes (chunks that were never touched by a
+   * fresh scan since the version that introduced document_sequence) — still reflects whatever
+   * order they were first written in, chunk-by-chunk, section-by-section, back when the file was
+   * originally ingested.
+   */
+  sourceChunkInsertOrder(runId: string): string[] {
+    return (this.db.prepare(`SELECT binding_id FROM source_chunks WHERE run_id = ? ORDER BY rowid`).all(runId) as Array<{ binding_id: string }>)
+      .map((row) => row.binding_id);
   }
 
   /**
    * Connector-only compensation for a refresh that committed before the source run lost its
-   * config/lease fence. Only the exact successor→predecessor edge written by refreshSourceConcept
-   * is reversible; every other state is rejected. An exact completed compensation is replay-safe.
+   * config/lease fence. Only the exact successor→predecessor edge written by
+   * supersedeSourceChunkObservation is reversible; every other state is rejected. An exact
+   * completed compensation is replay-safe.
    */
   async rollbackSourceRunBinding(runId: string, bindingId: string): Promise<SourceConceptRollbackResult> {
     const authorize = (): { conceptId: string; successorObservationId: string; predecessorObservationId: string } => {
@@ -2472,20 +2853,23 @@ export class MonetCore {
       }
       return observation;
     };
+    // FILE=CONCEPT (ratified, Phase 1): classification and compensation now rest ENTIRELY on the
+    // two observations' own superseded_by/superseded_at state, never on active_observation_id — a
+    // file concept's single "active" pointer no longer identifies "the" current observation (it
+    // legitimately holds many simultaneously-active ones), so it cannot serve as this CAS's fence
+    // the way it did under the retired one-chunk-one-concept model.
     const classify = (row: ConceptRow): "forward" | "replay" => {
       if (row.kind !== "source") throw new Error("rollbackSourceRunBinding requires a source concept");
-      if (row.status !== "active" || !row.source_identity || !row.active_observation_id) {
+      if (row.status !== "active" || !row.source_identity) {
         throw new Error("source rollback requires an active source projection");
       }
       const successor = validateOwner(row, readObservation(successorObservationId), "successor");
       const predecessor = validateOwner(row, readObservation(predecessorObservationId), "predecessor");
-      if (row.active_observation_id === successorObservationId
-          && successor.superseded_by === null && successor.superseded_at === null
+      if (successor.superseded_by === null && successor.superseded_at === null
           && predecessor.superseded_by === successorObservationId && predecessor.superseded_at !== null) {
         return "forward";
       }
-      if (row.active_observation_id === predecessorObservationId
-          && predecessor.superseded_by === null && predecessor.superseded_at === null
+      if (predecessor.superseded_by === null && predecessor.superseded_at === null
           && successor.superseded_by === null && successor.superseded_at !== null) {
         return "replay";
       }
@@ -2507,9 +2891,6 @@ export class MonetCore {
         return { concept: toConcept(row), replayed: true };
       })();
     }
-    const predecessor = validateOwner(initial, readObservation(predecessorObservationId), "predecessor");
-    const body = predecessor.content.trim();
-    const embedding = await this.embedder.embed(predecessor.content);
 
     return this.db.immediateTransaction((): SourceConceptRollbackResult => {
       const currentAuthorization = authorize();
@@ -2522,10 +2903,10 @@ export class MonetCore {
       if (!row) throw new Error("source concept disappeared during rollback");
       const state = classify(row);
       if (state === "replay") return { concept: toConcept(row), replayed: true };
-      const currentPredecessor = validateOwner(row, readObservation(predecessorObservationId), "predecessor");
-      const version = row.version + 1;
-      const title = firstLine(body) || row.title;
-      this.unwindConceptGraph(conceptId, row.circle);
+      // Compensation is observation-only: this binding's ONE evidence pair flips back, but the
+      // file concept's own title/body/embedding are never derived from a single observation any
+      // more (item 4 — recomputed holistically, post-publish, from every currently active chunk),
+      // so there is nothing concept-level to roll back here. version/dirty/graph are untouched.
       const terminalAt = Date.now();
       const terminal = this.db.prepare(
         `UPDATE observations SET superseded_by=NULL,superseded_at=?
@@ -2537,47 +2918,10 @@ export class MonetCore {
           WHERE id=? AND concept_id=? AND superseded_by=? AND superseded_at IS NOT NULL`,
       ).run(predecessorObservationId, conceptId, successorObservationId);
       if (restored.changes !== 1) throw new Error("source rollback predecessor changed during compensation");
-      const activated = this.db.prepare(
-        `UPDATE concepts SET title=?,body=?,embedding=?,source_refs=?,version=?,dirty=0,
-                active_observation_id=?,updated_at=unixepoch()*1000
-          WHERE id=? AND kind='source' AND status='active' AND active_observation_id=?
-            AND circle=? AND source_identity=?`,
-      ).run(title, body, embToJson(embedding), currentPredecessor.source_refs, version,
-        predecessorObservationId, conceptId, successorObservationId, row.circle, row.source_identity);
-      if (activated.changes !== 1) throw new Error("source rollback active observation compare-and-swap failed");
-      this.writeRevision(conceptId, version, body);
-      this.rederiveConceptGraph(conceptId, row.circle);
       return { concept: toConcept(this.getRow(conceptId)!), replayed: false };
     })();
   }
 
-  /** Return the exact active source-ledger observation, or reject a stale/foreign refresh. */
-  private currentSourceObservation(conceptId: string, observationId: string, sourceIdentity: string): { content: string } {
-    const observation = this.db
-      .prepare(
-        `SELECT content, concept_id, kind, source_refs, superseded_by, superseded_at
-           FROM observations WHERE id = ?`,
-      )
-      .get(observationId) as {
-        content: string;
-        concept_id: string | null;
-        kind: string;
-        source_refs: string | null;
-        superseded_by: string | null;
-        superseded_at: number | null;
-      } | undefined;
-    if (!observation) throw new Error(`source observation not found: ${observationId}`);
-    if (observation.concept_id !== conceptId) {
-      throw new Error("source refresh observation does not belong to the source concept");
-    }
-    if (observation.kind !== "source" || canonicalSourceIdentityFromJson(observation.source_refs) !== sourceIdentity) {
-      throw new Error("source refresh observation identity does not match the source concept");
-    }
-    if (observation.superseded_by !== null || observation.superseded_at !== null) {
-      throw new Error("cannot refresh from a superseded source observation");
-    }
-    return observation;
-  }
 
   /** Retire a concept without deleting immutable evidence. Restoring re-derives its graph. */
   retireConcept(id: string): Concept | null {
@@ -2600,6 +2944,15 @@ export class MonetCore {
       this.db
         .prepare(`UPDATE concepts SET status = 'retired', updated_at = ? WHERE id = ?`)
         .run(retiredAt, id);
+      // FILE=CONCEPT (ratified, Phase 1): unconditionally null a retiring source concept's
+      // active_observation_id. It is vestigial (set once at creation, never "the" current
+      // observation once a concept legitimately holds many simultaneously-active ones), so it
+      // cannot be relied on to already equal the one observation supersedeObservation happened to
+      // terminate — acknowledgeCleanup's "retired implies null pointer" invariant still needs it
+      // cleared explicitly, here, unconditionally, on every full retirement.
+      if (row.kind === "source") {
+        this.db.prepare(`UPDATE concepts SET active_observation_id = NULL WHERE id = ?`).run(id);
+      }
       this.db
         .prepare(
           `INSERT INTO concept_tombstones (concept_id, retired_at, updated_at) VALUES (?, ?, ?)
@@ -2742,7 +3095,20 @@ export class MonetCore {
       nativeParams.push(offset + Math.max(0, Math.floor(opts.limit)));
     }
     const sourceProjections = this.authorizedSourceProjections(opts.sourceAuthorizationContext, circle);
-    const authorizedSourceObservation = new Map(sourceProjections.map((projection) => [projection.row.id, projection.observationId]));
+    // FILE=CONCEPT (ratified, Phase 1): a source concept now legitimately has MANY simultaneously
+    // active observations (one per chunk), not one — provenance below must count every one of
+    // them, not just a single "authorized observation". Seeded with an empty set per authorized
+    // source concept id first so "has this key" unambiguously means "is a source concept" even if
+    // (defensively) the populate query below somehow finds zero rows for it.
+    const authorizedSourceConceptIds = sourceProjections.map((projection) => projection.row.id);
+    const authorizedSourceObservations = new Map<string, Set<string>>(authorizedSourceConceptIds.map((id) => [id, new Set<string>()]));
+    if (authorizedSourceConceptIds.length) {
+      const placeholders = authorizedSourceConceptIds.map(() => "?").join(",");
+      const activeRows = this.db
+        .prepare(`SELECT concept_id, observation_id FROM source_chunks WHERE lifecycle='active' AND concept_id IN (${placeholders})`)
+        .all(...authorizedSourceConceptIds) as Array<{ concept_id: string; observation_id: string }>;
+      for (const activeRow of activeRows) authorizedSourceObservations.get(activeRow.concept_id)?.add(activeRow.observation_id);
+    }
     const rows = (this.db.prepare(nativeSql).all(...nativeParams) as ConceptRow[]).concat(
         sourceProjections.map((projection) => projection.row),
       ).filter((row) => !opts.cursor
@@ -2770,8 +3136,8 @@ export class MonetCore {
         )
         .all(...ids) as Array<{ oid: string; cid: string; scope: string }>;
       for (const p of prov) {
-        const publishedObservationId = authorizedSourceObservation.get(p.cid);
-        if (publishedObservationId !== undefined && p.oid !== publishedObservationId) continue;
+        const activeSourceObservations = authorizedSourceObservations.get(p.cid);
+        if (activeSourceObservations !== undefined && !activeSourceObservations.has(p.oid)) continue;
         const list = provByConcept.get(p.cid) ?? [];
         if (!list.includes(p.scope)) list.push(p.scope);
         provByConcept.set(p.cid, list);
@@ -3896,14 +4262,6 @@ export class MonetCore {
           AND snapshot.snapshot_id=source.active_snapshot_id
           AND snapshot.ingest_config_hash=source.active_ingest_config_hash
           AND snapshot.config_version=run.config_version AND snapshot.state='active'
-         JOIN source_chunks chunk
-           ON chunk.source_id=source.id AND chunk.run_id=source.active_run_id
-          AND chunk.snapshot_id=source.active_snapshot_id AND chunk.config_version=run.config_version
-          AND chunk.lifecycle='active' AND chunk.concept_id=concept.id
-         JOIN observations observation
-           ON observation.id=chunk.observation_id AND observation.concept_id=concept.id
-          AND observation.circle=source.circle AND observation.kind='source'
-          AND observation.content=chunk.content
          LEFT JOIN circle_aliases archived
            ON archived.from_name=concept.circle AND archived.status='archived'
         WHERE source.lifecycle='active'
@@ -3922,64 +4280,70 @@ export class MonetCore {
           AND source.active_run_id IS NOT NULL AND source.active_snapshot_id IS NOT NULL
           AND source.active_ingest_config_hash IS NOT NULL AND source.applied_config_version IS NOT NULL
           AND concept.kind='source' AND concept.status='active'
-          AND chunk.observation_id IS NOT NULL
-          AND chunk.source_ref=CASE WHEN json_valid(observation.source_refs)
-            THEN json_extract(observation.source_refs,'$[0]') ELSE NULL END
-          AND CASE WHEN json_valid(observation.source_refs)
-            THEN json_array_length(observation.source_refs) ELSE 0 END=1
-          AND substr(chunk.source_ref,1,length('source://' || source.id || '/'))='source://' || source.id || '/'
-          AND CASE WHEN json_valid(observation.embedding)
-            THEN json_type(observation.embedding)='array' AND json_array_length(observation.embedding)=?
+          -- REVIEW FIX (round 4, Codex thread 1, P1): a durable publish and this concept's own
+          -- recompute (recomputeSourceConceptBody) are two separate steps — a crash, a lost fence,
+          -- or an admission-skipped scheduler pass between them (see sweepPendingRecomputes' own
+          -- docstring) leaves knowledge_sources.active_run_id already advanced while the concept
+          -- row still holds its placeholder (first-ever publish) or the PRIOR recompute's now-stale
+          -- body (a re-publish). source_recompute_pending is exactly the durable marker for "this
+          -- row is not yet trustworthy" that recomputeSourceConceptBody clears on success — reusing
+          -- it here closes the read-time window instead of only healing it eventually: a concept
+          -- with an outstanding pending row is excluded from every authorized read (memory_fetch,
+          -- search, gather) until its own recompute clears the row, rather than briefly serving
+          -- stale/empty content. No false negatives: a genuinely fresh concept's pending row was
+          -- already cleared by the recompute that made it fresh, in the same transaction.
+          AND NOT EXISTS (SELECT 1 FROM source_recompute_pending pending WHERE pending.concept_id=concept.id)
+          AND CASE WHEN json_valid(concept.embedding)
+            THEN json_type(concept.embedding)='array' AND json_array_length(concept.embedding)=?
             ELSE 0 END
           AND NOT EXISTS (SELECT 1 FROM json_each(
-            CASE WHEN json_valid(observation.embedding) THEN observation.embedding ELSE '[]' END
-          ) observation_embedding
-            WHERE observation_embedding.type NOT IN ('integer','real')
-               OR observation_embedding.value>? OR observation_embedding.value< -?)
-          AND (
-            (concept.active_observation_id=chunk.observation_id
-              AND observation.superseded_by IS NULL AND observation.superseded_at IS NULL)
-            OR (
-              concept.active_observation_id IS NOT NULL
-              AND observation.superseded_by=concept.active_observation_id
-              AND observation.superseded_at IS NOT NULL
-              AND EXISTS (
-                SELECT 1 FROM source_staged_chunks staged
-                JOIN source_sync_runs staged_run ON staged_run.id=staged.run_id
-                  AND staged_run.source_id=source.id
-                JOIN observations successor ON successor.id=staged.observation_id
-                  AND successor.concept_id=concept.id AND successor.kind='source'
-                  AND successor.circle=source.circle
-                  AND successor.content=staged.content
-                  AND successor.superseded_by IS NULL AND successor.superseded_at IS NULL
-                WHERE staged.concept_id=concept.id
-                  AND staged.observation_id=concept.active_observation_id
-                  AND staged.predecessor_observation_id=chunk.observation_id
-                  AND staged.write_state IN ('engine-written','committed')
-                  AND (
-                    (staged_run.state IN ('staging','activating')
-                      AND staged_run.config_version=source.config_version
-                      AND staged_run.lease_fence=source.lease_fence)
-                    OR (
-                      staged_run.state='aborted' AND staged_run.result IN ('failed','partial')
-                      AND EXISTS (
-                        SELECT 1 FROM source_cleanup_items cleanup
-                        WHERE cleanup.source_id=source.id AND cleanup.run_id=staged.run_id
-                          AND cleanup.target_run_id=run.id AND cleanup.kind='reconcile-orphan'
-                          AND cleanup.binding_id=staged.binding_id
-                          AND cleanup.concept_id=concept.id
-                          AND cleanup.observation_id=staged.observation_id
-                          AND cleanup.predecessor_observation_id=chunk.observation_id
-                          AND cleanup.acknowledged_at IS NULL
-                      )
-                    )
-                  )
-                  AND staged.source_ref=CASE WHEN json_valid(successor.source_refs)
-                    THEN json_extract(successor.source_refs,'$[0]') ELSE NULL END
-                  AND CASE WHEN json_valid(successor.source_refs)
-                    THEN json_array_length(successor.source_refs) ELSE 0 END=1
-              )
-            )
+            CASE WHEN json_valid(concept.embedding) THEN concept.embedding ELSE '[]' END
+          ) concept_embedding
+            WHERE concept_embedding.type NOT IN ('integer','real')
+               OR concept_embedding.value>? OR concept_embedding.value< -?)
+          -- FILE=CONCEPT (ratified, Phase 1): existence, not identity. At least one active chunk
+          -- under the currently active published run/snapshot must legitimately tie this concept
+          -- to a properly-formed, ledger-consistent piece of evidence. Content itself
+          -- (title/body/embedding) comes straight off the concept row above, kept fresh by
+          -- recomputeSourceConceptBody — strictly post-publish, so it can never reflect a
+          -- not-yet-durable or partial chunk set (see that method's own docstring for why pre-
+          -- publish would leak). There is no more single "active observation" CAS/replay
+          -- disjunction to evaluate here: a file concept legitimately holds many simultaneously-
+          -- active observations now, so no single one of them needs disambiguating for a reader.
+          -- Deliberately NOT requiring the joined observation to be UNCONDITIONALLY un-superseded:
+          -- an in-flight (not-yet-published) refresh legitimately supersedes THIS published
+          -- chunk's observation pre-publish (supersedeSourceChunkObservation, called during
+          -- staging, exactly like before) while the concept's own content stays exactly as last
+          -- published — that observation's CONTENT (still joined and checked below) is unaffected
+          -- by its own supersession bookkeeping, so gating existence on "still live" would wrongly
+          -- hide an otherwise perfectly valid, currently-being-served publication the moment any
+          -- routine background sync starts staging its successor. What must still fail closed is
+          -- superseded_by pointing at GARBAGE (direct DB corruption, or a bug) rather than a real
+          -- successor of the SAME concept — supersedeSourceChunkObservation only ever points it at
+          -- one, so requiring that shape costs nothing for the legitimate case and still catches
+          -- the corrupt one.
+          AND EXISTS (
+            SELECT 1 FROM source_chunks chunk
+            JOIN observations observation
+              ON observation.id=chunk.observation_id AND observation.concept_id=concept.id
+             AND observation.circle=source.circle AND observation.kind='source'
+             AND observation.content=chunk.content
+             AND (
+               (observation.superseded_by IS NULL AND observation.superseded_at IS NULL)
+               OR (
+                 observation.superseded_at IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM observations successor WHERE successor.id=observation.superseded_by AND successor.concept_id=concept.id)
+               )
+             )
+            WHERE chunk.source_id=source.id AND chunk.run_id=source.active_run_id
+              AND chunk.snapshot_id=source.active_snapshot_id AND chunk.config_version=run.config_version
+              AND chunk.lifecycle='active' AND chunk.concept_id=concept.id
+              AND chunk.observation_id IS NOT NULL
+              AND chunk.source_ref=CASE WHEN json_valid(observation.source_refs)
+                THEN json_extract(observation.source_refs,'$[0]') ELSE NULL END
+              AND CASE WHEN json_valid(observation.source_refs)
+                THEN json_array_length(observation.source_refs) ELSE 0 END=1
+              AND substr(chunk.source_ref,1,length('source://' || source.id || '/'))='source://' || source.id || '/'
           )
           ${scope}
         ${tail}`,
@@ -3989,8 +4353,15 @@ export class MonetCore {
   /**
    * The single source-aware read projection. Every generic retrieval surface must come through
    * this predicate; kind/source_identity alone are staging fields and never publication authority.
-   * The returned row is rebuilt from the one authorized active observation so historical title,
-   * body, embedding, refs, slug, and support depth cannot leak through a mutable concept envelope.
+   *
+   * FILE=CONCEPT (ratified, Phase 1): the returned row is the concept row itself — title, body,
+   * embedding, support_count, updated_at, last_confirmed_at all live there directly now, kept
+   * fresh by recomputeSourceConceptBody (strictly post-publish). Previously this rebuilt the row
+   * from one authorized active observation because concepts.title/body/embedding were frozen at
+   * creation for a source concept and never the truth; that is no longer the case, so there is
+   * nothing left to rebuild — the EXISTS clause in queryAuthorizedSourcePublications is what
+   * keeps this fail-closed (an unauthorized or unpublished concept is excluded before it ever
+   * reaches this SELECT, exactly as before).
    */
   private authorizedSourceProjections(
     context?: Readonly<SourceAuthorizationContext>,
@@ -4010,43 +4381,8 @@ export class MonetCore {
       scope += " AND concept.id=?";
       params.push(conceptId);
     }
-    const records = this.queryAuthorizedSourcePublications<Array<ConceptRow & {
-      authorized_observation_id: string;
-      authorized_observation_content: string;
-      authorized_observation_embedding: string;
-      authorized_observation_refs: string;
-      authorized_published_at: number;
-    }>[number]>(context, `concept.*,observation.id AS authorized_observation_id,
-              observation.content AS authorized_observation_content,
-              observation.embedding AS authorized_observation_embedding,
-              observation.source_refs AS authorized_observation_refs,
-              run.published_at AS authorized_published_at`, scope, params);
-    return records.flatMap((record) => {
-      let embedding: number[];
-      try {
-        const parsed = JSON.parse(record.authorized_observation_embedding) as unknown;
-        if (!Array.isArray(parsed) || parsed.length !== this.embedder.dim
-            || parsed.some((value) => typeof value !== "number" || !Number.isFinite(value))) return [];
-        embedding = parsed;
-      } catch { return []; }
-      const title = firstLine(record.authorized_observation_content);
-      return [{
-        row: {
-          ...record,
-          slug: slugify(title),
-          title,
-          body: record.authorized_observation_content,
-          embedding: JSON.stringify(embedding),
-          source_refs: record.authorized_observation_refs,
-          support_count: 1,
-          dirty: 0,
-          updated_at: record.authorized_published_at,
-          last_confirmed_at: record.authorized_published_at,
-        },
-        observationId: record.authorized_observation_id,
-        observationContent: record.authorized_observation_content,
-      }];
-    });
+    const records = this.queryAuthorizedSourcePublications<ConceptRow>(context, "concept.*", scope, params);
+    return records.map((row) => ({ row }));
   }
 
   private authorizedSourceProjection(
@@ -7092,7 +7428,7 @@ export class MonetCore {
       return {
         ...toCard(projection.row, score, 0),
         viaSeed: true,
-        sourceRefs: projection.row.source_refs ? JSON.parse(projection.row.source_refs) as string[] : undefined,
+        ...capSourceRefs(projection.row.source_refs),
       };
     });
     const dense = this.scoreAllConcepts(emb, resolvedCircle, opts.includeArchived); // [{id, cos}] desc
@@ -7348,8 +7684,7 @@ export class MonetCore {
   private toGatherCard(r: Ranked): GatherCard | null {
     const row = this.getRow(r.id);
     if (!row || row.status === "retired" || isConnectorOwnedRow(row)) return null;
-    const refs = row.source_refs ? (JSON.parse(row.source_refs) as string[]) : undefined;
-    return { ...toCard(row, r.score, this.openContraCount(r.id)), viaSeed: r.viaSeed, sourceRefs: refs };
+    return { ...toCard(row, r.score, this.openContraCount(r.id)), viaSeed: r.viaSeed, ...capSourceRefs(row.source_refs) };
   }
 
   /** Per-edge-type: distinct non-seed concepts reachable from the seeds within `hop` (explainability). */
@@ -7417,15 +7752,110 @@ export class MonetCore {
    *     observation, updates running-mean embedding/body, and increments supportCount.
    *   - null sessionId: moved/old observations (detach reattach path) — no temporal refresh, no confidence bump.
    */
-  private appendSourceObservation(concept: ConceptRow): ConceptRow {
-    if (concept.kind !== "source") throw new Error("appendSourceObservation requires a source concept");
-    if (concept.status === "retired") throw new Error("cannot attach to a retired concept");
-    // Source body/title/vector are the active binding representation, not an aggregate of its
-    // evidence history. The connector will atomically refresh those fields after supersession.
-    this.db
-      .prepare(`UPDATE concepts SET support_count = support_count + 1, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
-      .run(concept.id);
-    return this.getRow(concept.id)!;
+  /**
+   * FILE=CONCEPT (ratified, Phase 1) write path for one chunk's evidence — replaces the retired
+   * single-observation appendSourceObservation/attach dispatch. storeInternal delegates the ENTIRE
+   * sourceConnector branch here instead of running the embed/bestMatches/dedup/graph/contradiction
+   * machinery below, none of which source ingestion ever used anyway (source resolution is always
+   * explicit — attachTo or forceNew, never score-based).
+   *
+   * No embedding is computed here at all (item 6 — file-level embedding only): a chunk
+   * observation's own embedding is an inert placeholder, never read back —
+   * authorizedSourceProjections projects title/body/embedding straight off the CONCEPT row, kept
+   * fresh by recomputeSourceConceptBody once per touched file, once per sync, only once that
+   * sync's run has durably published (never mid-flight — see recomputeSourceConceptBody's own
+   * docstring for why that timing matters).
+   *
+   * attachTo lands a new observation on an EXISTING file concept (a sibling chunk of the same
+   * file — created earlier this run, or resolved from a prior one) without touching its
+   * title/body/embedding/active_observation_id (the last is a permanently vestigial creation-time
+   * pointer now — see classifyOperationOwnership/rollbackSourceRunBinding in source-ledger.ts for
+   * why it can no longer mean "the" current observation). No attachTo creates a brand-new file
+   * concept (the first chunk of a never-before-seen file) with placeholder content.
+   */
+  private async storeSourceChunk(
+    content: string,
+    opts: SourceStoreOpts,
+    sourceIdentity: string,
+    receiptExpectation: OperationReceiptExpectation,
+  ): Promise<IngestResult> {
+    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
+    // Idempotency fast path, outside the transaction — mirrors storeInternal exactly.
+    if (opts.operationId) {
+      const prior = this.getOperationResult(opts.operationId, receiptExpectation);
+      if (prior) return prior;
+    }
+    const obsId = this.newId();
+    // OUTSIDE the transaction: session row is an audit trail; must survive a rolled-back store.
+    const sessionId = this.ensureSession();
+    const sourceRefs = opts.sourceRefs ?? [];
+    const refsJson = JSON.stringify(sourceRefs);
+    // FILE=CONCEPT (ratified, Phase 1) fix: `trimmed` feeds ONLY the placeholder title below, never
+    // the observation's own stored content. The chunker's own normalization (segmentSection,
+    // source-chunker.ts) strips trailing blank LINES but deliberately nothing narrower (e.g.
+    // trailing spaces on an otherwise-real last line) — contentHash/ingestFingerprint and the
+    // ledger's staged content are all computed from THAT exact string. Storing content.trim()
+    // instead silently diverges from it whenever a chunk's edge whitespace is narrower than a full
+    // trim (real-world content — e.g. copy-pasted chat transcripts — hits this constantly), which
+    // source-ledger.ts's validateDurableEngineReceipt then rejects as a content mismatch.
+    const trimmed = content.trim();
+    const placeholderEmb = embToJson(new Float32Array(this.embedder.dim));
+
+    return this.db.transaction((): IngestResult => {
+      // Re-check inside the write transaction for a competing caller that committed between the
+      // fast path and this transaction (mirrors storeInternal exactly).
+      if (opts.operationId) {
+        const prior = this.getOperationResult(opts.operationId, receiptExpectation);
+        if (prior) return prior;
+      }
+      this.nextSyncTimestamp();
+
+      let conceptId: string;
+      let action: IngestAction;
+      if (opts.attachTo) {
+        const target = this.getRow(opts.attachTo);
+        if (!target) throw new Error(`attachTo concept not found: ${opts.attachTo}`);
+        if (target.circle !== circle) throw new Error(`attachTo concept is in circle '${target.circle}' not '${circle}'`);
+        if (target.status === "retired") throw new Error("cannot attach to a retired concept");
+        if (target.kind !== "source") throw new Error("source evidence may attach only to a source concept");
+        if (target.source_identity !== sourceIdentity) throw new Error("source evidence identity does not match the target source concept");
+        conceptId = target.id;
+        action = "attached";
+        this.db
+          .prepare(`UPDATE concepts SET support_count = support_count + 1, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
+          .run(conceptId);
+      } else {
+        conceptId = this.newId();
+        const now = Date.now();
+        // Placeholder title/body/embedding: recomputeSourceConceptBody replaces them for real once
+        // this file's chunks for this sync are durably published. Nothing reads a source concept's
+        // row before then — authorizedSourceProjections requires a successful publication.
+        const placeholderTitle = firstLine(trimmed);
+        this.db
+          .prepare(
+            `INSERT INTO concepts (id, slug, title, body, kind, embedding, support_count, version, dirty, circle,
+                                   source_identity, active_observation_id, last_confirmed_at, last_confirmed_session_id)
+             VALUES (?, ?, ?, '', 'source', ?, 1, 0, 0, ?, ?, ?, ?, ?)`,
+          )
+          .run(conceptId, slugify(conceptId), placeholderTitle, placeholderEmb, circle, sourceIdentity, obsId, now, sessionId);
+        action = "created";
+      }
+      this.db
+        .prepare(
+          `INSERT INTO observations (id, content, embedding, kind, circle, session_id, author_agent_id, source_refs, concept_id)
+           VALUES (?, ?, ?, 'source', ?, ?, ?, ?, ?)`,
+        )
+        .run(obsId, content, placeholderEmb, circle, sessionId, this.agentId, refsJson, conceptId);
+      if (opts.operationId) {
+        this.db
+          .prepare(
+            `INSERT INTO ingest_operations (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score)
+             VALUES (?, ?, ?, 'source', ?, ?, 0)`,
+          )
+          .run(opts.operationId, conceptId, obsId, conceptId, action);
+      }
+      return { action, conceptId, observationId: obsId, score: 0, concept: toConcept(this.getRow(conceptId)!) };
+    })();
   }
 
   private attach(concept: ConceptRow, content: string, emb: Float32Array, sessionId?: string | null, observationId?: string): ConceptRow {
@@ -7678,6 +8108,15 @@ function toCard(r: ConceptRow, score: number, contradictions: number): SearchCar
     fetchHint: fetchHint(r.kind),
     circle: r.circle,
   };
+}
+
+/** REVIEW FIX (round 4, Codex thread 13): shared cap for both gather() source-card sites (the
+ *  direct-seed sourceRankedCards map and toGatherCard) — see SOURCE_REFS_CARD_CAP's own comment. */
+function capSourceRefs(sourceRefsJson: string | null): { sourceRefs?: string[]; sourceRefsTotal?: number } {
+  if (!sourceRefsJson) return {};
+  const all = JSON.parse(sourceRefsJson) as string[];
+  if (all.length <= SOURCE_REFS_CARD_CAP) return { sourceRefs: all };
+  return { sourceRefs: all.slice(0, SOURCE_REFS_CARD_CAP), sourceRefsTotal: all.length };
 }
 
 function fetchHint(kind: string): string {

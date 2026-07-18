@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
+import { HashingEmbeddingProvider } from "../embedding";
 import { MonetCore } from "../engine";
 import { computeSourceContentHash, computeSourceIngestFingerprint, computeSourceOperationId } from "../source-chunker";
 import { computeSourceManifestHash } from "../source-scanner";
+import type { EmbeddingProvider } from "../embedding";
 import type { SourceLedger } from "../source-ledger";
 import type { SourceManifestSkippedFileInput, SourceSyncRun, StageSourceManifestInput } from "../source-types";
 import type { StoragePort } from "../storage";
@@ -23,7 +25,7 @@ const sourceInput = (id: string, localPath: string) => ({
 type ManifestOverrides = Partial<StageSourceManifestInput> & { bindingGeneration?: number };
 
 const manifest = (run: SourceSyncRun, overrides: ManifestOverrides = {}): StageSourceManifestInput => {
-  const files = overrides.files ?? [{ relativePath: "README.md", type: "file" as const, contentHash: "file-1", byteLength: 12 }];
+  const files = overrides.files ?? [{ relativePath: "README.md", type: "file" as const, contentHash: "file-1", byteLength: 12, title: "README" }];
   const content = "Hello world";
   const contentHash = computeSourceContentHash(Buffer.from(content, "utf8"));
   const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
@@ -39,6 +41,7 @@ const manifest = (run: SourceSyncRun, overrides: ManifestOverrides = {}): StageS
     headingPath: ["Intro"],
     occurrence: 1,
     segmentIndex: 1,
+    documentSequence: 1,
     contentHash,
     ingestFingerprint,
     metadata,
@@ -74,7 +77,7 @@ async function materialize(
     ...(prior?.conceptId ? { attachTo: prior.conceptId } : { resolution: "forceNew" as const }),
   });
   if (prior?.observationId && writeState === "committed") {
-    await core.refreshSourceConcept(stored.conceptId, stored.observationId, prior.observationId);
+    await core.supersedeSourceChunkObservation(stored.conceptId, stored.observationId, prior.observationId);
   }
   const receipt = core.recordSourceBindingReceipt({
     runId: run.id,
@@ -158,7 +161,7 @@ describe("source ledger publication kernel", () => {
       expect(core.stageSourceManifest(partial).state).toBe("staging");
       const conflicting = manifest(first.run, {
         scanStatus: "partial",
-        files: [{ relativePath: "OTHER.md", type: "file", contentHash: "other", byteLength: 1 }],
+        files: [{ relativePath: "OTHER.md", type: "file", contentHash: "other", byteLength: 1, title: "OTHER" }],
         chunks: [],
       });
       expect(() => core.stageSourceManifest(conflicting)).toThrow(/conflicts/);
@@ -605,29 +608,29 @@ describe("source ledger publication kernel", () => {
       expect(() => core.acknowledgeSourceCleanup(cleanup.id)).toThrow(/terminally superseded/);
       await expect(core.rollbackSourceRunBinding("wrong-run", "binding-1")).rejects.toThrow(/no durable authorized/);
 
+      // File=concept (Phase 1): rollback is observation-pair-only now (see
+      // rollbackSourceRunBinding's own docstring) — it never touches the concept row's own
+      // title/body/embedding/active_observation_id/source_refs any more (recomputeSourceConceptBody,
+      // strictly post-publish, is what keeps those fresh; this run never published). Capture the
+      // concept row's snapshot BEFORE rollback to prove it is byte-for-byte untouched, and verify
+      // the real compensation — the observation pair's own superseded_by/at state — directly.
+      const beforeRollback = db.prepare(`SELECT active_observation_id,source_identity,source_refs,body,embedding FROM concepts WHERE id=?`)
+        .get(published.stored.conceptId);
       const rolledBack = await core.rollbackSourceRunBinding(second.run.id, "binding-1");
       expect(rolledBack.replayed).toBe(false);
-      expect(rolledBack.concept).toMatchObject({
-        id: published.stored.conceptId, body: firstManifest.chunks[0].content,
-        title: firstManifest.chunks[0].content.replace(/\.$/, ""), circle: "source-a", kind: "source",
-      });
+      expect(rolledBack.concept).toMatchObject({ id: published.stored.conceptId, circle: "source-a", kind: "source" });
       const projection = db.prepare(
         `SELECT active_observation_id,source_identity,source_refs,body,embedding FROM concepts WHERE id=?`,
       ).get(published.stored.conceptId) as {
         active_observation_id: string; source_identity: string; source_refs: string; body: string; embedding: string;
       };
+      expect(projection).toEqual(beforeRollback);
       const predecessor = db.prepare(`SELECT source_refs,embedding,superseded_by,superseded_at FROM observations WHERE id=?`).get(
         published.stored.observationId,
       ) as { source_refs: string; embedding: string; superseded_by: string | null; superseded_at: number | null };
       const successorRow = db.prepare(`SELECT superseded_by,superseded_at FROM observations WHERE id=?`).get(
         successor.stored.observationId,
       ) as { superseded_by: string | null; superseded_at: number | null };
-      expect(projection).toMatchObject({
-        active_observation_id: published.stored.observationId,
-        source_identity: "source://source-a", source_refs: predecessor.source_refs,
-        body: firstManifest.chunks[0].content,
-      });
-      expect(projection.embedding).toBe(predecessor.embedding);
       expect(predecessor).toMatchObject({ superseded_by: null, superseded_at: null });
       expect(successorRow.superseded_by).toBeNull();
       expect(successorRow.superseded_at).not.toBeNull();
@@ -637,7 +640,7 @@ describe("source ledger publication kernel", () => {
       expect(db.prepare(`SELECT 1 FROM concept_entities WHERE concept_id=? LIMIT 1`).get(published.stored.conceptId)).toBeUndefined();
 
       const replay = await core.rollbackSourceRunBinding(second.run.id, "binding-1");
-      expect(replay).toMatchObject({ replayed: true, concept: { id: published.stored.conceptId, body: firstManifest.chunks[0].content } });
+      expect(replay).toMatchObject({ replayed: true, concept: { id: published.stored.conceptId } });
       expect(core.acknowledgeSourceCleanup(cleanup.id).acknowledgedAt).not.toBeNull();
       const retry = core.beginSourceRun({ sourceId: "source-a", snapshotId: "second" });
       expect(retry.kind).toBe("started");
@@ -681,8 +684,12 @@ describe("source ledger publication kernel", () => {
       });
       expect(() => core.acknowledgeSourceCleanup(cleanup.id)).toThrow(/terminally superseded/);
       await expect(core.rollbackSourceRunBinding(first.run.id, "binding-1")).rejects.toThrow(/no durable authorized/);
+      // File=concept (Phase 1): rollback is observation-pair-only now — see
+      // rollbackSourceRunBinding's own docstring — so the returned concept row's body is whatever
+      // it already was (this run never published, so recomputeSourceConceptBody never ran); the
+      // real compensation is the observation pair superseded_by/at state, covered elsewhere.
       expect(await core.rollbackSourceRunBinding(second.run.id, "binding-1")).toMatchObject({
-        replayed: false, concept: { id: published.stored.conceptId, body: "Published predecessor." },
+        replayed: false, concept: { id: published.stored.conceptId },
       });
       expect(core.acknowledgeSourceCleanup(cleanup.id).acknowledgedAt).not.toBeNull();
       expect(core.getSource("source-a", { includeTombstoned: true })).toMatchObject({
@@ -810,7 +817,12 @@ describe("source ledger publication kernel", () => {
     }
   });
 
-  it("quarantines same-source cross-binding takeover while a normal same-binding successor still publishes", async () => {
+  // File=concept (Phase 1): a second binding attaching to an existing concept is no longer itself
+  // a violation — every chunk of ONE file legitimately shares its file concept now. The genuine
+  // violation this test protects against is a DIFFERENT file's chunk claiming another file's
+  // concept (relativePath "OTHER.md" vs. the target's "README.md"), which proves no binding_id OR
+  // relative_path lineage to it (classifyOperationOwnership's provenLineage check).
+  it("quarantines a cross-FILE takeover while a normal same-binding successor still publishes", async () => {
     const core = new MonetCore(":memory:");
     try {
       core.createSource(sourceInput("source-a", "/tmp/source-ledger-cross-binding"));
@@ -829,10 +841,13 @@ describe("source ledger publication kernel", () => {
         contentHash: base.contentHash, headingPath, metadata: base.metadata, ingestConfigHash: takeover.run.ingestConfigHash,
       });
       const hijack = {
-        ...base, bindingId: "binding-2", headingPath, sourceRef: "source://source-a/README.md#other~1", ingestFingerprint,
+        ...base, bindingId: "binding-2", relativePath: "OTHER.md", headingPath, sourceRef: "source://source-a/OTHER.md#other~1", ingestFingerprint,
         operationId: computeSourceOperationId("source-a", "binding-2", ingestFingerprint, "takeover", 1),
       };
-      const takeoverManifest = manifest(takeover.run, { chunks: [hijack] });
+      const takeoverManifest = manifest(takeover.run, {
+        chunks: [hijack],
+        files: [{ relativePath: "OTHER.md", type: "file", contentHash: hijack.contentHash, byteLength: hijack.content.length, title: "OTHER" }],
+      });
       core.stageSourceManifest(takeoverManifest);
       const hijackWrite = await core.storeSource(hijack.content, {
         circle: "source-a", sourceRefs: [hijack.sourceRef], operationId: hijack.operationId,
@@ -876,7 +891,7 @@ describe("source ledger publication kernel", () => {
 
       const moved = core.beginSourceRun({ sourceId: "source-a", snapshotId: "b" });
       if (moved.kind !== "started") throw new Error("expected moved run");
-      const file = { relativePath: "MOVED.md", type: "file" as const, contentHash: "moved-file", byteLength: 10 };
+      const file = { relativePath: "MOVED.md", type: "file" as const, contentHash: "moved-file", byteLength: 10, title: "MOVED" };
       const baseChunk = manifest(moved.run, { bindingGeneration: 2 }).chunks[0];
       const fingerprint = baseChunk.ingestFingerprint;
       const chunk = {
@@ -997,7 +1012,12 @@ describe("source ledger publication kernel", () => {
     }
   });
 
-  it("requires engine-proven receipts and rejects concept reuse across sibling bindings", async () => {
+  // File=concept (Phase 1): a sibling binding attaching to an existing concept is no longer
+  // itself a violation when it's the SAME file (every chunk of one file legitimately shares its
+  // concept now) — so "second" here is a chunk of a DIFFERENT file ("OTHER.md") to keep this a
+  // genuine cross-FILE concept-reuse violation, which classifyOperationOwnership's provenLineage
+  // check still rejects (no binding_id or relative_path lineage to the target concept).
+  it("requires engine-proven receipts and rejects concept reuse across a different file's binding", async () => {
     const core = new MonetCore(":memory:");
     try {
       core.createSource(sourceInput("source-a", "/tmp/source-ledger-receipts"));
@@ -1009,11 +1029,18 @@ describe("source ledger publication kernel", () => {
         ingestConfigHash: begun.run.ingestConfigHash,
       });
       const second = {
-        ...base.chunks[0], bindingId: "binding-2", bindingGeneration: 1, headingPath: ["Other"], sourceRef: "source://source-a/README.md#other~1",
+        ...base.chunks[0], bindingId: "binding-2", bindingGeneration: 1, relativePath: "OTHER.md", headingPath: ["Other"],
+        sourceRef: "source://source-a/OTHER.md#other~1",
         ingestFingerprint: secondFingerprint,
         operationId: computeSourceOperationId("source-a", "binding-2", secondFingerprint, "receipts", 1),
       };
-      const staged = manifest(begun.run, { chunks: [base.chunks[0], second] });
+      const staged = manifest(begun.run, {
+        chunks: [base.chunks[0], second],
+        files: [
+          ...base.files,
+          { relativePath: "OTHER.md", type: "file", contentHash: second.contentHash, byteLength: second.content.length, title: "OTHER" },
+        ],
+      });
       core.stageSourceManifest(staged);
       expect(() => core.recordSourceBindingReceipt({
         runId: begun.run.id, bindingId: "binding-1", conceptId: "forged", observationId: "forged", writeState: "engine-written",
@@ -1029,10 +1056,14 @@ describe("source ledger publication kernel", () => {
       const sibling = await core.storeSource(second.content, {
         circle: "source-a", sourceRefs: [second.sourceRef], operationId: second.operationId, attachTo: first.conceptId,
       });
+      // File=concept (Phase 1): caught earlier and more fundamentally now, by
+      // classifyOperationOwnership's provenLineage check (source-ledger.ts) — "OTHER.md"'s binding
+      // has no binding_id or relative_path lineage to "README.md"'s concept — rather than falling
+      // through to recordBindingReceipt's own same-run collision check.
       expect(() => core.recordSourceBindingReceipt({
         runId: begun.run.id, bindingId: "binding-2", conceptId: sibling.conceptId, observationId: sibling.observationId,
         predecessorObservationId: null, writeState: "engine-written",
-      })).toThrow(/collides|new binding/);
+      })).toThrow(/ownership|collides|new binding/);
     } finally {
       core.close();
     }
@@ -1389,12 +1420,16 @@ describe("source ledger schema migration", () => {
     }
   });
 
-  it("creates every v9 receipt/cleanup index on fresh and current-schema reopen", () => {
+  it("creates every v10 receipt/cleanup index on fresh and current-schema reopen", () => {
+    // File=concept (Phase 1): uq_source_staged_chunks_concept and uq_source_chunks_active_concept
+    // were dropped/replaced (source-ledger.ts's ensureSchema) — many chunks now legitimately
+    // share one concept_id, so "at most one [staged|active] chunk per concept" is no longer a
+    // valid index. uq_source_chunks_active_concept_slot is the replacement: per-(concept,
+    // natural-key-slot) uniqueness.
     const expected = [
       "idx_source_cleanup_run",
-      "uq_source_staged_chunks_concept",
       "uq_source_staged_chunks_observation",
-      "uq_source_chunks_active_concept",
+      "uq_source_chunks_active_concept_slot",
       "uq_source_chunks_active_observation",
     ];
     const indexNames = (db: StoragePort) => (db.prepare(
@@ -1428,7 +1463,100 @@ describe("source ledger schema migration", () => {
     }
   });
 
-  it("serially repairs partial v9 registry and ledger columns across two open connections", () => {
+  it("physically enforces uq_source_chunks_active_concept_slot: relaxed across slots, still exclusive within one (item 3b)", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      core.createSource(sourceInput("source-a", "/tmp/source-a-slot-index"));
+      const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+
+      const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+      const buildChunk = (bindingId: string, headingPath: string[], documentSequence: number, content: string) => {
+        const contentHash = computeSourceContentHash(Buffer.from(content, "utf8"));
+        const ingestFingerprint = computeSourceIngestFingerprint({
+          contentHash, headingPath, metadata, ingestConfigHash: begun.run.ingestConfigHash,
+        });
+        return {
+          bindingId, bindingGeneration: 1,
+          operationId: computeSourceOperationId(begun.run.sourceId, bindingId, ingestFingerprint, begun.run.snapshotId, 1),
+          relativePath: "README.md", headingPath, occurrence: 1, segmentIndex: 1, documentSequence,
+          contentHash, ingestFingerprint, metadata,
+          sourceRef: `source://source-a/README.md#${headingPath[0].toLowerCase()}~1`, content,
+        };
+      };
+      const staged = manifest(begun.run, {
+        chunks: [
+          buildChunk("binding-1", ["Intro"], 1, "Intro body"),
+          buildChunk("binding-2", ["Details"], 2, "Details body"),
+        ],
+      });
+      core.stageSourceManifest(staged);
+
+      // Two DIFFERENT slots (different heading) of the SAME file legitimately share one concept —
+      // the relaxed half of file=concept's invariant, proven through the real write path.
+      const first = await core.storeSource(staged.chunks[0].content, {
+        circle: "source-a", sourceRefs: [staged.chunks[0].sourceRef], operationId: staged.chunks[0].operationId,
+        resolution: "forceNew",
+      });
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: "binding-1", conceptId: first.conceptId, observationId: first.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+      const second = await core.storeSource(staged.chunks[1].content, {
+        circle: "source-a", sourceRefs: [staged.chunks[1].sourceRef], operationId: staged.chunks[1].operationId,
+        attachTo: first.conceptId,
+      });
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: "binding-2", conceptId: second.conceptId, observationId: second.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+      core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+
+      const db = (core as unknown as { db: StoragePort }).db;
+      const activeRows = db.prepare(
+        `SELECT * FROM source_chunks WHERE lifecycle='active' ORDER BY heading_path_json`,
+      ).all() as Array<Record<string, unknown>>;
+      expect(activeRows).toHaveLength(2);
+      expect(activeRows[0].concept_id).toBe(first.conceptId);
+      expect(activeRows[1].concept_id).toBe(first.conceptId);
+
+      // The retained half: physically cloning one active row's full slot identity (same
+      // concept_id/relative_path/heading_path_json/occurrence/segment_index), changing only the
+      // run/binding primary key, must be rejected by uq_source_chunks_active_concept_slot — a real
+      // physical backstop, not merely an application-layer check.
+      const template = activeRows[0];
+      const insertClone = (runId: string, bindingId: string) => db.prepare(`
+        INSERT INTO source_chunks (
+          source_id, run_id, snapshot_id, config_version, binding_id, binding_generation, operation_id,
+          relative_path, heading_path_json, occurrence, segment_index, document_sequence,
+          content_hash, ingest_fingerprint, metadata_json, source_ref, content,
+          concept_id, observation_id, predecessor_observation_id, write_state, lifecycle
+        ) VALUES (
+          @source_id, @run_id, @snapshot_id, @config_version, @binding_id, @binding_generation, @operation_id,
+          @relative_path, @heading_path_json, @occurrence, @segment_index, @document_sequence,
+          @content_hash, @ingest_fingerprint, @metadata_json, @source_ref, @content,
+          @concept_id, @observation_id, @predecessor_observation_id, @write_state, @lifecycle
+        )
+      `).run({ ...template, run_id: runId, binding_id: bindingId, observation_id: null, write_state: "committed" });
+
+      expect(() => insertClone("clone-run", "clone-binding")).toThrow(/UNIQUE constraint failed/);
+
+      // Lifecycle-scoping: the partial index only covers lifecycle='active'. Superseding the
+      // original row at that exact slot frees it, so a NEW active row at the SAME slot (still a
+      // distinct run_id/binding_id) is accepted — exactly what real supersession relies on.
+      db.prepare(`UPDATE source_chunks SET lifecycle='superseded' WHERE run_id=@run_id AND binding_id=@binding_id`)
+        .run({ run_id: template.run_id as string, binding_id: template.binding_id as string });
+      expect(() => insertClone("clone-run-2", "clone-binding-2")).not.toThrow();
+      const stillActive = db.prepare(
+        `SELECT relative_path, heading_path_json FROM source_chunks WHERE lifecycle='active' AND concept_id=?`,
+      ).all(first.conceptId);
+      expect(stillActive).toHaveLength(2); // the untouched Details row + the freshly-inserted clone
+    } finally {
+      core.close();
+    }
+  });
+
+  it("serially repairs partial v9 registry and ledger columns across two open connections, landing on v10", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-v9-partial-race-"));
     const path = join(dir, "monet.db");
     try {
@@ -1460,7 +1588,7 @@ describe("source ledger schema migration", () => {
       left.close();
 
       const again = new MonetCore(path);
-      expect(((again as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(9);
+      expect(((again as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(10);
       again.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -1514,7 +1642,7 @@ describe("source ledger schema migration", () => {
     }
   });
 
-  it("bumps v8 stores to v9 idempotently while graph-disabled fresh stores remain v0", () => {
+  it("bumps v8 stores to v10 idempotently while graph-disabled fresh stores remain v0", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-ledger-migrate-"));
     const path = join(dir, "monet.db");
     try {
@@ -1529,7 +1657,7 @@ describe("source ledger schema migration", () => {
 
       const migrated = new MonetCore(path);
       const migratedDb = (migrated as unknown as { db: StoragePort }).db;
-      expect(migratedDb.pragma("user_version", { simple: true })).toBe(9);
+      expect(migratedDb.pragma("user_version", { simple: true })).toBe(10);
       for (const table of ["source_sync_runs", "source_snapshots", "source_staged_files", "source_files", "source_staged_chunks", "source_chunks", "source_cleanup_items", "source_removals", "source_removal_items"]) {
         expect(migratedDb.prepare(`PRAGMA table_info(${table})`).all()).not.toEqual([]);
       }
@@ -1540,7 +1668,7 @@ describe("source ledger schema migration", () => {
       expect((migratedDb.prepare(`SELECT sql FROM sqlite_master WHERE name='source_cleanup_items'`).get() as { sql: string }).sql).toContain("quarantine-non-authorizing");
       migrated.close();
       const reopened = new MonetCore(path);
-      expect(((reopened as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(9);
+      expect(((reopened as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(10);
       reopened.close();
       const disabled = new MonetCore(":memory:", { graphEnabled: false });
       expect(((disabled as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(0);
@@ -1703,6 +1831,331 @@ describe("source ledger schema migration", () => {
       core.abortSourceRun(begun.run.id, "failed", "exercise aborted fence");
       await assertFence();
       expect((await core.getConcept(native.conceptId))?.body).toContain("native sentinel knowledge");
+    } finally {
+      core.close();
+    }
+  });
+});
+
+describe("file-level embedding only (item 6)", () => {
+  it("never embeds an individual chunk write; recomputeSourceConceptBody embeds the whole file exactly once", async () => {
+    const real = new HashingEmbeddingProvider();
+    const calls: string[] = [];
+    const spy: EmbeddingProvider = {
+      dim: real.dim,
+      modelId: real.modelId,
+      embed: (text) => {
+        calls.push(text);
+        return real.embed(text);
+      },
+    };
+    const core = new MonetCore(":memory:", { embedder: spy });
+    try {
+      core.createSource(sourceInput("source-a", "/tmp/source-a-file-embed"));
+      const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+
+      const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+      const buildChunk = (bindingId: string, headingPath: string[], documentSequence: number, content: string) => {
+        const contentHash = computeSourceContentHash(Buffer.from(content, "utf8"));
+        const ingestFingerprint = computeSourceIngestFingerprint({
+          contentHash, headingPath, metadata, ingestConfigHash: begun.run.ingestConfigHash,
+        });
+        return {
+          bindingId, bindingGeneration: 1,
+          operationId: computeSourceOperationId(begun.run.sourceId, bindingId, ingestFingerprint, begun.run.snapshotId, 1),
+          relativePath: "README.md", headingPath, occurrence: 1, segmentIndex: 1, documentSequence,
+          contentHash, ingestFingerprint, metadata,
+          sourceRef: `source://source-a/README.md#${headingPath[0].toLowerCase()}~1`, content,
+        };
+      };
+      const staged = manifest(begun.run, {
+        chunks: [
+          buildChunk("binding-1", ["Intro"], 1, "Intro body text"),
+          buildChunk("binding-2", ["Details"], 2, "Details body text"),
+        ],
+      });
+      core.stageSourceManifest(staged);
+
+      const first = await core.storeSource(staged.chunks[0].content, {
+        circle: "source-a", sourceRefs: [staged.chunks[0].sourceRef], operationId: staged.chunks[0].operationId,
+        resolution: "forceNew",
+      });
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: "binding-1", conceptId: first.conceptId, observationId: first.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+      const second = await core.storeSource(staged.chunks[1].content, {
+        circle: "source-a", sourceRefs: [staged.chunks[1].sourceRef], operationId: staged.chunks[1].operationId,
+        attachTo: first.conceptId,
+      });
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: "binding-2", conceptId: second.conceptId, observationId: second.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+      // Every chunk-level write (create + attach) uses a placeholder embedding — the real embedder
+      // is never called per chunk, only per whole-file recompute.
+      expect(calls).toHaveLength(0);
+
+      core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+      expect(calls).toHaveLength(0); // publish alone still doesn't recompute/embed
+
+      await core.recomputeSourceConceptBody(first.conceptId);
+      expect(calls).toHaveLength(1);
+      // The one call embeds the FILE's reconstructed body (both chunks, position-ordered), not
+      // either chunk's own text in isolation.
+      expect(calls[0]).toContain("Intro body text");
+      expect(calls[0]).toContain("Details body text");
+      expect(calls[0]).not.toBe("Intro body text");
+      expect(calls[0]).not.toBe("Details body text");
+
+      // A second recompute (e.g. a later sync cycle) embeds again exactly once more — linear in
+      // recompute count, never per chunk and never accumulating extra calls per chunk touched.
+      await core.recomputeSourceConceptBody(first.conceptId);
+      expect(calls).toHaveLength(2);
+    } finally {
+      core.close();
+    }
+  });
+});
+
+describe("recomputeSourceConceptBody CAS against a concurrent chunk-set mutation (review fix, IMPORTANT)", () => {
+  it("retries against the current chunk set instead of persisting a body gathered before a concurrent chunk landed", async () => {
+    // embed() is async and runs OUTSIDE any transaction (SQLite transactions are synchronous), so
+    // the active chunk set can legitimately change between the gather (body/title/refs built from
+    // a SELECT) and the write transaction that persists them — a race the write transaction used
+    // to be blind to (it re-checked only concept status, never the chunk set it read from). This
+    // simulates exactly that: a chunk lands mid-embed, via the embedder itself as the interleave
+    // point, standing in for a concurrent writer.
+    const real = new HashingEmbeddingProvider();
+    const db = { current: null as unknown as StoragePort };
+    const calls: string[] = [];
+    let landedConcurrentChunk = false;
+    const spy: EmbeddingProvider = {
+      dim: real.dim,
+      modelId: real.modelId,
+      embed: (text) => {
+        calls.push(text);
+        if (!landedConcurrentChunk) {
+          landedConcurrentChunk = true;
+          // Clone an existing active row's full shape, only changing what must be unique — the
+          // ledger's own realistic row shape, not a hand-rolled partial one.
+          const template = db.current
+            .prepare(`SELECT * FROM source_chunks WHERE lifecycle='active' LIMIT 1`)
+            .get() as Record<string, unknown>;
+          db.current.prepare(`
+            INSERT INTO source_chunks (
+              source_id, run_id, snapshot_id, config_version, binding_id, binding_generation, operation_id,
+              relative_path, heading_path_json, occurrence, segment_index, document_sequence,
+              content_hash, ingest_fingerprint, metadata_json, source_ref, content,
+              concept_id, observation_id, predecessor_observation_id, write_state, lifecycle
+            ) VALUES (
+              @source_id, @run_id, @snapshot_id, @config_version, @binding_id, @binding_generation, @operation_id,
+              @relative_path, @heading_path_json, @occurrence, @segment_index, @document_sequence,
+              @content_hash, @ingest_fingerprint, @metadata_json, @source_ref, @content,
+              @concept_id, @observation_id, @predecessor_observation_id, @write_state, @lifecycle
+            )
+          `).run({
+            ...template, run_id: "concurrent-run", binding_id: "concurrent-binding",
+            heading_path_json: JSON.stringify(["Concurrent"]), document_sequence: 99,
+            content: "concurrently landed content", observation_id: null, write_state: "committed",
+          });
+        }
+        return real.embed(text);
+      },
+    };
+    const core = new MonetCore(":memory:", { embedder: spy });
+    db.current = (core as unknown as { db: StoragePort }).db;
+    try {
+      core.createSource(sourceInput("source-a", "/tmp/source-a-recompute-cas"));
+      const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+
+      const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+      const buildChunk = (bindingId: string, headingPath: string[], documentSequence: number, content: string) => {
+        const contentHash = computeSourceContentHash(Buffer.from(content, "utf8"));
+        const ingestFingerprint = computeSourceIngestFingerprint({
+          contentHash, headingPath, metadata, ingestConfigHash: begun.run.ingestConfigHash,
+        });
+        return {
+          bindingId, bindingGeneration: 1,
+          operationId: computeSourceOperationId(begun.run.sourceId, bindingId, ingestFingerprint, begun.run.snapshotId, 1),
+          relativePath: "README.md", headingPath, occurrence: 1, segmentIndex: 1, documentSequence,
+          contentHash, ingestFingerprint, metadata,
+          sourceRef: `source://source-a/README.md#${headingPath[0].toLowerCase()}~1`, content,
+        };
+      };
+      const staged = manifest(begun.run, {
+        chunks: [
+          buildChunk("binding-1", ["Intro"], 1, "Intro body text"),
+          buildChunk("binding-2", ["Details"], 2, "Details body text"),
+        ],
+      });
+      core.stageSourceManifest(staged);
+      const first = await core.storeSource(staged.chunks[0].content, {
+        circle: "source-a", sourceRefs: [staged.chunks[0].sourceRef], operationId: staged.chunks[0].operationId,
+        resolution: "forceNew",
+      });
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: "binding-1", conceptId: first.conceptId, observationId: first.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+      const second = await core.storeSource(staged.chunks[1].content, {
+        circle: "source-a", sourceRefs: [staged.chunks[1].sourceRef], operationId: staged.chunks[1].operationId,
+        attachTo: first.conceptId,
+      });
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: "binding-2", conceptId: second.conceptId, observationId: second.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+      core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+
+      // Does not throw, does not silently persist a stale two-chunk body — retries and picks up
+      // the concurrently landed third chunk.
+      await core.recomputeSourceConceptBody(first.conceptId);
+
+      expect(calls.length).toBeGreaterThan(1); // at least one stale attempt, then a successful retry
+      const db2 = db.current;
+      const persisted = db2.prepare(`SELECT body FROM concepts WHERE id=?`).get(first.conceptId) as { body: string };
+      expect(persisted.body).toContain("Intro body text");
+      expect(persisted.body).toContain("Details body text");
+      expect(persisted.body).toContain("concurrently landed content");
+      // The LAST embed call (the one that actually got persisted) covers all three chunks — the
+      // first, stale call (two chunks only) never won.
+      expect(calls[calls.length - 1]).toContain("concurrently landed content");
+    } finally {
+      core.close();
+    }
+  });
+});
+
+describe("recomputeSourceConceptBody body reconstruction (round 4, Codex thread 9)", () => {
+  it("joins split segments of ONE oversized section with a single newline, never an artificial blank paragraph", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      core.createSource(sourceInput("source-a", "/tmp/source-a-split-segments"));
+      const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+      const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+      const buildChunk = (
+        bindingId: string, headingPath: string[], occurrence: number, segmentIndex: number, documentSequence: number, content: string,
+      ) => {
+        const contentHash = computeSourceContentHash(Buffer.from(content, "utf8"));
+        const ingestFingerprint = computeSourceIngestFingerprint({
+          contentHash, headingPath, metadata, ingestConfigHash: begun.run.ingestConfigHash,
+        });
+        return {
+          bindingId, bindingGeneration: 1,
+          operationId: computeSourceOperationId(begun.run.sourceId, bindingId, ingestFingerprint, begun.run.snapshotId, 1),
+          relativePath: "README.md", headingPath, occurrence, segmentIndex, documentSequence,
+          contentHash, ingestFingerprint, metadata,
+          sourceRef: `source://source-a/README.md#${headingPath[0]!.toLowerCase()}~${occurrence}`, content,
+        };
+      };
+      // ONE section ("Big") split into two chunker segments — segmentSection (source-chunker.ts)
+      // strips each segment's OWN trailing newline before storing it, so the join between segment 1
+      // and segment 2 is NOT a section break and must not gain an artificial blank line. A second,
+      // genuinely separate section ("Small") follows, where a real "\n\n" break IS expected.
+      const staged = manifest(begun.run, {
+        chunks: [
+          buildChunk("binding-1", ["Big"], 1, 1, 1, "big section line one\nbig section line two"),
+          buildChunk("binding-2", ["Big"], 1, 2, 2, "big section line three\nbig section line four"),
+          buildChunk("binding-3", ["Small"], 1, 1, 3, "small section body"),
+        ],
+      });
+      core.stageSourceManifest(staged);
+      let conceptId: string | undefined;
+      for (const chunk of staged.chunks) {
+        const stored = await core.storeSource(chunk.content, {
+          circle: "source-a", sourceRefs: [chunk.sourceRef], operationId: chunk.operationId,
+          ...(conceptId ? { attachTo: conceptId } : { resolution: "forceNew" as const }),
+        });
+        conceptId = stored.conceptId;
+        core.recordSourceBindingReceipt({
+          runId: begun.run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId, observationId: stored.observationId,
+          predecessorObservationId: null, writeState: "committed",
+        });
+      }
+      core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+      await core.recomputeSourceConceptBody(conceptId!);
+
+      const persisted = (core as unknown as { db: { prepare: (s: string) => { get: (...a: unknown[]) => unknown } } }).db
+        .prepare(`SELECT body FROM concepts WHERE id=?`).get(conceptId) as { body: string };
+      // Same-section split segments: exactly ONE newline at the join, never a blank line.
+      expect(persisted.body).toContain("big section line two\nbig section line three");
+      expect(persisted.body).not.toContain("big section line two\n\nbig section line three");
+      // Genuine section boundary: the real "\n\n" break is preserved.
+      expect(persisted.body).toContain("big section line four\n\nsmall section body");
+      expect(persisted.body).not.toContain("big section line four\nsmall section body");
+    } finally {
+      core.close();
+    }
+  });
+});
+
+describe("recomputeSourceConceptBody support_count normalization (round 4, Codex thread 7)", () => {
+  it("resets support_count to the CURRENT active chunk count, undoing per-write inflation from prior edits", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      core.createSource(sourceInput("source-a", "/tmp/source-a-support-count"));
+      const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+      const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+      const buildChunk = (bindingId: string, headingPath: string[], documentSequence: number, content: string) => {
+        const contentHash = computeSourceContentHash(Buffer.from(content, "utf8"));
+        const ingestFingerprint = computeSourceIngestFingerprint({
+          contentHash, headingPath, metadata, ingestConfigHash: begun.run.ingestConfigHash,
+        });
+        return {
+          bindingId, bindingGeneration: 1,
+          operationId: computeSourceOperationId(begun.run.sourceId, bindingId, ingestFingerprint, begun.run.snapshotId, 1),
+          relativePath: "README.md", headingPath, occurrence: 1, segmentIndex: 1, documentSequence,
+          contentHash, ingestFingerprint, metadata,
+          sourceRef: `source://source-a/README.md#${headingPath[0]!.toLowerCase()}~1`, content,
+        };
+      };
+      const staged = manifest(begun.run, {
+        chunks: [
+          buildChunk("binding-1", ["A"], 1, "section a body"),
+          buildChunk("binding-2", ["B"], 2, "section b body"),
+          buildChunk("binding-3", ["C"], 3, "section c body"),
+        ],
+      });
+      core.stageSourceManifest(staged);
+      let conceptId: string | undefined;
+      for (const chunk of staged.chunks) {
+        const stored = await core.storeSource(chunk.content, {
+          circle: "source-a", sourceRefs: [chunk.sourceRef], operationId: chunk.operationId,
+          ...(conceptId ? { attachTo: conceptId } : { resolution: "forceNew" as const }),
+        });
+        conceptId = stored.conceptId;
+        core.recordSourceBindingReceipt({
+          runId: begun.run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId, observationId: stored.observationId,
+          predecessorObservationId: null, writeState: "committed",
+        });
+      }
+      core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+
+      // storeSourceChunk's attach branch increments support_count on every write — before ANY
+      // recompute has ever run, the raw row already sits at 3 (1 from creation + 2 attaches).
+      // Simulate several MORE attaches (exactly what a repeatedly re-synced/edited file produces)
+      // without recomputing in between, so support_count keeps climbing well past the file's
+      // actual, current section count.
+      for (let i = 0; i < 5; i++) {
+        await core.storeSource(`irrelevant repeated attach ${i}`, {
+          circle: "source-a", sourceRefs: [staged.chunks[0]!.sourceRef], attachTo: conceptId!,
+        });
+      }
+      const db = (core as unknown as { db: { prepare: (s: string) => { get: (...a: unknown[]) => unknown } } }).db;
+      const inflated = db.prepare(`SELECT support_count FROM concepts WHERE id=?`).get(conceptId) as { support_count: number };
+      expect(inflated.support_count).toBe(8); // 1 create + 2 attaches + 5 more attaches
+
+      await core.recomputeSourceConceptBody(conceptId!);
+      const normalized = db.prepare(`SELECT support_count FROM concepts WHERE id=?`).get(conceptId) as { support_count: number };
+      // Only 3 chunks are ACTIVE (the 5 "irrelevant repeated attach" calls created plain
+      // observations, never source_chunks rows) — support_count must reflect that, not the 8
+      // storeSourceChunk-side increments.
+      expect(normalized.support_count).toBe(3);
     } finally {
       core.close();
     }

@@ -37,6 +37,21 @@ export interface EmbeddingProvider {
   embed(text: string): Float32Array | Promise<Float32Array>;
 }
 
+// REVIEW FIX (round 4, Codex thread 14): bumped when TOKENIZATION changes the hashing vector
+// space, even though `dim` (and the model's "shape") stays the same — modelId is the ONLY signal
+// engine.ts's graft rejection (assertCompatibleGraft, embedderModelId mismatch → EmbedderMismatchError)
+// has to tell two hashing stores' vector spaces apart. Before this constant existed, EVERY
+// HashingEmbeddingProvider advertised the same "hashing:dim=256" regardless of tokenizer version,
+// so old-tokenizer and new-tokenizer vectors were indistinguishable to that check: a graft from an
+// old-tokenizer store would be silently ACCEPTED into a new-tokenizer one (and vice versa),
+// mixing incompatible vector spaces exactly the way the modelId check exists to prevent. Bump this
+// whenever `embed()`'s tokenization (not just its output dimension) changes. A store still holding
+// the OLD modelId is not hard-failed anywhere on open (no code path compares a persisted "this
+// store's model" against the live embedder at construction time) — it simply needs its native
+// concepts (and, per thread 11, their observations) re-embedded, exactly like an ONNX default
+// swap; migrate-file-concept.ts's re-embed pass covers this identically either way.
+const HASHING_TOKENIZER_VERSION = 2; // 2: Unicode-aware \p{L}\p{N} tokenizer (item 9, multilingual swap); 1 (implicit, pre-existing): ASCII-only [a-z0-9]
+
 export class HashingEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
   // Calibrated for the lexical (token/trigram) cosine distribution — looser than a
@@ -46,14 +61,17 @@ export class HashingEmbeddingProvider implements EmbeddingProvider {
 
   constructor(dim = 256) {
     this.dim = dim;
-    this.modelId = `hashing:dim=${dim}`;
+    this.modelId = `hashing:dim=${dim}:tok=${HASHING_TOKENIZER_VERSION}`;
   }
 
   embed(text: string): Float32Array {
     const v = new Float32Array(this.dim);
+    // Unicode-aware tokenizer (item 9, multilingual swap): \p{L}\p{N} (with the `u` flag) keeps
+    // any script's letters/digits — Korean, CJK, Cyrillic, etc. — instead of the old ASCII-only
+    // [a-z0-9] class, which silently stripped non-Latin text down to zero features.
     const words = text
       .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
       .split(/\s+/)
       .filter(Boolean);
 

@@ -35,6 +35,15 @@ const RESULT_MAX_CHARS = 40_000; // hard ceiling on any serialized tool result
 const FETCH_MAX_OBS = 20; // most-recent observations returned by memory_fetch
 const FETCH_OBS_MAX_CHARS = 1_200; // per-observation cap
 const FETCH_BODY_MAX_CHARS = 6_000; // concept body cap
+// REVIEW FIX (MINOR): source concept outline cap (file=concept, Ruling 9). A cheap upper bound on
+// how many entries the size-fit loop below ever iterates over — NOT the real guarantee (see that
+// loop's own comment). 500 was unsound on its own: headingPath is caller/document content with no
+// length ceiling, and at a realistic 2-3-level, moderately-long heading path (~250 chars/entry
+// serialized), 500 entries alone runs to ~125 000 chars — over 3x the 40 000-char RESULT_MAX_CHARS
+// ceiling, well past where ok() would truncate the JSON mid-array and leave an unparseable
+// response. 200 keeps this bound cheap (O(n) JSON.stringify calls in the fit loop, n ≤ 200) while
+// staying close enough to the size-fit's own typical stopping point that it rarely binds first.
+const FETCH_OUTLINE_MAX_ENTRIES = 200;
 
 /** Truncate `s` to `max` chars, flagging whether it was clipped (so callers can signal it). */
 function clip(s: string, max: number): { text: string; clipped: boolean } {
@@ -718,13 +727,14 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_fetch",
-    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them.",
+    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them. Source concepts (kind='source', file=concept) are different: they return STRUCTURE, not content, by default — `title`, `sourcePath` + `sourceId` (pass sourceId to the source_path tool for the on-disk location, then grep the path for detail), and an `outline` of every active section (headingPath, occurrence, observationId), never `observations`/needsSynthesis. Pass includeBody:true for the full concatenated file body if you need it read inline instead of via the path.",
     {
       id: z.string(),
       circle: z.string().optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
-      observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages."),
+      observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages. Not used for source concepts (they return an outline instead — see includeBody)."),
+      includeBody: z.boolean().optional().describe("Source concepts only (kind='source'): include the full concatenated file body. Default false — the response returns structure (title, sourcePath, outline) instead, since a source concept's body can run to the whole file. Ignored for non-source concepts, which always include body."),
     },
-    async ({ id, circle, observationsOffset }) => {
+    async ({ id, circle, observationsOffset, includeBody }) => {
       // memory_fetch is READ-ONLY — the pre-mutation capture rule (Fix B) does not apply here.
       // We defer capturePrewarmSnapshot until after homeCircle is resolved so that an omit-circle
       // call (store-wide lookup) snapshots the concept's actual home circle rather than the
@@ -749,9 +759,65 @@ export function registerMonetCoreTools(
           synthesize: false,
           observationsOffset: observationsOffset ?? 0,
           pageSize: FETCH_MAX_OBS,
+          includeBody,
           sourceAuthorizationContext,
         });
         if (!c) return err(`concept not found: ${id}`);
+
+        // File=concept (ratified, Phase 1), Ruling 9: a source concept's outline is present iff
+        // the engine classified it as connector-owned — structure, not paginated observations.
+        if (c.outline !== undefined) {
+          const body = includeBody ? clip(c.body ?? "", FETCH_BODY_MAX_CHARS) : undefined;
+          const fixedFields = {
+            id: c.id, circle: c.circle, kind: c.kind, title: c.title, sourcePath: c.sourcePath, sourceId: c.sourceId,
+            totalObservations: c.totalObservations,
+            ...(body ? { body: body.text, ...(body.clipped ? { bodyTruncated: true } : {}) } : { bodyOmitted: true }),
+            supportCount: c.supportCount, confidence: c.confidence, version: c.version, lastConfirmedAt: c.lastConfirmedAt,
+          };
+          // REVIEW FIX (MINOR): headingPath is caller/document content with no length ceiling, so
+          // a count cap alone (FETCH_OUTLINE_MAX_ENTRIES) is not provably safe against a file with
+          // long or deeply-nested headings — same overflow shape memory_first_block's own "list"
+          // action already guards against (see FIRST_BLOCK_LIST_MAX_LIMIT's comment). Two caps
+          // cooperate the same way here: the count cap bounds how many JSON.stringify calls this
+          // loop makes (cheap, O(n), n ≤ FETCH_OUTLINE_MAX_ENTRIES); the size fit against the ACTUAL
+          // serialized envelope (fixed fields + growing outline) is the real guarantee, stopping
+          // one entry before the payload would cross budget so ok() never has to truncate this
+          // response mid-JSON and leave it unparseable.
+          const okNote = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
+          const sizeBudget = RESULT_MAX_CHARS - okNote.length;
+          const countCapped = c.outline.slice(0, FETCH_OUTLINE_MAX_ENTRIES);
+          const fitOutline: Array<{ headingPath: string[]; occurrence: number; segmentIndex: number; observationId: string }> = [];
+          // REVIEW FIX (round 4, Codex thread 10): check the budget BEFORE pushing, uniformly for
+          // EVERY entry including the first. The old loop pushed the first candidate unconditionally
+          // (its pre-push check was gated on `fitOutline.length > 0`, which is always false on
+          // entry 1) and only then checked the budget — so a single pathologically long heading path
+          // still landed in fitOutline even though it alone exceeded sizeBudget, and the response
+          // fell through to readOk/ok() truncating the serialized JSON mid-object: unparseable
+          // output instead of a valid, merely-shorter one. Checking first means a first entry that
+          // alone is over budget is dropped entirely, leaving fitOutline empty rather than invalid.
+          for (const entry of countCapped) {
+            // REVIEW FIX (round 5, Codex thread R5-5): segmentIndex was dropped when building the
+            // fitted candidate entries, even though SourceOutlineEntry (engine.ts) carries it — a
+            // section split across multiple chunker segments (an oversized heading, see thread 9/
+            // R5-3) surfaced as indistinguishable, same-looking outline entries here.
+            const candidate = [...fitOutline, { headingPath: entry.headingPath, occurrence: entry.occurrence, segmentIndex: entry.segmentIndex, observationId: entry.observationId }];
+            const serialized = JSON.stringify({ ...fixedFields, outline: candidate }, null, 2);
+            if (serialized.length > sizeBudget) break; // would cross budget, even as the very first entry — stop, let the note explain
+            fitOutline.push(candidate[candidate.length - 1]!);
+          }
+          return readOk({
+            ...fixedFields,
+            outline: fitOutline,
+            ...(c.outline.length > fitOutline.length
+              ? {
+                  outlineNote: fitOutline.length === 0
+                    ? `This file's outline could not be included: even the first of ${c.outline.length} section(s) exceeds the result-size limit. memory_fetch a specific observation id, or narrow the query.`
+                    : `Showing the first ${fitOutline.length} of ${c.outline.length} sections.`,
+                }
+              : {}),
+          }, "memory_fetch", capturedBlock);
+        }
+
         const total = c.totalObservations;
         const offset = c.observationsOffset;
         // Engine already returned exactly one page; all observations in c.observations are kept.

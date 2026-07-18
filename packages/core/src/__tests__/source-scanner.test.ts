@@ -68,7 +68,8 @@ describe("source scanner configuration and glob semantics", () => {
     expect(DEFAULT_SOURCE_SCANNER_LIMITS.maxChunkBytes).toBe(32 * 1024);
     expect(DEFAULT_SOURCE_SCANNER_LIMITS.maxEntries).toBe(100_000);
     expect(SOURCE_SCANNER_VERSION).toBe("v2");
-    expect(SOURCE_CHUNKER_VERSION).toBe("v2");
+    // File=concept (Phase 1): chunker bumped v2->v3 for the minimum-chunk merge pass (item 8).
+    expect(SOURCE_CHUNKER_VERSION).toBe("v3");
   });
 
   it("matches conservative anchored POSIX globs with segment-aware **", () => {
@@ -158,6 +159,11 @@ describe("source scanner deterministic bytes and parsing", () => {
 
   it("extracts flat metadata, ATX hierarchy and occurrence while ignoring headings inside fences", () => {
     const dir = root();
+    // File=concept (Phase 1): each section is padded past MIN_SOURCE_SECTION_BYTES (200) so the
+    // new minimum-chunk merge pass (item 8) leaves these five sections distinct — this fixture is
+    // about heading/occurrence structure, not merge behavior (covered separately in
+    // source-chunker.test.ts).
+    const PAD = "Padding text to keep this section safely above the two-hundred-byte minimum-chunk merge threshold so heading boundaries in this fixture stay distinct end. Padding text to keep this section safely above the merge threshold again.";
     put(dir, "guide.md", [
       "---",
       "scope: repository",
@@ -165,17 +171,22 @@ describe("source scanner deterministic bytes and parsing", () => {
       "owner: docs",
       "---",
       "Preamble.",
+      PAD,
       "# Parent",
       "first",
       "```md",
       "# Not a heading",
       "```",
+      PAD,
       "## Child",
       "one",
+      PAD,
       "## Child",
       "two",
+      PAD,
       "# Parent",
       "three",
+      PAD,
     ].join("\r\n"));
     const result = scanSourceSnapshot({ root: dir, config: { include: ["guide.md"] } });
 
@@ -661,8 +672,13 @@ describe("source hash domains", () => {
   });
 
   it("changes only the edited sibling fingerprint while keeping natural identity out of it", () => {
+    // File=concept (Phase 1): each section carries a 60-byte filler line so it individually stays
+    // under maxChunkBytes (100) but any two combined exceed it — the minimum-chunk merge pass
+    // (item 8) then cap-blocks the forward merge and keeps A/B as distinct sections, which is what
+    // this test's two-chunk premise needs. The filler is inert content, irrelevant to fingerprinting.
+    const filler = "x".repeat(60);
     const base = {
-      text: "# A\nalpha\n# B\nbravo",
+      text: `# A\nalpha\n${filler}\n# B\nbravo\n${filler}`,
       fileContentHash: computeSourceContentHash(Buffer.from("same raw file")),
       ingestConfigHash: "same-config",
       maxChunkBytes: 100,
@@ -674,7 +690,7 @@ describe("source hash domains", () => {
     const edited = chunkSourceText({
       ...base,
       relativePath: "a.md",
-      text: "# A\nalpha edited\n# B\nbravo",
+      text: `# A\nalpha edited\n${filler}\n# B\nbravo\n${filler}`,
       fileContentHash: computeSourceContentHash(Buffer.from("edited raw file")),
     }).chunks;
     expect(edited[0].ingestFingerprint).not.toBe(first[0].ingestFingerprint);
@@ -684,8 +700,12 @@ describe("source hash domains", () => {
   });
 
   it("gives slug-colliding exact heading vectors distinct refs without changing content fingerprints on move", () => {
+    // File=concept (Phase 1): same padding rationale as above — both sections share identical
+    // body content by design (testing slug collision independent of content), so both need the
+    // same filler to stay individually under the cap while combined exceeding it.
+    const filler = "x".repeat(60);
     const base = {
-      text: "# A!\nsame\n# a?\nsame",
+      text: `# A!\nsame\n${filler}\n# a?\nsame\n${filler}`,
       fileContentHash: computeSourceContentHash(Buffer.from("raw")),
       ingestConfigHash: "config",
       maxChunkBytes: 100,

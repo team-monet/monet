@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MonetCore } from "../engine";
 import type { EmbeddingProvider } from "../embedding";
 import { registerMonetCoreTools } from "../mcp-server";
-import { computeSourceContentHash, computeSourceIngestFingerprint, computeSourceOperationId } from "../source-chunker";
+import { computeSourceContentHash, computeSourceIngestFingerprint, computeSourceOperationId, sourceHeadingAnchor } from "../source-chunker";
 import { computeSourceManifestHash } from "../source-scanner";
 import type { SourceSyncRun, StageSourceManifestInput } from "../source-types";
 import type { StoragePort } from "../storage";
@@ -36,7 +36,7 @@ function oneChunkManifest(run: SourceSyncRun, text = content, bindingGeneration 
   const ingestFingerprint = computeSourceIngestFingerprint({
     contentHash, headingPath: ["Retrieval"], metadata, ingestConfigHash: run.ingestConfigHash,
   });
-  const files = [{ relativePath: "README.md", type: "file" as const, contentHash: "file-hash", byteLength: Buffer.byteLength(text) }];
+  const files = [{ relativePath: "README.md", type: "file" as const, contentHash: "file-hash", byteLength: Buffer.byteLength(text), title: "README" }];
   return {
     runId: run.id,
     scanStatus: "complete",
@@ -45,7 +45,7 @@ function oneChunkManifest(run: SourceSyncRun, text = content, bindingGeneration 
     chunks: [{
       bindingId: "binding-1", bindingGeneration,
       operationId: computeSourceOperationId(run.sourceId, "binding-1", ingestFingerprint, run.snapshotId, bindingGeneration),
-      relativePath: "README.md", headingPath: ["Retrieval"], occurrence: 1, segmentIndex: 1,
+      relativePath: "README.md", headingPath: ["Retrieval"], occurrence: 1, segmentIndex: 1, documentSequence: 1,
       contentHash, ingestFingerprint, metadata,
       sourceRef: `source://${run.sourceId}/README.md#retrieval~1`, content: text,
     }],
@@ -70,6 +70,10 @@ async function publish(core: MonetCore, sourceId = "source-a", text = content, s
     activationToken: core.beginSourceActivation(begun.run.id),
     expectedManifestHash: manifest.manifestHash,
   });
+  // File=concept (Phase 1): title/body/embedding are placeholders until this — recomputeSourceConceptBody
+  // is the connector's own post-publish step (source-sync.ts's recomputeTouchedSourceConcepts), required
+  // here too since this helper drives the ledger by hand instead of through syncSource.
+  await core.recomputeSourceConceptBody(stored.conceptId);
   return { run: begun.run, chunk, stored };
 }
 
@@ -93,8 +97,10 @@ describe("authorized source-backed generic retrieval", () => {
     expect((await core.search("cobalt walruses", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(stored.conceptId);
     expect(core.listMemories(circle, { sourceAuthorizationContext: auth })).toContainEqual(expect.objectContaining({ id: stored.conceptId, kind: "source", supportCount: 1 }));
     expect(core.conceptCount(circle, auth)).toBe(1);
-    await expect(core.getConcept(stored.conceptId, { synthesize: false, sourceAuthorizationContext: auth })).resolves.toMatchObject({
-      id: stored.conceptId, body: content, observations: [{ id: stored.observationId, content }],
+    // File=concept (Phase 1), Ruling 9: a source concept's getConcept returns structure (outline)
+    // by default, not observations — body is opt-in via includeBody.
+    await expect(core.getConcept(stored.conceptId, { synthesize: false, includeBody: true, sourceAuthorizationContext: auth })).resolves.toMatchObject({
+      id: stored.conceptId, body: content, outline: [{ observationId: stored.observationId }],
       totalObservations: 1, supportCount: 1, dirty: false, needsSynthesis: false, synthesizedNow: false,
     });
     const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
@@ -134,7 +140,7 @@ describe("authorized source-backed generic retrieval", () => {
     expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).not.toBeNull();
     core.updateSource("source-a", { include: ["*.md"], exclude: ["drafts/**"] });
     expect(core.getSource("source-a")?.status).toBe("pending-replacement");
-    expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).toMatchObject({ body: content });
+    expect(await core.getConcept(stored.conceptId, { includeBody: true, sourceAuthorizationContext: auth })).toMatchObject({ body: content });
   });
 
   it("fails closed for uncommitted, aborted, tombstoned, stale-pointer, foreign-binding and corrupt-observation states", async () => {
@@ -172,6 +178,38 @@ describe("authorized source-backed generic retrieval", () => {
     expect(await visible()).toBe(false);
   });
 
+  it("hides an authorized publication while its recompute is durably pending, across every read surface (round 4, Codex thread 1, P1)", async () => {
+    // The exact crash window Codex found: a publish lands durably (knowledge_sources.active_run_id
+    // already advanced) but the process dies (or an admission-skipped scheduled pass, see thread
+    // 12) before recomputeSourceConceptBody runs — the concept row still holds its placeholder
+    // (first-ever publish) or the PRIOR recompute's now-stale body (a re-publish). Simulated here
+    // directly via source_recompute_pending, the SAME durable marker recomputeSourceConceptBody
+    // itself clears on success (engine.ts) — reusing it to GATE reads closes the window instead of
+    // only ever healing it eventually.
+    const core = makeCore();
+    core.createSource(sourceInput());
+    const { run, stored } = await publish(core);
+    expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).not.toBeNull();
+    expect((await core.search("cobalt walruses", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(stored.conceptId);
+
+    const db = rawDb(core);
+    db.prepare(`INSERT INTO source_recompute_pending (concept_id, source_id, run_id, created_at) VALUES (?,?,?,?)`)
+      .run(stored.conceptId, "source-a", run.id, Date.now());
+
+    expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).toBeNull();
+    expect(await core.search("cobalt walruses", { circle, sourceAuthorizationContext: auth })).toEqual([]);
+    expect(core.listMemories(circle, { sourceAuthorizationContext: auth })).toEqual([]);
+    const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
+    expect(gathered.seed.map((c) => c.id)).not.toContain(stored.conceptId);
+    expect(gathered.ranked.map((c) => c.id)).not.toContain(stored.conceptId);
+
+    // No false negatives: once recompute clears the pending row (the normal, non-crashed case —
+    // and exactly what the sweep does for a stranded one), the concept is visible again.
+    await core.recomputeSourceConceptBody(stored.conceptId);
+    expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).not.toBeNull();
+    expect((await core.search("cobalt walruses", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(stored.conceptId);
+  });
+
   it("fetches only the active observation without synthesis/usefulness writes and sources cannot influence native graph results", async () => {
     const core = makeCore();
     const nativeA = await core.store("Native cobalt walrus anchor.", { circle, resolution: "forceNew" });
@@ -185,8 +223,9 @@ describe("authorized source-backed generic retrieval", () => {
     expect(withContext.reachableByType).toEqual(withoutContext.reachableByType);
     expect(withContext.ranked.map((row) => row.id)).toEqual(expect.arrayContaining([nativeA.conceptId, nativeB.conceptId, stored.conceptId]));
 
+    // File=concept (Phase 1), Ruling 9: structure (outline), not observations, by default.
     const fetched = await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth });
-    expect(fetched?.observations).toEqual([{ id: stored.observationId, content: "Cobalt walruses supports: #native-cobalt-walrus-anchor" }]);
+    expect(fetched?.outline).toEqual([expect.objectContaining({ observationId: stored.observationId })]);
     expect(rawDb(core).prepare(`SELECT usefulness_score,dirty FROM concepts WHERE id=?`).get(stored.conceptId)).toEqual(before);
     await expect(core.store("forged", { circle, sourceRefs: ["source://source-a/README.md#retrieval~1"] })).rejects.toThrow(/reserved/);
     await expect(core.store("attach", { circle, attachTo: stored.conceptId })).rejects.toThrow(/source concept/);
@@ -295,7 +334,16 @@ describe("authorized source-backed generic retrieval", () => {
     }
   });
 
-  it("keeps the active ledger predecessor visible after refresh and across a pre-publish crash", async () => {
+  // FILE=CONCEPT (Phase 1): under the old single-observation model, "predecessor visible" was a
+  // CAS/disjunction proof (Case A/B in queryAuthorizedSourcePublications) because the concept's
+  // body WAS updated pre-publish and something had to keep serving the old one until publication
+  // caught up. That entire class of leak is gone by construction now: recomputeSourceConceptBody
+  // (item 4) is the ONLY thing that ever touches a source concept's title/body/embedding, and it
+  // runs strictly post-publish — so an engine-written-and-activated-but-not-yet-published
+  // successor observation simply never reaches the concept row, crash or no crash. This test now
+  // documents that simpler guarantee directly, plus the still-real reconcile-orphan cleanup an
+  // abort produces for the orphaned observation pair.
+  it("never lets a pre-publish successor reach the concept row, crash or no crash", async () => {
     const root = mkdtempSync(join(tmpdir(), "monet-source-retrieval-refresh-"));
     const dbPath = join(root, "monet.db");
     let core = new MonetCore(dbPath, { defaultCircle: circle });
@@ -315,13 +363,17 @@ describe("authorized source-backed generic retrieval", () => {
         observationId: successor.observationId, predecessorObservationId: initial.stored.observationId,
         writeState: "engine-written",
       });
-      await core.refreshSourceConcept(successor.conceptId, successor.observationId, initial.stored.observationId);
+      await core.supersedeSourceChunkObservation(successor.conceptId, successor.observationId, initial.stored.observationId);
 
       const assertPublishedPredecessor = async (candidate: MonetCore) => {
-        const fetched = await candidate.getConcept(initial.stored.conceptId, { sourceAuthorizationContext: auth });
+        const fetched = await candidate.getConcept(initial.stored.conceptId, { sourceAuthorizationContext: auth, includeBody: true });
+        // File=concept (Phase 1), item 1: title is frontmatter title else filename-basename now
+        // (deriveSourceFileTitle) — never firstLine(chunk content), which was the old
+        // single-observation model's only option. oneChunkManifest's file entry has no
+        // frontmatter title, so it falls back to "README" (README.md minus extension).
         expect(fetched).toMatchObject({
-          body: content, title: "Published source retrieval evidence about cobalt walruses", slug: "published-source-retrieval-evidence-about-cobalt-walruses",
-          observations: [{ id: initial.stored.observationId, content }],
+          body: content, title: "README", slug: "readme",
+          outline: [{ observationId: initial.stored.observationId }],
         });
         expect(JSON.stringify(await candidate.search("STAGED successor", { circle, sourceAuthorizationContext: auth }))).not.toContain("STAGED");
         expect((await candidate.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth })).ranked)
@@ -419,13 +471,24 @@ describe("authorized source-backed generic retrieval", () => {
     expect(core.stats().sessions).toBe(0);
   });
 
-  it("hides malformed published embeddings without breaking native retrieval", async () => {
+  // File=concept (Phase 1): embedding validity is now checked on the CONCEPT row
+  // (queryAuthorizedSourcePublications validates concept.embedding directly — content and
+  // embedding both live there now, kept fresh by recomputeSourceConceptBody), not the
+  // observation's — a chunk observation's own embedding is an inert placeholder, never read back
+  // (item 6). Corrupting it must NOT affect visibility; corrupting the concept's own embedding
+  // still must.
+  it("hides malformed published concept embeddings without breaking native retrieval", async () => {
     const core = makeCore();
     const native = await core.store("native retrieval remains available", { circle, resolution: "forceNew" });
     core.createSource(sourceInput());
     const { stored } = await publish(core);
     const db = rawDb(core);
-    const original = (db.prepare(`SELECT embedding FROM observations WHERE id=?`).get(stored.observationId) as { embedding: string }).embedding;
+    const originalObservationEmbedding = (db.prepare(`SELECT embedding FROM observations WHERE id=?`).get(stored.observationId) as { embedding: string }).embedding;
+    db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run("not-json", stored.observationId);
+    expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).not.toBeNull();
+    db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run(originalObservationEmbedding, stored.observationId);
+
+    const original = (db.prepare(`SELECT embedding FROM concepts WHERE id=?`).get(stored.conceptId) as { embedding: string }).embedding;
     const invalid = [
       "not-json",
       JSON.stringify([0]),
@@ -433,7 +496,7 @@ describe("authorized source-backed generic retrieval", () => {
       `[1e999,${Array.from({ length: 255 }, () => "0").join(",")}]`,
     ];
     for (const embedding of invalid) {
-      db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run(embedding, stored.observationId);
+      db.prepare(`UPDATE concepts SET embedding=? WHERE id=?`).run(embedding, stored.conceptId);
       expect((await core.search("native retrieval", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(native.conceptId);
       expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).toBeNull();
       expect(core.listMemories(circle, { sourceAuthorizationContext: auth }).map((row) => row.id)).not.toContain(stored.conceptId);
@@ -442,7 +505,7 @@ describe("authorized source-backed generic retrieval", () => {
       expect(core.conceptCount(circle, auth)).toBe(1);
       expect(core.listCircles(undefined, { sourceAuthorizationContext: auth })).toContainEqual(expect.objectContaining({ circle, concepts: 1 }));
     }
-    db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run(original, stored.observationId);
+    db.prepare(`UPDATE concepts SET embedding=? WHERE id=?`).run(original, stored.conceptId);
     expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).not.toBeNull();
   });
 
@@ -505,22 +568,34 @@ describe("authorized source-backed generic retrieval", () => {
     expect(authorized[0]).toMatchObject({ circle: mixedCircles[0], concepts: 2 });
   });
 
-  it("orders and ages source projections by publication time, never the mutable envelope", async () => {
-    const core = new MonetCore(":memory:", { defaultCircle: circle, staleAfterMs: 1_000 });
+  // FILE=CONCEPT (Phase 1): the old mechanism this test named — read-time ordering sourced from
+  // run.published_at, overriding the concept's own (frozen-at-creation) updated_at — no longer
+  // exists. authorizedSourceProjections now projects the concept row directly (item 3c), and
+  // recomputeSourceConceptBody (item 4) is what stamps updated_at/last_confirmed_at, exactly
+  // once, strictly post-publish. The property worth protecting is the SAME one this test always
+  // protected, just via the new mechanism: a pre-publish write (staged, engine-written, even
+  // supersedeSourceChunkObservation-activated) must never move a source concept's read-visible
+  // timestamp or listMemories position — only a completed recompute may.
+  it("orders and ages source projections by their own recompute time, never a pending pre-publish write", async () => {
+    // A store-wide sync-revision trigger (engine.ts's `sync_${table}_update`, pre-existing and
+    // unrelated to file=concept) stamps updated_at from a monotonic mutation clock on every local
+    // UPDATE to `concepts` — a raw backdating UPDATE gets silently overwritten right back by it.
+    // So instead of forcing arbitrary timestamps, this drives ordering from real write sequence
+    // (native first, source second — later writes get later clock stamps) and asserts monotonic
+    // advancement by comparing actual returned values across steps, never a forced absolute one.
+    const core = new MonetCore(":memory:", { defaultCircle: circle, staleAfterMs: -1 });
     cores.push(core);
-    const db = rawDb(core);
     const native = await core.store("native ordering sentinel", { circle, resolution: "forceNew" });
     core.createSource(sourceInput());
     const initial = await publish(core);
-    const initialPublishedAt = Date.now() - 10_000;
-    db.prepare(`UPDATE source_sync_runs SET published_at=? WHERE id=?`).run(initialPublishedAt, initial.run.id);
-    db.prepare(`UPDATE source_snapshots SET published_at=? WHERE run_id=?`).run(initialPublishedAt, initial.run.id);
-    db.prepare(`UPDATE concepts SET updated_at=?,last_confirmed_at=? WHERE id=?`).run(initialPublishedAt + 100_000, initialPublishedAt + 100_000, initial.stored.conceptId);
-    db.prepare(`UPDATE concepts SET updated_at=?,last_confirmed_at=? WHERE id=?`).run(initialPublishedAt + 500, initialPublishedAt + 500, native.conceptId);
 
     const initialList = core.listMemories(circle, { sourceAuthorizationContext: auth });
-    expect(initialList.map((entry) => entry.id).slice(0, 2)).toEqual([native.conceptId, initial.stored.conceptId]);
-    expect(initialList.find((entry) => entry.id === initial.stored.conceptId)?.updatedAt).toBe(initialPublishedAt);
+    // Written after native, so it recomputed (and was stamped) later — sorts first.
+    expect(initialList.map((entry) => entry.id).slice(0, 2)).toEqual([initial.stored.conceptId, native.conceptId]);
+    const initialEntry = initialList.find((entry) => entry.id === initial.stored.conceptId)!;
+    const initialUpdatedAt = initialEntry.updatedAt;
+    const initialLastConfirmedAt = initialEntry.lastConfirmedAt!;
+    // staleAfterMs: -1 — anything already confirmed is stale as of now, regardless of clock resolution.
     expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).staleConcepts.map((entry) => entry.id)).toContain(initial.stored.conceptId);
 
     const replacement = core.beginSourceRun({ sourceId: "source-a", snapshotId: "timestamp-replacement" });
@@ -536,25 +611,46 @@ describe("authorized source-backed generic retrieval", () => {
       observationId: successor.observationId, predecessorObservationId: initial.stored.observationId,
     };
     core.recordSourceBindingReceipt({ ...receipt, writeState: "engine-written" });
-    await core.refreshSourceConcept(successor.conceptId, successor.observationId, initial.stored.observationId);
+    await core.supersedeSourceChunkObservation(successor.conceptId, successor.observationId, initial.stored.observationId);
+    // Pre-publish: the observation pair flipped, but the concept row's CONTENT (title/body/
+    // embedding) is untouched until recomputeSourceConceptBody, which only runs post-publish — the
+    // one thing this asserts is still the newly-staged content NOT reaching a reader early. (Its
+    // updated_at may tick forward slightly from storeSourceChunk's own support_count bump on
+    // attach — a benign "something is being synced" freshness signal, not a content leak — so
+    // this deliberately does not also assert updatedAt is byte-for-byte unchanged.)
     const pendingList = core.listMemories(circle, { sourceAuthorizationContext: auth });
-    expect(pendingList.map((entry) => entry.id).slice(0, 2)).toEqual([native.conceptId, initial.stored.conceptId]);
-    expect(pendingList.find((entry) => entry.id === initial.stored.conceptId)?.updatedAt).toBe(initialPublishedAt);
+    expect(pendingList.map((entry) => entry.id).slice(0, 2)).toEqual([initial.stored.conceptId, native.conceptId]);
+    expect(pendingList.find((entry) => entry.id === initial.stored.conceptId)?.updatedAt).toBeGreaterThanOrEqual(initialUpdatedAt);
+    await expect(core.getConcept(initial.stored.conceptId, { sourceAuthorizationContext: auth, includeBody: true }))
+      .resolves.toMatchObject({ body: content });
 
     core.recordSourceBindingReceipt({ ...receipt, writeState: "committed" });
     core.publishSourceRun({
       runId: replacement.run.id, activationToken: core.beginSourceActivation(replacement.run.id),
       expectedManifestHash: manifest.manifestHash,
     });
-    const laterPublishedAt = Date.now() + 10_000;
-    db.prepare(`UPDATE source_sync_runs SET published_at=? WHERE id=?`).run(laterPublishedAt, replacement.run.id);
-    db.prepare(`UPDATE source_snapshots SET published_at=? WHERE run_id=?`).run(laterPublishedAt, replacement.run.id);
+    await core.recomputeSourceConceptBody(successor.conceptId);
     const publishedList = core.listMemories(circle, { sourceAuthorizationContext: auth });
-    expect(publishedList[0]).toMatchObject({ id: initial.stored.conceptId, updatedAt: laterPublishedAt });
-    await expect(core.getConcept(initial.stored.conceptId, { sourceAuthorizationContext: auth })).resolves.toMatchObject({
-      body: manifest.chunks[0].content, lastConfirmedAt: laterPublishedAt,
-    });
-    expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).topConcepts.map((entry) => entry.id)).toContain(initial.stored.conceptId);
+    expect(publishedList[0].id).toBe(initial.stored.conceptId);
+    // Recompute is a real mutation: the sync clock strictly advances past its own pre-publish
+    // value. updatedAt (store-wide sync-revision trigger, engine.ts) and lastConfirmedAt
+    // (recomputeSourceConceptBody's own explicit wall-clock stamp) are deliberately two different
+    // monotonic clocks that can interleave within the same wall-clock millisecond under a tight
+    // in-memory test — so each is only compared against an earlier reading of ITSELF, never
+    // cross-clock against the other.
+    expect(publishedList[0].updatedAt).toBeGreaterThan(initialUpdatedAt);
+    const refetched = await core.getConcept(initial.stored.conceptId, { sourceAuthorizationContext: auth, includeBody: true });
+    expect(refetched).toMatchObject({ body: manifest.chunks[0].content });
+    expect(refetched!.lastConfirmedAt).toBeGreaterThan(initialLastConfirmedAt);
+    // staleAfterMs: -1 means everything is perpetually stale (by design, asserted above at
+    // publish time too) — so recompute can never promote this concept into topConcepts. What
+    // "ages ... by their own recompute time" actually buys here is a re-ranking within
+    // staleConcepts itself: that list sorts stalest (oldest confirmation) first, and the source
+    // concept was just reconfirmed while native never was, so it now sorts strictly after native
+    // instead of tying/leading it.
+    const finalStale = core.prewarm(circle, { sourceAuthorizationContext: auth }).staleConcepts.map((entry) => entry.id);
+    expect(finalStale).toEqual(expect.arrayContaining([initial.stored.conceptId, native.conceptId]));
+    expect(finalStale.indexOf(native.conceptId)).toBeLessThan(finalStale.indexOf(initial.stored.conceptId));
   });
 
   it("reports exact stale counts beyond the prewarm cap and paginates mixed native/source rows", async () => {
@@ -564,9 +660,13 @@ describe("authorized source-backed generic retrieval", () => {
     }
     core.createSource(sourceInput());
     await publish(core);
+    // File=concept (Phase 1): last_confirmed_at is the concept row's own, directly-stamped value
+    // now (recomputeSourceConceptBody sets it at recompute time — no more read-time override
+    // sourced from run.published_at), so this raw UPDATE affects the published source concept
+    // too, same as any native one — 26 stale (25 native + the 1 source), not 25.
     rawDb(core).prepare(`UPDATE concepts SET last_confirmed_at=1 WHERE circle=?`).run(circle);
     expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).staleConcepts).toHaveLength(20);
-    expect(core.overview(circle, { sourceAuthorizationContext: auth }).counts.stale).toBe(25);
+    expect(core.overview(circle, { sourceAuthorizationContext: auth }).counts.stale).toBe(26);
 
     const seen = new Set<string>();
     let cursor: { updatedAt: number; id: string } | undefined;
@@ -593,11 +693,17 @@ describe("authorized source-backed generic retrieval", () => {
     try {
       const search = await client.callTool({ name: "memory_search", arguments: { query: "cobalt", circle } }) as { content: Array<{ type: string; text: string }> };
       expect(JSON.parse(search.content[0].text)).toMatchObject({ results: [expect.objectContaining({ id: stored.conceptId })] });
-      expect(search.content.slice(1).map((item) => item.text).join("\n")).toContain("Published source retrieval evidence");
+      // File=concept (Phase 1), item 1: title is frontmatter title else filename-basename now
+      // (never firstLine(chunk content)) — oneChunkManifest's file entry has no frontmatter
+      // title, so README.md falls back to "README".
+      expect(search.content.slice(1).map((item) => item.text).join("\n")).toContain("README");
       const listed = await client.callTool({ name: "memory_list", arguments: { circle } }) as { content: Array<{ type: string; text: string }> };
       expect(JSON.parse(listed.content[0].text)).toMatchObject({ total: 1, memories: [expect.objectContaining({ id: stored.conceptId })] });
+      // Ruling 9: source concepts return structure (outline), not observations, by default.
       const fetched = await client.callTool({ name: "memory_fetch", arguments: { id: stored.conceptId, circle } }) as { content: Array<{ type: string; text: string }> };
-      expect(JSON.parse(fetched.content[0].text)).toMatchObject({ id: stored.conceptId, observations: [{ id: stored.observationId, content }] });
+      expect(JSON.parse(fetched.content[0].text)).toMatchObject({
+        id: stored.conceptId, title: "README", outline: [expect.objectContaining({ observationId: stored.observationId })],
+      });
       const gathered = await client.callTool({ name: "memory_gather", arguments: { intent: "cobalt", circle } }) as { content: Array<{ type: string; text: string }> };
       expect(JSON.parse(gathered.content[0].text).ranked).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
       const instrumented = core as unknown as { authorizedSourceProjections: (...args: unknown[]) => unknown[] };
@@ -637,5 +743,243 @@ describe("authorized source-backed generic retrieval", () => {
         await client.close(); await server.close();
       }
     }
+  });
+
+  it("fits a large outline under the tool-result ceiling by serialized size, never just a raw entry count (review fix, MINOR)", async () => {
+    // headingPath is document content with no length ceiling — a count cap alone
+    // (FETCH_OUTLINE_MAX_ENTRIES, mcp-server.ts) is not provably safe against a file with many
+    // moderately-long headings: 250 sections here, each with a realistic ~90-char heading, whose
+    // full outline would serialize to comfortably over the 40 000-char RESULT_MAX_CHARS ceiling.
+    const core = makeCore();
+    core.createSource(sourceInput());
+    const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-outline-fit" });
+    if (begun.kind !== "started") throw new Error("expected started run");
+    const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+    const sectionCount = 250;
+    const chunks = Array.from({ length: sectionCount }, (_, i) => {
+      const heading = `Section number ${i} with realistic padding text to make this heading a plausible real-world length`;
+      const text = `body text for section ${i}`;
+      const contentHash = computeSourceContentHash(Buffer.from(text, "utf8"));
+      const ingestFingerprint = computeSourceIngestFingerprint({
+        contentHash, headingPath: [heading], metadata, ingestConfigHash: begun.run.ingestConfigHash,
+      });
+      return {
+        bindingId: `binding-${i}`, bindingGeneration: 1,
+        operationId: computeSourceOperationId(begun.run.sourceId, `binding-${i}`, ingestFingerprint, begun.run.snapshotId, 1),
+        relativePath: "BIG.md", headingPath: [heading], occurrence: 1, segmentIndex: 1, documentSequence: i + 1,
+        contentHash, ingestFingerprint, metadata,
+        sourceRef: `source://source-a/BIG.md#${encodeURIComponent(heading.toLowerCase().replace(/[^a-z0-9]+/g, "-"))}~1`,
+        content: text,
+      };
+    });
+    const files = [{ relativePath: "BIG.md", type: "file" as const, contentHash: "big-file-hash", byteLength: 10_000, title: "BIG" }];
+    core.stageSourceManifest({
+      runId: begun.run.id, scanStatus: "complete", manifestHash: computeSourceManifestHash(files), files, chunks,
+    });
+    let conceptId: string | undefined;
+    for (const chunk of chunks) {
+      const stored = await core.storeSource(chunk.content, {
+        circle, sourceRefs: [chunk.sourceRef], operationId: chunk.operationId,
+        ...(conceptId ? { attachTo: conceptId } : { resolution: "forceNew" as const }),
+      });
+      conceptId = stored.conceptId;
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId, observationId: stored.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+    }
+    core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+    await core.recomputeSourceConceptBody(conceptId!);
+
+    const server = new McpServer({ name: "outline-fit-test", version: "1" });
+    registerMonetCoreTools(server, core, { sourceAuthorizationContext: auth, autoPrewarm: false, checkpointNudge: false });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "outline-fit-test-client", version: "1" });
+    await server.connect(serverTransport); await client.connect(clientTransport);
+    try {
+      const fetched = await client.callTool({ name: "memory_fetch", arguments: { id: conceptId, circle } }) as { content: Array<{ type: string; text: string }> };
+      const rawText = fetched.content[0].text;
+      // The real guarantee: never truncated mid-JSON by ok()'s own last-resort ceiling. A count-
+      // cap-only bug here would either overflow into ok()'s raw truncation (leaving unparseable
+      // JSON) or, if the cap were lowered blindly, undershoot; this proves neither happened by
+      // actually parsing the response.
+      const parsed = JSON.parse(rawText) as { outline: unknown[]; totalObservations: number; outlineNote?: string };
+      expect(rawText.length).toBeLessThan(40_000);
+      expect(parsed.totalObservations).toBe(sectionCount);
+      expect(parsed.outline.length).toBeGreaterThan(0);
+      expect(parsed.outline.length).toBeLessThan(sectionCount); // did not fit all 250 — this is the case that matters
+      expect(parsed.outlineNote).toBe(`Showing the first ${parsed.outline.length} of ${sectionCount} sections.`);
+    } finally {
+      await client.close(); await server.close();
+    }
+  });
+
+  it("drops a pathologically oversized outline entry instead of emitting it and truncating (round 4, Codex thread 10)", async () => {
+    // The exact bug: the old fit loop's pre-push size check was gated on fitOutline.length > 0, so
+    // the FIRST entry was always pushed unconditionally before the budget was ever checked against
+    // it. A single heading path long enough to blow the whole 40 000-char budget BY ITSELF still
+    // landed in fitOutline, and the response fell through to ok()'s last-resort truncation —
+    // invalid, unparseable JSON — instead of a valid, empty outline with an explanatory note.
+    const core = makeCore();
+    core.createSource(sourceInput());
+    const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-oversized-entry" });
+    if (begun.kind !== "started") throw new Error("expected started run");
+    const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+    // One heading path alone, well past 40 000 chars once serialized alongside the fixed fields.
+    const hugeHeading = "Section heading padding text ".repeat(2000);
+    const text = "body for the one oversized heading";
+    const contentHash = computeSourceContentHash(Buffer.from(text, "utf8"));
+    const ingestFingerprint = computeSourceIngestFingerprint({
+      contentHash, headingPath: [hugeHeading], metadata, ingestConfigHash: begun.run.ingestConfigHash,
+    });
+    const chunk = {
+      bindingId: "binding-0", bindingGeneration: 1,
+      operationId: computeSourceOperationId(begun.run.sourceId, "binding-0", ingestFingerprint, begun.run.snapshotId, 1),
+      relativePath: "HUGE.md", headingPath: [hugeHeading], occurrence: 1, segmentIndex: 1, documentSequence: 1,
+      contentHash, ingestFingerprint, metadata,
+      sourceRef: `source://source-a/HUGE.md#${encodeURIComponent(sourceHeadingAnchor([hugeHeading]))}~1`, content: text,
+    };
+    const files = [{ relativePath: "HUGE.md", type: "file" as const, contentHash: "huge-file-hash", byteLength: 100, title: "HUGE" }];
+    core.stageSourceManifest({
+      runId: begun.run.id, scanStatus: "complete", manifestHash: computeSourceManifestHash(files), files, chunks: [chunk],
+    });
+    const stored = await core.storeSource(chunk.content, {
+      circle, sourceRefs: [chunk.sourceRef], operationId: chunk.operationId, resolution: "forceNew",
+    });
+    core.recordSourceBindingReceipt({
+      runId: begun.run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId, observationId: stored.observationId,
+      predecessorObservationId: null, writeState: "committed",
+    });
+    core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+    await core.recomputeSourceConceptBody(stored.conceptId);
+
+    const server = new McpServer({ name: "outline-oversized-entry-test", version: "1" });
+    registerMonetCoreTools(server, core, { sourceAuthorizationContext: auth, autoPrewarm: false, checkpointNudge: false });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "outline-oversized-entry-test-client", version: "1" });
+    await server.connect(serverTransport); await client.connect(clientTransport);
+    try {
+      const fetched = await client.callTool({ name: "memory_fetch", arguments: { id: stored.conceptId, circle } }) as { content: Array<{ type: string; text: string }> };
+      const rawText = fetched.content[0].text;
+      // The real guarantee: this parses at all. A pre-fix response would truncate mid-JSON here.
+      const parsed = JSON.parse(rawText) as { outline: unknown[]; totalObservations: number; outlineNote?: string };
+      expect(rawText.length).toBeLessThan(40_000);
+      expect(parsed.totalObservations).toBe(1);
+      expect(parsed.outline).toEqual([]); // the one oversized entry was dropped, not truncated in place
+      expect(parsed.outlineNote).toContain("could not be included");
+    } finally {
+      await client.close(); await server.close();
+    }
+  });
+
+  it("preserves distinct segmentIndex values for a split section's outline entries (round 5, Codex thread R5-5)", async () => {
+    // Engine returns segmentIndex on SourceOutlineEntry (a section too large for maxChunkBytes
+    // splits into multiple chunker segments, same shape as round 4's thread 9/round 5's R5-3) —
+    // the MCP fit loop's fitted candidate entries dropped it, making split segments of ONE section
+    // indistinguishable from each other in memory_fetch's own outline output.
+    const core = makeCore();
+    core.createSource(sourceInput());
+    const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-segment-index" });
+    if (begun.kind !== "started") throw new Error("expected started run");
+    const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+    const buildChunk = (segmentIndex: number, documentSequence: number, content: string) => {
+      const contentHash = computeSourceContentHash(Buffer.from(content, "utf8"));
+      const ingestFingerprint = computeSourceIngestFingerprint({
+        contentHash, headingPath: ["Big"], metadata, ingestConfigHash: begun.run.ingestConfigHash,
+      });
+      return {
+        bindingId: `binding-${segmentIndex}`, bindingGeneration: 1,
+        operationId: computeSourceOperationId(begun.run.sourceId, `binding-${segmentIndex}`, ingestFingerprint, begun.run.snapshotId, 1),
+        relativePath: "BIG.md", headingPath: ["Big"], occurrence: 1, segmentIndex, documentSequence,
+        contentHash, ingestFingerprint, metadata,
+        sourceRef: `source://source-a/BIG.md#big~1`, content,
+      };
+    };
+    const chunks = [buildChunk(1, 1, "first half of an oversized section"), buildChunk(2, 2, "second half of an oversized section")];
+    const files = [{ relativePath: "BIG.md", type: "file" as const, contentHash: "big-file-hash", byteLength: 1000, title: "BIG" }];
+    core.stageSourceManifest({
+      runId: begun.run.id, scanStatus: "complete", manifestHash: computeSourceManifestHash(files), files, chunks,
+    });
+    let conceptId: string | undefined;
+    for (const chunk of chunks) {
+      const stored = await core.storeSource(chunk.content, {
+        circle, sourceRefs: [chunk.sourceRef], operationId: chunk.operationId,
+        ...(conceptId ? { attachTo: conceptId } : { resolution: "forceNew" as const }),
+      });
+      conceptId = stored.conceptId;
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId, observationId: stored.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+    }
+    core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+    await core.recomputeSourceConceptBody(conceptId!);
+
+    const server = new McpServer({ name: "outline-segment-index-test", version: "1" });
+    registerMonetCoreTools(server, core, { sourceAuthorizationContext: auth, autoPrewarm: false, checkpointNudge: false });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "outline-segment-index-test-client", version: "1" });
+    await server.connect(serverTransport); await client.connect(clientTransport);
+    try {
+      const fetched = await client.callTool({ name: "memory_fetch", arguments: { id: conceptId, circle } }) as { content: Array<{ type: string; text: string }> };
+      const parsed = JSON.parse(fetched.content[0].text) as { outline: Array<{ headingPath: string[]; occurrence: number; segmentIndex: number; observationId: string }> };
+      expect(parsed.outline).toHaveLength(2);
+      const segmentIndices = parsed.outline.map((entry) => entry.segmentIndex).sort();
+      expect(segmentIndices).toEqual([1, 2]); // pre-fix: both entries had segmentIndex undefined
+    } finally {
+      await client.close(); await server.close();
+    }
+  });
+
+  it("caps sourceRefs on a large source gather card, exposing the true total (round 4, Codex thread 13)", async () => {
+    // recomputeSourceConceptBody stores one source_refs entry per active chunk — hundreds for a
+    // large file — and gather()'s cards used to include that array verbatim. A gather response
+    // with even a couple of such cards can exceed RESULT_MAX_CHARS and get truncated mid-JSON by
+    // ok(), same failure shape as the outline bug above.
+    const core = makeCore();
+    core.createSource(sourceInput());
+    const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-refs-cap" });
+    if (begun.kind !== "started") throw new Error("expected started run");
+    const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+    const sectionCount = 40; // > SOURCE_REFS_CARD_CAP (20)
+    const chunks = Array.from({ length: sectionCount }, (_, i) => {
+      const heading = `Section ${i}`;
+      const text = `evidence about cobalt walruses, section ${i}`;
+      const contentHash = computeSourceContentHash(Buffer.from(text, "utf8"));
+      const ingestFingerprint = computeSourceIngestFingerprint({
+        contentHash, headingPath: [heading], metadata, ingestConfigHash: begun.run.ingestConfigHash,
+      });
+      return {
+        bindingId: `binding-${i}`, bindingGeneration: 1,
+        operationId: computeSourceOperationId(begun.run.sourceId, `binding-${i}`, ingestFingerprint, begun.run.snapshotId, 1),
+        relativePath: "MANY.md", headingPath: [heading], occurrence: 1, segmentIndex: 1, documentSequence: i + 1,
+        contentHash, ingestFingerprint, metadata,
+        sourceRef: `source://source-a/MANY.md#section-${i}~1`, content: text,
+      };
+    });
+    const files = [{ relativePath: "MANY.md", type: "file" as const, contentHash: "many-file-hash", byteLength: 10_000, title: "MANY" }];
+    core.stageSourceManifest({
+      runId: begun.run.id, scanStatus: "complete", manifestHash: computeSourceManifestHash(files), files, chunks,
+    });
+    let conceptId: string | undefined;
+    for (const chunk of chunks) {
+      const stored = await core.storeSource(chunk.content, {
+        circle, sourceRefs: [chunk.sourceRef], operationId: chunk.operationId,
+        ...(conceptId ? { attachTo: conceptId } : { resolution: "forceNew" as const }),
+      });
+      conceptId = stored.conceptId;
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId, observationId: stored.observationId,
+        predecessorObservationId: null, writeState: "committed",
+      });
+    }
+    core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
+    await core.recomputeSourceConceptBody(conceptId!);
+
+    const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
+    const card = gathered.ranked.find((c) => c.id === conceptId);
+    expect(card).toBeDefined();
+    expect(card!.sourceRefs).toHaveLength(20);
+    expect(card!.sourceRefsTotal).toBe(sectionCount);
   });
 });

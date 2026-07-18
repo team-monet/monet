@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
 
-export const SOURCE_CHUNKER_VERSION = "v2";
+export const SOURCE_CHUNKER_VERSION = "v3";
 
 const CONTENT_HASH_PREFIX = "monet-src-content/v1:sha256:";
 const CHUNK_FINGERPRINT_DOMAIN = "monet-src-ingest/v1";
 const OPERATION_ID_DOMAIN = "monet-src-op/v2";
 export const DEFAULT_SOURCE_MAX_CHUNKS = 100_000;
+/**
+ * Minimum-chunk merge pass (chunk-quality design, ratified): a section whose trimmed body is
+ * under this many UTF-8 bytes is never emitted as its own chunk — see mergeUndersizedSections.
+ */
+export const MIN_SOURCE_SECTION_BYTES = 200;
 
 class SourceParseDeadlineError extends Error {}
 class SourceChunkBudgetError extends Error {}
@@ -28,6 +33,13 @@ export interface SourceChunk {
   occurrence: number;
   /** One-based segment within the section. */
   segmentIndex: number;
+  /**
+   * One-based emission order across the WHOLE file (post-merge). headingPath/occurrence alone
+   * cannot recover cross-heading document order (a lexicographic heading comparison would sort
+   * "## Apple" before "## Zebra" even when Zebra appears first in the file) — this is the
+   * explicit position key a file concept's body reconstruction sorts by (ADR: document order).
+   */
+  documentSequence: number;
   body: string;
   metadata: SourceChunkMetadata;
   contentHash: string;
@@ -62,6 +74,13 @@ export interface ChunkSourceTextResult {
   chunks: SourceChunk[];
   diagnostics: SourceChunkDiagnostic[];
   complete: boolean;
+  /**
+   * The file's frontmatter `title:` value, trimmed, or null when absent/blank. Always populated
+   * from the same frontmatter parse that produces per-chunk metadata — even when the file has
+   * ZERO sections (frontmatter-only or empty body) and therefore emits zero chunks, so a file's
+   * display title (deriveSourceFileTitle) never depends on it having any chunks at all.
+   */
+  frontmatterTitle: string | null;
 }
 
 interface Section {
@@ -389,6 +408,77 @@ function sectionsFromMarkdown(lines: string[], deadlineExceeded?: () => boolean)
   return sections;
 }
 
+function sectionBodyBytes(lines: readonly string[]): number {
+  return Buffer.byteLength(trimBlankEdges([...lines]).join("\n"), "utf8");
+}
+
+function concatSectionLines(a: readonly string[], b: readonly string[]): string[] {
+  if (a.length === 0) return [...b];
+  if (b.length === 0) return [...a];
+  return [...a, "", ...b];
+}
+
+/**
+ * Minimum-chunk merge pass (chunk-quality design, ratified): a section whose trimmed body is
+ * under MIN_SOURCE_SECTION_BYTES is never emitted as its own chunk. Byte size alone decides it —
+ * a lone fenced code block or a one-line "See Also" section merges exactly like an undersized
+ * prose section; nothing here special-cases fences (segmentUnits downstream still recognizes a
+ * fence as its own unit regardless of which section(s) contributed the surrounding lines).
+ *
+ * An undersized section's lines carry FORWARD into the next section, which keeps ITS heading
+ * identity (the earlier, smaller section's identity is dropped — it never becomes a chunk of its
+ * own). A run of consecutive undersized sections keeps accumulating forward as long as the
+ * accumulated content stays under the minimum; the cap always wins over the minimum, though —
+ * merging forward never manufactures a section exceeding maxChunkBytes, so a merge that would
+ * bust the cap is skipped and the undersized section is emitted standalone instead (still small,
+ * but never oversized). A trailing undersized run at EOF has no next section to merge into, so it
+ * instead merges BACKWARD into the section before it (again capped at maxChunkBytes), keeping
+ * THAT section's identity. Horizontal rules were never section boundaries to begin with (ATX
+ * headings only — sectionsFromMarkdown) so there is nothing special to do for them here.
+ */
+function mergeUndersizedSections(sections: Section[], maxChunkBytes: number, deadlineExceeded?: () => boolean): Section[] {
+  if (sections.length <= 1) return sections;
+  const merged: Section[] = [];
+  let pending: Section | undefined;
+  for (const section of sections) {
+    checkDeadline(deadlineExceeded);
+    if (pending === undefined) {
+      pending = section;
+      continue;
+    }
+    if (sectionBodyBytes(pending.lines) >= MIN_SOURCE_SECTION_BYTES) {
+      merged.push(pending);
+      pending = section;
+      continue;
+    }
+    // Forward merge: the smaller, earlier `pending` flows into `section`, which keeps its own
+    // heading identity — pending's identity is dropped, exactly as the docstring above describes.
+    const combinedLines = concatSectionLines(pending.lines, section.lines);
+    if (sectionBodyBytes(combinedLines) > maxChunkBytes) {
+      merged.push(pending);
+      pending = section;
+      continue;
+    }
+    pending = { headingPath: section.headingPath, occurrence: section.occurrence, lines: combinedLines };
+  }
+  if (pending !== undefined) {
+    if (sectionBodyBytes(pending.lines) < MIN_SOURCE_SECTION_BYTES && merged.length > 0) {
+      // Backward merge (EOF only): no next section exists, so the trailing undersized run flows
+      // INTO the previous emitted section instead, which keeps ITS identity.
+      const last = merged[merged.length - 1];
+      const combinedLines = concatSectionLines(last.lines, pending.lines);
+      if (sectionBodyBytes(combinedLines) <= maxChunkBytes) {
+        merged[merged.length - 1] = { headingPath: last.headingPath, occurrence: last.occurrence, lines: combinedLines };
+      } else {
+        merged.push(pending);
+      }
+    } else {
+      merged.push(pending);
+    }
+  }
+  return merged;
+}
+
 function trimBlankEdges(lines: string[]): string[] {
   let start = 0;
   let end = lines.length;
@@ -545,6 +635,20 @@ export function sourceHeadingAnchor(headingPath: readonly string[]): string {
   return slug || "_untitled";
 }
 
+/**
+ * A source file's display title (file=concept, ratified): its frontmatter `title:` value when
+ * present and non-blank, else the filename with its extension stripped. Pure function of the
+ * already-parsed frontmatter title and the file's relative path — no I/O, no re-parsing, and no
+ * dependency on the file having any chunks (a frontmatter-only or empty file still gets a title).
+ */
+export function deriveSourceFileTitle(frontmatterTitle: string | null, relativePath: string): string {
+  const trimmed = frontmatterTitle?.trim();
+  if (trimmed) return trimmed;
+  const base = relativePath.slice(relativePath.lastIndexOf("/") + 1);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
 function encodeRelativePath(relativePath: string): string {
   return relativePath.split("/").map((part) => encodeURIComponent(part)).join("/");
 }
@@ -571,6 +675,10 @@ export function chunkSourceText(input: ChunkSourceTextInput): ChunkSourceTextRes
   if (!Number.isSafeInteger(maxChunks) || maxChunks < 0) throw new Error("maxChunks must be a nonnegative safe integer");
   const chunks: SourceChunk[] = [];
   const diagnostics: SourceChunkDiagnostic[] = [];
+  let documentSequence = 0;
+  // Populated as soon as frontmatter is parsed, independent of chunk count (a frontmatter-only or
+  // empty-body file still resolves a title) and left null if parsing never gets that far.
+  let frontmatterTitle: string | null = null;
   try {
     checkDeadline(input.deadlineExceeded);
     const normalizedText = input.text.replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "");
@@ -578,8 +686,11 @@ export function chunkSourceText(input: ChunkSourceTextInput): ChunkSourceTextRes
     const parsed = parseFrontmatter(normalizedText.split("\n"), input.relativePath, input.deadlineExceeded);
     if (parsed.diagnostic) diagnostics.push(parsed.diagnostic);
     const metadata = canonicalizeSourceChunkMetadata(parsed.metadata);
+    frontmatterTitle = metadata.frontmatter.title ? metadata.frontmatter.title : null;
 
-    const sections = sectionsFromMarkdown(parsed.bodyLines, input.deadlineExceeded);
+    const rawSections = sectionsFromMarkdown(parsed.bodyLines, input.deadlineExceeded);
+    checkDeadline(input.deadlineExceeded);
+    const sections = mergeUndersizedSections(rawSections, input.maxChunkBytes, input.deadlineExceeded);
     checkDeadline(input.deadlineExceeded);
     const sourceRefOccurrences = computeSourceRefOccurrences(sections.map((section) => ({
       relativePath: input.relativePath,
@@ -610,11 +721,13 @@ export function chunkSourceText(input: ChunkSourceTextInput): ChunkSourceTextRes
         const ingestFingerprint = computeSourceIngestFingerprint({
           contentHash, headingPath: section.headingPath, metadata, ingestConfigHash: input.ingestConfigHash,
         });
+        documentSequence += 1;
         chunks.push({
           relativePath: input.relativePath,
           headingPath: [...section.headingPath],
           occurrence: section.occurrence,
           segmentIndex,
+          documentSequence,
           body,
           metadata: canonicalizeSourceChunkMetadata(metadata),
           contentHash,
@@ -633,5 +746,5 @@ export function chunkSourceText(input: ChunkSourceTextInput): ChunkSourceTextRes
     }
   }
 
-  return { chunks, diagnostics, complete: diagnostics.length === 0 };
+  return { chunks, diagnostics, complete: diagnostics.length === 0, frontmatterTitle };
 }
