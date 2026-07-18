@@ -1,4 +1,4 @@
-import type { EffectiveSourceScanConfig } from "./source-scanner";
+import type { EffectiveSourceScanConfig, SourceScanDiagnosticCode } from "./source-scanner";
 import type { SourceChunkMetadata } from "./source-chunker";
 
 /** Durable source kinds supported by the P0 registry. */
@@ -146,6 +146,8 @@ export interface ConnectorSourceStatus {
   freshness: "fresh" | "stale" | "unknown";
   filesIndexed: number;
   chunksIndexed: number;
+  /** Files excluded from the active publication by skip-and-diagnose (wrong type, oversized, unparseable). */
+  filesSkipped: number;
   dirtyFiles: number;
   lastError?: string;
   schedule: SourceScheduleStatus;
@@ -198,6 +200,8 @@ export interface SourceSyncRun {
   manifestHash: string | null;
   fileCount: number;
   chunkCount: number;
+  /** Files excluded from this run's manifest by skip-and-diagnose. Never overloads write_state "skipped". */
+  filesSkipped: number;
   createdAt: number;
   updatedAt: number;
   publishedAt: number | null;
@@ -254,12 +258,33 @@ export interface SourceManifestChunkInput {
   bindingIdHint?: { bindingId: string; priorRunId: string };
 }
 
+/** A file excluded from a manifest by skip-and-diagnose: wrong type, oversized, or unparseable content. */
+export interface SourceManifestSkippedFileInput {
+  relativePath: string;
+  code: SourceScanDiagnosticCode;
+  message: string;
+  /** Best-effort: the file's last-confirmed size when it was previously published; omitted otherwise. */
+  byteLength?: number;
+}
+
 export interface StageSourceManifestInput {
   runId: string;
   scanStatus: "complete" | "partial";
   manifestHash: string;
   files: SourceManifestFileInput[];
   chunks: SourceManifestChunkInput[];
+  skipped?: SourceManifestSkippedFileInput[];
+}
+
+/** Durable per-run skip-and-diagnose audit record. */
+export interface SourceSkippedFileRecord {
+  sourceId: string;
+  runId: string;
+  relativePath: string;
+  code: SourceScanDiagnosticCode;
+  message: string;
+  byteLength: number;
+  createdAt: number;
 }
 
 export interface RecordSourceBindingReceiptInput {

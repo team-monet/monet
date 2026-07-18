@@ -14,13 +14,21 @@ import {
   DEFAULT_SOURCE_MAX_CHUNKS,
   SOURCE_CHUNKER_VERSION,
   chunkSourceText,
+  classifySourceFileContent,
   computeSourceContentHash,
   hashSourceDomain,
   type SourceChunk,
   type SourceChunkDiagnostic,
 } from "./source-chunker";
 
-export const SOURCE_SCANNER_VERSION = "v1";
+// CODEX FIX (3606534114): the not-markdown skip-and-diagnose semantics changed what a source's
+// scan can select without changing any config field, so a source whose ACTIVE publication already
+// includes a wrong-type file from before this change would otherwise take the unchanged-commit/
+// unchanged-config noop path on its next sync forever, never re-evaluating and never getting a
+// skip diagnostic. Bumping the version is this codebase's existing mechanism for exactly this
+// (ingestConfigHash and scanConfigVersion both derive from it) — forces one real rescan per
+// source on next sync, after which normal noop/change detection resumes.
+export const SOURCE_SCANNER_VERSION = "v2";
 
 export interface SourceScannerLimits {
   /** Maximum filesystem entries retained, whether selected or not; one extra entry may be probed to prove overflow. */
@@ -65,6 +73,20 @@ const DEFAULT_EXCLUDES = Object.freeze([
   "vendor/**",
 ]);
 
+const MARKDOWN_EXTENSION_RE = /\.(?:md|markdown|mdc)$/i;
+
+/**
+ * Pure path classifier: a source is Markdown iff its extension is .md/.markdown/.mdc
+ * (case-insensitive) or its exact basename is `.clinerules` (no extension). Never reads bytes.
+ * Must accept every curated AUTO_DETECT_INCLUDES entry above, including the extensionless
+ * `.clinerules` and the `.mdc` files under `.cursor/rules/**`, or auto-detection would
+ * false-positive its own curated set.
+ */
+export function isMarkdownSourcePath(relativePath: string): boolean {
+  const basename = relativePath.slice(relativePath.lastIndexOf("/") + 1);
+  return basename === ".clinerules" || MARKDOWN_EXTENSION_RE.test(basename);
+}
+
 const CONFIG_HASH_DOMAIN = "monet-src-ingest-config/v1";
 const MANIFEST_HASH_DOMAIN = "monet-src-manifest/v1";
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
@@ -98,6 +120,7 @@ export type SourceScanDiagnosticCode =
   | "file-too-large"
   | "invalid-utf8"
   | "io-error"
+  | "not-markdown"
   | "parse-time-exceeded"
   | "symlink-rejected"
   | "root-escape-rejected"
@@ -421,8 +444,11 @@ export function computeSourceManifestHash(files: readonly SourceScanFile[]): str
 
 /**
  * Produce an immutable, deterministic view of selected Markdown. Selection and output order use
- * raw UTF-8 POSIX-path bytes. Security or resource uncertainty fails closed: the result is partial
- * and cannot be published, but deterministic successfully-read evidence remains inspectable.
+ * raw UTF-8 POSIX-path bytes. Security or resource uncertainty at the tree level fails closed: the
+ * result is partial and cannot be published, but deterministic successfully-read evidence remains
+ * inspectable. A per-file problem (wrong type, oversized, invalid UTF-8, unparseable frontmatter, an
+ * indivisible chunk) instead excludes just that file and is recorded as a diagnostic; the scan still
+ * completes and is publishable whenever no tree-level violation occurred.
  */
 export function scanSourceSnapshot(input: ScanSourceSnapshotInput): SourceScanResult {
   const config = effectiveSourceScanConfig(input.config);
@@ -505,7 +531,16 @@ export function scanSourceSnapshot(input: ScanSourceSnapshotInput): SourceScanRe
       stopped = true;
       return;
     }
+    // RATIFIED: selectedFiles is the resource bound on selection, not on publication — it counts
+    // every included path reaching this point, including one that turns out not-markdown and gets
+    // excluded just below. A tree with more included-but-wrong-type entries than maxFiles
+    // legitimately exhausts the traversal budget before a real file is ever seen; deliberate, not
+    // an accident of check ordering.
     selectedFiles++;
+    if (!isMarkdownSourcePath(relativePath)) {
+      diagnostics.push({ code: "not-markdown", message: "included path is not a recognized Markdown source", relativePath });
+      return;
+    }
     if (enumerated.size > BigInt(config.limits.maxFileBytes)) {
       diagnostics.push({
         code: "file-too-large",
@@ -528,45 +563,71 @@ export function scanSourceSnapshot(input: ScanSourceSnapshotInput): SourceScanRe
     const read = secureRead(root, absolutePath, relativePath, enumerated, readLimit, deadlineExceeded);
     if (read.diagnostic) {
       diagnostics.push(read.diagnostic);
+      // SECURITY-CONSERVATIVE INTERIM: secureRead's post-enumeration recheck exists specifically
+      // to catch the node's type or identity changing between enumeration and read — a race
+      // signal, not the routine walk-time symlink/unsupported-node skip (which never reaches
+      // secureRead at all; entries are filtered out during enumeration and that stays skip,
+      // unchanged). Fail closed on all of secureRead's rejections, matching the directory-level
+      // io-error precedent above and the docstring's fail-closed promise. io-error is the least
+      // certain of these (a transient read failure with no positive race evidence) and may relax
+      // to skip later once a per-file carry-forward staleness bound exists, so a perpetually
+      // unreadable previously-published file can't re-serve indefinitely-stale content behind a
+      // green status with no bound on how stale; that bound is a tracked follow-up, out of scope
+      // here. symlink-rejected/unsupported-node here are a confirmed type change mid-scan and stop
+      // unconditionally.
       if (read.diagnostic.code === "parse-time-exceeded" || read.diagnostic.code === "toctou-rejected" ||
-          read.diagnostic.code === "root-escape-rejected") stopped = true;
+          read.diagnostic.code === "root-escape-rejected" || read.diagnostic.code === "io-error" ||
+          read.diagnostic.code === "symlink-rejected" || read.diagnostic.code === "unsupported-node") stopped = true;
       return;
     }
     if (read.limitExceeded || !read.bytes) {
+      // Two distinct semantics behind one truncation: the per-file limit bound this read (the
+      // file itself is too large), or the source's remaining aggregate budget was the smaller
+      // number (the file would fit its own limit alone but the source ran out of total bytes).
+      // Give each a message that says which, rather than sharing one ambiguous string.
+      const perFileBound = readLimit === config.limits.maxFileBytes;
       diagnostics.push({
-        code: readLimit === config.limits.maxFileBytes ? "file-too-large" : "file-budget-exceeded",
-        message: "file exceeded an inclusive byte limit during bounded read",
+        code: perFileBound ? "file-too-large" : "file-budget-exceeded",
+        message: perFileBound
+          ? `file exceeded the inclusive ${config.limits.maxFileBytes}-byte per-file limit during bounded read`
+          : `file exceeded the inclusive ${config.limits.maxTotalBytes}-byte total-bytes budget during bounded read`,
         relativePath,
       });
       stopped = true;
       return;
     }
 
+    // Whole-file granularity (ratified): a file joins the published manifest only once its
+    // content clears every gate below. An invalid-utf8 or chunker diagnostic (invalid-frontmatter,
+    // chunk-budget-exceeded) drops this file's buffered bytes and chunks entirely rather than
+    // publishing them partially; the diagnostic is still recorded and the scan keeps walking.
     const contentHash = computeSourceContentHash(read.bytes);
-    files.push({ relativePath, type: "file", contentHash, byteLength: read.bytes.length });
     totalBytes += read.bytes.length;
-    let text: string;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes).replace(/\r\n?/g, "\n");
-    } catch {
-      diagnostics.push({ code: "invalid-utf8", message: "included file is not strict UTF-8", relativePath });
+    // CODEX FIX (3606534097): UTF-8 + frontmatter validity are now the shared classifier
+    // (source-chunker.ts) — the exact same pure function of bytes the materializer calls pre-seal
+    // for blocker 5a's content-mismatch case. Behavior here is unchanged: same decode, same
+    // normalization, same diagnostic shape; the existing scanner suite is the regression proof.
+    const classified = classifySourceFileContent(read.bytes, relativePath, deadlineExceeded);
+    if (classified.diagnostic) {
+      diagnostics.push(classified.diagnostic);
       return;
     }
     const chunked = chunkSourceText({
       relativePath,
-      text,
+      text: classified.text!,
       fileContentHash: contentHash,
       ingestConfigHash,
       maxChunkBytes: config.limits.maxChunkBytes,
       maxChunks: config.limits.maxChunks - chunks.length,
       deadlineExceeded,
     });
-    for (const chunk of chunked.chunks) chunks.push(chunk);
-    diagnostics.push(...chunked.diagnostics);
-    if (chunked.diagnostics.some((diagnostic) => diagnostic.code === "parse-time-exceeded")) {
-      stopped = true;
+    if (chunked.diagnostics.length > 0) {
+      diagnostics.push(...chunked.diagnostics);
+      if (chunked.diagnostics.some((diagnostic) => diagnostic.code === "parse-time-exceeded")) stopped = true;
       return;
     }
+    files.push({ relativePath, type: "file", contentHash, byteLength: read.bytes.length });
+    for (const chunk of chunked.chunks) chunks.push(chunk);
     stopForDeadline(relativePath);
   };
 
@@ -691,8 +752,13 @@ export function scanSourceSnapshot(input: ScanSourceSnapshotInput): SourceScanRe
       try {
         stats = lstatSync(absolutePath, { bigint: true }) as BigIntStats;
       } catch (error) {
+        // SECURITY-CONSERVATIVE INTERIM, in lockstep with the secureRead io-error stop above: an
+        // lstat failure here is indistinguishable from a race against something actively
+        // removing/replacing the node mid-walk, so it fails closed like the directory-level
+        // io-error precedent, not a routine per-file skip.
         diagnostics.push({ code: "io-error", message: `cannot inspect path: ${String(error)}`, relativePath });
-        continue;
+        stopped = true;
+        return;
       }
       const selected = matchesAny(config.include, relativePath);
       if (stats.isSymbolicLink()) {
@@ -733,10 +799,14 @@ export function scanSourceSnapshot(input: ScanSourceSnapshotInput): SourceScanRe
   walkDirectory(rootLexical, "", rootIdentity);
   if (!stopped && !sameDirectory(root, rootLexical, rootIdentity)) {
     diagnostics.push({ code: "toctou-rejected", message: "source root identity changed during scan" });
+    stopped = true;
   }
 
   files.sort((a, b) => compareUtf8(a.relativePath, b.relativePath));
-  const partial = diagnostics.length > 0;
+  // Tree-level violations (resource budgets, TOCTOU, root escape) always set `stopped` and fail
+  // the whole scan closed; a per-file diagnostic (wrong type, oversized, invalid content) never
+  // sets it, so those files are simply excluded while the rest of the scan still publishes.
+  const partial = stopped;
   return {
     status: partial ? "partial" : "complete",
     publishable: !partial,

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +13,7 @@ import {
   SOURCE_SCANNER_VERSION,
   computeSourceManifestHash,
   effectiveSourceScanConfig,
+  isMarkdownSourcePath,
   matchesSourceGlob,
   scanSourceSnapshot,
 } from "../source-scanner";
@@ -66,7 +67,7 @@ describe("source scanner configuration and glob semantics", () => {
     ]));
     expect(DEFAULT_SOURCE_SCANNER_LIMITS.maxChunkBytes).toBe(32 * 1024);
     expect(DEFAULT_SOURCE_SCANNER_LIMITS.maxEntries).toBe(100_000);
-    expect(SOURCE_SCANNER_VERSION).toBe("v1");
+    expect(SOURCE_SCANNER_VERSION).toBe("v2");
     expect(SOURCE_CHUNKER_VERSION).toBe("v2");
   });
 
@@ -241,11 +242,14 @@ describe("source scanner deterministic bytes and parsing", () => {
     expect(result).toMatchObject({ complete: false, chunks: [] });
     expect(result.diagnostics).toEqual([expect.objectContaining({ code: "chunk-budget-exceeded" })]);
 
+    // A chunker diagnostic is per-file (whole-file granularity, ratified): b.md is dropped
+    // entirely from files/chunks and diagnosed, but a.md still publishes and the scan completes.
     const dir = root();
     put(dir, "a.md", "a");
     put(dir, "b.md", "b");
     const scan = scanSourceSnapshot({ root: dir, config: { include: ["*.md"], limits: { maxChunks: 1 } } });
-    expect(scan).toMatchObject({ status: "partial", publishable: false });
+    expect(scan).toMatchObject({ status: "complete", publishable: true });
+    expect(scan.files.map((file) => file.relativePath)).toEqual(["a.md"]);
     expect(scan.chunks).toHaveLength(1);
     expect(scan.diagnostics).toEqual([expect.objectContaining({ code: "chunk-budget-exceeded", relativePath: "b.md" })]);
   });
@@ -265,19 +269,22 @@ describe("source scanner deterministic bytes and parsing", () => {
     expect(checks).toBeLessThan(100);
   });
 
-  it("marks invalid UTF-8 and unsupported nested frontmatter partial and unpublishable", () => {
+  it("excludes invalid UTF-8 and unsupported nested frontmatter as per-file diagnostics while remaining publishable", () => {
     const invalidUtf8 = root();
     put(invalidUtf8, "bad.md", Uint8Array.from([0xc3, 0x28]));
     const badText = scanSourceSnapshot({ root: invalidUtf8, config: { include: ["bad.md"] } });
-    expect(badText).toMatchObject({ status: "partial", publishable: false });
-    expect(badText.files).toHaveLength(1);
-    expect(badText.diagnostics).toEqual([expect.objectContaining({ code: "invalid-utf8" })]);
+    expect(badText).toMatchObject({ status: "complete", publishable: true });
+    expect(badText.files).toHaveLength(0);
+    expect(badText.chunks).toHaveLength(0);
+    expect(badText.diagnostics).toEqual([expect.objectContaining({ code: "invalid-utf8", relativePath: "bad.md" })]);
 
     const nested = root();
     put(nested, "nested.md", "---\nowner:\n  name: docs\n---\n# Body\ntext");
     const badMetadata = scanSourceSnapshot({ root: nested, config: { include: ["nested.md"] } });
-    expect(badMetadata).toMatchObject({ status: "partial", publishable: false });
-    expect(badMetadata.diagnostics).toEqual([expect.objectContaining({ code: "invalid-frontmatter" })]);
+    expect(badMetadata).toMatchObject({ status: "complete", publishable: true });
+    expect(badMetadata.files).toHaveLength(0);
+    expect(badMetadata.chunks).toHaveLength(0);
+    expect(badMetadata.diagnostics).toEqual([expect.objectContaining({ code: "invalid-frontmatter", relativePath: "nested.md" })]);
   });
 });
 
@@ -299,14 +306,22 @@ describe("source scanner resource and filesystem boundaries", () => {
 
   it.each([
     ["files", { maxFiles: 0 }, "file-budget-exceeded"],
-    ["file bytes", { maxFileBytes: 2 }, "file-too-large"],
     ["total bytes", { maxTotalBytes: 2 }, "file-budget-exceeded"],
-  ])("returns a partial snapshot after exceeding the %s budget", (_label, limits, code) => {
+  ])("returns a partial snapshot after exceeding the %s budget (tree-level, gate regression)", (_label, limits, code) => {
     const dir = root();
     put(dir, "a.md", "abc");
     const result = scanSourceSnapshot({ root: dir, config: { include: ["a.md"], limits } });
     expect(result).toMatchObject({ status: "partial", publishable: false });
     expect(result.diagnostics).toEqual([expect.objectContaining({ code })]);
+  });
+
+  it("excludes an individually oversized file as a per-file diagnostic while remaining publishable", () => {
+    const dir = root();
+    put(dir, "a.md", "abc");
+    const result = scanSourceSnapshot({ root: dir, config: { include: ["a.md"], limits: { maxFileBytes: 2 } } });
+    expect(result).toMatchObject({ status: "complete", publishable: true });
+    expect(result.files).toHaveLength(0);
+    expect(result.diagnostics).toEqual([expect.objectContaining({ code: "file-too-large", relativePath: "a.md" })]);
   });
 
   it("accepts elapsed == maxParseMs and rejects elapsed > maxParseMs", () => {
@@ -416,9 +431,13 @@ describe("source scanner resource and filesystem boundaries", () => {
     mkdirSync(join(dir, "node_modules"));
     symlinkSync(join(outside, "secret.md"), join(dir, "node_modules", "ignored.md"));
     const result = scanSourceSnapshot({ root: dir, config: { include: ["linked.md", "docs/**/*.md"] } });
-    expect(result).toMatchObject({ status: "partial", publishable: false, files: [] });
+    // A selected symlink is a per-node diagnostic (never followed) that does not stop the scan:
+    // it is simply excluded, and the (otherwise empty) selection still completes and publishes.
+    expect(result).toMatchObject({ status: "complete", publishable: true, files: [] });
     expect(result.diagnostics).toEqual([expect.objectContaining({ code: "symlink-rejected", relativePath: "linked.md" })]);
 
+    // A symlinked ROOT is a tree-level rejection (gate regression): the whole scan fails closed
+    // before any walk begins, since there is no root to safely enumerate at all.
     const linkedRoot = join(root(), "linked-root");
     symlinkSync(outside, linkedRoot);
     expect(scanSourceSnapshot({ root: linkedRoot, config: { include: ["**/*.md"] } })).toMatchObject({
@@ -428,14 +447,14 @@ describe("source scanner resource and filesystem boundaries", () => {
     });
   });
 
-  it("rejects a symlink that can hide selected descendants while leaving an unrelated symlink silent", () => {
+  it("excludes a symlink that can hide selected descendants as a per-node diagnostic while leaving an unrelated symlink silent", () => {
     const dir = root();
     const outside = root();
     put(outside, "inside.md", "outside");
     symlinkSync(outside, join(dir, "docs"));
     symlinkSync(outside, join(dir, "unrelated"));
     const result = scanSourceSnapshot({ root: dir, config: { include: ["docs/**/*.md"] } });
-    expect(result).toMatchObject({ status: "partial", publishable: false, files: [] });
+    expect(result).toMatchObject({ status: "complete", publishable: true, files: [] });
     expect(result.diagnostics).toEqual([
       expect.objectContaining({ code: "symlink-rejected", relativePath: "docs" }),
     ]);
@@ -485,6 +504,150 @@ describe("source scanner resource and filesystem boundaries", () => {
     });
     expect(result).toMatchObject({ status: "partial", publishable: false, files: [] });
     expect(result.diagnostics).toEqual([expect.objectContaining({ code: "toctou-rejected", relativePath: "a.md" })]);
+  });
+
+  it("fails closed if the root is replaced in the narrow window after the walk returns", () => {
+    // Regression for a gap the gate fix would otherwise expose: the final post-walk root-identity
+    // recheck pushed a toctou-rejected diagnostic without setting `stopped`, so under the old
+    // `partial = diagnostics.length > 0` gate it was safely (if accidentally) conservative, but
+    // under `partial = stopped` it would have gone unnoticed and published. `stopped` must be set
+    // here too so a root-level TOCTOU still fails closed.
+    const dir = root();
+    put(dir, "a.md", "a");
+    const moved = `${dir}-swapped`;
+    const result = scanSourceSnapshot({
+      root: dir,
+      config: { include: ["*.md"] },
+      now: () => {
+        // sameDirectory() is re-checked repeatedly during the walk; only a replacement performed
+        // strictly after walkDirectory's own final check (and observed only by the outer check)
+        // exercises this exact gap. Swapping unconditionally on every clock read, including the
+        // very last one taken after the walk completes, reaches that window deterministically.
+        try { renameSync(dir, moved); mkdirSync(dir); } catch { /* already swapped */ }
+        return 0;
+      },
+    });
+    expect(result).toMatchObject({ status: "partial", publishable: false });
+    expect(result.diagnostics.some((diagnostic) => diagnostic.code === "toctou-rejected")).toBe(true);
+    rmSync(moved, { recursive: true, force: true });
+  });
+
+  it("fails closed on a per-file io-error while reading (security-conservative interim)", () => {
+    const dir = root();
+    put(dir, "unreadable.md", "content");
+    chmodSync(join(dir, "unreadable.md"), 0o000);
+    try {
+      const result = scanSourceSnapshot({ root: dir, config: { include: ["*.md"] } });
+      expect(result).toMatchObject({ status: "partial", publishable: false, files: [] });
+      expect(result.diagnostics).toEqual([expect.objectContaining({ code: "io-error", relativePath: "unreadable.md" })]);
+    } finally {
+      chmodSync(join(dir, "unreadable.md"), 0o644);
+    }
+  });
+
+  // NOTE (deviation, documented rather than shipped as a flaky/unreachable test): symlink-rejected
+  // and unsupported-node ALSO now stop when raised from secureRead's own post-enumeration recheck
+  // (source-scanner.ts, the `before.isSymbolicLink()`/`!before.isFile()` branch), sharing the exact
+  // same `read.diagnostic.code === ...` OR-chain as the io-error case proven above. Probed
+  // empirically (12 candidate clock-tick values against this file's own now()/deadlineExceeded()
+  // call sites): every reachable tick lands either at a directory-level identity check (the
+  // rmSync+symlinkSync swap mutates the parent directory, which the walk's own per-child
+  // sameDirectory() checks observe first) or inside the read loop after openSync already succeeded
+  // on the original inode (producing toctou-rejected, already covered above and unaffected by this
+  // change). secureRead's own `before = lstatSync(...)` and the checks immediately after it call
+  // deadlineExceeded() nowhere, so there is no hookable point in that exact window — the race this
+  // branch defends against is narrower than this harness's clock-tick technique can land. Coverage
+  // here rests on: the io-error case just above exercising the identical OR-chain addition through
+  // a reachable sibling branch of the same `if (read.diagnostic)` block, and this being a one-line,
+  // low-risk widening of an already-tested condition rather than new logic.
+});
+
+describe("source scanner Markdown classification and skip-and-diagnose", () => {
+  it("classifies extension and .clinerules paths as Markdown, case-insensitively on extension only", () => {
+    expect(isMarkdownSourcePath("README.md")).toBe(true);
+    expect(isMarkdownSourcePath("README.MD")).toBe(true);
+    expect(isMarkdownSourcePath("notes/topic.Markdown")).toBe(true);
+    expect(isMarkdownSourcePath(".cursor/rules/style.mdc")).toBe(true);
+    expect(isMarkdownSourcePath(".clinerules")).toBe(true);
+    expect(isMarkdownSourcePath("nested/.clinerules")).toBe(true);
+    expect(isMarkdownSourcePath("README.md.bak")).toBe(false);
+    expect(isMarkdownSourcePath("script.mdx")).toBe(false);
+    expect(isMarkdownSourcePath("image.png")).toBe(false);
+    expect(isMarkdownSourcePath("Makefile")).toBe(false);
+    expect(isMarkdownSourcePath(".clinerules.md")).toBe(true);
+    expect(isMarkdownSourcePath("notclinerules")).toBe(false);
+  });
+
+  it("excludes a non-Markdown selected file as a per-file diagnostic while remaining publishable", () => {
+    const dir = root();
+    put(dir, "a.md", "# A\nkept");
+    put(dir, "notes.txt", "excluded");
+    const result = scanSourceSnapshot({ root: dir, config: { include: ["*.md", "*.txt"] } });
+    expect(result).toMatchObject({ status: "complete", publishable: true });
+    expect(result.files.map((file) => file.relativePath)).toEqual(["a.md"]);
+    expect(result.diagnostics).toEqual([expect.objectContaining({ code: "not-markdown", relativePath: "notes.txt" })]);
+  });
+
+  it("never false-positives the curated auto-detect set, including extensionless .clinerules and .mdc under .cursor/rules/**", () => {
+    const dir = root();
+    put(dir, ".clinerules", "rules body");
+    put(dir, ".cursor/rules/style.mdc", "style rules");
+    put(dir, "AGENTS.md", "# Agents\nbody");
+    const result = scanSourceSnapshot({ root: dir, config: effectiveSourceScanConfig({ autoDetect: true }) });
+    expect(result).toMatchObject({ status: "complete", publishable: true, diagnostics: [] });
+    expect(result.files.map((file) => file.relativePath).sort()).toEqual([
+      ".clinerules", ".cursor/rules/style.mdc", "AGENTS.md",
+    ]);
+  });
+
+  it("publishes a mixed tree: good files alongside not-markdown, oversized, invalid-utf8, and invalid-frontmatter exclusions", () => {
+    const dir = root();
+    put(dir, "good-one.md", "# Good\nfirst body");
+    put(dir, "good-two.md", "# Good\nsecond body");
+    put(dir, "wrong-type.log", "not markdown");
+    put(dir, "oversized.md", "x".repeat(64));
+    put(dir, "invalid.md", Uint8Array.from([0xc3, 0x28]));
+    put(dir, "bad-frontmatter.md", "---\nowner:\n  name: docs\n---\n# Body\ntext");
+    const result = scanSourceSnapshot({
+      root: dir,
+      config: { include: ["*.md", "*.log"], limits: { maxFileBytes: 50 } },
+    });
+    expect(result.status).toBe("complete");
+    expect(result.publishable).toBe(true);
+    expect(result.files.map((file) => file.relativePath).sort()).toEqual(["good-one.md", "good-two.md"]);
+    expect(result.chunks.map((chunk) => chunk.relativePath).sort()).toEqual(["good-one.md", "good-two.md"]);
+    const codesByPath = Object.fromEntries(result.diagnostics.map((diagnostic) => [diagnostic.relativePath, diagnostic.code]));
+    expect(codesByPath).toEqual({
+      "wrong-type.log": "not-markdown",
+      "oversized.md": "file-too-large",
+      "invalid.md": "invalid-utf8",
+      "bad-frontmatter.md": "invalid-frontmatter",
+    });
+  });
+
+  it("is complete and publishable with zero files when every selected file is skip-and-diagnosed", () => {
+    const dir = root();
+    put(dir, "wrong-type.log", "not markdown");
+    put(dir, "invalid.md", Uint8Array.from([0xc3, 0x28]));
+    const result = scanSourceSnapshot({ root: dir, config: { include: ["*.md", "*.log"] } });
+    expect(result).toMatchObject({ status: "complete", publishable: true, files: [], chunks: [] });
+    expect(result.diagnostics).toHaveLength(2);
+  });
+
+  it("counts a not-markdown file against the maxFiles selection budget (ratified, minor c)", () => {
+    // a.txt sorts before b.md and consumes the sole maxFiles slot even though it's excluded as
+    // not-markdown: selectedFiles is the resource bound on what the walk is willing to inspect,
+    // not on what ultimately publishes, so a real file arriving after budget-consuming wrong-type
+    // entries is legitimately budget-rejected rather than silently let through.
+    const dir = root();
+    put(dir, "a.txt", "not markdown");
+    put(dir, "b.md", "# B\n\nbody\n");
+    const result = scanSourceSnapshot({ root: dir, config: { include: ["*.txt", "*.md"], limits: { maxFiles: 1 } } });
+    expect(result).toMatchObject({ status: "partial", publishable: false, files: [] });
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({ code: "not-markdown", relativePath: "a.txt" }),
+      expect.objectContaining({ code: "file-budget-exceeded", relativePath: "b.md" }),
+    ]);
   });
 });
 

@@ -9,7 +9,8 @@ import {
 import { constants } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { computeSourceIngestConfigHash, computeSourceManifestHash, effectiveSourceScanConfig, matchesSourceGlob } from "./source-scanner";
-import type { EffectiveSourceScanConfig } from "./source-scanner";
+import type { EffectiveSourceScanConfig, SourceScanDiagnostic } from "./source-scanner";
+import { classifySourceFileContent } from "./source-chunker";
 import { managedGitEnvironment, validateManagedGitInvocation, validateManagedGitRepository } from "./source-git";
 import {
   assertManagedDirectoryTrust, freezeSameDeviceTree, removeFrozenSameDeviceTree, revalidateSameDeviceTree,
@@ -63,6 +64,23 @@ export interface RepoMdMaterializerOptions {
   /** Exact per-source lock ownership fence, checked immediately before managed mutations. */
   assertOwnership?: () => void;
   fault?: (point: RepoMdMaterializerFaultPoint) => void;
+  /**
+   * BLOCKER 5a: the prior published file list, supplied by the caller (syncSource), which has
+   * ledger access this module intentionally does not. Enables pre-seal carry-forward — a
+   * previously-published path this run's own tree-level diagnostics exclude gets its bytes copied
+   * from the prior sealed snapshot into the one being sealed now, before it seals. Absent for a
+   * source's first-ever run (nothing prior to carry). Chunk-level carry (content, fingerprints)
+   * stays entirely in planManifest; this only carries raw file bytes into the snapshot.
+   */
+  priorPublication?: {
+    /** CODEX FIX (3606534127): identifies WHICH prior publication carried bytes came from, so a
+     * cache-reuse hit against a snapshot sealed with carried content can be fenced to the exact
+     * prior publication it was carried from — see carryFenceStale. */
+    runId: string;
+    snapshotId: string;
+    ingestConfigHash: string;
+    files: ReadonlyArray<{ relativePath: string }>;
+  };
 }
 
 export interface RepoMdMaterialization {
@@ -71,6 +89,20 @@ export interface RepoMdMaterialization {
   snapshotPath: string;
   currentPath: string;
   repositoryRoot: string;
+  /** Per-file skip-and-diagnose evidence for this materialization; see enumerateSelectedTree. */
+  diagnostics: SourceScanDiagnostic[];
+  /**
+   * BLOCKER 5a EDGE CASE: previously-published paths that needed pre-seal carry-forward (per
+   * priorPublication) but could not get it because the prior sealed snapshot required to source
+   * their bytes was missing, corrupt, or otherwise failed validation. Always present; empty when
+   * nothing needed carrying or every carry succeeded. Non-empty here is a signal the caller
+   * (syncSource) MUST act on: never stage a manifest that would carry these paths forward, since
+   * their bytes are not (and cannot safely be made) present in this snapshot — degrade the run to
+   * a graceful tree-level-partial abort instead, matching the docstring's fail-closed promise.
+   * Deliberately a data field, not a thrown error: by the time syncSource checks it, a durable run
+   * already exists to abort cleanly, so there is no need to fail before one does.
+   */
+  carryForwardUnavailable: string[];
 }
 
 interface TreeEntry { path: string; oid: string; size: number; mode: string }
@@ -80,6 +112,34 @@ interface SnapshotMarker {
   configHash: string;
   variant: string;
   files: Array<{ path: string; size: number; sha256: string; mode?: "100644" | "100755" }>;
+  /**
+   * Skip-and-diagnose evidence captured at seal time, durable across process crash/resume and
+   * cache-reuse reads of this exact sealed snapshot. Optional because markers sealed before this
+   * field existed have none on disk; treat a missing value as `[]`, never as a validation failure.
+   */
+  diagnostics?: SourceScanDiagnostic[];
+  /**
+   * BLOCKER 5a: the subset of `files` that were pre-seal carried forward from a prior sealed
+   * snapshot rather than freshly selected from THIS commit's Git tree — a sealed, tamper-evident
+   * (validateSealedSnapshot's content walk covers every file, carried or not) record of exactly
+   * which paths those are. This is what lets validateSealedSnapshotAgainstGit treat carried
+   * entries as first-class expected members of an EXACT match (entries ∪ carriedPaths), rather
+   * than relaxing the match to "at least entries" — a superset relaxation was explicitly rejected.
+   * Optional/empty for a marker with nothing carried. Written for BOTH source types when a carry
+   * occurs (pre-seal carry runs for repo-md and git-md alike); repo-md merely never READS it —
+   * only git-md's against-Git cross-check consumes it at cache-reuse time.
+   */
+  carriedPaths?: string[];
+  /**
+   * CODEX FIX (3606534127): the prior publication's runId that carriedPaths' bytes were sourced
+   * from at seal time. A sealed snapshot's carried content is only valid for reuse (cache-reuse
+   * hit) while the CURRENT prior publication is still that same run — if the source has since
+   * healed, changed, or otherwise re-published, a stale cache hit would return carried bytes that
+   * no longer match what planManifest (reading the CURRENT ledger) would carry, even though
+   * snapshotId+configHash alone still match. Present whenever carriedPaths is non-empty; absent
+   * (and ignored) otherwise.
+   */
+  carriedFromRunId?: string;
 }
 
 interface FrozenManagedDirectory { path: string; dev: number; ino: number }
@@ -964,21 +1024,55 @@ function hashFileGitProof(
 function validateSealedSnapshotAgainstGit(
   snapshotPath: string, marker: SnapshotMarker, entries: readonly TreeEntry[], check: () => void = () => undefined,
 ): void {
-  if (marker.files.length !== entries.length) throw new Error("cached git-md snapshot does not match the selected Git manifest");
+  // BLOCKER 5a reconciliation: a sealed marker may legitimately include pre-seal carried entries
+  // beyond what Git currently selects for this commit. marker.carriedPaths is the sealed record of
+  // exactly which paths those are, so the expected set here is entries ∪ carriedPaths — still an
+  // EXACT match (every member proven, no member unaccounted for), not a relaxation to "at least
+  // entries". Carried entries' own content was already fully hash-verified against the marker by
+  // validateSealedSnapshot's directory walk (called immediately before this at the one call site);
+  // there is no Git blob to cross-check them against for a path absent from entries, since it is,
+  // by definition, not currently Git-selected for this commit.
+  //
+  // CODEX FIX (3606534097) SUBTLETY: entries and carriedPaths are no longer necessarily disjoint.
+  // A classifier-substituted path (John's ruling "A") is BOTH currently Git-selected (its fresh
+  // blob exists and was materialized) AND carried (its content was deliberately replaced with the
+  // prior sealed snapshot's bytes because the fresh blob failed content classification) — its
+  // proof is carriedPaths membership + the same content walk, not a Git-blob-hash match, since its
+  // bytes intentionally do NOT match Git's current blob at that path. The union (not sum) of
+  // entries and carriedPaths is still the full expected set, still an exact match either way.
+  const carriedPaths = new Set(marker.carriedPaths ?? []);
+  const entryByPath = new Map(entries.map((entry) => [entry.path, entry]));
+  const expectedPaths = new Set<string>([...entryByPath.keys(), ...carriedPaths]);
+  if (marker.files.length !== expectedPaths.size) {
+    throw new Error("cached git-md snapshot does not match the selected Git manifest");
+  }
   const byPath = new Map(marker.files.map((file) => [file.path, file]));
-  for (const entry of entries) {
+  for (const [path, entry] of entryByPath) {
     check();
-    const cached = byPath.get(entry.path);
-    if (!cached || cached.mode !== entry.mode || cached.size !== entry.size) {
+    const cached = byPath.get(path);
+    if (!cached) throw new Error("cached git-md snapshot path, mode, or size does not match Git");
+    if (carriedPaths.has(path)) {
+      // Substituted: already content-verified by validateSealedSnapshot's walk; deliberately not
+      // checked against Git's blob for this path.
+      byPath.delete(path);
+      continue;
+    }
+    if (cached.mode !== entry.mode || cached.size !== entry.size) {
       throw new Error("cached git-md snapshot path, mode, or size does not match Git");
     }
-    const proof = hashFileGitProof(join(snapshotPath, entry.path), entry.oid.length, check);
+    const proof = hashFileGitProof(join(snapshotPath, path), entry.oid.length, check);
     if (proof.size !== entry.size || proof.sha256 !== cached.sha256 || proof.oid !== entry.oid) {
       throw new Error("cached git-md snapshot content does not match its Git blob");
     }
-    byPath.delete(entry.path);
+    byPath.delete(path);
   }
-  if (byPath.size !== 0) throw new Error("cached git-md snapshot contains paths absent from Git");
+  for (const path of carriedPaths) {
+    if (entryByPath.has(path)) continue; // already verified above (substituted)
+    check();
+    if (!byPath.has(path)) throw new Error("cached git-md snapshot marker.carriedPaths names a path absent from marker.files");
+    byPath.delete(path);
+  }
+  if (byPath.size !== 0) throw new Error("cached git-md snapshot contains paths absent from Git and unexplained by carry-forward");
 }
 
 function validateSealedSnapshotAgainstLedger(
@@ -1418,7 +1512,7 @@ async function enumerateSelectedTree(
   execFile: typeof nodeExecFile,
   localGit?: { timeoutMs: number; executable: string },
   deadline?: GitMaterializationDeadline,
-): Promise<{ config: EffectiveSourceScanConfig; entries: TreeEntry[] }> {
+): Promise<{ config: EffectiveSourceScanConfig; entries: TreeEntry[]; diagnostics: SourceScanDiagnostic[] }> {
   const config = options.config ?? effectiveSourceScanConfig({ autoDetect: source.autoDetect, include: source.include, exclude: source.exclude });
   const listingLimit = Math.min(32 * 1024 * 1024, Math.max(1024 * 1024, config.limits.maxEntries * 512));
   const args = ["ls-tree", "-r", "-t", "-z", "--long", snapshotId];
@@ -1457,6 +1551,7 @@ async function enumerateSelectedTree(
   }
   if (records.length > config.limits.maxEntries) throw new Error("pinned Git tree exceeds the materialization entry limit");
   const entries: TreeEntry[] = [];
+  const diagnostics: SourceScanDiagnostic[] = [];
   let totalBytes = 0;
   for (const record of records) {
     options.assertOwnership?.();
@@ -1469,16 +1564,31 @@ async function enumerateSelectedTree(
     const selected = config.include.some((pattern) => matchesSourceGlob(pattern, path))
       && !config.exclude.some((pattern) => matchesSourceGlob(pattern, path));
     if (!selected) continue;
-    if (type !== "blob" || (mode !== "100644" && mode !== "100755")) throw new Error("selected Git entry is not a regular file");
+    // Per-file: a non-regular selected entry or an individually oversized blob is skipped and
+    // diagnosed rather than aborting the whole tree. Tree-level budgets below (maxEntries above,
+    // maxFiles/maxTotalBytes below) remain hard throws — those bound aggregate resource use, not
+    // one file's content, and skip-and-diagnose must never let them silently no-op.
+    if (type !== "blob" || (mode !== "100644" && mode !== "100755")) {
+      diagnostics.push({ code: "unsupported-node", message: "selected Git entry is not a regular file", relativePath: path });
+      continue;
+    }
     const size = Number(sizeText);
-    if (!Number.isSafeInteger(size) || size < 0 || size > config.limits.maxFileBytes) throw new Error("selected Git file exceeds the materialization file limit");
+    if (!Number.isSafeInteger(size) || size < 0 || size > config.limits.maxFileBytes) {
+      diagnostics.push({
+        code: "file-too-large",
+        message: `selected Git blob exceeds the inclusive ${config.limits.maxFileBytes}-byte materialization limit`,
+        relativePath: path,
+      });
+      continue;
+    }
     if (entries.length >= config.limits.maxFiles) throw new Error("selected Git tree exceeds the materialization file limit");
     totalBytes += size;
     if (!Number.isSafeInteger(totalBytes) || totalBytes > config.limits.maxTotalBytes) throw new Error("selected Git tree exceeds the materialization total-byte limit");
     entries.push({ path, oid: oid!, size, mode: mode! });
   }
   entries.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
-  return { config, entries };
+  diagnostics.sort((a, b) => Buffer.compare(Buffer.from(a.relativePath ?? ""), Buffer.from(b.relativePath ?? "")));
+  return { config, entries, diagnostics };
 }
 
 async function streamExactGitBlob(
@@ -1687,6 +1797,131 @@ function sweepOwnedMaterializationStaging(
   }
 }
 
+/**
+ * BLOCKER 5a: tree-level-only mirror of planManifest's protectingSkipPath carry decision
+ * (source-sync.ts), restricted to what is knowable at THIS point — the prior published file list
+ * and this run's own tree-level (materializer) diagnostics. Scanner diagnostics do not exist yet
+ * here (the scanner has not run), so a scanner-only-diagnosed carry is deliberately out of scope:
+ * its bytes are already present via normal materialization (the file WAS selected and read fine at
+ * this level), so pre-seal carry-forward has nothing to do for it. A path carries here only if it
+ * was previously published, is not selected this run, and is exact-matched or nested under a
+ * directory-shaped diagnostic this run — mirroring planManifest's protectingSkipPath carry
+ * sources (cases a/b), kept in lockstep and verified by cross-check regression tests for those
+ * shapes. KNOWN DIVERGENCE (open, tracked): planManifest has a THIRD carry source this mirror
+ * structurally cannot produce — case (c), a rename whose DESTINATION is tree-level diagnosed
+ * this run (carried under a NEW path that is by definition not in priorFiles; keyed off
+ * movedToFrom, not protectingSkipPath). For that shape the manifest carries bytes this snapshot
+ * never receives: git-md fails validateSealedSnapshotAgainstLedger post-publish; repo-md
+ * publishes with a source_path gap for that one file. Reachable with realistic limits (a small
+ * maxFileBytes plus a >50%-similar rename crossing it). Pre-existing before pre-seal carry
+ * landed; closing it requires the materializer to know rename pairs pre-seal — a follow-up
+ * design, not a copy step.
+ */
+/**
+ * CODEX FIX (3606534127): true when a cache-reuse candidate's carried content (if any) is stale
+ * relative to the CURRENT prior publication — the source healed/changed/re-published since this
+ * exact snapshot was sealed, so its carried bytes no longer match what a fresh materialize+carry
+ * would produce even though snapshotId+configHash alone still match. A marker with no carried
+ * content at all is never stale by this check (nothing in it depends on prior-publication state).
+ */
+function carryFenceStale(
+  marker: Pick<SnapshotMarker, "carriedPaths" | "carriedFromRunId">,
+  priorPublication: RepoMdMaterializerOptions["priorPublication"],
+): boolean {
+  if (!marker.carriedPaths || marker.carriedPaths.length === 0) return false;
+  // No prior-publication expectation supplied means the caller isn't asking "would a fresh
+  // materialize of this commit right now carry from the current prior" — it's the self-heal /
+  // "re-verify my own already-active snapshot" call (source-sync.ts), which has no NEW carry
+  // decision to make: whatever this snapshot carried, if anything, was decided and sealed when it
+  // was ORIGINALLY published, and nothing about that publication has changed just because we're
+  // re-confirming it. Trust the cache rather than comparing against an absent expectation.
+  if (!priorPublication) return false;
+  return marker.carriedFromRunId !== priorPublication.runId;
+}
+
+function treeLevelCarryCandidates(
+  priorFiles: ReadonlyArray<{ relativePath: string }>,
+  selectedPaths: ReadonlySet<string>,
+  diagnostics: readonly SourceScanDiagnostic[],
+  config: Pick<EffectiveSourceScanConfig, "include" | "exclude">,
+): string[] {
+  const diagnosedPaths = new Set(
+    diagnostics.map((diagnostic) => diagnostic.relativePath).filter((path): path is string => path !== undefined),
+  );
+  const protectingDiagnosedPath = (path: string): string | undefined =>
+    [...diagnosedPaths].find((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+  // CODEX FIX (3606534107): a carry candidate must still be selected by the CURRENT effective
+  // include/exclude config — mirrors the identical fix in planManifest's carrySources
+  // (source-sync.ts). Without this, a config change that newly excludes a descendant of a
+  // diagnosed subtree gets silently overridden by pre-seal carry-forward, so the exclusion is
+  // never enforced (its bytes keep reappearing in every newly sealed snapshot) until the subtree
+  // heals.
+  const isCurrentlySelected = (path: string): boolean =>
+    config.include.some((pattern) => matchesSourceGlob(pattern, path))
+    && !config.exclude.some((pattern) => matchesSourceGlob(pattern, path));
+  return priorFiles
+    .map((file) => file.relativePath)
+    .filter((path) => !selectedPaths.has(path) && protectingDiagnosedPath(path) !== undefined && isCurrentlySelected(path))
+    .sort((a, b) => Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")));
+}
+
+/**
+ * Copies each candidate's bytes from the PRIOR sealed snapshot into the staging `tree` about to be
+ * sealed as the new one, returning marker-ready file entries for the ones that succeeded and the
+ * paths that could not be carried (prior snapshot missing/corrupt, or the specific path absent
+ * from it — never thrown; see RepoMdMaterialization.carryForwardUnavailable).
+ */
+async function carryForwardPriorFiles(
+  candidates: readonly string[],
+  priorPublication: { snapshotId: string; ingestConfigHash: string },
+  snapshotsPath: string,
+  tree: string,
+  deadline: GitMaterializationDeadline | undefined,
+  beforeMutation: () => void,
+  check: () => void,
+): Promise<{ files: SnapshotMarker["files"]; unavailable: string[] }> {
+  if (candidates.length === 0) return { files: [], unavailable: [] };
+  const priorVariant = variantName(priorPublication.snapshotId, priorPublication.ingestConfigHash);
+  const priorSnapshotPath = join(snapshotsPath, priorVariant);
+  const priorSidecarPath = `${priorSnapshotPath}.complete.json`;
+  let priorMarker: SnapshotMarker;
+  try {
+    // Full validation, not just a stat: every prior file's hash is re-verified against its own
+    // marker, exactly as a cache-reuse hit would. Corruption anywhere in the prior snapshot must
+    // be caught here, not silently propagated into what this run seals as fresh truth.
+    priorMarker = validateSealedSnapshot(priorSnapshotPath, priorSidecarPath, priorPublication.snapshotId, priorPublication.ingestConfigHash, check);
+  } catch {
+    return { files: [], unavailable: [...candidates] };
+  }
+  const priorByPath = new Map(priorMarker.files.map((file) => [file.path, file]));
+  const files: SnapshotMarker["files"] = [];
+  const unavailable: string[] = [];
+  for (const path of candidates) {
+    deadline?.check();
+    check();
+    let validated: string;
+    try { validated = validateArchivePath(path); } catch { unavailable.push(path); continue; }
+    const priorFile = priorByPath.get(validated);
+    if (!priorFile) { unavailable.push(path); continue; }
+    const sourcePath = join(priorSnapshotPath, validated);
+    const target = join(tree, validated);
+    if (!contained(priorSnapshotPath, sourcePath) || !contained(tree, target)) { unavailable.push(path); continue; }
+    let bytes: Buffer;
+    try { bytes = readFileSync(sourcePath); } catch { unavailable.push(path); continue; }
+    // Re-hash on the way out rather than trust the (already-validated) prior marker a second time
+    // silently — matches the paranoia of materializeGitBlobs/extractGitArchive immediately below,
+    // which never trust a size/hash claim without independently reproducing it.
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (bytes.length !== priorFile.size || sha256 !== priorFile.sha256) { unavailable.push(path); continue; }
+    beforeMutation();
+    mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+    beforeMutation();
+    writeFileSync(target, bytes, { mode: priorFile.mode === "100755" ? 0o700 : 0o600 });
+    files.push({ path: validated, size: priorFile.size, sha256: priorFile.sha256, ...(priorFile.mode ? { mode: priorFile.mode } : {}) });
+  }
+  return { files, unavailable };
+}
+
 async function materializeRepoMdCommitAtRoot(
   source: KnowledgeSource,
   snapshotId: string,
@@ -1715,9 +1950,25 @@ async function materializeRepoMdCommitAtRoot(
   sweepOwnedMaterializationStaging(source.type, root, snapshotsPath, frozenSnapshots, beforeMutation, safeTreeOps, check);
   if (source.type === "repo-md") {
     try {
-      validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash);
-      durableSnapshotParents(options, root, beforeMutation);
-      return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top };
+      const cached = validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash);
+      // CODEX FIX (3606534127): a cache hit is only valid if this snapshot has no carried content,
+      // or its carried content still traces to the CURRENT prior publication. Otherwise this
+      // variant is stale — remove it so the fresh materialize below re-seals against the current
+      // prior publication instead of silently returning bytes carried from a since-superseded one.
+      if (!carryFenceStale(cached, options.priorPublication)) {
+        durableSnapshotParents(options, root, beforeMutation);
+        // This cache-reuse fast path never re-walks the tree, but skip-and-diagnose evidence from
+        // the run that originally sealed this exact snapshot was persisted in the marker (see the
+        // seal site below), so it survives cache reuse and crash/resume alike. A marker sealed
+        // before this field existed simply has none.
+        return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top, diagnostics: cached.diagnostics ?? [], carryForwardUnavailable: [] };
+      }
+      revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+      removeManagedTree(snapshotPath, "stale carried managed source snapshot",
+        () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, safeTreeOps, check);
+      revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+      beforeMutation();
+      rmSync(sidecarPath, { force: true });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -1754,14 +2005,28 @@ async function materializeRepoMdCommitAtRoot(
     if (verified !== snapshotId) throw new Error("pinned git-md commit is unavailable or changed");
     top = registered;
   }
-  const { config, entries } = await enumerateSelectedTree(source, snapshotId, top, { ...options, config: desiredConfig }, execFile, localGit, deadline);
+  const { config, entries, diagnostics } = await enumerateSelectedTree(source, snapshotId, top, { ...options, config: desiredConfig }, execFile, localGit, deadline);
   if (source.type === "git-md" && treeExists && sidecarExists) {
     revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
     const marker = validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash, deadline!.check);
     validateSealedSnapshotAgainstGit(snapshotPath, marker, entries, deadline!.check);
     deadline!.check();
-    durableSnapshotParents(options, root, beforeMutation);
-    return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top };
+    // CODEX FIX (3606534127): same fence as the repo-md fast path above — a cache hit with carried
+    // content is only valid while it still traces to the CURRENT prior publication.
+    if (!carryFenceStale(marker, options.priorPublication)) {
+      durableSnapshotParents(options, root, beforeMutation);
+      // This snapshot was already sealed by an earlier materialization. `diagnostics` was just
+      // recomputed fresh for the validateSealedSnapshotAgainstGit proof above, but the marker's own
+      // persisted diagnostics (see the seal site below) are the durable record of what that earlier
+      // run actually excluded, so report those rather than the just-recomputed set.
+      return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top, diagnostics: marker.diagnostics ?? [], carryForwardUnavailable: [] };
+    }
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    removeManagedTree(snapshotPath, "stale carried managed source snapshot",
+      () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, safeTreeOps, check);
+    revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
+    beforeMutation();
+    rmSync(sidecarPath, { force: true });
   }
   let totalBytes = 0;
   let pathArgBytes = 0;
@@ -1790,22 +2055,111 @@ async function materializeRepoMdCommitAtRoot(
   beforeMutation();
   mkdirSync(tree, { mode: 0o700 });
   try {
-    let files: SnapshotMarker["files"] = [];
+    // BLOCKER 5a: pre-seal carry-forward, computed and attempted BEFORE any fresh entry is
+    // materialized or anything is sealed. If any candidate can't be safely carried, bail out here
+    // — before archiving/blob-extracting the fresh entries, and definitely before sealSnapshot —
+    // so an incomplete snapshot is never sealed and never becomes a future cache-reuse hit that
+    // silently reports itself complete. The finally block below still cleans up this staging tree.
+    const carryCandidates = options.priorPublication
+      ? treeLevelCarryCandidates(options.priorPublication.files, new Set(entries.map((entry) => entry.path)), diagnostics, config)
+      : [];
+    const carried = carryCandidates.length > 0
+      ? await carryForwardPriorFiles(
+          carryCandidates, options.priorPublication!, snapshotsPath, tree, deadline,
+          () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, check,
+        )
+      : { files: [] as SnapshotMarker["files"], unavailable: [] as string[] };
+    if (carried.unavailable.length > 0) {
+      return {
+        snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top,
+        diagnostics, carryForwardUnavailable: carried.unavailable,
+      };
+    }
+    let files: SnapshotMarker["files"] = [...carried.files];
     if (entries.length > 0) {
-      if (source.type === "git-md") files = (await materializeGitBlobs(
+      if (source.type === "git-md") files = [...files, ...(await materializeGitBlobs(
         options.spawn ?? nodeSpawn, localGit!.executable, localGit!.timeoutMs, top, tree, entries, deadline!,
         () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); },
-      )).map((file, index) => ({ ...file, mode: entries[index]!.mode as "100644" | "100755" }));
+      )).map((file, index) => ({ ...file, mode: entries[index]!.mode as "100644" | "100755" }))];
       else {
         await runGit(execFile, ["--literal-pathspecs", "archive", "--format=tar", `--output=${archive!}`, snapshotId, "--", ...entries.map((entry) => entry.path)], top);
         if (statSync(archive!).size > maxArchiveBytes) throw new Error("git archive exceeds the materialization byte limit");
-        files = extractGitArchive(archive!, tree, entries, maxArchiveBytes, beforeMutation);
+        files = [...files, ...extractGitArchive(archive!, tree, entries, maxArchiveBytes, beforeMutation)];
       }
       options.fault?.("after-archive");
     }
+    // CODEX FIX (3606534097), John's ruling "A" (shared classifier, extract-and-share): a
+    // previously-published path that's STILL Git-selected this run — so it materialized normally,
+    // above, with FRESH bytes — but whose fresh content would fail the scanner (invalid UTF-8 or
+    // frontmatter) is the case pre-seal carry-forward above structurally cannot cover, since that
+    // logic only ever considers paths ABSENT from entries. Classify the small set of previously-
+    // published + currently-selected files' just-written fresh bytes with the SAME shared
+    // classifier the scanner itself now uses (source-chunker.ts), and on failure, substitute the
+    // prior sealed snapshot's bytes for that path — reusing carryForwardPriorFiles exactly as
+    // above, including its identical graceful-degradation-on-unavailable-prior semantics.
+    // Deliberately excludes chunk-budget-exceeded (walk-order-dependent, not a pure function of
+    // this file's bytes alone) — see the residual handling in syncSource (source-sync.ts).
+    const classifyCandidates = options.priorPublication
+      ? entries.filter((entry) => options.priorPublication!.files.some((file) => file.relativePath === entry.path))
+      : [];
+    const substitutePaths: string[] = [];
+    // Recorded for audit visibility (source_skipped_files) even though — see below — the scanner
+    // will read valid (substituted) bytes at this path and never itself notice anything was wrong.
+    // Without this, the substitution would be functionally correct but completely silent: no
+    // record anywhere that this run's fresh content at this path was rejected and replaced.
+    const substitutionDiagnostics: SourceScanDiagnostic[] = [];
+    for (const entry of classifyCandidates) {
+      deadline?.check();
+      check();
+      const freshBytes = readFileSync(join(tree, entry.path));
+      const classified = classifySourceFileContent(freshBytes, entry.path);
+      if (classified.diagnostic) {
+        substitutePaths.push(entry.path);
+        substitutionDiagnostics.push(classified.diagnostic);
+      }
+    }
+    const substituted = substitutePaths.length > 0
+      ? await carryForwardPriorFiles(
+          substitutePaths, options.priorPublication!, snapshotsPath, tree, deadline,
+          () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, check,
+        )
+      : { files: [] as SnapshotMarker["files"], unavailable: [] as string[] };
+    // From here on, prefer allDiagnostics (original tree-level diagnostics + this run's
+    // classifier-substitution audit records) over the original `diagnostics` binding.
+    const allDiagnostics = substitutionDiagnostics.length > 0 ? [...diagnostics, ...substitutionDiagnostics] : diagnostics;
+    if (substituted.unavailable.length > 0) {
+      return {
+        snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top,
+        diagnostics: allDiagnostics, carryForwardUnavailable: [...carried.unavailable, ...substituted.unavailable],
+      };
+    }
+    if (substituted.files.length > 0) {
+      // carryForwardPriorFiles already overwrote these paths' bytes in `tree` with the prior
+      // content; the marker's file entries (size/sha256/mode) must agree with what's now actually
+      // on disk, replacing the fresh (rejected) entries materializeGitBlobs/extractGitArchive wrote
+      // moments ago.
+      const substitutedByPath = new Map(substituted.files.map((file) => [file.path, file]));
+      files = files.map((file) => substitutedByPath.get(file.path) ?? file);
+    }
+    const allCarriedPaths = [...carried.files.map((file) => file.path), ...substituted.files.map((file) => file.path)];
     const marker: SnapshotMarker = {
       version: 2, snapshotId, configHash: computeSourceIngestConfigHash(config),
       variant: variantName(snapshotId, desiredConfigHash), files,
+      // Persisted durably so a crash between sealing this snapshot and staging its manifest — or
+      // any later cache-reuse hit against this exact snapshot — can recover the same evidence a
+      // fault-free run would have used, instead of silently reporting no skips at all. Includes
+      // classifier-substitution audit records (CODEX FIX 3606534097) so a future cache-reuse read
+      // of this exact snapshot also reports them, not just this fresh-materialize invocation.
+      diagnostics: allDiagnostics,
+      // BLOCKER 5a: sealed alongside the files themselves so a later cache-reuse read can
+      // reconcile validateSealedSnapshotAgainstGit's exact-match check against entries ∪
+      // carriedPaths instead of entries alone — see that function's own comment. Includes BOTH
+      // tree-level carries (paths absent from entries) and classifier substitutions (paths present
+      // in entries whose fresh content was replaced) — validateSealedSnapshotAgainstGit
+      // distinguishes the two by whether the path is also in entries.
+      ...(allCarriedPaths.length > 0
+        ? { carriedPaths: allCarriedPaths, carriedFromRunId: options.priorPublication!.runId }
+        : {}),
     };
     deadline?.check();
     sealSnapshot(tree, () => { beforeMutation(); revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps); }, safeTreeOps, check);
@@ -1838,7 +2192,7 @@ async function materializeRepoMdCommitAtRoot(
     validateSealedSnapshot(snapshotPath, sidecarPath, snapshotId, desiredConfigHash, check);
     deadline?.check();
     durableSnapshotParents(options, root, beforeMutation);
-    return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top };
+    return { snapshotId, configHash: desiredConfigHash, snapshotPath, currentPath: join(root, "current"), repositoryRoot: top, diagnostics: allDiagnostics, carryForwardUnavailable: [] };
   } finally {
     revalidateSnapshotsDirectory(frozenSnapshots, safeTreeOps);
     removeManagedTree(tree, "managed source temporary snapshot",

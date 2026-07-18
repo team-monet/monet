@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import { MonetCore } from "../engine";
 import { computeSourceContentHash, computeSourceIngestFingerprint, computeSourceOperationId } from "../source-chunker";
 import { computeSourceManifestHash } from "../source-scanner";
-import type { SourceSyncRun, StageSourceManifestInput } from "../source-types";
+import type { SourceLedger } from "../source-ledger";
+import type { SourceManifestSkippedFileInput, SourceSyncRun, StageSourceManifestInput } from "../source-types";
 import type { StoragePort } from "../storage";
 
 const sourceInput = (id: string, localPath: string) => ({
@@ -50,6 +51,7 @@ const manifest = (run: SourceSyncRun, overrides: ManifestOverrides = {}): StageS
     manifestHash: overrides.manifestHash ?? computeSourceManifestHash(files),
     files,
     chunks,
+    ...(overrides.skipped !== undefined ? { skipped: overrides.skipped } : {}),
   };
 };
 
@@ -1165,9 +1167,136 @@ describe("source ledger publication kernel", () => {
       core.close();
     }
   });
+
+  it("stages, persists, and republishes skip-and-diagnose evidence with an idempotent replay and independently-recomputed counts", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      core.createSource(sourceInput("source-a", "/tmp/source-skip"));
+      const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+      const skipped: SourceManifestSkippedFileInput[] = [
+        { relativePath: "bad.txt", code: "not-markdown", message: "included path is not a recognized Markdown source" },
+        { relativePath: "huge.md", code: "file-too-large", message: "file exceeds the inclusive 1024-byte limit" },
+      ];
+      const staged = manifest(begun.run, { skipped });
+      const run = core.stageSourceManifest(staged);
+      expect(run.filesSkipped).toBe(2);
+
+      // Idempotent replay: re-staging the exact same manifest (including skipped) while still in
+      // staging state returns the existing run rather than re-inserting or throwing.
+      expect(core.stageSourceManifest(staged)).toEqual(run);
+      // A manifest that replays everything but the skipped list is a genuine conflict, proving
+      // skipped entries are part of the staged-manifest identity, not incidental metadata.
+      expect(() => core.stageSourceManifest({ ...staged, skipped: [skipped[0]] })).toThrow(/conflicts with existing run contents/);
+
+      const rows = core.listSourceSkippedFiles(begun.run.id);
+      expect(rows.map(({ relativePath, code, message }) => ({ relativePath, code, message }))).toEqual(skipped);
+      expect(rows.every((row) => row.sourceId === "source-a" && row.runId === begun.run.id && row.byteLength === 0 && row.createdAt > 0)).toBe(true);
+
+      const written = await materialize(core, begun.run, staged, "engine-written");
+      core.recordSourceBindingReceipt({
+        runId: begun.run.id, bindingId: "binding-1", conceptId: written.stored.conceptId,
+        observationId: written.stored.observationId, predecessorObservationId: null, writeState: "committed",
+      });
+      const token = core.beginSourceActivation(begun.run.id);
+      core.publishSourceRun({ runId: begun.run.id, activationToken: token, expectedManifestHash: staged.manifestHash });
+
+      expect(core.getSourceRun(begun.run.id)!.filesSkipped).toBe(2);
+      // activePublication is ledger-internal (no MonetCore wrapper); independently recomputed
+      // via COUNT queries against the published tables, unlike the cached run.filesSkipped above.
+      const ledger = (core as unknown as { sourceLedger: SourceLedger }).sourceLedger;
+      const publication = ledger.activePublication("source-a", begun.run.id, "snap-1", begun.run.ingestConfigHash);
+      expect(publication).toMatchObject({ filesIndexed: 1, chunksIndexed: 1, filesSkipped: 2 });
+    } finally {
+      core.close();
+    }
+  });
+
+  it("persists multiple diagnostics for the same path rather than collapsing to the last one seen (minor a)", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      core.createSource(sourceInput("source-multi-skip", "/tmp/source-multi-skip"));
+      const begun = core.beginSourceRun({ sourceId: "source-multi-skip", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+      const skipped: SourceManifestSkippedFileInput[] = [
+        { relativePath: "flaky.md", code: "invalid-frontmatter", message: "first diagnostic for this path" },
+        { relativePath: "flaky.md", code: "chunk-budget-exceeded", message: "second diagnostic for the same path" },
+      ];
+      const staged = manifest(begun.run, { skipped });
+      const run = core.stageSourceManifest(staged);
+      expect(run.filesSkipped).toBe(2);
+      const rows = core.listSourceSkippedFiles(begun.run.id);
+      expect(rows.map(({ relativePath, code, message }) => ({ relativePath, code, message }))).toEqual(skipped);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("persists a supplied byteLength for a skipped file's audit record (minor b)", async () => {
+    const core = new MonetCore(":memory:");
+    try {
+      core.createSource(sourceInput("source-skip-bytes", "/tmp/source-skip-bytes"));
+      const begun = core.beginSourceRun({ sourceId: "source-skip-bytes", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+      const skipped: SourceManifestSkippedFileInput[] = [
+        { relativePath: "big.md", code: "file-too-large", message: "file exceeds the inclusive limit", byteLength: 4096 },
+        { relativePath: "unknown.md", code: "not-markdown", message: "included path is not a recognized Markdown source" },
+      ];
+      core.stageSourceManifest(manifest(begun.run, { skipped }));
+      const rows = core.listSourceSkippedFiles(begun.run.id);
+      expect(rows.find((row) => row.relativePath === "big.md")).toMatchObject({ byteLength: 4096 });
+      // No byteLength supplied (a path never previously published has no known size): persists as
+      // the column default rather than throwing or omitting the row.
+      expect(rows.find((row) => row.relativePath === "unknown.md")).toMatchObject({ byteLength: 0 });
+    } finally {
+      core.close();
+    }
+  });
 });
 
 describe("source ledger schema migration", () => {
+  it("adds source_sync_runs.files_skipped and the source_skipped_files table idempotently, defaulting existing rows to 0", () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-source-skipped-migration-"));
+    const path = join(dir, "monet.db");
+    try {
+      const first = new MonetCore(path);
+      first.createSource(sourceInput("source-a", "/tmp/source-a"));
+      const begun = first.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-1" });
+      if (begun.kind !== "started") throw new Error("expected started run");
+      first.stageSourceManifest(manifest(begun.run));
+      const db = (first as unknown as { db: StoragePort }).db;
+      // Simulate a pre-migration database: drop the column and table an older release predates.
+      db.exec(`ALTER TABLE source_sync_runs DROP COLUMN files_skipped`);
+      db.exec(`DROP TABLE source_skipped_files`);
+      first.close();
+
+      const reopened = new MonetCore(path);
+      const run = reopened.getSourceRun(begun.run.id)!;
+      expect(run.filesSkipped).toBe(0);
+      const reopenedDb = (reopened as unknown as { db: StoragePort }).db;
+      const runColumns = reopenedDb.prepare(`PRAGMA table_info(source_sync_runs)`).all() as Array<{ name: string }>;
+      expect(runColumns.filter((column) => column.name === "files_skipped")).toHaveLength(1);
+      expect(reopenedDb.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_skipped_files'`).get()).toBeTruthy();
+      // NIT: idx_source_skipped_files_source_created was dropped as unused — no query filters by
+      // (source_id, created_at) on this table; listSkippedFiles filters by run_id and orders by
+      // sequence, and the run-scoped COUNT query filters by (source_id, run_id). A fresh table
+      // must not recreate it.
+      expect(reopenedDb.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_source_skipped_files_source_created'`).get()).toBeUndefined();
+      expect(reopened.listSourceSkippedFiles(begun.run.id)).toEqual([]);
+      reopened.close();
+
+      // Idempotent: schema is already current, so a second reopen must not throw or duplicate anything.
+      const twice = new MonetCore(path);
+      expect(twice.getSourceRun(begun.run.id)!.filesSkipped).toBe(0);
+      const columnsAgain = (twice as unknown as { db: StoragePort }).db.prepare(`PRAGMA table_info(source_sync_runs)`).all() as Array<{ name: string }>;
+      expect(columnsAgain.filter((column) => column.name === "files_skipped")).toHaveLength(1);
+      twice.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+
   it("backfills verification by observed run count despite backward and equal clocks", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-attempt-causal-migrate-"));
     const path = join(dir, "monet.db");

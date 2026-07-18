@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { MonetCore } from "../engine";
+import { computeSourceContentHash } from "../source-chunker";
 import { syncRepoMdSource as runRepoMdSync } from "../source-sync";
 import type { RepoMdSyncFaultPoint, RepoMdSyncOptions } from "../source-sync";
+import { computeSourceIngestConfigHash, scanSourceSnapshot } from "../source-scanner";
 import type { StoragePort } from "../storage";
 
 function git(cwd: string, ...args: string[]): string {
@@ -72,6 +74,24 @@ function sourceAttemptState(core: MonetCore, sourceId: string) {
     prePin: count("source_pre_pin_attempts"),
     verification: count("source_verification_checks"),
   };
+}
+
+/** Raw bytes for `relativePath` as they actually sit in the currently-published sealed snapshot —
+ * the same surface `source_path`/`sourcePath()` exposes — independent of what the ledger's
+ * manifest claims. This is the blocker 5a cross-check: read here, not just the ledger. */
+function rawSnapshotBytes(f: { core: MonetCore }, relativePath: string): Buffer {
+  const located = f.core.sourcePath("repo-source", { callerId: "caller", projectId: "project" });
+  return readFileSync(join(located.snapshotPath, relativePath));
+}
+
+/** The sealed snapshot marker's own carriedPaths record (blocker 5a) for the CURRENTLY published
+ * snapshot+config variant — read directly from the sidecar, since it isn't part of any public API. */
+function sealedMarkerCarriedPaths(f: { core: MonetCore; storage: string }): string[] {
+  const source = f.core.getSource("repo-source")!;
+  const variant = `${source.activeSnapshotId!}-${source.activeIngestConfigHash!.slice(-64)}`;
+  const sidecarPath = join(f.storage, "repo-md", "repo-source", "snapshots", `${variant}.complete.json`);
+  const marker = JSON.parse(readFileSync(sidecarPath, "utf8")) as { carriedPaths?: string[] };
+  return marker.carriedPaths ?? [];
 }
 
 describe("repo-md committed-HEAD sync", () => {
@@ -727,7 +747,7 @@ describe("repo-md committed-HEAD sync", () => {
     } finally { f.cleanup(); }
   });
 
-  it("aborts partial scans without writes or inferred deletion", async () => {
+  it("skip-and-diagnoses a transiently unreadable file without inferred deletion, then resumes the same binding once healed", async () => {
     const f = fixture("partial");
     try {
       const initial = await f.core.syncRepoMdSource("repo-source");
@@ -735,7 +755,62 @@ describe("repo-md committed-HEAD sync", () => {
       const active = f.core.listSourceChunks(activeRun, true)[0]!;
       writeFileSync(join(f.repo, "README.md"), Buffer.from([0xff, 0xfe, 0xfd]));
       git(f.repo, "add", "README.md"); git(f.repo, "commit", "-m", "invalid utf8");
-      const partial = await f.core.syncRepoMdSource("repo-source");
+
+      // A per-file diagnostic (invalid UTF-8) no longer blocks the whole scan: the run publishes,
+      // minus the unreadable file, rather than aborting partial.
+      const skipped = await f.core.syncRepoMdSource("repo-source");
+      expect(skipped.status).toBe("published");
+      expect(initial.snapshotId).not.toBe(skipped.snapshotId);
+      // The carried-forward file stays indexed (its content is still live); filesSkipped records
+      // that THIS run could not confirm it fresh.
+      expect(f.core.sourceStatus("repo-source", { callerId: "caller", projectId: "project" })).toMatchObject({
+        lastSyncResult: "success", filesIndexed: 1, filesSkipped: 1,
+      });
+
+      // CLOSURE FIX: README.md's prior binding carries forward unchanged rather than being
+      // inferred deleted — same bindingId/conceptId/observationId, concept lifecycle untouched,
+      // and no retire-absent cleanup item is created for it.
+      const skippedRun = f.core.getSource("repo-source")!.activeRunId!;
+      expect(skippedRun).not.toBe(activeRun);
+      const carried = f.core.listSourceChunks(skippedRun, true)[0]!;
+      expect(carried).toMatchObject({
+        bindingId: active.bindingId, conceptId: active.conceptId,
+        observationId: active.observationId, lifecycle: "active",
+      });
+      expect(rawConcept(f.core, active.conceptId!).status).toBe("active");
+      expect(f.core.listSourceCleanupItems(skipped.runId!).some((item) => item.kind === "retire-absent")).toBe(false);
+
+      // Healing the file resumes the SAME binding/concept lineage rather than forking a new one.
+      f.commit("# Intro\n\nhealed body\n", "healed");
+      const healed = await f.core.syncRepoMdSource("repo-source");
+      expect(healed.status).toBe("published");
+      const healedChunk = f.core.listSourceChunks(healed.runId!, true)[0]!;
+      expect(healedChunk.bindingId).toBe(active.bindingId);
+      expect(healedChunk.conceptId).toBe(active.conceptId);
+      expect(healedChunk.observationId).not.toBe(active.observationId);
+      expect(healedChunk.predecessorObservationId).toBe(active.observationId);
+      expect(rawConcept(f.core, active.conceptId!).body).toContain("healed body");
+    } finally { f.cleanup(); }
+  });
+
+  it("aborts tree-level partial scans without writes or inferred deletion (gate regression)", async () => {
+    const f = fixture("tree-partial");
+    try {
+      const initial = await f.core.syncRepoMdSource("repo-source");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      const active = f.core.listSourceChunks(activeRun, true)[0]!;
+      f.commit("# Intro\n\nchanged committed body\n", "changed");
+      // A tree-level violation still fails the whole scan closed, distinguishing it from the
+      // per-file skip-and-diagnose case above; injecting the scanner result isolates this from
+      // any particular resource limit while proving the sync-level abort/no-write/no-deletion path.
+      const syncWithScan = f.core.syncRepoMdSource.bind(f.core) as unknown as (
+        sourceId: string,
+        options: { scan: (input: Parameters<typeof scanSourceSnapshot>[0]) => ReturnType<typeof scanSourceSnapshot> },
+      ) => ReturnType<typeof f.core.syncRepoMdSource>;
+      const partial = await syncWithScan("repo-source", { scan: (input) => ({
+        ...scanSourceSnapshot(input), status: "partial", publishable: false,
+        diagnostics: [{ code: "entry-budget-exceeded", message: "injected tree-level partial scan" }],
+      }) });
       expect(partial.status).toBe("partial");
       expect(f.core.getSource("repo-source")!.activeRunId).toBe(activeRun);
       expect(f.core.listSourceChunks(activeRun, true)[0]).toMatchObject({ observationId: active.observationId, lifecycle: "active" });
@@ -743,6 +818,642 @@ describe("repo-md committed-HEAD sync", () => {
       expect(initial.snapshotId).not.toBe(partial.snapshotId);
     } finally { f.cleanup(); }
   });
+
+  it("publishes complete with zero files when every selected file is skip-and-diagnosed on a first sync", async () => {
+    const f = fixture("all-bad");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "README.md"), Buffer.from([0xff, 0xfe, 0xfd]));
+      git(f.repo, "add", "README.md"); git(f.repo, "commit", "-m", "corrupt the only file");
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("published");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      expect(f.core.listSourceFiles(activeRun, true)).toEqual([]);
+      expect(f.core.listSourceChunks(activeRun, true)).toEqual([]);
+      expect(f.core.sourceStatus("repo-source", { callerId: "caller", projectId: "project" })).toMatchObject({
+        lastSyncResult: "success", filesIndexed: 0, filesSkipped: 1,
+      });
+    } finally { f.cleanup(); }
+  });
+
+  it("publishes a mixed tree of good, wrong-type, oversized, and invalid-frontmatter files with a stable skip set across repeated syncs (incident regression)", async () => {
+    const f = fixture("mixed-tree");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md", "*.docx"] });
+      writeFileSync(join(f.repo, "second.md"), "# Second\n\nsecond body\n");
+      writeFileSync(join(f.repo, "notes.docx"), "wrong-type bytes, not Markdown");
+      writeFileSync(join(f.repo, "bad-frontmatter.md"), "---\nowner:\n  name: docs\n---\n# Body\ntext");
+      writeFileSync(join(f.repo, "oversized.md"), Buffer.alloc(3 * 1024 * 1024, 0x61));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "mixed tree");
+      const first = await f.core.syncRepoMdSource("repo-source");
+      expect(first.status).toBe("published");
+      const firstRun = f.core.getSource("repo-source")!.activeRunId!;
+      expect(f.core.listSourceFiles(firstRun, true).map((file) => file.relativePath).sort()).toEqual(["README.md", "second.md"]);
+      const status = f.core.sourceStatus("repo-source", { callerId: "caller", projectId: "project" });
+      expect(status).toMatchObject({ lastSyncResult: "success", filesIndexed: 2, filesSkipped: 3, freshness: "fresh" });
+      expect(status.schedule.consecutiveFailures).toBe(0);
+
+      // Force a genuine second scan (not a same-HEAD noop) by touching only a good file. The same
+      // three files are still bad in exactly the same way: this incident's regression is that the
+      // second run must reproduce the identical deterministic skip set, publish clean, and show
+      // zero failures/backoff growth, rather than the pre-fix behavior of the whole source wedging.
+      f.commit("# Intro\n\nupdated committed body\n", "touch good file");
+      const second = await f.core.syncRepoMdSource("repo-source");
+      expect(second.status).toBe("published");
+      expect(second.snapshotId).not.toBe(first.snapshotId);
+      const secondRun = f.core.getSource("repo-source")!.activeRunId!;
+      const codes = (runId: string) => f.core.listSourceSkippedFiles(runId)
+        .map((row) => ({ relativePath: row.relativePath, code: row.code }))
+        .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+      const firstCodes = codes(firstRun);
+      const secondCodes = codes(secondRun);
+      expect(secondCodes).toEqual(firstCodes);
+      expect(secondCodes).toEqual([
+        { relativePath: "bad-frontmatter.md", code: "invalid-frontmatter" },
+        { relativePath: "notes.docx", code: "not-markdown" },
+        { relativePath: "oversized.md", code: "file-too-large" },
+      ]);
+      const statusAgain = f.core.sourceStatus("repo-source", { callerId: "caller", projectId: "project" });
+      expect(statusAgain).toMatchObject({ lastSyncResult: "success", filesSkipped: 3 });
+      expect(statusAgain.schedule.consecutiveFailures).toBe(0);
+    } finally { f.cleanup(); }
+  });
+
+  it("gracefully aborts partial instead of throwing when carried-forward content exceeds the run's chunk budget (blocker 1 regression)", async () => {
+    const f = fixture("carry-budget");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nbody\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      const first = await f.core.syncRepoMdSource("repo-source");
+      expect(first.status).toBe("published");
+      const firstActiveRun = f.core.getSource("repo-source")!.activeRunId!;
+      const priorChunks = f.core.listSourceChunks(firstActiveRun, true);
+      expect(priorChunks).toHaveLength(2);
+
+      // Corrupt A.md so it becomes skip-and-diagnosed (carry-forward eligible), and patch the next
+      // run's own persisted budget to exactly what README.md's surviving fresh chunk alone fills —
+      // isolated from any particular default limit, matching the auditor's tight-budget repro shape.
+      writeFileSync(join(f.repo, "A.md"), Buffer.from([0xff, 0xfe, 0xfd]));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "corrupt A");
+      let patched = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => {
+          if (point === "after-begin" && !patched) {
+            patched = true;
+            const runId = f.core.resumeSourceRun("repo-source")!.id;
+            const db = (f.core as unknown as { db: StoragePort }).db;
+            const row = db.prepare(`SELECT effective_config_json FROM source_sync_runs WHERE id=?`).get(runId) as { effective_config_json: string };
+            const config = JSON.parse(row.effective_config_json);
+            config.limits.maxChunks = 1;
+            // ingest_config_hash is a SEPARATE stored column, not recomputed from
+            // effective_config_json on read — keep both consistent (as a real config-driven new
+            // run always would) or the scanner's own freshly-recomputed hash (from effectiveConfig)
+            // disagrees with this run's stored ingestConfigHash the moment anything gets rescanned.
+            db.prepare(`UPDATE source_sync_runs SET effective_config_json=?, ingest_config_hash=? WHERE id=?`)
+              .run(JSON.stringify(config), computeSourceIngestConfigHash(config), runId);
+            throw new Error("force resume with patched budget");
+          }
+        },
+      })).rejects.toThrow("force resume with patched budget");
+
+      // BLOCKER 1 FIX: README.md's fresh chunk alone fills the patched maxChunks=1 budget; adding
+      // A.md's carried chunk on top pushes the staged manifest to 2. Without the fix,
+      // planManifest's carry-forward silently exceeds the budget and validateManifest throws,
+      // which the outer handler records as a hard "failed" run (the cured disease reintroduced)
+      // instead of this graceful partial abort with the prior publication left untouched.
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("partial");
+      expect(f.core.getSource("repo-source")!.activeRunId).toBe(firstActiveRun);
+      expect(f.core.listSourceChunks(firstActiveRun, true)).toEqual(priorChunks);
+    } finally { f.cleanup(); }
+  });
+
+  it("carries a binding across a rename whose destination itself fails validation this run (blocker 2 regression)", async () => {
+    const f = fixture("rename-into-skip");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      const initial = await f.core.syncRepoMdSource("repo-source");
+      const active = f.core.listSourceChunks(initial.runId!, true)[0]!;
+
+      // Rename README.md -> NEW.md and, in the SAME commit, append one invalid UTF-8 byte: the
+      // destination never reaches scan.files (it's skip-diagnosed, not scanned), so ordinary
+      // rename matching — keyed off addedPaths, which requires a successful scan — can't fire for
+      // it. The corruption is a minimal one-byte perturbation so Git's own similarity-based rename
+      // detection still recognizes NEW.md as README.md's rename target.
+      const original = readFileSync(join(f.repo, "README.md"));
+      git(f.repo, "mv", "README.md", "NEW.md");
+      writeFileSync(join(f.repo, "NEW.md"), Buffer.concat([original, Buffer.from([0x80])]));
+      git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "rename into invalid utf-8");
+
+      const renamed = await f.core.syncRepoMdSource("repo-source");
+      expect(renamed.status).toBe("published");
+      expect(f.core.listSourceSkippedFiles(renamed.runId!).map((row) => row.relativePath)).toEqual(["NEW.md"]);
+      const carried = f.core.listSourceChunks(renamed.runId!, true).find((chunk) => chunk.relativePath === "NEW.md");
+      expect(carried).toMatchObject({ bindingId: active.bindingId, conceptId: active.conceptId, lifecycle: "active" });
+      expect(carried!.sourceRef).toBe("source://repo-source/NEW.md#intro~1");
+      expect(rawConcept(f.core, active.conceptId!).status).toBe("active");
+      expect(f.core.listSourceCleanupItems(renamed.runId!).some((item) => item.kind === "retire-absent")).toBe(false);
+
+      // Healing NEW.md resumes the SAME binding/concept lineage (heal-cycle continuity) instead of
+      // forking a new one.
+      writeFileSync(join(f.repo, "NEW.md"), "# Intro\n\nhealed after rename\n");
+      git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "heal NEW.md");
+      const healed = await f.core.syncRepoMdSource("repo-source");
+      expect(healed.status).toBe("published");
+      const healedChunk = f.core.listSourceChunks(healed.runId!, true)[0]!;
+      expect(healedChunk.bindingId).toBe(active.bindingId);
+      expect(healedChunk.conceptId).toBe(active.conceptId);
+      expect(healedChunk.predecessorObservationId).toBe(carried!.observationId);
+      expect(rawConcept(f.core, active.conceptId!).body).toContain("healed after rename");
+    } finally { f.cleanup(); }
+  });
+
+  it("preserves skip-and-diagnose evidence for a materializer-excluded file across a crash between begin and stage (blocker 3 regression)", async () => {
+    const f = fixture("resume-diagnostics");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nbody\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      const initial = await f.core.syncRepoMdSource("repo-source");
+      expect(initial.status).toBe("published");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      const active = f.core.listSourceChunks(activeRun, true).find((chunk) => chunk.relativePath === "A.md")!;
+
+      // Replace the previously published A.md with a selected Git symlink: a materializer-level
+      // skip that never reaches the scanner at all, so its diagnostic depends entirely on the
+      // pin-time materialize call's own result.
+      unlinkSync(join(f.repo, "A.md"));
+      symlinkSync("README.md", join(f.repo, "A.md"));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "replace A.md with a symlink");
+
+      let fired = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => { if (point === "after-begin" && !fired) { fired = true; throw new Error("begin crash"); } },
+      })).rejects.toThrow("begin crash");
+      const stranded = f.core.resumeSourceRun("repo-source")!;
+      expect(stranded.state).toBe("scanning");
+
+      // Fault-free resume: a fresh invocation has no in-memory pin-time evidence (pinnedDiagnostics
+      // is unset), so it must recover the pin-time materializer diagnostic from the now-durably-
+      // sealed snapshot's own marker instead of silently reporting none.
+      const resumed = await f.core.syncRepoMdSource("repo-source");
+      expect(resumed.status).toBe("published");
+      const resumedRun = f.core.getSource("repo-source")!.activeRunId!;
+      // byteLength wiring (minor): carried into the skip record from A.md's last-confirmed size.
+      expect(f.core.listSourceSkippedFiles(resumedRun).map((row) => ({ relativePath: row.relativePath, code: row.code, byteLength: row.byteLength })))
+        .toEqual(expect.arrayContaining([{ relativePath: "A.md", code: "unsupported-node", byteLength: Buffer.byteLength("# A\n\nbody\n") }]));
+      const carried = f.core.listSourceChunks(resumedRun, true).find((chunk) => chunk.relativePath === "A.md")!;
+      expect(carried).toMatchObject({ bindingId: active.bindingId, conceptId: active.conceptId, lifecycle: "active" });
+      expect(rawConcept(f.core, active.conceptId!).status).toBe("active");
+      expect(f.core.listSourceCleanupItems(resumed.runId!).some((item) => item.kind === "retire-absent" && item.bindingId === active.bindingId)).toBe(false);
+    } finally { f.cleanup(); }
+  });
+
+  it("protects previously published descendants when their subtree root becomes a non-regular Git entry (blocker 4 regression)", async () => {
+    const f = fixture("subtree-symlink");
+    try {
+      f.core.updateSource("repo-source", { include: ["docs/**"], exclude: [] });
+      mkdirSync(join(f.repo, "docs"));
+      writeFileSync(join(f.repo, "docs", "a.md"), "# A\n\ndoc a body\n");
+      writeFileSync(join(f.repo, "docs", "b.md"), "# B\n\ndoc b body\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add docs subtree");
+      const initial = await f.core.syncRepoMdSource("repo-source");
+      expect(initial.status).toBe("published");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      const activeChunks = f.core.listSourceChunks(activeRun, true);
+      expect(activeChunks.map((chunk) => chunk.relativePath).sort()).toEqual(["docs/a.md", "docs/b.md"]);
+
+      // Replace the whole subtree with a symlink: the diagnostic names the subtree ROOT ("docs"),
+      // not each descendant individually — exact-path protection alone would wrongly retire both.
+      rmSync(join(f.repo, "docs"), { recursive: true });
+      symlinkSync(".", join(f.repo, "docs"));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "replace docs subtree with a symlink");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("published");
+      expect(f.core.listSourceSkippedFiles(result.runId!).map((row) => row.relativePath)).toEqual(["docs"]);
+      const carried = f.core.listSourceChunks(result.runId!, true);
+      expect(carried.map((chunk) => chunk.relativePath).sort()).toEqual(["docs/a.md", "docs/b.md"]);
+      expect(carried.map((chunk) => chunk.bindingId).sort()).toEqual(activeChunks.map((chunk) => chunk.bindingId).sort());
+      expect(carried.every((chunk) => chunk.lifecycle === "active")).toBe(true);
+      for (const chunk of activeChunks) expect(rawConcept(f.core, chunk.conceptId!).status).toBe("active");
+      expect(f.core.listSourceCleanupItems(result.runId!).some((item) => item.kind === "retire-absent")).toBe(false);
+
+      // THE CROSS-CHECK (scope item 3, "subtree"): both descendants the materializer pre-seal
+      // carried and both descendants planManifest carried into the manifest agree, and the sealed
+      // snapshot actually delivers their prior bytes. Compared against the FILE record's
+      // contentHash (whole-file bytes), not the chunk's (which hashes only that chunk's body,
+      // excluding e.g. its own heading line — a different, smaller hash domain).
+      expect(sealedMarkerCarriedPaths(f).sort()).toEqual(["docs/a.md", "docs/b.md"]);
+      const carriedFiles = f.core.listSourceFiles(result.runId!, true);
+      for (const [path, body] of [["docs/a.md", "doc a body"], ["docs/b.md", "doc b body"]] as const) {
+        const file = carriedFiles.find((candidate) => candidate.relativePath === path)!;
+        const raw = rawSnapshotBytes(f, path);
+        expect(computeSourceContentHash(raw)).toBe(file.contentHash);
+        expect(raw.toString("utf8")).toContain(body);
+      }
+    } finally { f.cleanup(); }
+  });
+
+  it("does not carry a subtree descendant the current config now excludes (Codex 3606534107)", async () => {
+    const f = fixture("subtree-exclude-drift");
+    try {
+      f.core.updateSource("repo-source", { include: ["docs/**"], exclude: [] });
+      mkdirSync(join(f.repo, "docs"));
+      writeFileSync(join(f.repo, "docs", "a.md"), "# A\n\ndoc a body\n");
+      writeFileSync(join(f.repo, "docs", "private.md"), "# Private\n\nsecret body\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add docs subtree");
+      const initial = await f.core.syncRepoMdSource("repo-source");
+      expect(initial.status).toBe("published");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      const activeChunks = f.core.listSourceChunks(activeRun, true);
+      expect(activeChunks.map((chunk) => chunk.relativePath).sort()).toEqual(["docs/a.md", "docs/private.md"]);
+      const privateBinding = activeChunks.find((chunk) => chunk.relativePath === "docs/private.md")!;
+
+      // Simultaneously: replace docs/ with a symlink (diagnoses the whole subtree) AND newly
+      // exclude docs/private.md via config. Without the fix, subtree-protection carry-forward
+      // would silently resurrect the now-explicitly-excluded file in both the manifest and the
+      // pre-seal-carried snapshot, until the subtree healed.
+      rmSync(join(f.repo, "docs"), { recursive: true });
+      symlinkSync(".", join(f.repo, "docs"));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "replace docs subtree with a symlink");
+      f.core.updateSource("repo-source", { exclude: ["docs/private.md"] });
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("published");
+      const carried = f.core.listSourceChunks(result.runId!, true);
+      expect(carried.map((chunk) => chunk.relativePath)).toEqual(["docs/a.md"]);
+      // The now-excluded binding is correctly treated as absent (retired), not silently kept alive
+      // by carry-forward.
+      expect(f.core.listSourceCleanupItems(result.runId!)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "retire-absent", bindingId: privateBinding.bindingId }),
+      ]));
+
+      // Cross-check: the pre-seal materializer carry set agrees — it never carried the excluded
+      // descendant into the newly sealed snapshot either.
+      expect(sealedMarkerCarriedPaths(f)).toEqual(["docs/a.md"]);
+    } finally { f.cleanup(); }
+  });
+
+  it("does not reuse a cached snapshot's stale carried content across a different prior publication (Codex 3606534127)", async () => {
+    const f = fixture("carry-cache-stale-prior-publication");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\noriginal body\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      await f.core.syncRepoMdSource("repo-source");
+
+      // Commit X: A.md becomes a symlink (materializer-diagnosed) — carries "original body" into
+      // a NEWLY sealed snapshot for X.
+      unlinkSync(join(f.repo, "A.md"));
+      symlinkSync("README.md", join(f.repo, "A.md"));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "replace A.md with a symlink");
+      const symlinkResult = await f.core.syncRepoMdSource("repo-source");
+      expect(symlinkResult.status).toBe("published");
+      const commitX = git(f.repo, "rev-parse", "HEAD");
+      expect(symlinkResult.snapshotId).toBe(commitX);
+      expect(sealedMarkerCarriedPaths(f)).toEqual(["A.md"]);
+      expect(rawSnapshotBytes(f, "A.md").toString("utf8")).toBe("# A\n\noriginal body\n");
+
+      // Heal A.md with DIFFERENT content at a new commit — the prior publication changes.
+      rmSync(join(f.repo, "A.md"));
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nhealed body\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "heal A with new content");
+      const healedResult = await f.core.syncRepoMdSource("repo-source");
+      expect(healedResult.status).toBe("published");
+      expect(f.core.listSourceChunks(healedResult.runId!, true).find((chunk) => chunk.relativePath === "A.md")!.content)
+        .toContain("healed body");
+
+      // Revisit commit X directly: the SAME snapshotId+config as the symlink sync above, whose
+      // sealed snapshot (still on disk) carries the ORIGINAL body from before A.md healed. The
+      // CURRENT prior publication is now the healed run, not the one active when X was first sealed.
+      execFileSync("git", ["reset", "--hard", commitX], { cwd: f.repo });
+      const revisited = await f.core.syncRepoMdSource("repo-source");
+      expect(revisited.status).toBe("published");
+      expect(revisited.snapshotId).toBe(commitX);
+      const revisitedChunk = f.core.listSourceChunks(revisited.runId!, true).find((chunk) => chunk.relativePath === "A.md")!;
+
+      // THE FIX: the rebuilt snapshot must carry the CURRENT prior publication's content (healed
+      // body), not the stale content from when this exact snapshot variant was first sealed —
+      // proving the cache hit was correctly fenced and rebuilt rather than blindly reused.
+      expect(revisitedChunk.content).toContain("healed body");
+      const raw = rawSnapshotBytes(f, "A.md");
+      expect(raw.toString("utf8")).toContain("healed body");
+      expect(raw.toString("utf8")).not.toContain("original body");
+      const carriedFile = f.core.listSourceFiles(revisited.runId!, true).find((file) => file.relativePath === "A.md")!;
+      expect(computeSourceContentHash(raw)).toBe(carriedFile.contentHash);
+    } finally { f.cleanup(); }
+  });
+
+  it("recomputes a carried chunk's fingerprint when the effective ingest config changes in the same run as a skip (blocker 6 regression)", async () => {
+    const f = fixture("carry-config-change");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nbody\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      await f.core.syncRepoMdSource("repo-source");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      const active = f.core.listSourceChunks(activeRun, true).find((chunk) => chunk.relativePath === "A.md")!;
+
+      // Corrupt A.md (carry-eligible) AND change the effective ingest config in the same cycle.
+      // The carried chunk's fingerprint was computed under the OLD ingestConfigHash;
+      // validateManifest checks every chunk's fingerprint against the CURRENT run's hash
+      // unconditionally, carried or not, and the one existing config-hash fence only disables
+      // content-hash rename matching — it does not gate carry-forward at all.
+      writeFileSync(join(f.repo, "A.md"), Buffer.from([0xff, 0xfe, 0xfd]));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "corrupt A");
+      f.core.updateSource("repo-source", { exclude: ["NEVER.md"] });
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("published");
+      const carried = f.core.listSourceChunks(result.runId!, true).find((chunk) => chunk.relativePath === "A.md")!;
+      expect(carried).toMatchObject({ bindingId: active.bindingId, conceptId: active.conceptId, lifecycle: "active" });
+      expect(carried.ingestFingerprint).not.toBe(active.ingestFingerprint);
+      expect(rawConcept(f.core, active.conceptId!).status).toBe("active");
+    } finally { f.cleanup(); }
+  });
+
+  it("carries a previously-published file's bytes into the newly sealed snapshot when it becomes an oversized blob (blocker 5a scenario; plain-skip cross-check)", async () => {
+    const f = fixture("carry-into-snapshot-oversized");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nbody\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      await f.core.syncRepoMdSource("repo-source");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      const active = f.core.listSourceChunks(activeRun, true).find((chunk) => chunk.relativePath === "A.md")!;
+
+      // Grows A.md past maxFileBytes: enumerateSelectedTree's own blob-size check (a MATERIALIZER
+      // diagnostic, from Git's reported size, before any read) fires here — the exact shape
+      // blocker 5a's Codex comment named ("the file became an oversized blob"), and the only shape
+      // pre-seal carry-forward is scoped to (a scanner-diagnosed carry's bytes are already present
+      // via normal materialization; out of scope here, see the KNOWN OPEN GAP comment this closes).
+      writeFileSync(join(f.repo, "A.md"), Buffer.alloc(3 * 1024 * 1024, 0x61));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "grow A past the per-file limit");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("published");
+      expect(f.core.listSourceSkippedFiles(result.runId!).map((row) => ({ relativePath: row.relativePath, code: row.code })))
+        .toEqual(expect.arrayContaining([{ relativePath: "A.md", code: "file-too-large" }]));
+      const carried = f.core.listSourceChunks(result.runId!, true).find((chunk) => chunk.relativePath === "A.md")!;
+      expect(carried).toMatchObject({ bindingId: active.bindingId, conceptId: active.conceptId, lifecycle: "active" });
+
+      // THE CROSS-CHECK (scope item 3/4): the materializer's pre-seal carry set and planManifest's
+      // final carried-file set agree, and the sealed snapshot actually delivers what the manifest
+      // claims — not the fresh (grown) bytes just committed. Compared against the FILE record's
+      // contentHash (whole-file bytes), not the chunk's own (a different, smaller hash domain).
+      expect(sealedMarkerCarriedPaths(f)).toEqual(["A.md"]);
+      const carriedFile = f.core.listSourceFiles(result.runId!, true).find((file) => file.relativePath === "A.md")!;
+      const raw = rawSnapshotBytes(f, "A.md");
+      expect(computeSourceContentHash(raw)).toBe(carriedFile.contentHash);
+      expect(raw.toString("utf8")).toBe("# A\n\nbody\n");
+    } finally { f.cleanup(); }
+  });
+
+  // DELIBERATELY NOT COVERED (rename+skip cross-check via a materializer-diagnosed destination,
+  // e.g. rename into an oversized blob): constructing it reliably fought two requirements in
+  // tension — the destination must be similar enough to the ORIGINAL content for Git's rename
+  // detection to fire (REPO_MD_RENAME_SIMILARITY, source-materializer.ts), and different enough in
+  // SIZE to cross maxFileBytes. A tiny append preserves similarity but rarely reaches a realistic
+  // maxFileBytes; a wholesale size change (e.g. Buffer.alloc(3MB)) reliably falls below the
+  // similarity threshold and Git simply never reports the rename. CORRECTION (cold audit of
+  // 67ad7c3): the shape IS constructible with realistic small limits — e.g. maxFileBytes=10 with
+  // a 15-byte file renamed+grown to 18 bytes stays >50% similar (REPO_MD_RENAME_SIMILARITY=50)
+  // while crossing the limit — the 3MB-blob difficulty above was self-imposed, not fundamental.
+  // And the composition claim is FALSE for this shape: planManifest's case-(c) rename carry emits
+  // a destination path the pre-seal mirror structurally cannot produce (it iterates prior files
+  // only), so the manifest claims bytes the sealed snapshot lacks — git-md fails the ledger
+  // cross-check post-publish; repo-md leaves a source_path gap. This is the KNOWN OPEN case-(c)
+  // divergence documented at treeLevelCarryCandidates (source-materializer.ts) and planManifest's
+  // carry comment (source-sync.ts); pre-existing before pre-seal carry landed, tracked as a
+  // follow-up requiring pre-seal rename knowledge. A regression test lands with that fix.
+
+  it("gracefully aborts partial instead of throwing when a materializer-diagnosed carry pushes the run over its chunk budget (budget-abort cross-check)", async () => {
+    const f = fixture("carry-budget-materializer");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nbody\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const firstActiveRun = f.core.getSource("repo-source")!.activeRunId!;
+      const priorChunks = f.core.listSourceChunks(firstActiveRun, true);
+      expect(priorChunks).toHaveLength(2);
+
+      writeFileSync(join(f.repo, "A.md"), Buffer.alloc(3 * 1024 * 1024, 0x61));
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "grow A past the per-file limit");
+      let patched = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => {
+          if (point === "after-begin" && !patched) {
+            patched = true;
+            const runId = f.core.resumeSourceRun("repo-source")!.id;
+            const db = (f.core as unknown as { db: StoragePort }).db;
+            const row = db.prepare(`SELECT effective_config_json FROM source_sync_runs WHERE id=?`).get(runId) as { effective_config_json: string };
+            const config = JSON.parse(row.effective_config_json);
+            config.limits.maxChunks = 1;
+            // ingest_config_hash is a SEPARATE stored column, not recomputed from
+            // effective_config_json on read — keep both consistent (as a real config-driven new
+            // run always would) or the scanner's own freshly-recomputed hash (from effectiveConfig)
+            // disagrees with this run's stored ingestConfigHash the moment anything gets rescanned.
+            db.prepare(`UPDATE source_sync_runs SET effective_config_json=?, ingest_config_hash=? WHERE id=?`)
+              .run(JSON.stringify(config), computeSourceIngestConfigHash(config), runId);
+            throw new Error("force resume with patched budget");
+          }
+        },
+      })).rejects.toThrow("force resume with patched budget");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("partial");
+      expect(f.core.getSource("repo-source")!.activeRunId).toBe(firstActiveRun);
+      expect(f.core.listSourceChunks(firstActiveRun, true)).toEqual(priorChunks);
+      expect(first.status).toBe("published");
+    } finally { f.cleanup(); }
+  });
+
+  it("gracefully aborts partial instead of throwing when a carried chunk exceeds a lowered maxChunkBytes (audit regression: the fifth budget dimension)", async () => {
+    const f = fixture("carry-chunk-bytes-budget");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), `# A\n\n${"x".repeat(200)}\n`);
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const firstActiveRun = f.core.getSource("repo-source")!.activeRunId!;
+      const priorChunks = f.core.listSourceChunks(firstActiveRun, true);
+      const priorA = priorChunks.find((chunk) => chunk.relativePath === "A.md")!;
+      expect(Buffer.byteLength(priorA.content, "utf8")).toBeGreaterThan(100);
+
+      // Rename A.md -> B.md with a minimal one-byte invalid-UTF-8 append (preserves Git's rename
+      // similarity detection, same technique as the blocker-2 regression above), NOT a same-path
+      // symlink/oversized-blob/same-path-corruption trigger: those are all now either pre-seal
+      // classifier-substituted (CODEX FIX 3606534097 — the scanner never sees bad bytes, so it
+      // naturally re-discovers and re-chunks the substituted content, bypassing planManifest's
+      // carry mechanism entirely) or intercepted by the order-dependent residual check, making
+      // planManifest's own carry-forward structurally unreachable via those triggers now. B.md,
+      // however, was never ITSELF previously published — only A.md was — so it is not a
+      // classifier-substitution candidate at all (that candidate set is exactly the previously-
+      // published, currently-selected paths); the scanner genuinely rejects B.md's still-corrupted
+      // fresh bytes, and planManifest's rename-carry (case c) is what supplies its content, exactly
+      // as blocker 2 already proves — this is the one remaining same-run shape where a carried
+      // chunk's byte size is decided by planManifest rather than a natural rescan.
+      const originalA = readFileSync(join(f.repo, "A.md"));
+      git(f.repo, "mv", "A.md", "B.md");
+      writeFileSync(join(f.repo, "B.md"), Buffer.concat([originalA, Buffer.from([0x80])]));
+      git(f.repo, "add", "B.md"); git(f.repo, "commit", "-m", "rename A to B with invalid utf-8");
+      let patched = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => {
+          if (point === "after-begin" && !patched) {
+            patched = true;
+            const runId = f.core.resumeSourceRun("repo-source")!.id;
+            const db = (f.core as unknown as { db: StoragePort }).db;
+            const row = db.prepare(`SELECT effective_config_json FROM source_sync_runs WHERE id=?`).get(runId) as { effective_config_json: string };
+            const config = JSON.parse(row.effective_config_json);
+            config.limits.maxChunkBytes = 100;
+            // ingest_config_hash is a SEPARATE stored column, not recomputed from
+            // effective_config_json on read — keep both consistent (as a real config-driven new
+            // run always would) or the scanner's own freshly-recomputed hash (from effectiveConfig)
+            // disagrees with this run's stored ingestConfigHash the moment anything gets rescanned
+            // — exactly what a freshly re-chunked (now two-piece, still-selected) file exposes.
+            db.prepare(`UPDATE source_sync_runs SET effective_config_json=?, ingest_config_hash=? WHERE id=?`)
+              .run(JSON.stringify(config), computeSourceIngestConfigHash(config), runId);
+            throw new Error("force resume with lowered maxChunkBytes");
+          }
+        },
+      })).rejects.toThrow("force resume with lowered maxChunkBytes");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("partial");
+      expect(f.core.getSource("repo-source")!.activeRunId).toBe(firstActiveRun);
+      expect(f.core.listSourceChunks(firstActiveRun, true)).toEqual(priorChunks);
+      expect(first.status).toBe("published");
+    } finally { f.cleanup(); }
+  });
+
+  it("publishes through a same-path frontmatter corruption via pre-seal classifier substitution, then heals the same binding (Codex 3606534097 incident shape)", async () => {
+    const f = fixture("classifier-substitution-incident");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\noriginal body\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      await f.core.syncRepoMdSource("repo-source");
+      const activeRun = f.core.getSource("repo-source")!.activeRunId!;
+      const active = f.core.listSourceChunks(activeRun, true).find((chunk) => chunk.relativePath === "A.md")!;
+
+      // Corrupt A.md's frontmatter (nested/nonflat — still a perfectly valid, in-budget Git blob,
+      // still selected). John's ruling "A": the pre-seal classifier (source-chunker.ts) rejects
+      // the fresh bytes and substitutes the prior sealed snapshot's bytes BEFORE the scanner ever
+      // runs on this commit.
+      writeFileSync(join(f.repo, "A.md"), "---\nowner:\n  name: docs\n---\n# A\n\nnew body\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "corrupt A's frontmatter");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      // THE INCIDENT SHAPE: sync PUBLISHES (never partial, never throws) — substitution means the
+      // scanner reads valid (substituted, prior) bytes and never itself notices anything was wrong.
+      expect(result.status).toBe("published");
+      // Audit visibility survives even though the scanner sees clean content: the materializer's
+      // own classifier rejection is still durably recorded (source_skipped_files).
+      expect(f.core.listSourceSkippedFiles(result.runId!).map((row) => ({ relativePath: row.relativePath, code: row.code })))
+        .toEqual(expect.arrayContaining([{ relativePath: "A.md", code: "invalid-frontmatter" }]));
+      // Index keeps the OLD content records: same binding/concept, content unchanged.
+      const carried = f.core.listSourceChunks(result.runId!, true).find((chunk) => chunk.relativePath === "A.md")!;
+      expect(carried).toMatchObject({ bindingId: active.bindingId, conceptId: active.conceptId, lifecycle: "active" });
+      expect(carried.content).toContain("original body");
+      expect(rawConcept(f.core, active.conceptId!).status).toBe("active");
+
+      // The snapshot serves the OLD bytes for that path — not the fresh, corrupted commit's bytes
+      // — and the manifest's claimed contentHash matches exactly what's physically there.
+      expect(sealedMarkerCarriedPaths(f)).toEqual(["A.md"]);
+      const carriedFile = f.core.listSourceFiles(result.runId!, true).find((file) => file.relativePath === "A.md")!;
+      const raw = rawSnapshotBytes(f, "A.md");
+      expect(computeSourceContentHash(raw)).toBe(carriedFile.contentHash);
+      expect(raw.toString("utf8")).toBe("# A\n\noriginal body\n");
+
+      // Heal cycle: fixing the frontmatter resumes the SAME binding/concept lineage rather than
+      // forking a new one.
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nhealed body\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "heal A");
+      const healed = await f.core.syncRepoMdSource("repo-source");
+      expect(healed.status).toBe("published");
+      const healedChunk = f.core.listSourceChunks(healed.runId!, true).find((chunk) => chunk.relativePath === "A.md")!;
+      expect(healedChunk.bindingId).toBe(active.bindingId);
+      expect(healedChunk.conceptId).toBe(active.conceptId);
+      expect(healedChunk.content).toContain("healed body");
+    } finally { f.cleanup(); }
+  });
+
+  // NOTE: this proves the incident shape end-to-end for repo-md, including the sealed-snapshot
+  // byte-level cross-check. The git-md-specific validator subtlety (validateSealedSnapshotAgainstGit
+  // treating a substituted path as a member of BOTH entries and carriedPaths — source-materializer.ts)
+  // is verified by direct code inspection/tracing rather than a dedicated git-md test: git-md's own
+  // test fixtures (source-git.test.ts) are a substantially larger, separate harness (managed remote
+  // fetch simulation) this session did not build out. The reworked function is exercised identically
+  // regardless of source type — its inputs are just (marker, entries), and its logic contains no
+  // repo-md/git-md branching — so the repo-md-level proof that carriedPaths/carriedFromRunId are
+  // populated correctly is strong indirect evidence; flagging the gap rather than skipping it silently.
+
+  it("degrades to a graceful tree-level-partial exit when a previously-published, classifier-valid file is chunk-budget-skipped (Codex 3606534097 order-dependent residual)", async () => {
+    const f = fixture("chunk-budget-residual");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "A.md"), "# A\n\nx\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add A");
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const firstActiveRun = f.core.getSource("repo-source")!.activeRunId!;
+      const priorChunks = f.core.listSourceChunks(firstActiveRun, true);
+      expect(priorChunks.map((chunk) => chunk.relativePath).sort()).toEqual(["A.md", "README.md"]);
+
+      // Force a genuine rescan (not a same-commit noop) with BOTH files' own content untouched and
+      // classifier-valid, then patch maxChunks to exactly what "A.md" alone consumes (files walk in
+      // sorted order; "A.md" sorts before "README.md"). README.md — previously published,
+      // classifier-valid, untouched — is what runs out of walk-order-dependent chunk budget: a
+      // diagnostic the pre-seal classifier could not have predicted, since chunk-budget-exceeded
+      // depends on cumulative usage across the whole walk, not this file's own bytes.
+      f.commit("# Intro\n\nunrelated content change to force a rescan\n", "unrelated change");
+      let patched = false;
+      await expect(f.core.syncRepoMdSource("repo-source", {
+        fault: (point) => {
+          if (point === "after-begin" && !patched) {
+            patched = true;
+            const runId = f.core.resumeSourceRun("repo-source")!.id;
+            const db = (f.core as unknown as { db: StoragePort }).db;
+            const row = db.prepare(`SELECT effective_config_json FROM source_sync_runs WHERE id=?`).get(runId) as { effective_config_json: string };
+            const config = JSON.parse(row.effective_config_json);
+            config.limits.maxChunks = 1;
+            db.prepare(`UPDATE source_sync_runs SET effective_config_json=?, ingest_config_hash=? WHERE id=?`)
+              .run(JSON.stringify(config), computeSourceIngestConfigHash(config), runId);
+            throw new Error("force resume with a one-chunk budget");
+          }
+        },
+      })).rejects.toThrow("force resume with a one-chunk budget");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("partial");
+      expect(result.diagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "chunk-budget-exceeded", relativePath: "README.md" }),
+      ]));
+      expect(f.core.getSource("repo-source")!.activeRunId).toBe(firstActiveRun);
+      expect(f.core.listSourceChunks(firstActiveRun, true)).toEqual(priorChunks);
+      expect(first.status).toBe("published");
+    } finally { f.cleanup(); }
+  });
+
+  // DELIBERATELY NOT COVERED BY AN AUTOMATED TEST (prior-sealed-snapshot-unavailable edge case):
+  // attempted by deleting the prior sealed snapshot directory + sidecar directly on disk before a
+  // second sync. This reliably came back "published", not "partial" — discovered why: repo-md
+  // sources self-heal their ACTIVE snapshot at the very start of EVERY sync (source-sync.ts, the
+  // `if (source.activeSnapshotId && type !== "git-md")` block, unconditional, runs before the pin
+  // block for the NEW commit even begins) — materializeCommit for the active snapshotId silently
+  // rebuilds exactly what was just deleted, before this run's own carry-forward logic ever gets a
+  // chance to observe it missing. Reaching the edge case would need either a git-md fixture (no
+  // equivalent self-heal — this test file only sets up repo-md) or fault-injecting a deletion
+  // between self-heal and the carry attempt, and no fault point exists between them today.
+  // Confidence here rests on code inspection instead: carryForwardPriorFiles' try/catch around
+  // validateSealedSnapshot returns `unavailable` (never throws) on ANY failure reading the prior
+  // snapshot, and the syncSource check immediately after skipDiagnostics is assembled aborts
+  // gracefully as partial before ever calling stageSourceManifest — the identical, already-tested
+  // graceful-abort machinery the maxChunks/maxChunkBytes budget tests above exercise, just with
+  // this specific trigger condition unverified end-to-end.
 
   it("compensates a committed refresh when config drift fences activation", async () => {
     const f = fixture("drift");

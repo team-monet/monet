@@ -7,6 +7,7 @@ import {
   computeSourceManifestHash,
   effectiveSourceScanConfig,
 } from "./source-scanner";
+import type { SourceScanDiagnosticCode } from "./source-scanner";
 import {
   SOURCE_CHUNKER_VERSION,
   canonicalizeSourceChunkMetadata,
@@ -29,9 +30,11 @@ import type {
   SourceFileRecord,
   SourceManifestChunkInput,
   SourceManifestFileInput,
+  SourceManifestSkippedFileInput,
   SourcePublishedManifest,
   SourceRemoval,
   SourceRemovalItem,
+  SourceSkippedFileRecord,
   SourceSyncRun,
   SourceSyncRunResult,
   StageSourceManifestInput,
@@ -50,6 +53,7 @@ interface RunRow {
   scan_config_version: string; effective_config_json: string; config_version: number; lease_fence: number; complete: number;
   state: SourceSyncRun["state"]; result: SourceSyncRunResult | null; reason: string | null;
   activation_token: string | null; manifest_hash: string | null; file_count: number; chunk_count: number;
+  files_skipped: number;
   created_at: number; updated_at: number; published_at: number | null; finished_at: number | null;
 }
 
@@ -73,6 +77,7 @@ export interface SourcePublicationView {
   run: SourceSyncRun;
   filesIndexed: number;
   chunksIndexed: number;
+  filesSkipped: number;
 }
 
 export interface SourceAttemptView {
@@ -180,6 +185,7 @@ function rowToRun(row: RunRow): SourceSyncRun {
     configVersion: row.config_version, leaseFence: row.lease_fence, complete: row.complete === 1,
     state: row.state, result: row.result, reason: row.reason, activationToken: row.activation_token,
     manifestHash: row.manifest_hash, fileCount: row.file_count, chunkCount: row.chunk_count,
+    filesSkipped: row.files_skipped,
     createdAt: row.created_at, updatedAt: row.updated_at, publishedAt: row.published_at, finishedAt: row.finished_at,
   };
 }
@@ -218,6 +224,7 @@ export class SourceLedger {
         manifest_hash TEXT,
         file_count INTEGER NOT NULL DEFAULT 0,
         chunk_count INTEGER NOT NULL DEFAULT 0,
+        files_skipped INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         published_at INTEGER,
@@ -302,6 +309,18 @@ export class SourceLedger {
         PRIMARY KEY (run_id, relative_path)
       );
       CREATE INDEX IF NOT EXISTS idx_source_files_source_snapshot ON source_files(source_id, snapshot_id, config_version);
+
+      CREATE TABLE IF NOT EXISTS source_skipped_files (
+        run_id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        relative_path TEXT NOT NULL,
+        code TEXT NOT NULL,
+        message TEXT NOT NULL,
+        byte_length INTEGER NOT NULL DEFAULT 0 CHECK (byte_length >= 0),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (run_id, sequence)
+      );
 
       CREATE TABLE IF NOT EXISTS source_staged_chunks (
         run_id TEXT NOT NULL,
@@ -529,6 +548,12 @@ export class SourceLedger {
       }
       if (!columns.some((column) => column.name === "binding_generation")) {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN binding_generation INTEGER NOT NULL DEFAULT 1 CHECK (binding_generation >= 1)`);
+      }
+    }
+    {
+      const runColumns = this.db.prepare(`PRAGMA table_info(source_sync_runs)`).all() as Array<{ name: string }>;
+      if (!runColumns.some((column) => column.name === "files_skipped")) {
+        this.db.exec(`ALTER TABLE source_sync_runs ADD COLUMN files_skipped INTEGER NOT NULL DEFAULT 0`);
       }
     }
     // Reconstruct the cleanup table under an IMMEDIATE transaction. Older releases could crash
@@ -773,12 +798,13 @@ export class SourceLedger {
     return this.db.immediateTransaction(() => {
       const run = this.requireRun(input.runId);
       if (run.state !== "scanning" && run.state !== "staging") throw new Error(`cannot stage manifest while run is ${run.state}`);
-      this.validateManifest(run, input.files, input.chunks);
+      const skipped = input.skipped ?? [];
+      this.validateManifest(run, input.files, input.chunks, skipped);
       if (input.manifestHash !== computeSourceManifestHash(input.files)) {
         throw new Error("manifestHash does not match the staged file manifest");
       }
       for (const chunk of input.chunks) this.validateBindingProof(run, chunk);
-      const replay = canonicalJson(this.manifestShape(input.scanStatus, input.manifestHash, input.files, input.chunks));
+      const replay = canonicalJson(this.manifestShape(input.scanStatus, input.manifestHash, input.files, input.chunks, skipped));
       if (run.state === "staging") {
         const stored = this.readStagedManifest(run.id, run.complete ? "complete" : "partial", run.manifestHash!);
         if (canonicalJson(stored) !== replay) throw new Error("staged manifest conflicts with existing run contents");
@@ -799,8 +825,13 @@ export class SourceLedger {
           canonicalJson(canonicalizeSourceChunkMetadata(chunk.metadata)), chunk.sourceRef, chunk.content,
         );
       }
-      this.db.prepare(`UPDATE source_sync_runs SET state='staging', complete=?, manifest_hash=?, file_count=?, chunk_count=?, updated_at=? WHERE id=?`).run(
-        input.scanStatus === "complete" ? 1 : 0, requireString(input.manifestHash, "manifestHash"), input.files.length, input.chunks.length, now, run.id,
+      skipped.forEach((skip, index) => {
+        this.db.prepare(`INSERT INTO source_skipped_files (run_id,source_id,sequence,relative_path,code,message,byte_length,created_at) VALUES (?,?,?,?,?,?,?,?)`).run(
+          run.id, run.sourceId, index + 1, skip.relativePath, skip.code, skip.message, skip.byteLength ?? 0, now,
+        );
+      });
+      this.db.prepare(`UPDATE source_sync_runs SET state='staging', complete=?, manifest_hash=?, file_count=?, chunk_count=?, files_skipped=?, updated_at=? WHERE id=?`).run(
+        input.scanStatus === "complete" ? 1 : 0, requireString(input.manifestHash, "manifestHash"), input.files.length, input.chunks.length, skipped.length, now, run.id,
       );
       return this.requireRun(run.id);
     })();
@@ -1032,7 +1063,8 @@ export class SourceLedger {
     if (!snapshot || snapshot.state !== "active") throw new Error("source active snapshot is not published");
     const files = this.db.prepare(`SELECT COUNT(*) AS count FROM source_files WHERE source_id=? AND run_id=? AND snapshot_id=?`).get(sourceId, runId, snapshotId) as { count: number };
     const chunks = this.db.prepare(`SELECT COUNT(*) AS count FROM source_chunks WHERE source_id=? AND run_id=? AND snapshot_id=? AND lifecycle='active'`).get(sourceId, runId, snapshotId) as { count: number };
-    return { run, filesIndexed: files.count, chunksIndexed: chunks.count };
+    const skipped = this.db.prepare(`SELECT COUNT(*) AS count FROM source_skipped_files WHERE source_id=? AND run_id=?`).get(sourceId, runId) as { count: number };
+    return { run, filesIndexed: files.count, chunksIndexed: chunks.count, filesSkipped: skipped.count };
   }
 
   /** Exact published file manifest used to authenticate offline active-pointer repair. */
@@ -1482,6 +1514,15 @@ export class SourceLedger {
     return (this.db.prepare(`SELECT * FROM source_cleanup_items WHERE run_id=? ORDER BY id`).all(runId) as Array<Record<string, unknown>>).map((row) => this.cleanupRow(row));
   }
 
+  /** Durable skip-and-diagnose audit trail for one run, in the order they were staged. */
+  listSkippedFiles(runId: string): SourceSkippedFileRecord[] {
+    const run = this.requireRun(runId);
+    return (this.db.prepare(`SELECT * FROM source_skipped_files WHERE run_id=? ORDER BY sequence`).all(runId) as Array<Record<string, unknown>>).map((row) => ({
+      sourceId: run.sourceId, runId, relativePath: row.relative_path as string, code: row.code as SourceScanDiagnosticCode,
+      message: row.message as string, byteLength: row.byte_length as number, createdAt: row.created_at as number,
+    }));
+  }
+
   nextBindingGeneration(sourceId: string, bindingId: string): number {
     requireString(sourceId, "sourceId");
     requireString(bindingId, "bindingId");
@@ -1769,8 +1810,13 @@ export class SourceLedger {
     }
   }
 
-  private validateManifest(run: SourceSyncRun, files: SourceManifestFileInput[], chunks: SourceManifestChunkInput[]): void {
-    if (!Array.isArray(files) || !Array.isArray(chunks)) throw new Error("manifest files and chunks must be arrays");
+  private validateManifest(
+    run: SourceSyncRun, files: SourceManifestFileInput[], chunks: SourceManifestChunkInput[],
+    skipped: SourceManifestSkippedFileInput[] = [],
+  ): void {
+    if (!Array.isArray(files) || !Array.isArray(chunks) || !Array.isArray(skipped)) {
+      throw new Error("manifest files, chunks, and skipped entries must be arrays");
+    }
     if (files.length > run.effectiveConfig.limits.maxFiles) throw new Error("manifest exceeds the run maxFiles limit");
     if (chunks.length > run.effectiveConfig.limits.maxChunks) throw new Error("manifest exceeds the run maxChunks limit");
     const paths = new Set<string>();
@@ -1787,6 +1833,32 @@ export class SourceLedger {
       if (paths.has(file.relativePath)) throw new Error("manifest contains a duplicate file path");
       paths.add(file.relativePath);
     }
+    // A skipped path MAY also appear in `files`: the closure fix carries a previously-published
+    // file's exact prior record forward unchanged (see planManifest) so its diagnostic is recorded
+    // without inferring deletion. A path MAY also appear more than once in `skipped`: a single
+    // path can legitimately collect more than one diagnostic in a run, so entries are NOT deduped
+    // or rejected as duplicates by path — the durable audit trail (source_skipped_files) is
+    // sequence-ordered per run, with no per-path uniqueness constraint either.
+    for (const skip of skipped) {
+      requireSourceRelativePath(skip.relativePath, "skipped.relativePath");
+      requireString(skip.code, "skipped.code"); requireString(skip.message, "skipped.message");
+      if (skip.byteLength !== undefined) requireInteger(skip.byteLength, "skipped.byteLength");
+    }
+    // INVARIANT (deliberate, both directions considered): the staged manifest's `files` need not
+    // be a superset of everything the sealed snapshot on disk contains — a scanner-level skip
+    // (e.g. invalid frontmatter) excludes a materialized file from `files` while the snapshot,
+    // already sealed from all materializer-selected regular entries, still has its bytes.
+    // snapshot ⊇ manifest is acceptable: the raw file is one rg/directory-listing away even though
+    // it was never indexed. The reverse is never acceptable: `files` ⊄ snapshot would mean the
+    // manifest claims content as indexed that the snapshot can't actually serve. For
+    // materializer-level skips of previously-published paths (same-path and subtree shapes) this
+    // is CLOSED: pre-seal carry (treeLevelCarryCandidates/carryForwardPriorFiles in
+    // source-materializer.ts) copies carried bytes into the snapshot before sealing, reconciled
+    // in validateSealedSnapshotAgainstGit via marker.carriedPaths as an exact entries ∪ carried
+    // match. ONE REMAINING OPEN SHAPE (tracked): a rename whose destination is tree-level
+    // diagnosed the same run — carried by planManifest under a new path the pre-seal mirror
+    // cannot know (rename pairs aren't computed pre-seal); see the carry-forward comment in
+    // planManifest (source-sync.ts) and treeLevelCarryCandidates' docstring.
     const bindings = new Set<string>(); const operations = new Set<string>(); const identities = new Set<string>();
     const headingIdentities = new Map<string, { relativePath: string; headingPath: string[]; occurrence: number }>();
     for (const chunk of chunks) {
@@ -1841,10 +1913,14 @@ export class SourceLedger {
   private readStagedManifest(runId: string, scanStatus: "complete" | "partial", manifestHash: string): unknown {
     const files = this.listFiles(runId).map(({ sourceId: _s, runId: _r, snapshotId: _n, configVersion: _c, ...file }) => file);
     const chunks = this.listChunks(runId).map(({ sourceId: _s, runId: _r, snapshotId: _n, configVersion: _c, conceptId: _ci, observationId: _oi, predecessorObservationId: _pi, writeState: _w, lifecycle: _l, ...chunk }) => chunk);
-    return this.manifestShape(scanStatus, manifestHash, files, chunks);
+    const skipped = this.listSkippedFiles(runId).map(({ relativePath, code, message }) => ({ relativePath, code, message }));
+    return this.manifestShape(scanStatus, manifestHash, files, chunks, skipped);
   }
 
-  private manifestShape(scanStatus: "complete" | "partial", manifestHash: string, files: SourceManifestFileInput[], chunks: SourceManifestChunkInput[]): unknown {
+  private manifestShape(
+    scanStatus: "complete" | "partial", manifestHash: string, files: SourceManifestFileInput[],
+    chunks: SourceManifestChunkInput[], skipped: SourceManifestSkippedFileInput[] = [],
+  ): unknown {
     return {
       scanStatus,
       manifestHash,
@@ -1853,6 +1929,7 @@ export class SourceLedger {
         canonicalJson([a.relativePath, a.headingPath, a.occurrence, a.segmentIndex]),
         canonicalJson([b.relativePath, b.headingPath, b.occurrence, b.segmentIndex]),
       )),
+      skipped: [...skipped].sort((a, b) => compareUtf8(a.relativePath, b.relativePath)),
     };
   }
 

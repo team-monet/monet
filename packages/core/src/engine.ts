@@ -53,6 +53,7 @@ import type {
   SourceRemoval,
   SourceRemovalItem,
   SourcePublishedManifest,
+  SourceSkippedFileRecord,
   SourceSyncRun,
   StageSourceManifestInput,
   UpdateSourceInput,
@@ -4122,6 +4123,7 @@ export class MonetCore {
     const attempt = statusView.attempt;
     let filesIndexed = 0;
     let chunksIndexed = 0;
+    let filesSkipped = 0;
     if (source.activeRunId || source.activeSnapshotId || source.activeIngestConfigHash) {
       if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash) {
         throw new Error("source active publication metadata is incomplete");
@@ -4129,6 +4131,7 @@ export class MonetCore {
       const active = this.sourceLedger.activePublication(source.id, source.activeRunId, source.activeSnapshotId, source.activeIngestConfigHash);
       filesIndexed = active.filesIndexed;
       chunksIndexed = active.chunksIndexed;
+      filesSkipped = active.filesSkipped;
     }
     const verificationWins = attempt.latestAttempt?.kind === "verification"
       && attempt.latestVerificationAt !== null && attempt.latestVerificationRunCount === attempt.runCount;
@@ -4169,7 +4172,7 @@ export class MonetCore {
       lastSyncResult: latestResult,
       ...(lastSuccessfulSyncAt >= 0 ? { lastSuccessfulSyncAt } : {}),
       ...(source.activeSnapshotId ? { indexedRevision: source.activeSnapshotId } : {}),
-      freshness, filesIndexed, chunksIndexed, dirtyFiles: attempt.dirtyFiles,
+      freshness, filesIndexed, chunksIndexed, filesSkipped, dirtyFiles: attempt.dirtyFiles,
       schedule: {
         state: schedule.state,
         ...(schedule.nextAttemptAt !== undefined ? { nextAttemptAt: schedule.nextAttemptAt } : {}),
@@ -4416,6 +4419,10 @@ export class MonetCore {
 
   listSourceCleanupItems(runId: string): SourceCleanupItem[] {
     return this.sourceLedger.listCleanupItems(runId);
+  }
+
+  listSourceSkippedFiles(runId: string): SourceSkippedFileRecord[] {
+    return this.sourceLedger.listSkippedFiles(runId);
   }
 
   nextSourceBindingGeneration(sourceId: string, bindingId: string): number {

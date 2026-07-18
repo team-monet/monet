@@ -144,14 +144,38 @@ describe("repo-md committed-HEAD materializer", () => {
       expect(readFileSync(join(selected.snapshotPath, "README.md"), "utf8")).toBe("committed bytes\n");
       expect(() => readFileSync(join(selected.snapshotPath, "HUGE.bin"))).toThrow();
 
+      // An individually oversized selected blob is skipped and diagnosed rather than aborting the
+      // whole materialization; the snapshot still seals, just with zero files in it here.
       const selectedHuge = { ...f.source, include: ["HUGE.bin"] };
-      await expect(materializeRepoMdHead(selectedHuge, {
+      const skippedHuge = await materializeRepoMdHead(selectedHuge, {
         sourceStorageDir: join(f.root, "other-managed"),
         config: {
           autoDetect: false, include: ["HUGE.bin"], exclude: [],
           limits: { maxEntries: 10, maxFiles: 1, maxFileBytes: 1024, maxTotalBytes: 1024, maxParseMs: 1000, maxChunkBytes: 100, maxChunks: 10 },
         },
+      });
+      expect(skippedHuge.diagnostics).toEqual([expect.objectContaining({ code: "file-too-large", relativePath: "HUGE.bin" })]);
+      expect(readdirSync(skippedHuge.snapshotPath)).toEqual([]);
+
+      // Tree-level budgets (gate regression) still throw hard: two individually valid, regular,
+      // in-budget files still overrun a maxFiles=1 / maxTotalBytes budget.
+      writeFileSync(join(f.repo, "OTHER.md"), "second\n");
+      git(f.repo, "add", "OTHER.md"); git(f.repo, "commit", "-m", "second small file");
+      const twoFiles = { ...f.source, include: ["*.md"] };
+      await expect(materializeRepoMdHead(twoFiles, {
+        sourceStorageDir: join(f.root, "two-files-managed"),
+        config: {
+          autoDetect: false, include: ["*.md"], exclude: [],
+          limits: { maxEntries: 10, maxFiles: 1, maxFileBytes: 1024, maxTotalBytes: 1024 * 1024, maxParseMs: 1000, maxChunkBytes: 100, maxChunks: 10 },
+        },
       })).rejects.toThrow(/file limit/);
+      await expect(materializeRepoMdHead(twoFiles, {
+        sourceStorageDir: join(f.root, "byte-budget-managed"),
+        config: {
+          autoDetect: false, include: ["*.md"], exclude: [],
+          limits: { maxEntries: 10, maxFiles: 10, maxFileBytes: 1024, maxTotalBytes: 20, maxParseMs: 1000, maxChunkBytes: 100, maxChunks: 10 },
+        },
+      })).rejects.toThrow(/total-byte limit/);
     } finally { f.cleanup(); }
   });
 
@@ -425,12 +449,15 @@ describe("repo-md committed-HEAD materializer", () => {
     } finally { f.cleanup(); }
   });
 
-  it("rejects committed Git symlinks and serializes ownership-token locks with stale takeover", async () => {
+  it("skips a committed Git symlink as a per-file diagnostic and serializes ownership-token locks with stale takeover", async () => {
     const f = fixture();
     try {
       symlinkSync("README.md", join(f.repo, "LINK.md"));
       git(f.repo, "add", "LINK.md"); git(f.repo, "commit", "-m", "symlink");
-      await expect(materializeRepoMdHead({ ...f.source, include: ["*.md"] }, { sourceStorageDir: f.storage })).rejects.toThrow(/not a regular/);
+      const skipped = await materializeRepoMdHead({ ...f.source, include: ["*.md"] }, { sourceStorageDir: f.storage });
+      expect(skipped.diagnostics).toEqual([expect.objectContaining({ code: "unsupported-node", relativePath: "LINK.md" })]);
+      expect(readFileSync(join(skipped.snapshotPath, "README.md"), "utf8")).toBe("committed bytes\n");
+      expect(() => readFileSync(join(skipped.snapshotPath, "LINK.md"))).toThrow();
 
       let now = 0;
       let release!: () => void;

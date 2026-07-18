@@ -284,6 +284,46 @@ function parseFrontmatter(lines: string[], relativePath: string, deadlineExceede
   };
 }
 
+/**
+ * CODEX FIX (3606534097), John's ruling "A" (shared-classifier, extract-and-share not duplicate):
+ * the scanner's pure per-file content checks — UTF-8 validity and frontmatter validity — extracted
+ * into one shared, pure function of bytes (no walk state, no I/O). The scanner's processFile calls
+ * this as an early gate (source-scanner.ts); the materializer calls it pre-seal, only for the small
+ * set of previously-published-and-currently-selected paths, to detect a case pre-seal
+ * carry-forward (blocker 5a) structurally cannot: a path still Git-selected this run whose FRESH
+ * content would fail the scanner. Deliberately excludes chunk-budget-exceeded — that diagnostic
+ * depends on cumulative chunk usage across the whole walk (maxChunks - chunks-used-so-far), so it
+ * is not a pure function of one file's bytes and cannot be predicted pre-seal; see the
+ * order-dependent residual handling in syncSource (source-sync.ts) for that case instead.
+ */
+export interface SourceFileClassification {
+  /** LF-normalized, BOM-stripped decoded text — present only when the file classifies as valid. */
+  text?: string;
+  /** Present only when the file classifies as invalid; identical in shape and message text to
+   * what the scanner/chunker would independently have produced for the same bytes. */
+  diagnostic?: { code: "invalid-utf8" | "invalid-frontmatter"; message: string; relativePath: string };
+}
+
+export function classifySourceFileContent(
+  bytes: Uint8Array, relativePath: string, deadlineExceeded?: () => boolean,
+): SourceFileClassification {
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r\n?/g, "\n");
+  } catch {
+    return { diagnostic: { code: "invalid-utf8", message: "included file is not strict UTF-8", relativePath } };
+  }
+  // Mirrors chunkSourceText's own (otherwise redundant) normalization exactly, so classification
+  // is decided against precisely the same text chunkSourceText would itself parse.
+  const normalizedText = decoded.replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "");
+  const parsed = parseFrontmatter(normalizedText.split("\n"), relativePath, deadlineExceeded);
+  // parseFrontmatter's own diagnostic literals are exhaustively code: "invalid-frontmatter" (never
+  // chunk-budget-exceeded/parse-time-exceeded, which chunkSourceText raises elsewhere, not here) —
+  // reconstructed rather than narrowed so callers get a precisely-typed, exhaustive result.
+  if (parsed.diagnostic) return { diagnostic: { code: "invalid-frontmatter", message: parsed.diagnostic.message, relativePath } };
+  return { text: normalizedText };
+}
+
 function openingFence(line: string): { marker: "`" | "~"; length: number } | undefined {
   const match = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
   if (!match) return undefined;
