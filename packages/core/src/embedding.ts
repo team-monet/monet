@@ -45,12 +45,39 @@ export interface EmbeddingProvider {
 // so old-tokenizer and new-tokenizer vectors were indistinguishable to that check: a graft from an
 // old-tokenizer store would be silently ACCEPTED into a new-tokenizer one (and vice versa),
 // mixing incompatible vector spaces exactly the way the modelId check exists to prevent. Bump this
-// whenever `embed()`'s tokenization (not just its output dimension) changes. A store still holding
-// the OLD modelId is not hard-failed anywhere on open (no code path compares a persisted "this
-// store's model" against the live embedder at construction time) — it simply needs its native
-// concepts (and, per thread 11, their observations) re-embedded, exactly like an ONNX default
-// swap; migrate-file-concept.ts's re-embed pass covers this identically either way.
-const HASHING_TOKENIZER_VERSION = 2; // 2: Unicode-aware \p{L}\p{N} tokenizer (item 9, multilingual swap); 1 (implicit, pre-existing): ASCII-only [a-z0-9]
+// whenever `embed()`'s tokenization (not just its output dimension) changes.
+//
+// UPDATE (embedder-pin ADR, slice 1): the next sentence used to end this comment: "A store still
+// holding the OLD modelId is not hard-failed anywhere on open (no code path compares a persisted
+// 'this store's model' against the live embedder at construction time)." That is no longer true —
+// see MonetCore.ensureEmbedderPin (engine.ts) and the `sync_meta.embedder_model_id` pin it
+// enforces. A store pinned to "hashing:dim=256:tok=1" now gets tokenizer v1 re-instantiated (via
+// instantiateEmbedderForPin, embedding-onnx.ts) at open time rather than silently drifting onto
+// whatever HASHING_TOKENIZER_VERSION this build defaults to. Re-embedding (migrate-file-concept.ts)
+// is still how a store VOLUNTARILY moves its pin to a new tokenizer version — it is just no longer
+// the only thing standing between an old store and a silent vector-space mismatch.
+const HASHING_TOKENIZER_VERSION = 2; // default for FRESH instances; HASHING_TOKENIZERS below lists every version this build can still instantiate
+
+/**
+ * Tokenizers keyed by version — each produces the word list `embed()` hashes into features.
+ *
+ * Standing principle (embedder-pin ADR): an embed-affecting change ADDS a new entry here behind a
+ * new version number. NEVER edit an existing entry's implementation in place. A store may be
+ * PINNED to an old version indefinitely (see the embedder-pin ADR / instantiateEmbedderForPin in
+ * embedding-onnx.ts), so old versions must stay instantiable, byte-identical, forever — the same
+ * rule the ONNX side follows by never reusing a model string for a changed model. The version
+ * number IS the vector space's identity.
+ */
+const HASHING_TOKENIZERS: Record<number, (text: string) => string[]> = {
+  // 1 (pre-existing; resurrected from v0.8.1 for the embedder-pin ADR so old hashing stores stay
+  // instantiable): ASCII-only — silently stripped any non-Latin script down to nothing (the item-9
+  // bug tokenizer v2, below, exists to fix).
+  1: (text) => text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean),
+  // 2 (item 9, multilingual swap; current default): Unicode-aware \p{L}\p{N} (with the `u` flag)
+  // keeps any script's letters/digits — Korean, CJK, Cyrillic, etc. — instead of the old ASCII-only
+  // [a-z0-9] class, which silently stripped non-Latin text down to zero features.
+  2: (text) => text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean),
+};
 
 export class HashingEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
@@ -58,22 +85,31 @@ export class HashingEmbeddingProvider implements EmbeddingProvider {
   // semantic model because lexical overlap saturates lower. (Preserved spike defaults.)
   readonly recommendedThresholds: EmbeddingThresholds = { tauAttach: 0.55, tauAmbiguous: 0.4 };
   readonly modelId: string;
+  private readonly tokenize: (text: string) => string[];
 
-  constructor(dim = 256) {
+  /**
+   * `tokenizerVersion` defaults to this build's current default (HASHING_TOKENIZER_VERSION) but
+   * accepts any version this build still knows how to instantiate (HASHING_TOKENIZERS above) — the
+   * embedder-pin loader (instantiateEmbedderForPin, embedding-onnx.ts) uses this to resurrect the
+   * EXACT tokenizer an older store was pinned to. Fails closed (throws) on an unrecognized version:
+   * guessing would silently mix vector spaces, exactly what modelId versioning exists to prevent.
+   */
+  constructor(dim = 256, tokenizerVersion: number = HASHING_TOKENIZER_VERSION) {
     this.dim = dim;
-    this.modelId = `hashing:dim=${dim}:tok=${HASHING_TOKENIZER_VERSION}`;
+    const tokenize = HASHING_TOKENIZERS[tokenizerVersion];
+    if (!tokenize) {
+      throw new Error(
+        `HashingEmbeddingProvider: unknown tokenizer version ${tokenizerVersion}. ` +
+          `Known versions: ${Object.keys(HASHING_TOKENIZERS).join(", ")}.`,
+      );
+    }
+    this.tokenize = tokenize;
+    this.modelId = `hashing:dim=${dim}:tok=${tokenizerVersion}`;
   }
 
   embed(text: string): Float32Array {
     const v = new Float32Array(this.dim);
-    // Unicode-aware tokenizer (item 9, multilingual swap): \p{L}\p{N} (with the `u` flag) keeps
-    // any script's letters/digits — Korean, CJK, Cyrillic, etc. — instead of the old ASCII-only
-    // [a-z0-9] class, which silently stripped non-Latin text down to zero features.
-    const words = text
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, " ")
-      .split(/\s+/)
-      .filter(Boolean);
+    const words = this.tokenize(text);
 
     const add = (feature: string, weight: number): void => {
       const h = hash32(feature);

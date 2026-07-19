@@ -108,3 +108,140 @@ export async function createLocalEmbedder(opts: { model?: string } = {}): Promis
     return new HashingEmbeddingProvider();
   }
 }
+
+/**
+ * The ONNX default before the item 9 multilingual swap (English-only, 384-dim). Not used by
+ * `createLocalEmbedder` (which always names today's default) — kept as a named identity for the
+ * embedder-pin backfill: a pre-pin store found holding 384-dim vectors necessarily predates the
+ * swap, so THIS is the only model that could have produced them (see MonetCore.ensureEmbedderPin,
+ * engine.ts).
+ */
+export const LEGACY_ONNX_DEFAULT_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
+
+// INVARIANT (Codex review, PR #51, FIX F, widened by FIX L, widened again by FIX Q): the loader's
+// recognized-format space MUST cover at least every model-id shape the provider constructors
+// accept, or this build can mint a pin (source='created', via a fresh store's constructor-provided
+// embedder) that its OWN loader then refuses to satisfy. OnnxEmbeddingProvider passes `model`
+// straight through to transformers.js's pipeline() with zero validation or transformation (see
+// `mod.pipeline("feature-extraction", this.model)` below) — confirmed by reading the call site, not
+// assumed: this.model is whatever opts.model ?? the class default was, untouched. transformers.js's
+// pipeline() natively accepts a local filesystem path — relative ("./models/foo"), POSIX-absolute
+// ("/opt/models/foo"), or WINDOWS-absolute/UNC ("C:\models\foo", "\\host\share\models\foo") — in
+// addition to a Hugging Face hub "<owner>/<repo>" id. OnnxEmbeddingProvider places no restriction
+// narrower than that, and no platform check: a Windows host can pass a backslash-separated path
+// exactly as freely as a POSIX host passes a forward-slash one. FIX L widened the recognizer from
+// owner/repo-only to "any forward slash", closing the POSIX-path gap — but a Windows path like
+// `C:\models\foo` contains ZERO forward slashes, so it still fell through to the unrecognized-format
+// branch and the same "this build minted a pin its own loader refuses" bug FIX L closed reopened for
+// exactly the platform FIX L didn't test on.
+//
+// The recognizer is now deliberately "anything with a forward slash OR a backslash, anywhere" — not
+// a platform-specific path grammar — for the same reason FIX L gave for its own widening: the
+// constructor's own accepted space is that broad and un-validated, so a narrower regex here would
+// just reintroduce the same class of bug for whatever shape (or platform) it excludes next. Ordered
+// AFTER the hashing:... match (checked first, below) so a hashing pin never falls through to an
+// attempted (and certain-to-fail) ONNX load. Strings with neither separator (no owner/repo, no path
+// of either flavor) still fall through to the unrecognized-format branch with no instantiation
+// attempt at all. Separator-CONTAINING garbage (a malformed path, a nonexistent hub id) fails at an
+// actual load attempt, wrapped as UnsatisfiableEmbedderError below, rather than being rejected
+// instantly by format alone — the same closed outcome (this store still does not serve), just a
+// slower path to it. This was already true for owner/repo- and POSIX-path-shaped garbage since FIX F
+// and FIX L respectively; backslash-shaped garbage now joins them for the same reason.
+const RECOGNIZED_ONNX_PIN_FORMAT = /[/\\]/;
+const HASHING_PIN_FORMAT = /^hashing:dim=(\d+):tok=(\d+)$/;
+
+/**
+ * Thrown by instantiateEmbedderForPin when a store's pinned embedder cannot be satisfied: the pin
+ * names a hashing tokenizer version this build doesn't implement, an ONNX model that failed to
+ * load, or a modelId format this build has never seen. `modelId` is always the pin that could not
+ * be satisfied (never the fallback the caller might have been using instead — there is no
+ * fallback: see instantiateEmbedderForPin's doc comment).
+ *
+ * Styled after engine.ts's EmbedderMismatchError: constructor args become public readonly fields,
+ * `name` is set explicitly so `instanceof` and `.name` both identify it after serialization.
+ */
+export class UnsatisfiableEmbedderError extends Error {
+  constructor(
+    public readonly modelId: string,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "UnsatisfiableEmbedderError";
+  }
+}
+
+/**
+ * Strictly instantiate the embedder named by a store's pin (`sync_meta.embedder_model_id`) —
+ * the enforcement half of the embedder-pin ADR. Called by MonetCore.ensureEmbedderPin whenever the
+ * constructor-provided embedder doesn't already satisfy the pin.
+ *
+ * NEVER substitutes another embedder. There is no fallback of any kind here — that silent
+ * ONNX→hashing degrade is exactly what createLocalEmbedder does for a FRESH store's initial
+ * choice, and exactly what a PINNED store must never do (a fallback would silently write a
+ * different vector space into a store that already committed to one). Any failure — an unknown
+ * hashing tokenizer version, an ONNX model that won't load, a modelId this build doesn't
+ * recognize — throws UnsatisfiableEmbedderError and the store must not serve.
+ */
+export async function instantiateEmbedderForPin(modelId: string): Promise<EmbeddingProvider> {
+  const hashingMatch = modelId.match(HASHING_PIN_FORMAT);
+  if (hashingMatch) {
+    const dim = Number(hashingMatch[1]);
+    const tokenizerVersion = Number(hashingMatch[2]);
+    try {
+      return new HashingEmbeddingProvider(dim, tokenizerVersion);
+    } catch (e) {
+      throw new UnsatisfiableEmbedderError(
+        modelId,
+        `This store is pinned to '${modelId}', but this Monet build does not implement that hashing ` +
+          `tokenizer version. The store may have been created by a NEWER version of Monet — upgrade ` +
+          `monet-core and try again.`,
+        { cause: e },
+      );
+    }
+  }
+
+  if (RECOGNIZED_ONNX_PIN_FORMAT.test(modelId)) {
+    const onnx = new OnnxEmbeddingProvider({ model: modelId });
+    let warmup: Float32Array;
+    try {
+      warmup = await onnx.embed("warmup"); // forces model load now, same discipline as createLocalEmbedder
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      throw new UnsatisfiableEmbedderError(
+        modelId,
+        `This store is pinned to '${modelId}', but this Monet instance could not load that model ` +
+          `(${why}). The store may have been created by a NEWER version of Monet, or the model failed ` +
+          `to download — upgrade monet-core and/or check network access.`,
+        { cause: e },
+      );
+    }
+    // Codex review (PR #51, FIX B, superseded by FIX J below): OnnxEmbeddingProvider.dim is a
+    // class-declared constant (`opts.dim ?? 384`), NOT measured from the model's actual output — a
+    // pin naming a model this build has never hardcoded a dim for (e.g. a future non-384-dim
+    // Xenova release, or any custom model FIX F's widened recognizer now accepts) would otherwise
+    // load "successfully" while this.embedder.dim silently disagrees with what embed() actually
+    // produces.
+    //
+    // FIX J (PR #51): verified by reading embed() (above) — it is PURELY DECLARATIVE. embed() never
+    // references this.dim at all; it returns Float32Array.from(output.data) straight from the
+    // model's own pooled output, with no slicing/padding/resizing to match a declared width. So the
+    // declared dim can never make embed()'s output correct or incorrect — it can only DESCRIBE that
+    // output correctly or incorrectly. Since the pin (modelId) alone fully determines the vector
+    // space regardless of what dim anyone declared, the right fix is measure-and-adopt, not reject:
+    // if the warmup's real width differs from the class default, re-instantiate with the MEASURED
+    // width as the declared dim and return THAT — the declaration follows reality. This makes
+    // FIX B's mismatch rejection unnecessary (removed); UnsatisfiableEmbedderError below still
+    // covers actual load failures. The one cost: a mismatched-default model pays a second lazy
+    // model load on its first REAL embed() call (a fresh instance's own this.extractor starts
+    // null) — bounded and one-time, and not a re-download: the model is already cached on disk
+    // from the warmup just above, so this is a re-init of the runtime session, not a network hit.
+    return warmup.length === onnx.dim ? onnx : new OnnxEmbeddingProvider({ model: modelId, dim: warmup.length });
+  }
+
+  throw new UnsatisfiableEmbedderError(
+    modelId,
+    `This store is pinned to an unrecognized embedder '${modelId}'. The store may have been created ` +
+      `by a NEWER version of Monet — upgrade monet-core to open it.`,
+  );
+}

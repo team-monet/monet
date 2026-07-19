@@ -85,12 +85,97 @@
  *      report no change — that is the only real signal the graph has actually settled, on any
  *      store shape.
  *
+ * Embedder pin (Codex review, PR #51 round 5, FIX N): under --apply, this script stamps sync_meta's
+ * pin to the CHOSEN --embedder (core.adoptEmbedderPin()) as the FIRST thing it does after opening
+ * the store — before source re-sync (step 1), before native re-embed (step 3), before the graph
+ * rebuild (step 4). Two consequences this ordering exists to prevent:
+ *   (i) Without a stamp, a freshly re-embedded store still has NO recorded pin (or a stale one from
+ *       before this run), so its NEXT served open backfills a pin by DIMENSION alone — which cannot
+ *       tell "the OLD default that happens to share this dimension" from "the NEW one this run just
+ *       wrote every vector in", silently mis-pinning e.g. a multilingual re-embed back to the legacy
+ *       English default the very next time anything opens the store for real.
+ *   (ii) Re-running this script against its OWN prior --apply output would otherwise open an
+ *        ALREADY-pinned store with a constructor embedder that DELIBERATELY differs from that pin
+ *        (that mismatch is what --embedder means: "re-embed under THIS model, whatever the store is
+ *        pinned to now") — arming the constructor-time pin guard and making every gated call in the
+ *        source-sync loop (storeInternal, gather, etc.) throw EmbedderPinUnsatisfiedError. The
+ *        per-source try/catch (see migrateOneSource) swallows that as an ordinary sync failure,
+ *        reported and skipped exactly like a transient network error — silently leaving that
+ *        source's concepts unmigrated forever, not merely delayed to the next run, since nothing
+ *        about "sync failed, retry later" distinguishes this from a real transient fault.
+ *
+ * Stamping EARLY (before any re-embed work, not after) is a deliberate ordering choice for THIS
+ * dev/operator harness specifically — not a general pattern to copy. It means a crash mid-run can
+ * leave the pin already pointing at the target embedder while some vectors are still, temporarily,
+ * under the OLD model: a real, if transient, inconsistent state. Accepted here because (a) a
+ * verified backup is ALREADY mandatory before running this script at all (see the NEVER-without-a-
+ * backup warning just below — this is designed to run against a disposable COPY), and (b) every
+ * step this script runs is idempotent, so simply re-running it converges the store to fully-migrated
+ * regardless of where a prior run crashed (see the DETERMINISM note above for the graph
+ * specifically — the SAME "just run it again" guidance covers a stamp-then-crash too). The future
+ * first-class core.migrateEmbeddings() (slice 2, not yet built) will instead flip the pin LAST,
+ * atomically, only once every vector is confirmed re-embedded — this script is a one-shot operator
+ * tool bridging until that exists, and its stamp-early ordering should NOT be read as the pattern a
+ * production migration primitive ought to follow.
+ *
+ * Preflight (Codex review, PR #51 round 6, FIX P; reordered round 7, FIX X): under --apply, BEFORE
+ * this script even CONSTRUCTS a MonetCore — not merely before adoptEmbedderPin(), as round 6 first
+ * had it — this script confirms the chosen --embedder can actually produce a real embedding
+ * (preflightEmbedder, below — a plain `await embedder.embed("preflight")`). Round 6's ordering was
+ * itself a bug for a vector-free target DB: MonetCore's OWN constructor can mint a 'created' pin
+ * (its fresh-store branch) naming an embedder that construction never actually verified could load
+ * — a preflight running AFTER that construction could then fail, exiting the whole run while
+ * leaving exactly the unsatisfied pin it existed to prevent. Preflighting BEFORE construction closes
+ * this: the embedder instance exists independently of the core (it's passed INTO the constructor,
+ * not derived from it), so reordering costs nothing. Direct consequence of the stamp-early ordering
+ * above either way: without SOME preflight, an --embedder onnx run on a host where the model/
+ * transformers.js can't load would stamp a pin, then have every per-item re-embed attempt in
+ * reembedNativeConcepts/migrateOneSource fail — each caught individually by its own per-item
+ * try/catch, never aborting the run — leaving a NON-EMPTY store permanently pinned to a model that
+ * can never produce a vector, its data still unrewritten. A failed preflight ABORTS THE WHOLE RUN
+ * before anything is written: no construction, no stamp, no partial work — the thrown error
+ * propagates out of main() uncaught (see the bottom of this file), which already prints it and exits
+ * non-zero. Gated on --apply only, same as adoptEmbedderPin itself: report-only never writes
+ * anything regardless (see below — deferCreatedPin covers even the vector-free-DB construction-time
+ * case now), so there is nothing here for a preflight failure to protect. hashing's own preflight is
+ * instant and network-free either way (pure synchronous JS, no I/O), so the only real-world trigger
+ * for this abort path is --embedder onnx on a host that can't reach or load the model.
+ *
+ * Exclusivity: this migration workflow requires EXCLUSIVE access to the target store. Close every
+ * live session (MCP server, CLI) holding this store open before running --apply — a concurrent
+ * writer touching the store mid-migration is undefined territory this script makes no attempt to
+ * detect or coordinate with. The planned first-class core.migrateEmbeddings() (slice 2, see the
+ * ordering note above) will enforce this mechanically with a real WAL-native lock probe before
+ * touching anything; this one-shot operator script relies on the operator's own discipline instead.
+ *
+ * Exit code (Codex review, PR #51 round 8, FIX Y): every loop in this script (source sync/orphan
+ * retirement, native re-embed, native observation re-embed, graph rebuild) is deliberately per-item
+ * resilient — one bad item is caught, recorded, and skipped, never aborting the rest of that SAME
+ * run (each loop's own docstring explains why: completing everything else maximizes progress per
+ * invocation). That resilience has a sharp edge, though: under --apply, the pin is already stamped
+ * to the target embedder (stamp-early, see "Embedder pin" above) by the time any of these loops even
+ * run — so a run that finishes with SOME failures still exits 0 by default, looking like a clean
+ * success, while the store is actually half-migrated: some vectors under the NEW model, some still
+ * under the OLD one, all scored under the SAME (new) thresholds. This script now FAILS HARD instead:
+ * if --apply and ANY loop recorded even one failure, main() throws after printing the full report
+ * (not mid-run — the per-item resilience above is unchanged) and the process exits non-zero, with a
+ * prominent, hard-to-miss block explaining the store is mid-migration, must not be opened by any
+ * served path, and should simply be re-run (every step here is idempotent and retries failed items
+ * from scratch) until a pass reports zero failures everywhere — or the mandatory backup restored.
+ * Report-only is unaffected: nothing is ever mutated under it, so there is nothing to warn about
+ * (every loop above returns an empty, failure-free report when !applyFlag anyway).
+ *
  * Report-only by default (still opens the store, which still auto-upgrades the schema — that half
- * is additive and unconditional either way). --apply is required to actually re-sync sources,
- * retire orphans, re-embed natives, and rebuild their graph. NEVER point this at a store you care
- * about without a tested, verified backup — it is designed to run against a disposable COPY, and
- * the copy step is the caller's job, not this script's: it operates on exactly the db-path and
- * storage-dir it's given.
+ * is additive and unconditional either way; the pin is NOT stamped in this mode). Two independent
+ * guarantees now cover this, not one: adoptEmbedderPin() only ever runs under --apply (covers an
+ * ALREADY-pinned store); MonetCoreOptions.deferCreatedPin is passed whenever NOT --apply (Codex
+ * review, PR #51 round 7, FIX V — covers a genuinely vector-free target DB, whose fresh-store
+ * branch would otherwise mint a 'created' pin during construction itself, on a plain report-only
+ * inspection that promises never to write anything). --apply is required to actually stamp the pin,
+ * re-sync sources, retire orphans, re-embed natives, and rebuild their graph. NEVER point this at a
+ * store you care about without a tested, verified backup — it is designed to run against a
+ * disposable COPY, and the copy step is the caller's job, not this script's: it operates on exactly
+ * the db-path and storage-dir it's given.
  *
  * --embedder (hashing|onnx): which embedder generates every fresh vector this run writes — both the
  * source re-sync's recompute and the native re-embed pass share ONE instance, so the whole store
@@ -113,12 +198,40 @@ import type { EmbeddingProvider } from "../src/embedding";
 import type { KnowledgeSource } from "../src/source-types";
 import type { StoragePort } from "../src/storage";
 
+/**
+ * Preflight check (Codex review, PR #51 round 6, FIX P) — confirms `embedder` can actually produce
+ * a real embedding BEFORE this script commits to anything. See the file docstring's "Preflight"
+ * section for the full failure mode this closes (the direct consequence of round 5's stamp-early
+ * ordering: an --embedder onnx run on a host where the model can't load would otherwise stamp the
+ * pin, then have every per-item re-embed fail silently, caught one at a time, never aborting the
+ * run). Throws (never returns a boolean) so a caller can't accidentally proceed past a failed
+ * preflight by forgetting to check a return value — main() lets the throw propagate uncaught, which
+ * aborts the whole run before adoptEmbedderPin or any re-embed work runs.
+ *
+ * Exported for testability: embedder-pin.test.ts-adjacent unit tests import this directly against a
+ * real (hashing) and a fake failing embedder, without invoking main() — see the entry-point guard
+ * at the bottom of this file (same established pattern as scripts/scrub-corpus.mjs/scrub-db.mjs).
+ */
+export async function preflightEmbedder(embedder: EmbeddingProvider, label: string): Promise<void> {
+  try {
+    await embedder.embed("preflight");
+  } catch (e) {
+    throw new Error(
+      `Embedder preflight failed for --embedder ${label}: this model cannot produce an embedding ` +
+        `right now (network unreachable, model not cached locally, or a genuine load failure). ` +
+        `Aborting BEFORE stamping the pin or touching any data — nothing was written. Fix the ` +
+        `underlying issue (or choose a different --embedder) and re-run.`,
+      { cause: e },
+    );
+  }
+}
+
 interface OrphanConcept {
   id: string;
   title: string;
 }
 
-interface SourceMigrationReport {
+export interface SourceMigrationReport {
   sourceId: string;
   type: KnowledgeSource["type"];
   lifecycle: KnowledgeSource["lifecycle"];
@@ -133,7 +246,7 @@ interface SourceMigrationReport {
   error: string | null;
 }
 
-interface NativeReembedReport {
+export interface NativeReembedReport {
   attempted: number;
   succeeded: number;
   succeededIds: string[];
@@ -143,7 +256,7 @@ interface NativeReembedReport {
   durationMs: number;
 }
 
-interface GraphRebuildReport {
+export interface GraphRebuildReport {
   attempted: number;
   succeeded: number;
   failed: Array<{ id: string; error: string }>;
@@ -382,6 +495,57 @@ function printReport(
   }
 }
 
+/**
+ * Whether ANY loop above recorded a failure — source sync/orphan retirement, native concept
+ * re-embed, native observation re-embed, or graph rebuild (Codex review, PR #51 round 8, FIX Y).
+ * Every one of those loops is deliberately per-item resilient (one bad item never aborts the rest —
+ * see each loop's own docstring for why), so a --apply run can complete and print a report while
+ * some vectors are still stranded under the OLD embedding model. This predicate is what main() uses
+ * to decide whether a completed run must still exit non-zero. Exported for testability: a pure
+ * function over the three report shapes, no I/O of its own — the ordering/looping logic that
+ * PRODUCES these reports still isn't independently testable without a real MonetCore and real (or
+ * poisoned) sources, but the fail-hard DECISION itself is exercised directly, without needing to
+ * drive a full run to prove this part works.
+ */
+export function anyMigrationFailure(
+  reports: SourceMigrationReport[], native: NativeReembedReport, graph: GraphRebuildReport,
+): boolean {
+  return (
+    reports.some((r) => r.error !== null) ||
+    native.failed.length > 0 ||
+    native.observationReembedFailed.length > 0 ||
+    graph.failed.length > 0
+  );
+}
+
+/**
+ * Builds the prominent, impossible-to-miss failure message main() throws when
+ * anyMigrationFailure() is true under --apply (Codex review, PR #51 round 8, FIX Y). Exported for
+ * testability — asserting on its exact content without needing to drive main() end-to-end.
+ */
+export function migrationIncompleteMessage(embedderLabel: string): string {
+  const bar = "!".repeat(78);
+  return [
+    "",
+    bar,
+    "MIGRATION INCOMPLETE — this store is MID-MIGRATION, not done.",
+    bar,
+    `The pin already points at the target embedder (${embedderLabel}) — that stamp happens`,
+    "deliberately EARLY, before this run's own work, and stays UNCHANGED by a failure discovered",
+    "later (see this file's docstring, \"Embedder pin\" section). Some vectors reported above are",
+    "STILL under the OLD model, mismatched against that pin.",
+    "",
+    "DO NOT open this store with any served path (the MCP server, the CLI) until it is fully",
+    "migrated — queries would silently mix two incompatible vector spaces.",
+    "",
+    "Re-run this script against the SAME db-path: every step here is idempotent, and a failed",
+    "item is retried from scratch on the next invocation exactly like one that was never touched",
+    "(see the per-section CAVEATs printed above). Keep re-running until a pass reports ZERO",
+    "failures in every section. If failures persist, restore the mandatory backup instead.",
+    bar,
+  ].join("\n");
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const flagValue = (name: string): string | undefined => {
@@ -432,8 +596,34 @@ async function main(): Promise<void> {
   }
 
   const embedder: EmbeddingProvider = embedderChoice === "onnx" ? new OnnxEmbeddingProvider() : new HashingEmbeddingProvider();
-  const core = new MonetCore(dbPath, { ...(storageDir ? { sourceStorageDir: storageDir } : {}), embedder });
+  // Codex review (PR #51 round 7, FIX X): preflight BEFORE constructing MonetCore, not after (round
+  // 6's FIX P ran it post-construction) — see the file docstring's "Preflight" section for why: on a
+  // vector-free target DB, construction's OWN fresh-store branch can stamp a 'created' pin naming
+  // an embedder that then turns out to be unloadable, so a preflight that runs AFTER construction
+  // can fail while leaving exactly the unsatisfied pin it was meant to prevent. The embedder
+  // instance exists independently of the core, so running this first costs nothing.
+  if (applyFlag) await preflightEmbedder(embedder, embedderChoice);
+  const core = new MonetCore(dbPath, {
+    ...(storageDir ? { sourceStorageDir: storageDir } : {}),
+    embedder,
+    // Codex review (PR #51 round 7, FIX V): report-only must never write a pin, even against a
+    // vector-free target DB whose fresh-store branch would otherwise mint one — see
+    // MonetCoreOptions.deferCreatedPin's own doc comment and the file docstring's "Report-only by
+    // default" section. Under --apply, construction now runs only AFTER a successful preflight
+    // (immediately above), so any 'created' pin minted here is always of a PROVEN-loadable embedder
+    // — closing the interplay between the two fixes: report-only never stamps regardless of
+    // preflight; --apply's stamp (construction's own, or adoptEmbedderPin's below) is never of an
+    // embedder that hasn't just been confirmed to actually work.
+    deferCreatedPin: !applyFlag,
+  });
   try {
+    // Codex review (PR #51 round 5, FIX N): stamp the pin to THIS run's --embedder before any
+    // re-sync/re-embed/graph work — see the file docstring's "Embedder pin" section for why the
+    // ordering matters and why --apply gates it (a report-only/dry-run pass must never write
+    // anything, pin included; deferCreatedPin above already covers the fresh-store case — this
+    // covers the already-pinned-to-something-else case adoptEmbedderPin exists for).
+    // adoptEmbedderPin() is synchronous — no await needed.
+    if (applyFlag) core.adoptEmbedderPin();
     const sources = core.listSources({ includeTombstoned: true }).filter((s) => !onlySourceId || s.id === onlySourceId);
     // REVIEW FIX (round 4, Codex thread 16): a store with NO matching sources (a native-only
     // store, or one whose sources were already migrated/removed since the last embedder swap)
@@ -456,12 +646,32 @@ async function main(): Promise<void> {
     // file docstring's step 4 and rederiveNativeConceptGraphs' own docstring for why.
     const graph = await rederiveNativeConceptGraphs(core, native.succeededIds, applyFlag);
     printReport(reports, native, graph, applyFlag, embedderChoice);
+
+    // Codex review (PR #51 round 8, FIX Y): every loop above is deliberately per-item resilient (see
+    // each loop's own docstring) so ONE run makes maximum progress even when something is broken —
+    // but that same resilience means a --apply run can complete and exit 0 with the pin ALREADY
+    // stamped to the target space (adoptEmbedderPin above, or construction's own fresh-store branch)
+    // while some vectors are STILL under the OLD model: a genuinely half-migrated store that looks,
+    // from the exit code alone, like a clean success. FAIL HARD here, at the very end, on the
+    // SUMMARY — never mid-run (the loops above are untouched; this is purely a post-hoc check).
+    // Report-only is unaffected: nothing was ever mutated under it, so there is nothing to warn
+    // about — anyMigrationFailure is always false there anyway (every loop above returns an empty
+    // report when !applyFlag), but the guard below is explicit about it, not incidental.
+    if (applyFlag && anyMigrationFailure(reports, native, graph)) {
+      throw new Error(migrationIncompleteMessage(embedderChoice));
+    }
   } finally {
     core.close();
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+// Run only when invoked directly (`tsx scripts/migrate-file-concept.ts ...`), never as a side
+// effect of importing this module's exported preflightEmbedder elsewhere (Codex review, PR #51
+// round 6, FIX P's test coverage imports it from src/__tests__ — that import must not also execute
+// a full migration run). Same established pattern as scripts/scrub-corpus.mjs/scrub-db.mjs.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

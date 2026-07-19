@@ -59,6 +59,7 @@ import type {
   UpdateSourceInput,
 } from "./source-types";
 import { EmbeddingProvider, HashingEmbeddingProvider, cosine, blend, blendWeighted } from "./embedding";
+import { instantiateEmbedderForPin, UnsatisfiableEmbedderError, LEGACY_ONNX_DEFAULT_MODEL_ID } from "./embedding-onnx";
 import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
 import type { GraftPayload, GraftResult, SyncConceptRow, SyncEdgeComponentRow, SyncEdgeRow } from "./sync-types";
@@ -129,6 +130,31 @@ export class EmbedderMismatchError extends Error {
   ) {
     super(`Embedder mismatch: payload uses '${incoming}' but this engine uses '${local}'. Cannot graft incompatible vector spaces.`);
     this.name = "EmbedderMismatchError";
+  }
+}
+
+/**
+ * Thrown by a served embed choke point OR a cross-store exchange method (store/storeSource/
+ * search/saveWorkstream/gather/recomputeSourceConceptBody/exportDelta/graftRows/batchDedup — see
+ * assertPinSatisfied's doc comment for the exact list and why each is included) when the
+ * engine was constructed with an embedder that does NOT match this store's recorded pin, and
+ * ensureEmbedderPin() has not yet been awaited to reconcile the two (MonetCore.pinUnsatisfied).
+ *
+ * Closes the cross-consumer bypass: "await ensureEmbedderPin() before serving" was otherwise
+ * JSDoc-only — an external caller (e.g. a monet-client CLI path) that skipped it would silently run
+ * the wrong-space embedder against a pinned store: bad recall on a read, mixed-space writes on a
+ * write, with no signal anything was wrong. This makes that misuse a loud, immediate throw instead.
+ */
+export class EmbedderPinUnsatisfiedError extends Error {
+  constructor(
+    public readonly pinnedModelId: string,
+    public readonly constructedModelId: string,
+  ) {
+    super(
+      `This store is pinned to '${pinnedModelId}' but the engine was constructed with ` +
+        `'${constructedModelId}'. Await core.ensureEmbedderPin() before serving.`,
+    );
+    this.name = "EmbedderPinUnsatisfiedError";
   }
 }
 
@@ -495,6 +521,29 @@ export interface BatchReassignResult {
 
 export interface MonetCoreOptions {
   embedder?: EmbeddingProvider;
+  /**
+   * Strict pin-satisfaction loader used by ensureEmbedderPin() when the store's persisted pin
+   * (sync_meta.embedder_model_id) doesn't match `embedder` above. Defaults to
+   * instantiateEmbedderForPin (embedding-onnx.ts). Override only as a deterministic test seam
+   * (e.g. to satisfy an ONNX pin without a real model load) — production code should never need a
+   * different loader, since substituting one would defeat the whole point of the pin.
+   */
+  embedderLoader?: (modelId: string) => Promise<EmbeddingProvider>;
+  /**
+   * Suppress the fresh-store 'created' pin stamp (Codex review, PR #51 round 7, FIX V) — a genuinely
+   * fresh/vector-free store gets the SAME legacy-shape sync_meta row a pre-pin-ADR store gets (no
+   * pin columns named, NULL pin), instead of pinning itself to `embedder` above. FOR INSPECTION/
+   * REPORT TOOLING ONLY (scripts/migrate-file-concept.ts's report-only/dry-run path is the
+   * motivating, and so far only, caller) — a report-only run still CONSTRUCTS a MonetCore (schema
+   * auto-upgrade is unconditional) but must never WRITE anything, pin included; without this flag a
+   * vector-free target DB would get permanently pinned to whatever embedder the inspection happened
+   * to construct with, even though nothing was ever meant to be written. Served paths (the MCP
+   * server, an ordinary CLI query/store/search) MUST NEVER set this: the pin then simply gets
+   * created normally by ensureEmbedderPin's empty-store backfill path on first real serve (source
+   * 'backfilled', not 'created' — a cosmetic difference only; the store still ends up correctly
+   * pinned, just one step later than usual). Default false — every existing caller is unaffected.
+   */
+  deferCreatedPin?: boolean;
   synthesizer?: Synthesizer;
   tauAttach?: number;
   tauAmbiguous?: number;
@@ -606,9 +655,38 @@ interface OperationReceiptExpectation {
 export class MonetCore {
   private db: StoragePort;
   private embedder: EmbeddingProvider;
+  /** Strict pin-satisfaction loader for ensureEmbedderPin() — see MonetCoreOptions.embedderLoader. */
+  private embedderLoader: (modelId: string) => Promise<EmbeddingProvider>;
   private synthesizer: Synthesizer;
-  private tauAttach: number;
-  private tauAmbiguous: number;
+  // tauAttach/tauAmbiguous/edgeSimMin (below) are assigned via applyEmbedderDerivedThresholds(),
+  // not a direct `this.x = ` in the constructor body, so `strictPropertyInitialization` cannot see
+  // the assignment — definite-assignment-asserted (`!`) rather than left unsafely optional; the
+  // constructor calls applyEmbedderDerivedThresholds() unconditionally before either field is read.
+  private tauAttach!: number;
+  private tauAmbiguous!: number;
+  /**
+   * The RAW tauAttach/tauAmbiguous/edgeSimMin opts as passed to the constructor (undefined where
+   * not explicitly set) — captured once, verbatim, so applyEmbedderDerivedThresholds can re-apply
+   * the constructor's documented precedence (explicit opt → embedder's recommendedThresholds →
+   * legacy default) under a DIFFERENT embedder after ensureEmbedderPin() swaps this.embedder.
+   * Without this, an explicit opt's precedence over the embedder's recommendation could not be
+   * honored on re-derivation — there would be no way to tell "explicitly 0.55" from "defaulted to
+   * 0.55 because the original embedder happened to recommend it".
+   */
+  private explicitThresholdOpts: Pick<MonetCoreOptions, "tauAttach" | "tauAmbiguous" | "edgeSimMin">;
+  /**
+   * Constructor-time pin guard (embedder-pin ADR, review hardening): armed at the end of the
+   * constructor when this store already has a recorded pin that does NOT match the
+   * constructor-provided embedder. The "await ensureEmbedderPin() before serving" contract is
+   * otherwise JSDoc-only — an external consumer (e.g. a monet-client CLI path) that constructs
+   * MonetCore and calls store()/search() etc. without that await would silently run the wrong-space
+   * embedder against a pinned store. Every served embed choke point calls assertPinSatisfied()
+   * first (see that method for the exact list). Cleared by ensureEmbedderPin() once it has
+   * reconciled this.embedder with the pin, one way or the other.
+   */
+  private pinUnsatisfied = false;
+  /** See MonetCoreOptions.deferCreatedPin — read once by initSyncIdentity's fresh-store branch. */
+  private deferCreatedPin: boolean;
   private agentId: string;
   private scopeContext: string | null;
   private defaultCircle: string;
@@ -616,7 +694,7 @@ export class MonetCore {
   private sessionId: string | null = null; // lazily opened on first write/checkpoint
   private graphEnabled: boolean;
   private graphParams: GraphParams;
-  private edgeSimMin: number;
+  private edgeSimMin!: number; // see the tauAttach/tauAmbiguous comment above — same reason
   private newId: () => string;
   private sourceRegistry: SourceRegistry;
   private sourceLedger: SourceLedger;
@@ -639,11 +717,17 @@ export class MonetCore {
   constructor(db: string | StoragePort = ":memory:", opts: MonetCoreOptions = {}) {
     this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
+    this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
+    this.deferCreatedPin = opts.deferCreatedPin ?? false;
     this.synthesizer = opts.synthesizer ?? new DeterministicSynthesizer();
     // Thresholds belong with the embedding space (cosine distributions differ per model).
-    // Precedence: explicit opt → the embedder's calibrated recommendation → legacy default.
-    this.tauAttach = opts.tauAttach ?? this.embedder.recommendedThresholds?.tauAttach ?? 0.55;
-    this.tauAmbiguous = opts.tauAmbiguous ?? this.embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
+    // Precedence: explicit opt → the embedder's calibrated recommendation → legacy default. Raw
+    // opts captured first so this precedence can be re-applied verbatim under a DIFFERENT embedder
+    // later (embedder-pin ADR: ensureEmbedderPin may swap this.embedder after construction — see
+    // applyEmbedderDerivedThresholds). tauAttach/tauAmbiguous/edgeSimMin are set as a side effect of
+    // that call below, not assigned directly here, so there is exactly one place that implements
+    // the precedence rule.
+    this.explicitThresholdOpts = { tauAttach: opts.tauAttach, tauAmbiguous: opts.tauAmbiguous, edgeSimMin: opts.edgeSimMin };
     this.agentId = opts.agentId ?? "local-agent";
     this.newId = opts.idGen ?? randomUUID;
     this.sourceStorageDir = resolve(opts.sourceStorageDir ?? resolve(homedir(), ".monet", "sources"));
@@ -662,9 +746,10 @@ export class MonetCore {
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
     this.graphEnabled = opts.graphEnabled ?? true;
     this.graphParams = { ...DEFAULT_GRAPH_PARAMS, ...opts.graph, wType: { ...DEFAULT_GRAPH_PARAMS.wType, ...opts.graph?.wType } };
-    // A `related` edge needs more overlap than a semantic model implies; bind to the embedder scale.
-    const semantic = (this.embedder.recommendedThresholds?.tauAttach ?? 0) >= 0.7;
-    this.edgeSimMin = opts.edgeSimMin ?? (semantic ? 0.45 : 0.4);
+    // Sets tauAttach/tauAmbiguous/edgeSimMin from this.embedder + explicitThresholdOpts (both
+    // already assigned above) — see the method's doc comment for why this must also run again
+    // after any embedder-pin swap, not just here at construction.
+    this.applyEmbedderDerivedThresholds(this.embedder);
     this.init();
     this.initSyncIdentity(opts.syncDeviceId);
     this.sourceRegistry.ensureSchema();
@@ -682,6 +767,17 @@ export class MonetCore {
     if (versionAfterSourceLedger >= SOURCE_LEDGER_SCHEMA_VERSION && versionAfterSourceLedger < SOURCE_FILE_CONCEPT_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
     }
+    // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
+    // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
+    // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
+    // reading the pin only AFTER it runs means a fresh store's read here always finds a match and
+    // never arms. A pre-pin store (pin still NULL — backfill only happens in ensureEmbedderPin,
+    // which needs the async loader and the dimension-sampling read this constructor deliberately
+    // does not do) also never arms: NULL isn't "non-NULL and different", it's simply unknown yet,
+    // and legacy callers (eval harness, scripts/*.ts) that never call ensureEmbedderPin() must keep
+    // working unmodified against such a store.
+    const pinRow = this.db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null };
+    this.pinUnsatisfied = pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== this.embedderModelId;
   }
 
   private initSyncIdentity(requested?: string): void {
@@ -694,11 +790,80 @@ export class MonetCore {
       // Wall time only seeds a store once. Fold in legacy semantic timestamps so the first logical
       // tick is newer than every row already present in a pre-v8 database.
       const seed = Math.max(Date.now(), this.maxPersistedSyncTimestamp());
-      this.db
-        .prepare(`INSERT INTO sync_meta (singleton, device_id, last_mutation_at) VALUES (1, ?, ?)`)
-        .run(deviceId, seed);
+      // Embedder pin (embedder-pin ADR, slice 1; Codex review PR #51, FIX E): this branch runs at
+      // most once ever — exactly when the sync_meta singleton row is first created — but "no row
+      // yet" is NOT the same claim as "genuinely fresh store". The comment two lines up already
+      // acknowledges the shape that breaks that assumption: a pre-v8 database predates sync_meta
+      // ENTIRELY (the table itself is created fresh by init()'s CREATE TABLE IF NOT EXISTS on this
+      // very open, same as for a truly fresh store), so it reaches this exact branch on its first
+      // open under sync-aware code while already carrying real legacy vectors in
+      // observations/concepts from before the table existed. Pinning such a store to the
+      // CONSTRUCTOR embedder here — as if fresh — would be permanently wrong whenever that embedder
+      // differs from whatever actually produced the legacy vectors: ensureEmbedderPin's
+      // dimension-based backfill (backfillEmbedderPin) would never run, because embedderModelId
+      // already "matches" a pin that was never earned from the store's actual evidence. Probe for
+      // legacy vectors before deciding: init()'s CREATE TABLE IF NOT EXISTS has already run by this
+      // point (this.init() precedes this.initSyncIdentity() in the constructor), so observations
+      // and concepts exist and are queryable regardless of which shape this store turns out to be.
+      // Codex review (PR #51 round 7, FIX V + FIX W): two MORE reasons — beyond FIX E's legacy-
+      // vector probe above — that "no row yet" must not mint a 'created' pin:
+      //   - deferCreatedPin (FIX V) — the CALLER explicitly declared it is inspection/report
+      //     tooling that must never write anything (see MonetCoreOptions.deferCreatedPin's own doc
+      //     comment). Checked independently of hasAnyStoredVector(): a report-only run against a
+      //     genuinely EMPTY target DB must still not stamp a pin, even though FIX E's own vector
+      //     probe alone would see "no legacy evidence" and mint one.
+      //   - this.embedder.modelId === undefined (FIX W) — embedderModelId's own fallback
+      //     (`dim:${this.embedder.dim}`, see that getter) is a COMPARISON convenience for the graft
+      //     rejection check, never a persistable identity: any other anonymous provider of the SAME
+      //     dimension satisfies it trivially later, making the whole guard vacuous for exactly the
+      //     population (custom/test-fixture embedders with no real modelId) most likely to differ
+      //     from each other in ways only their body matters, not their declared name. A store
+      //     meant to be genuinely pinned needs a provider with a real modelId; anonymous ones don't
+      //     get to mint one on this store's behalf. This is path 1 of 3 that principle now covers —
+      //     backfillEmbedderPin's own empty-store branch (path 2, round 8) and ensureEmbedderPin's
+      //     FIX O recovery branch (path 3, FIX AB round 9) apply it identically, each at the moment
+      //     THEY would otherwise mint a dim:N pin.
+      // All three reasons (FIX E, FIX V, FIX W) converge on the exact SAME "write the legacy-shape
+      // row" branch below — there is nothing shape-specific about any one of them once the decision
+      // is "don't pin yet".
+      if (this.hasAnyStoredVector() || this.deferCreatedPin || this.embedder.modelId === undefined) {
+        // Leave embedder_model_id/embedder_pin_source/embedder_pinned_at NULL — identical to a
+        // pre-pin store that has ALWAYS had a sync_meta row. The constructor-time guard read below
+        // (this method returns before that code runs) sees NULL and stays unarmed — nothing is
+        // "unsatisfied" until ensureEmbedderPin() actually runs and backfills from this store's
+        // real vector evidence.
+        this.db
+          .prepare(`INSERT INTO sync_meta (singleton, device_id, last_mutation_at) VALUES (1, ?, ?)`)
+          .run(deviceId, seed);
+      } else {
+        // Genuinely fresh (no legacy evidence, no defer request, a real modelId) — pins to the
+        // embedder it was actually constructed with. `source = 'created'` distinguishes this from a
+        // later backfill onto a pre-pin store that never recorded one (see ensureEmbedderPin /
+        // backfillEmbedderPin).
+        this.db
+          .prepare(
+            `INSERT INTO sync_meta (singleton, device_id, last_mutation_at, embedder_model_id, embedder_pin_source, embedder_pinned_at)
+             VALUES (1, ?, ?, ?, 'created', ?)`,
+          )
+          .run(deviceId, seed, this.embedderModelId, Date.now());
+      }
     }
     this.syncDeviceId = deviceId;
+  }
+
+  /**
+   * Does this store hold ANY evidence vector at all — in `observations` or `concepts`, regardless
+   * of kind? Deliberately coarse and unfiltered (unlike sampleStoredVectorDim's kind='source'
+   * exclusion, FIX G/K): the callers here only need "is there any history at all", not a precise
+   * inventory, so erring toward "yes, treat as non-empty" is the conservative direction for both.
+   * Shared by initSyncIdentity's legacy-upgrade probe (FIX E) and migrate()'s graph-backfill
+   * trustworthiness check (Codex review, PR #51 round 4, FIX M).
+   */
+  private hasAnyStoredVector(): boolean {
+    return (
+      this.db.prepare(`SELECT 1 FROM observations LIMIT 1`).get() !== undefined ||
+      this.db.prepare(`SELECT 1 FROM concepts WHERE embedding IS NOT NULL LIMIT 1`).get() !== undefined
+    );
   }
 
   /** Highest semantic timestamp already persisted in any sync-relevant row family. */
@@ -949,7 +1114,10 @@ export class MonetCore {
         last_mutation_at INTEGER NOT NULL,
         applying_remote INTEGER NOT NULL DEFAULT 0,
         closure_migrated INTEGER NOT NULL DEFAULT 0,
-        clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))
+        clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical')),
+        embedder_model_id TEXT,
+        embedder_pin_source TEXT CHECK (embedder_pin_source IN ('created', 'backfilled', 'migrated')),
+        embedder_pinned_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS memory_edge_components (
         src_id TEXT NOT NULL,
@@ -989,6 +1157,34 @@ export class MonetCore {
         PRIMARY KEY (origin_id, table_name, natural_key)
       );
     `);
+    // Embedder pin columns (embedder-pin ADR, slice 1) — guarded here in init(), NOT in migrate()
+    // (Codex review, PR #51 round 6, FIX T): a v8-era store whose sync_meta TABLE already exists
+    // (predates these 3 columns) but whose SINGLETON ROW does not yet exist (e.g. this store's very
+    // first open ever under ANY v8+ code, or a stranded partial-init from a crash before the row was
+    // written) reaches initSyncIdentity()'s `!existing` branch — which INSERTs naming
+    // embedder_model_id/embedder_pin_source/embedder_pinned_at explicitly — BEFORE migrate() ever
+    // runs (constructor order: init() -> initSyncIdentity() -> ... -> migrate()). If these columns
+    // only existed via a guard inside migrate(), that INSERT would fail with "no such column:
+    // embedder_model_id" on such a store — bricking it at open, for every store shape, not just the
+    // pin-related ones this ADR is scoped to. Guarding immediately after the CREATE TABLE IF NOT
+    // EXISTS above (this same exec() call, same transaction-free but still-synchronous sequence)
+    // means the columns exist unconditionally before ANY sync_meta write, including
+    // initSyncIdentity's. The FIX E backfill-vs-create branch and the constructor-time guard's own
+    // pin read both happen even later (both after migrate()), so moving this guard earlier only
+    // helps them — nothing downstream depends on this guard specifically running from WITHIN
+    // migrate() rather than init(). CHECK-constraint text kept byte-identical to the original
+    // migrate()-based guard (below) so an existing store's column definition never changes shape,
+    // only WHEN it gets added.
+    const syncMetaColsForPin = this.db.prepare(`PRAGMA table_info(sync_meta)`).all() as Array<{ name: string }>;
+    if (!syncMetaColsForPin.some((c) => c.name === "embedder_model_id")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN embedder_model_id TEXT`);
+    }
+    if (!syncMetaColsForPin.some((c) => c.name === "embedder_pin_source")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN embedder_pin_source TEXT CHECK (embedder_pin_source IN ('created', 'backfilled', 'migrated'))`);
+    }
+    if (!syncMetaColsForPin.some((c) => c.name === "embedder_pinned_at")) {
+      this.db.exec(`ALTER TABLE sync_meta ADD COLUMN embedder_pinned_at INTEGER`);
+    }
   }
 
   /** Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
@@ -1005,6 +1201,11 @@ export class MonetCore {
     if (!syncMetaCols.some((c) => c.name === "clock_mode")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))`);
     }
+    // Embedder pin columns: guarded in init() now, immediately after sync_meta's CREATE TABLE IF NOT
+    // EXISTS (Codex review, PR #51 round 6, FIX T — see that guard's own comment for why it had to
+    // move earlier than initSyncIdentity(), which runs before this method). Nothing left to do here;
+    // kept as a marker comment, not a silent gap, so a future reader grepping migrate() for "embedder
+    // pin" still finds the explanation instead of concluding the column-add was dropped entirely.
     const closureNeedsMigration = (this.db.prepare(
       `SELECT closure_migrated AS value FROM sync_meta WHERE singleton = 1`,
     ).get() as { value: number }).value === 0;
@@ -1116,10 +1317,34 @@ export class MonetCore {
     // edges for concepts stored before the graph feature. Version-gated so it runs at most once, and only
     // when the graph is enabled — a graph-disabled open must NOT consume the upgrade slot (the next
     // graph-enabled open should still backfill).
-    const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (this.graphEnabled && version < GRAPH_SCHEMA_VERSION) {
-      this.backfillGraph();
-      this.db.pragma(`user_version = ${GRAPH_SCHEMA_VERSION}`);
+    //
+    // DEFER, don't run, when the thresholds backfillGraph would use right now (this.tauAttach/
+    // this.edgeSimMin — already derived from the CONSTRUCTOR-PROVIDED embedder, above in this same
+    // constructor call) cannot yet be trusted (Codex review, PR #51 round 4, FIX M). Two cases:
+    //   - The store is ALREADY PINNED to a DIFFERENT embedder than the constructor provided.
+    //     backfillGraph would cosine-compare stored vectors from the PINNED space under thresholds
+    //     calibrated for the CONSTRUCTOR's space — permanently wrong/missing `related` edges, since
+    //     this is version-gated to run at most once. Realistic trigger: a store pinned to hashing
+    //     while graphEnabled:false (never yet reached this gate — see the comment above), later
+    //     reopened graphEnabled:true with a mismatched constructor embedder (e.g. the ONNX default).
+    //   - The pin is still NULL but the store already holds vectors: backfillEmbedderPin's inference
+    //     hasn't run yet, so we don't even know WHICH space's thresholds would be correct.
+    // Deferring means simply NOT bumping user_version past GRAPH_SCHEMA_VERSION here — the trigger
+    // condition below stays true on the next check. ensureEmbedderPin() (async, runs after
+    // construction — ADR-CONTRACT: every served path awaits it) completes the deferred backfill via
+    // runGraphBackfillIfPending() once this.embedder is confirmed to satisfy the pin, under
+    // trustworthy thresholds (whether via a swap+re-derivation or a same-embedder confirmation). A
+    // store whose caller never calls ensureEmbedderPin() keeps the backfill pending indefinitely —
+    // strictly safer than running it now with untrusted thresholds, and every served path already
+    // calls ensureEmbedderPin() (see assertPinSatisfied's gated-call-site list) before touching
+    // anything the missing edges would affect.
+    const pinRowForGraphBackfill = this.db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null };
+    const graphBackfillTrustworthy =
+      pinRowForGraphBackfill.embedder_model_id !== null
+        ? pinRowForGraphBackfill.embedder_model_id === this.embedderModelId // pinned: trustworthy only if the pin matches what's about to score
+        : !this.hasAnyStoredVector(); // unpinned: trustworthy only if there's nothing yet to mis-score (genuinely empty)
+    if (graphBackfillTrustworthy) {
+      this.runGraphBackfillIfPending();
     }
     // 0.6.0 temporal layer (TEMPORAL_SCHEMA_VERSION = 2):
     //   - last_confirmed_at / last_confirmed_session_id on concepts (evidence-confirmation timestamps)
@@ -1573,6 +1798,7 @@ export class MonetCore {
   }
 
   private async storeInternal(content: string, opts: StoreOpts, sourceConnector: boolean): Promise<IngestResult> {
+    this.assertPinSatisfied(); // embedder-pin ADR — before anything else, including the sourceConnector branch to storeSourceChunk
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
     const sourceIdentity = sourceConnector ? canonicalSourceIdentity(opts.sourceRefs ?? []) : null;
     if (sourceConnector && !sourceIdentity) throw new Error("source ingestion requires one canonical source identity");
@@ -1835,6 +2061,7 @@ export class MonetCore {
    * to that circle (unchanged single-circle behavior).
    */
   async search(query: string, opts: { circle?: string; limit?: number; includeArchived?: boolean } & SourceAwareReadOptions = {}): Promise<SearchCard[]> {
+    this.assertPinSatisfied(); // embedder-pin ADR
     const limit = opts.limit ?? 5;
     const emb = await this.embedder.embed(query);
     const resolvedCircle = opts.circle !== undefined ? this.resolveCircle(opts.circle) : undefined;
@@ -2000,6 +2227,7 @@ export class MonetCore {
    * never marked dirty. Restored next session via getActiveWorkstreams / prewarm (#242).
    */
   async saveWorkstream(payload: WorkstreamPayload, opts: { circle?: string; summary?: string } = {}): Promise<Workstream> {
+    this.assertPinSatisfied(); // embedder-pin ADR
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
     const sessionId = this.ensureSession();
     const full: WorkstreamPayload = { ...payload, lastSessionId: sessionId };
@@ -2483,6 +2711,7 @@ export class MonetCore {
   }
 
   async recomputeSourceConceptBody(conceptId: string): Promise<void> {
+    this.assertPinSatisfied(); // embedder-pin ADR — routine source-sync maintenance, not the migration script's re-embed pass
     const initial = this.getRow(conceptId);
     if (!initial) throw new Error(`concept not found: ${conceptId}`);
     if (initial.kind !== "source") throw new Error("recomputeSourceConceptBody requires a source concept");
@@ -2968,6 +3197,7 @@ export class MonetCore {
 
   /** Restore a retired concept's active read status and graph footprint. */
   restoreConcept(id: string): Concept | null {
+    this.assertPinSatisfied(); // embedder-pin ADR — rederiveConceptGraph below scores this concept's stored vector against every OTHER concept's under this.tauAttach/this.edgeSimMin
     const row = this.getRow(id);
     if (!row) return null;
     if (row.kind === "workstream") throw new Error("cannot restore a workstream concept");
@@ -3193,6 +3423,7 @@ export class MonetCore {
    * scoped session state, not knowledge) cannot be reassigned.
    */
   reassignCircle(id: string, toCircle: string, opts: { resolution?: "auto" | "forceNew" } = {}): ReassignResult | null {
+    this.assertPinSatisfied(); // embedder-pin ADR — bestMatches below decides merge-vs-move under this.tauAttach/this.tauAmbiguous
     const src = this.getRow(id);
     if (!src) return null;
     if (src.kind === "workstream") throw new Error("cannot reassign a workstream concept");
@@ -3234,6 +3465,7 @@ export class MonetCore {
    * When ALL observations are detached into a named destConceptId the emptied source is deleted.
    */
   async detach(sourceConceptId: string, observationIds: string[], opts: { destConceptId?: string; circle?: string } = {}): Promise<DetachResult> {
+    this.assertPinSatisfied(); // embedder-pin ADR — rederiveConceptGraph below (via unwind+rederive on the source/dest split) scores stored vectors under this.tauAttach/this.edgeSimMin
     if (observationIds.length === 0) throw new Error("observationIds must be non-empty");
 
     const srcRow = this.getRow(sourceConceptId);
@@ -4795,6 +5027,564 @@ export class MonetCore {
     return this.embedder.modelId ?? `dim:${this.embedder.dim}`;
   }
 
+  // ---- embedder pin (embedder-pin ADR, slice 1) ----------------------------
+
+  /**
+   * Constructor-time pin guard — called at the top of every served embed choke point, every
+   * cross-store exchange method, every vector-threshold-comparison method, AND every dim-sized
+   * vector WRITE, BEFORE any other work, so a caller that skipped `await ensureEmbedderPin()` fails
+   * loudly and immediately rather than silently running the wrong-space embedder. Gated call sites,
+   * by category (Codex review, PR #51 round 9, FIX AC, widened the taxonomy from three categories
+   * to four — see the fourth, below, for what it added):
+   *  - Embed choke points (every place this.embedder.embed() is reachable from a normal client
+   *    request): store/storeSource (via storeInternal — its non-source-connector branch is the
+   *    real embed call; see category 4 below for its OTHER branch), search, saveWorkstream, gather,
+   *    recomputeSourceConceptBody (routine source-sync maintenance, NOT a one-off migration).
+   *  - Cross-store exchange (reads/compares embedderModelId or stored vector data against another
+   *    engine's data — Codex review, PR #51, FIX A): exportDelta (would otherwise stamp the WRONG
+   *    embedderModelId onto its payload, poisoning whatever engine grafts it), graftRows (would
+   *    otherwise validate the incoming payload against the WRONG local identity), batchDedup
+   *    (reads already-grafted concepts' stored vectors and cosine-compares them using
+   *    this.tauAmbiguous — which is ALSO miscalibrated whenever this.pinUnsatisfied is true, since
+   *    applyEmbedderDerivedThresholds hasn't run against the pin-satisfying embedder yet).
+   *  - Vector-threshold comparison WITHOUT embedding (reads bestMatches/cosine against ALREADY-
+   *    STORED vectors, applying this.tauAttach/this.tauAmbiguous/this.edgeSimMin — Codex review,
+   *    PR #51, FIX H): reassignCircle (bestMatches decides merge-vs-move under tauAttach/
+   *    tauAmbiguous), mergeCircle (delegates to reassignCircle per concept, but gates explicitly
+   *    at its OWN top too — the per-item try/catch further down wraps any thrown error into a
+   *    generic "mergeCircle failed for concept X: ..." Error, so gating here first preserves
+   *    EmbedderPinUnsatisfiedError's identity instead of losing it to that wrapper), restoreConcept
+   *    and detach (both call rederiveConceptGraph, which runs bestMatches against every other
+   *    concept under tauAttach/edgeSimMin to rebuild `related` edges).
+   *  - Dim-sized vector WRITES without embedding (Codex review, PR #51 round 9, FIX AC — a category
+   *    the FIX H audit missed: writing a vector SIZED from this.embedder.dim into a pinned store is
+   *    its own hazard independent of any threshold comparison, since a wrong-dimension write from an
+   *    unensured mismatched core corrupts that row for every FUTURE cosine comparison against it,
+   *    not just the write itself): storeInternal's source-connector branch to storeSourceChunk (its
+   *    placeholder vector's dimension derives from this.embedder.dim — gating storeInternal's own
+   *    entry, already required for category 1 above, covers this branch too, confirmed by reading
+   *    storeSourceChunk's only caller); recomputeNativeConceptProjection (its empty-observation
+   *    branch writes `new Float32Array(this.embedder.dim)` directly into concepts.embedding — gated
+   *    at its own top, the "preferred" fix per FIX AC's own ruling: enumerated all 4 callers
+   *    (resolveContradiction, supersedeObservation — both newly protected by this single gate;
+   *    restoreConcept, graftRows — both ALREADY gated independently, for their own
+   *    category-3/category-2 reasons, so this is redundant-but-harmless belt-and-suspenders for
+   *    them) and confirmed none is a legitimate ungated caller — scripts/migrate-file-concept.ts
+   *    never calls any of the four, and even if it did, core.adoptEmbedderPin() already clears
+   *    this.pinUnsatisfied before any of the script's own work runs, so gating this method does not
+   *    break the migration harness).
+   *
+   * Deliberately NOT gated (full audit — every bestMatches/cosine call site AND every dim-sized
+   * vector write in this class was traced to one of the methods above or to one of these):
+   *  - reembedConcept, reembedConceptObservations, rederiveNativeConceptGraph — all three exist
+   *    SPECIFICALLY for the migration script's cross-embedder re-embed pass
+   *    (scripts/migrate-file-concept.ts is their only caller; see their own doc comments), so
+   *    running with a DIFFERENT embedder than whatever the store currently holds is their entire
+   *    purpose, not a bug to guard against.
+   *  - backfillGraph — the one-time pre-graph-schema backfill invoked from migrate() during
+   *    construction, i.e. strictly BEFORE this.pinUnsatisfied is computed (armed at the very end of
+   *    the constructor, after migrate() returns) and not reachable from any post-construction
+   *    public method — this.pinUnsatisfied genuinely cannot gate it. NOT a documented limitation
+   *    though (Codex review, PR #51 round 4, FIX M superseded that framing): migrate() now defers
+   *    the backfill instead of running it under untrustworthy thresholds, and ensureEmbedderPin()
+   *    completes the deferred backfill once this.embedder is confirmed to satisfy the pin — see
+   *    runGraphBackfillIfPending and migrate()'s own DEFER comment for the full mechanics.
+   *  - unwindConceptGraph — pure edge deletion (DELETE statements only); no cosine/bestMatches call
+   *    anywhere in it, and no vector write of any kind, dim-sized or otherwise.
+   *  - adoptEmbedderPin — the operator-intent pin-stamp primitive itself (Codex review, PR #51
+   *    round 5, FIX N). By design, this is the ONE place allowed to run while this.pinUnsatisfied
+   *    is true and simply clear it by fiat — gating it with the very guard it exists to clear would
+   *    be circular. No bestMatches/cosine call of its own — a raw UPDATE plus a guard clear, nothing
+   *    more (round 6, FIX R: it deliberately does NOT complete a deferred graph backfill either —
+   *    see its own doc comment for why that would score OLD, pre-migration vectors under NEW-space
+   *    thresholds). Not reachable from any served path (see its own doc comment) —
+   *    scripts/migrate-file-concept.ts is its only caller, same population as the three
+   *    re-embed/regraph methods directly above.
+   */
+  private assertPinSatisfied(): void {
+    if (!this.pinUnsatisfied) return;
+    const row = this.db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null };
+    throw new EmbedderPinUnsatisfiedError(row.embedder_model_id ?? "(unknown)", this.embedderModelId);
+  }
+
+  /**
+   * Sets tauAttach/tauAmbiguous/edgeSimMin for `embedder`, honoring the constructor's documented
+   * precedence: explicit opt (explicitThresholdOpts, captured once at construction) → `embedder`'s
+   * own calibrated recommendedThresholds → legacy default. This is the ONLY place that
+   * precedence is implemented — called once unconditionally from the constructor, and again from
+   * ensureEmbedderPin() whenever it swaps this.embedder.
+   *
+   * Why this must re-run on a swap (not just at construction): a store's constructor may be handed
+   * ANY embedder as its initial best guess (e.g. the MCP server's default ONNX provider), but end
+   * up pinned to a completely different one (e.g. a legacy hashing store backfilled to tok=1).
+   * tauAttach/tauAmbiguous/edgeSimMin are cosine-distribution-calibrated PER embedding space — an
+   * ONNX-calibrated tauAttach (~0.72) left in place over a hashing embedder (whose similarities
+   * saturate far lower, ~0.55) makes resolve-or-create's attach branch nearly unreachable: every
+   * store() would fork a new concept instead of attaching, silently breaking dedup. That is the
+   * same class of silent degradation this whole ADR exists to eliminate, just one level down (the
+   * embedder identity was fixed; the thresholds calibrated for the WRONG identity were not).
+   */
+  private applyEmbedderDerivedThresholds(embedder: EmbeddingProvider): void {
+    this.tauAttach = this.explicitThresholdOpts.tauAttach ?? embedder.recommendedThresholds?.tauAttach ?? 0.55;
+    this.tauAmbiguous = this.explicitThresholdOpts.tauAmbiguous ?? embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
+    // A `related` edge needs more overlap than a semantic model implies; bind to the embedder scale.
+    const semantic = (embedder.recommendedThresholds?.tauAttach ?? 0) >= 0.7;
+    this.edgeSimMin = this.explicitThresholdOpts.edgeSimMin ?? (semantic ? 0.45 : 0.4);
+  }
+
+  /**
+   * Enforce this store's embedder pin. MUST be awaited once by every served entry point before
+   * handling any request (see createMonetCoreMcpServer, mcp-server.ts) — the constructor itself
+   * stays synchronous and cannot satisfy a pin that requires an async model load, so this is the
+   * seam that closes the gap between "constructed" and "safe to serve".
+   *
+   * - No pin recorded yet (a pre-pin store, opened for the first time under pin-aware code):
+   *   backfill one — see backfillEmbedderPin.
+   * - Pin already satisfied by the constructor-provided embedder (embedderModelId matches): no-op
+   *   — no rewrite, no swap, no threshold recomputation (applyEmbedderDerivedThresholds is NOT
+   *   called on this path; the constructor's own call already set the right values for this case).
+   * - Pin recorded but NOT satisfied: replace this.embedder with one instantiated strictly against
+   *   the pin (embedderLoader, default instantiateEmbedderForPin). NEVER substitutes another
+   *   embedder — any failure propagates as UnsatisfiableEmbedderError and this store must not
+   *   serve. Every write/query call site routes through the same private `embedder` field
+   *   (store/search/graftRows/etc. — including the graft-rejection comparison in graftRows, which
+   *   reads embedderModelId off whatever this.embedder ends up being here), so a swap here
+   *   propagates everywhere with no other call site needing to know it happened. Immediately after
+   *   the swap, tauAttach/tauAmbiguous/edgeSimMin are re-derived for the NEW embedder
+   *   (applyEmbedderDerivedThresholds) — otherwise they would stay calibrated for whichever
+   *   embedder the constructor originally received, silently miscalibrating resolve-or-create.
+   *
+   * Also clears the constructor-time pin guard (this.pinUnsatisfied) on BOTH branches: the swap
+   * branch clears it because this.embedder now genuinely satisfies the pin; the early-return branch
+   * clears it defensively (it should never be armed there — the guard was only ever set from a
+   * mismatch this same read would also have caught — but a stray true here must never survive a
+   * confirmed-satisfied check).
+   *
+   * Codex review (PR #51, FIX C): the guard is armed the INSTANT a mismatch is confirmed — before
+   * `await this.embedderLoader(...)`, not after. If the loader then throws (e.g. an ONNX model
+   * unreachable offline) and a caller catches that rejection and keeps using this core anyway, the
+   * guard must already be armed so every embed choke point still fails closed. Arming only after a
+   * successful load would leave fail-closed behavior dependent on every caller correctly exiting on
+   * an ensureEmbedderPin() rejection — exactly the kind of caller-discipline assumption this whole
+   * ADR exists to stop relying on.
+   *
+   * Codex review (PR #51, FIX I): the SAME reasoning applies one step earlier — backfillEmbedderPin
+   * itself can throw (a mixed-dimension store, or a single dimension this build doesn't recognize)
+   * before `pinnedModelId` is ever assigned. That throw is caught here specifically to arm the guard
+   * before rethrowing. This produces a state worth naming explicitly: pin is (and stays) NULL, yet
+   * the guard is ARMED — legitimately poisoned, not a bug. It is NOT the same as the ordinary
+   * never-ensured pre-pin store (which stays unarmed by design — see the constructor-time guard and
+   * the "guard stays inert" test): that store hasn't been checked yet and might turn out fine; THIS
+   * store has been checked and PROVEN unsafe. A caller that catches this rejection and keeps using
+   * the core must not get an inert guard silently serving the constructor embedder against a store
+   * we just demonstrated cannot be pinned.
+   *
+   * Codex review (PR #51 round 4, FIX M): once this.embedder is confirmed to satisfy the pin — via
+   * either branch below — also completes any graph backfill migrate() deferred at construction time
+   * (runGraphBackfillIfPending; see that method and migrate()'s own DEFER comment). This turns the
+   * old unconditional early `return` on the already-satisfied branch into a fallthrough: cheap
+   * (a single user_version pragma read) and idempotent (no-op whenever nothing was deferred, which
+   * is every store this fix doesn't change the behavior of).
+   *
+   * Codex review (PR #51 round 5, FIX O): if the loader throws AND this store holds ZERO stored
+   * vectors, re-pin to the CURRENT constructor-provided embedder instead of propagating the
+   * failure. Fail-closed's entire rationale is protecting a vector space that real data already
+   * committed to — an empty store has no such commitment, so refusing to serve it forever over an
+   * unloadable pin (e.g. a 'created' pin from a raw, never-warmed provider whose model id turned
+   * out to be wrong or unreachable — see the constructor: a fresh store pins itself to
+   * `this.embedderModelId`, a bare string read off the embedder instance, with no load attempt of
+   * any kind) is pure self-inflicted bricking. A NON-empty store with an unsatisfiable pin still
+   * fails closed exactly as before — FIX I's poisoning semantics are untouched for that case.
+   *
+   * Codex review (PR #51 round 9, FIX AB): FIX O's own re-pin above wrote `this.embedderModelId` —
+   * for an ANONYMOUS constructor embedder (no real modelId), that's the same dim:N comparison
+   * fallback FIX W (path 1) and backfillEmbedderPin's empty-store branch (path 2) already refuse to
+   * persist; see either of those doc comments for the shared principle line this is path 3 of.
+   * When this.embedder.modelId is undefined, the recovery below overwrites the bad pin to fully
+   * NULL instead — the store is empty, so NULL is the honest "no committed space" state, and a
+   * later real-identity open backfills it normally (path 2, above) exactly as any other pre-pin
+   * empty store would. A real-modelId embedder's recovery is completely unchanged.
+   *
+   * Coherence contract (Codex review, PR #51 round 6, declined thread 3610396462 — no code change,
+   * doc only): the SELECT immediately below re-reads the PERSISTED pin on every single invocation,
+   * so this method is always correct against whatever the pin says AT THE MOMENT it runs. What it
+   * does NOT do is guard against the pin being mutated by a DIFFERENT process WHILE this core sits
+   * open and already-ensured between calls — that coherence is guaranteed by store exclusivity (the
+   * migration workflow's documented requirement to close live sessions first; see
+   * scripts/migrate-file-concept.ts's own docstring), not by a re-read on every gated call.
+   *
+   * Codex review (PR #51 round 8, FIX AA): "the pin matches the constructor embedder's modelId
+   * string" is NOT the same claim as "the constructor embedder can actually PRODUCE a vector" —
+   * embedderModelId is a bare string, set at construction with no load attempt of any kind (see the
+   * constructor). A raw, never-warmed OnnxEmbeddingProvider (or any custom async provider) whose
+   * model can't load would pass the satisfied branch's string comparison trivially and clear the
+   * guard without this store ever having produced one real vector — the MCP factory would then
+   * start "successfully," and the failure would surface on the FIRST REAL REQUEST instead of at
+   * startup. The swap branch below doesn't have this gap: instantiateEmbedderForPin's ONNX path
+   * already performs a real `await onnx.embed("warmup")` as part of instantiation (verified by
+   * reading it, not assumed — embedding-onnx.ts), so a swap that "succeeds" has already proven
+   * itself. The satisfied branch never calls the loader at all, so nothing has ever proven this
+   * embedder works — closed by running the identical validation embed there too, BEFORE clearing
+   * the guard. Cost: for hashing, microseconds (pure synchronous JS). For ONNX, this forces the
+   * model load at ensure time instead of the first real request — which is exactly where a served
+   * path WANTS that cost to land (startup, not mid-request), and the mcp-cli path already warmed
+   * this SAME instance during chooseStartupEmbedder (FIX U/Z), so the extra embed() call here is a
+   * cache-hit against an already-initialized model session, not a second cold load.
+   *
+   * No FIX O recovery applies here, even for an empty store: FIX O's whole rationale is "the PIN
+   * names something the loader couldn't build, so fall back to the embedder we DO have working" —
+   * but here the LIVE embedder itself is the one that just failed validation. Re-pinning to a
+   * known-broken embedder would be meaningless (it would just fail again on the very next real
+   * request); this fails loudly instead, the same way a swap-branch failure always has.
+   */
+  async ensureEmbedderPin(): Promise<void> {
+    const row = this.db
+      .prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`)
+      .get() as { embedder_model_id: string | null };
+    let pinnedModelId: string;
+    if (row.embedder_model_id !== null) {
+      pinnedModelId = row.embedder_model_id;
+    } else {
+      try {
+        pinnedModelId = this.backfillEmbedderPin();
+      } catch (e) {
+        this.pinUnsatisfied = true; // poisoned: pin stays NULL, but we now KNOW this store is unsafe (FIX I)
+        throw e;
+      }
+    }
+    if (pinnedModelId === this.embedderModelId) {
+      // FIX AA: a matching modelId proves identity, not capability — validate BEFORE clearing the
+      // guard. See this method's own doc comment for the full reasoning and cost analysis.
+      try {
+        await this.embedder.embed("pin-satisfaction preflight");
+      } catch (e) {
+        // No FIX O recovery here (see doc comment) — the live embedder IS the one that just
+        // failed, so poison the guard and fail loudly, same as an ordinary swap-branch failure.
+        this.pinUnsatisfied = true;
+        throw new UnsatisfiableEmbedderError(
+          pinnedModelId,
+          `This store is pinned to '${pinnedModelId}', which matches the constructor-provided ` +
+            `embedder's own identity — but that embedder failed to produce a vector when asked ` +
+            `(${e instanceof Error ? e.message : String(e)}). A matching modelId only proves the ` +
+            `embedder CLAIMS to be the right one; it does not prove it actually works. Fix the ` +
+            `underlying issue (network, model cache, a broken custom provider) and re-run.`,
+          { cause: e },
+        );
+      }
+      this.pinUnsatisfied = false; // defensive — see doc comment
+    } else {
+      this.pinUnsatisfied = true; // armed BEFORE the loader can fail — see doc comment (FIX C)
+      try {
+        this.embedder = await this.embedderLoader(pinnedModelId);
+        this.applyEmbedderDerivedThresholds(this.embedder);
+        this.pinUnsatisfied = false; // swap succeeded — this.embedder now satisfies the pin
+      } catch (e) {
+        // FIX O: empty store, no committed space to protect — re-pin to the live constructor
+        // embedder (this.embedder was never reassigned above, so it's still exactly what the
+        // constructor set it to) rather than bricking forever. A NON-empty store, or any failure
+        // that isn't UnsatisfiableEmbedderError (a loader-injected fake throwing something else in
+        // tests, say), keeps this.pinUnsatisfied armed and rethrows — unchanged from before FIX O.
+        if (!(e instanceof UnsatisfiableEmbedderError) || this.hasAnyStoredVector()) throw e;
+        if (this.embedder.modelId === undefined) {
+          // FIX AB (round 9): the recovery re-pin must not mint dim:N either — see this method's
+          // own doc comment (principle line) and backfillEmbedderPin's matching branch. Overwrite
+          // the bad pin to fully NULL (the store is empty — NULL is the honest, no-committed-space
+          // state) instead of a third dim:N path; a later real-identity open backfills it normally.
+          this.db
+            .prepare(
+              `UPDATE sync_meta SET embedder_model_id = NULL, embedder_pin_source = NULL, embedder_pinned_at = NULL WHERE singleton = 1`,
+            )
+            .run();
+        } else {
+          this.db
+            .prepare(
+              `UPDATE sync_meta SET embedder_model_id = ?, embedder_pin_source = 'backfilled', embedder_pinned_at = ? WHERE singleton = 1`,
+            )
+            .run(this.embedderModelId, Date.now());
+        }
+        this.pinUnsatisfied = false; // re-pinned (to the embedder this.embedder already is, or to NULL for an anonymous one) — satisfied without a swap
+      }
+    }
+    // this.embedder definitely satisfies the pin now (either it always did, the swap above just made
+    // it so, or FIX O's empty-store re-pin just made it so) — safe to complete any deferred graph
+    // backfill under trustworthy thresholds (FIX M). Trivially a no-op whenever there was nothing to
+    // backfill (certainly true for FIX O's empty-store branch), but one unconditional call site keeps
+    // the invariant simple: always safe once this.embedder is confirmed to satisfy the pin, however.
+    this.runGraphBackfillIfPending();
+  }
+
+  /**
+   * EXPLICIT operator-intent primitive for migration/repair tooling that is ABOUT TO REWRITE this
+   * store's vectors into the CURRENT constructor-provided embedder's space (Codex review, PR #51
+   * round 5, FIX N — scripts/migrate-file-concept.ts's native re-embed pass is its motivating,
+   * and so far only, caller). Unconditionally stamps sync_meta's pin to this.embedderModelId —
+   * source 'migrated', pinned_at now. This is a DELIBERATE OVERWRITE, NOT the CAS-guarded backfill
+   * write (backfillEmbedderPin's `WHERE embedder_model_id IS NULL`): backfillEmbedderPin INFERS
+   * what space an already-written store's existing vectors must have come from; this method is the
+   * operator DECLARING what space the store is about to become — which may legitimately differ
+   * from whatever it was pinned to a moment ago (that's the whole point: a migration run that
+   * re-embeds every vector under a NEW model needs the pin to end up naming that new model, not
+   * whatever it happened to name before).
+   *
+   * Also unconditionally clears the constructor-time guard (this.pinUnsatisfied = false) — the
+   * constructor may well have armed it against the OLD pin (the migration script's embedder
+   * deliberately differs from whatever the store was pinned to; that mismatch is the guard's exact
+   * trigger condition), and this call is the mechanism by which this store's caller makes the
+   * CURRENT embedder authoritative by fiat, not by satisfying a pre-existing pin the way
+   * ensureEmbedderPin does.
+   *
+   * Does NOT call applyEmbedderDerivedThresholds: this.embedder itself is UNCHANGED by this method
+   * (unlike ensureEmbedderPin's swap branch, which replaces this.embedder with a freshly-loaded
+   * one) — it pins the constructor-provided embedder exactly as it already is, so whatever
+   * thresholds the constructor already derived for it at construction time remain correct.
+   *
+   * Does NOT call runGraphBackfillIfPending() — deliberately reverted from round 5's original
+   * version, which did (Codex review, PR #51 round 6, FIX R: round 5's own spec was wrong here).
+   * "Trustworthy by declaration" covers the EMBEDDER identity — this.embedder now genuinely matches
+   * the pin — but NOT the store's VECTOR CONTENTS, which are still pre-migration at the moment this
+   * method runs (scripts/migrate-file-concept.ts calls this BEFORE its re-embed passes, by design —
+   * see FIX N). Completing a deferred backfillGraph() right here would derive `related`/`about`
+   * edges by cosine-comparing OLD-space stored vectors under the NEW embedder's thresholds — the
+   * exact wrong-space comparison FIX M's deferral exists to prevent, reopened one level up by this
+   * method's own call site. Worse, backfillGraph() is version-gated to run AT MOST ONCE
+   * (runGraphBackfillIfPending bumps user_version past GRAPH_SCHEMA_VERSION on completion) — running
+   * it now would PERMANENTLY consume that one-time slot on garbage edges, unrecoverable even if the
+   * script's own later rebuild pass succeeds perfectly.
+   *
+   * The pending slot (if migrate() deferred one at construction) simply stays pending across this
+   * call — untouched, not specially marked, since "untouched" already IS the correct pending state
+   * (see migrate()'s own DEFER comment). It resolves one of two ways, both safe:
+   *   1. The NEXT open with a matching embedder over FULLY migrated vectors reaches migrate()'s own
+   *      trustworthy check, which now sees the pin match and runs the backfill normally, deriving
+   *      edges from data that is by then actually all in one space.
+   *   2. Verified by reading both methods (not assumed): rederiveNativeConceptGraph (engine.ts,
+   *      below reembedConceptObservations) is a PER-CONCEPT unwind+rederive — no PRAGMA user_version
+   *      read or write anywhere in it, entirely independent of backfillGraph's one-time whole-store
+   *      gate. scripts/migrate-file-concept.ts's own step 4 (rederiveNativeConceptGraphs) calls it
+   *      for every successfully re-embedded concept, AFTER step 3's re-embed pass completes — so a
+   *      successful migration run already leaves every touched concept's edges individually correct
+   *      via THIS mechanism, with or without backfillGraph ever having run. When backfillGraph
+   *      eventually does run (path 1, above), its writes are idempotent (INSERT OR IGNORE, per its
+   *      own doc comment) over data step 4 already made internally consistent — not superseded in
+   *      the sense of "never runs", but in the sense that its eventual result is already what step 4
+   *      established, for everything step 4 touched.
+   *
+   * Deliberately synchronous, unlike ensureEmbedderPin: this never loads a DIFFERENT embedder (no
+   * embedderLoader call of any kind) — this.embedder is already live and already what the pin is
+   * about to name, so there is no async model-load step to await.
+   *
+   * NEVER call this from a served path (the MCP server, a CLI query/store/search command). The
+   * served contract remains ensureEmbedderPin() — which enforces whatever pin ALREADY exists and
+   * never overwrites it just because a caller happens to construct with a different embedder.
+   * Calling adoptEmbedderPin() from a served path would let any ordinary caller silently re-pin a
+   * store to whatever it was constructed with, defeating the entire ADR this pin mechanism exists
+   * to enforce. This method exists ONLY for tooling that is ITSELF the source of truth for what the
+   * store's embedder space is about to be — i.e. that is actively rewriting every vector in the
+   * store to match, in the same run, immediately after calling this (see
+   * scripts/migrate-file-concept.ts's own docstring for the ordering rationale: stamp EARLY, before
+   * the re-embed work, so a crash mid-run leaves the pin already pointing at the target space).
+   */
+  adoptEmbedderPin(): void {
+    this.db
+      .prepare(
+        `UPDATE sync_meta SET embedder_model_id = ?, embedder_pin_source = 'migrated', embedder_pinned_at = ? WHERE singleton = 1`,
+      )
+      .run(this.embedderModelId, Date.now());
+    this.pinUnsatisfied = false;
+    // FIX R: deliberately NOT calling runGraphBackfillIfPending() here — see the doc comment above.
+  }
+
+  /**
+   * Decide and persist the pin for a store that doesn't have one yet (embedder_model_id was NULL
+   * — a pre-pin store opened for the first time under pin-aware code). Returns the newly-pinned
+   * modelId — the ACTUAL persisted value, which after a lost CAS race (below) is NOT necessarily
+   * the value this call locally computed. Does not itself swap this.embedder (ensureEmbedderPin
+   * does that if the returned pin doesn't match the live embedder).
+   *
+   * A store already holding vectors was necessarily built by whichever embedder produced that
+   * dimensionality — this codebase has only ever shipped two: the pre-item-9 English ONNX default
+   * (384-dim) and hashing tokenizer v1 (256-dim; every published hashing store predates tokenizer
+   * v2, which shipped alongside this pin, so a pre-pin 256-dim store cannot be anything else). An
+   * empty store has no evidence to infer from, so it is pinned exactly like a fresh one: to
+   * whatever embedder it was just constructed with. Any OTHER dimension means this store's history
+   * doesn't match anything this build knows how to name — fail closed rather than guess.
+   *
+   * RELEASE INVARIANT this dimension inference depends on (Codex review, PR #51 — documented, not
+   * code-changed): it is sound if and only if no RELEASED binary ever wrote post-swap vectors
+   * (the item-9 multilingual ONNX default, or hashing tokenizer v2) without ALSO writing a pin. A
+   * store's raw bytes cannot distinguish "384-dim, written by the pre-swap English ONNX default"
+   * from "384-dim, written by the post-swap multilingual ONNX default" (both models are 384-dim),
+   * nor "256-dim ASCII-only content written by tokenizer v1" from "the same ASCII-only content
+   * written by tokenizer v2" (the two tokenizers are byte-identical on pure-ASCII input — see
+   * embedding.ts). This holds today: every published tag/npm version through the one immediately
+   * preceding this pin still shipped the PRE-swap defaults, and the default swap ships in the SAME
+   * release as this pin machinery — so no released binary can have produced post-swap vectors
+   * without also being pin-aware. The only stores that could violate this are unreleased dev/
+   * dogfood builds that ran an intermediate commit with the new defaults but without the pin (see
+   * the PR body for the explicit pin-stamp given to those specific stores). Any FUTURE default
+   * swap (a new ONNX model, or a HASHING_TOKENIZERS v3) MUST ship in the same release as whatever
+   * mechanism extends this inference to recognize it — never land the swap first and the
+   * recognition later, or this same ambiguity reopens for real.
+   *
+   * EMPTY STORE + ANONYMOUS EMBEDDER (Codex review, PR #51 round 8 — closes a finding flagged
+   * during round 7's FIX W, same principle applied one level deeper; this is path 2 of 3 — see
+   * initSyncIdentity's fresh-store branch for path 1 (FIX W) and ensureEmbedderPin's FIX O recovery
+   * branch for path 3 (FIX AB, round 9) — all three cite this exact paragraph): when the store is
+   * empty AND this.embedder has no modelId, this method does NOT persist anything — see the
+   * dim===null branch below. dim:N (embedderModelId's own fallback) is a COMPARISON convenience for
+   * the graft-rejection check, never a persistable identity — the exact reasoning FIX W already
+   * applied to the fresh-store 'created' path applies identically here, one level deeper, to the
+   * backfill path FIX W's own scope didn't reach. Returning this.embedderModelId WITHOUT writing it
+   * lets ensureEmbedderPin's caller-side comparison (pinnedModelId === this.embedderModelId) pass
+   * trivially — this.embedder already satisfies "whatever this call returns" by construction,
+   * since it's the same getter read twice — clearing the guard and letting the store serve under
+   * the anonymous embedder exactly as it always could, with NOTHING weak persisted. The pin stays
+   * honestly NULL until a real-identity embedder opens this same (still-empty) store, whose OWN
+   * pass through this exact branch (real modelId this time) backfills it properly, CAS-guarded, the
+   * normal way. Deliberately NOT a refuse-to-serve/throw here: a weak dim:N pin protects nothing to
+   * begin with (any same-dimension anonymous provider satisfies it trivially), so refusing service
+   * over its ABSENCE would break legitimate anonymous test constructs for zero protective gain —
+   * NULL is strictly more honest than dim:N, not a lesser guarantee than dim:N ever actually was.
+   */
+  private backfillEmbedderPin(): string {
+    const dim = this.sampleStoredVectorDim();
+    let modelId: string;
+    if (dim === null) {
+      // See this method's own doc comment ("EMPTY STORE + ANONYMOUS EMBEDDER") for the full
+      // reasoning — short-circuits BEFORE the shared CAS write below, on purpose: there is nothing
+      // here worth persisting under a dim:N label.
+      if (this.embedder.modelId === undefined) return this.embedderModelId;
+      modelId = this.embedderModelId; // empty store, REAL-modelId embedder — treat like fresh: pin to it
+    } else if (dim === 384) {
+      modelId = LEGACY_ONNX_DEFAULT_MODEL_ID;
+    } else if (dim === 256) {
+      modelId = new HashingEmbeddingProvider(256, 1).modelId; // "hashing:dim=256:tok=1"
+    } else {
+      throw new UnsatisfiableEmbedderError(
+        `dim:${dim}`,
+        `This store has ${dim}-dimensional vectors but no recorded embedder pin, and ${dim} matches ` +
+          `neither known legacy default (384 = ${LEGACY_ONNX_DEFAULT_MODEL_ID}, 256 = hashing tok=1). ` +
+          `Refusing to guess which embedder produced these vectors — this store needs a manual pin.`,
+      );
+    }
+    // CAS (Codex review, PR #51, FIX D): two processes/instances opening the same pre-pin store
+    // concurrently can both read NULL and reach this point. Without the WHERE guard, last writer
+    // wins and the loser continues believing ITS OWN computed modelId is the pin, when the
+    // persisted row actually names the other process's embedder — exactly the silent vector-space
+    // mismatch this whole ADR exists to prevent, just relocated to the backfill moment itself.
+    const result = this.db
+      .prepare(
+        `UPDATE sync_meta SET embedder_model_id = ?, embedder_pin_source = 'backfilled', embedder_pinned_at = ?
+           WHERE singleton = 1 AND embedder_model_id IS NULL`,
+      )
+      .run(modelId, Date.now());
+    if (result.changes === 0) {
+      // Lost the race: someone else's backfill (or a 'created'/'migrated' pin) landed between our
+      // NULL read and this UPDATE. Adopt the WINNER's persisted pin — never report our own
+      // locally-computed value as if it were what's actually on disk.
+      const row = this.db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null };
+      // Non-null is guaranteed: sync_meta's singleton row exists (this method only runs after
+      // initSyncIdentity), and changes === 0 here means something else already set it non-NULL.
+      return row.embedder_model_id!;
+    }
+    return modelId;
+  }
+
+  /**
+   * Sampled vector width from the store's evidence ledger, or null if it holds no vectors at all.
+   *
+   * Samples BOTH `observations` and `concepts` (excluding source-connector placeholders — see
+   * below) and unions the distinct dimensions found across them (Codex review, PR #51 round 6,
+   * FIX S — round 5 and earlier sampled either/or, observations preferred, concepts checked ONLY
+   * when observations was empty; see the superseded rationale note at the bottom of this comment
+   * for why that was a real gap, not a stylistic difference). Checking BOTH, unconditionally, is
+   * what actually catches a native concept↔observation cross-table mismatch: a crashed or partial
+   * scripts/migrate-file-concept.ts re-embed can rewrite concepts.embedding for a concept (step 3's
+   * reembedConcept) and then fail — process killed, or reembedConceptObservations throwing — before
+   * that SAME concept's observations.embedding rows are rewritten, leaving the two tables in
+   * DIFFERENT dimensions while EACH TABLE, sampled alone, shows only ONE dimension (so the old
+   * either/or's own within-one-table mixed-dim check never fires either). The checkpoint-only shape
+   * (workstream vectors in `concepts`, ZERO `observations`) still pins correctly: the union of
+   * `{}` (empty table) and `{singleDim}` is just `{singleDim}`, identical to the old fallback's
+   * result for that shape.
+   *
+   * Excludes `kind = 'source'` rows from BOTH tables (observations: Codex review, PR #51, FIX G;
+   * concepts: FIX K, same disease one table over): storeSourceChunk stages every source-connector
+   * observation with a PLACEHOLDER zero-vector sized by whatever this.embedder.dim happened to be
+   * AT STAGING TIME (see storeSourceChunk's placeholderEmb), and a newly-created source CONCEPT row
+   * carries that same kind of placeholder (see storeSourceChunk's own concepts INSERT — the
+   * file=concept reshape made source concepts first-class `kind='source'` rows) until
+   * recomputeSourceConceptBody publishes its real, recomputed body embedding over it. Neither is
+   * ever semantic evidence, and neither dimension necessarily reflects the store's real pinned
+   * identity — whichever embedder happened to be live at staging/recompute time. Left unfiltered,
+   * a connector-backed pre-pin store staged under one embedder but recomputed under another could
+   * infer the WRONG dimension from a placeholder, or spuriously trip the mixed-dimension fail-closed
+   * below on two dimensions that were never both "real". This exclusion is exactly why unioning is
+   * now safe where the ORIGINAL either/or's own doc comment worried it wouldn't be (see below) — the
+   * "old placeholder concept rows" scenario that comment cited as a source of harmless cross-table
+   * disagreement is a `kind = 'source'` row, which this filter already removes from the concepts
+   * side of the union before the two tables are ever compared.
+   *
+   * Consequence, stated plainly: a store whose ONLY vectors are source data (placeholder
+   * observations and/or not-yet-recomputed source concepts, nothing native) now samples EMPTY on
+   * both tables and pins the LIVE embedder (same as Shape 4's genuinely-empty case), rather than
+   * inferring anything from source placeholders. Accepted, not a gap: (1) the source-connector
+   * pipeline has never shipped publicly, so no public pre-pin source-only store exists to mis-pin;
+   * (2) this codebase's own dogfood source stores get an explicit pin-stamp before any pinning-aware
+   * build opens them (tracked in the PR body); (3) cheaply distinguishing a recomputed-real source
+   * projection from a placeholder without inventing a new marker isn't warranted for a population
+   * that has never been released.
+   *
+   * Fails closed with UnsatisfiableEmbedderError — rather than blessing an arbitrary row via an
+   * unordered LIMIT 1 — when the UNION across both tables holds MORE THAN ONE distinct vector
+   * dimension. Covers two real released/reachable shapes now, not one: (a) createLocalEmbedder's
+   * ONNX↔hashing fallback flip-flopping across restarts (model unavailable → hashing; model
+   * available again → ONNX) — the within-one-table case, already caught before FIX S; (b) a
+   * crashed/partial migration-script re-embed leaving concepts and observations in different spaces
+   * — the cross-table case FIX S adds. cosine() silently truncates to the shorter vector on a
+   * dimension mismatch, so either shape's mis-scoring would otherwise be entirely invisible. DISTINCT
+   * + LIMIT 2 per table stops scanning each table as soon as ITS OWN second distinct dimension is
+   * found, so this stays cheap even on a large mixed table; both tables are always sampled now
+   * (needed for the union), a small, fixed cost independent of table size either way.
+   *
+   * SUPERSEDED RATIONALE (kept for history, no longer followed): the original either/or reasoned
+   * that "two tables merely disagreeing... is a different, not-actually-alarming situation", citing
+   * "old placeholder concept rows" as the harmless case — but placeholder rows are exactly what the
+   * kind='source' exclusion above already removes from consideration, so that concern never actually
+   * applied to the genuinely-native data this method is scoped to. What the either/or actually left
+   * unchecked was real, native, cross-table disagreement — precisely the crashed-migration shape
+   * FIX S closes.
+   */
+  private sampleStoredVectorDim(): number | null {
+    const distinctDims = (table: "observations" | "concepts"): number[] =>
+      (this.db
+        .prepare(
+          `SELECT DISTINCT json_array_length(embedding) AS dim FROM ${table} WHERE kind != 'source' LIMIT 2`,
+        )
+        .all() as Array<{ dim: number }>)
+        .map((r) => r.dim);
+
+    const observationDims = distinctDims("observations");
+    const conceptDims = distinctDims("concepts");
+    const dims = [...new Set([...observationDims, ...conceptDims])];
+
+    if (dims.length === 0) return null; // truly vector-free — neither table holds a row
+    if (dims.length > 1) {
+      throw new UnsatisfiableEmbedderError(
+        `dim:${dims.join("+")}`,
+        `This store holds vectors of at least two different dimensions (${dims.join(", ")}) across its ` +
+          `observations (${observationDims.length > 0 ? observationDims.join(", ") : "none"}) and concepts ` +
+          `(${conceptDims.length > 0 ? conceptDims.join(", ") : "none"}) tables, with no recorded embedder ` +
+          `pin. This can happen from the classic flip-flop (an ONNX model unavailable on one run, falling ` +
+          `back to hashing, available again later) or from a crashed/partial re-embed (e.g. ` +
+          `scripts/migrate-file-concept.ts interrupted after rewriting concepts.embedding but before ` +
+          `observations.embedding for the same concept, or vice versa). Refusing to guess which is correct; ` +
+          `this store needs migration/repair before it can be pinned.`,
+      );
+    }
+    return dims[0];
+  }
+
   /**
    * Export all rows modified since `since` (epoch ms; pass 0 for a full export).
    *
@@ -4803,6 +5593,7 @@ export class MonetCore {
    * are scoped to the exported concept ids (no watermark column on those tables).
    */
   exportDelta(since: number): GraftPayload {
+    this.assertPinSatisfied(); // embedder-pin ADR — a mismatched constructor embedder would stamp the WRONG embedderModelId onto this payload, poisoning the receiving store
     return this.db.transaction((): GraftPayload => {
       // The first read both captures the cursor and establishes SQLite's read snapshot. Every
       // timestamped query is upper-bounded by that cursor, so a writer that commits while this
@@ -5080,6 +5871,7 @@ export class MonetCore {
    * from different model spaces make cosine comparisons garbage (batchDedup would be wrong).
    */
   graftRows(payload: GraftPayload): GraftResult {
+    this.assertPinSatisfied(); // embedder-pin ADR — a mismatched constructor embedder would validate the incoming payload against the WRONG local identity
     const localModelId = this.embedderModelId;
     if (payload.embedderModelId !== localModelId) {
       throw new EmbedderMismatchError(payload.embedderModelId, localModelId);
@@ -5923,8 +6715,18 @@ export class MonetCore {
     return { inserted, skipped, conceptsMarkedDirty: [...conceptsMarkedDirty] };
   }
 
-  /** Rebuild deterministic native read-model metadata from the union of active evidence. */
+  /**
+   * Rebuild deterministic native read-model metadata from the union of active evidence.
+   *
+   * Codex review (PR #51 round 9, FIX AC): gated — its empty-observation branch writes a vector
+   * SIZED from this.embedder.dim directly into concepts.embedding with no embed() call to gate
+   * (see assertPinSatisfied's "dim-sized vector writes" category for the full rationale and the
+   * caller enumeration this gate covers). Called from resolveContradiction, supersedeObservation
+   * (both newly protected here), and restoreConcept/graftRows (already independently gated for
+   * their own reasons — this is redundant-but-harmless for them).
+   */
   private recomputeNativeConceptProjection(conceptId: string, relayAt: number): void {
+    this.assertPinSatisfied(); // embedder-pin ADR, FIX AC — the empty-observation branch below writes a this.embedder.dim-sized vector with no embed() call to gate it otherwise
     const concept = this.getRow(conceptId);
     if (!concept || isConnectorOwnedRow(concept) || concept.status === "retired") return;
     const observations = this.db.prepare(
@@ -6000,6 +6802,7 @@ export class MonetCore {
    * Only safe to call AFTER graftRows() — it reads the concepts table and calls upsertEdgeBoth.
    */
   batchDedup(graftedConceptIds: string[]): void {
+    this.assertPinSatisfied(); // embedder-pin ADR — part of the graft workflow; a mismatched constructor embedder also means this.tauAmbiguous is calibrated for the WRONG vector space
     if (!this.graphEnabled || graftedConceptIds.length === 0) return;
     const graftedSet = new Set(graftedConceptIds);
     for (const id of graftedConceptIds) {
@@ -6177,6 +6980,11 @@ export class MonetCore {
     into: string,
     opts: { resolution?: "auto" | "forceNew" } = {},
   ): Promise<MergeCircleResult> {
+    // embedder-pin ADR — explicit here too (not just relying on the per-concept reassignCircle()
+    // calls below), so a mismatched-embedder caller gets EmbedderPinUnsatisfiedError directly
+    // instead of that same error wrapped into a generic "mergeCircle failed for concept X: ..."
+    // Error by the per-item try/catch further down (Codex review, PR #51, FIX H).
+    this.assertPinSatisfied();
     const lastConceptSnapshot = new Map(this.lastConceptByCircle);
     try {
       return this.db.immediateTransaction((): MergeCircleResult => {
@@ -6718,6 +7526,23 @@ export class MonetCore {
       const type = mm[1].toLowerCase().replace("-", "_");
       const target = this.resolveRef(mm[2], circle, conceptId);
       if (target) this.upsertEdge(conceptId, target, type, ASSERTED_WEIGHT, "asserted", circle);
+    }
+  }
+
+  /**
+   * Runs the one-time graph backfill (backfillGraph, below) if the schema version says it hasn't
+   * happened yet AND the graph is enabled; idempotent no-op otherwise (Codex review, PR #51 round 4,
+   * FIX M). Extracted so BOTH callers share one implementation of "is it pending, and if so, run it
+   * and record completion":
+   *   - migrate() — the normal, non-deferred path (trustworthy thresholds at construction time).
+   *   - ensureEmbedderPin() — completes a backfill migrate() deferred because thresholds were NOT
+   *     trustworthy at construction time, now that this.embedder is confirmed to satisfy the pin.
+   */
+  private runGraphBackfillIfPending(): void {
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (this.graphEnabled && version < GRAPH_SCHEMA_VERSION) {
+      this.backfillGraph();
+      this.db.pragma(`user_version = ${GRAPH_SCHEMA_VERSION}`);
     }
   }
 
@@ -7379,6 +8204,7 @@ export class MonetCore {
     intent: string,
     opts: { circle?: string; limit?: number; depth?: number; includeArchived?: boolean } & SourceAwareReadOptions = {},
   ): Promise<GatherResult> {
+    this.assertPinSatisfied(); // embedder-pin ADR
     const limit = opts.limit ?? 12;
     const params = opts.depth ? { ...this.graphParams, hopLimit: Math.max(1, Math.min(opts.depth, 3)) } : this.graphParams;
     const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };

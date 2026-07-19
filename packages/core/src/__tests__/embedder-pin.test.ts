@@ -1,0 +1,1631 @@
+/**
+ * embedder-pin ADR, slice 1 — pin storage (Task 2) and open-time enforcement + backfill (Task 4).
+ *
+ * The store PINS its embedder (sync_meta.embedder_model_id/embedder_pin_source/embedder_pinned_at);
+ * MonetCore.ensureEmbedderPin() enforces it. These tests cover the closure matrix from the brief:
+ * fresh (1), pre-pin ONNX legacy (2), pre-pin hashing legacy (3), empty (4), steady state (6),
+ * legacy declined (7), unsatisfiable (9), and the graft-rejection interaction.
+ *
+ * All stores are :memory: or a mkdtemp'd temp file — never ~/.monet. No test performs a real ONNX
+ * load: Shape 2 injects a fake embedderLoader (per the brief, ONNX satisfaction may be
+ * faked/injected — the assertion is the pin decision); every other shape either uses hashing for
+ * real (no network) or never reaches instantiation at all (Shape 9's unrecognized-format case).
+ */
+import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, rmSync, copyFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { MonetCore, EmbedderMismatchError, EmbedderPinUnsatisfiedError } from "../engine";
+import { HashingEmbeddingProvider, cosine, type EmbeddingProvider, type EmbeddingThresholds } from "../embedding";
+import { UnsatisfiableEmbedderError, LEGACY_ONNX_DEFAULT_MODEL_ID } from "../embedding-onnx";
+import { createMonetCoreMcpServer } from "../mcp-server";
+
+interface PinRow {
+  embedder_model_id: string | null;
+  embedder_pin_source: string | null;
+  embedder_pinned_at: number | null;
+}
+
+/** White-box helpers, matching this codebase's established `(core as any).db` test convention
+ *  (see sync.test.ts) — MonetCore has no public pin-inspection API, by design (the pin is an
+ *  internal invariant the engine enforces, not something callers are meant to poke at). */
+function readPin(core: MonetCore): PinRow {
+  return (core as any).db.prepare(`SELECT embedder_model_id, embedder_pin_source, embedder_pinned_at FROM sync_meta WHERE singleton = 1`).get();
+}
+
+function writePin(core: MonetCore, modelId: string, source: "created" | "backfilled" | "migrated" = "backfilled"): void {
+  (core as any).db
+    .prepare(`UPDATE sync_meta SET embedder_model_id = ?, embedder_pin_source = ?, embedder_pinned_at = ? WHERE singleton = 1`)
+    .run(modelId, source, Date.now());
+}
+
+function clearPin(core: MonetCore): void {
+  (core as any).db.prepare(`UPDATE sync_meta SET embedder_model_id = NULL, embedder_pin_source = NULL, embedder_pinned_at = NULL WHERE singleton = 1`).run();
+}
+
+/** Fabricates a real vector of the given width directly in the evidence ledger ("write vectors
+ *  directly", per the brief) — bypasses store()/embed() entirely so the test controls dimension
+ *  independent of whatever embedder happens to be live. `kind` defaults to 'statement' (the
+ *  column's own SQL default — genuine semantic evidence); pass 'source' to fabricate a
+ *  source-connector placeholder observation (FIX G). */
+function insertFakeObservation(core: MonetCore, dim: number, id = "fake-legacy-obs", kind = "statement"): void {
+  (core as any).db
+    .prepare(`INSERT INTO observations (id, content, embedding, author_agent_id, kind) VALUES (?, ?, ?, ?, ?)`)
+    .run(id, "legacy content predating the embedder pin", JSON.stringify(new Array(dim).fill(0.01)), "legacy-agent", kind);
+}
+
+/** Fabricates a real concept vector directly (FIX 2's concepts fallback / FIX K's source-only
+ *  shape) — minimal valid row satisfying the concepts table's NOT NULL columns. `kind` defaults to
+ *  'fact' (the column's own SQL default — a native concept); pass 'source' to fabricate a
+ *  staged-not-yet-recomputed source concept's placeholder (FIX K). */
+function insertFakeConcept(core: MonetCore, dim: number, id = "fake-legacy-concept", kind = "fact"): void {
+  (core as any).db
+    .prepare(`INSERT INTO concepts (id, slug, title, body, embedding, kind) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(id, id, "fake title", "fake body", JSON.stringify(new Array(dim).fill(0.02)), kind);
+}
+
+/** tok=1 and tok=2 diverge only on non-ASCII input — a cheap, real (no-mock) way to prove an
+ *  embedder instance is genuinely tok=1, not merely modelId-labeled as one. */
+function isGenuinelyTok1(embedder: { embed(text: string): Float32Array | Promise<Float32Array> }, sample: string): boolean {
+  const tok2Reference = new HashingEmbeddingProvider(256, 2).embed(sample);
+  const actual = embedder.embed(sample);
+  if (actual instanceof Promise) throw new Error("expected a sync hashing embedder");
+  return JSON.stringify(Array.from(actual)) !== JSON.stringify(Array.from(tok2Reference));
+}
+
+/**
+ * Stands in for the post-swap ONNX default (Xenova/paraphrase-multilingual-MiniLM-L12-v2): a
+ * real semantic model's recommendedThresholds (see OnnxEmbeddingProvider, embedding-onnx.ts —
+ * tauAttach 0.72 / tauAmbiguous 0.5), WITHOUT any real model load. Used as the constructor's
+ * initial `embedder` opt to reproduce "a server whose default embedder is ONNX opens a store
+ * that turns out to be pinned to legacy hashing" without touching the network — the fix under
+ * test (threshold re-derivation on swap) never needs this fake's embed() output to be realistic,
+ * only its recommendedThresholds to be ONNX-shaped.
+ */
+class FakeOnnxLikeProvider implements EmbeddingProvider {
+  readonly dim = 384;
+  readonly recommendedThresholds: EmbeddingThresholds = { tauAttach: 0.72, tauAmbiguous: 0.5 };
+  readonly modelId = "fake-onnx-like-for-threshold-test";
+  embed(_text: string): Float32Array {
+    return new Float32Array(this.dim); // never actually compared — every test below swaps this.embedder out before storing/searching
+  }
+}
+
+describe("embedder pin — fresh store (Shape 1)", () => {
+  it("pins at creation (source 'created', modelId = the active embedder's), and reopening selects the same embedder without rewriting the pin", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-fresh-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const core1 = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
+      const pin1 = readPin(core1);
+      expect(pin1.embedder_model_id).toBe("hashing:dim=256:tok=2");
+      expect(pin1.embedder_pin_source).toBe("created");
+      expect(typeof pin1.embedder_pinned_at).toBe("number");
+
+      await core1.ensureEmbedderPin(); // already satisfied at construction — must be a pure no-op
+      expect(readPin(core1)).toEqual(pin1);
+      core1.close();
+
+      const core2 = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
+      await core2.ensureEmbedderPin();
+      expect(readPin(core2)).toEqual(pin1); // reopen: pin untouched
+      expect((core2 as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // same embedder selected
+      core2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("embedder pin — backfill on open (Shapes 2, 3, 4)", () => {
+  it("Shape 2: a pre-pin store holding 384-dim vectors backfills to the legacy English ONNX default (ONNX satisfaction injected — no real load)", async () => {
+    let loaderCalledWith: string | undefined;
+    const core = new MonetCore(":memory:", {
+      embedder: new HashingEmbeddingProvider(), // whatever was live before pin-aware code — irrelevant once a pin is inferred
+      embedderLoader: async (modelId) => {
+        loaderCalledWith = modelId;
+        return new HashingEmbeddingProvider(); // stand-in satisfying provider; the assertion is the pin DECISION, not a real ONNX load
+      },
+    });
+    insertFakeObservation(core, 384);
+    clearPin(core); // simulate: this store predates the embedder-pin ADR entirely
+    expect(readPin(core).embedder_model_id).toBeNull();
+
+    await core.ensureEmbedderPin();
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID);
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    expect(typeof pin.embedder_pinned_at).toBe("number");
+    expect(loaderCalledWith).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID); // enforcement actually asked the loader to satisfy the backfilled pin
+    core.close();
+  });
+
+  it("Shape 3: a pre-pin store holding 256-dim vectors backfills to hashing tok=1, AND the strict loader really instantiates it (no fake)", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // default tok=2
+    insertFakeObservation(core, 256);
+    clearPin(core);
+    expect(readPin(core).embedder_model_id).toBeNull();
+
+    await core.ensureEmbedderPin(); // no embedderLoader override — exercises the REAL instantiateEmbedderForPin
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=1");
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=1"); // real swap happened
+
+    expect(isGenuinelyTok1((core as any).embedder, "こんにちは世界")).toBe(true);
+    core.close();
+  });
+
+  it("Shape 4: an empty pre-pin store (zero vectors) pins to the current live embedder, source 'backfilled', no swap needed", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    clearPin(core); // no observations ever inserted — genuinely empty
+    expect(readPin(core).embedder_model_id).toBeNull();
+
+    await core.ensureEmbedderPin();
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2");
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // already satisfied — no swap
+    core.close();
+  });
+
+  it("any OTHER dimension fails closed instead of guessing", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    insertFakeObservation(core, 512); // matches neither known legacy default (384, 256)
+    clearPin(core);
+
+    let caught: unknown;
+    try {
+      await core.ensureEmbedderPin();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(UnsatisfiableEmbedderError);
+    expect((caught as Error).message).toMatch(/512/);
+    expect(readPin(core).embedder_model_id).toBeNull(); // refused to write a guessed pin
+    core.close();
+  });
+});
+
+describe("embedder pin — steady state and legacy declined (Shapes 6, 7)", () => {
+  it("Shape 6: pin already matches the provided embedder — open proceeds with no rewrite (no UPDATE fired) and an unchanged pin", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    const before = readPin(core); // written 'created' at construction
+
+    const prepareSpy = vi.spyOn((core as any).db, "prepare");
+    await core.ensureEmbedderPin();
+    const wroteToPin = prepareSpy.mock.calls.some(
+      ([sql]) => typeof sql === "string" && /UPDATE sync_meta SET embedder_model_id/.test(sql),
+    );
+    expect(wroteToPin).toBe(false);
+    expect(readPin(core)).toEqual(before);
+    core.close();
+  });
+
+  it("Shape 7: pin is hashing tok=1 but the provided embedder is tok=2 — open ends with a tok=1 embedder active for BOTH write and query", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // tok=2 default
+    writePin(core, "hashing:dim=256:tok=1", "backfilled"); // simulates an earlier open having already backfilled this (Shape 3)
+
+    await core.ensureEmbedderPin();
+
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=1");
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=1"); // pin itself is untouched — tok=2 was DECLINED, not adopted
+    expect(isGenuinelyTok1((core as any).embedder, "こんにちは世界")).toBe(true);
+
+    // Round trip proof: write AND query both actually route through the swapped instance, not just
+    // a dangling private field.
+    await core.store("hello world, this is a pin round trip test", { circle: "pin-shape-7" });
+    const results = await core.search("hello world round trip", { circle: "pin-shape-7" });
+    expect(results.length).toBeGreaterThan(0);
+    core.close();
+  });
+});
+
+describe("embedder pin — unsatisfiable (Shape 9)", () => {
+  // Codex review (PR #51 round 5, FIX O): fail-closed now protects a COMMITTED vector space, not
+  // an unconditional refusal — an empty store has nothing to protect (see the dedicated FIX O
+  // describe block below for that recovery path). Every case in THIS block is deliberately
+  // NON-empty (insertFakeObservation) so it keeps demonstrating the invariant it always meant to:
+  // an unsatisfiable pin over REAL data fails closed, full stop.
+  it("hashing pin with an unknown tokenizer version: UnsatisfiableEmbedderError, store does not serve", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    insertFakeObservation(core, 256); // non-empty — FIX O's empty-store recovery must not apply here
+    writePin(core, "hashing:dim=256:tok=99");
+
+    let caught: unknown;
+    try {
+      await core.ensureEmbedderPin();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(UnsatisfiableEmbedderError);
+    expect((caught as UnsatisfiableEmbedderError).modelId).toBe("hashing:dim=256:tok=99");
+    // The live embedder was never replaced — a failed enforcement must not leave a half-swapped state.
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2");
+    core.close();
+  });
+
+  it("an unrecognized/garbage/future pin format (no slash — FIX F widened ONNX recognition to any owner/repo shape, so a slash-containing string like 'some/garbage-future-model' is now legitimately dispatched into the ONNX path instead): UnsatisfiableEmbedderError naming a newer Monet version, store does not serve", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    insertFakeObservation(core, 256); // non-empty — FIX O's empty-store recovery must not apply here
+    writePin(core, "some-garbage-future-model-no-slash");
+
+    let caught: unknown;
+    try {
+      await core.ensureEmbedderPin();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(UnsatisfiableEmbedderError);
+    expect((caught as UnsatisfiableEmbedderError).modelId).toBe("some-garbage-future-model-no-slash");
+    expect((caught as Error).message).toMatch(/newer version of monet/i);
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // unswapped
+    core.close();
+  });
+
+  it("an unsatisfiable pin also stops createMonetCoreMcpServer from starting — the served-path choke point actually rejects", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    insertFakeObservation(core, 256); // non-empty — FIX O's empty-store recovery must not apply here
+    writePin(core, "hashing:dim=256:tok=99");
+
+    await expect(createMonetCoreMcpServer(core)).rejects.toThrow(UnsatisfiableEmbedderError);
+    core.close();
+  });
+});
+
+describe("embedder pin — graft rejection compares against the PINNED identity", () => {
+  it("a graft payload whose embedderModelId doesn't match the pin still throws EmbedderMismatchError, comparing against the pin (not whatever the constructor happened to receive)", async () => {
+    const source = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(256, 2) });
+    await source.store("a fact worth exporting", { circle: "c" });
+    const payload = source.exportDelta(0);
+    source.close();
+    expect(payload.embedderModelId).toBe("hashing:dim=256:tok=2");
+
+    const dest = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(256, 1) }); // pins tok=1 at creation
+    await dest.ensureEmbedderPin(); // steady state, no-op — confirms the pin is what graftRows will compare against
+
+    let caught: unknown;
+    try {
+      dest.graftRows(payload);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(EmbedderMismatchError);
+    expect((caught as EmbedderMismatchError).local).toBe("hashing:dim=256:tok=1"); // the PINNED identity
+    expect((caught as EmbedderMismatchError).incoming).toBe("hashing:dim=256:tok=2");
+    dest.close();
+  });
+});
+
+// ---- embedder pin — threshold re-derivation on swap (post-review fix) --------------------------
+//
+// tauAttach/tauAmbiguous/edgeSimMin are cosine-distribution-calibrated PER embedding space (see
+// EmbeddingProvider.recommendedThresholds). The constructor derives them from whichever embedder
+// it's handed — but ensureEmbedderPin() can later replace that embedder entirely (Shapes 2/3/7
+// above). Left unfixed, a store constructed with an ONNX-shaped default (tauAttach ~0.72) that
+// turns out to be pinned to legacy hashing (whose cosine similarities saturate far lower, ~0.55)
+// would keep running resolve-or-create under the WRONG embedder's thresholds: tauAttach effectively
+// unreachable, so store() forks a new concept on every call instead of attaching — dedup silently
+// dies. Same silent-degradation class the whole ADR exists to eliminate, one level down.
+describe("embedder pin — thresholds re-derive under the swapped-in embedder (not left stale from construction)", () => {
+  // Verified independently (not asserted blindly): this pair's REAL hashing-tok=1 cosine score
+  // sits strictly between hashing's tauAttach (0.55) and the fake ONNX-like provider's tauAttach
+  // (0.72) — the exact band the bug and the fix disagree about.
+  const TEXT_A = "the database migration failed due to a lock timeout";
+  const TEXT_B = "the schema migration failed because of a connection timeout";
+
+  it("sanity: TEXT_A/TEXT_B's real tok=1 cosine score sits strictly between hashing's tauAttach (0.55) and the fake's tauAttach (0.72)", () => {
+    const tok1 = new HashingEmbeddingProvider(256, 1);
+    const score = cosine(tok1.embed(TEXT_A), tok1.embed(TEXT_B));
+    expect(score).toBeGreaterThan(0.55);
+    expect(score).toBeLessThan(0.72);
+  });
+
+  it("(a) a pair that would have forked under the stale ONNX-calibrated thresholds attaches cleanly once thresholds are re-derived for the swapped-in hashing embedder", async () => {
+    const core = new MonetCore(":memory:", { embedder: new FakeOnnxLikeProvider() });
+    // Pre-swap: thresholds computed from the FAKE (ONNX-shaped) embedder at construction — this is
+    // the buggy-precursor state a naive "just replace this.embedder" fix would leave in place.
+    expect((core as any).tauAttach).toBe(0.72);
+    expect((core as any).tauAmbiguous).toBe(0.5);
+    expect((core as any).edgeSimMin).toBe(0.45); // semantic branch: 0.72 >= 0.7
+
+    writePin(core, "hashing:dim=256:tok=1", "backfilled"); // simulates an earlier open having already pinned this store to legacy hashing (Shape 3)
+    await core.ensureEmbedderPin(); // real loader — swaps in a REAL HashingEmbeddingProvider(256, 1)
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=1"); // swap happened
+
+    // Direct field assertion (reasonable accessor: this codebase's established white-box test
+    // convention, e.g. `(core as any).db` throughout sync.test.ts — no public accessor exists and
+    // none should, per Task 4's own design: the pin is an internal invariant, not a public knob).
+    expect((core as any).tauAttach).toBe(0.55); // hashing's own recommendedThresholds — NOT the stale 0.72
+    expect((core as any).tauAmbiguous).toBe(0.4);
+    expect((core as any).edgeSimMin).toBe(0.4); // semantic branch flips: 0.55 < 0.7
+
+    // Behavioral proof, not just the field read: store the pair from the sanity test above. Under
+    // the corrected 0.55 threshold this ATTACHES (one concept). Under the stale 0.72/0.5 pair it
+    // would have landed in the [0.5, 0.72) "ambiguous" band, which resolve-or-create forks into a
+    // SEPARATE concept for non-correction evidence (engine.ts's store() branch: action="ambiguous"
+    // calls this.create(), not this.attach()) — i.e. dedup would have silently broken.
+    const first = await core.store(TEXT_A, { circle: "threshold-fix" });
+    const second = await core.store(TEXT_B, { circle: "threshold-fix" });
+    expect(second.action).toBe("attached");
+    expect(second.conceptId).toBe(first.conceptId); // ONE concept — would have been two pre-fix
+    expect(core.conceptCount("threshold-fix")).toBe(1);
+    core.close();
+  });
+
+  it("(b) an explicit tauAttach/tauAmbiguous/edgeSimMin opt still wins after a swap — the precedence rule, not just the embedder's recommendation, survives", async () => {
+    const core = new MonetCore(":memory:", {
+      embedder: new FakeOnnxLikeProvider(),
+      tauAttach: 0.66,
+      tauAmbiguous: 0.33,
+      edgeSimMin: 0.22,
+    });
+    expect((core as any).tauAttach).toBe(0.66); // explicit opt wins over the fake's 0.72 at construction
+    expect((core as any).tauAmbiguous).toBe(0.33);
+    expect((core as any).edgeSimMin).toBe(0.22);
+
+    writePin(core, "hashing:dim=256:tok=1", "backfilled");
+    await core.ensureEmbedderPin(); // triggers a real swap (fake's modelId !== the pin)
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=1"); // swap DID happen
+
+    // ...but the explicit opts still win under the NEW embedder too — hashing's own 0.55/0.4 never
+    // gets a chance to apply, because explicit opts sit ABOVE "the embedder's recommendation" in
+    // the precedence chain regardless of which embedder is live.
+    expect((core as any).tauAttach).toBe(0.66);
+    expect((core as any).tauAmbiguous).toBe(0.33);
+    expect((core as any).edgeSimMin).toBe(0.22);
+    core.close();
+  });
+
+  it("(c) steady state (pin already satisfied): thresholds are byte-identical and the recompute path never runs", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // pins itself at construction — already satisfied
+    const before = {
+      tauAttach: (core as any).tauAttach,
+      tauAmbiguous: (core as any).tauAmbiguous,
+      edgeSimMin: (core as any).edgeSimMin,
+    };
+
+    const recomputeSpy = vi.spyOn(core as any, "applyEmbedderDerivedThresholds");
+    await core.ensureEmbedderPin(); // pin already matches the constructor-provided embedder — steady state
+    expect(recomputeSpy).not.toHaveBeenCalled(); // the swap branch (and its threshold recompute) never ran — proves "no side effects", not just "same values"
+
+    expect((core as any).tauAttach).toBe(before.tauAttach);
+    expect((core as any).tauAmbiguous).toBe(before.tauAmbiguous);
+    expect((core as any).edgeSimMin).toBe(before.edgeSimMin);
+    core.close();
+  });
+});
+
+// ---- embedder pin — review hardening: constructor-time guard + backfill closure gaps -----------
+//
+// Three gaps a review pass found after slice 1 landed:
+//  FIX 1: "await ensureEmbedderPin() before serving" was JSDoc-only — an external consumer that
+//         skipped the await ran the constructor-provided embedder against pinned-space vectors
+//         with no signal anything was wrong. Closed by a synchronous constructor-time guard
+//         (pinUnsatisfied) enforced at every served embed choke point (assertPinSatisfied()).
+//  FIX 2: sampleStoredVectorDim only ever read `observations`, so a checkpoint-only pre-pin store
+//         (workstream vectors in `concepts`, ZERO observations — saveWorkstream() never inserts
+//         one) read as "empty" and false-pinned to the live embedder instead of the dimension its
+//         real vectors actually carry.
+//  FIX 3: sampleStoredVectorDim's old unordered LIMIT 1 blessed an arbitrary row on a store mixing
+//         two vector dimensions (a real shape: createLocalEmbedder's ONNX↔hashing fallback can
+//         flip-flop across restarts) — cosine() truncates silently on a dimension mismatch, so the
+//         resulting mis-scoring would have been invisible. Now fails closed instead of guessing.
+describe("embedder pin — constructor-time guard (review hardening, FIX 1)", () => {
+  it("(a) guard arms on a mismatched reopen — store()/search() throw EmbedderPinUnsatisfiedError before ensureEmbedderPin(), then succeed under the pinned embedder after", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-guard-arms-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      // Build a store genuinely pinned to hashing tok=1 (a real prior engine instance, not fabricated SQL).
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+      seed.close();
+
+      // Reopen with a DIFFERENT embedder (tok=2) and skip ensureEmbedderPin — the exact bypass this
+      // fix closes (an external consumer that forgets the await).
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 2) });
+      expect((core as any).pinUnsatisfied).toBe(true); // armed at construction
+
+      let caught: unknown;
+      try {
+        await core.store("hello there, this must not be written under the wrong embedder");
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(EmbedderPinUnsatisfiedError);
+      expect((caught as EmbedderPinUnsatisfiedError).pinnedModelId).toBe("hashing:dim=256:tok=1");
+      expect((caught as EmbedderPinUnsatisfiedError).constructedModelId).toBe("hashing:dim=256:tok=2");
+      await expect(core.search("hello")).rejects.toThrow(EmbedderPinUnsatisfiedError);
+      // Nothing was actually written by the rejected store() call above.
+      expect((core as any).db.prepare(`SELECT COUNT(*) AS n FROM observations`).get().n).toBe(0);
+
+      // Await the enforcement step — the guard clears, and the SAME calls now succeed under the
+      // real, pinned tok=1 embedder.
+      await core.ensureEmbedderPin();
+      expect((core as any).pinUnsatisfied).toBe(false);
+      expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=1");
+      const stored = await core.store("hello there, this attaches under the pinned embedder");
+      expect(stored.conceptId).toBeTruthy();
+      const found = await core.search("hello there");
+      expect(found.length).toBeGreaterThan(0);
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) guard stays inert (no throw, ensureEmbedderPin never called) for a fresh store AND for a pre-pin legacy store — the existing scripts/eval contract", async () => {
+    // Fresh store: initSyncIdentity self-pins to the constructor embedder BEFORE the constructor's
+    // guard read, so the read always finds a match — never arms.
+    const fresh = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    expect((fresh as any).pinUnsatisfied).toBe(false);
+    await expect(fresh.store("a fact on a fresh store, no ensureEmbedderPin call at all")).resolves.toMatchObject({ action: expect.any(String) });
+    fresh.close();
+
+    // Pre-pin legacy store: fabricate on disk (real vectors + NULL pin), then construct a FRESH
+    // engine instance against that file — the constructor's guard read happens against the
+    // genuinely-NULL pin AT THIS construction (not a value nulled out after an already-computed
+    // flag from a prior, different-pin construction).
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-guard-inert-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
+      insertFakeObservation(seed, 256);
+      clearPin(seed);
+      seed.close();
+
+      const legacy = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() }); // reopen — reads the genuinely-NULL pin
+      expect((legacy as any).pinUnsatisfied).toBe(false); // NULL isn't "non-NULL and different" — nothing to be unsatisfied about until ensure runs
+      await expect(legacy.store("a fact on a pre-pin legacy store, no ensureEmbedderPin call at all")).resolves.toMatchObject({ action: expect.any(String) });
+      legacy.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("embedder pin — checkpoint-only and mixed-dimension backfill (review hardening, FIX 2 + FIX 3)", () => {
+  it("(c) a checkpoint-only pre-pin store (one workstream vector in concepts, ZERO observations) backfills to hashing tok=1 from the concepts fallback, not the live embedder's id", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // default tok=2
+    await core.saveWorkstream({ status: "active", nextSteps: ["resume later"] }, { circle: "checkpoint-only" });
+    // Confirm the shape before asserting on it: saveWorkstream() really does write zero observations.
+    expect((core as any).db.prepare(`SELECT COUNT(*) AS n FROM observations`).get().n).toBe(0);
+    expect((core as any).db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind='workstream'`).get().n).toBe(1);
+
+    clearPin(core); // simulate: this store predates the embedder-pin ADR
+
+    await core.ensureEmbedderPin();
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=1"); // NOT "hashing:dim=256:tok=2" (the live embedder) — inferred from the real 256-dim workstream vector
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=1"); // swap followed the backfilled pin, same as Shape 3
+    core.close();
+  });
+
+  it("(d) a store mixing 256-dim and 384-dim observations throws UnsatisfiableEmbedderError naming both dimensions and writes no pin", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    insertFakeObservation(core, 256, "obs-256");
+    insertFakeObservation(core, 384, "obs-384");
+    clearPin(core);
+
+    let caught: unknown;
+    try {
+      await core.ensureEmbedderPin();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(UnsatisfiableEmbedderError);
+    expect((caught as Error).message).toMatch(/256/);
+    expect((caught as Error).message).toMatch(/384/);
+    expect(readPin(core).embedder_model_id).toBeNull(); // no pin written — fail closed, not a guess
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // unswapped
+    core.close();
+  });
+});
+
+// ---- embedder pin — Codex review (PR #51): 4 apply-now fixes ----------------------------------
+describe("embedder pin — cross-store exchange guard (Codex review, PR #51, FIX A)", () => {
+  it("exportDelta, graftRows, and batchDedup all throw EmbedderPinUnsatisfiedError on a mismatched reopen, and succeed once ensureEmbedderPin has run", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-guard-sync-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+      seed.close();
+
+      // Reopen with a DIFFERENT embedder and skip ensureEmbedderPin — without FIX A, exportDelta
+      // would stamp the WRONG embedderModelId (poisoning whatever engine grafts the payload) and
+      // graftRows would validate incoming payloads against that same wrong local identity.
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 2) });
+      expect((core as any).pinUnsatisfied).toBe(true);
+
+      expect(() => core.exportDelta(0)).toThrow(EmbedderPinUnsatisfiedError);
+      expect(() => core.graftRows({} as unknown as Parameters<MonetCore["graftRows"]>[0])).toThrow(EmbedderPinUnsatisfiedError);
+      // batchDedup too — reads already-grafted vectors and cosine-compares them using
+      // this.tauAmbiguous, which is ALSO miscalibrated whenever pinUnsatisfied is true.
+      expect(() => core.batchDedup([])).toThrow(EmbedderPinUnsatisfiedError);
+
+      await core.ensureEmbedderPin();
+      expect((core as any).pinUnsatisfied).toBe(false);
+
+      // Now all three actually work, under the pinned embedder — exportDelta stamps the CORRECT
+      // (pinned) identity, not the mismatched constructor one, and grafting the store's own export
+      // back into itself is self-consistent (no EmbedderMismatchError).
+      const payload = core.exportDelta(0);
+      expect(payload.embedderModelId).toBe("hashing:dim=256:tok=1");
+      expect(() => core.graftRows(payload)).not.toThrow();
+      expect(() => core.batchDedup([])).not.toThrow();
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("embedder pin — guard arms before the loader can fail (Codex review, PR #51, FIX C)", () => {
+  it("if ensureEmbedderPin's loader throws, the guard stays armed afterward — store()/search() still fail closed instead of silently proceeding", async () => {
+    const core = new MonetCore(":memory:", {
+      embedder: new HashingEmbeddingProvider(), // tok=2 — will need a swap once backfilled to the legacy ONNX default
+      embedderLoader: async () => {
+        throw new Error("simulated: offline, ONNX model unavailable");
+      },
+    });
+    insertFakeObservation(core, 384); // backfills to LEGACY_ONNX_DEFAULT_MODEL_ID, which the injected loader always fails to satisfy
+    clearPin(core);
+    expect((core as any).pinUnsatisfied).toBe(false); // unarmed before ensure — pin was still NULL at construction
+
+    await expect(core.ensureEmbedderPin()).rejects.toThrow(/simulated: offline/);
+    expect((core as any).pinUnsatisfied).toBe(true); // armed the instant the mismatch was confirmed, BEFORE the loader failed — not left false by the failed await
+
+    // A caller that (wrongly) catches the rejection above and keeps using core must NOT get an
+    // unguarded operation — pre-FIX-C they would have (pinUnsatisfied stayed false all along).
+    await expect(core.store("this must not silently write under the wrong embedder")).rejects.toThrow(EmbedderPinUnsatisfiedError);
+    await expect(core.search("this must not silently query under the wrong embedder")).rejects.toThrow(EmbedderPinUnsatisfiedError);
+    core.close();
+  });
+});
+
+describe("embedder pin — concurrent backfill race is CAS-safe (Codex review, PR #51, FIX D)", () => {
+  it("a lost backfill race adopts the already-persisted (winning) pin instead of overwriting it", () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // tok=2
+    insertFakeObservation(core, 256); // this instance would independently compute "hashing:dim=256:tok=1"
+    clearPin(core);
+
+    // Simulate: another process/instance already won the backfill race between this instance's own
+    // NULL read and its write. Pre-seed the WINNER's pin, then call backfillEmbedderPin() DIRECTLY
+    // (bypassing ensureEmbedderPin's own NULL gate, which would otherwise short-circuit before ever
+    // reaching the CAS write this test targets — matches the coordinator's own suggested
+    // technique). backfillEmbedderPin's internal flow (sample -> compute -> CAS write) is
+    // unaffected by how it's invoked, so this exercises the exact same race window a genuine
+    // concurrent process would hit.
+    writePin(core, LEGACY_ONNX_DEFAULT_MODEL_ID, "backfilled");
+
+    const result = (core as any).backfillEmbedderPin() as string;
+    expect(result).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID); // adopted the WINNER's pin, not its own "hashing:dim=256:tok=1" computation
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID); // untouched — never overwrote the winner
+    expect(pin.embedder_pin_source).toBe("backfilled"); // still the winner's original stamp, not re-stamped by the loser
+    core.close();
+  });
+});
+
+describe("embedder pin — a failed backfill poisons the guard (Codex review, PR #51 round 3, FIX I)", () => {
+  it("a mixed-dim pre-pin store's failed ensureEmbedderPin arms the guard even though the pin stays NULL — subsequent store()/search() fail closed instead of silently proceeding", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    insertFakeObservation(core, 256, "obs-256");
+    insertFakeObservation(core, 384, "obs-384");
+    clearPin(core);
+    expect((core as any).pinUnsatisfied).toBe(false); // unarmed before ensure — pin was still NULL at construction
+
+    await expect(core.ensureEmbedderPin()).rejects.toThrow(UnsatisfiableEmbedderError);
+    // Poisoned: pin stays NULL (backfillEmbedderPin's CAS write never ran — the throw happens
+    // before it), yet the guard is now ARMED. Distinct from an ordinary never-ensured pre-pin
+    // store, which stays unarmed (see Shape/FIX 1 test (b)) — THIS store has been checked and
+    // proven unsafe, not merely "not checked yet".
+    expect(readPin(core).embedder_model_id).toBeNull();
+    expect((core as any).pinUnsatisfied).toBe(true);
+
+    // A caller that (wrongly) catches the rejection above and keeps using core must NOT get an
+    // unguarded operation — pre-FIX-I they would have (pinUnsatisfied stayed false all along).
+    await expect(core.store("this must not silently write under the wrong embedder")).rejects.toThrow(EmbedderPinUnsatisfiedError);
+    await expect(core.search("this must not silently query under the wrong embedder")).rejects.toThrow(EmbedderPinUnsatisfiedError);
+    core.close();
+  });
+});
+
+// ---- embedder pin — Codex round 2 (PR #51): 4 more apply-now fixes -----------------------------
+describe("embedder pin — legacy-upgrade stores must not get a 'created' pin (Codex review, PR #51, FIX E)", () => {
+  it("a store whose sync_meta row is being created for the first time, but which already holds real vectors, gets a NULL pin (not 'created') — the guard stays unarmed until ensureEmbedderPin backfills it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-legacy-upgrade-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      // Build a store with a real 384-dim vector on disk, using the public API (simplest way to get
+      // a realistic, schema-correct row) — this is NOT yet the "pre-v8 upgrade" simulation itself.
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
+      insertFakeObservation(seed, 384); // pretend this store's real historical embedder was 384-dim ONNX
+      // Simulate the pre-v8-upgrade shape: DELETE the sync_meta row entirely (not just null its pin
+      // columns). From initSyncIdentity's perspective — it only checks for the ROW, never whether
+      // the TABLE itself pre-existed — this is indistinguishable from "the table never had this
+      // row", exactly the state a genuine pre-v8 database is in on its first open under sync-aware
+      // code (init()'s CREATE TABLE IF NOT EXISTS creates the table fresh, but no row has ever
+      // existed for it).
+      (seed as any).db.prepare(`DELETE FROM sync_meta WHERE singleton = 1`).run();
+      seed.close();
+
+      // Reopen with a DIFFERENT embedder than whatever "produced" the legacy vectors — simulating a
+      // server whose default swapped since this store was last used. The backfilled pin will be
+      // ONNX-shaped (384-dim legacy default), so — per the ADR's own test discipline — inject a
+      // fake embedderLoader rather than let ensureEmbedderPin's swap reach the REAL loader, which
+      // would attempt a genuine network/model load.
+      let loaderCalledWith: string | undefined;
+      const core = new MonetCore(dbPath, {
+        embedder: new HashingEmbeddingProvider(), // hashing tok=2 — mismatched vs the 384-dim legacy vectors either way
+        embedderLoader: async (modelId) => {
+          loaderCalledWith = modelId;
+          return new HashingEmbeddingProvider(); // stand-in — the assertion is the pin DECISION, not a real ONNX load
+        },
+      });
+      expect(readPin(core).embedder_model_id).toBeNull(); // NOT 'created' — the legacy-vector probe caught it
+      expect(readPin(core).embedder_pin_source).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // NULL pin never arms — nothing to be unsatisfied about until ensure runs
+
+      await core.ensureEmbedderPin();
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID);
+      expect(pin.embedder_pin_source).toBe("backfilled"); // NOT 'created'
+      expect(loaderCalledWith).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID);
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // "existing test must keep passing" (per the brief): the fresh-store 'created'-pin case is
+  // already covered by Shape 1's test above ("pins at creation (source 'created' ...") — confirmed
+  // still green after this fix (see the PR's full-suite run), not duplicated here.
+});
+
+describe("embedder pin — source placeholder observations excluded from dimension inference (Codex review, PR #51, FIX G)", () => {
+  it("a 256-dim source-connector placeholder alongside a genuine 384-dim native observation pins 384 (the real evidence), not a mixed-dim throw", async () => {
+    // The backfilled pin will be ONNX-shaped (384-dim) — inject a fake embedderLoader (ADR test
+    // discipline: real instantiation only for hashing) instead of letting the swap reach the real
+    // loader, which would attempt a genuine network/model load.
+    const core = new MonetCore(":memory:", {
+      embedder: new HashingEmbeddingProvider(),
+      embedderLoader: async () => new HashingEmbeddingProvider(), // stand-in — the assertion is the pin DECISION, not a real ONNX load
+    });
+    insertFakeObservation(core, 256, "source-placeholder-1", "source"); // staged under a hashing fallback, kind='source' — not semantic evidence
+    insertFakeObservation(core, 384, "native-real-1", "statement"); // genuine semantic evidence, recomputed under ONNX
+    clearPin(core);
+
+    await core.ensureEmbedderPin();
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID); // the REAL native vector's dimension, not the 256-dim source placeholder
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    core.close();
+  });
+
+  it("a store whose ONLY observations are source placeholders falls through to the concepts fallback and pins from a genuine NATIVE concept vector there", async () => {
+    const core = new MonetCore(":memory:", {
+      embedder: new HashingEmbeddingProvider(),
+      embedderLoader: async () => new HashingEmbeddingProvider(), // stand-in — no real ONNX load (see the test above)
+    });
+    insertFakeObservation(core, 256, "source-placeholder-only", "source"); // the ONLY observation row — a placeholder, not genuine evidence
+    insertFakeConcept(core, 384); // kind='fact' (the default) — a genuine NATIVE concept vector, unaffected by FIX K's kind='source' exclusion; see the FIX K test below for the all-source-kind shape
+    clearPin(core);
+
+    await core.ensureEmbedderPin();
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID); // fell through to concepts — observations held ONLY a source placeholder, which FIX G excludes
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    core.close();
+  });
+
+  it("(FIX K) a store whose ONLY vectors are source placeholders in BOTH tables (staged observations AND not-yet-recomputed source concepts) samples empty and pins the live embedder — no throw, no guess", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // default tok=2
+    insertFakeObservation(core, 256, "source-obs-placeholder", "source"); // excluded by FIX G
+    insertFakeConcept(core, 256, "source-concept-placeholder", "source"); // excluded by FIX K — a staged-not-yet-recomputed source concept's placeholder
+    clearPin(core);
+
+    await core.ensureEmbedderPin(); // no embedderLoader override needed — samples empty, so this is Shape 4's "pin to the live embedder" path, no swap
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2"); // BOTH tables sampled empty (both rows are kind='source') — pinned to the live embedder, exactly like Shape 4
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // already satisfied — no swap
+    core.close();
+  });
+});
+
+describe("embedder pin — vector-threshold comparison guard (Codex review, PR #51, FIX H)", () => {
+  it("reassignCircle and mergeCircle throw EmbedderPinUnsatisfiedError on a mismatched reopen, and succeed once ensureEmbedderPin has run", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-guard-vector-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+      const stored = await seed.store("a fact that will be reassigned", { circle: "source-circle" });
+      seed.close();
+
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 2) }); // mismatched, no ensure
+      expect((core as any).pinUnsatisfied).toBe(true);
+
+      expect(() => core.reassignCircle(stored.conceptId, "dest-circle")).toThrow(EmbedderPinUnsatisfiedError);
+      await expect(core.mergeCircle("source-circle", "dest-circle")).rejects.toThrow(EmbedderPinUnsatisfiedError);
+      // Neither rejected call actually reassigned/merged anything.
+      expect((core as any).db.prepare(`SELECT circle FROM concepts WHERE id = ?`).get(stored.conceptId)).toEqual({ circle: "source-circle" });
+
+      await core.ensureEmbedderPin();
+      expect((core as any).pinUnsatisfied).toBe(false);
+
+      // Now both actually work, under the pinned embedder.
+      const result = core.reassignCircle(stored.conceptId, "dest-circle");
+      expect(result).not.toBeNull();
+      expect(["moved", "merged", "noop"]).toContain(result!.action);
+      await expect(core.mergeCircle("source-circle", "dest-circle")).resolves.toBeDefined();
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("restoreConcept and detach (found via the FIX H audit, not explicitly named in the review) also throw EmbedderPinUnsatisfiedError when the guard is armed", async () => {
+    // White-box arm (matches this file's established convention) rather than a full mismatched-
+    // reopen setup: this test's only job is confirming these two methods actually call the gate —
+    // the gate's own mechanism (arms/clears correctly, blocks/permits correctly) is already proven
+    // repeatedly above and in the FIX A/C round-trip tests.
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    (core as any).pinUnsatisfied = true;
+    expect(() => core.restoreConcept("nonexistent-id")).toThrow(EmbedderPinUnsatisfiedError);
+    await expect(core.detach("nonexistent-id", ["obs-1"])).rejects.toThrow(EmbedderPinUnsatisfiedError);
+    core.close();
+  });
+});
+
+// ---- embedder pin — Codex round 4 (PR #51): graph backfill deferral ----------------------------
+//
+// The one site FIX H's audit documented as "architecturally ungateable" (backfillGraph runs during
+// migrate(), strictly before this.pinUnsatisfied is even computed) turned out to have a real
+// consequence Codex found: an already-PINNED store opened by a mismatched constructor embedder,
+// with the one-time graph backfill still pending (user_version < GRAPH_SCHEMA_VERSION), would run
+// that backfill's bestMatches comparisons under thresholds calibrated for the WRONG embedder —
+// permanently wrong/missing `related` edges, since the backfill is version-gated to run at most
+// once. The fix is deferral: migrate() now only runs the backfill when the pin (or its absence)
+// makes the constructor-provided thresholds trustworthy; ensureEmbedderPin() completes any deferred
+// backfill once this.embedder is confirmed to satisfy the pin.
+//
+// Realistic trigger for "already pinned, backfill still pending": a store used with
+// graphEnabled:false (migrate()'s own pre-existing comment: "a graph-disabled open must NOT consume
+// the upgrade slot") gets pinned normally (initSyncIdentity runs regardless of graphEnabled), then
+// is later reopened graphEnabled:true with a different embedder than whatever it was pinned to.
+describe("embedder pin — graph backfill deferred until thresholds are trustworthy (Codex review, PR #51 round 4, FIX M)", () => {
+  const TEXT_A = "the database migration failed due to a lock timeout";
+  const TEXT_B = "the schema migration failed because of a connection timeout";
+
+  it("(test a) a mismatched-embedder open on an already-pinned, backfill-still-pending store defers the backfill; ensureEmbedderPin completes it with an edge set matching a correctly-opened reference", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-graph-defer-a-"));
+    const seedPath = join(dir, "seed.db");
+    const mismatchedPath = join(dir, "mismatched.db");
+    const referencePath = join(dir, "reference.db");
+    try {
+      // Seed: pin to hashing tok=1, graphEnabled:false so the one-time backfill's version slot is
+      // NEVER consumed — the realistic way this state arises. Two lexically-related concepts (dedup
+      // off, so both survive as distinct concepts for backfillGraph's neighbor search to relate)
+      // give backfillGraph something to actually find.
+      const seed = new MonetCore(seedPath, {
+        embedder: new HashingEmbeddingProvider(256, 1),
+        graphEnabled: false,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1, // dedup off — force two distinct concepts to compare, matches this codebase's own freshCore() convention for exercising the graph
+      });
+      await seed.store(TEXT_A, { circle: "c" });
+      await seed.store(TEXT_B, { circle: "c" });
+      seed.close();
+
+      copyFileSync(seedPath, mismatchedPath);
+      copyFileSync(seedPath, referencePath);
+
+      // Reference: reopen with the MATCHING embedder, graph enabled — pin matches constructor
+      // embedder, so migrate() does NOT defer; backfill runs normally, synchronously, in the
+      // constructor (test (b)'s exact shape, used here purely as the "ground truth" comparison).
+      const reference = new MonetCore(referencePath, {
+        embedder: new HashingEmbeddingProvider(256, 1),
+        graphEnabled: true,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1,
+        edgeSimMin: 0.1, // low floor so the lexically-related pair reliably clears it — this test asserts EQUIVALENCE between two paths, not calibration
+      });
+      const referenceEdges = reference.edges();
+      expect(referenceEdges.length).toBeGreaterThan(0); // sanity: there IS something to backfill
+      reference.close();
+
+      // The path this fix closes: reopen with a MISMATCHED embedder (tok=2 stands in for "an
+      // ONNX-ish constructor default" — avoids real ONNX/network while still being a genuine
+      // vector-space mismatch), graph enabled.
+      const mismatched = new MonetCore(mismatchedPath, {
+        embedder: new HashingEmbeddingProvider(256, 2),
+        graphEnabled: true,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1,
+        edgeSimMin: 0.1,
+      });
+      expect((mismatched as any).pinUnsatisfied).toBe(true); // mismatched — constructor-time guard confirms it independently
+      expect(mismatched.edges()).toEqual([]); // construction did NOT create graph edges — deferred, not silently wrong
+
+      await mismatched.ensureEmbedderPin(); // swaps to real hashing tok=1 (satisfies the pin), re-derives thresholds, THEN completes the deferred backfill
+      expect((mismatched as any).embedderModelId).toBe("hashing:dim=256:tok=1");
+
+      const mismatchedEdges = mismatched.edges();
+      expect(mismatchedEdges.length).toBeGreaterThan(0);
+      // Edge-set equivalence against the always-correctly-opened reference: both are copies of the
+      // SAME seed file (same concept/observation ids, byte-identical rows), so a direct comparison
+      // after sorting to a stable key is a genuine structural equality check, not a coincidence.
+      const sortKey = (e: { srcId: string; dstId: string; type: string }) => `${e.srcId}\0${e.dstId}\0${e.type}`;
+      const sortEdges = (edges: typeof referenceEdges) => [...edges].sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : 1));
+      expect(sortEdges(mismatchedEdges)).toEqual(sortEdges(referenceEdges));
+      mismatched.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("(test b) a MATCHING-embedder reopen of an already-pinned, backfill-still-pending store still runs the backfill normally during construction — unchanged from before this fix, no ensureEmbedderPin() call needed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-graph-defer-b-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, {
+        embedder: new HashingEmbeddingProvider(256, 1),
+        graphEnabled: false,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1,
+      });
+      await seed.store(TEXT_A, { circle: "c" });
+      await seed.store(TEXT_B, { circle: "c" });
+      seed.close();
+
+      // Reopen with the SAME (matching) embedder, graph now enabled — the pin already matches, so
+      // this must NOT defer. No ensureEmbedderPin() call anywhere in this test — the existing
+      // scripts/eval contract, exactly as before this fix.
+      const core = new MonetCore(dbPath, {
+        embedder: new HashingEmbeddingProvider(256, 1),
+        graphEnabled: true,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1,
+        edgeSimMin: 0.1,
+      });
+      expect((core as any).pinUnsatisfied).toBe(false); // matches — never armed
+      expect(core.edges().length).toBeGreaterThan(0); // backfill ran DURING CONSTRUCTION — before any ensure call could have run it
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("(test c) a deferred backfill that's never ensured produces no edges and no crash — the store otherwise serves per the existing guard rules, and a LATER matching-embedder open completes it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-graph-defer-c-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1), graphEnabled: false, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      await seed.store(TEXT_A, { circle: "c" });
+      await seed.store(TEXT_B, { circle: "c" });
+      seed.close();
+
+      const mismatched = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 2), graphEnabled: true });
+      expect(mismatched.edges()).toEqual([]); // deferred — no crash, no edges, construction completed fine
+      // Never call ensureEmbedderPin(). edges() is a read-only introspection method (not one of
+      // assertPinSatisfied's gated call sites — it derives nothing, just reads memory_edge as-is),
+      // so it still "serves" per the guard rules exactly as documented: gated operations would throw
+      // (proven elsewhere in this file), ungated read-only ones do not.
+      mismatched.close();
+
+      // A LATER open with the MATCHING embedder completes the backfill — proving the deferral is
+      // genuinely durable (user_version never got bumped past GRAPH_SCHEMA_VERSION), not a
+      // one-shot loss of the upgrade slot.
+      const later = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1), graphEnabled: true, tauAttach: 1.1, tauAmbiguous: 1.1, edgeSimMin: 0.1 });
+      expect((later as any).pinUnsatisfied).toBe(false); // matches — completes normally, synchronously, during THIS construction
+      expect(later.edges().length).toBeGreaterThan(0);
+      later.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- embedder pin — Codex round 5 (PR #51): empty-store recovery from an unsatisfiable pin ------
+//
+// FIX O narrows fail-closed's scope: it exists to protect a vector space real data already
+// committed to. An EMPTY store has no such commitment, so refusing to serve it forever over an
+// unloadable pin (e.g. a 'created' pin stamped from a raw, never-warmed provider whose modelId
+// string turned out to be wrong or unreachable — the constructor writes that pin as a bare string
+// read off the embedder instance, with NO load attempt of any kind, so nothing catches the mistake
+// until the NEXT open tries to actually satisfy it) is pure self-inflicted bricking with nothing to
+// show for it. The Shape 9 tests above were updated (insertFakeObservation added) specifically
+// because they used to incidentally exercise this exact empty-store case — they now assert the
+// invariant they always meant to (fail-closed protects REAL data) on non-empty stores, while this
+// block owns the empty-store recovery path explicitly.
+describe("embedder pin — empty store with an unsatisfiable pin recovers instead of bricking (Codex review, PR #51 round 5, FIX O)", () => {
+  it("(test 1) an empty store pinned to a garbage/unloadable model re-pins to the live constructor embedder on ensureEmbedderPin, and genuinely serves under it afterward", async () => {
+    const core = new MonetCore(":memory:", {
+      embedder: new HashingEmbeddingProvider(), // the CURRENT, WORKING embedder this store was actually constructed with (tok=2 default)
+      embedderLoader: async (modelId) => {
+        throw new UnsatisfiableEmbedderError(modelId, `mock: model '${modelId}' cannot be loaded`);
+      },
+    });
+    writePin(core, "Xenova/definitely-does-not-exist-mock", "created"); // simulates the bug: an earlier raw provider's unloadable modelId, stamped with no load attempt
+    expect(readPin(core).embedder_model_id).toBe("Xenova/definitely-does-not-exist-mock");
+
+    await core.ensureEmbedderPin(); // must NOT throw — FIX O recovers instead of bricking an empty store
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2"); // re-pinned to the LIVE constructor embedder
+    expect(pin.embedder_pin_source).toBe("backfilled");
+    expect((core as any).pinUnsatisfied).toBe(false);
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // this.embedder was never swapped — still the constructor's own instance
+
+    // Round-trip proof, not just field reads: store()/search() actually work now.
+    await core.store("fix O empty store recovery round trip test", { circle: "fix-o" });
+    const results = await core.search("fix O empty store recovery", { circle: "fix-o" });
+    expect(results.length).toBeGreaterThan(0);
+    core.close();
+  });
+
+  it("(test 2) a NON-empty store with an unsatisfiable pin still fails closed — FIX O's recovery never fires when there's real data to protect, guard stays poisoned exactly like FIX I", async () => {
+    const core = new MonetCore(":memory:", {
+      embedder: new HashingEmbeddingProvider(),
+      embedderLoader: async (modelId) => {
+        throw new UnsatisfiableEmbedderError(modelId, `mock: model '${modelId}' cannot be loaded`);
+      },
+    });
+    insertFakeObservation(core, 256); // real data — FIX O's "nothing to protect" rationale does not apply
+    writePin(core, "Xenova/definitely-does-not-exist-mock", "created");
+
+    let caught: unknown;
+    try {
+      await core.ensureEmbedderPin();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(UnsatisfiableEmbedderError);
+    expect((core as any).pinUnsatisfied).toBe(true); // poisoned — FIX I's semantics, untouched by FIX O
+    expect(readPin(core).embedder_model_id).toBe("Xenova/definitely-does-not-exist-mock"); // pin NOT rewritten
+
+    // The guard actually gates — same round-trip pattern used throughout this file (FIX 1/FIX C).
+    await expect(core.search("anything", { circle: "fix-o" })).rejects.toThrow(EmbedderPinUnsatisfiedError);
+    core.close();
+  });
+
+  it("(round 9, FIX AB) an empty store pinned to garbage, opened with an ANONYMOUS (no-modelId) embedder: ensureEmbedderPin succeeds, the recovery re-pin becomes fully NULL (not dim:N), and the store genuinely serves; a LATER real-id open backfills it correctly afterward", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-fix-ab-anon-recovery-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const anonymous: EmbeddingProvider = { dim: 256, embed: (_text: string) => new Float32Array(256) }; // no modelId — same shape as FIX W's/round-8's anonymous-provider tests
+      const core = new MonetCore(dbPath, {
+        embedder: anonymous,
+        embedderLoader: async (modelId) => {
+          throw new UnsatisfiableEmbedderError(modelId, `mock: model '${modelId}' cannot be loaded`);
+        },
+      });
+      writePin(core, "Xenova/definitely-does-not-exist-mock", "created"); // simulates the bug: an earlier raw provider's unloadable modelId, stamped with no load attempt
+      expect(readPin(core).embedder_model_id).toBe("Xenova/definitely-does-not-exist-mock");
+
+      await core.ensureEmbedderPin(); // must NOT throw — FIX O recovers instead of bricking, AND (FIX AB) must NOT mint dim:256 doing it
+
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBeNull(); // NOT "dim:256" — the entire point of FIX AB
+      expect(pin.embedder_pin_source).toBeNull();
+      expect(pin.embedder_pinned_at).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // still cleared — the store still genuinely serves
+
+      // Round-trip proof, not just field reads: store()/search() actually work now, under the
+      // anonymous embedder, exactly as FIX O always promised.
+      await core.store("fix AB empty store anonymous recovery round trip test", { circle: "fix-ab" });
+      const results = await core.search("fix AB empty store anonymous recovery", { circle: "fix-ab" });
+      expect(results.length).toBeGreaterThan(0);
+      core.close();
+
+      // A LATER open with a REAL-id, same-dimension embedder still backfills correctly — the
+      // anonymous recovery above never poisoned the pin (it stayed NULL throughout), so the CAS
+      // write here succeeds exactly as it would for any other pre-pin store with real evidence.
+      const later = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+      expect((later as any).pinUnsatisfied).toBe(false);
+      await later.ensureEmbedderPin();
+      const laterPin = readPin(later);
+      expect(laterPin.embedder_model_id).toBe("hashing:dim=256:tok=1");
+      expect(laterPin.embedder_pin_source).toBe("backfilled");
+      later.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("(test 3) an empty store with a satisfiable pin mismatch still takes the normal swap path — FIX O's recovery branch never fires when the loader succeeds", async () => {
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // tok=2, empty
+    writePin(core, "hashing:dim=256:tok=1", "backfilled"); // satisfiable mismatch — the loader will succeed, not throw
+
+    await core.ensureEmbedderPin(); // real loader — succeeds normally, no failure for FIX O's catch to intercept
+
+    const pin = readPin(core);
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=1"); // swapped-TO identity — NOT re-pinned back to the constructor's tok=2
+    expect(pin.embedder_pin_source).toBe("backfilled"); // untouched by this UPDATE — FIX O's branch never ran, this is the ORIGINAL write
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=1");
+    expect((core as any).pinUnsatisfied).toBe(false);
+    core.close();
+  });
+});
+
+// ---- embedder pin — Codex round 5 (PR #51): adoptEmbedderPin, the operator-intent stamp ----------
+//
+// FIX N: scripts/migrate-file-concept.ts re-embeds a store's vectors under a CHOSEN embedder
+// (--embedder onnx|hashing) but never told the pin machinery about it — so (i) a freshly-migrated
+// store backfills to whatever legacy default matches its NEW vectors' dimension on its next served
+// open (dimension-only inference can't distinguish the OLD default from the NEW one at the same
+// dimension), and (ii) re-running the script against its OWN already-pinned output hits the
+// constructor guard (the migration embedder deliberately differs from the pin) and every gated
+// source-sync call throws, silently unmigrated. adoptEmbedderPin() is the fix: an explicit,
+// synchronous, operator-intent primitive that stamps the CURRENT embedder as the pin by fiat.
+describe("embedder pin — adoptEmbedderPin, the operator-intent migration stamp (Codex review, PR #51 round 5, FIX N)", () => {
+  const TEXT_A = "the database migration failed due to a lock timeout";
+  const TEXT_B = "the schema migration failed because of a connection timeout";
+
+  it("(test 1) a pre-pin store: adoptEmbedderPin writes the pin (source 'migrated') and clears the guard, but deliberately LEAVES a deferred graph backfill pending — it completes only on a later, matching-embedder open (Codex review, PR #51 round 6, FIX R)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-adopt-pin-prepin-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      // Seed: real content under hashing tok=1, graphEnabled:false (never consumes the one-time
+      // graph-backfill upgrade slot — same realistic setup as FIX M's tests), THEN clear the pin to
+      // simulate a genuinely pre-ADR store (clearPin — this file's established "predates the pin
+      // entirely" convention, e.g. Shapes 2/3/4).
+      const seed = new MonetCore(dbPath, {
+        embedder: new HashingEmbeddingProvider(256, 1),
+        graphEnabled: false,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1, // dedup off — two distinct concepts for the graph backfill to actually relate
+      });
+      await seed.store(TEXT_A, { circle: "c" });
+      await seed.store(TEXT_B, { circle: "c" });
+      clearPin(seed);
+      seed.close();
+
+      // Reopen graph-enabled with the SAME embedder. Pin is NULL (unknown, not "non-NULL and
+      // different") so the constructor-time guard stays unarmed — but migrate()'s trustworthiness
+      // check (FIX M) sees a NULL pin over a store that already holds vectors and DEFERS: inference
+      // hasn't run yet, so no space is yet known-correct, even though this reopen's embedder happens
+      // to match what the vectors were actually written with.
+      const core = new MonetCore(dbPath, {
+        embedder: new HashingEmbeddingProvider(256, 1),
+        graphEnabled: true,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1,
+        edgeSimMin: 0.1,
+      });
+      expect(readPin(core).embedder_model_id).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // NULL pin never arms the guard
+      expect(core.edges()).toEqual([]); // deferred — construction created no edges
+
+      core.adoptEmbedderPin(); // synchronous, no await
+
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=1");
+      expect(pin.embedder_pin_source).toBe("migrated");
+      expect(typeof pin.embedder_pinned_at).toBe("number");
+      expect((core as any).pinUnsatisfied).toBe(false);
+      // FIX R: adopt must NOT complete the deferred backfill — at THIS moment the store's VECTORS
+      // are still pre-migration (this call runs BEFORE any re-embed work, by FIX N's own design),
+      // even though the EMBEDDER identity is now trustworthy. Completing it here would derive edges
+      // from the OLD vector space under NEW-space thresholds and permanently consume the one-time
+      // version-gated slot on garbage — the exact wrong-space bug FIX M closed, reopened one level
+      // up by adopt's own former call to runGraphBackfillIfPending.
+      expect(core.edges()).toEqual([]); // slot remains pending — untouched by adopt
+      core.close();
+
+      // A LATER, matching-embedder reopen completes it normally through migrate()'s own trustworthy
+      // path — by then, in the real migration flow, the script's re-embed pass has already brought
+      // the vectors into this same space (or, per FIX R's doc comment, the script's own per-concept
+      // rederiveNativeConceptGraph pass has already made every touched concept's edges correct
+      // independently of this slot at all).
+      const later = new MonetCore(dbPath, {
+        embedder: new HashingEmbeddingProvider(256, 1),
+        graphEnabled: true,
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1,
+        edgeSimMin: 0.1,
+      });
+      expect((later as any).pinUnsatisfied).toBe(false);
+      expect(later.edges().length).toBeGreaterThan(0); // NOW it completes
+      later.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("(test 2) an already-pinned store opened with a different embedder (guard armed): adoptEmbedderPin overwrites the pin to the constructor embedder, clears the guard, store()/search() work, and a later matching reopen is satisfied with no ensureEmbedderPin() call", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-adopt-pin-mismatch-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) }); // pins itself 'created' to tok=1
+      expect(readPin(seed).embedder_model_id).toBe("hashing:dim=256:tok=1");
+      seed.close();
+
+      // Reopen with a DIFFERENT embedder — stands in for "the migration script's --embedder choice
+      // deliberately differs from whatever this store happens to be pinned to" (FIX N's exact
+      // coupling: once a store IS pinned, re-running the script against its own output must not
+      // silently fail under the constructor guard).
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 2) }); // tok=2 — mismatched vs the tok=1 pin
+      expect((core as any).pinUnsatisfied).toBe(true); // guard armed at construction — confirms the pre-state independently
+
+      // Prove the guard actually gates BEFORE adopting — the exact failure FIX N closes for the
+      // migration script's source-sync loop (storeInternal is a gated call site).
+      await expect(core.store("must not silently write under the mismatched embedder", { circle: "fix-n" })).rejects.toThrow(EmbedderPinUnsatisfiedError);
+
+      core.adoptEmbedderPin(); // the operator (the migration script) declares tok=2 the target space
+
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2"); // overwritten to the CONSTRUCTOR embedder, not merely cleared
+      expect(pin.embedder_pin_source).toBe("migrated");
+      expect((core as any).pinUnsatisfied).toBe(false);
+
+      // Round-trip proof: write and query both actually work now, not just a cleared flag.
+      const stored = await core.store("adopt embedder pin round trip test", { circle: "fix-n" });
+      expect(stored.action).not.toBe(undefined);
+      const results = await core.search("adopt embedder pin round trip", { circle: "fix-n" });
+      expect(results.length).toBeGreaterThan(0);
+      core.close();
+
+      // Subsequent reopen with the NEW-matching embedder is satisfied at construction — no
+      // ensureEmbedderPin() call anywhere in this branch, proving the stamp is durable, not
+      // in-memory-only.
+      const later = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 2) });
+      expect((later as any).pinUnsatisfied).toBe(false);
+      expect(readPin(later).embedder_model_id).toBe("hashing:dim=256:tok=2");
+      later.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // (test 3, per the brief — "dry-run-shaped usage absence") is deliberately NOT a new test here:
+  // every pre-existing test in this file that never calls adoptEmbedderPin() is that proof already
+  // — none of them observe a 'migrated' pin source or a surprise guard-clear, and the full suite
+  // passing unchanged after this fix IS the assertion. Adding a redundant no-op test here would only
+  // restate what the other 30+ tests in this file already demonstrate by never once calling it.
+});
+
+// ---- embedder pin — cross-table dimension mismatch (Codex review, PR #51 round 6, FIX S) --------
+//
+// A crash mid-re-embed (scripts/migrate-file-concept.ts's step 3: reembedConcept rewrites
+// concepts.embedding, then a SEPARATE call, reembedConceptObservations, rewrites that same
+// concept's observations.embedding — not atomic together) can leave ONE concept's own row in the
+// NEW dimension while its own observations stay in the OLD one, or vice versa. The pre-FIX-S
+// either/or sampler (observations preferred, concepts checked ONLY when observations was empty)
+// never cross-checked the two tables against each other — it would silently pin whichever table it
+// happened to sample, ignoring that the OTHER table disagreed. FIX S unions the distinct dimensions
+// found in BOTH tables and fails closed the moment the union holds more than one.
+describe("embedder pin — cross-table dimension mismatch now caught (Codex review, PR #51 round 6, FIX S)", () => {
+  it("native observations at one dimension (256, alone the ONLY dim in that table) and native concepts at another (384, alone the ONLY dim in that table): UnsatisfiableEmbedderError naming both dims and both tables, no pin written", async () => {
+    // Deliberately ONE dimension per table (not a mix WITHIN either table) — this is exactly the
+    // shape the pre-FIX-S either/or sampler's own "prefers observations" logic would have sampled
+    // as "observations: single dim 256, done" WITHOUT ever looking at concepts, silently ignoring
+    // that concepts disagrees at 384. The union-based sampler now sees both and fails closed.
+    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
+    insertFakeObservation(core, 256, "fake-obs-256", "statement"); // native — NOT kind='source'
+    insertFakeConcept(core, 384, "fake-concept-384", "fact"); // native — NOT kind='source'
+    clearPin(core); // simulate: this store predates the embedder-pin ADR, now caught mid-crash
+
+    let caught: unknown;
+    try {
+      await core.ensureEmbedderPin();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(UnsatisfiableEmbedderError);
+    const err = caught as UnsatisfiableEmbedderError;
+    expect(err.message).toMatch(/256/);
+    expect(err.message).toMatch(/384/);
+    expect(err.message).toMatch(/observations/);
+    expect(err.message).toMatch(/concepts/);
+    expect(readPin(core).embedder_model_id).toBeNull(); // refused to guess — no pin written
+    // The live embedder was never replaced — a failed enforcement must not leave a half-swapped state.
+    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2");
+    core.close();
+  });
+});
+
+// ---- embedder pin — old-shape sync_meta table without a singleton row (Codex review, PR #51 -----
+// ---- round 6, FIX T) ------------------------------------------------------------------------------
+//
+// A v8-era store whose sync_meta TABLE already exists (old columns — this codebase's own migrate()
+// guards for applying_remote/closure_migrated/clock_mode already handle THAT evolution) but whose
+// SINGLETON ROW is absent (its very first open under ANY v8+ code, or a stranded partial-init from
+// a crash before the row was ever written) reaches initSyncIdentity()'s `!existing` branch BEFORE
+// migrate() ever runs (constructor order: init() -> initSyncIdentity() -> ... -> migrate()). Before
+// FIX T, the 3 pin columns were only guarded inside migrate(). Fault-injection-verified TWO distinct
+// crash sites this bug produced, both fixed by the SAME relocation: the EMPTY-variant shape hits
+// initSyncIdentity's 'created' INSERT, which names embedder_model_id explicitly, and threw "no such
+// column: embedder_model_id" right there; the VECTORED-variant shape takes initSyncIdentity's OTHER
+// branch (that INSERT deliberately does NOT name the pin columns — see FIX E), so it survives
+// initSyncIdentity unharmed but then throws the SAME "no such column" error one step later, inside
+// migrate() itself, at the FIX M-era graph-backfill-trustworthiness read (`SELECT embedder_model_id
+// FROM sync_meta`). Either way the store could not be opened at all. FIX T moves the guard into
+// init(), immediately after sync_meta's CREATE TABLE IF NOT EXISTS, so the columns exist before ANY
+// sync_meta write or read — closing both crash sites at once, not just the more obvious one.
+//
+// Fabricates the OLD shape directly via raw better-sqlite3 (matching this codebase's own
+// source-ledger.test.ts convention for exercising a migration path) — a genuinely fresh MonetCore
+// construction can't produce "table exists, columns missing, no row" on its own, since init()'s
+// CREATE TABLE IF NOT EXISTS always creates the FULL modern column set when the table doesn't exist
+// yet; the bug only reproduces when the table already exists in the OLD shape from BEFORE this code
+// ever touched it.
+function fabricateOldShapeSyncMeta(dbPath: string, opts: { withNativeVector?: boolean } = {}): void {
+  const raw = new Database(dbPath);
+  try {
+    // Exact pre-pin shape: every column migrate() itself already guards for (applying_remote,
+    // closure_migrated, clock_mode) present, the 3 pin columns absent, NO singleton row.
+    raw.exec(`
+      CREATE TABLE sync_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        device_id TEXT NOT NULL,
+        last_mutation_at INTEGER NOT NULL,
+        applying_remote INTEGER NOT NULL DEFAULT 0,
+        closure_migrated INTEGER NOT NULL DEFAULT 0,
+        clock_mode TEXT NOT NULL DEFAULT 'wall' CHECK (clock_mode IN ('wall', 'logical'))
+      );
+    `);
+    if (opts.withNativeVector) {
+      // Modern observations shape (copied verbatim from init()) — only sync_meta is deliberately
+      // old-shaped here; a pre-existing NATIVE vector is what should make FIX E's "legacy-upgrade,
+      // don't stamp 'created'" branch fire once the store actually opens.
+      raw.exec(`
+        CREATE TABLE observations (
+          id TEXT PRIMARY KEY,
+          content TEXT NOT NULL,
+          embedding TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'statement',
+          circle TEXT NOT NULL DEFAULT 'default',
+          concept_id TEXT,
+          superseded_by TEXT,
+          superseded_at INTEGER,
+          session_id TEXT,
+          author_agent_id TEXT NOT NULL,
+          source_refs TEXT,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+          sync_revision INTEGER NOT NULL DEFAULT 1,
+          sync_writer TEXT
+        );
+      `);
+      raw
+        .prepare(`INSERT INTO observations (id, content, embedding, author_agent_id) VALUES (?, ?, ?, ?)`)
+        .run("legacy-obs", "pre-existing legacy content", JSON.stringify(new Array(256).fill(0.01)), "legacy-agent");
+    }
+  } finally {
+    raw.close();
+  }
+}
+
+describe("embedder pin — old-shape sync_meta table without a singleton row does not brick the store (Codex review, PR #51 round 6, FIX T)", () => {
+  it("empty variant (no pre-existing vectors): open succeeds, pin gets 'created' against the live embedder — same as an ordinary fresh store", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-old-sync-meta-empty-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      fabricateOldShapeSyncMeta(dbPath); // no vectors — table exists, old shape, no row
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() }); // must not throw
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2");
+      expect(pin.embedder_pin_source).toBe("created"); // genuinely empty — treated like a fresh store (FIX E)
+      expect((core as any).pinUnsatisfied).toBe(false);
+      // Round-trip proof the store is genuinely usable, not just non-throwing at construction.
+      await core.store("fix T old-shape sync_meta recovery test", { circle: "fix-t" });
+      const results = await core.search("fix T old-shape recovery", { circle: "fix-t" });
+      expect(results.length).toBeGreaterThan(0);
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("vectored variant (a pre-existing native vector, simulating a real v8-era store with history): open succeeds, pin stays NULL per FIX E's legacy-upgrade branch — not stamped 'created'", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-pin-old-sync-meta-vectored-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      fabricateOldShapeSyncMeta(dbPath, { withNativeVector: true });
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() }); // must not throw
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBeNull(); // FIX E: legacy vectors present — NOT stamped 'created'
+      expect(pin.embedder_pin_source).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // NULL pin never arms the guard
+
+      // ensureEmbedderPin backfills from the pre-existing 256-dim vector, same as any other pre-pin
+      // legacy store (Shape 3) — proving the store isn't just openable but genuinely recoverable.
+      await core.ensureEmbedderPin();
+      const pinAfter = readPin(core);
+      expect(pinAfter.embedder_model_id).toBe("hashing:dim=256:tok=1");
+      expect(pinAfter.embedder_pin_source).toBe("backfilled");
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- embedder pin — deferCreatedPin suppresses the fresh-store stamp (Codex review, PR #51 -------
+// ---- round 7, FIX V) --------------------------------------------------------------------------
+//
+// scripts/migrate-file-concept.ts's report-only path constructs a MonetCore (schema auto-upgrade is
+// unconditional) but promises never to WRITE anything. Against a genuinely vector-free target DB,
+// the fresh-store branch would otherwise mint a 'created' pin naming the script's default embedder
+// — a plain inspection permanently choosing the store's space. deferCreatedPin makes the fresh-store
+// branch write the SAME legacy-shape row a pre-pin store gets, leaving the pin genuinely NULL.
+describe("embedder pin — deferCreatedPin suppresses the fresh-store stamp (Codex review, PR #51 round 7, FIX V)", () => {
+  it("a fresh store constructed with deferCreatedPin:true gets NULL pin instead of 'created'; guard stays unarmed; a LATER normal open pins via the ordinary empty-store backfill path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-defer-created-pin-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(), deferCreatedPin: true });
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBeNull(); // NOT 'hashing:dim=256:tok=2'
+      expect(pin.embedder_pin_source).toBeNull();
+      expect(pin.embedder_pinned_at).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // NULL pin never arms the guard
+      core.close();
+
+      // A LATER normal open (no deferCreatedPin) pins via the SAME empty-store backfill path Shape
+      // 4 already covers — source 'backfilled', not 'created', but a genuine, real pin all the same.
+      const later = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
+      expect((later as any).pinUnsatisfied).toBe(false); // still NULL at construction — unarmed
+      await later.ensureEmbedderPin();
+      const laterPin = readPin(later);
+      expect(laterPin.embedder_model_id).toBe("hashing:dim=256:tok=2");
+      expect(laterPin.embedder_pin_source).toBe("backfilled");
+      later.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deferCreatedPin has no effect on an ALREADY-pinned store (initSyncIdentity's fresh-store branch never runs when the singleton row already exists) — steady state is completely unaffected", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-defer-created-pin-noop-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() }); // pins itself 'created' normally
+      const before = readPin(seed);
+      expect(before.embedder_model_id).toBe("hashing:dim=256:tok=2");
+      seed.close();
+
+      // Reopen the SAME (already-pinned) store with deferCreatedPin:true — the flag only ever
+      // matters for a store whose singleton row doesn't exist yet; this store's does.
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(), deferCreatedPin: true });
+      expect(readPin(core)).toEqual(before); // byte-identical — no rewrite of any kind
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- embedder pin — anonymous (no-modelId) providers must not mint a dim:N 'created' pin ----------
+// ---- (Codex review, PR #51 round 7, FIX W) ---------------------------------------------------
+//
+// embedderModelId's dim:N fallback (`this.embedder.modelId ?? \`dim:${this.embedder.dim}\``) is a
+// COMPARISON convenience for the graft-rejection check, never a persistable identity — any other
+// anonymous provider of the SAME dimension satisfies it trivially later regardless of how
+// differently it actually embeds text, making the constructor-time guard vacuously pass for exactly
+// the population most likely to differ from each other in ways only their body matters.
+describe("embedder pin — anonymous providers (no modelId) must not mint a dim:N 'created' pin (Codex review, PR #51 round 7, FIX W)", () => {
+  it("a fresh store constructed with an anonymous (no-modelId) embedder gets NULL pin instead of a dim:N 'created' stamp", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-anon-embedder-pin-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const anonymous: EmbeddingProvider = { dim: 256, embed: (_text: string) => new Float32Array(256) }; // no modelId — matches va-ranking-probe.test.ts's makeStubEmbedder shape
+      const core = new MonetCore(dbPath, { embedder: anonymous });
+      const pin = readPin(core);
+      expect(pin.embedder_model_id).toBeNull(); // NOT "dim:256"
+      expect(pin.embedder_pin_source).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // NULL pin never arms the guard
+      core.close();
+
+      // Later opened with a REAL-id provider (same dim): ordinary empty-store backfill semantics
+      // apply — pins to the live embedder's own real id, source 'backfilled', not the anonymous
+      // provider's ephemeral dim:256 label (which was never persisted in the first place).
+      const later = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+      expect((later as any).pinUnsatisfied).toBe(false);
+      await later.ensureEmbedderPin();
+      const laterPin = readPin(later);
+      expect(laterPin.embedder_model_id).toBe("hashing:dim=256:tok=1");
+      expect(laterPin.embedder_pin_source).toBe("backfilled");
+      later.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("(round 8, closes a finding flagged during this same round) an ALREADY pre-pin, empty store opened with an anonymous embedder: ensureEmbedderPin succeeds and the store genuinely serves, but the persisted pin STAYS NULL (never dim:N) — a LATER real-id-embedder open still backfills correctly, proving nothing was poisoned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-anon-embedder-backfill-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      // Build a genuinely pre-pin, empty store (clearPin simulates "predates the ADR entirely" —
+      // this file's established convention, e.g. Shapes 2/3/4) using an anonymous embedder. This
+      // exercises backfillEmbedderPin's dim===null branch directly via ensureEmbedderPin, distinct
+      // from the fresh-store 'created' path the test above covers.
+      const anonymous: EmbeddingProvider = { dim: 256, embed: (_text: string) => new Float32Array(256) };
+      const core = new MonetCore(dbPath, { embedder: anonymous });
+      clearPin(core);
+      expect(readPin(core).embedder_model_id).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // NULL pin never arms the guard
+
+      await core.ensureEmbedderPin(); // hits backfillEmbedderPin's dim===null branch — MUST NOT throw, MUST NOT write
+
+      const pinAfter = readPin(core);
+      expect(pinAfter.embedder_model_id).toBeNull(); // STILL NULL — nothing weak (dim:256) was persisted
+      expect(pinAfter.embedder_pin_source).toBeNull();
+      expect(pinAfter.embedder_pinned_at).toBeNull();
+      expect((core as any).pinUnsatisfied).toBe(false); // guard cleared — store genuinely serves
+
+      // Round-trip proof, not just field reads: store()/search() actually work under the anonymous
+      // embedder now — the whole point of NOT refusing to serve here.
+      await core.store("round 8 empty-store anonymous-embedder backfill test", { circle: "r8" });
+      const results = await core.search("round 8 empty-store anonymous", { circle: "r8" });
+      expect(results.length).toBeGreaterThan(0);
+      core.close();
+
+      // A LATER open with a REAL-id, same-dimension embedder still backfills correctly — the
+      // anonymous open above never poisoned the pin (it stayed NULL throughout), so the CAS write
+      // here succeeds exactly as it would for any other pre-pin store with real evidence.
+      const later = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+      expect((later as any).pinUnsatisfied).toBe(false);
+      await later.ensureEmbedderPin();
+      const laterPin = readPin(later);
+      expect(laterPin.embedder_model_id).toBe("hashing:dim=256:tok=1");
+      expect(laterPin.embedder_pin_source).toBe("backfilled");
+      later.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- embedder pin — satisfied-pin validation (Codex review, PR #51 round 8, FIX AA) --------------
+//
+// "The pin's modelId string matches the constructor embedder's modelId string" is an identity
+// claim, not a capability claim — embedderModelId is a bare string read off the embedder instance
+// at construction, with no load attempt of any kind. A raw, never-warmed provider (or any custom
+// async provider) whose model can't actually load would satisfy that string comparison trivially.
+// ensureEmbedderPin's satisfied branch now runs a real validation embed before clearing the guard,
+// exactly mirroring what the swap branch already gets for free via instantiateEmbedderForPin's own
+// warmup. The existing steady-state coverage — "(c) steady state (pin already satisfied): thresholds
+// are byte-identical and the recompute path never runs" (this file, threshold re-derivation describe
+// block) — already proves the working-provider case is unaffected: it spies on
+// applyEmbedderDerivedThresholds specifically, a DIFFERENT method than the one FIX AA adds a call
+// to, so it keeps passing for the right reason, not by accident.
+describe("embedder pin — satisfied-pin validation (Codex review, PR #51 round 8, FIX AA)", () => {
+  it("a satisfied pin (modelId matches the constructor embedder) whose embedder fails to actually produce a vector: ensureEmbedderPin rejects, the guard is poisoned, and the pin itself stays untouched — NOT re-pinned, since FIX O's recovery deliberately does not apply here", async () => {
+    const brokenButMatching: EmbeddingProvider = {
+      dim: 384,
+      modelId: "broken-but-matching-model",
+      embed: async (_text: string) => {
+        throw new Error("model session crashed");
+      },
+    };
+    // Genuinely EMPTY store (:memory:, zero store() calls ever) — deliberately the exact shape FIX
+    // O recovers for a SWAP failure, to prove that recovery does NOT extend to this branch: the
+    // live embedder itself is the one that just failed, so there is nothing safe to fall back to.
+    const core = new MonetCore(":memory:", { embedder: brokenButMatching });
+    // Fresh store pins itself 'created' to this SAME modelId at construction (a real modelId, so
+    // FIX W's anonymous-provider check doesn't apply either) — pinnedModelId === this.embedderModelId
+    // is trivially true inside ensureEmbedderPin, taking the satisfied branch.
+    expect(readPin(core).embedder_model_id).toBe("broken-but-matching-model");
+    expect((core as any).pinUnsatisfied).toBe(false); // matches by construction — guard starts unarmed
+
+    let caught: unknown;
+    try {
+      await core.ensureEmbedderPin();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(UnsatisfiableEmbedderError);
+    expect((caught as UnsatisfiableEmbedderError).modelId).toBe("broken-but-matching-model");
+    expect((caught as Error).message).toMatch(/matches the constructor-provided/i);
+    expect((caught as UnsatisfiableEmbedderError).cause).toBeInstanceOf(Error);
+    expect((caught as { cause: Error }).cause.message).toMatch(/model session crashed/);
+    expect((core as any).pinUnsatisfied).toBe(true); // poisoned — guard now armed even though the PIN never changed
+
+    // Not re-pinned (no FIX O recovery here) — the persisted value is exactly what it was before
+    // this call, proving this is a validation failure, not a re-pin decision.
+    const pinAfter = readPin(core);
+    expect(pinAfter.embedder_model_id).toBe("broken-but-matching-model");
+    expect(pinAfter.embedder_pin_source).toBe("created");
+
+    // The guard actually gates — same round-trip pattern used throughout this file.
+    await expect(core.search("anything", { circle: "fix-aa" })).rejects.toThrow(EmbedderPinUnsatisfiedError);
+    core.close();
+  });
+
+  it("the served-path choke point actually rejects too: createMonetCoreMcpServer fails to start when the satisfied-pin validation fails", async () => {
+    const brokenButMatching: EmbeddingProvider = {
+      dim: 384,
+      modelId: "broken-but-matching-model-2",
+      embed: async (_text: string) => {
+        throw new Error("model session crashed");
+      },
+    };
+    const core = new MonetCore(":memory:", { embedder: brokenButMatching });
+    await expect(createMonetCoreMcpServer(core)).rejects.toThrow(UnsatisfiableEmbedderError);
+    core.close();
+  });
+
+  // The genuinely-WORKING-provider case (steady state must stay completely unaffected) is
+  // deliberately NOT a new test here — see this describe block's own header comment: "(c) steady
+  // state (pin already satisfied): thresholds are byte-identical and the recompute path never
+  // runs" (this file's threshold re-derivation describe block, above) already proves it, spying on
+  // applyEmbedderDerivedThresholds specifically — a method FIX AA's validation embed never calls —
+  // so it keeps passing for the right reason, not by accident. Adding a redundant test here would
+  // only restate what that test already demonstrates.
+});
+
+// ---- embedder pin — dim-sized vector writes are gated too (Codex review, PR #51 round 9, --------
+// ---- FIX AC) --------------------------------------------------------------------------------
+//
+// recomputeNativeConceptProjection's empty-observation branch writes `new Float32Array(this.
+// embedder.dim)` directly into concepts.embedding, with no embed() call for any existing gate to
+// catch. A wrong-dimension write from an unensured mismatched core corrupts that row for every
+// FUTURE cosine comparison against it, not just the write itself — the FIX H audit's threshold-
+// comparison lens correctly found no bestMatches/cosine call in this method and moved on, missing
+// that a dim-sized WRITE is its own hazard. Gated at the method's own top (assertPinSatisfied),
+// covering all 4 callers: resolveContradiction and supersedeObservation (newly protected here),
+// restoreConcept and graftRows (already independently gated for their own reasons).
+describe("embedder pin — dim-sized vector writes are gated too (Codex review, PR #51 round 9, FIX AC)", () => {
+  it("a pinned store's ONLY observation, terminally superseded by an UNENSURED core with a GENUINELY DIFFERENT dimension: supersedeObservation throws EmbedderPinUnsatisfiedError BEFORE writing a wrong-dimension zero vector — the whole operation is atomic (supersedeObservation's own pre-existing db.transaction wrapper also covers the now-gated recomputeNativeConceptProjection call), so nothing is left half-mutated; after ensureEmbedderPin, the identical call succeeds", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-fix-ac-dim-write-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(256, 1) });
+      const stored = await seed.store("a lone fact whose only observation will be terminally superseded", { circle: "fix-ac" });
+      seed.close();
+
+      // Reopen with a MISMATCHED, UNENSURED embedder of a GENUINELY DIFFERENT DIMENSION (384, not
+      // 256) — guard armed at construction, ensureEmbedderPin never called. A real dim delta (not
+      // just a different tokenizer version at the same dim) is deliberate here: it makes the
+      // "wrong-dimension write" hazard this fix closes unambiguous under fault injection (below) —
+      // a corrupted write is provably 384-long against a store pinned to 256, not just "some other
+      // vector space at the same length."
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider(384, 1) });
+      expect((core as any).pinUnsatisfied).toBe(true);
+
+      // Terminal supersession of this concept's ONLY observation drives its active-observation
+      // count to zero, reaching recomputeNativeConceptProjection's empty-observation branch — the
+      // exact dim-sized zero-vector write FIX AC gates.
+      expect(() => core.supersedeObservation(stored.observationId, null)).toThrow(EmbedderPinUnsatisfiedError);
+
+      // The WHOLE operation rolled back — confirmed directly, not assumed: supersedeObservation's
+      // own body (engine.ts) is wrapped in ONE db.transaction() that also covers the now-gated
+      // recomputeNativeConceptProjection call, so the earlier UPDATE observations SET
+      // superseded_by/superseded_at never committed either.
+      const obsRow = (core as any).db.prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`).get(stored.observationId) as {
+        superseded_by: string | null;
+        superseded_at: number | null;
+      };
+      expect(obsRow.superseded_by).toBeNull();
+      expect(obsRow.superseded_at).toBeNull();
+
+      // The concept's embedding is UNTOUCHED too — still 256-long (the original, correctly-pinned
+      // vector), not overwritten with a 384-long zero vector from the mismatched core.
+      const conceptRow = (core as any).db.prepare(`SELECT embedding FROM concepts WHERE id = ?`).get(stored.conceptId) as { embedding: string };
+      expect((JSON.parse(conceptRow.embedding) as number[]).length).toBe(256);
+
+      await core.ensureEmbedderPin(); // swaps this.embedder to the real, pin-satisfying dim=256/tok=1
+      expect((core as any).pinUnsatisfied).toBe(false);
+
+      const result = core.supersedeObservation(stored.observationId, null); // the IDENTICAL call now succeeds
+      expect(result.terminal).toBe(true);
+      expect(result.alreadySuperseded).toBe(false);
+      core.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

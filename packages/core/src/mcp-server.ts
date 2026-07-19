@@ -2199,6 +2199,15 @@ export async function createMonetCoreMcpServer(
   core: MonetCore,
   options: CreateMonetCoreMcpServerOptions = {},
 ): Promise<McpServer> {
+  // Embedder-pin enforcement (embedder-pin ADR, slice 1) — MonetCore's constructor is synchronous
+  // and cannot itself satisfy a pin that requires an async model load, so every served path awaits
+  // this once before handling any request. This is the single choke point for both "the MCP
+  // server" and "the CLI": scripts/mcp-cli.ts constructs `core` and immediately calls this factory,
+  // so covering this call site covers that entry point too, without duplicating the enforcement
+  // call at every construction site. Throws UnsatisfiableEmbedderError (never silently substitutes
+  // another embedder) if the store's pin can't be honored — propagates uncaught, so the server
+  // must not start and the process exits non-zero (see scripts/mcp-cli.ts's main().catch()).
+  await core.ensureEmbedderPin();
   const server = new McpServer(
     { name: "monet-core", version: "0.7.0" },
     {

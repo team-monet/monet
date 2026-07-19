@@ -16,6 +16,7 @@
  * its own port AND its own schema setup; that is out of scope for the shipped engine.
  */
 import Database from "better-sqlite3";
+import { existsSync } from "node:fs";
 
 /** The result of a write (INSERT/UPDATE/DELETE) — mirrors better-sqlite3's RunResult. */
 export interface RunResult {
@@ -87,5 +88,44 @@ export class BetterSqlitePort implements StoragePort {
 
   close(): void {
     this.db.close();
+  }
+}
+
+/**
+ * Lightweight, read-only peek at a store's persisted embedder pin (sync_meta.embedder_model_id),
+ * WITHOUT constructing a MonetCore — no schema creation, no migration, no sync-identity write, no
+ * WAL-mode pragma side effects on the file (Codex review, PR #51 round 7, FIX U —
+ * scripts/mcp-cli.ts's startup sequencing is the motivating, and so far only, caller: it needs to
+ * know what a store is ALREADY pinned to before choosing which embedder to construct and warm up,
+ * not after paying that embedder's own load cost). Lives here, not engine.ts: it never touches
+ * MonetCore's schema/migration logic, only the raw driver — the same reason BetterSqlitePort, the
+ * only other direct better-sqlite3 consumer in this codebase, lives here too.
+ *
+ * Tolerant by design — returns null (never throws) for every "nothing to read yet" shape: the file
+ * doesn't exist (a genuinely first-ever run — better-sqlite3's readonly mode can't create one, so
+ * this checks existence first rather than let that surface as a thrown error), the file exists but
+ * isn't a monet-core database, the sync_meta table doesn't exist (pre-v8), the singleton row
+ * doesn't exist yet, or the pin columns themselves don't exist (pre-embedder-pin-ADR schema, before
+ * MonetCore's own init()-time guard has ever run against this file — see engine.ts's FIX T). A
+ * caller sees "no persisted pin" in every one of those cases and falls back to whatever it would
+ * have done before this helper existed — this function only ever NARROWS a caller's choice, never
+ * widens what "no pin" means beyond what MonetCore's own pin machinery already treats as unpinned.
+ */
+export function readStoredEmbedderPin(dbPath: string): string | null {
+  if (!existsSync(dbPath)) return null;
+  let db: Database.Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    const row = db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as
+      | { embedder_model_id: string | null }
+      | undefined;
+    return row?.embedder_model_id ?? null;
+  } catch {
+    // Missing table, missing column, a file that isn't actually a sqlite db, a locked file, etc. —
+    // every failure mode collapses to "we don't know the pin", never a thrown error upward. The
+    // caller's normal (pre-pin-aware) fallback path already handles "unknown pin" correctly.
+    return null;
+  } finally {
+    db?.close();
   }
 }
