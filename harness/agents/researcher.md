@@ -21,7 +21,7 @@ When asked to research a topic, return a structured response with:
 - Use your host's web-search tool for discovery — on Claude Code this is `ddg_search` (MCP) or the built-in web search; on other hosts use the equivalent.
 - Use your host's URL-fetch tool to read and extract content from discovered URLs — on Claude Code this is `webfetch`; use the equivalent where available.
 - Do not edit files.
-- Do not make decisions that override Stig or Aria judgment.
+- Do not make decisions that override Stig judgment.
 - Prioritize relevance and specificity over comprehensiveness.
 - When research reveals the question is underspecified, flag what's missing.
 - Stay neutral: present options and tradeoffs, then recommend based on stated context.

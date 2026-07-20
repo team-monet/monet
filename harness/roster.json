@@ -35,7 +35,7 @@
       "prompt": "agents/analyst.md",
       "touchesMonet": false,
       "model": "sonnet",
-      "description": "Use PROACTIVELY for architecture and planning under constraints: assess feasibility, risks, and the approach before implementation. Does not write code."
+      "description": "Use PROACTIVELY for architecture and planning under constraints: assess feasibility, risks, and the approach before implementation. Also use when product scope or acceptance criteria are unclear: it surfaces the ambiguity back to the lead to take to the user — it does not decide scope. Does not write code."
     },
     {
       "name": "mechanic",
@@ -71,7 +71,7 @@
       "prompt": "agents/reviewer.md",
       "touchesMonet": false,
       "model": "opus",
-      "description": "Use PROACTIVELY after writing or changing code to review for correctness, security, and maintainability. Returns findings by severity; does not mutate PRs."
+      "description": "Use PROACTIVELY after writing or changing code to review for correctness, security, maintainability, and basic operational risk (SLOs, retries, observability). Flags live incident or release-readiness concerns to the lead. Returns findings by severity; does not mutate PRs."
     },
     {
       "name": "auditor",
@@ -90,24 +90,6 @@
       "touchesMonet": false,
       "model": "opus",
       "description": "Use PROACTIVELY for trust-boundary, auth, secrets, or data-exposure concerns: threat-model and review for security risk."
-    },
-    {
-      "name": "reliability",
-      "role": "incident / regression / readiness review",
-      "mode": "subagent",
-      "prompt": "agents/reliability.md",
-      "touchesMonet": false,
-      "model": "sonnet",
-      "description": "Use PROACTIVELY for incident, regression, or release-readiness review: SLOs, observability, and operational risk."
-    },
-    {
-      "name": "aria",
-      "role": "product scope / acceptance criteria",
-      "mode": "subagent",
-      "prompt": "agents/aria.md",
-      "touchesMonet": false,
-      "model": "sonnet",
-      "description": "Use PROACTIVELY when product scope or acceptance criteria are unclear: define what and why, scope the work, and set acceptance criteria."
     }
   ]
 }

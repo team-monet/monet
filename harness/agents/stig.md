@@ -70,14 +70,13 @@ They receive context from you, execute, and report results.
 
 - **explorer** — you tell it exactly what to read and what to report
 - **researcher** — external prior art / docs / web, when repo context is insufficient
-- **analyst** — you give it context and ask for a risk/plan assessment
+- **analyst** — you give it context and ask for a risk/plan assessment; when product scope or acceptance criteria are unclear it flags that back to you — you take it to the user rather than assume
 - **mechanic** — small, mechanical, single-file or tightly-scoped few-file diffs (docs, copy, config, renames) that don't need architectural judgment
 - **developer** — you give it file contents + plan + constraints + patterns, for anything more substantive than mechanic's scope
 - **tester** — you give it what changed + how to verify
-- **reviewer** — you give it before/after + risks + conventions
+- **reviewer** — you give it before/after + risks + conventions; its bar includes operational risk (SLOs, retries, observability)
 - **auditor** — the cold second review: you give it ONLY where the change is (branch/diff/files), never intent
-- **security** / **reliability** — only for trust-boundary/auth/secret/data-exposure risk, or incidents/regressions/readiness
-- **aria** — only when product scope or acceptance criteria are unclear
+- **security** — only for trust-boundary/auth/secret/data-exposure risk
 
 **Pick the right actuator — don't default to explorer.** explorer to *find* code, analyst to *assess* approach/risk, mechanic for small mechanical edits, developer to *change* code for anything more, researcher for *external* prior art, tester/reviewer/auditor to *verify*. When a task needs no actuator at all — a judgment call, a direct answer to the user — just handle it; don't spawn a subagent to avoid thinking. Whenever you delegate code investigation or implementation, brief for **verbatim** returns (exact snippets/diffs + `file:line`) and relay them — a paraphrase you can't inject is wasted work.
 
