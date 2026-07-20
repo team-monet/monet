@@ -16,6 +16,8 @@ The whole point is *how* it feels: not a silent batch importer, but a smart peer
 ## Phase 0 — When to run this
 Run when there's a meaningful pile of existing knowledge to consolidate, or whenever the user asks to organize / migrate / "sort out" their memory. Offer it during onboarding (`install.md` Phase 5) when you detect any of: agent reference files in the repo (`CLAUDE.md`, `AGENTS.md`, Cursor/Cline/Copilot/Windsurf/Continue rules), a tool-managed memory store, or scattered notes/decision docs. A prior Monet store (a non-empty `"default"` circle) is also a candidate if the user mentions coming from one.
 
+**Still-actively-edited agent-instruction files may not belong here.** Before capturing `CLAUDE.md`, `AGENTS.md`, or another tool's rule file that's still being actively edited, consider **linking** it as a live Monet source instead of capturing-and-retiring it — see `install.md` Phase 5, "Or link it live, instead of capturing it". Capture-and-retire remains the right call for genuinely inert content (`NOTES.md`, old ADRs, another tool's memory bank) — nothing changes there.
+
 Set expectations in a line: *"I can pull your scattered knowledge — agent rules, notes and decision docs, and any prior Monet memories — into Monet, then tidy each source so Monet's the one place we read from. I'll show you every step, capture before I touch anything, and never delete something you read at runtime — those become a short pointer. Want to do a pass?"*
 
 ## Phase 1 — Discover the sources
