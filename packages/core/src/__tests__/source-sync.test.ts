@@ -1298,6 +1298,75 @@ describe("repo-md committed-HEAD sync", () => {
     } finally { f.cleanup(); }
   });
 
+  it("ingests array-valued frontmatter alongside a genuinely-invalid file, and sourceStatus's skip count reflects only the real skip (frontmatter array tolerance)", async () => {
+    const f = fixture("frontmatter-array-mixed");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      // Real vaults (Obsidian, etc.) use array-valued frontmatter for keys other than `tags`
+      // routinely — this file used to be silently dropped (invalid-frontmatter) even though it has
+      // no genuinely nested structure, just a flat list of names.
+      writeFileSync(join(f.repo, "meeting.md"), "---\nattendees: [Priya Patel, Sarah Chen]\n---\n# Standup\nDiscussed the roadmap.\n");
+      // A genuinely nested value (map, not a flat list) is still unsupported and still skips —
+      // unaffected by this fix.
+      writeFileSync(join(f.repo, "bad-frontmatter.md"), "---\nowner:\n  name: docs\n---\n# Body\ntext");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "frontmatter array mix");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      expect(result.status).toBe("published");
+      const runId = f.core.getSource("repo-source")!.activeRunId!;
+      // README.md (fixture default) + meeting.md now both ingest; bad-frontmatter.md alone skips.
+      expect(f.core.listSourceFiles(runId, true).map((file) => file.relativePath).sort()).toEqual(["README.md", "meeting.md"]);
+      expect(f.core.listSourceSkippedFiles(runId).map((row) => ({ relativePath: row.relativePath, code: row.code })))
+        .toEqual([{ relativePath: "bad-frontmatter.md", code: "invalid-frontmatter" }]);
+
+      // Surfaced in the status projection (source_status MCP tool / core.sourceStatus): a sync
+      // that skipped a file no longer looks perfectly healthy at a glance, and — the actual fix
+      // here — the array-frontmatter file is no longer counted among the skips at all.
+      const status = f.core.sourceStatus("repo-source", { callerId: "caller", projectId: "project" });
+      expect(status).toMatchObject({ lastSyncResult: "success", filesIndexed: 2, filesSkipped: 1, freshness: "fresh" });
+    } finally { f.cleanup(); }
+  });
+
+  it("re-evaluates an already-published source on an otherwise-UNCHANGED working tree once its stored ingest-config hash goes stale (review fix, Codex P1 finding 1)", async () => {
+    // SOURCE_CHUNKER_VERSION's own bump (v3->v4, source-chunker.ts) is what actually closes this in
+    // production: a classification-affecting parser change must change computeSourceIngestConfigHash
+    // so an already-registered, already-synced source doesn't take beginSourceRun's unchanged-
+    // snapshot/config noop path (source-ledger.ts ~835-837) forever. This test can't literally
+    // replay an OLDER build's parser (that code no longer exists once this fix lands), so it proves
+    // the exact mechanism the version bump relies on directly: ANY staleness in the source's stored
+    // active_ingest_config_hash — for whatever reason, a version bump included — defeats the noop
+    // short-circuit and forces one real re-scan on an UNCHANGED git tree, which then reflects the
+    // CURRENT parser's classification (proven separately, extensively, by this file's and
+    // frontmatter-array-values.test.ts's other tests).
+    const f = fixture("stale-ingest-hash");
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "meeting.md"), "---\nattendees: [Priya Patel, Sarah Chen]\n---\n# Standup\nDiscussed the roadmap.\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add array-frontmatter file");
+
+      const first = await f.core.syncRepoMdSource("repo-source");
+      expect(first.status).toBe("published");
+      const firstRun = f.core.getSource("repo-source")!.activeRunId!;
+      expect(f.core.listSourceFiles(firstRun, true).map((file) => file.relativePath).sort()).toEqual(["README.md", "meeting.md"]);
+
+      // Simulate a stale ingest-config hash on an otherwise fully-published, up-to-date source —
+      // standing in for "this exact publication predates a classification-affecting version bump"
+      // without depending on any specific OLD parser's behavior.
+      const rawDb = (f.core as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db;
+      rawDb.prepare(`UPDATE knowledge_sources SET active_ingest_config_hash = ? WHERE id = ?`).run("stale-pre-bump-hash", "repo-source");
+
+      // No commit, no config change: the working tree is byte-for-byte what it was for `first`.
+      const second = await f.core.syncRepoMdSource("repo-source");
+      expect(second.status).not.toBe("noop"); // the stale hash alone defeats the noop short-circuit
+      expect(second.status).toBe("published");
+      const secondRun = f.core.getSource("repo-source")!.activeRunId!;
+      expect(secondRun).not.toBe(firstRun); // a genuine new run actually happened, not a cache hit
+      // The re-scan reflects the CURRENT (already-correct) parser — still both files, still no skips.
+      expect(f.core.listSourceFiles(secondRun, true).map((file) => file.relativePath).sort()).toEqual(["README.md", "meeting.md"]);
+      expect(f.core.listSourceSkippedFiles(secondRun)).toEqual([]);
+    } finally { f.cleanup(); }
+  });
+
   it("gracefully aborts partial instead of throwing when carried-forward content exceeds the run's chunk budget (blocker 1 regression)", async () => {
     const f = fixture("carry-budget");
     try {

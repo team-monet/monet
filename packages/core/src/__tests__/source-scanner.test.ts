@@ -69,7 +69,10 @@ describe("source scanner configuration and glob semantics", () => {
     expect(DEFAULT_SOURCE_SCANNER_LIMITS.maxEntries).toBe(100_000);
     expect(SOURCE_SCANNER_VERSION).toBe("v2");
     // File=concept (Phase 1): chunker bumped v2->v3 for the minimum-chunk merge pass (item 8).
-    expect(SOURCE_CHUNKER_VERSION).toBe("v3");
+    // Frontmatter array tolerance (ratified): bumped v3->v4 for the classification change (a flat
+    // scalar list is now accepted for any key, not just tags) — see SOURCE_CHUNKER_VERSION's own
+    // comment (source-chunker.ts) for why a classification change requires this.
+    expect(SOURCE_CHUNKER_VERSION).toBe("v4");
   });
 
   it("matches conservative anchored POSIX globs with segment-aware **", () => {

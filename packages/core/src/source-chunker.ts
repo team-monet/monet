@@ -1,6 +1,18 @@
 import { createHash } from "node:crypto";
 
-export const SOURCE_CHUNKER_VERSION = "v3";
+// REVIEW FIX (Codex P1 finding 1): v3->v4 for the frontmatter array-tolerance change (a flat
+// scalar list is now accepted for any key, not just `tags`) — a CLASSIFICATION change, exactly
+// like the v2->v3 minimum-chunk-merge bump before it (see source-scanner.test.ts). Without this,
+// an already-registered, already-synced source whose working tree hasn't otherwise changed takes
+// beginSourceRun's unchanged-snapshot/config noop path (source-ledger.ts) forever — the parser
+// never runs again, so a previously-skipped array-frontmatter file stays skipped until a user
+// edits the repo or its source config, even on a build that would now accept it. Bumping this
+// constant changes computeSourceIngestConfigHash (source-scanner.ts) and therefore
+// computeSourceIngestFingerprint (below) for every chunk, which defeats BOTH the source-level noop
+// short-circuit AND materializeStagedBindings' (source-sync.ts) per-chunk unchanged-content skip on
+// the very next sync of any existing source — forcing one full, real re-scan and re-materialization
+// pass regardless of whether the underlying file bytes changed at all.
+export const SOURCE_CHUNKER_VERSION = "v4";
 
 const CONTENT_HASH_PREFIX = "monet-src-content/v1:sha256:";
 const CHUNK_FINGERPRINT_DOMAIN = "monet-src-ingest/v1";
@@ -198,6 +210,37 @@ export function computeSourceRefOccurrences(identities: readonly SourceHeadingId
   return result;
 }
 
+/**
+ * A YAML flow-sequence value (`[a, b, c]`) reduced to its flat scalar elements — comma-split,
+ * trimmed, with matching outer quotes stripped per element (the same per-item shape `tags`' own
+ * dedicated parsing below produces). Returns `null` when this substrate's flat frontmatter model
+ * cannot represent the value: a mismatched bracket; a stray `[`, `]`, or `{` surviving inside the
+ * stripped payload (checked before splitting, so a quoted item can't hide one) — a nested array or
+ * an array of objects/maps; or (REVIEW FIX, Codex P2 finding 3) an UNQUOTED item that is itself an
+ * implicit YAML flow-mapping entry (`name: Priya`, no braces) — `attendees: [name: Priya]` is a
+ * flow sequence containing a mapping entry, not a flat scalar, and silently ingesting it as the
+ * literal string "name: Priya" would break the fail-closed contract this substrate promises for
+ * genuinely nested frontmatter. A colon immediately followed by whitespace, or a colon at the very
+ * end of the trimmed item, is YAML's own mapping-key indicator — checked on the UNQUOTED item only
+ * (a quoted item like "10:30 meeting" or "name: Priya" is unambiguously a scalar; quoting is exactly
+ * how YAML lets a colon be literal).
+ */
+function parseFlatScalarList(value: string): string[] | null {
+  if (!(value.startsWith("[") && value.endsWith("]"))) return null;
+  const payload = value.slice(1, -1);
+  if (/[\[\]{}]/.test(payload)) return null;
+  if (payload === "") return [];
+  const result: string[] = [];
+  for (const raw of payload.split(",").map((item) => item.trim())) {
+    if (raw === "") continue; // matches the prior .filter(Boolean) semantics
+    const quoted =
+      raw.length >= 2 && ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")));
+    if (!quoted && /:(\s|$)/.test(raw)) return null; // implicit flow-mapping entry — genuinely nested
+    result.push(quoted ? raw.slice(1, -1) : raw);
+  }
+  return result;
+}
+
 function parseFrontmatter(lines: string[], relativePath: string, deadlineExceeded?: () => boolean): FrontmatterResult {
   const emptyMetadata = (): SourceChunkMetadata => ({ tags: [], scope: null, frontmatter: {} });
   if (lines[0] !== "---") return { bodyLines: lines, metadata: emptyMetadata() };
@@ -254,22 +297,51 @@ function parseFrontmatter(lines: string[], relativePath: string, deadlineExceede
         },
       };
     }
-    if (
-      value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-    ) {
+    // REVIEW FIX (Codex P2 finding 2): captured BEFORE stripping — a quoted value is unambiguously
+    // a scalar in YAML (quoting is exactly how a scalar that LOOKS like other syntax, e.g.
+    // `title: "[Draft]"` or `alias: "[ADR-42]"`, stays a literal scalar). Stripping the quotes
+    // first and then re-inspecting the RESULT for a leading `[` — the bug this fixes — cannot tell
+    // "[Draft]" (a literal scalar, originally quoted) apart from [Draft] (an actual one-item flow
+    // sequence, never quoted); only the pre-strip form carries that distinction.
+    const rawValueWasQuoted =
+      value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")));
+    if (rawValueWasQuoted) {
       value = value.slice(1, -1);
     }
-    if (/^[|>{]/.test(value) || (key !== "tags" && value.startsWith("["))) {
+    if (/^[|>{]/.test(value)) {
       return {
         bodyLines: lines,
         metadata: emptyMetadata(),
         diagnostic: {
           code: "invalid-frontmatter",
-          message: "frontmatter supports only flat scalar values and a flat tags list",
+          message: "frontmatter supports only flat scalar values, flat scalar lists, and a flat tags list",
           relativePath,
         },
       };
+    }
+    // Real vaults (Obsidian, etc.) use array-valued frontmatter routinely for keys other than
+    // `tags` — attendees, participants, aliases, ... A flat scalar list (no nested array/object)
+    // is accepted for ANY key and stored the same shape a plain scalar is: frontmatter is a flat
+    // Record<string,string> (canonicalizeSourceChunkMetadata sorts/hashes it as such), so the list
+    // is joined back into one comma-separated string rather than inventing a second value shape.
+    // `tags` keeps its own dedicated (pre-existing, untouched) bracket handling below — its raw
+    // bracketed value passes through here unchanged so that code sees exactly what it saw before.
+    // Gated on !rawValueWasQuoted (Codex P2 finding 2): an originally-quoted value is never a list
+    // candidate, however bracket-shaped it looks post-strip — see rawValueWasQuoted's own comment.
+    if (!rawValueWasQuoted && value.startsWith("[") && key !== "tags") {
+      const list = parseFlatScalarList(value);
+      if (list === null) {
+        return {
+          bodyLines: lines,
+          metadata: emptyMetadata(),
+          diagnostic: {
+            code: "invalid-frontmatter",
+            message: "frontmatter supports only flat scalar values, flat scalar lists, and a flat tags list",
+            relativePath,
+          },
+        };
+      }
+      value = list.join(", ");
     }
     flat[key] = value;
   }
