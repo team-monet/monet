@@ -3,11 +3,12 @@ import { Command } from "commander";
 import path from "node:path";
 import fs from "node:fs";
 import { createRequire } from "node:module";
-import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
+import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
 import { ensureMonetDir, getDbPath, getMonetDir } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { registerSourceCommands, SourceCliError } from "./source-cli.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
+import { openServedCore, openSourceCore, openStatusCore } from "./bootstrap.js";
 
 // Read version from package.json so it can never drift from the published version.
 // esbuild inlines the import.meta.url-relative path at bundle time; the bundled
@@ -56,8 +57,7 @@ program
     // ACL match against.
     process.env.MONET_CALLER_ID = deriveCallerId();
     process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
-    const core = new MonetCore(getDbPath(), {
-      embedder: await createLocalEmbedder(),
+    const core = await openServedCore(getDbPath(), {
       scopeContext: projectDir,
       defaultCircle: circle,
     });
@@ -73,7 +73,7 @@ program
   .option("--circle <name>", "Scope stats to a named circle")
   .action(async (options) => {
     ensureMonetDir();
-    const core = new MonetCore(getDbPath());
+    const core = openStatusCore(getDbPath());
     const s = core.stats(options.circle);
     console.log(`Monet Status`);
     console.log(`------------------`);
@@ -150,7 +150,7 @@ registerSourceCommands(program, {
   openCore(storageDir) {
     if (storageDir) process.env.MONET_STORAGE_DIR = path.resolve(storageDir);
     const monetDir = ensureMonetDir();
-    return new MonetCore(getDbPath(), { sourceStorageDir: path.join(monetDir, "sources") });
+    return openSourceCore(getDbPath(), path.join(monetDir, "sources"));
   },
   deriveCircle,
   deriveCallerId,
@@ -159,7 +159,9 @@ registerSourceCommands(program, {
 });
 
 void program.parseAsync().catch((error: unknown) => {
-  if (error instanceof SourceCliError) {
+  if (error instanceof FreshStoreEmbedderUnavailableError) {
+    console.error(error.message);
+  } else if (error instanceof SourceCliError) {
     console.error(`monet source: ${error.message}`);
   } else {
     console.error(error instanceof Error ? error.message : String(error));

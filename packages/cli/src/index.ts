@@ -1,7 +1,8 @@
 import path from "node:path";
-import { MonetCore, createLocalEmbedder, createMonetCoreMcpServer } from "@team-monet/core";
+import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
 import { ensureMonetDir, getDbPath } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
+import { openServedCore } from "./bootstrap.js";
 
 async function main() {
   ensureMonetDir();
@@ -19,8 +20,7 @@ async function main() {
   // See circle.ts for details.
   process.env.MONET_CALLER_ID = deriveCallerId();
   process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
-  const core = new MonetCore(getDbPath(), {
-    embedder: await createLocalEmbedder(),
+  const core = await openServedCore(getDbPath(), {
     scopeContext: projectDir,
     defaultCircle: circle,
   });
@@ -29,7 +29,11 @@ async function main() {
   console.error(`Circle: ${circle}`);
 }
 
-main().catch((err) => {
-  console.error("Failed to start Monet:", err);
+main().catch((error: unknown) => {
+  if (error instanceof FreshStoreEmbedderUnavailableError) {
+    console.error(error.message);
+  } else {
+    console.error("Failed to start Monet:", error);
+  }
   process.exit(1);
 });
