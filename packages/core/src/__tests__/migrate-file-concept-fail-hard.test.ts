@@ -35,6 +35,7 @@ function migrationReport(failures = 0): EmbeddingMigrationReport {
       "native-concepts": phase,
       "native-observations": { total: 0, completed: 0, failed: 0 },
       "source-concepts": { total: 0, completed: 0, failed: 0 },
+      "source-chunk-observations": { total: 0, completed: 0, failed: 0 },
       workstreams: { total: 0, completed: 0, failed: 0 },
       "native-graph": { total: 0, completed: 0, failed: 0 },
       complete: { total: 1, completed: failures === 0 ? 1 : 0, failed: 0 },

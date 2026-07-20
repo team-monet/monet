@@ -11,6 +11,9 @@ import {
   type EmbeddingMigrationProgress,
 } from "../index";
 import type { EmbeddingProvider } from "../embedding";
+import { computeSourceContentHash, computeSourceIngestFingerprint, computeSourceOperationId, sourceHeadingAnchor } from "../source-chunker";
+import { computeSourceManifestHash } from "../source-scanner";
+import type { SourceSyncRun, StageSourceManifestInput } from "../source-types";
 
 class SpaceEmbedder implements EmbeddingProvider {
   readonly dim = 4;
@@ -72,6 +75,64 @@ function pinRow(db: RawDb): { embedder_model_id: string | null; embedder_pin_sou
 
 function expected(embedder: SpaceEmbedder, text: string): number[] {
   return Array.from(embedder.embed(text));
+}
+
+interface Section { headingPath: string[]; content: string }
+
+/** Lean hand-driven ledger publish (mirrors source-chunk-retrieval.test.ts's own helpers) — a
+ *  REAL source_chunks-backed publication with `sections.length` active chunks under one concept,
+ *  for the "migrates a real ledger-published source concept's chunk observations" test below.
+ *  seedFixture's own source concept deliberately bypasses this (see its comment) to keep the
+ *  MAIN heterogeneous-inventory test's fixture minimal; this is the dedicated real-chunk coverage
+ *  the reviewer asked for. */
+async function publishSourceWithChunks(core: MonetCore, sourceId: string, sections: Section[]): Promise<{ conceptId: string; observationIds: string[] }> {
+  core.createSource({
+    id: sourceId, type: "repo-md", name: sourceId, localPath: `/tmp/${sourceId}`, circle: sourceId,
+    access: { allowedCallerIds: ["caller"], allowedProjectIds: ["project"] }, writeBack: "none",
+  });
+  const begun = core.beginSourceRun({ sourceId, snapshotId: `snapshot-${sourceId}` });
+  if (begun.kind !== "started") throw new Error("expected a new run");
+  const run: SourceSyncRun = begun.run;
+  const relativePath = "NOTES.md";
+  const chunks = sections.map((section, i) => {
+    const contentHash = computeSourceContentHash(Buffer.from(section.content, "utf8"));
+    const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
+    const ingestFingerprint = computeSourceIngestFingerprint({
+      contentHash, headingPath: section.headingPath, metadata, ingestConfigHash: run.ingestConfigHash,
+    });
+    const bindingId = `binding-${i + 1}`;
+    return {
+      bindingId, bindingGeneration: 1,
+      operationId: computeSourceOperationId(run.sourceId, bindingId, ingestFingerprint, run.snapshotId, 1),
+      relativePath, headingPath: section.headingPath, occurrence: 1, segmentIndex: 1, documentSequence: i + 1,
+      contentHash, ingestFingerprint, metadata,
+      sourceRef: `source://${run.sourceId}/${relativePath}#${sourceHeadingAnchor(section.headingPath)}~1`,
+      content: section.content,
+    };
+  });
+  const totalBytes = sections.reduce((n, s) => n + Buffer.byteLength(s.content, "utf8"), 0);
+  const files = [{ relativePath, type: "file" as const, contentHash: "file-hash", byteLength: totalBytes, title: relativePath }];
+  const manifest: StageSourceManifestInput = { runId: run.id, scanStatus: "complete", manifestHash: computeSourceManifestHash(files), files, chunks };
+  core.stageSourceManifest(manifest);
+  let attachTo: string | undefined;
+  let conceptId = "";
+  const observationIds: string[] = [];
+  for (const chunk of chunks) {
+    const stored = await core.storeSource(chunk.content, {
+      circle: sourceId, sourceRefs: [chunk.sourceRef], operationId: chunk.operationId,
+      ...(attachTo ? { attachTo } : { resolution: "forceNew" as const }),
+    });
+    conceptId = stored.conceptId;
+    attachTo = stored.conceptId;
+    observationIds.push(stored.observationId);
+    core.recordSourceBindingReceipt({
+      runId: run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId,
+      observationId: stored.observationId, predecessorObservationId: null, writeState: "committed",
+    });
+  }
+  core.publishSourceRun({ runId: run.id, activationToken: core.beginSourceActivation(run.id), expectedManifestHash: manifest.manifestHash });
+  await core.recomputeSourceConceptBody(conceptId);
+  return { conceptId, observationIds };
 }
 
 function withTempDb(run: (dbPath: string) => void | Promise<void>): Promise<void> {
@@ -163,7 +224,9 @@ describe("MonetCore.migrateEmbeddings", () => {
         ),
       );
       const execution: string[] = [];
-      const methodNames = ["reembedConcept", "reembedConceptObservations", "reembedSourceConcept", "reembedWorkstream"] as const;
+      const methodNames = [
+        "reembedConcept", "reembedConceptObservations", "reembedSourceConcept", "reembedSourceChunkObservations", "reembedWorkstream",
+      ] as const;
       for (const name of methodNames) {
         const original = (core as any)[name].bind(core);
         (core as any)[name] = async (id: string) => {
@@ -190,6 +253,14 @@ describe("MonetCore.migrateEmbeddings", () => {
           "native-concepts": { total: 3, completed: 3, failed: 0 },
           "native-observations": { total: 3, completed: 3, failed: 0 },
           "source-concepts": { total: 1, completed: 1, failed: 0 },
+          // seedFixture's source concept is created via a direct storeSource call, bypassing the
+          // ledger's staging/publish pipeline entirely — it has no source_chunks row at all, so
+          // reembedSourceChunkObservations (scoped to source_chunks.lifecycle='active', matching
+          // scoreSourceConcepts' own read) correctly finds nothing to migrate for it. "1" here
+          // means the phase RAN for this one source concept id, not that it found any chunks —
+          // see the dedicated "migrates a real ledger-published source concept's chunk
+          // observations" test below for actual chunk-rewrite coverage.
+          "source-chunk-observations": { total: 1, completed: 1, failed: 0 },
           workstreams: { total: 1, completed: 1, failed: 0 },
           "native-graph": { total: 2, completed: 2, failed: 0 },
           complete: { total: 1, completed: 1, failed: 0 },
@@ -218,6 +289,11 @@ describe("MonetCore.migrateEmbeddings", () => {
         ]) {
           expect(vector(db, "observations", id)).toEqual(expected(target, observationContent.get(id)!));
         }
+        // Unchanged by migration — NOT because chunk observations are exempt (they aren't: see
+        // reembedSourceChunkObservations), but because this specific observation has no
+        // source_chunks row at all (seedFixture bypasses the ledger pipeline), so it is invisible
+        // to that phase's active-chunk query, exactly like it would be invisible to
+        // scoreSourceConcepts' own read at retrieval time.
         expect(vector(db, "observations", fixture.sourceObservation)).toEqual(placeholderBefore);
         expect(stableRows(db)).toEqual(stableBefore);
 
@@ -234,7 +310,8 @@ describe("MonetCore.migrateEmbeddings", () => {
         expect(db.prepare(`SELECT 1 FROM concept_entities WHERE concept_id = ? LIMIT 1`).get(fixture.retired)).toBeUndefined();
 
         const phaseOrder: EmbeddingMigrationPhase[] = [
-          "preflight", "lock", "native-concepts", "native-observations", "source-concepts", "workstreams", "native-graph", "complete",
+          "preflight", "lock", "native-concepts", "native-observations", "source-concepts", "source-chunk-observations",
+          "workstreams", "native-graph", "complete",
         ];
         const observed = progress.map((event) => phaseOrder.indexOf(event.phase));
         expect(observed).toEqual([...observed].sort((a, b) => a - b));
@@ -262,6 +339,7 @@ describe("MonetCore.migrateEmbeddings", () => {
           "native-concepts": { total: 3, completed: 3, failed: 0 },
           "native-observations": { total: 3, completed: 3, failed: 0 },
           "source-concepts": { total: 1, completed: 1, failed: 0 },
+          "source-chunk-observations": { total: 1, completed: 1, failed: 0 },
           workstreams: { total: 1, completed: 1, failed: 0 },
           "native-graph": { total: 2, completed: 2, failed: 0 },
         });
@@ -336,6 +414,113 @@ describe("MonetCore.migrateEmbeddings", () => {
         );
       } finally {
         retry.close();
+      }
+    });
+  });
+
+  it("migrates a real ledger-published source concept's ACTIVE chunk observations, including one that's still an old-build zero placeholder (reviewer finding 4)", async () => {
+    await withTempDb(async (dbPath) => {
+      const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
+      const core0 = new MonetCore(dbPath, { embedder: oldEmbedder });
+      const { observationIds } = await publishSourceWithChunks(core0, "migration-chunks-source", [
+        { headingPath: ["Database"], content: "We chose PostgreSQL for the billing service database." },
+        { headingPath: ["Caching"], content: "Redis backs the session cache for notify-service." },
+      ]);
+      const [databaseObservationId, cachingObservationId] = observationIds;
+      // Simulate the Caching chunk predating chunk-granular source retrieval entirely (an
+      // old-build zero placeholder that was never re-synced) — migration should still give it a
+      // real TARGET-space vector, not skip it because it's already zero.
+      const db0 = dbOf(core0);
+      db0.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(JSON.stringify(new Array(oldEmbedder.dim).fill(0)), cachingObservationId);
+      core0.close();
+
+      const target = new SpaceEmbedder("test:space:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target });
+      const db = dbOf(core);
+      try {
+        const report = await core.migrateEmbeddings({ targetModelId: target.modelId });
+        expect(report.failures).toEqual([]);
+        expect(report.phases["source-chunk-observations"]).toMatchObject({ failed: 0 });
+
+        // The Database chunk (already real, old-embedder-space) is rewritten to the target space.
+        expect(vector(db, "observations", databaseObservationId)).toEqual(
+          expected(target, "We chose PostgreSQL for the billing service database."),
+        );
+        // The Caching chunk — ACTIVE, but seeded as an old-build zero placeholder — ALSO gets a
+        // real target-space vector: migration doesn't special-case "already zero" as "nothing to
+        // migrate here."
+        const cachingAfter = vector(db, "observations", cachingObservationId);
+        expect(cachingAfter.every((component) => component === 0)).toBe(false);
+        expect(cachingAfter).toEqual(expected(target, "Redis backs the session cache for notify-service."));
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  it("leaves a superseded chunk observation untouched by migration, migrating only its active successor (reviewer finding 4)", async () => {
+    await withTempDb(async (dbPath) => {
+      const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
+      const core0 = new MonetCore(dbPath, { embedder: oldEmbedder });
+      const { conceptId, observationIds } = await publishSourceWithChunks(core0, "migration-supersede-source", [
+        { headingPath: ["Database"], content: "We chose PostgreSQL for the billing service database." },
+      ]);
+      const [predecessorObservationId] = observationIds;
+
+      // A second run that edits the SAME (only) section — supersedes the predecessor observation.
+      const replacement = core0.beginSourceRun({ sourceId: "migration-supersede-source", snapshotId: "snapshot-migration-supersede-source-2" });
+      if (replacement.kind !== "started") throw new Error("expected replacement run");
+      const editedContent = "We chose PostgreSQL for the billing service database, now with read replicas.";
+      const editedContentHash = computeSourceContentHash(Buffer.from(editedContent, "utf8"));
+      const editedMetadata = { tags: [] as string[], scope: null, frontmatter: {} };
+      const editedFingerprint = computeSourceIngestFingerprint({
+        contentHash: editedContentHash, headingPath: ["Database"], metadata: editedMetadata, ingestConfigHash: replacement.run.ingestConfigHash,
+      });
+      const editedFiles = [{ relativePath: "NOTES.md", type: "file" as const, contentHash: "file-hash", byteLength: Buffer.byteLength(editedContent), title: "NOTES.md" }];
+      const editedManifest: StageSourceManifestInput = {
+        runId: replacement.run.id, scanStatus: "complete", manifestHash: computeSourceManifestHash(editedFiles), files: editedFiles,
+        chunks: [{
+          bindingId: "binding-1", bindingGeneration: 2,
+          operationId: computeSourceOperationId("migration-supersede-source", "binding-1", editedFingerprint, replacement.run.snapshotId, 2),
+          relativePath: "NOTES.md", headingPath: ["Database"], occurrence: 1, segmentIndex: 1, documentSequence: 1,
+          contentHash: editedContentHash, ingestFingerprint: editedFingerprint, metadata: editedMetadata,
+          sourceRef: "source://migration-supersede-source/NOTES.md#database~1", content: editedContent,
+        }],
+      };
+      core0.stageSourceManifest(editedManifest);
+      const successor = await core0.storeSource(editedContent, {
+        circle: "migration-supersede-source", sourceRefs: [editedManifest.chunks[0].sourceRef],
+        operationId: editedManifest.chunks[0].operationId, attachTo: conceptId,
+      });
+      core0.recordSourceBindingReceipt({
+        runId: replacement.run.id, bindingId: "binding-1", conceptId: successor.conceptId,
+        observationId: successor.observationId, predecessorObservationId, writeState: "engine-written",
+      });
+      await core0.supersedeSourceChunkObservation(successor.conceptId, successor.observationId, predecessorObservationId);
+      core0.recordSourceBindingReceipt({ runId: replacement.run.id, bindingId: "binding-1", writeState: "committed" });
+      core0.publishSourceRun({
+        runId: replacement.run.id, activationToken: core0.beginSourceActivation(replacement.run.id), expectedManifestHash: editedManifest.manifestHash,
+      });
+      await core0.recomputeSourceConceptBody(successor.conceptId);
+      const db0 = dbOf(core0);
+      const predecessorBeforeMigration = vector(db0, "observations", predecessorObservationId);
+      core0.close();
+
+      const target = new SpaceEmbedder("test:space:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target });
+      const db = dbOf(core);
+      try {
+        const report = await core.migrateEmbeddings({ targetModelId: target.modelId });
+        expect(report.failures).toEqual([]);
+
+        // The now-superseded predecessor is untouched — reembedSourceChunkObservations is scoped
+        // to source_chunks.lifecycle='active' only, and the predecessor's row flipped to
+        // 'superseded' the moment the second run published.
+        expect(vector(db, "observations", predecessorObservationId)).toEqual(predecessorBeforeMigration);
+        // The successor (currently ACTIVE) gets a real target-space vector of its OWN content.
+        expect(vector(db, "observations", successor.observationId)).toEqual(expected(target, editedContent));
+      } finally {
+        core.close();
       }
     });
   });

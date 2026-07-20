@@ -2,8 +2,10 @@ import { execFile as nodeExecFile, execFileSync } from "node:child_process";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MonetCore } from "../engine";
+import { HashingEmbeddingProvider } from "../embedding";
+import type { EmbeddingProvider } from "../embedding";
 import { computeSourceContentHash } from "../source-chunker";
 import { syncRepoMdSource as runRepoMdSync } from "../source-sync";
 import type { RepoMdSyncFaultPoint, RepoMdSyncOptions } from "../source-sync";
@@ -34,7 +36,7 @@ function makeWritable(path: string): void {
   } catch { /* test cleanup */ }
 }
 
-function fixture(label: string) {
+function fixture(label: string, opts: { embedder?: EmbeddingProvider } = {}) {
   const root = mkdtempSync(join(tmpdir(), `monet-repo-sync-${label}-`));
   const repo = join(root, "repo");
   const storage = join(root, "managed");
@@ -44,7 +46,7 @@ function fixture(label: string) {
   git(repo, "config", "user.name", "Test");
   writeFileSync(join(repo, "README.md"), "# Intro\n\ninitial committed body\n");
   git(repo, "add", "README.md"); git(repo, "commit", "-m", "initial");
-  const core = new MonetCore(db, { sourceStorageDir: storage });
+  const core = new MonetCore(db, { sourceStorageDir: storage, ...(opts.embedder ? { embedder: opts.embedder } : {}) });
   core.createSource({
     id: "repo-source", type: "repo-md", name: "repo", localPath: repo, circle: "repo-source",
     include: ["README.md"], exclude: [], autoDetect: false,
@@ -1296,6 +1298,73 @@ describe("repo-md committed-HEAD sync", () => {
       expect(statusAgain).toMatchObject({ lastSyncResult: "success", filesSkipped: 3 });
       expect(statusAgain.schedule.consecutiveFailures).toBe(0);
     } finally { f.cleanup(); }
+  });
+
+  it("does not wedge the whole sync when one chunk's embed() throws mid-materialize — degrades that chunk to the zero-vector placeholder, diagnoses it, and still publishes (reviewer finding 7)", async () => {
+    // materializeStagedBindings (source-sync.ts) calls core.storeSource per chunk with no
+    // try/catch of its own — before storeSourceChunk's own fix (engine.ts), an embed() throw here
+    // (a realistic transient ONNX hiccup) would propagate to the run-level failure handler and
+    // abort the ENTIRE sync pre-publish, reintroducing the "one file wedges the whole source"
+    // class skip-and-diagnose (#49) eliminated for classification failures. This proves the fix
+    // end-to-end: the run still publishes, every OTHER chunk still gets a real vector, and the
+    // failure is diagnosed (stderr) rather than silent.
+    //
+    // Throws exactly ONCE, on the first embed() call whose text contains the marker — that call is
+    // troubled.md's OWN chunk embed during materialization (chronologically first). This
+    // deliberately does NOT also fail troubled.md's post-publish recomputeSourceConceptBody
+    // whole-file embed (same marker text, called later): that embed call is a SEPARATE, already-
+    // accepted risk (post-publish, self-healing via the source_recompute_pending sweep) — out of
+    // scope for this fix, and conflating the two would test something this change never claimed.
+    const real = new HashingEmbeddingProvider();
+    const troubledMarker = "TROUBLED SECTION MARKER";
+    let hasThrown = false;
+    const flaky: EmbeddingProvider = {
+      dim: real.dim,
+      modelId: real.modelId,
+      embed: (text) => {
+        if (!hasThrown && text.includes(troubledMarker)) {
+          hasThrown = true;
+          throw new Error("injected transient embedding failure");
+        }
+        return real.embed(text);
+      },
+    };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const f = fixture("embed-failure", { embedder: flaky });
+    try {
+      f.core.updateSource("repo-source", { include: ["*.md"] });
+      writeFileSync(join(f.repo, "troubled.md"), `# Troubled\n\n${troubledMarker} appears in this section.\n`);
+      writeFileSync(join(f.repo, "fine.md"), "# Fine\n\nOrdinary content with no marker at all.\n");
+      git(f.repo, "add", "-A"); git(f.repo, "commit", "-m", "add troubled and fine files");
+
+      const result = await f.core.syncRepoMdSource("repo-source");
+      // The run still publishes — a single chunk's embed failure does not wedge the source.
+      expect(result.status).toBe("published");
+      const runId = f.core.getSource("repo-source")!.activeRunId!;
+      expect(f.core.listSourceFiles(runId, true).map((file) => file.relativePath).sort()).toEqual(["README.md", "fine.md", "troubled.md"]);
+      // Not a skip: troubled.md is fully ingested (chunked, staged, committed, published) — only
+      // its retrieval VECTOR is degraded, which is an entirely different axis from skip-and-diagnose.
+      expect(f.core.listSourceSkippedFiles(runId)).toEqual([]);
+
+      const rawDb = (f.core as unknown as { db: StoragePort }).db;
+      const embeddingFor = (relativePath: string): number[] => {
+        const row = rawDb
+          .prepare(
+            `SELECT o.embedding AS embedding FROM source_chunks sc JOIN observations o ON o.id = sc.observation_id
+              WHERE sc.relative_path = ? AND sc.lifecycle = 'active'`,
+          )
+          .get(relativePath) as { embedding: string };
+        return JSON.parse(row.embedding) as number[];
+      };
+      expect(embeddingFor("troubled.md").every((component) => component === 0)).toBe(true);
+      expect(embeddingFor("fine.md").some((component) => component !== 0)).toBe(true);
+
+      // Diagnosed via stderr, not silent.
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("embedding failed for a source chunk"));
+    } finally {
+      errorSpy.mockRestore();
+      f.cleanup();
+    }
   });
 
   it("ingests array-valued frontmatter alongside a genuinely-invalid file, and sourceStatus's skip count reflects only the real skip (frontmatter array tolerance)", async () => {

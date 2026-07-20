@@ -1837,8 +1837,8 @@ describe("source ledger schema migration", () => {
   });
 });
 
-describe("file-level embedding only (item 6)", () => {
-  it("never embeds an individual chunk write; recomputeSourceConceptBody embeds the whole file exactly once", async () => {
+describe("chunk-level vs whole-file embedding (item 6; revised by chunk-granular source retrieval)", () => {
+  it("embeds each chunk write with its own raw content once, and recomputeSourceConceptBody separately embeds the whole reconstructed file exactly once per recompute", async () => {
     const real = new HashingEmbeddingProvider();
     const calls: string[] = [];
     const spy: EmbeddingProvider = {
@@ -1893,26 +1893,31 @@ describe("file-level embedding only (item 6)", () => {
         runId: begun.run.id, bindingId: "binding-2", conceptId: second.conceptId, observationId: second.observationId,
         predecessorObservationId: null, writeState: "committed",
       });
-      // Every chunk-level write (create + attach) uses a placeholder embedding — the real embedder
-      // is never called per chunk, only per whole-file recompute.
-      expect(calls).toHaveLength(0);
+      // Chunk-granular source retrieval (ratified): each chunk write now embeds its OWN raw
+      // content once — the per-chunk retrieval vector search()/gather() rank a source concept's
+      // best chunk by (scoreSourceConcepts) — never the whole file at this point, since
+      // recomputeSourceConceptBody hasn't run yet. The concept's own placeholder embedding
+      // (concepts.embedding at create time) is unaffected and still uses no real embed() call.
+      expect(calls).toEqual(["Intro body text", "Details body text"]);
 
       core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
-      expect(calls).toHaveLength(0); // publish alone still doesn't recompute/embed
+      expect(calls).toHaveLength(2); // publish alone still doesn't recompute/embed
 
       await core.recomputeSourceConceptBody(first.conceptId);
-      expect(calls).toHaveLength(1);
-      // The one call embeds the FILE's reconstructed body (both chunks, position-ordered), not
-      // either chunk's own text in isolation.
-      expect(calls[0]).toContain("Intro body text");
-      expect(calls[0]).toContain("Details body text");
-      expect(calls[0]).not.toBe("Intro body text");
-      expect(calls[0]).not.toBe("Details body text");
+      expect(calls).toHaveLength(3);
+      // The THIRD call — recompute's own — embeds the FILE's reconstructed body (both chunks,
+      // position-ordered), not either chunk's own text in isolation. Unchanged by this revision:
+      // recomputeSourceConceptBody still derives a source concept's OWN embedding straight from
+      // its body text, never from the per-chunk observations.embedding values above.
+      expect(calls[2]).toContain("Intro body text");
+      expect(calls[2]).toContain("Details body text");
+      expect(calls[2]).not.toBe("Intro body text");
+      expect(calls[2]).not.toBe("Details body text");
 
       // A second recompute (e.g. a later sync cycle) embeds again exactly once more — linear in
       // recompute count, never per chunk and never accumulating extra calls per chunk touched.
       await core.recomputeSourceConceptBody(first.conceptId);
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(4);
     } finally {
       core.close();
     }
@@ -1927,16 +1932,24 @@ describe("recomputeSourceConceptBody CAS against a concurrent chunk-set mutation
     // to be blind to (it re-checked only concept status, never the chunk set it read from). This
     // simulates exactly that: a chunk lands mid-embed, via the embedder itself as the interleave
     // point, standing in for a concurrent writer.
+    //
+    // Chunk-granular source retrieval (ratified) added its OWN embed() calls earlier in this same
+    // test — one per chunk write (storeSourceChunk), well before recomputeSourceConceptBody ever
+    // runs. The race under test is specifically recomputeSourceConceptBody's own gather-then-write
+    // window, so the injection is armed explicitly right before that call rather than firing on
+    // whichever embed() call happens to be globally first — the two chunk-write embeds above have
+    // no SELECT-then-write CAS of their own for a concurrent row to race.
     const real = new HashingEmbeddingProvider();
     const db = { current: null as unknown as StoragePort };
     const calls: string[] = [];
+    let armed = false;
     let landedConcurrentChunk = false;
     const spy: EmbeddingProvider = {
       dim: real.dim,
       modelId: real.modelId,
       embed: (text) => {
         calls.push(text);
-        if (!landedConcurrentChunk) {
+        if (armed && !landedConcurrentChunk) {
           landedConcurrentChunk = true;
           // Clone an existing active row's full shape, only changing what must be unique — the
           // ledger's own realistic row shape, not a hand-rolled partial one.
@@ -2010,11 +2023,16 @@ describe("recomputeSourceConceptBody CAS against a concurrent chunk-set mutation
       });
       core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
 
+      // Arm the injection HERE, not at construction: the two chunk writes above already made
+      // their own embed() calls (chunk-granular source retrieval) with no gather-then-write CAS of
+      // their own — only recomputeSourceConceptBody's window below is under test.
+      const callsBeforeRecompute = calls.length;
+      armed = true;
       // Does not throw, does not silently persist a stale two-chunk body — retries and picks up
       // the concurrently landed third chunk.
       await core.recomputeSourceConceptBody(first.conceptId);
 
-      expect(calls.length).toBeGreaterThan(1); // at least one stale attempt, then a successful retry
+      expect(calls.length - callsBeforeRecompute).toBeGreaterThan(1); // at least one stale attempt, then a successful retry
       const db2 = db.current;
       const persisted = db2.prepare(`SELECT body FROM concepts WHERE id=?`).get(first.conceptId) as { body: string };
       expect(persisted.body).toContain("Intro body text");

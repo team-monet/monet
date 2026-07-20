@@ -172,6 +172,12 @@ export type EmbeddingMigrationPhase =
   | "native-concepts"
   | "native-observations"
   | "source-concepts"
+  // REVIEW FIX (Codex reviewer finding 4, P1): a source concept's ACTIVE chunk observations are
+  // now real, semantic per-chunk retrieval vectors (chunk-granular source retrieval) — exactly as
+  // embedder-space-sensitive as any native observation, and covered by the same "migration
+  // coverage = ALL persisted vectors" invariant "native-observations" exists to uphold for native
+  // concepts. See reembedSourceChunkObservations' own docstring for the full reasoning.
+  | "source-chunk-observations"
   | "workstreams"
   | "native-graph"
   | "complete";
@@ -2223,8 +2229,9 @@ export class MonetCore {
     );
     const contradictions = this.openContradictionCountsGlobal(resolvedCircle);
     const defaultCircle = this.defaultCircle;
+    const sourceScores = this.scoreSourceConcepts(rows, emb);
     return rows
-      .map((r) => ({ row: r, score: cosine(emb, jsonToEmb(r.embedding)) }))
+      .map((r) => ({ row: r, score: r.kind === "source" ? sourceScores.get(r.id)! : cosine(emb, jsonToEmb(r.embedding)) }))
       .sort((a, b) => {
         const diff = b.score - a.score;
         if (Math.abs(diff) > 1e-9) return diff;
@@ -3046,9 +3053,13 @@ export class MonetCore {
    * migration exists to close.
    *
    * Scoped to native concepts only (mirrors listNativeConceptIds' own exclusions): a source
-   * chunk's observation embedding is always a placeholder zero-vector (storeSourceChunk) —
-   * recomputeSourceConceptBody derives a source concept's embedding straight from its body text,
-   * never from observations.embedding — so re-embedding one would be pure waste, not a fix.
+   * chunk's observation embedding is a REAL per-chunk retrieval vector now (chunk-granular source
+   * retrieval — storeSourceChunk embeds each chunk's own content; search()/gather()'s
+   * scoreSourceConcepts reads it back for best-chunk ranking), but it is refreshed by ordinary
+   * re-sync of changed content (storeSourceChunk), never by this migration pass. A source
+   * concept's OWN embedding still derives straight from its body text via
+   * recomputeSourceConceptBody, never from observations.embedding — so re-embedding one here
+   * would still be pure waste, not a fix.
    *
    * Deliberately un-filtered by supersession: detach()'s own read of a native concept's
    * observations (srcObsRows) is itself unfiltered by superseded_by/superseded_at, so a superseded
@@ -4778,6 +4789,74 @@ export class MonetCore {
     return this.authorizedSourceProjections(context, undefined, true, conceptId)[0] ?? null;
   }
 
+  /**
+   * Chunk-granular source retrieval (ratified): scores each kind='source' row in `rows` by
+   * MAX(whole-file concepts.embedding cosine, every ACTIVE chunk vector's cosine)
+   * (source_chunks.lifecycle='active' → observations.embedding — the same join listMemories' own
+   * provenance count uses above, at `SELECT concept_id, observation_id FROM source_chunks WHERE
+   * lifecycle='active' ...`), instead of JUST the single mean-pooled whole-file concepts.embedding
+   * every OTHER consumer (dedup, graph, pin sampling) still reads unchanged. A multi-section
+   * file's one on-topic chunk no longer gets diluted below the noise floor by every unrelated
+   * section sharing that one vector.
+   *
+   * REVIEW FIX (Codex P2 finding 5): the whole-file cosine is an UNCONDITIONAL candidate in the
+   * max now, not an all-or-nothing fallback used only when every chunk vector is zero. The
+   * all-zero case (a store synced by an older build, storeSourceChunk used to write an all-zero
+   * placeholder always; see its own comment) is the OBVIOUS case that needs it, but a subtler one
+   * matters just as much: a file PARTIALLY refreshed by a content-changing sync on an old-build
+   * store — the edited section gets a real vector, every UNCHANGED section keeps its zero
+   * placeholder (storeSourceChunk only ever writes on an actual content change; see
+   * materializeStagedBindings' unchanged-content fast path, source-sync.ts). With the old
+   * all-or-nothing fallback, ANY non-zero chunk suppressed it entirely, so a query about one of the
+   * still-zero UNCHANGED sections scored against only the unrelated edited chunk — worse than
+   * status-quo whole-file scoring, not just no-better. Folding the whole-file cosine into the max
+   * unconditionally closes that gap (it's a superset of the old behavior: identical whenever no
+   * chunk is non-zero, since the max of one candidate is itself; never worse when a chunk IS
+   * non-zero, since max only ever adds a candidate, never removes one).
+   *
+   * REVIEW FIX (Codex P2 finding 6, revised per reviewer follow-up): the chunk-vector query joins
+   * the candidate id list through `json_each(?)` on ONE bound JSON-array parameter — the same
+   * param-count-independent shape this file already uses for ACL membership checks
+   * (authorizedSourceProjections' allowed_caller_ids_json/allowed_project_ids_json EXISTS clauses,
+   * above) — rather than an unbounded `IN (?,?,...)` whose host-parameter count scales with the
+   * candidate count. The scanner allows up to 10,000 files per source (maxFiles,
+   * source-scanner.ts), and this build's actual ceiling was measured directly: SQLite 3.49.2 here
+   * accepts up to 32766 bound parameters and throws "too many SQL variables" at 32767 — a real,
+   * reachable number for a large multi-source circle, not a theoretical one. json_each(?) makes
+   * this query's parameter count exactly 1 regardless of how many source concepts are in scope.
+   *
+   * Non-source rows are ignored (absent from the returned map) — callers keep scoring those with
+   * plain cosine against concepts.embedding, exactly as before. search() and gather() both call
+   * this with their own candidate set so the two stay consistent.
+   */
+  private scoreSourceConcepts(rows: readonly ConceptRow[], emb: Float32Array): Map<string, number> {
+    const scores = new Map<string, number>();
+    const sourceRows = rows.filter((r) => r.kind === "source");
+    if (sourceRows.length === 0) return scores;
+    const sourceIds = sourceRows.map((r) => r.id);
+    const chunkVectors = this.db
+      .prepare(
+        `SELECT sc.concept_id AS concept_id, o.embedding AS embedding
+           FROM source_chunks sc JOIN observations o ON o.id = sc.observation_id
+          WHERE sc.lifecycle = 'active' AND sc.concept_id IN (SELECT value FROM json_each(?))`,
+      )
+      .all(JSON.stringify(sourceIds)) as Array<{ concept_id: string; embedding: string }>;
+    const bestByConceptId = new Map<string, number>();
+    for (const chunk of chunkVectors) {
+      const vec = jsonToEmb(chunk.embedding);
+      if (isZeroVector(vec)) continue; // pre-chunk-embedding placeholder — excluded, not scored as 0
+      const cos = cosine(emb, vec);
+      const prior = bestByConceptId.get(chunk.concept_id);
+      if (prior === undefined || cos > prior) bestByConceptId.set(chunk.concept_id, cos);
+    }
+    for (const row of sourceRows) {
+      const wholeFileCos = cosine(emb, jsonToEmb(row.embedding));
+      const bestChunkCos = bestByConceptId.get(row.id);
+      scores.set(row.id, bestChunkCos === undefined ? wholeFileCos : Math.max(wholeFileCos, bestChunkCos));
+    }
+    return scores;
+  }
+
   createSource(input: CreateSourceInput): KnowledgeSource {
     return this.sourceRegistry.createSource(input);
   }
@@ -5495,6 +5574,7 @@ export class MonetCore {
       "native-concepts",
       "native-observations",
       "source-concepts",
+      "source-chunk-observations",
       "workstreams",
       "native-graph",
       "complete",
@@ -5549,10 +5629,14 @@ export class MonetCore {
       report.phases["native-concepts"].total = nativeIds.length;
       report.phases["native-observations"].total = nativeIds.length;
       report.phases["source-concepts"].total = sourceIds.length;
+      // Same id set as "source-concepts" (every source concept, whether or not it currently has
+      // any active chunk — reembedSourceChunkObservations is a no-op for one with none, mirroring
+      // reembedConceptObservations' own empty-observations no-op for native concepts).
+      report.phases["source-chunk-observations"].total = sourceIds.length;
       report.phases.workstreams.total = workstreamIds.length;
 
       if (dryRun) {
-        for (const phase of ["native-concepts", "native-observations", "source-concepts", "workstreams"] as const) {
+        for (const phase of ["native-concepts", "native-observations", "source-concepts", "source-chunk-observations", "workstreams"] as const) {
           report.phases[phase].completed = report.phases[phase].total;
           emit(phase);
         }
@@ -5600,6 +5684,23 @@ export class MonetCore {
         emit("source-concepts", id);
       }
       if (sourceIds.length === 0) emit("source-concepts");
+
+      // REVIEW FIX (Codex reviewer finding 4, P1): independent of the source-concepts phase above
+      // (that rewrites concepts.embedding from body text; this rewrites each ACTIVE chunk's own
+      // observations.embedding from its own content) — no ordering dependency, mirrors
+      // native-concepts/native-observations' own independence. A per-source failure here does NOT
+      // roll back that source's already-succeeded source-concepts phase (same per-item-resilient,
+      // fail-hard-at-end contract as every other phase).
+      for (const id of sourceIds) {
+        try {
+          await this.reembedSourceChunkObservations(id);
+        } catch (error) {
+          fail("source-chunk-observations", id, error);
+        }
+        report.phases["source-chunk-observations"].completed += 1;
+        emit("source-chunk-observations", id);
+      }
+      if (sourceIds.length === 0) emit("source-chunk-observations");
 
       for (const id of workstreamIds) {
         try {
@@ -5658,6 +5759,54 @@ export class MonetCore {
     const embedding = await this.embedder.embed(row.body);
     this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`).run(embToJson(embedding), conceptId);
     return true;
+  }
+
+  /**
+   * Migration coverage (Codex reviewer finding 4, P1): a source concept's ACTIVE chunk
+   * observations (chunk-granular source retrieval, storeSourceChunk) are now real, semantic
+   * per-chunk retrieval vectors — scoreSourceConcepts compares them DIRECTLY against a live query
+   * embedding, so they are exactly as embedder-space-sensitive as any native observation and
+   * belong in the same "migration coverage = ALL persisted [live-compared] vectors" invariant
+   * reembedConceptObservations documents for native concepts. Left un-migrated, a source concept
+   * with a real (non-zero) chunk vector would silently compare a freshly-migrated query embedding
+   * against a STALE OLD-MODEL chunk vector after migration — not gracefully suboptimal, actively
+   * WRONG (an old-space vector's cosine against a new-space query is meaningless noise, not a
+   * degraded-but-valid signal) — until every touched chunk happens to be rewritten by a later
+   * content-changing sync or a classification-affecting version bump.
+   *
+   * Scoped to ACTIVE chunks only (source_chunks.lifecycle='active' — the exact scope
+   * scoreSourceConcepts itself reads), unlike reembedConceptObservations' DELIBERATELY unfiltered
+   * native-observation scope: a superseded source-chunk observation has no detach()-style
+   * un-supersession path back into a live retrieval comparison (source concepts are excluded from
+   * the generic detach() API entirely — isConnectorOwnedRow gates it), so re-embedding a dead row
+   * nobody will ever compare again would be pure waste, not a coverage gap the way an unfiltered
+   * native scope closes one for detach().
+   *
+   * Every active chunk is re-embedded unconditionally, including one that's currently the
+   * pre-chunk-embedding all-zero placeholder (an old-build store, or simply a chunk this same
+   * migration run hasn't otherwise touched) — "re-embed from stored content" doesn't need to tell
+   * "was real, now stale-space" apart from "was never real"; both need a fresh embed() call under
+   * the target model, and treating them alike is a free, incidental backfill for the
+   * never-re-synced case, not a special case worth detecting and skipping.
+   */
+  private async reembedSourceChunkObservations(conceptId: string): Promise<number> {
+    const row = this.getRow(conceptId);
+    if (!row || !isConnectorOwnedRow(row)) return 0;
+    const rows = this.db
+      .prepare(
+        `SELECT o.id AS id, o.content AS content
+           FROM source_chunks sc JOIN observations o ON o.id = sc.observation_id
+          WHERE sc.concept_id = ? AND sc.lifecycle = 'active'`,
+      )
+      .all(conceptId) as Array<{ id: string; content: string }>;
+    if (rows.length === 0) return 0;
+    const embedded = await Promise.all(rows.map(async (r) => ({ id: r.id, embedding: await this.embedder.embed(r.content) })));
+    this.db.transaction((): void => {
+      for (const e of embedded) {
+        this.db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(embToJson(e.embedding), e.id);
+      }
+    })();
+    return embedded.length;
   }
 
   private async reembedWorkstream(conceptId: string): Promise<boolean> {
@@ -8657,8 +8806,9 @@ export class MonetCore {
     const sourceProjections = this.authorizedSourceProjections(
       opts.sourceAuthorizationContext, resolvedCircle, opts.includeArchived,
     );
+    const sourceScores = this.scoreSourceConcepts(sourceProjections.map((projection) => projection.row), emb);
     const sourceDense = sourceProjections
-      .map((projection) => ({ projection, cos: cosine(emb, jsonToEmb(projection.row.embedding)) }))
+      .map((projection) => ({ projection, cos: sourceScores.get(projection.row.id)! }))
       .filter(({ cos }) => cos > 0)
       .sort((a, b) => b.cos - a.cos || (a.projection.row.id < b.projection.row.id ? -1 : 1));
     const intentTokens = new Set(tokenize(intent));
@@ -9066,6 +9216,44 @@ export class MonetCore {
     // source-ledger.ts's validateDurableEngineReceipt then rejects as a content mismatch.
     const trimmed = content.trim();
     const placeholderEmb = embToJson(new Float32Array(this.embedder.dim));
+    // Chunk-granular source retrieval (ratified): a real embedding of this chunk's OWN content,
+    // computed OUTSIDE the write transaction — db.transaction() callbacks must run synchronously
+    // and embed() may be async, the same reason recomputeSourceConceptBody's own embed() call sits
+    // outside its write transaction. search()/gather() (scoreSourceConcepts) read this back to
+    // rank a source concept by its single BEST-matching chunk instead of one mean-pooled
+    // whole-file vector. Deliberately NOT batched across this file's sibling chunks: the caller
+    // (materializeStagedBindings, source-sync.ts) resolves each new file's concept id from the
+    // FIRST chunk it writes and every later chunk of that file depends on that resolution — a
+    // genuine sequential data dependency, not just an unbatched loop — so precomputing embeddings
+    // for a whole file's chunks up front would need a broader restructure of that resume-safety-
+    // sensitive loop, out of scope here. The concept's OWN embedding (placeholderEmb above, and
+    // its post-recompute real whole-file value) is entirely unaffected — only this new per-chunk
+    // retrieval signal is written here.
+    //
+    // REVIEW FIX (reviewer finding 7, MEDIUM): embed() is now in the critical write path.
+    // materializeStagedBindings (source-sync.ts) calls storeSource per chunk with NO try/catch of
+    // its own, so an unhandled throw here would propagate to the run-level failure handler
+    // (source-sync.ts's top-level catch) and abort the ENTIRE sync pre-publish — reintroducing
+    // exactly the "one file wedges the whole source" class skip-and-diagnose (#49) eliminated for
+    // classification failures. A realistic trigger: a transient ONNX hiccup partway through a
+    // large first sync. Caught here and degraded to the SAME zero-vector placeholder
+    // scoreSourceConcepts already treats as "fall back to whole-file" — this one chunk's retrieval
+    // quality drops to today's pre-chunk-granular status quo, but every OTHER chunk still gets its
+    // real vector and the sync still completes and publishes. Diagnosed via stderr (the channel
+    // this codebase already uses for a degraded-but-recovered condition — store-embedder.ts,
+    // embedding-onnx.ts — never stdout, which the MCP stdio transport owns) so an operator can see
+    // it happened; self-heals the same way any other zero-vector chunk does, on the next sync that
+    // actually rewrites this content (a real edit, or a classification-affecting version bump).
+    let chunkEmb: string;
+    try {
+      chunkEmb = embToJson(await this.embedder.embed(content));
+    } catch (error) {
+      console.error(
+        `[monet-core] embedding failed for a source chunk (${sourceRefs[0] ?? sourceIdentity}); ` +
+          `writing the zero-vector placeholder and continuing (cause: ${error instanceof Error ? error.message : String(error)}).`,
+      );
+      chunkEmb = placeholderEmb;
+    }
 
     return this.db.transaction((): IngestResult => {
       // Re-check inside the write transaction for a competing caller that committed between the
@@ -9111,7 +9299,7 @@ export class MonetCore {
           `INSERT INTO observations (id, content, embedding, kind, circle, session_id, author_agent_id, source_refs, concept_id)
            VALUES (?, ?, ?, 'source', ?, ?, ?, ?, ?)`,
         )
-        .run(obsId, content, placeholderEmb, circle, sessionId, this.agentId, refsJson, conceptId);
+        .run(obsId, content, chunkEmb, circle, sessionId, this.agentId, refsJson, conceptId);
       if (opts.operationId) {
         this.db
           .prepare(
@@ -9422,6 +9610,15 @@ function embToJson(v: Float32Array): string {
 
 function jsonToEmb(s: string): Float32Array {
   return Float32Array.from(JSON.parse(s) as number[]);
+}
+
+/** True iff every component is exactly 0 — the pre-chunk-embedding placeholder storeSourceChunk
+ *  used to write for every source chunk observation (chunk-granular source retrieval,
+ *  scoreSourceConcepts's zero-vector fallback), or the create-time concept placeholder before
+ *  recomputeSourceConceptBody's first real write. */
+function isZeroVector(v: Float32Array): boolean {
+  for (let i = 0; i < v.length; i++) if (v[i] !== 0) return false;
+  return true;
 }
 
 function firstLine(content: string): string {
