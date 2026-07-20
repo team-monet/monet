@@ -29,6 +29,7 @@ export interface SourceCliDependencies {
    */
   deriveCallerId(): string;
   deriveProjectId(projectDir: string): string;
+  dbPath(storageDir?: string): string;
 }
 
 export class SourceCliError extends Error {
@@ -103,6 +104,14 @@ function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
+export function printStoreLine(dbPath: string): void {
+  console.error(`store: ${path.resolve(dbPath)}`);
+}
+
+function printStore(command: Command, dependencies: SourceCliDependencies): void {
+  printStoreLine(dependencies.dbPath(parentOptions(command).dir));
+}
+
 function resolveRepoRoot(projectDir: string, configuredPath: string | undefined): string {
   const resolved = path.resolve(projectDir, configuredPath ?? projectDir);
   return existsSync(resolved) ? realpathSync.native(resolved) : resolved;
@@ -136,6 +145,14 @@ function printSource(source: KnowledgeSource, identity: ServerIdentity): void {
   console.log(`Exclude:    ${source.exclude.join(", ") || "(none)"}`);
 }
 
+function formatRefresh(refresh: KnowledgeSource["refresh"]): string {
+  if (refresh.mode === "manual") return "manual (sync only when explicitly requested)";
+  const intervalSeconds = refresh.intervalSeconds!;
+  const minutes = intervalSeconds / 60;
+  const cadence = Number.isInteger(minutes) ? `every ${minutes}m` : `every ${intervalSeconds}s`;
+  return `${cadence} (first sync runs when a server is up — \`monet start\`)`;
+}
+
 function printSourceTable(sources: KnowledgeSource[]): void {
   const headers = ["ID", "NAME", "TYPE", "CIRCLE", "STATUS", "LOCAL PATH"];
   const rows = sources.map((source) => [
@@ -159,6 +176,7 @@ function parentOptions(command: Command): SourceParentOptions {
 function withCore<T>(command: Command, dependencies: SourceCliDependencies, action: (core: SourceCore) => T): T {
   let core: SourceCore | undefined;
   try {
+    printStore(command, dependencies);
     core = dependencies.openCore(parentOptions(command).dir);
     return action(core);
   } catch (error) {
@@ -198,13 +216,17 @@ function buildRefresh(
   current?: KnowledgeSource["refresh"],
 ): KnowledgeSource["refresh"] | undefined {
   const seconds = parsePositiveInteger(options.intervalSeconds, "--interval-seconds");
-  if (options.refresh === undefined && seconds === undefined) return undefined;
+  if (options.refresh === undefined && seconds === undefined) {
+    return current === undefined ? { mode: "interval", intervalSeconds: 3600 } : undefined;
+  }
   const mode = options.refresh ?? "interval";
   if (mode === "manual") {
     if (seconds !== undefined) throw new SourceCliError("--interval-seconds is valid only with --refresh interval");
     return { mode: "manual" };
   }
-  const intervalSeconds = seconds ?? (current?.mode === "interval" ? current.intervalSeconds : undefined);
+  const intervalSeconds = seconds ?? (current === undefined
+    ? 3600
+    : current.mode === "interval" ? current.intervalSeconds : undefined);
   if (intervalSeconds === undefined) throw new SourceCliError("--refresh interval requires --interval-seconds");
   return { mode: "interval", intervalSeconds };
 }
@@ -227,8 +249,8 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
     .option("--remote <url>", "Credential-free git-md https or ssh URL")
     .option("--branch <branch>", "Explicit git-md branch")
     .option("--write-back <mode>", "Write-back policy", "none")
-    .option("--refresh <mode>", "Refresh policy", "manual")
-    .option("--interval-seconds <seconds>", "Refresh interval when --refresh interval")
+    .option("--refresh <mode>", "Refresh policy (default: interval)")
+    .option("--interval-seconds <seconds>", "Refresh interval when --refresh interval (default: 3600)")
     .option("--auto-detect <true|false>", "Enable or disable future automatic path detection");
   add.options.find((option) => option.long === "--write-back")?.choices(["none", "pull-request"]);
   add.options.find((option) => option.long === "--refresh")?.choices(["manual", "interval"]);
@@ -240,7 +262,7 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
   add.action((name: string, options: AddOptions, command: Command) => withCore(command, dependencies, (core) => {
     const projectDir = path.resolve(dependencies.projectDir());
     const autoDetect = parseBoolean(options.autoDetect, "--auto-detect");
-    const refresh = buildRefresh(options) ?? { mode: "manual" as const };
+    const refresh = buildRefresh(options)!;
     let input: CreateSourceInput;
 
     if (options.type === "repo-md") {
@@ -290,6 +312,7 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
     console.log(`Configured source ${created.id} (${created.name})`);
     console.log(`Status: ${created.status}`);
     console.log(`Local path: ${created.localPath}`);
+    console.log(`refresh: ${formatRefresh(created.refresh)}`);
     console.log("Content sync: not run");
     // The ACLs above are only useful if the operator knows what THIS server actually presents —
     // surface it so --allow-caller/--allow-project can be checked against reality, not guesswork.

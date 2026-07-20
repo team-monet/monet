@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
 import { ensureMonetDir, getDbPath, getMonetDir } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
-import { registerSourceCommands, SourceCliError } from "./source-cli.js";
+import { printStoreLine, registerSourceCommands, SourceCliError } from "./source-cli.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openSourceCore, openStatusCore } from "./bootstrap.js";
 
@@ -75,6 +75,7 @@ program
     ensureMonetDir();
     const core = openStatusCore(getDbPath());
     const s = core.stats(options.circle);
+    printStoreLine(getDbPath());
     console.log(`Monet Status`);
     console.log(`------------------`);
     console.log(`Storage:       ${getDbPath()}`);
@@ -151,6 +152,9 @@ registerSourceCommands(program, {
     if (storageDir) process.env.MONET_STORAGE_DIR = path.resolve(storageDir);
     const monetDir = ensureMonetDir();
     return openSourceCore(getDbPath(), path.join(monetDir, "sources"));
+  },
+  dbPath(storageDir) {
+    return storageDir ? path.join(path.resolve(storageDir), "monet.db") : path.resolve(getDbPath());
   },
   deriveCircle,
   deriveCallerId,

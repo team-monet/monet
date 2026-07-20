@@ -46,6 +46,7 @@ describe("source CLI", () => {
       deriveCallerId: vi.fn(() => "test-caller"),
       deriveProjectId: vi.fn(() => "test-project-id"),
       projectDir: () => projectDir,
+      dbPath: () => dbPath,
     };
   });
 
@@ -54,18 +55,26 @@ describe("source CLI", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  async function run(args: string[]): Promise<string> {
-    const lines: string[] = [];
+  async function run(args: string[]): Promise<{ stdout: string; stderr: string }> {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
     const log = vi.spyOn(console, "log").mockImplementation((...values: unknown[]) => {
-      lines.push(values.map(String).join(" "));
+      stdout.push(values.map(String).join(" "));
+    });
+    const error = vi.spyOn(console, "error").mockImplementation((...values: unknown[]) => {
+      stderr.push(values.map(String).join(" "));
     });
     const program = new Command().name("monet");
     registerSourceCommands(program, dependencies);
     try {
       await program.parseAsync(["node", "monet", ...args]);
-      return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+      return {
+        stdout: stdout.length === 0 ? "" : `${stdout.join("\n")}\n`,
+        stderr: stderr.length === 0 ? "" : `${stderr.join("\n")}\n`,
+      };
     } finally {
       log.mockRestore();
+      error.mockRestore();
     }
   }
 
@@ -89,10 +98,11 @@ describe("source CLI", () => {
       "--allow-project", "project-a",
     ]);
 
-    expect(output).toContain("Status: pending-initial-sync");
-    expect(output).toContain(`Local path: ${canonicalProjectDir}`);
-    expect(output).toContain("Content sync: not run");
-    expect(output).toContain("Server identity: caller test-caller · project test-project-id");
+    expect(output.stderr).toBe(`store: ${dbPath}\n`);
+    expect(output.stdout).toContain("Status: pending-initial-sync");
+    expect(output.stdout).toContain(`Local path: ${canonicalProjectDir}`);
+    expect(output.stdout).toContain("Content sync: not run");
+    expect(output.stdout).toContain("Server identity: caller test-caller · project test-project-id");
     const source = inspect((core) => core.listSources()[0]);
     expect(source).toMatchObject({
       type: "repo-md",
@@ -107,6 +117,64 @@ describe("source CLI", () => {
     // not the repo-md source's own root — those two can differ (e.g. a custom --path).
     expect(dependencies.deriveProjectId).toHaveBeenCalledWith(projectDir);
     expect(closeCount).toBe(1);
+  });
+
+  it("defaults add to hourly refresh and prints the first-sync behavior", async () => {
+    const output = await run([
+      "source", "add", "Project docs", "--type", "repo-md",
+      "--allow-caller", "caller-a", "--allow-project", "project-a",
+    ]);
+
+    expect(output.stdout).toContain("refresh: every 60m (first sync runs when a server is up — `monet start`)");
+    expect(inspect((core) => core.listSources()[0].refresh)).toEqual({
+      mode: "interval",
+      intervalSeconds: 3600,
+    });
+  });
+
+  it("uses the hourly default when add explicitly selects interval refresh", async () => {
+    const output = await run([
+      "source", "add", "Interval docs", "--type", "repo-md", "--refresh", "interval",
+      "--allow-caller", "caller-a", "--allow-project", "project-a",
+    ]);
+
+    expect(output.stdout).toContain("refresh: every 60m (first sync runs when a server is up — `monet start`)");
+    expect(inspect((core) => core.listSources()[0].refresh)).toEqual({
+      mode: "interval",
+      intervalSeconds: 3600,
+    });
+  });
+
+  it("keeps explicit manual refresh available", async () => {
+    const output = await run([
+      "source", "add", "Manual docs", "--type", "repo-md", "--refresh", "manual",
+      "--allow-caller", "caller-a", "--allow-project", "project-a",
+    ]);
+
+    expect(output.stdout).toContain("refresh: manual (sync only when explicitly requested)");
+    expect(inspect((core) => core.listSources()[0].refresh)).toEqual({ mode: "manual" });
+  });
+
+  it("preserves update interval reuse and manual-to-interval validation", async () => {
+    await run([
+      "source", "add", "Project docs", "--type", "repo-md",
+      "--refresh", "interval", "--interval-seconds", "1800",
+      "--allow-caller", "caller-a", "--allow-project", "project-a",
+    ]);
+    const created = inspect((core) => core.listSources()[0]);
+
+    await run(["source", "update", created.id, "--refresh", "interval"]);
+    expect(inspect((core) => core.getSource(created.id)!.refresh)).toEqual({
+      mode: "interval",
+      intervalSeconds: 1800,
+    });
+
+    await run(["source", "update", created.id, "--refresh", "manual"]);
+    await expect(run(["source", "update", created.id, "--refresh", "interval"])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({
+        message: "--refresh interval requires --interval-seconds",
+      }),
+    );
   });
 
   it("derives a repo-md default circle from the resolved custom --path root", async () => {
@@ -181,13 +249,16 @@ describe("source CLI", () => {
     const created = inspect((core) => core.listSources()[0]);
 
     const table = await run(["source", "list"]);
-    expect(table).toMatch(/^ID\s+NAME\s+TYPE\s+CIRCLE\s+STATUS\s+LOCAL PATH/m);
-    expect(table).toContain("LOCAL PATH");
-    expect(table).toContain(created.id);
+    expect(table.stderr).toBe(`store: ${dbPath}\n`);
+    expect(table.stdout).toMatch(/^ID\s+NAME\s+TYPE\s+CIRCLE\s+STATUS\s+LOCAL PATH/m);
+    expect(table.stdout).toContain("LOCAL PATH");
+    expect(table.stdout).toContain(created.id);
 
     const json = await run(["source", "list", "--json"]);
-    expect(json).toBe(`${JSON.stringify([created], null, 2)}\n`);
-    expect(await run(["source", "show", created.id, "--path-only"])).toBe(`${realpathSync.native(projectDir)}\n`);
+    expect(json.stderr).toBe(`store: ${dbPath}\n`);
+    expect(json.stdout).toBe(`${JSON.stringify([created], null, 2)}\n`);
+    expect((await run(["source", "show", created.id, "--path-only"])).stdout)
+      .toBe(`${realpathSync.native(projectDir)}\n`);
 
     await run([
       "source", "update", created.id,
@@ -215,21 +286,21 @@ describe("source CLI", () => {
     const created = inspect((core) => core.listSources()[0]);
 
     const plain = await run(["source", "show", created.id]);
-    expect(plain).toContain("Server identity: caller test-caller · project test-project-id");
-    expect(plain).toContain("Callers:    caller-a");
-    expect(plain).toContain("Projects:   project-a");
+    expect(plain.stdout).toContain("Server identity: caller test-caller · project test-project-id");
+    expect(plain.stdout).toContain("Callers:    caller-a");
+    expect(plain.stdout).toContain("Projects:   project-a");
     expect(dependencies.deriveProjectId).toHaveBeenCalledWith(projectDir);
 
-    // --json is a documented "stable JSON" contract (see README) — must stay exactly the
-    // KnowledgeSource object, with no identity line mixed in.
+    // Machine-oriented variants keep stdout payload-only; store visibility is on stderr.
     const json = await run(["source", "show", created.id, "--json"]);
-    expect(json).toBe(`${JSON.stringify(created, null, 2)}\n`);
-    expect(json).not.toContain("Server identity");
+    expect(json.stdout).toBe(`${JSON.stringify(created, null, 2)}\n`);
+    expect(json.stderr).toBe(`store: ${dbPath}\n`);
+    expect(json.stdout).not.toContain("Server identity");
 
-    // --path-only is documented to print exactly the absolute local path — same guarantee.
     const pathOnly = await run(["source", "show", created.id, "--path-only"]);
-    expect(pathOnly).toBe(`${realpathSync.native(projectDir)}\n`);
-    expect(pathOnly).not.toContain("Server identity");
+    expect(pathOnly.stdout).toBe(`${realpathSync.native(projectDir)}\n`);
+    expect(pathOnly.stderr).toBe(`store: ${dbPath}\n`);
+    expect(pathOnly.stdout).not.toContain("Server identity");
   });
 
   it("rejects empty updates, closes on errors, and tombstones without deleting repo paths", async () => {
@@ -245,8 +316,8 @@ describe("source CLI", () => {
     expect(closeCount).toBe(2);
 
     const output = await run(["source", "remove", created.id, "--yes"]);
-    expect(output).toContain("Status: tombstoned");
-    expect(output).toContain("Local path was not deleted");
+    expect(output.stdout).toContain("Status: tombstoned");
+    expect(output.stdout).toContain("Local path was not deleted");
     expect(inspect((core) => core.listSources())).toEqual([]);
     expect(inspect((core) => core.listSources({ includeTombstoned: true }))[0].status).toBe("tombstoned");
     expect(() => mkdirSync(projectDir, { recursive: true })).not.toThrow();
