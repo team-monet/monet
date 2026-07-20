@@ -80,7 +80,7 @@
       "prompt": "agents/auditor.md",
       "touchesMonet": false,
       "model": "opus",
-      "description": "Use PROACTIVELY as the independent second review on substantive changes: audits the diff against the codebase with NO design context — data-model closure, sibling precedents, advertised contracts, invariant bypass, bounds, determinism. Pairs with reviewer (who audits against intent); brief it with only the diff location."
+      "description": "Use PROACTIVELY as the independent second review on high-risk changes, or when the lead escalates a surprising diff: audits the diff against the codebase with NO design context — data-model closure, sibling precedents, advertised contracts, invariant bypass, bounds, determinism. Pairs with reviewer (who audits against intent); brief it with only the diff location."
     },
     {
       "name": "security",
