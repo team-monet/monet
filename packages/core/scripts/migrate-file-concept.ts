@@ -1,227 +1,74 @@
 /**
- * One-shot DATA migration for the file=concept reshape (Phase 1, ratified).
+ * Operator harness for the file=concept source refresh and embedder migration.
  *
- * Background: before this reshape, EVERY chunk (heading section) of a source file was its own
- * separate `kind:source` concept. After the reshape, ALL chunks of one file consolidate onto ONE
- * file-level concept — enforced going forward by the write path (source-sync.ts's
- * fileConceptThisRun) and the physical schema (uq_source_chunks_active_concept_slot). Opening an
- * existing store with the new code upgrades its SCHEMA automatically and unconditionally
- * (MonetCore's version-gated ensureSchema — additive columns/indexes, safe on any open), but
- * nothing about that upgrade touches existing DATA. This script does the data half, in three steps:
+ * These are now two explicitly separate operations:
  *
- * REVIEW FIX (round 4, Codex thread 16): steps 3-4 (native re-embed + graph rebuild) run under
- * --apply REGARDLESS of whether any source matches (or exists at all) — they cover the model-swap
- * consistency of the WHOLE store, not just source-touched concepts, so a native-only store (or one
- * whose only sources have already been removed) still needs them. Only step 1-2 (source re-sync +
- * orphan sweep) is skipped when there is nothing to re-sync.
+ *   1. `--refresh-sources` re-reads registered sources from their network/filesystem origins, runs
+ *      the ordinary source-sync path, and retires abandoned file=concept orphans. It uses the
+ *      store's CURRENT pinned embedder and can change content independently of vector migration.
+ *      On recovery from an existing migration sentinel it is skipped, so source content stays fixed
+ *      while the same target vector migration converges.
+ *   2. Embedder migration always delegates the complete persisted-vector lifecycle to
+ *      `MonetCore.migrateEmbeddings({ targetModelId, dryRun, onProgress })`. With no `--apply` this
+ *      is a dry-run inventory; with `--apply` it rewrites native concepts and observations, source
+ *      concepts, workstreams, and finally the native graph. It never implicitly refreshes sources.
  *
- *   1. Re-sync every source (independently isolated — REVIEW FIX: one source's failure is caught,
- *      reported, and does not abort the batch). SOURCE_CHUNKER_VERSION bumped v2->v3 (the
- *      minimum-chunk merge pass), which is baked into every chunk's ingestFingerprint — so the
- *      very next sync treats every chunk as changed, regardless of whether its content actually
- *      differs, and runs it through the real write path. fileConceptThisRun (source-sync.ts)
- *      resolves ONE target concept per file from that file's whole staged chunk set upfront, so
- *      every chunk of a file lands on the same concept — whichever prior per-chunk concept a
- *      surviving binding first resolves to.
- *   2. Sweep orphans (per source). Re-sync reassigns a surviving binding's chunk onto the winning
- *      file concept, but nothing in the ordinary sync path retires the LOSING prior per-chunk
- *      concepts it abandons: retire-absent cleanup only fires for a binding that disappeared
- *      entirely, and these bindings didn't disappear, they just changed which concept they point
- *      at. Left alone they end up `status='active'` with zero active source_chunks rows forever.
- *      This finds every such orphan per source (kind='source', source_identity matches,
- *      status='active', zero active chunks per core.hasActiveSourceChunks) and retires it.
- *   3. Re-embed every NATIVE concept (store-wide, once, after the per-source loop). REVIEW FIX
- *      (MAJOR): an embedder swap (item 9's multilingual default) otherwise strands every existing
- *      native concept under the OLD model's vector space while queries embed with the NEW model —
- *      cosine-compared directly, with no model gate, silently degrading (or actively misleading)
- *      similarity search/gather/dedup for the entire pre-existing store, not just source content.
- *      This re-embeds every native concept's CURRENT body with the SAME embedder instance the
- *      whole run uses (see --embedder below), leaving the WHOLE store under one model. Idempotent
- *      (a deterministic embedder re-embedding an unchanged body always produces the same vector).
- *      REVIEW FIX (round 4, Codex thread 11): immediately re-embeds that SAME concept's own
- *      observations too (reembedConceptObservations) — recomputeNativeConceptProjection and
- *      detach() both derive a concept's embedding FROM observations.embedding on ordinary native-
- *      concept paths, so leaving them behind would let a later split/detach silently reintroduce an
- *      old-model vector into concepts.embedding even after this same concept's row is migrated.
- *   4. Rebuild the similarity graph for every concept step 3 re-embedded (store-wide, once, AFTER
- *      step 3 completes in full — never interleaved with it). COLD-AUDIT FIX (MAJOR): step 3 alone
- *      migrates a concept's VECTOR but not its stored `related`/`about` edges (memory_edge) — those
- *      are computed once at write time (upsertEdgeBoth, off a bestMatches neighborhood search) and
- *      never revisited just because the vector they were computed from changed. Left alone, every
- *      edge keeps pointing at OLD-model-similarity neighbors forever, and gather()'s spread walk
- *      trusts them blindly. This step calls MonetCore.rederiveNativeConceptGraph for every
- *      concept step 3 successfully re-embedded — unwinding and rebuilding its edges from its NEW
- *      embedding. Run only AFTER every native is re-embedded, never per-concept inside step 3's own
- *      loop: rederiving concept A's neighbors while concept B (a candidate neighbor) still carries
- *      its PRE-swap vector would score two incompatible embedding spaces against each other and
- *      persist garbage edges — see that method's own docstring for the full reasoning.
+ * Stamp ordering: core.migrateEmbeddings writes a durable `embedder_migration` sentinel under held
+ * SQLite-exclusive ownership, then stamps the target pin early before rewriting vectors. The pin is
+ * therefore never the sole proof of consistency: a crash leaves the sentinel in place, and every
+ * served path fails closed while it exists. Re-running the SAME target reacquires the lock and
+ * converges idempotently; a different target is rejected until the backup is restored or the active
+ * migration is completed.
  *
- *      DETERMINISM, verified empirically (four consecutive --apply runs against the same store):
- *      `related` edges (NN/cosine over a FIXED post-step-3 embedding set) are order-independent and
- *      stable immediately. `about` edges are gated by a pre-existing, order-sensitive hub threshold
- *      (isHubDf: df/n at the moment each concept is processed — deriveEntityEdges, same mechanism
- *      hub-edge-filter.test.ts documents) — listNativeConceptIds' ORDER BY id makes the processing
- *      order itself repeatable, but the FIRST rebuild pass over a store's pre-existing (possibly
- *      long-accumulated) graph still shows bounded, one-time churn while df/n moves off that old
- *      distribution (observed: ~2-3% of edges on a 441-concept/31k-edge store). A SECOND pass
- *      already reaches a true fixed point: verified byte-identical (src_id, dst_id, type, weight,
- *      origin) edge sets, by SHA-256, across two independent runs starting from a settled store.
- *      Practical implication: run this migration, then run it again once more before trusting the
- *      graph is fully settled — both re-syncing sources and re-embedding natives are already
- *      idempotent no-ops on a second run, so the only thing a second run actually still does is
- *      finish settling the graph.
+ * Exclusivity: core.migrateEmbeddings now enforces this mechanically with SQLite-native exclusive
+ * ownership and a 5-second busy timeout. If another MCP server, CLI, dashboard, backup, or indexer
+ * holds the store open, migration stops before touching migration state and prints operator
+ * remediation. Close every process using the database, wait for exit, and re-run; do not inspect the
+ * same store with another Monet command while migration is active.
  *
- *      ROUND 4 UPDATE, verified empirically against a real ~230MB/3600-concept store (a live
- *      corpus's first-ever file=concept consolidation — 2818 legacy per-chunk source concepts
- *      collapsing to 195 file concepts, 444 native concepts, ~39.7k memory_edge rows before):
- *      that "run it again once more" guidance held for Phase 2's PURE re-embed scenario (sources
- *      already consolidated, only vectors moving), but a store's FIRST-EVER file=concept
- *      consolidation is a much bigger one-time topology change — 1903 concepts disappearing in a
- *      single pass moves entity df/n far more than a re-embed alone does. This run needed a THIRD
- *      pass to reach the same byte-identical-edge-set fixed point (pass 1→2: 39681→31398→31302
- *      edges, still moving; pass 2→3: 31302→31302, SHA-256-identical). Don't assume a fixed
- *      number of passes: after --apply, diff the store's own edgesBefore/edgesAfter counts across
- *      consecutive runs (or hash memory_edge's own rows) and keep re-running until two IN A ROW
- *      report no change — that is the only real signal the graph has actually settled, on any
- *      store shape.
+ * Preflight: under `--apply`, the chosen target embedder must produce a vector BEFORE any source
+ * refresh or MonetCore construction. migrateEmbeddings repeats this validation internally; the
+ * redundancy is intentional and cheap. A failed preflight creates no DB, stamps no pin, and writes
+ * no source data.
  *
- * Embedder pin (Codex review, PR #51 round 5, FIX N): under --apply, this script stamps sync_meta's
- * pin to the CHOSEN --embedder (core.adoptEmbedderPin()) as the FIRST thing it does after opening
- * the store — before source re-sync (step 1), before native re-embed (step 3), before the graph
- * rebuild (step 4). Two consequences this ordering exists to prevent:
- *   (i) Without a stamp, a freshly re-embedded store still has NO recorded pin (or a stale one from
- *       before this run), so its NEXT served open backfills a pin by DIMENSION alone — which cannot
- *       tell "the OLD default that happens to share this dimension" from "the NEW one this run just
- *       wrote every vector in", silently mis-pinning e.g. a multilingual re-embed back to the legacy
- *       English default the very next time anything opens the store for real.
- *   (ii) Re-running this script against its OWN prior --apply output would otherwise open an
- *        ALREADY-pinned store with a constructor embedder that DELIBERATELY differs from that pin
- *        (that mismatch is what --embedder means: "re-embed under THIS model, whatever the store is
- *        pinned to now") — arming the constructor-time pin guard and making every gated call in the
- *        source-sync loop (storeInternal, gather, etc.) throw EmbedderPinUnsatisfiedError. The
- *        per-source try/catch (see migrateOneSource) swallows that as an ordinary sync failure,
- *        reported and skipped exactly like a transient network error — silently leaving that
- *        source's concepts unmigrated forever, not merely delayed to the next run, since nothing
- *        about "sync failed, retry later" distinguishes this from a real transient fault.
+ * Fail-hard behavior: source refresh and core vector phases remain per-item resilient so one bad
+ * item does not prevent progress on siblings. Any recorded failure still makes the command exit
+ * non-zero after rendering the full report. Core migration failures retain the durable sentinel, so
+ * served paths stay closed until the same target succeeds or a verified backup is restored.
  *
- * Stamping EARLY (before any re-embed work, not after) is a deliberate ordering choice for THIS
- * dev/operator harness specifically — not a general pattern to copy. It means a crash mid-run can
- * leave the pin already pointing at the target embedder while some vectors are still, temporarily,
- * under the OLD model: a real, if transient, inconsistent state. Accepted here because (a) a
- * verified backup is ALREADY mandatory before running this script at all (see the NEVER-without-a-
- * backup warning just below — this is designed to run against a disposable COPY), and (b) every
- * step this script runs is idempotent, so simply re-running it converges the store to fully-migrated
- * regardless of where a prior run crashed (see the DETERMINISM note above for the graph
- * specifically — the SAME "just run it again" guidance covers a stamp-then-crash too). The future
- * first-class core.migrateEmbeddings() (slice 2, not yet built) will instead flip the pin LAST,
- * atomically, only once every vector is confirmed re-embedded — this script is a one-shot operator
- * tool bridging until that exists, and its stamp-early ordering should NOT be read as the pattern a
- * production migration primitive ought to follow.
- *
- * Preflight (Codex review, PR #51 round 6, FIX P; reordered round 7, FIX X): under --apply, BEFORE
- * this script even CONSTRUCTS a MonetCore — not merely before adoptEmbedderPin(), as round 6 first
- * had it — this script confirms the chosen --embedder can actually produce a real embedding
- * (preflightEmbedder, below — a plain `await embedder.embed("preflight")`). Round 6's ordering was
- * itself a bug for a vector-free target DB: MonetCore's OWN constructor can mint a 'created' pin
- * (its fresh-store branch) naming an embedder that construction never actually verified could load
- * — a preflight running AFTER that construction could then fail, exiting the whole run while
- * leaving exactly the unsatisfied pin it existed to prevent. Preflighting BEFORE construction closes
- * this: the embedder instance exists independently of the core (it's passed INTO the constructor,
- * not derived from it), so reordering costs nothing. Direct consequence of the stamp-early ordering
- * above either way: without SOME preflight, an --embedder onnx run on a host where the model/
- * transformers.js can't load would stamp a pin, then have every per-item re-embed attempt in
- * reembedNativeConcepts/migrateOneSource fail — each caught individually by its own per-item
- * try/catch, never aborting the run — leaving a NON-EMPTY store permanently pinned to a model that
- * can never produce a vector, its data still unrewritten. A failed preflight ABORTS THE WHOLE RUN
- * before anything is written: no construction, no stamp, no partial work — the thrown error
- * propagates out of main() uncaught (see the bottom of this file), which already prints it and exits
- * non-zero. Gated on --apply only, same as adoptEmbedderPin itself: report-only never writes
- * anything regardless (see below — deferCreatedPin covers even the vector-free-DB construction-time
- * case now), so there is nothing here for a preflight failure to protect. hashing's own preflight is
- * instant and network-free either way (pure synchronous JS, no I/O), so the only real-world trigger
- * for this abort path is --embedder onnx on a host that can't reach or load the model.
- *
- * Exclusivity: this migration workflow requires EXCLUSIVE access to the target store. Close every
- * live session (MCP server, CLI) holding this store open before running --apply — a concurrent
- * writer touching the store mid-migration is undefined territory this script makes no attempt to
- * detect or coordinate with. The planned first-class core.migrateEmbeddings() (slice 2, see the
- * ordering note above) will enforce this mechanically with a real WAL-native lock probe before
- * touching anything; this one-shot operator script relies on the operator's own discipline instead.
- *
- * Exit code (Codex review, PR #51 round 8, FIX Y): every loop in this script (source sync/orphan
- * retirement, native re-embed, native observation re-embed, graph rebuild) is deliberately per-item
- * resilient — one bad item is caught, recorded, and skipped, never aborting the rest of that SAME
- * run (each loop's own docstring explains why: completing everything else maximizes progress per
- * invocation). That resilience has a sharp edge, though: under --apply, the pin is already stamped
- * to the target embedder (stamp-early, see "Embedder pin" above) by the time any of these loops even
- * run — so a run that finishes with SOME failures still exits 0 by default, looking like a clean
- * success, while the store is actually half-migrated: some vectors under the NEW model, some still
- * under the OLD one, all scored under the SAME (new) thresholds. This script now FAILS HARD instead:
- * if --apply and ANY loop recorded even one failure, main() throws after printing the full report
- * (not mid-run — the per-item resilience above is unchanged) and the process exits non-zero, with a
- * prominent, hard-to-miss block explaining the store is mid-migration, must not be opened by any
- * served path, and should simply be re-run (every step here is idempotent and retries failed items
- * from scratch) until a pass reports zero failures everywhere — or the mandatory backup restored.
- * Report-only is unaffected: nothing is ever mutated under it, so there is nothing to warn about
- * (every loop above returns an empty, failure-free report when !applyFlag anyway).
- *
- * Report-only by default (still opens the store, which still auto-upgrades the schema — that half
- * is additive and unconditional either way; the pin is NOT stamped in this mode). Two independent
- * guarantees now cover this, not one: adoptEmbedderPin() only ever runs under --apply (covers an
- * ALREADY-pinned store); MonetCoreOptions.deferCreatedPin is passed whenever NOT --apply (Codex
- * review, PR #51 round 7, FIX V — covers a genuinely vector-free target DB, whose fresh-store
- * branch would otherwise mint a 'created' pin during construction itself, on a plain report-only
- * inspection that promises never to write anything). --apply is required to actually stamp the pin,
- * re-sync sources, retire orphans, re-embed natives, and rebuild their graph. NEVER point this at a
- * store you care about without a tested, verified backup — it is designed to run against a
- * disposable COPY, and the copy step is the caller's job, not this script's: it operates on exactly
- * the db-path and storage-dir it's given.
- *
- * --embedder (hashing|onnx): which embedder generates every fresh vector this run writes — both the
- * source re-sync's recompute and the native re-embed pass share ONE instance, so the whole store
- * ends up under the SAME model consistently. COLD-AUDIT FIX: --apply now REQUIRES --embedder
- * explicitly (errors otherwise) — this decides the store's semantic model, too consequential a
- * choice for an implicit default. A REAL migration must pass --embedder onnx: John's ruling —
- * production uses the multilingual ONNX model (embedding-onnx.ts's default), and this script never
- * assumes that silently. A report-only/dry-run pass (no --apply) may still omit --embedder — it
- * defaults to hashing there, since nothing is actually written.
+ * `--apply` requires an explicit `--embedder hashing|onnx`; report-only defaults to hashing. A real
+ * production migration uses `--embedder onnx`. Always run against a tested, disposable backup copy.
  *
  * Usage:
- *   tsx scripts/migrate-file-concept.ts <db-path> --storage-dir <dir> [--source <sourceId>]
- *     --embedder hashing|onnx --apply
- *   tsx scripts/migrate-file-concept.ts <db-path> --storage-dir <dir>   # report-only, no flags needed
+ *   tsx scripts/migrate-file-concept.ts <db-path> --embedder hashing|onnx --apply
+ *   tsx scripts/migrate-file-concept.ts <db-path> [--embedder hashing|onnx]              # dry-run
+ *   tsx scripts/migrate-file-concept.ts <db-path> --refresh-sources --storage-dir <dir>
+ *     [--source <sourceId>] [--embedder hashing|onnx --apply]
  */
-import { HashingEmbeddingProvider } from "../src/embedding";
+import { HashingEmbeddingProvider, type EmbeddingProvider } from "../src/embedding";
 import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
-import { MonetCore } from "../src/engine";
-import type { EmbeddingProvider } from "../src/embedding";
+import {
+  EmbedderMigrationFailedError,
+  EmbedderMigrationIncompleteError,
+  MonetCore,
+  type EmbeddingMigrationProgress,
+  type EmbeddingMigrationReport,
+} from "../src/engine";
+import { chooseStoreEmbedder } from "../src/store-embedder";
 import type { KnowledgeSource } from "../src/source-types";
 import type { StoragePort } from "../src/storage";
 
-/**
- * Preflight check (Codex review, PR #51 round 6, FIX P) — confirms `embedder` can actually produce
- * a real embedding BEFORE this script commits to anything. See the file docstring's "Preflight"
- * section for the full failure mode this closes (the direct consequence of round 5's stamp-early
- * ordering: an --embedder onnx run on a host where the model can't load would otherwise stamp the
- * pin, then have every per-item re-embed fail silently, caught one at a time, never aborting the
- * run). Throws (never returns a boolean) so a caller can't accidentally proceed past a failed
- * preflight by forgetting to check a return value — main() lets the throw propagate uncaught, which
- * aborts the whole run before adoptEmbedderPin or any re-embed work runs.
- *
- * Exported for testability: embedder-pin.test.ts-adjacent unit tests import this directly against a
- * real (hashing) and a fake failing embedder, without invoking main() — see the entry-point guard
- * at the bottom of this file (same established pattern as scripts/scrub-corpus.mjs/scrub-db.mjs).
- */
+/** Confirm the target can embed before constructing or mutating anything. */
 export async function preflightEmbedder(embedder: EmbeddingProvider, label: string): Promise<void> {
   try {
     await embedder.embed("preflight");
-  } catch (e) {
+  } catch (error) {
     throw new Error(
       `Embedder preflight failed for --embedder ${label}: this model cannot produce an embedding ` +
         `right now (network unreachable, model not cached locally, or a genuine load failure). ` +
-        `Aborting BEFORE stamping the pin or touching any data — nothing was written. Fix the ` +
+        `Aborting before constructing MonetCore or touching any data — nothing was written. Fix the ` +
         `underlying issue (or choose a different --embedder) and re-run.`,
-      { cause: e },
+      { cause: error },
     );
   }
 }
@@ -231,7 +78,7 @@ interface OrphanConcept {
   title: string;
 }
 
-export interface SourceMigrationReport {
+export interface SourceRefreshReport {
   sourceId: string;
   type: KnowledgeSource["type"];
   lifecycle: KnowledgeSource["lifecycle"];
@@ -246,23 +93,39 @@ export interface SourceMigrationReport {
   error: string | null;
 }
 
-export interface NativeReembedReport {
-  attempted: number;
-  succeeded: number;
-  succeededIds: string[];
-  failed: Array<{ id: string; error: string }>;
-  observationsReembedded: number;
-  observationReembedFailed: Array<{ id: string; error: string }>;
-  durationMs: number;
+type MigrationCore = Pick<MonetCore, "migrateEmbeddings">;
+
+/** Thin, testable delegation seam: all vector and graph mechanics stay in MonetCore. */
+export function runEmbeddingMigration(
+  core: MigrationCore,
+  targetModelId: string,
+  apply: boolean,
+  onProgress?: (event: EmbeddingMigrationProgress) => void,
+): Promise<EmbeddingMigrationReport> {
+  return core.migrateEmbeddings({ targetModelId, dryRun: !apply, onProgress });
 }
 
-export interface GraphRebuildReport {
-  attempted: number;
-  succeeded: number;
-  failed: Array<{ id: string; error: string }>;
-  durationMs: number;
-  edgesBefore: number;
-  edgesAfter: number;
+export function formatEmbeddingMigrationReport(report: EmbeddingMigrationReport): string {
+  const lines = [
+    "",
+    `=== embedding migration report (${report.dryRun ? "DRY-RUN" : "APPLIED"}, target=${report.targetModelId}) ===`,
+  ];
+  for (const [phase, result] of Object.entries(report.phases)) {
+    lines.push(
+      `${phase.padEnd(20)} completed=${String(result.completed).padStart(5)}/${String(result.total).padEnd(5)} failed=${result.failed}`,
+    );
+  }
+  if (report.failures.length > 0) {
+    lines.push("", "FAILURES:");
+    for (const failure of report.failures) {
+      lines.push(`  - [${failure.phase}] ${failure.id}: ${failure.message}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function anySourceRefreshFailure(reports: SourceRefreshReport[]): boolean {
+  return reports.some((report) => report.error !== null);
 }
 
 function activeSourceConceptCount(core: MonetCore, sourceId: string): number {
@@ -281,299 +144,133 @@ function findOrphanConcepts(core: MonetCore, sourceId: string): OrphanConcept[] 
   return candidates.filter((candidate) => !core.hasActiveSourceChunks(candidate.id));
 }
 
-async function migrateOneSource(core: MonetCore, source: KnowledgeSource, apply: boolean): Promise<SourceMigrationReport> {
+async function refreshOneSource(core: MonetCore, source: KnowledgeSource): Promise<SourceRefreshReport> {
   const startedAt = Date.now();
   const conceptsBefore = activeSourceConceptCount(core, source.id);
-  let syncStatus = "skipped (report-only)";
+  let syncStatus = `skipped (lifecycle=${source.lifecycle})`;
   let filesPublished: number | null = null;
   let chunksPublished: number | null = null;
   let error: string | null = null;
+  const orphansRetired: OrphanConcept[] = [];
 
-  if (apply) {
-    if (source.lifecycle !== "active") {
-      syncStatus = `skipped (lifecycle=${source.lifecycle})`;
-    } else {
-      // REVIEW FIX (MAJOR, operational note): isolated per source — one source's failure (a
-      // transient materializer error, an unreadable local path, anything) must not abort every
-      // OTHER source's migration. Caught, reported, and the batch continues.
-      try {
-        const result = source.type === "git-md" ? await core.syncGitMdSource(source.id) : await core.syncRepoMdSource(source.id);
-        syncStatus = result.status;
-        if (result.runId) {
-          filesPublished = core.listSourceFiles(result.runId, true).length;
-          chunksPublished = core.listSourceChunks(result.runId, true).length;
-        }
-      } catch (e) {
-        syncStatus = "FAILED";
-        error = e instanceof Error ? e.message : String(e);
+  if (source.lifecycle === "active") {
+    try {
+      const result = source.type === "git-md"
+        ? await core.syncGitMdSource(source.id)
+        : await core.syncRepoMdSource(source.id);
+      syncStatus = result.status;
+      if (result.runId) {
+        filesPublished = core.listSourceFiles(result.runId, true).length;
+        chunksPublished = core.listSourceChunks(result.runId, true).length;
       }
+    } catch (cause) {
+      syncStatus = "FAILED";
+      error = cause instanceof Error ? cause.message : String(cause);
     }
   }
 
   const conceptsAfterSync = activeSourceConceptCount(core, source.id);
-  let orphans: OrphanConcept[] = [];
-  if (apply && !error) {
-    orphans = findOrphanConcepts(core, source.id);
-    for (const orphan of orphans) {
+  if (error === null) {
+    for (const orphan of findOrphanConcepts(core, source.id)) {
       try {
         core.retireConcept(orphan.id);
-      } catch (e) {
-        error = `orphan retirement failed for ${orphan.id}: ${e instanceof Error ? e.message : String(e)}`;
+        orphansRetired.push(orphan);
+      } catch (cause) {
+        error = `orphan retirement failed for ${orphan.id}: ${cause instanceof Error ? cause.message : String(cause)}`;
         break;
       }
     }
   }
-  const conceptsAfterSweep = activeSourceConceptCount(core, source.id);
 
   return {
-    sourceId: source.id, type: source.type, lifecycle: source.lifecycle, syncStatus,
-    filesPublished, chunksPublished, conceptsBefore, conceptsAfterSync, conceptsAfterSweep,
-    orphansRetired: orphans, durationMs: Date.now() - startedAt, error,
+    sourceId: source.id,
+    type: source.type,
+    lifecycle: source.lifecycle,
+    syncStatus,
+    filesPublished,
+    chunksPublished,
+    conceptsBefore,
+    conceptsAfterSync,
+    conceptsAfterSweep: activeSourceConceptCount(core, source.id),
+    orphansRetired,
+    durationMs: Date.now() - startedAt,
+    error,
   };
 }
 
-/** REVIEW FIX (MAJOR): re-embeds every native concept under the run's chosen embedder — see the
- *  file docstring's step 3. Each concept is isolated (one bad body/embed() failure is recorded and
- *  skipped, never aborts the pass) since this can touch every native concept in the store.
- *
- *  REVIEW FIX (round 4, Codex thread 11): also re-embeds each successfully-migrated concept's own
- *  OBSERVATIONS (reembedConceptObservations, engine.ts) — reembedConcept above only ever rewrote
- *  concepts.embedding, but recomputeNativeConceptProjection and detach() both derive a concept's
- *  embedding FROM observations.embedding on ordinary, frequently-hit native-concept paths. Left
- *  un-migrated, any one of those would silently pull an old-model vector back into a concept this
- *  script JUST migrated. Tracked separately from the concept-level failed list: an observation
- *  re-embed failure leaves that concept's OWN vector correctly migrated (still eligible for the
- *  graph rebuild pass below) and only that concept's observations at risk of the stale-vector
- *  regression on a LATER split/detach — worth surfacing, not worth treating as a re-embed failure. */
-async function reembedNativeConcepts(core: MonetCore, apply: boolean): Promise<NativeReembedReport> {
-  const startedAt = Date.now();
-  if (!apply) {
-    return { attempted: 0, succeeded: 0, succeededIds: [], failed: [], observationsReembedded: 0, observationReembedFailed: [], durationMs: 0 };
+function printSourceRefreshReport(reports: SourceRefreshReport[]): void {
+  console.log("\n=== explicit source refresh report ===\n");
+  if (reports.length === 0) {
+    console.log("No matching sources found.");
+    return;
   }
-  const ids = core.listNativeConceptIds();
-  const succeededIds: string[] = [];
-  const failed: Array<{ id: string; error: string }> = [];
-  let observationsReembedded = 0;
-  const observationReembedFailed: Array<{ id: string; error: string }> = [];
-  for (const id of ids) {
-    let conceptReembedded = false;
-    try {
-      conceptReembedded = await core.reembedConcept(id);
-      if (conceptReembedded) succeededIds.push(id);
-    } catch (e) {
-      failed.push({ id, error: e instanceof Error ? e.message : String(e) });
-      continue;
-    }
-    if (!conceptReembedded) continue;
-    try {
-      observationsReembedded += await core.reembedConceptObservations(id);
-    } catch (e) {
-      observationReembedFailed.push({ id, error: e instanceof Error ? e.message : String(e) });
-    }
-  }
-  return {
-    attempted: ids.length, succeeded: succeededIds.length, succeededIds, failed,
-    observationsReembedded, observationReembedFailed, durationMs: Date.now() - startedAt,
-  };
-}
-
-function totalEdgeCount(core: MonetCore): number {
-  const db = (core as unknown as { db: StoragePort }).db;
-  return (db.prepare(`SELECT COUNT(*) AS n FROM memory_edge`).get() as { n: number }).n;
-}
-
-/**
- * COLD-AUDIT FIX (MAJOR): rebuilds the stored similarity graph for every concept step 3 (re-embed)
- * successfully touched — see the file docstring's step 4 for why this is a strictly SEPARATE,
- * later pass, never folded into the re-embed loop. Scoped to succeededIds only, deliberately: a
- * concept whose re-embed itself failed is STILL under the old model, so rederiving its neighbors
- * now would be scoring it against a store that (from its own vector's perspective) hasn't swapped
- * yet — left alone, it stays exactly as consistent as it was before this script ran, healed the
- * next time the migration re-runs (see the report's own failed-source caveat, printReport). Each
- * concept is isolated the same way the re-embed loop is. */
-async function rederiveNativeConceptGraphs(core: MonetCore, succeededIds: string[], apply: boolean): Promise<GraphRebuildReport> {
-  const startedAt = Date.now();
-  const edgesBefore = totalEdgeCount(core);
-  if (!apply) return { attempted: 0, succeeded: 0, failed: [], durationMs: 0, edgesBefore, edgesAfter: edgesBefore };
-  let succeeded = 0;
-  const failed: Array<{ id: string; error: string }> = [];
-  for (const id of succeededIds) {
-    try {
-      if (core.rederiveNativeConceptGraph(id)) succeeded++;
-    } catch (e) {
-      failed.push({ id, error: e instanceof Error ? e.message : String(e) });
-    }
-  }
-  return { attempted: succeededIds.length, succeeded, failed, durationMs: Date.now() - startedAt, edgesBefore, edgesAfter: totalEdgeCount(core) };
-}
-
-function printReport(
-  reports: SourceMigrationReport[], native: NativeReembedReport, graph: GraphRebuildReport, apply: boolean, embedderLabel: string,
-): void {
-  console.log(`\n=== file=concept migration report (${apply ? "APPLIED" : "report-only"}, embedder=${embedderLabel}) ===\n`);
-  for (const r of reports) {
-    console.log(`source ${r.sourceId} (${r.type}, lifecycle=${r.lifecycle})`);
-    console.log(`  sync status:         ${r.syncStatus}${r.error ? `  [ERROR: ${r.error}]` : ""}`);
-    console.log(`  files published:     ${r.filesPublished ?? "n/a"}`);
-    console.log(`  chunks published:    ${r.chunksPublished ?? "n/a"}`);
-    console.log(`  active source concepts  before: ${r.conceptsBefore}`);
-    console.log(`  active source concepts  after sync (pre-sweep): ${r.conceptsAfterSync}`);
-    console.log(`  active source concepts  after orphan sweep:     ${r.conceptsAfterSweep}`);
-    console.log(`  orphans retired:     ${r.orphansRetired.length}`);
-    const shown = r.orphansRetired.slice(0, 20);
-    for (const o of shown) console.log(`    - ${o.id}  "${o.title}"`);
-    if (r.orphansRetired.length > shown.length) console.log(`    ... and ${r.orphansRetired.length - shown.length} more`);
-    console.log(`  duration:            ${r.durationMs}ms\n`);
-  }
-  const totals = reports.reduce(
-    (acc, r) => ({
-      before: acc.before + r.conceptsBefore,
-      afterSweep: acc.afterSweep + r.conceptsAfterSweep,
-      orphans: acc.orphans + r.orphansRetired.length,
-      failures: acc.failures + (r.error ? 1 : 0),
-    }),
-    { before: 0, afterSweep: 0, orphans: 0, failures: 0 },
-  );
-  console.log(`SOURCES TOTAL: ${totals.before} active source concepts before -> ${totals.afterSweep} after `
-    + `(${totals.orphans} orphans retired, ${totals.failures} source(s) failed).`);
-  if (totals.failures > 0) {
-    const failedIds = reports.filter((r) => r.error).map((r) => r.sourceId);
-    console.log(`  CAVEAT: ${totals.failures} source(s) failed and were skipped: ${failedIds.join(", ")}.`);
-    console.log(`  Their concepts remain exactly as they were before this run (still under the OLD`);
-    console.log(`  chunk-per-concept shape, and — if this is also an embedder-swap run — still under`);
-    console.log(`  the OLD embedding model too, since a failed sync never reaches this source's own`);
-    console.log(`  data). Re-running this migration heals them: every step here is idempotent, and a`);
-    console.log(`  source that failed once is retried from scratch on the next invocation, exactly`);
-    console.log(`  like a source that was never migrated at all.`);
-  }
-
-  console.log(`\nnative re-embed (item 9, model-swap consistency)`);
-  console.log(`  attempted: ${native.attempted}`);
-  console.log(`  succeeded: ${native.succeeded}`);
-  console.log(`  failed:    ${native.failed.length}`);
-  for (const f of native.failed.slice(0, 20)) console.log(`    - ${f.id}: ${f.error}`);
-  if (native.failed.length > 20) console.log(`    ... and ${native.failed.length - 20} more`);
-  console.log(`  duration:  ${native.durationMs}ms`);
-  if (native.failed.length > 0) {
-    console.log(`  CAVEAT: ${native.failed.length} native concept(s) failed to re-embed and were skipped —`);
-    console.log(`  they remain under the OLD embedding model. Re-running this migration retries them`);
-    console.log(`  (listNativeConceptIds re-lists every non-retired native every run; this is not a`);
-    console.log(`  one-shot list consumed on first failure).`);
-  }
-
-  // REVIEW FIX (round 4, Codex thread 11): observation-level re-embed — see reembedNativeConcepts'
-  // own docstring for why this has to run per-concept, right after that concept's own re-embed.
-  console.log(`\nnative observation re-embed (round 4, thread 11: detach()/projection-rebuild consistency)`);
-  console.log(`  observations re-embedded: ${native.observationsReembedded}`);
-  console.log(`  concepts with a failed observation re-embed: ${native.observationReembedFailed.length}`);
-  for (const f of native.observationReembedFailed.slice(0, 20)) console.log(`    - ${f.id}: ${f.error}`);
-  if (native.observationReembedFailed.length > 20) console.log(`    ... and ${native.observationReembedFailed.length - 20} more`);
-  if (native.observationReembedFailed.length > 0) {
-    console.log(`  CAVEAT: this concept's OWN vector is correctly migrated (still eligible for the graph`);
-    console.log(`  rebuild below) — only its observations remain under the OLD model, at risk of a later`);
-    console.log(`  memory_detach or projection rebuild pulling an old-model vector back into`);
-    console.log(`  concepts.embedding. Re-running this migration retries them (reembedConceptObservations`);
-    console.log(`  is idempotent, same as reembedConcept).`);
-  }
-
-  // COLD-AUDIT FIX (MAJOR): graph rebuild — see the file docstring's step 4.
-  console.log(`\nnative similarity-graph rebuild (cold-audit fix, item 9 model-swap consistency)`);
-  console.log(`  attempted: ${graph.attempted} (every native concept re-embed just succeeded for)`);
-  console.log(`  succeeded: ${graph.succeeded}`);
-  console.log(`  failed:    ${graph.failed.length}`);
-  for (const f of graph.failed.slice(0, 20)) console.log(`    - ${f.id}: ${f.error}`);
-  if (graph.failed.length > 20) console.log(`    ... and ${graph.failed.length - 20} more`);
-  console.log(`  store-wide memory_edge rows before: ${graph.edgesBefore}`);
-  console.log(`  store-wide memory_edge rows after:  ${graph.edgesAfter}`);
-  console.log(`  duration:  ${graph.durationMs}ms`);
-  if (graph.failed.length > 0) {
-    console.log(`  CAVEAT: ${graph.failed.length} concept(s) re-embedded successfully but failed to`);
-    console.log(`  rebuild their graph — their VECTOR is under the new model, but their stored`);
-    console.log(`  related/about edges may still reflect old-model neighbors. Re-running this`);
-    console.log(`  migration retries them (reembedConcept is idempotent, so the vector step is a`);
-    console.log(`  harmless no-op the second time; only the graph step actually needed a retry).`);
+  for (const report of reports) {
+    console.log(`source ${report.sourceId} (${report.type}, lifecycle=${report.lifecycle})`);
+    console.log(`  sync status: ${report.syncStatus}${report.error ? ` [ERROR: ${report.error}]` : ""}`);
+    console.log(`  files/chunks published: ${report.filesPublished ?? "n/a"}/${report.chunksPublished ?? "n/a"}`);
+    console.log(
+      `  active source concepts: ${report.conceptsBefore} -> ${report.conceptsAfterSync} -> ${report.conceptsAfterSweep}`,
+    );
+    console.log(`  orphans retired: ${report.orphansRetired.length}`);
+    console.log(`  duration: ${report.durationMs}ms\n`);
   }
 }
 
-/**
- * Whether ANY loop above recorded a failure — source sync/orphan retirement, native concept
- * re-embed, native observation re-embed, or graph rebuild (Codex review, PR #51 round 8, FIX Y).
- * Every one of those loops is deliberately per-item resilient (one bad item never aborts the rest —
- * see each loop's own docstring for why), so a --apply run can complete and print a report while
- * some vectors are still stranded under the OLD embedding model. This predicate is what main() uses
- * to decide whether a completed run must still exit non-zero. Exported for testability: a pure
- * function over the three report shapes, no I/O of its own — the ordering/looping logic that
- * PRODUCES these reports still isn't independently testable without a real MonetCore and real (or
- * poisoned) sources, but the fail-hard DECISION itself is exercised directly, without needing to
- * drive a full run to prove this part works.
- */
-export function anyMigrationFailure(
-  reports: SourceMigrationReport[], native: NativeReembedReport, graph: GraphRebuildReport,
-): boolean {
-  return (
-    reports.some((r) => r.error !== null) ||
-    native.failed.length > 0 ||
-    native.observationReembedFailed.length > 0 ||
-    graph.failed.length > 0
+function printMigrationProgress(event: EmbeddingMigrationProgress): void {
+  const current = event.currentId === undefined ? "" : ` current=${event.currentId}`;
+  console.log(
+    `[migration:${event.phase}] ${event.completed}/${event.total} completed; ${event.failed} failed${current}`,
   );
 }
 
-/**
- * Builds the prominent, impossible-to-miss failure message main() throws when
- * anyMigrationFailure() is true under --apply (Codex review, PR #51 round 8, FIX Y). Exported for
- * testability — asserting on its exact content without needing to drive main() end-to-end.
- */
-export function migrationIncompleteMessage(embedderLabel: string): string {
-  const bar = "!".repeat(78);
-  return [
-    "",
-    bar,
-    "MIGRATION INCOMPLETE — this store is MID-MIGRATION, not done.",
-    bar,
-    `The pin already points at the target embedder (${embedderLabel}) — that stamp happens`,
-    "deliberately EARLY, before this run's own work, and stays UNCHANGED by a failure discovered",
-    "later (see this file's docstring, \"Embedder pin\" section). Some vectors reported above are",
-    "STILL under the OLD model, mismatched against that pin.",
-    "",
-    "DO NOT open this store with any served path (the MCP server, the CLI) until it is fully",
-    "migrated — queries would silently mix two incompatible vector spaces.",
-    "",
-    "Re-run this script against the SAME db-path: every step here is idempotent, and a failed",
-    "item is retried from scratch on the next invocation exactly like one that was never touched",
-    "(see the per-section CAVEATs printed above). Keep re-running until a pass reports ZERO",
-    "failures in every section. If failures persist, restore the mandatory backup instead.",
-    bar,
-  ].join("\n");
+async function refreshSources(
+  dbPath: string,
+  storageDir: string | undefined,
+  onlySourceId: string | undefined,
+): Promise<SourceRefreshReport[]> {
+  const core = new MonetCore(dbPath, {
+    embedder: await chooseStoreEmbedder(dbPath),
+    ...(storageDir ? { sourceStorageDir: storageDir } : {}),
+  });
+  try {
+    await core.ensureEmbedderPin();
+    const sources = core
+      .listSources({ includeTombstoned: true })
+      .filter((source) => !onlySourceId || source.id === onlySourceId);
+    const reports: SourceRefreshReport[] = [];
+    for (const source of sources) reports.push(await refreshOneSource(core, source));
+    return reports;
+  } finally {
+    core.close();
+  }
 }
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const flagValue = (name: string): string | undefined => {
-    const idx = args.indexOf(name);
-    return idx >= 0 ? args[idx + 1] : undefined;
+    const index = args.indexOf(name);
+    return index >= 0 ? args[index + 1] : undefined;
   };
-  const dbPath = args.find((a, i) => !a.startsWith("--") && !["--storage-dir", "--source", "--embedder"].includes(args[i - 1] ?? ""));
+  const dbPath = args.find(
+    (arg, index) => !arg.startsWith("--") && !["--storage-dir", "--source", "--embedder"].includes(args[index - 1] ?? ""),
+  );
   const applyFlag = args.includes("--apply");
+  const refreshSourcesFlag = args.includes("--refresh-sources");
   const storageDir = flagValue("--storage-dir");
   const onlySourceId = flagValue("--source");
   const embedderArg = flagValue("--embedder");
 
   if (!dbPath) {
-    console.error("Usage: tsx scripts/migrate-file-concept.ts <db-path> --storage-dir <dir> [--source <sourceId>]");
-    console.error("         --embedder hashing|onnx --apply");
-    console.error("       tsx scripts/migrate-file-concept.ts <db-path> --storage-dir <dir>   # report-only");
-    console.error("  (no --apply = report-only: opens the store [schema auto-upgrades], counts");
-    console.error("   concepts per source, re-syncs/retires/re-embeds NOTHING)");
+    console.error("Usage: tsx scripts/migrate-file-concept.ts <db-path> [--embedder hashing|onnx] [--apply]");
+    console.error("       [--refresh-sources] [--storage-dir <dir>] [--source <sourceId>]");
     process.exit(1);
   }
-  // COLD-AUDIT FIX: --apply requires --embedder explicitly — this decides the store's semantic
-  // model, too consequential a choice for an implicit default. Report-only may still omit it
-  // (defaults to hashing) since nothing is actually written under either model.
+  if (onlySourceId !== undefined && !refreshSourcesFlag) {
+    console.error("--source only scopes the explicit --refresh-sources operation.");
+    process.exit(1);
+  }
   if (applyFlag && embedderArg === undefined) {
-    console.error('--apply requires --embedder explicitly: specify --embedder onnx|hashing explicitly —');
-    console.error("this decides the store's semantic model.");
-    console.error("(A REAL migration should pass --embedder onnx — John's ruling, production uses the");
-    console.error(" multilingual ONNX model. --embedder hashing is for a fast, dependency-free dry run.)");
+    console.error("--apply requires --embedder onnx|hashing explicitly; this decides the store's semantic model.");
     process.exit(1);
   }
   const embedderChoice = embedderArg ?? "hashing";
@@ -582,96 +279,66 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (!applyFlag) {
-    console.log("REPORT-ONLY mode (the store's SCHEMA still auto-upgrades on open — additive, not");
-    console.log("destructive: new columns/index only). No source is re-synced, no concept is retired,");
-    console.log("re-embedded, or graph-rebuilt. Pass --apply (and --embedder) to actually run the migration.\n");
+  if (applyFlag || refreshSourcesFlag) {
+    console.log("WARNING: this command can rewrite source content and/or every persisted semantic vector.");
+    console.log("Run it only against a disposable COPY backed by a tested, verified backup.");
+    console.log(`Target db: ${dbPath}`);
   } else {
-    console.log("WARNING: --apply re-syncs every listed source, retires orphaned concepts, re-embeds");
-    console.log("every native concept, and rebuilds its similarity graph. This should be running");
-    console.log("against a disposable COPY, never a store you care about.");
-    console.log(`Target db:      ${dbPath}`);
-    console.log(`Target storage: ${storageDir ?? "(engine default)"}`);
-    console.log(`Embedder:       ${embedderChoice}${embedderChoice === "hashing" ? " (NOT the production model — pass --embedder onnx for a real migration)" : ""}\n`);
+    console.log("DRY-RUN: inventories and validates the embedding migration without changing durable state.");
   }
 
-  const embedder: EmbeddingProvider = embedderChoice === "onnx" ? new OnnxEmbeddingProvider() : new HashingEmbeddingProvider();
-  // Codex review (PR #51 round 7, FIX X): preflight BEFORE constructing MonetCore, not after (round
-  // 6's FIX P ran it post-construction) — see the file docstring's "Preflight" section for why: on a
-  // vector-free target DB, construction's OWN fresh-store branch can stamp a 'created' pin naming
-  // an embedder that then turns out to be unloadable, so a preflight that runs AFTER construction
-  // can fail while leaving exactly the unsatisfied pin it was meant to prevent. The embedder
-  // instance exists independently of the core, so running this first costs nothing.
-  if (applyFlag) await preflightEmbedder(embedder, embedderChoice);
+  const targetEmbedder: EmbeddingProvider = embedderChoice === "onnx"
+    ? new OnnxEmbeddingProvider()
+    : new HashingEmbeddingProvider();
+  if (applyFlag) await preflightEmbedder(targetEmbedder, embedderChoice);
+
+  let sourceReports: SourceRefreshReport[] = [];
+  if (refreshSourcesFlag) {
+    try {
+      sourceReports = await refreshSources(dbPath, storageDir, onlySourceId);
+      printSourceRefreshReport(sourceReports);
+    } catch (error) {
+      if (!(error instanceof EmbedderMigrationIncompleteError)) throw error;
+      console.error(
+        "Source refresh skipped because this store already has an incomplete embedder migration; " +
+          "source content must remain unchanged until the same target migration converges.",
+      );
+    }
+  }
+
+  const targetModelId = targetEmbedder.modelId;
+  if (targetModelId === undefined) throw new Error("The selected migration embedder has no persistable modelId.");
   const core = new MonetCore(dbPath, {
+    embedder: targetEmbedder,
     ...(storageDir ? { sourceStorageDir: storageDir } : {}),
-    embedder,
-    // Codex review (PR #51 round 7, FIX V): report-only must never write a pin, even against a
-    // vector-free target DB whose fresh-store branch would otherwise mint one — see
-    // MonetCoreOptions.deferCreatedPin's own doc comment and the file docstring's "Report-only by
-    // default" section. Under --apply, construction now runs only AFTER a successful preflight
-    // (immediately above), so any 'created' pin minted here is always of a PROVEN-loadable embedder
-    // — closing the interplay between the two fixes: report-only never stamps regardless of
-    // preflight; --apply's stamp (construction's own, or adoptEmbedderPin's below) is never of an
-    // embedder that hasn't just been confirmed to actually work.
     deferCreatedPin: !applyFlag,
   });
   try {
-    // Codex review (PR #51 round 5, FIX N): stamp the pin to THIS run's --embedder before any
-    // re-sync/re-embed/graph work — see the file docstring's "Embedder pin" section for why the
-    // ordering matters and why --apply gates it (a report-only/dry-run pass must never write
-    // anything, pin included; deferCreatedPin above already covers the fresh-store case — this
-    // covers the already-pinned-to-something-else case adoptEmbedderPin exists for).
-    // adoptEmbedderPin() is synchronous — no await needed.
-    if (applyFlag) core.adoptEmbedderPin();
-    const sources = core.listSources({ includeTombstoned: true }).filter((s) => !onlySourceId || s.id === onlySourceId);
-    // REVIEW FIX (round 4, Codex thread 16): a store with NO matching sources (a native-only
-    // store, or one whose sources were already migrated/removed since the last embedder swap)
-    // used to return here BEFORE reaching the native re-embed pass — but the whole POINT of that
-    // pass (item 9's model-swap consistency, see the file docstring's step 3) is that it affects
-    // EVERY native concept in the store regardless of whether any source happens to exist, let
-    // alone match --source. The early return now only skips the PER-SOURCE loop (nothing to
-    // re-sync/sweep-orphan when there is no matching source); native re-embed + graph rebuild
-    // always run under --apply, same as when sources ARE present. --embedder stays hard-required
-    // for --apply regardless (checked above, before this function's own logic runs at all).
-    if (sources.length === 0) {
-      console.log(`No sources found${onlySourceId ? ` matching --source ${onlySourceId}` : ""}. Skipping source re-sync/orphan-sweep —`);
-      console.log("still running the native re-embed + graph rebuild passes below (they cover the whole");
-      console.log("store, not just source-touched concepts).");
-    }
-    const reports: SourceMigrationReport[] = [];
-    for (const source of sources) reports.push(await migrateOneSource(core, source, applyFlag));
-    const native = await reembedNativeConcepts(core, applyFlag);
-    // COLD-AUDIT FIX (MAJOR): strictly AFTER the re-embed loop above has fully completed — see the
-    // file docstring's step 4 and rederiveNativeConceptGraphs' own docstring for why.
-    const graph = await rederiveNativeConceptGraphs(core, native.succeededIds, applyFlag);
-    printReport(reports, native, graph, applyFlag, embedderChoice);
-
-    // Codex review (PR #51 round 8, FIX Y): every loop above is deliberately per-item resilient (see
-    // each loop's own docstring) so ONE run makes maximum progress even when something is broken —
-    // but that same resilience means a --apply run can complete and exit 0 with the pin ALREADY
-    // stamped to the target space (adoptEmbedderPin above, or construction's own fresh-store branch)
-    // while some vectors are STILL under the OLD model: a genuinely half-migrated store that looks,
-    // from the exit code alone, like a clean success. FAIL HARD here, at the very end, on the
-    // SUMMARY — never mid-run (the loops above are untouched; this is purely a post-hoc check).
-    // Report-only is unaffected: nothing was ever mutated under it, so there is nothing to warn
-    // about — anyMigrationFailure is always false there anyway (every loop above returns an empty
-    // report when !applyFlag), but the guard below is explicit about it, not incidental.
-    if (applyFlag && anyMigrationFailure(reports, native, graph)) {
-      throw new Error(migrationIncompleteMessage(embedderChoice));
+    try {
+      const report = await runEmbeddingMigration(core, targetModelId, applyFlag, printMigrationProgress);
+      console.log(formatEmbeddingMigrationReport(report));
+    } catch (error) {
+      if (error instanceof EmbedderMigrationFailedError) {
+        console.error(formatEmbeddingMigrationReport(error.report));
+      }
+      throw error;
     }
   } finally {
     core.close();
   }
+
+  if (anySourceRefreshFailure(sourceReports)) {
+    throw new Error(
+      "SOURCE REFRESH INCOMPLETE: one or more sources failed, but sibling refreshes and the requested " +
+        "embedding migration were allowed to finish. Fix the reported source failures and re-run " +
+        "--refresh-sources, or restore the verified backup.",
+    );
+  }
 }
 
-// Run only when invoked directly (`tsx scripts/migrate-file-concept.ts ...`), never as a side
-// effect of importing this module's exported preflightEmbedder elsewhere (Codex review, PR #51
-// round 6, FIX P's test coverage imports it from src/__tests__ — that import must not also execute
-// a full migration run). Same established pattern as scripts/scrub-corpus.mjs/scrub-db.mjs.
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    console.error(error);
+    console.error(error instanceof Error ? error.stack ?? error.message : String(error));
     process.exit(1);
   });
 }

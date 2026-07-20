@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { readStoredEmbedderPin } from "../storage";
+import { readStoredEmbedderPin, readStoredVectorPresence } from "../storage";
 import { MonetCore } from "../engine";
 import { HashingEmbeddingProvider } from "../embedding";
 
@@ -108,6 +108,36 @@ describe("readStoredEmbedderPin (Codex review, PR #51 round 7, FIX U)", () => {
     try {
       const neverCreated = join(dir, "does-not-exist.db");
       expect(readStoredEmbedderPin(neverCreated)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readStoredVectorPresence", () => {
+  it("distinguishes a missing or empty store from one with persisted vectors", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-read-vector-presence-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      expect(readStoredVectorPresence(dbPath)).toBe(false);
+      const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
+      expect(readStoredVectorPresence(dbPath)).toBe(false);
+      await core.store("persisted vector", { resolution: "forceNew" });
+      core.close();
+      expect(readStoredVectorPresence(dbPath)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns false for a valid pre-schema SQLite file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-read-vector-shapes-"));
+    try {
+      const rawPath = join(dir, "raw.db");
+      const raw = new Database(rawPath);
+      raw.exec(`CREATE TABLE unrelated (id INTEGER PRIMARY KEY)`);
+      raw.close();
+      expect(readStoredVectorPresence(rawPath)).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

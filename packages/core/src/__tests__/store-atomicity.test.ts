@@ -104,6 +104,14 @@ class CrashingEntityPort implements StoragePort {
     return this.inner.immediateTransaction(fn);
   }
 
+  acquireExclusiveOwnership(): void {
+    this.inner.acquireExclusiveOwnership();
+  }
+
+  releaseExclusiveOwnership(): void {
+    this.inner.releaseExclusiveOwnership();
+  }
+
   close(): void {
     this.inner.close();
   }

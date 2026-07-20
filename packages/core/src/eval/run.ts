@@ -38,6 +38,7 @@ function parseFlags(argv: string[]): Flags {
 async function pickEmbedder(pref: Flags["embedder"]): Promise<{ embedder: EmbeddingProvider; name: string }> {
   if (pref === "hashing") return { embedder: new HashingEmbeddingProvider(), name: "HashingEmbeddingProvider (lexical)" };
   if (pref === "onnx") process.env.MONET_EMBEDDER = "onnx"; // make createLocalEmbedder throw if MiniLM can't load
+  // Eval auto mode intentionally preserves createLocalEmbedder's lexical fallback for reportability.
   const embedder = await createLocalEmbedder();
   const semantic = embedder.constructor.name === "OnnxEmbeddingProvider";
   return { embedder, name: `${embedder.constructor.name}${semantic ? " (MiniLM, semantic)" : " (lexical fallback)"}` };

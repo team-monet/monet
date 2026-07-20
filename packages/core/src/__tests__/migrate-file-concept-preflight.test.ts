@@ -1,26 +1,8 @@
 /**
- * scripts/migrate-file-concept.ts — preflightEmbedder unit tests (Codex review, PR #51 round 6,
- * FIX P; ordering corrected round 7, FIX X). The direct consequence of round 5's stamp-early
- * ordering (adoptEmbedderPin runs BEFORE any re-embed work): without a preflight check, an
- * --embedder onnx run on a host where the model/transformers.js can't load would stamp the pin,
- * then have every per-item re-embed attempt fail silently (each caught individually by
- * migrateOneSource/reembedNativeConcepts' own per-item try/catch, never aborting the run) —
- * leaving a non-empty store permanently pinned to a model that can never produce a vector.
- *
- * ROUND 7 UPDATE (FIX X): round 6 called preflightEmbedder AFTER constructing MonetCore — a bug for
- * a vector-free target DB, since construction's OWN fresh-store branch could mint a 'created' pin
- * naming an embedder preflight hadn't verified yet. main() now calls preflightEmbedder BEFORE
- * constructing anything; preflightEmbedder ITSELF is unchanged (still a standalone function with no
- * MonetCore dependency at all) — this file's tests below were already agnostic to WHERE in main()
- * the function gets called, so they need no code change, only this docstring update for accuracy.
- * The stronger, ordering-specific claim ("the core is never constructed on a failing preflight") is
- * NOT something a unit test of preflightEmbedder alone can prove — it's a property of main()'s own
- * sequencing, which isn't independently exported/testable without contorting the script (main()
- * does real argv/fs/console work). That claim is verified via the manual-verification protocol
- * instead: a real disposable, NEVER-before-existing db path, preflighted with a genuinely throwing
- * embedder in main()'s exact round-7 order (preflight, then construction) — the target file is
- * proven to never even get CREATED, not merely "pin unchanged" (round 6's weaker manual-verification
- * claim, which required an already-existing seeded store).
+ * scripts/migrate-file-concept.ts — preflightEmbedder unit tests. The thin harness still validates
+ * the selected target embedder before any MonetCore construction or optional source refresh. Core's
+ * migrateEmbeddings repeats the preflight internally; this outer check protects the stronger CLI
+ * invariant that a broken target causes no database or source-content write at all.
  *
  * Imports preflightEmbedder directly from the script (exported for testability). main() is guarded
  * behind an import.meta.url entry-point check so importing this module never triggers a real CLI

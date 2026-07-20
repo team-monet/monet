@@ -1,4 +1,13 @@
-export { MonetCore, EmbedderMismatchError, EmbedderPinUnsatisfiedError } from "./engine";
+export {
+  MonetCore,
+  EmbedderMismatchError,
+  EmbedderPinUnsatisfiedError,
+  EmbedderMigrationValidationError,
+  EmbedderMigrationConflictError,
+  EmbedderMigrationIncompleteError,
+  EmbedderMigrationStartError,
+  EmbedderMigrationFailedError,
+} from "./engine";
 export type {
   Concept,
   SourceConceptRollbackResult,
@@ -28,8 +37,15 @@ export type {
   MergeCircleResult,
   MergeConceptResult,
   BatchReassignResult,
+  EmbedderMigrationValidationReason,
+  EmbeddingMigrationPhase,
+  EmbeddingMigrationProgress,
+  EmbeddingMigrationItemFailure,
+  EmbeddingMigrationPhaseReport,
+  EmbeddingMigrationReport,
 } from "./engine";
-export { BetterSqlitePort, readStoredEmbedderPin } from "./storage";
+export { BetterSqlitePort, StorageExclusiveLockError, readStoredEmbedderPin, readStoredVectorPresence } from "./storage";
+export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError } from "./store-embedder";
 export {
   DEFAULT_SOURCE_SCANNER_LIMITS,
   SOURCE_SCANNER_VERSION,
@@ -133,7 +149,15 @@ export type { ExtractedEntity, EntityKind } from "./extract-entities";
 export type { GraphParams } from "./graph";
 export { HashingEmbeddingProvider, cosine } from "./embedding";
 export type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
-export { OnnxEmbeddingProvider, createLocalEmbedder, instantiateEmbedderForPin, UnsatisfiableEmbedderError, LEGACY_ONNX_DEFAULT_MODEL_ID } from "./embedding-onnx";
+export {
+  OnnxEmbeddingProvider,
+  createLocalEmbedder,
+  createLocalEmbedderWithProvenance,
+  instantiateEmbedderForPin,
+  UnsatisfiableEmbedderError,
+  LEGACY_ONNX_DEFAULT_MODEL_ID,
+} from "./embedding-onnx";
+export type { LocalEmbedderSelection, LocalEmbedderWithProvenance } from "./embedding-onnx";
 export { DeterministicSynthesizer } from "./synthesis";
 export type { Synthesizer } from "./synthesis";
 export { createMonetCoreMcpServer } from "./mcp-server";

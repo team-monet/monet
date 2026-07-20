@@ -88,10 +88,24 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
  *
  * Logs go to stderr so they never corrupt the stdio MCP channel.
  */
-export async function createLocalEmbedder(opts: { model?: string } = {}): Promise<EmbeddingProvider> {
+export type LocalEmbedderSelection = "onnx" | "explicit-hashing" | "implicit-hashing-fallback";
+
+export interface LocalEmbedderWithProvenance {
+  provider: EmbeddingProvider;
+  selection: LocalEmbedderSelection;
+}
+
+/**
+ * Selects the local embedder exactly like createLocalEmbedder(), while preserving whether hashing
+ * was an explicit operator choice or an automatic fallback. Store-aware startup needs that
+ * distinction before a fresh store permanently records its first embedder pin.
+ */
+export async function createLocalEmbedderWithProvenance(
+  opts: { model?: string } = {},
+): Promise<LocalEmbedderWithProvenance> {
   const pref = process.env.MONET_EMBEDDER?.toLowerCase();
   if (pref === "hashing" || pref === "lexical") {
-    return new HashingEmbeddingProvider();
+    return { provider: new HashingEmbeddingProvider(), selection: "explicit-hashing" };
   }
 
   const onnx = new OnnxEmbeddingProvider(opts);
@@ -99,14 +113,18 @@ export async function createLocalEmbedder(opts: { model?: string } = {}): Promis
     console.error("[monet-core] loading local embedding model (paraphrase-multilingual-MiniLM-L12-v2; first run downloads once)…");
     await onnx.embed("warmup"); // forces model load + native init now, not on the first store
     console.error("[monet-core] semantic embeddings ready (multilingual MiniLM, 384-dim).");
-    return onnx;
+    return { provider: onnx, selection: "onnx" };
   } catch (e) {
     const why = e instanceof Error ? e.message : String(e);
     if (pref === "onnx") throw new Error(`MONET_EMBEDDER=onnx but MiniLM failed to load: ${why}`);
     console.error(`[monet-core] MiniLM unavailable (${why}); falling back to lexical embedder.`);
     console.error("[monet-core] recall will be lexical, not semantic. Set MONET_EMBEDDER=onnx to require MiniLM.");
-    return new HashingEmbeddingProvider();
+    return { provider: new HashingEmbeddingProvider(), selection: "implicit-hashing-fallback" };
   }
+}
+
+export async function createLocalEmbedder(opts: { model?: string } = {}): Promise<EmbeddingProvider> {
+  return (await createLocalEmbedderWithProvenance(opts)).provider;
 }
 
 /**

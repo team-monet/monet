@@ -18,7 +18,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { StoragePort, BetterSqlitePort } from "./storage";
+import { StoragePort, BetterSqlitePort, StorageExclusiveLockError } from "./storage";
 import { SourceRegistry } from "./source-registry";
 import { SourceLedger } from "./source-ledger";
 import type { SourceScheduleBasis } from "./source-ledger";
@@ -155,6 +155,119 @@ export class EmbedderPinUnsatisfiedError extends Error {
         `'${constructedModelId}'. Await core.ensureEmbedderPin() before serving.`,
     );
     this.name = "EmbedderPinUnsatisfiedError";
+  }
+}
+
+export type EmbedderMigrationValidationReason =
+  | "empty-target"
+  | "anonymous-provider"
+  | "empty-provider-model-id"
+  | "target-mismatch"
+  | "preflight-failed"
+  | "preflight-dimension-mismatch";
+
+export type EmbeddingMigrationPhase =
+  | "preflight"
+  | "lock"
+  | "native-concepts"
+  | "native-observations"
+  | "source-concepts"
+  | "workstreams"
+  | "native-graph"
+  | "complete";
+
+export interface EmbeddingMigrationProgress {
+  phase: EmbeddingMigrationPhase;
+  completed: number;
+  total: number;
+  failed: number;
+  currentId?: string;
+}
+
+export interface EmbeddingMigrationItemFailure {
+  phase: EmbeddingMigrationPhase;
+  id: string;
+  message: string;
+}
+
+export interface EmbeddingMigrationPhaseReport {
+  total: number;
+  completed: number;
+  failed: number;
+}
+
+export interface EmbeddingMigrationReport {
+  targetModelId: string;
+  dryRun: boolean;
+  phases: Record<EmbeddingMigrationPhase, EmbeddingMigrationPhaseReport>;
+  failures: EmbeddingMigrationItemFailure[];
+}
+
+/** The requested migration target cannot be safely represented by the configured embedder. */
+export class EmbedderMigrationValidationError extends Error {
+  constructor(
+    public readonly reason: EmbedderMigrationValidationReason,
+    public readonly targetModelId: string,
+    public readonly providerModelId: string | undefined,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "EmbedderMigrationValidationError";
+  }
+}
+
+/** A store already has an incomplete migration for a different target. */
+export class EmbedderMigrationConflictError extends Error {
+  constructor(
+    public readonly requestedTargetModelId: string,
+    public readonly activeTargetModelId: string,
+    public readonly startedAt: number,
+  ) {
+    super(
+      `Cannot migrate this store to '${requestedTargetModelId}': an incomplete migration to ` +
+        `'${activeTargetModelId}' started at ${startedAt}. Re-run the same target or restore a verified backup.`,
+    );
+    this.name = "EmbedderMigrationConflictError";
+  }
+}
+
+/** A migration sentinel remains, so the store must not serve until recovery completes. */
+export class EmbedderMigrationIncompleteError extends Error {
+  constructor(
+    public readonly targetModelId: string,
+    public readonly startedAt: number,
+  ) {
+    super(
+      `Embedder migration to '${targetModelId}' started at ${startedAt} is incomplete. ` +
+        `Re-run the same target, or restore a verified backup. Never serve this store while this sentinel exists.`,
+    );
+    this.name = "EmbedderMigrationIncompleteError";
+  }
+}
+
+const EMBEDDER_MIGRATION_LOCK_MESSAGE =
+  "Cannot start embedder migration: this Monet store is in use and an exclusive lock could not be acquired within 5 seconds. " +
+  "Stop every Monet process using this database — MCP servers, CLI commands, dashboards, backup/indexer connections — " +
+  "wait for them to exit, then re-run. Do not run `monet status` or `monet source` against this store while migration is active.";
+
+/** Engine-level remediation wrapper for an exclusive-lock acquisition failure. */
+export class EmbedderMigrationStartError extends Error {
+  constructor(public override readonly cause: StorageExclusiveLockError) {
+    super(EMBEDDER_MIGRATION_LOCK_MESSAGE, { cause });
+    this.name = "EmbedderMigrationStartError";
+  }
+}
+
+/** One or more persisted vectors or native graphs could not be migrated. */
+export class EmbedderMigrationFailedError extends Error {
+  constructor(public readonly report: EmbeddingMigrationReport) {
+    const failures = Object.values(report.phases).reduce((total, phase) => total + phase.failed, 0);
+    super(
+      `Embedder migration to '${report.targetModelId}' failed for ${failures} item${failures === 1 ? "" : "s"}. ` +
+        "The migration sentinel remains; fix the reported failures and re-run the same target.",
+    );
+    this.name = "EmbedderMigrationFailedError";
   }
 }
 
@@ -652,6 +765,11 @@ interface OperationReceiptExpectation {
   sourceIdentity?: string;
 }
 
+interface EmbedderMigrationRow {
+  target_model_id: string;
+  started_at: number;
+}
+
 export class MonetCore {
   private db: StoragePort;
   private embedder: EmbeddingProvider;
@@ -685,6 +803,8 @@ export class MonetCore {
    * reconciled this.embedder with the pin, one way or the other.
    */
   private pinUnsatisfied = false;
+  /** True only after beginEmbedderMigration successfully returns with this engine owning the lock. */
+  private ownsEmbedderMigrationLock = false;
   /** See MonetCoreOptions.deferCreatedPin — read once by initSyncIdentity's fresh-store branch. */
   private deferCreatedPin: boolean;
   private agentId: string;
@@ -777,7 +897,10 @@ export class MonetCore {
     // and legacy callers (eval harness, scripts/*.ts) that never call ensureEmbedderPin() must keep
     // working unmodified against such a store.
     const pinRow = this.db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null };
-    this.pinUnsatisfied = pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== this.embedderModelId;
+    // FIX: an incomplete migration always wins over a matching pin. begin stamps the target pin before
+    // vectors are rewritten, so equality alone is not evidence that this store is safe to serve.
+    this.pinUnsatisfied = this.readEmbedderMigration() !== undefined
+      || (pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== this.embedderModelId);
   }
 
   private initSyncIdentity(requested?: string): void {
@@ -1119,6 +1242,11 @@ export class MonetCore {
         embedder_pin_source TEXT CHECK (embedder_pin_source IN ('created', 'backfilled', 'migrated')),
         embedder_pinned_at INTEGER
       );
+      CREATE TABLE IF NOT EXISTS embedder_migration (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        target_model_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS memory_edge_components (
         src_id TEXT NOT NULL,
         dst_id TEXT NOT NULL,
@@ -1339,10 +1467,17 @@ export class MonetCore {
     // calls ensureEmbedderPin() (see assertPinSatisfied's gated-call-site list) before touching
     // anything the missing edges would affect.
     const pinRowForGraphBackfill = this.db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null };
+    // FIX: a migration sentinel makes pin equality untrustworthy here. beginEmbedderMigration()
+    // deliberately stamps the TARGET pin before vectors are rewritten, so a reopened pre-graph store
+    // can have a matching target pin while every stored vector is still in the old space. Constructor-
+    // time backfill runs before the final served-path guard is armed and consumes a one-shot schema
+    // version; deriving edges in that window would therefore make stale-space graph data permanent.
+    // Keep the backfill pending whenever recovery state exists, regardless of what the pin says.
     const graphBackfillTrustworthy =
-      pinRowForGraphBackfill.embedder_model_id !== null
+      this.readEmbedderMigration() === undefined
+      && (pinRowForGraphBackfill.embedder_model_id !== null
         ? pinRowForGraphBackfill.embedder_model_id === this.embedderModelId // pinned: trustworthy only if the pin matches what's about to score
-        : !this.hasAnyStoredVector(); // unpinned: trustworthy only if there's nothing yet to mis-score (genuinely empty)
+        : !this.hasAnyStoredVector()); // unpinned: trustworthy only if there's nothing yet to mis-score (genuinely empty)
     if (graphBackfillTrustworthy) {
       this.runGraphBackfillIfPending();
     }
@@ -2879,8 +3014,8 @@ export class MonetCore {
   /**
    * REVIEW FIX (MAJOR): re-embeds one native concept's CURRENT body in place, with this instance's
    * embedder — nothing else about the row changes (title/support_count/etc. untouched). Used by
-   * the migration script's native re-embed pass so an embedder swap leaves the WHOLE store under
-   * one model, not just the source concepts a re-sync happens to touch. Idempotent (a deterministic
+   * migrateEmbeddings' native-vector phase so an embedder swap leaves the WHOLE store under one
+   * model. Idempotent (a deterministic
    * embedder re-embedding the same body always produces the same vector) and safe to call on a
    * concept id that no longer exists (returns false, no-op) for a caller iterating a list gathered
    * moments earlier.
@@ -2905,8 +3040,8 @@ export class MonetCore {
    * detach() uses a moved observation's own embedding directly (new-destination case) or blends it
    * in one at a time via attach() (existing-destination case). Left un-migrated, ANY of those —
    * routine contradiction resolution, a dirty-concept sweep, or an ordinary memory_detach split —
-   * would silently pull an old-model vector straight back into concepts.embedding even after the
-   * migration script's native re-embed pass (reembedConcept, above) already moved that same
+   * would silently pull an old-model vector straight back into concepts.embedding even after
+   * migrateEmbeddings' native-concept phase (reembedConcept, above) already moved that same
    * concept's OWN row to the new model, reopening exactly the incompatible-space comparison the
    * migration exists to close.
    *
@@ -2920,8 +3055,8 @@ export class MonetCore {
    * observation's embedding can still be read and written back into a concept's vector via that
    * path. Re-embedding only the active subset would leave that same gap half-closed.
    *
-   * No CAS/fingerprint retry (unlike recomputeSourceConceptBody): this exists for the one-shot
-   * migration script, which runs single-pass, not for the live concurrent-write path — the same
+   * No CAS/fingerprint retry (unlike recomputeSourceConceptBody): this exists for the exclusively
+   * locked migrateEmbeddings lifecycle, not for the live concurrent-write path — the same
    * accepted risk envelope reembedConcept itself already operates under (no CAS against a
    * concurrent body edit either).
    */
@@ -2949,9 +3084,9 @@ export class MonetCore {
    * (bestMatches, scored against every OTHER concept's CURRENT embedding) is only meaningful once
    * the whole comparison set is under the SAME model. Called mid-loop — while sibling concepts
    * still carry their pre-swap embedding — it would score this concept's NEW vector against
-   * neighbors' OLD vectors, two incompatible spaces, and persist garbage "related" edges. Callers
-   * (the migration script) MUST re-embed every native concept first in one pass, then call this for
-   * every one of them in a completely separate, later pass, once the whole store shares one model.
+   * neighbors' OLD vectors, two incompatible spaces, and persist garbage "related" edges.
+   * migrateEmbeddings therefore completes every vector phase first, then calls this in a completely
+   * separate final graph phase once the whole store shares one model.
    *
    * Transaction-wrapped so a crash never leaves a concept mid-unwound (edges removed, not yet
    * rebuilt) — matches reassignCircle/recomputeSourceConceptBody's own convention for this pair.
@@ -4459,7 +4594,26 @@ export class MonetCore {
   }
 
   close(): void {
-    this.db.close();
+    let releaseError: unknown;
+    try {
+      if (this.ownsEmbedderMigrationLock) this.releaseEmbedderMigrationOwnership();
+    } catch (error) {
+      releaseError = error;
+    }
+
+    try {
+      this.db.close();
+    } catch (closeError) {
+      if (releaseError !== undefined) {
+        throw new AggregateError(
+          [releaseError, closeError],
+          "Embedder migration lock release and storage close both failed.",
+          { cause: releaseError },
+        );
+      }
+      throw closeError;
+    }
+    if (releaseError !== undefined) throw releaseError;
   }
 
   // ---- source registry ----------------------------------------------------
@@ -5069,18 +5223,15 @@ export class MonetCore {
    *    (resolveContradiction, supersedeObservation — both newly protected by this single gate;
    *    restoreConcept, graftRows — both ALREADY gated independently, for their own
    *    category-3/category-2 reasons, so this is redundant-but-harmless belt-and-suspenders for
-   *    them) and confirmed none is a legitimate ungated caller — scripts/migrate-file-concept.ts
-   *    never calls any of the four, and even if it did, core.adoptEmbedderPin() already clears
-   *    this.pinUnsatisfied before any of the script's own work runs, so gating this method does not
-   *    break the migration harness).
+   *    them) and confirmed none is a legitimate ungated caller. migrateEmbeddings uses dedicated
+   *    re-embed primitives below instead, so gating this method does not block migration).
    *
    * Deliberately NOT gated (full audit — every bestMatches/cosine call site AND every dim-sized
    * vector write in this class was traced to one of the methods above or to one of these):
-   *  - reembedConcept, reembedConceptObservations, rederiveNativeConceptGraph — all three exist
-   *    SPECIFICALLY for the migration script's cross-embedder re-embed pass
-   *    (scripts/migrate-file-concept.ts is their only caller; see their own doc comments), so
-   *    running with a DIFFERENT embedder than whatever the store currently holds is their entire
-   *    purpose, not a bug to guard against.
+   *  - reembedConcept, reembedConceptObservations, rederiveNativeConceptGraph — migration-only
+   *    primitives called by migrateEmbeddings while it owns the store exclusively. Running with a
+   *    DIFFERENT embedder than whatever the store currently holds is their purpose, not a bug to
+   *    guard against.
    *  - backfillGraph — the one-time pre-graph-schema backfill invoked from migrate() during
    *    construction, i.e. strictly BEFORE this.pinUnsatisfied is computed (armed at the very end of
    *    the constructor, after migrate() returns) and not reachable from any post-construction
@@ -5091,17 +5242,30 @@ export class MonetCore {
    *    runGraphBackfillIfPending and migrate()'s own DEFER comment for the full mechanics.
    *  - unwindConceptGraph — pure edge deletion (DELETE statements only); no cosine/bestMatches call
    *    anywhere in it, and no vector write of any kind, dim-sized or otherwise.
-   *  - adoptEmbedderPin — the operator-intent pin-stamp primitive itself (Codex review, PR #51
-   *    round 5, FIX N). By design, this is the ONE place allowed to run while this.pinUnsatisfied
-   *    is true and simply clear it by fiat — gating it with the very guard it exists to clear would
-   *    be circular. No bestMatches/cosine call of its own — a raw UPDATE plus a guard clear, nothing
-   *    more (round 6, FIX R: it deliberately does NOT complete a deferred graph backfill either —
-   *    see its own doc comment for why that would score OLD, pre-migration vectors under NEW-space
-   *    thresholds). Not reachable from any served path (see its own doc comment) —
-   *    scripts/migrate-file-concept.ts is its only caller, same population as the three
-   *    re-embed/regraph methods directly above.
+   *  - adoptEmbedderPin — the low-level operator escape hatch itself. By design, this is allowed to
+   *    run while this.pinUnsatisfied is true and simply clear it by fiat — gating it with the very
+   *    guard it exists to clear would be circular. No bestMatches/cosine call of its own — a raw
+   *    UPDATE plus a guard clear, nothing more. The shipped harness does not call it; see its own doc
+   *    comment for the strict repair-only boundary.
    */
+  private readEmbedderMigration(): EmbedderMigrationRow | undefined {
+    return this.db
+      .prepare(`SELECT target_model_id, started_at FROM embedder_migration WHERE singleton = 1`)
+      .get() as EmbedderMigrationRow | undefined;
+  }
+
+  private throwIfEmbedderMigrationIncomplete(): void {
+    const migration = this.readEmbedderMigration();
+    if (migration) {
+      throw new EmbedderMigrationIncompleteError(migration.target_model_id, migration.started_at);
+    }
+  }
+
   private assertPinSatisfied(): void {
+    // FIX: query the durable sentinel on every gate, before consulting the in-memory pin flag. The
+    // migration intentionally stamps the future pin before vector rewriting, so a matching pin can
+    // coexist with incomplete mixed/old-space data and must never let a served method through.
+    this.throwIfEmbedderMigrationIncomplete();
     if (!this.pinUnsatisfied) return;
     const row = this.db.prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`).get() as { embedder_model_id: string | null };
     throw new EmbedderPinUnsatisfiedError(row.embedder_model_id ?? "(unknown)", this.embedderModelId);
@@ -5238,6 +5402,7 @@ export class MonetCore {
    * request); this fails loudly instead, the same way a swap-branch failure always has.
    */
   async ensureEmbedderPin(): Promise<void> {
+    this.throwIfEmbedderMigrationIncomplete();
     const row = this.db
       .prepare(`SELECT embedder_model_id FROM sync_meta WHERE singleton = 1`)
       .get() as { embedder_model_id: string | null };
@@ -5314,82 +5479,357 @@ export class MonetCore {
   }
 
   /**
-   * EXPLICIT operator-intent primitive for migration/repair tooling that is ABOUT TO REWRITE this
-   * store's vectors into the CURRENT constructor-provided embedder's space (Codex review, PR #51
-   * round 5, FIX N — scripts/migrate-file-concept.ts's native re-embed pass is its motivating,
-   * and so far only, caller). Unconditionally stamps sync_meta's pin to this.embedderModelId —
-   * source 'migrated', pinned_at now. This is a DELIBERATE OVERWRITE, NOT the CAS-guarded backfill
-   * write (backfillEmbedderPin's `WHERE embedder_model_id IS NULL`): backfillEmbedderPin INFERS
-   * what space an already-written store's existing vectors must have come from; this method is the
-   * operator DECLARING what space the store is about to become — which may legitimately differ
-   * from whatever it was pinned to a moment ago (that's the whole point: a migration run that
-   * re-embeds every vector under a NEW model needs the pin to end up naming that new model, not
-   * whatever it happened to name before).
-   *
-   * Also unconditionally clears the constructor-time guard (this.pinUnsatisfied = false) — the
-   * constructor may well have armed it against the OLD pin (the migration script's embedder
-   * deliberately differs from whatever the store was pinned to; that mismatch is the guard's exact
-   * trigger condition), and this call is the mechanism by which this store's caller makes the
-   * CURRENT embedder authoritative by fiat, not by satisfying a pre-existing pin the way
-   * ensureEmbedderPin does.
-   *
-   * Does NOT call applyEmbedderDerivedThresholds: this.embedder itself is UNCHANGED by this method
-   * (unlike ensureEmbedderPin's swap branch, which replaces this.embedder with a freshly-loaded
-   * one) — it pins the constructor-provided embedder exactly as it already is, so whatever
-   * thresholds the constructor already derived for it at construction time remain correct.
-   *
-   * Does NOT call runGraphBackfillIfPending() — deliberately reverted from round 5's original
-   * version, which did (Codex review, PR #51 round 6, FIX R: round 5's own spec was wrong here).
-   * "Trustworthy by declaration" covers the EMBEDDER identity — this.embedder now genuinely matches
-   * the pin — but NOT the store's VECTOR CONTENTS, which are still pre-migration at the moment this
-   * method runs (scripts/migrate-file-concept.ts calls this BEFORE its re-embed passes, by design —
-   * see FIX N). Completing a deferred backfillGraph() right here would derive `related`/`about`
-   * edges by cosine-comparing OLD-space stored vectors under the NEW embedder's thresholds — the
-   * exact wrong-space comparison FIX M's deferral exists to prevent, reopened one level up by this
-   * method's own call site. Worse, backfillGraph() is version-gated to run AT MOST ONCE
-   * (runGraphBackfillIfPending bumps user_version past GRAPH_SCHEMA_VERSION on completion) — running
-   * it now would PERMANENTLY consume that one-time slot on garbage edges, unrecoverable even if the
-   * script's own later rebuild pass succeeds perfectly.
-   *
-   * The pending slot (if migrate() deferred one at construction) simply stays pending across this
-   * call — untouched, not specially marked, since "untouched" already IS the correct pending state
-   * (see migrate()'s own DEFER comment). It resolves one of two ways, both safe:
-   *   1. The NEXT open with a matching embedder over FULLY migrated vectors reaches migrate()'s own
-   *      trustworthy check, which now sees the pin match and runs the backfill normally, deriving
-   *      edges from data that is by then actually all in one space.
-   *   2. Verified by reading both methods (not assumed): rederiveNativeConceptGraph (engine.ts,
-   *      below reembedConceptObservations) is a PER-CONCEPT unwind+rederive — no PRAGMA user_version
-   *      read or write anywhere in it, entirely independent of backfillGraph's one-time whole-store
-   *      gate. scripts/migrate-file-concept.ts's own step 4 (rederiveNativeConceptGraphs) calls it
-   *      for every successfully re-embedded concept, AFTER step 3's re-embed pass completes — so a
-   *      successful migration run already leaves every touched concept's edges individually correct
-   *      via THIS mechanism, with or without backfillGraph ever having run. When backfillGraph
-   *      eventually does run (path 1, above), its writes are idempotent (INSERT OR IGNORE, per its
-   *      own doc comment) over data step 4 already made internally consistent — not superseded in
-   *      the sense of "never runs", but in the sense that its eventual result is already what step 4
-   *      established, for everything step 4 touched.
-   *
-   * Deliberately synchronous, unlike ensureEmbedderPin: this never loads a DIFFERENT embedder (no
-   * embedderLoader call of any kind) — this.embedder is already live and already what the pin is
-   * about to name, so there is no async model-load step to await.
-   *
-   * NEVER call this from a served path (the MCP server, a CLI query/store/search command). The
-   * served contract remains ensureEmbedderPin() — which enforces whatever pin ALREADY exists and
-   * never overwrites it just because a caller happens to construct with a different embedder.
-   * Calling adoptEmbedderPin() from a served path would let any ordinary caller silently re-pin a
-   * store to whatever it was constructed with, defeating the entire ADR this pin mechanism exists
-   * to enforce. This method exists ONLY for tooling that is ITSELF the source of truth for what the
-   * store's embedder space is about to be — i.e. that is actively rewriting every vector in the
-   * store to match, in the same run, immediately after calling this (see
-   * scripts/migrate-file-concept.ts's own docstring for the ordering rationale: stamp EARLY, before
-   * the re-embed work, so a crash mid-run leaves the pin already pointing at the target space).
+   * Rewrite every persisted semantic vector into the configured embedder's space under the durable
+   * migration lifecycle. Inventories are disjoint and deterministic; graph derivation is a separate
+   * final pass so no new-space vector is ever compared with an old-space sibling.
    */
-  adoptEmbedderPin(): void {
+  async migrateEmbeddings(opts: {
+    targetModelId: string;
+    dryRun?: boolean;
+    onProgress?: (event: EmbeddingMigrationProgress) => void;
+  }): Promise<EmbeddingMigrationReport> {
+    const dryRun = opts.dryRun ?? false;
+    const phases: EmbeddingMigrationPhase[] = [
+      "preflight",
+      "lock",
+      "native-concepts",
+      "native-observations",
+      "source-concepts",
+      "workstreams",
+      "native-graph",
+      "complete",
+    ];
+    const report: EmbeddingMigrationReport = {
+      targetModelId: opts.targetModelId,
+      dryRun,
+      phases: Object.fromEntries(
+        phases.map((phase) => [phase, { total: phase === "preflight" || phase === "lock" || phase === "complete" ? 1 : 0, completed: 0, failed: 0 }]),
+      ) as Record<EmbeddingMigrationPhase, EmbeddingMigrationPhaseReport>,
+      failures: [],
+    };
+    const emit = (phase: EmbeddingMigrationPhase, currentId?: string): void => {
+      opts.onProgress?.({ phase, ...report.phases[phase], ...(currentId === undefined ? {} : { currentId }) });
+    };
+    const fail = (phase: EmbeddingMigrationPhase, id: string, error: unknown): void => {
+      report.phases[phase].failed += 1;
+      report.failures.push({ phase, id, message: error instanceof Error ? error.message : String(error) });
+    };
+
+    try {
+      await this.beginEmbedderMigration(opts.targetModelId, !dryRun, (phase) => {
+        report.phases[phase].completed = 1;
+        emit(phase);
+      });
+
+      const nativeRows = this.db
+        .prepare(
+          `SELECT id, status FROM concepts
+            WHERE kind NOT IN ('workstream', 'source')
+              AND source_identity IS NULL AND active_observation_id IS NULL
+            ORDER BY id`,
+        )
+        .all() as Array<{ id: string; status: string }>;
+      const sourceIds = (this.db
+        .prepare(
+          `SELECT id FROM concepts
+            WHERE kind = 'source' OR source_identity IS NOT NULL OR active_observation_id IS NOT NULL
+            ORDER BY id`,
+        )
+        .all() as Array<{ id: string }>).map((row) => row.id);
+      const workstreamIds = (this.db
+        .prepare(
+          `SELECT id FROM concepts
+            WHERE kind = 'workstream' AND source_identity IS NULL AND active_observation_id IS NULL
+            ORDER BY id`,
+        )
+        .all() as Array<{ id: string }>).map((row) => row.id);
+      const nativeIds = nativeRows.map((row) => row.id);
+      const activeNativeIds = nativeRows.filter((row) => row.status === "active").map((row) => row.id);
+
+      report.phases["native-concepts"].total = nativeIds.length;
+      report.phases["native-observations"].total = nativeIds.length;
+      report.phases["source-concepts"].total = sourceIds.length;
+      report.phases.workstreams.total = workstreamIds.length;
+
+      if (dryRun) {
+        for (const phase of ["native-concepts", "native-observations", "source-concepts", "workstreams"] as const) {
+          report.phases[phase].completed = report.phases[phase].total;
+          emit(phase);
+        }
+        report.phases["native-graph"].total = activeNativeIds.length;
+        report.phases["native-graph"].completed = activeNativeIds.length;
+        emit("native-graph");
+        this.abortEmbedderMigration();
+        report.phases.complete.completed = 1;
+        emit("complete");
+        return report;
+      }
+
+      const failedNativeVectors = new Set<string>();
+      for (const id of nativeIds) {
+        try {
+          await this.reembedConcept(id);
+        } catch (error) {
+          failedNativeVectors.add(id);
+          fail("native-concepts", id, error);
+        }
+        report.phases["native-concepts"].completed += 1;
+        emit("native-concepts", id);
+      }
+      if (nativeIds.length === 0) emit("native-concepts");
+
+      for (const id of nativeIds) {
+        try {
+          await this.reembedConceptObservations(id);
+        } catch (error) {
+          failedNativeVectors.add(id);
+          fail("native-observations", id, error);
+        }
+        report.phases["native-observations"].completed += 1;
+        emit("native-observations", id);
+      }
+      if (nativeIds.length === 0) emit("native-observations");
+
+      for (const id of sourceIds) {
+        try {
+          await this.reembedSourceConcept(id);
+        } catch (error) {
+          fail("source-concepts", id, error);
+        }
+        report.phases["source-concepts"].completed += 1;
+        emit("source-concepts", id);
+      }
+      if (sourceIds.length === 0) emit("source-concepts");
+
+      for (const id of workstreamIds) {
+        try {
+          await this.reembedWorkstream(id);
+        } catch (error) {
+          fail("workstreams", id, error);
+        }
+        report.phases.workstreams.completed += 1;
+        emit("workstreams", id);
+      }
+      if (workstreamIds.length === 0) emit("workstreams");
+
+      // This phase is intentionally after every vector phase. A native concept is eligible only when
+      // both its concept row and every observation vector were rewritten successfully in this run.
+      const graphIds = activeNativeIds.filter((id) => !failedNativeVectors.has(id));
+      report.phases["native-graph"].total = graphIds.length;
+      for (const id of graphIds) {
+        try {
+          this.rederiveNativeConceptGraph(id);
+        } catch (error) {
+          fail("native-graph", id, error);
+        }
+        report.phases["native-graph"].completed += 1;
+        emit("native-graph", id);
+      }
+      if (graphIds.length === 0) emit("native-graph");
+
+      if (report.failures.length > 0) {
+        this.abortEmbedderMigration();
+        throw new EmbedderMigrationFailedError(report);
+      }
+
+      this.completeEmbedderMigration();
+      report.phases.complete.completed = 1;
+      emit("complete");
+      return report;
+    } catch (error) {
+      if (this.ownsEmbedderMigrationLock) {
+        try {
+          this.abortEmbedderMigration();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            "Embedder migration failed and exclusive-lock cleanup also failed.",
+            { cause: error },
+          );
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async reembedSourceConcept(conceptId: string): Promise<boolean> {
+    const row = this.getRow(conceptId);
+    if (!row || !isConnectorOwnedRow(row)) return false;
+    const embedding = await this.embedder.embed(row.body);
+    this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`).run(embToJson(embedding), conceptId);
+    return true;
+  }
+
+  private async reembedWorkstream(conceptId: string): Promise<boolean> {
+    const row = this.getRow(conceptId);
+    if (!row || row.kind !== "workstream" || isConnectorOwnedRow(row)) return false;
+    const payload = JSON.parse(row.body) as WorkstreamPayload;
+    const embedding = await this.embedder.embed(workstreamText(payload));
+    this.db.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`).run(embToJson(embedding), conceptId);
+    return true;
+  }
+
+  private async beginEmbedderMigration(
+    targetModelId: string,
+    persistMigrationState = true,
+    onPhaseComplete?: (phase: "preflight" | "lock") => void,
+  ): Promise<void> {
+    const providerModelId = this.embedder.modelId;
+    if (targetModelId.trim().length === 0) {
+      throw new EmbedderMigrationValidationError(
+        "empty-target",
+        targetModelId,
+        providerModelId,
+        "Embedder migration targetModelId must be a non-empty persistable model identifier.",
+      );
+    }
+    if (providerModelId === undefined) {
+      throw new EmbedderMigrationValidationError(
+        "anonymous-provider",
+        targetModelId,
+        providerModelId,
+        "Cannot start embedder migration with an anonymous provider: dim:N is comparison-only and cannot be persisted.",
+      );
+    }
+    if (providerModelId.trim().length === 0) {
+      throw new EmbedderMigrationValidationError(
+        "empty-provider-model-id",
+        targetModelId,
+        providerModelId,
+        "Cannot start embedder migration because the configured provider has an empty modelId.",
+      );
+    }
+    if (targetModelId !== providerModelId) {
+      throw new EmbedderMigrationValidationError(
+        "target-mismatch",
+        targetModelId,
+        providerModelId,
+        `Embedder migration target '${targetModelId}' does not exactly match provider modelId '${providerModelId}'.`,
+      );
+    }
+
+    let preflight: Float32Array;
+    try {
+      preflight = await this.embedder.embed("embedder migration preflight");
+    } catch (cause) {
+      throw new EmbedderMigrationValidationError(
+        "preflight-failed",
+        targetModelId,
+        providerModelId,
+        `Embedder migration preflight failed for '${targetModelId}': ${cause instanceof Error ? cause.message : String(cause)}.`,
+        { cause },
+      );
+    }
+    if (!(preflight instanceof Float32Array) || preflight.length !== this.embedder.dim) {
+      throw new EmbedderMigrationValidationError(
+        "preflight-dimension-mismatch",
+        targetModelId,
+        providerModelId,
+        `Embedder migration preflight for '${targetModelId}' returned dimension ${preflight?.length ?? "unknown"}; ` +
+          `the provider declares dimension ${this.embedder.dim}.`,
+      );
+    }
+    onPhaseComplete?.("preflight");
+
+    try {
+      this.db.acquireExclusiveOwnership();
+      this.ownsEmbedderMigrationLock = true;
+    } catch (cause) {
+      if (cause instanceof StorageExclusiveLockError) throw new EmbedderMigrationStartError(cause);
+      throw cause;
+    }
+
+    try {
+      const active = this.readEmbedderMigration();
+      if (active && active.target_model_id !== targetModelId) {
+        throw new EmbedderMigrationConflictError(targetModelId, active.target_model_id, active.started_at);
+      }
+      if (persistMigrationState) {
+        if (!active) {
+          // FIX: the singleton sentinel is crash recovery state, not merely a cooperative advisory.
+          // It is written under the retained raw SQLite lock before the future pin is stamped so any
+          // interruption leaves the next constructor/ensure/gated operation visibly fail-closed.
+          this.db
+            .prepare(`INSERT INTO embedder_migration (singleton, target_model_id, started_at) VALUES (1, ?, ?)`)
+            .run(targetModelId, Date.now());
+        }
+        this.writeMigratedEmbedderPin();
+        this.pinUnsatisfied = false;
+      }
+      onPhaseComplete?.("lock");
+    } catch (primaryError) {
+      try {
+        this.releaseEmbedderMigrationOwnership();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [primaryError, cleanupError],
+          "Embedder migration start failed and exclusive-lock cleanup also failed.",
+          { cause: primaryError },
+        );
+      }
+      throw primaryError;
+    }
+  }
+
+  private completeEmbedderMigration(): void {
+    // FIX: delete the durable sentinel BEFORE releasing the exclusive lock. If the process crashes
+    // after deletion but before unlock, SQLite drops the connection lock on process exit and the
+    // completed store is safe. Reversing the order creates a window where another process can enter
+    // while the sentinel still advertises incomplete/mixed-space data, defeating both invariants.
+    let deleteError: unknown;
+    try {
+      this.db.prepare(`DELETE FROM embedder_migration WHERE singleton = 1`).run();
+    } catch (error) {
+      deleteError = error;
+    }
+
+    try {
+      this.releaseEmbedderMigrationOwnership();
+    } catch (releaseError) {
+      if (deleteError !== undefined) {
+        throw new AggregateError(
+          [deleteError, releaseError],
+          "Embedder migration sentinel deletion and exclusive-lock cleanup both failed.",
+          { cause: deleteError },
+        );
+      }
+      throw releaseError;
+    }
+    if (deleteError !== undefined) throw deleteError;
+  }
+
+  private abortEmbedderMigration(): void {
+    this.releaseEmbedderMigrationOwnership();
+  }
+
+  private releaseEmbedderMigrationOwnership(): void {
+    if (!this.ownsEmbedderMigrationLock) return;
+    this.db.releaseExclusiveOwnership();
+    this.ownsEmbedderMigrationLock = false;
+  }
+
+  private writeMigratedEmbedderPin(): void {
     this.db
       .prepare(
         `UPDATE sync_meta SET embedder_model_id = ?, embedder_pin_source = 'migrated', embedder_pinned_at = ? WHERE singleton = 1`,
       )
       .run(this.embedderModelId, Date.now());
+  }
+
+  /**
+   * Low-level operator escape hatch that overwrites the durable pin with the current constructor-
+   * provided embedder and clears the in-memory mismatch guard. The shipped migration harness uses
+   * migrateEmbeddings(), whose preflight, durable sentinel, exclusive lock, complete vector inventory,
+   * graph-last ordering, and failure report make this raw overwrite unnecessary.
+   *
+   * This remains public solely for deliberate repair work where the operator independently knows the
+   * store's vector space. It does not validate the provider, acquire exclusivity, write a migration
+   * sentinel, rewrite vectors, rebuild graphs, or run a deferred graph backfill. Never call it from a
+   * served path or use it as a substitute for migrateEmbeddings(); doing so can make an inconsistent
+   * store appear pin-satisfied.
+   */
+  adoptEmbedderPin(): void {
+    this.writeMigratedEmbedderPin();
     this.pinUnsatisfied = false;
     // FIX R: deliberately NOT calling runGraphBackfillIfPending() here — see the doc comment above.
   }
