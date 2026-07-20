@@ -129,9 +129,8 @@ After the worker files are written, update the mode marker's `workers=` list (Ti
 
 **Reconcile, don't clobber — when a prior install exists with local edits.** Don't blindly overwrite a Stig block or agent file the user has changed. Compare the installed version against the new canonical and merge: keep the user's customizations (extra rules, model choices, tone), apply the new changes. Ensure these invariants survive — and warn the user if one of their edits conflicts with them:
 - the Stig block's `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers and each worker's `<!-- with-monet:agent -->` marker (lose them and a later update can't find the block),
-- the **Git & PR guardrail**,
 - "sub-contexts can't spawn sub-contexts — the lead is the only orchestrator",
-- the Monet lifecycle (`agent_context` at start; `memory_store` / `memory_checkpoint`),
+- the Monet lifecycle (`agent_context` at start; the `memory_store` write discipline),
 - the **main-session convergence check** ("Scan before you send" — the structural paragraph immediately after "Spend the return"),
 - each worker's `name` + `description` — the `description` drives your host's dispatch trigger; if it's broken, delegation silently stops.
 
