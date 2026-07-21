@@ -43,12 +43,14 @@ const EDGE_DASHED = new Set(['possible_duplicate_of']);
 
 let DATA = null;         // /api/graph payload
 let ENTITIES = null;     // /api/entities payload (lazy)
+let _entitiesMode = null;
 // Generation counter — incremented when Refresh clears the ENTITIES cache.
 // fetchEntities() captures the counter at call time; if it has changed when the
 // response arrives, the result is discarded so a slow in-flight response from a
 // prior Refresh cannot overwrite a freshly-invalidated cache.
 let _entitiesGen = 0;
 let FIRST_BLOCK = null;  // /api/firstblock payload (lazy, invalidated on Refresh)
+let _firstBlockMode = null;
 let SOURCES = null;      // /api/sources payload (lazy, invalidated on Refresh)
 // Generation counter — incremented when Refresh clears the FIRST_BLOCK cache.
 // Mirrors _entitiesGen: a stale in-flight response is discarded rather than
@@ -56,6 +58,14 @@ let SOURCES = null;      // /api/sources payload (lazy, invalidated on Refresh)
 let _firstBlockGen = 0;
 // Mirrors _firstBlockGen for the SOURCES cache.
 let _sourcesGen = 0;
+
+// All graph writers (initial load, visibility toggle, manual Refresh) share one
+// latest-started-request-wins generation. Visibility mode alone is not enough:
+// false -> true -> false can leave two same-mode requests in flight, and the
+// older false response must not overwrite the newer one.
+let _graphRequestGen = 0;
+let _spinnerOwnerGen = 0;
+const STALE_REQUEST = Symbol('stale-request');
 
 const state = {
   circle: 'all',
@@ -68,6 +78,12 @@ const state = {
   edgeTypes: { ...EDGE_DEFAULTS },
   minWeight: 0,
   entityOverlay: false,
+  // Retired concepts are excluded server-side by default (server.ts SQL
+  // retired-exclusion default). Unlike the other flag-chips this can't be a
+  // pure client-side filter over already-fetched DATA — the rows simply
+  // aren't in the payload unless refetched with includeRetired=1. See the
+  // 'show-retired' flag-chip handler below.
+  showRetired: false,
   conceptSort: { col: 'updated_at', dir: -1 },
   entitySort: { col: 'df', dir: -1 },
 };
@@ -156,6 +172,7 @@ function persistState() {
     minConfidence: state.minConfidence,
     minWeight: state.minWeight,
     entityOverlay: state.entityOverlay,
+    showRetired: state.showRetired,
   };
   lsSet(payload);
 }
@@ -199,6 +216,7 @@ function restoreUiState() {
   if (typeof stored.minConfidence === 'number') state.minConfidence = stored.minConfidence;
   if (typeof stored.minWeight === 'number') state.minWeight = stored.minWeight;
   if (typeof stored.entityOverlay === 'boolean') state.entityOverlay = stored.entityOverlay;
+  if (typeof stored.showRetired === 'boolean') state.showRetired = stored.showRetired;
 }
 
 // ── Utility ──────────────────────────────────────────────────────────────────
@@ -398,15 +416,22 @@ function getFilteredEdges(nodeIds) {
   });
 }
 
-function aliasMap() {
-  if (!DATA) return {};
+function aliasMap(data = DATA) {
+  if (!data) return {};
   const m = {};
-  for (const a of DATA.aliases) m[a.from_name] = a.to_name;
+  for (const a of data.aliases) m[a.from_name] = a.to_name;
   return m;
 }
 
-function canonicalCircle(name) {
-  return aliasMap()[name] || name;
+function canonicalCircle(name, data = DATA) {
+  const aliases = aliasMap(data);
+  const seen = new Set();
+  let current = name;
+  while (aliases[current] && !seen.has(current)) {
+    seen.add(current);
+    current = aliases[current];
+  }
+  return current;
 }
 
 function degreeCounts() {
@@ -421,40 +446,54 @@ function degreeCounts() {
 
 // ── Fetch ────────────────────────────────────────────────────────────────────
 
-async function fetchGraph() {
-  const r = await fetch('/api/graph');
+async function fetchGraph(includeRetired) {
+  const qs = includeRetired ? '?includeRetired=1' : '';
+  const r = await fetch('/api/graph' + qs);
   if (!r.ok) throw new Error(`/api/graph returned ${r.status}`);
   return r.json();
 }
 
-async function fetchEntities() {
-  if (ENTITIES) return ENTITIES;
+async function fetchEntities(includeRetired = state.showRetired) {
+  if (ENTITIES && _entitiesMode === includeRetired) return ENTITIES;
   // Capture generation at call time so a delayed response from a prior Refresh
   // (which set ENTITIES=null and incremented _entitiesGen) cannot repopulate the
   // cache after it was intentionally cleared (entities refresh race, round-5 fix).
   const gen = _entitiesGen;
-  const r = await fetch('/api/entities');
-  if (!r.ok) throw new Error(`/api/entities returned ${r.status}`);
-  const data = await r.json();
-  if (_entitiesGen !== gen) return ENTITIES; // stale — discard
+  const qs = includeRetired ? '?includeRetired=1' : '';
+  let data;
+  try {
+    const r = await fetch('/api/entities' + qs);
+    if (!r.ok) throw new Error(`/api/entities returned ${r.status}`);
+    data = await r.json();
+  } catch (err) {
+    if (_entitiesGen !== gen || state.showRetired !== includeRetired) return STALE_REQUEST;
+    throw err;
+  }
+  if (_entitiesGen !== gen || state.showRetired !== includeRetired) return STALE_REQUEST;
   ENTITIES = data;
+  _entitiesMode = includeRetired;
   return ENTITIES;
 }
 
-async function fetchFirstBlock() {
-  if (FIRST_BLOCK) return FIRST_BLOCK;
+async function fetchFirstBlock(includeRetired = state.showRetired) {
+  if (FIRST_BLOCK && _firstBlockMode === includeRetired) return FIRST_BLOCK;
   // Capture generation at call time so a delayed response from a prior Refresh
   // (which set FIRST_BLOCK=null and incremented _firstBlockGen) cannot repopulate
   // the cache after it was intentionally cleared, mirroring the _entitiesGen guard.
   const gen = _firstBlockGen;
-  const r = await fetch('/api/firstblock');
-  if (!r.ok) throw new Error(`/api/firstblock returned ${r.status}`);
-  const data = await r.json();
-  // Return a guaranteed empty payload when stale rather than FIRST_BLOCK (which
-  // Refresh just set to null).  Callers destructure data.rows immediately after
-  // `await`; returning null would throw.
-  if (_firstBlockGen !== gen) return { rows: [] }; // stale — discard
+  const qs = includeRetired ? '?includeRetired=1' : '';
+  let data;
+  try {
+    const r = await fetch('/api/firstblock' + qs);
+    if (!r.ok) throw new Error(`/api/firstblock returned ${r.status}`);
+    data = await r.json();
+  } catch (err) {
+    if (_firstBlockGen !== gen || state.showRetired !== includeRetired) return STALE_REQUEST;
+    throw err;
+  }
+  if (_firstBlockGen !== gen || state.showRetired !== includeRetired) return STALE_REQUEST;
   FIRST_BLOCK = data;
+  _firstBlockMode = includeRetired;
   return FIRST_BLOCK;
 }
 
@@ -469,6 +508,114 @@ async function fetchSources() {
   if (_sourcesGen !== gen) return { sources: [] }; // stale — discard
   SOURCES = data;
   return SOURCES;
+}
+
+function invalidateDependentCaches(includeSources) {
+  ENTITIES = null;
+  _entitiesMode = null;
+  _entitiesGen++;
+  FIRST_BLOCK = null;
+  _firstBlockMode = null;
+  _firstBlockGen++;
+  if (includeSources) {
+    SOURCES = null;
+    _sourcesGen++;
+  }
+}
+
+function entitiesForCurrentMode() {
+  return _entitiesMode === state.showRetired ? ENTITIES : null;
+}
+
+function isCurrentGraphRequest(generation, includeRetired) {
+  return generation === _graphRequestGen && state.showRetired === includeRetired;
+}
+
+// Normalize a persisted raw alias to its canonical target, but only keep it if
+// that canonical circle exists in the accepted visibility graph. An alias row
+// can outlive its last visible concept, so aliases alone are not proof that a
+// circle is selectable in the current mode.
+function reconcileCurrentCircle(data = DATA) {
+  if (!data || state.circle === 'all') return;
+  const canonical = canonicalCircle(state.circle, data);
+  const acceptedCircles = new Set(data.circles.map(c => c.canonicalName));
+  state.circle = acceptedCircles.has(canonical) ? canonical : 'all';
+}
+
+function reconcileSelectedDetail(
+  data = DATA,
+  { close = deselectConcept, render = renderDetailPanel } = {},
+) {
+  if (!data || !state.selectedId) return;
+  if (data.concepts.some(c => c.id === state.selectedId)) {
+    render(state.selectedId);
+  } else {
+    close();
+  }
+}
+
+function renderAcceptedGraph() {
+  renderTopBar();
+  renderStatBar();
+  renderRail();
+  redrawGraph();
+  rerenderActiveView();
+}
+
+// Shared coordinator for the only three /api/graph writers. Cache invalidation,
+// graph commit, state reconciliation, dependent reload, rendering, and spinner
+// cleanup are all guarded by the same generation + captured visibility mode.
+async function reloadGraph({
+  invalidateCaches = false,
+  invalidateSources = false,
+  spinner = true,
+  render = renderAcceptedGraph,
+  detailCallbacks,
+} = {}) {
+  const includeRetired = state.showRetired;
+  const generation = ++_graphRequestGen;
+  const btn = document.getElementById('refresh-btn');
+
+  if (invalidateCaches && isCurrentGraphRequest(generation, includeRetired)) {
+    invalidateDependentCaches(invalidateSources);
+  }
+  if (spinner && btn) {
+    _spinnerOwnerGen = generation;
+    btn.classList.add('spinning');
+  }
+
+  try {
+    const data = await fetchGraph(includeRetired);
+    if (!isCurrentGraphRequest(generation, includeRetired)) return STALE_REQUEST;
+
+    DATA = data;
+    reconcileCurrentCircle(data);
+    reconcileSelectedDetail(data, detailCallbacks);
+
+    if (state.entityOverlay) {
+      const entities = await fetchEntities(includeRetired);
+      if (entities === STALE_REQUEST || !isCurrentGraphRequest(generation, includeRetired)) {
+        return STALE_REQUEST;
+      }
+      // The first reconciliation above intentionally closes a vanished selection
+      // immediately, but a surviving detail initially renders before the matching
+      // entity cache is available. Reconcile again only after that payload and this
+      // graph generation are both accepted so the final panel replaces its Load shell.
+      reconcileSelectedDetail(data, detailCallbacks);
+    }
+
+    if (!isCurrentGraphRequest(generation, includeRetired)) return STALE_REQUEST;
+    if (render) render();
+    return { generation, includeRetired };
+  } catch (err) {
+    if (!isCurrentGraphRequest(generation, includeRetired)) return STALE_REQUEST;
+    throw err;
+  } finally {
+    if (spinner && btn && _spinnerOwnerGen === generation) {
+      _spinnerOwnerGen = 0;
+      btn.classList.remove('spinning');
+    }
+  }
 }
 
 // ── Top bar & stat bar ───────────────────────────────────────────────────────
@@ -1708,6 +1855,11 @@ function drawFrame() {
     const isHovered = node.id === hovered;
     const isSelected = node.id === selected;
     const isDimmed = neighbors && !neighbors.has(node.id);
+    // Retired nodes only ever appear here when the "Show retired" filter is on
+    // (server excludes them by default) — dim them so they read as background
+    // context rather than live memory, reusing the same globalAlpha mechanism
+    // as the neighbor-dim above rather than new drawing machinery.
+    const isRetired = node.status === 'retired';
 
     ctx.save();
     ctx.globalAlpha = isDimmed ? 0.12 : 1;
@@ -1729,7 +1881,7 @@ function drawFrame() {
     ctx.beginPath();
     ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
     ctx.fillStyle = color;
-    ctx.globalAlpha = isDimmed ? 0.12 : (isEntity ? 0.5 : 0.9);
+    ctx.globalAlpha = isDimmed ? 0.12 : isRetired ? 0.35 : (isEntity ? 0.5 : 0.9);
     ctx.fill();
 
     ctx.shadowBlur = 0;
@@ -2125,6 +2277,7 @@ function showTooltip(e, node) {
   if (node.confidence !== null && node.confidence !== undefined) parts.push(`conf ${(node.confidence * 100).toFixed(0)}%`);
   if (node.support_count) parts.push(`support ${node.support_count}`);
   if (node.status === 'disputed') parts.push('⚠ disputed');
+  if (node.status === 'retired') parts.push('retired');
   if (node.dirty) parts.push('dirty');
   document.getElementById('tt-meta').textContent = parts.join(' · ');
   const conf = node.confidence !== null && node.confidence !== undefined ? node.confidence : null;
@@ -2287,8 +2440,9 @@ function buildGraph(scatter = false) {
 
   // Entity overlay
   let entityNodes = [], entityEdges = [];
-  if (state.entityOverlay && ENTITIES) {
-    const { entities, links } = ENTITIES;
+  const visibleEntities = entitiesForCurrentMode();
+  if (state.entityOverlay && visibleEntities) {
+    const { entities, links } = visibleEntities;
     // Only top entities for the current circle
     const circleLinks = state.circle === 'all'
       ? links
@@ -2468,6 +2622,7 @@ async function renderDetailPanel(id) {
   const statusBadges = [
     `<span class="kind-badge" style="color:${kindColor(concept.kind)};border:1px solid ${kindColor(concept.kind)}40;background:${kindColor(concept.kind)}12">${escHtml(concept.kind)}</span>`,
     concept.status === 'disputed' ? `<span class="badge-disputed">disputed</span>` : '',
+    concept.status === 'retired' ? `<span class="badge-retired">retired</span>` : '',
     concept.dirty ? `<span class="badge-dirty">dirty</span>` : '',
   ].filter(Boolean).join(' ');
 
@@ -2651,7 +2806,7 @@ async function renderDetailPanel(id) {
   // at the correct position (between Connections and Contradictions).  Targeting
   // by id avoids any DOM append after innerHTML, preserving section order.
   const entPlaceholder = document.getElementById(entPlaceholderId);
-  if (ENTITIES) {
+  if (entitiesForCurrentMode()) {
     appendEntitySection(scroll, id, entPlaceholder);
   } else {
     // Show a lazy-load shell inside the placeholder until entities are fetched.
@@ -2665,7 +2820,9 @@ async function renderDetailPanel(id) {
     `;
     if (entPlaceholder) entPlaceholder.replaceWith(lazyShell);
     lazyShell.querySelector('#load-ent-btn').addEventListener('click', async () => {
-      await fetchEntities();
+      const includeRetired = state.showRetired;
+      const entities = await fetchEntities(includeRetired);
+      if (entities === STALE_REQUEST || state.showRetired !== includeRetired) return;
       if (state.activeTab === 'entities') renderEntitiesTable();
       // Guard against a stale continuation: if the user selected a different
       // concept while the fetch was in flight, the panel has already been
@@ -2678,8 +2835,9 @@ async function renderDetailPanel(id) {
 }
 
 function appendEntitySection(scroll, conceptId, placeholder) {
-  if (!ENTITIES) return;
-  const { entities, links } = ENTITIES;
+  const data = entitiesForCurrentMode();
+  if (!data) return;
+  const { entities, links } = data;
   // Gather (scope, entity_key) pairs for this concept so each scope's entity
   // is treated independently — prevents another scope's surface/kind winning.
   const conceptLinks = links.filter(l => l.concept_id === conceptId);
@@ -2750,6 +2908,9 @@ function renderConceptsTable() {
     const tr = document.createElement('tr');
     tr.dataset.id = c.id;
     if (c.id === state.selectedId) tr.classList.add('selected');
+    // Only reachable with "Show retired" on (server excludes retired by
+    // default) — dim the row rather than hide it, same treatment as the graph.
+    if (c.status === 'retired') tr.classList.add('retired');
     const conf = c.confidence !== null && c.confidence !== undefined;
     tr.innerHTML = `
       <td class="td-title"><div class="td-title-inner" title="${escHtml(c.title)}">${escHtml(c.title)}</div></td>
@@ -2778,8 +2939,11 @@ function renderConceptsTable() {
 // ── Entities view ────────────────────────────────────────────────────────────
 
 async function renderEntitiesTable() {
-  await fetchEntities();
-  const { entities, links } = ENTITIES;
+  const gen = _entitiesGen;
+  const includeRetired = state.showRetired;
+  const data = await fetchEntities(includeRetired);
+  if (data === STALE_REQUEST || gen !== _entitiesGen || state.showRetired !== includeRetired) return;
+  const { entities, links } = data;
 
   // Count concepts per entity, keyed by (entity_key + scope) so a key present
   // in two circles doesn't inflate either circle's count.
@@ -3178,14 +3342,16 @@ async function renderFirstBlock() {
   if (!list) return;
 
   const gen = _firstBlockGen;
+  const includeRetired = state.showRetired;
   let data;
   try {
-    data = await fetchFirstBlock();
+    data = await fetchFirstBlock(includeRetired);
   } catch (err) {
+    if (gen !== _firstBlockGen || state.showRetired !== includeRetired) return;
     list.innerHTML = `<div style="padding:24px 16px;color:var(--danger);font-size:13px">Failed to load First Block: ${escHtml(err.message)}</div>`;
     return;
   }
-  if (gen !== _firstBlockGen) return; // stale — a newer Refresh superseded this; don't render
+  if (data === STALE_REQUEST || gen !== _firstBlockGen || state.showRetired !== includeRetired) return;
 
   let rows = data.rows || [];
 
@@ -3290,6 +3456,7 @@ async function renderSources() {
   try {
     data = await fetchSources();
   } catch (err) {
+    if (gen !== _sourcesGen) return;
     el.innerHTML = `<div style="padding:24px 16px;color:var(--danger);font-size:13px">Failed to load sources: ${escHtml(err.message)}</div>`;
     return;
   }
@@ -3433,30 +3600,15 @@ async function init() {
   // Restore UI state from localStorage BEFORE fetching so circle/tab are correct
   restoreUiState();
 
+  let graphLoad;
   try {
-    DATA = await fetchGraph();
+    graphLoad = await reloadGraph({ spinner: false, render: null });
   } catch (err) {
     document.getElementById('loading').querySelector('.loading-msg').textContent =
       'Failed to load: ' + err.message;
     return;
   }
-
-  // Validate restored circle against the loaded store.  If state.circle was
-  // persisted for a different --dir store (or a circle that no longer exists),
-  // neither the canonical nor the raw name will appear in DATA.circles, and
-  // getFilteredConcepts() would silently return [] → blank dashboard.
-  // Reset to 'all' so the user always sees data rather than an empty graph.
-  if (state.circle !== 'all') {
-    const knownNames = new Set([
-      ...DATA.circles.map(c => c.canonicalName),
-      // Also accept raw names in case the alias map isn't symmetric
-      ...DATA.aliases.map((a) => a.from_name),
-      ...DATA.aliases.map((a) => a.to_name),
-    ]);
-    if (!knownNames.has(state.circle)) {
-      state.circle = 'all';
-    }
-  }
+  if (graphLoad === STALE_REQUEST || !isCurrentGraphRequest(graphLoad.generation, graphLoad.includeRetired)) return;
 
   // Hide loading
   const loading = document.getElementById('loading');
@@ -3481,15 +3633,11 @@ async function init() {
   // Sync entity overlay chip
   const eChip = document.querySelector('.flag-chip[data-flag="entity-overlay"]');
   if (eChip) eChip.classList.toggle('active', state.entityOverlay);
+  // Sync show-retired chip
+  const rChip = document.querySelector('.flag-chip[data-flag="show-retired"]');
+  if (rChip) rChip.classList.toggle('active', state.showRetired);
 
   initCanvas();
-
-  // If the entity overlay was persisted on but ENTITIES is null (first load or
-  // after a page reload), fetch entities before drawing so the overlay actually
-  // renders on the first graph build rather than silently skipping entity nodes.
-  if (state.entityOverlay && !ENTITIES) {
-    await fetchEntities();
-  }
 
   buildGraph();
 
@@ -3566,11 +3714,25 @@ async function init() {
       chip.addEventListener('click', async () => {
         state.entityOverlay = !state.entityOverlay;
         chip.classList.toggle('active', state.entityOverlay);
-        if (state.entityOverlay && !ENTITIES) {
-          await fetchEntities();
+        if (state.entityOverlay && !entitiesForCurrentMode()) {
+          const includeRetired = state.showRetired;
+          const entities = await fetchEntities(includeRetired);
+          if (entities === STALE_REQUEST || state.showRetired !== includeRetired) return;
         }
         redrawGraph();
         rerenderActiveView();
+      });
+    } else if (flag === 'show-retired') {
+      // Unlike the other flag-chips this can't just re-filter DATA already in
+      // memory — retired concepts are excluded server-side by default, so
+      // toggling this refetches /api/graph (and the entities cache, which also
+      // depends on includeRetired) with the param flipped. Mirrors the Refresh
+      // button's cache-invalidation flow below.
+      chip.addEventListener('click', async () => {
+        state.showRetired = !state.showRetired;
+        chip.classList.toggle('active', state.showRetired);
+        scheduleSave();
+        await reloadGraph({ invalidateCaches: true });
       });
     } else {
       chip.addEventListener('click', () => {
@@ -3611,42 +3773,7 @@ async function init() {
 
   // Refresh button
   document.getElementById('refresh-btn').addEventListener('click', async () => {
-    const btn = document.getElementById('refresh-btn');
-    btn.classList.add('spinning');
-    try {
-      DATA = await fetchGraph();
-      // Invalidate the entities cache and bump the generation counter so any
-      // in-flight /api/entities response that arrives after this point is discarded
-      // (entities refresh race, round-5 class-A fix).
-      ENTITIES = null;
-      _entitiesGen++;
-      // Invalidate the first_block cache and bump its generation counter so any
-      // in-flight /api/firstblock response that arrives after this point is discarded,
-      // mirroring the entities refresh race fix above.
-      FIRST_BLOCK = null;
-      _firstBlockGen++;
-      // Same for the sources cache.
-      SOURCES = null;
-      _sourcesGen++;
-      // If the entity overlay is on, refetch entities BEFORE redrawing so the
-      // overlay survives a Refresh.  buildGraph checks `state.entityOverlay && ENTITIES`
-      // and silently skips entity nodes when ENTITIES is null — which is the window
-      // that exists between the cache-clear above and the fetch completing.
-      // fetchEntities() honours the generation token, so a stale response still can't
-      // repopulate the cache after a second rapid Refresh.
-      if (state.entityOverlay) {
-        await fetchEntities();
-      }
-      renderTopBar();
-      renderStatBar();
-      renderRail();
-      redrawGraph();
-      // Rerender whichever tab is active — stale rows stay visible otherwise.
-      // redrawGraph() only updates the canvas; tab views need an explicit call.
-      rerenderActiveView();
-    } finally {
-      btn.classList.remove('spinning');
-    }
+    await reloadGraph({ invalidateCaches: true, invalidateSources: true });
   });
 
   // Keyboard shortcuts

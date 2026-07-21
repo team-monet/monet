@@ -262,7 +262,7 @@ describe("SQL.countsLegacy — legacy-schema stores (no source-ingestion columns
         source_refs TEXT, aliases TEXT, body TEXT
       );
       CREATE TABLE observations (id TEXT PRIMARY KEY);
-      CREATE TABLE memory_edge (id TEXT PRIMARY KEY, type TEXT, dismissed_at INTEGER);
+      CREATE TABLE memory_edge (id TEXT PRIMARY KEY, src_id TEXT, dst_id TEXT, type TEXT, dismissed_at INTEGER);
       CREATE TABLE entities (key TEXT);
       CREATE TABLE sessions (id TEXT);
       CREATE TABLE contradictions (id TEXT, status TEXT);

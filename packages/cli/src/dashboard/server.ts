@@ -163,17 +163,41 @@ function querySnap(snapPath: string, sql: string): Record<string, unknown>[] {
 // filter.
 const SOURCE_MARKER = `(c.kind = 'source' OR c.source_identity IS NOT NULL OR c.active_observation_id IS NOT NULL)`;
 
+// Retired-exclusion default, aligned with the engine's own read convention:
+// engine.ts filters `status != 'retired'` in 90+ read paths (e.g. listCircles
+// at engine.ts:4536), and the dashboard previously didn't mirror that at all —
+// every retired concept (82% of a mature store) rendered as a first-class
+// node/row right alongside live ones. Unlike SOURCE_MARKER/kind='source' (which
+// stays visible per John's no-hiding ruling), retired concepts are excluded by
+// default here; `includeRetired=1` on the affected /api routes restores the
+// unfiltered query below. status='disputed' is a different value of the same
+// column and is never touched by this filter — disputed concepts stay visible
+// in both modes, matching John's ruling that disputed must always show.
+const RETIRED_FILTER = `status != 'retired'`;
+
 // Exported so dashboard-source-marker.test.ts can run the real query strings
 // against a seeded test DB, rather than testing a parallel reimplementation of
 // the marker-union logic that could silently drift from what actually runs.
 export const SQL = {
-  // Full concepts table — every row, including raw ingested "source" content
-  // (e.g. Obsidian vault chunks). This is also the array that becomes graph
-  // nodes AND the Concepts tab's rows: per John's no-hiding ruling, source rows
-  // are first-class visible in both, not routed to a separate view. Scale is
-  // bounded client-side (GRAPH_NODE_LIMIT on the Graph tab, simple pagination
-  // on the Concepts tab if needed) rather than by excluding rows here.
+  // Full concepts table, minus retired rows by default (see RETIRED_FILTER) —
+  // including raw ingested "source" content (e.g. Obsidian vault chunks), which
+  // stays first-class per John's no-hiding ruling (unaffected by this filter).
+  // This is also the array that becomes graph nodes AND the Concepts tab's
+  // rows. Scale is bounded client-side (GRAPH_NODE_LIMIT on the Graph tab,
+  // simple pagination on the Concepts tab if needed) rather than by excluding
+  // rows here.
   concepts: `
+    SELECT id, slug, title, kind, status, confidence, circle,
+           support_count, version, dirty, usefulness_score,
+           created_at, updated_at, last_confirmed_at, source_refs, aliases, body
+    FROM concepts c
+    WHERE c.${RETIRED_FILTER}
+    ORDER BY updated_at DESC
+  `,
+
+  // includeRetired=1 variant — every concept row, retired included. Identical
+  // to `concepts` above minus the WHERE clause.
+  conceptsIncludeRetired: `
     SELECT id, slug, title, kind, status, confidence, circle,
            support_count, version, dirty, usefulness_score,
            created_at, updated_at, last_confirmed_at, source_refs, aliases, body
@@ -199,7 +223,33 @@ export const SQL = {
   // never links source/chunk concepts into the graph anyway (0 of 39,196 live
   // edges touch a source concept), so this is a no-op on today's data and a
   // correctness fix for whenever that invariant stops holding.
+  //
+  // Retired-exclusion default: joined to concepts on BOTH endpoints so an edge
+  // with either endpoint retired is dropped entirely — a graph node that
+  // doesn't render (retired, excluded from SQL.concepts) must never leave a
+  // dangling edge pointing at it. Mirrors the engine's own edges() query
+  // (engine.ts ~4187-4197: `JOIN concepts src ... JOIN concepts dst ...
+  // src.status != 'retired' AND dst.status != 'retired'`) — src_id/dst_id are
+  // always concept ids in this schema (memory_edge.src_type/dst_type are both
+  // 'concept' for every row in the audited store), matching that convention.
+  // The INNER JOIN on concepts for both endpoints also drops any edge whose
+  // endpoint is not a live concept row (orphaned or non-'concept'-typed endpoint),
+  // consistent with the client's getFilteredEdges behavior and harmless (0 such
+  // rows in the audited store).
   edges: `
+    SELECT e.id, e.src_id, e.dst_id, e.type, e.weight, e.origin, e.count, e.scope,
+           e.created_at, e.last_reinforced_at
+    FROM memory_edge e
+    JOIN concepts src ON src.id = e.src_id
+    JOIN concepts dst ON dst.id = e.dst_id
+    WHERE e.dismissed_at IS NULL
+      AND src.${RETIRED_FILTER}
+      AND dst.${RETIRED_FILTER}
+    ORDER BY e.weight DESC
+  `,
+
+  // includeRetired=1 variant — the original ungenerated query, no concepts join.
+  edgesIncludeRetired: `
     SELECT id, src_id, dst_id, type, weight, origin, count, scope,
            created_at, last_reinforced_at
     FROM memory_edge e
@@ -228,15 +278,53 @@ export const SQL = {
 
   aliases: `SELECT from_name, to_name, status FROM circle_aliases`,
 
-  // Aggregate counts across the FULL store (never filtered) so the header stat
-  // bar's honest split ("N concepts · M from sources") stays accurate. This is
-  // SOURCE_MARKER's only remaining consumer post no-hiding ruling — a
-  // disclosure of composition, not a basis for excluding rows elsewhere.
+  // Aggregate counts across the store, retired concepts excluded by default
+  // (see RETIRED_FILTER) so the header stat bar's "All (N)" / "N concepts · M
+  // from sources" numbers match what's actually rendered elsewhere in the
+  // default view. `disputed` deliberately does NOT get an added retired
+  // exclusion: status is a single column, 'disputed' and 'retired' are
+  // mutually exclusive values of it, so the disputed count is already
+  // unaffected — disputed concepts stay visible in both modes. `edgesLive` and
+  // `possibleDuplicatePairs` are joined to concepts on both endpoints (mirrors
+  // SQL.edges) so these header counts match the length of the actual
+  // (retired-filtered) edges/dup-pair arrays the UI renders and filters
+  // against. `observations`, `edgesDismissed`, `entities`, `sessions`,
+  // `contradictionsOpen/Resolved` are left unfiltered — none of them touch the
+  // concepts table, and (contradictions specifically) are safe because the
+  // engine's retireConcept (monet-core/src/engine.ts:unwindConceptGraph) sets
+  // a retired concept's open contradictions to status='dismissed' when retiring
+  // the concept, so openContras (Health view's contradictions.filter(status===
+  // 'open') in app.js renderHealth) can never reference a retired/absent concept.
+  // That engine invariant ensures the Health view's concept-map dereference is safe.
   // NOTE: references c.source_identity / c.active_observation_id via
   // SOURCE_MARKER, which don't exist on stores predating the source-ingestion
   // schema. handleGraph() checks conceptsHasSourceColumns() before running
   // this and falls back to countsLegacy below when they're absent.
   counts: `
+    SELECT
+      (SELECT COUNT(*) FROM concepts WHERE ${RETIRED_FILTER}) as concepts,
+      (SELECT COUNT(*) FROM concepts c WHERE ${SOURCE_MARKER} AND c.${RETIRED_FILTER}) as sourceConcepts,
+      (SELECT COUNT(*) FROM observations) as observations,
+      (SELECT COUNT(*) FROM memory_edge e
+         JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
+         JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
+        WHERE e.dismissed_at IS NULL) as edgesLive,
+      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NOT NULL) as edgesDismissed,
+      (SELECT COUNT(*) FROM entities) as entities,
+      (SELECT COUNT(*) FROM sessions) as sessions,
+      (SELECT COUNT(*) FROM contradictions WHERE status='open') as contradictionsOpen,
+      (SELECT COUNT(*) FROM contradictions WHERE status='resolved') as contradictionsResolved,
+      (SELECT COUNT(*) FROM concepts WHERE status='disputed') as disputed,
+      (SELECT COUNT(*) FROM concepts WHERE dirty=1 AND ${RETIRED_FILTER}) as dirty,
+      (SELECT COUNT(*) FROM memory_edge e
+         JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
+         JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
+        WHERE e.type='possible_duplicate_of' AND e.dismissed_at IS NULL) as possibleDuplicatePairs
+  `,
+
+  // includeRetired=1 variant — identical to `counts` minus every retired
+  // exclusion (the original, pre-this-change query).
+  countsIncludeRetired: `
     SELECT
       (SELECT COUNT(*) FROM concepts) as concepts,
       (SELECT COUNT(*) FROM concepts c WHERE ${SOURCE_MARKER}) as sourceConcepts,
@@ -260,8 +348,32 @@ export const SQL = {
   // such a store CAN carry (kind always exists; the other two columns don't
   // on this schema, and NOT their absence being silently miscounted as 0 —
   // kind-only is what these rows' actual data supports, not an approximation).
-  // Otherwise identical to `counts`. Selected by conceptsHasSourceColumns().
+  // Otherwise identical to `counts` (including the same retired-exclusion
+  // default). Selected by conceptsHasSourceColumns().
   countsLegacy: `
+    SELECT
+      (SELECT COUNT(*) FROM concepts WHERE ${RETIRED_FILTER}) as concepts,
+      (SELECT COUNT(*) FROM concepts WHERE kind = 'source' AND ${RETIRED_FILTER}) as sourceConcepts,
+      (SELECT COUNT(*) FROM observations) as observations,
+      (SELECT COUNT(*) FROM memory_edge e
+         JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
+         JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
+        WHERE e.dismissed_at IS NULL) as edgesLive,
+      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NOT NULL) as edgesDismissed,
+      (SELECT COUNT(*) FROM entities) as entities,
+      (SELECT COUNT(*) FROM sessions) as sessions,
+      (SELECT COUNT(*) FROM contradictions WHERE status='open') as contradictionsOpen,
+      (SELECT COUNT(*) FROM contradictions WHERE status='resolved') as contradictionsResolved,
+      (SELECT COUNT(*) FROM concepts WHERE status='disputed') as disputed,
+      (SELECT COUNT(*) FROM concepts WHERE dirty=1 AND ${RETIRED_FILTER}) as dirty,
+      (SELECT COUNT(*) FROM memory_edge e
+         JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
+         JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
+        WHERE e.type='possible_duplicate_of' AND e.dismissed_at IS NULL) as possibleDuplicatePairs
+  `,
+
+  // includeRetired=1 variant of countsLegacy.
+  countsLegacyIncludeRetired: `
     SELECT
       (SELECT COUNT(*) FROM concepts) as concepts,
       (SELECT COUNT(*) FROM concepts WHERE kind = 'source') as sourceConcepts,
@@ -277,7 +389,24 @@ export const SQL = {
       (SELECT COUNT(*) FROM memory_edge WHERE type='possible_duplicate_of' AND dismissed_at IS NULL) as possibleDuplicatePairs
   `,
 
+  // avgConfidence/graphDensity restricted to non-retired concepts by default so
+  // the stat-bar numbers describe what's actually on screen, not a metric
+  // dominated by an 82%-retired store. graphDensity's edge subquery is joined
+  // to concepts on both endpoints, mirroring SQL.edges/counts.edgesLive.
   health: `
+    SELECT
+      AVG(CASE WHEN confidence IS NOT NULL THEN confidence END) as avgConfidence,
+      (SELECT COUNT(*) FROM memory_edge e
+         JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
+         JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
+        WHERE e.dismissed_at IS NULL) * 1.0 /
+        NULLIF((SELECT COUNT(*) FROM concepts WHERE ${RETIRED_FILTER}), 0) as graphDensity
+    FROM concepts
+    WHERE ${RETIRED_FILTER}
+  `,
+
+  // includeRetired=1 variant — the original ungenerated query.
+  healthIncludeRetired: `
     SELECT
       AVG(CASE WHEN confidence IS NOT NULL THEN confidence END) as avgConfidence,
       (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NULL) * 1.0 /
@@ -293,19 +422,50 @@ export const SQL = {
   // of a ~2.6s total /api/graph response on the live store (3,278 concepts /
   // 4,535 observations), the single largest server-side cost by far. Same
   // output, computed the cheap way.
+  //
+  // Retired-exclusion default: a circle whose visible count drops to 0 (every
+  // concept in it retired) simply produces no GROUP BY row here — handleGraph's
+  // canonical-circle fold only ever iterates rows this query returns, so that
+  // circle naturally disappears from the circle list/selector with no extra
+  // logic needed.
   circleConcepts: `
+    SELECT circle as name, COUNT(*) as conceptCount
+    FROM concepts
+    WHERE ${RETIRED_FILTER}
+    GROUP BY circle
+  `,
+
+  // includeRetired=1 variant — the original ungenerated query.
+  circleConceptsIncludeRetired: `
     SELECT circle as name, COUNT(*) as conceptCount
     FROM concepts
     GROUP BY circle
   `,
 
+  // Observations carry no status of their own and aren't joined to concepts
+  // here (see the cross-product comment above) — a retired concept's prior
+  // observations are historical record, not something retiring the concept
+  // retroactively hides. Left unfiltered in both modes.
   circleObservations: `
     SELECT circle as scope, COUNT(*) as observationCount
     FROM observations
     GROUP BY circle
   `,
 
+  // Joined to concepts on both endpoints (mirrors SQL.edges) so per-circle edge
+  // counts (shown in the circle picker / cluster tooltips) match the actual
+  // retired-filtered edges array rather than overcounting edges that don't render.
   circleEdges: `
+    SELECT e.scope as scope, COUNT(*) as edgeCount
+    FROM memory_edge e
+    JOIN concepts src ON src.id = e.src_id AND src.${RETIRED_FILTER}
+    JOIN concepts dst ON dst.id = e.dst_id AND dst.${RETIRED_FILTER}
+    WHERE e.dismissed_at IS NULL
+    GROUP BY e.scope
+  `,
+
+  // includeRetired=1 variant — the original ungenerated query.
+  circleEdgesIncludeRetired: `
     SELECT scope, COUNT(*) as edgeCount
     FROM memory_edge
     WHERE dismissed_at IS NULL
@@ -327,7 +487,20 @@ export const SQL = {
     ORDER BY df DESC
   `,
 
+  // Joined to concepts and retired-filtered by default so the Entities tab's
+  // "# Concepts" column (derived client-side by counting these link rows per
+  // entity) doesn't count links to concepts that are no longer visible
+  // anywhere else in the default view — the same "entity joins" trace the
+  // concept-node/edge/dup-pair queries above got.
   entityLinks: `
+    SELECT ce.concept_id as concept_id, ce.entity_key as entity_key, ce.scope as scope
+    FROM concept_entities ce
+    JOIN concepts c ON c.id = ce.concept_id
+    WHERE c.${RETIRED_FILTER}
+  `,
+
+  // includeRetired=1 variant — the original ungenerated query, no concepts join.
+  entityLinksIncludeRetired: `
     SELECT concept_id, entity_key, scope
     FROM concept_entities
   `,
@@ -389,10 +562,62 @@ export const SQL = {
     ORDER BY e.source_id, e.sequence DESC
   `,
 
-  // first_block rows joined to their concept for title + status.
+  // first_block rows joined to their concept for title + status. Retired joined
+  // concepts are hidden by default, while orphan rows remain visible so a
+  // missing concept record does not silently erase the stored First Block slot.
   // The table may not exist in stores not yet migrated by the new engine;
   // the caller guards with an existence check before running this query.
   firstBlock: `
+    SELECT
+      fb.concept_id   AS conceptId,
+      fb.circle,
+      fb.summary,
+      fb.summary_dirty AS summaryDirty,
+      fb.position,
+      c.title         AS title,
+      c.status        AS conceptStatus
+    FROM first_block fb
+    LEFT JOIN concepts c ON c.id = fb.concept_id
+    WHERE fb.deleted_at IS NULL
+      AND (c.status IS NULL OR c.status != 'retired')
+    ORDER BY fb.position ASC
+  `,
+
+  // includeRetired=1 variant — preserves the previous unfiltered semantics.
+  firstBlockIncludeRetired: `
+    SELECT
+      fb.concept_id   AS conceptId,
+      fb.circle,
+      fb.summary,
+      fb.summary_dirty AS summaryDirty,
+      fb.position,
+      c.title         AS title,
+      c.status        AS conceptStatus
+    FROM first_block fb
+    LEFT JOIN concepts c ON c.id = fb.concept_id
+    WHERE fb.deleted_at IS NULL
+    ORDER BY fb.position ASC
+  `,
+
+  // Legacy-schema variants for stores whose first_block table predates the
+  // deleted_at column. The standalone dashboard opens stores read-only and does
+  // not run engine migrations, so these must not reference the missing column.
+  firstBlockLegacy: `
+    SELECT
+      fb.concept_id   AS conceptId,
+      fb.circle,
+      fb.summary,
+      fb.summary_dirty AS summaryDirty,
+      fb.position,
+      c.title         AS title,
+      c.status        AS conceptStatus
+    FROM first_block fb
+    LEFT JOIN concepts c ON c.id = fb.concept_id
+    WHERE c.status IS NULL OR c.status != 'retired'
+    ORDER BY fb.position ASC
+  `,
+
+  firstBlockLegacyIncludeRetired: `
     SELECT
       fb.concept_id   AS conceptId,
       fb.circle,
@@ -425,6 +650,17 @@ export function conceptsHasSourceColumns(db: InstanceType<typeof Database>): boo
   return names.has("source_identity") && names.has("active_observation_id");
 }
 
+/** Select a current- or legacy-schema First Block query without migrating the read-only store. */
+export function selectFirstBlockSql(
+  db: InstanceType<typeof Database>,
+  includeRetired: boolean,
+): string {
+  const cols = db.prepare(`PRAGMA table_info(first_block)`).all() as Array<{ name: string }>;
+  const hasDeletedAt = cols.some((c) => c.name === "deleted_at");
+  if (hasDeletedAt) return includeRetired ? SQL.firstBlockIncludeRetired : SQL.firstBlock;
+  return includeRetired ? SQL.firstBlockLegacyIncludeRetired : SQL.firstBlockLegacy;
+}
+
 // ── API handlers ─────────────────────────────────────────────────────────────
 
 /** Empty-but-valid graph payload for a fresh/empty store directory. */
@@ -442,13 +678,13 @@ function emptyGraphPayload(): unknown {
   };
 }
 
-async function handleGraph(): Promise<unknown> {
+async function handleGraph(includeRetired: boolean): Promise<unknown> {
   if (!fs.existsSync(getDbPath())) return emptyGraphPayload();
   const snap = await makeSnapshot();
   try {
-    const concepts           = querySnap(snap, SQL.concepts);
+    const concepts           = querySnap(snap, includeRetired ? SQL.conceptsIncludeRetired : SQL.concepts);
     const observations       = querySnap(snap, SQL.observations);
-    const edges              = querySnap(snap, SQL.edges);
+    const edges              = querySnap(snap, includeRetired ? SQL.edgesIncludeRetired : SQL.edges);
     const contradictions     = querySnap(snap, SQL.contradictions);
     const sessions           = querySnap(snap, SQL.sessions);
     const revisionsCount     = querySnap(snap, SQL.revisionsCount);
@@ -463,11 +699,14 @@ async function handleGraph(): Promise<unknown> {
     } finally {
       colsDb.close();
     }
-    const [counts]           = querySnap(snap, hasSourceColumns ? SQL.counts : SQL.countsLegacy) as [Record<string, number>];
-    const [health]           = querySnap(snap, SQL.health) as [Record<string, number | null>];
-    const circleConceptsRaw     = querySnap(snap, SQL.circleConcepts) as Array<{ name: string; conceptCount: number }>;
+    const countsSql = hasSourceColumns
+      ? (includeRetired ? SQL.countsIncludeRetired : SQL.counts)
+      : (includeRetired ? SQL.countsLegacyIncludeRetired : SQL.countsLegacy);
+    const [counts]           = querySnap(snap, countsSql) as [Record<string, number>];
+    const [health]           = querySnap(snap, includeRetired ? SQL.healthIncludeRetired : SQL.health) as [Record<string, number | null>];
+    const circleConceptsRaw     = querySnap(snap, includeRetired ? SQL.circleConceptsIncludeRetired : SQL.circleConcepts) as Array<{ name: string; conceptCount: number }>;
     const circleObservationsRaw = querySnap(snap, SQL.circleObservations) as Array<{ scope: string; observationCount: number }>;
-    const circleEdgesRaw     = querySnap(snap, SQL.circleEdges) as Array<{ scope: string; edgeCount: number }>;
+    const circleEdgesRaw     = querySnap(snap, includeRetired ? SQL.circleEdgesIncludeRetired : SQL.circleEdges) as Array<{ scope: string; edgeCount: number }>;
     const circleEntitiesRaw  = querySnap(snap, SQL.circleEntities) as Array<{ scope: string; key: string }>;
 
     const aliasMap: Record<string, string> = {};
@@ -558,19 +797,19 @@ async function handleGraph(): Promise<unknown> {
   }
 }
 
-async function handleEntities(): Promise<unknown> {
+async function handleEntities(includeRetired: boolean): Promise<unknown> {
   if (!fs.existsSync(getDbPath())) return { entities: [], links: [] };
   const snap = await makeSnapshot();
   try {
     const entities = querySnap(snap, SQL.entities);
-    const links    = querySnap(snap, SQL.entityLinks);
+    const links    = querySnap(snap, includeRetired ? SQL.entityLinksIncludeRetired : SQL.entityLinks);
     return { entities, links };
   } finally {
     try { fs.unlinkSync(snap); } catch { /* ignore */ }
   }
 }
 
-async function handleFirstBlock(circle: string | null): Promise<unknown> {
+async function handleFirstBlock(circle: string | null, includeRetired: boolean): Promise<unknown> {
   if (!fs.existsSync(getDbPath())) return { rows: [] };
   const snap = await makeSnapshot();
   try {
@@ -579,17 +818,19 @@ async function handleFirstBlock(circle: string | null): Promise<unknown> {
     // payload (rather than a 500) when pointed at an older store.
     const db = new Database(snap, { readonly: true });
     let tableExists = false;
+    let firstBlockSql: string | null = null;
     try {
       const row = db.prepare(
         `SELECT 1 FROM sqlite_master WHERE type='table' AND name='first_block'`
       ).get();
       tableExists = !!row;
+      if (tableExists) firstBlockSql = selectFirstBlockSql(db, includeRetired);
     } finally {
       db.close();
     }
     if (!tableExists) return { rows: [] };
 
-    let rows = querySnap(snap, SQL.firstBlock);
+    let rows = querySnap(snap, firstBlockSql!);
     // Filter by circle when requested.  Resolve aliases so that a caller passing
     // a canonical name (e.g. "example-circle") matches rows stored under the raw alias
     // (e.g. "code-6849de25"), mirroring the alias aggregation in handleGraph().
@@ -597,13 +838,22 @@ async function handleFirstBlock(circle: string | null): Promise<unknown> {
       const aliases = querySnap(snap, SQL.aliases) as Array<{ from_name: string; to_name: string }>;
       const aliasMap: Record<string, string> = {};
       for (const a of aliases) aliasMap[a.from_name] = a.to_name;
-      // Accept both the raw name and the canonical (aliased) name so callers can
-      // pass either form.  A row's circle field holds the raw DB value; resolve it
-      // to canonical before comparing against the requested circle.
+      const canonical = (name: string): string => {
+        const seen = new Set<string>();
+        let current = name;
+        while (aliasMap[current] && !seen.has(current)) {
+          seen.add(current);
+          current = aliasMap[current];
+        }
+        return current;
+      };
+      // Normalize both sides so a requested raw alias and its canonical target
+      // select the same rows, including rows stored under another equivalent raw
+      // alias. Comparing only the row side made raw-alias requests asymmetric.
+      const requestedCircle = canonical(circle);
       rows = rows.filter(r => {
         const rawCircle = r["circle"] as string;
-        const canonCircle = aliasMap[rawCircle] || rawCircle;
-        return rawCircle === circle || canonCircle === circle;
+        return canonical(rawCircle) === requestedCircle;
       });
     }
     return { rows };
@@ -945,7 +1195,9 @@ export function startDashboard(port: number): void {
       if (pathname === "/style.css") return serveStatic(res, "style.css");
 
       if (pathname === "/api/graph") {
-        const data = await handleGraph();
+        const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
+        const includeRetired = url.searchParams.get("includeRetired") === "1";
+        const data = await handleGraph(includeRetired);
         const json = JSON.stringify(data);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(json);
@@ -953,7 +1205,9 @@ export function startDashboard(port: number): void {
       }
 
       if (pathname === "/api/entities") {
-        const data = await handleEntities();
+        const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
+        const includeRetired = url.searchParams.get("includeRetired") === "1";
+        const data = await handleEntities(includeRetired);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(data));
         return;
@@ -969,7 +1223,8 @@ export function startDashboard(port: number): void {
       if (pathname === "/api/firstblock") {
         const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
         const circle = url.searchParams.get("circle");
-        const data = await handleFirstBlock(circle);
+        const includeRetired = url.searchParams.get("includeRetired") === "1";
+        const data = await handleFirstBlock(circle, includeRetired);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(data));
         return;

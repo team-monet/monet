@@ -556,6 +556,10 @@ tbody tr {
 }
 tbody tr:hover { background: var(--glass); }
 tbody tr.selected { background: rgba(124,109,219,0.1); }
+/* Only reachable with "Show retired" on — server excludes retired by default.
+   Dimmed rather than hidden, mirroring the graph node treatment. */
+tbody tr.retired { opacity: 0.5; }
+tbody tr.retired:hover { opacity: 0.75; }
 
 td {
   padding: 8px 12px;
@@ -628,6 +632,15 @@ td {
   background: rgba(251,191,36,0.1);
   color: var(--warn);
   border: 1px solid rgba(251,191,36,0.3);
+}
+.badge-retired {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  background: var(--glass);
+  color: var(--text-muted);
+  border: 1px solid var(--glass-border);
 }
 
 /* ── Entities view ── */
