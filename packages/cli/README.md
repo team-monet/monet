@@ -42,7 +42,7 @@ monet dashboard -d ./path    # -d, --dir <path>  point at a specific store
 
 ## Register Markdown sources — `monet source`
 
-The source commands configure the local registry only. They do **not** clone, scan, parse, ingest, or sync any content. A newly added source stays `pending-initial-sync` until a separate sync implementation is available.
+The source commands configure the local registry only; they do **not** themselves clone, scan, parse, ingest, or sync content. A newly added source stays `pending-initial-sync` until its first sync runs, either automatically via the background scheduler or on demand via the `source_sync` MCP tool (disable the scheduler with `MONET_NO_SOURCE_SCHEDULER=1` if needed).
 
 Both source types use default-deny access lists, so at least one caller ID and one project ID are required:
 
