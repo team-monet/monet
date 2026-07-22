@@ -11,11 +11,11 @@ The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet
 | `team-monet/monet` | **Monet** — the local-first client: the `monet` MCP server + CLI (npm `@team-monet/monet`). |
 | **`with-monet` (this repo)** | The **lightweight, agent-agnostic harness**: portable agent prompts + bootstrap that wire a host to `monet`. |
 
-**`Stig` is a state-centric lead** — the memory discipline (extract → review → commit) is now structural in Monet, so Stig's prompt stays lean and focuses on assembling context for the worker team rather than bookkeeping its own memory.
+**`Stig` is a state-centric lead** — it restores project, product, and user context; shapes material product work with the user; and assembles focused context for execution without turning routine technical work into ceremony.
 
 ## The team
 
-- **`stig`** — state-centric lead. Restores via `agent_context` (prewarm), delegates with pre-assembled context, and is the only agent that touches Monet.
+- **`stig`** — state-centric lead and product lens. Restores via `agent_context` (prewarm), keeps product judgment with the user, delegates with pre-assembled context, and is the only agent that touches Monet.
 - Workers Stig delegates to: `explorer`, `researcher`, `analyst`, `mechanic`, `developer`, `tester`, `reviewer`, `auditor`, `security`.
 
 ## Install — agent-first (paste one line into your agent)
