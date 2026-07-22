@@ -32,6 +32,7 @@ import {
   syncScheduledRepoMdSource as runScheduledRepoMdSync,
 } from "./source-sync";
 import { validateSourcePublishedPath } from "./source-materializer";
+import { MONET_SCHEMA_VERSION } from "./schema-version";
 import { sanitizeSourceError } from "./source-errors";
 import type { RemoteGitOptions } from "./source-git";
 import type { GitMdSyncOptions, GitMdSyncResult, RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
@@ -70,6 +71,18 @@ import {
   blendWeighted,
 } from "./embedding";
 export { EmbedderOutputDimensionError, EmbedderOutputNonFiniteError } from "./embedding";
+import {
+  inspectLiveEmbeddingPopulations,
+  parseFiniteEmbeddingJson,
+  toEmbeddingWidthInventory,
+  type EmbeddingWidthInventory,
+  type MalformedEmbeddingInventory,
+} from "./embedding-state";
+export type {
+  EmbeddingWidthInventory,
+  MalformedEmbeddingInventory,
+  MalformedEmbeddingPopulation,
+} from "./embedding-state";
 import { instantiateEmbedderForPin, UnsatisfiableEmbedderError, LEGACY_ONNX_DEFAULT_MODEL_ID } from "./embedding-onnx";
 import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
@@ -126,9 +139,8 @@ const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/a
 // The ticket that authorized this migration named "SOURCE_SCHEMA_VERSION 6→7", but 7 is already
 // SOURCE_REGISTRY_SCHEMA_VERSION (a prior, unrelated migration) — reusing it would corrupt that
 // gate, so this is the next free sequential slot after SOURCE_LEDGER_SCHEMA_VERSION instead.
-const SOURCE_FILE_CONCEPT_SCHEMA_VERSION = 10;
+const SOURCE_FILE_CONCEPT_SCHEMA_VERSION = MONET_SCHEMA_VERSION;
 export const FIRST_BLOCK_SUMMARY_MAX_CHARS = 800; // hard cap on a first_block summary (cost signal)
-const MALFORMED_EMBEDDING_SAMPLE_LIMIT = 20;
 
 /**
  * Thrown by graftRows() when the exporting engine used a different embedding model than the
@@ -164,32 +176,11 @@ export class EmbedderPinUnsatisfiedError extends Error {
   ) {
     super(
       `This store is pinned to '${pinnedModelId}' but the engine was constructed with ` +
-        `'${constructedModelId}'. Await core.ensureEmbedderPin() before serving.`,
+        `'${constructedModelId}'. Run \`monet doctor\`, then preview a repair with ` +
+        `\`monet repair --target <onnx|hashing|exact-model-id>\`.`,
     );
     this.name = "EmbedderPinUnsatisfiedError";
   }
-}
-
-/** Deterministic, non-throwing width inventory for the store's live semantic vectors. */
-export interface MalformedEmbeddingPopulation {
-  count: number;
-  /** Deterministic, bounded diagnostic sample; `count` remains exact. */
-  sampleIds: string[];
-}
-
-export interface MalformedEmbeddingInventory {
-  nativeObservations: MalformedEmbeddingPopulation;
-  nativeConcepts: MalformedEmbeddingPopulation;
-  sourceObservations: MalformedEmbeddingPopulation;
-  sourceConcepts: MalformedEmbeddingPopulation;
-}
-
-export interface EmbeddingWidthInventory {
-  observationDims: number[];
-  conceptDims: number[];
-  sourceObservationDims: number[];
-  sourceConceptDims: number[];
-  malformed: MalformedEmbeddingInventory;
 }
 
 /** A live persisted semantic vector is not a finite numeric JSON array. */
@@ -198,7 +189,7 @@ export class MalformedEmbeddingStoreError extends Error {
     const total = Object.values(malformed).reduce((sum, population) => sum + population.count, 0);
     super(
       `This store contains ${total} malformed live semantic vector${total === 1 ? "" : "s"}. ` +
-        "Run 'monet doctor' to inspect the affected populations before serving or mutating this store.",
+        "Run `monet doctor`, then preview a repair with `monet repair --target <onnx|hashing|exact-model-id>`.",
     );
     this.name = "MalformedEmbeddingStoreError";
   }
@@ -231,11 +222,8 @@ export class EmbedderWidthConflictError extends Error {
         `live semantic vector(s) of dimension ${storedWidths.join(", ")}. A model pin cannot make ` +
         `mixed widths safe. This usually means the configured embedder changed ` +
         `(e.g. an ONNX model cache became unreadable and silently fell back to the hashing embedder) ` +
-        `since the last write. Restore the embedder that produced the existing vectors before writing ` +
-        `more data, or call adoptEmbedderPin() once you have independently confirmed this store's ` +
-        `correct embedder identity, or run scripts/migrate-file-concept.ts to re-embed this store onto ` +
-        `one consistent model. Run 'monet doctor' to diagnose this store, or 'monet repair' to pin or ` +
-        `fix it.`,
+        `since the last write. Run \`monet doctor\`, then preview a repair onto one consistent ` +
+        `embedder with \`monet repair --target <onnx|hashing|exact-model-id>\`.`,
     );
     this.name = "EmbedderWidthConflictError";
   }
@@ -347,7 +335,8 @@ export class EmbedderMigrationConflictError extends Error {
   ) {
     super(
       `Cannot migrate this store to '${requestedTargetModelId}': an incomplete migration to ` +
-        `'${activeTargetModelId}' started at ${startedAt}. Re-run the same target or restore a verified backup.`,
+        `'${activeTargetModelId}' started at ${startedAt}. Resume it with ` +
+        `\`monet repair --resume --apply --yes\`, or restore a verified backup.`,
     );
     this.name = "EmbedderMigrationConflictError";
   }
@@ -361,7 +350,8 @@ export class EmbedderMigrationIncompleteError extends Error {
   ) {
     super(
       `Embedder migration to '${targetModelId}' started at ${startedAt} is incomplete. ` +
-        `Re-run the same target, or restore a verified backup. Never serve this store while this sentinel exists.`,
+        `Resume it with \`monet repair --resume --apply --yes\`, or restore a verified backup. ` +
+        `Never serve this store while this sentinel exists.`,
     );
     this.name = "EmbedderMigrationIncompleteError";
   }
@@ -386,7 +376,7 @@ export class EmbedderMigrationFailedError extends Error {
     const failures = Object.values(report.phases).reduce((total, phase) => total + phase.failed, 0);
     super(
       `Embedder migration to '${report.targetModelId}' failed for ${failures} item${failures === 1 ? "" : "s"}. ` +
-        "The migration sentinel remains; fix the reported failures and re-run the same target.",
+        "The migration sentinel remains; fix the reported failures, then run `monet repair --resume --apply --yes`.",
     );
     this.name = "EmbedderMigrationFailedError";
   }
@@ -427,8 +417,8 @@ export class EmbedderMigrationAbandonRefusedError extends Error {
         `${widths.sourceObservationDims.join(", ") || "none"}; source concepts: ` +
         `${widths.sourceConceptDims.join(", ") || "none"}). Abandoning now risks stranding a permanently ` +
         `mixed vector-space store — refusing. Fix whatever made '${targetModelId}' unavailable (e.g. ` +
-        `restore the ONNX model cache) and re-run migrateEmbeddings with the SAME targetModelId to ` +
-        `finish the rewrite, or restore a verified backup taken before this migration started.`,
+        `restore the ONNX model cache), then run \`monet repair --resume --apply --yes\` to finish ` +
+        `the same rewrite, or restore a verified backup taken before this migration started.`,
     );
     this.name = "EmbedderMigrationAbandonRefusedError";
   }
@@ -474,10 +464,8 @@ export class EmbedderMigrationAbandonUnsupportedError extends Error {
         `Monet older than the one that added prior-pin capture. Restoring the exact prior pin is ` +
         `impossible, and guessing from vector width alone is unsafe on a store already proven pin-aware ` +
         `(two different embedders can share the same width — e.g. the hashing tokenizer v1/v2 default ` +
-        `swap, both 256-dim). Finish the SAME migration (fix whatever made '${targetModelId}' unavailable ` +
-        `and re-run migrateEmbeddings with the identical targetModelId), restore a verified backup, or ` +
-        `call adoptEmbedderPin() once you have independently confirmed this store's true prior embedder ` +
-        `identity.`,
+        `swap, both 256-dim). Fix whatever made '${targetModelId}' unavailable and run ` +
+        `\`monet repair --resume --apply --yes\` to finish the same migration, or restore a verified backup.`,
     );
     this.name = "EmbedderMigrationAbandonUnsupportedError";
   }
@@ -6934,55 +6922,7 @@ export class MonetCore {
    * so doctor/repair tooling can report the complete live-width shape without throwing.
    */
   inspectEmbeddingWidths(): EmbeddingWidthInventory {
-    type StoredEmbeddingRow = { id: string; embedding: string };
-    const inspect = (rows: StoredEmbeddingRow[], excludeZero: boolean): {
-      dims: number[];
-      malformed: MalformedEmbeddingPopulation;
-    } => {
-      const dims = new Set<number>();
-      const malformedIds: string[] = [];
-      for (const row of rows) {
-        const embedding = parseFiniteEmbeddingJson(row.embedding);
-        if (embedding === null) {
-          malformedIds.push(row.id);
-          continue;
-        }
-        if (!excludeZero || !isZeroVector(embedding)) dims.add(embedding.length);
-      }
-      malformedIds.sort();
-      return {
-        dims: [...dims].sort((a, b) => a - b),
-        malformed: { count: malformedIds.length, sampleIds: malformedIds.slice(0, MALFORMED_EMBEDDING_SAMPLE_LIMIT) },
-      };
-    };
-    const nativeObservations = inspect(
-      this.enforcedNativeObservationRows(),
-      false,
-    );
-    const nativeConcepts = inspect(
-      this.enforcedNativeConceptRows(),
-      false,
-    );
-    const sourceObservations = inspect(
-      this.enforcedSourceObservationRows(),
-      true,
-    );
-    const sourceConcepts = inspect(
-      this.enforcedSourceConceptRows(),
-      true,
-    );
-    return {
-      observationDims: nativeObservations.dims,
-      conceptDims: nativeConcepts.dims,
-      sourceObservationDims: sourceObservations.dims,
-      sourceConceptDims: sourceConcepts.dims,
-      malformed: {
-        nativeObservations: nativeObservations.malformed,
-        nativeConcepts: nativeConcepts.malformed,
-        sourceObservations: sourceObservations.malformed,
-        sourceConcepts: sourceConcepts.malformed,
-      },
-    };
+    return toEmbeddingWidthInventory(inspectLiveEmbeddingPopulations(this.db));
   }
 
   /**
@@ -7263,9 +7203,8 @@ export class MonetCore {
         `dim:${dim}`,
         `This store has ${dim}-dimensional vectors but no recorded embedder pin, and ${dim} matches ` +
           `neither known legacy default (384 = ${LEGACY_ONNX_DEFAULT_MODEL_ID}, 256 = hashing tok=1). ` +
-          `Refusing to guess which embedder produced these vectors — this store needs a manual pin: ` +
-            `call adoptEmbedderPin() once you have independently confirmed the correct embedder, or ` +
-            `run 'monet doctor' to diagnose this store, or 'monet repair' to pin it for you.`,
+          `Refusing to guess which embedder produced these vectors. Run \`monet doctor\`, then preview ` +
+          `a repair with \`monet repair --target <onnx|hashing|exact-model-id>\`.`,
       );
     }
     // CAS (Codex review, PR #51, FIX D): two processes/instances opening the same pre-pin store
@@ -7321,12 +7260,9 @@ export class MonetCore {
           `${widths.sourceObservationDims.join(", ") || "none"}; active source concepts: ` +
           `${widths.sourceConceptDims.join(", ") || "none"}), with no recorded embedder ` +
           `pin. This can happen from the classic flip-flop (an ONNX model unavailable on one run, falling ` +
-          `back to hashing, available again later) or from a crashed/partial re-embed (e.g. ` +
-          `scripts/migrate-file-concept.ts interrupted after rewriting concepts.embedding but before ` +
-          `observations.embedding for the same concept, or vice versa). Refusing to guess which is ` +
-          `correct: run scripts/migrate-file-concept.ts to re-embed this store onto one consistent ` +
-          `model, call adoptEmbedderPin() once you have independently confirmed the correct embedder, ` +
-          `or run 'monet doctor' to diagnose this store, or 'monet repair' to fix it.`,
+          `back to hashing, available again later) or from a crashed/partial re-embed. Refusing to guess ` +
+          `which model is correct: run \`monet doctor\`, then preview a repair onto one consistent model ` +
+          `with \`monet repair --target <onnx|hashing|exact-model-id>\`.`,
       );
     }
     return dims[0];
@@ -10847,24 +10783,6 @@ function toContradiction(r: ContradictionRow): Contradiction {
 
 function embToJson(v: Float32Array): string {
   return JSON.stringify(Array.from(v));
-}
-
-/** Strict persisted-vector parser shared by diagnostics and hostile sync payload validation. */
-function parseFiniteEmbeddingJson(value: unknown): Float32Array | null {
-  if (typeof value !== "string") return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(parsed) || !parsed.every((element) => typeof element === "number" && Number.isFinite(element))) {
-    return null;
-  }
-  const converted = Float32Array.from(parsed);
-  if (converted.length !== parsed.length) return null;
-  for (const element of converted) if (!Number.isFinite(element)) return null;
-  return converted;
 }
 
 function jsonToEmb(s: string): Float32Array {

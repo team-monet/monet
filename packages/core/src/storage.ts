@@ -16,7 +16,10 @@
  * its own port AND its own schema setup; that is out of scope for the shipped engine.
  */
 import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { chmod, link, lstat, stat, unlink } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 
 /** The result of a write (INSERT/UPDATE/DELETE) — mirrors better-sqlite3's RunResult. */
 export interface RunResult {
@@ -49,6 +52,41 @@ export class StorageExclusiveLockError extends Error {
 
   /** Present when cleanup could not verify restored shared access after the acquisition failure. */
   readonly cleanupError?: unknown;
+}
+
+export interface VerifiedBackupResult {
+  sourcePath: string;
+  path: string;
+  createdAt: number;
+  bytes: number;
+  quickCheck: "ok";
+}
+
+export class VerifiedBackupDestinationExistsError extends Error {
+  constructor(public readonly destinationPath: string) {
+    super(`Refusing to overwrite existing backup destination '${destinationPath}'.`);
+    this.name = "VerifiedBackupDestinationExistsError";
+  }
+}
+
+export class VerifiedBackupVerificationError extends Error {
+  constructor(
+    public readonly partialPath: string,
+    public readonly check: string[],
+  ) {
+    super(`SQLite backup verification failed for '${partialPath}': PRAGMA quick_check returned ${check.join("; ") || "no result"}.`);
+    this.name = "VerifiedBackupVerificationError";
+  }
+}
+
+async function pathEntryExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 /**
@@ -84,12 +122,14 @@ export interface StoragePort {
 export class BetterSqlitePort implements StoragePort {
   private db: Database.Database;
   private readonly memoryOnly: boolean;
+  private readonly dbPath: string;
   private ownsExclusiveLock = false;
   private uncertainExclusiveLockError?: StorageExclusiveLockError;
 
   constructor(path = ":memory:") {
     this.memoryOnly = path === ":memory:";
-    this.db = new Database(path);
+    this.dbPath = this.memoryOnly ? path : resolve(path);
+    this.db = new Database(this.dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
   }
@@ -116,6 +156,98 @@ export class BetterSqlitePort implements StoragePort {
 
   inTransaction(): boolean {
     return this.db.inTransaction;
+  }
+
+  /** Atomically publish without replacing any directory entry created by another actor. */
+  private async publishVerifiedBackup(partialPath: string, destinationPath: string): Promise<void> {
+    try {
+      await link(partialPath, destinationPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new VerifiedBackupDestinationExistsError(destinationPath);
+      }
+      throw error;
+    }
+    await unlink(partialPath);
+  }
+
+  /**
+   * Create a WAL-consistent repair backup while retaining exclusive ownership for the caller's
+   * subsequent MonetCore construction/mutation. Every failure removes only this call's unique
+   * partial file and releases ownership; an existing destination is never overwritten.
+   */
+  async createVerifiedBackup(destination: string): Promise<VerifiedBackupResult> {
+    if (this.memoryOnly) throw new Error("Verified repair backups require a file-backed SQLite store.");
+    const destinationPath = resolve(destination);
+    const partialPath = join(
+      dirname(destinationPath),
+      `.${basename(destinationPath)}.partial-${process.pid}-${randomUUID()}`,
+    );
+    let primaryError: unknown;
+    try {
+      this.acquireExclusiveOwnership();
+      if (await pathEntryExists(destinationPath)) throw new VerifiedBackupDestinationExistsError(destinationPath);
+
+      // better-sqlite3's online backup reads through this same connection and includes committed WAL
+      // frames while the connection's retained EXCLUSIVE ownership prevents external mutation.
+      await this.db.backup(partialPath);
+      const verification = new Database(partialPath, { readonly: true, fileMustExist: true });
+      let check: string[];
+      try {
+        check = (verification.pragma("quick_check") as Array<{ quick_check: string }>).map((row) => row.quick_check);
+      } finally {
+        verification.close();
+      }
+      // A readonly open of a WAL-mode backup can materialize empty sidecars beside the unique
+      // partial. They belong to this partial, not the final backup, and must not leak past rename.
+      for (const sidecarPath of [`${partialPath}-wal`, `${partialPath}-shm`]) {
+        try {
+          await unlink(sidecarPath);
+        } catch (cleanupError) {
+          if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") throw cleanupError;
+        }
+      }
+      if (check.length !== 1 || check[0] !== "ok") {
+        throw new VerifiedBackupVerificationError(partialPath, check);
+      }
+      await chmod(partialPath, 0o600);
+      const { size: bytes } = await stat(partialPath);
+      // Hard-link publication is atomic and no-clobber: unlike POSIX rename(), it fails with EEXIST
+      // if a file, symlink, or directory wins the race after the initial refusal check.
+      await this.publishVerifiedBackup(partialPath, destinationPath);
+      return {
+        sourcePath: this.dbPath,
+        path: destinationPath,
+        createdAt: Date.now(),
+        bytes,
+        quickCheck: "ok",
+      };
+    } catch (error) {
+      primaryError = error;
+      const partialCleanupErrors: unknown[] = [];
+      for (const ownedPath of [partialPath, `${partialPath}-wal`, `${partialPath}-shm`]) {
+        try {
+          await unlink(ownedPath);
+        } catch (cleanupError) {
+          if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") partialCleanupErrors.push(cleanupError);
+        }
+      }
+      let releaseError: unknown;
+      try {
+        this.releaseExclusiveOwnership();
+      } catch (cleanupError) {
+        releaseError = cleanupError;
+      }
+      const cleanupErrors = [...partialCleanupErrors, releaseError].filter((value) => value !== undefined);
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [primaryError, ...cleanupErrors],
+          "Verified SQLite backup failed and cleanup could not be completed.",
+          { cause: primaryError },
+        );
+      }
+      throw error;
+    }
   }
 
   acquireExclusiveOwnership(): void {

@@ -169,6 +169,16 @@ export const LEGACY_ONNX_DEFAULT_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
 const RECOGNIZED_ONNX_PIN_FORMAT = /[/\\]/;
 const HASHING_PIN_FORMAT = /^hashing:dim=(\d+):tok=(\d+)$/;
 
+/** Parse the width/version identity encoded by a canonical hashing embedder pin. */
+export function parseHashingEmbedderPin(modelId: string): { dimension: number; tokenizerVersion: number } | null {
+  const match = modelId.match(HASHING_PIN_FORMAT);
+  if (!match) return null;
+  const dimension = Number(match[1]);
+  const tokenizerVersion = Number(match[2]);
+  if (!Number.isSafeInteger(dimension) || !Number.isSafeInteger(tokenizerVersion)) return null;
+  return { dimension, tokenizerVersion };
+}
+
 /**
  * Thrown by instantiateEmbedderForPin when a store's pinned embedder cannot be satisfied: the pin
  * names a hashing tokenizer version this build doesn't implement, an ONNX model that failed to
@@ -203,18 +213,16 @@ export class UnsatisfiableEmbedderError extends Error {
  * recognize — throws UnsatisfiableEmbedderError and the store must not serve.
  */
 export async function instantiateEmbedderForPin(modelId: string): Promise<EmbeddingProvider> {
-  const hashingMatch = modelId.match(HASHING_PIN_FORMAT);
-  if (hashingMatch) {
-    const dim = Number(hashingMatch[1]);
-    const tokenizerVersion = Number(hashingMatch[2]);
+  const hashingPin = parseHashingEmbedderPin(modelId);
+  if (hashingPin) {
     try {
-      return new HashingEmbeddingProvider(dim, tokenizerVersion);
+      return new HashingEmbeddingProvider(hashingPin.dimension, hashingPin.tokenizerVersion);
     } catch (e) {
       throw new UnsatisfiableEmbedderError(
         modelId,
         `This store is pinned to '${modelId}', but this Monet build does not implement that hashing ` +
           `tokenizer version. The store may have been created by a NEWER version of Monet — upgrade ` +
-          `monet-core and try again.`,
+          `the shipped \`@team-monet/monet\` package and try again.`,
         { cause: e },
       );
     }
@@ -231,7 +239,7 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
         modelId,
         `This store is pinned to '${modelId}', but this Monet instance could not load that model ` +
           `(${why}). The store may have been created by a NEWER version of Monet, or the model failed ` +
-          `to download — upgrade monet-core and/or check network access.`,
+          `to download — upgrade the shipped \`@team-monet/monet\` package and/or check network access.`,
         { cause: e },
       );
     }
@@ -265,6 +273,6 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
   throw new UnsatisfiableEmbedderError(
     modelId,
     `This store is pinned to an unrecognized embedder '${modelId}'. The store may have been created ` +
-      `by a NEWER version of Monet — upgrade monet-core to open it.`,
+      `by a NEWER version of Monet — upgrade the shipped \`@team-monet/monet\` package to open it.`,
   );
 }

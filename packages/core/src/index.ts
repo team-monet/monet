@@ -56,7 +56,31 @@ export type {
   MalformedEmbeddingInventory,
   MalformedEmbeddingPopulation,
 } from "./engine";
-export { BetterSqlitePort, StorageExclusiveLockError, readStoredEmbedderPin, readStoredVectorPresence } from "./storage";
+export {
+  BetterSqlitePort,
+  StorageExclusiveLockError,
+  VerifiedBackupDestinationExistsError,
+  VerifiedBackupVerificationError,
+  readStoredEmbedderPin,
+  readStoredVectorPresence,
+} from "./storage";
+export type { VerifiedBackupResult } from "./storage";
+export { inspectStoredEmbedderState, StoredEmbedderStateDiagnosticError } from "./diagnostics";
+export type {
+  StoredDatabaseIntegrity,
+  StoredEmbedderDiagnosticFailureReason,
+  StoredEmbedderMigration,
+  StoredEmbedderPin,
+  StoredEmbedderSafetyAssessment,
+  StoredEmbedderStateInspection,
+} from "./diagnostics";
+export type {
+  EmbeddingPopulationName,
+  LiveEmbeddingPopulationInspection,
+  StoredEmbeddingPopulationInspection,
+  StoredEmbeddingPopulations,
+} from "./embedding-state";
+export { MONET_SCHEMA_VERSION } from "./schema-version";
 export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError } from "./store-embedder";
 export {
   DEFAULT_SOURCE_SCANNER_LIMITS,
@@ -159,7 +183,7 @@ export { renderOverview } from "./render-overview";
 export { extractEntities } from "./extract-entities";
 export type { ExtractedEntity, EntityKind } from "./extract-entities";
 export type { GraphParams } from "./graph";
-export { HashingEmbeddingProvider, cosine } from "./embedding";
+export { HashingEmbeddingProvider, cosine, validateEmbeddingProviderOutput } from "./embedding";
 export type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
 export {
   OnnxEmbeddingProvider,
