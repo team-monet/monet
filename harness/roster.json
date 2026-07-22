@@ -34,8 +34,8 @@
       "mode": "subagent",
       "prompt": "agents/analyst.md",
       "touchesMonet": false,
-      "model": "sonnet",
-      "description": "Use PROACTIVELY for architecture and planning under constraints: assess feasibility, risks, and the approach before implementation. Also use when product scope or acceptance criteria are unclear: it surfaces the ambiguity back to the lead to take to the user — it does not decide scope. Does not write code."
+      "model": "opus",
+      "description": "Use when architecture, scope, contracts, cross-reference closure, or risk needs a decision-complete plan before implementation. Produces a proportionate invariant-to-acceptance closure matrix and returns unresolved scope or contract questions to the lead for user approval. Skip for already-clear routine work. Does not write code."
     },
     {
       "name": "mechanic",
@@ -52,8 +52,8 @@
       "mode": "subagent",
       "prompt": "agents/developer.md",
       "touchesMonet": false,
-      "model": "sonnet",
-      "description": "Use PROACTIVELY to implement and refactor code, add tests, and run local validation, once the approach and the user's go-ahead are clear."
+      "model": "opus",
+      "description": "Use to implement one complete ratified slice, map code and tests to its invariants, self-verify, and return compact acceptance evidence once the approach and the user's go-ahead are clear."
     },
     {
       "name": "tester",
@@ -62,7 +62,7 @@
       "prompt": "agents/tester.md",
       "touchesMonet": false,
       "model": "sonnet",
-      "description": "Use PROACTIVELY to verify a change: design and run tests, reproduce regressions, and judge whether it actually works."
+      "description": "Use in the slice's single combined verification gate when runtime evidence is needed: design and run tests, reproduce regressions, and group failures by root invariant and sibling closure."
     },
     {
       "name": "reviewer",
@@ -71,7 +71,7 @@
       "prompt": "agents/reviewer.md",
       "touchesMonet": false,
       "model": "opus",
-      "description": "Use PROACTIVELY after writing or changing code to review for correctness, security, maintainability, and basic operational risk (SLOs, retries, observability). Flags live incident or release-readiness concerns to the lead. Returns findings by severity; does not mutate PRs."
+      "description": "Use in the slice's single combined verification gate to review correctness, maintainability, compatibility, and operational risk. Groups findings by root invariant and sibling closure; flags live-incident or release-readiness concerns to the lead and does not mutate PRs."
     },
     {
       "name": "auditor",
@@ -80,7 +80,7 @@
       "prompt": "agents/auditor.md",
       "touchesMonet": false,
       "model": "opus",
-      "description": "Use PROACTIVELY as the independent second review on high-risk changes, or when the lead escalates a surprising diff: audits the diff against the codebase with NO design context — data-model closure, sibling precedents, advertised contracts, invariant bypass, bounds, determinism. Pairs with reviewer (who audits against intent); brief it with only the diff location."
+      "description": "Use exceptionally for data-loss risk, auth/security, public contracts, migrations/data-model closure, or a surprising diff. Audits only the diff location against the codebase with NO design context — never add it as automatic ceremony."
     },
     {
       "name": "security",
