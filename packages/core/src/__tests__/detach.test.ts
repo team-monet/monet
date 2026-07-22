@@ -1152,9 +1152,8 @@ describe("detach — reembedConceptObservations closes the stale-vector reintrod
       // are instance methods keyed off `this.embedder` — swap it in place, matching how the
       // migration script's own single long-lived embedder instance works.
       (c as unknown as { embedder: EmbeddingProvider }).embedder = newEmbedder;
-      expect(await c.reembedConcept(a.conceptId)).toBe(true);
-      const touched = await c.reembedConceptObservations(a.conceptId);
-      expect(touched).toBe(2);
+      const migration = await c.migrateEmbeddings({ targetModelId: "new-model" });
+      expect(migration.failures).toEqual([]);
 
       // Both the concept's own row AND every observation now carry the NEW model's vector.
       const conceptRow = db.prepare(`SELECT embedding FROM concepts WHERE id=?`).get(a.conceptId) as { embedding: string };

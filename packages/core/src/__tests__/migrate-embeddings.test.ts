@@ -6,6 +6,9 @@ import Database from "better-sqlite3";
 import {
   EmbedderMigrationFailedError,
   EmbedderMigrationIncompleteError,
+  EmbedderMigrationReentryError,
+  EmbedderRepairOwnershipError,
+  MalformedEmbeddingStoreError,
   MonetCore,
   type EmbeddingMigrationPhase,
   type EmbeddingMigrationProgress,
@@ -19,6 +22,8 @@ class SpaceEmbedder implements EmbeddingProvider {
   readonly dim = 4;
   readonly failures = new Set<string>();
   readonly calls: string[] = [];
+  readonly wrongWidths = new Set<string>();
+  readonly nonfinite = new Set<string>();
 
   constructor(
     readonly modelId: string,
@@ -29,6 +34,12 @@ class SpaceEmbedder implements EmbeddingProvider {
     this.calls.push(text);
     if ([...this.failures].some((needle) => text.includes(needle))) {
       throw new Error(`injected embedding failure for ${text}`);
+    }
+    if ([...this.wrongWidths].some((needle) => text.includes(needle))) {
+      return new Float32Array(this.dim - 1);
+    }
+    if ([...this.nonfinite].some((needle) => text.includes(needle))) {
+      return new Float32Array([this.space, Number.NaN, 0, 0]);
     }
     let checksum = 0;
     for (const char of text) checksum = (checksum + char.codePointAt(0)!) % 997;
@@ -209,6 +220,60 @@ function stableRows(db: RawDb): {
 }
 
 describe("MonetCore.migrateEmbeddings", () => {
+  it("keeps every public mutation family observational during dry-run callbacks while committed receipts remain no-op successes", async () => {
+    const target = new SpaceEmbedder("test:space:target", 2);
+    const core = new MonetCore(":memory:", { embedder: target, tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const committed = await core.store("durable idempotent receipt", {
+      resolution: "forceNew",
+      operationId: "migration-reentry-receipt",
+    });
+    const blocked: string[] = [];
+    let receiptRetry: Promise<unknown> | undefined;
+    let freshStore: Promise<unknown> | undefined;
+    let repairAttempt: Promise<unknown> | undefined;
+    try {
+      const report = await core.migrateEmbeddings({
+        targetModelId: target.modelId,
+        dryRun: true,
+        onProgress(event) {
+          if (event.phase !== "preflight") return;
+          const mutations: Array<[string, () => unknown]> = [
+            ["circle/archive", () => core.archiveCircle("default")],
+            ["circle/unarchive", () => core.unarchiveCircle("default")],
+            ["circle/rename", () => core.renameCircle("default", "other")],
+            ["graph/dismiss", () => core.dismissPossibleDuplicate("missing-a", "missing-b")],
+            ["graph/dedup", () => core.batchDedup([])],
+            ["lifecycle/retire", () => core.retireConcept("missing")],
+            ["pin/adopt", () => core.adoptEmbedderPin()],
+            ["source/create", () => core.createSource({} as never)],
+            ["source/run", () => core.beginSourceRun({} as never)],
+            ["first-block/promote", () => core.promoteToFirstBlock("missing", "summary", "default")],
+          ];
+          for (const [name, mutate] of mutations) {
+            expect(mutate, name).toThrow(EmbedderMigrationReentryError);
+            blocked.push(name);
+          }
+          repairAttempt = core.reembedConcept(committed.conceptId);
+          void repairAttempt.catch(() => undefined);
+          receiptRetry = core.store("ignored retry content", { operationId: "migration-reentry-receipt" });
+          freshStore = core.store("must not queue a fresh write", { operationId: "migration-reentry-fresh" });
+          void freshStore.catch(() => undefined);
+        },
+      });
+      expect(report.failures).toEqual([]);
+      expect(blocked).toHaveLength(10);
+      await expect(receiptRetry).resolves.toMatchObject({
+        conceptId: committed.conceptId,
+        observationId: committed.observationId,
+      });
+      await expect(freshStore).rejects.toBeInstanceOf(EmbedderMigrationReentryError);
+      await expect(repairAttempt).rejects.toBeInstanceOf(EmbedderRepairOwnershipError);
+      expect((dbOf(core).prepare(`SELECT COUNT(*) AS n FROM ingest_operations`).get() as { n: number }).n).toBe(1);
+    } finally {
+      core.close();
+    }
+  });
+
   it("migrates the heterogeneous persisted-vector inventory and derives native graph strictly last", async () => {
     await withTempDb(async (dbPath) => {
       const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
@@ -225,20 +290,20 @@ describe("MonetCore.migrateEmbeddings", () => {
       );
       const execution: string[] = [];
       const methodNames = [
-        "reembedConcept", "reembedConceptObservations", "reembedSourceConcept", "reembedSourceChunkObservations", "reembedWorkstream",
+        "reembedConcept", "writePreparedNativeObservations", "reembedSourceConcept", "writePreparedSourceObservations", "reembedWorkstream",
       ] as const;
       for (const name of methodNames) {
         const original = (core as any)[name].bind(core);
-        (core as any)[name] = async (id: string) => {
-          const result = await original(id);
-          execution.push(`vector:${name}:${id}`);
+        (core as any)[name] = async (...args: unknown[]) => {
+          const result = await original(...args);
+          execution.push(`vector:${name}`);
           return result;
         };
       }
-      const originalGraph = (core as any).rederiveNativeConceptGraph.bind(core);
-      (core as any).rederiveNativeConceptGraph = (id: string) => {
-        execution.push(`graph:${id}`);
-        return originalGraph(id);
+      const originalGraph = (core as any).replaceNativeRelatedGraph.bind(core);
+      (core as any).replaceNativeRelatedGraph = (...args: unknown[]) => {
+        execution.push("graph:replace");
+        return originalGraph(...args);
       };
       const progress: EmbeddingMigrationProgress[] = [];
 
@@ -251,7 +316,7 @@ describe("MonetCore.migrateEmbeddings", () => {
         expect(report.failures).toEqual([]);
         expect(report.phases).toMatchObject({
           "native-concepts": { total: 3, completed: 3, failed: 0 },
-          "native-observations": { total: 3, completed: 3, failed: 0 },
+          "native-observations": { total: 4, completed: 4, failed: 0 },
           "source-concepts": { total: 1, completed: 1, failed: 0 },
           // seedFixture's source concept is created via a direct storeSource call, bypassing the
           // ledger's staging/publish pipeline entirely — it has no source_chunks row at all, so
@@ -289,23 +354,18 @@ describe("MonetCore.migrateEmbeddings", () => {
         ]) {
           expect(vector(db, "observations", id)).toEqual(expected(target, observationContent.get(id)!));
         }
-        // Unchanged by migration — NOT because chunk observations are exempt (they aren't: see
-        // reembedSourceChunkObservations), but because this specific observation has no
-        // source_chunks row at all (seedFixture bypasses the ledger pipeline), so it is invisible
-        // to that phase's active-chunk query, exactly like it would be invisible to
-        // scoreSourceConcepts' own read at retrieval time.
-        expect(vector(db, "observations", fixture.sourceObservation)).toEqual(placeholderBefore);
+        // Untracked source observations remain live by conservative inventory policy and migrate.
+        expect(vector(db, "observations", fixture.sourceObservation)).toEqual(
+          expected(target, "source observation placeholder"),
+        );
+        expect(vector(db, "observations", fixture.sourceObservation)).not.toEqual(placeholderBefore);
         expect(stableRows(db)).toEqual(stableBefore);
 
         const graphEvents = execution.map((event, index) => ({ event, index })).filter(({ event }) => event.startsWith("graph:"));
         const lastVectorIndex = execution.reduce((last, event, index) => event.startsWith("vector:") ? index : last, -1);
-        expect(graphEvents).toHaveLength(2);
+        expect(graphEvents).toHaveLength(1);
         expect(graphEvents.every(({ index }) => index > lastVectorIndex)).toBe(true);
-        expect(graphEvents.map(({ event }) => event)).toEqual([
-          `graph:${fixture.activeA}`,
-          `graph:${fixture.activeB}`,
-        ].sort());
-        expect(execution).not.toContain(`graph:${fixture.retired}`);
+        expect(graphEvents.map(({ event }) => event)).toEqual(["graph:replace"]);
         expect(db.prepare(`SELECT 1 FROM concept_entities WHERE concept_id = ? LIMIT 1`).get(fixture.activeA)).toBeTruthy();
         expect(db.prepare(`SELECT 1 FROM concept_entities WHERE concept_id = ? LIMIT 1`).get(fixture.retired)).toBeUndefined();
 
@@ -315,6 +375,63 @@ describe("MonetCore.migrateEmbeddings", () => {
         ];
         const observed = progress.map((event) => phaseOrder.indexOf(event.phase));
         expect(observed).toEqual([...observed].sort((a, b) => a - b));
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  it("refreshes disputed related state while preserving every non-model graph byte and excluding retired graph state", async () => {
+    await withTempDb(async (dbPath) => {
+      const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
+      const setup = new MonetCore(dbPath, { embedder: oldEmbedder, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const a = await setup.store("AuthService and PostgreSQL share the billing path.", { resolution: "forceNew" });
+      const b = await setup.store("AuthService and PostgreSQL protect invoice writes.", { resolution: "forceNew" });
+      const retired = await setup.store("Retired graph state must not be refreshed.", { resolution: "forceNew" });
+      setup.flagContradiction(a.conceptId, { detail: "keep this concept disputed during migration" });
+      setup.retireConcept(retired.conceptId);
+      const setupDb = dbOf(setup);
+      (setup as any).upsertEdge(a.conceptId, b.conceptId, "follows", 0.37, "fixture", "default");
+      (setup as any).upsertEdgeBoth(a.conceptId, b.conceptId, "possible_duplicate_of", 0.91, "fixture", "default");
+      setup.dismissPossibleDuplicate(a.conceptId, b.conceptId, "migration-reviewer");
+      (setup as any).upsertEdge(retired.conceptId, retired.conceptId, "follows", 0.19, "fixture", "default");
+      setupDb.prepare(`DELETE FROM memory_edge_components WHERE type='related' AND (src_id=? OR dst_id=?)`).run(a.conceptId, a.conceptId);
+      setupDb.prepare(`DELETE FROM memory_edge WHERE type='related' AND (src_id=? OR dst_id=?)`).run(a.conceptId, a.conceptId);
+      (setup as any).upsertEdgeBoth(a.conceptId, b.conceptId, "related", 0.123, "stale-model", "default");
+      const preservedSnapshot = (database: RawDb) => JSON.stringify({
+        edges: database.prepare(`SELECT * FROM memory_edge WHERE type!='related' ORDER BY id`).all(),
+        components: database.prepare(`SELECT * FROM memory_edge_components WHERE type!='related' ORDER BY src_id,dst_id,type,scope,writer_id`).all(),
+        entities: database.prepare(`SELECT * FROM entities ORDER BY key,scope`).all(),
+        memberships: database.prepare(`SELECT * FROM concept_entities ORDER BY concept_id,entity_key,scope`).all(),
+      });
+      const before = preservedSnapshot(setupDb);
+      setup.close();
+
+      const target = new SpaceEmbedder("test:space:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target, tauAttach: 1.1, tauAmbiguous: 1.1, edgeSimMin: 0 });
+      const db = dbOf(core);
+      const graphIds: string[] = [];
+      try {
+        const report = await core.migrateEmbeddings({
+          targetModelId: target.modelId,
+          onProgress: (event) => { if (event.phase === "native-graph" && event.currentId) graphIds.push(event.currentId); },
+        });
+        expect(report.phases["native-graph"]).toEqual({ total: 2, completed: 2, failed: 0 });
+        expect(graphIds.sort()).toEqual([a.conceptId, b.conceptId].sort());
+        expect(graphIds).not.toContain(retired.conceptId);
+        expect((db.prepare(`SELECT status FROM concepts WHERE id=?`).get(a.conceptId) as { status: string }).status).toBe("disputed");
+        expect(preservedSnapshot(db)).toBe(before);
+        const refreshed = db.prepare(
+          `SELECT weight,origin FROM memory_edge WHERE type='related' AND ((src_id=? AND dst_id=?) OR (src_id=? AND dst_id=?)) ORDER BY id`,
+        ).all(a.conceptId, b.conceptId, b.conceptId, a.conceptId) as Array<{ weight: number; origin: string }>;
+        // The target model may legitimately put the pair below its related threshold. Either way,
+        // the stale model rows/components are gone and any surviving relation is target-derived.
+        expect(refreshed).not.toContainEqual({ weight: 0.123, origin: "stale-model" });
+        expect(db.prepare(`SELECT 1 FROM memory_edge_components WHERE type='related' AND origin='stale-model' LIMIT 1`).get()).toBeUndefined();
+        const duplicateRows = db.prepare(
+          `SELECT dismissed_by FROM memory_edge WHERE type='possible_duplicate_of' AND ((src_id=? AND dst_id=?) OR (src_id=? AND dst_id=?)) ORDER BY id`,
+        ).all(a.conceptId, b.conceptId, b.conceptId, a.conceptId) as Array<{ dismissed_by: string | null }>;
+        expect(duplicateRows).toEqual([{ dismissed_by: "migration-reviewer" }, { dismissed_by: "migration-reviewer" }]);
       } finally {
         core.close();
       }
@@ -337,7 +454,7 @@ describe("MonetCore.migrateEmbeddings", () => {
         expect(report.failures).toEqual([]);
         expect(report.phases).toMatchObject({
           "native-concepts": { total: 3, completed: 3, failed: 0 },
-          "native-observations": { total: 3, completed: 3, failed: 0 },
+          "native-observations": { total: 4, completed: 4, failed: 0 },
           "source-concepts": { total: 1, completed: 1, failed: 0 },
           "source-chunk-observations": { total: 1, completed: 1, failed: 0 },
           workstreams: { total: 1, completed: 1, failed: 0 },
@@ -360,6 +477,73 @@ describe("MonetCore.migrateEmbeddings", () => {
     });
   });
 
+  it("blocks synchronous abandon from onProgress('lock') for the full in-process migration run", async () => {
+    await withTempDb(async (dbPath) => {
+      const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
+      const fixture = await seedFixture(dbPath, oldEmbedder);
+      const before = new Database(dbPath);
+      const oldVector = JSON.parse((before.prepare(`SELECT embedding FROM concepts WHERE id = ?`).get(fixture.activeA) as { embedding: string }).embedding);
+      before.close();
+
+      const target = new SpaceEmbedder("test:space:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target });
+      let blocked = false;
+      try {
+        const report = await core.migrateEmbeddings({
+          targetModelId: target.modelId,
+          onProgress(event) {
+            if (event.phase === "lock") {
+              expect(() => core.abandonEmbedderMigration()).toThrow(/migrateEmbeddings\(\) is active/i);
+              blocked = true;
+            }
+          },
+        });
+        expect(report.failures).toEqual([]);
+        expect(blocked).toBe(true);
+        expect(migrationRow(dbOf(core))).toBeUndefined();
+        expect(pinRow(dbOf(core)).embedder_model_id).toBe(target.modelId);
+        expect(vector(dbOf(core), "concepts", fixture.activeA)).not.toEqual(oldVector);
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  it("blocks a queued microtask abandon after onProgress('lock') until the outer migration completes", async () => {
+    await withTempDb(async (dbPath) => {
+      const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
+      const fixture = await seedFixture(dbPath, oldEmbedder);
+      const target = new SpaceEmbedder("test:space:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target });
+      let abandonAttempt: Promise<void> | undefined;
+      let abandonError: unknown;
+      try {
+        const report = await core.migrateEmbeddings({
+          targetModelId: target.modelId,
+          onProgress(event) {
+            if (event.phase === "lock") {
+              abandonAttempt = new Promise<void>((resolve) => {
+                queueMicrotask(() => {
+                  try { core.abandonEmbedderMigration(); } catch (error) { abandonError = error; }
+                  resolve();
+                });
+              });
+            }
+          },
+        });
+        await abandonAttempt;
+        expect(abandonError).toBeInstanceOf(Error);
+        expect((abandonError as Error).message).toMatch(/migrateEmbeddings\(\) is active/i);
+        expect(report.failures).toEqual([]);
+        expect(migrationRow(dbOf(core))).toBeUndefined();
+        expect(pinRow(dbOf(core)).embedder_model_id).toBe(target.modelId);
+        expect(vector(dbOf(core), "concepts", fixture.activeA)[0]).toBe(2);
+      } finally {
+        core.close();
+      }
+    });
+  });
+
   it("retains fail-closed recovery state after an item failure and converges on same-target retry", async () => {
     await withTempDb(async (dbPath) => {
       const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
@@ -367,12 +551,6 @@ describe("MonetCore.migrateEmbeddings", () => {
       const failing = new SpaceEmbedder("test:space:target", 2);
       failing.failures.add("second active concept");
       const first = new MonetCore(dbPath, { embedder: failing });
-      const graphIds: string[] = [];
-      const originalGraph = (first as any).rederiveNativeConceptGraph.bind(first);
-      (first as any).rederiveNativeConceptGraph = (id: string) => {
-        graphIds.push(id);
-        return originalGraph(id);
-      };
       let caught: unknown;
       try {
         try {
@@ -390,8 +568,7 @@ describe("MonetCore.migrateEmbeddings", () => {
           }),
         ]));
         expect(failure.report.phases["native-concepts"]).toEqual({ total: 3, completed: 3, failed: 1 });
-        expect(failure.report.phases["native-graph"]).toEqual({ total: 1, completed: 1, failed: 0 });
-        expect(graphIds).toEqual([fixture.activeA]);
+        expect(failure.report.phases["native-graph"]).toEqual({ total: 2, completed: 0, failed: 0 });
         expect(migrationRow(dbOf(first))).toEqual({ target_model_id: failing.modelId });
         await expect(first.search("must stay closed")).rejects.toBeInstanceOf(EmbedderMigrationIncompleteError);
         await expect(first.ensureEmbedderPin()).rejects.toBeInstanceOf(EmbedderMigrationIncompleteError);
@@ -524,4 +701,171 @@ describe("MonetCore.migrateEmbeddings", () => {
       }
     });
   });
+
+  it("covers orphan native, untracked source, and active missing-concept source observations while excluding dead source residue", async () => {
+    await withTempDb(async (dbPath) => {
+      const old = new SpaceEmbedder("test:coverage:old", 1);
+      const setup = new MonetCore(dbPath, { embedder: old });
+      const db0 = dbOf(setup);
+      const insertObservation = (id: string, content: string, kind: string) => db0.prepare(
+        `INSERT INTO observations (id, content, embedding, author_agent_id, kind, concept_id) VALUES (?, ?, ?, 'fixture', ?, NULL)`,
+      ).run(id, content, JSON.stringify(Array.from(old.embed(content))), kind);
+      insertObservation("orphan-native", "orphan native coverage", "statement");
+      insertObservation("untracked-source", "untracked source coverage", "source");
+      insertObservation("missing-concept-source", "missing concept source coverage", "source");
+      insertObservation("dead-source", "dead source residue", "source");
+      const insertChunk = (id: string, observationId: string, lifecycle: string, conceptId: string | null) => db0.prepare(
+        `INSERT INTO source_chunks (
+           source_id, run_id, snapshot_id, config_version, binding_id, binding_generation, operation_id,
+           relative_path, heading_path_json, occurrence, segment_index, document_sequence, content_hash,
+           ingest_fingerprint, metadata_json, source_ref, content, concept_id, observation_id,
+           predecessor_observation_id, write_state, lifecycle
+         ) VALUES ('fixture-source', ?, 'snapshot', 1, ?, 1, ?, 'a.md', '[]', 1, 1, 1,
+                   'hash', 'fingerprint', '{}', 'source://fixture', 'content', ?, ?, NULL, 'committed', ?)`,
+      ).run(id, id, `op-${id}`, conceptId, observationId, lifecycle);
+      insertChunk("missing-active", "missing-concept-source", "active", "missing-concept");
+      insertChunk("dead", "dead-source", "superseded", "missing-concept");
+      const deadBefore = vector(db0, "observations", "dead-source");
+      setup.close();
+
+      const target = new SpaceEmbedder("test:coverage:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target });
+      try {
+        const report = await core.migrateEmbeddings({ targetModelId: target.modelId });
+        expect(report.phases["native-observations"].total).toBe(1);
+        expect(report.phases["source-chunk-observations"].total).toBe(2);
+        expect(vector(dbOf(core), "observations", "orphan-native")).toEqual(expected(target, "orphan native coverage"));
+        expect(vector(dbOf(core), "observations", "untracked-source")).toEqual(expected(target, "untracked source coverage"));
+        expect(vector(dbOf(core), "observations", "missing-concept-source")).toEqual(expected(target, "missing concept source coverage"));
+        expect(vector(dbOf(core), "observations", "dead-source")).toEqual(deadBefore);
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  it("keeps related graph untouched on pregraph proof failure and keeps the sentinel on late final-proof corruption", async () => {
+    await withTempDb(async (dbPath) => {
+      const old = new SpaceEmbedder("test:proof:old", 1);
+      const fixture = await seedFixture(dbPath, old);
+      const target = new SpaceEmbedder("test:proof:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target, edgeSimMin: 0, tauAttach: 1.1 });
+      const db = dbOf(core);
+      const relatedSnapshot = () => JSON.stringify({
+        edges: db.prepare(`SELECT * FROM memory_edge WHERE type='related' ORDER BY id`).all(),
+        components: db.prepare(`SELECT * FROM memory_edge_components WHERE type='related' ORDER BY src_id,dst_id,writer_id`).all(),
+      });
+      const before = relatedSnapshot();
+      const originalWorkstream = (core as any).reembedWorkstream.bind(core);
+      (core as any).reembedWorkstream = async (...args: unknown[]) => {
+        const result = await originalWorkstream(...args);
+        db.prepare(`UPDATE observations SET embedding='[1]' WHERE id=?`).run(fixture.currentObservation);
+        return result;
+      };
+      try {
+        await expect(core.migrateEmbeddings({ targetModelId: target.modelId })).rejects.toBeInstanceOf(EmbedderMigrationFailedError);
+        expect(relatedSnapshot()).toBe(before);
+        expect(migrationRow(db)).toEqual({ target_model_id: target.modelId });
+      } finally {
+        core.close();
+      }
+    });
+
+    await withTempDb(async (dbPath) => {
+      const old = new SpaceEmbedder("test:proof-late:old", 1);
+      const fixture = await seedFixture(dbPath, old);
+      const target = new SpaceEmbedder("test:proof-late:target", 2);
+      const core = new MonetCore(dbPath, { embedder: target, edgeSimMin: 0, tauAttach: 1.1 });
+      const db = dbOf(core);
+      const originalReplace = (core as any).replaceNativeRelatedGraph.bind(core);
+      (core as any).replaceNativeRelatedGraph = (...args: unknown[]) => {
+        const result = originalReplace(...args);
+        db.prepare(`UPDATE observations SET embedding='[null]' WHERE id=?`).run(fixture.currentObservation);
+        return result;
+      };
+      try {
+        await expect(core.migrateEmbeddings({ targetModelId: target.modelId })).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
+        expect(migrationRow(db)).toEqual({ target_model_id: target.modelId });
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  it("rejects non-finite output after a valid migration preflight without persisting JSON null", async () => {
+    await withTempDb(async (dbPath) => {
+      const old = new SpaceEmbedder("test:nonfinite:old", 1);
+      const fixture = await seedFixture(dbPath, old);
+      const target = new SpaceEmbedder("test:nonfinite:target", 2);
+      target.nonfinite.add("first observation");
+      const core = new MonetCore(dbPath, { embedder: target });
+      try {
+        const before = dbOf(core).prepare(`SELECT embedding FROM concepts WHERE id=?`).get(fixture.activeA) as { embedding: string };
+        let caught: unknown;
+        try { await core.migrateEmbeddings({ targetModelId: target.modelId }); } catch (error) { caught = error; }
+        expect(caught).toBeInstanceOf(EmbedderMigrationFailedError);
+        expect((caught as EmbedderMigrationFailedError).report.failures.some(
+          (failure) => failure.phase === "native-concepts" && failure.message.includes("non-finite component"),
+        )).toBe(true);
+        expect(dbOf(core).prepare(`SELECT embedding FROM concepts WHERE id=?`).get(fixture.activeA)).toEqual(before);
+        expect(JSON.stringify(dbOf(core).prepare(`SELECT embedding FROM concepts`).all())).not.toContain("null");
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  for (const scenario of [
+    { phase: "native-concepts", needle: "native-concept-wrong" },
+    { phase: "native-observations", needle: "native-observation-wrong" },
+    { phase: "source-concepts", needle: "Persisted source body" },
+    { phase: "source-chunk-observations", needle: "source-chunk-wrong" },
+    { phase: "workstreams", needle: "question step decision context" },
+  ] as const) {
+    it(`validates every ${scenario.phase} provider result before its rewrite and resumes safely after correction`, async () => {
+      await withTempDb(async (dbPath) => {
+        const oldEmbedder = new SpaceEmbedder("test:space:old", 1);
+        const fixture = await seedFixture(dbPath, oldEmbedder);
+        const setup = new MonetCore(dbPath, { embedder: oldEmbedder });
+        const published = await publishSourceWithChunks(setup, `wrong-${scenario.phase}`, [
+          { headingPath: ["One"], content: "source-chunk-wrong" },
+          { headingPath: ["Two"], content: "source-chunk-good" },
+        ]);
+        const setupDb = dbOf(setup);
+        setupDb.prepare(`UPDATE concepts SET body = ? WHERE id = ?`).run("native-concept-wrong", fixture.activeB);
+        setupDb.prepare(`UPDATE observations SET content = ? WHERE id = ?`).run("native-observation-wrong", fixture.currentObservation);
+        setup.close();
+
+        const target = new SpaceEmbedder("test:space:target", 2);
+        target.wrongWidths.add(scenario.needle);
+        const core = new MonetCore(dbPath, { embedder: target });
+        const db = dbOf(core);
+        const batchIds = scenario.phase === "native-observations"
+          ? [fixture.supersededObservation, fixture.currentObservation]
+          : scenario.phase === "source-chunk-observations" ? published.observationIds : [];
+        const batchBefore = batchIds.map((id) => ({ id, vector: vector(db, "observations", id) }));
+        try {
+          let failure: unknown;
+          try {
+            await core.migrateEmbeddings({ targetModelId: target.modelId });
+          } catch (error) {
+            failure = error;
+          }
+          expect(failure).toBeInstanceOf(EmbedderMigrationFailedError);
+          const report = (failure as EmbedderMigrationFailedError).report;
+          expect(report.failures.some((item) => item.phase === scenario.phase && /declared dimension/.test(item.message))).toBe(true);
+          expect(migrationRow(db)?.target_model_id).toBe(target.modelId);
+          for (const before of batchBefore) expect(vector(db, "observations", before.id)).toEqual(before.vector);
+
+          target.wrongWidths.clear();
+          const retry = await core.migrateEmbeddings({ targetModelId: target.modelId });
+          expect(retry.failures).toEqual([]);
+          expect(migrationRow(db)).toBeUndefined();
+          expect(pinRow(db).embedder_model_id).toBe(target.modelId);
+        } finally {
+          core.close();
+        }
+      });
+    });
+  }
 });

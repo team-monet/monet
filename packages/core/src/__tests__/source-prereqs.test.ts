@@ -395,7 +395,7 @@ describe("source-pipeline core prerequisites", () => {
       expect((await core.gather("retire source retrieval")).ranked.map((c) => c.id)).not.toContain(source.conceptId);
       expect(core.prewarm().topConcepts.map((c) => c.id)).not.toContain(source.conceptId);
 
-      expect(core.restoreConcept(source.conceptId)!.status).toBe("active");
+      expect(() => core.restoreConcept(source.conceptId)).toThrow(/source sync\/rebuild owns restoration/);
       expect((await core.search("retire source retrieval")).map((c) => c.id)).not.toContain(source.conceptId);
     } finally {
       core.close();

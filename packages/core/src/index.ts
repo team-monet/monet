@@ -2,11 +2,20 @@ export {
   MonetCore,
   EmbedderMismatchError,
   EmbedderPinUnsatisfiedError,
+  EmbedderWidthConflictError,
+  MalformedEmbeddingStoreError,
+  EmbedderOutputDimensionError,
+  EmbedderOutputNonFiniteError,
+  EmbedderIdentityRequiredError,
+  EmbedderMigrationReentryError,
+  EmbedderRepairOwnershipError,
   EmbedderMigrationValidationError,
   EmbedderMigrationConflictError,
   EmbedderMigrationIncompleteError,
   EmbedderMigrationStartError,
   EmbedderMigrationFailedError,
+  EmbedderMigrationAbandonRefusedError,
+  EmbedderMigrationAbandonUnsupportedError,
 } from "./engine";
 export type {
   Concept,
@@ -43,6 +52,9 @@ export type {
   EmbeddingMigrationItemFailure,
   EmbeddingMigrationPhaseReport,
   EmbeddingMigrationReport,
+  EmbeddingWidthInventory,
+  MalformedEmbeddingInventory,
+  MalformedEmbeddingPopulation,
 } from "./engine";
 export { BetterSqlitePort, StorageExclusiveLockError, readStoredEmbedderPin, readStoredVectorPresence } from "./storage";
 export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError } from "./store-embedder";

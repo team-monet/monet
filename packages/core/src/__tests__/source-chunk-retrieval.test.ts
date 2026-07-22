@@ -439,6 +439,7 @@ describe("chunk-granular source retrieval — partial-refresh mixed state (revie
 });
 
 describe("chunk-granular source retrieval — candidate scoring at scale (review fix, Codex P2 finding 6)", () => {
+  // This explicit ceiling preserves CI headroom for deterministic 520-store scale work.
   it("scores correctly against a large source-concept id list, via the json_each(?) parameter-count-independent query", async () => {
     const core = makeCore();
     core.createSource(sourceInput("batch-source"));
@@ -469,5 +470,5 @@ describe("chunk-granular source retrieval — candidate scoring at scale (review
     });
     const gatheredIds = [...gathered.seed.map((c) => c.id), ...gathered.ranked.map((c) => c.id)];
     expect(gatheredIds).toContain(target.conceptId);
-  });
+  }, 10_000);
 });

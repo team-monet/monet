@@ -30,11 +30,62 @@ export interface EmbeddingProvider {
   /**
    * A stable string identifier for this embedder's model and configuration (e.g.
    * "hashing:dim=256" or "Xenova/all-MiniLM-L6-v2"). Used by the sync layer to reject
-   * cross-machine grafts where the vector spaces are incompatible.
+   * cross-machine grafts where the vector spaces are incompatible. It may be omitted for a
+   * provider used only against truly vector-free/read-only state; persisting any semantic vector
+   * requires a non-empty, non-synthetic modelId before the first write.
    */
   readonly modelId?: string;
   /** May be sync (lexical) or async (a real model). The engine always awaits it. */
   embed(text: string): Float32Array | Promise<Float32Array>;
+}
+
+/** A provider's runtime output disagreed with its declared vector contract. */
+export class EmbedderOutputDimensionError extends Error {
+  constructor(
+    public readonly declaredWidth: number,
+    public readonly actualWidth: number | null,
+    public readonly population?: "native" | "source",
+    public readonly actualType = "Float32Array",
+  ) {
+    super(
+      actualWidth === null
+        ? `Embedding provider returned ${actualType}; expected Float32Array of declared dimension ${declaredWidth}.`
+        : `Embedding provider returned dimension ${actualWidth}; expected its declared dimension ${declaredWidth}.`,
+    );
+    this.name = "EmbedderOutputDimensionError";
+  }
+}
+
+/** A provider returned the right container and width, but at least one unusable component. */
+export class EmbedderOutputNonFiniteError extends Error {
+  constructor(
+    public readonly index: number,
+    public readonly value: number,
+    public readonly population?: "native" | "source",
+  ) {
+    super(`Embedding provider returned a non-finite component at index ${index}; every component must be finite.`);
+    this.name = "EmbedderOutputNonFiniteError";
+  }
+}
+
+/** Runtime-check a provider result before it is persisted or used for similarity scoring. */
+export function validateEmbeddingProviderOutput(
+  provider: Pick<EmbeddingProvider, "dim">,
+  output: unknown,
+  population?: "native" | "source",
+): Float32Array {
+  if (!(output instanceof Float32Array)) {
+    const actualType = output === null ? "null" : Array.isArray(output) ? "Array" : typeof output;
+    throw new EmbedderOutputDimensionError(provider.dim, null, population, actualType);
+  }
+  if (output.length !== provider.dim) {
+    throw new EmbedderOutputDimensionError(provider.dim, output.length, population);
+  }
+  for (let index = 0; index < output.length; index++) {
+    const value = output[index]!;
+    if (!Number.isFinite(value)) throw new EmbedderOutputNonFiniteError(index, value, population);
+  }
+  return output;
 }
 
 // REVIEW FIX (round 4, Codex thread 14): bumped when TOKENIZATION changes the hashing vector

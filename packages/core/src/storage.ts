@@ -64,6 +64,8 @@ export interface StoragePort {
   transaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R;
   /** Acquire SQLite's write reservation before `fn` reads; serializes registry/circle identity changes. */
   immediateTransaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R;
+  /** Optional best-effort cache hint: whether this connection is inside a transaction/savepoint. */
+  inTransaction?(): boolean;
   /**
    * Retain connection-level exclusive ownership until releaseExclusiveOwnership() or close().
    * `:memory:` databases have no cross-process identity, so adapters may implement this as a no-op.
@@ -110,6 +112,10 @@ export class BetterSqlitePort implements StoragePort {
 
   immediateTransaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
     return this.db.transaction(fn).immediate;
+  }
+
+  inTransaction(): boolean {
+    return this.db.inTransaction;
   }
 
   acquireExclusiveOwnership(): void {

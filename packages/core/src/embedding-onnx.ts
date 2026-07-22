@@ -1,5 +1,5 @@
 import type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
-import { HashingEmbeddingProvider } from "./embedding";
+import { HashingEmbeddingProvider, validateEmbeddingProviderOutput } from "./embedding";
 
 /**
  * Real semantic embeddings via a bundled ONNX model (transformers.js) — in-process,
@@ -111,7 +111,8 @@ export async function createLocalEmbedderWithProvenance(
   const onnx = new OnnxEmbeddingProvider(opts);
   try {
     console.error("[monet-core] loading local embedding model (paraphrase-multilingual-MiniLM-L12-v2; first run downloads once)…");
-    await onnx.embed("warmup"); // forces model load + native init now, not on the first store
+    const warmup: unknown = await onnx.embed("warmup"); // forces model load + native init now, not on the first store
+    validateEmbeddingProviderOutput(onnx, warmup);
     console.error("[monet-core] semantic embeddings ready (multilingual MiniLM, 384-dim).");
     return { provider: onnx, selection: "onnx" };
   } catch (e) {
@@ -254,7 +255,11 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
     // model load on its first REAL embed() call (a fresh instance's own this.extractor starts
     // null) — bounded and one-time, and not a re-download: the model is already cached on disk
     // from the warmup just above, so this is a re-init of the runtime session, not a network hit.
-    return warmup.length === onnx.dim ? onnx : new OnnxEmbeddingProvider({ model: modelId, dim: warmup.length });
+    if (warmup.length === onnx.dim) return onnx;
+    const measured = new OnnxEmbeddingProvider({ model: modelId, dim: warmup.length });
+    const measuredWarmup: unknown = await measured.embed("warmup");
+    validateEmbeddingProviderOutput(measured, measuredWarmup);
+    return measured;
   }
 
   throw new UnsatisfiableEmbedderError(

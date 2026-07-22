@@ -540,6 +540,7 @@ const SIBLING_B_TEXT = "frobnitz-sibling-beta-arousal-group3";
 
 function makeStubEmbedder(): import("../embedding").EmbeddingProvider {
   return {
+    modelId: "test:va-ranking-group3:dim=8",
     dim: DIM,
     embed(text: string): Float32Array {
       if (text === SEED_TEXT || text === QUERY_TEXT) return E1;

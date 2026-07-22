@@ -8,7 +8,7 @@ import { describe, it, expect, vi } from "vitest";
 import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MonetCore, EmbedderMismatchError } from "../engine";
+import { MonetCore, EmbedderMismatchError, EmbedderWidthConflictError, MalformedEmbeddingStoreError } from "../engine";
 import { HashingEmbeddingProvider } from "../embedding";
 import type { GraftPayload } from "../sync-types";
 
@@ -90,6 +90,131 @@ describe("graft idempotency", () => {
     src.close();
     dst.close();
   });
+});
+
+describe("graft vector parsing and full atomicity", () => {
+  it("rejects malformed, arbitrary-width, mixed-width, and late-invalid payloads without changing rows or sync_meta", async () => {
+    const src = freshCore();
+    const dst = freshCore();
+    try {
+      await src.store("Strict graft vector fixture.", { resolution: "forceNew" });
+      const valid = src.exportDelta(0);
+      const db = (dst as any).db as import("../storage").StoragePort;
+      const snapshot = () => JSON.stringify({
+        syncMeta: db.prepare(`SELECT * FROM sync_meta`).all(),
+        sessions: db.prepare(`SELECT * FROM sessions ORDER BY id`).all(),
+        concepts: db.prepare(`SELECT * FROM concepts ORDER BY id`).all(),
+        observations: db.prepare(`SELECT * FROM observations ORDER BY id`).all(),
+      });
+      const before = snapshot();
+      const malformed = [
+        `null`,
+        `{"value":1}`,
+        `[true]`,
+        `["1"]`,
+        `[null]`,
+        `[1e400]`,
+      ];
+      for (const embedding of malformed) {
+        const payload = structuredClone(valid);
+        payload.concepts[0]!.embedding = embedding;
+        expect(() => dst.graftRows(payload), embedding).toThrow(/JSON array of finite numbers/);
+        expect(snapshot(), embedding).toBe(before);
+      }
+
+      const mixed = structuredClone(valid);
+      mixed.concepts[0]!.embedding = `[]`;
+      expect(() => dst.graftRows(mixed)).toThrow(/mixed widths safe|live semantic vector/i);
+      expect(snapshot()).toBe(before);
+
+      const wrong = structuredClone(valid);
+      wrong.concepts[0]!.embedding = `[0]`;
+      wrong.observations[0]!.embedding = `[0]`;
+      expect(() => dst.graftRows(wrong)).toThrow(/live semantic vector/i);
+      expect(snapshot()).toBe(before);
+
+      const lateInvalid = structuredClone(valid);
+      (lateInvalid.concepts[0] as unknown as { circle: null }).circle = null;
+      expect(() => dst.graftRows(lateInvalid)).toThrow();
+      expect(snapshot()).toBe(before);
+    } finally {
+      src.close();
+      dst.close();
+    }
+  });
+
+  it.each(["edge-only", "component-only"] as const)(
+    "rejects the %s payload against a mixed live store without graph or clock mutation",
+    async (shape) => {
+      const core = freshCore({ graphEnabled: false });
+      try {
+        const first = await core.store("Mixed graft endpoint one.", { resolution: "forceNew" });
+        const second = await core.store("Mixed graft endpoint two.", { resolution: "forceNew" });
+        const now = Date.now();
+        const edge = {
+          id: "mixed-graft-edge",
+          src_id: first.conceptId,
+          src_type: "concept",
+          dst_id: second.conceptId,
+          dst_type: "concept",
+          type: "related",
+          weight: 0.2,
+          origin: "fixture",
+          count: 1,
+          created_at: now,
+          last_reinforced_at: now,
+          scope: "default",
+          dismissed_at: null,
+          dismissed_by: null,
+        };
+        const component = {
+          src_id: first.conceptId,
+          dst_id: second.conceptId,
+          type: "related",
+          scope: "default",
+          writer_id: "mixed-graft-peer",
+          count: 1,
+          weight: 0.2,
+          origin: "fixture",
+          created_at: now,
+          last_reinforced_at: now,
+          revision: 1,
+          updated_at: now,
+        };
+        core.graftRows(basePayload({
+          schemaVersion: 8,
+          ...(shape === "edge-only" ? { edges: [edge] } : { edgeComponents: [component] }),
+        }));
+
+        const db = (core as any).db as import("../storage").StoragePort;
+        db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(
+          JSON.stringify(new Array(384).fill(0.1)),
+          first.observationId,
+        );
+        const snapshot = () => JSON.stringify({
+          syncMeta: db.prepare(`SELECT * FROM sync_meta WHERE singleton = 1`).get(),
+          edges: db.prepare(`SELECT * FROM memory_edge ORDER BY id`).all(),
+          components: db.prepare(
+            `SELECT * FROM memory_edge_components ORDER BY src_id, dst_id, type, scope, writer_id`,
+          ).all(),
+        });
+        const before = snapshot();
+        const incoming = basePayload({
+          schemaVersion: 8,
+          ...(shape === "edge-only"
+            ? { edges: [{ ...edge, weight: 0.9, last_reinforced_at: now + 1 }] }
+            : { edgeComponents: [{ ...component, count: 2, weight: 0.9, revision: 2, updated_at: now + 1 }] }),
+        });
+
+        expect(incoming.concepts).toEqual([]);
+        expect(incoming.observations).toEqual([]);
+        expect(() => core.graftRows(incoming)).toThrow(EmbedderWidthConflictError);
+        expect(snapshot()).toBe(before);
+      } finally {
+        core.close();
+      }
+    },
+  );
 });
 
 describe("terminal supersession replication", () => {
@@ -265,9 +390,10 @@ describe("retirement tombstone replication", () => {
           `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, circle, embedding,
                                  support_count, dirty, updated_at, created_at, usefulness_score, arousal_score)
            VALUES ('legacy-retired', 'legacy-retired', 'Legacy retired', 'Replica body', 'fact', 'active', .6,
-                   'default', '[]', 1, 0, 1, 1, 0, 0)`,
+                   'default', ?, 1, 0, 1, 1, 0, 0)`,
         )
-        .run();
+        .run(JSON.stringify(new Array(256).fill(0)));
+      await replica.ensureEmbedderPin();
       const watermark = Date.now();
       await new Promise((resolve) => setTimeout(resolve, 2));
       legacy
@@ -361,8 +487,8 @@ describe("dirty-marking on graft", () => {
       .db.exec(`
         INSERT INTO concepts (id, slug, title, body, kind, status, confidence, circle, embedding, support_count, dirty, updated_at, created_at, usefulness_score, arousal_score)
         VALUES
-          ('concept-a', 'concept-a', 'Concept A', '', 'fact', 'active', 0.6, 'default', '[]', 1, 0, ${now}, ${now}, 0, 0),
-          ('concept-b', 'concept-b', 'Concept B', '', 'fact', 'active', 0.6, 'default', '[]', 1, 0, ${now}, ${now}, 0, 0)
+          ('concept-a', 'concept-a', 'Concept A', '', 'fact', 'active', 0.6, 'default', '${JSON.stringify(new Array(256).fill(0))}', 1, 0, ${now}, ${now}, 0, 0),
+          ('concept-b', 'concept-b', 'Concept B', '', 'fact', 'active', 0.6, 'default', '${JSON.stringify(new Array(256).fill(0))}', 1, 0, ${now}, ${now}, 0, 0)
       `);
 
     // Build a payload that has a new observation only for concept A.
@@ -374,7 +500,7 @@ describe("dirty-marking on graft", () => {
         {
           id: "obs-new-a",
           content: "New evidence for A.",
-          embedding: "[]",
+          embedding: JSON.stringify(new Array(256).fill(0)),
           kind: "statement",
           circle: "default",
           concept_id: "concept-a",
@@ -647,6 +773,29 @@ describe("batchDedup cross-machine dedup", () => {
 
     src.close();
     dst.close();
+  });
+
+  it.each([
+    { name: "malformed", embedding: "[null]", error: MalformedEmbeddingStoreError },
+    { name: "mixed-width", embedding: "[0]", error: EmbedderWidthConflictError },
+  ])("rejects a $name live store before any graph or sync mutation", async ({ embedding, error }) => {
+    const core = freshCore({ tauAmbiguous: 0, graphEnabled: true });
+    try {
+      const local = await core.store("local dedup proof row", { resolution: "forceNew" });
+      const grafted = await core.store("grafted dedup proof row", { resolution: "forceNew" });
+      const db = (core as any).db as import("../storage").StoragePort;
+      db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run(embedding, local.observationId);
+      const snapshot = () => JSON.stringify({
+        sync: db.prepare(`SELECT * FROM sync_meta`).all(),
+        edges: db.prepare(`SELECT * FROM memory_edge ORDER BY id`).all(),
+        components: db.prepare(`SELECT * FROM memory_edge_components ORDER BY src_id,dst_id,type,scope,writer_id`).all(),
+      });
+      const before = snapshot();
+      expect(() => core.batchDedup([grafted.conceptId])).toThrow(error);
+      expect(snapshot()).toBe(before);
+    } finally {
+      core.close();
+    }
   });
 });
 

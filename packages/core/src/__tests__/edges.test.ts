@@ -275,7 +275,7 @@ describe("rederiveNativeConceptGraph (cold-audit fix, MAJOR — model-swap graph
       dim: 2,
       modelId: "edges-test-controlled",
       embed: (text) => {
-        const [x, y] = vectors[text][phase];
+        const [x, y] = vectors[text]?.[phase] ?? [1, 0];
         const norm = Math.sqrt(x * x + y * y) || 1;
         return new Float32Array([x / norm, y / norm]);
       },
@@ -291,23 +291,83 @@ describe("rederiveNativeConceptGraph (cold-audit fix, MAJOR — model-swap graph
       expect(beforeReembed.has(pairKey(a.conceptId, b.conceptId))).toBe(true);
       expect(beforeReembed.has(pairKey(a.conceptId, c.conceptId))).toBe(false);
 
-      // Re-embed all three under the "new model" (mirrors the migration script's step 3).
+      // The owned migration rewrites all vectors, then rebuilds the graph only after the full set
+      // is in the new space. The low-level helpers are intentionally no longer callable standalone.
       phase = "new";
-      for (const id of [a.conceptId, b.conceptId, c.conceptId]) expect(await core.reembedConcept(id)).toBe(true);
-      // reembedConcept alone must NOT touch the graph — the stale A-B edge is still exactly there.
-      expect(relatedPairs(core)).toEqual(beforeReembed);
-
-      // Rebuild the graph for every re-embedded concept (mirrors the migration script's step 4) —
-      // must run only once every concept is already under the new model (all three re-embedded
-      // above) or this would score new-model A against still-old-model neighbors.
-      for (const id of [a.conceptId, b.conceptId, c.conceptId]) expect(core.rederiveNativeConceptGraph(id)).toBe(true);
+      await core.migrateEmbeddings({ targetModelId: "edges-test-controlled" });
       const afterRebuild = relatedPairs(core);
       expect(afterRebuild.has(pairKey(a.conceptId, b.conceptId))).toBe(false); // stale edge gone
       expect(afterRebuild.has(pairKey(a.conceptId, c.conceptId))).toBe(true); // fresh edge created
 
-      // Determinism: rebuilding again from the same, now-settled state reproduces the identical edge set.
-      for (const id of [a.conceptId, b.conceptId, c.conceptId]) core.rederiveNativeConceptGraph(id);
+      // Determinism: repeating the complete owned repair reproduces the identical edge set.
+      await core.migrateEmbeddings({ targetModelId: "edges-test-controlled" });
       expect(relatedPairs(core)).toEqual(afterRebuild);
+    } finally {
+      core.close();
+    }
+  });
+
+  it("replaces the complete 9-concept target graph deterministically with self excluded before six and asymmetric selections unioned", async () => {
+    const names = ["anchor", "b-one", "b-two", "b-three", "b-four", "b-five", "b-six", "d-seven", "d-eight"];
+    const degrees = [0, 20, 25, 30, 35, 40, 50, 80, 85];
+    const vectors = new Map(names.map((name, index) => {
+      const radians = degrees[index]! * Math.PI / 180;
+      return [name, new Float32Array([Math.cos(radians), Math.sin(radians)])] as const;
+    }));
+    const embedder: EmbeddingProvider = {
+      dim: 2,
+      modelId: "edges-nine-controlled",
+      embed: (text) => vectors.get(text) ?? vectors.get("anchor")!,
+    };
+    let id = 0;
+    const core = new MonetCore(":memory:", {
+      embedder, tauAttach: 1.1, tauAmbiguous: 1.1, edgeSimMin: 0,
+      idGen: () => `fixture-${String(++id).padStart(4, "0")}`,
+    });
+    try {
+      const conceptByName = new Map<string, string>();
+      for (const name of names) {
+        const stored = await core.store(name, { resolution: "forceNew" });
+        conceptByName.set(name, stored.conceptId);
+      }
+      const anchor = conceptByName.get("anchor")!;
+      const sixth = conceptByName.get("b-six")!;
+      (core as any).upsertEdgeBoth(anchor, conceptByName.get("b-one")!, "possible_duplicate_of", .8, "fixture", "default");
+      core.dismissPossibleDuplicate(anchor, conceptByName.get("b-one")!, "graph-fixture");
+      const db = (core as any).db;
+      const preserved = () => JSON.stringify({
+        edges: db.prepare(`SELECT * FROM memory_edge WHERE type != 'related' ORDER BY id`).all(),
+        components: db.prepare(`SELECT * FROM memory_edge_components WHERE type != 'related' ORDER BY src_id,dst_id,type,scope,writer_id`).all(),
+        entities: db.prepare(`SELECT * FROM entities ORDER BY key,scope`).all(),
+        memberships: db.prepare(`SELECT * FROM concept_entities ORDER BY concept_id,entity_key,scope`).all(),
+      });
+      const nonRelatedBefore = preserved();
+
+      const ids = names.map((name) => conceptByName.get(name)!);
+      const vectorById = new Map(names.map((name) => [conceptByName.get(name)!, vectors.get(name)!]));
+      const directed = new Map<string, Set<string>>();
+      for (const src of ids) {
+        const a = vectorById.get(src)!;
+        const selected = ids.filter((dst) => dst !== src).map((dst) => {
+          const b = vectorById.get(dst)!;
+          return { dst, score: a[0]! * b[0]! + a[1]! * b[1]! };
+        }).sort((x, y) => y.score - x.score || x.dst.localeCompare(y.dst)).slice(0, 6);
+        directed.set(src, new Set(selected.map(({ dst }) => dst)));
+      }
+      expect(directed.get(anchor)!.has(sixth)).toBe(true); // exactly sixth after self is removed
+      expect(directed.get(sixth)!.has(anchor)).toBe(false); // union must retain this asymmetric pick
+      const expectedPairs = new Set<string>();
+      for (const [src, destinations] of directed) {
+        for (const dst of destinations) expectedPairs.add(pairKey(src, dst));
+      }
+
+      await core.migrateEmbeddings({ targetModelId: embedder.modelId! });
+      expect(relatedPairs(core)).toEqual(expectedPairs);
+      expect(relatedPairs(core).has(pairKey(anchor, sixth))).toBe(true);
+      expect(preserved()).toBe(nonRelatedBefore);
+      await core.migrateEmbeddings({ targetModelId: embedder.modelId! });
+      expect(relatedPairs(core)).toEqual(expectedPairs);
+      expect(preserved()).toBe(nonRelatedBefore);
     } finally {
       core.close();
     }
@@ -318,8 +378,8 @@ describe("rederiveNativeConceptGraph (cold-audit fix, MAJOR — model-swap graph
     try {
       const stored = await core.store("some native concept to retire", { resolution: "forceNew" });
       core.retireConcept(stored.conceptId);
-      expect(core.rederiveNativeConceptGraph(stored.conceptId)).toBe(false);
-      expect(core.rederiveNativeConceptGraph("does-not-exist")).toBe(false);
+      expect(() => core.rederiveNativeConceptGraph(stored.conceptId)).toThrow(/requires active embedder migration ownership/);
+      expect(() => core.rederiveNativeConceptGraph("does-not-exist")).toThrow(/requires active embedder migration ownership/);
     } finally {
       core.close();
     }

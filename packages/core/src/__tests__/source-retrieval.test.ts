@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MonetCore } from "../engine";
+import { MalformedEmbeddingStoreError, MonetCore } from "../engine";
 import type { EmbeddingProvider } from "../embedding";
 import { registerMonetCoreTools } from "../mcp-server";
 import { computeSourceContentHash, computeSourceIngestFingerprint, computeSourceOperationId, sourceHeadingAnchor } from "../source-chunker";
@@ -471,13 +471,7 @@ describe("authorized source-backed generic retrieval", () => {
     expect(core.stats().sessions).toBe(0);
   });
 
-  // File=concept (Phase 1): embedding validity is now checked on the CONCEPT row
-  // (queryAuthorizedSourcePublications validates concept.embedding directly — content and
-  // embedding both live there now, kept fresh by recomputeSourceConceptBody), not the
-  // observation's — a chunk observation's own embedding is an inert placeholder, never read back
-  // (item 6). Corrupting it must NOT affect visibility; corrupting the concept's own embedding
-  // still must.
-  it("hides malformed published concept embeddings without breaking native retrieval", async () => {
+  it("fails closed on malformed live source vectors while diagnostics and structural filtering remain available", async () => {
     const core = makeCore();
     const native = await core.store("native retrieval remains available", { circle, resolution: "forceNew" });
     core.createSource(sourceInput());
@@ -486,6 +480,8 @@ describe("authorized source-backed generic retrieval", () => {
     const originalObservationEmbedding = (db.prepare(`SELECT embedding FROM observations WHERE id=?`).get(stored.observationId) as { embedding: string }).embedding;
     db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run("not-json", stored.observationId);
     expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).not.toBeNull();
+    expect(core.inspectEmbeddingWidths().malformed.sourceObservations).toMatchObject({ count: 1 });
+    await expect(core.search("native retrieval", { circle, sourceAuthorizationContext: auth })).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
     db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run(originalObservationEmbedding, stored.observationId);
 
     const original = (db.prepare(`SELECT embedding FROM concepts WHERE id=?`).get(stored.conceptId) as { embedding: string }).embedding;
@@ -497,16 +493,26 @@ describe("authorized source-backed generic retrieval", () => {
     ];
     for (const embedding of invalid) {
       db.prepare(`UPDATE concepts SET embedding=? WHERE id=?`).run(embedding, stored.conceptId);
-      expect((await core.search("native retrieval", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(native.conceptId);
+      const isZeroPlaceholder = embedding === JSON.stringify([0]);
+      if (isZeroPlaceholder) {
+        expect((await core.search("native retrieval", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(native.conceptId);
+      } else {
+        await expect(core.search("native retrieval", { circle, sourceAuthorizationContext: auth })).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
+      }
       expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).toBeNull();
       expect(core.listMemories(circle, { sourceAuthorizationContext: auth }).map((row) => row.id)).not.toContain(stored.conceptId);
-      expect((await core.gather("cobalt", { circle, sourceAuthorizationContext: auth })).ranked.map((row) => row.id)).not.toContain(stored.conceptId);
+      if (isZeroPlaceholder) {
+        expect((await core.gather("cobalt", { circle, sourceAuthorizationContext: auth })).ranked.map((row) => row.id)).not.toContain(stored.conceptId);
+      } else {
+        await expect(core.gather("cobalt", { circle, sourceAuthorizationContext: auth })).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
+      }
       expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).topConcepts.map((row) => row.id)).not.toContain(stored.conceptId);
       expect(core.conceptCount(circle, auth)).toBe(1);
       expect(core.listCircles(undefined, { sourceAuthorizationContext: auth })).toContainEqual(expect.objectContaining({ circle, concepts: 1 }));
     }
     db.prepare(`UPDATE concepts SET embedding=? WHERE id=?`).run(original, stored.conceptId);
     expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).not.toBeNull();
+    expect((await core.search("native retrieval", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(native.conceptId);
   });
 
   it("keeps native gather scores/order stable while a stronger source displaces the weak tail", async () => {

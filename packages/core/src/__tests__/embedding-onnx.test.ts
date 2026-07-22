@@ -8,7 +8,12 @@
 // brief). MonetCore.ensureEmbedderPin's own ONNX-satisfying path is additionally covered at the
 // engine level via an injected fake loader (see embedder-pin.test.ts, Shape 2).
 import { describe, expect, it, vi } from "vitest";
-import { instantiateEmbedderForPin, UnsatisfiableEmbedderError, LEGACY_ONNX_DEFAULT_MODEL_ID } from "../embedding-onnx";
+import {
+  createLocalEmbedderWithProvenance,
+  instantiateEmbedderForPin,
+  UnsatisfiableEmbedderError,
+  LEGACY_ONNX_DEFAULT_MODEL_ID,
+} from "../embedding-onnx";
 import { HashingEmbeddingProvider } from "../embedding";
 
 // Hoisted by vitest above these imports — intercepts OnnxEmbeddingProvider's dynamic
@@ -60,6 +65,20 @@ vi.mock("@huggingface/transformers", () => ({
 describe("LEGACY_ONNX_DEFAULT_MODEL_ID", () => {
   it("names the pre-item-9 English ONNX default exactly", () => {
     expect(LEGACY_ONNX_DEFAULT_MODEL_ID).toBe("Xenova/all-MiniLM-L6-v2");
+  });
+});
+
+describe("fresh ONNX selection output contract", () => {
+  it("rejects a warmup whose real width disagrees with the fresh provider declaration", async () => {
+    const prior = process.env.MONET_EMBEDDER;
+    process.env.MONET_EMBEDDER = "onnx";
+    try {
+      await expect(createLocalEmbedderWithProvenance({ model: "Xenova/mock-wrong-dim-model" }))
+        .rejects.toThrow(/declared dimension 384/);
+    } finally {
+      if (prior === undefined) delete process.env.MONET_EMBEDDER;
+      else process.env.MONET_EMBEDDER = prior;
+    }
   });
 });
 

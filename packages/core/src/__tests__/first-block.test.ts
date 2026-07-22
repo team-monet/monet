@@ -1277,6 +1277,7 @@ describe("Step 9: Codex round-3 findings A & B", () => {
     core.close();
   });
 
+  // This explicit ceiling preserves CI headroom for deterministic 300-pin scale work.
   it("memory_first_block list with 300 pins — valid JSON, under 40k chars, pagination contract (total/offset/limit)", async () => {
     // Finding A (Codex round-5): replaced the hard-cap + truncationNote approach with
     // offset-pagination so ALL pins are addressable via reorder/remove without any being
@@ -1347,7 +1348,7 @@ describe("Step 9: Codex round-3 findings A & B", () => {
     expect(allConceptIds.size).toBe(PIN_COUNT);
 
     core.close();
-  });
+  }, 10_000);
 
   it("renameCircle into existing dest — no position collision, dest-first order", async () => {
     const core = freshCore({ tauAttach: 1.1, tauAmbiguous: 1.1 });

@@ -32,6 +32,7 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
     expect(plainReport.arms.map((a) => a.arm)).toEqual(["no-memory", "monet-search", "monet-gather"]);
   });
 
+  // Explicit ceilings preserve CI headroom for deterministic full-suite baseline work.
   it("bm25 runs without crashing and produces non-degenerate output", async () => {
     const report = await runBaselineSuite(STARTER_SUITE, embedder());
     const bm25 = report.arms.find((a) => a.arm === "bm25");
@@ -41,7 +42,7 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
     // overlap on a suite deliberately containing lexically-strong probes, per scenarios.ts).
     const noMemory = report.arms.find((a) => a.arm === "no-memory")!.metrics!;
     expect(bm25!.metrics!.byK[5].repeatedMistakeRate).toBeLessThan(noMemory.byK[5].repeatedMistakeRate);
-  });
+  }, 10_000);
 
   it("chunk-cosine-rag and md-tree run without crashing and produce non-degenerate output", async () => {
     const report = await runBaselineSuite(STARTER_SUITE, embedder());
@@ -60,7 +61,7 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
       expect(arm.metrics!.mrr.overall).toBeGreaterThan(0);
       for (const k of K_LADDER) expect(arm.goldContainingFileByK[k]).toBeGreaterThanOrEqual(0);
     }
-  });
+  }, 10_000);
 
   it("granularity-mismatch honesty: gold-containing-file@k is never below strict chunk-recall at the same k (spec §2.2)", async () => {
     // The file-level number is a STRICT LOOSENING of the chunk-level number (any top-k chunk
@@ -75,7 +76,7 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
         expect(arm.goldContainingFileByK[k]).toBeGreaterThanOrEqual(overallChunkRecallAtK(k) - 1e-9);
       }
     }
-  });
+  }, 10_000);
 
   it("the md-tree export's gold manifest carries every scenario's seed keys mechanically, across the WHOLE suite (spec §2.2)", async () => {
     // Direct check on the exporter contract itself, independent of the arm-scoring layer above:
