@@ -4,20 +4,20 @@
   "agents": [
     {
       "name": "stig",
-      "role": "state-centric lead",
+      "role": "product owner with strong technical understanding",
       "mode": "primary",
       "prompt": "agents/stig.md",
       "touchesMonet": true,
-      "description": "The lead. Installed into the host's lead-persona target, holds project context via Monet, and delegates to the workers below via the host's delegation primitive."
+      "description": "The product owner and lead. Owns routine direction, priority, scope, and disposition; uses context, Monet, and orchestration as supporting mechanisms and delegates execution."
     },
     {
       "name": "explorer",
-      "role": "code investigation",
+      "role": "product and engineering evidence investigation",
       "mode": "subagent",
       "prompt": "agents/explorer.md",
       "touchesMonet": false,
       "model": "haiku",
-      "description": "Use PROACTIVELY to investigate the codebase: locate files, symbols, call sites, and how a feature works, then report concise findings. Read-only — never edits."
+      "description": "Use PROACTIVELY when Stig needs exact product or engineering evidence: inspect the relevant product sources/decisions/boundaries/outcomes or code paths/behavior, then return only the requested lane(s) and unknowns. Read-only; never decides priority, scope, supported contract, or disposition."
     },
     {
       "name": "researcher",

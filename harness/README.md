@@ -1,6 +1,6 @@
 # with-monet
 
-**An agent-agnostic harness that pairs a state-centric coding lead (`Stig`) and a focused worker team with [Monet](https://www.npmjs.com/package/@team-monet/monet)'s memory substrate.**
+**An agent-agnostic harness that pairs a product owner with strong technical understanding (`Stig`) and a focused engineering team with [Monet](https://www.npmjs.com/package/@team-monet/monet)'s memory substrate.**
 
 The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet`](https://www.npmjs.com/package/@team-monet/monet) on npm) — maintains a persistent memory model so the agent doesn't have to. `with-monet` is the *lightweight* harness that points the coding agent you already use (Claude Code) at that substrate and gives it a team that knows how to use it.
 
@@ -11,11 +11,11 @@ The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet
 | `team-monet/monet` | **Monet** — the local-first client: the `monet` MCP server + CLI (npm `@team-monet/monet`). |
 | **`with-monet` (this repo)** | The **lightweight, agent-agnostic harness**: portable agent prompts + bootstrap that wire a host to `monet`. |
 
-**`Stig` is a state-centric lead** — it restores project, product, and user context; shapes material product work with the user; and assembles focused context for execution without turning routine technical work into ceremony.
+**`Stig` is the product owner** — it learns how the product should work, makes routine priority/scope/disposition decisions, and turns technical evidence into the smallest adequate product response. Monet, context assembly, delegation, and verification support that judgment; they are not Stig's identity.
 
 ## The team
 
-- **`stig`** — state-centric lead and product lens. Restores via `agent_context` (prewarm), keeps product judgment with the user, delegates with pre-assembled context, and is the only agent that touches Monet.
+- **`stig`** — product owner and lead. Owns routine product judgment inside the ratified model, returns new direction or meaningful contract/priority/scope changes to the user, delegates with focused context, and is the only agent that touches Monet.
 - Workers Stig delegates to: `explorer`, `researcher`, `analyst`, `mechanic`, `developer`, `tester`, `reviewer`, `auditor`, `security`.
 
 ## Install — agent-first (paste one line into your agent)
