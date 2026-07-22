@@ -1,0 +1,863 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { Command } from "commander";
+import {
+  BetterSqlitePort,
+  HashingEmbeddingProvider,
+  MonetCore,
+  OnnxEmbeddingProvider,
+  inspectStoredEmbedderState,
+  instantiateEmbedderForPin,
+  validateEmbeddingProviderOutput,
+  type EmbeddingMigrationProgress,
+  type EmbeddingMigrationReport,
+  type EmbeddingProvider,
+  type StoredEmbedderStateInspection,
+  type VerifiedBackupResult,
+} from "@team-monet/core";
+import { getDbPath } from "./db/index.js";
+
+const RECOVERY_SCHEMA = "monet.recovery.v1";
+const PROBE_TEXT = "Monet embedding-provider recovery preflight";
+
+export interface RecoveryCliDependencies {
+  dbPath(storageDir?: string): string;
+  inspect(dbPath: string): StoredEmbedderStateInspection;
+  instantiate(modelId: string): Promise<EmbeddingProvider>;
+  createPort(dbPath: string): BetterSqlitePort;
+  createCore(port: BetterSqlitePort, embedder?: EmbeddingProvider): MonetCore;
+  now(): Date;
+  uuid(): string;
+  setExitCode(code: number): void;
+}
+
+export interface ProviderResult {
+  loadStatus: "not-checked" | "available" | "unavailable" | "incompatible";
+  modelId?: string;
+  dim?: number;
+  reason?: string;
+  storeCompatibility?: "compatible" | "unproven" | "incompatible";
+  storeDimensions?: number[];
+}
+
+interface DoctorOptions {
+  dir?: string;
+  json?: boolean;
+  checkProvider?: boolean;
+}
+
+interface RepairOptions {
+  target?: string;
+  resume?: boolean;
+  abandon?: boolean;
+  dir?: string;
+  json?: boolean;
+  apply?: boolean;
+  yes?: boolean;
+}
+
+type RepairMode = "target" | "resume" | "abandon";
+
+interface RepairFailureContext {
+  dbPath: string;
+  inspection?: StoredEmbedderStateInspection;
+  assessment?: StoredEmbedderStateInspection["assessment"];
+  provider?: ProviderResult;
+  nextCommands?: string[];
+  backup?: VerifiedBackupResult;
+}
+
+class RepairOperationError extends Error {
+  constructor(message: string, readonly context: RepairFailureContext, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RepairOperationError";
+  }
+}
+
+function messageFrom(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function commandBase(dbPath: string): string {
+  return `monet repair --dir ${shellQuote(path.dirname(dbPath))}`;
+}
+
+function doctorCommand(dbPath: string, checkProvider = false): string {
+  return `monet doctor --dir ${shellQuote(path.dirname(dbPath))}${checkProvider ? " --check-provider" : ""}`;
+}
+
+function resumeCommand(dbPath: string, apply = false): string {
+  return `${commandBase(dbPath)} --resume${apply ? " --apply --yes" : ""}`;
+}
+
+function abandonCommand(dbPath: string, apply = false): string {
+  return `${commandBase(dbPath)} --abandon${apply ? " --apply --yes" : ""}`;
+}
+
+function targetCommand(dbPath: string, target: string, apply = false): string {
+  return `${commandBase(dbPath)} --target ${shellQuote(target)}${apply ? " --apply --yes" : ""}`;
+}
+
+function hasStoredVectors(inspection: StoredEmbedderStateInspection): boolean {
+  return Object.values(inspection.populations).some((population) =>
+    population.status === "known" && (population.scoredVectorCount > 0 || population.malformed.count > 0),
+  );
+}
+
+function isEmptyUnpinnedStore(inspection: StoredEmbedderStateInspection): boolean {
+  if (inspection.pin.status !== "known" || inspection.pin.modelId !== null) return false;
+  return Object.values(inspection.populations).every((population) =>
+    population.status === "known" && population.liveRowCount === 0 && population.malformed.count === 0,
+  );
+}
+
+function nextCommandsForInspection(
+  inspection: StoredEmbedderStateInspection,
+  assessment = inspection.assessment,
+): string[] {
+  const dbPath = inspection.dbPath;
+  if (!inspection.exists) return [`monet start --dir ${shellQuote(path.dirname(dbPath))}`];
+  if (inspection.migration.status === "active") {
+    const commands = [resumeCommand(dbPath), resumeCommand(dbPath, true)];
+    if (inspection.migration.abandon.classification === "safe") {
+      commands.push(abandonCommand(dbPath), abandonCommand(dbPath, true));
+    }
+    return commands;
+  }
+  if (assessment === "safe") return [];
+  if (inspection.pin.status === "known" && inspection.pin.modelId) {
+    return [doctorCommand(dbPath, true), targetCommand(dbPath, inspection.pin.modelId)];
+  }
+  if (hasStoredVectors(inspection)) {
+    return [targetCommand(dbPath, "onnx"), targetCommand(dbPath, "hashing")];
+  }
+  return [doctorCommand(dbPath, true)];
+}
+
+function providerNeedsAction(provider: ProviderResult): boolean {
+  return provider.loadStatus === "unavailable" || provider.loadStatus === "incompatible";
+}
+
+interface ReconciledAssessment {
+  assessment: StoredEmbedderStateInspection["assessment"];
+  provider: ProviderResult;
+}
+
+function reconcileProviderWithStore(
+  inspection: StoredEmbedderStateInspection,
+  provider: ProviderResult,
+): ReconciledAssessment {
+  if (provider.loadStatus !== "available" || provider.modelId === undefined || provider.dim === undefined) {
+    return { assessment: inspection.assessment, provider };
+  }
+
+  const unproven = (reason: string, storeDimensions: number[] = []): ReconciledAssessment => ({
+    assessment: inspection.assessment,
+    provider: { ...provider, storeCompatibility: "unproven", storeDimensions, reason },
+  });
+  if (!inspection.exists) return unproven("The store does not exist, so provider compatibility cannot be proven.");
+  if (inspection.integrity.status !== "ok") return unproven("SQLite integrity is not clean.");
+  if (inspection.schemaVersion !== inspection.supportedSchemaVersion) {
+    return unproven("The store schema is not the current supported schema.");
+  }
+  if (inspection.migration.status !== "none") return unproven("An embedder migration sentinel is present or unknown.");
+  if (inspection.pin.status !== "known" || inspection.pin.modelId !== provider.modelId) {
+    return unproven("The provider identity does not match the exact durable store pin.");
+  }
+
+  const populations = Object.values(inspection.populations);
+  if (populations.some((population) => population.status !== "known")) {
+    return unproven("At least one live embedding population could not be inspected.");
+  }
+  const knownPopulations = populations.filter((population) => population.status === "known");
+  if (knownPopulations.some((population) => population.malformed.count > 0)) {
+    return unproven("Malformed embeddings prevent a compatibility proof.");
+  }
+
+  const nonempty = knownPopulations.filter((population) => population.liveRowCount > 0);
+  const storeDimensions = [...new Set(nonempty.flatMap((population) => population.dimensions))].sort((a, b) => a - b);
+  if (nonempty.length === 0) {
+    return unproven("The store has no live embedding population from which to prove a vector width.", storeDimensions);
+  }
+  if (nonempty.some((population) => population.scoredVectorCount === 0 || population.dimensions.length !== 1)) {
+    return unproven("Every nonempty live population must contribute one scored vector width; zero-only populations remain conservative.", storeDimensions);
+  }
+  if (storeDimensions.length !== 1) {
+    return unproven("Live embedding populations do not share one uniform global width.", storeDimensions);
+  }
+  if (storeDimensions[0] !== provider.dim) {
+    return {
+      assessment: inspection.assessment,
+      provider: {
+        ...provider,
+        loadStatus: "incompatible",
+        storeCompatibility: "incompatible",
+        storeDimensions,
+        reason: `Stored vectors use width ${storeDimensions[0]}, but provider '${provider.modelId}' declares width ${provider.dim}.`,
+      },
+    };
+  }
+  return {
+    assessment: inspection.assessment === "unknown" ? "safe" : inspection.assessment,
+    provider: { ...provider, storeCompatibility: "compatible", storeDimensions },
+  };
+}
+
+async function checkProvider(
+  modelId: string | null,
+  dependencies: RecoveryCliDependencies,
+): Promise<{ result: ProviderResult; provider?: EmbeddingProvider }> {
+  if (!modelId) {
+    return { result: { loadStatus: "unavailable", reason: "The store has no exact embedder model ID to check." } };
+  }
+  try {
+    const provider = await dependencies.instantiate(modelId);
+    if (typeof provider.modelId !== "string" || provider.modelId.trim().length === 0) {
+      throw new Error("The selected provider has no stable model ID.");
+    }
+    if (provider.modelId !== modelId) {
+      throw new Error(`The selected provider reports model ID '${provider.modelId}', not '${modelId}'.`);
+    }
+    const output = await provider.embed(PROBE_TEXT);
+    validateEmbeddingProviderOutput(provider, output);
+    return {
+      provider,
+      result: { loadStatus: "available", modelId: provider.modelId, dim: provider.dim },
+    };
+  } catch (error) {
+    return {
+      result: { loadStatus: "unavailable", modelId, reason: messageFrom(error) },
+    };
+  }
+}
+
+function resolveTargetAlias(target: string): string {
+  const normalized = target.trim();
+  if (normalized.length === 0) throw new Error("--target must be a nonblank exact model ID, 'onnx', or 'hashing'.");
+  if (normalized === "onnx") return new OnnxEmbeddingProvider().modelId;
+  if (normalized === "hashing") return new HashingEmbeddingProvider().modelId;
+  if (/^dim:/i.test(normalized)) {
+    throw new Error("Dimension-only targets are ambiguous; use 'onnx', 'hashing', or an exact model ID.");
+  }
+  return normalized;
+}
+
+function integrityLabel(inspection: StoredEmbedderStateInspection): string {
+  if (inspection.integrity.status === "ok") return "ok";
+  if (inspection.integrity.status === "failed") return `failed (${inspection.integrity.check.join("; ")})`;
+  return `unknown (${inspection.integrity.reason})`;
+}
+
+function pinLabel(inspection: StoredEmbedderStateInspection): string {
+  if (inspection.pin.status === "unknown") return `unknown (${inspection.pin.reason})`;
+  if (!inspection.pin.modelId) return "unpinned";
+  return `${inspection.pin.modelId} (source: ${inspection.pin.source ?? "unknown"})`;
+}
+
+function migrationLabel(inspection: StoredEmbedderStateInspection): string {
+  const migration = inspection.migration;
+  if (migration.status === "none") return "none";
+  if (migration.status === "unknown") return `unknown (${migration.reason})`;
+  return `active -> ${migration.targetModelId}; rewrite ${migration.rewriteProgress}; abandon ${migration.abandon.classification}`;
+}
+
+function printInspection(
+  inspection: StoredEmbedderStateInspection,
+  assessment = inspection.assessment,
+): void {
+  console.log(`Database:   ${inspection.dbPath}`);
+  console.log(`Exists:     ${inspection.exists ? "yes" : "no"}`);
+  console.log(`Assessment: ${assessment}`);
+  if (assessment !== inspection.assessment) console.log(`Raw safety: ${inspection.assessment} (reconciled with exact provider)`);
+  console.log(`Schema:     ${inspection.schemaVersion ?? "none"} (supported: ${inspection.supportedSchemaVersion})`);
+  console.log(`Integrity:  ${integrityLabel(inspection)}`);
+  console.log(`Pin:        ${pinLabel(inspection)}`);
+  console.log(`Migration:  ${migrationLabel(inspection)}`);
+  console.log("Embedding populations:");
+  for (const [name, population] of Object.entries(inspection.populations)) {
+    if (population.status === "unknown") {
+      console.log(`  ${name}: unknown (${population.reason})`);
+    } else {
+      const samples = population.malformed.sampleIds.length > 0
+        ? `; malformed samples ${population.malformed.sampleIds.join(", ")}`
+        : "";
+      console.log(
+        `  ${name}: rows ${population.liveRowCount}; vectors ${population.scoredVectorCount}; zero ${population.ignoredZeroVectorCount}; dimensions [${population.dimensions.join(", ")}]; malformed ${population.malformed.count}${samples}`,
+      );
+    }
+  }
+}
+
+function printCommands(commands: string[]): void {
+  if (commands.length === 0) return;
+  console.log("Next commands:");
+  for (const command of commands) console.log(`  ${command}`);
+}
+
+function printProvider(provider: ProviderResult): void {
+  if (provider.loadStatus === "not-checked") {
+    console.log("Provider:   not checked (use --check-provider)");
+  } else if (provider.loadStatus === "available") {
+    const compatibility = provider.storeCompatibility ? `; store ${provider.storeCompatibility}` : "";
+    console.log(`Provider:   available (${provider.modelId}; ${provider.dim} dimensions${compatibility})`);
+    if (provider.reason) console.log(`Provider evidence: ${provider.reason}`);
+  } else {
+    console.log(`Provider:   ${provider.loadStatus}${provider.modelId ? ` (${provider.modelId})` : ""}: ${provider.reason}`);
+  }
+}
+
+function jsonDoctor(
+  inspection: StoredEmbedderStateInspection,
+  assessment: StoredEmbedderStateInspection["assessment"],
+  provider: ProviderResult,
+  nextCommands: string[],
+): Record<string, unknown> {
+  return {
+    schema: RECOVERY_SCHEMA,
+    command: "doctor",
+    ok: assessment === "safe" && !providerNeedsAction(provider),
+    dbPath: inspection.dbPath,
+    schemaVersion: inspection.schemaVersion,
+    supportedSchemaVersion: inspection.supportedSchemaVersion,
+    integrity: inspection.integrity,
+    pin: inspection.pin,
+    populations: inspection.populations,
+    migration: inspection.migration,
+    assessment,
+    rawAssessment: inspection.assessment,
+    provider,
+    nextCommands,
+  };
+}
+
+function jsonInspection(
+  inspection: StoredEmbedderStateInspection,
+  assessment = inspection.assessment,
+): Record<string, unknown> {
+  return {
+    schemaVersion: inspection.schemaVersion,
+    supportedSchemaVersion: inspection.supportedSchemaVersion,
+    integrity: inspection.integrity,
+    pin: inspection.pin,
+    populations: inspection.populations,
+    migration: inspection.migration,
+    assessment,
+    rawAssessment: inspection.assessment,
+  };
+}
+
+function printJson(value: unknown): void {
+  console.log(JSON.stringify(value));
+}
+
+function inspectOrThrow(dbPath: string, dependencies: RecoveryCliDependencies): StoredEmbedderStateInspection {
+  try {
+    return dependencies.inspect(dbPath);
+  } catch (error) {
+    throw new RepairOperationError(messageFrom(error), { dbPath }, { cause: error });
+  }
+}
+
+async function runDoctor(options: DoctorOptions, dependencies: RecoveryCliDependencies): Promise<void> {
+  const dbPath = path.resolve(dependencies.dbPath(options.dir));
+  console.error(`store: ${dbPath}`);
+  try {
+    const inspection = inspectOrThrow(dbPath, dependencies);
+    let provider: ProviderResult = { loadStatus: "not-checked" };
+    let assessment = inspection.assessment;
+    if (options.checkProvider) {
+      console.error("provider: checking stored embedder");
+      const modelId = inspection.pin.status === "known" ? inspection.pin.modelId : null;
+      const checked = await checkProvider(modelId, dependencies);
+      const reconciled = reconcileProviderWithStore(inspection, checked.result);
+      provider = reconciled.provider;
+      assessment = reconciled.assessment;
+    }
+    const nextCommands = nextCommandsForInspection(inspection, assessment);
+    if (options.json) {
+      printJson(jsonDoctor(inspection, assessment, provider, nextCommands));
+    } else {
+      console.log("Monet Doctor");
+      console.log("------------");
+      printInspection(inspection, assessment);
+      printProvider(provider);
+      printCommands(nextCommands);
+    }
+    if (assessment !== "safe" || providerNeedsAction(provider)) dependencies.setExitCode(2);
+  } catch (error) {
+    printRecoveryError("doctor", options.json ?? false, error, { dbPath });
+    dependencies.setExitCode(1);
+  }
+}
+
+function selectMode(options: RepairOptions): RepairMode {
+  const selected = [options.target !== undefined, options.resume === true, options.abandon === true].filter(Boolean).length;
+  if (selected !== 1) throw new Error("Choose exactly one repair mode: --target <model-id>, --resume, or --abandon.");
+  if (options.apply && !options.yes) throw new Error("--apply requires --yes; repair never prompts interactively.");
+  if (options.yes && !options.apply) throw new Error("--yes is valid only with --apply.");
+  if (options.resume) return "resume";
+  if (options.abandon) return "abandon";
+  return "target";
+}
+
+function ensureInspectableForRepair(inspection: StoredEmbedderStateInspection): void {
+  if (!inspection.exists) throw new Error("The Monet store does not exist; there is nothing to repair.");
+  if (inspection.integrity.status !== "ok") {
+    throw new Error(`The store integrity result is ${integrityLabel(inspection)}; refusing repair.`);
+  }
+  if (inspection.schemaVersion !== null && inspection.schemaVersion > inspection.supportedSchemaVersion) {
+    throw new Error(
+      `Store schema ${inspection.schemaVersion} is newer than supported schema ${inspection.supportedSchemaVersion}; refusing repair.`,
+    );
+  }
+  if (inspection.pin.status === "unknown" || inspection.migration.status === "unknown") {
+    throw new Error("The store's embedder state is unknown; refusing repair until diagnosis succeeds completely.");
+  }
+}
+
+function backupPath(dbPath: string, now: Date, uuid: string): string {
+  const timestamp = now.toISOString().replace(/[-:.]/g, "");
+  return path.join(path.dirname(dbPath), "backups", `monet-before-repair-${timestamp}-${uuid}.db`);
+}
+
+function progressLine(event: EmbeddingMigrationProgress): string {
+  const current = event.currentId ? ` ${event.currentId}` : "";
+  return `repair: ${event.phase} ${event.completed}/${event.total} failed=${event.failed}${current}`;
+}
+
+async function applyRepair(
+  mode: RepairMode,
+  dbPath: string,
+  inspection: StoredEmbedderStateInspection,
+  targetModelId: string | undefined,
+  provider: EmbeddingProvider | undefined,
+  providerResult: ProviderResult,
+  dependencies: RecoveryCliDependencies,
+): Promise<{ backup: VerifiedBackupResult; report: EmbeddingMigrationReport | { action: "abandon"; status: "completed" } }> {
+  const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
+  mkdirSync(path.dirname(destination), { recursive: true });
+  let port: BetterSqlitePort | undefined;
+  let core: MonetCore | undefined;
+  let backup: VerifiedBackupResult | undefined;
+  let result: { backup: VerifiedBackupResult; report: EmbeddingMigrationReport | { action: "abandon"; status: "completed" } } | undefined;
+  let operationError: unknown;
+  try {
+    port = dependencies.createPort(dbPath);
+    backup = await port.createVerifiedBackup(destination);
+    console.error(`backup: ${backup.path}`);
+    core = dependencies.createCore(port, provider);
+    if (mode === "abandon") {
+      core.abandonEmbedderMigration();
+      result = { backup, report: { action: "abandon", status: "completed" } };
+    } else {
+      const report = await core.migrateEmbeddings({
+        targetModelId: targetModelId!,
+        onProgress(event) {
+          console.error(progressLine(event));
+        },
+      });
+      result = { backup, report };
+    }
+  } catch (error) {
+    operationError = error;
+  }
+
+  let closeError: unknown;
+  try {
+    if (core) core.close();
+    else port?.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (operationError !== undefined || closeError !== undefined) {
+    const causes = [operationError, closeError].filter((error) => error !== undefined);
+    const cause = causes.length === 1 ? causes[0] : new AggregateError(causes);
+    let message = operationError === undefined
+      ? `Repair completed, but closing the database failed: ${messageFrom(closeError)}`
+      : closeError === undefined
+        ? messageFrom(operationError)
+        : `${messageFrom(operationError)}; closing the repair database also failed: ${messageFrom(closeError)}`;
+    let failureInspection = inspection;
+    let nextCommands = mode === "target" && targetModelId
+      ? [targetCommand(dbPath, targetModelId), targetCommand(dbPath, targetModelId, true)]
+      : [resumeCommand(dbPath), resumeCommand(dbPath, true)];
+    if (backup) {
+      try {
+        failureInspection = dependencies.inspect(dbPath);
+        nextCommands = nextCommandsForInspection(failureInspection);
+      } catch (error) {
+        message += ` Retry-state inspection also failed: ${messageFrom(error)}`;
+        // Once an owned repair reached the backup/core boundary, an unseen sentinel is possible.
+        // Resume is the conservative retry; it will refuse safely if no sentinel was stamped.
+        nextCommands = [resumeCommand(dbPath), resumeCommand(dbPath, true), doctorCommand(dbPath)];
+      }
+    }
+    throw new RepairOperationError(message, {
+      dbPath,
+      inspection: failureInspection,
+      provider: providerResult,
+      nextCommands,
+      ...(backup ? { backup } : {}),
+    }, { cause });
+  }
+  return result!;
+}
+
+async function runRepair(options: RepairOptions, dependencies: RecoveryCliDependencies): Promise<void> {
+  const dbPath = path.resolve(dependencies.dbPath(options.dir));
+  console.error(`store: ${dbPath}`);
+  let latestInspection: StoredEmbedderStateInspection | undefined;
+  let latestProvider: ProviderResult | undefined;
+  let latestNextCommands: string[] | undefined;
+  let latestBackup: VerifiedBackupResult | undefined;
+  try {
+    const mode = selectMode(options);
+    const inspection = inspectOrThrow(dbPath, dependencies);
+    latestInspection = inspection;
+    ensureInspectableForRepair(inspection);
+
+    let targetModelId: string | undefined;
+    if (mode === "target") targetModelId = resolveTargetAlias(options.target!);
+    if (mode === "resume") {
+      if (inspection.migration.status !== "active") {
+        throw new RepairOperationError("No embedder migration sentinel is active; there is nothing to resume.", {
+          dbPath,
+          inspection,
+          provider: { loadStatus: "not-checked" },
+          nextCommands: [doctorCommand(dbPath)],
+        });
+      }
+      targetModelId = inspection.migration.targetModelId;
+    }
+
+    if (mode === "target" && inspection.migration.status === "active") {
+      const resume = resumeCommand(dbPath, true);
+      throw new RepairOperationError(
+        `An embedder migration to '${inspection.migration.targetModelId}' is already active. Resume the sentinel target instead.`,
+        {
+          dbPath,
+          inspection,
+          provider: { loadStatus: "not-checked" },
+          nextCommands: [resumeCommand(dbPath), resume],
+        },
+      );
+    }
+
+    if (mode === "abandon") {
+      if (inspection.migration.status !== "active") {
+        throw new RepairOperationError("No embedder migration sentinel is active; there is nothing to abandon.", {
+          dbPath,
+          inspection,
+          provider: { loadStatus: "not-checked" },
+          nextCommands: [doctorCommand(dbPath)],
+        });
+      }
+      if (inspection.migration.abandon.classification !== "safe") {
+        throw new RepairOperationError(
+          `The active migration cannot be safely abandoned (${inspection.migration.abandon.classification}): ${inspection.migration.abandon.reason}`,
+          {
+            dbPath,
+            inspection,
+            provider: { loadStatus: "not-checked" },
+            nextCommands: [resumeCommand(dbPath), resumeCommand(dbPath, true)],
+          },
+        );
+      }
+    }
+
+    let provider: EmbeddingProvider | undefined;
+    let providerResult: ProviderResult = { loadStatus: "not-checked" };
+    let loadedProviderResult = providerResult;
+    let assessment = inspection.assessment;
+    let noOpReason: string | undefined;
+    latestProvider = providerResult;
+    if (mode === "target" && isEmptyUnpinnedStore(inspection)) {
+      noOpReason = "The store is empty and unpinned; no embedding repair is required.";
+    }
+    if (targetModelId && noOpReason === undefined) {
+      console.error(`provider: preflighting ${targetModelId}`);
+      const checked = await checkProvider(targetModelId, dependencies);
+      provider = checked.provider;
+      loadedProviderResult = checked.result;
+      providerResult = loadedProviderResult;
+      latestProvider = providerResult;
+      if (!provider) {
+        const providerCommands = mode === "resume"
+          ? [resumeCommand(dbPath), resumeCommand(dbPath, true)]
+          : [doctorCommand(dbPath, true), targetCommand(dbPath, targetModelId)];
+        throw new RepairOperationError(`Provider '${targetModelId}' is unavailable: ${providerResult.reason}`, {
+          dbPath,
+          inspection,
+          provider: providerResult,
+          nextCommands: providerCommands,
+        });
+      }
+      if (
+        mode === "target"
+        && inspection.pin.status === "known"
+        && inspection.pin.modelId === targetModelId
+      ) {
+        const reconciled = reconcileProviderWithStore(inspection, loadedProviderResult);
+        providerResult = reconciled.provider;
+        assessment = reconciled.assessment;
+        latestProvider = providerResult;
+        if (assessment === "safe" && !providerNeedsAction(providerResult)) {
+          noOpReason = `The store is already compatible with '${targetModelId}'; no embedding repair is required.`;
+        }
+      }
+    }
+
+    const nextCommands = noOpReason !== undefined
+      ? []
+      : mode === "abandon"
+      ? [abandonCommand(dbPath, true), resumeCommand(dbPath)]
+      : mode === "resume"
+        ? [resumeCommand(dbPath), resumeCommand(dbPath, true)]
+        : [targetCommand(dbPath, targetModelId!), targetCommand(dbPath, targetModelId!, true)];
+    latestNextCommands = nextCommands;
+
+    if (noOpReason !== undefined) {
+      if (options.apply) {
+        throw new RepairOperationError(`${noOpReason} Refusing a needless embedding rewrite.`, {
+          dbPath,
+          inspection,
+          assessment,
+          provider: providerResult,
+          nextCommands,
+        });
+      }
+      const report = {
+        status: "preview",
+        action: "none",
+        targetModelId: targetModelId ?? null,
+        repairRequired: false,
+        reason: noOpReason,
+        databaseMutation: false,
+        backupRequiredOnApply: false,
+      };
+      if (options.json) {
+        printJson({
+          schema: RECOVERY_SCHEMA,
+          command: "repair",
+          ok: true,
+          applied: false,
+          mode,
+          dbPath,
+          ...jsonInspection(inspection, assessment),
+          inspection,
+          provider: providerResult,
+          nextCommands,
+          backup: null,
+          report,
+        });
+      } else {
+        console.log("Monet Repair Preview");
+        console.log("--------------------");
+        printInspection(inspection, assessment);
+        printProvider(providerResult);
+        console.log("Action:     none");
+        console.log(`Reason:     ${noOpReason}`);
+        console.log("Mutation:   none");
+        console.log("Backup:     not required");
+      }
+      return;
+    }
+
+    if (!options.apply) {
+      const report = {
+        status: "preview",
+        action: mode,
+        targetModelId: targetModelId ?? null,
+        repairRequired: true,
+        databaseMutation: false,
+        backupRequiredOnApply: true,
+      };
+      if (options.json) {
+        printJson({
+          schema: RECOVERY_SCHEMA,
+          command: "repair",
+          ok: true,
+          applied: false,
+          mode,
+          dbPath,
+          ...jsonInspection(inspection, assessment),
+          inspection,
+          provider: providerResult,
+          nextCommands,
+          backup: null,
+          report,
+        });
+      } else {
+        console.log("Monet Repair Preview");
+        console.log("--------------------");
+        printInspection(inspection, assessment);
+        printProvider(providerResult);
+        console.log(`Action:     ${mode}`);
+        if (targetModelId) console.log(`Target:     ${targetModelId}`);
+        console.log("Mutation:   none (preview only)");
+        console.log("Backup:     required automatically by --apply --yes");
+        printCommands(nextCommands);
+      }
+      return;
+    }
+
+    const result = await applyRepair(
+      mode,
+      dbPath,
+      inspection,
+      targetModelId,
+      provider,
+      providerResult,
+      dependencies,
+    );
+    latestBackup = result.backup;
+    let after: StoredEmbedderStateInspection;
+    try {
+      after = dependencies.inspect(dbPath);
+    } catch (error) {
+      throw new RepairOperationError(`Repair applied, but post-repair diagnosis failed: ${messageFrom(error)}`, {
+        dbPath,
+        inspection,
+        provider: providerResult,
+        nextCommands: [doctorCommand(dbPath), resumeCommand(dbPath), resumeCommand(dbPath, true)],
+        backup: result.backup,
+      }, { cause: error });
+    }
+    latestInspection = after;
+    const afterReconciled = provider
+      ? reconcileProviderWithStore(after, loadedProviderResult)
+      : { assessment: after.assessment, provider: providerResult };
+    providerResult = afterReconciled.provider;
+    assessment = afterReconciled.assessment;
+    latestProvider = providerResult;
+    const afterCommands = nextCommandsForInspection(after, assessment);
+    latestNextCommands = afterCommands;
+    if (options.json) {
+      printJson({
+        schema: RECOVERY_SCHEMA,
+        command: "repair",
+        ok: true,
+        applied: true,
+        mode,
+        dbPath,
+        ...jsonInspection(after, assessment),
+        inspection: after,
+        provider: providerResult,
+        nextCommands: afterCommands,
+        backup: result.backup,
+        report: result.report,
+      });
+    } else {
+      console.log("Monet Repair Complete");
+      console.log("---------------------");
+      printInspection(after, assessment);
+      console.log(`Backup:     ${result.backup.path}`);
+      console.log(`Action:     ${mode}`);
+      if (targetModelId) console.log(`Target:     ${targetModelId}`);
+      printCommands(afterCommands);
+    }
+  } catch (error) {
+    const contextual = error instanceof RepairOperationError
+      ? error
+      : new RepairOperationError(messageFrom(error), {
+          dbPath,
+          ...(latestInspection ? { inspection: latestInspection } : {}),
+          ...(latestProvider ? { provider: latestProvider } : {}),
+          ...(latestNextCommands ? { nextCommands: latestNextCommands } : {}),
+          ...(latestBackup ? { backup: latestBackup } : {}),
+        }, { cause: error });
+    printRecoveryError("repair", options.json ?? false, contextual, { dbPath });
+    dependencies.setExitCode(1);
+  }
+}
+
+function printRecoveryError(
+  command: "doctor" | "repair",
+  json: boolean,
+  error: unknown,
+  fallback: RepairFailureContext,
+): void {
+  const context = error instanceof RepairOperationError ? error.context : fallback;
+  const message = messageFrom(error);
+  if (json) {
+    printJson({
+      schema: RECOVERY_SCHEMA,
+      command,
+      ok: false,
+      dbPath: context.dbPath,
+      ...(context.inspection ? jsonInspection(context.inspection) : {}),
+      ...(context.assessment ? { assessment: context.assessment, rawAssessment: context.inspection?.assessment } : {}),
+      error: { name: error instanceof Error ? error.name : "Error", message },
+      inspection: context.inspection ?? null,
+      provider: context.provider ?? { loadStatus: "not-checked" },
+      nextCommands: context.nextCommands ?? [],
+      backup: context.backup ?? null,
+      report: null,
+    });
+  } else {
+    console.error(`monet ${command}: ${message}`);
+    console.error(`database: ${context.dbPath}`);
+    if (context.inspection) {
+      console.error(`assessment: ${context.assessment ?? context.inspection.assessment}`);
+      console.error(`pin: ${pinLabel(context.inspection)}`);
+      console.error(`migration: ${migrationLabel(context.inspection)}`);
+    }
+    if (context.provider?.loadStatus === "unavailable" || context.provider?.loadStatus === "incompatible") {
+      console.error(`provider: ${context.provider.loadStatus}: ${context.provider.reason}`);
+    }
+    if (context.backup) console.error(`backup retained: ${context.backup.path}`);
+    for (const next of context.nextCommands ?? []) console.error(`next: ${next}`);
+  }
+}
+
+export function defaultRecoveryDependencies(): RecoveryCliDependencies {
+  return {
+    dbPath(storageDir) {
+      return storageDir ? path.join(path.resolve(storageDir), "monet.db") : path.resolve(getDbPath());
+    },
+    inspect: inspectStoredEmbedderState,
+    instantiate: instantiateEmbedderForPin,
+    createPort: (dbPath) => new BetterSqlitePort(dbPath),
+    createCore: (port, embedder) => new MonetCore(port, {
+      ...(embedder ? { embedder } : {}),
+      deferCreatedPin: true,
+    }),
+    now: () => new Date(),
+    uuid: randomUUID,
+    setExitCode(code) {
+      process.exitCode = code;
+    },
+  };
+}
+
+export function registerRecoveryCommands(
+  program: Command,
+  dependencies: RecoveryCliDependencies = defaultRecoveryDependencies(),
+): Command {
+  program
+    .command("doctor")
+    .description("Diagnose the stored embedder pin, vectors, migration state, and provider availability")
+    .option("-d, --dir <storage-directory>", "Storage directory (default: .monet or ~/.monet)")
+    .option("--json", "Print one stable JSON result object")
+    .option("--check-provider", "Load and validate the exact provider recorded by the store")
+    .action((options: DoctorOptions) => runDoctor(options, dependencies));
+
+  program
+    .command("repair")
+    .description("Preview or apply a verified, backup-first embedder repair")
+    .option("--target <onnx|hashing|exact-model-id>", "Rewrite all embeddings to this provider")
+    .option("--resume", "Resume the exact target recorded by an active migration sentinel")
+    .option("--abandon", "Safely abandon a not-yet-rewritten migration when core permits it")
+    .option("-d, --dir <storage-directory>", "Storage directory (default: .monet or ~/.monet)")
+    .option("--json", "Print one stable JSON result object")
+    .option("--apply", "Apply the repair after provider preflight and verified backup")
+    .option("--yes", "Confirm --apply noninteractively")
+    .action((options: RepairOptions) => runRepair(options, dependencies));
+
+  return program;
+}

@@ -40,42 +40,134 @@ monet dashboard -p 8080      # -p, --port <n>   custom port
 monet dashboard -d ./path    # -d, --dir <path>  point at a specific store
 ```
 
-## Register Markdown sources — `monet source`
+## Diagnose and repair an embedder store — `monet doctor` / `monet repair`
 
-The source commands configure the local registry only; they do **not** themselves clone, scan, parse, ingest, or sync content. A newly added source stays `pending-initial-sync` until its first sync runs, either automatically via the background scheduler or on demand via the `source_sync` MCP tool (disable the scheduler with `MONET_NO_SOURCE_SCHEDULER=1` if needed).
-
-Both source types use default-deny access lists, so at least one caller ID and one project ID are required:
+If Monet reports an embedder pin mismatch, an interrupted embedding migration, malformed vectors, or an unavailable local model, start with the read-only diagnostic command:
 
 ```bash
-# Register the current repository; --path defaults to the resolved project directory
-monet source add "Project docs" \
-  --type repo-md \
-  --include "README.md" --include "docs/**/*.md" \
-  --exclude "vendor/**" \
-  --allow-caller local-agent --allow-project github.com/team-monet/monet-client
-
-# Register a remote repository. Monet allocates the local path but does not clone it.
-monet source add "Shared docs" \
-  --type git-md --circle shared-docs \
-  --remote https://github.com/acme/docs.git --branch main \
-  --allow-scheme https --allow-host github.com \
-  --allow-caller local-agent --allow-project github.com/team-monet/monet-client
-
-monet source list
-monet source list --json
-monet source show <source-id>
-monet source show <source-id> --path-only
-monet source update <source-id> --include "handbook/**/*.md" --clear-excludes
-monet source remove <source-id> --yes
+monet doctor
+monet doctor --check-provider       # also load and probe the exact pinned provider
+monet doctor --dir ~/.monet --json  # machine-readable result; diagnostics stay on stderr
 ```
 
-`--allow-caller`/`--allow-project` must match the identity your server actually presents, not an arbitrary label: `local-agent` is the default caller ID (`--allow-caller codex` grants an ID no server ever presents unless `MONET_CALLER_ID=codex` is set), and the project ID defaults to `host/org/repo` derived from the invocation directory's git remote (`github.com/team-monet/monet-client` above, for this repo). Both `monet source add` and `monet source show` print the exact caller/project identity your running server will present, and either default can be overridden with the `MONET_CALLER_ID` / `MONET_PROJECT_ID` env vars.
+`doctor` prints the absolute database path, SQLite integrity and schema, the durable model pin, all four live embedding populations (including dimensions and malformed-row samples), any migration sentinel, and copy-paste next commands. It does not construct `MonetCore` or alter the database. A healthy diagnosis exits `0`; a completed diagnosis that needs recovery or provider action exits `2`; inspection failures exit `1`. An unavailable provider is reported separately from store safety—for example, an unsupported hashing tokenizer or missing ONNX cache does not by itself mean the database is corrupt. For an ONNX or custom model ID whose shape cannot be proven from the pin alone, `--check-provider` can reconcile an otherwise `unknown` assessment only when the exact provider loads and every clean live population has the same matching vector width.
 
-`source update` changes mutable registry configuration only: name, include/exclude patterns, ACLs, Git transport policy, write-back policy, refresh policy, and auto-detection preference. Source identity (type, circle, repository/root, remote, and branch) is immutable; remove and add a new source to change it. Removal creates a tombstone and never deletes the registered local path.
+Repairs are previews unless both confirmation flags are present. Choose exactly one mode:
 
-When the Monet store is project-local, registering the repository root is safe: Monet permanently retains a source-relative exclusion for its managed `.monet/sources` subtree, including after `--clear-excludes`. A repo root equal to or inside that managed subtree is rejected. Active sources cannot share the same canonical local path; removing a source releases the path for a new source ID while preserving the old ID tombstone.
+```bash
+# Preview a complete rewrite to a built-in provider alias.
+monet repair --target hashing
+monet repair --target onnx
 
-All source commands use the existing storage resolution (`MONET_STORAGE_DIR`, an existing `./.monet`, then `~/.monet`). To override it for one invocation, put `--dir` on the parent command, for example `monet source --dir ./scratch-store list`.
+# Exact persisted model IDs are also accepted (quote them in scripts).
+monet repair --target 'hashing:dim=256:tok=2' --json
+
+# Apply only after reviewing the preview; this command never prompts.
+monet repair --target hashing --apply --yes
+
+# An interrupted migration must use the sentinel's exact target.
+monet repair --resume
+monet repair --resume --apply --yes
+
+# Abandon is available only when core proves no vectors were rewritten and can restore the prior pin.
+monet repair --abandon
+monet repair --abandon --apply --yes
+```
+
+Preview classifies the durable state before offering an apply command. An empty unpinned store or a clean, provider-compatible same-target store reports `action: none`; no backup or rewrite is needed, and `--apply --yes` refuses. Abandon preview also refuses unless a sentinel exists and core diagnostics classify it as safe. A valid target or resume preview loads and probes the exact provider but does not open the database for mutation. Apply preflights the provider again, takes exclusive SQLite ownership, and creates a verified backup before core can migrate schema or embeddings. Backups are automatic and cannot be disabled or redirected:
+
+```text
+<storage-directory>/backups/monet-before-repair-<UTC>-<uuid>.db
+```
+
+The backup path is printed immediately and retained if later work fails. Stop other Monet processes if exclusive ownership cannot be acquired, then rerun the same command. Do not delete an active migration sentinel or edit the pin manually: use `--resume`, or use `--abandon` only when its preview says core classifies abandonment as safe. Successful previews and applies exit `0`; invalid flags, provider failures, locks, unsafe abandon attempts, backup failures, and migration failures exit `1`.
+
+## Register Markdown sources — `monet source`
+
+Linked sources keep living Markdown available to Monet as the files change. Use one when the file or repository remains the source of truth, such as a handbook, ADR tree, or agent instructions. Use the `memory_store` MCP tool for a point-in-time capture instead: a distilled decision, preference, constraint, or reason that should not silently change when a file is edited.
+
+`monet source` configures the local registry; it does **not** itself clone, scan, parse, ingest, or sync content. Both source types are default-deny, so every registration requires at least one caller ID and one project ID. Replace the values below for your environment:
+
+```bash
+# Defaults shown here: change them if MONET_CALLER_ID or MONET_PROJECT_ID is set.
+CALLER_ID="local-agent"
+PROJECT_ID="github.com/acme/widgets"
+
+# Link a tightly scoped Markdown set in the current repository.
+monet source add "Project docs" \
+  --type repo-md \
+  --include "README.md" \
+  --include "docs/**/*.md" \
+  --exclude "docs/private/**" \
+  --exclude "docs/generated/**" \
+  --allow-caller "$CALLER_ID" \
+  --allow-project "$PROJECT_ID"
+```
+
+The command prints the new source ID, `Status: pending-initial-sync`, and `Server identity: caller … · project …`. There is no separate `whoami` command. Copy the printed ID, inspect the registration, and compare the printed identity with its `Callers` and `Projects` ACLs:
+
+```bash
+SOURCE_ID="<source-id printed by add>" # replace this placeholder
+monet source show "$SOURCE_ID"
+
+# Run this only if the printed server identity does not match the ACLs.
+monet source update "$SOURCE_ID" \
+  --allow-caller "<caller from Server identity>" \
+  --allow-project "<project from Server identity>"
+```
+
+`local-agent` is the default caller. The default project ID is derived from the invocation repository's Git remote as `host/org/repo`; `MONET_CALLER_ID` and `MONET_PROJECT_ID` override them. Run the CLI against the same store as the MCP server: storage resolves through `MONET_STORAGE_DIR`, an existing `./.monet`, then `~/.monet`. For a one-off override, put `--dir` on `source`, for example `monet source --dir ./scratch-store list`.
+
+For Markdown in another Git repository, allowlist both the URL scheme and host. Monet allocates a local path at registration but does not clone until sync:
+
+```bash
+monet source add "Shared handbook" \
+  --type git-md \
+  --circle shared-handbook \
+  --remote "https://github.com/acme/handbook.git" \
+  --branch main \
+  --include "README.md" \
+  --include "handbook/**/*.md" \
+  --exclude "handbook/private/**" \
+  --allow-scheme https \
+  --allow-host github.com \
+  --allow-caller "$CALLER_ID" \
+  --allow-project "$PROJECT_ID"
+```
+
+Initial and manual syncs are MCP operations, not source CLI subcommands. Ask a connected agent to call `source_sync` with `{"sourceId":"<source-id>"}`. Registrations default to an hourly interval; an active `monet start` server runs due syncs in the background. Set `MONET_NO_SOURCE_SCHEDULER=1` on the server to disable scheduled syncs. Set an explicit cadence or switch to manual refresh with:
+
+```bash
+monet source update "$SOURCE_ID" --refresh interval --interval-seconds 1800
+monet source update "$SOURCE_ID" --refresh manual
+```
+
+After syncing, ask the agent to call `source_status` with `{"sourceId":"<source-id>"}` and check `lastSyncResult`, `filesIndexed`, `filesSkipped`, and `freshness`, then spot-check a distinctive phrase with `memory_search`. Call `source_path` with the same argument to get the sealed, read-only path for the exact active indexed snapshot; it is not the source working tree or the registry's allocated local path. Only a complete published snapshot is exposed, never a partial run.
+
+Use the CLI to list and inspect registry configuration:
+
+```bash
+monet source list
+monet source list --json
+monet source show "$SOURCE_ID"
+monet source show "$SOURCE_ID" --json
+monet source show "$SOURCE_ID" --path-only # registered local/allocated path
+monet source update "$SOURCE_ID" \
+  --include "handbook/**/*.md" \
+  --exclude "handbook/private/**"
+```
+
+`source update` replaces the mutable fields supplied on that invocation: name, include/exclude patterns, ACLs, Git transport policy, write-back policy, refresh policy, and auto-detection preference. Source type, circle, repository root, remote, and branch are immutable; remove and re-add the source to change them. Removal requires confirmation, creates a tombstone, and does not delete the registered path:
+
+```bash
+monet source remove "$SOURCE_ID" --yes
+monet source list --include-tombstoned
+monet source show "$SOURCE_ID" --include-tombstoned
+```
+
+When the Monet store is project-local, registering the repository root is safe: Monet permanently retains a source-relative exclusion for its managed `.monet/sources` subtree, including after `--clear-excludes`. A repository root equal to or inside that managed subtree is rejected. Active sources cannot share the same canonical local path; removing a source releases the path for a new source ID while preserving the old ID tombstone.
+
+For the complete, version-matched option list, run `monet source --help` and `monet source <add|list|show|update|remove> --help`.
 
 ## License
 

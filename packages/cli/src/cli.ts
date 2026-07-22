@@ -9,6 +9,7 @@ import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { printStoreLine, registerSourceCommands, SourceCliError } from "./source-cli.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openSourceCore, openStatusCore } from "./bootstrap.js";
+import { registerRecoveryCommands } from "./repair-cli.js";
 
 // Read version from package.json so it can never drift from the published version.
 // esbuild inlines the import.meta.url-relative path at bundle time; the bundled
@@ -161,6 +162,8 @@ registerSourceCommands(program, {
   deriveProjectId,
   projectDir: resolveProjectDir,
 });
+
+registerRecoveryCommands(program);
 
 void program.parseAsync().catch((error: unknown) => {
   if (error instanceof FreshStoreEmbedderUnavailableError) {
