@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import type { IngestResult, SourceConceptRollbackResult } from "./engine";
 import {
   detectRepoMdRenames, materializeGitMdCommit, materializeRepoMdCommit, materializeRepoMdHead, pointSourceCurrent,
-  removeSourceMaterializations, sourceSnapshotPath, revokeSourceCurrent, validateSourceMaterializationRemoval, validateSourcePublishedPath,
-  withGitMdMaterializerLock, withRepoMdMaterializerLock,
+  removeSourceMaterializations, repairActiveSourceSnapshotStrictSuperset, sourceSnapshotPath, revokeSourceCurrent,
+  validateSourceMaterializationRemoval, validateSourcePublishedPath,
+  validateStagedSourcePublication, withGitMdMaterializerLock, withRepoMdMaterializerLock,
 } from "./source-materializer";
-import type { RepoMdMaterializerOptions } from "./source-materializer";
+import type { RepoMdMaterialization, RepoMdMaterializerOptions } from "./source-materializer";
 import { syncManagedGitRepository, validateManagedGitRepository } from "./source-git";
 import type { RemoteGitOptions } from "./source-git";
 import {
@@ -24,6 +25,18 @@ import type {
 
 const compareUtf8 = (a: string, b: string): number => Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
 
+function mergeScanDiagnostics(...groups: readonly (readonly SourceScanDiagnostic[])[]): SourceScanDiagnostic[] {
+  const seen = new Set<string>();
+  const merged: SourceScanDiagnostic[] = [];
+  for (const diagnostic of groups.flat()) {
+    const key = JSON.stringify([diagnostic.code, diagnostic.relativePath ?? null, diagnostic.message]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(diagnostic);
+  }
+  return merged;
+}
+
 export type RepoMdSyncFaultPoint =
   | "after-pin" | "after-begin" | "after-stage" | "after-store" | "after-engine-written"
   | "after-refresh" | "after-committed" | "after-activation" | "after-publish" | "after-current" | "after-cleanup"
@@ -32,7 +45,8 @@ export type RepoMdSyncFaultPoint =
   | "before-remove-complete" | "after-remove-complete"
   | "after-recompute";
 
-type CallerMaterializerOptions = Omit<Partial<RepoMdMaterializerOptions>, "sourceStorageDir" | "config" | "lockStaleMs" | "now" | "assertOwnership">;
+type CallerMaterializerOptions = Omit<Partial<RepoMdMaterializerOptions>,
+  "sourceStorageDir" | "config" | "lockStaleMs" | "now" | "assertOwnership" | "activePublication">;
 
 export interface RepoMdSyncOptions {
   lockStaleMs?: number;
@@ -188,34 +202,70 @@ function requireUnchangedGitMdSource(core: SourceSyncCorePort, sourceId: string,
   return current;
 }
 
-function requireExactActivePublication(
+function activePublicationRecoverySignature(source: KnowledgeSource): string {
+  return JSON.stringify({
+    type: source.type,
+    lifecycle: source.lifecycle,
+    activeRunId: source.activeRunId,
+    activeSnapshotId: source.activeSnapshotId,
+    activeIngestConfigHash: source.activeIngestConfigHash,
+    configVersion: source.configVersion,
+    leaseFence: source.leaseFence,
+  });
+}
+
+function requireUnchangedActivePublication(
   core: SourceSyncCorePort,
   source: KnowledgeSource,
-  expectedSignature: string,
+  expectedRecoverySignature: string,
+  publication: SourcePublishedManifest,
+  expectedGitSignature?: string,
 ): KnowledgeSource {
-  const current = requireUnchangedGitMdSource(core, source.id, expectedSignature);
-  if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash
-      || current.activeRunId !== source.activeRunId || current.activeSnapshotId !== source.activeSnapshotId
-      || current.activeIngestConfigHash !== source.activeIngestConfigHash) {
-    throw new Error("git-md active publication changed during local recovery");
+  const current = requireActiveSource(core, source.id, source.type);
+  if (expectedGitSignature !== undefined && gitMdSourceSignature(current) !== expectedGitSignature) {
+    throw new Error("git-md source changed during remote synchronization");
+  }
+  if (activePublicationRecoverySignature(current) !== expectedRecoverySignature) {
+    throw new Error("source active publication changed during local recovery");
   }
   core.validateSourceActivePublication(
-    current.id, current.activeRunId, current.activeSnapshotId, current.activeIngestConfigHash,
+    current.id, publication.runId, publication.snapshotId, publication.ingestConfigHash,
   );
   return current;
 }
 
 function activePublishedManifest(core: SourceSyncCorePort, source: KnowledgeSource): SourcePublishedManifest {
   if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash) {
-    throw new Error("git-md active publication metadata is incomplete");
+    throw new Error("source active publication metadata is incomplete");
   }
+  const run = core.getSourceRun(source.activeRunId);
+  if (!run || run.snapshotId !== source.activeSnapshotId) {
+    throw new Error("source active publication run/snapshot fence is inconsistent");
+  }
+  // The registry hash may intentionally be stale after a scanner/parser version change. The
+  // canonical published ledger remains the durable active run tuple until the replacement run
+  // publishes, so authenticate that tuple rather than reconstructing rows under the stale hash.
   return core.getSourcePublishedManifest(
-    source.id, source.activeRunId, source.activeSnapshotId, source.activeIngestConfigHash,
+    source.id, run.id, run.snapshotId, run.ingestConfigHash,
   );
 }
 
-/** Restore only the stable pointer from an already-published sealed variant, before any remote work. */
-function repairGitMdActivePublication(
+function stagedPublishedManifest(core: SourceSyncCorePort, run: SourceSyncRun): SourcePublishedManifest {
+  if (!run.manifestHash) throw new Error("staged source run is missing its manifest hash");
+  return {
+    sourceId: run.sourceId,
+    runId: run.id,
+    snapshotId: run.snapshotId,
+    ingestConfigHash: run.ingestConfigHash,
+    configVersion: run.configVersion,
+    leaseFence: run.leaseFence,
+    manifestHash: run.manifestHash,
+    files: core.listSourceFiles(run.id),
+  };
+}
+
+/** Authenticate and recover the stored active publication before connector-specific acquisition. */
+function recoverActivePublication(
   core: SourceSyncCorePort,
   source: KnowledgeSource,
   options: RuntimeOptions,
@@ -223,23 +273,39 @@ function repairGitMdActivePublication(
 ): KnowledgeSource {
   if (!source.activeRunId && !source.activeSnapshotId && !source.activeIngestConfigHash) return source;
   if (!source.activeRunId || !source.activeSnapshotId || !source.activeIngestConfigHash) {
-    throw new Error("git-md active publication metadata is incomplete");
+    throw new Error("source active publication metadata is incomplete");
   }
-  const expectedSignature = gitMdSourceSignature(source);
-  requireExactActivePublication(core, source, expectedSignature);
-  const revalidate = (): void => {
-    options.preflight?.();
-    requireExactActivePublication(core, source, expectedSignature);
-  };
-  let publishedPathValid = false;
+  const expectedRecoverySignature = activePublicationRecoverySignature(source);
+  const expectedGitSignature = source.type === "git-md" ? gitMdSourceSignature(source) : undefined;
   const publication = activePublishedManifest(core, source);
+  const revalidate = (): void => {
+    // Preserve the coordinator's exact lock-token/inode, scheduler-lease, authorization,
+    // preflight, and connector fences before checking the durable publication identity.
+    assertRuntimeOwnership(options);
+    requireUnchangedActivePublication(
+      core, source, expectedRecoverySignature, publication, expectedGitSignature,
+    );
+  };
+  revalidate();
+  let publishedPathValid = false;
   try {
-    validateSourcePublishedPath(source, source.activeSnapshotId, source.activeIngestConfigHash, options.sourceStorageDir, publication);
+    validateSourcePublishedPath(
+      source, publication.snapshotId, publication.ingestConfigHash, options.sourceStorageDir, publication, revalidate,
+    );
     publishedPathValid = true;
   } catch { /* The sealed variant is revalidated below before any pointer repair. */ }
   if (!publishedPathValid) {
-    pointSourceCurrent(source, source.activeSnapshotId, source.activeIngestConfigHash, {
+    repairActiveSourceSnapshotStrictSuperset(source, publication, {
       ...materializer,
+      assertOwnership: revalidate,
+      fault: (point) => {
+        materializer.fault?.(point);
+        revalidate();
+      },
+    });
+    pointSourceCurrent(source, publication.snapshotId, publication.ingestConfigHash, {
+      ...materializer,
+      assertOwnership: revalidate,
       fault: (point) => {
         materializer.fault?.(point);
         revalidate();
@@ -247,10 +313,16 @@ function repairGitMdActivePublication(
     }, publication);
   }
   revalidate();
-  validateSourcePublishedPath(source, source.activeSnapshotId, source.activeIngestConfigHash, options.sourceStorageDir, publication);
+  validateSourcePublishedPath(
+    source, publication.snapshotId, publication.ingestConfigHash, options.sourceStorageDir, publication, revalidate,
+  );
   revalidate();
-  validateSourcePublishedPath(source, source.activeSnapshotId, source.activeIngestConfigHash, options.sourceStorageDir, publication);
-  return requireExactActivePublication(core, source, expectedSignature);
+  validateSourcePublishedPath(
+    source, publication.snapshotId, publication.ingestConfigHash, options.sourceStorageDir, publication, revalidate,
+  );
+  return requireUnchangedActivePublication(
+    core, source, expectedRecoverySignature, publication, expectedGitSignature,
+  );
 }
 
 async function materializeCommit(source: KnowledgeSource, snapshotId: string, options: RepoMdMaterializerOptions) {
@@ -262,7 +334,7 @@ async function materializeCommit(source: KnowledgeSource, snapshotId: string, op
 function materializerOptions(options: RuntimeOptions): RepoMdMaterializerOptions {
   const {
     sourceStorageDir: _callerStorage, config: _callerConfig, lockStaleMs: _callerLock,
-    now: _callerClock, ...caller
+    now: _callerClock, activePublication: _callerPublication, ...caller
   } = (options.materializer ?? {}) as Partial<RepoMdMaterializerOptions>;
   return {
     ...caller,
@@ -455,18 +527,9 @@ async function planManifest(
   //       renamed to NEW this run, and NEW is itself diagnosed — carried under NEW, reusing OLD's
   //       binding so a later heal of NEW resumes the same concept instead of forking a new one.
   //
-  // SNAPSHOT CONSISTENCY STATUS: for cases (a)/(b) — same-path and subtree-nested materializer
-  // skips of previously-published paths — the gap is CLOSED: treeLevelCarryCandidates +
-  // carryForwardPriorFiles (source-materializer.ts) copy the carried bytes from the prior sealed
-  // snapshot into the new one BEFORE sealing, and validateSealedSnapshotAgainstGit reconciles via
-  // marker.carriedPaths (entries ∪ carriedPaths, still an exact match). Cross-check regression
-  // tests hold the two carry decisions in lockstep for those shapes. REMAINING OPEN (tracked):
-  // case (c) below — a rename whose destination is TREE-LEVEL diagnosed this run — is carried
-  // here under a NEW path the pre-seal mirror structurally cannot know (it iterates prior files
-  // only; rename pairs are not computed pre-seal). For that one shape the manifest still claims
-  // bytes the snapshot lacks: git-md fails the ledger cross-check post-publish; repo-md leaves a
-  // source_path gap. Closing it needs pre-seal rename knowledge — a follow-up design decision;
-  // see treeLevelCarryCandidates' docstring and the invariant comment in source-ledger.ts.
+  // Cases (a)/(b) copy the carried bytes into staging before the canonical scan and seal. Case (c)
+  // can still produce a manifest/snapshot mismatch because rename evidence is computed later; the
+  // mandatory pre-activation ledger parity gate catches it and preserves the prior publication.
   // CODEX FIX (3606534107): a same-path/subtree carry candidate must still be selected by the
   // CURRENT effective include/exclude config, not just previously published and diagnosis-
   // protected. Without this, a config change that newly excludes a descendant of a diagnosed
@@ -942,16 +1005,17 @@ function verifyUnchangedPublication(
   if (!active.activeRunId || !active.activeSnapshotId || !active.activeIngestConfigHash) {
     throw new Error("unchanged source is missing its active publication tuple");
   }
-  const publication = active.type === "git-md" ? activePublishedManifest(core, active) : undefined;
-  pointSourceCurrent(active, active.activeSnapshotId, active.activeIngestConfigHash, materializer, publication);
+  const publication = activePublishedManifest(core, active);
+  if (snapshotId !== publication.snapshotId) throw new Error("unchanged candidate does not match the canonical active publication");
+  pointSourceCurrent(active, publication.snapshotId, publication.ingestConfigHash, materializer, publication);
   options.preflight?.();
-  validateSourcePublishedPath(active, active.activeSnapshotId, active.activeIngestConfigHash, options.sourceStorageDir, publication);
+  validateSourcePublishedPath(active, publication.snapshotId, publication.ingestConfigHash, options.sourceStorageDir, publication);
   options.preflight?.();
-  validateSourcePublishedPath(active, active.activeSnapshotId, active.activeIngestConfigHash, options.sourceStorageDir, publication);
+  validateSourcePublishedPath(active, publication.snapshotId, publication.ingestConfigHash, options.sourceStorageDir, publication);
   mutate();
   core.recordSourceVerification({
-    sourceId: active.id, runId: active.activeRunId, snapshotId: active.activeSnapshotId,
-    ingestConfigHash: active.activeIngestConfigHash,
+    sourceId: active.id, runId: publication.runId, snapshotId: publication.snapshotId,
+    ingestConfigHash: publication.ingestConfigHash,
     configVersion: active.configVersion, leaseFence: active.leaseFence,
   });
   onVerified();
@@ -1097,23 +1161,6 @@ async function syncSource(
     const guardedOptions: RuntimeOptions = { ...options, assertOwnership: assertAuthorizedOwnership };
     assertAuthorizedOwnership();
     let source = requireSourceLineage(core, sourceId, type);
-    // BLOCKER 5a: computed once, early, and threaded through mat to every materialize call this
-    // invocation makes. The materializer intentionally has no ledger access, so this is the only
-    // way it can locate and validate the prior sealed snapshot needed for pre-seal carry-forward.
-    // Mirrors planManifest's own (later, independent) priorRun/priorFiles computation exactly —
-    // same source.activeRunId, same core.listSourceFiles(..., true) — so the two carry decisions
-    // read the same prior-published truth.
-    if (source.activeRunId) {
-      const priorRunForCarry = core.getSourceRun(source.activeRunId);
-      if (priorRunForCarry) {
-        mat.priorPublication = {
-          runId: priorRunForCarry.id,
-          snapshotId: priorRunForCarry.snapshotId,
-          ingestConfigHash: priorRunForCarry.ingestConfigHash,
-          files: core.listSourceFiles(source.activeRunId, true).map((file) => ({ relativePath: file.relativePath })),
-        };
-      }
-    }
     let run = core.resumeSourceRun(sourceId);
     // REVIEW FIX (round 4, Codex thread 15): resumeSourceRun hands back ANY nonterminal run for
     // this source with no version check — a run created under an OLDER SOURCE_SCANNER_VERSION/
@@ -1170,10 +1217,9 @@ async function syncSource(
     }
 
     const execute = async (): Promise<RepoMdSyncResult> => {
-    // Diagnostics from the initial pin materialization, valid only for the exact run it begot.
-    // The later "scanning" materialize call below targets the same already-sealed snapshot and
-    // is a cache-reuse hit (diagnostics: []) by design, so its own result is not the source of
-    // truth for a freshly-pinned run; this is.
+    // The initial pin is the exact candidate for the run it creates. Reuse it in this invocation;
+    // resumed runs rebuild their non-active candidate from the immutable source commit.
+    let pinnedMaterialization: RepoMdMaterialization | undefined;
     let pinnedDiagnostics: SourceScanDiagnostic[] | undefined;
     // BLOCKER 5a: mirrors pinnedDiagnostics exactly — valid only for the exact run the pin begot,
     // undefined (fall back to the scanning block's own materialize result) on genuine resume.
@@ -1193,13 +1239,12 @@ async function syncSource(
     // sweepPendingRecomputes' own docstring.
     await sweepPendingRecomputes(core, sourceId, guardedOptions);
 
-    if (type === "git-md") {
-      try { source = repairGitMdActivePublication(core, source, guardedOptions, mat); }
-      catch (error) {
-        recordCurrentPrePinFailure(error);
-        throw error;
-      }
+    try { source = recoverActivePublication(core, source, guardedOptions, mat); }
+    catch (error) {
+      recordCurrentPrePinFailure(error);
+      throw error;
     }
+    mat.activePublication = source.activeRunId ? activePublishedManifest(core, source) : undefined;
 
     if (run?.state === "aborted") {
       await drainCleanup(core, run, guardedOptions);
@@ -1207,18 +1252,6 @@ async function syncSource(
     }
     if (run?.state === "cleaning") {
       source = requireActiveSource(core, sourceId, type);
-      if (source.activeSnapshotId) {
-        // CODEX FIX (3606534127): self-heal re-verifies/repairs the snapshot that IS the active
-        // publication — it has no new carry decision to make (whatever it carried, if anything,
-        // was decided when it was originally sealed), so the prior-publication carry fence must
-        // not apply here. Passing the ambient mat.priorPublication (which describes the CURRENT
-        // active run — i.e. this exact run) would wrongly compare this snapshot's own
-        // carriedFromRunId (its OWN prior, an earlier run) against itself and evict a perfectly
-        // valid snapshot every time it carried anything at all.
-        if (type !== "git-md") await materializeCommit(source, source.activeSnapshotId, { ...mat, priorPublication: undefined, config: run.effectiveConfig });
-        pointSourceCurrent(source, source.activeSnapshotId, computeSourceIngestConfigHash(run.effectiveConfig), mat,
-          type === "git-md" ? activePublishedManifest(core, source) : undefined);
-      }
       await drainCleanup(core, run, guardedOptions);
       // REVIEW FIX (BLOCKER): this is a resume of an ALREADY-published run — a PR#49-era fast path
       // that predates recomputeTouchedSourceConcepts and returned "published" without ever calling
@@ -1230,15 +1263,6 @@ async function syncSource(
     }
 
     source = requireActiveSource(core, sourceId, type);
-    if (source.activeSnapshotId && type !== "git-md") {
-      const activeRun = source.activeRunId ? core.getSourceRun(source.activeRunId) : null;
-      if (!activeRun) throw new Error("active repo-md source is missing its published run");
-      // CODEX FIX (3606534127): same reasoning as the cleaning-state self-heal above — re-
-      // materializing the CURRENTLY ACTIVE snapshot is never a "should this carry from the current
-      // prior" decision, so the prior-publication fence must not apply.
-      await materializeCommit(source, source.activeSnapshotId, { ...mat, priorPublication: undefined, config: activeRun.effectiveConfig });
-      pointSourceCurrent(source, source.activeSnapshotId, computeSourceIngestConfigHash(activeRun.effectiveConfig), mat);
-    }
 
     if (!run) {
       try {
@@ -1278,7 +1302,8 @@ async function syncSource(
         invocationRun = run;
         // run.snapshotId === pinned.snapshotId and run.effectiveConfig matches what `pinned` just
         // materialized with, so this is exact evidence for the run the "scanning" block is about
-        // to (redundantly, cache-hit) re-materialize.
+        // to consume.
+        pinnedMaterialization = pinned;
         pinnedDiagnostics = pinned.diagnostics;
         pinnedCarryForwardUnavailable = pinned.carryForwardUnavailable;
         options.fault?.("after-begin");
@@ -1293,8 +1318,8 @@ async function syncSource(
     mutate();
     let snapshotPath = sourceSnapshotPath(source, run.snapshotId, runConfigHash, options.sourceStorageDir, mutate, mat.safeTreeOps);
     if (run.state === "scanning") {
-      let materialized;
-      try {
+      let materialized = pinnedMaterialization;
+      if (!materialized) try {
         materialized = await materializeCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
       } catch (error) {
         const writeFree = core.listSourceFiles(run.id).length === 0 && core.listSourceChunks(run.id).length === 0;
@@ -1328,6 +1353,7 @@ async function syncSource(
           invocationRun = run;
           // The pin no longer describes this run's snapshot: this materialize call (below) is now
           // the fresh, authoritative one for the replacement commit.
+          pinnedMaterialization = undefined;
           pinnedDiagnostics = undefined;
           pinnedCarryForwardUnavailable = undefined;
           runConfigHash = computeSourceIngestConfigHash(run.effectiveConfig);
@@ -1336,14 +1362,22 @@ async function syncSource(
           materialized = await materializeCommit(source, run.snapshotId, { ...mat, config: run.effectiveConfig });
         }
       }
+      if (materialized.preSealStatus === "partial") {
+        mutate();
+        core.abortSourceRun(run.id, "partial", JSON.stringify(materialized.diagnostics));
+        return {
+          sourceId, snapshotId: run.snapshotId, runId: run.id, status: "partial",
+          diagnostics: materialized.diagnostics,
+        };
+      }
       const scanLimits = run.effectiveConfig.limits;
       const scanned = (options.scan ?? scanSourceSnapshot)({ root: snapshotPath, config: run.effectiveConfig });
       // Merge tree-materialization skips (never reached the scanner) with scan-time skips
       // (materialized but excluded on read) into one skip-and-diagnose evidence set for this run.
-      // The "scanning" state's own materialize call above is a cache-reuse hit (diagnostics: [])
-      // whenever this exact run was just freshly pinned in this same invocation, so prefer that
-      // pin's real evidence when it applies to this exact run.
-      const skipDiagnostics = [...(pinnedDiagnostics ?? materialized.diagnostics), ...scanned.diagnostics];
+      // A freshly pinned run reuses its in-memory materialization above, preserving that pin's
+      // rejection evidence. A resumed run rebuilds its disposable candidate and uses the rebuilt
+      // materialization's evidence instead.
+      const skipDiagnostics = mergeScanDiagnostics(pinnedDiagnostics ?? materialized.diagnostics, scanned.diagnostics);
       // BLOCKER 5a EDGE CASE: pre-seal carry-forward (source-materializer.ts) could not source
       // some previously-published paths' bytes because the prior sealed snapshot it needed was
       // missing, corrupt, or otherwise failed validation. Those paths' bytes are NOT in this run's
@@ -1372,8 +1406,8 @@ async function syncSource(
       // manifest/snapshot mismatch shape blocker 5a and this fix close, reached a different way.
       // Degrade to the same graceful tree-level-partial exit; loud, and self-heals on the very next
       // sync once walk order or budget shifts (identical commit, no new failure to accumulate).
-      const priorPublishedPaths = new Set((mat.priorPublication?.files ?? []).map((file) => file.relativePath));
-      const budgetResidualPaths = scanned.diagnostics
+      const priorPublishedPaths = new Set((mat.activePublication?.files ?? []).map((file) => file.relativePath));
+      const budgetResidualPaths = skipDiagnostics
         .filter((diagnostic) => diagnostic.code === "chunk-budget-exceeded"
           && diagnostic.relativePath !== undefined && priorPublishedPaths.has(diagnostic.relativePath))
         .map((diagnostic) => diagnostic.relativePath!);
@@ -1432,6 +1466,16 @@ async function syncSource(
     if (run.state === "staging") {
       await materializeStagedBindings(core, source, run, guardedOptions);
       try {
+        validateStagedSourcePublication(source, stagedPublishedManifest(core, run), options.sourceStorageDir, mutate);
+      } catch (error) {
+        mutate();
+        const aborted = core.abortSourceRun(
+          run.id, "failed", error instanceof Error ? error.message : "staged source publication parity failed",
+        );
+        await drainCleanup(core, aborted, guardedOptions);
+        throw error;
+      }
+      try {
         mutate();
         core.beginSourceActivation(run.id);
       } catch (error) {
@@ -1449,6 +1493,16 @@ async function syncSource(
 
     if (run.state === "activating") {
       try {
+        validateStagedSourcePublication(source, stagedPublishedManifest(core, run), options.sourceStorageDir, mutate);
+      } catch (error) {
+        mutate();
+        const aborted = core.abortSourceRun(
+          run.id, "failed", error instanceof Error ? error.message : "source activation parity failed",
+        );
+        await drainCleanup(core, aborted, guardedOptions);
+        throw error;
+      }
+      try {
         mutate();
         core.publishSourceRun({ runId: run.id, activationToken: run.activationToken! });
       } catch (error) {
@@ -1460,12 +1514,10 @@ async function syncSource(
       }
       options.fault?.("after-publish");
       source = requireActiveSource(core, sourceId, type);
-      const publishedManifest = type === "git-md" ? activePublishedManifest(core, source) : undefined;
-      if (type === "git-md") {
-        if (source.activeRunId !== run.id || source.activeSnapshotId !== run.snapshotId
-            || source.activeIngestConfigHash !== runConfigHash) throw new Error("git-md publication changed after durable publish");
-        core.validateSourceActivePublication(source.id, run.id, run.snapshotId, runConfigHash);
-      }
+      const publishedManifest = activePublishedManifest(core, source);
+      if (source.activeRunId !== run.id || source.activeSnapshotId !== run.snapshotId
+          || publishedManifest.ingestConfigHash !== runConfigHash) throw new Error("source publication changed after durable publish");
+      core.validateSourceActivePublication(source.id, run.id, run.snapshotId, runConfigHash);
       pointSourceCurrent(source, run.snapshotId, runConfigHash, mat, publishedManifest);
       validateSourcePublishedPath(source, run.snapshotId, runConfigHash, options.sourceStorageDir, publishedManifest);
       run = core.getSourceRun(run.id)!;
@@ -1477,8 +1529,8 @@ async function syncSource(
     await recomputeTouchedSourceConcepts(core, run, guardedOptions);
     options.fault?.("after-recompute");
     source = requireActiveSource(core, sourceId, type);
-    const finalPublication = type === "git-md" ? activePublishedManifest(core, source) : undefined;
-    if (type === "git-md") core.validateSourceActivePublication(source.id, run.id, run.snapshotId, runConfigHash);
+    const finalPublication = activePublishedManifest(core, source);
+    core.validateSourceActivePublication(source.id, run.id, run.snapshotId, runConfigHash);
     pointSourceCurrent(source, run.snapshotId, runConfigHash, mat, finalPublication);
     validateSourcePublishedPath(source, run.snapshotId, runConfigHash, options.sourceStorageDir, finalPublication);
     options.fault?.("after-current");

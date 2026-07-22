@@ -2092,9 +2092,10 @@ export class SourceLedger {
     // manifest claims content as indexed that the snapshot can't actually serve. For
     // materializer-level skips of previously-published paths (same-path and subtree shapes) this
     // is CLOSED: pre-seal carry (treeLevelCarryCandidates/carryForwardPriorFiles in
-    // source-materializer.ts) copies carried bytes into the snapshot before sealing, reconciled
-    // in validateSealedSnapshotAgainstGit via marker.carriedPaths as an exact entries ∪ carried
-    // match. ONE REMAINING OPEN SHAPE (tracked): a rename whose destination is tree-level
+    // source-materializer.ts) copies carried bytes into the snapshot before sealing;
+    // canonicalizeStaging folds them into marker.files as the exact sealed accepted set, and the
+    // pre-activation ledger-parity gate proves that set against source_files. ONE REMAINING OPEN
+    // SHAPE (tracked): a rename whose destination is tree-level
     // diagnosed the same run — carried by planManifest under a new path the pre-seal mirror
     // cannot know (rename pairs aren't computed pre-seal); see the carry-forward comment in
     // planManifest (source-sync.ts) and treeLevelCarryCandidates' docstring.

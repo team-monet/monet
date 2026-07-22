@@ -144,8 +144,8 @@ describe("repo-md committed-HEAD materializer", () => {
       expect(readFileSync(join(selected.snapshotPath, "README.md"), "utf8")).toBe("committed bytes\n");
       expect(() => readFileSync(join(selected.snapshotPath, "HUGE.bin"))).toThrow();
 
-      // An individually oversized selected blob is skipped and diagnosed rather than aborting the
-      // whole materialization; the snapshot still seals, just with zero files in it here.
+      // A selected non-Markdown blob is diagnosed before any accepted Markdown budget is spent;
+      // the snapshot still seals, just with zero files in it here.
       const selectedHuge = { ...f.source, include: ["HUGE.bin"] };
       const skippedHuge = await materializeRepoMdHead(selectedHuge, {
         sourceStorageDir: join(f.root, "other-managed"),
@@ -154,7 +154,7 @@ describe("repo-md committed-HEAD materializer", () => {
           limits: { maxEntries: 10, maxFiles: 1, maxFileBytes: 1024, maxTotalBytes: 1024, maxParseMs: 1000, maxChunkBytes: 100, maxChunks: 10 },
         },
       });
-      expect(skippedHuge.diagnostics).toEqual([expect.objectContaining({ code: "file-too-large", relativePath: "HUGE.bin" })]);
+      expect(skippedHuge.diagnostics).toEqual([expect.objectContaining({ code: "not-markdown", relativePath: "HUGE.bin" })]);
       expect(readdirSync(skippedHuge.snapshotPath)).toEqual([]);
 
       // Tree-level budgets (gate regression) still throw hard: two individually valid, regular,
@@ -208,7 +208,7 @@ describe("repo-md committed-HEAD materializer", () => {
     } finally { f.cleanup(); }
   });
 
-  it("seals snapshots, validates exact-OID reuse, and rejects tampering", async () => {
+  it("seals snapshots and safely rebuilds a non-active candidate after tampering", async () => {
     const f = fixture();
     try {
       const first = await materializeRepoMdHead(f.source, { sourceStorageDir: f.storage });
@@ -220,7 +220,9 @@ describe("repo-md committed-HEAD materializer", () => {
       expect(reused.snapshotPath).toBe(first.snapshotPath);
       chmodSync(file, 0o600);
       writeFileSync(file, "tampered bytes");
-      await expect(materializeRepoMdHead(f.source, { sourceStorageDir: f.storage })).rejects.toThrow(/sealed|tampered/);
+      const rebuilt = await materializeRepoMdHead(f.source, { sourceStorageDir: f.storage });
+      expect(rebuilt.snapshotPath).toBe(first.snapshotPath);
+      expect(readFileSync(file, "utf8")).toBe("committed bytes\n");
     } finally { f.cleanup(); }
   });
 
@@ -228,7 +230,8 @@ describe("repo-md committed-HEAD materializer", () => {
     const f = fixture();
     try {
       writeFileSync(join(f.repo, "EXTRA.md"), "extra committed bytes\n");
-      git(f.repo, "add", "EXTRA.md"); git(f.repo, "commit", "-m", "extra");
+      writeFileSync(join(f.repo, "IMAGE.png"), Buffer.alloc(1024, 7));
+      git(f.repo, "add", "EXTRA.md", "IMAGE.png"); git(f.repo, "commit", "-m", "extra");
       const readmeOnly = await materializeRepoMdHead(f.source, { sourceStorageDir: f.storage });
       const broad = await materializeRepoMdHead({ ...f.source, include: ["**"] }, { sourceStorageDir: f.storage });
       expect(broad.snapshotId).toBe(readmeOnly.snapshotId);
@@ -236,8 +239,12 @@ describe("repo-md committed-HEAD materializer", () => {
       expect(broad.snapshotPath).not.toBe(readmeOnly.snapshotPath);
       expect(readdirSync(readmeOnly.snapshotPath)).toEqual(["README.md"]);
       expect(readdirSync(broad.snapshotPath).sort()).toEqual(["EXTRA.md", "README.md"]);
+      expect(broad.diagnostics).toEqual([expect.objectContaining({ code: "not-markdown", relativePath: "IMAGE.png" })]);
       expect(existsSync(`${readmeOnly.snapshotPath}.complete.json`)).toBe(true);
       expect(existsSync(`${broad.snapshotPath}.complete.json`)).toBe(true);
+      const marker = JSON.parse(readFileSync(`${broad.snapshotPath}.complete.json`, "utf8")) as Record<string, unknown>;
+      expect(Object.keys(marker).sort()).toEqual(["configHash", "files", "snapshotId", "variant", "version"]);
+      expect(JSON.stringify(marker)).not.toContain("IMAGE.png");
       const reused = await materializeRepoMdHead(f.source, { sourceStorageDir: f.storage });
       expect(reused.snapshotPath).toBe(readmeOnly.snapshotPath);
       pointRepoMdCurrent(f.source.id, broad.snapshotId, broad.configHash, { sourceStorageDir: f.storage });
@@ -245,7 +252,7 @@ describe("repo-md committed-HEAD materializer", () => {
     } finally { f.cleanup(); }
   });
 
-  it("requires both variant halves and enforces the external manifest's exact tree closure", async () => {
+  it("discards incomplete or untrusted non-active variants and rebuilds from the commit", async () => {
     for (const mutation of ["sidecar-only", "extra", "directory", "missing", "marker"] as const) {
       const f = fixture();
       try {
@@ -286,13 +293,11 @@ describe("repo-md committed-HEAD materializer", () => {
           }));
           chmodSync(sidecar, 0o400);
         }
-        await expect(materializeRepoMdHead(f.source, { sourceStorageDir: f.storage })).rejects.toThrow(/tampered|directory|incomplete|marker/);
-        if (mutation === "directory") {
-          rmSync(sidecar);
-          const rebuilt = await materializeRepoMdHead(f.source, { sourceStorageDir: f.storage });
-          expect(readdirSync(rebuilt.snapshotPath)).toEqual(["README.md"]);
-          expect(existsSync(`${rebuilt.snapshotPath}.complete.json`)).toBe(true);
-        }
+        const rebuilt = await materializeRepoMdHead(f.source, { sourceStorageDir: f.storage });
+        expect(rebuilt.snapshotPath).toBe(first.snapshotPath);
+        expect(readdirSync(rebuilt.snapshotPath)).toEqual(["README.md"]);
+        expect(readFileSync(join(rebuilt.snapshotPath, "README.md"), "utf8")).toBe("committed bytes\n");
+        expect(existsSync(`${rebuilt.snapshotPath}.complete.json`)).toBe(true);
       } finally { f.cleanup(); }
     }
   });

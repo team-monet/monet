@@ -127,6 +127,27 @@ function rewriteSealedSnapshot(snapshot: string, relativePath: string, content: 
   chmodSync(sidecar, 0o400);
 }
 
+function addFileToSealedSnapshot(snapshot: string, relativePath: string, content: Buffer): void {
+  const sidecar = `${snapshot}.complete.json`;
+  const marker = JSON.parse(readFileSync(sidecar, "utf8")) as {
+    files: Array<{ path: string; size: number; sha256: string; mode?: "100644" | "100755" }>;
+  };
+  if (marker.files.some((file) => file.path === relativePath)) throw new Error("test snapshot path already exists");
+  chmodSync(snapshot, 0o700);
+  writeFileSync(join(snapshot, relativePath), content, { mode: 0o400 });
+  marker.files.push({
+    path: relativePath,
+    size: content.length,
+    sha256: createHash("sha256").update(content).digest("hex"),
+    mode: "100644",
+  });
+  marker.files.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+  chmodSync(snapshot, 0o500);
+  chmodSync(sidecar, 0o600);
+  writeFileSync(sidecar, JSON.stringify(marker));
+  chmodSync(sidecar, 0o400);
+}
+
 function fixture(sourcePathValidationCheck?: () => void) {
   const root = mkdtempSync(join(tmpdir(), "monet-git-md-"));
   const upstream = join(root, "upstream");
@@ -1847,15 +1868,41 @@ describe("managed git-md remote materialization", () => {
     } finally { f.cleanup(); }
   });
 
-  it("authenticates rewritten cached variants against Git before reuse", async () => {
+  it("discards and rebuilds a rewritten non-active candidate from Git", async () => {
     const f = fixture();
     try {
       mkdirSync(f.storage, { recursive: true });
       const oid = await syncManagedGitRepository(f.source, f.storage, { execFile: f.localRemoteExec });
       const cached = await materializeGitMdCommit(f.source, oid, { sourceStorageDir: f.storage });
       rewriteSealedSnapshot(cached.snapshotPath, "README.md", "# Forged\n\nrewritten cache\n");
-      await expect(materializeGitMdCommit(f.source, oid, { sourceStorageDir: f.storage }))
-        .rejects.toThrow(/does not match (its Git blob|Git)/);
+      const rebuilt = await materializeGitMdCommit(f.source, oid, { sourceStorageDir: f.storage });
+      expect(rebuilt.snapshotPath).toBe(cached.snapshotPath);
+      expect(readFileSync(join(rebuilt.snapshotPath, "README.md"), "utf8")).toContain("first");
+    } finally { f.cleanup(); }
+  });
+
+  it("seals only accepted Markdown from a broad mixed-content source", async () => {
+    const f = fixture();
+    try {
+      mkdirSync(join(f.upstream, "docs"));
+      mkdirSync(join(f.upstream, "assets"));
+      writeFileSync(join(f.upstream, "docs", "guide.md"), "# Guide\n\naccepted\n");
+      writeFileSync(join(f.upstream, "assets", "pixel.png"), Buffer.alloc(4096, 7));
+      writeFileSync(join(f.upstream, "notes.txt"), "not markdown\n");
+      git(f.upstream, "add", "docs/guide.md", "assets/pixel.png", "notes.txt");
+      git(f.upstream, "commit", "-m", "mixed source");
+      mkdirSync(f.storage, { recursive: true });
+      const source = { ...f.source, include: ["**"] };
+      const oid = await syncManagedGitRepository(source, f.storage, { execFile: f.localRemoteExec });
+      const materialized = await materializeGitMdCommit(source, oid, { sourceStorageDir: f.storage });
+      expect(readFileSync(join(materialized.snapshotPath, "README.md"), "utf8")).toContain("first");
+      expect(readFileSync(join(materialized.snapshotPath, "docs", "guide.md"), "utf8")).toContain("accepted");
+      expect(existsSync(join(materialized.snapshotPath, "assets", "pixel.png"))).toBe(false);
+      expect(existsSync(join(materialized.snapshotPath, "notes.txt"))).toBe(false);
+      expect(materialized.diagnostics.map((diagnostic) => diagnostic.relativePath).sort())
+        .toEqual(["assets/pixel.png", "notes.txt"]);
+      const marker = JSON.parse(readFileSync(`${materialized.snapshotPath}.complete.json`, "utf8")) as Record<string, unknown>;
+      expect(Object.keys(marker).sort()).toEqual(["configHash", "files", "snapshotId", "variant", "version"]);
     } finally { f.cleanup(); }
   });
 
@@ -1880,6 +1927,124 @@ describe("managed git-md remote materialization", () => {
         } } } })).rejects.toThrow(/ledger|manifest|content|corrupt/);
         expect(credentialCalls).toBe(0);
         expect(existsSync(join(f.storage, "git-md", f.source.id, "current"))).toBe(false);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it("repairs a shipped active strict-superset snapshot from canonical accepted ledger paths", async () => {
+    const f = fixture();
+    try {
+      const image = Buffer.alloc(2048, 7);
+      writeFileSync(join(f.upstream, "IMAGE.png"), image);
+      git(f.upstream, "add", "IMAGE.png"); git(f.upstream, "commit", "-m", "mixed source");
+      f.core.updateSource(f.source.id, { include: ["**"] });
+      const first = await f.core.syncGitMdSource(f.source.id);
+      const activeBefore = f.core.getSource(f.source.id)!;
+      const current = join(f.storage, "git-md", f.source.id, "current");
+      const currentTarget = readlinkSync(current);
+      const snapshot = realpathSync.native(current);
+      addFileToSealedSnapshot(snapshot, "IMAGE.png", image);
+      expect(() => f.core.sourcePath(f.source.id, f.auth)).toThrow(/durable ledger path set/);
+
+      let interrupted = false;
+      await expect(f.core.syncGitMdSource(f.source.id, { materializer: { fault: (point) => {
+        if (point === "before-snapshot-rename" && !interrupted) {
+          interrupted = true;
+          throw new Error("interrupt validated active repair");
+        }
+      } } })).rejects.toThrow("interrupt validated active repair");
+      expect(f.core.getSource(f.source.id)).toMatchObject({
+        activeRunId: activeBefore.activeRunId,
+        activeSnapshotId: activeBefore.activeSnapshotId,
+        activeIngestConfigHash: activeBefore.activeIngestConfigHash,
+      });
+      expect(readlinkSync(current)).toBe(currentTarget);
+      expect(readFileSync(join(snapshot, "IMAGE.png"))).toEqual(image);
+
+      let interruptedOldPair = false;
+      await expect(f.core.syncGitMdSource(f.source.id, { materializer: { fault: (point) => {
+        if (point === "before-sidecar-rename" && !interruptedOldPair) {
+          interruptedOldPair = true;
+          throw new Error("interrupt active repair old-pair move");
+        }
+      } } })).rejects.toThrow("interrupt active repair old-pair move");
+      expect(f.core.getSource(f.source.id)).toMatchObject({
+        activeRunId: activeBefore.activeRunId,
+        activeSnapshotId: activeBefore.activeSnapshotId,
+        activeIngestConfigHash: activeBefore.activeIngestConfigHash,
+      });
+      expect(readlinkSync(current)).toBe(currentTarget);
+      expect(readFileSync(join(snapshot, "IMAGE.png"))).toEqual(image);
+
+      let interruptedSwap = false;
+      await expect(f.core.syncGitMdSource(f.source.id, { materializer: { fault: (point) => {
+        if (point === "after-snapshot-rename" && !interruptedSwap) {
+          interruptedSwap = true;
+          throw new Error("interrupt active repair swap");
+        }
+      } } })).rejects.toThrow("interrupt active repair swap");
+      expect(f.core.getSource(f.source.id)).toMatchObject({
+        activeRunId: activeBefore.activeRunId,
+        activeSnapshotId: activeBefore.activeSnapshotId,
+        activeIngestConfigHash: activeBefore.activeIngestConfigHash,
+      });
+      expect(readlinkSync(current)).toBe(currentTarget);
+      expect(readFileSync(join(snapshot, "IMAGE.png"))).toEqual(image);
+
+      await expect(f.core.syncGitMdSource(f.source.id)).resolves.toMatchObject({
+        status: "noop", runId: null, snapshotId: first.snapshotId,
+      });
+      const activeAfter = f.core.getSource(f.source.id)!;
+      expect(activeAfter).toMatchObject({
+        activeRunId: activeBefore.activeRunId,
+        activeSnapshotId: activeBefore.activeSnapshotId,
+        activeIngestConfigHash: activeBefore.activeIngestConfigHash,
+      });
+      expect(readlinkSync(current)).toBe(currentTarget);
+      expect(existsSync(join(realpathSync.native(current), "IMAGE.png"))).toBe(false);
+      const marker = JSON.parse(readFileSync(`${realpathSync.native(current)}.complete.json`, "utf8")) as {
+        files: Array<{ path: string }>;
+      };
+      expect(marker.files.map((file) => file.path)).toEqual(["README.md"]);
+      expect(readFileSync(join(f.core.sourcePath(f.source.id, f.auth).path, "README.md"), "utf8")).toContain("first");
+    } finally { f.cleanup(); }
+  });
+
+  it("fences active recovery snapshot and current mutations after exact lock takeover", async () => {
+    for (const boundary of ["before-snapshot-rename", "before-current-swap"] as const) {
+      const f = fixture();
+      try {
+        await f.core.syncGitMdSource(f.source.id);
+        const sourceRoot = join(f.storage, "git-md", f.source.id);
+        const current = join(sourceRoot, "current");
+        const currentTarget = readlinkSync(current);
+        const snapshot = realpathSync.native(current);
+        if (boundary === "before-snapshot-rename") {
+          addFileToSealedSnapshot(snapshot, "IMAGE.png", Buffer.alloc(2048, 7));
+        } else {
+          rmSync(current);
+        }
+
+        let tookOver = false;
+        await expect(f.core.syncGitMdSource(f.source.id, { materializer: { fault: (point) => {
+          if (point !== boundary || tookOver) return;
+          tookOver = true;
+          const lock = join(f.storage, "git-md", `.lock-${f.source.id}`);
+          renameSync(lock, `${lock}.displaced-${boundary}`);
+          mkdirSync(lock, { mode: 0o700 });
+          writeFileSync(join(lock, "owner.json"), JSON.stringify({
+            token: "replacement-owner", heartbeatAt: Date.now(), pid: process.pid, host: "replacement-host",
+          }), { mode: 0o600 });
+        } } })).rejects.toThrow(/lock ownership was lost/);
+        expect(tookOver).toBe(true);
+
+        if (boundary === "before-snapshot-rename") {
+          expect(readlinkSync(current)).toBe(currentTarget);
+          expect(readFileSync(join(snapshot, "IMAGE.png"))).toEqual(Buffer.alloc(2048, 7));
+        } else {
+          expect(existsSync(current)).toBe(false);
+          expect(readdirSync(sourceRoot).some((name) => name.startsWith(".current-"))).toBe(false);
+        }
       } finally { f.cleanup(); }
     }
   });

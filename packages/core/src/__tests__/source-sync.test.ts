@@ -1,5 +1,6 @@
 import { execFile as nodeExecFile, execFileSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -107,14 +108,80 @@ function rawSnapshotBytes(f: { core: MonetCore }, relativePath: string): Buffer 
   return readFileSync(join(located.snapshotPath, relativePath));
 }
 
-/** The sealed snapshot marker's own carriedPaths record (blocker 5a) for the CURRENTLY published
- * snapshot+config variant — read directly from the sidecar, since it isn't part of any public API. */
-function sealedMarkerCarriedPaths(f: { core: MonetCore; storage: string }): string[] {
+type TestSnapshotMarker = {
+  snapshotId: string;
+  configHash: string;
+  variant: string;
+  files: Array<{ path: string; size: number; sha256: string; mode?: "100644" | "100755" }>;
+};
+
+function mutateSealedRepoSnapshot(
+  snapshot: string,
+  mutate: (marker: TestSnapshotMarker) => void,
+): void {
+  const sidecar = `${snapshot}.complete.json`;
+  const marker = JSON.parse(readFileSync(sidecar, "utf8")) as TestSnapshotMarker;
+  chmodSync(snapshot, 0o700);
+  chmodSync(sidecar, 0o600);
+  mutate(marker);
+  marker.files.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+  for (const file of marker.files) {
+    const path = join(snapshot, file.path);
+    if (existsSync(path)) chmodSync(path, 0o400);
+  }
+  chmodSync(snapshot, 0o500);
+  writeFileSync(sidecar, JSON.stringify(marker));
+  chmodSync(sidecar, 0o400);
+}
+
+function addFileToRepoSnapshot(snapshot: string, relativePath: string, content: Buffer): void {
+  mutateSealedRepoSnapshot(snapshot, (marker) => {
+    writeFileSync(join(snapshot, relativePath), content, { mode: 0o400 });
+    marker.files.push({
+      path: relativePath,
+      size: content.length,
+      sha256: createHash("sha256").update(content).digest("hex"),
+      mode: "100644",
+    });
+  });
+}
+
+function rewriteRepoSnapshotFile(snapshot: string, relativePath: string, content: Buffer): void {
+  mutateSealedRepoSnapshot(snapshot, (marker) => {
+    const file = marker.files.find((candidate) => candidate.path === relativePath);
+    if (!file) throw new Error("test snapshot file missing");
+    chmodSync(join(snapshot, relativePath), 0o600);
+    writeFileSync(join(snapshot, relativePath), content);
+    file.size = content.length;
+    file.sha256 = createHash("sha256").update(content).digest("hex");
+  });
+}
+
+function synthesizeOldRepoPublicationIdentity(
+  f: ReturnType<typeof fixture>,
+  oldHash: string,
+): { oldVariant: string; currentHash: string } {
   const source = f.core.getSource("repo-source")!;
-  const variant = `${source.activeSnapshotId!}-${source.activeIngestConfigHash!.slice(-64)}`;
-  const sidecarPath = join(f.storage, "repo-md", "repo-source", "snapshots", `${variant}.complete.json`);
-  const marker = JSON.parse(readFileSync(sidecarPath, "utf8")) as { carriedPaths?: string[] };
-  return marker.carriedPaths ?? [];
+  const run = f.core.getSourceRun(source.activeRunId!)!;
+  const currentHash = run.ingestConfigHash;
+  const snapshots = join(f.storage, "repo-md", "repo-source", "snapshots");
+  const currentVariant = join(snapshots, `${run.snapshotId}-${currentHash.slice(-64)}`);
+  const oldVariant = join(snapshots, `${run.snapshotId}-${oldHash.slice(-64)}`);
+  mutateSealedRepoSnapshot(currentVariant, (marker) => {
+    marker.configHash = oldHash;
+    marker.variant = `${run.snapshotId}-${oldHash.slice(-64)}`;
+  });
+  renameSync(currentVariant, oldVariant);
+  renameSync(`${currentVariant}.complete.json`, `${oldVariant}.complete.json`);
+  const current = join(f.storage, "repo-md", "repo-source", "current");
+  rmSync(current);
+  symlinkSync(join("snapshots", `${run.snapshotId}-${oldHash.slice(-64)}`), current, "dir");
+  const db = (f.core as unknown as { db: StoragePort }).db;
+  db.prepare(`UPDATE source_sync_runs SET ingest_config_hash=?,scan_config_version=? WHERE id=?`)
+    .run(oldHash, "synthetic-old-scanner/synthetic-old-chunker", run.id);
+  db.prepare(`UPDATE source_snapshots SET ingest_config_hash=? WHERE run_id=?`).run(oldHash, run.id);
+  db.prepare(`UPDATE knowledge_sources SET active_ingest_config_hash=? WHERE id=?`).run(oldHash, source.id);
+  return { oldVariant, currentHash };
 }
 
 describe("repo-md committed-HEAD sync", () => {
@@ -636,6 +703,171 @@ describe("repo-md committed-HEAD sync", () => {
     } finally { f.cleanup(); }
   });
 
+  it("authenticates exact repo-md active state and repairs missing or wrong current under its stored identity", async () => {
+    const f = fixture("repo-active-current-repair");
+    try {
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const source = f.core.getSource("repo-source")!;
+      const current = join(f.storage, "repo-md", "repo-source", "current");
+      const storedTarget = readlinkSync(current);
+      await expect(f.core.syncRepoMdSource("repo-source")).resolves.toMatchObject({ status: "noop", runId: null });
+
+      rmSync(current);
+      await expect(f.core.syncRepoMdSource("repo-source")).resolves.toMatchObject({ status: "noop", runId: null });
+      expect(readlinkSync(current)).toBe(storedTarget);
+
+      rmSync(current);
+      symlinkSync(join("snapshots", `${"0".repeat(40)}-${"0".repeat(64)}`), current, "dir");
+      await expect(f.core.syncRepoMdSource("repo-source")).resolves.toMatchObject({ status: "noop", runId: null });
+      expect(readlinkSync(current)).toBe(storedTarget);
+      expect(f.core.getSource("repo-source")).toMatchObject({
+        activeRunId: first.runId,
+        activeSnapshotId: first.snapshotId,
+        activeIngestConfigHash: source.activeIngestConfigHash,
+      });
+    } finally { f.cleanup(); }
+  });
+
+  it("repairs repo-md's shipped non-Markdown strict superset and restores the old pair across interruption", async () => {
+    const f = fixture("repo-strict-superset-repair");
+    try {
+      const image = Buffer.alloc(2048, 7);
+      writeFileSync(join(f.repo, "IMAGE.png"), image);
+      git(f.repo, "add", "IMAGE.png"); git(f.repo, "commit", "-m", "mixed source");
+      f.core.updateSource("repo-source", { include: ["**"] });
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const active = f.core.getSource("repo-source")!;
+      const current = join(f.storage, "repo-md", "repo-source", "current");
+      const target = readlinkSync(current);
+      const snapshot = resolve(dirname(current), target);
+      addFileToRepoSnapshot(snapshot, "IMAGE.png", image);
+
+      let interrupted = false;
+      await expect(f.core.syncRepoMdSource("repo-source", { materializer: { fault: (point) => {
+        if (point === "before-sidecar-rename" && !interrupted) {
+          interrupted = true;
+          throw new Error("interrupt repo active repair split pair");
+        }
+      } } })).rejects.toThrow("interrupt repo active repair split pair");
+      expect(readlinkSync(current)).toBe(target);
+      expect(readFileSync(join(snapshot, "IMAGE.png"))).toEqual(image);
+      expect(f.core.getSource("repo-source")).toMatchObject({
+        activeRunId: active.activeRunId,
+        activeSnapshotId: active.activeSnapshotId,
+        activeIngestConfigHash: active.activeIngestConfigHash,
+      });
+
+      await expect(f.core.syncRepoMdSource("repo-source")).resolves.toMatchObject({
+        status: "noop", runId: null, snapshotId: first.snapshotId,
+      });
+      expect(readlinkSync(current)).toBe(target);
+      expect(existsSync(join(resolve(dirname(current), readlinkSync(current)), "IMAGE.png"))).toBe(false);
+      expect(f.core.getSource("repo-source")).toMatchObject({ activeRunId: active.activeRunId });
+    } finally { f.cleanup(); }
+  });
+
+  it("fails repo-md active repair closed for extra Markdown, missing accepted bytes, or accepted hash conflict", async () => {
+    for (const mutation of ["extra-markdown", "missing-accepted", "accepted-conflict"] as const) {
+      const f = fixture(`repo-active-repair-${mutation}`);
+      try {
+        const first = await f.core.syncRepoMdSource("repo-source");
+        const active = f.core.getSource("repo-source")!;
+        const current = join(f.storage, "repo-md", "repo-source", "current");
+        const snapshot = resolve(dirname(current), readlinkSync(current));
+        if (mutation === "extra-markdown") {
+          addFileToRepoSnapshot(snapshot, "EXTRA.md", Buffer.from("# Extra\n\nnot in ledger\n"));
+        } else if (mutation === "missing-accepted") {
+          addFileToRepoSnapshot(snapshot, "IMAGE.png", Buffer.alloc(32, 1));
+          mutateSealedRepoSnapshot(snapshot, (marker) => {
+            rmSync(join(snapshot, "README.md"));
+            marker.files = marker.files.filter((file) => file.path !== "README.md");
+          });
+        } else {
+          addFileToRepoSnapshot(snapshot, "IMAGE.png", Buffer.alloc(32, 1));
+          rewriteRepoSnapshotFile(snapshot, "README.md", Buffer.from("# Forged\n\nconflict\n"));
+        }
+        const verificationBefore = sourceAttemptState(f.core, "repo-source").verification;
+        await expect(f.core.syncRepoMdSource("repo-source")).rejects.toThrow(/ledger|snapshot|strict-superset/i);
+        expect(sourceAttemptState(f.core, "repo-source").verification).toBe(verificationBefore);
+        expect(f.core.getSource("repo-source")).toMatchObject({
+          activeRunId: first.runId,
+          activeSnapshotId: first.snapshotId,
+          activeIngestConfigHash: active.activeIngestConfigHash,
+        });
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it("repairs stored repo-md publication before a missing local clone fails without freshness verification", async () => {
+    const f = fixture("repo-missing-local-after-repair");
+    try {
+      await f.core.syncRepoMdSource("repo-source");
+      const current = join(f.storage, "repo-md", "repo-source", "current");
+      const target = readlinkSync(current);
+      rmSync(current);
+      renameSync(f.repo, `${f.repo}-missing`);
+      const verificationBefore = sourceAttemptState(f.core, "repo-source").verification;
+
+      await expect(f.core.syncRepoMdSource("repo-source")).rejects.toThrow(/ENOENT|no such file|repository/i);
+      expect(readlinkSync(current)).toBe(target);
+      expect(readFileSync(join(f.core.sourcePath("repo-source", { callerId: "caller", projectId: "project" }).path, "README.md"), "utf8"))
+        .toContain("initial committed body");
+      expect(sourceAttemptState(f.core, "repo-source").verification).toBe(verificationBefore);
+    } finally { f.cleanup(); }
+  });
+
+  it("migrates a genuine old repo-md publication identity through a current-hash candidate atomically", async () => {
+    const f = fixture("repo-old-publication-migration");
+    try {
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const oldHash = `monet-src-ingest-config/v1:sha256:${"1".repeat(64)}`;
+      const { oldVariant, currentHash } = synthesizeOldRepoPublicationIdentity(f, oldHash);
+      const current = join(f.storage, "repo-md", "repo-source", "current");
+      const oldTarget = readlinkSync(current);
+      let interrupted = false;
+      await expect(f.core.syncRepoMdSource("repo-source", { fault: (point) => {
+        if (point === "after-stage" && !interrupted) {
+          interrupted = true;
+          throw new Error("interrupt current-hash candidate");
+        }
+      } })).rejects.toThrow("interrupt current-hash candidate");
+      expect(readlinkSync(current)).toBe(oldTarget);
+      expect(resolve(dirname(current), oldTarget)).toBe(oldVariant);
+      expect(f.core.getSource("repo-source")).toMatchObject({
+        activeRunId: first.runId,
+        activeSnapshotId: first.snapshotId,
+        activeIngestConfigHash: oldHash,
+      });
+
+      const migrated = await f.core.syncRepoMdSource("repo-source");
+      expect(migrated.status).toBe("published");
+      expect(migrated.runId).not.toBe(first.runId);
+      expect(f.core.getSource("repo-source")!.activeIngestConfigHash).toBe(currentHash);
+      expect(readlinkSync(current)).toContain(currentHash.slice(-64));
+      expect(existsSync(oldVariant)).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  it("rejects corrupt canonical published files on unchanged repo-md without recording verification", async () => {
+    const f = fixture("repo-published-ledger-corruption");
+    try {
+      const first = await f.core.syncRepoMdSource("repo-source");
+      const activeBefore = f.core.getSource("repo-source")!;
+      const attemptsBefore = sourceAttemptState(f.core, "repo-source");
+      const db = (f.core as unknown as { db: StoragePort }).db;
+      db.prepare(`UPDATE source_files SET content_hash=? WHERE run_id=? AND relative_path=?`)
+        .run(`monet-src-content/v1:sha256:${"0".repeat(64)}`, first.runId, "README.md");
+
+      await expect(f.core.syncRepoMdSource("repo-source")).rejects.toThrow(/active publication file manifest is corrupt/i);
+      expect(sourceAttemptState(f.core, "repo-source").verification).toBe(attemptsBefore.verification);
+      expect(f.core.getSource("repo-source")).toMatchObject({
+        activeRunId: activeBefore.activeRunId,
+        activeSnapshotId: activeBefore.activeSnapshotId,
+        activeIngestConfigHash: activeBefore.activeIngestConfigHash,
+      });
+    } finally { f.cleanup(); }
+  });
+
   it("rebuilds a scanning resume from the run's persisted config variant, not mutable registry config", async () => {
     const f = fixture("resume-config-variant");
     try {
@@ -1146,74 +1378,6 @@ describe("repo-md committed-HEAD sync", () => {
     } finally { f.cleanup(); }
   });
 
-  it("carries a pre-upgrade file forward with a derived title and document-order-correct chunk sequence (round 5, Codex threads R5-1, R5-2)", async () => {
-    // Shared fixture for both threads: a store that predates the title/document_sequence columns
-    // backfills every existing source_files/source_chunks row to title='' / document_sequence=1
-    // (schema-upgrade defaults, source-ledger.ts's ensureSchema) — simulated here directly, since
-    // reproducing an ACTUAL pre-upgrade schema would mean running old code. If one of those
-    // pre-upgrade files is skip-diagnosed on its first sync after the upgrade, planManifest's
-    // carry-forward path picks up those exact backfilled placeholder values verbatim — but the
-    // skip must be one the materializer's OWN pre-seal carry-forward cannot rescue (it copies
-    // bytes from the prior snapshot at the SAME path, which would let the scanner re-scan it
-    // fresh and never actually reach planManifest's carriedFiles/carriedChunks at all). A rename
-    // whose DESTINATION is corrupted (same technique as the existing "blocker 2 regression" test)
-    // has no same-path prior snapshot to rescue from, so it genuinely stays skip-diagnosed.
-    // Sections are named in REVERSE alphabetical document order (Zebra before Apple) specifically
-    // so a lexicographic tie-break (what an all-tied document_sequence falls back to) would
-    // visibly reorder the reconstructed body relative to the real document order — a same-order
-    // pair could pass by coincidence even with the bug present.
-    const f = fixture("pre-upgrade-carry");
-    try {
-      f.core.updateSource("repo-source", { include: ["*.md"] });
-      const zebraBody = "zebra padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
-      const appleBody = "apple padding text to exceed the two hundred byte minimum section size threshold reliably. ".repeat(3);
-      f.commit(`# Zebra\n\n${zebraBody}\n\n# Apple\n\n${appleBody}\n`, "two sections, reverse-alphabetical document order");
-      const first = await f.core.syncRepoMdSource("repo-source");
-      const conceptId = f.core.listSourceChunks(first.runId!, true)[0]!.conceptId!;
-      const before = rawConcept(f.core, conceptId).body;
-      // Sanity: real document order is Zebra-then-Apple, and it differs from the lexicographic
-      // (Apple-before-Zebra) order this test is designed to catch a regression toward.
-      expect(before.indexOf("zebra padding")).toBeLessThan(before.indexOf("apple padding"));
-
-      // Simulate the pre-upgrade backfill directly on this run's own rows.
-      const db = (f.core as unknown as { db: StoragePort }).db;
-      db.prepare(`UPDATE source_files SET title='' WHERE run_id=?`).run(first.runId);
-      db.prepare(`UPDATE source_chunks SET document_sequence=1 WHERE run_id=?`).run(first.runId);
-
-      // Rename README.md -> NEW.md and, in the SAME commit, append one invalid UTF-8 byte: the
-      // destination never reaches scan.files (it's skip-diagnosed, not scanned) and has no
-      // same-path prior snapshot for the materializer to rescue from, so it genuinely stays
-      // skip-diagnosed — the ONLY path to a valid next publication is carry-forward picking up
-      // the backfilled placeholder rows directly.
-      const original = readFileSync(join(f.repo, "README.md"));
-      git(f.repo, "mv", "README.md", "NEW.md");
-      writeFileSync(join(f.repo, "NEW.md"), Buffer.concat([original, Buffer.from([0x80])]));
-      git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "rename into invalid utf-8");
-
-      // REVIEW FIX (round 5, Codex thread R5-1): pre-fix, this threw "file.title must be a
-      // nonempty string" — carrying the backfilled '' title verbatim into validateManifest.
-      const carried = await f.core.syncRepoMdSource("repo-source");
-      expect(carried.status).toBe("published");
-      expect(f.core.listSourceSkippedFiles(carried.runId!).map((row) => row.relativePath)).toEqual(["NEW.md"]);
-      const carriedFile = db.prepare(`SELECT title FROM source_files WHERE run_id=? AND relative_path='NEW.md'`).get(carried.runId) as { title: string };
-      expect(carriedFile.title.length).toBeGreaterThan(0);
-      expect(carriedFile.title).toBe("NEW"); // deriveSourceFileTitle's own basename fallback
-
-      // REVIEW FIX (round 5, Codex thread R5-2): the carried chunks all carry document_sequence=1
-      // verbatim pre-fix — recomputeSourceConceptBody's ORDER BY document_sequence then ties, and
-      // SQLite's own fallback tie-break reorders the two sections away from document order.
-      // Recompute is forced directly here since these carried chunks are otherwise 'skipped'
-      // (unchanged content) and would not trigger recomputeTouchedSourceConcepts on their own —
-      // the load-bearing claim is about the PERSISTED, carried document_sequence values
-      // themselves, independent of when a recompute happens to run.
-      await f.core.recomputeSourceConceptBody(conceptId);
-      const after = rawConcept(f.core, conceptId).body;
-      expect(after).toContain("zebra padding");
-      expect(after).toContain("apple padding");
-      expect(after.indexOf("zebra padding")).toBeLessThan(after.indexOf("apple padding"));
-    } finally { f.cleanup(); }
-  });
-
   it("aborts tree-level partial scans without writes or inferred deletion (gate regression)", async () => {
     const f = fixture("tree-partial");
     try {
@@ -1486,7 +1650,7 @@ describe("repo-md committed-HEAD sync", () => {
     } finally { f.cleanup(); }
   });
 
-  it("carries a binding across a rename whose destination itself fails validation this run (blocker 2 regression)", async () => {
+  it("rejects a rename carry absent from the sealed snapshot before activation", async () => {
     const f = fixture("rename-into-skip");
     try {
       f.core.updateSource("repo-source", { include: ["*.md"] });
@@ -1503,82 +1667,20 @@ describe("repo-md committed-HEAD sync", () => {
       writeFileSync(join(f.repo, "NEW.md"), Buffer.concat([original, Buffer.from([0x80])]));
       git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "rename into invalid utf-8");
 
-      const renamed = await f.core.syncRepoMdSource("repo-source");
-      expect(renamed.status).toBe("published");
-      expect(f.core.listSourceSkippedFiles(renamed.runId!).map((row) => row.relativePath)).toEqual(["NEW.md"]);
-      const carried = f.core.listSourceChunks(renamed.runId!, true).find((chunk) => chunk.relativePath === "NEW.md");
-      expect(carried).toMatchObject({ bindingId: active.bindingId, conceptId: active.conceptId, lifecycle: "active" });
-      expect(carried!.sourceRef).toBe("source://repo-source/NEW.md#intro~1");
+      await expect(f.core.syncRepoMdSource("repo-source")).rejects.toThrow(/ledger|snapshot|parity/);
+      expect(f.core.getSource("repo-source")!.activeRunId).toBe(initial.runId);
+      expect(f.core.getSource("repo-source")!.activeSnapshotId).toBe(initial.snapshotId);
+      expect(rawSnapshotBytes(f, "README.md").toString("utf8")).toBe(original.toString("utf8"));
       expect(rawConcept(f.core, active.conceptId!).status).toBe("active");
-      expect(f.core.listSourceCleanupItems(renamed.runId!).some((item) => item.kind === "retire-absent")).toBe(false);
 
-      // Healing NEW.md resumes the SAME binding/concept lineage (heal-cycle continuity) instead of
-      // forking a new one.
+      // Once the destination is valid, a fresh candidate can publish normally.
       writeFileSync(join(f.repo, "NEW.md"), "# Intro\n\nhealed after rename\n");
       git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "heal NEW.md");
       const healed = await f.core.syncRepoMdSource("repo-source");
       expect(healed.status).toBe("published");
       const healedChunk = f.core.listSourceChunks(healed.runId!, true)[0]!;
-      expect(healedChunk.bindingId).toBe(active.bindingId);
-      expect(healedChunk.conceptId).toBe(active.conceptId);
-      expect(healedChunk.predecessorObservationId).toBe(carried!.observationId);
-      expect(rawConcept(f.core, active.conceptId!).body).toContain("healed after rename");
-    } finally { f.cleanup(); }
-  });
-
-  it("rebuilds a renamed carry's sourceRef from the recomputed canonical rank, not a gapped raw occurrence (review fix, MINOR)", async () => {
-    // The minimum-chunk merge pass (item 8) can leave a heading-anchor group's raw occurrence
-    // values sparse: three "Notes" sections (occurrence 1/2/3), the first undersized, merges
-    // FORWARD into the second (mergeUndersizedSections, source-chunker.ts) — the surviving group
-    // is occurrence {2,3}, not {1,2,3}. computeSourceRefOccurrences' canonical rank is always
-    // DENSE by sorted order within the group (source-chunker.ts), so it renumbers this gapped
-    // group to ranks {1,2} — no longer equal to the raw occurrence column. A renamed carry (case
-    // (c): the destination is itself skip-diagnosed this run, so it never reaches scan.files and
-    // must be carried under its new path) used to rebuild sourceRef straight from the raw
-    // occurrence value, which validateManifest's own independent canonical-rank recomputation
-    // (source-ledger.ts) then rejected as a mismatch.
-    const f = fixture("renamed-carry-gapped-occurrence");
-    try {
-      f.core.updateSource("repo-source", { include: ["*.md"] });
-      const big2 = "second Notes section content padded well past the merge floor\n".repeat(5);
-      const big3 = "third Notes section content padded well past the merge floor\n".repeat(5);
-      f.commit(`# Notes\ntiny\n# Notes\n${big2}\n# Notes\n${big3}`, "three Notes sections, first undersized");
-      const initial = await f.core.syncRepoMdSource("repo-source");
-      expect(initial.status).toBe("published");
-      const firstChunks = f.core.listSourceChunks(initial.runId!, true);
-      // Confirms the merge pass actually produced the gapped shape this test exercises: two
-      // surviving "Notes" chunks, canonical-ranked {1,2} on the FIRST (non-carry) publish already.
-      expect(firstChunks).toHaveLength(2);
-      const sortedFirst = [...firstChunks].sort((a, b) => a.sourceRef.localeCompare(b.sourceRef));
-      expect(sortedFirst.map((chunk) => chunk.sourceRef)).toEqual([
-        "source://repo-source/README.md#notes~1", "source://repo-source/README.md#notes~2",
-      ]);
-      const firstConceptId = firstChunks[0]!.conceptId!;
-
-      // Rename into a skip (blocker 2 shape): the destination never reaches scan.files, so it must
-      // be carried, exercising the sourceRef-rebuild code this test targets.
-      const original = readFileSync(join(f.repo, "README.md"));
-      git(f.repo, "mv", "README.md", "NEW.md");
-      writeFileSync(join(f.repo, "NEW.md"), Buffer.concat([original, Buffer.from([0x80])]));
-      git(f.repo, "add", "NEW.md"); git(f.repo, "commit", "-m", "rename into invalid utf-8");
-
-      const renamed = await f.core.syncRepoMdSource("repo-source");
-      // Pre-fix, this threw "chunk.sourceRef occurrence does not match its canonical heading
-      // identity" the instant staging tried to rebuild these refs from the raw (gapped) occurrence.
-      expect(renamed.status).toBe("published");
-      const carriedChunks = f.core.listSourceChunks(renamed.runId!, true);
-      expect(carriedChunks).toHaveLength(2);
-      expect(carriedChunks.every((chunk) => chunk.relativePath === "NEW.md")).toBe(true);
-      expect(carriedChunks.every((chunk) => chunk.conceptId === firstConceptId)).toBe(true);
-      const sortedCarried = [...carriedChunks].sort((a, b) => a.sourceRef.localeCompare(b.sourceRef));
-      // The canonical rank survives the rename intact — {1,2}, never the raw {2,3} occurrence.
-      expect(sortedCarried.map((chunk) => chunk.sourceRef)).toEqual([
-        "source://repo-source/NEW.md#notes~1", "source://repo-source/NEW.md#notes~2",
-      ]);
-      const body = rawConcept(f.core, firstConceptId).body;
-      expect(body).toContain("tiny");
-      expect(body).toContain(big2.trim());
-      expect(body).toContain(big3.trim());
+      expect(healedChunk.relativePath).toBe("NEW.md");
+      expect(rawConcept(f.core, healedChunk.conceptId!).body).toContain("healed after rename");
     } finally { f.cleanup(); }
   });
 
@@ -1658,7 +1760,6 @@ describe("repo-md committed-HEAD sync", () => {
       // snapshot actually delivers their prior bytes. Compared against the FILE record's
       // contentHash (whole-file bytes), not the chunk's (which hashes only that chunk's body,
       // excluding e.g. its own heading line — a different, smaller hash domain).
-      expect(sealedMarkerCarriedPaths(f).sort()).toEqual(["docs/a.md", "docs/b.md"]);
       const carriedFiles = f.core.listSourceFiles(result.runId!, true);
       for (const [path, body] of [["docs/a.md", "doc a body"], ["docs/b.md", "doc b body"]] as const) {
         const file = carriedFiles.find((candidate) => candidate.relativePath === path)!;
@@ -1705,7 +1806,6 @@ describe("repo-md committed-HEAD sync", () => {
 
       // Cross-check: the pre-seal materializer carry set agrees — it never carried the excluded
       // descendant into the newly sealed snapshot either.
-      expect(sealedMarkerCarriedPaths(f)).toEqual(["docs/a.md"]);
     } finally { f.cleanup(); }
   });
 
@@ -1726,7 +1826,6 @@ describe("repo-md committed-HEAD sync", () => {
       expect(symlinkResult.status).toBe("published");
       const commitX = git(f.repo, "rev-parse", "HEAD");
       expect(symlinkResult.snapshotId).toBe(commitX);
-      expect(sealedMarkerCarriedPaths(f)).toEqual(["A.md"]);
       expect(rawSnapshotBytes(f, "A.md").toString("utf8")).toBe("# A\n\noriginal body\n");
 
       // Heal A.md with DIFFERENT content at a new commit — the prior publication changes.
@@ -1816,7 +1915,6 @@ describe("repo-md committed-HEAD sync", () => {
       // final carried-file set agree, and the sealed snapshot actually delivers what the manifest
       // claims — not the fresh (grown) bytes just committed. Compared against the FILE record's
       // contentHash (whole-file bytes), not the chunk's own (a different, smaller hash domain).
-      expect(sealedMarkerCarriedPaths(f)).toEqual(["A.md"]);
       const carriedFile = f.core.listSourceFiles(result.runId!, true).find((file) => file.relativePath === "A.md")!;
       const raw = rawSnapshotBytes(f, "A.md");
       expect(computeSourceContentHash(raw)).toBe(carriedFile.contentHash);
@@ -1976,7 +2074,6 @@ describe("repo-md committed-HEAD sync", () => {
 
       // The snapshot serves the OLD bytes for that path — not the fresh, corrupted commit's bytes
       // — and the manifest's claimed contentHash matches exactly what's physically there.
-      expect(sealedMarkerCarriedPaths(f)).toEqual(["A.md"]);
       const carriedFile = f.core.listSourceFiles(result.runId!, true).find((file) => file.relativePath === "A.md")!;
       const raw = rawSnapshotBytes(f, "A.md");
       expect(computeSourceContentHash(raw)).toBe(carriedFile.contentHash);
@@ -1994,16 +2091,6 @@ describe("repo-md committed-HEAD sync", () => {
       expect(healedChunk.content).toContain("healed body");
     } finally { f.cleanup(); }
   });
-
-  // NOTE: this proves the incident shape end-to-end for repo-md, including the sealed-snapshot
-  // byte-level cross-check. The git-md-specific validator subtlety (validateSealedSnapshotAgainstGit
-  // treating a substituted path as a member of BOTH entries and carriedPaths — source-materializer.ts)
-  // is verified by direct code inspection/tracing rather than a dedicated git-md test: git-md's own
-  // test fixtures (source-git.test.ts) are a substantially larger, separate harness (managed remote
-  // fetch simulation) this session did not build out. The reworked function is exercised identically
-  // regardless of source type — its inputs are just (marker, entries), and its logic contains no
-  // repo-md/git-md branching — so the repo-md-level proof that carriedPaths/carriedFromRunId are
-  // populated correctly is strong indirect evidence; flagging the gap rather than skipping it silently.
 
   it("degrades to a graceful tree-level-partial exit when a previously-published, classifier-valid file is chunk-budget-skipped (Codex 3606534097 order-dependent residual)", async () => {
     const f = fixture("chunk-budget-residual");
