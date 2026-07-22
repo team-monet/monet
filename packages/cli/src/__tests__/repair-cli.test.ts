@@ -165,11 +165,51 @@ describe("doctor and repair CLI", () => {
     const unavailable = fakeDependencies(inspection());
     vi.mocked(unavailable.instantiate).mockRejectedValueOnce(new Error("provider cache unavailable"));
     const output = await run(["doctor", "--check-provider", "--json"], unavailable);
-    expect(JSON.parse(output.stdout).provider).toMatchObject({
+    const result = JSON.parse(output.stdout);
+    expect(result.provider).toMatchObject({
       loadStatus: "unavailable",
       reason: "provider cache unavailable",
     });
+    expect(result.nextCommands).toEqual([
+      `monet doctor --dir '/tmp/monet test/store'"'"'s dir' --check-provider`,
+      `monet repair --dir '/tmp/monet test/store'"'"'s dir' --target 'hashing:dim=256:tok=2'`,
+      `monet repair --dir '/tmp/monet test/store'"'"'s dir' --target 'hashing'`,
+      `monet repair --dir '/tmp/monet test/store'"'"'s dir' --target 'onnx'`,
+    ]);
     expect(unavailable.exits).toEqual([2]);
+  });
+
+  it("treats a healthy unpinned store as having no exact provider to check", async () => {
+    const state = inspection({ pin: { status: "known", modelId: null, source: null, pinnedAt: null } });
+    const dependencies = fakeDependencies(state);
+
+    const output = await run(["doctor", "--check-provider", "--json"], dependencies);
+
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      ok: true,
+      assessment: "safe",
+      provider: {
+        loadStatus: "not-checked",
+        reason: "The store has no durable embedder pin, so there is no exact provider to check.",
+      },
+      nextCommands: [],
+    });
+    expect(dependencies.instantiate).not.toHaveBeenCalled();
+    expect(dependencies.exits).toEqual([]);
+  });
+
+  it("explains an inapplicable provider check in human output", async () => {
+    const state = inspection({ pin: { status: "known", modelId: null, source: null, pinnedAt: null } });
+    const dependencies = fakeDependencies(state);
+
+    const output = await run(["doctor", "--check-provider"], dependencies);
+
+    expect(output.stdout).toContain(
+      "Provider:   not checked: The store has no durable embedder pin, so there is no exact provider to check.",
+    );
+    expect(output.stdout).not.toContain("use --check-provider");
+    expect(dependencies.instantiate).not.toHaveBeenCalled();
+    expect(dependencies.exits).toEqual([]);
   });
 
   it("reconciles an exact custom provider only when its validated width matches every live population", async () => {
@@ -215,6 +255,10 @@ describe("doctor and repair CLI", () => {
         reason: expect.stringContaining("declares width 256"),
       },
     });
+    expect(JSON.parse(incompatibleOutput.stdout).nextCommands).toEqual([
+      `monet doctor --dir '/tmp/monet test/store'"'"'s dir' --check-provider`,
+      `monet repair --dir '/tmp/monet test/store'"'"'s dir' --target 'acme/custom-embedding'`,
+    ]);
     expect(incompatible.exits).toEqual([2]);
   });
 

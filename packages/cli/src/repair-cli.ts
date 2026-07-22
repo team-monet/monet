@@ -119,6 +119,7 @@ function isEmptyUnpinnedStore(inspection: StoredEmbedderStateInspection): boolea
 function nextCommandsForInspection(
   inspection: StoredEmbedderStateInspection,
   assessment = inspection.assessment,
+  provider: ProviderResult = { loadStatus: "not-checked" },
 ): string[] {
   const dbPath = inspection.dbPath;
   if (!inspection.exists) return [`monet start --dir ${shellQuote(path.dirname(dbPath))}`];
@@ -128,6 +129,13 @@ function nextCommandsForInspection(
       commands.push(abandonCommand(dbPath), abandonCommand(dbPath, true));
     }
     return commands;
+  }
+  if (providerNeedsAction(provider) && inspection.pin.status === "known" && inspection.pin.modelId) {
+    const commands = [doctorCommand(dbPath, true), targetCommand(dbPath, inspection.pin.modelId)];
+    if (provider.loadStatus === "unavailable") {
+      commands.push(targetCommand(dbPath, "hashing"), targetCommand(dbPath, "onnx"));
+    }
+    return [...new Set(commands)];
   }
   if (assessment === "safe") return [];
   if (inspection.pin.status === "known" && inspection.pin.modelId) {
@@ -213,7 +221,12 @@ async function checkProvider(
   dependencies: RecoveryCliDependencies,
 ): Promise<{ result: ProviderResult; provider?: EmbeddingProvider }> {
   if (!modelId) {
-    return { result: { loadStatus: "unavailable", reason: "The store has no exact embedder model ID to check." } };
+    return {
+      result: {
+        loadStatus: "not-checked",
+        reason: "The store has no durable embedder pin, so there is no exact provider to check.",
+      },
+    };
   }
   try {
     const provider = await dependencies.instantiate(modelId);
@@ -301,7 +314,9 @@ function printCommands(commands: string[]): void {
 
 function printProvider(provider: ProviderResult): void {
   if (provider.loadStatus === "not-checked") {
-    console.log("Provider:   not checked (use --check-provider)");
+    console.log(provider.reason
+      ? `Provider:   not checked: ${provider.reason}`
+      : "Provider:   not checked (use --check-provider)");
   } else if (provider.loadStatus === "available") {
     const compatibility = provider.storeCompatibility ? `; store ${provider.storeCompatibility}` : "";
     console.log(`Provider:   available (${provider.modelId}; ${provider.dim} dimensions${compatibility})`);
@@ -378,7 +393,7 @@ async function runDoctor(options: DoctorOptions, dependencies: RecoveryCliDepend
       provider = reconciled.provider;
       assessment = reconciled.assessment;
     }
-    const nextCommands = nextCommandsForInspection(inspection, assessment);
+    const nextCommands = nextCommandsForInspection(inspection, assessment, provider);
     if (options.json) {
       printJson(jsonDoctor(inspection, assessment, provider, nextCommands));
     } else {
