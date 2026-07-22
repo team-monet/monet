@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
@@ -25,6 +26,7 @@ describe("source CLI", () => {
     dbPath = join(dir, "store", "monet.db");
     sourceStorageDir = join(dir, "store", "sources");
     mkdirSync(projectDir, { recursive: true });
+    initGitRepository(projectDir);
     mkdirSync(join(dir, "store"), { recursive: true });
     closeCount = 0;
     dependencies = {
@@ -87,6 +89,252 @@ describe("source CLI", () => {
     }
   }
 
+  function initGitRepository(root: string, commit = true): void {
+    mkdirSync(root, { recursive: true });
+    execFileSync("git", ["init", "--quiet", root]);
+    execFileSync("git", ["-C", root, "config", "user.email", "source-cli@example.test"]);
+    execFileSync("git", ["-C", root, "config", "user.name", "Source CLI Test"]);
+    if (commit) {
+      writeFileSync(join(root, "README.md"), "# Source CLI fixture\n");
+      execFileSync("git", ["-C", root, "add", "README.md"]);
+      execFileSync("git", ["-C", root, "commit", "--quiet", "-m", "fixture"]);
+    }
+  }
+
+  it("infers an existing local Git root, name, and current server ACL without syncing", async () => {
+    const repository = join(projectDir, "my-vault");
+    initGitRepository(repository);
+    writeFileSync(join(repository, "draft.md"), "not committed\n");
+
+    const output = await run([
+      "source", "add", "./my-vault",
+      "--include", "README.md",
+      "--exclude", "generated/**",
+    ]);
+
+    const registered = inspect((core) => core.listSources()[0]);
+    expect(registered).toMatchObject({
+      type: "repo-md",
+      name: "my-vault",
+      localPath: realpathSync.native(repository),
+      access: { allowedCallerIds: ["test-caller"], allowedProjectIds: ["test-project-id"] },
+      include: ["README.md"],
+      exclude: ["generated/**"],
+      status: "pending-initial-sync",
+    });
+    expect(output.stdout).toContain(`Registered source: ${registered.id}`);
+    expect(output.stdout).toContain("Type: repo-md");
+    expect(output.stdout).toContain(`Origin: ${realpathSync.native(repository)}`);
+    expect(output.stdout).toContain("Committed HEAD: required; sync excludes working-tree changes");
+    expect(output.stdout).toContain("ACL callers: test-caller");
+    expect(output.stdout).toContain("ACL projects: test-project-id");
+    expect(output.stdout).toContain("Content sync: not run");
+    expect(output.stdout).toContain(`MCP source_sync with {"sourceId":"${registered.id}"}`);
+    expect(output.stdout).toContain("Server identity: caller test-caller · project test-project-id");
+  });
+
+  it("infers and canonicalizes a strict SCP SSH remote with exact transport defaults", async () => {
+    const output = await run([
+      "source", "add", "git@github.com:org/docs.git",
+      "--branch", "main",
+    ]);
+
+    const registered = inspect((core) => core.listSources()[0]);
+    expect(registered).toMatchObject({
+      type: "git-md",
+      name: "docs",
+      remoteUrl: "ssh://git@github.com/org/docs",
+      branch: "main",
+      access: { allowedCallerIds: ["test-caller"], allowedProjectIds: ["test-project-id"] },
+      transport: { allowedUrlSchemes: ["ssh"], allowedHosts: ["github.com"] },
+      include: ["**/*.md"],
+      autoDetect: false,
+      status: "pending-initial-sync",
+    });
+    expect(output.stdout).toContain("Origin: ssh://git@github.com/org/docs");
+    expect(output.stdout).toContain("Transport schemes: ssh");
+    expect(output.stdout).toContain("Transport hosts: github.com");
+    expect(output.stdout).toContain("Content sync: not run");
+  });
+
+  it("defaults inferred local selection to Markdown and lets explicit include replace it", async () => {
+    const defaultRepository = join(projectDir, "default-selection");
+    const explicitRepository = join(projectDir, "explicit-selection");
+    initGitRepository(defaultRepository);
+    initGitRepository(explicitRepository);
+
+    await run(["source", "add", "./default-selection"]);
+    await run(["source", "add", "./explicit-selection", "--include", "README.md"]);
+
+    const [first, second] = inspect((core) => core.listSources());
+    expect(first).toMatchObject({ include: ["**/*.md"], autoDetect: false });
+    expect(second).toMatchObject({ include: ["README.md"], autoDetect: false });
+  });
+
+  it("infers HTTPS remote details and accepts an explicit name and exact ACL/transport overrides", async () => {
+    await run([
+      "source", "add", "https://github.com/acme/docs.git",
+      "--branch", "stable",
+      "--name", "Team docs",
+      "--allow-caller", "caller-a",
+      "--allow-caller", "caller-b",
+      "--allow-project", "project-a",
+      "--allow-scheme", "https",
+      "--allow-host", "GITHUB.COM",
+    ]);
+
+    expect(inspect((core) => core.listSources()[0])).toMatchObject({
+      type: "git-md",
+      name: "Team docs",
+      remoteUrl: "https://github.com/acme/docs",
+      branch: "stable",
+      access: { allowedCallerIds: ["caller-a", "caller-b"], allowedProjectIds: ["project-a"] },
+      transport: { allowedUrlSchemes: ["https"], allowedHosts: ["github.com"] },
+      include: ["**/*.md"],
+      autoDetect: false,
+    });
+  });
+
+  it("rejects local inferred origins that are not the exact Git root with a committed HEAD", async () => {
+    const plainDirectory = join(dir, "plain");
+    mkdirSync(plainDirectory);
+    await expect(run(["source", "add", plainDirectory])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: expect.stringContaining("not a Git worktree") }),
+    );
+
+    const emptyRepository = join(projectDir, "empty-repo");
+    initGitRepository(emptyRepository, false);
+    await expect(run(["source", "add", "./empty-repo"])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: expect.stringContaining("committed HEAD") }),
+    );
+
+    const repository = join(projectDir, "rooted-repo");
+    initGitRepository(repository);
+    mkdirSync(join(repository, "docs"));
+    await expect(run(["source", "add", "./rooted-repo/docs"])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: expect.stringContaining("must be the Git worktree root") }),
+    );
+    expect(closeCount).toBe(0);
+    expect(inspect((core) => core.listSources())).toEqual([]);
+  });
+
+  it("rejects unsupported, credential-bearing, and ambiguous remote forms", async () => {
+    const cases = [
+      ["ftp://github.com/org/docs.git", "scheme must be https or ssh"],
+      ["https://user:secret@github.com/org/docs.git", "must not contain embedded credentials"],
+      ["github.com:org/docs.git", "ambiguous remote origin"],
+      ["git@@github.com:org/docs.git", "use an explicit ssh:// URL"],
+      ["git@github.com:", "use an explicit ssh:// URL"],
+      ["git@github..com:org/docs.git", "use an explicit ssh:// URL"],
+      ["deploy@gitlab.com:org/docs.git", "use an explicit ssh:// URL"],
+      ["git@github.com:org/docs/extra.git", "use an explicit ssh:// URL"],
+    ] as const;
+    for (const [origin, message] of cases) {
+      await expect(run(["source", "add", origin, "--branch", "main"])).rejects.toEqual(
+        expect.objectContaining<Partial<SourceCliError>>({ message: expect.stringContaining(message) }),
+      );
+    }
+  });
+
+  it("accepts explicit non-GitHub ssh URLs while keeping SCP shorthand GitHub-only", async () => {
+    await run([
+      "source", "add", "ssh://deploy@gitlab.example.com/org/docs.git", "--branch", "main",
+    ]);
+    expect(inspect((core) => core.listSources()[0])).toMatchObject({
+      type: "git-md",
+      remoteUrl: "ssh://deploy@gitlab.example.com/org/docs",
+      transport: { allowedUrlSchemes: ["ssh"], allowedHosts: ["gitlab.example.com"] },
+    });
+  });
+
+  it("requires a remote branch and prevents inferred transport widening", async () => {
+    await expect(run(["source", "add", "git@github.com:org/docs.git"])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: "remote Git origin requires --branch" }),
+    );
+    await expect(run([
+      "source", "add", "https://github.com/org/docs.git", "--branch", "main",
+      "--allow-scheme", "https", "--allow-scheme", "ssh",
+    ])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: expect.stringContaining("exact https scheme") }),
+    );
+    await expect(run([
+      "source", "add", "https://github.com/org/docs.git", "--branch", "main",
+      "--allow-host", "github.com", "--allow-host", "example.com",
+    ])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: expect.stringContaining("exact github.com host") }),
+    );
+  });
+
+  it("keeps inferred local and remote acquisition flags separate", async () => {
+    const repository = join(projectDir, "local-repo");
+    initGitRepository(repository);
+    await expect(run(["source", "add", "./local-repo", "--branch", "main"])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: expect.stringContaining("local inferred origins") }),
+    );
+    await expect(run([
+      "source", "add", "https://github.com/org/docs.git", "--branch", "main", "--path", "./local-repo",
+    ])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({ message: "remote inferred origins do not accept --path" }),
+    );
+  });
+
+  it("prefers existing local Git paths containing remote-like punctuation", async () => {
+    const atRepository = join(projectDir, "docs@local");
+    const colonRepository = join(projectDir, "docs:local");
+    initGitRepository(atRepository);
+    initGitRepository(colonRepository);
+
+    await run(["source", "add", "./docs@local"]);
+    await run(["source", "add", "./docs:local"]);
+
+    const registered = inspect((core) => core.listSources());
+    expect(registered.map((source) => source.localPath).sort()).toEqual([
+      realpathSync.native(atRepository),
+      realpathSync.native(colonRepository),
+    ].sort());
+    expect(registered.every((source) => source.type === "repo-md")).toBe(true);
+  });
+
+  it("rejects terminal control characters in every source-name path before registration", async () => {
+    const localWithControl = join(projectDir, "bad\u001bname");
+    initGitRepository(localWithControl);
+    const cases = [
+      ["source", "add", "https://github.com/org/bad%1Bname.git", "--branch", "main"],
+      ["source", "add", "https://github.com/org/docs.git", "--branch", "main", "--name", "bad\u0007name"],
+      ["source", "add", "./bad\u001bname"],
+      [
+        "source", "add", "bad\u0085name", "--type", "repo-md",
+        "--allow-caller", "caller-a", "--allow-project", "project-a",
+      ],
+    ];
+    for (const args of cases) {
+      await expect(run(args)).rejects.toEqual(expect.objectContaining<Partial<SourceCliError>>({
+        message: "source name must not contain terminal control characters",
+      }));
+    }
+    expect(inspect((core) => core.listSources())).toEqual([]);
+  });
+
+  it("preserves legacy --type validation instead of applying inferred defaults", async () => {
+    await expect(run(["source", "add", "Project docs", "--type", "repo-md"])).rejects.toEqual(
+      expect.objectContaining<Partial<SourceCliError>>({
+        message: "legacy --type syntax requires at least one --allow-caller",
+      }),
+    );
+  });
+
+  it("rejects an invalid legacy repo-md path before creating a registration", async () => {
+    const plainDirectory = join(dir, "legacy-plain");
+    mkdirSync(plainDirectory);
+    await expect(run([
+      "source", "add", "Legacy docs", "--type", "repo-md", "--path", "../legacy-plain",
+      "--allow-caller", "caller-a", "--allow-project", "project-a",
+    ])).rejects.toEqual(expect.objectContaining<Partial<SourceCliError>>({
+      message: expect.stringContaining("not a Git worktree"),
+    }));
+    expect(closeCount).toBe(0);
+  });
+
   it("adds repo-md at the resolved project path with required default-deny ACLs", async () => {
     const canonicalProjectDir = realpathSync.native(projectDir);
     const output = await run([
@@ -130,6 +378,7 @@ describe("source CLI", () => {
       mode: "interval",
       intervalSeconds: 3600,
     });
+    expect(inspect((core) => core.listSources()[0])).toMatchObject({ include: [], autoDetect: false });
   });
 
   it("uses the hourly default when add explicitly selects interval refresh", async () => {
@@ -179,7 +428,7 @@ describe("source CLI", () => {
 
   it("derives a repo-md default circle from the resolved custom --path root", async () => {
     const customRoot = join(dir, "shared-docs");
-    mkdirSync(customRoot);
+    initGitRepository(customRoot);
     const canonicalCustomRoot = realpathSync.native(customRoot);
     await run([
       "source", "add", "Shared docs",

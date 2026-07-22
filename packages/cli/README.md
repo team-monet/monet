@@ -86,25 +86,29 @@ The backup path is printed immediately and retained if later work fails. Stop ot
 
 Linked sources keep living Markdown available to Monet as the files change. Use one when the file or repository remains the source of truth, such as a handbook, ADR tree, or agent instructions. Use the `memory_store` MCP tool for a point-in-time capture instead: a distilled decision, preference, constraint, or reason that should not silently change when a file is edited.
 
-`monet source` configures the local registry; it does **not** itself clone, scan, parse, ingest, or sync content. Both source types are default-deny, so every registration requires at least one caller ID and one project ID. Replace the values below for your environment:
+Sources are Git repositories: either an existing local clone or a remote repository Monet will clone and manage. The concise commands infer the internal source type, name, ACL, and exact transport policy:
 
 ```bash
-# Defaults shown here: change them if MONET_CALLER_ID or MONET_PROJECT_ID is set.
-CALLER_ID="local-agent"
-PROJECT_ID="github.com/acme/widgets"
-
-# Link a tightly scoped Markdown set in the current repository.
-monet source add "Project docs" \
-  --type repo-md \
+# An existing clone. Run this from its parent or use an absolute path.
+monet source add ./my-vault \
   --include "README.md" \
   --include "docs/**/*.md" \
-  --exclude "docs/private/**" \
-  --exclude "docs/generated/**" \
-  --allow-caller "$CALLER_ID" \
-  --allow-project "$PROJECT_ID"
+  --exclude "docs/generated/**"
+
+# A GitHub remote Monet will manage. This exact shorthand is canonicalized to ssh://.
+monet source add git@github.com:org/docs.git \
+  --branch main \
+  --include "README.md" \
+  --include "docs/**/*.md"
 ```
 
-The command prints the new source ID, `Status: pending-initial-sync`, and `Server identity: caller … · project …`. There is no separate `whoami` command. Copy the printed ID, inspect the registration, and compare the printed identity with its `Callers` and `Projects` ACLs:
+The local path must exist, be the exact Git worktree root, and have a committed `HEAD`; later syncs exclude working-tree changes. Remote sources require `--branch`. SCP shorthand is accepted only as `git@github.com:<owner>/<repo>[.git]`; use an explicit credential-free `ssh://user@host/owner/repo.git` URL for other SSH hosts or users. SSH remotes use the SSH agent inherited by Monet, so the Monet process must have the correct `SSH_AUTH_SOCK`; the command never embeds credentials in the stored URL.
+
+When concise syntax omits `--include`, Monet registers `**/*.md`, selecting Markdown at the root and below without selecting artifact files. Any explicit `--include` replaces that default; repeat it to select multiple Markdown path sets. Include and exclude filters remain editable after registration.
+
+`monet source add` only registers the source. It does **not** clone, scan, parse, ingest, or sync content during the command. Output includes the new source ID and internal type, origin, applied ACL and transport policy, `Content sync: not run`, and the MCP `source_sync` next step. Concise registration defaults the ACL to the exact caller and project IDs printed as `Server identity: caller … · project …`. Supplying `--allow-caller` or `--allow-project` replaces that field's default, so repeat the flag with both the printed identity and any additional identities that should have access. Use `--name "Project docs"` to override the name inferred from the repository directory or remote basename.
+
+Copy the printed ID, inspect the registration, and compare the printed identity with its ACLs:
 
 ```bash
 SOURCE_ID="<source-id printed by add>" # replace this placeholder
@@ -118,18 +122,24 @@ monet source update "$SOURCE_ID" \
 
 `local-agent` is the default caller. The default project ID is derived from the invocation repository's Git remote as `host/org/repo`; `MONET_CALLER_ID` and `MONET_PROJECT_ID` override them. Run the CLI against the same store as the MCP server: storage resolves through `MONET_STORAGE_DIR`, an existing `./.monet`, then `~/.monet`. For a one-off override, put `--dir` on `source`, for example `monet source --dir ./scratch-store list`.
 
-For Markdown in another Git repository, allowlist both the URL scheme and host. Monet allocates a local path at registration but does not clone until sync:
+The original explicit syntax remains available for scripts and advanced ACL/transport configuration. With `--type`, the positional value remains the display name and the existing required flags are unchanged:
 
 ```bash
+CALLER_ID="local-agent"
+PROJECT_ID="github.com/acme/widgets"
+
+monet source add "Project docs" \
+  --type repo-md \
+  --path ./my-vault \
+  --allow-caller "$CALLER_ID" \
+  --allow-project "$PROJECT_ID"
+
 monet source add "Shared handbook" \
   --type git-md \
   --circle shared-handbook \
-  --remote "https://github.com/acme/handbook.git" \
+  --remote "ssh://git@github.com/acme/handbook.git" \
   --branch main \
-  --include "README.md" \
-  --include "handbook/**/*.md" \
-  --exclude "handbook/private/**" \
-  --allow-scheme https \
+  --allow-scheme ssh \
   --allow-host github.com \
   --allow-caller "$CALLER_ID" \
   --allow-project "$PROJECT_ID"
@@ -157,7 +167,7 @@ monet source update "$SOURCE_ID" \
   --exclude "handbook/private/**"
 ```
 
-`source update` replaces the mutable fields supplied on that invocation: name, include/exclude patterns, ACLs, Git transport policy, write-back policy, refresh policy, and auto-detection preference. Source type, circle, repository root, remote, and branch are immutable; remove and re-add the source to change them. Removal requires confirmation, creates a tombstone, and does not delete the registered path:
+Include and exclude filters can be changed dynamically with `source update`; the next sync applies the new selection. `source update` replaces the mutable fields supplied on that invocation: name, include/exclude patterns, ACLs, Git transport policy, write-back policy, refresh policy, and auto-detection preference. Source type, circle, repository root, remote, and branch are immutable; remove and re-add the source to change them. Removal requires confirmation, creates a tombstone, and does not delete the registered path:
 
 ```bash
 monet source remove "$SOURCE_ID" --yes
