@@ -2915,15 +2915,134 @@ export class MonetCore {
           .run(nowMs, opts.by ?? null, contradictionId);
         // dismiss: do NOT refresh temporal fields (no new evidence confirms; the conflict is simply set aside)
       } else {
-        const allIds = (
-          this.db.prepare(`SELECT id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`).all(conceptId) as Array<{ id: string }>
-        ).map((o) => o.id);
-        const priors = allIds.filter((oid) => oid !== c.observation_id);
-        const winnerObsId = opts.decision === "accept-new" ? c.observation_id : priors[priors.length - 1] ?? null;
+        // MINIMAL INFERENCE, AND ONLY WHERE IT IS NOT A GUESS. `contradictions.observation_id`
+        // records only the CORRECTING observation;
+        // no column records what it contradicted. Earlier rounds tried to deduce the loser anyway —
+        // all-but-the-winner, then the-single-prior, then the-single-live-prior-in-insertion-order —
+        // and each round produced a fresh crop of edge cases (dead corrections, terminally
+        // superseded rows, evidence attached after the fact, foreign observation ids): eight
+        // findings over three review rounds on one method, each narrower than the last. That
+        // pattern is the signal that the PREMISE is wrong rather than the implementation. The loser
+        // is not recorded, so it cannot be deduced, and a wrong deduction destroys evidence
+        // permanently and silently — observed live, where one status correction superseded six
+        // observations, four of them unrelated findings from another week.
+        //
+        // So this path supersedes ONLY what the contradiction literally names, and refuses whatever
+        // it cannot establish:
+        //   accept-new   → supersedes NOTHING. The reconciled `body` is the record of the verdict
+        //                  and is therefore required. The contradicted claim stays live until
+        //                  someone synthesises it away — a known, accepted cost, and the reason a
+        //                  `contradicted_observation_id` column is the real fix (tracked separately).
+        //   keep-current → the correction LOST, and it is named on the row. Supersede exactly it.
+        const correcting = c.observation_id === null
+          ? undefined
+          : this.db
+              .prepare(`SELECT id, concept_id, superseded_by, superseded_at FROM observations WHERE id = ?`)
+              .get(c.observation_id) as
+                { id: string; concept_id: string | null; superseded_by: string | null; superseded_at: number | null } | undefined;
 
-        if (winnerObsId) {
-          const supersede = this.db.prepare(`UPDATE observations SET superseded_by = ?, superseded_at = ? WHERE id = ?`);
-          for (const loser of allIds.filter((oid) => oid !== winnerObsId)) supersede.run(winnerObsId, nowMs, loser);
+        // A verdict needs its correcting observation to exist, belong here, and still be live.
+        // flagContradiction validates none of this, so a contradiction can name another concept's
+        // row, or one superseded since. Resolving either way builds a pointer out of a row that is
+        // not part of this dispute; refuse instead, leaving `dismiss` available.
+        if (c.observation_id !== null) {
+          if (!correcting || correcting.concept_id !== conceptId) {
+            throw new Error(
+              `contradiction ${contradictionId} names observation ${c.observation_id}, which does not belong to concept ${conceptId}; ` +
+              `resolve it with decision:"dismiss" instead`,
+            );
+          }
+          if (correcting.superseded_by !== null || correcting.superseded_at !== null) {
+            throw new Error(
+              `contradiction ${contradictionId} names observation ${c.observation_id}, which is no longer live evidence; ` +
+              `resolve it with decision:"dismiss" instead`,
+            );
+          }
+        }
+
+        // Live evidence in insertion order — the ordering detach() uses to decide who the parties to
+        // a dispute are. Liveness needs BOTH columns null: terminal supersession
+        // (supersedeObservation(id, null)) leaves superseded_by NULL with superseded_at set.
+        const liveIds = (
+          this.db
+            .prepare(
+              `SELECT id FROM observations
+                WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL
+                ORDER BY created_at, rowid`,
+            )
+            .all(conceptId) as Array<{ id: string }>
+        ).map((o) => o.id);
+        // Only evidence PREDATING the correction is party to it; a guard note added afterwards is
+        // not something the correction contradicted. Same boundary as detach().
+        const correctingIndex = c.observation_id === null ? liveIds.length : liveIds.indexOf(c.observation_id);
+        const priors = liveIds.slice(0, correctingIndex);
+
+        // keep-current keeps a prior, so there must be one. With none, the verdict would close the
+        // conflict and leave the REJECTED correction as the concept's only live evidence — the
+        // opposite of what was asked, recorded as success.
+        if (opts.decision === "keep-current" && priors.length === 0) {
+          throw new Error(
+            `cannot resolve this contradiction with keep-current: concept ${conceptId} has no live observation ` +
+            `predating the correction to keep. Use decision:"accept-new", or "dismiss".`,
+          );
+        }
+
+        // WHO LOSES, AND WHO (IF ANYONE) REPLACES THEM.
+        //
+        // accept-new: the counterpart is unambiguous ONLY when exactly one live prior predates the
+        // correction. Then that prior lost and the correction genuinely IS its successor — a real,
+        // identified pointer. With several priors nothing records which was contradicted, so
+        // supersede NONE rather than guess.
+        //
+        // keep-current: the correction lost, and it is named on the row. But NOTHING identifies
+        // which prior beat it, so it gets NO successor — a TERMINAL supersession (superseded_at set,
+        // superseded_by NULL), the representation this engine already uses for "retired, no
+        // replacement claimed". Naming an arbitrary prior would be a guess with a second-order
+        // consequence: detach()'s inbound-pointer cleanup clears supersession when the named
+        // successor is moved away, which would RESURRECT the rejected correction as live evidence.
+        const supersessions: Array<{ loser: string; successor: string | null }> =
+          opts.decision === "keep-current"
+            ? (c.observation_id !== null ? [{ loser: c.observation_id, successor: null }] : [])
+            // accept-new promotes the CORRECTING observation over the prior, so it needs one. A
+            // contradiction flagged without an observationId (flagContradiction's bare form) names
+            // no new evidence, so there is nothing to accept and nothing to supersede — without this
+            // guard the sole observation would be terminally retired and the concept left empty.
+            : (c.observation_id !== null && priors.length === 1)
+              ? [{ loser: priors[0]!, successor: c.observation_id }]
+              : [];
+        const losers = supersessions.map((x) => x.loser);
+        // What the contradiction records as having resolved it. Only accept-new has an identified
+        // winner; keep-current kept an unidentified prior, so there is nothing honest to name.
+        const resolutionObsId = opts.decision === "accept-new" ? c.observation_id : null;
+
+        // AMBIGUOUS accept-new only: several live priors, none identifiable, so nothing is
+        // superseded. If the caller also omits `body`, NOTHING records which claim won, yet the
+        // contradiction closes and the concept returns to active — contradictory evidence laundered
+        // into "confirmed". Deliberately NARROW: with exactly one prior the loser IS superseded, so
+        // a body-less accept-new stays valid there (first-block relies on it, marking the pinned
+        // summary dirty instead). Widening this to "always require a body" breaks that designed path
+        // and several subsystems that build on accept-new's supersession.
+        // `c.observation_id !== null` scopes this to real corrections. A contradiction flagged
+        // without one names no competing claim, so there is no "which won" to record and the bare
+        // form stays valid without a body, as it always has.
+        if (opts.decision === "accept-new" && c.observation_id !== null
+            && losers.length === 0 && priors.length > 0
+            && (opts.body === undefined || opts.body.trim() === "")) {
+          throw new Error(
+            `cannot resolve this contradiction with accept-new and no reconciled body: the concept has ` +
+            `${priors.length} live prior observations and nothing records which one was contradicted, so ` +
+            `superseding any of them would be a guess. Pass \`body\` stating the resolution, or use ` +
+            `decision:"dismiss" to set the conflict aside without a verdict.`,
+          );
+        }
+
+        if (supersessions.length > 0) {
+          // `AND concept_id = ?` remains a second gate on the write itself, independent of the
+          // ownership check above.
+          const supersede = this.db.prepare(
+            `UPDATE observations SET superseded_by = ?, superseded_at = ? WHERE id = ? AND concept_id = ?`,
+          );
+          for (const x of supersessions) supersede.run(x.successor, nowMs, x.loser, conceptId);
           // First Block hook: winner supersedes losers → effective content changes even without an
           // explicit body. Invalidate so the user refreshes the pinned summary.
           // dismiss never reaches this branch; the hook is safe to fire unconditionally here.
@@ -2939,14 +3058,14 @@ export class MonetCore {
             .run(opts.body, nextTitle, version, conceptId);
           this.writeRevision(conceptId, version, opts.body);
           // First Block hook: body explicitly changed — invalidate regardless of supersede path.
-          // Idempotent if winnerObsId already fired above (dirty=1 twice is harmless).
+          // Idempotent if the supersede branch already fired above (dirty=1 twice is harmless).
           this.invalidateFirstBlockEntry(conceptId);
         }
         this.db
           .prepare(
             `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, resolved_at = ?, resolved_by = ? WHERE id = ?`,
           )
-          .run(winnerObsId, nowMs, opts.by ?? null, contradictionId);
+          .run(resolutionObsId, nowMs, opts.by ?? null, contradictionId);
         // accept-new / keep-current: a verdict is evidence that the concept's state is confirmed — refresh.
         this.db
           .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
