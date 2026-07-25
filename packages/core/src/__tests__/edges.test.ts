@@ -12,6 +12,18 @@ import { MonetCore } from "../engine";
 import { extractEntities, singularize } from "../extract-entities";
 import type { EmbeddingProvider } from "../embedding";
 
+/**
+ * Read a concept's stored source_refs straight from the row. These tests are about what lands in
+ * concepts.source_refs (merge-on-attach, post-upgrade backfill); gather cards were only ever the
+ * window onto it, and they now carry sourceRefsCount rather than the refs themselves.
+ */
+const storedRefs = (core: MonetCore, conceptId: string): string[] => {
+  const row = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+    .prepare(`SELECT source_refs FROM concepts WHERE id = ?`)
+    .get(conceptId) as { source_refs: string | null } | undefined;
+  return JSON.parse(row?.source_refs ?? "[]") as string[];
+};
+
 describe("extractEntities", () => {
   it("pulls structural entities: identifiers, libs, paths, error codes", () => {
     const keys = (s: string): string[] => extractEntities(s).map((e) => e.key);
@@ -202,7 +214,8 @@ describe("codex-review fixes", () => {
     await core.store("Auth uses JSON web tokens for sessions.", { sourceRefs: ["src/auth.ts"] }); // attaches; new ref
     const card = (await core.gather("Auth uses JSON web tokens for sessions.")).ranked.find((c) => c.id === first.conceptId);
     expect(card, "the merged concept should be gathered").toBeTruthy();
-    expect([...(card!.sourceRefs ?? [])].sort()).toEqual(["docs/auth.md", "src/auth.ts"]);
+    expect([...storedRefs(core, first.conceptId)].sort()).toEqual(["docs/auth.md", "src/auth.ts"]);
+    expect(card!.sourceRefsCount).toBe(2);
     core.close();
   });
 
@@ -242,7 +255,8 @@ describe("codex-review fixes", () => {
       old.close();
       const upgraded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
       const card = (await upgraded.gather("Auth uses JSON web tokens for sessions.")).ranked.find((c) => c.id === a.conceptId);
-      expect([...(card?.sourceRefs ?? [])].sort()).toEqual(["docs/auth.md", "src/auth.ts"]);
+      expect(card, "the backfilled concept should be gathered").toBeTruthy();
+      expect([...storedRefs(upgraded, a.conceptId)].sort()).toEqual(["docs/auth.md", "src/auth.ts"]);
       upgraded.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

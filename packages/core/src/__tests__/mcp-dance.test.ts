@@ -40,13 +40,21 @@ describe("agent-driven synthesis (the MCP dance)", () => {
     core.close();
   });
 
-  it("listDirty surfaces concepts + evidence for batch synthesis (checkpoint)", async () => {
+  it("listDirty surfaces a synthesis WORKLIST — identity and size, never observation text", async () => {
     const core = new MonetCore(":memory:");
     await core.store("We use SQLite for storage.");
     await core.store("The team prefers pytest for testing.");
     const dirty = core.listDirty();
     expect(dirty).toHaveLength(2);
-    expect(dirty[0].observations.length).toBeGreaterThan(0);
+    // Enough to decide what to work on: which concept, and how much evidence is waiting.
+    expect(dirty[0]!.id).toBeTruthy();
+    expect(dirty[0]!.title).toBeTruthy();
+    expect(dirty[0]!.observationCount).toBeGreaterThan(0);
+    // The evidence itself must NOT ride along — memory_checkpoint returns this list, and returning
+    // every dirty concept's observations is what blew the host's tool-result limit.
+    const serialized = JSON.stringify(dirty);
+    expect(serialized).not.toContain("We use SQLite for storage.");
+    expect(serialized).not.toContain("The team prefers pytest for testing.");
     core.close();
   });
 });

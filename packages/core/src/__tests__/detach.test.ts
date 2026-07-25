@@ -13,6 +13,20 @@ import type { StoragePort } from "../storage";
 import { cosine } from "../embedding";
 import type { EmbeddingProvider } from "../embedding";
 
+/**
+ * Read a concept's stored source_refs straight from the row.
+ *
+ * Gather cards used to carry the refs themselves, so these assertions read them off a card. Cards
+ * now carry only sourceRefsCount, and detach's contract is about the STORED refs anyway — so
+ * asserting the row is both the necessary change and the more direct test.
+ */
+const storedRefs = (core: MonetCore, conceptId: string): string[] => {
+  const row = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+    .prepare(`SELECT source_refs FROM concepts WHERE id = ?`)
+    .get(conceptId) as { source_refs: string | null } | undefined;
+  return JSON.parse(row?.source_refs ?? "[]") as string[];
+};
+
 /** Force all stores into separate concepts (no dedup interference). */
 function core(): MonetCore {
   return new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
@@ -391,15 +405,15 @@ describe("detach — source_refs recompute (Finding 2)", () => {
 
     // Source should now have only "file://alpha.md" in its refs.
     // Destination should have "file://beta.md".
-    // Verify via gather() which reads concepts.source_refs for GatherCard.sourceRefs.
+    expect(storedRefs(c, a.conceptId)).toEqual(["file://alpha.md"]);
+    expect(storedRefs(c, r.destConceptId!)).toEqual(["file://beta.md"]);
+
+    // The gather card reports HOW MANY refs each concept carries, never which ones.
     // (ranked is GatherCard[] and includes seeds re-ranked; no need to fall back to seed.)
     const gSrc = await c.gather("Alpha content for the source concept.");
     const srcCard = gSrc.ranked.find((card) => card.id === a.conceptId);
-    expect(srcCard?.sourceRefs).toEqual(["file://alpha.md"]);
-
-    const gDst = await c.gather("Beta content attached to source.");
-    const dstCard = gDst.ranked.find((card) => card.id === r.destConceptId);
-    expect(dstCard?.sourceRefs).toEqual(["file://beta.md"]);
+    expect(srcCard?.sourceRefsCount).toBe(1);
+    expect(srcCard).not.toHaveProperty("sourceRefs");
 
     c.close();
   });
@@ -419,9 +433,7 @@ describe("detach — source_refs recompute (Finding 2)", () => {
     await c.detach(src.conceptId, [obs2Id], { destConceptId: dest.conceptId });
 
     // Destination should now have dest.md ∪ beta.md.
-    const gDst = await c.gather("Destination concept.");
-    const dstCard = gDst.ranked.find((card) => card.id === dest.conceptId);
-    const refs = dstCard?.sourceRefs ?? [];
+    const refs = storedRefs(c, dest.conceptId);
     expect(refs).toContain("file://dest.md");
     expect(refs).toContain("file://beta.md");
 

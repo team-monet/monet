@@ -106,7 +106,7 @@ describe("authorized source-backed generic retrieval", () => {
     const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
     expect(gathered.seed).toContainEqual(expect.objectContaining({ id: stored.conceptId, kind: "source" }));
     expect(gathered.ranked).toContainEqual(expect.objectContaining({
-      id: stored.conceptId, viaSeed: true, sourceRefs: [chunk.sourceRef],
+      id: stored.conceptId, viaSeed: true, sourceRefsCount: 1,
     }));
     expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).topConcepts).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
     expect(core.overview(circle, { sourceAuthorizationContext: auth })).toMatchObject({
@@ -377,7 +377,7 @@ describe("authorized source-backed generic retrieval", () => {
         });
         expect(JSON.stringify(await candidate.search("STAGED successor", { circle, sourceAuthorizationContext: auth }))).not.toContain("STAGED");
         expect((await candidate.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth })).ranked)
-          .toContainEqual(expect.objectContaining({ id: initial.stored.conceptId, sourceRefs: [initial.chunk.sourceRef] }));
+          .toContainEqual(expect.objectContaining({ id: initial.stored.conceptId, sourceRefsCount: 1 }));
       };
       await assertPublishedPredecessor(core);
       expect(core.abortSourceRun(replacement.run.id, "failed", "test crash before rollback").state).toBe("aborted");
@@ -937,17 +937,19 @@ describe("authorized source-backed generic retrieval", () => {
     }
   });
 
-  it("caps sourceRefs on a large source gather card, exposing the true total (round 4, Codex thread 13)", async () => {
+  it("reports a source gather card's ref COUNT and never the refs themselves (supersedes the round-4 cap)", async () => {
     // recomputeSourceConceptBody stores one source_refs entry per active chunk — hundreds for a
     // large file — and gather()'s cards used to include that array verbatim. A gather response
     // with even a couple of such cards can exceed RESULT_MAX_CHARS and get truncated mid-JSON by
-    // ok(), same failure shape as the outline bug above.
+    // ok(), same failure shape as the outline bug above. Round 4 (Codex thread 13) capped the array
+    // at the first 20; the payload-noise pass found the capped 20 were not consumed either, so the
+    // card now carries only the count.
     const core = makeCore();
     core.createSource(sourceInput());
     const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-refs-cap" });
     if (begun.kind !== "started") throw new Error("expected started run");
     const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
-    const sectionCount = 40; // > SOURCE_REFS_CARD_CAP (20)
+    const sectionCount = 40; // comfortably more than the old 20-entry card cap
     const chunks = Array.from({ length: sectionCount }, (_, i) => {
       const heading = `Section ${i}`;
       const text = `evidence about cobalt walruses, section ${i}`;
@@ -985,7 +987,9 @@ describe("authorized source-backed generic retrieval", () => {
     const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
     const card = gathered.ranked.find((c) => c.id === conceptId);
     expect(card).toBeDefined();
-    expect(card!.sourceRefs).toHaveLength(20);
-    expect(card!.sourceRefsTotal).toBe(sectionCount);
+    expect(card!.sourceRefsCount).toBe(sectionCount);
+    // The refs themselves must not ride along on the card at any size.
+    expect(card).not.toHaveProperty("sourceRefs");
+    expect(JSON.stringify(card)).not.toContain("source://source-a/MANY.md");
   });
 });

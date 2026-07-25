@@ -732,7 +732,7 @@ export function registerMonetCoreTools(
       id: z.string(),
       circle: z.string().optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
       observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages. Not used for source concepts (they return an outline instead — see includeBody)."),
-      includeBody: z.boolean().optional().describe("Source concepts only (kind='source'): include the full concatenated file body. Default false — the response returns structure (title, sourcePath, outline) instead, since a source concept's body can run to the whole file. Ignored for non-source concepts, which always include body."),
+      includeBody: z.boolean().optional().describe("Source concepts (kind='source'): include the full concatenated file body. Default false — the response returns structure (title, sourcePath, outline) instead, since a source concept's body can run to the whole file. Normal concepts: the body is included by default; pass false to get the OBSERVATIONS instead of the body. That matters only when the body is long enough to be truncated — the response then carries the body alone, and includeBody:false is how you ask for the evidence instead."),
     },
     async ({ id, circle, observationsOffset, includeBody }) => {
       // memory_fetch is READ-ONLY — the pre-mutation capture rule (Fix B) does not apply here.
@@ -822,20 +822,34 @@ export function registerMonetCoreTools(
         const offset = c.observationsOffset;
         // Engine already returned exactly one page; all observations in c.observations are kept.
         const kept = c.observations;
-        const omitted = 0;
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
+        // BODY OR OBSERVATIONS — NEVER BOTH ONCE THE BODY NO LONGER FITS.
+        // A clipped body means this concept has already spent the response budget. Appending an
+        // observation page on top spends what is left on newest-first churn (commit hashes, test
+        // counts, transport fixes) while the durable synthesized claim is the part that just got
+        // cut — the high-value half truncated to pay for the low-value half. Measured on a concept
+        // whose body clipped at 191,120 chars: ~200 useful tokens inside ~10K of response.
+        // So the default view serves the BODY, and a caller that wants the evidence instead asks
+        // for it explicitly with includeBody:false.
+        const sendBody = includeBody !== false;
+        const sendObservations = !sendBody || !body.clipped;
         return readOk({
           id: c.id,
           circle: c.circle, // pass this back to memory_synthesize if it isn't your session default
           kind: c.kind,
-          body: body.text,
-          ...(body.clipped ? { bodyTruncated: true } : {}),
-          observations: kept.map((o) => ({ id: o.id, content: clip(o.content, FETCH_OBS_MAX_CHARS).text })),
+          ...(sendBody ? { body: body.text, ...(body.clipped ? { bodyTruncated: true } : {}) } : { bodyOmitted: true }),
+          ...(sendObservations
+            ? { observations: kept.map((o) => ({ id: o.id, content: clip(o.content, FETCH_OBS_MAX_CHARS).text })) }
+            : {}),
           totalObservations: total,
           observationsOffset: offset,
           // Note: omitted is always 0 (engine returns exactly one page). Use kept.length vs total
           // to detect whether more pages exist. Offset here is newest-first (offset 0 = newest page).
-          ...(kept.length === 0 && offset > 0
+          ...(!sendObservations
+            ? {
+                observationsNote: `Body truncated, so its ${total} observation(s) were withheld — sending both would cut the synthesized body further to pay for newest-first evidence. Re-fetch with includeBody:false to get the observations instead.`,
+              }
+            : kept.length === 0 && offset > 0
             ? {
                 observationsNote: `No observations at offset ${offset} of ${total}.`,
               }
@@ -853,14 +867,30 @@ export function registerMonetCoreTools(
           version: c.version,
           lastConfirmedAt: c.lastConfirmedAt,
           needsSynthesis: c.needsSynthesis,
-          // Only invite synthesis when ALL evidence is shown (offset=0 AND total fits one page).
-          // memory_synthesize clears `dirty` with the body the agent writes, so synthesizing from
-          // a partial view would discard the unseen observations from the canonical body.
+          // Synthesis routing. memory_synthesize clears `dirty` with the body the agent writes, so
+          // synthesizing from a partial view would discard unseen observations — hence the
+          // offset=0 AND total-fits-one-page gate. But "no observations in THIS response" has two
+          // very different causes and only one of them is permanent:
+          //   (a) all evidence is here                        → synthesize now
+          //   (b) evidence withheld so the truncated body fit, yet it WOULD all fit in one page
+          //                                                   → say so, and name the one re-fetch
+          //   (c) genuinely more observations than a page     → defer, leave dirty
+          // Case (b) is created by the body-or-observations trim above, and without its own branch
+          // it fell into (c) — whose message both misstates the reason ("more observations than
+          // shown") and says to leave the concept dirty. That permanently strands exactly the
+          // concepts the checkpoint worklist points at: 52 of them in the live store at the time of
+          // this change, every one synthesizable after a single includeBody:false fetch. Deepening
+          // the synthesis debt is the one outcome this whole pass must not produce.
           ...(c.needsSynthesis && offset === 0 && total <= FETCH_MAX_OBS
-            ? {
-                synthesisInstruction:
-                  "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body) — pass this concept's `circle` (above) if it isn't your session default.",
-              }
+            ? sendObservations
+              ? {
+                  synthesisInstruction:
+                    "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body) — pass this concept's `circle` (above) if it isn't your session default.",
+                }
+              : {
+                  synthesisInstruction:
+                    `This concept has unsynthesized evidence, withheld here so the truncated body could fit. All ${total} observation(s) fit in a single page — re-fetch with includeBody:false to read them, then write a coherent body and call memory_synthesize(id, body), passing this concept's \`circle\` (above) if it isn't your session default. Do NOT synthesize from the body alone.`,
+                }
             : c.needsSynthesis
               ? {
                   synthesisDeferred:
@@ -893,7 +923,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_checkpoint",
-    "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives as a workstream that next session's agent_context restores. Also returns any concepts still needing synthesis.",
+    "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives as a workstream that next session's agent_context restores. Also returns the concepts still needing synthesis as a WORKLIST — id, title, kind and observationCount only, never the observation text. memory_fetch(id) the one you decide to synthesize.",
     {
       circle: z.string().optional(),
       summary: z.string().optional(),
@@ -922,7 +952,7 @@ export function registerMonetCoreTools(
           dirtyCount: dirty.length,
           dirty,
           guidance: dirty.length
-            ? "For each dirty concept: read observations → write a coherent body → memory_synthesize(id, body). If `circle` above isn't your session default, pass it: memory_synthesize(id, body, circle)."
+            ? "For each dirty concept you choose to work: memory_fetch(id) to read its observations → write a coherent body → memory_synthesize(id, body). If `circle` above isn't your session default, pass it: memory_synthesize(id, body, circle)."
             : saved
               ? "Workstream saved — next session's agent_context will restore it. Nothing left to synthesize."
               : "Nothing to synthesize.",
@@ -1411,9 +1441,17 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleConcepts` (unconfirmed — worth re-checking), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
-    { circle: z.string().optional() },
-    async ({ circle }) => {
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleCount` (how many concepts are unconfirmed past the staleness window — pass includeStale:true for the cards themselves, which is a curation pass, not session restore), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
+    {
+      circle: z.string().optional(),
+      includeStale: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include the full staleConcepts card list. OFF by default: the list is titles plus a confidence number with no indication of why the caller should care, and it is not what session restore is for. The response always carries staleCount; pass true when you are actually doing a re-confirmation pass.",
+        ),
+    },
+    async ({ circle, includeStale }) => {
       const resolvedCircle = scope(circle);
       const state = core.prewarm(resolvedCircle, { sourceAuthorizationContext });
       const ov = core.overview(resolvedCircle, { sourceAuthorizationContext });
@@ -1437,12 +1475,24 @@ export function registerMonetCoreTools(
             `(${firstBlockSerial.length} chars vs ${FIRST_BLOCK_INJECTION_MAX_CHARS} char budget) — review/trim via memory_first_block or the dashboard.]`
           : activeFirstBlock;
 
+      // staleConcepts is a CURATION list, not session-restore context, and it was the largest
+      // never-consumed block in the prewarm payload — 20 cards of title + confidence with nothing
+      // saying why the caller should act on any of them. Session restore now carries the COUNT
+      // (store-wide and honest, unlike the capped list length); an agent actually running a
+      // re-confirmation pass asks for the cards with includeStale:true.
+      const { staleConcepts, ...restState } = state;
+
       return wrapSuccess(ok({
         agentId: core.getAgentId(),
         mode: "local",
         circle: resolvedCircle,
         ...(state.resolvedFrom !== undefined ? { resolvedFrom: state.resolvedFrom } : {}),
-        ...state,
+        ...restState,
+        ...(includeStale ? { staleConcepts } : {}),
+        // Unconditional: a caller must be able to read staleCount as a stable number and tell
+        // "zero stale" apart from "server predates this field". Conditioning it on >0 would make
+        // the absent case ambiguous, and one integer is not the noise this pass is about.
+        staleCount: ov.counts.stale,
         firstBlock: injectedFirstBlock,
         ...(advisory !== null ? { curationAttention: advisory } : {}),
         ...(others.length > 0 ? { otherCircles: others } : {}),

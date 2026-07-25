@@ -2542,20 +2542,25 @@ describe("scrubSizeDb — copy-then-scrub, the full per-size operation", () => {
       expect(serialized).not.toContain("key_GZTqlLr41FS2p7AY");
       expect(serialized).not.toContain("192.168.1.10");
 
-      // gather() attaches sourceRefs via toGatherCard (engine.ts) — assert it comes back as a
-      // CLEAN array (not a raw unparsed JSON string, not containing raw paths), proving the
-      // engine-side JSON.parse still works against this JSON-aware-scrubbed column.
+      // gather() reads concepts.source_refs via countSourceRefs (engine.ts). A numeric count on the
+      // card proves the engine-side JSON.parse still works against this JSON-aware-scrubbed column
+      // (a raw unparsed string would throw there). The refs themselves are no longer carried on the
+      // card, so assert their scrubbed CONTENT against the stored row.
       const gathered = await core.gather(conceptIds[0], { circle: SAMPLED_CIRCLE });
       const seedCard = gathered.seed.find((s) => s.id === conceptIds[0]);
       expect(seedCard).toBeDefined();
       const rankedOrSeed = gathered.ranked.find((r) => r.id === conceptIds[0]);
       if (rankedOrSeed) {
-        expect(Array.isArray(rankedOrSeed.sourceRefs)).toBe(true);
-        const joined = (rankedOrSeed.sourceRefs ?? []).join(" ");
-        expect(joined).not.toContain("/Users/dev");
-        expect(joined).not.toContain("~/code");
-        expect(rankedOrSeed.sourceRefs?.some((r) => r.startsWith("[redacted"))).toBe(true);
+        expect(typeof rankedOrSeed.sourceRefsCount).toBe("number");
       }
+      const scrubbedRow = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+        .prepare(`SELECT source_refs FROM concepts WHERE id = ?`)
+        .get(conceptIds[0]) as { source_refs: string | null } | undefined;
+      const scrubbedRefs = JSON.parse(scrubbedRow?.source_refs ?? "[]") as string[];
+      const joined = scrubbedRefs.join(" ");
+      expect(joined).not.toContain("/Users/dev");
+      expect(joined).not.toContain("~/code");
+      expect(scrubbedRefs.some((r) => r.startsWith("[redacted"))).toBe(true);
     } finally {
       core.close();
     }

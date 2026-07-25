@@ -110,13 +110,16 @@ const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
 const SEED_K = 10; // gather seed-set size
 const RRF_K = 60; // RRF constant for seed fusion
-// REVIEW FIX (round 4, Codex thread 13): a source concept's source_refs holds one entry per active
-// chunk — hundreds/thousands for a large file — so gather()'s cards must cap it the same way
-// memory_fetch's outline caps entries (mcp-server.ts's FETCH_OUTLINE_MAX_ENTRIES / size-fit loop),
-// else one huge source card can push ok()'s serialized memory_gather payload past its result-size
-// ceiling and get truncated mid-JSON. First N + a total count preserves "how many" without paying
-// for "all of them" in every gather response.
-const SOURCE_REFS_CARD_CAP = 20;
+// Cards carry a source-ref COUNT, never the refs themselves.
+//
+// Supersedes the round-4 / Codex-thread-13 fix, which capped source_refs at the first 20 entries
+// per card for exactly the right reason (one large source concept holds one ref per active chunk
+// and could push a serialized memory_gather payload past ok()'s size ceiling) but stopped one step
+// short: the capped 20 were not consumed either. They are file paths and agent ids — provenance a
+// caller reads via memory_fetch on the one concept it cares about, not something it needs on every
+// card of every gather. Measured: a single card in one field gather carried 20 refs against a true
+// total of 255, and none of them were used. The count keeps "how much provenance exists" — the
+// only part the ranking view ever needed — at a fixed cost per card.
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
 const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
 const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
@@ -685,10 +688,9 @@ export interface PrewarmState {
 export interface GatherCard extends SearchCard {
   /** True if this concept matched the intent directly (a seed); false if reached via the graph. */
   viaSeed: boolean;
-  /** Capped to SOURCE_REFS_CARD_CAP entries — see sourceRefsTotal when the real count is larger. */
-  sourceRefs?: string[];
-  /** Present only when sourceRefs was capped: the TRUE total ref count before capping. */
-  sourceRefsTotal?: number;
+  /** How many source refs this concept carries. The refs themselves are NOT on the card —
+   *  memory_fetch the concept when you actually need its provenance. Absent when there are none. */
+  sourceRefsCount?: number;
 }
 
 /** What gather(intent) returns: the seed set, the ranked gathered set, and why it stopped. */
@@ -3852,20 +3854,28 @@ export class MonetCore {
   }
 
   /** Concepts with unsynthesized evidence + their raw observations (for the agent to synthesize). */
-  listDirty(circle?: string): Array<{ id: string; slug: string; kind: string; observations: string[] }> {
+  /**
+   * The dirty (pending-synthesis) worklist as IDENTITY ONLY — never observation text.
+   *
+   * This is a worklist, not a read: the caller's next move is memory_fetch(id) on the one concept
+   * it decides to synthesize. Returning every dirty concept's full evidence inline made a WRITE
+   * path (memory_checkpoint) the single largest response in the system — it blew the host's
+   * tool-result limit twice in one session on a store with 167 dirty concepts, some carrying 130+
+   * observations. observationCount preserves the only thing the worklist actually needed the
+   * evidence for: how much work each entry represents.
+   */
+  listDirty(circle?: string): Array<{ id: string; slug: string; title: string; kind: string; observationCount: number }> {
     circle ??= this.defaultCircle; // honor the per-project default; pass a circle explicitly to scope elsewhere
     // status != 'retired' (not the implicit retired⟹dirty=0 invariant): retireConcept no longer zeros
     // dirty, so a retired concept's stale pending-synthesis state must be filtered here explicitly.
     const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ? AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`).all(circle) as ConceptRow[];
+    const countObs = this.db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = ?`);
     return rows.map((r) => ({
       id: r.id,
       slug: r.slug,
+      title: r.title,
       kind: r.kind,
-      observations: (
-        this.db
-          .prepare(`SELECT content FROM observations WHERE concept_id = ? ORDER BY created_at`)
-          .all(r.id) as Array<{ content: string }>
-      ).map((o) => o.content),
+      observationCount: (countObs.get(r.id) as { n: number }).n,
     }));
   }
 
@@ -10007,7 +10017,7 @@ export class MonetCore {
       return {
         ...toCard(projection.row, score, 0),
         viaSeed: true,
-        ...capSourceRefs(projection.row.source_refs),
+        ...countSourceRefs(projection.row.source_refs),
       };
     });
     const dense = this.scoreAllConcepts(emb, resolvedCircle, opts.includeArchived); // [{id, cos}] desc
@@ -10265,7 +10275,7 @@ export class MonetCore {
   private toGatherCard(r: Ranked): GatherCard | null {
     const row = this.getRow(r.id);
     if (!row || row.status === "retired" || isConnectorOwnedRow(row)) return null;
-    return { ...toCard(row, r.score, this.openContraCount(r.id)), viaSeed: r.viaSeed, ...capSourceRefs(row.source_refs) };
+    return { ...toCard(row, r.score, this.openContraCount(r.id)), viaSeed: r.viaSeed, ...countSourceRefs(row.source_refs) };
   }
 
   /** Per-edge-type: distinct non-seed concepts reachable from the seeds within `hop` (explainability). */
@@ -10741,13 +10751,12 @@ function toCard(r: ConceptRow, score: number, contradictions: number): SearchCar
   };
 }
 
-/** REVIEW FIX (round 4, Codex thread 13): shared cap for both gather() source-card sites (the
- *  direct-seed sourceRankedCards map and toGatherCard) — see SOURCE_REFS_CARD_CAP's own comment. */
-function capSourceRefs(sourceRefsJson: string | null): { sourceRefs?: string[]; sourceRefsTotal?: number } {
+/** Shared by both gather() source-card sites (the direct-seed sourceRankedCards map and
+ *  toGatherCard): report HOW MANY source refs a concept carries, never which ones. */
+function countSourceRefs(sourceRefsJson: string | null): { sourceRefsCount?: number } {
   if (!sourceRefsJson) return {};
   const all = JSON.parse(sourceRefsJson) as string[];
-  if (all.length <= SOURCE_REFS_CARD_CAP) return { sourceRefs: all };
-  return { sourceRefs: all.slice(0, SOURCE_REFS_CARD_CAP), sourceRefsTotal: all.length };
+  return all.length ? { sourceRefsCount: all.length } : {};
 }
 
 function fetchHint(kind: string): string {

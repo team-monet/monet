@@ -13,6 +13,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
 
+/**
+ * Read a concept's stored source_refs straight from the row. These tests assert PROVENANCE
+ * (recorded with the graph off; carried through a reassign-merge); gather cards were the window
+ * onto it and now carry sourceRefsCount rather than the refs themselves.
+ */
+const storedRefs = (core: MonetCore, conceptId: string): string[] => {
+  const row = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+    .prepare(`SELECT source_refs FROM concepts WHERE id = ?`)
+    .get(conceptId) as { source_refs: string | null } | undefined;
+  return JSON.parse(row?.source_refs ?? "[]") as string[];
+};
+
 /** Distinct concepts per store (dedup off) — to exercise the graph the way edges.test does. */
 function freshCore(): MonetCore {
   return new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
@@ -214,10 +226,11 @@ describe("sourceRefs provenance — recorded regardless of graph mode", () => {
       circle: "acme-api",
       sourceRefs: ["/work/acme-api/AGENTS.md"],
     });
-    // gather() exposes the concept-level source_refs on its ranked cards.
+    expect(storedRefs(core, r.conceptId)).toContain("/work/acme-api/AGENTS.md");
+    // gather() reports how many refs the concept carries, not which ones.
     const g = await core.gather("Build conventions: never run a root-level build.", { circle: "acme-api" });
     const card = g.ranked.find((c) => c.id === r.conceptId);
-    expect(card?.sourceRefs).toContain("/work/acme-api/AGENTS.md");
+    expect(card?.sourceRefsCount).toBe(1);
     core.close();
   });
 });
@@ -261,10 +274,8 @@ describe("reassignCircle — merge (dedup into an existing target)", () => {
     expect(r!.action).toBe("merged");
     const target = r!.conceptId;
 
-    // Both sources' return-to-source pointers survive (gather exposes concept-level source_refs).
-    const g = await core.gather("jose library auth tokens", { circle: "acme-api" });
-    const card = g.ranked.find((c) => c.id === target);
-    expect(card?.sourceRefs).toEqual(expect.arrayContaining(["/work/acme-api/AGENTS.md", "/work/default/NOTES.md"]));
+    // Both sources' return-to-source pointers survive the merge.
+    expect(storedRefs(core, target)).toEqual(expect.arrayContaining(["/work/acme-api/AGENTS.md", "/work/default/NOTES.md"]));
 
     // The carried-over open contradiction keeps the survivor disputed — not silently restored to active.
     expect((await core.getConcept(target, { synthesize: false }))!.status).toBe("disputed");
