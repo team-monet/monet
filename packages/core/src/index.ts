@@ -66,7 +66,7 @@ export {
   readStoredVectorPresence,
 } from "./storage";
 export type { VerifiedBackupResult } from "./storage";
-export { inspectStoredEmbedderState, StoredEmbedderStateDiagnosticError } from "./diagnostics";
+export { inspectStoredEmbedderState, StoredEmbedderStateDiagnosticError, inspectLifecycleEdgeIntegrity } from "./diagnostics";
 export type {
   StoredDatabaseIntegrity,
   StoredEmbedderDiagnosticFailureReason,
@@ -74,7 +74,41 @@ export type {
   StoredEmbedderPin,
   StoredEmbedderSafetyAssessment,
   StoredEmbedderStateInspection,
+  DanglingLifecycleEdge,
+  DanglingRatification,
+  LifecycleEdgeIntegrityReport,
+  LifecycleEdgeReadDb,
 } from "./diagnostics";
+/** Normative substrate: derivation / provenance / supersession as first-class objects, plus the
+ *  span scheme a provenance edge addresses. Engine-internal today — exported so the slices adding
+ *  rule capture and ratification flows build against a fixed API rather than reaching into engine. */
+export {
+  LIFECYCLE_EDGE_BIRTHS,
+  LIFECYCLE_EDGE_FAMILIES,
+  LIFECYCLE_EDGE_SCHEMA_SQL,
+  RATIFICATION_VERDICTS,
+} from "./lifecycle-edges";
+export type {
+  AddLifecycleEdgeInput,
+  GetLifecycleEdgesOptions,
+  LifecycleEdgeBirth,
+  LifecycleEdgeDirection,
+  LifecycleEdgeFamily,
+  LifecycleEdgeRow,
+  RatificationRow,
+  RatificationVerdict,
+  RecordRatificationInput,
+} from "./lifecycle-edges";
+export {
+  CLAUDE_CODE_HOST,
+  SPAN_SCHEME,
+  formatClaudeCodeAnchor,
+  formatSpan,
+  isSpanRef,
+  parseClaudeCodeAnchor,
+  parseSpan,
+} from "./spans";
+export type { ClaudeCodeAnchor, TranscriptSpan } from "./spans";
 export type {
   EmbeddingPopulationName,
   LiveEmbeddingPopulationInspection,
@@ -231,4 +265,6 @@ export type {
   SyncConceptTombstoneRow,
   SyncConceptRestorationRow,
   SyncSessionRow,
+  SyncLifecycleEdgeRow,
+  SyncRatificationRow,
 } from "./sync-types";

@@ -221,6 +221,41 @@ export interface SyncConceptRestorationRow {
   updated_at?: number;
 }
 
+/**
+ * A normative relation (derivation / provenance / supersession). Unlike `resolution_events`, which
+ * is deliberately local-only because it logs one device's embedder decisions, this is substrate
+ * truth: a machine that failed to receive it would disagree about what governs.
+ */
+export interface SyncLifecycleEdgeRow {
+  id: string;
+  family: string;
+  src_concept_id: string;
+  dst_concept_id: string | null;
+  dst_span: string | null;
+  born_of: string;
+  event_ref: string | null;
+  circle: string;
+  created_at: number;
+  sync_updated_at: number;
+  /** Convergence clock for `circle`, the sole mutable column (a circle rename rewrites it). */
+  sync_revision?: number;
+  sync_writer?: string | null;
+}
+
+/** A human ratification verdict over a concept, with the evidence packet it was ruled on. */
+export interface SyncRatificationRow {
+  id: string;
+  subject_concept_id: string;
+  verdict: string;
+  packet: string | null;
+  ratified_by: string | null;
+  circle: string;
+  created_at: number;
+  sync_updated_at: number;
+  sync_revision?: number;
+  sync_writer?: string | null;
+}
+
 // ---- the payload and result -----------------------------------------------
 
 export interface GraftPayload {
@@ -252,6 +287,9 @@ export interface GraftPayload {
   tombstones: SyncConceptTombstoneRow[];
   restorations: SyncConceptRestorationRow[];
   sessions?: SyncSessionRow[];
+  /** Normative substrate. Optional: a payload from before this slice simply carries none. */
+  lifecycleEdges?: SyncLifecycleEdgeRow[];
+  ratifications?: SyncRatificationRow[];
 }
 
 export interface GraftResult {

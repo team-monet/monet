@@ -102,7 +102,37 @@ export type {
 import { instantiateEmbedderForPin, UnsatisfiableEmbedderError, LEGACY_ONNX_DEFAULT_MODEL_ID } from "./embedding-onnx";
 import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
-import type { GraftPayload, GraftResult, SyncConceptRow, SyncEdgeComponentRow, SyncEdgeRow } from "./sync-types";
+import type {
+  GraftPayload, GraftResult, SyncConceptRow, SyncEdgeComponentRow, SyncEdgeRow,
+  SyncLifecycleEdgeRow, SyncRatificationRow,
+} from "./sync-types";
+import {
+  addLifecycleEdge,
+  createLifecycleEdgeSchema,
+  getLifecycleEdges,
+  getRatifications,
+  recordRatification,
+  walkDerivation,
+  LIFECYCLE_EDGE_BIRTHS,
+  LIFECYCLE_EDGE_FAMILIES,
+  RATIFICATION_VERDICTS,
+  ungovernableReason,
+  supersessionCycle,
+} from "./lifecycle-edges";
+import { parseSpan } from "./spans";
+import type {
+  AddLifecycleEdgeInput,
+  GetLifecycleEdgesOptions,
+  LifecycleEdgeBirth,
+  LifecycleEdgeDeps,
+  LifecycleEdgeFamily,
+  LifecycleEdgeRow,
+  RatificationRow,
+  RatificationVerdict,
+  RecordRatificationInput,
+} from "./lifecycle-edges";
+import { inspectLifecycleEdgeIntegrity } from "./diagnostics";
+import type { LifecycleEdgeIntegrityReport } from "./diagnostics";
 import {
   spread,
   fuse,
@@ -154,6 +184,18 @@ const SYNC_SCHEMA_VERSION = 5; // PRAGMA user_version gate for sync engine primi
 const SOURCE_SCHEMA_VERSION = 6; // PRAGMA user_version gate for source-concept prerequisites (ingest_operations, concept_tombstones/restorations, source_identity/active_observation_id)
 const SOURCE_REGISTRY_SCHEMA_VERSION = 7; // PRAGMA user_version gate for the durable knowledge_sources registry
 const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
+/**
+ * The PAYLOAD protocol version, deliberately a separate constant from the DB `user_version` ladder
+ * above (where 8 = sync closure, 9 = source ledger, 10 = source file-concept are already spent).
+ * exportDelta stamps this; graftRows refuses anything above it.
+ *
+ * The refusal is the point. Every other version test in this file is `>= SYNC_CLOSURE_SCHEMA_VERSION`
+ * — "at least the v8 contract" — with no ceiling, so before this a payload claiming any version at
+ * all was treated as v8: a sender carrying tables the receiver had never heard of would have its
+ * rows silently dropped while its cursor advanced, losing them permanently. A receiver must be able
+ * to say "this is newer than I understand" instead. Bump this whenever the payload gains a table.
+ */
+const SYNC_PAYLOAD_PROTOCOL_VERSION = 11; // 11: + lifecycle_edges, ratifications
 const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/activation ledger
 // PRAGMA user_version gate for the file=concept reshape (Phase 1, ratified): the
 // uq_source_chunks_active_concept -> uq_source_chunks_active_concept_slot index swap and the
@@ -1376,6 +1418,11 @@ export class MonetCore {
       concept_activity_components: ["usefulness_last_at", "arousal_last_at", "updated_at"],
       legacy_sync_state: ["updated_at"],
       knowledge_sources: ["created_at", "updated_at", "tombstoned_at"],
+      // Normative substrate syncs, so its stamps must hold the clock up the same way memory_edge's
+      // do. (The loop below reads PRAGMA table_info per table, so a store predating these tables
+      // contributes nothing rather than failing.)
+      lifecycle_edges: ["created_at", "sync_updated_at"],
+      ratifications: ["created_at", "sync_updated_at"],
     };
     const selects: string[] = [];
     for (const [table, candidates] of Object.entries(timestampColumns)) {
@@ -1743,6 +1790,10 @@ export class MonetCore {
     if (!syncMetaColsForPin.some((c) => c.name === "embedder_pinned_at")) {
       this.db.exec(`ALTER TABLE sync_meta ADD COLUMN embedder_pinned_at INTEGER`);
     }
+    // Normative substrate (lifecycle_edges + ratifications). Owned by src/lifecycle-edges.ts rather
+    // than inlined above: these tables are deliberately invisible to the similarity graph, and
+    // keeping their DDL out of the shared block is the first line of that separation.
+    createLifecycleEdgeSchema(this.db);
   }
 
   /** Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
@@ -7807,6 +7858,57 @@ export class MonetCore {
     return dims[0];
   }
 
+  // ---- normative substrate (lifecycle edges + ratifications) ---------------
+  //
+  // Thin delegation to src/lifecycle-edges.ts, which owns every statement against these tables.
+  // Engine-internal for now: no MCP tool surface exists, because no producer or consumer does
+  // either. Exported from index.ts so the slices that add rule capture and ratification flows have
+  // an API to build against.
+  //
+  // NOTE FOR THE MAINTENANCE PATH: nothing below is reachable from unwindConceptGraph,
+  // rederiveConceptGraph, detach, reassignCircle or the reembed path, and that is the design. These
+  // rows are normative record, not derived graph state; they must survive every operation that
+  // rebuilds the similarity graph. Do not "tidy" them from a graph-maintenance call site.
+
+  private lifecycleEdgeDeps(): LifecycleEdgeDeps {
+    return {
+      db: this.db,
+      newId: () => this.newId(),
+      nextSyncTimestamp: () => this.nextSyncTimestamp(),
+      syncDeviceId: this.syncDeviceId,
+    };
+  }
+
+  /** Record one normative edge. Validates family shape, span namespace, circle agreement and succession. */
+  addLifecycleEdge(input: AddLifecycleEdgeInput): LifecycleEdgeRow {
+    return this.db.transaction(() => addLifecycleEdge(this.lifecycleEdgeDeps(), input))();
+  }
+
+  /** Lifecycle edges touching `conceptId`, optionally narrowed to one family. */
+  getLifecycleEdges(conceptId: string, opts: GetLifecycleEdgesOptions): LifecycleEdgeRow[] {
+    return getLifecycleEdges(this.db, conceptId, opts);
+  }
+
+  /** One hop along derivation: `"out"` = the rules a principle derives, `"in"` = its parent principles. */
+  walkDerivation(conceptId: string, direction: "out" | "in"): string[] {
+    return walkDerivation(this.db, conceptId, direction);
+  }
+
+  /** Record a human ratification verdict over a concept. */
+  recordRatification(input: RecordRatificationInput): RatificationRow {
+    return this.db.transaction(() => recordRatification(this.lifecycleEdgeDeps(), input))();
+  }
+
+  /** Ratifications over a concept, newest first. */
+  getRatifications(subjectConceptId: string): RatificationRow[] {
+    return getRatifications(this.db, subjectConceptId);
+  }
+
+  /** Report-only sweep for normative rows whose endpoint concepts no longer resolve. */
+  lifecycleEdgeIntegrity(): LifecycleEdgeIntegrityReport {
+    return inspectLifecycleEdgeIntegrity(this.db);
+  }
+
   /**
    * Export all rows modified since `since` (epoch ms; pass 0 for a full export).
    *
@@ -7911,6 +8013,47 @@ export class MonetCore {
         contradictions = uniqueRowsById([...contradictions, ...closureContradictions] as Array<{ id: string }>);
       }
 
+      // Normative substrate. Mirrors the memory_edge export's sync_updated_at window, and diverges
+      // from its endpoint handling in two connected ways — both instances of one principle: THE
+      // NORMATIVE RECORD REPLICATES INDEPENDENTLY OF ENDPOINT LIVENESS.
+      //
+      //  1. Retired endpoints are not excluded (memory_edge excludes them). A rule's supersession
+      //     and provenance edges are exactly what audit and impeachment need AFTER it is retired.
+      //
+      //  2. Both endpoints join LEFT, not INNER. An INNER join means a row whose endpoint concept is
+      //     not present locally can never re-export — so in A→B→C, where B legitimately received a
+      //     dangling edge (the common case: A exports a retired rule's edges without the retired
+      //     concept row), C would never receive the audit record at all. The row travels on the
+      //     strength of the structural preflight it already passed at graft.
+      //
+      // The kind guards still apply WHERE THE ROW IS VISIBLE: an endpoint that resolves locally must
+      // be native. Security is three-deep and does not rest on this query alone — addLifecycleEdge
+      // refuses connector-owned/workstream endpoints at write time on the origin, this guard drops
+      // them wherever the row is visible, and every hop's graft backdoor guard independently rejects
+      // ids matching ITS OWN local source-owned set.
+      const nativeIfPresent = (alias: string, idColumn: string): string =>
+        `(${idColumn} IS NULL OR ${alias}.id IS NULL OR (
+            ${alias}.kind NOT IN ('source', 'workstream')
+            AND ${alias}.source_identity IS NULL AND ${alias}.active_observation_id IS NULL))`;
+      const lifecycleEdges = this.db
+        .prepare(
+          `SELECT le.* FROM lifecycle_edges le
+             LEFT JOIN concepts src ON src.id = le.src_concept_id
+             LEFT JOIN concepts dst ON dst.id = le.dst_concept_id
+            WHERE ${nativeIfPresent("src", "le.src_concept_id")}
+              AND ${nativeIfPresent("dst", "le.dst_concept_id")}
+              AND le.sync_updated_at >= ? AND le.sync_updated_at <= ?`,
+        )
+        .all(since, cutoff);
+      const ratifications = this.db
+        .prepare(
+          `SELECT r.* FROM ratifications r
+             LEFT JOIN concepts c ON c.id = r.subject_concept_id
+            WHERE ${nativeIfPresent("c", "r.subject_concept_id")}
+              AND r.sync_updated_at >= ? AND r.sync_updated_at <= ?`,
+        )
+        .all(since, cutoff);
+
       const circleAliases = this.db.prepare(`SELECT * FROM circle_aliases WHERE updated_at >= ? AND updated_at <= ?`).all(since, cutoff);
 
       const sessions = this.db
@@ -7975,7 +8118,7 @@ export class MonetCore {
       }
 
       return {
-        schemaVersion: SYNC_CLOSURE_SCHEMA_VERSION,
+        schemaVersion: SYNC_PAYLOAD_PROTOCOL_VERSION,
         exportedAt: cutoff,
         since,
         deviceId: this.syncDeviceId,
@@ -7995,6 +8138,8 @@ export class MonetCore {
         tombstones: tombstones as GraftPayload["tombstones"],
         restorations: restorations as GraftPayload["restorations"],
         sessions: sessions as GraftPayload["sessions"],
+        lifecycleEdges: lifecycleEdges as SyncLifecycleEdgeRow[],
+        ratifications: ratifications as SyncRatificationRow[],
       };
     })();
   }
@@ -8040,7 +8185,13 @@ export class MonetCore {
       // Lifecycle events are a backdoor too: a forged tombstone/restoration naming a local source
       // id would otherwise retire or resurrect a connector-owned concept through generic sync.
       (payload.tombstones ?? []).some((row) => localSourceIds.has(row.concept_id)) ||
-      (payload.restorations ?? []).some((row) => localSourceIds.has(row.concept_id));
+      (payload.restorations ?? []).some((row) => localSourceIds.has(row.concept_id)) ||
+      // Normative rows are a backdoor for the same reason lifecycle events are: a forged derivation
+      // edge or ratification naming a local source id would attach agent-authored authority to a
+      // connector-owned concept through generic sync.
+      (payload.lifecycleEdges ?? []).some((row) =>
+        localSourceIds.has(row.src_concept_id) || (row.dst_concept_id !== null && localSourceIds.has(row.dst_concept_id))) ||
+      (payload.ratifications ?? []).some((row) => localSourceIds.has(row.subject_concept_id));
     if (touchesSource) throw new Error("graftRows cannot mutate source-owned concepts");
 
     const isV8 = (payload.schemaVersion ?? 0) >= SYNC_CLOSURE_SCHEMA_VERSION;
@@ -8080,6 +8231,60 @@ export class MonetCore {
         }
       }
     }
+
+    // Governability at graft, for endpoints this store CAN resolve. The backdoor guard above covers
+    // source-owned ids; a workstream slips through it, and the structural preflight below
+    // deliberately does not resolve endpoints at all (so a legitimately dangling row can still
+    // travel — see the export's LEFT joins). Where the endpoint IS locally resolvable, it must pass
+    // the SAME predicate the local write path applies. One source of truth: ungovernableReason.
+    const assertGraftEndpointGovernable = (role: string, id: string | null, subject: string): void => {
+      if (id === null) return;
+      const local = this.db.prepare(
+        `SELECT kind, source_identity, active_observation_id FROM concepts WHERE id = ?`,
+      ).get(id) as { kind: string; source_identity: string | null; active_observation_id: string | null } | undefined;
+      if (!local) return; // not resolvable here — F2: it travels, the sweep reports it
+      const reason = ungovernableReason(local);
+      if (reason) throw new Error(`graftRows ${subject} ${role} concept '${id}' ${reason}`);
+    };
+
+    // Normative rows get a STRUCTURAL preflight instead of the endpoint-resolution one above, on
+    // purpose. Their endpoints are deliberately allowed to be locally unknown: a retired rule is
+    // excluded from the `concepts` export while its supersession/provenance edges still travel, and
+    // refusing those would discard exactly the audit record retirement makes valuable. An
+    // unresolvable endpoint is therefore reported by the dangling sweep, not rejected here. What IS
+    // rejected is a malformed row — shape, family/destination agreement, and span namespace —
+    // because letting one reach INSERT would trip a CHECK and abort the whole graft with a bare
+    // "CHECK constraint failed" instead of a diagnosable message.
+    for (const row of payload.lifecycleEdges ?? []) {
+      if (!LIFECYCLE_EDGE_FAMILIES.includes(row.family as LifecycleEdgeFamily)) {
+        throw new Error(`graftRows lifecycle edge '${row.id}' has unknown family '${row.family}'`);
+      }
+      if (!LIFECYCLE_EDGE_BIRTHS.includes(row.born_of as LifecycleEdgeBirth)) {
+        throw new Error(`graftRows lifecycle edge '${row.id}' has unknown born_of '${row.born_of}'`);
+      }
+      const isProvenance = row.family === "provenance";
+      if (isProvenance !== (row.dst_span !== null) || isProvenance !== (row.dst_concept_id === null)) {
+        throw new Error(`graftRows lifecycle edge '${row.id}' has a destination shape its family '${row.family}' forbids`);
+      }
+      if (row.dst_span !== null && parseSpan(row.dst_span) === null) {
+        throw new Error(`graftRows lifecycle edge '${row.id}' carries a dst_span that is not a span:// URI`);
+      }
+      if (row.dst_concept_id !== null && row.dst_concept_id === row.src_concept_id) {
+        throw new Error(`graftRows lifecycle edge '${row.id}' points a concept at itself`);
+      }
+      if (row.born_of === "ratification" && row.event_ref === null) {
+        throw new Error(`graftRows lifecycle edge '${row.id}' is ratification-born without an event_ref`);
+      }
+      for (const [role, id] of [["source", row.src_concept_id], ["destination", row.dst_concept_id]] as const) {
+        assertGraftEndpointGovernable(role, id, `lifecycle edge '${row.id}'`);
+      }
+    }
+    for (const row of payload.ratifications ?? []) {
+      if (!RATIFICATION_VERDICTS.includes(row.verdict as RatificationVerdict)) {
+        throw new Error(`graftRows ratification '${row.id}' has unknown verdict '${row.verdict}'`);
+      }
+      assertGraftEndpointGovernable("subject", row.subject_concept_id, `ratification '${row.id}'`);
+    }
   }
 
   /**
@@ -8099,6 +8304,14 @@ export class MonetCore {
     const localModelId = this.requireStableEmbedderIdentity();
     if (payload.embedderModelId !== localModelId) {
       throw new EmbedderMismatchError(payload.embedderModelId, localModelId);
+    }
+    // Forward-compatibility ceiling: refuse loudly rather than accept a payload whose newer tables
+    // this build would silently ignore while the sender's cursor moved past them.
+    if ((payload.schemaVersion ?? 0) > SYNC_PAYLOAD_PROTOCOL_VERSION) {
+      throw new Error(
+        `graftRows cannot apply a payload at protocol version ${payload.schemaVersion}: ` +
+          `this build understands up to ${SYNC_PAYLOAD_PROTOCOL_VERSION}. Upgrade the receiving store.`,
+      );
     }
     this.assertGraftPayloadIsNativeOnly(payload);
     // Validate the complete hostile vector surface before opening the write transaction. JSON
@@ -8125,7 +8338,7 @@ export class MonetCore {
       throw new EmbedderWidthConflictError(sortedIncomingWidths[0] ?? this.embedder.dim, sortedIncomingWidths, "native");
     }
 
-    const tables = ["sessions", "circle_aliases", "tombstones", "restorations", "deletions", "concepts", "concept_activity", "observations", "concept_revisions", "contradictions", "memory_edge", "memory_edge_components", "first_block", "entities", "concept_entities"] as const;
+    const tables = ["sessions", "circle_aliases", "tombstones", "restorations", "deletions", "concepts", "concept_activity", "observations", "concept_revisions", "contradictions", "memory_edge", "memory_edge_components", "first_block", "entities", "concept_entities", "lifecycle_edges", "ratifications"] as const;
     const inserted: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
     const skipped: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
     const conceptsWithChangedBindings = new Set<string>();
@@ -8855,6 +9068,122 @@ export class MonetCore {
         this.materializeEdge(src!, dst!, type!, scope!);
       }
 
+      // 8b. Normative substrate. Convergence needs no revision protocol: the ACT fields are
+      // immutable, so there is never a second version of them to lose.
+      //
+      // `circle` IS THE SOLE MUTABLE COLUMN, and it is the one legitimate exception to the
+      // append-only doctrine. Append-only protects the ACT — family, src, dst, born_of, event_ref,
+      // created_at — which record what happened and can never be revised. `circle` is not part of
+      // the act: it is locality metadata, and a circle RENAME on any replica legitimately rewrites
+      // it (a rename renames the locality itself; see renameCircle). Without an update path here a
+      // rename could never converge — the receiver would keep the dead circle name forever, since
+      // ON CONFLICT(id) DO NOTHING discards the incoming row silently.
+      //
+      // The guard is a strict sync_updated_at comparison, so a stale rename replayed after a newer
+      // one cannot clobber the newer locality. `created_at` always keeps the payload's semantic
+      // birth time; `sync_updated_at` takes this store's relay watermark so the row exports onward
+      // at the right position, exactly as memory_edge does above.
+      //
+      // These rows are inserted WITHOUT the isTombstoned/isActiveGraphConcept gate the similarity
+      // edges use. That gate keeps derived graph state tidy; applying it here would silently discard
+      // the provenance and supersession record of a retired rule, which is the record audit and
+      // impeachment exist to read. An endpoint that does not resolve is reported by the dangling
+      // sweep (inspectLifecycleEdgeIntegrity), never repaired here.
+      // RATIFICATIONS FIRST, then the edges that cite them. Ordering follows the reference
+      // direction (lifecycle_edges.event_ref → ratifications.id), matching the referential-integrity
+      // ordering the rest of this graft already respects. Nothing checks it today — graft is
+      // deliberately structural — but a payload legitimately carries a ratification-born edge
+      // beside its ratification, and landing the edge first would make any future graft-side
+      // existence check reject a self-consistent payload. Cheap to get right now, expensive to
+      // discover later.
+      for (const row of payload.ratifications ?? []) {
+        const current = this.db.prepare(`SELECT sync_revision FROM ratifications WHERE id = ?`)
+          .get(row.id) as { sync_revision: number } | undefined;
+        const [revision, writer] = incomingMeta(row, "ratifications", row.id, current?.sync_revision);
+        const r = this.db
+          .prepare(
+            `INSERT INTO ratifications
+               (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at,
+                sync_updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               circle = excluded.circle,
+               sync_updated_at = excluded.sync_updated_at,
+               sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > ratifications.sync_revision
+                OR (excluded.sync_revision = ratifications.sync_revision
+                    AND excluded.sync_writer > COALESCE(ratifications.sync_writer, ''))`,
+          )
+          .run(
+            row.id, row.subject_concept_id, row.verdict, row.packet ?? null,
+            row.ratified_by ?? null, row.circle, row.created_at, relayAt, revision, writer,
+          );
+        if (r.changes > 0) inserted.ratifications++;
+        else skipped.ratifications++;
+      }
+      for (const row of payload.lifecycleEdges ?? []) {
+        if (row.family === "supersession") {
+          // Two replicas can each record a different successor for one rule. The partial unique
+          // index would abort the whole graft, so the incumbent wins and the challenger is counted
+          // as skipped. Reconciling a genuinely divergent succession is an impeachment question,
+          // and impeachment is a later slice — this only guarantees the graft stays atomic.
+          const incumbent = this.db
+            .prepare(`SELECT id FROM lifecycle_edges WHERE family = 'supersession' AND src_concept_id = ?`)
+            .get(row.src_concept_id) as { id: string } | undefined;
+          if (incumbent && incumbent.id !== row.id) {
+            skipped.lifecycle_edges++;
+            continue;
+          }
+          // ...and the same treatment for a ring. The local write path walks the chain before
+          // accepting a supersession edge, but nothing stopped an incoming B→A from landing beside
+          // a local A→B, or one payload from carrying a whole ring. The walk runs against the state
+          // this row would join — everything already stored, including rows accepted earlier in THIS
+          // payload — so a ring lands only its acyclic prefix, deterministically in payload order.
+          // Incumbent wins, challenger is skipped; reconciling a genuinely divergent succession
+          // remains impeachment's job in a later slice.
+          if (row.dst_concept_id !== null && supersessionCycle(this.db, row.src_concept_id, row.dst_concept_id)) {
+            skipped.lifecycle_edges++;
+            continue;
+          }
+        }
+        const current = this.db.prepare(`SELECT sync_revision FROM lifecycle_edges WHERE id = ?`)
+          .get(row.id) as { sync_revision: number } | undefined;
+        const [revision, writer] = incomingMeta(row, "lifecycle_edges", row.id, current?.sync_revision);
+        const r = this.db
+          .prepare(
+            `INSERT INTO lifecycle_edges
+               (id, family, src_concept_id, dst_concept_id, dst_span, born_of, event_ref, circle,
+                created_at, sync_updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               circle = excluded.circle,
+               sync_updated_at = excluded.sync_updated_at,
+               sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > lifecycle_edges.sync_revision
+                OR (excluded.sync_revision = lifecycle_edges.sync_revision
+                    AND excluded.sync_writer > COALESCE(lifecycle_edges.sync_writer, ''))`,
+          )
+          .run(
+            row.id, row.family, row.src_concept_id, row.dst_concept_id ?? null, row.dst_span ?? null,
+            row.born_of, row.event_ref ?? null, row.circle, row.created_at, relayAt, revision, writer,
+          );
+        if (r.changes > 0) inserted.lifecycle_edges++;
+        else skipped.lifecycle_edges++;
+      }
+      // 8c. Causal clock ratchet. Unlike memory_edge — whose timestamps nothing reads causally —
+      // these created_at values ARE read causally: getRatifications and getLifecycleEdges order by
+      // them to answer "which act came first". Graft preserves the payload's created_at, so a peer
+      // whose clock ran ahead would leave every subsequent LOCAL act stamped below the imported
+      // ones and sorting as older. Ratchet the persisted clock past everything just imported, using
+      // the same MAX() form the v8 closure migration uses at the end of migrate().
+      let importedHigh = 0;
+      for (const row of payload.lifecycleEdges ?? []) importedHigh = Math.max(importedHigh, row.created_at);
+      for (const row of payload.ratifications ?? []) importedHigh = Math.max(importedHigh, row.created_at);
+      if (importedHigh > 0) {
+        this.db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at, ?) WHERE singleton = 1`)
+          .run(importedHigh);
+      }
+
       // 9. first_block — versioned convergence, including soft deletion
       for (const row of payload.firstBlock) {
         const concept = activeNativeConcept(row.concept_id);
@@ -9162,7 +9491,15 @@ export class MonetCore {
       // Existence check: from must either have concepts or already have an alias entry.
       const hasConcepts = (this.db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ?`).get(from) as { n: number }).n > 0;
       const hasAlias = !!this.db.prepare(`SELECT 1 FROM circle_aliases WHERE from_name = ? OR to_name = ?`).get(from, from);
-      if (!hasConcepts && !hasAlias) throw new Error(`circle not found: ${from}`);
+      // Normative rows keep a circle alive too. They outlive their concepts by design — a
+      // hard-delete consolidation strands them — so a circle can be populated by nothing but
+      // lifecycle_edges/ratifications. Counting only concepts made "circle not found" fire for
+      // exactly the rows the rename-follows path below exists to move, leaving them permanently
+      // stranded under a name that could never be renamed.
+      const hasNormative =
+        !!this.db.prepare(`SELECT 1 FROM lifecycle_edges WHERE circle = ? LIMIT 1`).get(from) ||
+        !!this.db.prepare(`SELECT 1 FROM ratifications WHERE circle = ? LIMIT 1`).get(from);
+      if (!hasConcepts && !hasAlias && !hasNormative) throw new Error(`circle not found: ${from}`);
 
       const renamedConceptIds = (this.db.prepare(
         `SELECT id FROM concepts WHERE circle = ? ORDER BY id`,
@@ -9171,6 +9508,26 @@ export class MonetCore {
       const conceptsUpdated = (this.db.prepare(`UPDATE concepts SET circle = ? WHERE circle = ?`).run(to, from)).changes;
       const observationsUpdated = (this.db.prepare(`UPDATE observations SET circle = ? WHERE circle = ?`).run(to, from)).changes;
       const edgesUpdated = this.moveEdgeScope(from, to);
+      // Normative substrate follows a RENAME, unlike a concept MOVE. The distinction is real: a move
+      // leaves the old circle existing and is a fact about the concept's new locality, so the edge
+      // keeps the circle its act happened in (the circle-of-the-act doctrine, pinned in
+      // lifecycle-edges.test.ts). A rename renames the locality ITSELF — the old name ceases to
+      // exist and every sibling scope-bearing table follows it — so a normative row left behind
+      // would name a circle that is gone, and any circle-scoped read would silently return nothing.
+      // The stamp is not optional: sync_updated_at is the only thing an incremental export selects
+      // on, so a rename that rewrote `circle` alone would be invisible to every peer forever —
+      // the rows would sit below the caller's watermark and never travel. moveEdgeScope takes a
+      // nextSyncTimestamp() stamp for memory_edge for exactly this reason; do the same here.
+      // sync_revision advances so the receiver can tell this rename from the locality it already
+      // holds; sync_writer records who renamed, breaking ties between concurrent renames.
+      const renameStamp = this.nextSyncTimestamp();
+      for (const table of ["lifecycle_edges", "ratifications"] as const) {
+        this.db.prepare(
+          `UPDATE ${table} SET circle = ?, sync_updated_at = ?,
+                  sync_revision = sync_revision + 1, sync_writer = ?
+            WHERE circle = ?`,
+        ).run(to, renameStamp, this.syncDeviceId, from);
+      }
       // entities: (key, scope) is a compound PK — a bulk UPDATE fails if `to` already has the same key
       // (e.g. when renaming circle-B into `canonical` after circle-A was already renamed there).
       // Merge: add from's df into any matching `to` row (upsert), then delete the from rows.

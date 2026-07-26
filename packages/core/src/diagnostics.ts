@@ -11,6 +11,7 @@ import {
 } from "./embedding-state";
 import { parseHashingEmbedderPin } from "./embedding-onnx";
 import { MONET_SCHEMA_VERSION } from "./schema-version";
+import type { LifecycleEdgeFamily } from "./lifecycle-edges";
 
 export type StoredEmbedderDiagnosticFailureReason = "locked" | "not-sqlite" | "unreadable";
 
@@ -431,4 +432,123 @@ export function inspectStoredEmbedderState(dbPath: string): StoredEmbedderStateI
     db?.close();
     if (snapshotDir) rmSync(snapshotDir, { recursive: true, force: true });
   }
+}
+
+// ---- lifecycle-edge integrity ----------------------------------------------
+
+/** The narrow read capability the sweep needs — satisfied by both `StoragePort` and a raw handle. */
+export interface LifecycleEdgeReadDb {
+  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+}
+
+/** One normative row whose endpoint concept no longer resolves. */
+export interface DanglingLifecycleEdge {
+  id: string;
+  family: LifecycleEdgeFamily;
+  circle: string;
+  srcConceptId: string;
+  dstConceptId: string | null;
+  /** Which endpoint(s) went missing. A provenance edge can only ever report `src`. */
+  missing: Array<"src" | "dst">;
+}
+
+/** One ratification whose subject concept no longer resolves. */
+export interface DanglingRatification {
+  id: string;
+  subjectConceptId: string;
+  circle: string;
+}
+
+export interface LifecycleEdgeIntegrityReport {
+  /** False when the store predates these tables; both lists are then trivially empty. */
+  tablesPresent: boolean;
+  edgesChecked: number;
+  ratificationsChecked: number;
+  dangling: DanglingLifecycleEdge[];
+  danglingRatifications: DanglingRatification[];
+}
+
+/**
+ * REPORT-ONLY sweep for normative rows pointing at concepts that no longer exist.
+ *
+ * Lifecycle edges are append-only and graph maintenance never deletes them, so the ordinary
+ * unwind/rederive/detach/reassign path cannot orphan one. The residual way it can happen is
+ * concept deletion: a full-consolidation `detach` deletes the source concept row outright, and a
+ * hard deletion removes an id permanently. No producer of lifecycle edges exists yet (rule capture
+ * arrives with a later slice), so no LIVE orphan is currently possible — which is exactly why this
+ * reports rather than repairs.
+ *
+ * REPAIR SEMANTICS ARE DELIBERATELY NOT DEFINED HERE. Whether an orphaned derivation edge should be
+ * dropped, re-pointed at the surviving consolidation target, or preserved as evidence that the rule
+ * once existed is a question about what impeachment and audit need, and those consumers do not
+ * exist yet. Guessing now would bake in an answer that the consuming slice would have to unpick.
+ */
+export function inspectLifecycleEdgeIntegrity(db: LifecycleEdgeReadDb): LifecycleEdgeIntegrityReport {
+  const present = new Set(
+    (
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('lifecycle_edges','ratifications')`)
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name),
+  );
+  if (!present.has("lifecycle_edges") || !present.has("ratifications")) {
+    return { tablesPresent: false, edgesChecked: 0, ratificationsChecked: 0, dangling: [], danglingRatifications: [] };
+  }
+
+  const edges = db
+    .prepare(
+      `SELECT e.id AS id, e.family AS family, e.circle AS circle,
+              e.src_concept_id AS src_concept_id, e.dst_concept_id AS dst_concept_id,
+              (SELECT 1 FROM concepts c WHERE c.id = e.src_concept_id) AS src_ok,
+              (SELECT 1 FROM concepts c WHERE c.id = e.dst_concept_id) AS dst_ok
+         FROM lifecycle_edges e
+        ORDER BY e.created_at ASC, e.id ASC`,
+    )
+    .all() as Array<{
+      id: string;
+      family: LifecycleEdgeFamily;
+      circle: string;
+      src_concept_id: string;
+      dst_concept_id: string | null;
+      src_ok: number | null;
+      dst_ok: number | null;
+    }>;
+
+  const dangling: DanglingLifecycleEdge[] = [];
+  for (const edge of edges) {
+    const missing: Array<"src" | "dst"> = [];
+    if (edge.src_ok === null) missing.push("src");
+    // A null dst_concept_id is a provenance edge addressing a span, not a missing concept.
+    if (edge.dst_concept_id !== null && edge.dst_ok === null) missing.push("dst");
+    if (missing.length === 0) continue;
+    dangling.push({
+      id: edge.id,
+      family: edge.family,
+      circle: edge.circle,
+      srcConceptId: edge.src_concept_id,
+      dstConceptId: edge.dst_concept_id,
+      missing,
+    });
+  }
+
+  const ratifications = db
+    .prepare(
+      `SELECT r.id AS id, r.subject_concept_id AS subject_concept_id, r.circle AS circle,
+              (SELECT 1 FROM concepts c WHERE c.id = r.subject_concept_id) AS subject_ok
+         FROM ratifications r
+        ORDER BY r.created_at ASC, r.id ASC`,
+    )
+    .all() as Array<{ id: string; subject_concept_id: string; circle: string; subject_ok: number | null }>;
+
+  const danglingRatifications: DanglingRatification[] = ratifications
+    .filter((row) => row.subject_ok === null)
+    .map((row) => ({ id: row.id, subjectConceptId: row.subject_concept_id, circle: row.circle }));
+
+  return {
+    tablesPresent: true,
+    edgesChecked: edges.length,
+    ratificationsChecked: ratifications.length,
+    dangling,
+    danglingRatifications,
+  };
 }
