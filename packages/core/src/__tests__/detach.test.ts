@@ -1189,3 +1189,66 @@ describe("detach — reembedConceptObservations closes the stale-vector reintrod
     }
   });
 });
+
+describe("detach — a surviving source must keep live evidence (Codex post-merge P1)", () => {
+  it("refuses a detach that would leave only superseded observations behind", async () => {
+    // keep-current retires a rejected correction TERMINALLY (superseded_at set, superseded_by NULL).
+    // detach rebuilds the source's body, title, embedding and support_count from raw remaining rows
+    // without asking whether any are live — so detaching the sole live prior would reconstruct an
+    // ACTIVE concept whose entire content is the rejected correction.
+    const c = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+    const base = await c.store("We decided to use SQLite as the storage backend.");
+    const corr = await c.store("We decided NOT to use SQLite as the storage backend.", {
+      kind: "correction", attachTo: base.conceptId,
+    });
+    c.resolveContradiction(corr.contradiction!.id, { decision: "keep-current", by: "agent" });
+
+    // The correction is retired; only `base` is live.
+    await expect(c.detach(base.conceptId, [base.observationId]))
+      .rejects.toThrow(/only superseded observations/);
+
+    // The concept is untouched — still carrying its live claim, not the rejected one.
+    const after = (await c.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(after.body).toContain("use SQLite");
+    c.close();
+  });
+
+  it("still allows splitting an accept-new pair — the prior is revived by this detach (Codex #68 P1)", async () => {
+    // {superseded prior, live correction}: detaching the correction leaves only the prior, which
+    // LOOKS dead — but detach's own inbound cleanup clears its superseded_by because the successor
+    // is leaving, so it comes back live. Judging liveness before that cleanup blocked a legitimate
+    // correction split.
+    const c = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+    const base = await c.store("We decided to use SQLite as the storage backend.");
+    const corr = await c.store("We decided NOT to use SQLite as the storage backend.", {
+      kind: "correction", attachTo: base.conceptId,
+    });
+    // accept-new with exactly one live prior: base is superseded BY corr (a real pointer).
+    c.resolveContradiction(corr.contradiction!.id, { decision: "accept-new", body: "Not SQLite.", by: "agent" });
+
+    const r = await c.detach(base.conceptId, [corr.observationId]);
+    expect(r.destConceptId).toBeTruthy();
+
+    // base is live again — its superseder left.
+    const row = (c as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+      .prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`)
+      .get(base.observationId) as { superseded_by: string | null; superseded_at: number | null };
+    expect(row.superseded_by).toBeNull();
+    expect(row.superseded_at).toBeNull();
+    c.close();
+  });
+
+  it("allows the detach when the superseded rows go too — the emptied source is removed", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+    const base = await c.store("We decided to use SQLite as the storage backend.");
+    const corr = await c.store("We decided NOT to use SQLite as the storage backend.", {
+      kind: "correction", attachTo: base.conceptId,
+    });
+    const dest = await c.store("Unrelated destination concept.", { resolution: "forceNew" });
+    c.resolveContradiction(corr.contradiction!.id, { decision: "keep-current", by: "agent" });
+
+    const r = await c.detach(base.conceptId, [base.observationId, corr.observationId], { destConceptId: dest.conceptId });
+    expect(r.sourceDeleted).toBe(true);
+    c.close();
+  });
+});

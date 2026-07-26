@@ -990,7 +990,7 @@ export function registerMonetCoreTools(
     "Mediate a contradiction OR dismiss a possible-duplicate pair — two verdict families, one tool. " +
     "CONTRADICTION VERDICT: pass `contradictionId` + `decision` ('accept-new' / 'keep-current' / 'dismiss'). " +
     "accept-new: the correcting evidence wins; keep-current: the prior wins; dismiss: not a real conflict. " +
-    "The losing observation is superseded; for accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain. " +
+    "WHAT GETS SUPERSEDED IS NARROW, because nothing records WHICH prior a correction contradicted. accept-new supersedes the single prior ONLY when exactly one live observation predates the correction; with several it supersedes NOTHING and REQUIRES `body`, which is then the only record of the verdict — the contradicted claim stays live evidence INDEFINITELY — nothing retires it automatically (memory_synthesize only rewrites the body), so it keeps contributing to support and the concept embedding until something explicitly supersedes or detaches it. keep-current retires the correction terminally, naming no successor. For accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain. " +
     "DUPLICATE-PAIR DISMISSAL: pass `conceptAId` + `conceptBId` (omit contradictionId/decision). " +
     "Asserts these two concepts are NOT duplicates — they leave the possibleDuplicates list and survive any future detach/rederive cycle. " +
     "Dismissing a pair where no live possible_duplicate_of edge exists succeeds idempotently with rowsUpdated: 0 (\"nothing to dismiss\" signal). " +

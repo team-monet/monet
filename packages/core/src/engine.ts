@@ -4193,8 +4193,8 @@ export class MonetCore {
 
     // Validate all observation ids belong to source.
     const srcObsRows = this.db
-      .prepare(`SELECT id, content, embedding, superseded_by, source_refs, created_at, session_id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
-      .all(sourceConceptId) as Array<{ id: string; content: string; embedding: string; superseded_by: string | null; source_refs: string | null; created_at: number; session_id: string | null }>;
+      .prepare(`SELECT id, content, embedding, superseded_by, superseded_at, source_refs, created_at, session_id FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
+      .all(sourceConceptId) as Array<{ id: string; content: string; embedding: string; superseded_by: string | null; superseded_at: number | null; source_refs: string | null; created_at: number; session_id: string | null }>;
     const srcObsIds = new Set(srcObsRows.map((o) => o.id));
     for (const id of observationIds) {
       if (!srcObsIds.has(id)) throw new Error(`observation ${id} does not belong to concept ${sourceConceptId}`);
@@ -4228,6 +4228,41 @@ export class MonetCore {
     const detachingSet = new Set(observationIds);
     const detachingRows = srcObsRows.filter((o) => detachingSet.has(o.id));
     const remainingRows = srcObsRows.filter((o) => !detachingSet.has(o.id));
+
+    // A SURVIVING SOURCE MUST KEEP LIVE EVIDENCE.
+    //
+    // Everything below rebuilds the source — body, title, slug, embedding, support_count,
+    // confidence, source_refs, temporal stamps — from `remainingRows` as raw rows, without asking
+    // whether any of them are still live. The last-observation guard above counts raw rows too.
+    // So a concept holding {live prior, superseded correction} passes the guard when the live prior
+    // is detached, and is then reconstructed as an ACTIVE concept whose entire content is a
+    // retired observation — a rejected correction presented as the concept's current claim.
+    //
+    // Reachable since keep-current began retiring corrections TERMINALLY (superseded_at set,
+    // superseded_by NULL): the query above did not even select that column, so terminal rows were
+    // invisible here.
+    //
+    // Fixed by making the state UNREACHABLE rather than by rendering it correctly. Excluding
+    // superseded rows from the rebuild instead would change body, support_count, and the embedding
+    // for every concept that carries superseded history — a far wider change than this defect
+    // warrants. An emptied source (remainingRows === 0) is fine: it gets deleted below.
+    // Liveness must be judged AFTER this detach's own inbound cleanup. A remaining row whose
+    // superseded_by points at an observation LEAVING in this detach is revived by that cleanup
+    // (it clears both supersession columns), so it counts as live here — otherwise this guard would
+    // block the legitimate split of an accept-new pair {superseded prior, live correction} when the
+    // correction moves away. A TERMINALLY superseded row has no pointer to clear and stays dead,
+    // which is exactly the case this guard exists for.
+    const remainingLive = remainingRows.filter((o) =>
+      (o.superseded_by === null && o.superseded_at === null) ||
+      (o.superseded_by !== null && detachingSet.has(o.superseded_by)),
+    );
+    if (remainingRows.length > 0 && remainingLive.length === 0) {
+      throw new Error(
+        `cannot detach: concept ${sourceConceptId} would be left with only superseded observations, ` +
+        `which would rebuild it from retired evidence. Include the superseded observation(s) in this ` +
+        `detach so the concept is emptied and removed, or use memory_reassign_circle to move the whole concept.`,
+      );
+    }
 
     const destAction: "created" | "attached" = destRow ? "attached" : "created";
     let destConceptId: string;
