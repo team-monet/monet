@@ -990,7 +990,8 @@ export function registerMonetCoreTools(
     "Mediate a contradiction OR dismiss a possible-duplicate pair — two verdict families, one tool. " +
     "CONTRADICTION VERDICT: pass `contradictionId` + `decision` ('accept-new' / 'keep-current' / 'dismiss'). " +
     "accept-new: the correcting evidence wins; keep-current: the prior wins; dismiss: not a real conflict. " +
-    "WHAT GETS SUPERSEDED IS NARROW, because nothing records WHICH prior a correction contradicted. accept-new supersedes the single prior ONLY when exactly one live observation predates the correction; with several it supersedes NOTHING and REQUIRES `body`, which is then the only record of the verdict — the contradicted claim stays live evidence INDEFINITELY — nothing retires it automatically (memory_synthesize only rewrites the body), so it keeps contributing to support and the concept embedding until something explicitly supersedes or detaches it. keep-current retires the correction terminally, naming no successor. For accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain. " +
+    "WHAT GETS SUPERSEDED: pass `contradictedObservationId` to name the observation the correction contradicted — you already have the evidence in front of you at this point, so a name given HERE is not a guess. accept-new then supersedes EXACTLY that observation (successor: the correcting observation), no matter how many other live observations the concept holds. keep-current records it as the prior being kept; it does not change what gets superseded (the correction is still retired with no successor — see below). The name is validated: it must exist, belong to the same concept as the contradiction, be live (not already superseded), predate the correcting observation (a later observation was never in dispute with it — naming one is refused, not silently accepted), and not be the correcting observation itself. It also requires the contradiction to actually HAVE a correcting observation — a bare contradiction (flagged without one, e.g. via memory_flag_contradiction with no observationId) contradicted nothing, so naming a loser for it is refused for every decision, not only accept-new. " +
+    "Omit `contradictedObservationId` and the conservative fallback applies, because nothing else records WHICH prior a correction contradicted: accept-new supersedes the single prior ONLY when exactly one live observation predates the correction; with several it supersedes NOTHING and REQUIRES `body`, which is then the only record of the verdict — the contradicted claim stays live evidence INDEFINITELY — nothing retires it automatically (memory_synthesize only rewrites the body), so it keeps contributing to support and the concept embedding until something explicitly supersedes or detaches it. keep-current (named or not) retires the correction terminally, naming no successor. For accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain. " +
     "DUPLICATE-PAIR DISMISSAL: pass `conceptAId` + `conceptBId` (omit contradictionId/decision). " +
     "Asserts these two concepts are NOT duplicates — they leave the possibleDuplicates list and survive any future detach/rederive cycle. " +
     "Dismissing a pair where no live possible_duplicate_of edge exists succeeds idempotently with rowsUpdated: 0 (\"nothing to dismiss\" signal). " +
@@ -1000,13 +1001,22 @@ export function registerMonetCoreTools(
       contradictionId: z.string().optional().describe("The contradiction to mediate. Required for contradiction verdicts; omit for duplicate-pair dismissal."),
       decision: z.enum(["accept-new", "keep-current", "dismiss"]).optional().describe("Verdict for a contradiction. Required when contradictionId is present."),
       body: z.string().optional(),
+      contradictedObservationId: z.string().optional().describe(
+        "The observation the correction contradicted — the loser (accept-new) or the prior being kept " +
+        "(keep-current). Must exist, belong to the same concept as the contradiction, be live, predate the " +
+        "correcting observation (evidence added AFTER the correction was never in dispute with it), and not be the " +
+        "correcting observation itself; violating any of these throws rather than guessing. Also requires the " +
+        "contradiction to have a real correcting observation — invalid on one flagged without one (nothing to have " +
+        "contradicted). Optional; omitting it falls back to the conservative default described above. Invalid with " +
+        "decision:\"dismiss\" (a dismissal reaches no verdict, so naming a loser is meaningless).",
+      ),
       resolvedBy: z.string().optional(),
       circle: z.string().optional().describe("The circle the contradiction or concepts belong to (defaults to this session's circle)."),
       // Duplicate-pair dismissal fields (new in 0.6.0).
       conceptAId: z.string().optional().describe("First concept of a possible-duplicate pair to dismiss. Required for duplicate-pair dismissal; omit for contradiction verdicts."),
       conceptBId: z.string().optional().describe("Second concept of a possible-duplicate pair to dismiss. Required for duplicate-pair dismissal; omit for contradiction verdicts."),
     },
-    async ({ contradictionId, decision, body, resolvedBy, circle, conceptAId, conceptBId }) => {
+    async ({ contradictionId, decision, body, contradictedObservationId, resolvedBy, circle, conceptAId, conceptBId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         // --- Duplicate-pair dismissal path ---
@@ -1018,6 +1028,7 @@ export function registerMonetCoreTools(
           // would silently hide the pair instead. Name the conflict and point at both valid shapes.
           if (decision !== undefined) return err("field 'decision' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
           if (body !== undefined) return err("field 'body' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
+          if (contradictedObservationId !== undefined) return err("field 'contradictedObservationId' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
           // Scope enforcement: both concepts must live in the caller-named circle.
           const circleA = core.circleOf(conceptAId);
           const circleB = core.circleOf(conceptBId);
@@ -1033,7 +1044,7 @@ export function registerMonetCoreTools(
         if (!contradictionId) return err("contradictionId is required for contradiction verdicts");
         if (!decision) return err("decision is required for contradiction verdicts");
         if (core.circleOfContradiction(contradictionId) !== scope(circle)) return err(`contradiction not found: ${contradictionId}`); // scope enforcement
-        const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy });
+        const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy, contradictedObservationId });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
         // Idempotent no-op: contradiction already resolved or dismissed — zero mutations occurred.
         if ("alreadyClosed" in c) return mutOk({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus }, "memory_resolve", false, capturedBlock);

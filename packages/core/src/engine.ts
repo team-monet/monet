@@ -643,6 +643,15 @@ export interface Contradiction {
   status: string; // open | resolved | dismissed
   detail: string;
   resolutionObsId: string | null;
+  /** The observation the correction contradicted, as named by the resolver — always this
+   * concept's pre-correction evidence the correcting observation was in tension with, regardless
+   * of verdict. When this is non-null, `resolutionObsId !== null` (accept-new) means THIS
+   * observation lost and was superseded by the correction; `resolutionObsId === null`
+   * (keep-current) means THIS observation won and the correction was retired instead. NULL unless
+   * the resolver supplied contradictedObservationId. Always paired with a real correcting
+   * observation: a bare contradiction (flagged without one, so nothing was actually contradicted)
+   * cannot carry a name here — see resolveContradiction. */
+  contradictedObservationId: string | null;
   detectedAt: number;
   resolvedAt: number | null;
   resolvedBy: string | null;
@@ -936,6 +945,7 @@ interface ContradictionRow {
   status: string;
   detail: string;
   resolution_obs_id: string | null;
+  contradicted_observation_id: string | null;
   detected_at: number;
   resolved_at: number | null;
   resolved_by: string | null;
@@ -1364,6 +1374,16 @@ export class MonetCore {
         trigger_observation_id TEXT,
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
       );
+      -- contradicted_observation_id always names the observation the correction contradicted —
+      -- captured at resolveContradiction() time, when the caller has the evidence in hand, never
+      -- inferred from insertion order or embedding similarity (see the reasoning at
+      -- resolveContradiction). resolution_obs_id is what distinguishes the verdict: non-null
+      -- (accept-new) means the named observation LOST; null (keep-current) means it WON and the
+      -- correction lost instead. Always paired with a real correcting observation and always
+      -- predates it — a bare contradiction (flagged without a correcting observation) cannot carry
+      -- a name here. NULL on every row until a caller supplies contradictedObservationId; a fresh
+      -- install and a migrated pre-existing database behave identically here — both start NULL and
+      -- only ever get a value going forward.
       CREATE TABLE IF NOT EXISTS contradictions (
         id TEXT PRIMARY KEY,
         concept_id TEXT NOT NULL,
@@ -1372,6 +1392,7 @@ export class MonetCore {
         status TEXT NOT NULL DEFAULT 'open',
         detail TEXT NOT NULL DEFAULT '',
         resolution_obs_id TEXT,
+        contradicted_observation_id TEXT,
         detected_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         resolved_at INTEGER,
         resolved_by TEXT,
@@ -1942,6 +1963,10 @@ export class MonetCore {
     addColumn("contradictions", "updated_at", "INTEGER");
     addColumn("contradictions", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
     addColumn("contradictions", "sync_writer", "TEXT");
+    // Not part of the v8 sync-closure schema (no clock/writer semantics) — reusing this helper
+    // just for its idempotent nullable-ALTER behavior. A pre-existing database gets the column
+    // with every row NULL, identical to a fresh install before any caller supplies it.
+    addColumn("contradictions", "contradicted_observation_id", "TEXT");
     addColumn("first_block", "updated_at", "INTEGER");
     addColumn("first_block", "sync_revision", "INTEGER NOT NULL DEFAULT 1");
     addColumn("first_block", "sync_writer", "TEXT");
@@ -2879,6 +2904,20 @@ export class MonetCore {
    * superseded; the agent's reconciled `body` (if given) is written; the concept restores to
    * active + confidence once no open contradictions remain. Returns the updated concept.
    *
+   * `opts.contradictedObservationId` names the observation this verdict treats as the loser
+   * (accept-new) or as the one being kept (keep-current). Resolution is the moment the caller
+   * actually has the evidence in front of it — the moment it is already required to write a
+   * reconciled `body` here — so a name given HERE is not a guess the way deducing it from
+   * insertion order or embedding similarity would be. Supplying it is optional and additive: every
+   * behavior below this point is byte-for-byte unchanged when it is omitted. It requires the
+   * contradiction to have a real correcting observation (rejected on a bare flagContradiction —
+   * there is nothing to have contradicted) and requires the named observation to PREDATE the
+   * correction — the same prior boundary the deduction below and detach() both use. Both
+   * requirements exist because getting either wrong is a silent, unrevivable data loss: naming a
+   * bare contradiction's loser has no successor to point to (terminal supersession, nothing for
+   * detach's inbound cleanup to ever undo), and naming something that postdates the correction
+   * builds a backwards-in-time pointer that destroys newer evidence in favor of the stale claim.
+   *
    * Idempotency gate: if the contradiction is already resolved or dismissed, returns
    * { alreadyClosed: true, contradictionStatus: string } with ZERO mutations — no temporal stamp,
    * no observation supersede, no status rewrite, no session opened. Mirrors the pair-dismissal
@@ -2886,7 +2925,7 @@ export class MonetCore {
    */
   resolveContradiction(
     contradictionId: string,
-    opts: { decision: "accept-new" | "keep-current" | "dismiss"; body?: string; by?: string },
+    opts: { decision: "accept-new" | "keep-current" | "dismiss"; body?: string; by?: string; contradictedObservationId?: string },
   ): Concept | { alreadyClosed: true; contradictionStatus: string } | null {
     this.assertNoEmbedderMigrationReentry("resolve a contradiction");
     const c = this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(contradictionId) as ContradictionRow | undefined;
@@ -2897,6 +2936,16 @@ export class MonetCore {
     const conceptId = c.concept_id;
     if (isConnectorOwnedRow(this.getRow(conceptId))) throw new Error("cannot mutate a source concept");
     if (this.getRow(conceptId)?.status === "retired") throw new Error("cannot mutate a retired concept");
+
+    // dismiss reaches no verdict, so there is no "loser" to name — reject rather than silently
+    // ignore a caller-supplied contradictedObservationId that would otherwise go nowhere.
+    if (opts.contradictedObservationId !== undefined && opts.decision === "dismiss") {
+      throw new Error(
+        `cannot resolve contradiction ${contradictionId} with decision:"dismiss" and a contradictedObservationId: ` +
+        `a dismissal reaches no verdict, so naming a loser is meaningless. Omit contradictedObservationId, or use ` +
+        `decision:"accept-new" or "keep-current" to act on the named observation.`,
+      );
+    }
 
     // ensureSession() OUTSIDE the transaction: the session row is an audit trail that must survive
     // even if the resolution transaction rolls back. Mirrors the same decision in store().
@@ -2915,25 +2964,33 @@ export class MonetCore {
           .run(nowMs, opts.by ?? null, contradictionId);
         // dismiss: do NOT refresh temporal fields (no new evidence confirms; the conflict is simply set aside)
       } else {
-        // MINIMAL INFERENCE, AND ONLY WHERE IT IS NOT A GUESS. `contradictions.observation_id`
-        // records only the CORRECTING observation;
-        // no column records what it contradicted. Earlier rounds tried to deduce the loser anyway —
-        // all-but-the-winner, then the-single-prior, then the-single-live-prior-in-insertion-order —
-        // and each round produced a fresh crop of edge cases (dead corrections, terminally
-        // superseded rows, evidence attached after the fact, foreign observation ids): eight
-        // findings over three review rounds on one method, each narrower than the last. That
-        // pattern is the signal that the PREMISE is wrong rather than the implementation. The loser
-        // is not recorded, so it cannot be deduced, and a wrong deduction destroys evidence
-        // permanently and silently — observed live, where one status correction superseded six
-        // observations, four of them unrelated findings from another week.
+        // MINIMAL INFERENCE, AND ONLY WHERE IT IS NOT A GUESS. Historically `contradictions.observation_id`
+        // recorded only the CORRECTING observation; no column recorded what it contradicted. Earlier
+        // rounds tried to deduce the loser anyway — all-but-the-winner, then the-single-prior, then
+        // the-single-live-prior-in-insertion-order — and each round produced a fresh crop of edge
+        // cases (dead corrections, terminally superseded rows, evidence attached after the fact,
+        // foreign observation ids): eight findings over three review rounds on one method, each
+        // narrower than the last. That pattern was the signal that the PREMISE was wrong rather than
+        // the implementation: the loser was not recorded, so it could not be deduced, and a wrong
+        // deduction destroys evidence permanently and silently — observed live, where one status
+        // correction superseded six observations, four of them unrelated findings from another week.
         //
-        // So this path supersedes ONLY what the contradiction literally names, and refuses whatever
-        // it cannot establish:
-        //   accept-new   → supersedes NOTHING. The reconciled `body` is the record of the verdict
-        //                  and is therefore required. The contradicted claim stays live until
-        //                  someone synthesises it away — a known, accepted cost, and the reason a
-        //                  `contradicted_observation_id` column is the real fix (tracked separately).
+        // THE REAL FIX: `opts.contradictedObservationId` lets the CALLER name the loser at
+        // resolution time, when it actually has the evidence in front of it — the same moment it is
+        // already asked to write a reconciled `body`. That is not a guess; it is validated below
+        // (exists, belongs to this concept, live, not the correction itself, a real correcting
+        // observation exists to have contradicted it, and it PREDATES that correction) and takes
+        // priority over deduction wherever it is supplied. Absent, this path falls back to the pre-existing
+        // deduction, which supersedes ONLY what the contradiction literally establishes without a
+        // name, and refuses whatever it cannot:
+        //   accept-new   → named loser present: supersedes EXACTLY it (see `supersessions` below).
+        //                  Absent: supersedes NOTHING unless exactly one live observation predates
+        //                  the correction (the one case a name would add no information over the
+        //                  deduction). The reconciled `body` is then the only record of the verdict
+        //                  and is therefore required — see the ambiguous-accept-new guard below.
         //   keep-current → the correction LOST, and it is named on the row. Supersede exactly it.
+        //                  A named contradictedObservationId here identifies which prior is being
+        //                  KEPT, not a supersession target — see the keep-current branch below.
         const correcting = c.observation_id === null
           ? undefined
           : this.db
@@ -2961,8 +3018,9 @@ export class MonetCore {
         }
 
         // Live evidence in insertion order — the ordering detach() uses to decide who the parties to
-        // a dispute are. Liveness needs BOTH columns null: terminal supersession
-        // (supersedeObservation(id, null)) leaves superseded_by NULL with superseded_at set.
+        // a dispute are, AND (below) who a named contradictedObservationId is allowed to name.
+        // Liveness needs BOTH columns null: terminal supersession (supersedeObservation(id, null))
+        // leaves superseded_by NULL with superseded_at set.
         const liveIds = (
           this.db
             .prepare(
@@ -2977,6 +3035,79 @@ export class MonetCore {
         const correctingIndex = c.observation_id === null ? liveIds.length : liveIds.indexOf(c.observation_id);
         const priors = liveIds.slice(0, correctingIndex);
 
+        // NAMED LOSER (opts.contradictedObservationId), validated the same way the correcting
+        // observation is above, PLUS two guards a corrected review round added because getting
+        // either wrong is a silent, unrevivable data loss:
+        //
+        //   1. The contradiction must have a real correcting observation. A bare contradiction
+        //      (flagContradiction's observationId-less form) contradicted nothing, so a name here
+        //      cannot mean "the observation it contradicted" — and for accept-new specifically,
+        //      wiring it through anyway would terminally supersede the named observation (no
+        //      successor: there is no correction to promote), which detach()'s inbound-pointer
+        //      cleanup can never undo (a terminal supersession leaves no pointer to clear). Rejected
+        //      for EVERY decision, not only accept-new: the field always means "the observation the
+        //      correction contradicted", and a bare contradiction contradicted nothing to name.
+        //   2. The named observation must be a PRIOR — i.e., in `priors` above, predating the
+        //      correction. Without this, naming a later observation (one created AFTER the
+        //      correction, never in dispute with it) builds a backwards-in-time successor pointer:
+        //      accept-new would retire genuinely newer evidence in favor of the stale corrected
+        //      claim. Applies to keep-current too — "the prior being kept" must actually be a prior.
+        //
+        // Unlike the correcting observation (flagged automatically, so never trusted blind), this id
+        // comes from the caller resolving the conflict right now — but "supplied at the moment of
+        // most trust" is still not "true", so it gets checked rather than written straight through.
+        if (opts.contradictedObservationId !== undefined) {
+          if (c.observation_id === null) {
+            throw new Error(
+              `contradiction ${contradictionId} has no correcting observation (it was flagged without one), so ` +
+              `contradictedObservationId cannot name what it "contradicted" — there is nothing to contradict. Omit ` +
+              `contradictedObservationId and resolve with just \`decision\`, or use decision:"dismiss".`,
+            );
+          }
+          const named = this.db
+            .prepare(`SELECT id, concept_id, superseded_by, superseded_at FROM observations WHERE id = ?`)
+            .get(opts.contradictedObservationId) as
+              { id: string; concept_id: string | null; superseded_by: string | null; superseded_at: number | null } | undefined;
+          if (!named) {
+            throw new Error(
+              `contradictedObservationId ${opts.contradictedObservationId} does not exist; pass the id of a live ` +
+              `observation belonging to concept ${conceptId}, or omit it to fall back to the conservative default.`,
+            );
+          }
+          if (named.concept_id !== conceptId) {
+            throw new Error(
+              `contradictedObservationId ${opts.contradictedObservationId} belongs to concept ${named.concept_id}, not ` +
+              `${conceptId}; naming it here would write a cross-concept supersession pointer. Pass an observation id ` +
+              `that actually belongs to concept ${conceptId}.`,
+            );
+          }
+          if (named.superseded_by !== null || named.superseded_at !== null) {
+            throw new Error(
+              `contradictedObservationId ${opts.contradictedObservationId} is no longer live evidence, so it cannot be ` +
+              `named as party to this contradiction; pick a live observation, or omit it to fall back to the ` +
+              `conservative default.`,
+            );
+          }
+          if (opts.contradictedObservationId === c.observation_id) {
+            throw new Error(
+              opts.decision === "keep-current"
+                ? `contradictedObservationId ${opts.contradictedObservationId} is the correcting observation itself; ` +
+                  `keep-current names the PRIOR being kept, and a correction cannot be its own prior. Name the prior ` +
+                  `observation being kept instead.`
+                : `contradictedObservationId ${opts.contradictedObservationId} is the correcting observation itself; a ` +
+                  `correction cannot contradict itself. Name the prior observation it contradicts instead.`,
+            );
+          }
+          if (!priors.includes(opts.contradictedObservationId)) {
+            throw new Error(
+              `contradictedObservationId ${opts.contradictedObservationId} does not predate correcting observation ` +
+              `${c.observation_id}; only evidence that existed before the correction is something it could have ` +
+              `contradicted. Name a live observation from before the correction, or omit it to fall back to the ` +
+              `conservative default.`,
+            );
+          }
+        }
+
         // keep-current keeps a prior, so there must be one. With none, the verdict would close the
         // conflict and leave the REJECTED correction as the concept's only live evidence — the
         // opposite of what was asked, recorded as success.
@@ -2989,27 +3120,36 @@ export class MonetCore {
 
         // WHO LOSES, AND WHO (IF ANYONE) REPLACES THEM.
         //
-        // accept-new: the counterpart is unambiguous ONLY when exactly one live prior predates the
-        // correction. Then that prior lost and the correction genuinely IS its successor — a real,
-        // identified pointer. With several priors nothing records which was contradicted, so
-        // supersede NONE rather than guess.
+        // accept-new: a named loser (opts.contradictedObservationId, already validated above) is
+        // unambiguous BY CONSTRUCTION — the caller identified it, not this code — so it is
+        // superseded exactly, REGARDLESS of how many live priors exist. This replaces the
+        // single-live-prior deduction below for this call only; the deduction stays exactly as it
+        // was for every call that omits the name. Absent a name, the counterpart is unambiguous ONLY
+        // when exactly one live prior predates the correction: then that prior lost and the
+        // correction genuinely IS its successor — a real, identified pointer. With several priors and
+        // no name, nothing records which was contradicted, so supersede NONE rather than guess.
         //
-        // keep-current: the correction lost, and it is named on the row. But NOTHING identifies
-        // which prior beat it, so it gets NO successor — a TERMINAL supersession (superseded_at set,
-        // superseded_by NULL), the representation this engine already uses for "retired, no
-        // replacement claimed". Naming an arbitrary prior would be a guess with a second-order
-        // consequence: detach()'s inbound-pointer cleanup clears supersession when the named
-        // successor is moved away, which would RESURRECT the rejected correction as live evidence.
+        // keep-current: the correction lost, and it is named on the row — that part needs no
+        // supplied name. A contradictedObservationId here identifies which prior is being KEPT, which
+        // is recorded on the contradictions row below but is deliberately NOT wired into successor:
+        // naming an arbitrary prior as successor would be a guess with a second-order consequence —
+        // detach()'s inbound-pointer cleanup clears supersession when the named successor is moved
+        // away, which would RESURRECT the rejected correction as live evidence. So keep-current still
+        // gets NO successor — a TERMINAL supersession (superseded_at set, superseded_by NULL), the
+        // representation this engine already uses for "retired, no replacement claimed" — exactly as
+        // before this parameter existed.
         const supersessions: Array<{ loser: string; successor: string | null }> =
           opts.decision === "keep-current"
             ? (c.observation_id !== null ? [{ loser: c.observation_id, successor: null }] : [])
-            // accept-new promotes the CORRECTING observation over the prior, so it needs one. A
-            // contradiction flagged without an observationId (flagContradiction's bare form) names
-            // no new evidence, so there is nothing to accept and nothing to supersede — without this
-            // guard the sole observation would be terminally retired and the concept left empty.
-            : (c.observation_id !== null && priors.length === 1)
-              ? [{ loser: priors[0]!, successor: c.observation_id }]
-              : [];
+            : opts.contradictedObservationId !== undefined
+              ? [{ loser: opts.contradictedObservationId, successor: c.observation_id }]
+              // accept-new promotes the CORRECTING observation over the prior, so it needs one. A
+              // contradiction flagged without an observationId (flagContradiction's bare form) names
+              // no new evidence, so there is nothing to accept and nothing to supersede — without this
+              // guard the sole observation would be terminally retired and the concept left empty.
+              : (c.observation_id !== null && priors.length === 1)
+                ? [{ loser: priors[0]!, successor: c.observation_id }]
+                : [];
         const losers = supersessions.map((x) => x.loser);
         // What the contradiction records as having resolved it. Only accept-new has an identified
         // winner; keep-current kept an unidentified prior, so there is nothing honest to name.
@@ -3025,7 +3165,13 @@ export class MonetCore {
         // `c.observation_id !== null` scopes this to real corrections. A contradiction flagged
         // without one names no competing claim, so there is no "which won" to record and the bare
         // form stays valid without a body, as it always has.
+        // `opts.contradictedObservationId === undefined` scopes this to the deduction path. When the
+        // caller names the loser, `losers.length` is never 0 (validated above, always superseded
+        // exactly), so this condition could never fire for a named call anyway — spelled out
+        // explicitly here so that stays true by design rather than by accident of two independently
+        // derived booleans, and so the loser-naming path never depends on a reconciled body existing.
         if (opts.decision === "accept-new" && c.observation_id !== null
+            && opts.contradictedObservationId === undefined
             && losers.length === 0 && priors.length > 0
             && (opts.body === undefined || opts.body.trim() === "")) {
           throw new Error(
@@ -3047,6 +3193,28 @@ export class MonetCore {
           // explicit body. Invalidate so the user refreshes the pinned summary.
           // dismiss never reaches this branch; the hook is safe to fire unconditionally here.
           this.invalidateFirstBlockEntry(conceptId);
+
+          // POSTCONDITION, mirroring detach()'s "a surviving source must keep live evidence" guard
+          // (src/engine.ts:4326-4358): a verdict must never leave a native concept with ZERO live
+          // observations — that would present a fully-retired concept as active, resting on
+          // nothing, exactly the state that guard exists to make unreachable for detach(). The bare-
+          // contradiction guard and the priors-membership guard above make every currently
+          // reachable path safe already: accept-new's successor is always the correcting
+          // observation, already checked live above, so it survives every supersede this function
+          // performs; keep-current only ever retires the correction itself, gated on priors.length >
+          // 0. This check does not rely on that reasoning holding forever — it makes the STATE
+          // itself unreachable instead, so a future change to the logic above fails loudly here
+          // rather than silently emptying a concept.
+          const stillLive = this.db
+            .prepare(`SELECT 1 FROM observations WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL LIMIT 1`)
+            .get(conceptId);
+          if (!stillLive) {
+            throw new Error(
+              `resolving contradiction ${contradictionId} would leave concept ${conceptId} with zero live ` +
+              `observations; refusing rather than presenting a fully-superseded concept as active. This should not ` +
+              `be reachable — please report it as a bug.`,
+            );
+          }
         }
         if (opts.body !== undefined) {
           const row = this.getRow(conceptId)!;
@@ -3063,9 +3231,13 @@ export class MonetCore {
         }
         this.db
           .prepare(
-            `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, resolved_at = ?, resolved_by = ? WHERE id = ?`,
+            `UPDATE contradictions SET status = 'resolved', resolution_obs_id = ?, contradicted_observation_id = ?, resolved_at = ?, resolved_by = ? WHERE id = ?`,
           )
-          .run(resolutionObsId, nowMs, opts.by ?? null, contradictionId);
+          // contradicted_observation_id records the observation the correction contradicted,
+          // verbatim as named — NULL when the caller did not supply one, for both decisions.
+          // resolution_obs_id distinguishes which verdict this was: non-null (accept-new) means the
+          // named observation lost; null (keep-current) means it won and the correction lost instead.
+          .run(resolutionObsId, opts.contradictedObservationId ?? null, nowMs, opts.by ?? null, contradictionId);
         // accept-new / keep-current: a verdict is evidence that the concept's state is confirmed — refresh.
         this.db
           .prepare(`UPDATE concepts SET last_confirmed_at = ?, last_confirmed_session_id = ? WHERE id = ?`)
@@ -7654,7 +7826,8 @@ export class MonetCore {
       payload.conceptRevisions.some((row) => localSourceIds.has(row.concept_id)) ||
       payload.contradictions.some((row) => localSourceIds.has(row.concept_id) ||
         (row.observation_id !== null && localSourceObservationIds.has(row.observation_id)) ||
-        (row.resolution_obs_id !== null && localSourceObservationIds.has(row.resolution_obs_id))) ||
+        (row.resolution_obs_id !== null && localSourceObservationIds.has(row.resolution_obs_id)) ||
+        (row.contradicted_observation_id != null && localSourceObservationIds.has(row.contradicted_observation_id))) ||
       payload.firstBlock.some((row) => localSourceIds.has(row.concept_id)) ||
       payload.conceptEntities.some((row) => localSourceIds.has(row.concept_id)) ||
       payload.edges.some((row) => localSourceIds.has(row.src_id) || localSourceIds.has(row.dst_id)) ||
@@ -8336,13 +8509,26 @@ export class MonetCore {
           .prepare(
             `INSERT INTO contradictions
                (id, concept_id, observation_id, kind, status, detail,
-                resolution_obs_id, detected_at, resolved_at, resolved_by,
+                resolution_obs_id, contradicted_observation_id, detected_at, resolved_at, resolved_by,
                 updated_at, sync_revision, sync_writer)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                concept_id = excluded.concept_id, observation_id = excluded.observation_id,
                kind = excluded.kind, status = excluded.status, detail = excluded.detail,
                resolution_obs_id = excluded.resolution_obs_id,
+               -- PRESENCE, not value. This column is the only one a peer predating it cannot carry,
+               -- so a legacy payload omits the KEY entirely — which arrives indistinguishable from
+               -- an explicit NULL, and a plain assignment would erase a locally recorded named loser
+               -- whenever such a peer relayed the row at a higher revision.
+               --
+               -- COALESCE is the wrong repair for that: an explicit NULL from a CURRENT-schema peer
+               -- is a legitimate value (it resolved without naming a loser), and swallowing it keeps
+               -- the losing peer's id while accepting the winner's status — a hybrid row, and the
+               -- two peers never converge. So the caller passes whether the KEY was present, and
+               -- only an actually-absent field preserves the local value; an explicit null takes
+               -- part in LWW like every other column.
+               contradicted_observation_id = CASE WHEN ? THEN excluded.contradicted_observation_id
+                                                  ELSE contradictions.contradicted_observation_id END,
                detected_at = excluded.detected_at, resolved_at = excluded.resolved_at,
                resolved_by = excluded.resolved_by, updated_at = excluded.updated_at,
                sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
@@ -8351,8 +8537,12 @@ export class MonetCore {
           )
           .run(
             row.id, row.concept_id, row.observation_id ?? null, row.kind, row.status, row.detail,
-            row.resolution_obs_id ?? null, row.detected_at, row.resolved_at ?? null,
+            row.resolution_obs_id ?? null, row.contradicted_observation_id ?? null, row.detected_at, row.resolved_at ?? null,
             row.resolved_by ?? null, relayAt, revision, writer,
+            // 15th parameter — the CASE in the DO UPDATE clause above. Unnamed parameters are
+            // numbered by order of appearance in the SQL text, and the DO UPDATE clause follows
+            // VALUES, so this binds there rather than to a column.
+            Object.prototype.hasOwnProperty.call(row, "contradicted_observation_id") ? 1 : 0,
           );
         if (r.changes > 0) inserted.contradictions++;
         else skipped.contradictions++;
@@ -10938,6 +11128,7 @@ function toContradiction(r: ContradictionRow): Contradiction {
     status: r.status,
     detail: r.detail,
     resolutionObsId: r.resolution_obs_id,
+    contradictedObservationId: r.contradicted_observation_id,
     detectedAt: r.detected_at,
     resolvedAt: r.resolved_at,
     resolvedBy: r.resolved_by,

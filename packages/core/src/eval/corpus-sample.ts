@@ -442,11 +442,15 @@ export function materializeSampledDb(sourceDbPath: string, outPath: string, sele
         Record<string, unknown>
       >;
       const insertContra = dest.prepare(
-        `INSERT INTO contradictions (id, concept_id, observation_id, kind, status, detail, resolution_obs_id, detected_at, resolved_at, resolved_by)
-         VALUES (@id, @concept_id, @observation_id, @kind, @status, @detail, @resolution_obs_id, @detected_at, @resolved_at, @resolved_by)`,
+        `INSERT INTO contradictions (id, concept_id, observation_id, kind, status, detail, resolution_obs_id, contradicted_observation_id, detected_at, resolved_at, resolved_by)
+         VALUES (@id, @concept_id, @observation_id, @kind, @status, @detail, @resolution_obs_id, @contradicted_observation_id, @detected_at, @resolved_at, @resolved_by)`,
       );
       dest.transaction((rows: Array<Record<string, unknown>>) => {
-        for (const r of rows) insertContra.run(r);
+        // The destination always carries the current schema (it is scaffolded by MonetCore above),
+        // but a SOURCE database written before contradicted_observation_id existed has no such
+        // column, so `SELECT *` omits the key and the named parameter would be unbound. Default it
+        // here rather than branching the statement on the source's shape.
+        for (const r of rows) insertContra.run({ ...r, contradicted_observation_id: r.contradicted_observation_id ?? null });
       })(contraRows);
 
       const ceRows = source.prepare(`SELECT * FROM concept_entities WHERE concept_id IN (${inClause})`).all(...selectedIds) as Array<

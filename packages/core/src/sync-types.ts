@@ -80,6 +80,11 @@ export interface SyncContradictionRow {
   status: string;
   detail: string;
   resolution_obs_id: string | null;
+  /** The observation the correction contradicted, as named by the resolver — non-null
+   * resolution_obs_id (accept-new) means this observation lost; null (keep-current) means it won.
+   * Always paired with a real, predating correcting observation. Added via ALTER TABLE —
+   * absent/null on rows from before that migration. */
+  contradicted_observation_id?: string | null;
   detected_at: number;
   resolved_at: number | null;
   resolved_by: string | null;

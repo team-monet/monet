@@ -1,4 +1,8 @@
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
 import { MonetCore } from "../engine";
 
 /**
@@ -19,6 +23,23 @@ const isSuperseded = (core: MonetCore, observationId: string): boolean => {
     .prepare(`SELECT superseded_by FROM observations WHERE id = ?`)
     .get(observationId) as { superseded_by: string | null } | undefined;
   return row?.superseded_by != null;
+};
+
+/** Raw supersession pair for an observation — distinguishes "revived" (both null) from "terminal"
+ * (superseded_at set, superseded_by null) from "superseded by a real successor" (both set). */
+const supersessionOf = (core: MonetCore, observationId: string): { superseded_by: string | null; superseded_at: number | null } => {
+  const row = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+    .prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`)
+    .get(observationId) as { superseded_by: string | null; superseded_at: number | null } | undefined;
+  return row ?? { superseded_by: null, superseded_at: null };
+};
+
+/** Raw peek at contradictions.contradicted_observation_id — not surfaced on PrewarmContradiction. */
+const contradictedObsOf = (core: MonetCore, contradictionId: string): string | null => {
+  const row = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+    .prepare(`SELECT contradicted_observation_id FROM contradictions WHERE id = ?`)
+    .get(contradictionId) as { contradicted_observation_id: string | null } | undefined;
+  return row?.contradicted_observation_id ?? null;
 };
 
 async function disputed(): Promise<{ core: MonetCore; conceptId: string; contradictionId: string }> {
@@ -406,5 +427,337 @@ describe("attach() status preservation (#fix — attach must never clear 'disput
     expect(after.status).toBe("active"); // 'active' preserved through attach
 
     core.close();
+  });
+});
+
+/**
+ * Named-loser resolution (contradictedObservationId): the caller can now name, at resolution
+ * time, exactly which observation a verdict is about — resolution is the moment the agent
+ * actually has the evidence in front of it, the same moment it is already asked for a reconciled
+ * `body`. This is additive: every test above this block exercises the ABSENT-parameter path and
+ * must keep passing byte-for-byte unchanged (that is the regression these tests guard against).
+ */
+describe("named-loser resolution (contradictedObservationId)", () => {
+  it("accept-new supersedes EXACTLY the named loser among several live priors — no body required", async () => {
+    // Same fixture as "a verdict never supersedes evidence the contradiction does not name" above:
+    // with no name, this concept's accept-new would supersede NOTHING (2+ live priors). Naming one
+    // of them makes the verdict explicit instead of refusing it.
+    const core = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+    const base = await core.store(BASE);
+    const findingA = await core.store("Unrelated finding A: the WAL checkpoint runs at 1000 pages.", { attachTo: base.conceptId });
+    const findingB = await core.store("Unrelated finding B: the lock is connection-level, not advisory.", { attachTo: base.conceptId });
+    const corr = await core.store(CORRECTION, { kind: "correction", attachTo: base.conceptId });
+    expect(corr.contradiction).toBeDefined();
+
+    const resolved = core.resolveContradiction(corr.contradiction!.id, {
+      decision: "accept-new",
+      contradictedObservationId: findingA.observationId,
+      by: "agent",
+      // deliberately NO body — the named loser is now the record of the verdict.
+    })!;
+    expect("alreadyClosed" in resolved).toBe(false);
+
+    // Exactly the named observation lost, with the correction as its real successor pointer.
+    expect(core.supersededObservationCount()).toBe(1);
+    expect(supersessionOf(core, findingA.observationId)).toEqual({ superseded_by: corr.observationId, superseded_at: expect.any(Number) });
+    // Everything else the contradiction did not name stays untouched.
+    expect(isSuperseded(core, base.observationId)).toBe(false);
+    expect(isSuperseded(core, findingB.observationId)).toBe(false);
+    // Recorded on the row for the caller (and any future reader) to see what this verdict named.
+    expect(contradictedObsOf(core, corr.contradiction!.id)).toBe(findingA.observationId);
+
+    const after = (await core.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(after.status).toBe("active");
+    expect(core.getOpenContradictions()).toHaveLength(0);
+    core.close();
+  });
+
+  it("without a name, the identical multi-prior fixture is still refused — the fallback is unchanged", async () => {
+    // Control for the test above: same concept shape, same decision, NO contradictedObservationId.
+    // This must still hit the pre-existing ambiguous-accept-new guard, proving the fallback path is
+    // untouched by this feature rather than accidentally loosened.
+    const core = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+    const base = await core.store(BASE);
+    await core.store("Unrelated finding A: the WAL checkpoint runs at 1000 pages.", { attachTo: base.conceptId });
+    await core.store("Unrelated finding B: the lock is connection-level, not advisory.", { attachTo: base.conceptId });
+    const corr = await core.store(CORRECTION, { kind: "correction", attachTo: base.conceptId });
+
+    expect(() =>
+      core.resolveContradiction(corr.contradiction!.id, { decision: "accept-new", by: "agent" }),
+    ).toThrow(/reconciled body/);
+    expect(core.supersededObservationCount()).toBe(0);
+    core.close();
+  });
+
+  it("keep-current with a named prior records it as KEPT, not a supersession target", async () => {
+    const { core, conceptId, contradictionId } = await disputed();
+    const before = (await core.getConcept(conceptId, { synthesize: false }))!;
+    const baseObsId = before.observations.find((o) => o.content.includes("We decided to use SQLite"))!.id;
+
+    const resolved = core.resolveContradiction(contradictionId, {
+      decision: "keep-current",
+      contradictedObservationId: baseObsId,
+      by: "agent",
+    })!;
+    expect("alreadyClosed" in resolved).toBe(false);
+
+    // The kept prior is untouched — naming it is not a supersession target for keep-current.
+    expect(supersessionOf(core, baseObsId)).toEqual({ superseded_by: null, superseded_at: null });
+    // The correction still lost, terminally (unchanged keep-current behavior).
+    const corrRow = supersessionOf(core, (await core.getConcept(conceptId, { synthesize: false }))!.observations
+      .find((o) => o.content.includes("NOT to use SQLite"))!.id);
+    expect(corrRow.superseded_at).not.toBeNull();
+    expect(corrRow.superseded_by).toBeNull();
+    // But WHO was kept is now on the record.
+    expect(contradictedObsOf(core, contradictionId)).toBe(baseObsId);
+    core.close();
+  });
+
+  describe("validation — each failure names what to do instead", () => {
+    it("throws when contradictedObservationId does not exist", async () => {
+      const { core, contradictionId } = await disputed();
+      expect(() =>
+        core.resolveContradiction(contradictionId, { decision: "accept-new", contradictedObservationId: "nonexistent-id", body: "x" }),
+      ).toThrow(/nonexistent-id.*does not exist/s);
+      core.close();
+    });
+
+    it("throws when contradictedObservationId belongs to a different concept", async () => {
+      const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 }); // keep concepts separate
+      const a = await core.store("Concept A: the deploy runs on Tuesdays.");
+      const b = await core.store("Concept B: totally unrelated, the office plants need watering.");
+      const corrA = await core.store("Concept A: the deploy runs on Wednesdays now.", { kind: "correction", attachTo: a.conceptId });
+      expect(corrA.contradiction).toBeDefined();
+
+      expect(() =>
+        core.resolveContradiction(corrA.contradiction!.id, {
+          decision: "accept-new", contradictedObservationId: b.observationId, body: "x",
+        }),
+      ).toThrow(/belongs to concept/);
+      expect(core.supersededObservationCount()).toBe(0);
+      core.close();
+    });
+
+    it("throws when contradictedObservationId is already superseded by a real successor", async () => {
+      const { core, conceptId, contradictionId } = await disputed();
+      const baseObsId = (await core.getConcept(conceptId, { synthesize: false }))!.observations
+        .find((o) => o.content.includes("We decided to use SQLite"))!.id;
+      core.resolveContradiction(contradictionId, { decision: "accept-new", contradictedObservationId: baseObsId, by: "agent" });
+      expect(isSuperseded(core, baseObsId)).toBe(true);
+
+      // A second correction arrives; naming the already-dead prior must be refused.
+      const second = await core.store("We decided to use Postgres as the storage backend for Monet Local.", {
+        kind: "correction", attachTo: conceptId,
+      });
+      expect(() =>
+        core.resolveContradiction(second.contradiction!.id, {
+          decision: "accept-new", contradictedObservationId: baseObsId, body: "x",
+        }),
+      ).toThrow(/no longer live evidence/);
+      core.close();
+    });
+
+    it("throws when contradictedObservationId is TERMINALLY superseded (superseded_by NULL, superseded_at set)", async () => {
+      const core = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+      const base = await core.store(BASE);
+      const removable = await core.store("Transient note that gets withdrawn.", { attachTo: base.conceptId });
+      const corr = await core.store(CORRECTION, { kind: "correction", attachTo: base.conceptId });
+      (core as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+        .prepare(`UPDATE observations SET superseded_by = NULL, superseded_at = ? WHERE id = ?`)
+        .run(Date.now(), removable.observationId);
+
+      expect(() =>
+        core.resolveContradiction(corr.contradiction!.id, {
+          decision: "accept-new", contradictedObservationId: removable.observationId, body: "x",
+        }),
+      ).toThrow(/no longer live evidence/);
+      core.close();
+    });
+
+    it("throws when contradictedObservationId is the correcting observation itself", async () => {
+      const { core, contradictionId } = await disputed();
+      // The contradiction's own observation_id IS the correcting observation — naming it as its
+      // own loser is the self-contradiction case the validation exists to catch.
+      const contra = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+        .prepare(`SELECT observation_id FROM contradictions WHERE id = ?`)
+        .get(contradictionId) as { observation_id: string };
+
+      expect(() =>
+        core.resolveContradiction(contradictionId, {
+          decision: "accept-new", contradictedObservationId: contra.observation_id, body: "x",
+        }),
+      ).toThrow(/correcting observation itself/);
+      core.close();
+    });
+
+    it("rejects contradictedObservationId with decision:\"dismiss\"", async () => {
+      const { core, conceptId, contradictionId } = await disputed();
+      const baseObsId = (await core.getConcept(conceptId, { synthesize: false }))!.observations
+        .find((o) => o.content.includes("We decided to use SQLite"))!.id;
+
+      expect(() =>
+        core.resolveContradiction(contradictionId, { decision: "dismiss", contradictedObservationId: baseObsId }),
+      ).toThrow(/dismissal reaches no verdict/);
+      expect(core.getOpenContradictions()).toHaveLength(1); // refused, not silently closed
+      core.close();
+    });
+
+    // Independent-audit round 2 findings: the two tests above (and the eight before them) all use a
+    // correction-backed contradiction, which is exactly why neither of these paths was caught the
+    // first time. Both are reproduced verbatim from the audit's repro steps.
+
+    it("BLOCKING: rejects contradictedObservationId on a BARE contradiction (accept-new) — would otherwise zero a concept's evidence", async () => {
+      // flagContradiction's observationId-less form: no correcting observation exists, so
+      // `successor` in the named-loser branch would be NULL — a TERMINAL supersession of the
+      // concept's ONLY observation. Unlike a real accept-new pointer, a terminal supersession has no
+      // successor for detach()'s inbound cleanup to ever clear, so this is an unrevivable deletion.
+      const core = new MonetCore(":memory:");
+      const a = await core.store("The office plants need watering on Mondays.");
+      const k = core.flagContradiction(a.conceptId, { detail: "policy changed, no specific evidence cited" });
+      expect(k.observationId).toBeNull();
+
+      expect(() =>
+        core.resolveContradiction(k.id, { decision: "accept-new", contradictedObservationId: a.observationId }),
+      ).toThrow(/has no correcting observation/);
+
+      // Refused means REFUSED: the sole observation is untouched, nothing lost.
+      expect(isSuperseded(core, a.observationId)).toBe(false);
+      expect(core.supersededObservationCount()).toBe(0);
+      const after = (await core.getConcept(a.conceptId, { synthesize: false }))!;
+      expect(after.observations).toHaveLength(1);
+      expect(after.status).not.toBe("retired");
+      expect(core.getOpenContradictions()).toHaveLength(1); // still open, not silently closed
+      core.close();
+    });
+
+    it("BLOCKING: rejects contradictedObservationId on a BARE contradiction (keep-current too — the field always means 'contradicted', and a bare contradiction contradicted nothing)", async () => {
+      const core = new MonetCore(":memory:");
+      const a = await core.store("The office plants need watering on Mondays.");
+      const k = core.flagContradiction(a.conceptId, { detail: "policy changed, no specific evidence cited" });
+
+      expect(() =>
+        core.resolveContradiction(k.id, { decision: "keep-current", contradictedObservationId: a.observationId }),
+      ).toThrow(/has no correcting observation/);
+      expect(isSuperseded(core, a.observationId)).toBe(false);
+      core.close();
+    });
+
+    it("MAJOR: rejects contradictedObservationId that POSTDATES the correction (accept-new) — would otherwise build a backwards-in-time pointer", async () => {
+      // D1 (obs A) -> correction (obs B) -> N (obs C, AFTER the correction). C never existed when
+      // the correction landed, so it was never in dispute with it. Naming C as the loser would
+      // retire the concept's NEWEST evidence in favor of the stale corrected claim.
+      const core = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+      const d1 = await core.store(BASE);
+      const corr = await core.store(CORRECTION, { kind: "correction", attachTo: d1.conceptId });
+      expect(corr.contradiction).toBeDefined();
+      const n = await core.store("Later, unrelated context: the WAL checkpoint runs at 1000 pages.", { attachTo: d1.conceptId });
+
+      expect(() =>
+        core.resolveContradiction(corr.contradiction!.id, {
+          decision: "accept-new", contradictedObservationId: n.observationId, body: "x",
+        }),
+      ).toThrow(/does not predate/);
+
+      // Refused means REFUSED: nothing superseded, all three observations still live.
+      expect(core.supersededObservationCount()).toBe(0);
+      expect(isSuperseded(core, d1.observationId)).toBe(false);
+      expect(isSuperseded(core, corr.observationId)).toBe(false);
+      expect(isSuperseded(core, n.observationId)).toBe(false);
+      core.close();
+    });
+
+    it("MAJOR: rejects contradictedObservationId that POSTDATES the correction (keep-current) — 'the prior being kept' must actually be a prior", async () => {
+      const core = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+      const d1 = await core.store(BASE);
+      const corr = await core.store(CORRECTION, { kind: "correction", attachTo: d1.conceptId });
+      const n = await core.store("Later, unrelated context: the WAL checkpoint runs at 1000 pages.", { attachTo: d1.conceptId });
+
+      expect(() =>
+        core.resolveContradiction(corr.contradiction!.id, {
+          decision: "keep-current", contradictedObservationId: n.observationId,
+        }),
+      ).toThrow(/does not predate/);
+      expect(core.supersededObservationCount()).toBe(0);
+      core.close();
+    });
+  });
+
+  it("POSTCONDITION guarantee: a valid named-loser accept-new always leaves the correction (successor) live, never zeroing the concept", async () => {
+    // This is the property the new postcondition check in resolveContradiction protects. It is not
+    // independently reachable through the public API once the bare-contradiction and
+    // priors-membership guards hold (the successor is always the already-validated-live correcting
+    // observation), so this test exercises the GUARANTEE rather than the throw branch itself.
+    const core = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+    const base = await core.store(BASE);
+    const corr = await core.store(CORRECTION, { kind: "correction", attachTo: base.conceptId });
+    core.resolveContradiction(corr.contradiction!.id, {
+      decision: "accept-new", contradictedObservationId: base.observationId, by: "agent",
+    });
+
+    expect(isSuperseded(core, corr.observationId)).toBe(false); // the successor is always live
+    const after = (await core.getConcept(base.conceptId, { synthesize: false }))!;
+    expect(after.status).toBe("active");
+    expect(after.confidence).toBeGreaterThan(0); // never the empty-concept projection
+    core.close();
+  });
+});
+
+describe("contradicted_observation_id migration (pre-existing database)", () => {
+  it("a database created before this column exists gets it added as NULL, and the feature works after migration", async () => {
+    // Simulate "this store predates the contradicted_observation_id column" faithfully, instead of
+    // hand-rolling a whole legacy schema: build a REAL store with the current code (so every other
+    // column/table/trigger is exactly what a real pre-existing store would have), then drop just the
+    // one column under test with raw SQL. Reopening exercises the exact addColumn() migration path a
+    // real upgrade would hit.
+    const dir = mkdtempSync(join(tmpdir(), "monet-contradicted-obs-migration-"));
+    const dbPath = join(dir, "monet.db");
+    try {
+      const core = new MonetCore(dbPath);
+      const a = await core.store(BASE);
+      const corr = await core.store(CORRECTION, { kind: "correction" });
+      expect(corr.contradiction).toBeDefined();
+      // Resolve the old way (no name) so this row is a realistic "existing row from before the
+      // feature shipped" — its contradicted_observation_id was never written.
+      core.resolveContradiction(corr.contradiction!.id, { decision: "accept-new", body: "Not SQLite.", by: "agent" });
+      const preExistingContradictionId = corr.contradiction!.id;
+      core.close();
+
+      // Strip the column to fabricate the pre-migration shape.
+      const raw = new Database(dbPath);
+      const columnsBefore = raw.prepare(`PRAGMA table_info(contradictions)`).all() as Array<{ name: string }>;
+      expect(columnsBefore.some((c) => c.name === "contradicted_observation_id")).toBe(true); // sanity: it was there
+      raw.exec(`ALTER TABLE contradictions DROP COLUMN contradicted_observation_id`);
+      const columnsAfterDrop = raw.prepare(`PRAGMA table_info(contradictions)`).all() as Array<{ name: string }>;
+      expect(columnsAfterDrop.some((c) => c.name === "contradicted_observation_id")).toBe(false);
+      raw.close();
+
+      // Reopen: MonetCore's migration (ensureSyncClosureSchema's addColumn) must restore the column
+      // without touching the existing row's data.
+      const reopened = new MonetCore(dbPath);
+      const columnsAfterMigration = (reopened as unknown as { db: { prepare(sql: string): { all(): unknown[] } } }).db
+        .prepare(`PRAGMA table_info(contradictions)`).all() as Array<{ name: string }>;
+      expect(columnsAfterMigration.some((c) => c.name === "contradicted_observation_id")).toBe(true);
+      // The pre-existing resolved row keeps NULL — migration never fabricates a value it wasn't given.
+      expect(contradictedObsOf(reopened, preExistingContradictionId)).toBeNull();
+      // getConcept/behavior on old data is otherwise untouched by the migration.
+      expect((await reopened.getConcept(a.conceptId, { synthesize: false }))!.status).toBe("active");
+
+      // And the feature itself works normally post-migration: a NEW contradiction on this same
+      // (migrated) store can use contradictedObservationId end to end.
+      const second = await reopened.store("We decided to use Postgres as the storage backend for Monet Local.", {
+        kind: "correction", attachTo: a.conceptId,
+      });
+      expect(second.contradiction).toBeDefined();
+      const survivorObsId = (await reopened.getConcept(a.conceptId, { synthesize: false }))!.observations
+        .find((o) => o.content.includes("NOT to use SQLite"))!.id;
+      reopened.resolveContradiction(second.contradiction!.id, {
+        decision: "accept-new", contradictedObservationId: survivorObsId, by: "agent",
+      });
+      expect(contradictedObsOf(reopened, second.contradiction!.id)).toBe(survivorObsId);
+      expect(isSuperseded(reopened, survivorObsId)).toBe(true);
+      reopened.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

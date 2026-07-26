@@ -742,6 +742,96 @@ describe("contradiction curation round-trip", () => {
     src.close();
     dst.close();
   });
+
+  // contradicted_observation_id is the one contradictions column a legacy peer cannot carry — it
+  // predates the column. Its ABSENCE therefore arrives indistinguishable from an explicit NULL, and
+  // a straight `= excluded.…` assignment would erase a locally recorded named loser every time such
+  // a peer relayed the row at a higher revision. Nothing would signal it: the supersession on
+  // `observations` survives, so only the audit record of WHICH observation lost disappears.
+  it("a legacy peer relaying at a higher revision does not erase contradicted_observation_id", async () => {
+    const src = freshCore({ syncDeviceId: "device-src" });
+    const dst = freshCore({ syncDeviceId: "device-dst" });
+
+    const a = await src.store("Ship date is March 3rd.");
+    const b = await src.store("Ship date moved to April 10th.", { kind: "correction", attachTo: a.conceptId });
+    const contradiction = b.contradiction!;
+    expect(contradiction).toBeDefined();
+
+    src.resolveContradiction(contradiction.id, {
+      decision: "accept-new",
+      contradictedObservationId: a.observationId,
+    });
+
+    dst.graftRows(src.exportDelta(0));
+
+    const read = () =>
+      // @ts-expect-error accessing private db for test
+      dst.db
+        .prepare(`SELECT contradicted_observation_id AS named, sync_revision AS rev FROM contradictions WHERE id = ?`)
+        .get(contradiction.id) as { named: string | null; rev: number };
+
+    const before = read();
+    expect(before.named).toBe(a.observationId);
+
+    // The legacy payload: the same contradiction row at a HIGHER revision (so it wins the LWW race)
+    // with the column absent entirely, exactly as a build predating it would serialize.
+    const relayed = src.exportDelta(0).contradictions.map((row) => {
+      const { contradicted_observation_id: _omitted, ...legacy } = row as unknown as Record<string, unknown>;
+      return { ...legacy, sync_revision: before.rev + 5, sync_writer: "device-legacy" };
+    });
+    dst.graftRows(basePayload({ contradictions: relayed as never, deviceId: "device-legacy" }));
+
+    const after = read();
+    expect(after.rev).toBeGreaterThan(before.rev); // the relay really did win
+    expect(after.named).toBe(a.observationId); // ...and the audit value survived it
+
+    src.close();
+    dst.close();
+  });
+
+  // The other direction, and the reason presence is checked rather than value: a CURRENT-schema
+  // peer that resolved WITHOUT naming a loser sends an explicit null, which is a real value and must
+  // win LWW like any other column. Swallowing it (as a COALESCE would) keeps the losing peer's id
+  // beside the winner's status — a hybrid row that never converges.
+  it("an explicit null from a current-schema peer wins LWW and clears contradicted_observation_id", async () => {
+    const src = freshCore({ syncDeviceId: "device-src" });
+    const dst = freshCore({ syncDeviceId: "device-dst" });
+
+    const a = await src.store("Ship date is March 3rd.");
+    const b = await src.store("Ship date moved to April 10th.", { kind: "correction", attachTo: a.conceptId });
+    const contradiction = b.contradiction!;
+
+    src.resolveContradiction(contradiction.id, {
+      decision: "accept-new",
+      contradictedObservationId: a.observationId,
+    });
+    dst.graftRows(src.exportDelta(0));
+
+    const read = () =>
+      // @ts-expect-error accessing private db for test
+      dst.db
+        .prepare(`SELECT contradicted_observation_id AS named, sync_revision AS rev FROM contradictions WHERE id = ?`)
+        .get(contradiction.id) as { named: string | null; rev: number };
+
+    const before = read();
+    expect(before.named).toBe(a.observationId);
+
+    // Current-schema peer: the key IS present and its value IS null.
+    const relayed = src.exportDelta(0).contradictions.map((row) => ({
+      ...(row as unknown as Record<string, unknown>),
+      contradicted_observation_id: null,
+      sync_revision: before.rev + 5,
+      sync_writer: "device-peer2",
+    }));
+    dst.graftRows(basePayload({ contradictions: relayed as never, deviceId: "device-peer2" }));
+
+    const after = read();
+    expect(after.rev).toBeGreaterThan(before.rev);
+    expect(after.named).toBeNull(); // the explicit null won — no hybrid row, peers converge
+
+    src.close();
+    dst.close();
+  });
 });
 
 // ---------------------------------------------------------------------------

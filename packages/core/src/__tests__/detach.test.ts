@@ -1238,6 +1238,51 @@ describe("detach — a surviving source must keep live evidence (Codex post-merg
     c.close();
   });
 
+  it("splitting a NAMED-loser accept-new pair with MULTIPLE live priors — only the named one revives (new: contradictedObservationId)", async () => {
+    // Same real-pointer mechanics as the test above, but reached through a path the implicit
+    // single-live-prior deduction would have REFUSED: two live observations predate the correction,
+    // so without a name accept-new would supersede nothing here. Naming the loser makes the pointer
+    // real anyway, and detach's inbound cleanup does not know or care how the pointer was decided —
+    // it only sees "superseded_by points at an observation that is leaving", so the same revival
+    // applies. The unrelated live prior (never named, never superseded) must stay untouched by both
+    // the resolution and the detach.
+    const c = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
+    const base = await c.store("We decided to use SQLite as the storage backend.");
+    const otherFinding = await c.store("Unrelated finding: the WAL checkpoint runs at 1000 pages.", { attachTo: base.conceptId });
+    const corr = await c.store("We decided NOT to use SQLite as the storage backend.", {
+      kind: "correction", attachTo: base.conceptId,
+    });
+    // Two live observations (base, otherFinding) predate the correction — ambiguous for the
+    // deduction, but the caller names base explicitly.
+    c.resolveContradiction(corr.contradiction!.id, {
+      decision: "accept-new", contradictedObservationId: base.observationId, by: "agent",
+    });
+
+    const beforeDetach = (c as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+      .prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`)
+      .get(base.observationId) as { superseded_by: string | null; superseded_at: number | null };
+    expect(beforeDetach.superseded_by).toBe(corr.observationId); // a real pointer, same shape as the single-prior case
+
+    const r = await c.detach(base.conceptId, [corr.observationId]);
+    expect(r.destConceptId).toBeTruthy();
+
+    // base is live again — its superseder (the moved correction) left.
+    const afterDetach = (c as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+      .prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`)
+      .get(base.observationId) as { superseded_by: string | null; superseded_at: number | null };
+    expect(afterDetach.superseded_by).toBeNull();
+    expect(afterDetach.superseded_at).toBeNull();
+
+    // otherFinding was never named by the resolution — live throughout, untouched by either the
+    // resolution or the detach.
+    const otherRow = (c as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
+      .prepare(`SELECT superseded_by, superseded_at FROM observations WHERE id = ?`)
+      .get(otherFinding.observationId) as { superseded_by: string | null; superseded_at: number | null };
+    expect(otherRow.superseded_by).toBeNull();
+    expect(otherRow.superseded_at).toBeNull();
+    c.close();
+  });
+
   it("allows the detach when the superseded rows go too — the emptied source is removed", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 0.0, tauAmbiguous: 0.0 });
     const base = await c.store("We decided to use SQLite as the storage backend.");
