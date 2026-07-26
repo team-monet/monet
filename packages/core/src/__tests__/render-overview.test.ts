@@ -66,6 +66,21 @@ describe("renderOverview", () => {
     expect(out).not.toContain("LIVING MODEL"); // nothing stored ⇒ section omitted
     expect(out).not.toContain("KNOWLEDGE GRAPH");
     expect(out).not.toContain("NEEDS ATTENTION");
+    expect(out).not.toContain("RESOLUTION"); // no decided writes ⇒ a row of zeros, omitted
+    c.close();
+  });
+
+  it("RESOLUTION section reports the decided modes and the duplicate-emission rate", async () => {
+    // The design's empirical check is "visible in curation", and THIS is the human curation
+    // surface — a field on the MCP JSON response does not discharge it.
+    const c = populated();
+    await c.store("AuthService validates requests in src/auth/service.ts.", { kind: "fact" });
+    await c.store("Deploys are gated on a green canary.", { kind: "decision" });
+    const out = renderOverview(c.overview("default"));
+    expect(out).toContain("RESOLUTION");
+    expect(out).toContain("how new evidence landed, last 30d");
+    expect(out).toContain("new 2");
+    expect(out).toContain("2 decided · 0% surfaced a possible duplicate");
     c.close();
   });
 

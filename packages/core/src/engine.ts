@@ -80,6 +80,14 @@ import {
   type NativeObservationMatch,
 } from "./retrieval";
 import {
+  isDecidedResolutionMode,
+  resolveIncoming,
+  type ResolutionDecision,
+  type ResolutionMode,
+  type ResolutionNomination,
+} from "./resolution";
+export type { ResolutionMode } from "./resolution";
+import {
   inspectLiveEmbeddingPopulations,
   parseFiniteEmbeddingJson,
   toEmbeddingWidthInventory,
@@ -129,6 +137,9 @@ const RRF_K = 60; // RRF constant for seed fusion
 // total of 255, and none of them were used. The count keeps "how much provenance exists" — the
 // only part the ranking view ever needed — at a fixed cost per card.
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
+/** Window for overview's resolution-mode counts. 30 days = the staleness horizon this store already
+ *  uses for "recent" (staleAfterMs default), so curation reads one consistent notion of lately. */
+const RESOLUTION_STATS_WINDOW_DAYS = 30;
 const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
 const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
 // Edges that may BOOST a similarity hit's rank: the "worked-on-together / causal" signals.
@@ -555,11 +566,39 @@ export interface IngestResult {
   conceptId: string;
   /** Immutable evidence id for this write; source ledgers bind this, not a derived concept state. */
   observationId: string;
+  /**
+   * The similarity behind this write — but NOT the same quantity on every path, which is a
+   * pre-existing asymmetry this field's callers have to know about:
+   *
+   *   auto resolution   the NOMINATION score (max cosine over the winning concept's own live
+   *                     observations), i.e. the number that actually drove resolve-or-create. 0
+   *                     when nothing was nominated. On a `blur-duplicate` this is LOWER than
+   *                     `nearMatchScore`, deliberately: evidence is what declined to attach, while
+   *                     the pairing came from the centroid.
+   *   attachTo          cosine against the concept the caller named.
+   *   forceNew          the informational CENTROID nearest-neighbour — a "what did it look like"
+   *                     courtesy, never a decision input (the caller asserted distinctness).
+   *
+   * Unifying the last one onto obs scores is deferred, not overlooked: it would change a reported
+   * number on a path whose semantics this slice does not otherwise touch.
+   */
   score: number;
   concept: Concept;
   contradiction?: Contradiction; // set when a kind="correction" attaches to an existing concept
-  nearMatchId?: string; // set on ambiguous fork: the existing concept this nearly matched
-  nearMatchScore?: number; // the cosine score of the near match
+  nearMatchId?: string; // set on any pairing mode: the existing concept this was linked to
+  nearMatchScore?: number; // the score that TRIGGERED the pairing — obs-level for the fork modes, centroid for blur-duplicate
+  /**
+   * HOW this write resolved — the finer-grained companion to `action` (see ResolutionMode,
+   * src/resolution.ts). Additive: `action`'s three values are a public contract and are unchanged,
+   * so a FORK SIGNAL (evidence matched an existing concept's observations but that concept's
+   * centroid disagreed — a bimodal concept surfaced for mediation) reports action="ambiguous" like
+   * any other fork, and only this field distinguishes it from an ordinary ambiguous-band fork.
+   *
+   * Preserved across an idempotency REPLAY (`operationId` re-use) by reading the original write's
+   * mode back out of `resolution_events` — a retry must be indistinguishable from the first call.
+   * Absent on the connector source path, which resolves nothing.
+   */
+  resolutionMode?: ResolutionMode;
 }
 
 /** Options for store() — resolution mode and direct attachment. */
@@ -752,6 +791,47 @@ export interface ConnectedConcept {
 }
 
 /**
+ * STORE-TIME RESOLUTION, AS A RATE (see src/resolution.ts). The design names fork rate and misfile
+ * rate as the empirical check on "find by evidence, confirm by identity", and this is the curation
+ * surface half of it: how the store has actually been deciding, in this circle, lately.
+ *
+ * READING IT — EVERY RATE DIVIDES BY `decidedTotal`, NEVER BY `windowTotal`:
+ *
+ *     fork rate               (fork-signal + ambiguous-fork) / decidedTotal
+ *     duplicate-emission rate (fork-signal + ambiguous-fork + blur-duplicate) / decidedTotal
+ *
+ * `windowTotal` counts every write, including `direct-attach` and `force-new` — writes where the
+ * caller named the target and resolution was never allowed to decide anything. A bulk import or a
+ * consolidation session is mostly those, and dividing by `windowTotal` would report a fork rate
+ * pushed toward zero by writes that could not possibly have forked. `decidedTotal` is the count of
+ * events that actually ran the rule (DECIDED_RESOLUTION_MODES, src/resolution.ts).
+ *
+ * Fork rate is kept to the two EVIDENCE-found pairings, because that is what the spec's "fork rate"
+ * names. Duplicate-emission rate is the broader one: how often ANY store call put a new pair in
+ * front of a human, blur-duplicate included. A fork-signal count climbing relative to attach says
+ * concepts are going bimodal faster than they are consolidating; a blur-duplicate count climbing
+ * says centroids are drifting away from the evidence under them. Both land in `possibleDuplicates`
+ * awaiting mediation. A `new` rate near 1.0 on a mature circle says nothing is resolving at all.
+ *
+ * MISFILE RATE IS NOT HERE, deliberately: it is not observable at store time. It is derived later
+ * by joining the durable `resolution_events` log against subsequent detach/reassign — a human
+ * moving an observation off the concept resolution chose IS the misfile — and this slice ships the
+ * log that makes that join possible rather than a tracker that guesses at it.
+ */
+export interface ResolutionStats {
+  /** Width of the `byMode`/`windowTotal`/`decidedTotal` window, in days. Numbers self-describe. */
+  windowDays: number;
+  /** Counts by resolution mode within the window; modes with no events in the window are omitted. */
+  byMode: Array<{ mode: ResolutionMode; count: number }>;
+  /** Every event in the window, bypasses included. Activity, NOT a rate denominator. */
+  windowTotal: number;
+  /** Events in the window that actually ran the resolution rule — THE denominator for every rate. */
+  decidedTotal: number;
+  /** All-time event count for this circle: says whether the window is representative. */
+  total: number;
+}
+
+/**
  * A glanceable, read-only snapshot of everything stored for a circle (the "what your agent
  * knows" view). Composes prewarm (living model + threads + contradictions) + scoped counts +
  * the connection-graph shape. Carries identity/shape only — never concept bodies (§4.5).
@@ -773,6 +853,8 @@ export interface MemoryOverview {
     possibleDuplicates: number;
   };
   health: { avgConfidence: number; graphDensity: number };
+  /** How store-time resolution has been deciding in this circle — the design's own empirical check. */
+  resolutionStats: ResolutionStats;
   livingModel: LivingModelCard[];
   activeThreads: PrewarmState["activeWorkstreams"];
   openContradictions: PrewarmContradiction[];
@@ -1586,6 +1668,52 @@ export class MonetCore {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (origin_id, table_name, natural_key)
       );
+      /*
+       * STORE-TIME RESOLUTION INSTRUMENTATION (find by evidence, confirm by identity — see
+       * src/resolution.ts). The design names the empirical check it wants on this rule — "fork rate
+       * and misfile rate, visible in curation" — so the log ships WITH the rule rather than being
+       * retrofitted once a suspicion arises: a rate you cannot compute for the weeks before you
+       * thought to ask is a rate you cannot use to judge the design.
+       *
+       * ONE ROW PER store() WRITE, every path, including the ones that bypass scoring entirely
+       * (attachTo / forceNew, recorded with null scores). Completeness is what makes it a RATE — a
+       * log of only the interesting cases has no denominator. CONNECTOR source ingest is the one
+       * exclusion: storeSource() never enters resolution at all (always explicit attachTo/forceNew,
+       * by construction, on its own write path), so logging it would inflate the denominator with
+       * writes that had no decision to make and depress every rate computed from it.
+       *
+       * observation_id is the join key, and the reason it is here: MISFILE RATE is derived LATER by
+       * joining this log against subsequent detach/reassign events (an observation that a human
+       * moved off the concept resolution put it on IS the misfile), not by any tracking machinery
+       * built now. matched_observation_id names the specific evidence that nominated the concept,
+       * so a suspicious decision can be re-examined against the exact vector pair that produced it.
+       *
+       * LOCAL AND UNSYNCED, deliberately: this is a diagnostic record of what THIS device's
+       * embedder decided under THIS device's thresholds. Replicating it would merge decision logs
+       * taken in different embedding spaces under one timeline and make every rate computed from it
+       * a lie. It is therefore absent from maxPersistedSyncTimestamp's table map and from the sync
+       * envelope, and its clock is wall time (Date.now()) rather than the persisted sync clock.
+       */
+      CREATE TABLE IF NOT EXISTS resolution_events (
+        /*
+         * INTEGER PRIMARY KEY (SQLite's rowid alias), NOT a generator id. An instrumentation row
+         * must not perturb the thing it instruments: taking an id from this.newId() per store()
+         * shifted every downstream concept id in the eval corpus by one — 100+ id hunks, zero
+         * metric differences, but a diff that no longer proves the metrics are unchanged. The log
+         * is local and append-only and needs no globally-unique id, so it takes the free one.
+         */
+        id INTEGER PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        circle TEXT NOT NULL,
+        observation_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        nominated_concept_id TEXT,
+        obs_score REAL,
+        matched_observation_id TEXT,
+        centroid_score REAL
+      );
+      CREATE INDEX IF NOT EXISTS idx_resolution_events_circle_ts ON resolution_events(circle, ts);
     `);
     // Embedder pin columns (embedder-pin ADR, slice 1) — guarded here in init(), NOT in migrate()
     // (Codex review, PR #51 round 6, FIX T): a v8-era store whose sync_meta TABLE already exists
@@ -2353,6 +2481,7 @@ export class MonetCore {
       score: number;
       nearMatchId?: string;
       nearMatchScore?: number;
+      resolutionMode?: ResolutionMode;
       contradiction?: Contradiction;
       prior?: IngestResult;
       proofToken?: EmbeddingWidthProofToken;
@@ -2376,17 +2505,37 @@ export class MonetCore {
       // The width proof above guarantees every live candidate can be compared without cosine's
       // truncation behavior. Keeping the scan inside this same transaction also freezes the set
       // through the ensuing mutation.
-      const matches = this.bestMatches(emb, circle, EDGE_NEIGHBORS);
+      //
+      // ONE candidate enumeration, TWO scans over it, answering two different questions:
+      //   - `related` EDGE DERIVATION asks a concept-to-concept question ("what is this near?") and
+      //     KEEPS the centroid scan. A concept's identity vector is the right object to relate
+      //     concepts by, and an edge is not a resolution decision — deriveEdges' inputs are
+      //     deliberately unchanged by this slice.
+      //   - RESOLUTION asks an evidence question ("does anything already stored actually SAY this?")
+      //     and scans OBSERVATIONS (nominateByObservation, below; src/resolution.ts for why).
+      // The two are allowed to disagree, and their disagreement is the fork signal.
+      const candidates = this.resolutionCandidates(circle);
+      const matches = this.rankByCentroid(candidates, emb, EDGE_NEIGHBORS);
+      // FIND BY EVIDENCE. Scanned before the incoming observation row is inserted below, so the
+      // store can never nominate a concept on the strength of the very observation it is resolving.
+      //
+      // SKIPPED ENTIRELY on the two paths that bypass scoring. Not a micro-optimization: the scan
+      // is the store path's dominant cost (it cosines every live observation vector in the circle,
+      // where the centroid scan cosines one vector per concept), and attachTo is how BULK
+      // CONSOLIDATION works — an import that attaches thousands of observations to named concepts
+      // would pay for a nomination it discards on every single one. Measured at 250 concepts /
+      // 2,500 observations, running it unconditionally made attachTo writes ~2.4x slower.
+      const nomination = opts.attachTo || opts.resolution === "forceNew"
+        ? null
+        : this.nominateByObservation(candidates, emb);
       // Keep the documented epoch-ms `since` contract even when this instance reuses a session
       // after a long idle. In logical maintenance mode this is still only a persisted +1.
       this.nextSyncTimestamp();
 
-      // The pre-embed candidate scan is deliberately outside this transaction. Re-read the
-      // participants here so a concurrent retirement cannot be revived by an ordinary store.
+      // Re-read the participants so a concurrent retirement cannot be revived by an ordinary store.
       const liveMatches = matches
         .map(({ match: candidate, score: candidateScore }) => ({ match: this.getRow(candidate.id), score: candidateScore }))
         .filter((candidate): candidate is { match: ConceptRow; score: number } => candidate.match !== null && candidate.match.status !== "retired");
-      const { match: activeMatch, score: activeScore } = liveMatches[0] ?? { match: null, score: 0 };
       let attachTarget: ConceptRow | null = null;
       if (opts.attachTo) {
         attachTarget = this.getRow(opts.attachTo);
@@ -2411,55 +2560,77 @@ export class MonetCore {
       let row: ConceptRow;
       let nearMatchId: string | undefined;
       let nearMatchScore: number | undefined;
+      let mode: ResolutionMode;
+      /** Did this write land on an ALREADY-EXISTING concept? The First Block and contradiction
+       *  hooks below both key on this rather than on the coarse `action` string: since the fork
+       *  signal, action="ambiguous" + kind="correction" no longer implies an attach (a correction
+       *  whose target is bimodal FORKS), so the old string test would open a contradiction against
+       *  a concept created microseconds earlier — one with nothing to contradict. */
+      let landedOnExisting: boolean;
+      /** The score that DROVE the decision — reported as IngestResult.score on the auto path. */
+      let autoScore = 0;
 
       if (opts.attachTo) {
         // Direct attach: bypass scoring, land on named concept. (sourceConnector calls never reach
         // here — storeInternal returns via storeSourceChunk before this transaction opens.)
         row = this.attach(attachTarget!, content, emb, sessionId, obsId);
         action = "attached";
+        mode = "direct-attach";
+        landedOnExisting = true;
       } else if (opts.resolution === "forceNew") {
         // Always create a new concept regardless of similarity.
         // forceNew intentionally records no possible_duplicate_of edge — the caller asserts distinctness (bulk import); the returned score still reports the nearest neighbor.
         row = this.create(content, emb, circle, opts.kind, sourceIdentity, sourceConnector ? obsId : null);
         action = "created";
+        mode = "force-new";
+        landedOnExisting = false;
       } else {
-        // Auto resolution: score-based deduplication.
-        if (activeMatch && activeScore >= this.tauAttach) {
-          action = "attached";
-          row = this.attach(activeMatch, content, emb, sessionId, obsId);
-        } else if (activeMatch && activeScore >= this.tauAmbiguous) {
-          // A wrong fork is recoverable (the pair can be merged later); a wrong merge is not
-          // (split loses provenance). Ambiguous-band evidence therefore forks, with a
-          // possible_duplicate_of edge for later mediation.
-          // Exception: kind="correction" is exempt from fork-on-ambiguous — the caller is
-          // explicitly asserting "this overrides existing memory", so the intent disambiguates.
-          if (opts.kind === "correction") {
-            // Attach to the near match and let the existing correction path open a contradiction.
-            action = "ambiguous";
-            row = this.attach(activeMatch, content, emb, sessionId, obsId);
-            nearMatchId = activeMatch.id;
-            nearMatchScore = activeScore;
-          } else {
-            action = "ambiguous";
-            row = this.create(content, emb, circle, opts.kind);
-            nearMatchId = activeMatch.id;
-            nearMatchScore = activeScore;
-            if (this.graphEnabled) {
-              this.upsertEdgeBoth(row.id, activeMatch.id, "possible_duplicate_of", activeScore, "cheap", circle);
-            }
-          }
+        // AUTO RESOLUTION — find by evidence, confirm by identity. The decision itself is a pure
+        // function (src/resolution.ts, unit-tested exhaustively at its band boundaries); everything
+        // below is execution of that decision inside this transaction.
+        const decision: ResolutionDecision = resolveIncoming({
+          nomination,
+          // The centroid argmax, for PAIRING only — it can never attach anything (see
+          // createOrPair). Read from the same scan `related` edge derivation uses, so a neighbour
+          // that centroid derivation considers is the same one resolution can pair with.
+          centroidTop: liveMatches[0]
+            ? { conceptId: liveMatches[0].match.id, centroidScore: liveMatches[0].score }
+            : null,
+          kind: opts.kind,
+          thresholds: { tauAttach: this.tauAttach, tauAmbiguous: this.tauAmbiguous },
+        });
+        action = decision.action;
+        mode = decision.mode;
+        nearMatchId = decision.nearMatchId;
+        nearMatchScore = decision.nearMatchScore;
+        autoScore = decision.score;
+        if (decision.attachToConceptId !== undefined) {
+          landedOnExisting = true;
+          row = this.attach(this.getRow(decision.attachToConceptId)!, content, emb, sessionId, obsId);
         } else {
-          action = "created";
+          landedOnExisting = false;
           row = this.create(content, emb, circle, opts.kind);
+          // All THREE pairing modes record the SAME possible_duplicate_of edge — they differ only
+          // in WHICH signal found the neighbour (evidence for ambiguous-fork and fork-signal,
+          // identity for blur-duplicate). Sharing the edge is the point: every such pair lands in
+          // front of the same curation surface (memory_overview's possibleDuplicates,
+          // memory_resolve) that already mediates duplicates. The weight comes from the decision
+          // rather than from `decision.score` because the pairing trigger is not always the
+          // create trigger — see ResolutionDecision.duplicateEdge for the rule.
+          if (decision.duplicateEdge !== undefined && this.graphEnabled) {
+            const { conceptId: pairedWith, weight } = decision.duplicateEdge;
+            this.upsertEdgeBoth(row.id, pairedWith, "possible_duplicate_of", weight, "cheap", circle);
+          }
         }
       }
 
       this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
+      this.recordResolutionEvent(circle, obsId, action, mode, nomination);
 
       // First Block hook: any path that ATTACHED to an EXISTING concept invalidates its summary.
-      // New-concept branches (create / forceNew + non-correction ambiguous) do NOT set dirty —
-      // there is no existing summary to invalidate for a brand-new concept.
-      if (action === "attached" || (action === "ambiguous" && opts.kind === "correction")) {
+      // New-concept branches (create / forceNew / either fork mode) do NOT set dirty — there is no
+      // existing summary to invalidate for a brand-new concept.
+      if (landedOnExisting) {
         this.invalidateFirstBlockEntry(row.id);
       }
 
@@ -2486,14 +2657,13 @@ export class MonetCore {
 
       // Contradiction detection is agent-judged, expressed cheaply: a "correction" that lands on
       // an EXISTING concept is the agent saying "this overrides what's there" → open a conflict
-      // (ADR §4.1 step 4 / §4.6). Novel corrections (action="created") have nothing to contradict.
-      // For attachTo: always flag regardless of the action-string gate (the caller explicitly named
-      // a target, so it is always an existing concept by validation above).
-      // For ambiguous corrections: action="ambiguous" but the correction was attached to the near match
-      // (F6 exemption), so we must treat it as existing to open the contradiction.
+      // (ADR §4.1 step 4 / §4.6). A correction that CREATED its concept — novel evidence, or a
+      // fork signal — has nothing to contradict: the concept it would dispute is the one this very
+      // call just wrote. `landedOnExisting` is the direct test for that and covers every path
+      // (attachTo, attach, the ambiguous-band correction exemption) without inferring attachment
+      // from the coarse `action` string.
       let contradiction: Contradiction | undefined;
-      const onExisting = action === "attached" || opts.attachTo !== undefined || (action === "ambiguous" && opts.kind === "correction");
-      if (opts.kind === "correction" && onExisting) {
+      if (opts.kind === "correction" && landedOnExisting) {
         contradiction = this.flagContradiction(row.id, {
           observationId: obsId,
           kind: "value-conflict",
@@ -2504,9 +2674,14 @@ export class MonetCore {
 
       // The operation receipt lives in the same transaction as all engine writes. A crash either
       // leaves neither, or leaves a retrievable (conceptId, observationId) pair for retry.
+      // forceNew's score stays the informational CENTROID nearest-neighbor it has always been (the
+      // caller asserted distinctness; the number is a "what did it look like" courtesy, not a
+      // decision). attachTo reports cosine against the target it was told to use. The auto path
+      // reports the score that actually drove the decision — now the NOMINATION's obs-level score,
+      // because that is what the decision was made on.
       const returnScore = opts.resolution === "forceNew" ? (liveMatches[0]?.score ?? 0)
         : opts.attachTo ? cosine(emb, jsonToEmb(row.embedding))
-        : activeScore;
+        : autoScore;
       if (opts.operationId) {
         this.db
           .prepare(
@@ -2523,7 +2698,7 @@ export class MonetCore {
       }
 
       const proofToken = this.captureEmbeddingWidthProof(emb.length);
-      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, contradiction, proofToken };
+      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, proofToken };
     })();
 
     if (txResult.prior) return txResult.prior;
@@ -2534,7 +2709,7 @@ export class MonetCore {
       this.lastConceptByCircle.set(circle, txResult.row.id);
     }
 
-    const { action, row, observationId, nearMatchId, nearMatchScore, contradiction } = txResult;
+    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction } = txResult;
 
     // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
     const returnScore = txResult.score;
@@ -2547,6 +2722,7 @@ export class MonetCore {
       concept: toConcept(row),
       contradiction,
       ...(nearMatchId !== undefined ? { nearMatchId, nearMatchScore } : {}),
+      ...(resolutionMode !== undefined ? { resolutionMode } : {}),
     };
   }
 
@@ -5114,6 +5290,38 @@ export class MonetCore {
       .all(circle) as Array<{ type: string; count: number }>;
   }
 
+  /**
+   * How store-time resolution has been deciding in this circle (see the ResolutionStats doc for how
+   * to read it, and src/resolution.ts for the rule being measured). Public accessor as well as
+   * overview()'s source — the rates are the design's own acceptance evidence, so they must be
+   * readable without rendering a whole overview.
+   *
+   * Ordered count-desc then mode-asc, matching edgeCountsByType's convention above (biggest first,
+   * deterministic among equals). Modes absent from the window are OMITTED rather than emitted as
+   * zeros: the mode vocabulary can grow, and a reader computing a rate divides by `windowTotal`.
+   */
+  resolutionStats(circle?: string, windowDays = RESOLUTION_STATS_WINDOW_DAYS): ResolutionStats {
+    circle ??= this.defaultCircle;
+    const since = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+    const byMode = this.db
+      .prepare(
+        `SELECT mode, COUNT(*) AS count FROM resolution_events
+          WHERE circle = ? AND ts >= ? GROUP BY mode ORDER BY count DESC, mode`,
+      )
+      .all(circle, since) as Array<{ mode: ResolutionMode; count: number }>;
+    const total = (this.db
+      .prepare(`SELECT COUNT(*) AS n FROM resolution_events WHERE circle = ?`)
+      .get(circle) as { n: number }).n;
+    const sum = (entries: typeof byMode): number => entries.reduce((acc, entry) => acc + entry.count, 0);
+    return {
+      windowDays,
+      byMode,
+      windowTotal: sum(byMode),
+      decidedTotal: sum(byMode.filter((entry) => isDecidedResolutionMode(entry.mode))),
+      total,
+    };
+  }
+
   /** The single largest "worked together" cluster (co_occurred connected component), or null. */
   topThread(circle?: string, minSize = 2): MemoryOverview["graph"]["thread"] {
     circle ??= this.defaultCircle;
@@ -5332,6 +5540,7 @@ export class MonetCore {
         avgConfidence: Number(avgConfidence.toFixed(2)),
         graphDensity: nativeConcepts === 0 ? 0 : Number((edges / nativeConcepts).toFixed(2)),
       },
+      resolutionStats: this.resolutionStats(circle),
       livingModel: pre.topConcepts,
       activeThreads: pre.activeWorkstreams,
       openContradictions: pre.openContradictions,
@@ -9502,19 +9711,115 @@ export class MonetCore {
   // ---- internals ---------------------------------------------------------
 
   /**
-   * Top-m concepts by cosine in a circle (workstreams excluded — identity-upserted, not
-   * embedding-resolved). matches[0] is the argmax the old bestMatch returned (so dedup is
-   * unchanged); the rest feed `related` edge derivation, reusing this single scan.
+   * THE CANDIDATE SET both store-time scans read: a circle's live NATIVE concepts. Workstreams are
+   * excluded (identity-upserted, not embedding-resolved) as are connector-owned source rows
+   * (explicit resolution only) and retirements.
+   *
+   * Extracted so the centroid scan (`related` edges) and the observation scan (resolution
+   * nomination) provably enumerate the SAME concepts from the SAME snapshot — a store-time decision
+   * and the edges derived alongside it disagreeing about which concepts exist would be a very quiet
+   * bug — and so the store path pays for this SELECT once instead of twice.
    */
-  private bestMatches(emb: Float32Array, circle: string, m: number): Array<{ match: ConceptRow; score: number }> {
-    const rows = this.db
+  private resolutionCandidates(circle: string): ConceptRow[] {
+    return this.db
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
       .all(circle) as ConceptRow[];
+  }
+
+  /** Top-m of an already-enumerated candidate set by CENTROID cosine. Ties break on the smaller id. */
+  private rankByCentroid(rows: readonly ConceptRow[], emb: Float32Array, m: number): Array<{ match: ConceptRow; score: number }> {
     return rows
       .map((r) => ({ match: r, score: cosine(emb, jsonToEmb(r.embedding)) }))
       .filter((x) => x.score > 0)
       .sort((a, b) => b.score - a.score || (a.match.id < b.match.id ? -1 : 1))
       .slice(0, m);
+  }
+
+  /**
+   * Top-m concepts by CENTROID cosine in a circle. Still the argmax the old bestMatch returned, and
+   * still what feeds `related` edge derivation — but no longer what RESOLUTION argmaxes over (see
+   * nominateByObservation and src/resolution.ts). Every remaining caller is a concept-level
+   * operation (merge-vs-move on reassign, graph rederivation, graph backfill) where comparing one
+   * concept's identity vector against another's is exactly the right question.
+   */
+  private bestMatches(emb: Float32Array, circle: string, m: number): Array<{ match: ConceptRow; score: number }> {
+    return this.rankByCentroid(this.resolutionCandidates(circle), emb, m);
+  }
+
+  /**
+   * FIND BY EVIDENCE — the nomination half of store-time resolution (src/resolution.ts explains
+   * why; this is only the scan). Argmax over per-concept BEST LIVE OBSERVATION cosine, using the
+   * same scorer the recall arm ranks with (scoreNativeConceptsByObservation, src/retrieval.ts), so
+   * "what would a search for this text find?" and "what does the store think this text IS?" can
+   * never drift apart.
+   *
+   * Returns null when nothing scored: an empty circle, or one whose every concept lacks a live,
+   * non-zero, positively-scoring observation vector. A concept with NO live observations is
+   * therefore un-nominatable — it cannot absorb anything, however close its centroid sits. That is
+   * the recall split's no-centroid-fallback edge, applied to the write path.
+   *
+   * The confirmation score is read from the SAME row object the candidate scan produced, not
+   * re-fetched — the two must describe one snapshot for the attach/fork verdict to mean anything.
+   *
+   * Ties break on the lexicographically smaller concept id (the codebase's determinism convention —
+   * rankByCentroid above, and the observation-level tie-break inside the scorer itself).
+   */
+  private nominateByObservation(candidates: readonly ConceptRow[], emb: Float32Array): ResolutionNomination | null {
+    if (candidates.length === 0) return null;
+    const scored = scoreNativeConceptsByObservation(this.db, candidates.map((c) => c.id), emb);
+    let best: ResolutionNomination | null = null;
+    for (const candidate of candidates) {
+      const match = scored.get(candidate.id);
+      if (match === undefined) continue;
+      if (best !== null && (match.score < best.obsScore || (match.score === best.obsScore && candidate.id > best.conceptId))) continue;
+      best = {
+        conceptId: candidate.id,
+        obsScore: match.score,
+        observationId: match.observationId,
+        centroidScore: cosine(emb, jsonToEmb(candidate.embedding)),
+      };
+    }
+    return best;
+  }
+
+  /**
+   * INSTRUMENTATION, written on EVERY store() — including the paths that bypass scoring, which
+   * record their mode with null scores. See the `resolution_events` DDL in init() for why this is
+   * complete rather than exception-only, why it is local/unsynced, and how misfile rate is meant to
+   * be derived from it later (join on `observation_id` against subsequent detach/reassign).
+   *
+   * The nomination is recorded as MEASURED, not as USED: a "new"-mode row still carries the
+   * sub-threshold nomination that lost, and a fork-signal row carries the centroid score that
+   * vetoed the attach. Logging only the winning side would make the log unable to answer the
+   * question it exists for — was this band the right place to cut? (A blur-duplicate row's
+   * `nominated_concept_id` is likewise the concept EVIDENCE nominated, which may not be the one the
+   * pairing edge went to; the pairing target is on the edge, the measurement is here.)
+   *
+   * Deliberately NOT wrapped in try/catch: it runs inside the store transaction, so a failure here
+   * rolls the write back rather than silently losing the row that write's rate depends on.
+   */
+  private recordResolutionEvent(
+    circle: string,
+    observationId: string,
+    action: IngestAction,
+    mode: ResolutionMode,
+    nomination: ResolutionNomination | null,
+  ): void {
+    // attachTo / forceNew never run the nomination scan at all (see storeInternal), so they record
+    // no scores — and this guard keeps that true by construction rather than by call-site
+    // discipline: a score in those rows would read as a decision input it never was.
+    const measured = mode === "direct-attach" || mode === "force-new" ? null : nomination;
+    this.db
+      .prepare(
+        `INSERT INTO resolution_events
+           (ts, circle, observation_id, action, mode, nominated_concept_id, obs_score, matched_observation_id, centroid_score)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        Date.now(), circle, observationId, action, mode,
+        measured?.conceptId ?? null, measured?.obsScore ?? null,
+        measured?.observationId ?? null, measured?.centroidScore ?? null,
+      );
   }
 
   // ---- #245 graph: derivation (write path) -------------------------------
@@ -11005,6 +11310,20 @@ export class MonetCore {
     const contradiction = operation.contradiction_id
       ? (this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(operation.contradiction_id) as ContradictionRow | undefined)
       : undefined;
+    // A RETRY MUST BE INDISTINGUISHABLE FROM THE ORIGINAL CALL — that is the whole contract of
+    // operationId ("a repeated write returns its original result", StoreOpts), and a caller
+    // branching on resolutionMode getting a different answer on retry than on the first call would
+    // be exactly the bug receipts exist to prevent. The mode is read back from `resolution_events`
+    // rather than stored a second time in this receipt: the receipt is already a POINTER SET (it
+    // rehydrates its concept, observation and contradiction from their own tables, above), and
+    // `ingest_operations` is a SYNCED table while the resolution log deliberately is not — widening
+    // it would replicate a local embedder's decision vocabulary to devices that never made it.
+    // Absent for source receipts (the connector path resolves nothing, so it logs nothing) and for
+    // writes made before this table existed; absent is also what the fresh path returns in both
+    // those cases, so the replay still matches it.
+    const resolution = this.db
+      .prepare(`SELECT mode FROM resolution_events WHERE observation_id = ?`)
+      .get(operation.observation_id) as { mode: ResolutionMode } | undefined;
     return {
       action: operation.action,
       conceptId: operation.concept_id,
@@ -11015,6 +11334,7 @@ export class MonetCore {
       ...(operation.near_match_id !== null
         ? { nearMatchId: operation.near_match_id, nearMatchScore: operation.near_match_score ?? 0 }
         : {}),
+      ...(resolution ? { resolutionMode: resolution.mode } : {}),
     };
   }
 

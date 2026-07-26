@@ -10,6 +10,7 @@
  * VISIBLE characters, so colored substrings never break alignment and no line exceeds `width`.
  */
 import type { MemoryOverview, EntityHub, ConnectedConcept, PossibleDuplicatePair } from "./engine";
+import { DECIDED_RESOLUTION_MODES } from "./resolution";
 
 interface RenderOpts {
   color?: boolean;
@@ -164,6 +165,27 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
       const bId = dim(`[${pd.conceptBId.slice(0, 8)}]`);
       out.push(truncate(`  · ${pd.conceptATitle} ${aId} / ${pd.conceptBTitle} ${bId}  (score: ${pd.score.toFixed(3)})`, width));
     }
+    out.push("");
+  }
+
+  // HOW RESOLUTION HAS BEEN DECIDING (src/resolution.ts). The design's empirical check on "find by
+  // evidence, confirm by identity" is fork rate and misfile rate "visible in curation" — and this
+  // is the human curation surface, so a JSON field on the MCP response does not discharge it.
+  // Compact by design: one line of mode counts plus the rate that matters, under the duplicate
+  // pairs those forks produced. Suppressed entirely on a store with no decided writes yet, where
+  // it would be a row of zeros telling nobody anything.
+  const rs = o.resolutionStats;
+  if (rs && rs.decidedTotal > 0) {
+    const decided = rs.byMode.filter((m) => DECIDED_RESOLUTION_MODES.includes(m.mode));
+    const paired = decided
+      .filter((m) => m.mode === "fork-signal" || m.mode === "ambiguous-fork" || m.mode === "blur-duplicate")
+      .reduce((sum, m) => sum + m.count, 0);
+    out.push(bold("RESOLUTION") + dim(`  — how new evidence landed, last ${rs.windowDays}d`));
+    out.push(truncate(dim(`  ${decided.map((m) => `${m.mode} ${m.count}`).join(" · ")}`), width));
+    out.push(truncate(
+      dim(`  ${rs.decidedTotal} decided · ${((paired / rs.decidedTotal) * 100).toFixed(0)}% surfaced a possible duplicate`),
+      width,
+    ));
     out.push("");
   }
 

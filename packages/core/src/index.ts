@@ -35,6 +35,7 @@ export type {
   GatherResult,
   GatherCard,
   MemoryOverview,
+  ResolutionStats,
   EntityHub,
   ConnectedConcept,
   MemoryListEntry,
@@ -86,6 +87,17 @@ export { MONET_SCHEMA_VERSION } from "./schema-version";
  *  a query can legitimately return FEWER cards than its limit — including zero. */
 export { NATIVE_SCORE_FLOOR } from "./retrieval";
 export type { NativeObservationMatch } from "./retrieval";
+/** Store-time resolution: find by evidence, confirm by identity. The DECISION is pure and exported
+ *  so a host can reason about (or test against) the exact bands its stores resolve under. */
+export { DECIDED_RESOLUTION_MODES, isDecidedResolutionMode, resolveIncoming } from "./resolution";
+export type {
+  ResolutionCentroidCandidate,
+  ResolutionDecision,
+  ResolutionInput,
+  ResolutionMode,
+  ResolutionNomination,
+  ResolutionThresholds,
+} from "./resolution";
 export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError } from "./store-embedder";
 export {
   DEFAULT_SOURCE_SCANNER_LIMITS,

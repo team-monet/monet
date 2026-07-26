@@ -148,6 +148,10 @@ describe("store() atomicity — crash during graph derivation", () => {
     const edgesBefore = port.countTable("memory_edge");
     const entitiesBefore = port.countTable("entities");
     const cesBefore = port.countTable("concept_entities");
+    // The store-time resolution log is written inside the same transaction, so it is covered by
+    // the same guarantee and counted here rather than assumed: an instrumentation row surviving a
+    // rolled-back write would report a decision the store never made, which is worse than no row.
+    const resolutionsBefore = port.countTable("resolution_events");
 
     // Arm crash: the next entities-table write will throw.
     port.armCrash();
@@ -163,6 +167,7 @@ describe("store() atomicity — crash during graph derivation", () => {
     expect(port.countTable("memory_edge")).toBe(edgesBefore);
     expect(port.countTable("entities")).toBe(entitiesBefore);
     expect(port.countTable("concept_entities")).toBe(cesBefore);
+    expect(port.countTable("resolution_events")).toBe(resolutionsBefore);
 
     c.close();
   });
@@ -186,15 +191,18 @@ describe("store() atomicity — crash during graph derivation", () => {
     // Counts unchanged.
     expect(port.countTable("observations")).toBe(obsBefore);
     expect(port.countTable("concepts")).toBe(conceptsBefore);
+    expect(port.countTable("resolution_events")).toBe(0);
 
     // Phase 2 — normal store succeeds (crash is disarmed after the single-shot fire).
     const result = await c.store("TypeScript EntityService path/to/file.ts");
     expect(result.action).toMatch(/^(created|attached)$/);
     expect(result.conceptId).toBeTruthy();
 
-    // Exactly one new observation and one new concept.
+    // Exactly one new observation, one new concept, and one resolution event — the log tracks
+    // COMMITTED writes exactly, which is what makes a rate computed from it trustworthy.
     expect(port.countTable("observations")).toBe(obsBefore + 1);
     expect(port.countTable("concepts")).toBe(conceptsBefore + 1);
+    expect(port.countTable("resolution_events")).toBe(1);
 
     // Full fetch works.
     const fetched = await c.getConcept(result.conceptId, { synthesize: false });
