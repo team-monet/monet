@@ -330,6 +330,13 @@ export interface RegisterMonetCoreToolsOpts {
   checkpointNudge?: boolean;
   /** Host-injected identity; never accepted from tool arguments. */
   sourceAuthorizationContext?: Readonly<SourceAuthorizationContext>;
+  /**
+   * Which model this runtime is serving — stamped on agent-scoped rules so the next model can
+   * retire this one's compensations. Host-supplied for the same reason the authorization context
+   * is: it is a property of the runtime, not something a tool argument should be able to claim.
+   * Falls back to MONET_MODEL_TAG.
+   */
+  modelTag?: string;
 }
 
 /**
@@ -389,6 +396,16 @@ export function registerMonetCoreTools(
   // the canonical circle without needing to know about the rename.
   const dc = core.getDefaultCircle();
   const scope = (circle?: string): string => core.resolveCircleName(circle ?? dc);
+
+  /**
+   * Which model an agent-scoped rule compensates for. HOST-SUPPLIED, never asked of the agent: the
+   * tag is a property of the runtime rather than of the judgment being stored, and "a new model
+   * retires the old model's compensations automatically" must not depend on a model reporting its
+   * own identity correctly. Absent (no MONET_MODEL_TAG, no explicit tag on the call), an
+   * agent-scoped capture is REFUSED rather than tagged with a guess — an untagged compensation is
+   * indistinguishable from a domain rule at the moment it matters, which is the shackle risk.
+   */
+  const defaultModelTag = opts?.modelTag ?? process.env.MONET_MODEL_TAG ?? undefined;
 
   /**
    * Capture the prewarm block BEFORE a handler runs (Fix B: snapshot prior state, not post-mutation
@@ -578,12 +595,54 @@ export function registerMonetCoreTools(
         .describe(
           "Concept id to attach this observation to directly, bypassing automatic deduplication. The concept must exist in the same circle. Mutually exclusive with resolution=\"forceNew\". Useful for manually consolidating a possible-duplicate pair surfaced by memory_overview.",
         ),
+      rule: z
+        .object({
+          stage: z
+            .string()
+            .describe(
+              "The action this rule fires at — a stage name, or the id of an existing stage. If no stage exists for this action yet, storing the rule CREATES it: a correction landing on an unstaged action is that stage's birth.",
+            ),
+          instance: z
+            .string()
+            .optional()
+            .describe(
+              'The concrete action you just watched go wrong, e.g. "Bash:git push --force origin main". Seeds the stage\'s trigger pattern when the stage is new — pass it whenever you have it.',
+            ),
+          scope: z
+            .enum(["domain", "agent"])
+            .optional()
+            .describe(
+              'Who this binds. "domain": it would still be true for a perfect agent (it describes the world). "agent" (default): it compensates for THIS model\'s failure habits. When uncertain, use "agent" — a wrong agent tag merely re-verifies on a model change, while a wrong domain tag shackles the next model.',
+            ),
+          modelTag: z
+            .string()
+            .optional()
+            .describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
+          reason: z
+            .string()
+            .optional()
+            .describe("One line naming the failure this prevents. This is what the gate shows, and the reason is what earns compliance."),
+        })
+        .optional()
+        .describe(
+          'Required when kind="rule". Binds the rule to the action it governs. Severity is always advisory here — blocking (deny) is declaration-only and lives in memory_declare.',
+        ),
     },
-    async ({ content, circle, kind, sourceRefs, resolution, attachTo }) => {
+    async ({ content, circle, kind, sourceRefs, resolution, attachTo, rule }) => {
       // Fix A + Fix B: capture the snapshot BEFORE the mutation so the block reflects prior state.
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
-        const r = await core.store(content, { circle: scope(circle), kind, sourceRefs, resolution, attachTo });
+        const r = await core.store(content, {
+          circle: scope(circle), kind, sourceRefs, resolution, attachTo,
+          // THE HOST TAG WINS. An agent-scoped rule names the model it compensates for, and the
+          // tag is a property of the RUNTIME, not of the judgment being stored — so the host's
+          // value is authoritative and the agent's is a fallback for hosts that supply none.
+          // Preferring the caller's had it backwards: a model that misreports its own identity
+          // (or simply guesses) would file its compensation under another model's tag, and the
+          // "a new model retires the old model's compensations" rule would then retire the wrong
+          // ones. Self-knowledge is exactly what this must not depend on.
+          ...(rule ? { rule: { ...rule, modelTag: defaultModelTag ?? rule.modelTag } } : {}),
+        });
         return mutOk({
           circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
@@ -597,9 +656,83 @@ export function registerMonetCoreTools(
             ? { contradiction: { id: r.contradiction.id, status: r.contradiction.status, detail: r.contradiction.detail } }
             : {}),
           ...(r.nearMatchId ? { nearMatchId: r.nearMatchId, nearMatchScore: r.nearMatchScore } : {}),
+          // A correction that overturned a rule did not attach to it — it birthed the rule's
+          // successor and superseded the incumbent. `conceptId` above is the successor.
+          ...(r.ruleSuccession ? { ruleSuccession: r.ruleSuccession } : {}),
         }, "memory_store", false, capturedBlock);
       } catch (e) {
         return err(`store failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_declare",
+    'Declare a rule or a stage on the user\'s authority. This is the SOVEREIGN entrance: unlike memory_store, which captures what a correction taught, this records what the user has decided — so it is the only surface that accepts severity="blocking" (deny the action, for safety boundaries where softness is dangerous) and the only one that may replace an existing rule\'s binding. NEVER declare on your own initiative: a declaration is the user legislating, so it needs the user to have said so. species="stage" creates or re-authors a gate address ("put a gate on terraform apply") — passing `patterns` REPLACES that stage\'s trigger patterns outright, which is how a mis-seeded pattern is fixed. species="rule" creates the rule and binds it to its stage, creating the stage if it does not exist. Standing grants and preferences are NOT a separate thing to declare: a gate returns what the rule says, so "proceed without asking" is a rule with permissive content. Principles (the always-on skeleton) are not declared here.',
+    {
+      species: z
+        .enum(["rule", "stage"])
+        .describe('"stage": create or re-author a gate address. "rule": create a rule and bind it to a stage.'),
+      stage: z
+        .string()
+        .describe("The action the gate fires on — a stage name, or the id of an existing stage. Required for both species."),
+      content: z.string().optional().describe('What the rule says. Required for species="rule".'),
+      patterns: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Trigger patterns as concrete command shapes, e.g. ["terraform apply", "Bash:git push --force"]. REPLACES the stage\'s existing patterns entirely — including an empty array, which makes the stage fire on nothing. Each is reduced to a tool constraint plus an ordered word run, and fires when those words appear in order anywhere in the intercepted action. Omit the field to leave the patterns alone.',
+        ),
+      instance: z
+        .string()
+        .optional()
+        .describe("A concrete instance to seed the pattern from, when the stage is new and no explicit patterns are given."),
+      severity: z
+        .enum(["advisory", "blocking"])
+        .optional()
+        .describe(
+          'OMIT THIS unless the user is ruling on the failure mode. Omitted PRESERVES whatever the rule already has (restating a rule\'s text or its gate is not a decision about whether it denies); on a brand-new rule, omitted means "advisory". "advisory": the rule is injected at the gate. "blocking": the action is DENIED — this exists only here, no agent and no projection can self-assign deny power, and only where softness is genuinely dangerous. Passing "advisory" for a rule that is currently blocking REMOVES the deny; that is allowed but it is the user\'s call, and the response reports it as downgraded.',
+        ),
+      acknowledgeBlockingRules: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Required when `patterns` would re-author a stage that has blocking rules bound to it: list every one of their concept ids. Changing a stage's patterns changes what its denies deny, so this confirms you have seen them. The error names the ids you are missing — show them to the user before acknowledging.",
+        ),
+      scope: z.enum(["domain", "agent"]).optional().describe('"domain": true for a perfect agent. "agent" (default): a compensation for this model.'),
+      modelTag: z.string().optional().describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
+      reason: z.string().optional().describe("One line naming the failure this prevents — what the gate shows, and what earns compliance."),
+      declaredBy: z.string().optional().describe("Who ruled. Defaults to the calling agent id."),
+      circle: z.string().optional(),
+      sourceRefs: z.array(z.string()).optional(),
+    },
+    async ({ species, stage, content, patterns, instance, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs, acknowledgeBlockingRules }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      try {
+        const r = await core.declare({
+          species, stage, content, patterns, instance, severity, scope: ruleScope,
+          modelTag: defaultModelTag ?? modelTag, reason, declaredBy, sourceRefs,
+          acknowledgeBlockingRules,
+          circle: scope(circle),
+        });
+        return mutOk(
+          {
+            circle: scope(circle),
+            ...r,
+            guidance:
+              r.species === "stage"
+                ? "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles."
+                : r.downgraded
+                  // A removed deny is never allowed to be something the user finds out later.
+                  ? "DENY REMOVED: this rule was blocking and is now advisory — the action it used to refuse will go through. Tell the user plainly. Re-declare with severity=\"blocking\" to restore it."
+                  : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.",
+          },
+          "memory_declare",
+          false,
+          capturedBlock,
+        );
+      } catch (e) {
+        return err(`declare failed: ${msg(e)}`);
       }
     },
   );

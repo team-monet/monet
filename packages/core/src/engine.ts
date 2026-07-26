@@ -104,7 +104,7 @@ import { Synthesizer, DeterministicSynthesizer } from "./synthesis";
 import { extractEntities } from "./extract-entities";
 import type {
   GraftPayload, GraftResult, SyncConceptRow, SyncEdgeComponentRow, SyncEdgeRow,
-  SyncLifecycleEdgeRow, SyncRatificationRow,
+  SyncLifecycleEdgeRow, SyncRatificationRow, SyncRuleBindingRow, SyncStageRow,
 } from "./sync-types";
 import {
   addLifecycleEdge,
@@ -119,7 +119,7 @@ import {
   ungovernableReason,
   supersessionCycle,
 } from "./lifecycle-edges";
-import { parseSpan } from "./spans";
+import { isSpanRef, parseSpan } from "./spans";
 import type {
   AddLifecycleEdgeInput,
   GetLifecycleEdgesOptions,
@@ -131,6 +131,47 @@ import type {
   RatificationVerdict,
   RecordRatificationInput,
 } from "./lifecycle-edges";
+import {
+  assertBlockingRuleMutationAllowed,
+  assertNoUnacknowledgedDenies,
+  bindRule,
+  blockingRuleMutationGuard,
+  bumpGateGeneration,
+  circleHasBlockingRule,
+  createGateSchema,
+  findStage,
+  formatTriggerPattern,
+  gateGeneration,
+  commitGateWrites,
+  evaluateGate,
+  gateStats,
+  getRuleBinding,
+  hasBlockingBinding,
+  inspectSidecar,
+  listStages,
+  liveBlockingRulesForStage,
+  materializeBlockingSidecar,
+  parseTriggerPatterns,
+  upsertStage,
+  RULE_BINDING_ORIGINS,
+  RULE_SCOPES,
+  RULE_SEVERITIES,
+  STAGE_ORIGINS,
+} from "./gates";
+import type {
+  BlockingSidecar,
+  GateDeps,
+  GateResult,
+  GateStats,
+  RuleBindingOrigin,
+  RuleBindingRow,
+  RuleScope,
+  RuleSeverity,
+  SidecarStaleness,
+  StageOrigin,
+  StageRow,
+  TriggerPattern,
+} from "./gates";
 import { inspectLifecycleEdgeIntegrity } from "./diagnostics";
 import type { LifecycleEdgeIntegrityReport } from "./diagnostics";
 import {
@@ -170,6 +211,8 @@ const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in ov
 /** Window for overview's resolution-mode counts. 30 days = the staleness horizon this store already
  *  uses for "recent" (staleAfterMs default), so curation reads one consistent notion of lately. */
 const RESOLUTION_STATS_WINDOW_DAYS = 30;
+/** Same window for gate stats, for the same reason — curation reads one consistent notion of lately. */
+const GATE_STATS_WINDOW_DAYS = 30;
 const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
 const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
 // Edges that may BOOST a similarity hit's rank: the "worked-on-together / causal" signals.
@@ -195,7 +238,7 @@ const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
  * rows silently dropped while its cursor advanced, losing them permanently. A receiver must be able
  * to say "this is newer than I understand" instead. Bump this whenever the payload gains a table.
  */
-const SYNC_PAYLOAD_PROTOCOL_VERSION = 11; // 11: + lifecycle_edges, ratifications
+const SYNC_PAYLOAD_PROTOCOL_VERSION = 12; // 11: + lifecycle_edges, ratifications; 12: + stages, rule_bindings
 const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/activation ledger
 // PRAGMA user_version gate for the file=concept reshape (Phase 1, ratified): the
 // uq_source_chunks_active_concept -> uq_source_chunks_active_concept_slot index swap and the
@@ -641,6 +684,43 @@ export interface IngestResult {
    * Absent on the connector source path, which resolves nothing.
    */
   resolutionMode?: ResolutionMode;
+  /**
+   * Set when this write was a correction that landed on a live RULE: the rule did not absorb the
+   * correction, it was SUPERSEDED by a successor born from it. `conceptId` above names the
+   * successor — the rule that governs from now on.
+   */
+  ruleSuccession?: RuleSuccession;
+  /** Set on a kind="rule" write: what the binding ended up as, and what it replaced. */
+  ruleBindingChange?: RuleBindingChange;
+}
+
+/**
+ * What a rule write did to the binding. Exists so a DOWNGRADE is reportable rather than merely
+ * performed: removing deny power is a decision a caller is entitled to make and never entitled to
+ * make silently.
+ */
+export interface RuleBindingChange {
+  conceptId: string;
+  severity: RuleSeverity;
+  /** Null when the binding is new. */
+  previousSeverity: RuleSeverity | null;
+  downgradedFromBlocking: boolean;
+}
+
+/**
+ * "A correction that overturns a rule births its successor at the same gate and supersedes the old
+ * rule in the same act — a gate never returns two contradicting rules."
+ */
+export interface RuleSuccession {
+  /** The overturned rule. Still active and searchable — it is the history, and the impeachment
+   *  evidence traveling up the parent edge — but never injected at a gate again. */
+  supersededRuleId: string;
+  /** The rule that now governs at that stage. */
+  successorRuleId: string;
+  /** The supersession lifecycle edge recording the act. */
+  supersessionEdgeId: string;
+  /** The stage both rules are bound to. Succession never moves a gate. */
+  stageId: string;
 }
 
 /** Options for store() — resolution mode and direct attachment. */
@@ -657,10 +737,136 @@ export interface StoreOpts {
   attachTo?: string;
   /** Durable caller-supplied idempotency key. A repeated write returns its original result. */
   operationId?: string;
+  /** Required when kind="rule": the stage this rule is bound to, and how it is scoped. */
+  rule?: RuleCaptureOpts;
+}
+
+/**
+ * Rule capture — "a rule is born at a correction", stored live when the agent notices it.
+ *
+ * Every field here answers a question the gate will be asked later: WHERE does this fire (`stage`
+ * + `instance`), WHAT does it cost to ignore (`reason` — "the reason is what earns compliance"),
+ * and WHO does it bind (`scope` + `modelTag`, so a new model can retire the old model's
+ * compensations automatically).
+ */
+export interface RuleCaptureOpts {
+  /** Stage name or id. Created if unknown — "a correction landing on an action with no stage IS
+   *  the stage's creation." */
+  stage: string;
+  /** The concrete action observed at the capture moment, e.g. "Bash:git push --force origin main".
+   *  Seeds the trigger pattern when the stage is being born; ignored when it already exists. */
+  instance?: string;
+  /** Advisory only on this surface. Blocking is declaration-only — use declare(). */
+  severity?: RuleSeverity;
+  /** Declaration only: replaces the stage's trigger patterns. Ignored on the capture path. */
+  patterns?: string[];
+  /** Declaration only: the live blocking rules a pattern replacement is knowingly re-aiming. */
+  acknowledgeBlockingRules?: string[];
+  /** Default "agent": when uncertain, tag agent. A wrong agent tag re-verifies on model change; a
+   *  wrong domain tag shackles the next model. */
+  scope?: RuleScope;
+  /** Which model this compensates for. Required when scope is "agent". */
+  modelTag?: string;
+  /** The prevented-failure one-liner the gate renders beside the rule. */
+  reason?: string;
+  /**
+   * INTERNAL — declare()'s entrance into this shared write path, never part of the agent-facing
+   * MCP surface (memory_store's schema does not expose it). It flips the binding's origin to
+   * `declaration`, which is what unlocks blocking severity and makes the binding REPLACE rather
+   * than defer to an existing one. The hard boundary is the schema's
+   * `severity != 'blocking' OR origin = 'declaration'` CHECK, not this flag: an engine caller that
+   * sets it IS declaring, which is the correct reading of a first-party API call.
+   */
+  declaration?: boolean;
+  /** Recorded on a declared binding: who ruled. Meaningless without `declaration`. */
+  declaredBy?: string;
 }
 
 /** Connector-only source ingestion options. `storeSource` is deliberately not exposed over MCP. */
-export type SourceStoreOpts = Omit<StoreOpts, "kind">;
+export type SourceStoreOpts = Omit<StoreOpts, "kind" | "rule">;
+
+/**
+ * A stage as read back: the registry entry, with its patterns already parsed. A stage is store-
+ * global and carries no circle — `git push --force` is the same action in every project.
+ */
+export interface StageView {
+  id: string;
+  name: string;
+  patterns: TriggerPattern[];
+  origin: StageOrigin;
+  /** False until these patterns have matched a real action at least once, anywhere. */
+  verified: boolean;
+  createdAt: number;
+}
+
+/** Input to declare() — the sovereign entrance for rules and stages. */
+export interface DeclareInput {
+  species: "rule" | "stage";
+  /** The action this fires on: a stage name, or an existing stage id. Required for both species. */
+  stage: string;
+  /** What the rule says. Required for species "rule". */
+  content?: string;
+  /** Replaces the stage's trigger patterns outright. Each entry is seeded like a capture instance. */
+  patterns?: string[];
+  /** A concrete instance to seed from when the stage is new and no explicit patterns were given. */
+  instance?: string;
+  /**
+   * THE ONLY SURFACE THAT ACCEPTS "blocking".
+   *
+   * OMITTED IS NOT "advisory". On a rule that already has a binding, omitting this preserves the
+   * severity already recorded — restating a rule's text or its gate is not a ruling on its failure
+   * mode. Only an explicit value changes it, and an explicit downgrade of a blocking rule is
+   * reported back as `{ downgraded: true, from: "blocking" }`.
+   */
+  severity?: RuleSeverity;
+  scope?: RuleScope;
+  modelTag?: string;
+  reason?: string;
+  declaredBy?: string;
+  circle?: string;
+  sourceRefs?: string[];
+  /**
+   * Required when `patterns` would re-author a stage that carries live blocking rules: name every
+   * one of them. Re-aiming a gate re-aims its denies, and this is what stops that from happening
+   * without the decision being made — see assertPatternReauthoringAcknowledged.
+   */
+  acknowledgeBlockingRules?: string[];
+}
+
+/**
+ * What a correction landing on a concept means. See ruleCorrectionVerdict for why this is a verdict
+ * rather than a boolean, and why nothing here throws.
+ */
+export type RuleCorrectionVerdict =
+  /** Overturn it: birth the successor and supersede the incumbent. */
+  | "supersede"
+  /** Not a rule at all — an ordinary correction, contradiction machinery applies. */
+  | "not-a-rule"
+  /** A live deny. Only declaration may replace or retire it. */
+  | "blocking"
+  /** Already superseded. History takes no corrections; the successor is the live rule. */
+  | "superseded";
+
+/** Outcome of declare(). */
+export type DeclareResult =
+  | {
+      species: "stage";
+      stage: StageView;
+      /** Rendered patterns before this call, so a re-authoring is auditable in-band. */
+      previousPatterns: string[];
+      /** Rendered patterns after. Equal to `previousPatterns` when nothing changed. */
+      patterns: string[];
+    }
+  | {
+      species: "rule";
+      conceptId: string;
+      action: IngestAction;
+      binding: RuleBindingRow;
+      stage: StageView;
+      /** Present ONLY when this declaration took deny power away from a rule that had it. */
+      downgraded?: true;
+      from?: "blocking";
+    };
 
 /** One stored observation as returned by getConcept (id needed to call detach). */
 export interface ObservationEntry {
@@ -897,6 +1103,8 @@ export interface MemoryOverview {
   health: { avgConfidence: number; graphDensity: number };
   /** How store-time resolution has been deciding in this circle — the design's own empirical check. */
   resolutionStats: ResolutionStats;
+  /** How the gates have been firing — fire precision, silence rate, and the dead-pattern watchlist. */
+  gateStats: GateStats;
   livingModel: LivingModelCard[];
   activeThreads: PrewarmState["activeWorkstreams"];
   openContradictions: PrewarmContradiction[];
@@ -1042,6 +1250,22 @@ export interface MonetCoreOptions {
   sourcePathValidationCheck?: () => void;
   /** Source-ledger/registry clock seam for deterministic scheduler and recovery tests. */
   sourceClock?: () => number;
+  /**
+   * Where to materialize the blocking-rule mirror (the local JSON sidecar a host hook reads when
+   * the server is unreachable). NO DEFAULT, deliberately: with one, every MonetCore ever
+   * constructed — tests, evals, one-off scripts — would write into the user's real store directory
+   * on the first declaration. The mirror belongs to whoever wired the hook that reads it, so that
+   * caller names the path. Unset means declarations write no file; the engine method still works
+   * when given an explicit path.
+   */
+  gateSidecarPath?: string;
+  /**
+   * Which model this runtime is serving. Agent-scoped rules — compensations for one model's failure
+   * habits — are delivered only when their tag matches this one, which is the mechanism behind "a
+   * new model retires the old model's compensations automatically". Unset means no filtering: a
+   * store that does not know which model is asking must not silently stop delivering rules.
+   */
+  runtimeModelTag?: string;
 }
 
 interface ConceptRow {
@@ -1232,6 +1456,10 @@ export class MonetCore {
   private sourceGit: RemoteGitOptions;
   private sourcePathValidationCheck: () => void;
   private sourceClock: () => number;
+  /** Where declarations re-materialize the blocking mirror. Null = nobody wired a hook to read it. */
+  private gateSidecarPath: string | null;
+  /** Which model this runtime is serving — the default for gate() and gateStats(). See the option. */
+  private runtimeModelTag: string | null;
   /** Stable store identity for sync; unlike agentId this is persisted and never defaults globally. */
   private syncDeviceId = "";
   /** The previous concept written in the current session, PER circle — for `follows` edges (ADR §3.7).
@@ -1263,6 +1491,8 @@ export class MonetCore {
     this.sourceStorageDir = resolve(opts.sourceStorageDir ?? resolve(homedir(), ".monet", "sources"));
     this.sourceGit = opts.sourceGit ?? {};
     this.sourceClock = opts.sourceClock ?? (() => Date.now());
+    this.gateSidecarPath = opts.gateSidecarPath ?? null;
+    this.runtimeModelTag = opts.runtimeModelTag ?? null;
     this.sourcePathValidationCheck = opts.sourcePathValidationCheck ?? (() => undefined);
     this.sourceRegistry = new SourceRegistry(this.db, {
       idGen: this.newId,
@@ -1423,6 +1653,11 @@ export class MonetCore {
       // contributes nothing rather than failing.)
       lifecycle_edges: ["created_at", "sync_updated_at"],
       ratifications: ["created_at", "sync_updated_at"],
+      // Stages and rule bindings sync, so their stamps hold the clock up too. `gate_events` is
+      // absent on purpose: it is local-only instrumentation on wall time, exactly like
+      // resolution_events.
+      stages: ["created_at", "sync_updated_at"],
+      rule_bindings: ["created_at", "sync_updated_at"],
     };
     const selects: string[] = [];
     for (const [table, candidates] of Object.entries(timestampColumns)) {
@@ -1794,6 +2029,10 @@ export class MonetCore {
     // than inlined above: these tables are deliberately invisible to the similarity graph, and
     // keeping their DDL out of the shared block is the first line of that separation.
     createLifecycleEdgeSchema(this.db);
+    // Gate substrate (stages + rule_bindings + gate_events). Owned by src/gates.ts for the same
+    // reason: the firing path is deliberately separate machinery from the similarity graph, and
+    // keeping its DDL out of the shared block above is the first line of that separation.
+    createGateSchema(this.db);
   }
 
   /** Guarded migration for older DBs: add columns if missing (SQLite has no ADD COLUMN IF NOT EXISTS). */
@@ -1882,6 +2121,15 @@ export class MonetCore {
     }
     if (!operationCols.some((c) => c.name === "source_concept_id")) {
       this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN source_concept_id TEXT`);
+    }
+    // The severity a rule write REPLACED. Everything else a receipt reports is a pointer it
+    // rehydrates from the substrate at replay — but a transition's starting point is not a pointer
+    // to anything: once the binding is overwritten, nothing in the store remembers what it was, and
+    // a retried operationId would report `downgradedFromBlocking: false` where the first call
+    // reported true. A caller branching on that would act differently on retry, which is the exact
+    // failure receipts exist to prevent. Local table, guarded ALTER, same as the two above.
+    if (!operationCols.some((c) => c.name === "rule_previous_severity")) {
+      this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_previous_severity TEXT`);
     }
     // aliases: slugs/ids a concept ANSWERS TO after absorbing another on merge — so an asserted
     // reference to a merged-away slug (`supports: #old-slug`) still resolves to the survivor.
@@ -2473,6 +2721,7 @@ export class MonetCore {
       if (opts.sourceRefs?.some((ref) => ref.startsWith("source://"))) {
         throw new Error("source:// provenance is reserved to the source connector");
       }
+      this.validateRuleCapture(opts);
     }
     this.assertPinSatisfied();
     this.requireStableEmbedderIdentity();
@@ -2534,6 +2783,8 @@ export class MonetCore {
       nearMatchScore?: number;
       resolutionMode?: ResolutionMode;
       contradiction?: Contradiction;
+      ruleSuccession?: RuleSuccession;
+      ruleBindingChange?: RuleBindingChange;
       prior?: IngestResult;
       proofToken?: EmbeddingWidthProofToken;
     } => {
@@ -2621,13 +2872,50 @@ export class MonetCore {
       /** The score that DROVE the decision — reported as IngestResult.score on the auto path. */
       let autoScore = 0;
 
+      /**
+       * RULE DEATH. Set when this correction landed on a live RULE concept: instead of attaching,
+       * the correction births the rule's successor and supersedes the incumbent in the same act.
+       * Held here so the post-branch hooks (First Block, contradiction) can see that nothing
+       * attached, and so the supersession edge can be written once, below, on either path.
+       */
+      let supersededRule: ConceptRow | null = null;
+
       if (opts.attachTo) {
         // Direct attach: bypass scoring, land on named concept. (sourceConnector calls never reach
         // here — storeInternal returns via storeSourceChunk before this transaction opens.)
-        row = this.attach(attachTarget!, content, emb, sessionId, obsId);
-        action = "attached";
+        // The caller NAMED this target, so a refused landing is reported rather than routed around.
+        const namedVerdict = this.ruleCorrectionVerdict(opts.kind, attachTarget!);
+        if (namedVerdict === "blocking") {
+          throw new Error(
+            `rule '${attachTarget!.id}' is a blocking rule and cannot be corrected: blocking severity is ` +
+              `declaration-only, so declaration is also the only path that may replace or retire it`,
+          );
+        }
+        if (namedVerdict === "superseded") {
+          throw new Error(
+            `rule '${attachTarget!.id}' has already been superseded by '${this.supersessorOf(attachTarget!.id)}' ` +
+              `and is retained as history; correct the successor instead`,
+          );
+        }
+        if (namedVerdict === "supersede") {
+          supersededRule = attachTarget!;
+          row = this.create(content, emb, circle, "rule");
+          action = "created";
+          landedOnExisting = false;
+        } else if (opts.kind === "rule" && !this.canCarryRuleEvidence(attachTarget!)) {
+          // The caller NAMED this target, so the mismatch is a caller error rather than something
+          // to route around silently — see canCarryRuleEvidence for why landing here at all would
+          // produce a rule that is stored and can never fire.
+          throw new Error(
+            `cannot attach rule evidence to concept '${attachTarget!.id}': ` +
+              `${attachTarget!.kind === "rule" ? "it has been superseded and is retained as history" : `it is a '${attachTarget!.kind}', not a rule`}`,
+          );
+        } else {
+          row = this.attach(attachTarget!, content, emb, sessionId, obsId);
+          action = "attached";
+          landedOnExisting = true;
+        }
         mode = "direct-attach";
-        landedOnExisting = true;
       } else if (opts.resolution === "forceNew") {
         // Always create a new concept regardless of similarity.
         // forceNew intentionally records no possible_duplicate_of edge — the caller asserts distinctness (bulk import); the returned score still reports the nearest neighbor.
@@ -2656,8 +2944,48 @@ export class MonetCore {
         nearMatchScore = decision.nearMatchScore;
         autoScore = decision.score;
         if (decision.attachToConceptId !== undefined) {
-          landedOnExisting = true;
-          row = this.attach(this.getRow(decision.attachToConceptId)!, content, emb, sessionId, obsId);
+          // A NOMINATED rule is corrected exactly like a NAMED one. The resolution hybrid decides
+          // WHICH concept this correction lands on; whether landing on it means "absorb" or
+          // "supersede" is a property of what it landed on, not of how it was found. Branching on
+          // the landed concept's kind is what keeps those two questions separate.
+          const landed = this.getRow(decision.attachToConceptId)!;
+          const verdict = this.ruleCorrectionVerdict(opts.kind, landed);
+          // FOUR WAYS A NOMINATED LANDING CAN BE REFUSED, and all of them fork rather than fail.
+          // Resolution chose this concept, not the caller: refusing the WRITE because the concept
+          // resolution picked turns out to be a deny, or dead, or the wrong species, would discard
+          // an observation the agent never asked to put there. Forking keeps the evidence and puts
+          // the near-match in front of a human, which is what the substrate already does whenever
+          // it declines to merge.
+          const forkReason: "blocking-rule" | "superseded-rule" | "species" | null =
+            verdict === "blocking" ? "blocking-rule"
+            : verdict === "superseded" ? "superseded-rule"
+            : opts.kind === "rule" && !this.canCarryRuleEvidence(landed) ? "species"
+            : null;
+          if (verdict === "supersede") {
+            supersededRule = landed;
+            landedOnExisting = false;
+            action = "created";
+            row = this.create(content, emb, circle, "rule");
+          } else if (forkReason !== null) {
+            landedOnExisting = false;
+            action = "created";
+            // A refused CORRECTION keeps its own kind (it is evidence about something, not a rule);
+            // a refused RULE capture is still a rule and must be born as one or it can never fire.
+            row = this.create(content, emb, circle, opts.kind === "rule" ? "rule" : opts.kind);
+            // PAIR them, exactly as the ordinary fork modes do. The evidence genuinely matched —
+            // that is why resolution wanted to attach — so the two belong in front of the same
+            // curation surface (memory_overview's possibleDuplicates) rather than sitting unlinked.
+            // Weight is the nomination's own obs-level score: the similarity that drove the
+            // decision this branch overrode.
+            nearMatchId = landed.id;
+            nearMatchScore = decision.score;
+            if (this.graphEnabled) {
+              this.upsertEdgeBoth(row.id, landed.id, "possible_duplicate_of", decision.score, "cheap", circle);
+            }
+          } else {
+            landedOnExisting = true;
+            row = this.attach(landed, content, emb, sessionId, obsId);
+          }
         } else {
           landedOnExisting = false;
           row = this.create(content, emb, circle, opts.kind);
@@ -2677,6 +3005,26 @@ export class MonetCore {
 
       this.db.prepare(`UPDATE observations SET concept_id = ? WHERE id = ?`).run(row.id, obsId);
       this.recordResolutionEvent(circle, obsId, action, mode, nomination);
+
+      // ---- the normative half of this write ---------------------------------
+      // Same transaction as the observation and the concept, deliberately: a successor rule
+      // without its supersession edge would be a SECOND live rule at one gate, which is precisely
+      // the state "a gate never returns two contradicting rules" forbids.
+      let ruleSuccession: RuleSuccession | undefined;
+      let ruleBindingChange: RuleBindingChange | undefined;
+      if (supersededRule !== null) {
+        ruleSuccession = this.succeedRule(supersededRule, row, obsId, opts);
+      } else if (opts.kind === "rule") {
+        ruleBindingChange = this.captureRuleBinding(row, opts);
+      }
+      // Provenance: a sourceRef in the span:// namespace is a transcript location, so it becomes a
+      // first-class provenance edge as well as an ordinary ref ("every rule must trace to a
+      // transcript span"). Non-span refs stay ordinary refs. Span ABSENCE is not an error here —
+      // the scanner backfills missing spans in a later slice, and a live capture that has no span
+      // to offer must still be allowed to store the rule.
+      if (opts.kind === "rule" || ruleSuccession !== undefined) {
+        this.recordRuleProvenance(row.id, sourceRefs, obsId);
+      }
 
       // First Block hook: any path that ATTACHED to an EXISTING concept invalidates its summary.
       // New-concept branches (create / forceNew / either fork mode) do NOT set dirty — there is no
@@ -2737,19 +3085,20 @@ export class MonetCore {
         this.db
           .prepare(
             `INSERT INTO ingest_operations
-               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (operation_id, concept_id, observation_id, writer_domain, source_concept_id, action, score, near_match_id, near_match_score, contradiction_id, rule_previous_severity)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             opts.operationId, row.id, obsId, receiptExpectation.domain,
             receiptExpectation.domain === "source" ? row.id : null,
             action, returnScore,
             nearMatchId ?? null, nearMatchScore ?? null, contradiction?.id ?? null,
+            ruleBindingChange?.previousSeverity ?? null,
           );
       }
 
       const proofToken = this.captureEmbeddingWidthProof(emb.length);
-      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, proofToken };
+      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, proofToken };
     })();
 
     if (txResult.prior) return txResult.prior;
@@ -2760,10 +3109,14 @@ export class MonetCore {
       this.lastConceptByCircle.set(circle, txResult.row.id);
     }
 
-    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction } = txResult;
+    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction, ruleSuccession, ruleBindingChange } = txResult;
 
     // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
     const returnScore = txResult.score;
+
+    // A rule write can put deny power in play (a declaration) or end it (a supersession). Gated on
+    // the rule paths so an ordinary store() does not pay a read on the hot path.
+    if (ruleBindingChange !== undefined || ruleSuccession !== undefined) this.refreshGateSidecar();
 
     return {
       action,
@@ -2774,6 +3127,8 @@ export class MonetCore {
       contradiction,
       ...(nearMatchId !== undefined ? { nearMatchId, nearMatchScore } : {}),
       ...(resolutionMode !== undefined ? { resolutionMode } : {}),
+      ...(ruleSuccession !== undefined ? { ruleSuccession } : {}),
+      ...(ruleBindingChange !== undefined ? { ruleBindingChange } : {}),
     };
   }
 
@@ -3133,6 +3488,22 @@ export class MonetCore {
     if (!row) throw new Error(`concept not found: ${conceptId}`);
     if (isConnectorOwnedRow(row)) throw new Error("cannot mutate a source concept");
     if (row.status === "retired") throw new Error("cannot mutate a retired concept");
+    // CHOKEPOINT, and then some. Flagging sets status='disputed' and the gate delivers only active
+    // concepts, so this removed a deny through an ordinary MCP tool with no declaration in sight.
+    // The guard is consulted for the deny case so the doctrine reads from one place...
+    assertBlockingRuleMutationAllowed(this.db, conceptId, "dispute (contradiction)");
+    // ...and then the refusal widens to EVERY rule, blocking or not, because the design says rules
+    // do not work this way at all: "a correction that overturns a rule births its successor and
+    // supersedes the old rule IN THE SAME ACT", and a gate returns rules, never contradictions. A
+    // rule in tension with something is corrected — memory_store kind="correction" — which
+    // supersedes it and leaves the successor governing. There is nothing for mediation to mediate.
+    if (row.kind === "rule") {
+      throw new Error(
+        `concept '${conceptId}' is a rule and cannot be flagged as contradicted: a rule is overturned by ` +
+          `correcting it (memory_store kind="correction"), which supersedes it and births its successor ` +
+          `in one act. Blocking rules change only by declaration.`,
+      );
+    }
     const id = this.newId();
     // Atomic: contradiction insert + concept status/confidence update must be all-or-nothing.
     // Called both standalone (MCP/agent) and from inside store()'s own transaction envelope;
@@ -4293,6 +4664,12 @@ export class MonetCore {
     if (row.status === "retired") return toConcept(row);
     const result = this.db.transaction((): Concept => {
       const retiredAt = this.nextConceptLifecycleTimestamp(id);
+      // CHOKEPOINT. Retiring a live deny removes it from the gate, and that is declaration's
+      // decision to make, not retirement's.
+      assertBlockingRuleMutationAllowed(this.db, id, "retire");
+      // A retired rule governs nothing, so retiring one whose deny was already withdrawn CHANGES
+      // THE MIRROR — the over-block case: the file keeps denying an action nothing denies any more.
+      this.noteBlockingRuleTouched(id);
       // Retiring removes a concept from every public curation surface; an open contradiction can
       // no longer be mediated there, so close it explicitly rather than leaving an orphaned alert.
       this.db
@@ -4325,6 +4702,7 @@ export class MonetCore {
       return toConcept(this.getRow(id)!);
     })();
     for (const [circle, conceptId] of this.lastConceptByCircle) if (conceptId === id) this.lastConceptByCircle.delete(circle);
+    this.refreshGateSidecar(); // no-op unless retiring this concept moved the generation
     return result;
   }
 
@@ -4337,8 +4715,12 @@ export class MonetCore {
     if (row.kind === "workstream") throw new Error("cannot restore a workstream concept");
     if (isConnectorOwnedRow(row)) throw new Error("cannot restore a connector-owned source concept; source sync/rebuild owns restoration");
     if (row.status !== "retired") return toConcept(row);
-    return this.db.transaction((): Concept => {
+    const restored = this.db.transaction((): Concept => {
       const restoredAt = this.nextConceptLifecycleTimestamp(id);
+      // Restoring a retired deny puts it back into the mirror. Missing this bump is the UNDER-block
+      // direction — the file would omit a deny the store is enforcing, and isSidecarStale would
+      // call the file current — so it is the one that must not be forgotten.
+      this.noteBlockingRuleTouched(id);
       this.db
         .prepare(
           `INSERT INTO concept_restorations (concept_id, restored_at, updated_at) VALUES (?, ?, ?)
@@ -4351,6 +4733,8 @@ export class MonetCore {
       this.rederiveConceptGraph(id, row.circle);
       return toConcept(this.getRow(id)!);
     })();
+    this.refreshGateSidecar();
+    return restored;
   }
 
   /** Strictly order local retire/restore events and keep legacy wall-clock watermarks safe. */
@@ -4584,7 +4968,17 @@ export class MonetCore {
     // Under forceNew: never merge; if score >= tauAmbiguous, record a possible_duplicate_of edge.
     const top = this.bestMatches(jsonToEmb(src.embedding), resolvedTo, 1)[0];
     let mergeInto: ConceptRow | null = null;
-    if (opts.resolution !== "forceNew") {
+    // A RULE IS NEVER CONSUMED BY AN AUTOMATIC MERGE. The candidate scan is kind-blind, so a rule
+    // moved between circles could be merged into a similar concept of ANY kind — a fact it
+    // paraphrases, most likely — which hard-deletes the rule, strands its binding, and makes a deny
+    // disappear as a side effect of an innocent circle move. Nobody declared anything.
+    //
+    // Moving instead is always safe (the binding follows the concept, the gate re-scopes by the
+    // concept's circle), and the near-match is not thrown away: it records possible_duplicate_of,
+    // the same shape forceNew uses, so the pair still reaches curation. Rules merge only by
+    // explicit human consolidation — which is the same boundary the whole severity tier rests on.
+    const rulesNeverAutoMerge = src.kind === "rule";
+    if (opts.resolution !== "forceNew" && !rulesNeverAutoMerge) {
       mergeInto = (top && top.score >= this.tauAttach) ? top.match : null;
     }
     const committed = this.db.immediateTransaction(() => {
@@ -4597,8 +4991,9 @@ export class MonetCore {
       return { result, proofToken: this.captureEmbeddingWidthProof(this.embedder.dim) };
     })();
     const result = committed.result;
-    // Under forceNew with a near-match: record possible_duplicate_of edge (both directions).
-    if (opts.resolution === "forceNew" && top && top.score >= this.tauAmbiguous && this.graphEnabled) {
+    // Under forceNew — or for a rule, which is never auto-merged — a near-match records a
+    // possible_duplicate_of edge (both directions) instead of being merged away.
+    if ((opts.resolution === "forceNew" || rulesNeverAutoMerge) && top && top.score >= this.tauAmbiguous && this.graphEnabled) {
       const survivingId = result.conceptId;
       this.upsertEdgeBoth(survivingId, top.match.id, "possible_duplicate_of", top.score, "cheap", resolvedTo);
     }
@@ -4607,6 +5002,10 @@ export class MonetCore {
     // deleted row). Drop any lastConcept pointer to it.
     for (const [c, v] of this.lastConceptByCircle) if (v === src.id) this.lastConceptByCircle.delete(c);
     this.installEmbeddingWidthProof(committed.proofToken);
+    // Every other generation-bump site re-materializes; this one bumped and did not. Detection
+    // already covered it (isSidecarStale would have said so), but a mirror that goes stale on an
+    // ordinary circle move and waits for someone to ask is not the contract the other sites keep.
+    this.refreshGateSidecar();
     return result;
   }
 
@@ -4855,7 +5254,10 @@ export class MonetCore {
             this.db
               .prepare(`UPDATE contradictions SET concept_id = ? WHERE id = ?`)
               .run(destConceptId, contra.id);
-            // Destination becomes disputed (mirror flagContradiction's status flip).
+            // Destination becomes disputed (mirror flagContradiction's status flip) — which is a
+            // deny-removal door if the destination is a live blocking rule, reached without any
+            // call to flagContradiction at all.
+            assertBlockingRuleMutationAllowed(this.db, destConceptId, "dispute (contradiction)");
             this.db
               .prepare(`UPDATE concepts SET status = 'disputed', updated_at = unixepoch() * 1000 WHERE id = ?`)
               .run(destConceptId);
@@ -4906,6 +5308,8 @@ export class MonetCore {
             .get(destConceptId) as { n: number }
         ).n;
         if (openCarried > 0) {
+          // Same door, reached by carrying an already-open contradiction onto the destination.
+          assertBlockingRuleMutationAllowed(this.db, destConceptId, "dispute (contradiction)");
           this.db
             .prepare(`UPDATE concepts SET status = 'disputed', updated_at = unixepoch() * 1000 WHERE id = ? AND status != 'disputed'`)
             .run(destConceptId);
@@ -4971,6 +5375,11 @@ export class MonetCore {
             )
             .run(mergedLca, mergedLcaSession, mergedUsefulness, mergedFetchedAt, mergedArousalScore, mergedArousalTs, destConceptId);
         }
+        // CHOKEPOINT (door 8). Consolidating detach ends with the source hard-deleted, so moving a
+        // live deny's last observation elsewhere took the deny with it — no declaration, and the
+        // binding left pointing at nothing. Advisory rules keep the existing behaviour; only a live
+        // deny is refused, and the error names the two ways to withdraw one first.
+        assertBlockingRuleMutationAllowed(this.db, sourceConceptId, "consolidating detach");
         // Consolidation: all observations moved to an existing dest — delete the source concept.
         // Graph must be unwound first; no rederive since the concept no longer exists.
         // First Block hook: source is deleted — remove its entry (referential integrity — no dangling row).
@@ -5592,6 +6001,7 @@ export class MonetCore {
         graphDensity: nativeConcepts === 0 ? 0 : Number((edges / nativeConcepts).toFixed(2)),
       },
       resolutionStats: this.resolutionStats(circle),
+      gateStats: this.gateStats(circle),
       livingModel: pre.topConcepts,
       activeThreads: pre.activeWorkstreams,
       openContradictions: pre.openContradictions,
@@ -7881,7 +8291,28 @@ export class MonetCore {
 
   /** Record one normative edge. Validates family shape, span namespace, circle agreement and succession. */
   addLifecycleEdge(input: AddLifecycleEdgeInput): LifecycleEdgeRow {
-    return this.db.transaction(() => addLifecycleEdge(this.lifecycleEdgeDeps(), input))();
+    const row = this.db.transaction((): LifecycleEdgeRow => {
+      // CHOKEPOINT (door 11). This API predates the guard, and the door inventory that found the
+      // others was a grep over status writes and concept deletes — which structurally could not see
+      // it, because superseding a rule removes it from the gate without touching either. An
+      // exported, supported method that takes deny power away is the same door as any other.
+      //
+      // No born_of exemption, for the reason door 9 settled: a supersession removes a live deny,
+      // and whether the act was legitimate is a question about the rule's state HERE. Withdraw the
+      // deny first (declare it advisory) and the supersession is then free — which is what
+      // withdrawDeny does, and what declare() will do directly once the skeleton slice gives it a
+      // successor surface.
+      if (input.family === "supersession") {
+        assertBlockingRuleMutationAllowed(this.db, input.srcConceptId, "supersession");
+      }
+      const written = addLifecycleEdge(this.lifecycleEdgeDeps(), input);
+      // Superseding a rule ends its delivery, so doing it to a rule whose deny was already
+      // withdrawn still changes the mirror.
+      if (written.family === "supersession") this.noteBlockingRuleTouched(written.src_concept_id);
+      return written;
+    })();
+    this.refreshGateSidecar();
+    return row;
   }
 
   /** Lifecycle edges touching `conceptId`, optionally narrowed to one family. */
@@ -7907,6 +8338,552 @@ export class MonetCore {
   /** Report-only sweep for normative rows whose endpoint concepts no longer resolve. */
   lifecycleEdgeIntegrity(): LifecycleEdgeIntegrityReport {
     return inspectLifecycleEdgeIntegrity(this.db);
+  }
+
+  // ---- gate substrate (stages, rule bindings, firing) -----------------------
+  //
+  // Thin delegation to src/gates.ts, which owns every statement against these tables. What lives
+  // HERE is only what the engine owns anyway: id and clock policy, the store()-path hooks that make
+  // rule birth and rule death byproducts of an ordinary write, and transaction boundaries.
+
+  private gateDeps(): GateDeps {
+    return {
+      db: this.db,
+      newId: () => this.newId(),
+      nextSyncTimestamp: () => this.nextSyncTimestamp(),
+      syncDeviceId: this.syncDeviceId,
+    };
+  }
+
+  /**
+   * Everything about a `kind: "rule"` write that can be judged BEFORE any embedding or transaction.
+   * Rejecting early matters most for the blocking case: an agent that tried to mint deny power must
+   * get an error naming where deny power actually comes from, not a constraint violation from four
+   * layers down.
+   */
+  private validateRuleCapture(opts: StoreOpts): void {
+    if (opts.kind !== "rule") {
+      if (opts.rule !== undefined) throw new Error('store option `rule` requires kind "rule"');
+      return;
+    }
+    const rule = opts.rule;
+    if (!rule || !rule.stage || rule.stage.trim().length === 0) {
+      throw new Error('kind "rule" requires rule.stage — a rule is bound to a specific action, and the stage is its address');
+    }
+    if (rule.severity !== undefined && rule.severity !== "advisory" && !rule.declaration) {
+      throw new Error(
+        `severity '${rule.severity}' cannot be captured: blocking is declaration-only (no agent, and no ` +
+          `projection, can self-assign deny power). Use memory_declare to declare a blocking rule.`,
+      );
+    }
+    const scope: RuleScope = rule.scope ?? "agent";
+    if (!RULE_SCOPES.includes(scope)) {
+      throw new Error(`rule scope '${scope}' is not one of ${RULE_SCOPES.join(", ")}`);
+    }
+    if (scope === "agent" && !rule.modelTag) {
+      throw new Error(
+        'an agent-scoped rule requires rule.modelTag naming the model it compensates for (pass scope "domain" for a rule that would be true for a perfect agent)',
+      );
+    }
+  }
+
+  /**
+   * What does this correction landing on this concept MEAN?
+   *
+   * A verdict rather than a boolean, and deliberately WITHOUT throwing, because the right response
+   * to a refused landing depends on how the concept was chosen:
+   *
+   *   - The caller NAMED it (attachTo). A refusal is correct feedback — they asked for a specific
+   *     thing that cannot be done, and telling them is the whole point.
+   *   - RESOLUTION nominated it. A refusal here would throw away the agent's observation over a
+   *     property of a concept the agent never mentioned. The write must survive; it forks and pairs,
+   *     the same treatment the two species-boundary cases already get.
+   *
+   * The earlier version threw from inside the predicate, which meant the nominated case discarded
+   * the correction entirely — a safety guard that ate data.
+   */
+  private ruleCorrectionVerdict(kind: string | undefined, row: ConceptRow): RuleCorrectionVerdict {
+    if (kind !== "correction" || row.kind !== "rule") return "not-a-rule";
+    const binding = getRuleBinding(this.db, row.id);
+    // Blocking first: an agent correction on a deny would create an ADVISORY successor and leave the
+    // deny superseded — deny power removed by an ordinary store() call, the safety boundary
+    // defeated from the exit side. Declaration is the only mutation path for a blocking rule, in
+    // both directions.
+    if (binding?.severity === "blocking") return "blocking";
+    if (this.supersessorOf(row.id) !== null) return "superseded";
+    return "supersede";
+  }
+
+  /** The successor a rule was replaced by, or null when it still governs. */
+  private supersessorOf(conceptId: string): string | null {
+    const row = this.db
+      .prepare(`SELECT dst_concept_id AS id FROM lifecycle_edges WHERE family = 'supersession' AND src_concept_id = ?`)
+      .get(conceptId) as { id: string | null } | undefined;
+    return row?.id ?? null;
+  }
+
+  /**
+   * May this concept receive rule evidence? Two refusals, both closing a SILENT loss.
+   *
+   * NOT A RULE. `gateQuery` delivers only `kind = 'rule'` concepts, so a binding attached to a fact
+   * (which is reachable: the nomination scan ranks observations across every kind, and a rule often
+   * paraphrases a fact that is already stored) would be accepted, stored, and never fire. The store
+   * would have taken the write and lost the governance — the worst failure a memory substrate has.
+   * A rule and the fact it is built on are also genuinely different objects: absorbing one into the
+   * other would silently promote a description of the world into something that governs.
+   *
+   * SUPERSEDED. History does not accept new evidence. A rule captured afresh after its predecessor
+   * died must not attach to the dead one, or the newly noticed rule vanishes into a concept the
+   * gate is required never to inject again.
+   */
+  private canCarryRuleEvidence(row: ConceptRow): boolean {
+    if (row.kind !== "rule") return false;
+    return this.db
+      .prepare(`SELECT 1 FROM lifecycle_edges WHERE family = 'supersession' AND src_concept_id = ?`)
+      .get(row.id) === undefined;
+  }
+
+  /** Rule capture: birth the stage if the action has none, then bind the rule to it. */
+  private captureRuleBinding(row: ConceptRow, opts: StoreOpts): RuleBindingChange {
+    const rule = opts.rule!;
+    const declaration = rule.declaration === true;
+    // NO STAGE FOR A BINDING THAT WILL NOT USE IT. A re-capture onto an already-bound rule keeps
+    // the incumbent binding (mode "keep" below) — deliberately, so an incidental repeat cannot
+    // re-address a live rule — but the stage was being created first regardless, leaving an
+    // UNBOUND stage behind whenever the repeat named a different action. Those stages fire nothing,
+    // can never fire anything, and sit on the dead-pattern watchlist forever, which is precisely
+    // the noise that watchlist exists to make visible.
+    //
+    // The earlier reasoning for creating it anyway ("the correction really did happen at that
+    // action") is not wrong, it is just not worth a permanent registry entry: nothing points at the
+    // stage, so nothing records that it happened either. A capture that genuinely means to move a
+    // rule's address is a declaration.
+    const existingBinding = getRuleBinding(this.db, row.id);
+    if (!declaration && existingBinding) {
+      return {
+        conceptId: row.id,
+        severity: existingBinding.severity,
+        previousSeverity: existingBinding.severity,
+        downgradedFromBlocking: false,
+      };
+    }
+    const stage = upsertStage(this.gateDeps(), {
+      stage: rule.stage,
+      instance: rule.instance,
+      // Patterns ride in here rather than being applied by a separate declare()-side call. That is
+      // what collapses declaration into ONE transaction: there is no window in which a re-authored
+      // stage can survive a failed rule write.
+      patterns: declaration ? rule.patterns : undefined,
+      // Carried all the way to the mutation: upsertStage re-checks it inside this transaction, so a
+      // deny bound during declare()'s embed window cannot be re-aimed by a call validated before it
+      // existed.
+      acknowledgeBlockingRules: rule.acknowledgeBlockingRules,
+      origin: declaration ? "declaration" : "correction",
+    });
+    const bound = bindRule(
+      this.gateDeps(),
+      {
+        conceptId: row.id,
+        stageId: stage.id,
+        severity: rule.severity,
+        scope: rule.scope ?? "agent",
+        modelTag: rule.modelTag ?? null,
+        origin: declaration ? "declaration" : "correction",
+        declaredBy: declaration ? (rule.declaredBy ?? this.agentId) : null,
+        reason: rule.reason ?? null,
+      },
+      // A rule corrected twice is two observations, ONE rule — and its address does not move
+      // because an incidental repeat named a different stage. Declaration is a human deciding, so
+      // it replaces (and is therefore also how severity, reason and stage are ever edited).
+      declaration ? "replace" : "keep",
+    );
+    return {
+      conceptId: row.id,
+      severity: bound.row.severity,
+      previousSeverity: bound.previousSeverity,
+      downgradedFromBlocking: bound.downgradedFromBlocking,
+    };
+  }
+
+  /**
+   * RULE DEATH, executed. The correction has already created `successor`; this carries the address
+   * across and records the act.
+   *
+   * WHAT DOES NOT HAPPEN HERE IS THE POINT:
+   *   - No contradiction is opened and no First Block entry is invalidated — the caller's
+   *     `landedOnExisting` is false on this path, so the ordinary correction machinery never runs.
+   *     A superseded rule is not disputed evidence awaiting mediation; it is settled history.
+   *   - The old concept is NOT retired. It stays active and searchable on purpose: it is the
+   *     impeachment evidence, and the gate excludes it via the supersession edge alone.
+   *   - The successor is ALWAYS advisory-born. It cannot inherit blocking severity, because the
+   *     incumbent could never have been blocking (isRuleCorrectionTarget refuses that case).
+   *
+   * DOUBT TRAVELS UP THE PARENT EDGE, and this slice deliberately builds no machinery for it.
+   * "Correcting a rule casts doubt on the principle that derived it" — but the supersession edge IS
+   * that evidence: a later pass reads `lifecycle_edges` for supersessions whose source has an
+   * incoming derivation edge and marks the parent principle disputed. Adding an impeachment queue
+   * here would be a second record of a fact the substrate already holds. CONSUMER: the principle /
+   * skeleton slice.
+   */
+  private succeedRule(
+    incumbent: ConceptRow,
+    successor: ConceptRow,
+    correctionObservationId: string,
+    opts: StoreOpts,
+  ): RuleSuccession {
+    const binding = getRuleBinding(this.db, incumbent.id);
+    // A rule concept with no binding is a rule with no gate (a hand-written kind='rule' concept, or
+    // a binding that never replicated). Succeeding it still records the supersession — that is the
+    // history — but there is no address to carry, so the successor gets no binding either.
+    if (binding) {
+      bindRule(
+        this.gateDeps(),
+        {
+          conceptId: successor.id,
+          stageId: binding.stage_id,
+          severity: "advisory",
+          scope: opts.rule?.scope ?? (binding.scope as RuleScope),
+          modelTag: opts.rule?.modelTag ?? binding.model_tag,
+          origin: "correction",
+          declaredBy: null,
+          // The correction may supply a fresh prevented-failure line; otherwise the incumbent's
+          // reason carries forward, because the gate it guards has not changed.
+          reason: opts.rule?.reason ?? binding.reason,
+        },
+        "replace",
+      );
+    }
+    const edge = addLifecycleEdge(this.lifecycleEdgeDeps(), {
+      family: "supersession",
+      srcConceptId: incumbent.id,
+      dstConceptId: successor.id,
+      bornOf: "correction",
+      eventRef: correctionObservationId,
+    });
+    return {
+      supersededRuleId: incumbent.id,
+      successorRuleId: successor.id,
+      supersessionEdgeId: edge.id,
+      stageId: binding?.stage_id ?? "",
+    };
+  }
+
+  /**
+   * Turn every `span://` sourceRef on a rule write into a provenance edge. Non-span refs are left
+   * as ordinary refs — they are file paths and URLs, not transcript locations, and a provenance
+   * edge that accepted them would make "where did this rule come from" unanswerable without
+   * guessing a format (see src/spans.ts).
+   *
+   * Best-effort by construction: a malformed span throws from addLifecycleEdge, which would abort
+   * an otherwise-good rule capture over a provenance detail. The scanner backfills spans later, and
+   * a span-less rule is surfaced in curation — so a bad one is dropped here rather than fatal.
+   */
+  private recordRuleProvenance(conceptId: string, sourceRefs: string[], observationId: string): void {
+    for (const ref of sourceRefs) {
+      if (!isSpanRef(ref) || parseSpan(ref) === null) continue;
+      try {
+        addLifecycleEdge(this.lifecycleEdgeDeps(), {
+          family: "provenance",
+          srcConceptId: conceptId,
+          dstSpan: ref,
+          bornOf: "correction",
+          eventRef: observationId,
+        });
+      } catch {
+        // Already recorded, or an endpoint the normative substrate refuses. Either way provenance
+        // is an annotation on this write, never its purpose.
+      }
+    }
+  }
+
+  /**
+   * DECLARATION — the sovereign entrance. "Sovereignty replaces the battery": the human is not
+   * proposing a rule for the substrate to judge, they are stating one.
+   *
+   * This is the ONLY surface that accepts blocking severity, and the only one that can replace an
+   * existing binding. Both follow from the same fact: deny power and re-addressing are decisions,
+   * and a decision needs somebody to make it.
+   *
+   * `species` is deliberately a two-value vocabulary. Principle declaration belongs to the skeleton
+   * slice (it needs the battery, the ratification record and the materializer), and grants and
+   * preferences are NOT a third species — "a gate lookup returns what the rule says", so a standing
+   * order is a rule with permissive content.
+   */
+  async declare(input: DeclareInput): Promise<DeclareResult> {
+    // ---- VALIDATION, ENTIRELY BEFORE ANY WRITE ------------------------------
+    // A failed declaration must leave the store exactly as it found it. The previous shape validated
+    // as it went and wrote the stage first, so a rule declaration that failed downstream (a missing
+    // model tag, an embedder outage) still left the stage RE-ADDRESSED — a half-applied sovereign
+    // act, which is the one kind of act that must never be half-applied.
+    if (input.species !== "rule" && input.species !== "stage") {
+      throw new Error(
+        `species '${String(input.species)}' cannot be declared: this surface declares 'rule' and 'stage'. ` +
+          `A grant or preference is a rule with permissive content; principles arrive with the skeleton.`,
+      );
+    }
+    const circle = this.resolveCircle(input.circle ?? this.defaultCircle);
+    if (!input.stage || input.stage.trim().length === 0) {
+      throw new Error("declaring a rule or a stage requires `stage` — the action the gate fires on");
+    }
+    if (input.severity !== undefined && !RULE_SEVERITIES.includes(input.severity)) {
+      throw new Error(`rule severity '${input.severity}' is not one of ${RULE_SEVERITIES.join(", ")}`);
+    }
+    const scope: RuleScope = input.scope ?? "agent";
+    if (!RULE_SCOPES.includes(scope)) {
+      throw new Error(`rule scope '${scope}' is not one of ${RULE_SCOPES.join(", ")}`);
+    }
+    if (input.species === "rule") {
+      if (!input.content || input.content.trim().length === 0) {
+        throw new Error("declaring a rule requires `content` — what the rule says");
+      }
+      if (scope === "agent" && !input.modelTag) {
+        throw new Error(
+          'an agent-scoped rule requires modelTag naming the model it compensates for (pass scope "domain" for a rule that would be true for a perfect agent)',
+        );
+      }
+    }
+    this.assertPatternReauthoringAcknowledged(input);
+
+    const before = this.sidecarGeneration();
+    let result: DeclareResult;
+    if (input.species === "stage") {
+      const existing = findStage(this.db, input.stage);
+      const priorPatterns = existing ? this.toStageView(existing).patterns : [];
+      const stage = this.db.immediateTransaction(() =>
+        upsertStage(this.gateDeps(), {
+          stage: input.stage,
+          patterns: input.patterns,
+          instance: input.instance,
+          acknowledgeBlockingRules: input.acknowledgeBlockingRules,
+          origin: "declaration",
+        }),
+      )();
+      const view = this.toStageView(stage);
+      result = {
+        species: "stage",
+        stage: view,
+        // Old → new, in the response, so a pattern change is auditable IN BAND. A full pattern
+        // history table is DEFERRED (see assertPatternReauthoringAcknowledged): this response is
+        // the v1 record, which means an edit is visible to whoever made it but not reconstructible
+        // afterwards. Worth building when there is a second consumer of the history.
+        previousPatterns: priorPatterns.map(formatTriggerPattern),
+        patterns: view.patterns.map(formatTriggerPattern),
+      };
+    } else {
+      // ONE TRANSACTION. The stage upsert now happens INSIDE store()'s transaction (patterns ride
+      // through RuleCaptureOpts to captureRuleBinding's own upsertStage call), so there is no
+      // second write to be left standing when the first one fails. That is a structural fix, not a
+      // carefully-ordered one — there is no longer a window to order.
+      const stored = await this.store(input.content!, {
+        circle,
+        kind: "rule",
+        sourceRefs: input.sourceRefs,
+        rule: {
+          stage: input.stage,
+          instance: input.instance,
+          patterns: input.patterns,
+          acknowledgeBlockingRules: input.acknowledgeBlockingRules,
+          // Passed through UNDEFAULTED. `undefined` means "the caller did not rule on severity",
+          // which on an existing binding preserves what is there — see BindRuleInput.severity.
+          severity: input.severity,
+          scope,
+          modelTag: input.modelTag,
+          reason: input.reason,
+          declaration: true,
+          declaredBy: input.declaredBy,
+        },
+      });
+      const binding = getRuleBinding(this.db, stored.conceptId)!;
+      const change = stored.ruleBindingChange;
+      result = {
+        species: "rule",
+        conceptId: stored.conceptId,
+        action: stored.action,
+        binding,
+        stage: this.toStageView(findStage(this.db, binding.stage_id)!),
+        // A sovereign downgrade is ALLOWED and must be LOUD. Removing deny power is a real decision
+        // and the caller is entitled to make it, but it must never be something they discover later
+        // — so it is reported in the response rather than merely happening.
+        ...(change?.downgradedFromBlocking
+          ? { downgraded: true as const, from: "blocking" as const }
+          : {}),
+      };
+    }
+
+    // Re-materialize when (and only when) the substrate actually moved. The generation counter is
+    // what makes this precise: an unconditional rebuild on every declaration was the cheap version
+    // of this check, and it could not tell a caller — or the 4b hook — whether anything changed.
+    if (this.sidecarGeneration() !== before) this.refreshGateSidecar();
+    return result;
+  }
+
+  /**
+   * A stage's patterns are its firing surface, so re-authoring them REROUTES every rule bound to
+   * it — including the denies. That made "silence this deny" a single ordinary agent-callable
+   * declaration: edit the patterns, the deny stops matching, and the binding still reads `blocking`
+   * so nothing in the store looks wrong.
+   *
+   * The guard is acknowledgement, not prohibition: the human may absolutely re-aim a gate that
+   * carries a deny, but they must NAME the denies they are re-aiming. An agent that has not been
+   * told those rules exist cannot produce their ids, and a human who has been shown them is making
+   * the decision the parameter is asking about.
+   *
+   * DEFERRED, explicitly: there is no pattern-change audit trail. The declare response carries
+   * old → new (see above) and that is all — a change is visible to whoever made it, not
+   * reconstructible by whoever finds it later. The acknowledgement parameter is the v1 guard.
+   */
+  /**
+   * FAST FEEDBACK ONLY — the binding guard lives in upsertStage, inside the write transaction.
+   *
+   * This runs before the embed so a caller learns immediately which denies it has to name, but it
+   * is not the thing that makes the guard sound: between this check and the commit there is an
+   * embed, and a blocking rule bound in that window would be re-aimed by a call validated when it
+   * did not exist. upsertStage re-runs `assertNoUnacknowledgedDenies` against the same predicate
+   * inside the transaction that performs the replacement, which is where the window closes.
+   */
+  private assertPatternReauthoringAcknowledged(input: DeclareInput): void {
+    if (input.patterns === undefined) return;
+    const stage = findStage(this.db, input.stage);
+    if (!stage) return; // a stage being born carries no rules yet, so nothing can be rerouted
+    assertNoUnacknowledgedDenies(this.db, stage, input.acknowledgeBlockingRules);
+  }
+
+  private toStageView(row: StageRow): StageView {
+    return {
+      id: row.id,
+      name: row.name,
+      patterns: parseTriggerPatterns(row.trigger_patterns),
+      origin: row.origin,
+      verified: row.verified === 1,
+      createdAt: row.created_at,
+    };
+  }
+
+  /**
+   * THE GATE. Ask what governs this action, deterministically: pure SQL and string matching, no
+   * model, no network, no embedding — "silence when nothing matches".
+   *
+   * Writes, despite reading like a query: one instrumentation row per call (the fire-precision and
+   * silence-rate measures the design asks for), and the first match verifies a stage's pattern.
+   */
+  gate(opts: {
+    actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+  }): GateResult {
+    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
+    // THE READ, in its own deferred transaction, which ends before anything is written.
+    const { result, pending } = this.db.transaction(() =>
+      evaluateGate(this.db, {
+        actionContext: opts.actionContext,
+        circle,
+        now: opts.now,
+        record: opts.record,
+        runtimeModelTag: opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined,
+      }),
+    )();
+    // THE WRITES, separately, and ALLOWED TO FAIL. A deferred read transaction upgrading to a write
+    // one can be refused with SQLITE_BUSY when another connection commits in between — which, if
+    // the two were one transaction, would make a gate lookup THROW because an event row could not
+    // be inserted. That trade is unacceptable in the direction it fails: losing one instrumentation
+    // row costs a rounding error on a rate, and failing to deliver a deny costs the thing this
+    // subsystem exists for. The verdict is already computed and is returned either way.
+    if (pending) {
+      try {
+        this.db.immediateTransaction(() =>
+          commitGateWrites(this.db, pending, () => this.nextSyncTimestamp()),
+        )();
+      } catch {
+        // Instrumentation only. Deliberately swallowed — see above.
+      }
+    }
+    return result;
+  }
+
+  /** How the gates have been firing — fire precision and silence rate, the design's own measures. */
+  gateStats(circle?: string, windowDays = GATE_STATS_WINDOW_DAYS, runtimeModelTag?: string): GateStats {
+    return gateStats(this.db, {
+      circle: this.resolveCircle(circle ?? this.defaultCircle),
+      windowDays,
+      runtimeModelTag: runtimeModelTag ?? this.runtimeModelTag ?? undefined,
+    });
+  }
+
+  /** Every stage in the registry (store-global — a stage is a registry entry, not memory). */
+  stages(): StageView[] {
+    return listStages(this.db).map((row) => this.toStageView(row));
+  }
+
+  /** The binding that gives a rule its address, or null when the concept is not a bound rule. */
+  ruleBinding(conceptId: string): RuleBindingRow | null {
+    return getRuleBinding(this.db, conceptId);
+  }
+
+  /**
+   * The gate-substrate generation: a monotonic counter bumped in the same transaction as every
+   * mutation that can change what the blocking mirror should contain. A consumer that cannot
+   * re-materialize (the 4b hook, a CLI) polls this to know whether its copy is current.
+   */
+  sidecarGeneration(): number {
+    return gateGeneration(this.db);
+  }
+
+  /** Is the mirror at `path` current? A missing or unreadable file reports stale, never throws. */
+  isSidecarStale(path?: string): SidecarStaleness {
+    const target = path ?? this.gateSidecarPath;
+    if (!target) throw new Error("isSidecarStale needs a path: pass one, or construct MonetCore with gateSidecarPath");
+    return inspectSidecar(this.db, target, this.syncDeviceId);
+  }
+
+  /**
+   * Re-materialize the mirror IF this store has one wired and it is not already current.
+   *
+   * Called from every mutation site that can change the deny set — the same set of sites that bump
+   * the generation — so a configured sidecar tracks the store without anyone remembering to ask.
+   * Where no path is configured (the default), the generation still advances and this is a no-op:
+   * the substrate stays pollable even when nothing is mirroring it.
+   *
+   * Never throws into its caller. A store whose sidecar directory has gone read-only must still be
+   * able to retire a rule; the mirror being stale is a condition `isSidecarStale` reports, and
+   * turning it into a failed memory write would be the "a memory tool bricks your work on its own
+   * failure" mode the design explicitly refuses.
+   */
+  private refreshGateSidecar(): void {
+    if (!this.gateSidecarPath) return;
+    try {
+      if (!inspectSidecar(this.db, this.gateSidecarPath, this.syncDeviceId).stale) return;
+      materializeBlockingSidecar(this.db, this.gateSidecarPath, { storeIdentity: this.syncDeviceId });
+    } catch {
+      // Reported by isSidecarStale, never raised here. See above.
+    }
+  }
+
+  /**
+   * Bump the generation when `conceptId` holds deny power. The shared hook for every path that
+   * changes whether a blocking rule is DELIVERED without touching its binding — retire, hard
+   * delete, supersession — so those paths do not each re-derive what "matters to the mirror" means.
+   * Must be called inside the caller's transaction.
+   */
+  private noteBlockingRuleTouched(conceptId: string): void {
+    if (hasBlockingBinding(this.db, conceptId)) bumpGateGeneration(this.db);
+  }
+
+  /**
+   * Regenerate the blocking-rule mirror. Called automatically on every declaration when the store
+   * was constructed with `gateSidecarPath`; exposed for the CLI that installs the host hooks and
+   * for recovery after the file is lost.
+   *
+   * NO DEFAULT PATH ON PURPOSE. An engine that materialized to a well-known location whether or not
+   * anyone asked would have every construction of MonetCore — every test, every eval run, every
+   * one-off script — writing into the user's real `~/.monet`. The mirror belongs to whoever wired
+   * the hook that reads it, so that caller names the path.
+   */
+  materializeBlockingSidecar(path?: string): BlockingSidecar {
+    const target = path ?? this.gateSidecarPath;
+    if (!target) {
+      throw new Error(
+        "materializeBlockingSidecar needs a path: pass one, or construct MonetCore with gateSidecarPath",
+      );
+    }
+    return materializeBlockingSidecar(this.db, target, { storeIdentity: this.syncDeviceId });
   }
 
   /**
@@ -8054,6 +9031,24 @@ export class MonetCore {
         )
         .all(since, cutoff);
 
+      // Gate substrate. STAGES travel unconditionally on the watermark: a stage is a registry entry
+      // with no endpoint concept and no circle, so there is nothing to guard — the registry is the
+      // same object on every machine. RULE BINDINGS follow the normative-record rule established
+      // just above (LEFT join, retired endpoints included, kind-guarded only where the endpoint
+      // resolves locally): a binding whose rule was retired is exactly the record that says which
+      // gate that rule used to guard, and refusing to relay it would discard the audit trail.
+      const stages = this.db
+        .prepare(`SELECT * FROM stages WHERE sync_updated_at >= ? AND sync_updated_at <= ?`)
+        .all(since, cutoff);
+      const ruleBindings = this.db
+        .prepare(
+          `SELECT b.* FROM rule_bindings b
+             LEFT JOIN concepts c ON c.id = b.concept_id
+            WHERE ${nativeIfPresent("c", "b.concept_id")}
+              AND b.sync_updated_at >= ? AND b.sync_updated_at <= ?`,
+        )
+        .all(since, cutoff);
+
       const circleAliases = this.db.prepare(`SELECT * FROM circle_aliases WHERE updated_at >= ? AND updated_at <= ?`).all(since, cutoff);
 
       const sessions = this.db
@@ -8140,6 +9135,8 @@ export class MonetCore {
         sessions: sessions as GraftPayload["sessions"],
         lifecycleEdges: lifecycleEdges as SyncLifecycleEdgeRow[],
         ratifications: ratifications as SyncRatificationRow[],
+        stages: stages as SyncStageRow[],
+        ruleBindings: ruleBindings as SyncRuleBindingRow[],
       };
     })();
   }
@@ -8191,7 +9188,11 @@ export class MonetCore {
       // connector-owned concept through generic sync.
       (payload.lifecycleEdges ?? []).some((row) =>
         localSourceIds.has(row.src_concept_id) || (row.dst_concept_id !== null && localSourceIds.has(row.dst_concept_id))) ||
-      (payload.ratifications ?? []).some((row) => localSourceIds.has(row.subject_concept_id));
+      (payload.ratifications ?? []).some((row) => localSourceIds.has(row.subject_concept_id)) ||
+      // A rule binding is a backdoor for the same reason: a forged one naming a local source id
+      // would attach a gate address — and, with a blocking severity, deny power — to a
+      // connector-owned concept through generic sync.
+      (payload.ruleBindings ?? []).some((row) => localSourceIds.has(row.concept_id));
     if (touchesSource) throw new Error("graftRows cannot mutate source-owned concepts");
 
     const isV8 = (payload.schemaVersion ?? 0) >= SYNC_CLOSURE_SCHEMA_VERSION;
@@ -8285,6 +9286,46 @@ export class MonetCore {
       }
       assertGraftEndpointGovernable("subject", row.subject_concept_id, `ratification '${row.id}'`);
     }
+
+    // GATE SUBSTRATE. Structural preflight, exactly like the normative rows above and for the same
+    // reason: a binding whose rule concept is retired (and therefore absent from `concepts`) is a
+    // legitimate traveler, so an unresolvable endpoint is not an error here. What IS rejected is a
+    // malformed row, because letting one reach INSERT would trip a CHECK and abort the whole graft
+    // with a bare "CHECK constraint failed" instead of a diagnosable message.
+    for (const row of payload.stages ?? []) {
+      if (!STAGE_ORIGINS.includes(row.origin as StageOrigin)) {
+        throw new Error(`graftRows stage '${row.id}' has unknown origin '${row.origin}'`);
+      }
+      if (typeof row.name !== "string" || row.name.length === 0) {
+        throw new Error(`graftRows stage '${row.id}' has no name`);
+      }
+    }
+    for (const row of payload.ruleBindings ?? []) {
+      if (!RULE_SEVERITIES.includes(row.severity as RuleSeverity)) {
+        throw new Error(`graftRows rule binding '${row.concept_id}' has unknown severity '${row.severity}'`);
+      }
+      if (!RULE_SCOPES.includes(row.scope as RuleScope)) {
+        throw new Error(`graftRows rule binding '${row.concept_id}' has unknown scope '${row.scope}'`);
+      }
+      if (!RULE_BINDING_ORIGINS.includes(row.origin as RuleBindingOrigin)) {
+        throw new Error(`graftRows rule binding '${row.concept_id}' has unknown origin '${row.origin}'`);
+      }
+      // THE SAFETY BOUNDARY, ON THE WAY IN. The table's CHECK would reject this anyway, but a
+      // forged blocking binding must fail as a named refusal rather than as a constraint error that
+      // aborts an otherwise-good graft — and it must be impossible to mint deny power by relay.
+      if (row.severity === "blocking" && row.origin !== "declaration") {
+        throw new Error(
+          `graftRows rule binding '${row.concept_id}' claims blocking severity without a declaration origin: ` +
+            `blocking is declaration-only and cannot be minted by sync`,
+        );
+      }
+      if ((row.scope === "agent") !== (row.model_tag != null)) {
+        throw new Error(
+          `graftRows rule binding '${row.concept_id}' has a model tag its scope '${row.scope}' forbids (or lacks one it requires)`,
+        );
+      }
+      assertGraftEndpointGovernable("rule", row.concept_id, `rule binding '${row.concept_id}'`);
+    }
   }
 
   /**
@@ -8338,7 +9379,7 @@ export class MonetCore {
       throw new EmbedderWidthConflictError(sortedIncomingWidths[0] ?? this.embedder.dim, sortedIncomingWidths, "native");
     }
 
-    const tables = ["sessions", "circle_aliases", "tombstones", "restorations", "deletions", "concepts", "concept_activity", "observations", "concept_revisions", "contradictions", "memory_edge", "memory_edge_components", "first_block", "entities", "concept_entities", "lifecycle_edges", "ratifications"] as const;
+    const tables = ["sessions", "circle_aliases", "tombstones", "restorations", "deletions", "concepts", "concept_activity", "observations", "concept_revisions", "contradictions", "memory_edge", "memory_edge_components", "first_block", "entities", "concept_entities", "lifecycle_edges", "ratifications", "stages", "rule_bindings"] as const;
     const inserted: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
     const skipped: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
     const conceptsWithChangedBindings = new Set<string>();
@@ -8458,7 +9499,13 @@ export class MonetCore {
         if (r.changes > 0) inserted.deletions++;
         else skipped.deletions++;
         if (this.db.prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(row.concept_id)) {
-          this.hardDeleteNativeConcept(row.concept_id, false, row.deleted_at);
+          // CHOKEPOINT. Same reasoning as the relayed retire: the deletion EVENT is recorded either
+          // way, but a peer cannot delete a deny this machine is enforcing. Counted, not thrown.
+          if (blockingRuleMutationGuard(this.db, row.concept_id, "relayed delete").blocked) {
+            skipped.deletions++;
+          } else {
+            this.hardDeleteNativeConcept(row.concept_id, false, row.deleted_at);
+          }
         }
       }
       const isDeleted = (conceptId: string | null | undefined): boolean => !!conceptId && !!this.db
@@ -8665,6 +9712,16 @@ export class MonetCore {
         if (isConnectorOwnedRow(local)) continue;
         if (retiredAt !== null && (restoredAt === null || retiredAt >= restoredAt)) {
           if (local.status === "retired") continue;
+          // CHOKEPOINT. A relayed retire removes a deny exactly as a local one does; skipped and
+          // counted so the graft stays atomic. The tombstone ROW still landed above — the peer's
+          // event is on record — only its local effect on a live deny is refused.
+          if (blockingRuleMutationGuard(this.db, local.id, "relayed retire").blocked) {
+            skipped.tombstones++;
+            continue;
+          }
+          // A relayed restore puts a withdrawn deny back; both change what the offline hook must
+          // block on without any binding row moving.
+          this.noteBlockingRuleTouched(local.id);
           this.db
             .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = ?, resolved_by = 'sync-tombstone' WHERE concept_id = ? AND status = 'open'`)
             .run(retiredAt, local.id);
@@ -8677,6 +9734,7 @@ export class MonetCore {
             .prepare(`UPDATE concepts SET status = 'retired', updated_at = MAX(updated_at, ?) WHERE id = ?`)
             .run(retiredAt, local.id);
         } else if (restoredAt !== null && local.status === "retired") {
+          this.noteBlockingRuleTouched(local.id);
           this.db.prepare(`UPDATE concepts SET status = 'active', updated_at = MAX(updated_at, ?) WHERE id = ?`).run(restoredAt, local.id);
           if ((payload.schemaVersion ?? 0) < SYNC_CLOSURE_SCHEMA_VERSION) this.rederiveConceptGraph(local.id, local.circle);
         }
@@ -8739,8 +9797,19 @@ export class MonetCore {
             row.aliases ?? null, row.last_confirmed_at ?? null,
             row.last_confirmed_session_id ?? null, revision, writer,
           );
-        if (r.changes > 0) inserted.concepts++;
-        else skipped.concepts++;
+        if (r.changes > 0) {
+          inserted.concepts++;
+          // THE DANGLING-THEN-LIVE GAP. Normative rows relay independently of endpoint liveness, so
+          // a blocking BINDING can legitimately arrive in one payload and its rule CONCEPT in the
+          // next. The binding's arrival bumps the generation, but the sidecar materialized at that
+          // moment omits the rule (listBlockingRules joins concepts, which cannot resolve it yet) —
+          // and then the concept lands here, making the deny live in gateQuery while the file still
+          // reads as current. A deny the store enforces and the offline hook does not know about.
+          //
+          // An arriving concept that already has a blocking binding is therefore a mirror-changing
+          // event in its own right, regardless of payload order.
+          this.noteBlockingRuleTouched(row.id);
+        } else skipped.concepts++;
         const unionJson = (left: string | null | undefined, right: string | null | undefined): string | null => {
           const values = [...new Set([
             ...(left ? (JSON.parse(left) as string[]) : []),
@@ -8916,6 +9985,17 @@ export class MonetCore {
       // 7. contradictions — complete deterministic row convergence
       for (const row of payload.contradictions) {
         if (isTombstoned(row.concept_id)) {
+          skipped.contradictions++;
+          continue;
+        }
+        // CHOKEPOINT (door 7). Local flagContradiction refuses rules outright, but a relayed
+        // contradiction landed on one anyway — and the status recompute below turns an open
+        // contradiction into 'disputed', which drops the rule from the gate's status predicate. A
+        // deny removed by sync, with no declaration on either machine. Skipped and counted rather
+        // than thrown: an incoming row must never abort an otherwise-good graft (the incumbent-wins
+        // house pattern). The refusal covers every rule, matching the local rule exactly — a rule
+        // is corrected, never mediated.
+        if (this.getRow(row.concept_id)?.kind === "rule") {
           skipped.contradictions++;
           continue;
         }
@@ -9123,6 +10203,25 @@ export class MonetCore {
       }
       for (const row of payload.lifecycleEdges ?? []) {
         if (row.family === "supersession") {
+          // CHOKEPOINT (door 9). A supersession edge stops its source being delivered, so relaying
+          // one onto a live deny removes it — and a peer must not be able to do by sync what
+          // neither machine can do by hand.
+          //
+          // THE RECEIVER'S STATE DECIDES, not the sender's. An earlier version let
+          // declaration-born edges through on the reasoning that a declared successor is a
+          // legitimate withdrawal. It is — ON THE SENDER. Replica A supersedes a rule that is
+          // ADVISORY there, entirely legitimately; replica B has independently declared that same
+          // concept BLOCKING. A's edge is a valid act about a rule that no longer exists in the
+          // shape A saw, and applying it removes a deny B declared and A never knew about. Two
+          // sovereign acts collided, and relay is not the place that gets to pick a winner.
+          //
+          // So: no relay removes a live deny, full stop. Reconciling the collision is a curation
+          // question (and, once stage/act provenance relays, an act-relay one). Divergence is the
+          // accepted cost until the sync-surface slice — the same trade door 10 takes.
+          if (blockingRuleMutationGuard(this.db, row.src_concept_id, "relayed supersession").blocked) {
+            skipped.lifecycle_edges++;
+            continue;
+          }
           // Two replicas can each record a different successor for one rule. The partial unique
           // index would abort the whole graft, so the incumbent wins and the challenger is counted
           // as skipped. Reconciling a genuinely divergent succession is an impeachment question,
@@ -9167,9 +10266,173 @@ export class MonetCore {
             row.id, row.family, row.src_concept_id, row.dst_concept_id ?? null, row.dst_span ?? null,
             row.born_of, row.event_ref ?? null, row.circle, row.created_at, relayAt, revision, writer,
           );
-        if (r.changes > 0) inserted.lifecycle_edges++;
-        else skipped.lifecycle_edges++;
+        if (r.changes > 0) {
+          inserted.lifecycle_edges++;
+          // A supersession edge stops its source being delivered. Landing one on a rule this store
+          // blocks on removes that deny from the mirror without any binding changing.
+          if (row.family === "supersession") this.noteBlockingRuleTouched(row.src_concept_id);
+        } else skipped.lifecycle_edges++;
       }
+      // 8b. GATE SUBSTRATE. Stages first, then the bindings that name them: the reference direction
+      // is rule_bindings.stage_id → stages.id, matching the referential-integrity ordering the rest
+      // of this graft respects. Nothing CHECKS it (graft is deliberately structural — a binding may
+      // legitimately arrive before, or without, the stage its peer holds, and the gate simply never
+      // fires it), but a self-consistent payload must not be ordered wrongly.
+      for (const row of payload.stages ?? []) {
+        // A UNIQUE name collision under a DIFFERENT id means two replicas independently created the
+        // same stage before they ever synced. The insert would throw and abort the whole graft, so
+        // the incumbent wins and the challenger is counted as skipped — identical treatment to the
+        // divergent-successor case above, and for the identical reason: reconciling two stages that
+        // name one action is curation work, not relay work. The challenger's bindings still land
+        // and simply point at a stage this replica does not have, which the gate reads as silence.
+        const nameHolder = this.db.prepare(`SELECT id FROM stages WHERE name = ?`).get(row.name) as
+          | { id: string }
+          | undefined;
+        if (nameHolder && nameHolder.id !== row.id) {
+          skipped.stages++;
+          continue;
+        }
+        const current = this.db.prepare(`SELECT sync_revision, trigger_patterns FROM stages WHERE id = ?`)
+          .get(row.id) as { sync_revision: number; trigger_patterns: string } | undefined;
+        // DOOR 10. AN ACT REFUSED BY HAND MUST NOT LAND AS FACT BY RELAY. Locally, re-aiming a
+        // stage that carries live blocking rules requires acknowledgeBlockingRules — the human has
+        // to name every deny they are re-pointing. A grafted row carries no acknowledgment, so it
+        // does not converge here.
+        //
+        // This is the last member of the removal/re-aim class: the chokepoint stops a relayed act
+        // from REMOVING a deny, and this stops one from silently changing what a deny denies, which
+        // is the same authority by a different mechanism.
+        //
+        // SUCCESSOR DESIGN (sync-surface slice): stage edits on blocking-bound stages relay WITH
+        // their declaration record, and the receiving graft verifies it — born_of-style provenance
+        // for stage edits, exactly as lifecycle edges already carry. Until that exists, and with
+        // zero production sync callers, non-convergence costs nothing and closes the door.
+        //
+        // THE DELIBERATE CONSEQUENCE, stated so nobody rediscovers it as a bug: a legitimate
+        // multi-device pattern edit will NOT propagate to peers that hold blocking rules on that
+        // stage. Each device declares it locally until act-relay exists. Divergence you can see
+        // beats a deny quietly re-aimed by a machine that never asked.
+        //
+        // Scoped as narrowly as the risk: only when the patterns ACTUALLY DIFFER (byte comparison
+        // is exact here — both sides serialize through serializeTriggerPatterns, so an identical
+        // pattern set is an identical string) and only when live denies are bound. Identical-pattern
+        // rows, verified-OR convergence and advisory-only stages all flow untouched.
+        if (
+          current !== undefined &&
+          row.trigger_patterns !== current.trigger_patterns &&
+          liveBlockingRulesForStage(this.db, row.id).length > 0
+        ) {
+          skipped.stages++;
+          continue;
+        }
+        const [revision, writer] = incomingMeta(row, "stages", row.id, current?.sync_revision);
+        const r = this.db
+          .prepare(
+            `INSERT INTO stages
+               (id, name, trigger_patterns, origin, verified, created_at, sync_updated_at,
+                sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               trigger_patterns = excluded.trigger_patterns,
+               origin = excluded.origin,
+               sync_updated_at = excluded.sync_updated_at,
+               sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > stages.sync_revision
+                OR (excluded.sync_revision = stages.sync_revision
+                    AND excluded.sync_writer > COALESCE(stages.sync_writer, ''))`,
+          )
+          .run(
+            row.id, row.name, row.trigger_patterns, row.origin, row.verified ? 1 : 0,
+            row.created_at, relayAt, revision, writer,
+          );
+        // `verified` CONVERGES OUTSIDE THE REVISION CONTEST, as a monotonic OR. It is not an
+        // opinion two replicas can disagree about — it records that this pattern matched a real
+        // action SOMEWHERE, which is a fact that can only accumulate. Folding it into the guarded
+        // upsert would let a peer who has never fired the stage un-verify it by winning an
+        // unrelated pattern edit, and would make the dead-pattern watchlist lie in the dangerous
+        // direction (a live pattern reported dead).
+        if (row.verified) this.db.prepare(`UPDATE stages SET verified = 1 WHERE id = ?`).run(row.id);
+        if (r.changes > 0) {
+          inserted.stages++;
+          // Reachable only for a stage with no live denies bound (the guard above returns otherwise),
+          // or for a pattern-identical row — but a stage can gain a blocking rule later in this same
+          // payload, so the mirror still has to be told when one is in play.
+          if (liveBlockingRulesForStage(this.db, row.id).length > 0) bumpGateGeneration(this.db);
+        } else skipped.stages++;
+      }
+      for (const row of payload.ruleBindings ?? []) {
+        const current = this.db.prepare(
+          `SELECT sync_revision, severity, stage_id, scope, model_tag FROM rule_bindings WHERE concept_id = ?`,
+        ).get(row.concept_id) as
+          | { sync_revision: number; severity: string; stage_id: string; scope: string; model_tag: string | null }
+          | undefined;
+        // DENY POWER IS NOT DEMOTABLE BY RELAY. The preflight already refuses to MINT blocking
+        // through sync; without this, sync could still REMOVE it — an incoming advisory row winning
+        // the (revision, writer) contest would silently un-deny a rule this machine blocks on, and
+        // a stage_id repoint would leave it blocking a different action entirely. Between two
+        // devices in ordinary use, with no adversary, that composes into deny loss.
+        //
+        // So severity and stage_id are treated like the act-fields of a lifecycle edge: immutable
+        // via relay while the incumbent is blocking. The only incoming row allowed to touch such a
+        // binding is one that is itself declaration-origin blocking at the SAME stage — i.e. a peer
+        // restating the same deny, where convergence is meaningful. Anything else is skipped and
+        // counted, the incumbent-wins house pattern (see the divergent-successor case above).
+        // Reconciling a genuine disagreement about a deny is a human's job, not a merge rule's.
+        //
+        // DOOR 12: REMOVAL BY RECLASSIFICATION. severity and stage_id were not the whole set. An
+        // incoming row can leave `severity = 'blocking'` untouched — sailing past the demotion
+        // check — and rewrite SCOPE and MODEL_TAG instead: a domain-scoped deny (which always
+        // fires) becomes an agent-scoped compensation for some other model, and the model-tag
+        // delivery filter drops it. The deny is gone and every row still reads "blocking", which
+        // makes it the quietest removal of the twelve. Scope and model tag therefore join the
+        // immutable set, and a declaration-origin row changing them does not converge either —
+        // cross-device rescoping belongs to the act-relay successor design, not to a merge rule.
+        if (current?.severity === "blocking") {
+          const restatesTheDeny = row.severity === "blocking" && row.origin === "declaration";
+          const reclassifies =
+            row.stage_id !== current.stage_id ||
+            row.scope !== current.scope ||
+            (row.model_tag ?? null) !== current.model_tag;
+          if (!restatesTheDeny || reclassifies) {
+            skipped.rule_bindings++;
+            continue;
+          }
+        }
+        const [revision, writer] = incomingMeta(row, "rule_bindings", row.concept_id, current?.sync_revision);
+        const r = this.db
+          .prepare(
+            `INSERT INTO rule_bindings
+               (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+                created_at, sync_updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(concept_id) DO UPDATE SET
+               stage_id = excluded.stage_id,
+               severity = excluded.severity,
+               scope = excluded.scope,
+               model_tag = excluded.model_tag,
+               origin = excluded.origin,
+               declared_by = excluded.declared_by,
+               reason = excluded.reason,
+               sync_updated_at = excluded.sync_updated_at,
+               sync_revision = excluded.sync_revision, sync_writer = excluded.sync_writer
+             WHERE excluded.sync_revision > rule_bindings.sync_revision
+                OR (excluded.sync_revision = rule_bindings.sync_revision
+                    AND excluded.sync_writer > COALESCE(rule_bindings.sync_writer, ''))`,
+          )
+          .run(
+            row.concept_id, row.stage_id, row.severity, row.scope, row.model_tag ?? null,
+            row.origin, row.declared_by ?? null, row.reason ?? null, row.created_at, relayAt,
+            revision, writer,
+          );
+        if (r.changes > 0) {
+          inserted.rule_bindings++;
+          // A landed row that puts deny power in play — or takes it out — changes the mirror as
+          // surely as a local declaration does.
+          if (row.severity === "blocking" || current?.severity === "blocking") bumpGateGeneration(this.db);
+        } else skipped.rule_bindings++;
+      }
+
       // 8c. Causal clock ratchet. Unlike memory_edge — whose timestamps nothing reads causally —
       // these created_at values ARE read causally: getRatifications and getLifecycleEdges order by
       // them to answer "which act came first". Graft preserves the payload's created_at, so a peer
@@ -9179,6 +10442,10 @@ export class MonetCore {
       let importedHigh = 0;
       for (const row of payload.lifecycleEdges ?? []) importedHigh = Math.max(importedHigh, row.created_at);
       for (const row of payload.ratifications ?? []) importedHigh = Math.max(importedHigh, row.created_at);
+      // Stages are read causally too — listStages orders by created_at, and that order decides
+      // which stage a multi-stage fire names first.
+      for (const row of payload.stages ?? []) importedHigh = Math.max(importedHigh, row.created_at);
+      for (const row of payload.ruleBindings ?? []) importedHigh = Math.max(importedHigh, row.created_at);
       if (importedHigh > 0) {
         this.db.prepare(`UPDATE sync_meta SET last_mutation_at = MAX(last_mutation_at, ?) WHERE singleton = 1`)
           .run(importedHigh);
@@ -9322,6 +10589,9 @@ export class MonetCore {
     const proofToken = txn();
     this.installEmbeddingWidthProof(proofToken);
 
+    // A graft can land, remove, or reroute deny power (a blocking binding, a stage's patterns, a
+    // tombstone or a supersession on a blocking rule). No-op unless the generation actually moved.
+    this.refreshGateSidecar();
     return { inserted, skipped, conceptsMarkedDirty: [...conceptsMarkedDirty] };
   }
 
@@ -9475,7 +10745,7 @@ export class MonetCore {
    */
   renameCircle(from: string, to: string): RenameCircleResult {
     this.assertNoEmbedderMigrationReentry("rename a circle");
-    return this.db.immediateTransaction((): RenameCircleResult => {
+    const result = this.db.immediateTransaction((): RenameCircleResult => {
       // Resolve and authorize after acquiring the write reservation. A concurrent source create
       // either commits first and blocks this rename, or waits and observes the alias afterward.
       to = this.resolveCircle(to);
@@ -9504,6 +10774,10 @@ export class MonetCore {
       const renamedConceptIds = (this.db.prepare(
         `SELECT id FROM concepts WHERE circle = ? ORDER BY id`,
       ).all(from) as Array<{ id: string }>).map((row) => row.id);
+      // Read BEFORE the move: afterwards there is nothing left in `from` to find. Every sidecar
+      // entry carries the circle its rule lives in, so renaming a circle that holds a deny rewrites
+      // the mirror's content even though no binding was touched.
+      const renameTouchesDenyPower = circleHasBlockingRule(this.db, from);
 
       const conceptsUpdated = (this.db.prepare(`UPDATE concepts SET circle = ? WHERE circle = ?`).run(to, from)).changes;
       const observationsUpdated = (this.db.prepare(`UPDATE observations SET circle = ? WHERE circle = ?`).run(to, from)).changes;
@@ -9528,6 +10802,7 @@ export class MonetCore {
             WHERE circle = ?`,
         ).run(to, renameStamp, this.syncDeviceId, from);
       }
+      if (renameTouchesDenyPower) bumpGateGeneration(this.db);
       // entities: (key, scope) is a compound PK — a bulk UPDATE fails if `to` already has the same key
       // (e.g. when renaming circle-B into `canonical` after circle-A was already renamed there).
       // Merge: add from's df into any matching `to` row (upsert), then delete the from rows.
@@ -9622,6 +10897,9 @@ export class MonetCore {
       }
       return { from, to, action: "renamed", conceptsUpdated, observationsUpdated, edgesUpdated, entitiesUpdated };
     })();
+    // The mirror names each rule's circle, so a rename that moved a deny changed the file's content.
+    this.refreshGateSidecar();
+    return result;
   }
 
   /**
@@ -10704,6 +11982,9 @@ export class MonetCore {
     // (the query is on fb.circle, not c.circle, so this ordering is safe). The concept SURVIVES this
     // move, so its pin must survive too — UPDATE circle+position rather than DELETE. (Finding 2 — Codex PR-32)
     this.rehomeFirstBlockEntry(id, toCircle);
+    // Every sidecar entry names the circle its rule lives in, so moving a deny between circles
+    // rewrites the mirror even though the binding is untouched.
+    this.noteBlockingRuleTouched(id);
     this.db.prepare(`UPDATE concepts SET circle = ?, updated_at = unixepoch() * 1000 WHERE id = ?`).run(toCircle, id);
     const moved = this.db.prepare(`UPDATE observations SET circle = ? WHERE concept_id = ?`).run(toCircle, id);
     // Unwind the concept's footprint in the old circle (entity df + edges), then re-derive it inside
@@ -10877,6 +12158,15 @@ export class MonetCore {
     this.db.prepare(`DELETE FROM contradictions WHERE concept_id = ?`).run(conceptId);
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(conceptId);
     this.db.prepare(`DELETE FROM observations WHERE concept_id = ?`).run(conceptId);
+    // Before the row goes: a hard delete removes a blocking rule from the mirror exactly as a
+    // retire does, and the binding it is read from is about to be unjoinable.
+    this.noteBlockingRuleTouched(conceptId);
+    // CHOKEPOINT, LAST LINE OF DEFENCE. Every caller that can reach a live deny is guarded ahead of
+    // this (merge refuses to auto-merge rules, consolidating detach refuses outright, graft skips
+    // and counts), so reaching here with one blocked means a NEW caller was added without the
+    // guard. Refusing at the delete itself is what makes that a loud failure rather than a
+    // ninth door.
+    assertBlockingRuleMutationAllowed(this.db, conceptId, replicate ? "hard delete" : "relayed delete");
     this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(conceptId);
   }
 
@@ -11692,7 +12982,54 @@ export class MonetCore {
         ? { nearMatchId: operation.near_match_id, nearMatchScore: operation.near_match_score ?? 0 }
         : {}),
       ...(resolution ? { resolutionMode: resolution.mode } : {}),
+      ...this.replayRuleOutcome(operation),
     };
+  }
+
+  /**
+   * Rebuild a rule write's normative outcome at replay, from the substrate rather than from a
+   * second copy of it — the same discipline `resolutionMode` follows above.
+   *
+   * SUCCESSION is fully recoverable: the supersession edge records the correction observation that
+   * caused it in `event_ref`, so the receipt's observation id finds the exact edge and both ends.
+   * THE BINDING is recoverable except for what it replaced, which is why `rule_previous_severity`
+   * is the one field this receipt stores rather than points at (see its guarded ALTER above).
+   *
+   * Returns nothing for writes that were not rule writes — which is also what the fresh path
+   * returns for them, so the replay matches it.
+   */
+  private replayRuleOutcome(operation: IngestOperationRow): Partial<IngestResult> {
+    const out: Partial<IngestResult> = {};
+    const edge = this.db
+      .prepare(
+        `SELECT id, src_concept_id, dst_concept_id FROM lifecycle_edges
+          WHERE family = 'supersession' AND event_ref = ? AND dst_concept_id = ?`,
+      )
+      .get(operation.observation_id, operation.concept_id) as
+      | { id: string; src_concept_id: string; dst_concept_id: string }
+      | undefined;
+    if (edge) {
+      out.ruleSuccession = {
+        supersededRuleId: edge.src_concept_id,
+        successorRuleId: edge.dst_concept_id,
+        supersessionEdgeId: edge.id,
+        stageId: getRuleBinding(this.db, edge.dst_concept_id)?.stage_id ?? "",
+      };
+    }
+    const previousSeverity = (operation as { rule_previous_severity?: string | null }).rule_previous_severity ?? null;
+    const binding = getRuleBinding(this.db, operation.concept_id);
+    // A succession writes the successor's binding through the same helper, but the FRESH path
+    // reports only `ruleSuccession` for it — so replay must not invent a `ruleBindingChange` the
+    // first call never returned.
+    if (binding && !edge && this.getRow(operation.concept_id)?.kind === "rule") {
+      out.ruleBindingChange = {
+        conceptId: operation.concept_id,
+        severity: binding.severity,
+        previousSeverity: previousSeverity as RuleSeverity | null,
+        downgradedFromBlocking: previousSeverity === "blocking" && binding.severity !== "blocking",
+      };
+    }
+    return out;
   }
 
   private getRow(id: string): ConceptRow | null {

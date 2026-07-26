@@ -256,6 +256,44 @@ export interface SyncRatificationRow {
   sync_writer?: string | null;
 }
 
+/**
+ * A stage — the named address a corrected action creates. STORE-GLOBAL and therefore circle-less:
+ * `git push --force` is the same action in every project, so the registry replicates whole while
+ * the RULES bound to it stay in their own circles.
+ *
+ * `verified` is GROW-ONLY across replicas (see the graft path): a pattern that has fired anywhere
+ * has proved it matches something real, and that proof cannot be un-made by a peer who has not seen
+ * it yet.
+ */
+export interface SyncStageRow {
+  id: string;
+  name: string;
+  trigger_patterns: string; // JSON array of {tool, tokens}
+  origin: string;
+  verified: number;
+  created_at: number;
+  sync_updated_at: number;
+  /** Convergence clock for the mutable columns (trigger_patterns, origin). */
+  sync_revision?: number;
+  sync_writer?: string | null;
+}
+
+/** A rule's address: which stage it fires at, how hard, and for whom. */
+export interface SyncRuleBindingRow {
+  concept_id: string;
+  stage_id: string;
+  severity: string;
+  scope: string;
+  model_tag: string | null;
+  origin: string;
+  declared_by: string | null;
+  reason: string | null;
+  created_at: number;
+  sync_updated_at: number;
+  sync_revision?: number;
+  sync_writer?: string | null;
+}
+
 // ---- the payload and result -----------------------------------------------
 
 export interface GraftPayload {
@@ -290,6 +328,11 @@ export interface GraftPayload {
   /** Normative substrate. Optional: a payload from before this slice simply carries none. */
   lifecycleEdges?: SyncLifecycleEdgeRow[];
   ratifications?: SyncRatificationRow[];
+  /** Gate substrate. `gate_events` is deliberately absent — local instrumentation, like
+   *  `resolution_events`: replicating it would merge two machines' action streams under one
+   *  timeline and make every rate computed from it a lie. */
+  stages?: SyncStageRow[];
+  ruleBindings?: SyncRuleBindingRow[];
 }
 
 export interface GraftResult {

@@ -189,6 +189,34 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
     out.push("");
   }
 
+  // HOW THE GATES HAVE BEEN FIRING (src/gates.ts). The gate-firing design names its own measures —
+  // "fire precision and silence rate" — and this is the human curation surface, so a JSON field on
+  // the MCP response does not discharge them. Two lines: the rates, then the dead-pattern watchlist
+  // (a stage whose pattern has never matched anything is the failure mode a mechanically-seeded
+  // pattern actually has). Suppressed on a store that has never been asked, where it would be a row
+  // of zeros telling nobody anything — but NOT suppressed when there are only silences: a gate that
+  // never fires is exactly what this section exists to make visible.
+  const gs = o.gateStats;
+  if (gs && (gs.windowTotal > 0 || gs.unverifiedPatterns.length > 0)) {
+    out.push(bold("GATES") + dim(`  — what fired at the moment of action, last ${gs.windowDays}d`));
+    if (gs.windowTotal > 0) {
+      out.push(truncate(
+        dim(`  ${gs.windowTotal} asked · ${gs.fires} matched a stage · ${gs.silences} silent · ${gs.delivered} delivered a rule`),
+        width,
+      ));
+      for (const st of gs.byStage) {
+        out.push(truncate(`  ${padStartV(String(st.fires), 3)} × ${st.stageName}`, width));
+      }
+    }
+    if (gs.unverifiedPatterns.length > 0) {
+      out.push(truncate(yellow(`  ${gs.unverifiedPatterns.length} pattern(s) never fired`) + dim(" — declare to replace, or leave inert"), width));
+      for (const up of gs.unverifiedPatterns) {
+        out.push(truncate(dim(`      ${up.stageName}  [${up.patterns.join(" | ")}]  (${up.origin})`), width));
+      }
+    }
+    out.push("");
+  }
+
   if (o.otherCircles && o.otherCircles.length > 0) {
     out.push(bold("OTHER ROOMS") + dim("  — other circles in this store"));
     for (const oc of o.otherCircles) {
