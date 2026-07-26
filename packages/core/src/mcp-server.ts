@@ -623,7 +623,7 @@ export function registerMonetCoreTools(
           circle: circleLabel,
           results,
           guidance:
-            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
+            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle). `matchedObservationId` (when present) names WHICH observation matched, not what it said — still fetch to read. Fewer results than `limit` (or none) means nothing in your own memories scored above the relevance floor, not that the search failed; that floor applies to your memories only, so a connected source file can still appear on a query none of them answered.",
         }, "memory_search", capturedBlock);
       } catch (e) {
         return err(`search failed: ${msg(e)}`);
@@ -717,7 +717,7 @@ export function registerMonetCoreTools(
           stopReason: r.stopReason,
           reachableByType: r.reachableByType,
           guidance:
-            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle).",
+            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle). `matchedObservationId` (on ranked cards, when present) names WHICH observation matched, not what it said — still fetch to read; its absence means the card was reached by the graph or by wording overlap rather than by a direct match. A ranked card's `score` is its fused rank (similarity combined with graph activation), NOT that observation's own similarity. An empty `ranked` (or fewer than `limit`) means the intent matched nothing to build a context from, not that gather failed.",
         }, "memory_gather", capturedBlock);
       } catch (e) {
         return err(`gather failed: ${msg(e)}`);

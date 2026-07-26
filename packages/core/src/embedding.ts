@@ -187,6 +187,27 @@ export function cosine(a: Float32Array, b: Float32Array): number {
   return dot;
 }
 
+/** Serialize a vector for the `embedding` TEXT column (concepts and observations both). */
+export function embToJson(v: Float32Array): string {
+  return JSON.stringify(Array.from(v));
+}
+
+/** Inverse of embToJson. (Moved here from engine.ts with the retrieval extraction — it is an
+ *  embedding-serialization helper, and src/retrieval.ts needs it without depending on the engine.) */
+export function jsonToEmb(s: string): Float32Array {
+  return Float32Array.from(JSON.parse(s) as number[]);
+}
+
+/** True iff every component is exactly 0 — the pre-chunk-embedding placeholder storeSourceChunk
+ *  used to write for every source chunk observation (chunk-granular source retrieval,
+ *  scoreSourceConcepts's zero-vector exclusion, src/retrieval.ts), or the create-time concept
+ *  placeholder before recomputeSourceConceptBody's first real write. A zero vector is a
+ *  PLACEHOLDER, not a measurement: retrieval excludes it rather than scoring it as 0. */
+export function isZeroVector(v: Float32Array): boolean {
+  for (let i = 0; i < v.length; i++) if (v[i] !== 0) return false;
+  return true;
+}
+
 /** Running-mean blend of a concept's vector with a new supporting observation. */
 export function blend(current: Float32Array, next: Float32Array, currentCount: number): Float32Array {
   const out = new Float32Array(current.length);

@@ -69,8 +69,16 @@ import {
   cosine,
   blend,
   blendWeighted,
+  embToJson,
+  jsonToEmb,
 } from "./embedding";
 export { EmbedderOutputDimensionError, EmbedderOutputNonFiniteError } from "./embedding";
+import {
+  NATIVE_SCORE_FLOOR,
+  scoreNativeConceptsByObservation,
+  scoreSourceConcepts,
+  type NativeObservationMatch,
+} from "./retrieval";
 import {
   inspectLiveEmbeddingPopulations,
   parseFiniteEmbeddingJson,
@@ -527,6 +535,19 @@ export interface SearchCard {
   fetchHint: string;
   /** The circle this memory lives in. Always present — useful in store-wide (omitted-circle) results. */
   circle: string;
+  /**
+   * The unit split (observations retrieve, concepts deliver): WHICH of this concept's observations
+   * earned its dense score. Present on native concepts ranked through the dense arm — search()
+   * results and gather()'s RANKED cards. Absent on source concepts (they rank by file/chunk, #54),
+   * on concepts pulled in by a non-embedding arm (gather's lexical seed, entity seeding, graph
+   * spread), and on gather()'s SEED cards (those are scored by confidence, not by retrieval — see
+   * cardOf — so naming a matched observation beside that number would misread).
+   *
+   * The id ONLY — never the observation's content or an excerpt of it. A card shows shape and
+   * depth, never the claim (ADR §4.5, #232); naming the matching observation tells an agent WHERE
+   * the match is without letting it lift an answer instead of calling fetch.
+   */
+  matchedObservationId?: string;
 }
 
 export interface IngestResult {
@@ -2569,8 +2590,28 @@ export class MonetCore {
     const contradictions = this.openContradictionCountsGlobal(resolvedCircle);
     const defaultCircle = this.defaultCircle;
     const sourceScores = this.scoreSourceConcepts(rows, emb);
+    // THE UNIT SPLIT: native rows rank by their best LIVE OBSERVATION's cosine, not by the
+    // concept centroid (retired from query ranking — see src/retrieval.ts). Per-concept dedupe
+    // is structural: the MAX yields at most one entry per concept however many observations
+    // matched, so one concept still delivers exactly one card.
+    //
+    // THIS is where NATIVE_SCORE_FLOOR applies, and the ONLY place it does: card emission. A
+    // native row with no usable live observation vector, or whose best one falls below the floor,
+    // yields NO card — returning fewer than `limit`, possibly zero, is correct: silence over
+    // noise. gather() deliberately does NOT floor (its silence is structural; flooring its
+    // fusion inputs inverts its ranking — see the constant's note in src/retrieval.ts).
+    //
+    // Source rows are NOT floored: #54's file/chunk semantics are untouched by this slice, so a
+    // junk query can still return a low-cosine source card while every native row stays silent.
+    const nativeMatches = this.scoreNativeConcepts(nativeRows.map((r) => r.id), emb);
     return rows
-      .map((r) => ({ row: r, score: r.kind === "source" ? sourceScores.get(r.id)! : cosine(emb, jsonToEmb(r.embedding)) }))
+      .map((r) => {
+        if (r.kind === "source") return { row: r, score: sourceScores.get(r.id)!, matchedObservationId: undefined };
+        const match = nativeMatches.get(r.id);
+        if (match === undefined || match.score < NATIVE_SCORE_FLOOR) return null;
+        return { row: r, score: match.score, matchedObservationId: match.observationId };
+      })
+      .filter((c): c is { row: ConceptRow; score: number; matchedObservationId: string | undefined } => c !== null)
       .sort((a, b) => {
         const diff = b.score - a.score;
         if (Math.abs(diff) > 1e-9) return diff;
@@ -2583,7 +2624,7 @@ export class MonetCore {
         return a.row.id < b.row.id ? -1 : 1;
       })
       .slice(0, limit)
-      .map(({ row, score }) => toCard(row, score, contradictions.get(row.id) ?? 0));
+      .map(({ row, score, matchedObservationId }) => toCard(row, score, contradictions.get(row.id) ?? 0, matchedObservationId));
     })();
   }
 
@@ -5573,72 +5614,25 @@ export class MonetCore {
     return this.authorizedSourceProjections(context, undefined, true, conceptId)[0] ?? null;
   }
 
-  /**
-   * Chunk-granular source retrieval (ratified): scores each kind='source' row in `rows` by
-   * MAX(whole-file concepts.embedding cosine, every ACTIVE chunk vector's cosine)
-   * (source_chunks.lifecycle='active' → observations.embedding — the same join listMemories' own
-   * provenance count uses above, at `SELECT concept_id, observation_id FROM source_chunks WHERE
-   * lifecycle='active' ...`), instead of JUST the single mean-pooled whole-file concepts.embedding
-   * every OTHER consumer (dedup, graph, pin sampling) still reads unchanged. A multi-section
-   * file's one on-topic chunk no longer gets diluted below the noise floor by every unrelated
-   * section sharing that one vector.
-   *
-   * REVIEW FIX (Codex P2 finding 5): the whole-file cosine is an UNCONDITIONAL candidate in the
-   * max now, not an all-or-nothing fallback used only when every chunk vector is zero. The
-   * all-zero case (a store synced by an older build, storeSourceChunk used to write an all-zero
-   * placeholder always; see its own comment) is the OBVIOUS case that needs it, but a subtler one
-   * matters just as much: a file PARTIALLY refreshed by a content-changing sync on an old-build
-   * store — the edited section gets a real vector, every UNCHANGED section keeps its zero
-   * placeholder (storeSourceChunk only ever writes on an actual content change; see
-   * materializeStagedBindings' unchanged-content fast path, source-sync.ts). With the old
-   * all-or-nothing fallback, ANY non-zero chunk suppressed it entirely, so a query about one of the
-   * still-zero UNCHANGED sections scored against only the unrelated edited chunk — worse than
-   * status-quo whole-file scoring, not just no-better. Folding the whole-file cosine into the max
-   * unconditionally closes that gap (it's a superset of the old behavior: identical whenever no
-   * chunk is non-zero, since the max of one candidate is itself; never worse when a chunk IS
-   * non-zero, since max only ever adds a candidate, never removes one).
-   *
-   * REVIEW FIX (Codex P2 finding 6, revised per reviewer follow-up): the chunk-vector query joins
-   * the candidate id list through `json_each(?)` on ONE bound JSON-array parameter — the same
-   * param-count-independent shape this file already uses for ACL membership checks
-   * (authorizedSourceProjections' allowed_caller_ids_json/allowed_project_ids_json EXISTS clauses,
-   * above) — rather than an unbounded `IN (?,?,...)` whose host-parameter count scales with the
-   * candidate count. The scanner allows up to 10,000 files per source (maxFiles,
-   * source-scanner.ts), and this build's actual ceiling was measured directly: SQLite 3.49.2 here
-   * accepts up to 32766 bound parameters and throws "too many SQL variables" at 32767 — a real,
-   * reachable number for a large multi-source circle, not a theoretical one. json_each(?) makes
-   * this query's parameter count exactly 1 regardless of how many source concepts are in scope.
-   *
-   * Non-source rows are ignored (absent from the returned map) — callers keep scoring those with
-   * plain cosine against concepts.embedding, exactly as before. search() and gather() both call
-   * this with their own candidate set so the two stay consistent.
-   */
+  /** Thin delegate — the scoring math lives in src/retrieval.ts (see scoreSourceConcepts there
+   *  for the #54 chunk-granularity rationale and the json_each(?) parameter-count note). */
   private scoreSourceConcepts(rows: readonly ConceptRow[], emb: Float32Array): Map<string, number> {
-    const scores = new Map<string, number>();
-    const sourceRows = rows.filter((r) => r.kind === "source");
-    if (sourceRows.length === 0) return scores;
-    const sourceIds = sourceRows.map((r) => r.id);
-    const chunkVectors = this.db
-      .prepare(
-        `SELECT sc.concept_id AS concept_id, o.embedding AS embedding
-           FROM source_chunks sc JOIN observations o ON o.id = sc.observation_id
-          WHERE sc.lifecycle = 'active' AND sc.concept_id IN (SELECT value FROM json_each(?))`,
-      )
-      .all(JSON.stringify(sourceIds)) as Array<{ concept_id: string; embedding: string }>;
-    const bestByConceptId = new Map<string, number>();
-    for (const chunk of chunkVectors) {
-      const vec = jsonToEmb(chunk.embedding);
-      if (isZeroVector(vec)) continue; // pre-chunk-embedding placeholder — excluded, not scored as 0
-      const cos = cosine(emb, vec);
-      const prior = bestByConceptId.get(chunk.concept_id);
-      if (prior === undefined || cos > prior) bestByConceptId.set(chunk.concept_id, cos);
-    }
-    for (const row of sourceRows) {
-      const wholeFileCos = cosine(emb, jsonToEmb(row.embedding));
-      const bestChunkCos = bestByConceptId.get(row.id);
-      scores.set(row.id, bestChunkCos === undefined ? wholeFileCos : Math.max(wholeFileCos, bestChunkCos));
-    }
-    return scores;
+    return scoreSourceConcepts(this.db, rows, emb);
+  }
+
+  /**
+   * THE NATIVE DENSE ARM — thin delegate to src/retrieval.ts's scoreNativeConceptsByObservation
+   * (the unit split: observations retrieve, concepts deliver; see that module's header for the
+   * measured r = -0.58 length/relevance defect this closes).
+   *
+   * search() and gather()'s dense arm BOTH go through this one method, by construction — that is
+   * #54's lesson restated: the moment two ranking arms are allowed to score the same store
+   * differently, they drift. Concepts absent from the returned map (no live non-zero observation
+   * vector, or every observation below NATIVE_SCORE_FLOOR) do not rank densely at all; there is
+   * deliberately NO centroid fallback.
+   */
+  private scoreNativeConcepts(conceptIds: readonly string[], emb: Float32Array): Map<string, NativeObservationMatch> {
+    return scoreNativeConceptsByObservation(this.db, conceptIds, emb);
   }
 
   createSource(input: CreateSourceInput): KnowledgeSource {
@@ -10364,11 +10358,38 @@ export class MonetCore {
         ...countSourceRefs(projection.row.source_refs),
       };
     });
-    const dense = this.scoreAllConcepts(emb, resolvedCircle, opts.includeArchived); // [{id, cos}] desc
+    // THE UNIT SPLIT: `dense` is ranked by each concept's best LIVE OBSERVATION (shared with
+    // search() via scoreNativeConcepts) rather than by the concept centroid. ONLY the scoring
+    // SOURCE changed — the candidate condition is still `cos > 0`, exactly as before the split,
+    // so `sim` and the dense seed list cover the same rows they always did.
+    //
+    // NATIVE_SCORE_FLOOR is deliberately NOT applied anywhere in gather. Two reasons, both
+    // load-bearing:
+    //   1. Withholding a sub-floor concept from `sim` does not demote it — it PROMOTES it.
+    //      fuse() (src/graph.ts:126-134) branches on `sim > 0`; a concept missing from `sim`
+    //      takes the pure-graph branch `beta * activation * prior^priorExp`, which carries NO
+    //      relevance term. Sub-floor concepts DO reach that branch: lexicalSeed and entity
+    //      seeding are embedding-independent, and spread() copies its seeds straight into its
+    //      output (src/graph.ts:78), so activation is already 1.0 with no thread edge required.
+    //      A healthy fresh concept then scores ~0.387 there — enough to outrank a genuine match.
+    //      Keeping it in `sim` at its true low cosine is what actually ranks it low.
+    //   2. gather's junk-query silence is STRUCTURAL, not floor-derived: an intent that seeds
+    //      nothing returns early on `seedStrength.size === 0` below.
+    const dense = this.scoreAllConcepts(emb, resolvedCircle, opts.includeArchived); // [{id, cos, observationId}] desc
     const sim = new Map<string, number>();
-    for (const d of dense) if (d.cos > 0) sim.set(d.id, d.cos);
+    // matchedObservationById: which observation earned each dense score — carried onto RANKED
+    // cards only (the id only, never its content). A concept that entered via the lexical,
+    // entity, or graph arms has no entry: it did not match an observation, and its card must not
+    // claim it did. SEED cards deliberately do not carry it either — cardOf() scores them with
+    // row.confidence, and an observation id sitting next to a confidence value reads as "this is
+    // how strongly that observation matched", which it is not.
+    const matchedObservationById = new Map<string, string>();
+    for (const d of dense) {
+      sim.set(d.id, d.cos);
+      matchedObservationById.set(d.id, d.observationId);
+    }
 
-    const denseIds = dense.filter((d) => d.cos > 0).map((d) => d.id);
+    const denseIds = dense.map((d) => d.id);
     const lexIds = this.lexicalSeed(intent, resolvedCircle, 30, opts.includeArchived);
     const fused = rrfFuse([denseIds, lexIds], RRF_K).slice(0, SEED_K);
     const seedIds = fused.map((f) => f.id);
@@ -10424,7 +10445,7 @@ export class MonetCore {
     const reachCircle = resolvedCircle ?? this.defaultCircle;
     const nativeRanked = accepted
         .slice(0, limit)
-        .map((r) => this.toGatherCard(r))
+        .map((r) => this.toGatherCard(r, matchedObservationById.get(r.id)))
         .filter((c): c is GatherCard => c !== null);
     const mergedRanked = nativeRanked.concat(sourceRankedCards)
       .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
@@ -10476,26 +10497,50 @@ export class MonetCore {
     return rows.map((r) => ({ id: r.id, title: r.title, body: r.body, kind: r.kind }));
   }
 
-  /** Score all concepts by cosine. When `circle` is omitted, scores across all circles. Archived circles excluded by default. */
-  private scoreAllConcepts(emb: Float32Array, circle?: string, includeArchived?: boolean): Array<{ id: string; cos: number }> {
-    const rows: Array<{ id: string; embedding: string }> = circle !== undefined
+  /**
+   * gather()'s NATIVE DENSE ARM. Enumerates the in-scope native concepts, then ranks them through
+   * the SAME shared scorer search() uses (scoreNativeConcepts → src/retrieval.ts): each concept's
+   * score is the MAX cosine over its live observation vectors — the unit split — never the
+   * concept centroid, which is retired from query ranking.
+   *
+   * Concepts with no usable live observation vector, and concepts whose every observation falls
+   * below NATIVE_SCORE_FLOOR, are ABSENT from the result: they contribute neither a dense seed
+   * nor a `sim` term. They remain reachable in gather through the lexical seed, entity seeding,
+   * and graph spread — none of which is an embedding path. (search(), which has only this arm,
+   * simply does not return them.)
+   *
+   * The candidate SELECT no longer reads `concepts.embedding` at all — that column is exactly the
+   * blurred centroid this split retired, and not fetching a 384-float JSON blob per concept
+   * offsets the per-observation vector load this arm adds.
+   *
+   * When `circle` is omitted, scores across all circles. Archived circles excluded by default.
+   * Ranked desc; ties break by id ascending (determinism is a hard contract).
+   */
+  private scoreAllConcepts(
+    emb: Float32Array, circle?: string, includeArchived?: boolean,
+  ): Array<{ id: string; cos: number; observationId: string }> {
+    const rows: Array<{ id: string }> = circle !== undefined
       ? this.db
-          .prepare(`SELECT id, embedding FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
-          .all(circle) as Array<{ id: string; embedding: string }>
+          .prepare(`SELECT id FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
+          .all(circle) as Array<{ id: string }>
       : includeArchived
         ? this.db
-            .prepare(`SELECT id, embedding FROM concepts WHERE kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
-            .all() as Array<{ id: string; embedding: string }>
+            .prepare(`SELECT id FROM concepts WHERE kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
+            .all() as Array<{ id: string }>
         : this.db
             .prepare(
-              `SELECT c.id, c.embedding FROM concepts c
+              `SELECT c.id FROM concepts c
                 LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
                WHERE c.kind NOT IN ('workstream', 'source') AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND c.status != 'retired' AND ca.from_name IS NULL`,
             )
-            .all() as Array<{ id: string; embedding: string }>;
-    return rows
-      .map((r) => ({ id: r.id, cos: cosine(emb, jsonToEmb(r.embedding)) }))
-      .sort((a, b) => b.cos - a.cos || (a.id < b.id ? -1 : 1));
+            .all() as Array<{ id: string }>;
+    const matches = this.scoreNativeConcepts(rows.map((r) => r.id), emb);
+    const scored: Array<{ id: string; cos: number; observationId: string }> = [];
+    for (const r of rows) {
+      const match = matches.get(r.id);
+      if (match !== undefined) scored.push({ id: r.id, cos: match.score, observationId: match.observationId });
+    }
+    return scored.sort((a, b) => b.cos - a.cos || (a.id < b.id ? -1 : 1));
   }
 
   /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). When `circle` is omitted, seeds from all circles. Archived circles excluded by default. */
@@ -10610,16 +10655,19 @@ export class MonetCore {
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`).get(id) as { n: number }).n;
   }
 
+  /** NOTE: scores the card with `row.confidence`, not a retrieval score (pre-existing). That is
+   *  precisely why a seed card never carries `matchedObservationId` — the two side by side would
+   *  read as "confidence = how strongly that observation matched". Ranked cards carry it. */
   private cardOf(id: string): SearchCard | null {
     const row = this.getRow(id);
     if (!row || row.status === "retired" || isConnectorOwnedRow(row)) return null;
     return toCard(row, row.confidence, this.openContraCount(id));
   }
 
-  private toGatherCard(r: Ranked): GatherCard | null {
+  private toGatherCard(r: Ranked, matchedObservationId?: string): GatherCard | null {
     const row = this.getRow(r.id);
     if (!row || row.status === "retired" || isConnectorOwnedRow(row)) return null;
-    return { ...toCard(row, r.score, this.openContraCount(r.id)), viaSeed: r.viaSeed, ...countSourceRefs(row.source_refs) };
+    return { ...toCard(row, r.score, this.openContraCount(r.id), matchedObservationId), viaSeed: r.viaSeed, ...countSourceRefs(row.source_refs) };
   }
 
   /** Per-edge-type: distinct non-seed concepts reachable from the seeds within `hop` (explainability). */
@@ -11081,7 +11129,7 @@ function stableFingerprint(row: unknown): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function toCard(r: ConceptRow, score: number, contradictions: number): SearchCard {
+function toCard(r: ConceptRow, score: number, contradictions: number, matchedObservationId?: string): SearchCard {
   return {
     id: r.id,
     slug: r.slug,
@@ -11092,6 +11140,9 @@ function toCard(r: ConceptRow, score: number, contradictions: number): SearchCar
     score,
     fetchHint: fetchHint(r.kind),
     circle: r.circle,
+    // Omitted entirely (not set to undefined) when this concept did not rank via an observation,
+    // so JSON-serialized cards carry the key only when it means something.
+    ...(matchedObservationId !== undefined ? { matchedObservationId } : {}),
   };
 }
 
@@ -11133,23 +11184,6 @@ function toContradiction(r: ContradictionRow): Contradiction {
     resolvedAt: r.resolved_at,
     resolvedBy: r.resolved_by,
   };
-}
-
-function embToJson(v: Float32Array): string {
-  return JSON.stringify(Array.from(v));
-}
-
-function jsonToEmb(s: string): Float32Array {
-  return Float32Array.from(JSON.parse(s) as number[]);
-}
-
-/** True iff every component is exactly 0 — the pre-chunk-embedding placeholder storeSourceChunk
- *  used to write for every source chunk observation (chunk-granular source retrieval,
- *  scoreSourceConcepts's zero-vector fallback), or the create-time concept placeholder before
- *  recomputeSourceConceptBody's first real write. */
-function isZeroVector(v: Float32Array): boolean {
-  for (let i = 0; i < v.length; i++) if (v[i] !== 0) return false;
-  return true;
 }
 
 function firstLine(content: string): string {

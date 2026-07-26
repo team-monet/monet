@@ -81,6 +81,11 @@ export type {
   StoredEmbeddingPopulations,
 } from "./embedding-state";
 export { MONET_SCHEMA_VERSION } from "./schema-version";
+/** The unit split (observations retrieve, concepts deliver): the native dense arm's absolute
+ *  cosine floor. Exported alongside the other retrieval tuning constants because it is the reason
+ *  a query can legitimately return FEWER cards than its limit — including zero. */
+export { NATIVE_SCORE_FLOOR } from "./retrieval";
+export type { NativeObservationMatch } from "./retrieval";
 export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError } from "./store-embedder";
 export {
   DEFAULT_SOURCE_SCANNER_LIMITS,
