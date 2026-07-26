@@ -4,11 +4,11 @@
   "agents": [
     {
       "name": "stig",
-      "role": "product owner with strong technical understanding",
+      "role": "lead with strong technical understanding",
       "mode": "primary",
       "prompt": "agents/stig.md",
       "touchesMonet": true,
-      "description": "The product owner and lead. Owns routine direction, priority, scope, and disposition; uses context, Monet, and orchestration as supporting mechanisms and delegates execution."
+      "description": "The lead. The only agent the user talks to, the only one that uses Monet, and the only one that delegates. Answers directly when that suffices and delegates when a fresh isolated context earns its cost."
     },
     {
       "name": "explorer",
