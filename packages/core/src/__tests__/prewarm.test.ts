@@ -66,4 +66,19 @@ describe("prewarm — query-independent session start (#242)", () => {
     expect(state.topConcepts.map((t) => t.id)).not.toContain(ws.id); // workstream never in the living model
     core.close();
   });
+
+  it("carries the stage index (names of stages with a live rule) and omits it when empty", async () => {
+    const core = new MonetCore(":memory:");
+    // An ordinary fact carries no stage — the index stays absent, not an empty array, so an
+    // install with no stages carries no schema noise.
+    await core.store("We use SQLite for Monet Local storage.");
+    expect(core.prewarm().stageIndex).toBeUndefined();
+
+    await core.store("Never force-push to a shared branch.", {
+      kind: "rule",
+      rule: { stage: "git force push", scope: "agent", modelTag: "test-model" },
+    });
+    expect(core.prewarm().stageIndex).toEqual(["git force push"]);
+    core.close();
+  });
 });

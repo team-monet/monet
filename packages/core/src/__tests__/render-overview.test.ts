@@ -110,4 +110,37 @@ describe("renderOverview", () => {
     expect(out).toContain("score:");
     c.close();
   });
+
+  it("GATES section surfaces recognized-lookup activity even with zero mechanical fires IN THE WINDOW (review fix, item 4)", async () => {
+    const c = populated();
+    const longAgo = Date.now() - 40 * 24 * 60 * 60 * 1000; // outside the default 30-day stats window
+    await c.store("Never force-push to a shared branch.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "domain" },
+    });
+    // A mechanical fire OUTSIDE the stats window: verifies the pattern PERMANENTLY (verified is not
+    // time-windowed) without contributing to windowTotal (which is), isolating "recognized activity
+    // in the window" as the only thing this store has to report — proving the suppression condition
+    // needed widening, not just that the new line can render alongside other reasons to show GATES.
+    c.gate({ actionContext: "Bash:git push --force", now: longAgo });
+    c.stageLookup({ stage: "git force push" });
+    c.stageLookup({ stage: "git force push" });
+    c.stageLookup({ stage: "no such stage" });
+
+    const gs = c.gateStats();
+    expect(gs.windowTotal).toBe(0); // the old mechanical fire falls outside the window
+    expect(gs.unverifiedPatterns).toEqual([]); // ...but it verified the pattern permanently
+    expect(gs.byMatcher.find((m) => m.matcher === "recognized")?.count).toBe(3);
+
+    const out = renderOverview(c.overview("default"), { color: false });
+    expect(out).toContain("GATES");
+    expect(out).toContain("3 asked by recognition (stage_lookup)");
+    c.close();
+  });
+
+  it("GATES section stays suppressed when there is truly nothing to report", async () => {
+    const c = populated();
+    const out = renderOverview(c.overview("default"), { color: false });
+    expect(out).not.toContain("GATES");
+    c.close();
+  });
 });

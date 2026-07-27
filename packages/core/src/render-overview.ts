@@ -204,12 +204,21 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
   // of zeros telling nobody anything — but NOT suppressed when there are only silences: a gate that
   // never fires is exactly what this section exists to make visible.
   const gs = o.gateStats;
+  // `recognizedCount` (review fix, item 4): byMatcher's recognized-lookup count reaches no human
+  // otherwise — a JSON field on the MCP response does not discharge a disclosure whose whole
+  // purpose is that a human sees it, same standard this section already holds itself to below.
+  // Computed before the suppression check because it must ALSO be able to un-suppress the whole
+  // section: a store where every gate event is a recognized lookup (zero mechanical fires) has
+  // `windowTotal === 0` — windowTotal is mechanical-only by construction (see gateStats' own
+  // comment) — and without this term such a store would never show a GATES section at all despite
+  // real recognized activity.
+  const recognizedCount = gs?.byMatcher.find((m) => m.matcher === "recognized")?.count ?? 0;
   // `unexplainedDenies` joins the suppression condition rather than riding inside it: a store that
   // has never been asked can still hold a relayed deny that cannot explain itself, and that is
   // precisely the store where nobody is going to notice on their own. The section comment above
   // applies with full force here — a JSON field on the MCP response does not discharge a
   // disclosure whose whole purpose is that a human sees it.
-  if (gs && (gs.windowTotal > 0 || gs.unverifiedPatterns.length > 0 || gs.unexplainedDenies.length > 0)) {
+  if (gs && (gs.windowTotal > 0 || recognizedCount > 0 || gs.unverifiedPatterns.length > 0 || gs.unexplainedDenies.length > 0)) {
     out.push(bold("GATES") + dim(`  — what fired at the moment of action, last ${gs.windowDays}d`));
     if (gs.windowTotal > 0) {
       out.push(truncate(
@@ -219,6 +228,9 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
       for (const st of gs.byStage) {
         out.push(truncate(`  ${padStartV(String(st.fires), 3)} × ${st.stageName}`, width));
       }
+    }
+    if (recognizedCount > 0) {
+      out.push(truncate(dim(`  ${recognizedCount} asked by recognition (stage_lookup)`), width));
     }
     if (gs.unverifiedPatterns.length > 0) {
       out.push(truncate(yellow(`  ${gs.unverifiedPatterns.length} pattern(s) never fired`) + dim(" — declare to replace, or leave inert"), width));

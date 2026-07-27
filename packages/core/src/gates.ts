@@ -326,7 +326,15 @@ export const GATE_SCHEMA_SQL = `
     truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
     -- The context was past the refusal threshold and nothing was matched against it. Distinct from
     -- a silence with rule_count 0: that one means nothing governs, this one means nobody looked.
-    overflow INTEGER NOT NULL DEFAULT 0 CHECK (overflow IN (0, 1))
+    overflow INTEGER NOT NULL DEFAULT 0 CHECK (overflow IN (0, 1)),
+    -- WHICH MATCHER produced this row. 'mechanical' = gateQuery (trigger-pattern fire against an
+    -- intercepted action). 'recognized' = stageLookup (the agent named a stage). The two are
+    -- instrumented in the SAME table because both are "the gate answering a question", but they
+    -- are NOT the same population — see gateStats' own comment for why every other field on that
+    -- read stays scoped to 'mechanical' rather than blending the two. Added on the CREATE TABLE
+    -- above for a fresh install; an EXISTING store gets it via the guarded ALTER in
+    -- createGateSchema immediately below (SQLite has no ADD COLUMN IF NOT EXISTS).
+    matcher TEXT NOT NULL DEFAULT 'mechanical' CHECK (matcher IN ('mechanical', 'recognized'))
   );
   CREATE INDEX IF NOT EXISTS idx_gate_events_circle_ts ON gate_events(circle, ts);
 
@@ -368,6 +376,40 @@ export const GATE_SCHEMA_SQL = `
 /** Idempotent; safe on every open. */
 export function createGateSchema(db: StoragePort): void {
   db.exec(GATE_SCHEMA_SQL);
+  // COLUMN-GUARD PATTERN (SQLite has no ADD COLUMN IF NOT EXISTS), same convention as engine.ts's
+  // own migrate(): PRAGMA table_info, then ALTER only if missing. Lives HERE, in the function that
+  // owns gate_events' schema, rather than in engine.ts's migrate() — this module owns every
+  // statement against stages/rule_bindings/gate_events, migration included (module header).
+  //
+  // A store created before the recognized matcher shipped has a gate_events table with no
+  // `matcher` column; the CREATE TABLE IF NOT EXISTS above is a no-op against it, so the column
+  // must be added explicitly. Safe on a fresh store too — the guard simply finds the column
+  // already present (declared in the CREATE TABLE above) and does nothing. Every pre-existing row
+  // on an upgraded store backfills to 'mechanical', which is true by construction: 'recognized'
+  // did not exist before this slice, so every event any prior build could have written was one.
+  //
+  // NOT ATOMIC AGAINST A CONCURRENT SECOND MIGRATOR (review fix — Codex round 3): the MCP server
+  // and a `monet` CLI call are a SUPPORTED topology sharing one `.monet` DB (storage.ts's own WAL +
+  // busy_timeout setup exists exactly for this — "the MCP server and a `monet` CLI call can share
+  // one `.monet` DB"), so two processes CAN both open a pre-column store at once, both see the
+  // column absent via this PRAGMA probe, and both attempt the ALTER. The LOSER's ALTER throws
+  // SQLite's "duplicate column name" — which, unhandled, would abort that process's entire startup
+  // over a race the WINNER already resolved correctly. Caught here AS SUCCESS
+  // (idempotent-by-catch): the only thing this guard promises is "the column exists when this
+  // function returns", and a duplicate-column error is proof that promise is ALREADY kept by
+  // someone else's ALTER, not a real failure. Re-thrown for any OTHER error shape — those are real
+  // problems this guard has no business hiding.
+  const gateEventCols = db.prepare(`PRAGMA table_info(gate_events)`).all() as Array<{ name: string }>;
+  if (!gateEventCols.some((c) => c.name === "matcher")) {
+    try {
+      db.exec(
+        `ALTER TABLE gate_events ADD COLUMN matcher TEXT NOT NULL DEFAULT 'mechanical' CHECK (matcher IN ('mechanical', 'recognized'))`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("duplicate column name")) throw error;
+    }
+  }
 }
 
 // ---- the generation counter -------------------------------------------------
@@ -991,6 +1033,106 @@ export function normalizeStageName(name: string): string {
   return name.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+/**
+ * THE shared ceiling on a stage NAME's length — one constant, enforced at CREATION (upsertStage,
+ * below) and referenced by every MCP surface that accepts a stage name as input
+ * (mcp-server.ts's `stage_lookup`/`memory_store`/`memory_declare` schemas), so nothing storable is
+ * ever unlookupable and nothing lookupable-shaped is ever unstorable (review fix — Codex found the
+ * two ends had drifted: lookup capped its input while creation stayed unbounded).
+ *
+ * 500 is generous relative to what a "moment" name actually needs — every stage in this design's
+ * own fixtures and doc examples ("git force push", "opening a PR", "terraform apply") is under 30
+ * characters — so this is a REFUSAL threshold for content that was never a stage name in the
+ * design's sense, not a working ceiling anything legitimate should ever approach.
+ */
+export const STAGE_NAME_MAX_CHARS = 500;
+
+/**
+ * THE shared ceiling on an agent-scoped rule's `modelTag` length — one constant, enforced at every
+ * MINT/ENTRY boundary a modelTag can arrive through (review fix — Codex round 4: modelTag was the
+ * one wire-projected field with NO bound anywhere — the MCP capture zod schemas accepted an
+ * unrestricted string, `setRuntimeModelTag` accepted anything, `bindRule`/`validateRuleCapture`/
+ * `declare()`'s own agent-scope check only tested for PRESENCE, and graft's preflight didn't check
+ * it at all. A single oversized tag survives storage, then inflates every rule that carries it on
+ * the wire — enough of it, at STAGE_LOOKUP_BODY_CAP scale, could demote an otherwise-deliverable
+ * rule into the outline-only recovery tier from this one field's serialized size alone).
+ *
+ * Enforced as a NAMED REFUSAL, same lattice as STAGE_NAME_MAX_CHARS just above: `bindRule` (the
+ * authoritative, inside-the-transaction chokepoint), `MonetCore.validateRuleCapture`/`declare()`'s
+ * own early copies (engine.ts, for fast feedback before the embed), both MCP capture zod schemas
+ * (`memory_store`'s `rule.modelTag`, `memory_declare`'s `modelTag`), `setRuntimeModelTag` (the one
+ * write path that stamps the RUNTIME's own live tag rather than a captured rule's), and
+ * `graftRows`' own rule-binding preflight — no honest peer can hold a longer one once every minter
+ * refuses it, the same reasoning STAGE_NAME_MAX_CHARS's own graft check rests on.
+ *
+ * 200 — real model identifiers run well under 40 characters (e.g. "claude-sonnet-4-5-20250929",
+ * "gpt-4o-2024-11-20"). This is a REFUSAL threshold for content that was never a model id in the
+ * design's sense, generous headroom over anything a real provider actually issues, not a working
+ * ceiling anything legitimate should ever approach.
+ */
+export const MODEL_TAG_MAX_CHARS = 200;
+
+/**
+ * THE shared SQL-retrieval bounds for `stageLookup` (review fix — Codex round 2, extended round 3:
+ * the engine was materializing every live rule's FULL body, for an UNBOUNDED rule count, before
+ * the MCP layer ever got a chance to clip anything — the wire's own caps protected the RESPONSE,
+ * but nothing protected the RETRIEVAL that fed it). Defined here, once, and imported by
+ * mcp-server.ts rather than kept as separate wire-side constants that merely happened to agree
+ * with these, for the same reason STAGE_NAME_MAX_CHARS is shared rather than copied: two numbers
+ * that are SUPPOSED to be the same but are maintained as two literals are a drift bug waiting to
+ * happen, not a coincidence to document with a comment.
+ *
+ * STAGE_LOOKUP_RULES_CAP — the primary retrieval's row-count bound. `rulesForStages` is called
+ * with `limit: STAGE_LOOKUP_RULES_CAP + 1`: fetching one EXTRA row is the cheap way the engine
+ * learns "there are more than the cap" without a second query, and the wire trims that probe row
+ * before ever showing it (see evaluateStageLookup's own comment). 200 — unchanged from the wire's
+ * former STAGE_LOOKUP_RULES_MAX_ITERATE — is already far past what a real stage needs.
+ *
+ * STAGE_LOOKUP_BODY_CAP — the primary retrieval's per-row body-length bound, applied IN SQL via
+ * `substr(c.body, 1, STAGE_LOOKUP_BODY_CAP + 1)`. The same "+1 probe" trick: a body substr'd to
+ * `CAP + 1` chars lets the wire's existing `clip(body, STAGE_LOOKUP_BODY_CAP)` call correctly
+ * detect "this needed truncating" (length > CAP) without the engine adding a separate boolean
+ * field. KNOWN, ACCEPTED IMPRECISION: when the true body is much longer than `CAP + 1`, the wire's
+ * truncation-count note (e.g. "…[truncated 1 chars]") undercounts how much was actually cut — the
+ * SIGNAL ("this was truncated") stays correct, which is what the wire's clip() detection depends
+ * on, but the exact CHARACTER COUNT in that note is no longer honest once retrieval itself is
+ * bounded. Fixing the count would need the query to also return the body's true full length
+ * (LENGTH(c.body)) and thread it through StageLookupRule for a cosmetic detail in a note string;
+ * not done here — flagged instead of silently accepted. 6 000, matching the wire's prior
+ * FETCH_BODY_MAX_CHARS reuse for this surface.
+ *
+ * STAGE_LOOKUP_REASON_CAP — the SAME "+1 probe" substr bound, applied to `reason` (review fix —
+ * Codex round 3: `reason` was the residual axis left unbounded after round 2's body/count fix —
+ * advisory reasons carry no write-time length bound at all, unlike a blocking reason's ONE-LINE
+ * shape constraint, so one persisted giant reason could still defeat the row/body caps on its own
+ * axis). SAME KNOWN, ACCEPTED IMPRECISION as body's truncation-count note, PLUS one more: see
+ * `toGateRule`'s own comment for why `reasonMissing` — computed from this now-possibly-truncated
+ * value — stays correct for every realistic reason and is only wrong in a doubly-pathological
+ * shape this module declines to add SQL-side whitespace matching to chase (that path already
+ * caused a real bug once — see `hasNoReason`'s own "THE PREDICATE IS NOT IN THE SQL" doctrine).
+ * 1 200, matching the wire's prior FETCH_OBS_MAX_CHARS reuse for this surface.
+ *
+ * STAGE_LOOKUP_OUTLINE_CAP — bounds BOTH the wire's own outline-building iteration AND
+ * `ruleOutlineForStage`'s own SQL LIMIT (the compact {conceptId, title} projection used when the
+ * primary retrieval was capped — see that function's own comment for why a "no body" projection
+ * still needs a bound of its own). 500 — unchanged from the wire's former
+ * STAGE_LOOKUP_OMITTED_MAX_ITERATE.
+ *
+ * STAGE_INDEX_CAP — the stage-INDEX's own row-count bound (review fix — Codex round 3:
+ * `liveStageIndex` used to fetch `listStages`' full-column projection — every stage's serialized
+ * `trigger_patterns` blob included — for the ENTIRE registry, just to filter it down to a handful
+ * of live names; see `liveStageIndex`'s own comment). Same "+1 probe" shape, shared by both
+ * consumers that iterate a stage index at the wire layer (`stage_lookup`'s miss path and
+ * `agent_context`), so "the SQL cap" and "the wire's iteration cap" are one number, not two that
+ * happen to agree. 2 000 — unchanged from the wire's former STAGE_LOOKUP_INDEX_MAX_ITERATE /
+ * AGENT_CONTEXT_STAGE_INDEX_MAX_ITERATE (both were already this value).
+ */
+export const STAGE_LOOKUP_RULES_CAP = 200;
+export const STAGE_LOOKUP_BODY_CAP = 6_000;
+export const STAGE_LOOKUP_REASON_CAP = 1_200;
+export const STAGE_LOOKUP_OUTLINE_CAP = 500;
+export const STAGE_INDEX_CAP = 2_000;
+
 /** The engine-owned collaborators this module needs — same seam shape as LifecycleEdgeDeps. */
 export interface GateDeps {
   db: StoragePort;
@@ -1130,6 +1272,22 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
     return db.prepare(`SELECT * FROM stages WHERE id = ?`).get(existing.id) as StageRow;
   }
 
+  // NEW STAGE. STAGE_NAME_MAX_CHARS is enforced HERE — the one place a stage name is ever minted —
+  // so every creation surface (memory_store's rule capture, memory_declare's stage/rule species)
+  // inherits the bound for free, and stage_lookup's own input cap can reference the SAME constant
+  // with the guarantee that anything actually storable stays name-lookupable (review fix: the two
+  // ends had drifted, lookup capped at 500 while creation stayed unbounded). A NAMED REFUSAL, not a
+  // silent truncation — a name this long was never a "moment" in the design's sense; that content
+  // belongs in the rule's own instance/content/reason, not in the address.
+  const normalizedName = normalizeStageName(input.stage);
+  if (normalizedName.length > STAGE_NAME_MAX_CHARS) {
+    throw new Error(
+      `a stage name may be at most ${STAGE_NAME_MAX_CHARS} characters (got ${normalizedName.length}): ` +
+        `stage names are short, human-readable identifiers for a moment ("git force push", "opening a ` +
+        `PR"), not a command or a paragraph — put that in the rule's own instance, content, or reason.`,
+    );
+  }
+
   // Seeding precedence: explicit declared patterns, else the observed instance, else the stage name
   // itself. The last is the import/declaration case the design calls out — "their trigger pattern is
   // authored at import from the rule's named action and flagged unverified until its first fire".
@@ -1137,7 +1295,7 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
   const syncAt = deps.nextSyncTimestamp();
   const row: StageRow = {
     id: deps.newId(),
-    name: normalizeStageName(input.stage),
+    name: normalizedName,
     trigger_patterns: serializeTriggerPatterns(seeds),
     origin: input.origin,
     verified: 0,
@@ -1293,9 +1451,27 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
         `${JSON.stringify(input.reason)} — restate it as a single sentence.`,
     );
   }
-  const modelTag = input.scope === "agent" ? (input.modelTag ?? null) : null;
+  // WHITESPACE IS ABSENCE, here as everywhere (the reason resolution above): "   " is truthy in JS
+  // and non-null in SQL, so without this normalization a whitespace-only tag passed the presence
+  // check below and landed in rule_bindings as literal whitespace — a tag no runtime ever equals,
+  // making the rule undeliverable while looking configured.
+  const statedModelTag = input.scope === "agent" ? (input.modelTag ?? null) : null;
+  const modelTag = statedModelTag !== null && statedModelTag.trim() === "" ? null : statedModelTag;
   if (input.scope === "agent" && modelTag === null) {
     throw new Error("an agent-scoped rule requires a model tag naming the model it compensates for");
+  }
+  // THE AUTHORITATIVE LENGTH CHECK (review fix — Codex round 4, item 2): this is the one place
+  // EVERY agent-scoped modelTag passes through before landing in rule_bindings, so it is where the
+  // bound has to hold regardless of which caller (store()'s capture, declare()'s early copies in
+  // engine.ts, or a relay that skipped both) got here. Same lattice as the reason-shape checks just
+  // above: a bound this narrow (MODEL_TAG_MAX_CHARS's own comment) has no legitimate reason to be
+  // exceeded, so a caller that does is malformed, not merely unusual.
+  if (modelTag !== null && modelTag.length > MODEL_TAG_MAX_CHARS) {
+    throw new Error(
+      `a model tag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${modelTag.length}): ` +
+        `modelTag names which model a rule compensates for ("claude-sonnet-4-5-20250929"), not a ` +
+        `command or a paragraph.`,
+    );
   }
 
   if (existing && mode === "keep") {
@@ -1374,6 +1550,22 @@ export function hasNoReason(reason: unknown): boolean {
   // Nothing special-cases it, because it is not a special case.
   if (typeof reason !== "string") return true;
   return reason.trim() === "";
+}
+
+/**
+ * Does this concept's `body` amount to no invocation payload at all? Same defensive shape as
+ * `hasNoReason` just above — non-string reads as absent, blank-after-trim reads as absent — but it
+ * is its OWN predicate rather than a call to that one: `body` is the recognized matcher's
+ * capability payload (StageLookupRule.body), a different column answering a different question
+ * than a deny's explanation, and there is no write-time guard forcing it non-blank the way a
+ * blocking rule's `reason` is guarded (recognized delivery is advisory-only; nothing here is ever
+ * refused for lacking a body). The defensiveness is still earned: a concept created before this
+ * slice, or a row relayed from a peer, can carry a blank or non-string body, and toStageLookupRule
+ * must read that as "no payload" rather than leak "   " as though it were the invocation.
+ */
+function hasNoBody(body: unknown): boolean {
+  if (typeof body !== "string") return true;
+  return body.trim() === "";
 }
 
 /**
@@ -1515,6 +1707,120 @@ export interface GateQueryOptions {
   record?: boolean;
 }
 
+/**
+ * `stageLookup`'s own delivery shape: everything `GateRule` carries, plus the capability
+ * invocation payload the recognized matcher — and only the recognized matcher — spends the tokens
+ * on. A distinct type rather than a widened `GateRule` (design directive): "never the body" stays
+ * true for gateQuery's own delivery, unconditionally; this is agent-initiated pull at the moment of
+ * need, which is where paying for the extra field is right (docs/design/next-monet-skeleton-gates-
+ * recall.md, "Capabilities are content too — and the payload is the invocation, not a description").
+ */
+export interface StageLookupRule extends GateRule {
+  /** The rule concept's body when non-blank, else null — the invocation itself, not a description
+   *  of one. Null covers both "nothing was ever written below the title" and a blank/corrupt body
+   *  relayed from a peer (see `hasNoBody`) — the caller cannot tell those apart and should not need
+   *  to: either way there is no payload to act on. */
+  body: string | null;
+}
+
+export interface StageLookupOptions {
+  /**
+   * The stage name (or id) the agent recognizes itself to be at. Resolved via `findStage`: exact
+   * id, else exact/normalized (trimmed, whitespace-collapsed, case-insensitive) name. NO fuzzy or
+   * embedding matching — recognition is the agent's own act against the resident stage index, and
+   * this call is a lookup against it, not a search; a third matcher is out of scope by design.
+   *
+   * NAME-REACHABILITY SURVIVES A MECHANICAL RE-AIMING (doctrine, ruled). A stage's TRIGGER PATTERNS
+   * are the mechanical matcher's own firing surface — re-authoring them (memory_declare's
+   * `patterns`) reroutes what `gateQuery` matches, nothing else. This lookup resolves by NAME/id
+   * against the stage registry, never by pattern, so a rule bound to this stage — including a
+   * blocking one — stays reachable here exactly as before, until the RULE itself is withdrawn,
+   * downgraded, or superseded, or the stage's own rules all die (stage retirement/inertness). A
+   * pattern change is therefore never a rule-withdrawal lever by itself: it narrows what the agent
+   * is INTERCEPTED into, not what it can still ask for by name. See engine.ts's
+   * `assertPatternReauthoringAcknowledged` doc comment for the mechanical-side rationale this
+   * complements.
+   */
+  stage: string;
+  /** Locality: only rules whose concept lives in this circle are delivered — same as gateQuery. */
+  circle: string;
+  /** Same model-tag filter as GateQueryOptions.runtimeModelTag, applied through the same query. */
+  runtimeModelTag?: string;
+  /** Clock seam. Defaults to wall time. */
+  now?: number;
+  /** Sync clock seam for the gate_events row. Omitted = stamped with `now`. */
+  nextSyncTimestamp?: () => number;
+  /** `false` makes this call a pure read: no gate_events row. Mirrors GateQueryOptions.record. */
+  record?: boolean;
+}
+
+export interface StageLookupResult {
+  /**
+   * True when the named stage exists in the registry — a HIT, whether or not it delivered rules.
+   * False = a MISS (no such stage), never conflated with a stage-hit-no-rules: `rules: []` means
+   * two different things depending on `matched`, exactly as GateResult.silence disambiguates the
+   * mechanical side's own stage-hit-no-rules from a true silence.
+   *
+   * NIT: a HIT can reach stage-hit-no-rules for TWO different reasons, and this field alone does
+   * not distinguish them — the stage genuinely has no rules ANYWHERE, or it has rules bound in
+   * OTHER circles but none in the caller's own (stages are store-global; rule bindings are
+   * circle-scoped — see the module header's "WHY STAGES ARE STORE-GLOBAL" note). Both render as
+   * `matched: true, rules: []` here, which is correct (this circle's gate truly delivers nothing),
+   * but a curation reader asking "does anything govern this stage at all" needs `gateStats`/the
+   * stage registry, not this result, to tell the two apart.
+   */
+  matched: boolean;
+  /** The resolved stage, or null on a miss. */
+  stage: GateStageRef | null;
+  /**
+   * Live rules bound to the stage. Empty on a genuine stage-hit-no-rules AND on a miss alike.
+   *
+   * BOUNDED AT RETRIEVAL (review fix — Codex round 2): at most `STAGE_LOOKUP_RULES_CAP` entries,
+   * each with `body` itself substr'd to at most `STAGE_LOOKUP_BODY_CAP` characters. When the
+   * TRUE population is larger than that on either axis, `rulesTotal`/`rulesOutline` (below) carry
+   * what this array alone can no longer tell the whole truth about — `rules.length` is safe to
+   * treat as "the whole truth" ONLY when both of those are absent.
+   */
+  rules: StageLookupRule[];
+  /**
+   * The TRUE total count of live rules for this stage, present ONLY when it exceeds what `rules`
+   * itself holds — i.e., the SQL-level retrieval cap (`STAGE_LOOKUP_RULES_CAP`) actually bound
+   * something. Absent means `rules.length` IS the true total (the common case, and the ONLY case
+   * before this field existed); present means a caller computing "how many are not shown" must use
+   * THIS number, not `rules.length` — the retrieval itself is now capped, so `rules.length` alone
+   * can no longer be trusted as the whole truth the way it could when the query was unbounded.
+   */
+  rulesTotal?: number;
+  /**
+   * A compact {conceptId, text} outline of live rules BEYOND what `rules` itself holds (via
+   * `ruleOutlineForStage`) — present in the SAME situation `rulesTotal` is, and only up to
+   * `STAGE_LOOKUP_OUTLINE_CAP` entries (this projection is cheap per row, not free at any row
+   * count). Exists so the wire's omitted-rules recovery ladder can still NAME rules the primary,
+   * body-bearing fetch never retrieved at all — it cannot outline a row it never fetched, and this
+   * is that row's stand-in.
+   */
+  rulesOutline?: RuleOutlineEntry[];
+  /**
+   * The live stage index (`liveStageIndex`), carried on EVERY miss — including when the index
+   * ITSELF is empty (`[]`) — so a misremembered name self-repairs in one round trip. Absent on a
+   * hit — the agent already named the right stage and does not need the whole registry restated.
+   *
+   * DELIBERATELY NOT the same convention `PrewarmState.stageIndex` uses. Prewarm omits the field
+   * entirely when the index is empty ("no schema noise for installs with no stages" — there is
+   * nothing actionable to say). A miss is different: "no live stages exist at all" IS the
+   * informative answer to "why didn't my lookup match anything", so this field is present
+   * (as `[]`) whenever `matched` is false, never folded into an omitted-when-empty convention that
+   * would make an empty registry indistinguishable from a server that predates this field.
+   */
+  stageIndex?: string[];
+  /**
+   * The TRUE total count of live stages, present ONLY when `stageIndex` itself was capped at
+   * retrieval (`STAGE_INDEX_CAP` — review fix, Codex round 3) — mirrors `rulesTotal`'s own honesty
+   * contract exactly. Absent means `stageIndex.length` IS the true total.
+   */
+  stageIndexTotal?: number;
+}
+
 interface BindingJoinRow {
   concept_id: string;
   stage_id: string;
@@ -1524,8 +1830,295 @@ interface BindingJoinRow {
   origin: RuleBindingOrigin;
   reason: string | null;
   title: string;
+  /** The rule concept's full body. gateQuery's own mapper (toGateRule) never reads this field;
+   *  only stageLookup's (toStageLookupRule) does — selected unconditionally here rather than by a
+   *  second query, because the only thing that differs between the two matchers' delivery is which
+   *  fields their own mapper reads off the SAME row, and the chokepoint predicate below must not
+   *  have two copies to keep in sync. */
+  /**
+   * The rule concept's full body, or `null` when the caller asked `rulesForStages` NOT to select
+   * it (`withBody: false`). gateQuery's own mapper (toGateRule) never reads this field regardless
+   * of what it holds; only stageLookup's (toStageLookupRule) does, which is why ONLY that caller
+   * passes `withBody: true`. See rulesForStages' own comment for why this is a column-selection
+   * flag rather than always fetching it and discarding it in the mapper.
+   */
+  body: string | null;
   created_at: number;
   parent_concept_id: string | null;
+}
+
+/**
+ * THE shared liveness predicate every rule-delivery query in this module must agree on: active
+ * concept, kind='rule', not superseded, in the caller's circle, respecting the model-tag filter.
+ * A raw SQL fragment (not a function) because two DIFFERENT queries need to embed it verbatim in
+ * their own WHERE clause — `rulesForStages` (full rule delivery, scoped to specific stage ids) and
+ * `liveStageIdsWithRules` (liveStageIndex's own minimal existence check, over every stage) — and
+ * "the same predicate, maintained as two copies" is exactly the drift risk this module's chokepoint
+ * doctrine exists to close. Takes exactly 3 positional params, in order: circle, then the
+ * model-tag filter's two placeholders (both the same value — `runtimeModelTag ?? null`).
+ */
+const RULE_LIVENESS_WHERE = `
+          c.circle = ?
+          AND c.status = 'active'
+          AND c.kind = 'rule'
+          -- MODEL-TAG RETIREMENT. A domain rule always fires; an agent rule is a compensation for
+          -- one model and fires only for that model. A NULL runtime tag disables the filter
+          -- entirely rather than hiding every agent rule — see GateQueryOptions.runtimeModelTag.
+          AND (b.scope != 'agent' OR ? IS NULL OR b.model_tag = ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM lifecycle_edges e
+             WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
+          )`;
+
+/**
+ * THE shared rules-for-stages selection — every way a rule is fully DELIVERED by EITHER matcher
+ * passes through here (refactoring build: this replaces gateInternal's own former inline copy of
+ * this query). Same liveness (`RULE_LIVENESS_WHERE`), same circle scope, same model-tag filter,
+ * same parent-principle lookup, same ordering (blocking first, then birth order) gateQuery has
+ * always used; factoring it out means `stageLookup` answers through IDENTICAL chokepoint semantics
+ * rather than a second copy of this SQL that could silently drift from this one.
+ *
+ * `withBody` — SELECT `c.body` or not. gateInternal (the always-on mechanical fire path) passes
+ * `false`: it maps every row through `toGateRule`, which never reads body, so fetching and
+ * marshalling a concept's full body across the sqlite boundary on every single intercepted action
+ * was pure waste — the same class of waste `listMatchableStages` vs `listStages` already exists to
+ * avoid ("a narrower SELECT is the whole optimization; there is no cache, so there is no
+ * invalidation to get wrong"). Only `evaluateStageLookup` passes `true`, because only
+ * `toStageLookupRule` reads the field.
+ *
+ * `limit`/`bodyMaxChars`/`reasonMaxChars` — OPTIONAL SQL-level bounds (review fix — Codex round 2,
+ * extended round 3 to cover `reason`). All omitted (gateInternal's call, and any other future
+ * caller with no reason to cap) is BYTE-IDENTICAL to this function's pre-review-round-2 behavior:
+ * no LIMIT clause, `c.body`/`b.reason` selected whole. Only `evaluateStageLookup` passes them, at
+ * `STAGE_LOOKUP_RULES_CAP + 1` / `STAGE_LOOKUP_BODY_CAP + 1` / `STAGE_LOOKUP_REASON_CAP + 1` — see
+ * those constants' own comment for the "+1 probe" reasoning. `bodyMaxChars`/`reasonMaxChars`
+ * choose `substr` over a bare column reference — still a FIXED literal SQL shape, never
+ * interpolated caller data; the cap VALUE itself is a bound parameter (`?`), not
+ * string-interpolated, so this stays exactly as injection-safe as the unbounded form.
+ *
+ * `stageIds` empty returns empty with no query — both callers already know a miss/no-match
+ * delivers nothing.
+ */
+function rulesForStages(
+  db: StoragePort,
+  stageIds: string[],
+  circle: string,
+  runtimeModelTag: string | undefined,
+  withBody: boolean,
+  limit?: number,
+  bodyMaxChars?: number,
+  reasonMaxChars?: number,
+): BindingJoinRow[] {
+  if (stageIds.length === 0) return [];
+  const placeholders = stageIds.map(() => "?").join(",");
+  // `withBody`/`bodyMaxChars`/`reasonMaxChars` choose between FIXED literal column-expression
+  // SHAPES — never interpolated caller data — so this stays exactly as injection-safe as a
+  // hand-written static query; the cap VALUES (when set) are bound parameters, never interpolated.
+  const bodyColumn = !withBody ? "NULL" : bodyMaxChars !== undefined ? "substr(c.body, 1, ?)" : "c.body";
+  const reasonColumn = reasonMaxChars !== undefined ? "substr(b.reason, 1, ?)" : "b.reason";
+  const limitClause = limit !== undefined ? "LIMIT ?" : "";
+  // PARAMS IN THE EXACT ORDER THEIR `?` PLACEHOLDERS APPEAR IN THE SQL TEXT BELOW: reasonMaxChars'
+  // and bodyMaxChars' (both inside the SELECT list, REASON column written first — `reason` is
+  // selected before `title`/`body` below) first, then the IN-list, then RULE_LIVENESS_WHERE's own
+  // 3, then limit (at the very end) last. better-sqlite3 binds positionally, so this order is
+  // load-bearing — review fix (Codex round 3, item 1 follow-up): this was previously written
+  // body-then-reason, which is the ORDER THE COLUMNS APPEARED IN BEFORE THIS ROUND (only body had
+  // a placeholder; reason was a bare `b.reason` with none) — adding reason's OWN placeholder above
+  // without re-checking which column's `?` now comes first in the text silently swapped the two
+  // caps: reason bound to bodyMaxChars (6 000, so reasons under that almost never truncated) and
+  // body bound to reasonMaxChars (1 200, truncating bodies the wire's own STAGE_LOOKUP_BODY_CAP
+  // never asked to touch). Caught empirically, by a test asserting an EXACT capped length rather
+  // than only `toBeLessThanOrEqual` — the loose form passes on a swap by coincidence (both caps are
+  // "small enough"), which is exactly how this shipped unnoticed the first time.
+  const params: unknown[] = [];
+  if (reasonMaxChars !== undefined) params.push(reasonMaxChars);
+  if (bodyMaxChars !== undefined) params.push(bodyMaxChars);
+  params.push(...stageIds, circle, runtimeModelTag ?? null, runtimeModelTag ?? null);
+  if (limit !== undefined) params.push(limit);
+  return db
+    .prepare(
+      `SELECT b.concept_id, b.stage_id, b.severity, b.scope, b.model_tag, b.origin, ${reasonColumn} AS reason,
+              c.title, ${bodyColumn} AS body, b.created_at,
+              -- The parent principle, when there is one, as a CORRELATED SCALAR rather than a
+              -- join: a rule may carry several derivation edges, and a join would multiply the
+              -- gate's own rows to report a field. Scalar subquery = one row per rule, always,
+              -- and one round trip for the whole answer instead of one per delivered rule.
+              (SELECT p.src_concept_id FROM lifecycle_edges p
+                WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
+                ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_concept_id
+         FROM rule_bindings b
+         JOIN concepts c ON c.id = b.concept_id
+        WHERE b.stage_id IN (${placeholders})
+          AND ${RULE_LIVENESS_WHERE}
+        ORDER BY (b.severity = 'blocking') DESC, b.created_at ASC, b.concept_id ASC
+        ${limitClause}`,
+    )
+    .all(...params) as BindingJoinRow[];
+}
+
+/** One entry of `ruleOutlineForStage`'s compact projection — see that function's own comment. */
+export interface RuleOutlineEntry {
+  conceptId: string;
+  text: string;
+}
+
+/**
+ * A compact {conceptId, title} projection of a stage's live rules — no body, no reason, no
+ * severity/scope, none of the columns `rulesForStages`' full selection carries. Exists for exactly
+ * one reason (review fix — Codex round 2): when `evaluateStageLookup`'s primary, body-bearing
+ * fetch is capped at `STAGE_LOOKUP_RULES_CAP`, the wire's omitted-rules recovery outline (its
+ * degradation ladder's first tier — see mcp-server.ts's stage_lookup handler) still needs to NAME
+ * rules the primary fetch never even retrieved, and it cannot outline a row it never fetched. This
+ * query is cheap even at a larger cap than the primary one, because a title is ≤80 chars and there
+ * is no body/reason to marshal — but "cheap per row" is not "free at any row count", so this has
+ * its OWN bound (`limit`, always `STAGE_LOOKUP_OUTLINE_CAP` at the one call site) rather than being
+ * left unbounded on the theory that its smallness makes a bound unnecessary.
+ *
+ * Same liveness (`RULE_LIVENESS_WHERE`) and ordering as `rulesForStages`, so `offset` rows into the
+ * IDENTICAL sequence that function enumerates — the caller uses this to fetch exactly the rules
+ * BEYOND what the primary fetch already covered (`offset: STAGE_LOOKUP_RULES_CAP`), never
+ * re-describing rules the primary fetch already named.
+ */
+export function ruleOutlineForStage(
+  db: StoragePort,
+  stageId: string,
+  circle: string,
+  runtimeModelTag: string | undefined,
+  offset: number,
+  limit: number,
+): RuleOutlineEntry[] {
+  return db
+    .prepare(
+      `SELECT b.concept_id AS conceptId, c.title AS text
+         FROM rule_bindings b
+         JOIN concepts c ON c.id = b.concept_id
+        WHERE b.stage_id = ?
+          AND ${RULE_LIVENESS_WHERE}
+        ORDER BY (b.severity = 'blocking') DESC, b.created_at ASC, b.concept_id ASC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(stageId, circle, runtimeModelTag ?? null, runtimeModelTag ?? null, limit, offset) as RuleOutlineEntry[];
+}
+
+/**
+ * Live rule COUNT for one stage — same liveness/circle/model-tag predicate as `rulesForStages`, no
+ * row marshaling of any kind. Used only when the primary retrieval was capped (review fix — Codex
+ * round 2), so the wire can report an EXACT "how many total" rather than degrading to "at least N"
+ * — one indexed `COUNT(*)` is negligible next to the row-fetching cost it replaces, and it is a
+ * cost paid only in the (expected-rare) case that actually needs it.
+ */
+function countLiveRulesForStage(
+  db: StoragePort,
+  stageId: string,
+  circle: string,
+  runtimeModelTag: string | undefined,
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM rule_bindings b
+         JOIN concepts c ON c.id = b.concept_id
+        WHERE b.stage_id = ?
+          AND ${RULE_LIVENESS_WHERE}`,
+    )
+    .get(stageId, circle, runtimeModelTag ?? null, runtimeModelTag ?? null) as { n: number };
+  return row.n;
+}
+
+/**
+ * Names-only, LIVE-only, retrieval-bounded stage names, ACROSS EVERY STAGE (no stageIds
+ * restriction — this is `liveStageIndex`'s own query, and it always asks about the whole registry,
+ * never a subset). Review fix — Codex round 3: this REPLACES a former two-step approach
+ * (`listStages` fetching every column of every stage — including each one's serialized
+ * `trigger_patterns` blob — then filtering in JS against a separate live-id Set) with ONE JOINed,
+ * `SELECT DISTINCT s.name` query: no trigger_patterns, no origin, no verified flag, no clocks,
+ * materialized for EVERY stage on EVERY `agent_context` call, every `prewarm`, and every
+ * `stageLookup` miss, just to keep a handful of names — exactly the always-on retrieval cost the
+ * rules/body/reason SQL bounds elsewhere in this file exist to close. Shares `RULE_LIVENESS_WHERE`
+ * with `rulesForStages`/`countLiveRulesForStage` rather than a hand-rolled copy, so "live" cannot
+ * drift between them. No model-tag filter (hardcoded `null` params): the index is deliberately not
+ * model-tag-aware — see `liveStageIndex`'s own comment. `limit` bounds this too (the caller passes
+ * `STAGE_INDEX_CAP + 1`, the same "+1 probe" shape as the rules/body/reason caps) — a bare name is
+ * cheap per row, not free at any row count.
+ */
+function liveStageNamesCapped(db: StoragePort, circle: string, limit: number): string[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT s.name AS name
+         FROM stages s
+         JOIN rule_bindings b ON b.stage_id = s.id
+         JOIN concepts c ON c.id = b.concept_id
+        WHERE ${RULE_LIVENESS_WHERE}
+        ORDER BY s.name ASC
+        LIMIT ?`,
+    )
+    .all(circle, null, null, limit) as Array<{ name: string }>;
+  return rows.map((row) => row.name);
+}
+
+/**
+ * Distinct live-stage COUNT — same liveness/circle predicate as `liveStageNamesCapped`, no row
+ * marshaling of any kind. Used only when the primary fetch actually hit `STAGE_INDEX_CAP`, so the
+ * caller can report an EXACT "how many total" rather than degrading to "at least N" — mirrors
+ * `countLiveRulesForStage`'s own reasoning exactly (one indexed `COUNT(*)`, a cost paid only in
+ * this expected-rare case).
+ */
+function countLiveStages(db: StoragePort, circle: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(DISTINCT s.id) AS n
+         FROM stages s
+         JOIN rule_bindings b ON b.stage_id = s.id
+         JOIN concepts c ON c.id = b.concept_id
+        WHERE ${RULE_LIVENESS_WHERE}`,
+    )
+    .get(circle, null, null) as { n: number };
+  return row.n;
+}
+
+/** gateQuery's own delivery shape: title + reason, NEVER the body — see GateRule's own comment. */
+function toGateRule(row: BindingJoinRow): GateRule {
+  return {
+    conceptId: row.concept_id,
+    text: row.title,
+    // NON-STRINGS DELIVER AS NULL, so this field is the `string | null` it is declared to be. A
+    // BLOB in the column (TEXT affinity converts numbers, but not blobs) would otherwise be handed
+    // to a caller that has every right to call string methods on it — moving the crash from here
+    // to them. Blank strings still pass through verbatim: they are text, just useless text, and
+    // `reasonMissing` is what says so.
+    reason: typeof row.reason === "string" ? row.reason : null,
+    // Scoped to blocking on purpose: an advisory rule without a reason is the ordinary case, and
+    // marking those would drown the one population a caller actually has to say something about.
+    //
+    // COMPUTED FROM WHATEVER row.reason HOLDS, which is the FULL value for gateInternal's call
+    // (never bounded) but may be substr'd to STAGE_LOOKUP_REASON_CAP + 1 chars for
+    // evaluateStageLookup's (review fix — Codex round 3: reason's own SQL-retrieval bound). For
+    // every REALISTIC reason (under the cap, which every blocking reason already must be under —
+    // one line rarely runs anywhere near 1 200 characters) this is IDENTICAL to computing it on
+    // the full value: substr of a short string returns the whole string. The only way this could
+    // differ is a reason LONGER than the cap whose first `CAP + 1` characters are ALL
+    // whitespace-per-hasNoReason with real content beyond that boundary — a doubly-pathological
+    // shape (long AND specifically front-loaded with nothing) with no realistic authoring path,
+    // blocking or advisory. DELIBERATELY NOT chased with a SQL-side blank check instead: this
+    // module already learned that lesson once (see hasNoReason's own "THE PREDICATE IS NOT IN THE
+    // SQL" doctrine, and gateStats' `unexplainedDenies` comment) — SQLite's TRIM() and JS's
+    // `.trim()` disagree on tabs/newlines, and a wider hand-picked character set would only move
+    // the disagreement to some OTHER whitespace character neither implementation has hit yet. ONE
+    // definition of "blank," applied to whatever text actually reached this function, stays the
+    // correct trade against reintroducing that exact bug class for an edge case this narrow.
+    reasonMissing: row.severity === "blocking" && hasNoReason(row.reason),
+    severity: row.severity,
+    scope: row.scope,
+    modelTag: row.model_tag,
+    origin: row.origin,
+    stageId: row.stage_id,
+    ...(row.parent_concept_id !== null ? { projectedFromPrincipleId: row.parent_concept_id } : {}),
+  };
+}
+
+/** stageLookup's own delivery shape: everything toGateRule carries, plus the body payload. */
+function toStageLookupRule(row: BindingJoinRow): StageLookupRule {
+  return { ...toGateRule(row), body: hasNoBody(row.body) ? null : row.body };
 }
 
 /**
@@ -1552,6 +2145,9 @@ interface BindingJoinRow {
  * agent reads, and everything after it is stable so two machines with the same rules render the
  * same gate.
  */
+/** Which matcher produced a gate_events row. See that column's own comment in GATE_SCHEMA_SQL. */
+export type GateMatcher = "mechanical" | "recognized";
+
 /**
  * What a completed gate READ still owes the database. Held as data so the caller decides when — and
  * in what transaction — those writes happen. See `evaluateGate`.
@@ -1568,6 +2164,8 @@ export interface PendingGateWrites {
   primaryStageId: string | null;
   ruleCount: number;
   maxSeverity: RuleSeverity | null;
+  /** gateInternal always sets 'mechanical'; evaluateStageLookup always sets 'recognized'. */
+  matcher: GateMatcher;
 }
 
 /**
@@ -1604,8 +2202,8 @@ export function commitGateWrites(db: StoragePort, pending: PendingGateWrites, ne
     for (const id of pending.verifyStageIds) flip.run(stamp, id);
   }
   const eventId = db.prepare(
-    `INSERT INTO gate_events (ts, action_context, matched_stage_id, rule_count, max_severity, latency_us, circle, truncated, overflow)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO gate_events (ts, action_context, matched_stage_id, rule_count, max_severity, latency_us, circle, truncated, overflow, matcher)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     pending.now,
     pending.actionContext.length > MAX_RECORDED_CONTEXT_BYTES
@@ -1618,6 +2216,7 @@ export function commitGateWrites(db: StoragePort, pending: PendingGateWrites, ne
     pending.circle,
     pending.actionContext.length > MAX_RECORDED_CONTEXT_BYTES ? 1 : 0,
     pending.overflow ? 1 : 0,
+    pending.matcher,
   ).lastInsertRowid;
   // `lastInsertRowid` is optional on the port (an adapter may not report it). Without it the
   // per-stage links are skipped rather than written against a guessed id — an undercount in
@@ -1655,7 +2254,7 @@ function gateInternal(db: StoragePort, opts: GateQueryOptions): { result: GateRe
         ? {
             actionContext: clamped.text, circle: opts.circle, now, overflow: true,
             latencyUs: elapsedUs(startedAt), matchedStageIds: [], verifyStageIds: [],
-            primaryStageId: null, ruleCount: 0, maxSeverity: null,
+            primaryStageId: null, ruleCount: 0, maxSeverity: null, matcher: "mechanical",
           }
         : null,
     };
@@ -1672,60 +2271,12 @@ function gateInternal(db: StoragePort, opts: GateQueryOptions): { result: GateRe
   let rules: GateRule[] = [];
   let unverified: string[] = [];
   if (matched.length > 0) {
-    const placeholders = matched.map(() => "?").join(",");
-    const rows = db
-      .prepare(
-        `SELECT b.concept_id, b.stage_id, b.severity, b.scope, b.model_tag, b.origin, b.reason,
-                c.title, b.created_at,
-                -- The parent principle, when there is one, as a CORRELATED SCALAR rather than a
-                -- join: a rule may carry several derivation edges, and a join would multiply the
-                -- gate's own rows to report a field. Scalar subquery = one row per rule, always,
-                -- and one round trip for the whole answer instead of one per delivered rule.
-                (SELECT p.src_concept_id FROM lifecycle_edges p
-                  WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
-                  ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_concept_id
-           FROM rule_bindings b
-           JOIN concepts c ON c.id = b.concept_id
-          WHERE b.stage_id IN (${placeholders})
-            AND c.circle = ?
-            AND c.status = 'active'
-            AND c.kind = 'rule'
-            -- MODEL-TAG RETIREMENT. A domain rule always fires; an agent rule is a compensation for
-            -- one model and fires only for that model. A NULL runtime tag disables the filter
-            -- entirely rather than hiding every agent rule — see GateQueryOptions.runtimeModelTag.
-            AND (b.scope != 'agent' OR ? IS NULL OR b.model_tag = ?)
-            AND NOT EXISTS (
-              SELECT 1 FROM lifecycle_edges e
-               WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
-            )
-          ORDER BY (b.severity = 'blocking') DESC, b.created_at ASC, b.concept_id ASC`,
-      )
-      .all(
-        ...matched.map((stage) => stage.id),
-        opts.circle,
-        opts.runtimeModelTag ?? null,
-        opts.runtimeModelTag ?? null,
-      ) as BindingJoinRow[];
-
-    rules = rows.map((row) => ({
-      conceptId: row.concept_id,
-      text: row.title,
-      // NON-STRINGS DELIVER AS NULL, so this field is the `string | null` it is declared to be. A
-      // BLOB in the column (TEXT affinity converts numbers, but not blobs) would otherwise be handed
-      // to a caller that has every right to call string methods on it — moving the crash from here
-      // to them. Blank strings still pass through verbatim: they are text, just useless text, and
-      // `reasonMissing` is what says so.
-      reason: typeof row.reason === "string" ? row.reason : null,
-      // Scoped to blocking on purpose: an advisory rule without a reason is the ordinary case, and
-      // marking those would drown the one population a caller actually has to say something about.
-      reasonMissing: row.severity === "blocking" && hasNoReason(row.reason),
-      severity: row.severity,
-      scope: row.scope,
-      modelTag: row.model_tag,
-      origin: row.origin,
-      stageId: row.stage_id,
-      ...(row.parent_concept_id !== null ? { projectedFromPrincipleId: row.parent_concept_id } : {}),
-    }));
+    // THE CHOKEPOINT'S SHARED SELECTION (rulesForStages) — see that function's own comment. This
+    // used to be an inline query here; factored out so stageLookup answers through the identical
+    // liveness/scope/model-tag predicate rather than a second copy that could drift. withBody:
+    // false — toGateRule never reads a rule's body, so the mechanical fire path (the always-on,
+    // per-intercepted-action one) must not pay to fetch and marshal it either.
+    rules = rulesForStages(db, matched.map((stage) => stage.id), opts.circle, opts.runtimeModelTag, false).map(toGateRule);
 
     // FIRST FIRE VERIFIES THE PATTERN, whether or not it delivered a rule: what the flag records is
     // that the pattern matched something real, which is exactly what an authored-from-a-name
@@ -1768,6 +2319,7 @@ function gateInternal(db: StoragePort, opts: GateQueryOptions): { result: GateRe
           ruleCount: rules.length,
           maxSeverity: rules.some((rule) => rule.severity === "blocking") ? "blocking"
             : rules.length > 0 ? "advisory" : null,
+          matcher: "mechanical",
         }
       : null,
   };
@@ -1776,6 +2328,208 @@ function gateInternal(db: StoragePort, opts: GateQueryOptions): { result: GateRe
 const elapsedUs = (startedAt: bigint | null): number =>
   startedAt === null ? 0 : Number((process.hrtime.bigint() - startedAt) / 1000n);
 
+// ---- the stage index ---------------------------------------------------------
+
+/** `liveStageIndex`'s own result — see that function's comment for `total`'s honesty contract. */
+export interface LiveStageIndexResult {
+  names: string[];
+  /**
+   * True total count of live stages, present ONLY when `names` itself was capped at retrieval
+   * (`STAGE_INDEX_CAP`) — mirrors `StageLookupResult.rulesTotal`'s own honesty contract exactly.
+   * Absent means `names.length` IS the true total.
+   */
+  total?: number;
+}
+
+/**
+ * Stage names with at least one LIVE rule bound, in this circle — the resident stage index's whole
+ * payload (names only, never rule bodies: "the index carries only stages with live rules", the
+ * residency law, design of record ~268-278). "Live" is reused, not re-derived: this calls the exact
+ * same liveness predicate (`RULE_LIVENESS_WHERE`) `rulesForStages`/`countLiveRulesForStage` use, via
+ * `liveStageNamesCapped`'s own narrow, JOINed, names-only query — see that function's own comment
+ * for why materializing `listStages`' full-column projection (every stage's serialized
+ * `trigger_patterns` blob included) just to filter it down in JS was exactly the always-on
+ * retrieval cost this closes (review fix — Codex round 3). A stage whose rules have all died
+ * (retired or superseded) contributes no row and is silently absent — inert, uncounted, exactly as
+ * the design requires, and reached through the SAME chokepoint rather than a parallel liveness
+ * predicate.
+ *
+ * NOT model-tag filtered, unlike gateQuery/stageLookup's actual rule DELIVERY: the index is a
+ * stable map ("recognizing which named moment you are in"), and making stage NAMES flicker with
+ * whichever model happens to be running would defeat the one property recognition depends on —
+ * that the map does not move under the agent. `liveStageNamesCapped`'s own `null` model-tag params
+ * are exactly gateQuery's own documented meaning for an omitted runtime tag ("every agent-scoped
+ * rule still fires"), used here as the deliberate, permanent choice for the index rather than a
+ * caller's fallback.
+ *
+ * RETRIEVAL-BOUNDED (review fix — Codex round 3): at most `STAGE_INDEX_CAP` names. `total` is
+ * present, with the EXACT count (one indexed `COUNT(*)`, paid only in this expected-rare case),
+ * only when retrieval actually hit the cap — mirroring `StageLookupResult.rulesTotal`'s own
+ * contract so both callers (`stageLookup`'s miss path, `agent_context`/`prewarm`) can build an
+ * honest truncation signal the same way `rulesOmitted` already does.
+ */
+export function liveStageIndex(db: StoragePort, circle: string): LiveStageIndexResult {
+  const capped = liveStageNamesCapped(db, circle, STAGE_INDEX_CAP + 1);
+  if (capped.length <= STAGE_INDEX_CAP) return { names: capped };
+  return { names: capped.slice(0, STAGE_INDEX_CAP), total: countLiveStages(db, circle) };
+}
+
+// ---- the recognized matcher (stageLookup) ------------------------------------
+
+/**
+ * THE RECOGNIZED MATCHER, as a pure read — see `evaluateGate`'s own comment for why the read and
+ * the write are split (a deferred read transaction upgrading to a write one can be refused with
+ * SQLITE_BUSY; splitting them means the worst case is a lost instrumentation row, never a failed
+ * lookup). The agent NAMES a stage, so unlike gateInternal one lookup can resolve to at most one
+ * stage — there is no trigger-pattern fan-out here, and therefore no `stages`/`matchedStageIds`
+ * plural to track.
+ */
+export function evaluateStageLookup(
+  db: StoragePort,
+  opts: StageLookupOptions,
+): { result: StageLookupResult; pending: PendingGateWrites | null } {
+  const startedAt = typeof process !== "undefined" && process.hrtime ? process.hrtime.bigint() : null;
+  const now = opts.now ?? Date.now();
+  const record = opts.record !== false;
+  const stage = findStage(db, opts.stage);
+
+  if (!stage) {
+    // THE MISS CARRIES THE LIVE INDEX, unconditionally — this is part of the READ result (so a
+    // misremembered name self-repairs in one round trip), not the instrumentation, so it is
+    // computed whether or not `record` asked for a gate_events row.
+    const stageIndexResult = liveStageIndex(db, opts.circle);
+    const result: StageLookupResult = {
+      matched: false, stage: null, rules: [],
+      stageIndex: stageIndexResult.names,
+      ...(stageIndexResult.total !== undefined ? { stageIndexTotal: stageIndexResult.total } : {}),
+    };
+    return {
+      result,
+      pending: record
+        ? {
+            // ATTEMPTED RECOGNITIONS ARE THE NUMERATOR a future recognition-rate (scanner-slice)
+            // measure needs, and a miss recorded nowhere would silently drop out of that count —
+            // so a miss is recorded exactly like a hit, action_context = the name actually asked.
+            actionContext: opts.stage, circle: opts.circle, now, overflow: false,
+            latencyUs: elapsedUs(startedAt), matchedStageIds: [], verifyStageIds: [],
+            primaryStageId: null, ruleCount: 0, maxSeverity: null, matcher: "recognized",
+          }
+        : null,
+    };
+  }
+
+  // SAME CHOKEPOINT SEMANTICS AS gateQuery: liveness, circle, model-tag filter, parent principle —
+  // rulesForStages is the one query both matchers deliver through. withBody: true — this is the
+  // ONLY caller that needs it, because toStageLookupRule is the only mapper that reads it (the
+  // capability invocation payload).
+  //
+  // SQL-LEVEL BOUNDS (review fix — Codex round 2, extended round 3 to `reason`): the primary fetch
+  // caps how many rows come back (STAGE_LOOKUP_RULES_CAP, +1 as a cheap "were there more" probe —
+  // see that constant's own comment), how much of `body` each row carries (STAGE_LOOKUP_BODY_CAP,
+  // +1 for the same reason), and now how much of `reason` each row carries too
+  // (STAGE_LOOKUP_REASON_CAP, +1 — reason has no write-time length bound of its own, so it was the
+  // residual axis a persisted giant reason could still use to defeat the row/body caps).
+  // Materializing every live rule's FULL body/reason server-side, for an unbounded rule count, was
+  // exactly the always-on retrieval cost this closes — the wire only ever shows a bounded prefix
+  // on any axis anyway, and nothing upstream of this call needs the untruncated whole.
+  const primaryRows = rulesForStages(
+    db, [stage.id], opts.circle, opts.runtimeModelTag, true,
+    STAGE_LOOKUP_RULES_CAP + 1, STAGE_LOOKUP_BODY_CAP + 1, STAGE_LOOKUP_REASON_CAP + 1,
+  );
+  const capped = primaryRows.length > STAGE_LOOKUP_RULES_CAP;
+  const shownRows = capped ? primaryRows.slice(0, STAGE_LOOKUP_RULES_CAP) : primaryRows;
+  const rules = shownRows.map(toStageLookupRule);
+
+  // Only when the primary fetch actually hit the cap: an EXACT total (one indexed COUNT(*), a cost
+  // paid only in this — expected rare — case) and a compact outline of the rules the primary fetch
+  // never retrieved at all, so the wire's recovery ladder can still name them (see
+  // StageLookupResult's own comment on `rulesTotal`/`rulesOutline` for why `rules.length` alone can
+  // no longer be trusted as "the whole truth" once retrieval itself is bounded).
+  const rulesTotal = capped ? countLiveRulesForStage(db, stage.id, opts.circle, opts.runtimeModelTag) : undefined;
+  const rulesOutline = capped
+    ? ruleOutlineForStage(db, stage.id, opts.circle, opts.runtimeModelTag, STAGE_LOOKUP_RULES_CAP, STAGE_LOOKUP_OUTLINE_CAP)
+    : undefined;
+
+  const result: StageLookupResult = {
+    matched: true,
+    stage: { id: stage.id, name: stage.name },
+    rules,
+    ...(rulesTotal !== undefined ? { rulesTotal } : {}),
+    ...(rulesOutline !== undefined ? { rulesOutline } : {}),
+  };
+  return {
+    result,
+    pending: record
+      ? {
+          actionContext: opts.stage, circle: opts.circle, now, overflow: false,
+          latencyUs: elapsedUs(startedAt),
+          // A NAME lookup proves nothing about trigger-PATTERN realism, so unlike gateInternal this
+          // never populates verifyStageIds — `verified` stays exactly what it has always meant:
+          // this pattern matched a real intercepted action, not merely a name a human typed back.
+          matchedStageIds: [], verifyStageIds: [],
+          primaryStageId: stage.id,
+          // HONEST INSTRUMENTATION: the true rule count when retrieval was capped, not the
+          // (possibly much smaller) length of what was actually fetched.
+          ruleCount: rulesTotal ?? rules.length,
+          maxSeverity: rules.some((rule) => rule.severity === "blocking") ? "blocking" : rules.length > 0 ? "advisory" : null,
+          matcher: "recognized",
+        }
+      : null,
+  };
+}
+
+/**
+ * THE RECOGNIZED MATCHER. The agent NAMES a stage — no trigger-pattern matching, no fuzzy or
+ * embedding search: recognition is the agent's own act against the resident stage index, and this
+ * is a lookup against it. Delivers through the SAME chokepoint semantics as gateQuery (liveness,
+ * circle scope, model-tag filtering, parent principle) plus the one payload gateQuery never
+ * carries: each rule's `body`, the capability invocation, spent here because this is agent-
+ * initiated pull at the moment of need rather than an always-on injection.
+ *
+ * ADVISORY-ONLY BY DESIGN: severity is delivered as information — a blocking rule appears with its
+ * reason, exactly like an advisory one — and never enforced here. The deny tier stays on the
+ * mechanical gate; nothing about calling this can refuse an action.
+ *
+ * A stage with zero live rules is a HIT with `rules: []` (the stage-hit-no-rules signal — see
+ * GateResult.silence for why this is never conflated with a miss). A miss (no such stage) carries
+ * the live stage index so a misremembered name self-repairs in one round trip. Every call — hit or
+ * miss alike — records one gate_events row with matcher='recognized'; a miss records
+ * matched_stage_id NULL and action_context = the name actually asked, because attempted
+ * recognitions are the numerator a recognition-rate measure needs and a silently-dropped miss
+ * would corrupt exactly that count.
+ *
+ * The standalone form — evaluateStageLookup + commitGateWrites in one call, for a caller with no
+ * transaction of its own (same relationship gateQuery has to evaluateGate/commitGateWrites).
+ * MonetCore.stageLookup() uses the split form directly, for the same reason MonetCore.gate() does.
+ *
+ * TRANSACTION-WRAPPED, mirroring MonetCore.stageLookup() (engine.ts) EXACTLY (review fix — Codex
+ * round 4, item 3): that method wraps its own call to `evaluateStageLookup` in
+ * `this.db.transaction(...)()` — a single consistent read view — and only THEN, separately,
+ * `commitGateWrites` in its own `this.db.immediateTransaction(...)()`, inside a try/catch that
+ * swallows the write's failure (see MonetCore.gate()'s own comment for why: a deferred read
+ * transaction upgrading to a write one can be refused with SQLITE_BUSY, and losing one
+ * instrumentation row is the acceptable side of that trade — losing a verdict is not). Before this
+ * fix, THIS function — the one path a caller with no transaction of its own actually runs — issued
+ * `evaluateStageLookup`'s several reads (findStage, then rulesForStages, then — only when capped —
+ * countLiveRulesForStage/ruleOutlineForStage, or on a miss liveStageNamesCapped/countLiveStages) as
+ * separate, unwrapped statements. A concurrent writer (the SUPPORTED MCP+CLI topology storage.ts's
+ * WAL+busy_timeout setup exists for) landing a rule bind/retire BETWEEN two of those reads could
+ * make `rulesTotal`/`rulesOutline`/`stageIndexTotal` describe a DIFFERENT instant than the
+ * `rules`/`stageIndex` prefix already returned — an honest-looking total for a snapshot that never
+ * existed. Same split as the engine method, same swallow-on-write-failure, just constructed here
+ * instead of on `this.db`.
+ */
+export function stageLookup(db: StoragePort, opts: StageLookupOptions): StageLookupResult {
+  const { result, pending } = db.transaction(() => evaluateStageLookup(db, opts))();
+  if (pending) {
+    try {
+      db.immediateTransaction(() => commitGateWrites(db, pending, opts.nextSyncTimestamp))();
+    } catch {
+      // Instrumentation only. Deliberately swallowed — see this function's own comment above.
+    }
+  }
+  return result;
+}
 
 // ---- instrumentation readback -----------------------------------------------
 
@@ -1787,6 +2541,15 @@ const elapsedUs = (startedAt: bigint | null): number =>
  * `unverifiedPatterns` is deliberately STORE-GLOBAL rather than circle-scoped, unlike the counts: a
  * stage is a registry entry with no circle, and "this pattern has never matched anything anywhere"
  * is the question a dead pattern needs asked of it.
+ *
+ * EVERY FIELD BELOW EXCEPT `byMatcher` IS SCOPED TO THE MECHANICAL MATCHER — additive, not a
+ * restructure: `fires`/`silences`/`delivered`/`byStage` and the rest were "fire precision and
+ * silence rate" for gateQuery before stageLookup existed, and a recognized lookup's `matched` is a
+ * different verdict over a different population (an agent naming a stage, not an intercepted
+ * action — see stageLookup's own doc comment). Blending the two would silently change what these
+ * numbers have always meant the moment stageLookup starts getting called, which is exactly the
+ * kind of drift "additive only" is meant to rule out. `byMatcher` is the one new field, and the one
+ * place a reader sees recognized activity at all.
  */
 export interface GateStats {
   windowDays: number;
@@ -1809,6 +2572,13 @@ export interface GateStats {
   total: number;
   /** Fires per stage in the window, biggest first. */
   byStage: Array<{ stageId: string; stageName: string; fires: number }>;
+  /**
+   * Counts per matcher in the window — 'mechanical' (gateQuery) vs 'recognized' (stageLookup). The
+   * ONE field on this type that is NOT scoped to the mechanical matcher alone (see the interface's
+   * own doc comment). Only matcher values that actually appear in the window are listed — no
+   * zero-filled row for a matcher that never fired, same convention `byStage` already uses.
+   */
+  byMatcher: Array<{ matcher: GateMatcher; count: number }>;
   /** Stages whose patterns have never fired anywhere. Store-global; the dead-pattern watchlist. */
   unverifiedPatterns: Array<{ stageId: string; stageName: string; origin: StageOrigin; patterns: string[] }>;
   /**
@@ -1859,6 +2629,10 @@ export interface GateStatsOptions {
 export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
   const now = opts.now ?? Date.now();
   const since = now - opts.windowDays * 24 * 60 * 60 * 1000;
+  // MECHANICAL ONLY (see GateStats' own doc comment for why): a recognized lookup's `matched` is
+  // not a "fire" in the sense this query has always measured, and letting it through would move
+  // `windowTotal`/`total` off `fires + silences + overflows` — an invariant curation and tests
+  // already rely on — without changing either constant's name.
   const window = db
     .prepare(
       `SELECT
@@ -1866,13 +2640,16 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
          SUM(CASE WHEN matched_stage_id IS NOT NULL THEN 1 ELSE 0 END) AS fires,
          SUM(CASE WHEN rule_count > 0 THEN 1 ELSE 0 END) AS delivered,
          SUM(CASE WHEN overflow = 1 THEN 1 ELSE 0 END) AS overflows
-       FROM gate_events WHERE circle = ? AND ts >= ?`,
+       FROM gate_events WHERE circle = ? AND ts >= ? AND matcher = 'mechanical'`,
     )
     .get(opts.circle, since) as { total: number; fires: number | null; delivered: number | null; overflows: number | null };
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM gate_events WHERE circle = ?`).get(opts.circle) as { n: number }).n;
+  const total = (db.prepare(`SELECT COUNT(*) AS n FROM gate_events WHERE circle = ? AND matcher = 'mechanical'`).get(opts.circle) as { n: number }).n;
   // Counted from EVERY matched stage, not from the one that answered. A broad stage that matches
   // constantly alongside a narrow deny would otherwise report zero fires — and a stage reporting
-  // zero fires is exactly what curation reads as "dead, safe to remove".
+  // zero fires is exactly what curation reads as "dead, safe to remove". Mechanical-only with no
+  // explicit filter needed: stageLookup never writes gate_event_stages (a recognized lookup
+  // resolves to at most one stage, so matched_stage_id alone already carries it with no undercount
+  // risk — see evaluateStageLookup's own comment), so this table is mechanical fires by construction.
   const byStage = db
     .prepare(
       `SELECT es.stage_id AS stageId, s.name AS stageName, COUNT(*) AS fires
@@ -1884,6 +2661,17 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
         ORDER BY fires DESC, stageName ASC`,
     )
     .all(opts.circle, since) as Array<{ stageId: string; stageName: string; fires: number }>;
+  // THE ONE UNSCOPED QUERY — byMatcher's whole job is to break the window down BY matcher, so it
+  // reads every row rather than pre-filtering to one.
+  const byMatcher = db
+    .prepare(
+      `SELECT matcher, COUNT(*) AS count
+         FROM gate_events
+        WHERE circle = ? AND ts >= ?
+        GROUP BY matcher
+        ORDER BY matcher ASC`,
+    )
+    .all(opts.circle, since) as Array<{ matcher: GateMatcher; count: number }>;
   const unverified = db
     .prepare(`SELECT id, name, origin, trigger_patterns FROM stages WHERE verified = 0 ORDER BY created_at ASC, id ASC`)
     .all() as Array<{ id: string; name: string; origin: StageOrigin; trigger_patterns: string }>;
@@ -1913,6 +2701,7 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
     windowTotal: window.total,
     total,
     byStage,
+    byMatcher,
     unverifiedPatterns: unverified.map((stage) => ({
       stageId: stage.id,
       stageName: stage.name,

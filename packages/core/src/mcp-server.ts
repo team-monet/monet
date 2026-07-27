@@ -14,6 +14,15 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore, FIRST_BLOCK_SUMMARY_MAX_CHARS } from "./engine";
 import type { MergeConceptResult } from "./engine";
+import {
+  MODEL_TAG_MAX_CHARS,
+  STAGE_INDEX_CAP,
+  STAGE_LOOKUP_BODY_CAP,
+  STAGE_LOOKUP_OUTLINE_CAP,
+  STAGE_LOOKUP_REASON_CAP,
+  STAGE_LOOKUP_RULES_CAP,
+  STAGE_NAME_MAX_CHARS,
+} from "./gates";
 import type { SourceAuthorizationContext } from "./source-types";
 import { sanitizeSourceError } from "./source-errors";
 import { createSourceScheduler } from "./source-scheduler";
@@ -45,10 +54,98 @@ const FETCH_BODY_MAX_CHARS = 6_000; // concept body cap
 // staying close enough to the size-fit's own typical stopping point that it rarely binds first.
 const FETCH_OUTLINE_MAX_ENTRIES = 200;
 
+/**
+ * BLOCKER FIX: stage_lookup's `rules` array is unbounded on BOTH axes a memory_fetch response
+ * never is — how many rules a stage can accumulate over a store's lifetime, and how long each
+ * rule's `body` (a full concept body, no write-time cap) or `reason` (no write-time cap either,
+ * unlike a blocking rule's ONE-LINE constraint, which bounds shape, not length) can be. A count cap
+ * alone is unsound (a handful of huge bodies still blows the budget) and a per-field cap alone is
+ * unsound (many small-but-nonzero rules still add up), so both apply, plus a size-fit loop over the
+ * ACTUAL serialized response — the same three-part defense memory_fetch's outline uses
+ * (FETCH_OUTLINE_MAX_ENTRIES's own comment), applied here because stage_lookup has the identical
+ * "cap alone is a hope, not a guarantee" shape.
+ *
+ * WORST-CASE SIZE MATH (why a fixed rule-count cap could not be the guarantee on its own): with
+ * `body` capped to STAGE_LOOKUP_BODY_CAP (6 000, imported from gates.ts — see ITS OWN comment for
+ * why this is SQL-bounded now too, not just wire-clipped) and `reason` capped to
+ * STAGE_LOOKUP_REASON_CAP (1 200, SAME reasoning — round 3 extended the SQL bound to this axis
+ * too) — each plus clip()'s own truncation note (~40 chars) — one rule's `conceptId` (36-char
+ * uuid), `text` (≤80-char title), `severity`, `scope`, `reasonMissing`, `origin`, the optional
+ * `modelTag` and the optional `projectedFromPrincipleId` (another uuid) add roughly 300 more value
+ * chars, and 2-space pretty-print indentation/punctuation (JSON.stringify(..., null, 2), nested
+ * inside `rules` inside the result object) adds roughly 150 more. One capped rule therefore
+ * serializes to ~7 750 chars worst case — call it 8 000. The reviewer's own probe shape, 6 such
+ * rules, is ~48 000 chars alone — already past RESULT_MAX_CHARS (40 000) before the rest of the
+ * envelope (circle/matched/stage) is even counted, which is exactly the unparseable-JSON failure
+ * (ok() hard-slicing valid JSON at a byte offset with isError:false) this fitting loop exists to
+ * make impossible. A STORE WITH MANY SMALL RULES keeps every one of them; a store with a few huge
+ * ones stops before the ceiling — that is what the size-fit buys over a bare count.
+ */
+// STAGE_LOOKUP_RULES_CAP / STAGE_LOOKUP_BODY_CAP / STAGE_LOOKUP_REASON_CAP / STAGE_LOOKUP_OUTLINE_CAP
+// / STAGE_INDEX_CAP (all imported from gates.ts) used to be five separate wire-only constants here
+// (STAGE_LOOKUP_RULES_MAX_ITERATE, an inline FETCH_BODY_MAX_CHARS reuse, an inline FETCH_OBS_MAX_CHARS
+// reuse, STAGE_LOOKUP_OMITTED_MAX_ITERATE, and two separately-named 2,000s — STAGE_LOOKUP_
+// INDEX_MAX_ITERATE / AGENT_CONTEXT_STAGE_INDEX_MAX_ITERATE) that merely happened to agree with the
+// SQL-side caps evaluateStageLookup/liveStageIndex now enforce (review fix — Codex rounds 2-3: the
+// engine was materializing every rule's full body/reason, for an unbounded rule count, and every
+// stage's full row just to read its name, before this layer ever got a chance to clip anything).
+// Now there is exactly one definition of each, in gates.ts, so "the wire's cap" and "the SQL's cap"
+// cannot drift into two different numbers — this file only ever REFERENCES them below
+// (rules.length ≤ STAGE_LOOKUP_RULES_CAP and a stage index's own length ≤ STAGE_INDEX_CAP are now
+// ENGINE guarantees, so the size-fit loops no longer need their own separate count-cap slice before
+// iterating — STAGE_INDEX_CAP doubles as both the SQL LIMIT and the wire's iteration bound for both
+// of its consumers, stage_lookup's miss path and agent_context).
+// STAGE_NAME_MAX_CHARS (imported from gates.ts) is the shared ceiling on every `stage` tool
+// argument below (memory_store's `rule.stage`, memory_declare's `stage`, stage_lookup's `stage`) —
+// referenced directly rather than copied, because a lookup cap that disagreed with the creation
+// cap would mean either (a) a legitimately-stored name becomes unlookupable (the review-caught
+// bug: lookup capped at 500 while `upsertStage` stayed unbounded), or (b) a lookup would accept
+// what creation would refuse. `upsertStage` (gates.ts) is the AUTHORITATIVE enforcement — the one
+// place a stage name is ever minted, covering every creation path, including ones with no MCP zod
+// schema at all; the zod `.max(STAGE_NAME_MAX_CHARS)` calls below are the fast, friendly rejection
+// at the boundary, not a second source of truth.
+
 /** Truncate `s` to `max` chars, flagging whether it was clipped (so callers can signal it). */
 function clip(s: string, max: number): { text: string; clipped: boolean } {
   if (s.length <= max) return { text: s, clipped: false };
   return { text: `${s.slice(0, max)}\n…[truncated ${s.length - max} chars]`, clipped: true };
+}
+
+/**
+ * THE canonical "we had to cut this short" note — ok()'s own last-resort slicer and every size-fit
+ * loop in this file (stage_lookup's rules/stageIndex, agent_context's stageIndex) reserve the SAME
+ * number of characters for it, so none of them can under-reserve and let a caller-visible response
+ * tip past RESULT_MAX_CHARS by the difference. One constant rather than several copies, because a
+ * copy that drifted from ok()'s own text is exactly the inconsistency a shared-budget fix must not
+ * reintroduce at the very field (the truncation note itself) that proves the budget was honored.
+ */
+const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
+
+/**
+ * Fit as many strings from `items` into `envelope[key]` as fit within `budget` once the WHOLE
+ * envelope is serialized — the same incremental size-fit technique as memory_fetch's outline
+ * (FETCH_OUTLINE_MAX_ENTRIES's own comment) and stage_lookup's own `rules` array, generalized for a
+ * plain string array so stage_lookup's miss-path stageIndex and agent_context's stageIndex share
+ * ONE implementation rather than two copies that could quietly disagree about what "fits" means.
+ * `maxIterate` bounds the O(n) JSON.stringify calls the loop makes, cheaply, before the size check
+ * (which is expected to bind first for short strings like stage names) does.
+ */
+function fitStringArray(
+  envelope: Record<string, unknown>,
+  key: string,
+  items: string[],
+  maxIterate: number,
+  budget: number,
+): { fitted: string[]; omitted: number } {
+  const countCapped = items.slice(0, maxIterate);
+  const fitted: string[] = [];
+  for (const item of countCapped) {
+    const candidate = [...fitted, item];
+    const serialized = JSON.stringify({ ...envelope, [key]: candidate }, null, 2);
+    if (serialized.length > budget) break;
+    fitted.push(item);
+  }
+  return { fitted, omitted: items.length - fitted.length };
 }
 
 // ok() is the canonical serializer for successful tool results. content[0] is ALWAYS the
@@ -60,9 +157,8 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
 function ok(content: object): CallToolResult {
   let text = JSON.stringify(content, null, 2);
   if (text.length > RESULT_MAX_CHARS) {
-    const note = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
     // Reserve room for the note so the FINAL payload stays at/under the hard ceiling, not over it.
-    text = text.slice(0, Math.max(0, RESULT_MAX_CHARS - note.length)) + note;
+    text = text.slice(0, Math.max(0, RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length)) + RESULT_TRUNCATE_NOTE;
   }
   return { content: [{ type: "text", text }] };
 }
@@ -77,6 +173,47 @@ const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 
 /** Max characters for the prepended prewarm block (keeps it well under the ceiling). */
 const PREWARM_BLOCK_MAX_CHARS = 2_500;
+
+/**
+ * How many stage names buildPrewarmBlock's own recognition-cue line shows before a "+K more" tail
+ * (item 5b). 15 real, moderate-length stage names ("git force push", "starting a review pass", …)
+ * behind the line's own label render to ~290 chars — comfortably inside this function's own
+ * PREWARM_BLOCK_MAX_CHARS budget on its own, and the line still rides the existing lower-section
+ * size-fit if the rest of the block is large. Not unbounded: the whole point of a cap is that the
+ * cue stays a short, scannable list rather than growing without limit as stages accumulate — see
+ * the design's own "names are budgeted like anything else resident" note.
+ *
+ * A COUNT CAP ALONE IS NOT THE GUARANTEE (review fix — Codex round 2): stage creation imposes no
+ * per-name length bound the way this constant assumes ("moderate-length" was an assumption about
+ * REALISTIC names, not an enforced one) — wait, it now IS bounded by gates.ts's
+ * STAGE_NAME_MAX_CHARS, but that ceiling (500) is still generous enough that a handful of names
+ * near it blow well past this line's own budget. See STAGE_INDEX_PREWARM_LINE_MAX_CHARS below for
+ * the actual per-line size-fit this cap is now paired with.
+ */
+const STAGE_INDEX_PREWARM_MAX_SHOWN = 15;
+/**
+ * The recognition-cue line's OWN character budget (review fix — Codex round 2). The prior version
+ * joined up to STAGE_INDEX_PREWARM_MAX_SHOWN names into ONE line BEFORE buildPrewarmBlock's
+ * lower-section fitter ever runs — and that fitter accepts or drops WHOLE lines (see its own "Fit
+ * as many lower-priority lines as possible" loop), so a handful of names near
+ * STAGE_NAME_MAX_CHARS (500) made the JOINED LINE ITSELF exceed the ~2 400-char lower-section
+ * budget, and the fitter dropped the entire line — the WHOLE recognition cue silently vanishing,
+ * on exactly the rich stores where it matters most, on the auto-prewarm path a worker that never
+ * calls agent_context explicitly depends on for the ONLY in-flight delivery it gets.
+ *
+ * The fix builds the line INCREMENTALLY against THIS budget (append names while they still fit,
+ * append the "+K more" tail computed from what REALLY fit) rather than joining first and hoping
+ * the outer fitter accepts the result whole — so a non-empty prefix of the cue survives regardless
+ * of how long any individual name is. 800 is comfortably under PREWARM_BLOCK_MAX_CHARS (2 500) on
+ * its own, generous enough that STAGE_INDEX_PREWARM_MAX_SHOWN (not this budget) is what binds for
+ * realistic short names, and small enough that this one line can never itself consume the whole
+ * lower-section budget.
+ */
+const STAGE_INDEX_PREWARM_LINE_MAX_CHARS = 800;
+/** Reserved headroom for the optional " (+K more)" tail when deciding whether one more name still
+ *  fits (STAGE_INDEX_PREWARM_LINE_MAX_CHARS's own fitting loop) — a 4-digit count is already far
+ *  more stages than any real install has, so this margin is never actually exhausted in practice. */
+const STAGE_INDEX_PREWARM_TAIL_MARGIN_CHARS = 20;
 
 /**
  * Max characters for the firstBlock array serialized into the agent_context JSON payload.
@@ -169,6 +306,44 @@ function buildPrewarmBlock(
   const advisory = buildCurationAdvisory(ov, state.firstBlock);
   if (advisory !== null) {
     lowerLines.push(`Curation attention: ${advisory}.`);
+  }
+
+  // Stage index (review fix, item 5b): the recognition cue MUST actually reach a worker that never
+  // calls agent_context explicitly — auto-prewarm is the only in-flight delivery into that
+  // junctureless interior, and a stageIndex the structured agent_context payload carried but this
+  // rendered block never mentioned would leave that population with no cue at all. Names only, a
+  // top-N + "+K more" tail (not the full list — an unbounded join here would defeat the point of a
+  // cap), and placed in lowerLines (truncation-protected only up to the same budget every other
+  // lower-priority line gets) rather than firstBlockLines: this is a refreshed-every-call cue, not
+  // a governing pin that must survive truncation unconditionally.
+  const stageIndex = state.stageIndex ?? [];
+  if (stageIndex.length > 0) {
+    // BUILT INCREMENTALLY AGAINST THE LINE'S OWN BUDGET (review fix — Codex round 2): the prior
+    // version joined up to STAGE_INDEX_PREWARM_MAX_SHOWN names into ONE line BEFORE this function's
+    // own lower-section fitter (below) ever runs, and that fitter accepts or drops WHOLE lines — so
+    // a handful of names near STAGE_NAME_MAX_CHARS made the line ITSELF exceed the lower-section
+    // budget, and the fitter silently dropped the ENTIRE cue rather than a truncated prefix of it,
+    // on exactly the rich-store case the cue exists for. Appending names one at a time and stopping
+    // BEFORE the line would cross its own budget (see STAGE_INDEX_PREWARM_LINE_MAX_CHARS's own
+    // comment) guarantees a non-empty prefix survives regardless of name length, and the "+K more"
+    // tail below is computed from what ACTUALLY fit, not from the count-based cap alone.
+    const label = "Stages you can recognize (ask stage_lookup): ";
+    const shown: string[] = [];
+    for (const name of stageIndex.slice(0, STAGE_INDEX_PREWARM_MAX_SHOWN)) {
+      const candidateNames = shown.length === 0 ? name : `${shown.join(", ")}, ${name}`;
+      if (label.length + candidateNames.length + STAGE_INDEX_PREWARM_TAIL_MARGIN_CHARS > STAGE_INDEX_PREWARM_LINE_MAX_CHARS) break;
+      shown.push(name);
+    }
+    // THE TRUE TOTAL, not `stageIndex.length` alone (review fix — Codex round 4, item 1):
+    // `state.stageIndexTotal` is present exactly when `liveStageIndex`'s OWN retrieval was capped
+    // (STAGE_INDEX_CAP) — mirrors `rulesTotal`'s honesty contract. Before this fix, past that cap,
+    // `stageIndex.length` WAS the cap (2 000) regardless of how many more stages were actually
+    // retrieval-omitted, so "+K more" undercounted by exactly that omitted amount — an auto-prewarm
+    // worker (the ONE population this cue exists for; see the comment above) reading "+1985 more"
+    // when the true gap was, say, +3985 has no way to learn the difference from this line alone.
+    const trueTotal = state.stageIndexTotal ?? stageIndex.length;
+    const more = trueTotal - shown.length;
+    lowerLines.push(`${label}${shown.join(", ")}${more > 0 ? ` (+${more} more)` : ""}`);
   }
 
   // Active workstreams — up to 5.
@@ -404,8 +579,47 @@ export function registerMonetCoreTools(
    * own identity correctly. Absent (no MONET_MODEL_TAG, no explicit tag on the call), an
    * agent-scoped capture is REFUSED rather than tagged with a guess — an untagged compensation is
    * indistinguishable from a domain rule at the moment it matters, which is the shackle risk.
+   *
+   * BLANK COUNTS AS ABSENT, not as a configured empty tag (review fix — Codex round 4, item 4: THE
+   * BUG this closes). `process.env.MONET_MODEL_TAG` resolves to `""` under ordinary env
+   * templating (`MONET_MODEL_TAG=${SOME_VAR}` with `SOME_VAR` unset expands to an empty string,
+   * never to an absent variable) — a common, unremarkable deployment shape, not a misconfiguration.
+   * `""` is neither `null` nor `undefined`, so a bare `??` chain would happily accept it as "the
+   * host's answer" and hand it to `setRuntimeModelTag`, which — even now that the setter itself
+   * normalizes blank to a clear (see its own comment) — would still CLEAR an already-good tag the
+   * CONSTRUCTOR supplied (a test harness, an embedding host passing `runtimeModelTag` directly).
+   * That is the wrong direction: a blank env var should behave as though it were never SET, not as
+   * an explicit instruction to unset whatever was already configured. Trimming and treating a blank
+   * result as `undefined` HERE makes the `if (defaultModelTag !== undefined)` guard below skip the
+   * `setRuntimeModelTag` call entirely in that case, leaving the constructor's own tag untouched.
+   * The fix belongs at BOTH ends (this resolution, and the setter's own total-against-blank
+   * behavior) because they defend different callers: this one guards MCP registration specifically;
+   * the setter guards every OTHER caller of the public API.
    */
-  const defaultModelTag = opts?.modelTag ?? process.env.MONET_MODEL_TAG ?? undefined;
+  const rawModelTag = opts?.modelTag ?? process.env.MONET_MODEL_TAG;
+  const defaultModelTag = rawModelTag?.trim() ? rawModelTag.trim() : undefined;
+
+  // ONE CHAIN (review fix): gate()/stageLookup()/gateStats() all resolve `this.runtimeModelTag`
+  // when a call omits an explicit tag. Wiring it here, ONCE, is what makes every surface reachable
+  // from this process resolve the SAME tag — stage_lookup's handler used to pass `defaultModelTag`
+  // per-call while gate() fell back to `this.runtimeModelTag`, and in the default deployment
+  // (scripts/mcp-cli.ts constructs MonetCore without a runtimeModelTag option) that meant
+  // MonetCore's own field stayed null even with MONET_MODEL_TAG set, so stage_lookup correctly
+  // filtered a foreign-model rule while gate()/gateStats() (reading the still-null field) did not
+  // — the two surfaces silently disagreeing about which rules exist. Only set when defined: an
+  // explicit runtimeModelTag passed at MonetCore's OWN construction (a test harness, an embedding
+  // host) is a real host signal too, and an absent MCP-layer default must not silently erase it.
+  //
+  // THIS IS THE ONLY PLACE `defaultModelTag` (the CLOSURE-captured copy) is used from here on
+  // (review fix — Codex round 3, extending "one chain" to the WRITE path): memory_store's rule
+  // capture and memory_declare below used to stamp a NEW rule's modelTag from THIS closure
+  // variable directly, so a LATER `core.setRuntimeModelTag(...)` call (a live tag switch, e.g. a
+  // host that changes which model it is running mid-session) was invisible to capture even though
+  // gate()/stageLookup() already read the live field — a rule captured after the switch was
+  // stamped for the OLD model and immediately filtered out by the NEW one. Both handlers now call
+  // `core.getRuntimeModelTag()` at CALL TIME instead, so capture resolves from the SAME live source
+  // delivery already did.
+  if (defaultModelTag !== undefined) core.setRuntimeModelTag(defaultModelTag);
 
   /**
    * Capture the prewarm block BEFORE a handler runs (Fix B: snapshot prior state, not post-mutation
@@ -599,6 +813,7 @@ export function registerMonetCoreTools(
         .object({
           stage: z
             .string()
+            .max(STAGE_NAME_MAX_CHARS)
             .describe(
               "The action this rule fires at — a stage name, or the id of an existing stage. If no stage exists for this action yet, storing the rule CREATES it: a correction landing on an unstaged action is that stage's birth.",
             ),
@@ -616,6 +831,7 @@ export function registerMonetCoreTools(
             ),
           modelTag: z
             .string()
+            .max(MODEL_TAG_MAX_CHARS)
             .optional()
             .describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
           reason: z
@@ -641,7 +857,11 @@ export function registerMonetCoreTools(
           // (or simply guesses) would file its compensation under another model's tag, and the
           // "a new model retires the old model's compensations" rule would then retire the wrong
           // ones. Self-knowledge is exactly what this must not depend on.
-          ...(rule ? { rule: { ...rule, modelTag: defaultModelTag ?? rule.modelTag } } : {}),
+          //
+          // core.getRuntimeModelTag() — LIVE, not the closure-captured `defaultModelTag` (review
+          // fix, Codex round 3): a rule captured after a later setRuntimeModelTag() switch must be
+          // stamped for the model running NOW, not the one running at MCP registration time.
+          ...(rule ? { rule: { ...rule, modelTag: core.getRuntimeModelTag() ?? rule.modelTag } } : {}),
         });
         return mutOk({
           circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
@@ -675,6 +895,7 @@ export function registerMonetCoreTools(
         .describe('"stage": create or re-author a gate address. "rule": create a rule and bind it to a stage.'),
       stage: z
         .string()
+        .max(STAGE_NAME_MAX_CHARS)
         .describe("The action the gate fires on — a stage name, or the id of an existing stage. Required for both species."),
       content: z.string().optional().describe('What the rule says. Required for species="rule".'),
       patterns: z
@@ -700,7 +921,7 @@ export function registerMonetCoreTools(
           "Required when `patterns` would re-author a stage that has blocking rules bound to it: list every one of their concept ids. Changing a stage's patterns changes what its denies deny, so this confirms you have seen them. The error names the ids you are missing — show them to the user before acknowledging.",
         ),
       scope: z.enum(["domain", "agent"]).optional().describe('"domain": true for a perfect agent. "agent" (default): a compensation for this model.'),
-      modelTag: z.string().optional().describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
+      modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
       reason: z.string().optional().describe('One line naming the failure this prevents — what the gate shows, and what earns compliance. REQUIRED when severity is "blocking": a deny nobody can explain is a deny people learn to route around. Ask the user for it rather than inventing one.'),
       declaredBy: z.string().optional().describe("Who ruled. Defaults to the calling agent id."),
       circle: z.string().optional(),
@@ -711,7 +932,9 @@ export function registerMonetCoreTools(
       try {
         const r = await core.declare({
           species, stage, content, patterns, instance, severity, scope: ruleScope,
-          modelTag: defaultModelTag ?? modelTag, reason, declaredBy, sourceRefs,
+          // LIVE, not the closure-captured `defaultModelTag` — same review-fix reasoning as
+          // memory_store's own rule capture just above (Codex round 3).
+          modelTag: core.getRuntimeModelTag() ?? modelTag, reason, declaredBy, sourceRefs,
           acknowledgeBlockingRules,
           circle: scope(circle),
         });
@@ -1037,6 +1260,177 @@ export function registerMonetCoreTools(
         }, "memory_fetch", capturedBlock);
       } catch (e) {
         return err(`fetch failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "stage_lookup",
+    "You are at a named moment (see the stage index from agent_context): ask for that stage's rules before proceeding. Advisory delivery — rules arrive with the reason that earns compliance. A miss returns the live index.",
+    {
+      stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("The stage name (or id) you recognize — from the stage index agent_context/prewarm carries."),
+      circle: z.string().optional(),
+    },
+    async ({ stage, circle }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      try {
+        // ONE CHAIN: no runtimeModelTag passed here — core.setRuntimeModelTag() was called once at
+        // registration (above), so this resolves identically to gate()/gateStats() by construction.
+        const r = core.stageLookup({ stage, circle: scope(circle) });
+        const fixedFields = {
+          circle: scope(circle),
+          matched: r.matched,
+          ...(r.stage ? { stage: r.stage } : {}),
+        };
+        const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
+
+        // SIZE-FIT #1: rules (blocker fix). Same technique memory_fetch's outline uses (see
+        // FETCH_OUTLINE_MAX_ENTRIES's own comment) — per-field clip() bounds one rule's own size;
+        // this loop bounds the ARRAY by checking the ACTUAL serialized size against budget rather
+        // than trusting a fixed count, so many small rules all survive and a few huge ones stop
+        // before the ceiling (see STAGE_LOOKUP_BODY_CAP's own worst-case-math comment above). Always
+        // a fast no-op on a MISS — r.rules is [] there. No count-cap slice needed before iterating
+        // any more (review fix — Codex round 2): r.rules.length ≤ STAGE_LOOKUP_RULES_CAP is now an
+        // ENGINE guarantee (evaluateStageLookup's own SQL LIMIT), not something this loop has to
+        // re-enforce.
+        const fitRules: Array<Record<string, unknown>> = [];
+        for (const rule of r.rules) {
+          const bodyClip = rule.body !== null ? clip(rule.body, STAGE_LOOKUP_BODY_CAP) : null;
+          const reasonClip = rule.reason !== null ? clip(rule.reason, STAGE_LOOKUP_REASON_CAP) : null;
+          const candidateRule = {
+            conceptId: rule.conceptId,
+            text: rule.text,
+            reason: reasonClip ? reasonClip.text : rule.reason,
+            // Back on the wire (review fix): dropped in an earlier version, which broke
+            // derivability on a whitespace reason ("\t\n " → reason non-null but reasonMissing
+            // true) — the exact cross-surface class hasNoReason (gates.ts) exists to prevent, and
+            // this surface had quietly re-opened it by omitting the field rather than disagreeing
+            // on its value.
+            reasonMissing: rule.reasonMissing,
+            severity: rule.severity,
+            scope: rule.scope,
+            // origin/modelTag BACK ON THE WIRE (review fix — Codex round 2). VERIFIED premise: when
+            // no runtime model tag is configured, RULE_LIVENESS_WHERE's model-tag filter
+            // (`b.scope != 'agent' OR ? IS NULL OR b.model_tag = ?`, gates.ts) delivers EVERY
+            // agent-scoped rule regardless of its own model_tag — a NULL runtime tag makes the `?
+            // IS NULL` disjunct true unconditionally, so `scope:"agent"` on the wire does NOT imply
+            // "this compensates for the model currently running" in that (unconfigured) deployment.
+            // Without `modelTag` visible, an agent has no way to notice it just received a stale
+            // compensation for a DIFFERENT model — the exact non-derivability class whitespace
+            // reasonMissing was fixed for, and both fields are fixed-size (an enum, a short model
+            // identifier), so the token-budget argument that justified dropping unbounded prose
+            // never applied to them. `origin` always present (never null); `modelTag` omitted when
+            // null (domain scope) — matching this response's existing null-vs-omit convention
+            // (`body`/`stage`/`projectedFromPrincipleId` are all omit-when-absent, never
+            // serialized as an explicit `null`).
+            origin: rule.origin,
+            ...(rule.modelTag !== null ? { modelTag: rule.modelTag } : {}),
+            ...(bodyClip ? { body: bodyClip.text } : {}),
+            ...(rule.projectedFromPrincipleId !== undefined ? { projectedFromPrincipleId: rule.projectedFromPrincipleId } : {}),
+          };
+          const candidate = [...fitRules, candidateRule];
+          const serialized = JSON.stringify({ ...fixedFields, rules: candidate }, null, 2);
+          if (serialized.length > sizeBudget) break;
+          fitRules.push(candidateRule);
+        }
+        // HONEST TOTAL (review fix — Codex round 2): `r.rulesTotal`, when present, means the SQL
+        // retrieval itself was capped — `r.rules.length` alone would understate how many rules
+        // truly exist, not just how many the wire chose to show. Absent means `r.rules.length` IS
+        // the whole truth, exactly as before this fix (see StageLookupResult's own comment).
+        const rulesTotal = r.rulesTotal ?? r.rules.length;
+        const rulesOmittedCount = rulesTotal - fitRules.length;
+
+        // RECOVERY FOR OMITTED RULES (review fix): `rulesOmitted: K` alone is disclosure without
+        // repair — the caller cannot memory_fetch a rule it cannot name. Three-tier degradation,
+        // each tier fit against the SAME remaining budget as everything above (so recovering never
+        // itself reopens the ceiling this whole handler exists to respect) and each tier explicitly
+        // signaled via `omittedRulesDetail` so the caller never has to guess which shape it got:
+        //   1. "outline"       — {conceptId, text} per omitted rule (tiny: a uuid + an ≤80-char
+        //                         title) — memory_fetch(conceptId) is the actual recovery path.
+        //   2. "ids"           — conceptId only, when not even one outline entry fits.
+        //   3. "count-only"    — nothing beyond `rulesOmitted` itself fits (the pre-fix shape).
+        // "-partial" variants mean the tier itself had to stop before naming every omitted rule.
+        //
+        // CANDIDATES COME FROM TWO SOURCES (review fix — Codex round 2, now that retrieval itself
+        // can be capped): rules the primary fetch DID retrieve but this handler's own size-fit
+        // above did not show (`r.rules.slice(fitRules.length)`), and — only when SQL capped
+        // retrieval — rules the primary fetch never even retrieved, named instead by the engine's
+        // compact `r.rulesOutline` projection (gates.ts's `ruleOutlineForStage`). Both are projected
+        // down to the SAME {conceptId, text} shape up front so the ladder logic below stays single.
+        //
+        // "-partial" IS JUDGED AGAINST `rulesOmittedCount` (the TRUE omitted total), NOT against
+        // `omittedRules.length` (the candidate pool size) — `rulesOutline` can itself already be
+        // short of the true total (it has its own STAGE_LOOKUP_OUTLINE_CAP at the engine level), so
+        // comparing only to the candidate pool would silently call a pool that was ALREADY
+        // incomplete "outline" (fully covered) instead of "outline-partial".
+        let omittedRulesFields: Record<string, unknown> = {};
+        if (rulesOmittedCount > 0) {
+          const withinPrimaryOutline = r.rules.slice(fitRules.length).map((rule) => ({ conceptId: rule.conceptId, text: rule.text }));
+          const beyondPrimaryOutline = r.rulesOutline ?? [];
+          const omittedRules = [...withinPrimaryOutline, ...beyondPrimaryOutline];
+          const envelopeSoFar = { ...fixedFields, rules: fitRules, rulesTruncated: true, rulesOmitted: rulesOmittedCount };
+
+          const outlineCandidates = omittedRules.slice(0, STAGE_LOOKUP_OUTLINE_CAP);
+          const fittedOutline: Array<{ conceptId: string; text: string }> = [];
+          for (const entry of outlineCandidates) {
+            const candidate = [...fittedOutline, entry];
+            const serialized = JSON.stringify({ ...envelopeSoFar, omittedRules: candidate }, null, 2);
+            if (serialized.length > sizeBudget) break;
+            fittedOutline.push(entry);
+          }
+
+          if (fittedOutline.length > 0) {
+            omittedRulesFields = {
+              omittedRules: fittedOutline,
+              omittedRulesDetail: fittedOutline.length < rulesOmittedCount ? "outline-partial" : "outline",
+            };
+          } else {
+            const idCandidates = omittedRules.slice(0, STAGE_LOOKUP_OUTLINE_CAP).map((rule) => rule.conceptId);
+            const fittedIds: string[] = [];
+            for (const id of idCandidates) {
+              const candidate = [...fittedIds, id];
+              const serialized = JSON.stringify({ ...envelopeSoFar, omittedRuleIds: candidate }, null, 2);
+              if (serialized.length > sizeBudget) break;
+              fittedIds.push(id);
+            }
+            omittedRulesFields = fittedIds.length > 0
+              ? { omittedRuleIds: fittedIds, omittedRulesDetail: fittedIds.length < rulesOmittedCount ? "ids-partial" : "ids" }
+              : { omittedRulesDetail: "count-only" };
+          }
+        }
+
+        // SIZE-FIT #2: the stage index (review fix — Codex round 1: the MISS path's stageIndex was
+        // serialized unbounded, the same class as the rules/body blocker — stage creation imposes
+        // no aggregate bound on how many stages, or STAGE_NAME_MAX_CHARS-worth of characters, a
+        // store can accumulate). Fit against what's ACTUALLY left after rules + the recovery
+        // fields above. Always a fast no-op on a HIT — r.stageIndex is undefined there.
+        let stageIndexFit: { fitted: string[]; omitted: number } | null = null;
+        if (r.stageIndex !== undefined) {
+          const envelopeSoFar = { ...fixedFields, rules: fitRules, ...omittedRulesFields };
+          const fit = fitStringArray(envelopeSoFar, "stageIndex", r.stageIndex, STAGE_INDEX_CAP, sizeBudget);
+          // HONEST TOTAL (review fix — Codex round 3): `r.stageIndexTotal`, when present, means
+          // liveStageIndex's OWN retrieval was capped — `r.stageIndex.length` alone would understate
+          // how many live stages truly exist, not just how many the wire chose to show. Mirrors
+          // `rulesTotal`'s exact reasoning; see StageLookupResult's own comment.
+          const stageIndexTrueTotal = r.stageIndexTotal ?? r.stageIndex.length;
+          stageIndexFit = { fitted: fit.fitted, omitted: stageIndexTrueTotal - fit.fitted.length };
+        }
+
+        return readOk({
+          ...fixedFields,
+          rules: fitRules,
+          // EXPLICIT TRUNCATION SIGNAL: a caller must be able to tell "this stage really has only
+          // N rules" from "there are more, and the response stopped early" — the same distinction
+          // memory_fetch's outlineNote exists to carry. omittedRulesFields (above) is the recovery
+          // path this signal used to point at nothing.
+          ...(rulesOmittedCount > 0 ? { rulesTruncated: true, rulesOmitted: rulesOmittedCount, ...omittedRulesFields } : {}),
+          ...(stageIndexFit ? {
+            stageIndex: stageIndexFit.fitted,
+            ...(stageIndexFit.omitted > 0 ? { stageIndexTruncated: true, stageIndexOmitted: stageIndexFit.omitted } : {}),
+          } : {}),
+        }, "stage_lookup", capturedBlock);
+      } catch (e) {
+        return err(`stage_lookup failed: ${msg(e)}`);
       }
     },
   );
@@ -1589,7 +1983,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleCount` (how many concepts are unconfirmed past the staleness window — pass includeStale:true for the cards themselves, which is a curation pass, not session restore), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual.",
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleCount` (how many concepts are unconfirmed past the staleness window — pass includeStale:true for the cards themselves, which is a curation pass, not session restore), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules.",
     {
       circle: z.string().optional(),
       includeStale: z
@@ -1628,9 +2022,12 @@ export function registerMonetCoreTools(
       // saying why the caller should act on any of them. Session restore now carries the COUNT
       // (store-wide and honest, unlike the capped list length); an agent actually running a
       // re-confirmation pass asks for the cards with includeStale:true.
-      const { staleConcepts, ...restState } = state;
+      // stageIndex/stageIndexTotal are ALSO pulled out here (review fix, items 1 and 3) rather than
+      // left in restState's raw spread — they get their own bounded, honesty-checked replacement
+      // below instead of an unbounded original and an un-recomputed raw total.
+      const { staleConcepts, stageIndex: stageIndexFull, stageIndexTotal, ...restState } = state;
 
-      return wrapSuccess(ok({
+      const baseContent = {
         agentId: core.getAgentId(),
         mode: "local",
         circle: resolvedCircle,
@@ -1644,6 +2041,29 @@ export function registerMonetCoreTools(
         firstBlock: injectedFirstBlock,
         ...(advisory !== null ? { curationAttention: advisory } : {}),
         ...(others.length > 0 ? { otherCircles: others } : {}),
+      };
+
+      // SIZE-FIT (review fix — Codex named this surface too, the same class as stage_lookup's own
+      // rules/stageIndex blocker): fit against what's ACTUALLY left once everything ELSE in this
+      // payload is accounted for (firstBlock/topConcepts/workstreams can themselves be sizeable),
+      // not a bare fixed count assumed safe in the worst case — stage creation imposes no aggregate
+      // bound on how many stages, or STAGE_NAME_MAX_CHARS-worth of characters, a store can hold.
+      let stageIndexFit: { fitted: string[]; omitted: number } | null = null;
+      if (stageIndexFull !== undefined) {
+        const fit = fitStringArray(baseContent, "stageIndex", stageIndexFull, STAGE_INDEX_CAP, RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length);
+        // HONEST TOTAL (review fix — Codex round 3): `stageIndexTotal`, when present, means
+        // liveStageIndex's OWN retrieval was capped — `stageIndexFull.length` alone would understate
+        // how many live stages truly exist, not just how many the wire chose to show.
+        const stageIndexTrueTotal = stageIndexTotal ?? stageIndexFull.length;
+        stageIndexFit = { fitted: fit.fitted, omitted: stageIndexTrueTotal - fit.fitted.length };
+      }
+
+      return wrapSuccess(ok({
+        ...baseContent,
+        ...(stageIndexFit ? {
+          stageIndex: stageIndexFit.fitted,
+          ...(stageIndexFit.omitted > 0 ? { stageIndexTruncated: true, stageIndexOmitted: stageIndexFit.omitted } : {}),
+        } : {}),
       }), { isMutating: false, isCheckpointWithWorkstream: false, toolName: "agent_context" });
     },
   );

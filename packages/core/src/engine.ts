@@ -139,6 +139,7 @@ import {
   bumpGateGeneration,
   circleHasBlockingRule,
   createGateSchema,
+  evaluateStageLookup,
   findStage,
   formatTriggerPattern,
   gateGeneration,
@@ -152,12 +153,16 @@ import {
   inspectSidecar,
   listStages,
   liveBlockingRulesForStage,
+  liveStageIndex,
   materializeBlockingSidecar,
+  normalizeStageName,
   parseTriggerPatterns,
   upsertStage,
+  MODEL_TAG_MAX_CHARS,
   RULE_BINDING_ORIGINS,
   RULE_SCOPES,
   RULE_SEVERITIES,
+  STAGE_NAME_MAX_CHARS,
   STAGE_ORIGINS,
 } from "./gates";
 import type {
@@ -171,6 +176,7 @@ import type {
   RuleScope,
   RuleSeverity,
   SidecarStaleness,
+  StageLookupResult,
   StageOrigin,
   StageRow,
   TriggerPattern,
@@ -1009,6 +1015,20 @@ export interface PrewarmState {
     position: number;
     conceptStatus: "active" | "disputed";
   }>;
+  /**
+   * The resident stage index (liveStageIndex): names of stages with at least one live rule, never
+   * rule bodies (residency law). The recognition cue — "you are at a named moment; ask stage_lookup
+   * for its rules". Omitted entirely when empty, so an install with no stages carries no schema
+   * noise (same convention as `resolvedFrom`).
+   */
+  stageIndex?: string[];
+  /**
+   * The TRUE total count of live stages, present ONLY when `stageIndex` itself was capped at
+   * retrieval (`STAGE_INDEX_CAP` — review fix, Codex round 3) — mirrors
+   * `StageLookupResult.rulesTotal`'s own honesty contract. Absent means `stageIndex.length` IS the
+   * true total.
+   */
+  stageIndexTotal?: number;
 }
 
 /** A gather result row: a search card plus why it was pulled in (#245, ADR §4.7). */
@@ -1468,7 +1488,14 @@ export class MonetCore {
   private sourceClock: () => number;
   /** Where declarations re-materialize the blocking mirror. Null = nobody wired a hook to read it. */
   private gateSidecarPath: string | null;
-  /** Which model this runtime is serving — the default for gate() and gateStats(). See the option. */
+  /**
+   * Which model this runtime is serving — the default `gate()`/`stageLookup()`/`gateStats()` all
+   * fall back to when a call omits an explicit `runtimeModelTag`. Set at construction (the
+   * `runtimeModelTag` option) or later via `setRuntimeModelTag` — see that method's own comment for
+   * why a setter exists at all: it is what lets a host wire this ONCE, after the fact, so every
+   * surface that reads it resolves identically instead of each caller threading its own copy of
+   * the same env-var lookup through per-call arguments (the bug that fix closed).
+   */
   private runtimeModelTag: string | null;
   /** Stable store identity for sync; unlike agentId this is persisted and never defaults globally. */
   private syncDeviceId = "";
@@ -3505,6 +3532,7 @@ export class MonetCore {
       .slice(0, STALE_CONCEPTS_PREWARM_LIMIT)
       .map(livingModelCard);
 
+    const stageIndexResult = liveStageIndex(this.db, circle);
     return {
       firstBlock: this.getFirstBlock(circle),
       activeWorkstreams,
@@ -3512,6 +3540,8 @@ export class MonetCore {
       staleConcepts,
       openContradictions: this.getOpenContradictions(circle),
       ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
+      ...(stageIndexResult.names.length > 0 ? { stageIndex: stageIndexResult.names } : {}),
+      ...(stageIndexResult.total !== undefined ? { stageIndexTotal: stageIndexResult.total } : {}),
     };
   }
 
@@ -8418,9 +8448,22 @@ export class MonetCore {
     if (!RULE_SCOPES.includes(scope)) {
       throw new Error(`rule scope '${scope}' is not one of ${RULE_SCOPES.join(", ")}`);
     }
-    if (scope === "agent" && !rule.modelTag) {
+    // `!rule.modelTag` alone let a whitespace-only tag through: "   " is truthy, passed here, and
+    // landed as literal whitespace no runtime ever equals. Whitespace is absence (bindRule holds
+    // the authoritative copy of the same normalization).
+    if (scope === "agent" && (!rule.modelTag || rule.modelTag.trim() === "")) {
       throw new Error(
         'an agent-scoped rule requires rule.modelTag naming the model it compensates for (pass scope "domain" for a rule that would be true for a perfect agent)',
+      );
+    }
+    // FAST FEEDBACK, the same early-vs-authoritative split as every other check in this method
+    // (review fix — Codex round 4, item 2): bindRule (gates.ts) holds the authoritative copy inside
+    // the write transaction; this one lets a caller learn about an absurdly long modelTag before
+    // paying for an embed.
+    if (rule.modelTag !== undefined && rule.modelTag.length > MODEL_TAG_MAX_CHARS) {
+      throw new Error(
+        `rule.modelTag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${rule.modelTag.length}): ` +
+          `it names which model a rule compensates for, not a command or a paragraph.`,
       );
     }
   }
@@ -8708,6 +8751,14 @@ export class MonetCore {
           'an agent-scoped rule requires modelTag naming the model it compensates for (pass scope "domain" for a rule that would be true for a perfect agent)',
         );
       }
+      // SAME FAST-FEEDBACK LENGTH CHECK store()'s validateRuleCapture carries (review fix — Codex
+      // round 4, item 2); bindRule (gates.ts) still holds the authoritative copy.
+      if (input.modelTag !== undefined && input.modelTag.length > MODEL_TAG_MAX_CHARS) {
+        throw new Error(
+          `modelTag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${input.modelTag.length}): ` +
+            `it names which model a rule compensates for, not a command or a paragraph.`,
+        );
+      }
     }
     this.assertPatternReauthoringAcknowledged(input);
 
@@ -8785,10 +8836,25 @@ export class MonetCore {
   }
 
   /**
-   * A stage's patterns are its firing surface, so re-authoring them REROUTES every rule bound to
-   * it — including the denies. That made "silence this deny" a single ordinary agent-callable
-   * declaration: edit the patterns, the deny stops matching, and the binding still reads `blocking`
-   * so nothing in the store looks wrong.
+   * A stage's patterns are its MECHANICAL firing surface, so re-authoring them REROUTES every rule
+   * bound to it FOR THE MECHANICAL MATCHER — including the denies. That made "silence this
+   * mechanical deny" a single ordinary agent-callable declaration: edit the patterns, the deny
+   * stops matching an intercepted action, and the binding still reads `blocking` so nothing in the
+   * store looks wrong.
+   *
+   * DOCTRINE, RULED: pattern re-aiming is NOT a rule-withdrawal lever, on either matcher, and this
+   * guard's whole justification is scoped to the mechanical one. Patterns say WHICH TOOL SHAPES are
+   * this moment; rules say WHAT GOVERNS the moment — conflating "re-aim the patterns" with
+   * "withdraw the rule" made sense only while mechanical matching was the sole way anything reached
+   * a rule at all. Now that `stageLookup` resolves by stage NAME/id rather than by pattern, a rule
+   * bound here — including a blocking one — stays fully reachable by a correctly-recognizing agent
+   * after this re-authoring: only the MECHANICAL interception stops, not the rule's existence or
+   * its advisory delivery via recognition. Silently reducing a correctly-recognizing agent's
+   * protection through an act that never said "the rule stops applying" would be exactly the wrong
+   * kind of quiet. The universal ways to actually withdraw a rule are rule-level acts (declare it
+   * advisory, or let a correction supersede it) and the stage itself going inert (every rule bound
+   * to it dies — see the design's own "a stage whose rules have all died is inert ... removable by
+   * declaration"). This method's guard is about the FIRST of those two surfaces only.
    *
    * The guard is acknowledgement, not prohibition: the human may absolutely re-aim a gate that
    * carries a deny, but they must NAME the denies they are re-aiming. An agent that has not been
@@ -8827,6 +8893,89 @@ export class MonetCore {
   }
 
   /**
+   * Set which model this runtime is serving, AFTER construction. THE single place `gate()`,
+   * `stageLookup()` and `gateStats()` all resolve `this.runtimeModelTag` from when a call omits an
+   * explicit tag (see `gate()`'s own comment for that fallback chain).
+   *
+   * WHY A SETTER, not just the constructor option: `MonetCore` is typically constructed by one
+   * piece of code (e.g. scripts/mcp-cli.ts) and handed to another that knows the runtime's model
+   * tag (registerMonetCoreTools, which resolves it from an explicit option or MONET_MODEL_TAG).
+   * Before this setter existed, that second piece of code had no way to make its resolution the
+   * ONE the engine itself uses — it could only pass its own copy of the tag as a per-call argument
+   * to whichever methods it happened to call directly. That let two surfaces reachable from the
+   * SAME process (stageLookup, called by the stage_lookup MCP tool; gateStats, called from inside
+   * overview()) read model tag from two different places and silently diverge whenever
+   * MONET_MODEL_TAG was set but the MonetCore construction site did not forward it — exactly the
+   * review-caught bug this setter exists to close. Calling this once, at registration, makes every
+   * subsequent call from any code path in this process resolve the SAME tag by construction,
+   * without threading it through every call site by hand.
+   *
+   * `undefined` clears it back to "no runtime tag" (every agent-scoped rule fires, unfiltered) —
+   * the same meaning an omitted constructor option already has.
+   *
+   * BLANK (empty or whitespace-only) NORMALIZES TO THAT SAME "no runtime tag" CLEAR, not to a
+   * literal empty-string tag (review fix — Codex round 4, item 4: THE BUG this closes). Before this
+   * fix, `setRuntimeModelTag("")` — reachable whenever a host's resolved tag is blank, which env
+   * templating produces routinely (`MONET_MODEL_TAG=${SOME_VAR}` with `SOME_VAR` unset expands to
+   * an empty string, never to an absent variable) — stored the empty string ITSELF. Every
+   * downstream fallback chain reads `?? this.runtimeModelTag ?? undefined`, and `??` only triggers
+   * on `null`/`undefined`, never on `""` — so each one resolved to `""` rather than falling through
+   * to "unset". DELIVERY then silently filtered out EVERY agent-scoped rule (RULE_LIVENESS_WHERE's
+   * `b.model_tag = ?` never matches a real stored tag against `''`), and CAPTURE silently REFUSED
+   * every agent-scoped write (the "host tag wins" overwrite forced the new rule's modelTag to `""`
+   * regardless of what the agent supplied, which then failed the existing non-empty check) — both
+   * halves of agent scope dead, from nothing but a blank env var landing on a store that already
+   * had a perfectly good `runtimeModelTag` from construction.
+   *
+   * This is the codebase's own normalization doctrine, applied where it belongs: blank normalizes
+   * to absent EXACTLY where absence is legal (see `hasNoReason`/`normalizeStageName`'s own
+   * comments), and an unset runtime tag is a supported, ordinary configuration, not an error — so
+   * absence is legal here. Making THIS SETTER total against blank, rather than trusting every
+   * caller to pre-trim, is the same choice already made for reason/name normalization: the guard
+   * lives at the one place that cannot be bypassed, not at every call site that happens to
+   * remember it.
+   *
+   * LENGTH-BOUNDED, same MODEL_TAG_MAX_CHARS every other mint/entry boundary enforces (review fix
+   * — Codex round 4, item 2): this setter stamps `this.runtimeModelTag`, which capture handlers now
+   * read live via `getRuntimeModelTag()` and stamp straight onto a NEW rule's `modelTag` — so an
+   * unbounded tag here would land in `rule_bindings.model_tag` exactly as if a caller had typed it
+   * directly into `rule.modelTag`, bypassing every other boundary that refuses it. A named refusal
+   * here, not a silent truncation — same reasoning as every sibling check this constant backs.
+   */
+  setRuntimeModelTag(tag: string | undefined): void {
+    const trimmed = tag?.trim();
+    if (trimmed && trimmed.length > MODEL_TAG_MAX_CHARS) {
+      throw new Error(
+        `a runtime model tag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${trimmed.length}): ` +
+          `it names which model this runtime is serving, not a command or a paragraph.`,
+      );
+    }
+    this.runtimeModelTag = trimmed ? trimmed : null;
+  }
+
+  /**
+   * The model this runtime is CURRENTLY serving, live — the read counterpart to
+   * `setRuntimeModelTag` (review fix — Codex round 3: one-chain principle, extended to the WRITE
+   * path). Capture handlers (`memory_store`'s rule capture, `memory_declare`) used to stamp a NEW
+   * agent-scoped rule's `modelTag` from a CLOSURE-CAPTURED copy of the tag taken once at MCP
+   * registration time — so a live tag switch (`setRuntimeModelTag` called later, e.g. a host that
+   * changes which model it is running mid-session) was honored for DELIVERY (`gate()`/
+   * `stageLookup()` already read `this.runtimeModelTag` live) but NOT for CAPTURE: a rule written
+   * after the switch was stamped for the OLD model and immediately filtered out by the NEW one —
+   * captured, then instantly invisible, with no error and no obvious cause. This getter gives
+   * capture handlers the SAME live read delivery already had, so both directions of "which model is
+   * this" resolve from the one place `setRuntimeModelTag` writes.
+   *
+   * Returns `undefined` (not `null`) to match every other external presentation of this field
+   * (`gate()`'s own `opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined` chain) — `null` is
+   * this class's internal "unset" representation, `undefined` is what every consumer already
+   * expects an omitted/absent tag to look like.
+   */
+  getRuntimeModelTag(): string | undefined {
+    return this.runtimeModelTag ?? undefined;
+  }
+
+  /**
    * THE GATE. Ask what governs this action, deterministically: pure SQL and string matching, no
    * model, no network, no embedding — "silence when nothing matches".
    *
@@ -8860,6 +9009,43 @@ export class MonetCore {
         )();
       } catch {
         // Instrumentation only. Deliberately swallowed — see above.
+      }
+    }
+    return result;
+  }
+
+  /**
+   * THE RECOGNIZED MATCHER. The agent NAMES a stage it recognizes itself to be at (from the stage
+   * index `agent_context`/`prewarm` carries) — no trigger-pattern matching, no fuzzy or embedding
+   * search. Delivers through the SAME chokepoint semantics as gate() (liveness, circle, model-tag
+   * filter, parent principle), plus each rule's `body` — the capability invocation payload gate()
+   * never carries. Advisory-only by design: severity is delivered as information and never
+   * enforced here. See gates.ts's own `stageLookup` doc comment for the full contract (stage-hit-
+   * no-rules vs miss, the live-index-on-miss self-repair, and why every call records an event).
+   *
+   * Same read/write transaction split as gate(), for the same reason: the verdict is computed and
+   * returned first, and the gate_events write is separate and allowed to fail silently.
+   */
+  stageLookup(opts: {
+    stage: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+  }): StageLookupResult {
+    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
+    const { result, pending } = this.db.transaction(() =>
+      evaluateStageLookup(this.db, {
+        stage: opts.stage,
+        circle,
+        now: opts.now,
+        record: opts.record,
+        runtimeModelTag: opts.runtimeModelTag ?? this.runtimeModelTag ?? undefined,
+      }),
+    )();
+    if (pending) {
+      try {
+        this.db.immediateTransaction(() =>
+          commitGateWrites(this.db, pending, () => this.nextSyncTimestamp()),
+        )();
+      } catch {
+        // Instrumentation only. Deliberately swallowed — see gate()'s own comment for why.
       }
     }
     return result;
@@ -9386,6 +9572,37 @@ export class MonetCore {
       if (typeof row.name !== "string" || row.name.length === 0) {
         throw new Error(`graftRows stage '${row.id}' has no name`);
       }
+      // THE CREATION BOUND, ENFORCED ON THE WAY IN. upsertStage is the only place a name is ever
+      // minted and it refuses lengths past STAGE_NAME_MAX_CHARS, so no honest peer can hold a
+      // longer one — an over-length name arriving by relay is a malformed row, same lattice as the
+      // reason-shape checks below. Letting it land would strand a stage the index advertises but
+      // the lookup's own input boundary refuses to accept by name.
+      if (row.name.length > STAGE_NAME_MAX_CHARS) {
+        throw new Error(
+          `graftRows stage '${row.id}' has a ${row.name.length}-character name (max ${STAGE_NAME_MAX_CHARS}): ` +
+            `stage names are minted only by upsertStage, which refuses this length at creation`,
+        );
+      }
+      // THE SAME BOUNDARY, THE SAME LATTICE, ONE MORE AXIS (review fix — Codex round 3): upsertStage
+      // stores NORMALIZED names (trimmed, whitespace-collapsed, lowercased) and findStage normalizes
+      // every lookup key the same way before comparing — so a raw, non-canonical stored name (e.g.
+      // 'Git Force Push') is invisible to its own name-based lookup: liveStageIndex would advertise
+      // it verbatim, but stageLookup({stage: 'Git Force Push'}) normalizes to 'git force push' and
+      // the row's stored name never matches that string. No honest peer can hold a non-canonical
+      // name either — upsertStage is the ONLY minter and it always writes normalizeStageName's
+      // output — so a row failing this check is malformed, exactly like the length check just
+      // above, not a legitimate shape this store has simply never seen. REUSES normalizeStageName
+      // (gates.ts) rather than reimplementing it: a second hand-written copy of "trim, collapse
+      // whitespace, lowercase" is exactly the kind of two-implementations-of-one-predicate drift
+      // this file's own chokepoint doctrine warns against.
+      if (row.name !== normalizeStageName(row.name)) {
+        throw new Error(
+          `graftRows stage '${row.id}' has a non-canonical name '${row.name}' (would normalize to ` +
+            `'${normalizeStageName(row.name)}'): stage names are minted only by upsertStage, which ` +
+            `always stores normalizeStageName's own output — a raw name here would be advertised by ` +
+            `the stage index but miss its own name-based lookup`,
+        );
+      }
     }
     for (const row of payload.ruleBindings ?? []) {
       if (!RULE_SEVERITIES.includes(row.severity as RuleSeverity)) {
@@ -9441,6 +9658,27 @@ export class MonetCore {
       if ((row.scope === "agent") !== (row.model_tag != null)) {
         throw new Error(
           `graftRows rule binding '${row.concept_id}' has a model tag its scope '${row.scope}' forbids (or lacks one it requires)`,
+        );
+      }
+      // Whitespace is absence, and absence is illegal for agent scope — bindRule normalizes then
+      // refuses this shape at every local mint, so no honest peer can hold it (same lattice as the
+      // length check below): stored, it is a tag no runtime ever equals, a rule that looks
+      // configured and never delivers.
+      if (typeof row.model_tag === "string" && row.model_tag.trim() === "") {
+        throw new Error(
+          `graftRows rule binding '${row.concept_id}' has a whitespace-only model tag: ` +
+            `a model tag is a model id or it is absent, and bindRule refuses this shape at creation`,
+        );
+      }
+      // THE SAME BOUNDARY, THE SAME LATTICE (review fix — Codex round 4, item 2): bindRule refuses
+      // a modelTag past MODEL_TAG_MAX_CHARS at every local mint, so no honest peer can hold a
+      // longer one — a row failing this check is malformed, exactly like the stage-name-length and
+      // non-canonical-name checks above, not a legitimate shape this store has simply never seen.
+      if (typeof row.model_tag === "string" && row.model_tag.length > MODEL_TAG_MAX_CHARS) {
+        throw new Error(
+          `graftRows rule binding '${row.concept_id}' has a ${row.model_tag.length}-character model ` +
+            `tag (max ${MODEL_TAG_MAX_CHARS}): model tags are minted only by bindRule, which refuses ` +
+            `this length at creation`,
         );
       }
       assertGraftEndpointGovernable("rule", row.concept_id, `rule binding '${row.concept_id}'`);
