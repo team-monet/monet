@@ -8460,9 +8460,17 @@ export class MonetCore {
     // (review fix — Codex round 4, item 2): bindRule (gates.ts) holds the authoritative copy inside
     // the write transaction; this one lets a caller learn about an absurdly long modelTag before
     // paying for an embed.
-    if (rule.modelTag !== undefined && rule.modelTag.length > MODEL_TAG_MAX_CHARS) {
+    //
+    // ON THE TRIMMED LENGTH, not the raw one (review fix — round 5 follow-up, fast-path
+    // consistency): bindRule now stores the TRIMMED form of a nonblank tag, and this early check
+    // must judge the SAME form it does, or the two can disagree — a tag padded right at the
+    // boundary (one leading space plus exactly MODEL_TAG_MAX_CHARS real characters) would fail
+    // HERE on its raw length while bindRule's own trimmed check would have accepted it, refusing a
+    // caller for a shape the authoritative path never would have.
+    const trimmedModelTagLength = rule.modelTag?.trim().length;
+    if (trimmedModelTagLength !== undefined && trimmedModelTagLength > MODEL_TAG_MAX_CHARS) {
       throw new Error(
-        `rule.modelTag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${rule.modelTag.length}): ` +
+        `rule.modelTag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${trimmedModelTagLength}): ` +
           `it names which model a rule compensates for, not a command or a paragraph.`,
       );
     }
@@ -8746,16 +8754,25 @@ export class MonetCore {
       if (!input.content || input.content.trim().length === 0) {
         throw new Error("declaring a rule requires `content` — what the rule says");
       }
-      if (scope === "agent" && !input.modelTag) {
+      // WHITESPACE-AWARE, matching validateRuleCapture's own copy of this check (review fix — round
+      // 5 follow-up, fast-path consistency): `!input.modelTag` alone let a whitespace-only tag
+      // through — "   " is truthy — so this and store()'s copy disagreed about presence for the
+      // one caller (declare) that could reach this path with a whitespace-only tag no honest UI
+      // would produce but a relay-adjacent or scripted caller could.
+      if (scope === "agent" && (!input.modelTag || input.modelTag.trim() === "")) {
         throw new Error(
           'an agent-scoped rule requires modelTag naming the model it compensates for (pass scope "domain" for a rule that would be true for a perfect agent)',
         );
       }
       // SAME FAST-FEEDBACK LENGTH CHECK store()'s validateRuleCapture carries (review fix — Codex
       // round 4, item 2); bindRule (gates.ts) still holds the authoritative copy.
-      if (input.modelTag !== undefined && input.modelTag.length > MODEL_TAG_MAX_CHARS) {
+      //
+      // ON THE TRIMMED LENGTH, same reasoning as validateRuleCapture's own copy (review fix — round
+      // 5 follow-up): bindRule stores the trimmed form, so this must judge that form too.
+      const trimmedModelTagLength = input.modelTag?.trim().length;
+      if (trimmedModelTagLength !== undefined && trimmedModelTagLength > MODEL_TAG_MAX_CHARS) {
         throw new Error(
-          `modelTag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${input.modelTag.length}): ` +
+          `modelTag may be at most ${MODEL_TAG_MAX_CHARS} characters (got ${trimmedModelTagLength}): ` +
             `it names which model a rule compensates for, not a command or a paragraph.`,
         );
       }
@@ -9668,6 +9685,21 @@ export class MonetCore {
         throw new Error(
           `graftRows rule binding '${row.concept_id}' has a whitespace-only model tag: ` +
             `a model tag is a model id or it is absent, and bindRule refuses this shape at creation`,
+        );
+      }
+      // THE SAME CANONICALIZATION LATTICE, ONE MORE SHAPE (review fix — round 5 follow-up):
+      // bindRule now TRIMS a nonblank model tag before storing it — same reasoning as
+      // normalizeStageName for stage names — so a PADDED tag (" gpt-4 ") is exactly as unreachable
+      // as the whitespace-only shape just above: no honest peer can hold one. Left unrefused, it
+      // would strand a rule the binding advertises as compensating for a model whose OWN runtime
+      // tag (also trimmed, by setRuntimeModelTag) never equals it — RULE_LIVENESS_WHERE's
+      // `b.model_tag = ?` comparison is exact, not trimmed. Named refusal showing BOTH forms, same
+      // as the non-canonical-name check above.
+      if (typeof row.model_tag === "string" && row.model_tag !== row.model_tag.trim()) {
+        throw new Error(
+          `graftRows rule binding '${row.concept_id}' has a padded model tag '${row.model_tag}' ` +
+            `(would trim to '${row.model_tag.trim()}'): model tags are minted only by bindRule, ` +
+            `which always stores the trimmed form`,
         );
       }
       // THE SAME BOUNDARY, THE SAME LATTICE (review fix — Codex round 4, item 2): bindRule refuses

@@ -33,6 +33,7 @@ import {
   formatTriggerPattern,
   readTriggerPatterns,
   upsertStage,
+  liveStageIndex,
   matchesTriggerPattern,
   MODEL_TAG_MAX_CHARS,
   normalizeMatchToken,
@@ -3557,9 +3558,14 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     await expect(
       c.store("A compensation.", { kind: "rule", rule: { stage: "ws", scope: "agent", modelTag: "   " } }),
     ).rejects.toThrow(/requires rule\.modelTag/);
+    // declare()'s OWN early check (review fix — round 5 follow-up: fast-path consistency) now
+    // catches this itself, with its OWN field's name ("modelTag", not "rule.modelTag" — DeclareInput
+    // has no `rule` field) — before this fix it wasn't whitespace-aware and fell through to
+    // declare()'s internal store() delegation, whose validateRuleCapture caught it instead, under
+    // store()'s OWN "rule.modelTag" phrasing. Same refusal, earlier and correctly named.
     await expect(
       c.declare({ species: "rule", stage: "ws2", content: "Text.", scope: "agent", modelTag: "\t \n" }),
-    ).rejects.toThrow(/requires rule\.modelTag/);
+    ).rejects.toThrow(/requires modelTag/);
     c.close();
 
     const src = core({ syncDeviceId: "machine-a" });
@@ -3575,6 +3581,57 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
       ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, model_tag: "   " })),
     };
     expect(() => dst.graftRows(tampered)).toThrow(/whitespace-only model tag/);
+    src.close();
+    dst.close();
+  });
+
+  it("TRIMS a padded nonblank modelTag before storage — stores/delivers the canonical form, at BOTH capture entrances (Codex round 5 follow-up, item 1a)", async () => {
+    const padded = "  gpt-4  ";
+    const trimmed = "gpt-4";
+
+    const c = core();
+    const stored = await c.store("Never force-push to a shared branch.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: padded },
+    });
+    // STORED CANONICAL, not padded — bindRule trims before writing, the same canonical-form
+    // discipline normalizeStageName already enforces for stage names.
+    expect(c.ruleBinding(stored.conceptId)!.model_tag).toBe(trimmed);
+    // DELIVERS under the TRIMMED runtime tag, on BOTH matchers — setRuntimeModelTag already trims
+    // the RUNTIME side (round 4), so this only round-trips if storage now agrees on the same
+    // canonical form; the SQL comparison (RULE_LIVENESS_WHERE) is exact, never trimmed at read time.
+    expect(c.gate({ actionContext: "Bash:git push --force", runtimeModelTag: trimmed }).rules.map((r) => r.conceptId))
+      .toEqual([stored.conceptId]);
+    expect(c.stageLookup({ stage: "git force push", runtimeModelTag: trimmed }).rules.map((r) => r.conceptId))
+      .toEqual([stored.conceptId]);
+    c.close();
+
+    const d = core();
+    const declared = await d.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
+      scope: "agent", modelTag: padded,
+    });
+    if (declared.species !== "rule") throw new Error("unreachable");
+    expect(d.ruleBinding(declared.conceptId)!.model_tag).toBe(trimmed);
+    d.close();
+  });
+
+  it("REFUSES a relayed rule binding whose model_tag is padded — naming both forms — graft preflight (Codex round 5 follow-up, item 1a)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const dst = core({ syncDeviceId: "machine-b" });
+    const rule = await src.declare({
+      species: "rule", stage: "s", content: "Text.", severity: "advisory", scope: "agent", modelTag: "gpt-4",
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    const payload = src.exportDelta(0);
+    // No honest peer can hold this — bindRule trims at creation — so relay is the only route, same
+    // lattice as the whitespace-only and over-length checks beside it.
+    const tampered = {
+      ...payload,
+      ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, model_tag: "  gpt-4  " })),
+    };
+    expect(() => dst.graftRows(tampered)).toThrow(
+      /has a padded model tag '  gpt-4  ' \(would trim to 'gpt-4'\)/,
+    );
     src.close();
     dst.close();
   });
@@ -4006,6 +4063,55 @@ describe("stageLookup (standalone) — transaction boundaries", () => {
     // transactions, not one merged one.
     expect(writeStart).toBeGreaterThan(readEnd);
     expect(writeEnd).toBeGreaterThan(writeStart);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// liveStageIndex — one read transaction for names+total (Codex round 5 follow-up, item 1b)
+// ---------------------------------------------------------------------------
+describe("liveStageIndex — one read transaction for names+total", () => {
+  it("wraps liveStageNamesCapped and countLiveStages in ONE db.transaction(...) — the capped path exercises BOTH queries. STRUCTURAL ASSERTION, same technique as the standalone stageLookup transaction test above.", () => {
+    const dir = mkTmp();
+    const path = join(dir, "monet.db");
+    const setup = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    let n = 0;
+    const setupDb = raw(setup);
+    const deps = { db: setupDb as never, newId: () => `extra-stage-${n++}`, nextSyncTimestamp: () => Date.now(), syncDeviceId: "d" };
+    // Past STAGE_INDEX_CAP by a recognizable margin, so BOTH liveStageNamesCapped AND
+    // countLiveStages actually run — countLiveStages is skipped entirely when retrieval isn't
+    // capped, and a single-query call would not prove anything about the boundary BETWEEN two
+    // reads. Same fast raw-insert technique the SQL-level retrieval bound suite above uses.
+    const STAGE_COUNT = STAGE_INDEX_CAP + 5;
+    for (let i = 0; i < STAGE_COUNT; i++) {
+      const stage = upsertStage(deps, { stage: `bulk stage ${String(i).padStart(5, "0")}`, origin: "declaration" });
+      const conceptId = `bulk-concept-${i}`;
+      setupDb.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, circle, embedding)
+         VALUES (?, ?, ?, ?, 'rule', 'active', 'default', '[]')`,
+      ).run(conceptId, `bulk-slug-${i}`, `Bulk rule ${i}`, `Body ${i}`);
+      setupDb.prepare(
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, created_at, sync_updated_at, sync_revision)
+         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', ?, ?, 0)`,
+      ).run(conceptId, stage.id, Date.now(), Date.now());
+    }
+    setup.close();
+
+    const port = new TransactionLoggingStorage(path);
+    const result = liveStageIndex(port, "default");
+    port.close();
+
+    expect(result.names).toHaveLength(STAGE_INDEX_CAP);
+    expect(result.total).toBe(STAGE_COUNT); // sanity: this really is the capped, two-query path
+
+    // EXACTLY ONE read transaction spans BOTH queries — not two separate, unwrapped statements
+    // (which would reopen the same TOCTOU window round 4's standalone-stageLookup fix closed, just
+    // for this function): a concurrent writer landing a rule bind/retire BETWEEN the names query
+    // and the count query could otherwise make `total` describe a different instant than `names`.
+    expect(port.events.filter((e) => e === "transaction:call")).toHaveLength(1);
+    const readStart = port.events.indexOf("transaction:run:start");
+    const readEnd = port.events.indexOf("transaction:run:end");
+    expect(readStart).toBeGreaterThanOrEqual(0);
+    expect(readEnd).toBeGreaterThan(readStart);
   }, 30_000);
 });
 

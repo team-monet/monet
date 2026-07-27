@@ -1455,8 +1455,20 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
   // and non-null in SQL, so without this normalization a whitespace-only tag passed the presence
   // check below and landed in rule_bindings as literal whitespace — a tag no runtime ever equals,
   // making the rule undeliverable while looking configured.
+  //
+  // NONBLANK IS ALSO TRIMMED, not merely checked for blankness (review fix — round 5 follow-up,
+  // canonicalization): " gpt-4 " is not blank, so the check alone let it through UNCHANGED — padded,
+  // not absent. `setRuntimeModelTag` (engine.ts) already trims the RUNTIME'S OWN tag before storing
+  // it, and the SQL comparison this feeds (`RULE_LIVENESS_WHERE`'s `b.model_tag = ?`) is EXACT, not
+  // trimmed — so a rule stored with the padded form and a runtime resolved to the trimmed form
+  // (" gpt-4 " vs "gpt-4") would never equal each other, making the rule silently undeliverable for
+  // the exact model it names, while looking perfectly configured. ONE canonical form, minted HERE
+  // (the only place a modelTag is ever written), closes that gap the same way `normalizeStageName`
+  // closes it for stage names — trim before the length check below, so a padded-but-otherwise-at-
+  // the-boundary tag is judged by the form that is actually stored and actually compared.
   const statedModelTag = input.scope === "agent" ? (input.modelTag ?? null) : null;
-  const modelTag = statedModelTag !== null && statedModelTag.trim() === "" ? null : statedModelTag;
+  const trimmedModelTag = statedModelTag !== null ? statedModelTag.trim() : null;
+  const modelTag = trimmedModelTag === "" ? null : trimmedModelTag;
   if (input.scope === "agent" && modelTag === null) {
     throw new Error("an agent-scoped rule requires a model tag naming the model it compensates for");
   }
@@ -2367,11 +2379,27 @@ export interface LiveStageIndexResult {
  * only when retrieval actually hit the cap — mirroring `StageLookupResult.rulesTotal`'s own
  * contract so both callers (`stageLookup`'s miss path, `agent_context`/`prewarm`) can build an
  * honest truncation signal the same way `rulesOmitted` already does.
+ *
+ * ONE READ TRANSACTION FOR BOTH QUERIES (review fix — round 5 follow-up): the names query and the
+ * count query used to run as two separate, unwrapped statements — a concurrent writer (the
+ * SUPPORTED MCP+CLI topology storage.ts's WAL+busy_timeout setup exists for) landing a rule
+ * bind/retire BETWEEN them could make `total` describe a DIFFERENT instant than `names` already
+ * captured — the same class of bug round 4's `stageLookup` transaction fix closed for
+ * `evaluateStageLookup`'s own reads (see that function's own comment). Wrapping HERE, inside
+ * `liveStageIndex` itself, means every caller inherits the fix for free — the standalone
+ * `stageLookup`'s miss path, `MonetCore.prewarm()`/`agent_context` (via `PrewarmState.stageIndex`),
+ * and `evaluateStageLookup`'s own miss branch — none of them has to remember to wrap this call
+ * itself. better-sqlite3's `transaction()` NESTS SAFELY via a SAVEPOINT when called from inside an
+ * already-open transaction (e.g. `evaluateStageLookup`'s own read transaction, from round 4's
+ * `stageLookup` fix, or `MonetCore.stageLookup()`'s), so this is safe to call unconditionally —
+ * standalone or nested, never a double-BEGIN.
  */
 export function liveStageIndex(db: StoragePort, circle: string): LiveStageIndexResult {
-  const capped = liveStageNamesCapped(db, circle, STAGE_INDEX_CAP + 1);
-  if (capped.length <= STAGE_INDEX_CAP) return { names: capped };
-  return { names: capped.slice(0, STAGE_INDEX_CAP), total: countLiveStages(db, circle) };
+  return db.transaction((): LiveStageIndexResult => {
+    const capped = liveStageNamesCapped(db, circle, STAGE_INDEX_CAP + 1);
+    if (capped.length <= STAGE_INDEX_CAP) return { names: capped };
+    return { names: capped.slice(0, STAGE_INDEX_CAP), total: countLiveStages(db, circle) };
+  })();
 }
 
 // ---- the recognized matcher (stageLookup) ------------------------------------
