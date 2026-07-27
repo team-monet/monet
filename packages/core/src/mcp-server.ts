@@ -701,7 +701,7 @@ export function registerMonetCoreTools(
         ),
       scope: z.enum(["domain", "agent"]).optional().describe('"domain": true for a perfect agent. "agent" (default): a compensation for this model.'),
       modelTag: z.string().optional().describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
-      reason: z.string().optional().describe("One line naming the failure this prevents — what the gate shows, and what earns compliance."),
+      reason: z.string().optional().describe('One line naming the failure this prevents — what the gate shows, and what earns compliance. REQUIRED when severity is "blocking": a deny nobody can explain is a deny people learn to route around. Ask the user for it rather than inventing one.'),
       declaredBy: z.string().optional().describe("Who ruled. Defaults to the calling agent id."),
       circle: z.string().optional(),
       sourceRefs: z.array(z.string()).optional(),

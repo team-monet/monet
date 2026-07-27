@@ -147,6 +147,8 @@ import {
   gateStats,
   getRuleBinding,
   hasBlockingBinding,
+  hasLineBreak,
+  hasNoReason,
   inspectSidecar,
   listStages,
   liveBlockingRulesForStage,
@@ -163,6 +165,7 @@ import type {
   GateDeps,
   GateResult,
   GateStats,
+  SidecarMaterialization,
   RuleBindingOrigin,
   RuleBindingRow,
   RuleScope,
@@ -821,6 +824,13 @@ export interface DeclareInput {
   severity?: RuleSeverity;
   scope?: RuleScope;
   modelTag?: string;
+  /**
+   * One line naming the failure this rule prevents — what the gate shows when it fires.
+   * REQUIRED when `severity` is "blocking": a deny the agent cannot explain is a deny people
+   * learn to route around, and the boundary statement promises every deny carries its reason.
+   * Optional for advisory rules, where its absence is weaker guidance rather than a broken
+   * contract.
+   */
   reason?: string;
   declaredBy?: string;
   circle?: string;
@@ -1541,6 +1551,34 @@ export class MonetCore {
     // vectors are rewritten, so equality alone is not evidence that this store is safe to serve.
     this.pinUnsatisfied = this.readEmbedderMigration() !== undefined
       || (pinRow.embedder_model_id !== null && pinRow.embedder_model_id !== this.embedderModelId);
+    // OPENING THE STORE IS THE REPAIR TRIGGER for a mirror this build cannot serve from.
+    //
+    // Every other refresh site is a MUTATION site, which is exactly the wrong set for the case that
+    // needs this: an upgrade changes the format the reader demands without changing the store at
+    // all. Detection alone left the hook rejecting a file nothing regenerated, so offline blocking
+    // was unavailable for an unbounded window — until some unrelated gate-affecting write happened
+    // to occur — on every install that upgrades.
+    //
+    // CONSTRUCTION, NOT A LAZY FIRST-USE HOOK, and the reason is that the mirror's reader is in
+    // ANOTHER PROCESS. There is no in-process call that "needs the mirror" and could serve as the
+    // trigger: the hook reads the file precisely when this server is unreachable, so a lazy trigger
+    // would be betting that some unrelated call happens first — the same unbounded-window bet the
+    // bug is made of. A read-only session that never gates would never fire it at all.
+    //
+    // The cost is one header read plus a generation query, and ONLY for a store that was wired with
+    // a sidecar path — an opt-in that by definition means a hook is reading the file. Stores without
+    // one (every test, every eval run, every one-off script) return on the first line and touch no
+    // filesystem. Runs last so the schema, the migrations and the sync identity are all in place.
+    //
+    // EXCEPT IN REPORT-ONLY MODE. `deferCreatedPin` is the existing declaration that this caller is
+    // inspection or dry-run tooling which must never write anything — the same flag that already
+    // stops a pin being minted — so it governs here rather than a second, parallel notion of
+    // read-only. Without this, opening a store to LOOK at it created or replaced the active
+    // installation's mirror, which is a report-only invocation mutating the thing it is reporting
+    // on. The suppression is deliberately only on this automatic path: an explicit
+    // materializeBlockingSidecar() call is the caller asking, and the mutation sites are already
+    // writes by definition.
+    if (!this.deferCreatedPin) this.refreshGateSidecar();
   }
 
   private initSyncIdentity(requested?: string): void {
@@ -8628,6 +8666,35 @@ export class MonetCore {
     if (input.severity !== undefined && !RULE_SEVERITIES.includes(input.severity)) {
       throw new Error(`rule severity '${input.severity}' is not one of ${RULE_SEVERITIES.join(", ")}`);
     }
+    // A deny with no stated reason is what trains people to route around gates: the gate fires,
+    // the agent sees a refusal it cannot explain to the user, and the cheapest response is to
+    // rephrase until it stops firing. The boundary statement promises every deny carries the
+    // failure it prevents, and a promise the write path does not enforce is not a promise —
+    // so blocking is refused without one. Advisory rules are unaffected: an advisory with no
+    // reason is weaker guidance, not a broken contract.
+    //
+    // FAST FEEDBACK ONLY, on the severity the caller NAMED. This cannot be the whole guard: it runs
+    // before the embed, so it does not yet know which concept the declaration will land on and
+    // cannot consult the incumbent binding — which means a restatement that omits severity (and so
+    // PRESERVES blocking) never trips it. bindRule re-asks the question against the resolved
+    // severity, with the incumbent in hand, and that is the copy that makes the promise hold.
+    if (input.severity === "blocking" && (input.reason === undefined || input.reason.trim() === "")) {
+      throw new Error(
+        "a blocking rule requires `reason`: one line naming the failure this deny prevents. " +
+          "It is what the gate shows at the moment of refusal, and what makes the deny explainable " +
+          "to the person who has to live with it.",
+      );
+    }
+    // ONE LINE is the other half of the same question about a reason's shape — see bindRule, which
+    // holds the authoritative copy of both. Here for the same reason the blank check is here: an
+    // agent that has just written a multi-line reason should learn it before the embed, not after.
+    if (input.severity === "blocking" && hasLineBreak(input.reason)) {
+      throw new Error(
+        "a blocking rule's `reason` must be ONE LINE: it is printed beside the deny at the moment it " +
+          "fires, so a line break makes the gate appear to say something nobody wrote. Received " +
+          `${JSON.stringify(input.reason)} — restate it as a single sentence.`,
+      );
+    }
     const scope: RuleScope = input.scope ?? "agent";
     if (!RULE_SCOPES.includes(scope)) {
       throw new Error(`rule scope '${scope}' is not one of ${RULE_SCOPES.join(", ")}`);
@@ -8849,7 +8916,19 @@ export class MonetCore {
   private refreshGateSidecar(): void {
     if (!this.gateSidecarPath) return;
     try {
-      if (!inspectSidecar(this.db, this.gateSidecarPath, this.syncDeviceId).stale) return;
+      const verdict = inspectSidecar(this.db, this.gateSidecarPath, this.syncDeviceId);
+      if (!verdict.stale) return;
+      // THE ONE SKEW WE DELIBERATELY DECLINE. A file written by a build ahead of this one is stale
+      // — we cannot read its entries — but overwriting it is the thrash the forward-format rule
+      // exists to avoid.
+      //
+      // REDUNDANT WITH materializeBlockingSidecar's own guard, deliberately and not load-bearing on
+      // its own: that function would decline the rename anyway, after writing and unlinking a temp
+      // file. This returns before doing work whose outcome is already known, which matters now that
+      // the constructor calls this on EVERY open — otherwise a store with forward-format skew pays a
+      // write+unlink per open, forever, to reach a decision available from the header. Neither copy
+      // is the safety property by itself; each covers the other's removal.
+      if (verdict.reason === "format-ahead") return;
       materializeBlockingSidecar(this.db, this.gateSidecarPath, { storeIdentity: this.syncDeviceId });
     } catch {
       // Reported by isSidecarStale, never raised here. See above.
@@ -8875,8 +8954,16 @@ export class MonetCore {
    * anyone asked would have every construction of MonetCore — every test, every eval run, every
    * one-off script — writing into the user's real `~/.monet`. The mirror belongs to whoever wired
    * the hook that reads it, so that caller names the path.
+   *
+   * Returns the OUTCOME alongside the generated mirror. This is the surface the host-hook installer
+   * and the recovery path call, which makes it exactly the caller that must not be told a declined
+   * write succeeded: `outcome: "skipped-format-ahead"` is an operator problem to report, not a
+   * regenerated mirror. `"skipped-superseded"` is not an operator problem — a concurrent writer's
+   * generation already outran this call's, so the mirror on disk is fine — but it is worth telling
+   * apart from `"skipped-current"` in anything that logs outcomes, since one means "nothing changed"
+   * and the other means "something changed while we were computing."
    */
-  materializeBlockingSidecar(path?: string): BlockingSidecar {
+  materializeBlockingSidecar(path?: string): SidecarMaterialization {
     const target = path ?? this.gateSidecarPath;
     if (!target) {
       throw new Error(
@@ -9309,6 +9396,38 @@ export class MonetCore {
       }
       if (!RULE_BINDING_ORIGINS.includes(row.origin as RuleBindingOrigin)) {
         throw new Error(`graftRows rule binding '${row.concept_id}' has unknown origin '${row.origin}'`);
+      }
+      // A REASON IS TEXT OR IT IS ABSENT — there is no third thing. SQLite stores whatever it is
+      // handed, so without this a peer sending `reason: 42` lands a row that every read path then
+      // has to survive. The predicate side is hardened too (see hasNoReason) because rows already on
+      // disk cannot be un-sent, but a bad row should die HERE, at the boundary, rather than becoming
+      // a permanent resident that each new reader has to be careful about.
+      if (row.reason != null && typeof row.reason !== "string") {
+        throw new Error(
+          `graftRows rule binding '${row.concept_id}' has a non-string reason ` +
+            `(${typeof row.reason}): a reason is the one-line explanation shown beside the rule, or null`,
+        );
+      }
+      // THE SAME ONE-LINE PROMISE THE CHECK ABOVE MAKES, ENFORCED. No honest peer can hold a
+      // blocking reason that is both CONTENT-BEARING and multiline — declaration refuses that shape
+      // at both call sites (gates.ts ~1289, engine.ts ~8690) — so refusing it here cannot strip a
+      // peer of protection. Same type-lattice boundary as non-string above, not bindRule's
+      // "relay's answer is disclosure, never a veto".
+      //
+      // hasNoReason EXCLUDES BLANK FIRST, because a lone "\n" (or "\t", or "   ") is not a fake
+      // extra line of gate output — there is no content for it to impersonate — it is the SAME
+      // no-reason a relayed null/tab/space already relays and discloses rather than refuses (see
+      // "EVERY SURFACE AGREES ON WHAT COUNTS AS BLANK" in gates.test.ts). hasLineBreak alone cannot
+      // tell those apart, and bindRule never has to: its own blank check runs first and throws on
+      // that shape before hasLineBreak ever sees it. Skipping the exclusion here would make this
+      // the one surface that disagrees about what counts as absent.
+      if (row.severity === "blocking" && !hasNoReason(row.reason) && hasLineBreak(row.reason)) {
+        throw new Error(
+          `graftRows rule binding '${row.concept_id}' has a blocking reason that is not ONE LINE: ` +
+            `it is printed beside the deny at the moment it fires, so a line break makes the gate ` +
+            `appear to say something nobody wrote. Received ${JSON.stringify(row.reason)} — restate ` +
+            `it as a single sentence.`,
+        );
       }
       // THE SAFETY BOUNDARY, ON THE WAY IN. The table's CHECK would reject this anyway, but a
       // forged blocking binding must fail as a named refusal rather than as a constraint error that
@@ -10399,6 +10518,20 @@ export class MonetCore {
             continue;
           }
         }
+        // A RELAYED BLOCKING ROW WITH NO REASON IS ACCEPTED, AND FIRES. Local creation of one is
+        // refused (bindRule requires the reason a deny promises), and it is tempting to refuse it
+        // here too for symmetry. That would be the exact removal doors 9 and 10 established must
+        // never happen: a peer relays a deny, this machine declines it, and machine B ends up
+        // WITHOUT a deny machine A has — protection reduced by us, on our own initiative, over a
+        // missing sentence. No relay removes a live deny; that rule does not carve out the denies
+        // we find badly formed.
+        //
+        // So the reasonless deny lands, guards the action it was declared to guard, and is
+        // DISCLOSED instead: `reasonMissing` on the delivered rule and on the sidecar entry,
+        // counted in gateStats. The promise is unmet for that rule and visibly so, which is
+        // survivable; hiding it would make the promise false, which is not. The repair is an
+        // ordinary local declaration supplying the reason — no migration, and deliberately no
+        // backfill, because a backfill would be us inventing the sentence a human owes.
         const [revision, writer] = incomingMeta(row, "rule_bindings", row.concept_id, current?.sync_revision);
         const r = this.db
           .prepare(

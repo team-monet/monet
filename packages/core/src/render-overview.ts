@@ -17,6 +17,13 @@ interface RenderOpts {
   width?: number;
 }
 
+/**
+ * How many unexplained denies are named individually before the list is summarized. The header line
+ * always carries the true total, so capping shortens the view without ever understating the
+ * population — which is the one thing this disclosure must not do.
+ */
+const UNEXPLAINED_DENIES_SHOWN = 5;
+
 const ESC = String.fromCharCode(27); // \x1b — built at runtime to keep raw escape bytes out of source
 const ANSI = new RegExp(`${ESC}\\[[0-9;]*m`, "g");
 const ANSI_AT = new RegExp(`^${ESC}\\[[0-9;]*m`);
@@ -197,7 +204,12 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
   // of zeros telling nobody anything — but NOT suppressed when there are only silences: a gate that
   // never fires is exactly what this section exists to make visible.
   const gs = o.gateStats;
-  if (gs && (gs.windowTotal > 0 || gs.unverifiedPatterns.length > 0)) {
+  // `unexplainedDenies` joins the suppression condition rather than riding inside it: a store that
+  // has never been asked can still hold a relayed deny that cannot explain itself, and that is
+  // precisely the store where nobody is going to notice on their own. The section comment above
+  // applies with full force here — a JSON field on the MCP response does not discharge a
+  // disclosure whose whole purpose is that a human sees it.
+  if (gs && (gs.windowTotal > 0 || gs.unverifiedPatterns.length > 0 || gs.unexplainedDenies.length > 0)) {
     out.push(bold("GATES") + dim(`  — what fired at the moment of action, last ${gs.windowDays}d`));
     if (gs.windowTotal > 0) {
       out.push(truncate(
@@ -213,6 +225,33 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
       for (const up of gs.unverifiedPatterns) {
         out.push(truncate(dim(`      ${up.stageName}  [${up.patterns.join(" | ")}]  (${up.origin})`), width));
       }
+    }
+    if (gs.unexplainedDenies.length > 0) {
+      // Named as a repair, not an alarm. These denies are working; what is missing is the sentence
+      // shown to whoever they stop, and only a human can supply it — so the rules are NAMED here.
+      // `stageName` and the rule text are exactly what a repairing declaration takes, which is the
+      // difference between this line and one that sends somebody off to go find the row.
+      out.push(truncate(
+        yellow(`  ${gs.unexplainedDenies.length} deny(s) arrived with no reason`) + dim(" — declare the same rule with a reason to repair"),
+        width,
+      ));
+      for (const ud of gs.unexplainedDenies.slice(0, UNEXPLAINED_DENIES_SHOWN)) {
+        // THE ID LEADS, and that is a deliberate break from the POSSIBLE DUPLICATES block above,
+        // which trails it. The form is the same — 8 hex characters in brackets, dim — but placement
+        // is not decoration here: this line is truncated to `width`, and a trailing id is the first
+        // thing a long rule title pushes off the end. Titles are not unique, they are the concept's
+        // FIRST LINE rather than its content, and this list exists so somebody can fetch the exact
+        // rule before redeclaring it. Losing the id to truncation would leave a repair queue whose
+        // rows cannot identify what to repair — and redeclaring by a title that matched two rules
+        // repairs the wrong one. Truncation now eats the recognition aid and keeps the identifier.
+        const id = dim(`[${ud.conceptId.slice(0, 8)}]`);
+        out.push(truncate(`      ${id} ${dim(`${ud.stageName}  ·  ${ud.title}`)}`, width));
+      }
+      // The population is small by construction — local creation is refused, so every one of these
+      // arrived by relay — but "small by construction" is an argument, not a guarantee, and a
+      // curation view that becomes a wall of text is one people stop reading.
+      const hidden = gs.unexplainedDenies.length - UNEXPLAINED_DENIES_SHOWN;
+      if (hidden > 0) out.push(truncate(dim(`      … and ${hidden} more`), width));
     }
     out.push("");
   }

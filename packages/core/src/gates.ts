@@ -1178,6 +1178,15 @@ export interface BindRuleInput {
   modelTag?: string | null;
   origin: RuleBindingOrigin;
   declaredBy?: string | null;
+  /**
+   * OMITTED MEANS "DO NOT DECIDE THIS" HERE TOO — the sibling of `severity` above.
+   *
+   * Restating a rule's text or its gate is not a ruling on why the rule exists, so an omitted
+   * reason PRESERVES the incumbent's; only an explicit one replaces it. Blank is not a value: an
+   * empty or whitespace-only string normalizes to absent, which on a blocking rule is refused
+   * rather than stored (a deny renders its reason at the moment of refusal, and a blank line there
+   * is worse than the guard that would have caught it).
+   */
   reason?: string | null;
 }
 
@@ -1214,6 +1223,25 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
   // severity is not a value — it is the absence of a ruling, and the incumbent's ruling stands.
   const severity: RuleSeverity = input.severity ?? existing?.severity ?? "advisory";
 
+  // REASON RESOLVES THE SAME WAY, and for the same reason. Restating a rule's text or its gate is
+  // not a ruling on WHY the rule exists, exactly as it is not a ruling on its failure mode. The
+  // unconditional write this replaces cleared the incumbent's reason on every replace, so the
+  // documented onboarding re-sort — restate the rule, name no severity, name no reason — left a
+  // live deny firing with nothing underneath it. That is the precise failure the declaration guard
+  // exists to prevent, reached through the path most likely to be walked.
+  //
+  // A blank normalizes to absent so there is ONE representation of "no reason": the guard below and
+  // whatever renders the gate would otherwise disagree about whether "   " counts as an answer.
+  //
+  // THROUGH hasNoReason RATHER THAN A BARE .trim(), which is not tidying. `existing.reason` is read
+  // straight off disk, so it carries whatever a malformed peer wrote — and a bare `.trim()` on a
+  // number threw HERE too, meaning a rule with a corrupt reason could not even be re-declared to
+  // repair it. Routing through the shared predicate makes this path total for the same reason the
+  // read paths are, and rebinding then writes the normalized value, so an ordinary declaration
+  // cleans the row up on its way past.
+  const statedReason = input.reason ?? existing?.reason ?? null;
+  const reason = hasNoReason(statedReason) ? null : statedReason;
+
   if (!RULE_SEVERITIES.includes(severity)) {
     throw new Error(`rule severity '${severity}' is not one of ${RULE_SEVERITIES.join(", ")}`);
   }
@@ -1228,6 +1256,41 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
   if (severity === "blocking" && input.origin !== "declaration") {
     throw new Error(
       "blocking severity is declaration-only: no agent, and no projection, can self-assign deny power",
+    );
+  }
+  // THE AUTHORITATIVE MISSING-REASON CHECK, keyed on the RESOLVED severity rather than the named
+  // one. declare()'s copy of this can only see what the caller wrote: it validates before the embed,
+  // so it does not yet know which concept it will land on and cannot consult the incumbent binding.
+  // A restatement that omits severity therefore never sets `input.severity`, sails straight past
+  // that check, and could hand a live deny an empty-string reason. Here the incumbent is finally in
+  // hand and severity is already resolved, which is the only place the real question can be asked.
+  if (severity === "blocking" && reason === null) {
+    throw new Error(
+      "a blocking rule requires `reason`: one line naming the failure this deny prevents. " +
+        "Omitting it keeps the reason already recorded — there is no way to leave a deny without one.",
+    );
+  }
+  // THE SAME QUESTION, ABOUT THE OTHER WAY A REASON CAN BE THE WRONG SHAPE. Blank asks "is there
+  // nothing here"; this asks "is it the ONE LINE three doc comments promise". They sit together
+  // because they are one decision — a reason that cannot be rendered as the contract describes is
+  // not a reason — and because separating them is how the second one gets forgotten.
+  //
+  // REJECTED, NOT NORMALIZED, for the reason the blank case is: a malformed reason is refused rather
+  // than repaired. `"   "` is not quietly turned into a placeholder on a deny, and `"a\nb"` is not
+  // quietly flattened into `"a b"` — silently rewriting somebody's sentence hands them back words
+  // they did not choose, in the one field whose whole job is to be the human's own explanation. The
+  // caller can fix it; we cannot know what they meant. (Blank IS normalized to null, but only where
+  // absence is legal — that is normalizing what is meaningfully absent, not editing what is there.)
+  //
+  // ON THE SUPPLIED VALUE, not the resolved one, which is the deliberate difference from the check
+  // above. A preserved incumbent reason can only be malformed if it arrived by relay, and refusing
+  // there would make a peer's bad row block the local human from restating their own rule — turning
+  // somebody else's data into a lock on this store. Relay's answer is disclosure, never a veto.
+  if (severity === "blocking" && hasLineBreak(input.reason)) {
+    throw new Error(
+      "a blocking rule's `reason` must be ONE LINE: it is printed beside the deny at the moment it " +
+        "fires, so a line break makes the gate appear to say something nobody wrote. Received " +
+        `${JSON.stringify(input.reason)} — restate it as a single sentence.`,
     );
   }
   const modelTag = input.scope === "agent" ? (input.modelTag ?? null) : null;
@@ -1252,7 +1315,7 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
         WHERE concept_id = ?`,
     ).run(
       input.stageId, severity, input.scope, modelTag, input.origin,
-      input.declaredBy ?? null, input.reason ?? null, syncAt, deps.syncDeviceId, input.conceptId,
+      input.declaredBy ?? null, reason, syncAt, deps.syncDeviceId, input.conceptId,
     );
     if (touchesDenyPower) bumpGateGeneration(db);
     return { row: getRuleBinding(db, input.conceptId)!, previousSeverity, downgradedFromBlocking };
@@ -1266,7 +1329,7 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
     model_tag: modelTag,
     origin: input.origin,
     declared_by: input.declaredBy ?? null,
-    reason: input.reason ?? null,
+    reason,
     created_at: syncAt,
     sync_updated_at: syncAt,
     sync_revision: 0,
@@ -1286,6 +1349,56 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
 
 // ---- the gate ---------------------------------------------------------------
 
+/**
+ * Does this stored reason amount to no reason at all?
+ *
+ * ONE DEFINITION, shared by the gate, the sidecar and the stats, because a disclosure that three
+ * surfaces compute differently is worse than one they all omit. `bindRule` normalizes a blank to
+ * NULL on the way in, so locally these are the same question — but a relayed row is written
+ * straight through by graft and can arrive carrying "   ", and a whitespace reason renders as a
+ * blank line under the deny rather than as an answer.
+ */
+export function hasNoReason(reason: unknown): boolean {
+  // TOTAL OVER PERSISTED VALUES, and that is the load-bearing half. SQLite stores whatever a writer
+  // hands the column, so a malformed peer — or an older build, or a hand-edited row — can leave a
+  // NUMBER in `reason`. The typed signature says string, the runtime value is not, and `.trim()`
+  // threw: a matching gate query, a sidecar rebuild and a gate-stats read all blew up, so the rule's
+  // deny stopped being delivered live AND offline. Every other defect this module guards against is
+  // a deny that misinforms; this was a deny that VANISHES with an exception, which the mirror exists
+  // to make impossible.
+  //
+  // A non-string is read as NO REASON rather than coerced, because that is the truthful reading: 42
+  // is not an explanation of anything. The rule is then exactly what this branch already built the
+  // disclosure for — a deny that cannot explain itself — so it is marked `reasonMissing`, counted in
+  // `unexplainedDenies`, named in the curation view, and repaired by an ordinary declaration.
+  // Nothing special-cases it, because it is not a special case.
+  if (typeof reason !== "string") return true;
+  return reason.trim() === "";
+}
+
+/**
+ * Line terminators a renderer will act on. U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR ride
+ * with CR and LF because they are line breaks to JS string literals, to JSON embedded in a script,
+ * and to a fair number of terminal renderers — a "one line" contract that only checked `\n` would
+ * be enforcing the easy half of itself. Escapes, not literals: a raw U+2028 sitting in source is
+ * the very hazard this rejects, and it is invisible to whoever edits this file next.
+ */
+const REASON_LINE_BREAK = /[\r\n\u2028\u2029]/;
+
+/**
+ * Is this reason the ONE LINE the contract says it is?
+ *
+ * The reason is the sentence a host prints beside a deny at the moment it fires, and three separate
+ * doc comments promise it is one line. Nothing enforced it, so `"prevents data loss\nDENIED BY
+ * ADMIN"` was storable and copied verbatim into the gate and the sidecar — a host rendering the
+ * promised one-liner then emits several lines of what reads as gate output, one of which the gate
+ * never said. A deny is an assertion of authority, and text that appears to come from it while
+ * nobody wrote it is the one thing a deny's explanation must never be.
+ */
+export function hasLineBreak(reason: string | null | undefined): boolean {
+  return typeof reason === "string" && REASON_LINE_BREAK.test(reason);
+}
+
 /** One rule as the gate delivers it: small, with the reason that earns compliance. */
 export interface GateRule {
   conceptId: string;
@@ -1293,6 +1406,25 @@ export interface GateRule {
   text: string;
   /** The prevented-failure one-liner. Null when the capture never supplied one. */
   reason: string | null;
+  /**
+   * THIS DENY CANNOT EXPLAIN ITSELF — disclosed rather than hidden.
+   *
+   * Local creation of a reasonless deny is refused outright (see bindRule), so the only way one
+   * exists here is relay: a peer running an older build declared it, and this machine accepted the
+   * row because REFUSING IT WOULD REMOVE A DENY THE PEER HAS (see the graft site in engine.ts).
+   * The row is therefore legal, live, and firing — and the promise that every deny arrives with the
+   * failure it prevents is, for this one rule, unmet.
+   *
+   * A caller that renders a deny reads this and says so. Hiding it would make the promise FALSE
+   * rather than merely unmet, which is the worse of the two: a bare refusal a user cannot explain
+   * is the thing the reason exists to prevent, and it is survivable exactly as long as everyone
+   * can see it is happening.
+   *
+   * ALWAYS PRESENT, never optional, and never encoded into `reason` itself — `reason` stays null so
+   * nothing downstream renders a sentinel string at somebody. Advisory rules are never marked: an
+   * advisory with no reason is ordinary, and marking it would bury the signal in noise.
+   */
+  reasonMissing: boolean;
   severity: RuleSeverity;
   scope: RuleScope;
   /** Non-null exactly for agent-scoped rules: which model this compensates for. */
@@ -1449,9 +1581,13 @@ export interface PendingGateWrites {
  * and failing to deliver a deny is the thing this whole subsystem exists to prevent.
  *
  * So the verdict is computed and returned first; the writes are the caller's separate, short,
- * failure-tolerant transaction. Under today's locking_mode=EXCLUSIVE no second writer can exist and
- * this is theoretical — but the gate is the hot path of a host hook whose process architecture 4b
- * has not settled, and a verdict must not depend on a log.
+ * failure-tolerant transaction — MonetCore.gate() wraps it in try/catch and swallows a failure
+ * outright. That tolerance is what actually carries this, not exclusivity: storage.ts's own
+ * constructor sets WAL + busy_timeout precisely so the MCP server and a `monet` CLI call can share
+ * one `.monet` DB, and `locking_mode=EXCLUSIVE` is a narrow, opt-in, released state used elsewhere in
+ * this codebase (acquireExclusiveOwnership) — not the steady one. A second writer really can commit
+ * between this read and that write; the split exists so that when it does, the verdict already
+ * returned is unaffected and the lost write is a rounding error, not a thrown gate lookup.
  */
 export function evaluateGate(db: StoragePort, opts: GateQueryOptions): { result: GateResult; pending: PendingGateWrites | null } {
   return gateInternal(db, opts);
@@ -1574,7 +1710,15 @@ function gateInternal(db: StoragePort, opts: GateQueryOptions): { result: GateRe
     rules = rows.map((row) => ({
       conceptId: row.concept_id,
       text: row.title,
-      reason: row.reason,
+      // NON-STRINGS DELIVER AS NULL, so this field is the `string | null` it is declared to be. A
+      // BLOB in the column (TEXT affinity converts numbers, but not blobs) would otherwise be handed
+      // to a caller that has every right to call string methods on it — moving the crash from here
+      // to them. Blank strings still pass through verbatim: they are text, just useless text, and
+      // `reasonMissing` is what says so.
+      reason: typeof row.reason === "string" ? row.reason : null,
+      // Scoped to blocking on purpose: an advisory rule without a reason is the ordinary case, and
+      // marking those would drown the one population a caller actually has to say something about.
+      reasonMissing: row.severity === "blocking" && hasNoReason(row.reason),
       severity: row.severity,
       scope: row.scope,
       modelTag: row.model_tag,
@@ -1684,6 +1828,24 @@ export interface GateStats {
    * because without one there is nothing to be a candidate against.
    */
   retirementCandidates: Array<{ conceptId: string; title: string; modelTag: string; stageName: string }>;
+  /**
+   * Live denies in this circle carrying no reason — see GateRule.reasonMissing for how one exists
+   * at all (relay from an older peer; local creation is refused).
+   *
+   * LISTED, NOT COUNTED, and listed for a specific reason: this is a REPAIR QUEUE, and a repair
+   * queue that cannot say what to repair is just an alarm. A count tells a reader the population is
+   * not zero; these fields tell them what to type. `stageName` and `title` are exactly the `stage`
+   * and `content` a repairing declaration takes, so the rendered line can name the rule instead of
+   * sending somebody to go find it.
+   *
+   * A non-empty list is NOT an error state — the denies are live and doing their job. What is
+   * missing is the sentence shown to whoever they stop, and only a human can supply it.
+   *
+   * Empty today and intended to stay that way, but the shape is the one it will need: the sync
+   * surface is what makes this population reachable, and inheriting a count somebody has to widen
+   * later is how a disclosure ends up narrower than the thing it discloses.
+   */
+  unexplainedDenies: Array<{ conceptId: string; title: string; stageName: string }>;
 }
 
 export interface GateStatsOptions {
@@ -1773,6 +1935,53 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
           ORDER BY b.model_tag ASC, c.title ASC`,
       )
       .all(opts.runtimeModelTag, opts.circle) as GateStats["retirementCandidates"]),
+    // Deliberately NOT filtered by runtime model tag: a compensation for another model still holds
+    // deny power the moment that model runs, and a count that hid it would report zero on exactly
+    // the machine best placed to repair it. Same liveness predicate the gate and the sidecar use.
+    // THE PREDICATE IS NOT IN THE SQL, on purpose. It was, as `TRIM(b.reason) = ''` — and SQLite's
+    // one-argument TRIM strips ORDINARY SPACES ONLY, while `hasNoReason` uses JS trim() and catches
+    // tabs and newlines. A peer relaying "\t\n" therefore produced `reasonMissing: true` on the
+    // delivered rule and on the sidecar entry while this list stayed EMPTY and the overview's repair
+    // section stayed suppressed: a bare deny firing with nothing telling the human it exists. That
+    // is exactly the cross-surface disagreement `hasNoReason` was introduced to prevent, reappearing
+    // in the one surface that had not been made to share it.
+    //
+    // So SQL narrows to the live denies and TypeScript asks the question — ONE implementation, no
+    // equivalence to maintain between two dialects' idea of whitespace. The scan is bounded by the
+    // blocking population, which is the same set materializeBlockingSidecar already walks in full on
+    // every declaration, so this is not a new order of work.
+    unexplainedDenies: (db
+      .prepare(
+        // INNER JOIN, matching listBlockingRules and the stage-first path gateInternal takes. A
+        // binding can land without its stage — an incremental graft that omits the stage row, or a
+        // name collision that skips it — and graftRows documents that such a binding NEVER FIRES.
+        // A LEFT JOIN here put it in the deny list anyway, so the overview named a live deny that
+        // cannot deny anything and told the user to redeclare it: advice that would CREATE the
+        // missing stage and change what the store does. The disclosure surface has to ask the same
+        // question the delivery surface asks, or it describes a store nobody is running.
+        //
+        // Left out rather than given its own name. An orphaned binding is a different signal from a
+        // reasonless deny, and it is an expected TRANSIENT — the dangling-then-live case relay is
+        // built to close, self-healing on the graft that brings the stage. A standing curation item
+        // for a state that resolves itself is noise, and this branch's subject is denies that cannot
+        // explain themselves, not bindings that cannot fire.
+        `SELECT b.concept_id AS conceptId, c.title AS title, s.name AS stageName, b.reason AS reason
+           FROM rule_bindings b
+           JOIN concepts c ON c.id = b.concept_id
+           JOIN stages s ON s.id = b.stage_id
+          WHERE b.severity = 'blocking'
+            AND c.circle = ?
+            AND c.status = 'active'
+            AND c.kind = 'rule'
+            AND NOT EXISTS (
+              SELECT 1 FROM lifecycle_edges e
+               WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
+            )
+          ORDER BY s.name ASC, c.title ASC, b.concept_id ASC`,
+      )
+      .all(opts.circle) as Array<GateStats["unexplainedDenies"][number] & { reason: string | null }>)
+      .filter((row) => hasNoReason(row.reason))
+      .map(({ conceptId, title, stageName }) => ({ conceptId, title, stageName })),
   };
 }
 
@@ -1789,6 +1998,16 @@ export interface BlockingSidecarEntry {
   conceptId: string;
   ruleText: string;
   reason: string | null;
+  /**
+   * Same marker the live gate carries (see GateRule.reasonMissing), so the offline hook can say the
+   * same sentence. Without it the two disagree exactly where it matters least to be inconsistent
+   * and most to be honest: the hook runs when the server is unreachable, which is already the
+   * moment a user is least able to go and look the reason up.
+   *
+   * Every entry here is blocking by construction, so this is simply "no reason" — but it is
+   * computed, not implied, so a reader never has to know that `reason: "  "` meant absent.
+   */
+  reasonMissing: boolean;
   declaredBy: string | null;
   circle: string;
   /**
@@ -1810,8 +2029,14 @@ export interface BlockingSidecarEntry {
  * Bumped whenever an entry's SHAPE changes, so a reader can refuse a file it does not understand
  * rather than silently ignoring a field that decides whether a deny applies. Version 2 added
  * `scope` + `modelTag`; a version-1 file omits them and must not be trusted to filter.
+ *
+ * VERSION 3 added `reasonMissing`. Unlike `scope`, it does not decide WHETHER a deny applies — it
+ * decides what the hook can honestly say while applying it. That still earns the bump: a v2 reader
+ * pointed at a v3 file would render a reasonless deny as though nothing were wrong, which is the
+ * silent-omission failure the version exists to make impossible. The rule stays "the entry shape
+ * changed", not "the filter changed".
  */
-export const BLOCKING_SIDECAR_FORMAT = 2;
+export const BLOCKING_SIDECAR_FORMAT = 3;
 
 export interface BlockingSidecar {
   /** Shape version of `entries` — see BLOCKING_SIDECAR_FORMAT. */
@@ -1834,13 +2059,24 @@ export type SidecarStaleness =
   | { stale: false; generation: number }
   | {
       stale: true;
-      /** `foreign` = written by a different store; its generation number means nothing here. */
-      reason: "missing" | "malformed" | "behind" | "foreign";
+      /**
+       * `foreign` = written by a different store; its generation number means nothing here.
+       *
+       * `format` / `format-ahead` = this build cannot read the file's entry shape. Two reasons
+       * rather than one because they ask the OPERATOR for different things: `format` is a file an
+       * older build left behind, which the next materialize rewrites on its own; `format-ahead` is
+       * a file a NEWER build wrote, which this build deliberately will not touch — the fix there is
+       * to upgrade this install, and nothing that happens here will produce it.
+       */
+      reason: "missing" | "malformed" | "behind" | "foreign" | "format" | "format-ahead";
       fileGeneration: number | null;
       generation: number;
       /** Present on `foreign`: who wrote the file, and who this store is. */
       fileStoreIdentity?: string | null;
       storeIdentity?: string;
+      /** Present on the format reasons: the file's shape version, and the one this build speaks. */
+      fileFormat?: number | null;
+      format?: number;
     };
 
 /**
@@ -1878,6 +2114,15 @@ function readSidecarHeader(path: string): { generation: number; storeIdentity: s
   const header = parsed as Record<string, unknown>;
   if (typeof header.generation !== "number" || !Number.isFinite(header.generation)) return null;
   if (!Array.isArray(header.entries)) return null;
+  // FORMAT IS A DISCRETE VERSION NUMBER, not a magnitude to interpolate — there is no meaning between
+  // format 3 and format 4, so `3.5` is not "a number we can still compare", it is a corrupt header.
+  // Left unchecked, a fractional value greater than BLOCKING_SIDECAR_FORMAT passed `typeof === "number"`
+  // and read as a genuine future format: `format-ahead` in inspectSidecar, `skipped-format-ahead`
+  // forever in materializeBlockingSidecar — preserved on the promise of an upgrade that fixes nothing,
+  // because no build, past or future, will ever actually write a fractional format. Rejecting the
+  // whole header here (rather than coercing just this field to null) routes it through the SAME
+  // `malformed` path as any other structurally-wrong file, in both consumers, from one place.
+  if (typeof header.format === "number" && !Number.isInteger(header.format)) return null;
   return {
     generation: header.generation,
     storeIdentity: typeof header.storeIdentity === "string" ? header.storeIdentity : null,
@@ -1907,6 +2152,23 @@ export function inspectSidecar(db: StoragePort, path: string, storeIdentity?: st
   const fileStoreIdentity = header.storeIdentity;
   if (storeIdentity !== undefined && fileStoreIdentity !== storeIdentity) {
     return { stale: true, reason: "foreign", fileGeneration, generation, fileStoreIdentity, storeIdentity };
+  }
+  // SHAPE BEFORE VINTAGE, and after identity. The three checks narrow in the order a reader cares
+  // about: whose file is this, can I read its entries, is it current. A file whose format is not
+  // ours is stale WHATEVER its generation says — and that is the whole point, because the failure
+  // this closes is the quiet one: bump the format, and a v2 file whose generation and identity
+  // still match reported CURRENT, so an upgraded install kept serving a mirror its own hook would
+  // reject. The version number existed to make that impossible and, unchecked here, caused it.
+  //
+  // `null` covers a v1 file that predates the field entirely; it is not ours either.
+  if (header.format !== BLOCKING_SIDECAR_FORMAT) {
+    const ahead = header.format !== null && header.format > BLOCKING_SIDECAR_FORMAT;
+    return {
+      stale: true,
+      reason: ahead ? "format-ahead" : "format",
+      fileGeneration, generation,
+      fileFormat: header.format, format: BLOCKING_SIDECAR_FORMAT,
+    };
   }
   // Strict inequality, not `<`: a file claiming a generation AHEAD of the store is also not a
   // mirror of this store, and treating it as current would let a stale deny set govern here.
@@ -1946,13 +2208,42 @@ export function listBlockingRules(db: StoragePort): BlockingSidecarEntry[] {
       patternText: patterns.map(formatTriggerPattern),
       conceptId: row.concept_id,
       ruleText: row.title,
-      reason: row.reason,
+      // Same normalization as the live gate — and here it is also what keeps the file readable: a
+      // Buffer would serialize into the mirror as {"type":"Buffer","data":[...]}, which the hook
+      // would then have to parse around.
+      reason: typeof row.reason === "string" ? row.reason : null,
+      reasonMissing: hasNoReason(row.reason),
       declaredBy: row.declared_by,
       circle: row.circle,
       scope: row.scope,
       modelTag: row.model_tag,
     };
   });
+}
+
+/**
+ * What happened to the file on disk. `written` is the only outcome that changed it.
+ *
+ * `skipped-format-ahead` is the one that has to be legible: the mirror left in place is a shape this
+ * build cannot read, so a caller that treats the call as successful regeneration is reporting a
+ * working mirror over a file its own hook will reject.
+ *
+ * `skipped-superseded` is a BENIGN no-op like `skipped-current` — the file on disk already belongs to
+ * the store's current lineage, so the mirror is fine either way — but it is not the SAME no-op: it
+ * means a concurrent writer's generation outran the one this call snapshotted, not that this call's
+ * own snapshot matched what was already there. Kept distinct so instrumentation can tell "nothing had
+ * changed" from "something changed out from under us," even though neither is an operator problem.
+ */
+export type SidecarWriteOutcome = "written" | "skipped-format-ahead" | "skipped-current" | "skipped-superseded";
+
+/** The result of a materialize attempt: what was generated, and whether it reached disk. */
+export interface SidecarMaterialization {
+  outcome: SidecarWriteOutcome;
+  /**
+   * The mirror this call GENERATED. On disk only when `outcome` is "written" — on a skip it is what
+   * WOULD have been written, which is exactly the distinction the bare-sidecar return erased.
+   */
+  sidecar: BlockingSidecar;
 }
 
 /**
@@ -1965,12 +2256,18 @@ export function listBlockingRules(db: StoragePort): BlockingSidecarEntry[] {
  * The write happens even when there are no blocking rules — an EMPTY entries array is the correct
  * mirror of a store with nothing blocking, and is meaningfully different from a missing file (which
  * a hook must treat as "no mirror, fail open loudly").
+ *
+ * RETURNS THE OUTCOME, NOT JUST THE ARTIFACT. This used to hand back the freshly generated sidecar
+ * whatever happened, so a declined write looked identical to a successful one: install and recovery
+ * tooling reported "mirror regenerated" while the file on disk stayed `format-ahead` and unusable by
+ * the hook. A function that says it wrote when it did not is the failure this module spends its
+ * length preventing everywhere else, committed by the writer itself.
  */
 export function materializeBlockingSidecar(
   db: StoragePort,
   path: string,
   opts: { storeIdentity?: string; now?: number } = {},
-): BlockingSidecar {
+): SidecarMaterialization {
   // ONE TRANSACTION over the generation and the entries. Read separately, a bump committing between
   // them yields a file that stamps the NEW generation onto the OLD deny set — a mirror that claims
   // to be current while missing the very change that made it stale, which is worse than an honestly
@@ -1992,15 +2289,93 @@ export function materializeBlockingSidecar(
     // one, and the loser's generation then sits in the header claiming to be current. That is worse
     // than staleness, because `inspectSidecar` would agree with it.
     //
-    // Under today's locking_mode=EXCLUSIVE a second process cannot hold this database at all, so
-    // this is theoretical HERE — but the mirror is the artifact 4b reads, its process architecture
-    // is not settled, and a compare is two syscalls. A file already at or ahead of our generation
-    // (and written by this same store) is not one we should overwrite.
+    // Under today's WAL + busy_timeout — set in exactly this shape by storage.ts's own constructor,
+    // whose comment states the point plainly: "the MCP server and a `monet` CLI call can share one
+    // `.monet` DB". Multi-process is not a future architecture question 4b will eventually settle, it
+    // is the shipped topology TODAY, so the race the paragraph above describes is not theoretical: a
+    // compare before replace is load-bearing right now, not insurance against something that cannot
+    // happen. A same-store file already AT our generation is simply current — it already says what we
+    // are about to write — and is not one we should overwrite.
+    //
+    // AHEAD OF OUR SNAPSHOT IS AMBIGUOUS — the old `>=` handled it by preserving every ahead file the
+    // same way, which was right for one of the two events that produce this exact shape and wrong for
+    // the other:
+    //   (a) the store went BACKWARD since that file was written — a restore or a rollback — and the
+    //       file is debris of a lineage this store no longer has, the same event class as `foreign`
+    //       below, just without a different identity to catch it; or
+    //   (b) a legitimate newer writer of THIS SAME lineage published — store AND mirror — while we
+    //       were between our snapshot and this compare: exactly the race the first paragraph above
+    //       names, now reachable rather than theoretical. That file is not debris, it is simply RIGHT,
+    //       and we are the stale write.
+    // Both look identical from the snapshot alone (`existing.generation > sidecar.generation`, same
+    // store, same format), so the snapshot cannot be the tiebreaker. One more read can: the store's
+    // CURRENT generation, taken fresh, right here, rather than trusted from what we snapshotted
+    // earlier. (a) is still ahead of that fresh read too — no writer of this lineage could have
+    // produced a generation the store itself has never reached, so it falls through to the rename
+    // below exactly like foreign debris. (b) is at or behind the fresh read — a real write already
+    // landed it — so we decline, but WITHOUT claiming we wrote it: `skipped-superseded`, distinct from
+    // `skipped-current` so instrumentation can tell "we matched" from "we lost a race," even though a
+    // caller may treat both as the benign no-op they are.
+    //
+    // NARROWED, NOT CLOSED. A writer can still bump between the fresh read below and the rename two
+    // lines down — TOCTOU is inherent to compare-then-replace, and no amount of rereading removes the
+    // last gap. What the fresh read buys is the SIZE of the gap: from "any pause between the snapshot
+    // at the top of this function and this compare" down to two adjacent syscalls. And a miss in that
+    // narrowed gap self-heals: every mutation re-triggers a refresh, so a rare loss here is corrected
+    // by the very next one, not carried forward.
+    //
+    // FORMAT PARTICIPATES, and its absence here was the other half of the bug above. The generation
+    // compare was right about vintage and wrong to be the ONLY comparison: an upgraded install whose
+    // generation had not moved kept skipping the rename, so its v2 artifact survived indefinitely —
+    // until some unrelated mutation happened to bump the counter — while its own v3 hook rejected
+    // the file and lost offline blocking outright. Rewriting a file whose shape is not ours is the
+    // POINT of a version bump, so a format mismatch overrides the skip in both directions.
     const existing = readSidecarHeader(path);
-    if (existing !== null && existing.generation >= sidecar.generation
-        && existing.storeIdentity === (sidecar.storeIdentity ?? null)) {
+    // A build AHEAD of this one wrote it. Do not overwrite, and do not pretend it is fine.
+    //
+    // Not because clobbering loses data — the mirror is derived, and either build regenerates it
+    // from the store. The reason is THRASH: if an older build overwrote forward-format files, two
+    // installs sharing a path would each clobber the other on every invocation, and both hooks
+    // would fail intermittently and unreproducibly. Declining makes the failure deterministic and
+    // attributable — only the older install's hook rejects the file — and `inspectSidecar` names it
+    // `format-ahead`, which points at the one fix that works: upgrade this install. We also simply
+    // cannot know what a future entry shape means, and a writer that overwrites what it cannot read
+    // is guessing on the critical path of somebody's action.
+    // ...but only for OUR OWN mirror. The thrash argument needs two installs sharing a path for the
+    // same store; a forward-format file belonging to a DIFFERENT store is not the other half of a
+    // thrash pair, it is debris left in our path — by a restore that reused the directory, most
+    // likely. Deferring to it would be deferring to a file `inspectSidecar` has already called
+    // `foreign`, i.e. one we have decided we cannot read, and the skip would repeat forever: the
+    // refresh is a no-op every time, so this store never gets an offline deny at all. Identity
+    // therefore gates the preservation rule, and a foreign file is overwritten whatever its format.
+    const sameStore = existing !== null && existing.storeIdentity === (sidecar.storeIdentity ?? null);
+    const aheadOfUs = sameStore && existing.format !== null && existing.format > sidecar.format;
+    // EQUALITY ONLY. An ahead generation is NOT handled by widening this to `>=` — see AHEAD OF OUR
+    // SNAPSHOT IS AMBIGUOUS above — it is handled by asking the store, fresh, just below.
+    const alreadyCurrent = sameStore
+      && existing.format === sidecar.format
+      && existing.generation === sidecar.generation;
+    // Same shape as `alreadyCurrent` but for `>` rather than `===` — see the paragraph above for why
+    // this cannot be resolved from the snapshot and needs the store's CURRENT generation instead.
+    const aheadOfSnapshot = sameStore
+      && existing.format === sidecar.format
+      && existing.generation > sidecar.generation;
+    // THE FRESH READ. Only evaluated when it matters (short-circuited by `aheadOfSnapshot`), since
+    // every other path already has its answer without asking the store again.
+    const supersededByRace = aheadOfSnapshot && existing.generation <= gateGeneration(db);
+    if (aheadOfUs || alreadyCurrent || supersededByRace) {
       unlinkSync(tmp);
-      return sidecar;
+      // THREE SKIPS, and no two of them mean the same thing to a caller. `skipped-current`: the file
+      // already says what we would have said — a genuine no-op, the mirror is fine. `skipped-superseded`:
+      // a legitimate newer write already landed it before we got here — also a no-op, also fine, but
+      // named separately so instrumentation can see that THIS call specifically lost a race rather
+      // than matching on the first try. `skipped-format-ahead`: the file is a shape this build cannot
+      // read and deliberately will not replace — the mirror is NOT fine, and the caller has an
+      // operator problem to surface rather than a success to report.
+      const outcome: SidecarWriteOutcome = aheadOfUs ? "skipped-format-ahead"
+        : alreadyCurrent ? "skipped-current"
+        : "skipped-superseded";
+      return { outcome, sidecar };
     }
     renameSync(tmp, path);
   } catch (error) {
@@ -2012,5 +2387,5 @@ export function materializeBlockingSidecar(
     }
     throw error;
   }
-  return sidecar;
+  return { outcome: "written", sidecar };
 }

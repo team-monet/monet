@@ -36,7 +36,7 @@ import {
   parseTriggerPatterns,
   seedTriggerPattern,
 } from "../gates";
-import type { BlockingSidecar } from "../gates";
+import type { BlockingSidecar, SidecarMaterialization } from "../gates";
 import { formatSpan } from "../spans";
 
 /** Dedup DISABLED: every store() yields its own concept. */
@@ -476,6 +476,7 @@ describe("rule death — a correction supersedes rather than attaches", () => {
       stage: "terraform apply",
       content: "Never apply to production without a plan review.",
       severity: "blocking",
+      reason: "an unreviewed apply changes production before anyone has agreed to it",
       ...AGENT_RULE,
     });
     const conceptId = declared.species === "rule" ? declared.conceptId : "";
@@ -580,7 +581,7 @@ describe("declaration — the sovereign entrance", () => {
     const c = core();
     const declared = await c.declare({
       species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
-      severity: "blocking", declaredBy: "john", ...AGENT_RULE,
+      severity: "blocking", reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
     });
     if (declared.species !== "rule") throw new Error("unreachable");
     expect(declared.binding.severity).toBe("blocking");
@@ -598,7 +599,7 @@ describe("declaration — the sovereign entrance", () => {
     const c = resolvingCore();
     const first = await c.declare({
       species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
-      severity: "blocking", ...AGENT_RULE,
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
     const again = await c.declare({
@@ -608,6 +609,291 @@ describe("declaration — the sovereign entrance", () => {
     if (again.species !== "rule") throw new Error("unreachable");
     expect(again.conceptId).toBe(first.conceptId);
     expect(c.ruleBinding(first.conceptId)).toMatchObject({ severity: "advisory", reason: "downgraded on reflection" });
+    c.close();
+  });
+
+  it("REFUSES a blocking declaration that states no reason — a deny has to be explainable", async () => {
+    const c = core();
+    // The boundary statement promises every deny arrives carrying the failure it prevents, and a
+    // promise the write path does not enforce is not a promise. A deny the agent cannot explain is
+    // the one people learn to route around: the gate fires, the refusal is bare, and the cheapest
+    // response available is to rephrase the action until it stops matching.
+    await expect(c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      severity: "blocking", ...AGENT_RULE,
+    })).rejects.toThrow(/blocking rule requires `reason`/);
+
+    // Whitespace is not a reason. Without the trim, the check is satisfied by the SHAPE of a value
+    // rather than its content — which is the one bypass a required-field guard invites, and the
+    // gate would render a blank line where the explanation belongs.
+    await expect(c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      severity: "blocking", reason: "   ", ...AGENT_RULE,
+    })).rejects.toThrow(/blocking rule requires `reason`/);
+
+    // REFUSED MEANS NOTHING HAPPENED. The check sits with the rest of declare()'s validation, ahead
+    // of every write, so a failed sovereign act leaves no concept, no binding and no stage behind.
+    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM rule_bindings`).get()).toEqual({ n: 0 });
+    expect(c.stages()).toEqual([]);
+
+    // Advisory is deliberately untouched: an advisory with no reason is weaker guidance, not a
+    // broken contract, so requiring one there would be a cost with nothing on the other side.
+    const advisory = await c.declare({
+      species: "rule", stage: "rm -rf", content: "Prefer a dry run before deleting.", ...AGENT_RULE,
+    });
+    if (advisory.species !== "rule") throw new Error("unreachable");
+    expect(advisory.binding).toMatchObject({ severity: "advisory", reason: null });
+    c.close();
+  });
+
+  it("REFUSES an advisory→blocking UPGRADE that states no reason, and leaves the advisory standing", async () => {
+    const c = resolvingCore();
+    // The upgrade is the case the guard exists for, and the one severity-preservation makes easy to
+    // test wrong: an OMITTED severity preserves whatever the binding already has, so a declaration
+    // that omits it never rules on severity and never reaches this check. This one names `blocking`
+    // explicitly on a rule that is currently advisory — deny power actually being acquired.
+    const first = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", ...AGENT_RULE,
+    });
+    if (first.species !== "rule") throw new Error("unreachable");
+    expect(c.ruleBinding(first.conceptId)).toMatchObject({ severity: "advisory", reason: null });
+
+    await expect(c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      severity: "blocking", ...AGENT_RULE,
+    })).rejects.toThrow(/blocking rule requires `reason`/);
+    // The incumbent is exactly as it was found — including its own (absent) reason, which the
+    // refused declaration did not get to overwrite.
+    expect(c.ruleBinding(first.conceptId)).toMatchObject({ severity: "advisory", reason: null });
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]!.severity).toBe("advisory");
+
+    // With the reason supplied the same upgrade goes through, and the gate delivers it alongside.
+    const upgraded = await c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (upgraded.species !== "rule") throw new Error("unreachable");
+    expect(upgraded.conceptId).toBe(first.conceptId);
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+      .toMatchObject({ severity: "blocking", reason: "there is no undo" });
+    c.close();
+  });
+
+  /**
+   * A deny's reason is the second thing about it that an ordinary restatement must not silently
+   * take away. The severity-preservation rule already says restating a rule's text or its gate is
+   * not a ruling on its failure mode; these say the same about WHY it exists. Both halves live in
+   * bindRule so the two read as siblings rather than one rule and one special case.
+   */
+  const DENY = { stage: "rm -rf", content: "Never delete a tree unattended." };
+
+  it("PRESERVES an omitted reason exactly as it preserves an omitted severity", async () => {
+    const c = resolvingCore();
+    const deny = await c.declare({
+      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+
+    // THE ONBOARDING RE-SORT: the rule restated, with no ruling on severity and no ruling on the
+    // reason. Both survive. The write this replaces preserved the severity and cleared the reason,
+    // which left a live deny firing with nothing underneath it — the exact state the declaration
+    // guard exists to prevent, reached through the path most likely to be walked.
+    const again = await c.declare({ species: "rule", ...DENY, ...AGENT_RULE });
+    if (again.species !== "rule") throw new Error("unreachable");
+    expect(again.conceptId).toBe(deny.conceptId);
+    expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", reason: "there is no undo" });
+    // ...and the gate still DELIVERS it, which is the only form of survival that matters.
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+      .toMatchObject({ severity: "blocking", reason: "there is no undo" });
+
+    // The same holds one severity down, where no guard is involved at all — preservation is a
+    // property of the resolution, not a side effect of protecting deny power.
+    const advisory = await c.declare({
+      species: "rule", stage: "terraform apply", content: "Always run plan first.",
+      reason: "a plan is the only review anyone gets", ...AGENT_RULE,
+    });
+    if (advisory.species !== "rule") throw new Error("unreachable");
+    await c.declare({ species: "rule", stage: "terraform apply", content: "Always run plan first.", ...AGENT_RULE });
+    expect(c.ruleBinding(advisory.conceptId)).toMatchObject({
+      severity: "advisory", reason: "a plan is the only review anyone gets",
+    });
+    c.close();
+  });
+
+  it("carries a withdrawn deny's reason forward into the advisory it becomes", async () => {
+    const c = core();
+    const deny = await c.declare({
+      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    // Withdrawing deny power is a ruling on severity and nothing else. The rule still exists, still
+    // fires, and still exists for the reason it always did — so the withdrawal keeps it rather than
+    // leaving advisory guidance that cannot say what it is for.
+    await withdrawDeny(c, deny.conceptId, "rm -rf");
+    expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "advisory", reason: "there is no undo" });
+    c.close();
+  });
+
+  it("REFUSES a restatement that blanks a live deny's reason, though it never named a severity", async () => {
+    const c = resolvingCore();
+    const deny = await c.declare({
+      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+
+    // This is the case declare()'s guard structurally CANNOT catch. It runs before the embed, so it
+    // does not know which concept the declaration will land on and cannot consult the incumbent; all
+    // it can see is that the caller named no severity. Blocking is preserved by resolution, well
+    // after that check has passed — so the blank arrives at a rule that is about to keep denying.
+    for (const blank of ["", "   ", "\n\t "]) {
+      await expect(
+        c.declare({ species: "rule", ...DENY, reason: blank, ...AGENT_RULE }),
+        `reason ${JSON.stringify(blank)} must be refused`,
+      ).rejects.toThrow(/Omitting it keeps the reason already recorded/);
+      // Refused means UNCHANGED — not blanked, and not quietly downgraded to get around the guard.
+      expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", reason: "there is no undo" });
+    }
+
+    // The message is the one from bindRule, not declare()'s copy: this refusal was reached by
+    // resolving the severity against the incumbent, which is the whole point of the second guard.
+    await expect(c.declare({ species: "rule", ...DENY, reason: " ", ...AGENT_RULE }))
+      .rejects.toThrow(/a blocking rule requires `reason`/);
+    c.close();
+  });
+
+  it("lets an explicit reason replace on either severity, and lets an advisory clear its own", async () => {
+    const c = resolvingCore();
+    const deny = await c.declare({
+      species: "rule", patterns: ["Bash:rm -rf"], ...DENY,
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    // Preservation is not stickiness: a caller who states a reason is ruling on it, and that ruling
+    // lands without having to restate the severity alongside it.
+    await c.declare({ species: "rule", ...DENY, reason: "a deleted tree is not in any trash", ...AGENT_RULE });
+    expect(c.ruleBinding(deny.conceptId)).toMatchObject({
+      severity: "blocking", reason: "a deleted tree is not in any trash",
+    });
+
+    // On an ADVISORY rule the blank is allowed through, and normalizes to absent rather than to an
+    // empty string — one representation of "no reason", so nothing downstream has to know both.
+    // Weaker guidance is not a broken contract, so there is nothing here to protect.
+    const advisory = await c.declare({
+      species: "rule", stage: "terraform apply", content: "Always run plan first.",
+      reason: "a plan is the only review anyone gets", ...AGENT_RULE,
+    });
+    if (advisory.species !== "rule") throw new Error("unreachable");
+    await c.declare({
+      species: "rule", stage: "terraform apply", content: "Always run plan first.", reason: "  ", ...AGENT_RULE,
+    });
+    expect(c.ruleBinding(advisory.conceptId)).toMatchObject({ severity: "advisory", reason: null });
+    c.close();
+  });
+
+  /**
+   * A DENY'S REASON IS ONE LINE, and until now only the doc comments said so.
+   *
+   * The reason is printed beside the deny at the moment it fires. A line break in it means a host
+   * rendering the promised one-liner emits several lines that all read as gate output — and a deny
+   * is an assertion of authority, so text that appears to come from it while nobody wrote it is the
+   * one thing its explanation must never be. `"prevents data loss\nDENIED BY ADMIN"` was storable
+   * and copied verbatim into both the live gate and the sidecar.
+   */
+  for (const [label, bad] of [
+    ["newline", "prevents data loss\nDENIED BY ADMIN"],
+    ["carriage return", "prevents data loss\rDENIED BY ADMIN"],
+    ["line separator", "prevents data loss\u2028DENIED BY ADMIN"],
+    ["paragraph separator", "prevents data loss\u2029DENIED BY ADMIN"],
+    ["trailing newline", "there is no undo\n"],
+  ] as const) {
+    it(`REFUSES a blocking reason containing a ${label}, and stores nothing`, async () => {
+      const c = core();
+      await expect(c.declare({
+        species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+        severity: "blocking", reason: bad, ...AGENT_RULE,
+      })).rejects.toThrow(/must be ONE LINE/);
+      // Refused means nothing happened, as everywhere else in this validation block.
+      expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM rule_bindings`).get()).toEqual({ n: 0 });
+      expect(c.stages()).toEqual([]);
+      c.close();
+    });
+  }
+
+  it("REJECTS rather than normalizing, so nobody is handed back words they did not write", async () => {
+    const c = resolvingCore();
+    const deny = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+
+    // Flattening "a\nb" to "a b" would let the declaration succeed while changing the sentence — in
+    // the one field whose entire job is to be the human's own explanation of their own deny. Blank
+    // is refused rather than replaced with a placeholder for the same reason; these are one decision
+    // about malformed reasons, not two policies that happen to sit together.
+    await expect(c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      severity: "blocking", reason: "there is no undo\nand no backup", ...AGENT_RULE,
+    })).rejects.toThrow(/must be ONE LINE/);
+    // The incumbent is untouched — not flattened, not replaced.
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+      .toMatchObject({ severity: "blocking", reason: "there is no undo" });
+
+    // The error names what arrived, so the caller can see which field it has to restate.
+    await expect(c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      severity: "blocking", reason: "one\ntwo", ...AGENT_RULE,
+    })).rejects.toThrow(/one\\ntwo/);
+    c.close();
+  });
+
+  it("REFUSES a multi-line reason on a restatement that never named a severity", async () => {
+    const c = resolvingCore();
+    const deny = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+
+    // THE CASE THAT MAKES bindRule's COPY LOAD-BEARING, and the same hole the blank check had:
+    // declare()'s guard keys on the severity the caller NAMED, so a restatement that omits it sails
+    // past — while resolution preserves `blocking` and the multi-line reason lands on a live deny.
+    // Without the authoritative copy this exact call succeeds.
+    await expect(c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      reason: "there is no undo\nDENIED BY ADMIN", ...AGENT_RULE,
+    })).rejects.toThrow(/must be ONE LINE/);
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+      .toMatchObject({ severity: "blocking", reason: "there is no undo" });
+    c.close();
+  });
+
+  it("leaves an ADVISORY reason and ordinary interior whitespace alone", async () => {
+    const c = core();
+    // Scoped to blocking, matching the guard it sits beside. An advisory rule is guidance rather
+    // than an assertion of authority, and widening this would re-validate every captured rule's
+    // reason on a path this branch has no findings about.
+    const advisory = await c.declare({
+      species: "rule", stage: "terraform apply", content: "Always run plan first.",
+      reason: "a plan is the only review\nanyone gets", ...AGENT_RULE,
+    });
+    if (advisory.species !== "rule") throw new Error("unreachable");
+    expect(advisory.binding.reason).toBe("a plan is the only review\nanyone gets");
+
+    // And a blocking reason with tabs or runs of spaces is FINE — the question is "does this render
+    // as more than one line", not "is this whitespace-free".
+    const deny = await c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      severity: "blocking", reason: "there is\tno undo  at all", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    expect(deny.binding.reason).toBe("there is\tno undo  at all");
     c.close();
   });
 
@@ -665,7 +951,8 @@ describe("blocking sidecar — the materialized mirror", () => {
     // A second deny joins it, in the gate's own deterministic order.
     await c.declare({
       species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
-      content: "Never force-push to main.", severity: "blocking", ...AGENT_RULE,
+      content: "Never force-push to main.", severity: "blocking",
+      reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
     });
     expect(read(path).entries.map((e) => e.stageName)).toEqual(["git force push", "rm -rf"]);
 
@@ -674,7 +961,7 @@ describe("blocking sidecar — the materialized mirror", () => {
     expect(() => c.retireConcept(declared.conceptId)).toThrow(/would remove the blocking rule/);
     await withdrawDeny(c, declared.conceptId, "rm -rf");
     c.retireConcept(declared.conceptId);
-    expect(c.materializeBlockingSidecar().entries.map((e) => e.stageName)).toEqual(["git force push"]);
+    expect(c.materializeBlockingSidecar().sidecar.entries.map((e) => e.stageName)).toEqual(["git force push"]);
     expect(read(path).entries.map((e) => e.stageName)).toEqual(["git force push"]);
     c.close();
   });
@@ -687,7 +974,7 @@ describe("blocking sidecar — the materialized mirror", () => {
     const c = new MonetCore(":memory:", { gateSidecarPath: path, syncDeviceId: "machine-a" });
     const first = await c.declare({
       species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
-      severity: "blocking", ...AGENT_RULE,
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (first.species !== "rule") throw new Error("unreachable");
     expect(read(path).entries).toHaveLength(1);
@@ -709,15 +996,21 @@ describe("blocking sidecar — the materialized mirror", () => {
     const compensation = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
       content: "Old model deletes without confirming.", severity: "blocking", scope: "agent", modelTag: "model-1",
+      reason: "this model deletes without asking first",
     });
     await c.declare({
       species: "rule", stage: "rm -rf",
       content: "Deleting a tree is irreversible.", severity: "blocking", scope: "domain",
+      reason: "a deleted tree is not in any trash",
     });
     if (compensation.species !== "rule") throw new Error("unreachable");
 
     const sidecar = read(path);
-    expect(sidecar.format).toBe(2);
+    // 3 since `reasonMissing` joined the entry shape. A v2 reader pointed at this file would render
+    // a reasonless deny as though nothing were wrong, which is the silent-omission failure the
+    // version number exists to prevent — so the shape change earns the bump even though this field,
+    // unlike scope/modelTag below, does not decide whether a deny APPLIES.
+    expect(sidecar.format).toBe(3);
     // Without these fields the hook cannot apply the runtime-model filter gateQuery applies, so a
     // compensation for a retired model keeps denying whenever the server is unreachable — live and
     // offline disagreeing exactly when it is hardest to notice.
@@ -737,15 +1030,19 @@ describe("blocking sidecar — the materialized mirror", () => {
     const path = join(dir, "sidecar.json");
     const c = core();
     await c.declare({
-      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
     });
     // No gateSidecarPath: a MonetCore must never write into somebody's real store directory just
     // because it was constructed.
     expect(existsSync(path)).toBe(false);
     expect(() => c.materializeBlockingSidecar()).toThrow(/needs a path/);
 
-    const sidecar = c.materializeBlockingSidecar(path);
-    expect(sidecar.entries).toHaveLength(1);
+    const rebuilt = c.materializeBlockingSidecar(path);
+    // Explicit recovery against a path that held no file: this is the caller install tooling is,
+    // and "written" is the answer that entitles it to say the mirror was regenerated.
+    expect(rebuilt.outcome).toBe("written");
+    expect(rebuilt.sidecar.entries).toHaveLength(1);
     expect(read(path).entries[0]!.ruleText).toBe("Never delete a tree unattended");
     c.close();
   });
@@ -779,6 +1076,10 @@ describe("gateQuery", () => {
       conceptId: rule.conceptId,
       text: "Never force-push to a shared branch",
       reason: "it destroys teammates' commits",
+      // Present and FALSE on every ordinary rule. This assertion is `toEqual`, so it pins the whole
+      // delivered shape — which is how the field's arrival was noticed here rather than by a
+      // consumer discovering an undefined at the moment it wanted to render a deny.
+      reasonMissing: false,
       severity: "advisory",
       scope: "agent",
       modelTag: "test-model-1",
@@ -796,7 +1097,8 @@ describe("gateQuery", () => {
     const broad = await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", ...AGENT_RULE } });
     const narrow = await c.store("Never force-push to a shared branch.", { kind: "rule", rule: { stage: "git force push", ...AGENT_RULE } });
     const deny = await c.declare({
-      species: "rule", stage: "git force push", content: "Never force-push to main.", severity: "blocking", ...AGENT_RULE,
+      species: "rule", stage: "git force push", content: "Never force-push to main.", severity: "blocking",
+      reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
 
@@ -952,7 +1254,8 @@ describe("gate instrumentation", () => {
     await c.declare({ species: "stage", stage: "git force push", patterns: ["git push --force"] });
     const advisory = await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", ...AGENT_RULE } });
     const deny = await c.declare({
-      species: "rule", stage: "git force push", content: "Never force-push to main.", severity: "blocking", ...AGENT_RULE,
+      species: "rule", stage: "git force push", content: "Never force-push to main.", severity: "blocking",
+      reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
 
@@ -1120,6 +1423,482 @@ describe("gate substrate sync", () => {
     b.close();
   });
 
+  /**
+   * A DENY THAT CANNOT EXPLAIN ITSELF IS ACCEPTED, FIRED, AND DISCLOSED.
+   *
+   * Local creation of one is refused, so the only way a store holds one is relay from a peer whose
+   * build predates the requirement. Refusing it here for symmetry would be the removal doors 9 and
+   * 10 exist to forbid — machine B ending up without a deny machine A has, protection reduced by
+   * us, over a missing sentence. So it lands and guards, and every surface that shows the deny says
+   * what is missing from it. The promise is unmet for that rule and visibly so, which is
+   * survivable; hiding it would make the promise false, which is not.
+   */
+  const relayReasonlessDeny = async (
+    dst: MonetCore,
+    opts: { reason?: string | null } = {},
+  ): Promise<{ src: MonetCore; conceptId: string; inserted: number }> => {
+    const src = core({ syncDeviceId: "machine-a" });
+    // Declared legitimately HERE, because this build will not mint one without a reason. Stripping
+    // the reason from the exported row is what a peer running the older build relays natively.
+    const deny = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const payload = src.exportDelta(0);
+    const bindings = payload.ruleBindings!.map((b) =>
+      b.concept_id === deny.conceptId ? { ...b, reason: opts.reason ?? null } : b);
+    const result = dst.graftRows({ ...payload, ruleBindings: bindings });
+    return { src, conceptId: deny.conceptId, inserted: result.inserted.rule_bindings };
+  };
+
+  it("LANDS a relayed deny that carries no reason, fires it, and discloses it on every surface", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const dst = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b", gateSidecarPath: path,
+    });
+    const { src, conceptId, inserted } = await relayReasonlessDeny(dst);
+
+    // ACCEPTED, not skipped-and-counted. This is the assertion the ruling turns on.
+    expect(inserted).toBe(1);
+    expect(dst.ruleBinding(conceptId)).toMatchObject({ severity: "blocking", reason: null });
+
+    // ...and it GUARDS. A deny that landed but did not fire would be the same protection loss by a
+    // quieter route.
+    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    expect(fired.rules).toHaveLength(1);
+    expect(fired.rules[0]).toMatchObject({
+      conceptId, severity: "blocking", reason: null, reasonMissing: true,
+    });
+
+    // The MIRROR says it too — the hook runs when the server is unreachable, which is already the
+    // moment a user is least able to go and look the reason up.
+    const entry = dst.materializeBlockingSidecar().sidecar.entries[0]!;
+    expect(entry).toMatchObject({ conceptId, reason: null, reasonMissing: true });
+    // Present in the FILE, not merely in the return value: the file is what the hook reads.
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as BlockingSidecar;
+    expect(onDisk.format).toBe(3);
+    expect(onDisk.entries[0]).toMatchObject({ reasonMissing: true });
+
+    // ...and CURATION gets a REPAIR QUEUE, not an alarm: `stageName` and `title` are exactly the
+    // `stage` and `content` the repairing declaration below takes, so nothing has to be gone and
+    // found first.
+    expect(dst.gateStats("default").unexplainedDenies).toEqual([
+      { conceptId, title: "Never delete a tree unattended", stageName: "rm -rf" },
+    ]);
+
+    // The pairing that makes this coherent: what relay accepted, local declaration still refuses.
+    // Relay is the only way such a row exists, which is why disclosure is the answer and rejection
+    // is not.
+    await expect(dst.declare({
+      species: "rule", stage: "rm -rf", content: "Some other deny.", severity: "blocking", ...AGENT_RULE,
+    })).rejects.toThrow(/blocking rule requires `reason`/);
+
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * EVERY SURFACE AGREES ON WHAT COUNTS AS BLANK, including the one that nearly did not.
+   *
+   * bindRule normalizes a blank to NULL locally, but graft writes the peer's value straight through,
+   * so any of these can arrive intact. The curation list once asked this question in SQL, as
+   * `TRIM(reason) = ''` — and SQLite's one-argument TRIM strips ORDINARY SPACES ONLY. A relayed
+   * "\t" therefore marked the delivered rule and the sidecar entry while the list came back EMPTY
+   * and the overview's repair section stayed suppressed: a bare deny firing, with nothing anywhere
+   * telling the human it existed. Tabs and newlines are here because that is the case two dialects'
+   * idea of whitespace disagreed on, and " " is here because it is the one they agreed on — a test
+   * that only covered the agreeing case is what let the disagreement ship.
+   */
+  for (const [label, blank] of [["tab", "\t"], ["newline", "\n"], ["one space", " "], ["several spaces", "   "]] as const) {
+    it(`treats a relayed ${label} reason as no reason, on the gate, the mirror, the list AND the view`, async () => {
+      const dir = mkTmp();
+      const path = join(dir, "gate-sidecar.json");
+      const dst = new MonetCore(":memory:", {
+        tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-b", gateSidecarPath: path,
+      });
+      const { src, conceptId } = await relayReasonlessDeny(dst, { reason: blank });
+      // Stored verbatim: graft does not normalize a peer's value, which is exactly why every READER
+      // has to ask the same question rather than trusting the column to be canonical.
+      expect(dst.ruleBinding(conceptId)!.reason).toBe(blank);
+
+      expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+      expect(dst.materializeBlockingSidecar().sidecar.entries[0]).toMatchObject({ reasonMissing: true });
+      expect(dst.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId, stageName: "rm -rf" }]);
+      const rendered = renderOverview(dst.overview("default"), { color: false });
+      expect(rendered).toContain("1 deny(s) arrived with no reason");
+      expect(rendered).toContain("rm -rf  ·  Never delete a tree unattended");
+      src.close();
+      dst.close();
+    });
+  }
+
+  /**
+   * A DENY THAT VANISHES WITH AN EXCEPTION is worse than a deny that misinforms, and it was one
+   * `UPDATE` away. SQLite stores whatever a writer hands the column, so a malformed peer could leave
+   * a NUMBER in `reason`; `hasNoReason` then called `.trim()` on it and threw, taking out the
+   * matching gate query, the sidecar rebuild and the gate-stats read together — live AND offline
+   * delivery for that rule, which is precisely the pair the mirror exists to keep independent.
+   */
+  const corruptReason = (c: MonetCore, conceptId: string, value: unknown) =>
+    raw(c).prepare(`UPDATE rule_bindings SET reason = ? WHERE concept_id = ?`).run(value, conceptId);
+
+  for (const [label, value] of [
+    ["a blob", Buffer.from([0xff, 0xfe, 0x00])],
+    ["an empty blob", Buffer.alloc(0)],
+  ] as const) {
+    it(`survives ${label} already stored in reason, on every read path, and discloses it`, async () => {
+      const dir = mkTmp();
+      const path = join(dir, "gate-sidecar.json");
+      const c = new MonetCore(":memory:", {
+        tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+      });
+      const deny = await c.declare({
+        species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+        content: "Never delete a tree unattended.", severity: "blocking",
+        reason: "there is no undo", ...AGENT_RULE,
+      });
+      if (deny.species !== "rule") throw new Error("unreachable");
+
+      // Written UNDER the write path, the way a bad row actually exists: already on disk, unsendable
+      // back. Preflight protects new arrivals; only the predicate protects what is already here.
+      corruptReason(c, deny.conceptId, value);
+
+      // THE DENY STILL FIRES. Not throwing is the whole point — a rule whose read path raises is a
+      // rule that stops governing.
+      const fired = c.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+      expect(fired.rules).toHaveLength(1);
+      expect(fired.rules[0]).toMatchObject({ severity: "blocking", reasonMissing: true });
+
+      // ...and it lands in the disclosure this branch already built for a deny that cannot explain
+      // itself. Nothing special-cases a number, because it is not a special case: it is not an
+      // explanation, so the rule has none.
+      expect(c.materializeBlockingSidecar().sidecar.entries[0]).toMatchObject({ reasonMissing: true });
+      expect(c.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
+      expect(renderOverview(c.overview("default"), { color: false })).toContain("arrived with no reason");
+      // Delivered as NULL, not as the raw value: `reason` is declared `string | null`, and handing a
+      // caller a Buffer moves the crash from this module into theirs. The mirror stays readable JSON
+      // for the same reason.
+      expect(fired.rules[0]!.reason).toBeNull();
+      expect(c.materializeBlockingSidecar().sidecar.entries[0]!.reason).toBeNull();
+      c.close();
+    });
+  }
+
+  it("treats a NUMBER in reason as the text SQLite actually stored, not as corruption", async () => {
+    const c = core();
+    const deny = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+
+    // WORTH PINNING BECAUSE IT IS COUNTERINTUITIVE, and it is the assumption that made a number look
+    // like the crash vector. The column is `reason TEXT`, and TEXT AFFINITY CONVERTS a bound number
+    // on the way in — so this row comes back as the string "42.0", not as 42. `.trim()` works, the
+    // read paths never saw it, and treating it as absent would be marking a present (if silly)
+    // reason as missing. Blobs are the values affinity does NOT convert, which is why they are the
+    // case above.
+    corruptReason(c, deny.conceptId, 42);
+    expect(c.ruleBinding(deny.conceptId)!.reason).toBe("42.0");
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+      severity: "blocking", reason: "42.0", reasonMissing: false,
+    });
+    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+    c.close();
+  });
+
+  it("lets an ordinary declaration REPAIR a corrupt reason, rather than locking the rule", async () => {
+    const c = resolvingCore();
+    const deny = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    corruptReason(c, deny.conceptId, Buffer.from([0xff, 0xfe]));
+
+    // bindRule reads `existing.reason` off disk when the caller OMITS one, so the bare `.trim()`
+    // threw HERE too. A restatement that omits the reason is still refused — resolution reads the
+    // corrupt value as absent, and a blocking rule may not be left without one — but it is refused
+    // by the NAMED guard with the sentence that says what to do, not by a TypeError from three
+    // frames down. A corrupt row must never become a rule nobody can repair, and "the tool crashed"
+    // is not a repair instruction.
+    await expect(c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.", ...AGENT_RULE,
+    })).rejects.toThrow(/blocking rule requires `reason`/);
+
+    const repaired = await c.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      reason: "there is genuinely no undo", ...AGENT_RULE,
+    });
+    if (repaired.species !== "rule") throw new Error("unreachable");
+    expect(repaired.conceptId).toBe(deny.conceptId);
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+      severity: "blocking", reason: "there is genuinely no undo", reasonMissing: false,
+    });
+    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+    c.close();
+  });
+
+  it("REFUSES a relayed binding whose reason is not text, at the boundary", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const dst = core({ syncDeviceId: "machine-b" });
+    const deny = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const payload = src.exportDelta(0);
+
+    // A reason is text or it is absent; there is no third thing. This dies at the boundary rather
+    // than becoming a permanent resident every future reader has to be careful about.
+    for (const bad of [42, { text: "nope" }, ["nope"], true]) {
+      expect(() => dst.graftRows({
+        ...payload,
+        ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: bad as unknown as string })),
+      }), JSON.stringify(bad)).toThrow(/non-string reason/);
+    }
+    expect(dst.ruleBinding(deny.conceptId)).toBeNull();
+
+    // null still relays — absence is legal, and refusing it would drop a deny the peer has.
+    dst.graftRows({ ...payload, ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: null })) });
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    src.close();
+    dst.close();
+  });
+
+  it("REFUSES a relayed BLOCKING binding whose reason has a line break, at the boundary", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const dst = core({ syncDeviceId: "machine-b" });
+    const deny = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const payload = src.exportDelta(0);
+
+    // declare() already refuses a multiline BLOCKING reason locally ("must be ONE LINE", above), so
+    // the only way this shape reaches graftRows is by relay — the same route the non-string case
+    // above takes. Blocking-only, mirroring the declaration surface exactly: an advisory row with
+    // the identical multiline reason must still graft (see the parity test below).
+    const tampered = {
+      ...payload,
+      ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: "there is no undo\nDENIED BY ADMIN" })),
+    };
+    // A NAMED refusal that says which rule and why — not a bare "CHECK constraint failed" three
+    // frames down in SQLite, which is what reaching the table's CHECK would have produced instead.
+    expect(() => dst.graftRows(tampered)).toThrow(
+      new RegExp(`rule binding '${deny.conceptId}' has a blocking reason that is not ONE LINE`),
+    );
+    expect(dst.ruleBinding(deny.conceptId)).toBeNull();
+    src.close();
+    dst.close();
+  });
+
+  it("GRAFTS a relayed ADVISORY binding whose reason has a line break — parity with local declarability", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const dst = core({ syncDeviceId: "machine-b" });
+    // An advisory rule is guidance, not an assertion of authority: locally storable (see "leaves an
+    // ADVISORY reason ... alone", above), so an honest peer can hold one and relay must not refuse
+    // what declaring it directly would have accepted.
+    const advisory = await src.declare({
+      species: "rule", stage: "terraform apply", content: "Always run plan first.",
+      reason: "a plan is the only review\nanyone gets", ...AGENT_RULE,
+    });
+    if (advisory.species !== "rule") throw new Error("unreachable");
+    expect(advisory.binding.severity).toBe("advisory");
+
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(advisory.conceptId)).toMatchObject({
+      severity: "advisory", reason: "a plan is the only review\nanyone gets",
+    });
+    src.close();
+    dst.close();
+  });
+
+  it("leaves an ORPHANED binding out of the deny list, because it is not a deny that can fire", async () => {
+    const dst = core({ syncDeviceId: "machine-b" });
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+
+    // A binding with NO STAGE — the incremental graft that omits the stage row, which graftRows
+    // documents as landing a binding that never fires. Reasonless too, so it would qualify for the
+    // list on every count except the one that matters.
+    const payload = src.exportDelta(0);
+    dst.graftRows({
+      ...payload,
+      stages: [],
+      ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: null })),
+    });
+    expect(dst.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", reason: null });
+
+    // DELIVERY says it does not exist...
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
+    expect(dst.materializeBlockingSidecar(join(mkTmp(), "s.json")).sidecar.entries).toEqual([]);
+    // ...so DISCLOSURE must not say it does. Naming it here told the user to redeclare a rule whose
+    // redeclaration would CREATE the missing stage and change what the store does — a repair queue
+    // giving advice that alters behaviour rather than restoring it.
+    expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("arrived with no reason");
+
+    // And once the stage lands, the SAME binding is a live reasonless deny on every surface at once.
+    dst.graftRows(payload);
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+    expect(dst.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
+    src.close();
+    dst.close();
+  });
+
+  it("does NOT mark a reason that merely contains whitespace around real words", async () => {
+    const dst = core({ syncDeviceId: "machine-b" });
+    // The predicate asks "is there nothing here", not "is there whitespace here". A padded reason is
+    // a reason: it renders, it explains the deny, and marking it would put a rule on the repair
+    // queue that has nothing to repair.
+    const { src, conceptId } = await relayReasonlessDeny(dst, { reason: "  there is no undo  " });
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({
+      reason: "  there is no undo  ", reasonMissing: false,
+    });
+    expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
+    expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("arrived with no reason");
+    expect(conceptId).toBeTruthy();
+    src.close();
+    dst.close();
+  });
+
+  it("REPAIRS a relayed reasonless deny through an ordinary local declaration", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const dst = new MonetCore(":memory:", { syncDeviceId: "machine-b", gateSidecarPath: path });
+    const { src, conceptId } = await relayReasonlessDeny(dst);
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
+
+    // No migration and no backfill: the repair is a human stating the sentence they owe, through
+    // the same declaration surface as any other. `resolvingCore`-style resolution lands it on the
+    // relayed concept because the content is identical.
+    const repaired = await dst.declare({
+      species: "rule", stage: "rm -rf", content: "Never delete a tree unattended.",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (repaired.species !== "rule") throw new Error("unreachable");
+    expect(repaired.conceptId).toBe(conceptId);
+
+    // Severity was never named and is preserved — the repair supplies the reason WITHOUT the human
+    // having to re-assert deny power they never withdrew.
+    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    expect(fired.rules[0]).toMatchObject({
+      severity: "blocking", reason: "there is no undo", reasonMissing: false,
+    });
+    expect(dst.materializeBlockingSidecar().sidecar.entries[0]).toMatchObject({
+      reason: "there is no undo", reasonMissing: false,
+    });
+    expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
+    src.close();
+    dst.close();
+  });
+
+  it("NAMES the reasonless deny in the rendered curation view, on a store nobody has asked", async () => {
+    const dst = core({ syncDeviceId: "machine-b" });
+    const { src } = await relayReasonlessDeny(dst);
+
+    // NOT ONE GATE QUERY, and no dead patterns — so every condition that normally brings the GATES
+    // section into view is false. That is exactly the store where nobody finds this on their own,
+    // which is why the list joins the suppression condition rather than riding inside it. The
+    // section's own comment is the standard being met here: a JSON field on the MCP response does
+    // not discharge a disclosure whose whole purpose is that a human sees it.
+    const ov = dst.overview("default");
+    expect(ov.gateStats).toMatchObject({ windowTotal: 0 });
+    expect(ov.gateStats!.unexplainedDenies).toHaveLength(1);
+    const rendered = renderOverview(ov, { color: false });
+    expect(rendered).toContain("GATES");
+    expect(rendered).toContain("1 deny(s) arrived with no reason");
+    // Named as a repair with the actual next action, not as an alarm: these denies are working, and
+    // only a human can supply what is missing.
+    expect(rendered).toContain("declare the same rule with a reason to repair");
+    // THE RULE ITSELF, on the line: the stage to declare at and the text to declare. A disclosure
+    // whose purpose is repair has to say what to repair, or it is an alarm wearing its clothes.
+    expect(rendered).toContain("rm -rf  ·  Never delete a tree unattended");
+    // ...and the ID, so the exact rule can be FETCHED before it is redeclared. Titles are a concept's
+    // first line, not its content, and nothing makes them unique — repairing by title alone is how
+    // somebody fixes the wrong rule. Leads the row so truncation can never take it.
+    const conceptId = dst.gateStats("default").unexplainedDenies[0]!.conceptId;
+    expect(rendered).toContain(`[${conceptId.slice(0, 8)}] rm -rf  ·  Never delete a tree unattended`);
+    src.close();
+    dst.close();
+  });
+
+  it("summarizes rather than becoming a wall of text when many denies arrive unexplained", async () => {
+    const dst = core({ syncDeviceId: "machine-b" });
+    const src = core({ syncDeviceId: "machine-a" });
+    // Seven, against a cap of five. The population is small BY CONSTRUCTION — local creation is
+    // refused, so every one of these arrived by relay — but "small by construction" is an argument,
+    // not a guarantee, and a curation view people stop reading discloses nothing.
+    for (let i = 0; i < 7; i++) {
+      await src.declare({
+        species: "rule", stage: `gate-${i}`, patterns: [`Bash:tool${i} run`],
+        content: `Never run tool ${i} unattended.`, severity: "blocking",
+        reason: "there is no undo", ...AGENT_RULE,
+      });
+    }
+    const payload = src.exportDelta(0);
+    dst.graftRows({ ...payload, ruleBindings: payload.ruleBindings!.map((b) => ({ ...b, reason: null })) });
+
+    const stats = dst.gateStats("default");
+    expect(stats.unexplainedDenies).toHaveLength(7);
+    const rendered = renderOverview(dst.overview("default"), { color: false });
+    // The HEADER carries the true total — capping shortens the view, and must never understate the
+    // population, which is the one thing this disclosure cannot afford to do.
+    expect(rendered).toContain("7 deny(s) arrived with no reason");
+    expect(rendered).toContain("gate-0  ·  Never run tool 0 unattended");
+    expect(rendered).toContain("gate-4  ·  Never run tool 4 unattended");
+    expect(rendered).not.toContain("gate-5  ·");
+    expect(rendered).toContain("… and 2 more");
+    // Every named row is fetchable, not just the first — the id is part of the row shape rather
+    // than a decoration on the example.
+    for (const ud of stats.unexplainedDenies.slice(0, 5)) {
+      expect(rendered, ud.conceptId).toContain(`[${ud.conceptId.slice(0, 8)}] ${ud.stageName}`);
+    }
+
+    // AND IT SURVIVES A NARROW TERMINAL. At width 40 the titles are cut to nothing, which is exactly
+    // when a trailing id would have been the first thing lost — the case that made placement a
+    // correctness question rather than a style one.
+    const narrow = renderOverview(dst.overview("default"), { color: false, width: 40 });
+    expect(narrow).toContain(`[${stats.unexplainedDenies[0]!.conceptId.slice(0, 8)}]`);
+    src.close();
+    dst.close();
+  });
+
+  it("marks NOTHING when the reason is present, or when a reasonless rule is merely advisory", async () => {
+    const c = core();
+    // An advisory rule with no reason is the ordinary case, not a broken promise — marking it would
+    // bury the one population a caller has to say something about.
+    await c.store("Pull before you push.", { kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE } });
+    expect(c.gate({ actionContext: "Bash:git push" }).rules[0]).toMatchObject({
+      severity: "advisory", reason: null, reasonMissing: false,
+    });
+    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+
+    // ...and an ordinary deny, declared properly, is never marked either.
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: false });
+    expect(c.gateStats("default").unexplainedDenies).toEqual([]);
+    c.close();
+  });
+
   it("REFUSES a relayed binding that claims blocking without a declaration origin", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
@@ -1227,7 +2006,7 @@ describe("deny power cannot be removed by accident", () => {
     // Sovereignty runs both ways: the upgrade path is unchanged and reports no downgrade.
     const restored = await c.declare({
       species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
-      severity: "blocking", ...AGENT_RULE,
+      severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (restored.species !== "rule") throw new Error("unreachable");
     expect(restored.binding.severity).toBe("blocking");
@@ -1264,7 +2043,7 @@ describe("deny power cannot be removed by accident", () => {
     const c = resolvingCore();
     const declared = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (declared.species !== "rule") throw new Error("unreachable");
 
@@ -1402,7 +2181,7 @@ describe("deny power cannot be removed by accident", () => {
     await c.store("Never delete a directory tree unattended.", { circle: "target", kind: "fact" });
     const deny = await c.declare({
       circle: "origin", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a directory tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "origin" }).rules).toHaveLength(1);
@@ -1479,26 +2258,35 @@ describe("the robustness tail", () => {
     c.close();
   });
 
-  it("refuses to replace a sidecar that is already at or ahead of what we are writing", async () => {
+  it("OVERWRITES a sidecar whose generation is ahead of what we are writing, same-store or foreign", async () => {
     const dir = mkTmp();
     const path = join(dir, "gate-sidecar.json");
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
     await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     const current = read(path);
 
-    // rename() is atomic, but atomic is not ordered: a racing writer can land an OLDER snapshot on
-    // top of a newer one, and its generation then sits in the header claiming to be current — worse
-    // than staleness, because inspectSidecar would agree with it.
+    // rename() is atomic, but atomic is not ordered — that motivates COMPARING before replacing, not
+    // preserving whatever is already there. Multi-process is the shipped topology (WAL + busy_timeout,
+    // set in storage.ts's own constructor precisely so the MCP server and a `monet` CLI call can share
+    // one `.monet` DB), so a racing newer writer publishing between another call's snapshot and its
+    // rename is real, not theoretical — see materializeBlockingSidecar's own comment and the dedicated
+    // race test in "the sidecar generation contract" below, which pins THAT half. HERE, nothing else
+    // is mutating: the fabricated file is ahead of the store's CURRENT generation too, with no
+    // legitimate writer behind it, so it is debris of an abandoned lineage (a restore or a rollback) —
+    // the same event class as the foreign case below — and it is overwritten.
     const newer = { ...current, generation: current.generation + 5, entries: [] };
     writeFileSync(path, JSON.stringify(newer), "utf8");
-    c.materializeBlockingSidecar(path);
-    expect(read(path).generation).toBe(current.generation + 5); // not clobbered
-    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]);    // and no temp file left behind
+    const result = c.materializeBlockingSidecar(path);
+    expect(result.outcome).toBe("written");
+    expect(read(path).generation).toBe(current.generation); // the store's own count, not the fabricated one
+    expect(read(path).entries).toHaveLength(1);              // the store's real deny, not the fabricated empty set
+    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]);  // and no temp file left behind
 
-    // A file from ANOTHER store is not ours to defer to, however high its number.
+    // A file from ANOTHER store is not ours to defer to either, however high its number — identity
+    // already gated the preservation rule before generation did, and still does.
     writeFileSync(path, JSON.stringify({ ...newer, storeIdentity: "machine-b" }), "utf8");
     c.materializeBlockingSidecar(path);
     expect(read(path).storeIdentity).toBe("machine-a");
@@ -1512,7 +2300,7 @@ describe("the robustness tail", () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, defaultCircle: "proj" });
     const deny = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     expect(read(path).entries[0]!.circle).toBe("proj");
@@ -1587,7 +2375,7 @@ describe("receipt replay", () => {
     const c = resolvingCore();
     await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     const downgrade = await c.store("Never delete a tree unattended.", {
       kind: "rule", operationId: "op-downgrade-1",
@@ -1795,7 +2583,7 @@ describe("the chokepoint: every door is a call site", () => {
     });
     const deny = await src.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     dst.graftRows(src.exportDelta(0));
@@ -1880,7 +2668,8 @@ describe("the sidecar generation contract", () => {
     // 1. a blocking binding appears
     const deny = await c.declare({
       species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
-      content: "Never apply without a plan review.", severity: "blocking", ...AGENT_RULE,
+      content: "Never apply without a plan review.", severity: "blocking",
+      reason: "an unreviewed apply changes infrastructure nobody agreed to change", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     const afterDeclare = at();
@@ -1926,14 +2715,14 @@ describe("the sidecar generation contract", () => {
     const c = core({ circle: "proj" });
     const deny = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     const before = c.sidecarGeneration();
     c.renameCircle("proj", "project-renamed");
     expect(c.sidecarGeneration()).toBe(before + 1);
     // The mirror names each rule's circle, so the rename really did change the file's content.
-    expect(c.materializeBlockingSidecar(join(mkTmp(), "s.json")).entries[0]!.circle).toBe("project-renamed");
+    expect(c.materializeBlockingSidecar(join(mkTmp(), "s.json")).sidecar.entries[0]!.circle).toBe("project-renamed");
 
     const successor = await c.store("A replacement rule.", {
       circle: "project-renamed", kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
@@ -1957,13 +2746,21 @@ describe("the sidecar generation contract", () => {
     const path = join(dir, "gate-sidecar.json");
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
 
+    // Opening the store with a path configured LEAVES A USABLE MIRROR, before any rule exists. An
+    // empty entries array is the correct mirror of a store with nothing blocking, and is what makes
+    // the hook's "no file at all" case mean what it says.
+    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
+    expect(read(path).entries).toEqual([]);
+
     // MISSING is stale — the hook's question is "can I trust this to decide a deny", and for a file
-    // that is not there the answer is no.
+    // that is not there the answer is no. Removed by hand now that construction no longer leaves the
+    // path empty; the contract it pins is unchanged.
+    rmSync(path);
     expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "missing", fileGeneration: null });
 
     const deny = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     expect(read(path).generation).toBe(c.sidecarGeneration());
@@ -1993,13 +2790,423 @@ describe("the sidecar generation contract", () => {
     c.close();
   });
 
+  /**
+   * THE FORMAT BUMP HAS TO REACH DISK, or it is worse than not bumping at all.
+   *
+   * A version number that a reader honours and a writer ignores is how "defensive" turns into an
+   * outage: the hook rejects a shape it cannot parse — correctly — while nothing on the writing side
+   * ever replaces the file, so offline blocking is simply gone until an unrelated mutation happens
+   * to move the generation counter. The generation compare was right about vintage and wrong to be
+   * the only comparison.
+   */
+  const withDeny = async (path: string) => {
+    const c = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+    });
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    return c;
+  };
+
+  it("calls a mirror of the WRONG SHAPE stale, however current its generation and identity look", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+
+    // The upgraded install, exactly: same store, same generation, previous entry shape. Every check
+    // that existed before this one passes — which is what made the failure quiet.
+    const current = read(path);
+    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({
+      stale: true, reason: "format", fileFormat: 2, format: 3, fileGeneration: current.generation,
+    });
+
+    // A v1 file predates the field entirely. Not ours either, and it says so with fileFormat null
+    // rather than by being lumped in with unparseable junk.
+    const { format: _dropped, ...noFormat } = current;
+    writeFileSync(path, JSON.stringify(noFormat), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "format", fileFormat: null });
+    c.close();
+  });
+
+  /**
+   * A FRACTIONAL FORMAT IS MALFORMED, NOT A FUTURE FORMAT TO DEFER TO. Format versions are discrete —
+   * there is no meaning between format 3 and format 4 — so `3.5` is not "a number ahead of ours",
+   * it is a corrupt header. Before this fix it classified exactly like a genuine future build's file:
+   * `format-ahead` here, and `skipped-format-ahead` forever from materializeBlockingSidecar, preserved
+   * on the promise of an upgrade that would never arrive, since no build — past or future — will ever
+   * actually write format 3.5. Same permanent-strand shape as the round-9 generation finding, one
+   * field over.
+   */
+  it("treats a FRACTIONAL format as malformed, not as a future format to defer to", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path);
+
+    const fractional = { ...current, format: 3.5 };
+    writeFileSync(path, JSON.stringify(fractional), "utf8");
+    // NOT format-ahead: the whole header is rejected at the read seam, so this is indistinguishable
+    // from any other structurally-wrong file — same reason, same fileGeneration: null.
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+
+    const result = c.materializeBlockingSidecar();
+    expect(result.outcome).toBe("written"); // regenerated, not preserved as an unreadable "future" shape
+    expect(read(path).format).toBe(3);
+    expect(read(path).entries).toHaveLength(1);
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  it("REWRITES a stale-shaped mirror even though the generation has not moved", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path);
+
+    // Downgrade the file in place and change nothing else. Before format joined the replace
+    // decision, the skip-if-not-newer guard fired here and the v2 artifact survived indefinitely.
+    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    expect(c.sidecarGeneration()).toBe(current.generation); // nothing about the store has changed
+
+    c.materializeBlockingSidecar();
+    expect(read(path).format).toBe(3);
+    expect(read(path).entries[0]).toMatchObject({ reasonMissing: false });
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  it("REFUSES to overwrite a mirror written by a build AHEAD of this one, and names the skew", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path);
+
+    // A format we do not speak, from a writer we cannot second-guess. Declining is not about losing
+    // data — the mirror is derived and either build can regenerate it — it is about THRASH: if an
+    // older build clobbered forward-format files, two installs sharing a path would each overwrite
+    // the other on every invocation and both hooks would fail unreproducibly. Declining makes the
+    // failure deterministic and attributable to the install that needs upgrading.
+    const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
+    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
+
+    c.materializeBlockingSidecar();
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture); // untouched, byte for byte
+
+    // ...and NOT a silent no-op: the operator asking gets the direction of the skew, not just "bad".
+    expect(c.isSidecarStale()).toMatchObject({
+      stale: true, reason: "format-ahead", fileFormat: 99, format: 3,
+    });
+    c.close();
+  });
+
+  it("OVERWRITES a forward-format mirror that belongs to a different store", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path);
+
+    // Same unreadable future format as above — but somebody else's. The thrash argument needs two
+    // installs sharing a path for the SAME store; a foreign file is not the other half of a thrash
+    // pair, it is debris a restore left in our directory. Deferring to it would defer to a file we
+    // have already decided we cannot read, and the skip repeats forever — so this store would never
+    // get an offline deny at all, which is the failure the mirror exists to prevent.
+    const somebodyElses = {
+      ...current, format: 99, storeIdentity: "a-different-store-entirely",
+      entries: [{ somethingWeCannotRead: true }],
+    };
+    writeFileSync(path, JSON.stringify(somebodyElses), "utf8");
+
+    c.materializeBlockingSidecar();
+
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(after.format).toBe(3);
+    expect(after.storeIdentity).toBe(current.storeIdentity);
+    expect(after.entries).toHaveLength(1); // our deny, back on disk
+    expect(c.isSidecarStale()).toMatchObject({ stale: false });
+    c.close();
+  });
+
+  /**
+   * OPENING THE STORE IS THE REPAIR TRIGGER, because an upgrade is the one event that invalidates
+   * the mirror without touching the store. Every other refresh site is a MUTATION site, so
+   * detection alone left the hook rejecting a file that nothing regenerated: offline blocking
+   * unavailable until some unrelated gate-affecting write happened to occur.
+   */
+  it("REGENERATES a wrong-shaped mirror when the store is merely OPENED, with no write at all", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const first = await withDeny(path);
+    const current = read(path);
+    first.close();
+
+    // The upgrade, exactly: the file on disk is the previous shape, and nothing about the store has
+    // changed or is about to. Before this, the next reader was a v3 hook rejecting a v2 file.
+    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+
+    const reopened = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+    });
+    // NOT a declaration, NOT a gate, NOT a graft — the constructor returning is the whole event.
+    expect(read(path).format).toBe(3);
+    expect(reopened.isSidecarStale().stale).toBe(false);
+    reopened.close();
+  });
+
+  /**
+   * A WRITER THAT SAYS IT WROTE WHEN IT DID NOT is the same lie this module spends its length
+   * preventing everywhere else. materializeBlockingSidecar returned the freshly generated,
+   * current-format sidecar whatever happened — so a DECLINED write was indistinguishable from a
+   * successful one, and install or recovery tooling reported "mirror regenerated" over a file its
+   * own hook rejects. The artifact it hands back is what it GENERATED; the outcome is what reached
+   * disk, and only the caller can be trusted to know the difference matters.
+   */
+  it("reports skipped-format-ahead rather than claiming it wrote the mirror it declined", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path);
+    const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
+    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
+
+    const result = c.materializeBlockingSidecar();
+    expect(result.outcome).toBe("skipped-format-ahead");
+    // The generated mirror is still handed back — it is what WOULD have been written, and reading
+    // it is legitimate. What is no longer possible is mistaking it for the file on disk.
+    expect(result.sidecar.format).toBe(3);
+    expect(result.sidecar.entries).toHaveLength(1);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture);
+    // The two agree, which is the property that makes either one safe to act on.
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "format-ahead" });
+    c.close();
+  });
+
+  it("distinguishes a genuine no-op from a declined write, because they are not the same news", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+
+    // Nothing has changed since the declaration auto-refreshed the file, so it already says what we
+    // would say. The mirror is FINE — this is the one skip a caller may treat as success, and the
+    // reason the two skips needed separate names rather than a single boolean.
+    const noop = c.materializeBlockingSidecar();
+    expect(noop.outcome).toBe("skipped-current");
+    expect(c.isSidecarStale().stale).toBe(false);
+
+    // Recovery after the file is lost — the other documented reason this method is public. Here the
+    // write really happens, and "written" is what entitles the caller to report a repaired mirror.
+    rmSync(path);
+    const written = c.materializeBlockingSidecar();
+    expect(written.outcome).toBe("written");
+    expect(written.sidecar.entries).toHaveLength(1);
+    expect(read(path).entries).toHaveLength(1);
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  /**
+   * AHEAD OF OUR SNAPSHOT IS AMBIGUOUS ON ITS OWN — rollback debris and a legitimate racing writer
+   * produce the identical shape (same store, same format, `existing.generation > sidecar.generation`)
+   * and only a fresh read of the store's CURRENT generation tells them apart. See
+   * materializeBlockingSidecar's own comment for the full split. This pins the ROLLBACK half: no
+   * concurrent writer exists in this test, so the fabricated file is ahead of the store's CURRENT
+   * generation too, not merely ahead of what this call snapshotted — the only shape that is genuinely
+   * debris of an abandoned lineage. Before this fix, `existing.generation >= sidecar.generation`
+   * treated EVERY ahead file this way, race included: refresh became a permanent no-op, and explicit
+   * recovery reported `skipped-current` for a mirror that was, in truth, still serving an abandoned
+   * deny set. The RACE half is pinned by the sibling test below.
+   */
+  it("OVERWRITES a same-store, same-format mirror whose generation is ahead of the store's CURRENT generation (rollback, not a race)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path);
+
+    // Same store, same format — only the generation is wrong, and wrong in the direction that used
+    // to earn deference. Entries are wiped too, so a wrongly-preserved file would be caught either
+    // way: by the generation number staying too high, or by the deny silently disappearing.
+    const fromABackward = { ...current, generation: current.generation + 7, entries: [] };
+    writeFileSync(path, JSON.stringify(fromABackward), "utf8");
+    // PINS "ahead of CURRENT", not just "ahead of the old snapshot": nothing mutates the store between
+    // this line and the call below, so the store's live generation is still exactly `current.generation`
+    // — the fabricated file is ahead of THAT, which is what makes it rollback debris rather than a race.
+    expect(c.sidecarGeneration()).toBe(current.generation);
+
+    const result = c.materializeBlockingSidecar();
+    expect(result.outcome).toBe("written");
+    expect(read(path).generation).toBe(current.generation); // the store's own count, not the stale-ahead one
+    expect(read(path).entries).toHaveLength(1); // the store's real deny is back, not the fabricated empty set
+    // Not just overwritten — CURRENT afterward, which is the property recovery tooling relies on.
+    expect(c.isSidecarStale()).toMatchObject({ stale: false, generation: current.generation });
+    c.close();
+  });
+
+  /**
+   * THE RACE HALF of the same ambiguity, pinned separately because it is a DIFFERENT event with a
+   * DIFFERENT correct outcome, even though the snapshot alone cannot distinguish it from the rollback
+   * test above. Nothing here is fabricated except the ordering: a second declaration really does bump
+   * the store and really does refresh the file to the true, current generation — that IS what "a
+   * legitimate newer writer of this lineage published" looks like on disk. What cannot be reproduced
+   * honestly on one thread is a call whose OWN internal snapshot started before that write landed, so
+   * that one piece — and only that piece — is forced back to the stale value, via the same
+   * db.prepare interception the "instrumentation write cannot land" test above already uses.
+   */
+  it("does NOT overwrite a mirror a legitimate newer writer already published — skips as SUPERSEDED", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+    });
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    const staleSnapshot = c.sidecarGeneration();
+
+    // The winning writer. Real bump, real refresh — no doctored generation number anywhere here.
+    await c.declare({
+      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
+      content: "Never apply without a plan review.", severity: "blocking",
+      reason: "an unreviewed apply changes infrastructure nobody agreed to change", ...AGENT_RULE,
+    });
+    const wonTheRace = read(path);
+    expect(wonTheRace.generation).toBeGreaterThan(staleSnapshot);
+    expect(c.sidecarGeneration()).toBe(wonTheRace.generation);
+
+    // The losing call. Force ONLY its own opening snapshot back to the stale value; everything
+    // downstream is real, including the fresh generation read the fix under test performs at decision
+    // time — which is what has to see the TRUE, advanced generation for this test to mean anything.
+    const db = raw(c) as unknown as { prepare: (sql: string) => unknown };
+    const original = db.prepare.bind(db);
+    let genReads = 0;
+    db.prepare = (sql: string) => {
+      if (sql.includes("FROM gate_meta")) {
+        genReads += 1;
+        if (genReads === 1) return { get: () => ({ generation: staleSnapshot }) };
+      }
+      return original(sql);
+    };
+    let result: SidecarMaterialization;
+    try {
+      result = c.materializeBlockingSidecar();
+    } finally {
+      db.prepare = original;
+    }
+
+    expect(result.outcome).toBe("skipped-superseded");
+    expect(read(path)).toEqual(wonTheRace); // untouched, byte for byte — the winner's file survives
+    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]); // no temp file left behind either
+    expect(c.isSidecarStale().stale).toBe(false); // still current: the winner was right all along
+    c.close();
+  });
+
+  it("leaves a mirror from a NEWER build alone on open, rather than thrashing it every time", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const first = await withDeny(path);
+    const current = read(path);
+    first.close();
+
+    // The one skew we decline. If opening rewrote it, two installs sharing a path would clobber each
+    // other on every open — which is the failure the forward-format rule exists to avoid, and an
+    // open-time trigger is exactly what would make it constant rather than occasional.
+    //
+    // This is a REGRESSION GUARD on the new trigger, not a pin on the rule itself: the rule is
+    // pinned below by "REFUSES to overwrite a mirror written by a build AHEAD of this one", which is
+    // the test that fails if materializeBlockingSidecar's guard is removed. This one fails if the
+    // open-time path ever starts bypassing it.
+    const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
+    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
+
+    const reopened = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+    });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture); // untouched, byte for byte
+    expect(reopened.isSidecarStale()).toMatchObject({ stale: true, reason: "format-ahead" });
+    // No tmp debris either: declining happens before the write, not by writing and unlinking.
+    expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]);
+    reopened.close();
+  });
+
+  it("never lets a broken sidecar path fail the CONSTRUCTOR", () => {
+    const dir = mkTmp();
+    // The path's parent is a FILE, so every write against it fails. Opening a store must still
+    // succeed: a mirror that cannot be written is a condition isSidecarStale reports, never a reason
+    // somebody's store will not open.
+    writeFileSync(join(dir, "notadir"), "i am a file", "utf8");
+    const path = join(dir, "notadir", "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "missing" });
+    c.close();
+  });
+
+  it("does NOT write the mirror on open in report-only mode, however stale the file is", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const first = await withDeny(path);
+    const current = read(path);
+    first.close();
+    // A file the served runtime would rewrite on sight — so if report-only mode writes at all, it
+    // writes here.
+    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+
+    // `deferCreatedPin` is the EXISTING declaration that this caller is inspection or dry-run
+    // tooling which must never write anything — the same flag that already stops a pin being minted.
+    // Opening a store to LOOK at it must not mutate the installation being looked at.
+    const inspector = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+      deferCreatedPin: true,
+    });
+    expect(read(path).format).toBe(2);
+    // It can still SAY the mirror is stale — reporting is what this mode is for.
+    expect(inspector.isSidecarStale()).toMatchObject({ stale: true, reason: "format" });
+    // And an EXPLICIT call is the caller asking, which the suppression does not countermand.
+    expect(inspector.materializeBlockingSidecar().outcome).toBe("written");
+    expect(read(path).format).toBe(3);
+    inspector.close();
+
+    // The served runtime, for contrast: same file, same staleness, repaired by opening.
+    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    const served = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+    });
+    expect(read(path).format).toBe(3);
+    served.close();
+  });
+
+  it("creates no mirror at all on a first open in report-only mode", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    // The sharper case: nothing exists yet, so the automatic refresh would CREATE the artifact.
+    // Inspection tooling pointed at a path must not bring the file into being.
+    const inspector = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, deferCreatedPin: true,
+    });
+    expect(existsSync(path)).toBe(false);
+    expect(inspector.isSidecarStale()).toMatchObject({ stale: true, reason: "missing" });
+    inspector.close();
+  });
+
+  it("costs nothing on a store with no sidecar path — construction touches no filesystem", () => {
+    const dir = mkTmp();
+    // The opt-in is the whole cost control: a store nobody wired a hook to must not write into
+    // anyone's directory just because it was constructed.
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    expect(readdirSync(dir)).toEqual([]);
+    expect(() => c.isSidecarStale()).toThrow(/needs a path/);
+    c.close();
+  });
+
   it("auto-re-materializes from every mutation point when a path is configured", async () => {
     const dir = mkTmp();
     const path = join(dir, "gate-sidecar.json");
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
     const deny = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     expect(read(path).entries).toHaveLength(1);
@@ -2021,7 +3228,7 @@ describe("the sidecar generation contract", () => {
     const mine = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
     await mine.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     expect(mine.isSidecarStale().stale).toBe(false);
 
@@ -2032,7 +3239,8 @@ describe("the sidecar generation contract", () => {
     const theirs = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-b" });
     await theirs.declare({
       species: "rule", stage: "other gate", patterns: ["Bash:other"],
-      content: "A rule from another store entirely.", severity: "blocking", ...AGENT_RULE,
+      content: "A rule from another store entirely.", severity: "blocking",
+      reason: "it cannot be undone", ...AGENT_RULE,
     });
     // Same generation number on both sides, different stores.
     expect(theirs.sidecarGeneration()).toBe(mine.sidecarGeneration());
@@ -2051,7 +3259,7 @@ describe("the sidecar generation contract", () => {
     });
     const deny = await src.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     const payload = src.exportDelta(0);
@@ -2082,7 +3290,7 @@ describe("the sidecar generation contract", () => {
     });
     await src.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a tree unattended.", severity: "blocking", ...AGENT_RULE,
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
     });
     const before = dst.sidecarGeneration();
     dst.graftRows(src.exportDelta(0));
@@ -2308,7 +3516,8 @@ describe("MCP surface", () => {
 
     const declared = await call("memory_declare", {
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
-      content: "Never delete a directory tree unattended.", severity: "blocking", declaredBy: "john",
+      content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
+      declaredBy: "john",
     });
     expect(declared.isError).toBe(false);
     expect(declared.json).toMatchObject({ species: "rule" });
@@ -2388,6 +3597,25 @@ describe("MCP surface", () => {
       supersededRuleId: stored.json.conceptId,
       successorRuleId: corrected.json.conceptId,
     });
+    await client.close();
+    c.close();
+  });
+
+  it("hands back the missing-reason refusal as a tool error, not a raw throw", async () => {
+    const c = core();
+    const { call, client } = await harness(c, { modelTag: "host-supplied-model" });
+    // The agent has to be able to ACT on this, and the action is to go ask the user what the deny
+    // prevents. An isError response puts the sentence in the transcript where that can happen; a
+    // raw throw surfaces as a protocol failure, which reads as "the tool is broken" rather than
+    // "you left out the one field this rule is required to carry".
+    const r = await call("memory_declare", {
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a directory tree unattended.", severity: "blocking",
+    });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/blocking rule requires `reason`/);
+    // And the refusal was total: no stage was addressed, so nothing fires.
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
     await client.close();
     c.close();
   });
