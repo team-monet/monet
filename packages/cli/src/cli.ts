@@ -10,6 +10,8 @@ import { printStoreLine, registerSourceCommands, SourceCliError } from "./source
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openSourceCore, openStatusCore } from "./bootstrap.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
+import { registerGateCommands } from "./gate-cli.js";
+import { resolveProjectDir } from "./project-dir.js";
 
 // Read version from package.json so it can never drift from the published version.
 // esbuild inlines the import.meta.url-relative path at bundle time; the bundled
@@ -18,15 +20,6 @@ const _require = createRequire(import.meta.url);
 const { version } = _require("../package.json") as { version: string };
 
 const program = new Command();
-
-// Resolve the project directory this invocation is serving. Prefer an explicit override over
-// cwd — a host may spawn `monet` from elsewhere (Claude Code sets CLAUDE_PROJECT_DIR for stdio
-// MCP servers and documents that servers shouldn't rely on cwd). Shared by the `start` action,
-// the `config` command (so a generated config pins the project the config was made for — see
-// config-cli.ts), and the source commands.
-function resolveProjectDir(): string {
-  return path.resolve(process.env.MONET_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd());
-}
 
 program
   .name("monet")
@@ -164,6 +157,7 @@ registerSourceCommands(program, {
 });
 
 registerRecoveryCommands(program);
+registerGateCommands(program);
 
 void program.parseAsync().catch((error: unknown) => {
   if (error instanceof FreshStoreEmbedderUnavailableError) {
