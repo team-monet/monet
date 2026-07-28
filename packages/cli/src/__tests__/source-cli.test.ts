@@ -166,9 +166,11 @@ describe("source CLI", () => {
     await run(["source", "add", "./default-selection"]);
     await run(["source", "add", "./explicit-selection", "--include", "README.md"]);
 
-    const [first, second] = inspect((core) => core.listSources());
-    expect(first).toMatchObject({ include: ["**/*.md"], autoDetect: false });
-    expect(second).toMatchObject({ include: ["README.md"], autoDetect: false });
+    // Keyed by name, not array position: both sources register within the same timestamp
+    // granularity, so listSources() returns them in an unstable order.
+    const byName = new Map(inspect((core) => core.listSources()).map((source) => [source.name, source]));
+    expect(byName.get("default-selection")).toMatchObject({ include: ["**/*.md"], autoDetect: false });
+    expect(byName.get("explicit-selection")).toMatchObject({ include: ["README.md"], autoDetect: false });
   });
 
   it("infers HTTPS remote details and accepts an explicit name and exact ACL/transport overrides", async () => {
