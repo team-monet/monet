@@ -107,8 +107,10 @@ export type {
   RecordRatificationInput,
 } from "./lifecycle-edges";
 /** The gate substrate: stages, rule bindings, and the deterministic firing path. The pattern
- *  matcher is exported deliberately — the host-side hook that reads the blocking sidecar has to
- *  match with the SAME code the store matches with, or the offline deny and the live deny disagree. */
+ *  matcher is exported deliberately — the host-side CLI that reads the gate mirror has to match
+ *  with the SAME code the store matches with, or the offline answer and the live answer disagree.
+ *  `evaluateGateFromMirror` is that offline answer itself: the pure, no-db evaluator a 4b-C CLI
+ *  stands on. */
 export {
   GATE_SCHEMA_SQL,
   MODEL_TAG_MAX_CHARS,
@@ -123,26 +125,28 @@ export {
   STAGE_NAME_MAX_CHARS,
   STAGE_ORIGINS,
   COMMAND_BOUNDARY,
+  GATE_MIRROR_FORMAT,
   assertNoUnacknowledgedDenies,
   bumpGateGeneration,
-  circleHasBlockingRule,
   clampActionContext,
   createGateSchema,
   formatTriggerPattern,
   commitGateWrites,
   evaluateGate,
+  evaluateGateFromMirror,
   evaluateStageLookup,
   gateGeneration,
   gateQuery,
   gateStats,
-  hasBlockingBinding,
+  hasLiveBinding,
   hasLineBreak,
   hasNoReason,
   inspectSidecar,
-  listBlockingRules,
+  listGateMirrorEntries,
+  listGateMirrorStages,
   liveBlockingRulesForStage,
   liveStageIndex,
-  materializeBlockingSidecar,
+  materializeGateMirror,
   matchesTriggerPattern,
   normalizeMatchToken,
   normalizeStageName,
@@ -156,9 +160,11 @@ export {
 export type {
   ActionContext,
   BindRuleResult,
-  BlockingSidecar,
-  BlockingSidecarEntry,
   GateMatcher,
+  GateMirror,
+  GateMirrorCircleAlias,
+  GateMirrorEntry,
+  GateMirrorStage,
   GateQueryOptions,
   GateResult,
   GateRule,

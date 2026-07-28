@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
+import { BREADTH_CIRCLE } from "../gates";
 
 /**
  * Session-state survival (#241, ADR §3.6/§4.3): the agent compresses a session into a
@@ -33,6 +34,25 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     expect(w2.payload.decisions).toEqual(["use MiniLM-384 locally"]);
     expect(core.getActiveWorkstreams()).toHaveLength(1);
 
+    core.close();
+  });
+
+  /**
+   * THE 12th CIRCLE-MINTING SURFACE (Codex round 7, item 4; BREADTH_CIRCLE's own comment, gates.ts).
+   * A workstream is a concept like any other (kind='workstream') — it has no more business landing
+   * in circle '*' than a fact or a rule's own concept does. `saveWorkstream`'s own `opts.circle` had
+   * no guard of its own before this fix: a direct '*' argument sailed straight through
+   * resolveCircle (a plain passthrough for unmatched input) into the concept it creates or updates.
+   */
+  it("refuses to save a workstream into circle '*' — the reserved global-breadth marker, never a circle a concept can live in", async () => {
+    const core = new MonetCore(":memory:");
+    await expect(
+      core.saveWorkstream(
+        { status: "active", openQuestions: [], nextSteps: [] },
+        { circle: BREADTH_CIRCLE },
+      ),
+    ).rejects.toThrow(/reserved global-breadth marker/);
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
     core.close();
   });
 

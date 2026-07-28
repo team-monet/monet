@@ -15,10 +15,11 @@
  * The pattern fixtures near the top are the contract for the format itself: they are what a human
  * reads to predict firing, so they are asserted directly rather than through the engine.
  */
-import { describe, it, expect, afterEach, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync } from "node:fs";
+import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from "vitest";
+import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, statSync, symlinkSync } from "node:fs";
+import * as nodeCrypto from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -28,9 +29,18 @@ import { registerMonetCoreTools } from "../mcp-server";
 import { renderOverview } from "../render-overview";
 import {
   bindRule,
+  BREADTH_CIRCLE,
   COMMAND_BOUNDARY,
   createGateSchema,
+  evaluateGate,
+  evaluateGateFromMirror,
+  evaluateStageLookup,
   formatTriggerPattern,
+  gateGeneration,
+  gateQuery,
+  GATE_MIRROR_FORMAT,
+  LEGACY_STAR_CIRCLE,
+  migrateGateColumns,
   readTriggerPatterns,
   upsertStage,
   liveStageIndex,
@@ -48,9 +58,25 @@ import {
   STAGE_LOOKUP_RULES_CAP,
   STAGE_NAME_MAX_CHARS,
 } from "../gates";
-import type { BlockingSidecar, SidecarMaterialization } from "../gates";
+import type { GateMirror, SidecarMaterialization } from "../gates";
+import type { StoragePort } from "../storage";
 import { BetterSqlitePort, type Statement } from "../storage";
 import { formatSpan } from "../spans";
+
+// WRAPS, NEVER REPLACES, `randomUUID` (Codex round 9, item 1's own tests) — a plain `vi.spyOn` on
+// the imported "node:crypto" namespace throws ("Module namespace is not configurable in ESM"):
+// Node's own built-in module namespace objects are frozen, unlike vite-transformed source modules.
+// `vi.mock` intercepts at RESOLUTION instead, before gates.ts's own `import { randomUUID }` ever
+// binds — but `engine.ts` calls the SAME `randomUUID` for every concept/device id this entire file
+// mints (`this.newId = opts.idGen ?? randomUUID`), so the mock defaults to CALLING THROUGH to the
+// real implementation (`vi.fn(actual.randomUUID)`), and only ever gets a `mockReturnValueOnce`
+// layered on top, immediately before the ONE call a given test means to control, consumed by that
+// call alone. Never `mockReturnValue` (persistent) or `mockReset` here — either would silently
+// break id generation for every test that runs after, file-wide.
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:crypto")>();
+  return { ...actual, randomUUID: vi.fn(actual.randomUUID) };
+});
 
 /** Dedup DISABLED: every store() yields its own concept. */
 function core(opts: { syncDeviceId?: string; circle?: string } = {}): MonetCore {
@@ -922,20 +948,32 @@ describe("declaration — the sovereign entrance", () => {
 });
 
 // ---------------------------------------------------------------------------
-// the blocking sidecar
+// the gate mirror
 // ---------------------------------------------------------------------------
-describe("blocking sidecar — the materialized mirror", () => {
-  const read = (path: string): BlockingSidecar => JSON.parse(readFileSync(path, "utf8")) as BlockingSidecar;
+describe("gate mirror — the materialized mirror", () => {
+  const read = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
+
+  /** stageName moved off the entry and onto the mirror's own stage registry in format 4 — cross-
+   *  reference by stageId, the same join `evaluateGateFromMirror` does at read time. */
+  const stageNamesOf = (mirror: GateMirror): string[] =>
+    mirror.entries.map((e) => mirror.stages.find((s) => s.id === e.stageId)!.name);
 
   it("regenerates on every declaration, atomically, leaving no temp file behind", async () => {
     const dir = mkTmp();
     const path = join(dir, "gate-sidecar.json");
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
 
-    // An advisory declaration still rebuilds the mirror — and correctly writes an EMPTY one, which
-    // is meaningfully different from a missing file (a hook must read that as "no mirror").
+    // An advisory declaration still rebuilds the mirror — and, as of format 4, writes an entry for
+    // it: entries carries every live rule, not only blocking ones, so an all-advisory store is no
+    // longer indistinguishable from an empty one. It ALSO rebuilds the stage registry: the new stage
+    // appears in `stages` regardless of severity, since a rule-less-here stage can still MATCH —
+    // see GateMirror.stages' own comment.
     await c.declare({ species: "rule", stage: "terraform apply", content: "Always run plan first.", ...AGENT_RULE });
-    expect(read(path)).toMatchObject({ storeIdentity: "machine-a", entries: [] });
+    expect(read(path)).toMatchObject({
+      storeIdentity: "machine-a",
+      entries: [expect.objectContaining({ severity: "advisory", text: "Always run plan first" })],
+    });
+    expect(read(path).stages).toEqual([expect.objectContaining({ name: "terraform apply" })]);
 
     const declared = await c.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
@@ -945,41 +983,59 @@ describe("blocking sidecar — the materialized mirror", () => {
     if (declared.species !== "rule") throw new Error("unreachable");
 
     const sidecar = read(path);
-    expect(sidecar.entries).toHaveLength(1);
+    // TWO now: the earlier advisory "terraform apply" rule is still here (format 4 never drops an
+    // advisory rule the way the blocking-only mirror implicitly did), plus this new blocking one.
+    // Blocking sorts first regardless of creation order (gate-delivery order — see
+    // listGateMirrorEntries), so entries[0] is still the one this test is pinning field-for-field.
+    expect(sidecar.entries).toHaveLength(2);
     expect(sidecar.entries[0]).toMatchObject({
-      stageName: "rm -rf",
       conceptId: declared.conceptId,
-      ruleText: "Never delete a directory tree unattended",
+      stageId: declared.binding.stage_id,
+      severity: "blocking",
+      text: "Never delete a directory tree unattended",
       reason: "there is no undo",
-      declaredBy: "john",
       circle: "default",
-      patterns: [{ tool: "bash", tokens: ["rm", "-rf"] }],
-      patternText: ["bash: rm -rf"],
+      scope: "agent",
+      modelTag: "test-model-1",
+      origin: "declaration",
     });
+    // declaredBy is NOT projected into the mirror — GateRule (the live delivery shape this mirror
+    // promises to match) never carries it either; it stays queryable via c.ruleBinding() instead.
+    expect(sidecar.entries[0]).not.toHaveProperty("declaredBy");
+    const rmStage = sidecar.stages.find((s) => s.id === declared.binding.stage_id)!;
+    expect(rmStage.name).toBe("rm -rf");
+    expect(parseTriggerPatterns(rmStage.triggerPatterns)).toEqual([{ tool: "bash", tokens: ["rm", "-rf"] }]);
     expect(typeof sidecar.generatedAt).toBe("number");
 
     // Atomic: tmp+rename, so the directory holds exactly the finished file.
     expect(readdirSync(dir)).toEqual(["gate-sidecar.json"]);
 
-    // A second deny joins it, in the gate's own deterministic order.
+    // A second deny joins it, in the gate's own deterministic order — blocking-first, then
+    // created_at ASC: "rm -rf" was declared first, so it sorts before "git force push" even though
+    // the latter's NAME sorts first alphabetically.
     await c.declare({
       species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
       content: "Never force-push to main.", severity: "blocking",
       reason: "a rewritten history cannot be recovered from a teammate's clone", ...AGENT_RULE,
     });
-    expect(read(path).entries.map((e) => e.stageName)).toEqual(["git force push", "rm -rf"]);
+    // Three now: the two blocking rules (created-order, since severity ties within them) precede
+    // the standing advisory "terraform apply" one from the top of this test — severity dominates the
+    // sort, so it sorts last regardless of when it was declared.
+    expect(stageNamesOf(read(path))).toEqual(["rm -rf", "git force push", "terraform apply"]);
 
     // The mirror follows the store — but a live deny cannot simply be retired any more (the
     // chokepoint refuses), so withdrawing it is a declaration first and ordinary cleanup after.
     expect(() => c.retireConcept(declared.conceptId)).toThrow(/would remove the blocking rule/);
     await withdrawDeny(c, declared.conceptId, "rm -rf");
     c.retireConcept(declared.conceptId);
-    expect(c.materializeBlockingSidecar().sidecar.entries.map((e) => e.stageName)).toEqual(["git force push"]);
-    expect(read(path).entries.map((e) => e.stageName)).toEqual(["git force push"]);
+    // "rm -rf" is gone (retired); "git force push" (still blocking) sorts before "terraform apply"
+    // (advisory, untouched throughout).
+    expect(stageNamesOf(c.materializeGateMirror().sidecar)).toEqual(["git force push", "terraform apply"]);
+    expect(stageNamesOf(read(path))).toEqual(["git force push", "terraform apply"]);
     c.close();
   });
 
-  it("drops a deny from the mirror when a declaration downgrades it to advisory", async () => {
+  it("downgrades a deny to advisory in the mirror rather than dropping the rule — the DENY leaves, the RULE stays", async () => {
     const dir = mkTmp();
     const path = join(dir, "gate-sidecar.json");
     // Dedup ON, so a re-declaration of the same rule text lands on the same concept — which is what
@@ -991,6 +1047,7 @@ describe("blocking sidecar — the materialized mirror", () => {
     });
     if (first.species !== "rule") throw new Error("unreachable");
     expect(read(path).entries).toHaveLength(1);
+    expect(read(path).entries[0]).toMatchObject({ conceptId: first.conceptId, severity: "blocking" });
 
     const again = await c.declare({
       species: "rule", stage: "rm -rf", content: "Never delete a directory tree unattended.",
@@ -998,7 +1055,11 @@ describe("blocking sidecar — the materialized mirror", () => {
     });
     if (again.species !== "rule") throw new Error("unreachable");
     expect(again.conceptId).toBe(first.conceptId);
-    expect(read(path).entries).toEqual([]);
+    // NOT empty as of format 4: the mirror carries every live rule, both severities, so the rule
+    // stays visible — only its DENY POWER left. A v3 reader would have seen entries go empty here;
+    // a v4 reader sees the same one entry, now advisory.
+    expect(read(path).entries).toHaveLength(1);
+    expect(read(path).entries[0]).toMatchObject({ conceptId: first.conceptId, severity: "advisory" });
     c.close();
   });
 
@@ -1019,11 +1080,11 @@ describe("blocking sidecar — the materialized mirror", () => {
     if (compensation.species !== "rule") throw new Error("unreachable");
 
     const sidecar = read(path);
-    // 3 since `reasonMissing` joined the entry shape. A v2 reader pointed at this file would render
-    // a reasonless deny as though nothing were wrong, which is the silent-omission failure the
-    // version number exists to prevent — so the shape change earns the bump even though this field,
-    // unlike scope/modelTag below, does not decide whether a deny APPLIES.
-    expect(sidecar.format).toBe(3);
+    // 4 since the mirror stopped being blocking-only: `entries` now carries every live rule, both
+    // severities, and gained stage/circle-map siblings. A v3 reader pointed at this file would read
+    // `entries` as blocking-only and MISS every advisory rule silently — the shape change earns the
+    // bump for the same reason the v2→v3 one did.
+    expect(sidecar.format).toBe(4);
     // Without these fields the hook cannot apply the runtime-model filter gateQuery applies, so a
     // compensation for a retired model keeps denying whenever the server is unreachable — live and
     // offline disagreeing exactly when it is hardest to notice.
@@ -1049,14 +1110,348 @@ describe("blocking sidecar — the materialized mirror", () => {
     // No gateSidecarPath: a MonetCore must never write into somebody's real store directory just
     // because it was constructed.
     expect(existsSync(path)).toBe(false);
-    expect(() => c.materializeBlockingSidecar()).toThrow(/needs a path/);
+    expect(() => c.materializeGateMirror()).toThrow(/needs a path/);
 
-    const rebuilt = c.materializeBlockingSidecar(path);
+    const rebuilt = c.materializeGateMirror(path);
     // Explicit recovery against a path that held no file: this is the caller install tooling is,
     // and "written" is the answer that entitles it to say the mirror was regenerated.
     expect(rebuilt.outcome).toBe("written");
     expect(rebuilt.sidecar.entries).toHaveLength(1);
-    expect(read(path).entries[0]!.ruleText).toBe("Never delete a tree unattended");
+    expect(read(path).entries[0]!.text).toBe("Never delete a tree unattended");
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// evaluateGateFromMirror — parity with live gateQuery
+// ---------------------------------------------------------------------------
+/**
+ * THE SLICE'S CORRECTNESS BAR. `evaluateGateFromMirror` exists to answer the SAME question
+ * `MonetCore.gate()` does, from a materialized `GateMirror` alone — this is the property-style test
+ * 4b-C's CLI stands on: for every action context in a representative battery, against a
+ * representative rule/stage population, the offline verdict must equal the live one, field-for-field.
+ *
+ * COMPARED AGAINST `c.gate()`, NOT raw `gateQuery` (review fix — MATERIAL M3; this battery compared
+ * `gateQuery` directly until this fix). `gateQuery`/`evaluateGate` are PRE-resolution — they take a
+ * circle literally and never touch `circle_aliases` — because circle-alias resolution is
+ * `MonetCore.gate()`'s own job (`resolveCircle`, called before `evaluateGate`), not gateInternal's.
+ * `evaluateGateFromMirror` now resolves aliases itself (this same fix — see its own comment), which
+ * means it does MORE than raw `gateQuery` does: comparing it against `gateQuery` directly would
+ * FALSELY DISAGREE for a renamed circle's old name (offline resolves and delivers; raw gateQuery
+ * does not, on purpose) while HIDING the actual bug this fix closes — that comparing it against raw
+ * `gateQuery` in the first place could never catch a renamed circle going invisible offline, because
+ * neither side resolved. `c.gate()` is the surface a real caller actually uses, live; it is the one
+ * `evaluateGateFromMirror` must match.
+ *
+ * REPRESENTATION DIFFERENCES, enumerated rather than silently allowed to pass by coincidence:
+ *
+ *   `source` — "live" vs "sidecar". The ONE field the two are SUPPOSED to disagree on; asserted
+ *   explicitly below rather than compared for equality.
+ *
+ *   `GateRule.projectedFromPrincipleId` — the live path resolves a rule's parent principle via a
+ *   correlated subquery over `lifecycle_edges` (family='derivation'); `GateMirrorEntry` carries no
+ *   such id (deliverable 1's field list has none), so the offline path never sets it. Nothing in
+ *   this codebase writes a derivation edge for a rule yet (principles are a later slice), so every
+ *   rule in this battery has `parent_concept_id IS NULL` live too — the two are identical in
+ *   practice today, not merely permitted to differ. Flagged here so the gap has a name the day
+ *   projection ships, rather than surfacing as a silent behavior change to this test.
+ */
+describe("evaluateGateFromMirror — parity with live gate()", () => {
+  const dbOf = (c: MonetCore): StoragePort => (c as unknown as { db: StoragePort }).db;
+
+  it("answers THE SAME verdict as live gateQuery, field-for-field, across a representative population", async () => {
+    const c = core({ circle: "default" });
+    const db = dbOf(c);
+
+    // ---- the population ---------------------------------------------------
+    // (1) "git force push" — narrow, BLOCKING, agent-scoped, tag "model-a".
+    const forcePush = await c.declare({
+      species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
+      content: "Never force-push to a shared branch.", severity: "blocking",
+      reason: "a rewritten history cannot be recovered from a teammate's clone",
+      scope: "agent", modelTag: "model-a",
+    });
+    if (forcePush.species !== "rule") throw new Error("unreachable");
+
+    // (2) "git push" — BROAD, overlaps with (1)'s contexts, advisory, domain (always fires). Tests
+    //     the multi-stage union: a broad advisory stage and a narrow blocking stage both firing on
+    //     one action, blocking ranked first regardless of which stage is "broader".
+    await c.declare({
+      species: "rule", stage: "git push", patterns: ["Bash:git push"],
+      content: "Prefer a merge over a rebase on a shared branch.", severity: "advisory", scope: "domain",
+    });
+
+    // (3) "rm -rf" — ONE stage, TWO rules: domain blocking (always fires) + agent advisory (tag
+    //     "model-a"). Tests severity union WITHIN one stage and the domain-always-fires rule.
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Deleting a tree is irreversible.", severity: "blocking",
+      reason: "a deleted tree is not in any trash", scope: "domain",
+    });
+    await c.declare({
+      species: "rule", stage: "rm -rf",
+      content: "Confirm the target path before deleting.", severity: "advisory",
+      scope: "agent", modelTag: "model-a",
+    });
+
+    // (4) "npm publish" — agent-only, tag "model-b", FOREIGN relative to "model-a". Tests
+    //     tag-filtered stage-hit-no-rules (the stage matches; the only rule bound to it does not
+    //     deliver for a foreign runtime tag).
+    await c.declare({
+      species: "rule", stage: "npm publish", patterns: ["Bash:npm publish"],
+      content: "Run the dry-run publish first.", severity: "advisory", scope: "agent", modelTag: "model-b",
+    });
+
+    // (5) "terraform apply" — a TOOL-LESS pattern (fires under any tool prefix), advisory, domain,
+    //     NO reason (advisory + no reason is ordinary, never reasonMissing).
+    await c.declare({
+      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
+      content: "Always run plan before apply.", severity: "advisory", scope: "domain",
+    });
+
+    // (6) "kubectl delete" — a stage with ZERO rules bound. Tests stage-hit-no-rules the OTHER way:
+    //     no tag filtering involved, the stage simply has nothing bound to it anywhere.
+    await c.declare({ species: "stage", stage: "kubectl delete", patterns: ["kubectl delete"] });
+
+    // (7) "docker prune" — one SUPERSEDED rule, one live successor on the SAME stage/pattern.
+    const dockerOriginal = await c.store("Never prune without checking what is running.", {
+      kind: "rule", rule: { stage: "docker prune", instance: "Bash:docker system prune -a", scope: "domain" },
+    });
+    const dockerSuccessor = await c.store("Confirm containers are stopped before pruning.", {
+      kind: "correction", attachTo: dockerOriginal.conceptId,
+    });
+
+    // (8) "eslint --fix" — TWO advisory rules on one stage, one RETIRED. Tests that retirement
+    //     excludes exactly the retired rule, not its still-live stage-mate.
+    const eslintKeep = await c.store("Run eslint --fix only on staged files.", {
+      kind: "rule", rule: { stage: "eslint --fix", instance: "Bash:eslint --fix .", scope: "domain" },
+    });
+    const eslintRetired = await c.store("Review the diff after autofixing.", {
+      kind: "rule", rule: { stage: "eslint --fix", scope: "domain" },
+    });
+    c.retireConcept(eslintRetired.conceptId);
+
+    // (9) cross-circle — a blocking rule living in a DIFFERENT circle, on its own stage. Tests that
+    //     GateMirrorEntry.circle is respected exactly like RULE_LIVENESS_WHERE's c.circle = ?.
+    await c.declare({
+      circle: "other-circle", species: "rule", stage: "azure delete", patterns: ["Bash:az group delete"],
+      content: "Never delete a resource group without a snapshot.", severity: "blocking",
+      reason: "a deleted resource group has no undo", scope: "domain",
+    });
+
+    // (10) BREADTH — a global blocking rule (circle: "*") sharing a stage with a LOCAL advisory
+    //      rule in "default". Tests the union itself (both arrive, blocking-first, in the circle
+    //      that also has the local rule) AND that breadth alone reaches a circle with NOTHING local
+    //      bound to this stage at all — the whole point of "*", not merely a side effect of it.
+    const breadthDeny = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile present.", severity: "blocking",
+      reason: "an unlocked install can pull an unreviewed transitive dependency", scope: "domain",
+    });
+    if (breadthDeny.species !== "rule") throw new Error("unreachable");
+    // THE CONCEPT/BINDING SPLIT ITSELF, checked directly: the CONCEPT lives at the caller's own
+    // circle ("default", searchable/listable there like any other) while only the BINDING carries
+    // the breadth marker — the whole premise `RuleBindingRow.circle`'s own comment states.
+    expect((raw(c).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(breadthDeny.conceptId) as { circle: string }).circle)
+      .toBe("default");
+    expect(c.ruleBinding(breadthDeny.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE });
+    await c.declare({
+      circle: "default", species: "rule", stage: "npm install",
+      content: "Prefer `npm ci` over `npm install` in automation.", severity: "advisory", scope: "domain",
+    });
+
+    // (11) ALIAS — a rule declared in "proj", then the circle renamed to "project" (review fix —
+    //      MATERIAL M3). After the rename, `mirror.entries[].circle` reads "project" — the CANONICAL
+    //      name — same as the live concept row does; only `mirror.circleAliases` still remembers
+    //      "proj". A caller querying "proj" reaches the live rule ONLY because MonetCore.gate()
+    //      resolves through circle_aliases before ever calling evaluateGate; evaluateGateFromMirror
+    //      must resolve identically or a renamed circle's rules go permanently invisible offline
+    //      under the name every existing caller still has cached. This is the exact fixture that
+    //      would have caught the gap M3 closed — see evaluateGateFromMirror's own comment.
+    const aliasRule = await c.declare({
+      circle: "proj", species: "rule", stage: "helm delete", patterns: ["Bash:helm delete"],
+      content: "Never delete a release without checking its dependents.", severity: "blocking",
+      reason: "a dangling dependent release fails silently on its next upgrade", scope: "domain",
+    });
+    if (aliasRule.species !== "rule") throw new Error("unreachable");
+    c.renameCircle("proj", "project");
+
+    const materialized = c.materializeGateMirror(join(mkTmp(), "gate-mirror.json"));
+    expect(materialized.outcome).toBe("written");
+    const mirror = materialized.sidecar;
+    expect(mirror.format).toBe(GATE_MIRROR_FORMAT);
+
+    // ---- the battery: hits, misses, stage-hit-no-rules, overflow, tag-filtered, quoting/case -----
+    const scenarios: Array<{ label: string; actionContext: string; circle?: string; runtimeModelTag?: string }> = [
+      // multi-stage union (narrow blocking + broad advisory), across the tag axis
+      { label: "narrow+broad both match, tag matches the narrow rule", actionContext: "Bash:git push --force origin main", runtimeModelTag: "model-a" },
+      { label: "narrow+broad both match, unconfigured tag", actionContext: "Bash:git push --force origin main" },
+      { label: "narrow rule filtered by a foreign tag, broad advisory still fires", actionContext: "Bash:git push --force origin main", runtimeModelTag: "model-b" },
+      { label: "an ordinary push matches only the broad stage", actionContext: "Bash:git push origin main", runtimeModelTag: "model-a" },
+
+      // one stage, two rules (domain always-fires + agent tag-filtered)
+      { label: "rm -rf: domain+agent union, matching tag", actionContext: "Bash:rm -rf /tmp/x", runtimeModelTag: "model-a" },
+      { label: "rm -rf: domain only, foreign tag", actionContext: "Bash:rm -rf /tmp/x", runtimeModelTag: "model-b" },
+      { label: "rm -rf: domain+agent union, unconfigured tag", actionContext: "Bash:rm -rf /tmp/x" },
+
+      // tag-filtered stage-hit-no-rules
+      { label: "npm publish: tag matches", actionContext: "Bash:npm publish --access public", runtimeModelTag: "model-b" },
+      { label: "npm publish: foreign tag -> stage-hit-no-rules", actionContext: "Bash:npm publish --access public", runtimeModelTag: "model-a" },
+      { label: "npm publish: unconfigured -> delivers", actionContext: "Bash:npm publish --access public" },
+
+      // tool-less pattern
+      { label: "terraform apply via a tool-less pattern", actionContext: "Bash:terraform apply -auto-approve" },
+      { label: "terraform plan does not match", actionContext: "Bash:terraform plan" },
+
+      // pure stage-hit-no-rules (no rule bound anywhere, no tag involved)
+      { label: "kubectl delete: stage-hit-no-rules", actionContext: "Bash:kubectl delete pod x" },
+
+      // supersession / retirement exclusion
+      { label: "docker prune: only the successor delivers", actionContext: "Bash:docker system prune -a" },
+      { label: "eslint --fix: only the live sibling delivers", actionContext: "Bash:eslint --fix ." },
+
+      // miss and overflow
+      { label: "a plain miss", actionContext: "Bash:ls -la" },
+      { label: "overflow past the refusal threshold", actionContext: `Bash:${"x".repeat(4 * 1024 * 1024 + 16)} && git push --force` },
+
+      // quoting/case variants the matcher normalizes — same underlying command as the first scenario
+      { label: "case-folded", actionContext: "Bash:GIT PUSH --FORCE origin main", runtimeModelTag: "model-a" },
+      { label: "double-quoted", actionContext: `Bash:git "push" --force origin main`, runtimeModelTag: "model-a" },
+      { label: "single-quoted", actionContext: "Bash:git 'push' '--force' origin main", runtimeModelTag: "model-a" },
+      { label: "backslash-escaped", actionContext: "Bash:git push \\-\\-force origin main", runtimeModelTag: "model-a" },
+
+      // circle scoping
+      { label: "cross-circle rule invisible from default (stage-hit-no-rules)", actionContext: "Bash:az group delete --yes", circle: "default" },
+      { label: "cross-circle rule visible from its own circle", actionContext: "Bash:az group delete --yes", circle: "other-circle" },
+
+      // BREADTH: the global deny unions with the local advisory in "default", and reaches
+      // "other-circle" and a THIRD circle with nothing local bound to this stage at all — the
+      // reach is not an accident of which circles happen to already appear elsewhere in this test.
+      { label: "breadth: unions with the local advisory in the circle that has one", actionContext: "Bash:npm install", circle: "default" },
+      { label: "breadth: alone, reaching a circle with a local rule on OTHER stages but not this one", actionContext: "Bash:npm install", circle: "other-circle" },
+      { label: "breadth: alone, reaching a circle that has never appeared in this fixture at all", actionContext: "Bash:npm install", circle: "a-circle-nothing-else-ever-touches" },
+
+      // ALIAS (MATERIAL M3): the renamed-away name and the canonical name both deliver, identically,
+      // on both surfaces — the fixture that would have caught evaluateGateFromMirror answering
+      // "proj" with nothing while c.gate() answered it with the rule.
+      { label: "alias: the renamed-away name ('proj') still resolves and delivers", actionContext: "Bash:helm delete my-release", circle: "proj" },
+      { label: "alias: the canonical name ('project') delivers directly", actionContext: "Bash:helm delete my-release", circle: "project" },
+    ];
+
+    for (const scenario of scenarios) {
+      const opts = { actionContext: scenario.actionContext, circle: scenario.circle ?? "default", runtimeModelTag: scenario.runtimeModelTag };
+      const live = c.gate({ ...opts, record: false });
+      const offline = evaluateGateFromMirror(mirror, opts);
+      expect(offline.silence, scenario.label).toBe(live.silence);
+      expect(offline.overflow, scenario.label).toBe(live.overflow);
+      expect(offline.stage, scenario.label).toEqual(live.stage);
+      expect(offline.stages, scenario.label).toEqual(live.stages);
+      expect(offline.rules, scenario.label).toEqual(live.rules);
+      // The one deliberate, documented difference — see this describe block's own comment.
+      expect(live.source, scenario.label).toBe("live");
+      expect(offline.source, scenario.label).toBe("sidecar");
+    }
+
+    // ---- independent sanity checks on the LIVE side, so the battery is not "both sides share one
+    // bug" — parity alone cannot catch a mistake present in both gateInternal and the fixture's own
+    // assumptions about it. ------------------------------------------------------------------------
+    const union = gateQuery(db, { actionContext: "Bash:git push --force origin main", circle: "default", runtimeModelTag: "model-a", record: false });
+    expect(union.rules.map((r) => r.severity)).toEqual(["blocking", "advisory"]);
+    expect(union.rules.map((r) => r.conceptId)).toContain(forcePush.conceptId);
+
+    const rmUnion = gateQuery(db, { actionContext: "Bash:rm -rf /tmp/x", circle: "default", runtimeModelTag: "model-a", record: false });
+    expect(rmUnion.rules).toHaveLength(2);
+    expect(rmUnion.rules[0]!.severity).toBe("blocking");
+
+    const dockerLive = gateQuery(db, { actionContext: "Bash:docker system prune -a", circle: "default", record: false });
+    expect(dockerLive.rules.map((r) => r.conceptId)).toEqual([dockerSuccessor.conceptId]);
+
+    const eslintLive = gateQuery(db, { actionContext: "Bash:eslint --fix .", circle: "default", record: false });
+    expect(eslintLive.rules.map((r) => r.conceptId)).toEqual([eslintKeep.conceptId]);
+
+    const kubectlLive = gateQuery(db, { actionContext: "Bash:kubectl delete pod x", circle: "default", record: false });
+    expect(kubectlLive).toMatchObject({ silence: false, rules: [] });
+
+    const terraformLive = gateQuery(db, { actionContext: "Bash:terraform apply -auto-approve", circle: "default", record: false });
+    expect(terraformLive.rules[0]).toMatchObject({ severity: "advisory", reason: null, reasonMissing: false });
+
+    // BREADTH sanity: same global deny, three circles. Union + blocking-first where a local rule
+    // also matches; alone (but still delivered) everywhere else — including a circle this fixture
+    // never otherwise touches, proving the reach is the marker's, not an accident of overlap with
+    // some OTHER fixture data that happens to also live in "other-circle".
+    const npmDefault = gateQuery(db, { actionContext: "Bash:npm install", circle: "default", record: false });
+    expect(npmDefault.rules.map((r) => [r.severity, r.conceptId])).toEqual([
+      ["blocking", breadthDeny.conceptId],
+      ["advisory", expect.any(String)],
+    ]);
+    const npmOther = gateQuery(db, { actionContext: "Bash:npm install", circle: "other-circle", record: false });
+    expect(npmOther.rules.map((r) => r.conceptId)).toEqual([breadthDeny.conceptId]);
+    const npmElsewhere = gateQuery(db, { actionContext: "Bash:npm install", circle: "a-circle-nothing-else-ever-touches", record: false });
+    expect(npmElsewhere.rules.map((r) => r.conceptId)).toEqual([breadthDeny.conceptId]);
+    expect(npmElsewhere.silence).toBe(false);
+
+    // ALIAS sanity (MATERIAL M3), the representation difference made concrete: raw gateQuery is
+    // PRE-resolution and takes "proj" literally — it MUST come back empty, because nothing lives at
+    // that name any more, the rename moved the concept to "project". c.gate() resolves first and
+    // delivers. Both are correct; they are answering different questions, and evaluateGateFromMirror
+    // must agree with the SECOND one, not the first — which is exactly what the battery above pins.
+    expect(c.resolveCircleName("proj")).toBe("project");
+    const rawUnresolved = gateQuery(db, { actionContext: "Bash:helm delete my-release", circle: "proj", record: false });
+    expect(rawUnresolved.rules).toEqual([]);
+    const liveResolved = c.gate({ actionContext: "Bash:helm delete my-release", circle: "proj", record: false });
+    expect(liveResolved.rules.map((r) => r.conceptId)).toEqual([aliasRule.conceptId]);
+
+    c.close();
+  });
+});
+
+describe("breadth inherits into the recognized surfaces", () => {
+  it("a '*' binding makes its stage live in EVERY circle's index, and stageLookup delivers the global rule unioned with local ones", async () => {
+    const c = core({ circle: "default" });
+    const db = (c as unknown as { db: StoragePort }).db;
+
+    // A stage with ONLY a local advisory rule, in "default" — the control: it must NOT appear in
+    // some other circle's index, proving the test below is measuring breadth, not "every stage
+    // shows up everywhere regardless".
+    await c.declare({
+      species: "rule", stage: "eslint --fix all", patterns: ["Bash:eslint --fix --all"],
+      content: "Confirm the file count before a repo-wide autofix.", severity: "advisory", scope: "domain",
+    });
+
+    // The global rule: a BLOCKING breadth binding, plus a LOCAL advisory sharing its stage in
+    // "default" — same union shape the parity test's own breadth fixture uses.
+    const globalDeny = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "docker system prune --all", patterns: ["Bash:docker system prune --all --volumes"],
+      content: "Never prune with --volumes outside a maintenance window.", severity: "blocking",
+      reason: "a volume prune destroys data no image rebuild can recover", scope: "domain",
+    });
+    if (globalDeny.species !== "rule") throw new Error("unreachable");
+    await c.declare({
+      circle: "default", species: "rule", stage: "docker system prune --all",
+      content: "Announce in the ops channel before pruning.", severity: "advisory", scope: "domain",
+    });
+
+    // liveStageIndex: the global stage is live EVERYWHERE — including a circle with no local rule
+    // on it at all, and no other fixture data — while the local-only stage stays put in "default".
+    const elsewhere = liveStageIndex(db, "a-circle-with-nothing-of-its-own");
+    expect(elsewhere.names).toContain("docker system prune --all");
+    expect(elsewhere.names).not.toContain("eslint --fix all");
+    const home = liveStageIndex(db, "default");
+    expect(home.names).toEqual(expect.arrayContaining(["docker system prune --all", "eslint --fix all"]));
+
+    // stageLookup (the recognized matcher): from a circle with nothing local on this stage, the
+    // global deny alone still delivers — matching gateQuery's own union contract exactly, just
+    // reached by name instead of by pattern.
+    const recognizedElsewhere = c.stageLookup({ stage: "docker system prune --all", circle: "a-circle-with-nothing-of-its-own" });
+    expect(recognizedElsewhere.matched).toBe(true);
+    expect(recognizedElsewhere.rules.map((r) => r.conceptId)).toEqual([globalDeny.conceptId]);
+
+    // And from "default", where a local advisory ALSO binds this stage: both arrive, blocking-first.
+    const recognizedHome = c.stageLookup({ stage: "docker system prune --all", circle: "default" });
+    expect(recognizedHome.rules.map((r) => [r.severity, r.conceptId])).toEqual([
+      ["blocking", globalDeny.conceptId],
+      ["advisory", expect.any(String)],
+    ]);
     c.close();
   });
 });
@@ -1064,6 +1459,54 @@ describe("blocking sidecar — the materialized mirror", () => {
 // ---------------------------------------------------------------------------
 // the gate
 // ---------------------------------------------------------------------------
+/**
+ * CIRCLE '*' IS NOT A QUERYABLE CIRCLE, AT ANY ENTRANCE (Codex round 6, item 2, closing batch).
+ * `RULE_LIVENESS_WHERE`'s own `(b.circle = ? OR b.circle = '*')` — and evaluateGateFromMirror's
+ * identical JS-side twin — degenerates to matching ONLY global rules the instant `?` itself is bound
+ * to '*': both halves of the OR become the identical clause, silently dropping every LOCAL rule the
+ * caller actually meant to ask about, including a local DENY. Reachable only via a direct argument
+ * (a pre-breadth `MONET_CIRCLE=*` config, or any caller passing '*' straight through) — `resolveCircle`
+ * can never PRODUCE '*' from an ordinary circle name post-migration (round 4, item 4: no alias can
+ * ever hold '*' on either side once a store has been through it — verified, not assumed, by reading
+ * resolveCircle's own single-hop lookup and confirming no write path can create such a row anymore).
+ * `MonetCore.gate()`/`stageLookup()` carry no guard of their own — checked directly: both resolve
+ * their circle and pass it straight into evaluateGate/evaluateStageLookup unchanged, so the SHARED
+ * chokepoint one layer down (assertQueryableCircle, gates.ts) is what actually refuses for them too,
+ * proven here by calling the wrappers themselves, not only the functions they funnel through.
+ */
+describe("circle '*' is refused as query input, everywhere a gate query can be scoped", () => {
+  it("refuses at every entrance — evaluateGate, gateQuery, MonetCore.gate(), evaluateStageLookup, stageLookup (standalone), MonetCore.stageLookup(), and evaluateGateFromMirror — each naming the same repair", async () => {
+    const c = core();
+    await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
+    });
+    const db = (c as unknown as { db: StoragePort }).db;
+    const message = /circle '\*' is not a queryable circle.*reserved global-breadth marker.*Name a real circle/s;
+
+    // THE LIVE GATE FAMILY — the pure functions, then the MonetCore wrapper that funnels through them.
+    expect(() => evaluateGate(db, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
+    expect(() => gateQuery(db, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
+    expect(() => c.gate({ actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
+
+    // THE RECOGNIZED-MATCHER FAMILY — same shape, same three levels.
+    expect(() => evaluateStageLookup(db, { stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
+    expect(() => standaloneStageLookup(db, { stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
+    expect(() => c.stageLookup({ stage: "npm install", circle: BREADTH_CIRCLE })).toThrow(message);
+
+    // THE OFFLINE EVALUATOR — no shared internal to funnel through, checked directly.
+    const mirror = c.materializeGateMirror(join(mkTmp(), "s.json")).sidecar;
+    expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
+
+    // AN ORDINARY CIRCLE IS UNAFFECTED — the refusal is specific to '*', not a general regression.
+    // Stages are store-global (matched regardless of circle), so the stage itself still hits — the
+    // circle scoping shows up in `rules`, not `silence` (the stage-hit-no-rules case, not a miss).
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "an-ordinary-circle" })).toMatchObject({ silence: false, rules: [] });
+    expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: "default" })).not.toThrow();
+    c.close();
+  });
+});
+
 describe("gateQuery", () => {
   it("silence when nothing matches, and a stage with no rules is NOT silence", async () => {
     const c = core();
@@ -1486,14 +1929,20 @@ describe("gate substrate sync", () => {
       conceptId, severity: "blocking", reason: null, reasonMissing: true,
     });
 
-    // The MIRROR says it too — the hook runs when the server is unreachable, which is already the
-    // moment a user is least able to go and look the reason up.
-    const entry = dst.materializeBlockingSidecar().sidecar.entries[0]!;
-    expect(entry).toMatchObject({ conceptId, reason: null, reasonMissing: true });
-    // Present in the FILE, not merely in the return value: the file is what the hook reads.
-    const onDisk = JSON.parse(readFileSync(path, "utf8")) as BlockingSidecar;
-    expect(onDisk.format).toBe(3);
-    expect(onDisk.entries[0]).toMatchObject({ reasonMissing: true });
+    // The MIRROR says it too — a reader runs when the server is unreachable, which is already the
+    // moment a user is least able to go and look the reason up. reasonMissing is not STORED on the
+    // entry as of format 4 (computed at read via hasNoReason, the one predicate every surface
+    // shares) — evaluateGateFromMirror is that read, so running the mirror through it is what proves
+    // the offline surface still discloses this, not merely that the raw JSON carries a reason.
+    const mirrored = dst.materializeGateMirror().sidecar;
+    const entry = mirrored.entries[0]!;
+    expect(entry).toMatchObject({ conceptId, reason: null });
+    const offlineFired = evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
+    expect(offlineFired.rules[0]).toMatchObject({ conceptId, reason: null, reasonMissing: true });
+    // Present in the FILE, not merely in the return value: the file is what a reader actually opens.
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as GateMirror;
+    expect(onDisk.format).toBe(4);
+    expect(onDisk.entries[0]).toMatchObject({ conceptId, reason: null });
 
     // ...and CURATION gets a REPAIR QUEUE, not an alarm: `stageName` and `title` are exactly the
     // `stage` and `content` the repairing declaration below takes, so nothing has to be gone and
@@ -1538,7 +1987,9 @@ describe("gate substrate sync", () => {
       expect(dst.ruleBinding(conceptId)!.reason).toBe(blank);
 
       expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ reasonMissing: true });
-      expect(dst.materializeBlockingSidecar().sidecar.entries[0]).toMatchObject({ reasonMissing: true });
+      const mirrored = dst.materializeGateMirror().sidecar;
+      expect(evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules[0])
+        .toMatchObject({ reasonMissing: true });
       expect(dst.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId, stageName: "rm -rf" }]);
       const rendered = renderOverview(dst.overview("default"), { color: false });
       expect(rendered).toContain("1 deny(s) arrived with no reason");
@@ -1587,15 +2038,18 @@ describe("gate substrate sync", () => {
 
       // ...and it lands in the disclosure this branch already built for a deny that cannot explain
       // itself. Nothing special-cases a number, because it is not a special case: it is not an
-      // explanation, so the rule has none.
-      expect(c.materializeBlockingSidecar().sidecar.entries[0]).toMatchObject({ reasonMissing: true });
+      // explanation, so the rule has none. The offline evaluator reaches the same disclosure off the
+      // SAME mirror, through the SAME hasNoReason predicate — reasonMissing is computed, not stored.
+      const mirrored = c.materializeGateMirror().sidecar;
+      const offlineFired = evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
+      expect(offlineFired.rules[0]).toMatchObject({ reasonMissing: true });
       expect(c.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
       expect(renderOverview(c.overview("default"), { color: false })).toContain("arrived with no reason");
       // Delivered as NULL, not as the raw value: `reason` is declared `string | null`, and handing a
       // caller a Buffer moves the crash from this module into theirs. The mirror stays readable JSON
       // for the same reason.
       expect(fired.rules[0]!.reason).toBeNull();
-      expect(c.materializeBlockingSidecar().sidecar.entries[0]!.reason).toBeNull();
+      expect(mirrored.entries[0]!.reason).toBeNull();
       c.close();
     });
   }
@@ -1819,7 +2273,7 @@ describe("gate substrate sync", () => {
 
     // DELIVERY says it does not exist...
     expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules).toEqual([]);
-    expect(dst.materializeBlockingSidecar(join(mkTmp(), "s.json")).sidecar.entries).toEqual([]);
+    expect(dst.materializeGateMirror(join(mkTmp(), "s.json")).sidecar.entries).toEqual([]);
     // ...so DISCLOSURE must not say it does. Naming it here told the user to redeclare a rule whose
     // redeclaration would CREATE the missing stage and change what the store does — a repair queue
     // giving advice that alters behaviour rather than restoring it.
@@ -1873,9 +2327,10 @@ describe("gate substrate sync", () => {
     expect(fired.rules[0]).toMatchObject({
       severity: "blocking", reason: "there is no undo", reasonMissing: false,
     });
-    expect(dst.materializeBlockingSidecar().sidecar.entries[0]).toMatchObject({
-      reason: "there is no undo", reasonMissing: false,
-    });
+    const mirrored = dst.materializeGateMirror().sidecar;
+    expect(mirrored.entries[0]).toMatchObject({ reason: "there is no undo" });
+    expect(evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules[0])
+      .toMatchObject({ reason: "there is no undo", reasonMissing: false });
     expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
     src.close();
     dst.close();
@@ -2085,6 +2540,96 @@ describe("deny power cannot be removed by accident", () => {
     if (restored.species !== "rule") throw new Error("unreachable");
     expect(restored.binding.severity).toBe("blocking");
     expect(restored.downgraded).toBeUndefined();
+    c.close();
+  });
+
+  /**
+   * THE SAME "removed by accident" CLASS, one axis over: BREADTH (Codex round 2, item 1). Re-
+   * declaring an existing global ('*') rule without naming a circle used to silently narrow it —
+   * declare() could not distinguish "the caller ruled nothing" from "the caller explicitly named
+   * the session default", because the MCP handler eagerly resolved an omitted circle to the default
+   * BEFORE declare() ever saw it, and declare()'s own `isBreadth ? BREADTH_CIRCLE : undefined`
+   * collapsed both cases to the same `undefined`. Fixed at both seams — see RuleCaptureOpts.circle's
+   * own three-state contract for the engine-side half, and the memory_declare handler's own comment
+   * for the MCP-side half (tested separately, in "MCP surface", since it is a DIFFERENT bug from a
+   * DIFFERENT layer).
+   */
+  it("PATH 1 — breadth — re-declaring a global rule WITHOUT naming a circle preserves it, on the live gate, the mirror, and every circle", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { gateSidecarPath: path });
+    const CONTENT = "Never install without a lockfile present.";
+    const first = await c.declare({
+      circle: "*", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
+    });
+    if (first.species !== "rule") throw new Error("unreachable");
+    expect(first.binding.circle).toBe(BREADTH_CIRCLE);
+
+    // Re-declared with IDENTICAL content (dedup resolves onto the SAME concept — the "restatement"
+    // shape, same as PATH 1's own severity tests above) and NO circle at all.
+    const again = await c.declare({
+      species: "rule", stage: "npm install", content: CONTENT,
+      severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
+    });
+    if (again.species !== "rule") throw new Error("unreachable");
+    expect(again.conceptId).toBe(first.conceptId); // proves this really is a restatement, not a new rule
+    expect(again.binding.circle).toBe(BREADTH_CIRCLE);
+    expect(again.narrowedFromBreadth).toBeUndefined();
+    expect(again.previousCircle).toBeUndefined();
+
+    // LIVE GATE: fires from a circle the fixture never otherwise touches — the reach is the
+    // marker's, not an accident of overlap with some other circle.
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      .toEqual([first.conceptId]);
+    // THE MIRROR: materialized fresh, still carries '*' verbatim.
+    const mirror = c.materializeGateMirror(path).sidecar;
+    expect(mirror.entries.find((e) => e.conceptId === first.conceptId)?.circle).toBe(BREADTH_CIRCLE);
+    c.close();
+  });
+
+  it("PATH 1 — breadth — an EXPLICIT local circle narrows a global incumbent, and is reported loudly", async () => {
+    const c = new MonetCore(":memory:", {});
+    const CONTENT = "Never install without a lockfile present.";
+    const first = await c.declare({
+      circle: "*", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
+    });
+    if (first.species !== "rule") throw new Error("unreachable");
+
+    const narrowed = await c.declare({
+      circle: "default", species: "rule", stage: "npm install", content: CONTENT,
+      severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
+    });
+    if (narrowed.species !== "rule") throw new Error("unreachable");
+    expect(narrowed.conceptId).toBe(first.conceptId);
+    expect(narrowed.binding.circle).toBe("default");
+    // THE DISCLOSURE — legal (the owner's recorded act), never silent.
+    expect(narrowed).toMatchObject({ narrowedFromBreadth: true, previousCircle: BREADTH_CIRCLE });
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "some-other-circle" }).rules).toEqual([]);
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "default" }).rules.map((r) => r.conceptId))
+      .toEqual([first.conceptId]);
+
+    // Sovereignty runs both ways here too: re-widening is unchanged and reports no narrowing.
+    const restored = await c.declare({
+      circle: "*", species: "rule", stage: "npm install", content: CONTENT,
+      severity: "blocking", reason: "an unlocked install can drift", ...AGENT_RULE,
+    });
+    if (restored.species !== "rule") throw new Error("unreachable");
+    expect(restored.binding.circle).toBe(BREADTH_CIRCLE);
+    expect(restored.narrowedFromBreadth).toBeUndefined();
+    c.close();
+  });
+
+  it("a NEW declaration without a circle still defaults to defaultCircle, unchanged (Codex round 2, item 1 regression check)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, defaultCircle: "my-default" });
+    const rule = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    expect(rule.binding.circle).toBe("my-default");
+    expect(rule.narrowedFromBreadth).toBeUndefined();
     c.close();
   });
 
@@ -2307,7 +2852,7 @@ describe("deny power cannot be removed by accident", () => {
 });
 
 describe("the robustness tail", () => {
-  const read = (path: string): BlockingSidecar => JSON.parse(readFileSync(path, "utf8")) as BlockingSidecar;
+  const read = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
 
   it("returns its verdict even when the instrumentation write cannot land", async () => {
     const c = core();
@@ -2346,14 +2891,14 @@ describe("the robustness tail", () => {
     // preserving whatever is already there. Multi-process is the shipped topology (WAL + busy_timeout,
     // set in storage.ts's own constructor precisely so the MCP server and a `monet` CLI call can share
     // one `.monet` DB), so a racing newer writer publishing between another call's snapshot and its
-    // rename is real, not theoretical — see materializeBlockingSidecar's own comment and the dedicated
+    // rename is real, not theoretical — see materializeGateMirror's own comment and the dedicated
     // race test in "the sidecar generation contract" below, which pins THAT half. HERE, nothing else
     // is mutating: the fabricated file is ahead of the store's CURRENT generation too, with no
     // legitimate writer behind it, so it is debris of an abandoned lineage (a restore or a rollback) —
     // the same event class as the foreign case below — and it is overwritten.
     const newer = { ...current, generation: current.generation + 5, entries: [] };
     writeFileSync(path, JSON.stringify(newer), "utf8");
-    const result = c.materializeBlockingSidecar(path);
+    const result = c.materializeGateMirror(path);
     expect(result.outcome).toBe("written");
     expect(read(path).generation).toBe(current.generation); // the store's own count, not the fabricated one
     expect(read(path).entries).toHaveLength(1);              // the store's real deny, not the fabricated empty set
@@ -2362,10 +2907,162 @@ describe("the robustness tail", () => {
     // A file from ANOTHER store is not ours to defer to either, however high its number — identity
     // already gated the preservation rule before generation did, and still does.
     writeFileSync(path, JSON.stringify({ ...newer, storeIdentity: "machine-b" }), "utf8");
-    c.materializeBlockingSidecar(path);
+    c.materializeGateMirror(path);
     expect(read(path).storeIdentity).toBe("machine-a");
     expect(read(path).entries).toHaveLength(1);
     c.close();
+  });
+
+  /**
+   * FILE PERMISSIONS (Codex round 7, item 5, corrected by round 8, item 1; gate-boundary-statement.md,
+   * "Binding consequences for 4b", item 1) — reusing source-materializer's own precedent MECHANISM:
+   * mode supplied at creation time, never chmod-after. 0600 on the FILE defends against other local
+   * accounts and backup tooling reading the mirror's content — never against the agent itself (same
+   * uid) — the boundary doc's own framing, unchanged here. Three orthogonal cases, matching
+   * materializeGateMirror's own comment: a freshly-created directory (0700, since this call is the
+   * one minting it), a pre-existing directory (left exactly as it is — round 7 tightened it, which
+   * overreached on a caller-supplied, possibly-shared path; round 8 corrected that), and a
+   * pre-existing too-loose FILE (inherits the tight mode via rename regardless, no separate chmod
+   * call — this is the actual confidentiality boundary, not the directory).
+   */
+  it("writes the mirror file at 0600 and its directory at 0700, freshly created (Codex round 7, item 5)", async () => {
+    const dir = join(mkTmp(), "fresh-nested"); // does not exist yet: exercises mkdirSync's OWN mode
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    expect(read(path).entries).toHaveLength(1); // the hardening did not break the substantive write
+    if (process.platform !== "win32") {
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+    }
+    c.close();
+  });
+
+  it("leaves a pre-existing mirror directory's permissions untouched — the file's own 0600 is the confidentiality boundary, not the directory (Codex round 8, item 1)", async () => {
+    if (process.platform === "win32") return; // chmod bits are not meaningful on this platform
+    const dir = join(mkTmp(), "already-there");
+    mkdirSync(dir, { mode: 0o755 }); // simulates an ordinary, caller-owned directory predating this fix
+    expect(statSync(dir).mode & 0o777).toBe(0o755);
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    // UNTOUCHED, not tightened — round 7 chmod'd this to 0700, which overreached: `gateSidecarPath`
+    // is caller-supplied and `dir` may be `$HOME`, a project directory, or any other shared location
+    // the caller populated with unrelated content, none of it this module's to seize. See
+    // materializeGateMirror's own comment for why leaving it alone does not reopen the confidentiality
+    // gap the fix exists to close — the FILE's own 0600, asserted below, is the actual boundary.
+    expect(statSync(dir).mode & 0o777).toBe(0o755);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(read(path).entries).toHaveLength(1);
+    c.close();
+  });
+
+  it("a rename onto a pre-existing looser-permissioned mirror file tightens it to 0600 too, with no separate chmod (Codex round 7, item 5)", async () => {
+    if (process.platform === "win32") return;
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    writeFileSync(path, JSON.stringify({ format: GATE_MIRROR_FORMAT, generation: 0, entries: [] }), { mode: 0o644 });
+    expect(statSync(path).mode & 0o777).toBe(0o644);
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    // Inherited from the freshly-written 0600 tmp file via rename — see the "TARGET INHERITS 0600
+    // VIA RENAME" comment at materializeGateMirror's own renameSync call.
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(read(path).entries).toHaveLength(1);
+    c.close();
+  });
+
+  /**
+   * EXCLUSIVE, UNPREDICTABLE TMP CREATION (Codex round 9, item 1, P1) — the composition hole round
+   * 7 + round 8 opened between them: round 7 rejected `O_EXCL` reasoning the (then-tightened) 0700
+   * directory already closed the preplant window; round 8 correctly removed that tightening on its
+   * own separate terms; neither round was wrong alone, but together the tmp write was left with no
+   * exclusivity of its own AND no directory protection. `Date.now()` and `crypto.randomUUID()` are
+   * both pinned so the exact tmp path materializeGateMirror will attempt is known in advance —
+   * otherwise a test cannot pre-plant at the right path at all, which is itself part of what makes a
+   * REAL random suffix safe (an attacker cannot do what this test setup does).
+   */
+  it("refuses to write the mirror through a pre-planted regular file at the tmp path — its content survives untouched, and materialize throws named (Codex round 9, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    // DECLARE FIRST, mock SECOND — `store()`/`declare()` mint their own concept/binding ids via this
+    // SAME `randomUUID` (engine.ts's `this.newId`), so this runs with the REAL implementation still
+    // in effect, before the module-level mock's `mockReturnValueOnce` is ever armed.
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+
+    const fixedNow = 1732000000000;
+    const fixedUuid = "11111111-1111-1111-1111-111111111111";
+    // PERSISTENT for Date.now (materializeGateMirror calls it twice — once for `generatedAt`, once
+    // for the tmp suffix — both need the SAME value), explicitly restored below. ONCE ONLY for
+    // randomUUID — see the module-level `vi.mock` comment for why anything more persistent here
+    // would be file-wide unsafe.
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+    try {
+      vi.mocked(nodeCrypto.randomUUID).mockReturnValueOnce(fixedUuid as `${string}-${string}-${string}-${string}-${string}`);
+      const plantedTmp = join(dir, `.${basename(path)}.${process.pid}.${fixedNow}.${fixedUuid}.tmp`);
+      const plantedContent = "NOT A GATE MIRROR — planted ahead of the exclusive-create attempt";
+      writeFileSync(plantedTmp, plantedContent, "utf8");
+
+      // materializeGateMirror() DIRECTLY, not through declare()'s own refreshGateSidecar() — that
+      // path wraps materializeGateMirror in a try/catch that deliberately swallows failures (see
+      // refreshGateSidecar's own comment, engine.ts), which would hide the very throw this test
+      // exists to pin.
+      expect(() => c.materializeGateMirror(path)).toThrow(/freshly-randomized path/);
+      // THE PLANTED FILE'S CONTENT IS UNCHANGED — the write never went through it. `wx` failing
+      // means writeFileSync did not touch the existing inode at all, not merely "reverted" it.
+      expect(readFileSync(plantedTmp, "utf8")).toBe(plantedContent);
+      // THE REAL TARGET WAS NEVER CREATED EITHER — materialize failed before ever reaching rename.
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      nowSpy.mockRestore();
+      c.close();
+    }
+  });
+
+  it("refuses to write the mirror through a pre-planted symlink at the tmp path — the symlink's victim target survives untouched, and materialize throws named (Codex round 9, item 1)", async () => {
+    if (process.platform === "win32") return; // symlink semantics are not this test's concern there
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+
+    const fixedNow = 1732000000001;
+    const fixedUuid = "22222222-2222-2222-2222-222222222222";
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+    try {
+      vi.mocked(nodeCrypto.randomUUID).mockReturnValueOnce(fixedUuid as `${string}-${string}-${string}-${string}-${string}`);
+      const victim = join(mkTmp(), "victim.txt"); // a DIFFERENT directory — the classic symlink-escape shape
+      const victimContent = "the attacker's real target, elsewhere on disk";
+      writeFileSync(victim, victimContent, "utf8");
+      const plantedTmp = join(dir, `.${basename(path)}.${process.pid}.${fixedNow}.${fixedUuid}.tmp`);
+      symlinkSync(victim, plantedTmp);
+
+      expect(() => c.materializeGateMirror(path)).toThrow(/freshly-randomized path/);
+      // THE VICTIM FILE — what the symlink actually points at — IS UNCHANGED: `wx` refuses a
+      // pre-existing symlink at the leaf path WITHOUT following it (POSIX, cited in the mechanism's
+      // own comment), so the write never reaches the far end at all.
+      expect(readFileSync(victim, "utf8")).toBe(victimContent);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      nowSpy.mockRestore();
+      c.close();
+    }
   });
 
   it("re-materializes the mirror after a circle move, like every other bump site", async () => {
@@ -2421,6 +3118,8 @@ describe("receipt replay", () => {
     });
     expect(rule.ruleBindingChange).toEqual({
       conceptId: rule.conceptId, severity: "advisory", previousSeverity: null, downgradedFromBlocking: false,
+      narrowedFromBreadth: false, previousCircle: null, // brand-new binding — no incumbent to have replaced
+      circle: "default", // POST-write circle (Codex round 12, item 3) — this store's own implicit default
     });
     // A retry must be indistinguishable from the first call — the whole contract of operationId,
     // and a caller branching on these fields would otherwise act differently on retry.
@@ -2461,6 +3160,125 @@ describe("receipt replay", () => {
       rule: { stage: "rm -rf", severity: "advisory", declaration: true, ...AGENT_RULE },
     });
     expect(replayed.ruleBindingChange).toEqual(downgrade.ruleBindingChange);
+    c.close();
+  });
+
+  /**
+   * REPLAYS A NARROWING FAITHFULLY TOO (Codex round 10, item 4) — the SAME shape as the downgrade
+   * replay test just above, for the OTHER transition the substrate cannot re-derive from the current
+   * binding alone. Before this fix, `replayRuleOutcome` had no `rule_previous_circle` to read, so a
+   * replayed call always reported `narrowedFromBreadth: false` regardless of what the FIRST call
+   * said — exactly the under-disclosure the coordinator's own item names.
+   */
+  it("replays a NARROWING (from breadth) faithfully — the other transition the substrate cannot re-derive", async () => {
+    const c = resolvingCore();
+    await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    const narrowed = await c.store("Never delete a tree unattended.", {
+      circle: "default", kind: "rule", operationId: "op-narrow-1",
+      rule: { stage: "rm -rf", circle: "default", declaration: true, severity: "blocking", reason: "there is no undo", ...AGENT_RULE },
+    });
+    expect(narrowed.ruleBindingChange).toMatchObject({
+      previousCircle: BREADTH_CIRCLE, narrowedFromBreadth: true,
+    });
+    expect(c.ruleBinding(narrowed.conceptId)?.circle).toBe("default");
+    const replayed = await c.store("Never delete a tree unattended.", {
+      circle: "default", kind: "rule", operationId: "op-narrow-1",
+      rule: { stage: "rm -rf", circle: "default", declaration: true, severity: "blocking", reason: "there is no undo", ...AGENT_RULE },
+    });
+    expect(replayed.ruleBindingChange).toEqual(narrowed.ruleBindingChange);
+    c.close();
+  });
+
+  /**
+   * THE EXACT SCENARIO REVIEW FOUND (Codex round 12, item 3): the test just above proves A's own
+   * narrowing replays faithfully in isolation — it never proves A survives a LATER, DIFFERENT act
+   * touching the SAME binding. Comparing `previousCircle` against the binding's CURRENT circle (one
+   * version of `replayRuleOutcome` ago) was right at the moment A first ran and silently wrong
+   * forever after B moved the binding again — this is the test that would have caught it.
+   */
+  it("replays A's narrowing faithfully even after a LATER operation B widens the SAME rule back to breadth (Codex round 12, item 3)", async () => {
+    const c = resolvingCore();
+    await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    // OPERATION A: narrows the global rule to 'default'.
+    const narrowed = await c.store("Never delete a tree unattended.", {
+      circle: "default", kind: "rule", operationId: "op-narrow-then-widen-1",
+      rule: { stage: "rm -rf", circle: "default", declaration: true, severity: "blocking", reason: "there is no undo", ...AGENT_RULE },
+    });
+    expect(narrowed.ruleBindingChange).toMatchObject({ previousCircle: BREADTH_CIRCLE, narrowedFromBreadth: true, circle: "default" });
+
+    // OPERATION B, LATER, a DIFFERENT act (its own fresh operationId — not a retry of A): widens the
+    // SAME rule back to '*'. Top-level `circle` stays "default" — the CONCEPT's own home, unchanged
+    // this whole time (a concept may never itself live in '*'; only `rule.circle`, the BINDING's own
+    // ruling, can be the breadth marker — the same distinction the narrow step above already draws).
+    await c.store("Never delete a tree unattended.", {
+      circle: "default", kind: "rule", operationId: "op-widen-back-1",
+      rule: { stage: "rm -rf", circle: BREADTH_CIRCLE, declaration: true, severity: "blocking", reason: "there is no undo", ...AGENT_RULE },
+    });
+    // LIVE STATE, confirmed: global again, because of B.
+    expect(c.ruleBinding(narrowed.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    // REPLAYING A must still report what A ACTUALLY DID, not what the binding says NOW. Before this
+    // fix, `narrowedFromBreadth` compared A's own stored `previousCircle` against the LIVE binding
+    // (now '*' again, thanks to B) and silently reported `false` — A's own narrowing, erased.
+    const replayedA = await c.store("Never delete a tree unattended.", {
+      circle: "default", kind: "rule", operationId: "op-narrow-then-widen-1",
+      rule: { stage: "rm -rf", circle: "default", declaration: true, severity: "blocking", reason: "there is no undo", ...AGENT_RULE },
+    });
+    expect(replayedA.ruleBindingChange).toEqual(narrowed.ruleBindingChange);
+    expect(replayedA.ruleBindingChange).toMatchObject({
+      narrowedFromBreadth: true, previousCircle: BREADTH_CIRCLE, circle: "default",
+    });
+    c.close();
+  });
+
+  /**
+   * THE TWIN BUG, SAME FIX (Codex round 12, item 4 — the final item, flagged while implementing item
+   * 3, confirmed in scope, not silently expanded into). `downgradedFromBlocking` shared the exact
+   * comparison-against-the-live-binding shape `narrowedFromBreadth` just had — the test just above,
+   * one axis over.
+   */
+  it("replays A's downgrade faithfully even after a LATER operation B re-declares the SAME rule blocking (Codex round 12, item 4)", async () => {
+    const c = resolvingCore();
+    await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    // OPERATION A: downgrades the rule to advisory.
+    const downgrade = await c.store("Never delete a tree unattended.", {
+      kind: "rule", operationId: "op-downgrade-then-redeclare-1",
+      rule: { stage: "rm -rf", severity: "advisory", declaration: true, ...AGENT_RULE },
+    });
+    expect(downgrade.ruleBindingChange).toMatchObject({ previousSeverity: "blocking", downgradedFromBlocking: true, severity: "advisory" });
+
+    // OPERATION B, LATER, a DIFFERENT act (its own fresh operationId — not a retry of A): re-declares
+    // the SAME rule blocking again.
+    await c.store("Never delete a tree unattended.", {
+      kind: "rule", operationId: "op-redeclare-blocking-1",
+      rule: { stage: "rm -rf", severity: "blocking", declaration: true, reason: "there is no undo", ...AGENT_RULE },
+    });
+    // LIVE STATE, confirmed: blocking again, because of B.
+    expect(c.ruleBinding(downgrade.conceptId)!.severity).toBe("blocking");
+
+    // REPLAYING A must still report what A ACTUALLY DID, not what the binding says NOW. Before this
+    // fix, both `downgradedFromBlocking` AND `severity` itself compared/read against the LIVE binding
+    // (now blocking again, thanks to B) — `downgradedFromBlocking` would have silently reported
+    // `false` (A's own downgrade, erased), and `severity: "blocking"` would have contradicted
+    // `previousSeverity: "blocking"` outright, failing "indistinguishable from the first call" for
+    // that field alone even if the boolean had been fixed in isolation.
+    const replayedA = await c.store("Never delete a tree unattended.", {
+      kind: "rule", operationId: "op-downgrade-then-redeclare-1",
+      rule: { stage: "rm -rf", severity: "advisory", declaration: true, ...AGENT_RULE },
+    });
+    expect(replayedA.ruleBindingChange).toEqual(downgrade.ruleBindingChange);
+    expect(replayedA.ruleBindingChange).toMatchObject({
+      downgradedFromBlocking: true, previousSeverity: "blocking", severity: "advisory",
+    });
     c.close();
   });
 
@@ -2726,20 +3544,859 @@ describe("the chokepoint: every door is a call site", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// DOOR 13: the breadth graft surface
+// ---------------------------------------------------------------------------
+/**
+ * Doors 1-12 above guard a relayed row from quietly stripping a blocking rule's deny power. Breadth
+ * reopened the same question one field over: circle is now ALSO protection scope — "*" reaches
+ * every circle, unioned with local, no shadowing — so a relayed row that MINTS it, ESCALATES into
+ * it, or REDUCES out of it is exactly as dangerous as one that mints, reclassifies, or removes a
+ * deny, and needs the same discipline. This block is the review's own 8-item coverage sheet for that
+ * surface, each item its own numbered test, run against the fixed code (BLOCKER B2, MATERIAL M4,
+ * and the new named refusal in the circle_aliases graft loop).
+ */
+describe("DOOR 13: the breadth graft surface", () => {
+  it("13.1 refuses '*' minted from every non-declaration origin, severity flipped to advisory to prove the circle check does not ride on the (separate) blocking-only guard", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const payload = src.exportDelta(0);
+
+    for (const origin of ["correction", "projection", "import"] as const) {
+      const dst = core({ syncDeviceId: "machine-b" });
+      const forged = {
+        ...payload,
+        ruleBindings: payload.ruleBindings!.map((b) =>
+          b.concept_id === deny.conceptId ? { ...b, origin, severity: "advisory" } : b),
+      };
+      expect(() => dst.graftRows(forged as never), origin)
+        .toThrow(/breadth is declaration-only and cannot be minted by sync/);
+      dst.close();
+    }
+    src.close();
+  });
+
+  it("13.2 refuses a relayed CONCEPT with circle '*', for every concept kind — not only 'rule'", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const fact = await src.store("An ordinary fact.", { kind: "fact" });
+    const insight = await src.store("An ordinary insight.", { kind: "insight" });
+    const rule = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    const payload = src.exportDelta(0);
+
+    for (const conceptId of [fact.conceptId, insight.conceptId, rule.conceptId]) {
+      const dst = core({ syncDeviceId: "machine-b" });
+      const forged = {
+        ...payload,
+        concepts: payload.concepts.map((c) => (c.id === conceptId ? { ...c, circle: BREADTH_CIRCLE } : c)),
+        // Edges are irrelevant to what this test asks — an edge whose endpoint circle no longer
+        // matches its own recorded scope trips an EARLIER, unrelated preflight
+        // (assertGraftPayloadIsNativeOnly's edge-endpoint check) before this loop's own guard is
+        // ever reached. Stripped so each attempt isolates the ONE thing under test: the CONCEPT
+        // circle-minting guard, for a concept this store may have linked structurally.
+        edges: [],
+        edgeComponents: [],
+      };
+      expect(() => dst.graftRows(forged as never), conceptId)
+        .toThrow(/never a circle a concept lives in/);
+      dst.close();
+    }
+    src.close();
+  });
+
+  /**
+   * REVISED (Codex round 10, item 1, P1): this test previously asserted that escalation from local
+   * to '*' was held EVEN when the incoming row was declaration-origin and won the ordinary (revision,
+   * writer) convergence contest — its own comment read "Relay does not get to widen its own reach;
+   * only local declaration does." That was the exact bug this round's item 1 closes: a fabricated
+   * row with `origin: 'declaration'` and a higher revision IS, by this system's own trust model,
+   * indistinguishable from a genuine owner's later, recorded, legal re-declaration — the M4 hold's
+   * job is to refuse a MERGE-time reclassification no row can be trusted to assert on its own, not to
+   * refuse the owner's own act reaching a peer. See the M4 comment (engine.ts) for the full argument
+   * and why `origin === 'declaration'` alone is not enough (must also WIN convergence, so a stale
+   * declaration-origin replay cannot re-widen past a later, higher-revision act).
+   */
+  it("13.3 a legitimate widening (declaration-origin, wins convergence) now relays and lands; a FORGED one (any other origin) is still held outright, for BOTH incumbent severities", async () => {
+    for (const startSeverity of ["blocking", "advisory"] as const) {
+      const src = core({ syncDeviceId: "machine-a" });
+      const rule = await src.declare({
+        species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+        content: "Never delete a tree unattended.", severity: startSeverity,
+        ...(startSeverity === "blocking" ? { reason: "there is no undo" } : {}),
+        ...AGENT_RULE,
+      });
+      if (rule.species !== "rule") throw new Error("unreachable");
+      const dst = core({ syncDeviceId: "machine-b" });
+      dst.graftRows(src.exportDelta(0));
+      expect(dst.ruleBinding(rule.conceptId)!.circle, startSeverity).toBe("default");
+
+      // A later revision from the SAME lineage, declaration-origin, winning the ordinary convergence
+      // contest — the shape a genuine owner's own re-declaration actually takes once relayed. Lands.
+      const bindingRow = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+      const legit = dst.graftRows({
+        ...dst.exportDelta(0),
+        ruleBindings: [{
+          ...bindingRow, circle: BREADTH_CIRCLE, origin: "declaration",
+          sync_revision: (bindingRow.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+        }],
+      });
+      expect(legit.skipped.rule_bindings, startSeverity).toBe(0);
+      expect(dst.ruleBinding(rule.conceptId)!.circle, startSeverity).toBe(BREADTH_CIRCLE);
+
+      // THE FORGED SIBLING: identical shape, ONLY the origin differs (never declaration) — still
+      // held, even with a revision that would otherwise win. Origin is the trust boundary here, not
+      // revision alone (mirrors 13.1's own origin sweep, one level deeper — for an EXISTING binding).
+      const bindingRow2 = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+      for (const origin of ["correction", "projection", "import"] as const) {
+        const forged = dst.graftRows({
+          ...dst.exportDelta(0),
+          ruleBindings: [{
+            // severity flipped to advisory (matching 13.1's own precedent): a non-declaration origin
+            // can never legitimately claim blocking at all — an earlier, unrelated preflight
+            // (assertGraftPayloadIsNativeOnly) refuses that combination outright, before the M4
+            // check under test here is ever reached. Isolating THIS check means not tripping that one.
+            ...bindingRow2, circle: "default", origin, severity: "advisory",
+            sync_revision: (bindingRow2.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+          }],
+        } as never);
+        expect(forged.skipped.rule_bindings, `${startSeverity}/${origin}`).toBeGreaterThan(0);
+        expect(dst.ruleBinding(rule.conceptId)!.circle, `${startSeverity}/${origin}`).toBe(BREADTH_CIRCLE);
+      }
+      src.close();
+      dst.close();
+    }
+  });
+
+  /**
+   * REVISED (Codex round 10, item 1, P1), the "present" sub-case only: `bindingRow` here always
+   * inherits `origin: 'declaration'` from the incumbent (every rule this test declares is
+   * declaration-origin by construction), so the "present, different value" row this test already
+   * fabricates — declaration-origin, a higher revision — is EXACTLY the shape a genuine owner's own
+   * narrowing takes once relayed, not a forgery. It now lands, matching item 1's own fix. The
+   * "absent" sub-case is UNCHANGED — BLOCKER B2 (an old-protocol peer's silence must never read as a
+   * crossing attempt) is a completely separate concern this item does not touch, since `row.circle
+   * === undefined` never reaches the M4 check at all.
+   */
+  it("13.4 a legitimate reduction from '*' to local (present, declaration-origin, wins convergence) now relays and lands; ABSENT circle still preserves breadth (BLOCKER B2, untouched); a FORGED reduction (non-declaration origin) is still held, for BOTH incumbent severities", async () => {
+    for (const startSeverity of ["blocking", "advisory"] as const) {
+      for (const circleField of ["present", "absent"] as const) {
+        const label = `${startSeverity}/${circleField}`;
+        const src = core({ syncDeviceId: "machine-a" });
+        const rule = await src.declare({
+          circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+          content: "Never delete a tree unattended.", severity: startSeverity,
+          ...(startSeverity === "blocking" ? { reason: "there is no undo" } : {}),
+          ...AGENT_RULE,
+        });
+        if (rule.species !== "rule") throw new Error("unreachable");
+        const dst = core({ syncDeviceId: "machine-b" });
+        dst.graftRows(src.exportDelta(0));
+        expect(dst.ruleBinding(rule.conceptId)!.circle, label).toBe(BREADTH_CIRCLE);
+
+        const bindingRow = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+        const forgedRow: Record<string, unknown> = {
+          ...bindingRow, circle: "default",
+          sync_revision: (bindingRow.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+        };
+        if (circleField === "absent") {
+          // Genuinely ABSENT, not present-and-undefined: a real old-protocol peer's JSON never has
+          // the key at all — `circle` is optional on SyncRuleBindingRow for exactly this shape.
+          delete forgedRow.circle;
+        }
+        const result = dst.graftRows({ ...dst.exportDelta(0), ruleBindings: [forgedRow] } as never);
+        if (circleField === "present") {
+          // declaration-origin + wins convergence — lands, exactly the owner-narrowing shape.
+          expect(result.skipped.rule_bindings, label).toBe(0);
+          expect(dst.ruleBinding(rule.conceptId)!.circle, label).toBe("default");
+
+          // THE FORGED SIBLING, same present-circle shape, ONLY the origin differs — refused, but
+          // NOT by the M4 escape this item adds: a non-declaration origin claiming circle '*' at
+          // ALL is refused by the PRE-EXISTING '*'-minting preflight (assertGraftPayloadIsNativeOnly,
+          // DOOR 13.1's own precedent), thrown before M4's own check is ever reached — a more
+          // fundamental gate than this item's, and still fully in force. severity flipped to
+          // advisory too (matching 13.1): a non-declaration origin can never legitimately claim
+          // blocking either, a SEPARATE earlier preflight check.
+          const bindingRow2 = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+          for (const origin of ["correction", "projection", "import"] as const) {
+            expect(() => dst.graftRows({
+              ...dst.exportDelta(0),
+              ruleBindings: [{
+                ...bindingRow2, circle: BREADTH_CIRCLE, origin, severity: "advisory",
+                sync_revision: (bindingRow2.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+              }],
+            } as never), `${label}/${origin}`).toThrow(/breadth is declaration-only and cannot be minted by sync/);
+            expect(dst.ruleBinding(rule.conceptId)!.circle, `${label}/${origin}`).toBe("default");
+          }
+        } else {
+          // ABSENT: BLOCKER B2, untouched by this item — silence is never a crossing attempt, so the
+          // incumbent's breadth survives regardless of revision or origin.
+          expect(dst.ruleBinding(rule.conceptId)!.circle, label).toBe(BREADTH_CIRCLE);
+        }
+        src.close();
+        dst.close();
+      }
+    }
+  });
+
+  it("13.5 an old-protocol dangling deny (circle absent, reason absent) fires and discloses the moment its concept lands — no reopen required", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const full = src.exportDelta(0);
+    // Old-protocol: neither `circle` nor a reason ever existed on this wire.
+    const oldProtocol = {
+      ...full,
+      ruleBindings: full.ruleBindings!.map((b) => {
+        if (b.concept_id !== deny.conceptId) return b;
+        const copy: Record<string, unknown> = { ...b, reason: null };
+        delete copy.circle;
+        return copy;
+      }),
+    };
+
+    const dst = core({ syncDeviceId: "machine-b" });
+    // Payload 1: stage + binding, concept withheld — the documented dangling-then-live gap.
+    dst.graftRows({ ...oldProtocol, concepts: [], observations: [] } as never);
+    expect(
+      (raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(deny.conceptId) as { circle: string | null }).circle,
+    ).toBeNull();
+
+    // Payload 2: the concept arrives. NO REOPEN anywhere in this test — one MonetCore instance,
+    // no fresh construction, no createGateSchema call: BLOCKER B3 closes the gap right here.
+    dst.graftRows(oldProtocol as never);
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("default");
+
+    const fired = dst.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
+    expect(fired.rules[0]).toMatchObject({ severity: "blocking", reasonMissing: true });
+
+    expect(dst.gateStats("default").unexplainedDenies).toEqual([
+      { conceptId: deny.conceptId, title: "Never delete a tree unattended", stageName: "rm -rf" },
+    ]);
+    src.close();
+    dst.close();
+  });
+
+  it("13.6 a still-dangling NULL-circle binding is never a deliverable mirror entry", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const rule = await src.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    const full = src.exportDelta(0);
+    // Old-protocol: `circle` never existed on this wire — the one shape that actually leaves the
+    // binding NULL when its concept is withheld. A current-protocol row carries an explicit circle
+    // always, which resolves the binding immediately via EFFECTIVE CIRCLE's own fallback regardless
+    // of whether the concept exists yet — there would be nothing dangling to exclude.
+    const oldProtocol = {
+      ...full,
+      ruleBindings: full.ruleBindings!.map((b) => {
+        if (b.concept_id !== rule.conceptId) return b;
+        const copy: Record<string, unknown> = { ...b };
+        delete copy.circle;
+        return copy;
+      }),
+    };
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows({ ...oldProtocol, concepts: [], observations: [] } as never);
+    expect(
+      (raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null }).circle,
+    ).toBeNull();
+
+    // Dangling right now: the row exists (it holds and guards nothing yet), but it must not be
+    // OFFERED as a deliverable entry — minor m1's exclusion, at the exact moment it matters.
+    const stale = dst.materializeGateMirror(join(mkTmp(), "m.json")).sidecar;
+    expect(stale.entries).toEqual([]);
+
+    // ...and the moment the concept lands, in the SAME store, it is admitted (BLOCKER B3) — proving
+    // the exclusion above was the dangling row being genuinely absent, not a bug hiding it forever.
+    dst.graftRows(oldProtocol as never);
+    const settled = dst.materializeGateMirror(join(mkTmp(), "m.json")).sidecar;
+    expect(settled.entries.map((e) => e.conceptId)).toEqual([rule.conceptId]);
+    src.close();
+    dst.close();
+  });
+
+  it("13.7 a legitimate '*' deny relays verbatim and fires in a circle the receiver never configured", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile present.", severity: "blocking",
+      reason: "an unlocked install can pull an unreviewed transitive dependency", scope: "domain",
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    const result = dst.graftRows(src.exportDelta(0));
+    expect(result.inserted.rule_bindings).toBe(1);
+    expect(dst.ruleBinding(deny.conceptId)).toMatchObject({
+      circle: BREADTH_CIRCLE, severity: "blocking", origin: "declaration",
+    });
+
+    const fired = dst.gate({ actionContext: "Bash:npm install", circle: "a-circle-the-receiver-never-configured" });
+    expect(fired.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
+    src.close();
+    dst.close();
+  });
+
+  it("13.8 refuses a relayed circle_aliases row naming '*' on either side", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    await src.store("Unrelated concept so 'named' is a real circle to rename.", { circle: "named", kind: "fact" });
+    src.renameCircle("named", "canonical");
+    const payload = src.exportDelta(0);
+    const aliasRow = payload.circleAliases!.find((a) => a.from_name === "named")!;
+    expect(aliasRow).toBeDefined();
+
+    for (const forged of [
+      { ...aliasRow, from_name: BREADTH_CIRCLE },
+      { ...aliasRow, to_name: BREADTH_CIRCLE },
+    ]) {
+      const dst = core({ syncDeviceId: "machine-b" });
+      expect(() => dst.graftRows({ ...payload, circleAliases: [forged] } as never), JSON.stringify(forged))
+        .toThrow(/never a circle name an alias can hold on either side/);
+      dst.close();
+    }
+    src.close();
+  });
+
+  /**
+   * INHERITING BREADTH THROUGH SUPERSESSION IS NOT MINTING IT (Codex round 3, item 2d). Before this
+   * fix, correcting a global rule threw outright — bindRule's own declaration-only guard could not
+   * tell "succeedRule legitimately carrying an incumbent's '*' forward" from "an unrelated
+   * correction-origin caller self-assigning global reach", so it refused BOTH, rolling the whole
+   * correction back. A relayed row must get the identical protection: a peer who legitimately
+   * corrected a global rule locally must not have that correction refused the moment it crosses the
+   * wire, and a FORGED correction-origin '*' claim with no real supersession lineage must still be
+   * refused exactly as before.
+   */
+  it("13.9 a legitimate inherited successor relays and fires globally; a forged correction-origin '*' row with no '*' predecessor lineage is refused (Codex round 3, item 2d)", async () => {
+    // LEGITIMATE: correct a global advisory rule locally, then relay the successor's binding and
+    // the supersession edge together — the ordinary shape one incremental export produces.
+    const src = core({ syncDeviceId: "machine-a" });
+    const original = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
+    });
+    if (original.species !== "rule") throw new Error("unreachable");
+    const corrected = await src.store("Never install without a lockfile present, even in CI.", {
+      kind: "correction", attachTo: original.conceptId,
+    });
+    const dst = core({ syncDeviceId: "machine-b" });
+    const payload = src.exportDelta(0);
+    const result = dst.graftRows(payload);
+    expect(result.skipped.rule_bindings).toBe(0);
+    expect(dst.ruleBinding(corrected.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction" });
+    expect(dst.gate({ actionContext: "Bash:npm install", circle: "a-circle-dst-never-configured" }).rules.map((r) => r.conceptId))
+      .toEqual([corrected.conceptId]);
+
+    // FORGED: an ordinary unrelated local rule, relayed with a hand-forged circle:'*'/
+    // origin:'correction' claim and NO supersession edge anywhere — in this payload or already on
+    // dst — naming it as anyone's successor.
+    const src2 = core({ syncDeviceId: "machine-c" });
+    const ordinary = await src2.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "An ordinary local rule.", severity: "advisory", scope: "domain",
+    });
+    if (ordinary.species !== "rule") throw new Error("unreachable");
+    const ordinaryPayload = src2.exportDelta(0);
+    const forged = {
+      ...ordinaryPayload,
+      ruleBindings: (ordinaryPayload.ruleBindings ?? []).map((b) =>
+        b.concept_id === ordinary.conceptId ? { ...b, circle: BREADTH_CIRCLE, origin: "correction" } : b),
+    };
+    const dst2 = core({ syncDeviceId: "machine-d" });
+    expect(() => dst2.graftRows(forged as never))
+      .toThrow(/breadth is declaration-only and cannot be minted by sync/);
+
+    src.close(); dst.close(); src2.close(); dst2.close();
+  });
+
+  /**
+   * 13.10 THE DIVERGENT-CORRECTION RACE (Codex round 5, item 3, P1). Two replicas independently
+   * correct the SAME global rule — each produces its OWN genuinely legitimate successor and
+   * supersession edge, LOCALLY. The partial UNIQUE index on lifecycle_edges means only one edge can
+   * ever land on a given receiver's store (the pre-existing divergent-successor convention:
+   * incumbent wins, challenger's edge is skipped — see the edges loop's own comment, this file).
+   * Before this fix, the CHALLENGER's rule_bindings row still landed globally regardless, because the
+   * breadth-inheritance preflight only ever checked whether the challenger's OWN payload claimed a
+   * supersession edge — true, and NOT FORGED — but not whether that edge actually SURVIVED the
+   * receiver's own reconciliation moments later in the same transaction. Two divergent successors,
+   * both firing everywhere, one with orphaned authority: no supersession edge anywhere in the
+   * receiver's own store justified its breadth.
+   *
+   * CONVERGENCE, VERIFIED RATHER THAN ASSUMED: grafting the "winner's" delta back into the "loser"
+   * does NOT retroactively correct the loser — each replica's own local edge is ITS OWN incumbent on
+   * ITS OWN store, so "incumbent wins" resolves in the OPPOSITE direction on each side. The two
+   * replicas genuinely cannot converge without human mediation (this is the PRE-EXISTING
+   * divergent-successor semantics this fix does not change or attempt to close — "impeachment is a
+   * later slice", the edges loop's own comment); this test pins the invariants that must hold
+   * regardless of that divergence — nothing delivers twice, the receiver's own successor stays the
+   * one live global rule, the challenger's binding is skipped and counted — not the divergence itself.
+   */
+  it("13.10 the divergent-correction race: the receiver's own successor stays the one live global rule, the challenger's binding is skipped and counted, nothing delivers twice, and grafting back does not retroactively converge either side (Codex round 5, item 3)", async () => {
+    // Both replicas start from the SAME global rule — grafted from a common origin, not declared
+    // twice, so both sides genuinely share one src_concept_id to diverge over.
+    const origin = core({ syncDeviceId: "machine-origin" });
+    const shared = await origin.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
+    });
+    if (shared.species !== "rule") throw new Error("unreachable");
+    const originPayload = origin.exportDelta(0);
+
+    const src = core({ syncDeviceId: "machine-a" });
+    src.graftRows(originPayload);
+    const challenger = core({ syncDeviceId: "machine-b" });
+    challenger.graftRows(originPayload);
+
+    // INDEPENDENT, LOCAL, LEGITIMATE corrections — neither replica has synced with the other yet.
+    const successorA = await src.store("Never install without a lockfile present, even in CI.", {
+      kind: "correction", attachTo: shared.conceptId,
+    });
+    const successorB = await challenger.store("Never install without a lockfile — verify its checksum too.", {
+      kind: "correction", attachTo: shared.conceptId,
+    });
+    // Both verify as genuinely global, LOCALLY, on their own replica — the round 3 fix working
+    // exactly as intended on each side taken alone.
+    expect(src.ruleBinding(successorA.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction" });
+    expect(challenger.ruleBinding(successorB.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction" });
+
+    // THE RACE: src grafts challenger's delta. src already holds its OWN supersession edge
+    // (shared -> successorA) as the incumbent, so the divergent-successor convention skips
+    // challenger's edge (shared -> successorB) outright — proven directly below, not merely implied.
+    const challengerPayload = challenger.exportDelta(0);
+    const result = src.graftRows(challengerPayload);
+    expect(result.skipped.lifecycle_edges).toBeGreaterThan(0);
+
+    // THE FIX ITSELF: successorB's concept lands (the concepts loop is unconditional) but its
+    // binding does not — skipped and counted, not landed as global, not silently downgraded to
+    // local, not thrown.
+    expect(result.skipped.rule_bindings).toBeGreaterThan(0);
+    expect(await src.getConcept(successorB.conceptId)).not.toBeNull();
+    expect(src.ruleBinding(successorB.conceptId)).toBeNull();
+    // No surviving edge anywhere in src's own store names successorB as a successor either —
+    // the exact fact verifiesInheritedBreadthInStore checks, confirmed directly against the row.
+    expect(
+      raw(src).prepare(`SELECT 1 FROM lifecycle_edges WHERE family = 'supersession' AND dst_concept_id = ?`).get(successorB.conceptId),
+    ).toBeUndefined();
+
+    // NOTHING DELIVERS TWICE: src's own successor is the one live global rule, everywhere —
+    // including a circle this fixture never otherwise configured.
+    expect(src.gate({ actionContext: "Bash:npm install", circle: "a-circle-src-never-configured" }).rules.map((r) => r.conceptId))
+      .toEqual([successorA.conceptId]);
+
+    // CONVERGENCE, VERIFIED: grafting src's delta back into challenger does NOT retroactively
+    // correct the loser — challenger's OWN edge (shared -> successorB) is ITS OWN incumbent on ITS
+    // OWN store, so src's edge (shared -> successorA) is what gets skipped THIS time, in the
+    // opposite direction. Both replicas remain permanently, mutually divergent — the pre-existing
+    // semantics this fix does not attempt to close.
+    const srcPayload = src.exportDelta(0);
+    const reverseResult = challenger.graftRows(srcPayload);
+    expect(reverseResult.skipped.lifecycle_edges).toBeGreaterThan(0);
+    expect(reverseResult.skipped.rule_bindings).toBeGreaterThan(0);
+    expect(challenger.ruleBinding(successorA.conceptId)).toBeNull();
+    expect(challenger.gate({ actionContext: "Bash:npm install", circle: "a-circle-challenger-never-configured" }).rules.map((r) => r.conceptId))
+      .toEqual([successorB.conceptId]);
+
+    origin.close(); src.close(); challenger.close();
+  });
+
+  /**
+   * 13.11 THE FULL CONVERGENCE SEMANTICS (Codex round 10, item 1, P1) — not a fabricated row this
+   * time, but a REAL two-store sequence: machine A performs a genuine local re-declaration (round 3's
+   * legalized narrowing act), exports, and B's graft must agree — closing the exact bug this item
+   * names ("machine A explicitly narrows a '*' rule via re-declaration... machine B's graft skips
+   * the transition and the replicas diverge forever"). Then the other half: B's OWN stale copy of
+   * A's PRE-narrowing state, replayed back at A after A has moved on, must not resurrect '*' — proving
+   * `origin === 'declaration'` alone is not sufficient; the escape also requires WINNING the ordinary
+   * convergence contest, so a stale replay of an earlier, lower-revision act cannot undo a later one.
+   * Finally, a forged non-declaration-origin transition attempting the identical crossing is refused
+   * outright, confirming origin — not revision — is what makes an act trustworthy here.
+   *
+   * `new MonetCore(..., { syncDeviceId })` WITH DEFAULT DEDUP, not `core()`'s disabled-dedup helper
+   * (matching the existing "PATH 1 — breadth" precedent test above, not this describe block's own
+   * convention) — deliberately: the second `declare()` call below must resolve to the SAME concept
+   * as the first (identical stage + content), which default dedup guarantees and disabled dedup does
+   * not (`core()`'s own comment: "every store() yields its own concept" — verified against PATH 1's
+   * own working precedent before relying on it here, not assumed).
+   */
+  it("13.11 a legitimate owner narrowing relays and converges: B agrees; B's own stale ('*') delta replayed back at A does not resurrect it; a forged non-declaration transition is still held (Codex round 10, item 1)", async () => {
+    const src = new MonetCore(":memory:", { syncDeviceId: "machine-a" });
+    const rule = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
+      ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    const dst = new MonetCore(":memory:", { syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    // B's STALE snapshot, taken HERE — while B still holds '*' — is what a delayed relay of B's own
+    // state back to A would carry, later, after A has already moved on.
+    const staleFromB = dst.exportDelta(0);
+
+    // MACHINE A NARROWS ITS OWN RULE — a REAL local write, not a fabricated payload: an explicit
+    // circle argument re-scoping what declare() itself already governs (round 3's legalized act).
+    const narrowed = await src.declare({
+      circle: "default", species: "rule", stage: "rm -rf",
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
+      ...AGENT_RULE,
+    });
+    if (narrowed.species !== "rule") throw new Error("unreachable");
+    expect(narrowed.conceptId).toBe(rule.conceptId); // same concept, same binding — confirmed, not assumed
+    expect(narrowed).toMatchObject({ narrowedFromBreadth: true, previousCircle: BREADTH_CIRCLE });
+
+    // THE BUG THIS ITEM CLOSES: A's narrowing relays and B agrees — previously held forever.
+    const forward = dst.graftRows(src.exportDelta(0));
+    expect(forward.skipped.rule_bindings).toBe(0);
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("default");
+
+    // B's OWN STALE DELTA, replayed back at A, does NOT resurrect '*': A has since moved to a HIGHER
+    // revision, so the stale ('*', lower-revision, declaration-origin) row LOSES the ordinary
+    // convergence contest — declaration origin alone was never enough, it must also win.
+    const backAtA = src.graftRows(staleFromB);
+    expect(backAtA.skipped.rule_bindings).toBeGreaterThan(0);
+    expect(src.ruleBinding(rule.conceptId)!.circle).toBe("default");
+
+    // A FORGED transition — non-declaration origin, a revision that WOULD otherwise win — is
+    // refused, but NOT by the M4 escape this item adds: a non-declaration origin claiming circle
+    // '*' at all is refused by the PRE-EXISTING '*'-minting preflight (assertGraftPayloadIsNativeOnly,
+    // DOOR 13.1's own precedent), thrown before M4's own check is ever reached — a more fundamental
+    // gate than this item's, and still fully in force; this loop confirms it composes correctly with
+    // an EXISTING (already-narrowed) binding in play, not only a fresh one. severity flipped to
+    // advisory too (matching 13.1): a non-declaration origin can never legitimately claim blocking
+    // either, a separate earlier preflight check.
+    const bindingRow = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+    for (const origin of ["correction", "projection", "import"] as const) {
+      expect(() => dst.graftRows({
+        ...dst.exportDelta(0),
+        ruleBindings: [{
+          ...bindingRow, circle: BREADTH_CIRCLE, origin, severity: "advisory",
+          sync_revision: (bindingRow.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+        }],
+      } as never), origin).toThrow(/breadth is declaration-only and cannot be minted by sync/);
+      expect(dst.ruleBinding(rule.conceptId)!.circle, origin).toBe("default");
+    }
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * COMPOSING ROUND 10's NARROWING-LANDS WITH ROUND 1's CONCEPT-IS-TRUTH (Codex round 11, item 6,
+   * P1). 13.4 and 13.11 above both prove an admitted narrowing LANDS; neither one ever gives the
+   * concept a circle different from what the row itself claims, so neither notices that the landed
+   * VALUE was simply the row's own claim, never cross-checked against the concept. This test forces
+   * the divergence: B's own copy of the concept lives at 'y', entirely independent of sync, and A's
+   * relayed narrowing claims 'x' — the concept is the truth, exactly as it already is outside breadth
+   * (the NON-BREADTH REGIME just below in graftRows).
+   */
+  it("13.12 an admitted declaration-origin narrowing lands at the CONCEPT's own actual circle on the receiver, not the row's claimed circle, when the two diverge (Codex round 11, item 6)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const rule = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    // B's OWN CONCEPT MOVES, LOCALLY, INDEPENDENT OF SYNC — a plain reassignment, nothing to do with
+    // the binding's own breadth. The concept now lives at 'y' on B; the binding stays '*' — a global
+    // binding never follows its concept (trg_rule_bindings_follow_concept_circle's own `circle !=
+    // '*'` guard, gates.ts; the same invariant DOOR 13's old-build UPDATE test above already relies
+    // on for the identical reason).
+    dst.reassignCircle(rule.conceptId, "y");
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    // MACHINE A NARROWS ITS OWN RULE TO 'x' — a legitimate owner act (round 10's own M4 escape),
+    // relayed to B. B has never heard of 'x'; its own concept lives at 'y'.
+    const bindingRow = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+    const narrowedRow: Record<string, unknown> = {
+      ...bindingRow, circle: "x", origin: "declaration",
+      sync_revision: (bindingRow.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+    };
+    const result = dst.graftRows({ ...dst.exportDelta(0), ruleBindings: [narrowedRow] } as never);
+
+    // ADMITTED, not skipped — M4's own boundary check let it cross.
+    expect(result.skipped.rule_bindings).toBe(0);
+    // BUT LANDS AT 'y', the concept's own actual circle on B — NOT 'x', the row's mere claim.
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("y");
+    // And it delivers from 'y', never from 'x' — the divergence would otherwise silently move the
+    // rule's delivery to a circle its own concept never actually lived in on this store.
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "y" }).rules.map((r) => r.conceptId))
+      .toContain(rule.conceptId);
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "x" }).rules.map((r) => r.conceptId))
+      .not.toContain(rule.conceptId);
+
+    src.close();
+    dst.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// correcting a global rule inherits its breadth, not just its content
+// ---------------------------------------------------------------------------
+/**
+ * Codex round 3, item 2. succeedRule already passed the incumbent's circle to the successor
+ * unconditionally (inheritance was always the code's intent), but bindRule's own declaration-only
+ * breadth guard could not tell that apart from an unrelated caller minting '*' via a bare
+ * correction, and the schema CHECK would have rejected the write regardless — so correcting a
+ * global rule rolled the ENTIRE correction back: no successor, no supersession edge, nothing. Fixed
+ * through the full chain: the schema CHECK widens to accept correction-origin '*' (item 2a),
+ * bindRule verifies the claim via a `predecessorCircle` succeedRule threads through rather than
+ * bindRule inferring it (item 2b), and the graft preflight extends the identical governed exception
+ * to a relayed successor (item 2c, tested in DOOR 13.9 above).
+ */
+describe("correcting a global rule inherits its breadth, not just its content", () => {
+  it("correcting a global ADVISORY rule succeeds: the successor is '*', fires everywhere, and the supersession edge + disclosure are intact", async () => {
+    const c = core();
+    const original = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
+    });
+    if (original.species !== "rule") throw new Error("unreachable");
+    expect(c.ruleBinding(original.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    const corrected = await c.store("Never install without a lockfile present, even in CI.", {
+      kind: "correction", attachTo: original.conceptId,
+    });
+    // DISCLOSURE: the supersession is reported, not merely performed.
+    expect(corrected.ruleSuccession).toMatchObject({
+      supersededRuleId: original.conceptId, successorRuleId: corrected.conceptId,
+    });
+    // THE SUPERSESSION EDGE actually exists and names the right pair.
+    const edge = raw(c).prepare(
+      `SELECT src_concept_id, dst_concept_id, family FROM lifecycle_edges WHERE id = ?`,
+    ).get(corrected.ruleSuccession!.supersessionEdgeId) as { src_concept_id: string; dst_concept_id: string; family: string };
+    expect(edge).toMatchObject({ src_concept_id: original.conceptId, dst_concept_id: corrected.conceptId, family: "supersession" });
+    // THE SUCCESSOR INHERITS BREADTH — the fix itself.
+    expect(c.ruleBinding(corrected.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, origin: "correction", severity: "advisory" });
+    // FIRES EVERYWHERE, including a circle this fixture never otherwise touches.
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      .toEqual([corrected.conceptId]);
+    // THE OLD RULE IS HISTORY — active, searchable, never injected again (existing doctrine,
+    // unaffected by this fix — confirmed still true for a GLOBAL predecessor specifically).
+    expect((await c.getConcept(original.conceptId))!.status).toBe("active");
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "default" }).rules.map((r) => r.conceptId))
+      .toEqual([corrected.conceptId]); // the OLD concept id never appears
+    c.close();
+  });
+
+  /**
+   * DISAGREEMENT WITH THE REVIEW'S OWN PREMISE, STATED PLAINLY: the review asked for this same test
+   * "for a global BLOCKING rule (which additionally requires the acknowledgment door — verify the
+   * two guards compose rather than fight)". Investigated directly (ruleCorrectionVerdict, engine.ts)
+   * rather than assumed: there is no acknowledgment door that unlocks blocking-rule correction.
+   * `ruleCorrectionVerdict` returns `"blocking"` — refused, UNCONDITIONALLY — for ANY blocking
+   * incumbent, by explicit design ("Declaration is the only mutation path for a blocking rule, in
+   * both directions" — that function's own comment). `acknowledgeBlockingRules` is a REAL mechanism
+   * in this codebase, but for a different door entirely (re-authoring a STAGE's trigger patterns
+   * when blocking rules are bound to it — assertNoUnacknowledgedDenies), not for unlocking
+   * correction-based supersession of a blocking rule's CONTENT. succeedRule's own doc comment
+   * already states the successor "cannot inherit blocking severity, because the incumbent could
+   * never have been blocking" — this is a confirmed, pre-existing, deliberate invariant, not a gap
+   * this round's fix should touch. What this test proves instead: that invariant survives this fix
+   * completely unchanged — a global BLOCKING rule is exactly as refused-by-correction as a local
+   * one, for the SAME declaration-only reason, with no interaction with breadth at all.
+   */
+  it("correcting a global BLOCKING rule is still refused, unconditionally — declaration-only, unrelated to breadth (a correction to the review's own premise, not a gap this fix should close)", async () => {
+    const c = core();
+    const deny = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile.", severity: "blocking", reason: "unlocked installs drift",
+      scope: "domain",
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    await expect(
+      c.store("A challenger observation.", { kind: "correction", attachTo: deny.conceptId }),
+    ).rejects.toThrow(/blocking rule.*cannot be corrected/s);
+    // UNCHANGED: still blocking, still global, still firing — the refusal left it exactly as it was.
+    expect(c.ruleBinding(deny.conceptId)).toMatchObject({ severity: "blocking", circle: BREADTH_CIRCLE });
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// relayed circle divergence: the concept is authoritative (Codex round 1, item 3)
+// ---------------------------------------------------------------------------
+/**
+ * A DIFFERENT invariant than DOOR 13's, though it lives in the same loop: this is LOCAL-to-LOCAL,
+ * never '*' on either side. Once delivery started trusting `rule_bindings.circle` (for breadth's
+ * sake — a binding's circle can legitimately diverge from its concept's ONLY when it is breadth), a
+ * relayed row claiming a DIFFERENT ordinary circle than its own concept — declaration-origin, a
+ * legitimately higher revision, every DOOR 12 field unchanged, only circle diverging — landed
+ * untouched by every existing guard (DOOR 12 watches stage/scope/tag; the boundary check watches
+ * for '*' crossing a boundary) and silently moved the deny's delivery away from the circle its
+ * concept actually lives in. The fix restores the invariant that made pre-breadth delivery safe:
+ * for a NON-breadth binding, the concept's own circle is the truth, converged to silently (no skip
+ * counter — this is not a reclassification act, the row is simply wrong about a fact the concept
+ * already settles) whenever the concept exists.
+ */
+describe("relayed circle divergence: the concept is authoritative", () => {
+  it("a relayed row claiming a DIFFERENT local circle than its own concept converges to the concept — the deny STAYS in the concept's actual circle and still fires there (Codex round 1, item 3)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0)); // dst holds the incumbent; concept lives in "circle-a"
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+
+    // A later revision, same lineage, declaration-origin, EVERY door-12 field unchanged — claiming
+    // ONLY a different LOCAL circle. The concept itself does NOT move in this payload.
+    const bindingRow = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === deny.conceptId)!;
+    const result = dst.graftRows({
+      ...dst.exportDelta(0),
+      ruleBindings: [{
+        ...bindingRow, circle: "circle-b",
+        sync_revision: (bindingRow.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+      }],
+    });
+    // NOT held (the boundary-check shape is for '*' crossing a boundary; this is local-to-local) —
+    // the row converges silently to the concept's own circle, with no skip counter.
+    expect(result.skipped.rule_bindings).toBe(0);
+    expect(result.inserted.rule_bindings).toBe(1);
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+    expect((raw(dst).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(deny.conceptId) as { circle: string }).circle)
+      .toBe("circle-a");
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-b" }).rules).toEqual([]);
+    src.close();
+    dst.close();
+  });
+
+  it("a legitimate move — the concept row ALSO moves circles in the SAME payload — the binding follows it (Codex round 1, item 3)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+
+    // src moves the concept locally, then relays both the concept AND its binding together.
+    src.reassignCircle(deny.conceptId, "circle-b");
+    const payload = src.exportDelta(0);
+    expect(payload.concepts.find((c) => c.id === deny.conceptId)?.circle).toBe("circle-b");
+    const result = dst.graftRows(payload);
+    expect(result.skipped.rule_bindings).toBe(0);
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-b");
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-b" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules).toEqual([]);
+    src.close();
+    dst.close();
+  });
+
+  it("the SAME divergence, for an ADVISORY binding — non-breadth means non-breadth regardless of severity too (Codex round 1, item 3)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const rule = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Confirm before deleting.", severity: "advisory", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("circle-a");
+
+    const bindingRow = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+    const result = dst.graftRows({
+      ...dst.exportDelta(0),
+      ruleBindings: [{
+        ...bindingRow, circle: "circle-b",
+        sync_revision: (bindingRow.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+      }],
+    });
+    expect(result.skipped.rule_bindings).toBe(0);
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("circle-a");
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules.map((r) => r.conceptId))
+      .toEqual([rule.conceptId]);
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * A DIFFERENT bug than item 3's own, found WHILE writing that fix's "legitimate move" test above:
+   * renameCircle's (and moveConcept's) parallel `UPDATE rule_bindings SET circle = ?` carried no sync
+   * stamp at all — unlike `concepts`, `rule_bindings` has no automatic sync trigger, so a raw UPDATE
+   * against it is invisible to sync unless it stamps sync_updated_at/sync_revision/sync_writer
+   * itself (the way bindRule's own UPDATE branch already does). A rename relayed to a peer moved the
+   * CONCEPT (the concepts trigger caught that) while the BINDING stayed pointed at the OLD circle
+   * name on every other device FOREVER — not merely stale until an unrelated touch, genuinely
+   * permanent, since a row an incremental export never re-selects gets no second chance to converge.
+   * NOT one of Codex round 1's 4 named findings; fixed here because item 3's own explicitly
+   * requested "binding follows a legitimate move" scenario cannot be true without it.
+   */
+  it("renameCircle's rule_bindings update is stamped for sync too — a rename relayed to a peer moves the binding, not only the concept", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const deny = await src.declare({
+      circle: "circle-a", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows(src.exportDelta(0));
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-a");
+
+    src.renameCircle("circle-a", "circle-renamed");
+    const payload = src.exportDelta(0);
+    expect(payload.ruleBindings!.find((b) => b.concept_id === deny.conceptId)?.circle).toBe("circle-renamed");
+    const result = dst.graftRows(payload);
+    expect(result.skipped.rule_bindings).toBe(0);
+    expect(result.inserted.rule_bindings).toBe(1);
+    expect(dst.ruleBinding(deny.conceptId)!.circle).toBe("circle-renamed");
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-renamed" }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId]);
+    src.close();
+    dst.close();
+  });
+});
+
 describe("the sidecar generation contract", () => {
-  const read = (path: string): BlockingSidecar => JSON.parse(readFileSync(path, "utf8")) as BlockingSidecar;
+  const read = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
 
   it("bumps exactly once per mutation class, and not at all for unrelated writes", async () => {
     const c = resolvingCore();
     const at = (): number => c.sidecarGeneration();
     const start = at();
 
-    // An advisory rule is not deny power: nothing to mirror, nothing to bump.
+    // AN ADVISORY RULE IS MIRROR CONTENT TOO, as of format 4 (entries carries every live rule, both
+    // severities — no longer "an advisory rule is not deny power: nothing to mirror, nothing to
+    // bump", which was the correct read only while the mirror was blocking-only). This one call
+    // creates a NEW stage ("rm -rf" did not exist) AND a new binding — two mirror-relevant writes,
+    // two bumps. An ordinary FACT touches neither `stages` nor `rule_bindings`, so it still bumps
+    // nothing — that half of "not at all for unrelated writes" is unchanged.
     await c.store("An advisory rule.", { kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf", ...AGENT_RULE } });
+    const afterAdvisoryRule = at();
+    expect(afterAdvisoryRule).toBe(start + 2);
     await c.store("An ordinary fact.", { kind: "fact" });
-    expect(at()).toBe(start);
+    expect(at()).toBe(afterAdvisoryRule);
 
-    // 1. a blocking binding appears
+    // 1. a blocking binding appears, on a NEW stage — new stage (+1) and new binding (+1), same as
+    //    the advisory case above: severity does not change what counts as mirror-relevant creation.
     const deny = await c.declare({
       species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
       content: "Never apply without a plan review.", severity: "blocking",
@@ -2747,41 +4404,170 @@ describe("the sidecar generation contract", () => {
     });
     if (deny.species !== "rule") throw new Error("unreachable");
     const afterDeclare = at();
-    expect(afterDeclare).toBe(start + 1);
+    expect(afterDeclare).toBe(afterAdvisoryRule + 2);
 
-    // 2. patterns change on a stage that carries a deny
+    // 2. patterns change on a stage that carries a deny — unchanged from before: a stage carrying a
+    //    live blocking rule already bumped under the old, narrower gate, and still does under the
+    //    new, wider one (every stage's patterns are mirror content now, not only a denying stage's).
     await c.declare({
       species: "stage", stage: "terraform apply", patterns: ["terraform apply", "terraform destroy"],
       acknowledgeBlockingRules: [deny.conceptId],
     });
     const afterPatterns = at();
     expect(afterPatterns).toBe(afterDeclare + 1);
-    // ...but a no-op re-declaration of the SAME patterns changes nothing, so it bumps nothing.
+    // ...but a no-op re-declaration of the SAME patterns changes nothing, so it bumps nothing —
+    // upsertStage's own no-op guard (`nextPatterns === existing.trigger_patterns`) short-circuits
+    // before any bump decision is even reached, unaffected by this slice's widening.
     await c.declare({
       species: "stage", stage: "terraform apply", patterns: ["terraform apply", "terraform destroy"],
       acknowledgeBlockingRules: [deny.conceptId],
     });
     expect(at()).toBe(afterPatterns);
 
-    // 3. moving the rule between circles rewrites the entry's `circle` field
+    // 3. moving the rule between circles rewrites the entry's `circle` field — unchanged: this rule
+    //    is blocking, so both the old and new liveness predicate agree it is mirror-relevant.
     c.reassignCircle(deny.conceptId, "elsewhere");
     const afterMove = at();
     expect(afterMove).toBe(afterPatterns + 1);
 
-    // 4. an explicit downgrade — the only way to take deny power off a live rule
+    // 4. an explicit downgrade — the only way to take deny power off a live rule. +2, not +1, as of
+    //    Codex round 10, items 2+3: withdrawDeny's own store() call reaches bindRule's "replace"
+    //    branch, changing `severity` — one of the seven columns `trg_rule_bindings_bump_on_
+    //    reclassification` now also watches. That trigger composes with bindRule's OWN kept bump
+    //    (see that branch's own comment, gates.ts, for why — unlike every other case in this
+    //    family — the JS-side call could not be safely removed) rather than replacing it: a
+    //    genuine, single reclassification act now bumps twice, an accepted, documented cost, not a
+    //    regression. `afterDowngrade` still anchors every later delta below by its own actual value,
+    //    not by a hardcoded absolute, so nothing downstream needed to change.
     await withdrawDeny(c, deny.conceptId, "terraform apply", "elsewhere");
     const afterDowngrade = at();
-    expect(afterDowngrade).toBe(afterMove + 1);
+    expect(afterDowngrade).toBe(afterMove + 2);
 
-    // 5. retire, now that the deny has been withdrawn and retirement is ordinary cleanup. Bumps
-    //    nothing further: the rule stopped being in the mirror at the downgrade.
+    // 5. RETIRE, now that the deny has been withdrawn and retirement is ordinary cleanup. THIS is
+    //    where format 4 changes the count: the rule is ADVISORY now (not blocking) since step 4, so
+    //    the OLD blocking-only gate (hasBlockingBinding) would have seen no bump owed here — "the
+    //    rule stopped being in the mirror at the downgrade" was true when the mirror was
+    //    blocking-only. It is NOT true any more: the advisory rule is very much in `entries` after
+    //    the downgrade, and retiring it is what removes it now — so THIS bumps, where it used not to.
     c.retireConcept(deny.conceptId);
-    expect(at()).toBe(afterDowngrade);
-    // ...and now that nothing blocks, an ordinary rule write moves nothing at all.
-    const settled = at();
-    await c.store("Another advisory rule.", { kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE } });
+    const afterRetire = at();
+    expect(afterRetire).toBe(afterDowngrade + 1);
+
+    // ...and an ordinary NEW advisory rule write ALSO bumps now — on the EXISTING "rm -rf" stage, so
+    // only the binding is new (+1, not +2). This is the other half of what "not at all for unrelated
+    // writes" used to mean: an all-advisory write was UNRELATED to a blocking-only mirror. It is not
+    // unrelated to this one. Text deliberately dissimilar from "An advisory rule." above — this is
+    // resolvingCore, and a near-paraphrase would resolve onto the SAME concept (bindRule's `keep`
+    // branch, a genuine no-op that bumps nothing), which would test attach-dedup instead of this.
+    await c.store("Confirm before force-deleting a mounted volume.", { kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE } });
+    const afterNewAdvisoryRule = at();
+    expect(afterNewAdvisoryRule).toBe(afterRetire + 1);
+    // A FACT remains genuinely unrelated: it never touches stages or rule_bindings, retired or not.
     c.retireConcept((await c.store("A throwaway fact.", { kind: "fact" })).conceptId);
-    expect(at()).toBe(settled);
+    expect(at()).toBe(afterNewAdvisoryRule);
+    c.close();
+  });
+
+  /**
+   * THE MIRROR MUST STOP GOING STALE ON A RETITLE, EVERYWHERE ONE CAN HAPPEN (Codex round 6, item 1;
+   * closing the family round 2, item 4 opened). noteRuleTouched bumps the IN-MEMORY generation
+   * counter — that alone changes nothing ON DISK until something calls refreshGateSidecar(). Four
+   * call sites wrote noteRuleTouched but never that follow-up call: detach()'s partial-detach
+   * (source-survives) branch, resolveContradiction's explicit-body-override branch, applySynthesis
+   * (the agent-facing MCP twin), and synthesizeRow's own two callers (getConcept's lazy synthesis,
+   * checkpoint's batch). Each is proven directly below: a configured sidecar path, the retitling
+   * act, then reading the FILE ON DISK (not sidecarGeneration(), which only proves the IN-MEMORY
+   * counter moved) for the recomputed title, with no intervening unrelated mutation.
+   */
+  it("detach()'s partial-detach branch refreshes the on-disk mirror immediately — the recomputed source title lands without an unrelated write (Codex round 6, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
+    const rule = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
+      scope: "domain",
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    // A second observation on the SAME concept, so a PARTIAL detach (source survives) is reachable —
+    // detaching the first leaves the second as the source's sole remaining, recomputed-title evidence.
+    await c.store("Confirm the target path is not a mount point.", { attachTo: rule.conceptId });
+    const before = read(path);
+    expect(before.entries[0]!.text).not.toContain("Confirm the target path");
+
+    const firstObsId = (await c.getConcept(rule.conceptId))!.observations[0]!.id;
+    await c.detach(rule.conceptId, [firstObsId]);
+
+    // ON DISK, IMMEDIATELY — no unrelated mutation, no explicit materializeGateMirror() call.
+    const after = read(path);
+    expect(after.entries).toHaveLength(1); // still the same one live rule, just retitled
+    expect(after.entries[0]!.text).toContain("Confirm the target path");
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  it("closes the same family for applySynthesis, resolveContradiction's explicit-body-override, and both synthesizeRow callers (getConcept's lazy synthesis, checkpoint's batch) — each refreshes the on-disk mirror immediately (Codex round 6, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a" });
+
+    // applySynthesis: the agent-facing MCP twin of synthesizeRow's own retitling.
+    const forSynthesis = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Prefer npm ci over npm install.", severity: "advisory", scope: "domain",
+    });
+    if (forSynthesis.species !== "rule") throw new Error("unreachable");
+    await c.applySynthesis(forSynthesis.conceptId, "Always run npm ci in CI, never npm install.");
+    expect(read(path).entries.find((e) => e.conceptId === forSynthesis.conceptId)?.text)
+      .toContain("Always run npm ci in CI");
+    expect(c.isSidecarStale().stale).toBe(false);
+
+    // resolveContradiction: an explicit body override on the accept-new/keep-current verdict.
+    // "A rule is corrected, never mediated" (door 7's own comment, this file) refuses an open
+    // contradiction against a rule concept at EVERY documented entrance — local flagContradiction
+    // outright, and a relayed one too, unconditionally, regardless of severity. resolveContradiction
+    // itself carries no such guard (it operates on whatever open contradiction it is handed), so this
+    // is reachable only the way the codebase's own other defensive checks already assume things can
+    // arrive: a row that bypassed every guard (a hand-edited store, an older build predating door 7).
+    // Inserted directly, matching that convention, to prove resolveContradiction's OWN behavior on
+    // the row it is handed rather than relitigating how a contradiction could end up on a rule.
+    const forContradiction = await c.declare({
+      species: "rule", stage: "git push --force", patterns: ["Bash:git push --force"],
+      content: "Never force-push to a shared branch.", severity: "advisory", scope: "domain",
+    });
+    if (forContradiction.species !== "rule") throw new Error("unreachable");
+    const contradictionId = "bypassed-guard-contradiction-1";
+    raw(c).prepare(
+      `INSERT INTO contradictions (id, concept_id, kind, status, detail, detected_at, updated_at, sync_revision, sync_writer)
+       VALUES (?, ?, 'value-conflict', 'open', 'a peer disagrees', ?, ?, 0, 'x')`,
+    ).run(contradictionId, forContradiction.conceptId, Date.now(), Date.now());
+    c.resolveContradiction(contradictionId, { decision: "accept-new", body: "Force-push only with --force-with-lease, and only to your own branch." });
+    expect(read(path).entries.find((e) => e.conceptId === forContradiction.conceptId)?.text)
+      .toContain("Force-push only with --force-with-lease");
+    expect(c.isSidecarStale().stale).toBe(false);
+
+    // getConcept's lazy synthesis: a fetch that happens to be the trigger for pending synthesis.
+    const forLazySynthesis = await c.declare({
+      species: "rule", stage: "terraform apply", patterns: ["terraform apply"],
+      content: "Never apply without a plan review.", severity: "advisory", scope: "domain",
+    });
+    if (forLazySynthesis.species !== "rule") throw new Error("unreachable");
+    await c.store("Always run terraform plan and share the diff before applying.", { attachTo: forLazySynthesis.conceptId });
+    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(forLazySynthesis.conceptId); // force the lazy path
+    await c.getConcept(forLazySynthesis.conceptId, { synthesize: true });
+    expect(c.isSidecarStale().stale).toBe(false);
+
+    // checkpoint's batch: the same synthesizeRow, reached through the multi-concept path.
+    const forCheckpoint = await c.declare({
+      species: "rule", stage: "docker system prune", patterns: ["Bash:docker system prune"],
+      content: "Never prune without confirming with the team.", severity: "advisory", scope: "domain",
+    });
+    if (forCheckpoint.species !== "rule") throw new Error("unreachable");
+    await c.store("Post in #ops before pruning, every time.", { attachTo: forCheckpoint.conceptId });
+    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(forCheckpoint.conceptId);
+    await c.checkpoint();
+    expect(c.isSidecarStale().stale).toBe(false);
+
     c.close();
   });
 
@@ -2794,9 +4580,18 @@ describe("the sidecar generation contract", () => {
     if (deny.species !== "rule") throw new Error("unreachable");
     const before = c.sidecarGeneration();
     c.renameCircle("proj", "project-renamed");
-    expect(c.sidecarGeneration()).toBe(before + 1);
+    // +2, not +1, as of Codex round 11, item 3: trg_rule_bindings_follow_concept_circle's own
+    // unconditional bump for the moved concept (unchanged — this rename carries a live deny) PLUS
+    // trg_circle_aliases_bump_on_insert firing for the from→to alias row this rename also publishes
+    // (gates.ts, migrateGateColumns) — circle_aliases writes were not mirror-bump-covered by any
+    // mechanism at all before this round (see that trigger family's own comment for why: circle
+    // aliases only became mirror content in format 4, and no build predates knowing to bump for it
+    // deliberately; renameCircle's own gated JS bump happened to be silent here too, because the
+    // rule_bindings trigger had already advanced the generation before the gate was checked — see
+    // renameCircle's own comment, engine.ts, for the removed call this replaces).
+    expect(c.sidecarGeneration()).toBe(before + 2);
     // The mirror names each rule's circle, so the rename really did change the file's content.
-    expect(c.materializeBlockingSidecar(join(mkTmp(), "s.json")).sidecar.entries[0]!.circle).toBe("project-renamed");
+    expect(c.materializeGateMirror(join(mkTmp(), "s.json")).sidecar.entries[0]!.circle).toBe("project-renamed");
 
     const successor = await c.store("A replacement rule.", {
       circle: "project-renamed", kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
@@ -2810,8 +4605,12 @@ describe("the sidecar generation contract", () => {
     c.addLifecycleEdge({
       family: "supersession", srcConceptId: deny.conceptId, dstConceptId: successor.conceptId, bornOf: "declaration",
     });
-    // No further bump: the rule left the mirror at the withdrawal, not at the supersession.
-    expect(c.sidecarGeneration()).toBe(beforeSupersede);
+    // A FURTHER bump, where format 4 disagrees with format 3: the withdrawn rule is ADVISORY, not
+    // gone — it stayed in `entries` (both severities are mirror content now) right up until THIS
+    // supersession edge excludes it (the `NOT EXISTS supersession` clause every liveness check
+    // shares). "The rule left the mirror at the withdrawal" was true only while the mirror was
+    // blocking-only; here it leaves at the supersession, and that is what must bump.
+    expect(c.sidecarGeneration()).toBe(beforeSupersede + 1);
     c.close();
   });
 
@@ -2840,8 +4639,14 @@ describe("the sidecar generation contract", () => {
     expect(read(path).generation).toBe(c.sidecarGeneration());
     expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
 
-    // BEHIND — the file's own header is what makes this detectable at all.
-    const stale = read(path);
+    // BEHIND — the file's own header is what makes this detectable at all. `checksum` STRIPPED here
+    // (Codex round 12, item 1), not merely carried over: this test hand-mutates ONE field
+    // (`generation`) while keeping the rest, and a checksum copied verbatim from the pre-mutation
+    // read would now mismatch the mutated content — genuinely malformed, not merely behind, exactly
+    // the corruption detection the checksum exists to provide. Stripping it keeps this test isolated
+    // to the generation-comparison logic it actually targets (verify-if-present: an absent checksum
+    // skips verification entirely, the same dev-window path a pre-checksum v4 file takes).
+    const { checksum: _staleChecksum, ...stale } = read(path);
     writeFileSync(path, JSON.stringify({ ...stale, generation: stale.generation - 1 }), "utf8");
     expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind", fileGeneration: stale.generation - 1 });
 
@@ -2893,9 +4698,9 @@ describe("the sidecar generation contract", () => {
     // The upgraded install, exactly: same store, same generation, previous entry shape. Every check
     // that existed before this one passes — which is what made the failure quiet.
     const current = read(path);
-    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
     expect(c.isSidecarStale()).toMatchObject({
-      stale: true, reason: "format", fileFormat: 2, format: 3, fileGeneration: current.generation,
+      stale: true, reason: "format", fileFormat: 3, format: 4, fileGeneration: current.generation,
     });
 
     // A v1 file predates the field entirely. Not ours either, and it says so with fileFormat null
@@ -2908,11 +4713,11 @@ describe("the sidecar generation contract", () => {
 
   /**
    * A FRACTIONAL FORMAT IS MALFORMED, NOT A FUTURE FORMAT TO DEFER TO. Format versions are discrete —
-   * there is no meaning between format 3 and format 4 — so `3.5` is not "a number ahead of ours",
+   * there is no meaning between format 4 and format 5 — so `4.5` is not "a number ahead of ours",
    * it is a corrupt header. Before this fix it classified exactly like a genuine future build's file:
-   * `format-ahead` here, and `skipped-format-ahead` forever from materializeBlockingSidecar, preserved
+   * `format-ahead` here, and `skipped-format-ahead` forever from materializeGateMirror, preserved
    * on the promise of an upgrade that would never arrive, since no build — past or future — will ever
-   * actually write format 3.5. Same permanent-strand shape as the round-9 generation finding, one
+   * actually write format 4.5. Same permanent-strand shape as the round-9 generation finding, one
    * field over.
    */
   it("treats a FRACTIONAL format as malformed, not as a future format to defer to", async () => {
@@ -2921,17 +4726,379 @@ describe("the sidecar generation contract", () => {
     const c = await withDeny(path);
     const current = read(path);
 
-    const fractional = { ...current, format: 3.5 };
+    const fractional = { ...current, format: 4.5 };
     writeFileSync(path, JSON.stringify(fractional), "utf8");
     // NOT format-ahead: the whole header is rejected at the read seam, so this is indistinguishable
     // from any other structurally-wrong file — same reason, same fileGeneration: null.
     expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
 
-    const result = c.materializeBlockingSidecar();
+    const result = c.materializeGateMirror();
     expect(result.outcome).toBe("written"); // regenerated, not preserved as an unreadable "future" shape
-    expect(read(path).format).toBe(3);
+    expect(read(path).format).toBe(4);
     expect(read(path).entries).toHaveLength(1);
     expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  /**
+   * FORMAT 4 REQUIRES stages/circleAliases TOO (Codex round 1, item 2). readSidecarHeader checked
+   * `entries` but not the two arrays format 4 also added, so `{format:4, generation:n, entries:[]}`
+   * — every earlier check passing (a valid generation, entries genuinely an array, format genuinely
+   * an integer) — read as an ordinary CURRENT v4 file with two empty sections. It is not: it is
+   * structurally wrong, and reading `mirror.stages` off it throws (proven directly below) the first
+   * time anything iterates it — the read-path-throw class this fix closes at the ONE chokepoint both
+   * consumers share.
+   */
+  it("treats a format-4 header missing stages/circleAliases as malformed, not as an empty-but-current v4 file (Codex round 1, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+
+    // The exact shape Codex named: format matches, generation matches, entries is genuinely `[]` —
+    // stages and circleAliases simply never made it into this file at all.
+    const { stages: _stages, circleAliases: _circleAliases, ...missingBoth } = current;
+    writeFileSync(path, JSON.stringify({ ...missingBoth, entries: [] }), "utf8");
+    // BOTH SURFACES MUST AGREE. inspectSidecar says malformed —
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+    // — and materializeGateMirror regenerates rather than skipping "an already-current file" (the
+    // generation in the malformed header equals the store's own).
+    const result = c.materializeGateMirror();
+    expect(result.outcome).toBe("written");
+    expect(read(path).entries).toHaveLength(1);
+    expect(read(path).stages.length).toBeGreaterThan(0);
+    expect(read(path).circleAliases).toEqual([]);
+    expect(c.isSidecarStale().stale).toBe(false);
+
+    // Proven directly, not merely inferred: the shape this fix rejects would have crashed
+    // evaluateGateFromMirror on the read path this whole header check exists to keep off of — here,
+    // at `mirror.circleAliases.find(...)` (the M3 alias-resolution fix runs before the stages loop
+    // even starts); with only `stages` missing it throws one step later, iterating `mirror.stages`
+    // ("not iterable"). Either way: a TypeError on a read, not a graceful answer.
+    const malformed = { ...missingBoth, entries: [] } as unknown as GateMirror;
+    expect(() => evaluateGateFromMirror(malformed, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }))
+      .toThrow(TypeError);
+    c.close();
+  });
+
+  it("treats stages: 'not-an-array' as malformed too, at format 4 (Codex round 1, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path);
+
+    writeFileSync(path, JSON.stringify({ ...current, stages: "not-an-array" }), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+    const result = c.materializeGateMirror();
+    expect(result.outcome).toBe("written");
+    expect(Array.isArray(read(path).stages)).toBe(true);
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  /**
+   * ARRAY-NESS ALONE IS NOT ELEMENT SHAPE (Codex round 5, item 1, read-path-crash class).
+   * `Array.isArray(header.entries)` passed `entries: [null]` clean through — the array genuinely IS
+   * an array — and the crash lands one layer down, on the FIRST read of any element:
+   * `evaluateGateFromMirror`'s own filter dereferences `entry.stageId` unconditionally
+   * (`matchedStageIds.has(entry.stageId)`), so `entry === null` throws "Cannot read properties of
+   * null" before the filter's own logic ever runs — the same shape one layer over for
+   * `stage.triggerPatterns` and `row.from` (circleAliases). Proven directly against
+   * `evaluateGateFromMirror` itself below, not merely inferred from `isSidecarStale`'s own verdict —
+   * matching the precedent the format-4-missing-arrays test above already set.
+   */
+  it("treats [null] as a malformed element in entries, stages, AND circleAliases — not merely a malformed array (Codex round 5, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+
+    for (const field of ["entries", "stages", "circleAliases"] as const) {
+      const corrupted = { ...current, [field]: [null] };
+      writeFileSync(path, JSON.stringify(corrupted), "utf8");
+      expect(c.isSidecarStale(), field).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+      const result = c.materializeGateMirror();
+      expect(result.outcome, field).toBe("written"); // regenerated, not preserved as "already current"
+      // Regenerated to a genuine array with the corrupt [null] gone — NOT asserting a specific
+      // length here: circleAliases is legitimately EMPTY in this fixture (withDeny never renames a
+      // circle), while entries/stages each carry exactly the one real rule/stage. What every field
+      // shares is "no longer contains the corruption".
+      expect(Array.isArray(read(path)[field]), field).toBe(true);
+      expect(read(path)[field], field).not.toContain(null);
+      expect(c.isSidecarStale().stale, field).toBe(false);
+
+      // Proven directly: the shape this fix rejects would have crashed evaluateGateFromMirror on
+      // the read path this whole header check exists to keep off of.
+      expect(() => evaluateGateFromMirror(corrupted as unknown as GateMirror, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" }))
+        .toThrow(TypeError);
+    }
+    c.close();
+  });
+
+  it("treats an entry missing stageId as malformed, at format 4 (Codex round 5, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+    const entries = current.entries as Array<Record<string, unknown>>;
+
+    const { stageId: _stageId, ...entryMissingStageId } = entries[0]!;
+    const corrupted = { ...current, entries: [entryMissingStageId] };
+    writeFileSync(path, JSON.stringify(corrupted), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+    const result = c.materializeGateMirror();
+    expect(result.outcome).toBe("written");
+    expect(read(path).entries).toHaveLength(1);
+    expect((read(path).entries[0] as unknown as Record<string, unknown>).stageId).toBeDefined();
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  it("treats a stage with triggerPatterns of the wrong type (not a string) as malformed, at format 4 (Codex round 5, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+    const stages = current.stages as Array<Record<string, unknown>>;
+
+    // A NUMBER, not a string — `parseTriggerPatterns`'s own declared parameter type is `string`, and
+    // JSON.parse's implicit ToString coercion means this would not itself crash the parser (it
+    // silently yields zero patterns instead) — but that stage would go permanently, silently quiet,
+    // an offline/live parity gap the malformed classification exists to prevent, not only crashes.
+    const corrupted = { ...current, stages: [{ ...stages[0], triggerPatterns: 42 }] };
+    writeFileSync(path, JSON.stringify(corrupted), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+    const result = c.materializeGateMirror();
+    expect(result.outcome).toBe("written");
+    expect(typeof (read(path).stages[0] as unknown as Record<string, unknown>).triggerPatterns).toBe("string");
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  /**
+   * VALUE, NOT JUST SHAPE (Codex round 9, item 4 — a PR finding: an unrecognized severity "can
+   * similarly make a cached deny appear non-blocking to consumers"). `entry.severity === "blocking"`
+   * does not crash on a garbage string — it silently answers false, exactly the failure mode a mere
+   * `typeof === "string"` shape check (round 5) cannot catch, since a typo'd severity is still a
+   * string.
+   */
+  it("treats an entry with an unrecognized severity value as malformed, at format 4 (Codex round 9, item 4)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+    const entries = current.entries as Array<Record<string, unknown>>;
+
+    // A STRING, so round 5's own `typeof === "string"` shape check alone would have passed this
+    // clean through — the exact gap this item closes: "critical" is well-typed, just not one of
+    // RULE_SEVERITIES, and the live evaluator's own `severity === "blocking"` branch would have
+    // silently treated it as non-blocking, not thrown.
+    const corrupted = { ...current, entries: [{ ...entries[0], severity: "critical" }] };
+    writeFileSync(path, JSON.stringify(corrupted), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+    const result = c.materializeGateMirror();
+    expect(result.outcome).toBe("written");
+    expect(read(path).entries).toHaveLength(1);
+    expect(read(path).entries[0]!.severity).toBe("blocking"); // regenerated from the store, not the corrupt value
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  /**
+   * VALUE, NOT JUST SHAPE, THE SCOPE HALF (Codex round 9, item 4 — the PR finding's own worked
+   * example): "removing scope from an agent-scoped entry leaves the same-generation file classified
+   * as current, and `ruleTagIsLive(undefined, ...)` then treats that rule as domain-scoped and fires
+   * it for the wrong runtime model". `scope` was PREVIOUSLY not checked at all by
+   * `hasMirrorEntryShape` (round 5 deliberately excluded it, reasoning it could not crash) — this is
+   * the first shape/value check this field has ever had.
+   */
+  it("treats an entry with a missing or unrecognized scope value as malformed, at format 4 (Codex round 9, item 4)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+    const entries = current.entries as Array<Record<string, unknown>>;
+
+    for (const badScope of [undefined, "unrecognized-scope"] as const) {
+      const withOrWithoutScope: Record<string, unknown> = { ...entries[0] };
+      if (badScope === undefined) delete withOrWithoutScope.scope;
+      else withOrWithoutScope.scope = badScope;
+      const corrupted = { ...current, entries: [withOrWithoutScope] };
+      writeFileSync(path, JSON.stringify(corrupted), "utf8");
+      expect(c.isSidecarStale(), String(badScope)).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+      const result = c.materializeGateMirror();
+      expect(result.outcome, String(badScope)).toBe("written");
+      expect(read(path).entries, String(badScope)).toHaveLength(1);
+      expect(c.isSidecarStale().stale, String(badScope)).toBe(false);
+    }
+    c.close();
+  });
+
+  /**
+   * REFERENTIAL, NOT JUST PER-ELEMENT SHAPE (Codex round 11, item 5). Every check above validates
+   * ONE array's elements in isolation — entries individually well-shaped, stages individually
+   * well-shaped — but never asks whether the two arrays actually agree with each other.
+   * `GateMirrorEntry.stageId`'s own comment says plainly: "join against `GateMirror.stages` to match
+   * and to render" — an entry naming a stageId absent from this SAME file's own `stages[]` can never
+   * be reached through that join, live or offline.
+   */
+  it("treats an entry whose stageId names no stage in the same mirror as malformed, at format 4 (Codex round 11, item 5)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+    const entries = current.entries as Array<Record<string, unknown>>;
+
+    // A well-shaped entry — a real string stageId, so hasMirrorEntryShape alone passes it clean
+    // through — that simply names a stage absent from THIS file's own stages[]. HOLDS BY
+    // CONSTRUCTION for any file this build honestly writes (listGateMirrorEntries' own INNER JOIN to
+    // stages), so this can only arise from a hand-edited or corrupted file — exactly what this
+    // function exists to refuse.
+    const corrupted = { ...current, entries: [{ ...entries[0], stageId: "no-such-stage-in-this-file" }] };
+    writeFileSync(path, JSON.stringify(corrupted), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+    const result = c.materializeGateMirror();
+    expect(result.outcome).toBe("written");
+    expect(read(path).entries).toHaveLength(1);
+    // Regenerated from the store, not the corrupt value — the real stageId names a real stage again.
+    expect(read(path).entries[0]!.stageId).not.toBe("no-such-stage-in-this-file");
+    expect(read(path).stages.some((s) => s.id === read(path).entries[0]!.stageId)).toBe(true);
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  /**
+   * THE CONTENT CHECKSUM (Codex round 12, item 1 — closes the validation-depth category, John's own
+   * ratification 2026-07-28). Four tests: a plain round-trip, the corruption case the checksum exists
+   * for that no shape check could ever catch, the dev-window backward-compatibility case, and
+   * confirmation that adding a NEW field to the header did not disturb the EXISTING compare-before-
+   * replace machinery that reads the header for a completely different reason.
+   */
+  it("round-trips: materializeGateMirror writes a checksum, and the same file reads back as current", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const written = read(path);
+    // ADDITIVE, present on every file this build writes — a string, not merely truthy, and 64 hex
+    // characters (sha256's own digest length in hex).
+    expect(written.checksum).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
+    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
+    c.close();
+  });
+
+  it("a single-byte corruption inside an otherwise well-typed, well-shaped string is caught as malformed — the gap no shape check could ever close — and materializeGateMirror regenerates it (Codex round 12, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const before = read(path);
+    expect(before.entries[0]).toMatchObject({ reason: "there is no undo" });
+
+    // ONE CHARACTER, inside the `reason` string — still perfectly valid JSON (no structural
+    // character touched), still a STRING where a string is expected (every existing shape check
+    // passes this clean through, exactly as it would before this item existed), and still silently
+    // WRONG: the store's own reason is "there is no undo", the file now claims "Xhere is no undo".
+    // No `hasMirrorEntryShape`-style check can ever catch this — a corrupted string is still a
+    // string — which is precisely the depth the checksum exists to add.
+    const raw = readFileSync(path, "utf8");
+    expect(raw).toContain("there is no undo");
+    writeFileSync(path, raw.replace("there is no undo", "Xhere is no undo"), "utf8");
+
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "malformed", fileGeneration: null });
+    const result = c.materializeGateMirror();
+    expect(result.outcome).toBe("written");
+    // REGENERATED from the store, not the corrupted value — and the fresh file's own checksum now
+    // verifies against ITS content (not asserted equal to `before.checksum`: `generatedAt` is a live
+    // timestamp with no `now` override reachable through this public method, so two materializations
+    // legitimately produce two different canonical strings, and two different checksums, even over
+    // otherwise-identical content — exactly as the recipe's own inclusion of every field intends).
+    expect(read(path).entries[0]).toMatchObject({ reason: "there is no undo" });
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  it("a checksum-less v4 file (the dev-window case — a file predating this field) still reads as current (Codex round 12, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const withChecksum = read(path) as unknown as Record<string, unknown>;
+    expect(withChecksum.checksum).toBeDefined();
+
+    // SIMULATE a pre-checksum v4 file: every field this build already wrote, `checksum` simply never
+    // added at all — not `checksum: undefined` (which JSON.stringify would already drop on its own),
+    // genuinely absent, the same shape a file from before this item shipped has.
+    const { checksum: _omitted, ...withoutChecksum } = withChecksum;
+    expect(Object.keys(withoutChecksum)).not.toContain("checksum");
+    writeFileSync(path, JSON.stringify(withoutChecksum), "utf8");
+
+    // VERIFY-IF-PRESENT: absent here, so verification is skipped entirely — the file reads exactly
+    // as it always would have before this item existed, on the shape checks alone.
+    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
+    c.close();
+  });
+
+  it("the checksum survives the compare-before-replace path — skipped-current still recognizes an up-to-date checksummed file, and a corrupted one is overwritten rather than skipped (Codex round 12, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const firstWrite = read(path);
+    expect(firstWrite.checksum).toBeDefined();
+
+    // NOTHING CHANGED about the store — materializing again must recognize the EXISTING, checksummed
+    // file as already current and decline to rewrite it. This is the exact path
+    // materializeGateMirror's own comment calls "COMPARE BEFORE REPLACE": readSidecarHeader is called
+    // on the file BEFORE any decision to write, and that function is where checksum verification
+    // lives — confirming the addition of a new field to the header did not disturb the skip logic,
+    // which reads generation/storeIdentity/format from that SAME return value and has no notion of
+    // `checksum` of its own.
+    const repeat = c.materializeGateMirror();
+    expect(repeat.outcome).toBe("skipped-current");
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(firstWrite); // untouched, byte for byte
+    expect(c.isSidecarStale()).toEqual({ stale: false, generation: c.sidecarGeneration() });
+
+    // A CORRUPTED existing file must NOT be recognized as "already current" and skipped — it reads
+    // as if it were not there at all (readSidecarHeader returns null), so the compare-before-replace
+    // logic falls through every skip branch and proceeds to overwrite it, exactly like any other
+    // malformed file.
+    const raw = readFileSync(path, "utf8");
+    writeFileSync(path, raw.replace("there is no undo", "Xhere is no undo"), "utf8");
+    const afterCorruption = c.materializeGateMirror();
+    expect(afterCorruption.outcome).toBe("written");
+    expect(read(path)).toMatchObject({ entries: [expect.objectContaining({ reason: "there is no undo" })] });
+    expect(c.isSidecarStale().stale).toBe(false);
+    c.close();
+  });
+
+  /**
+   * THE v4-ARRAY REQUIREMENT MUST NOT SWALLOW THE FUTURE (review fix — Codex round 2, item 5; round
+   * 1's own fix, above, is what this bounds). `format >= 4` with no upper bound applied the "must
+   * have stages/circleAliases as arrays" requirement to ANY format at or past 4 — including one this
+   * build has never heard of. A legitimate same-store v5 file that legitimately restructured those
+   * fields would fail that shape check exactly like a truly corrupt file: `malformed`, not
+   * `format-ahead` — and materializeGateMirror would then OVERWRITE it, which is precisely the
+   * thrash the format-ahead machinery exists to prevent (see its own "REFUSES to overwrite..." test
+   * above), broken by the very guard meant to strengthen it.
+   */
+  it("treats a format AHEAD of this build as format-ahead, not malformed — even with missing or restructured v4 arrays (Codex round 2, item 5)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = await withDeny(path);
+    const current = read(path) as unknown as Record<string, unknown>;
+
+    // A legitimate future build's file: format ahead of what THIS build understands, and its own
+    // (here, deliberately incompatible) shape for whatever format 4 called stages/circleAliases —
+    // this build cannot know whether that is "restructured" or "missing", and must not guess.
+    const futureFormat = (current.format as number) + 1;
+    const fromTheFuture = {
+      ...current, format: futureFormat, stages: { restructured: true }, circleAliases: "not even an array",
+    };
+    writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
+    expect(c.isSidecarStale()).toMatchObject({
+      stale: true, reason: "format-ahead", fileFormat: futureFormat, format: GATE_MIRROR_FORMAT,
+    });
+
+    c.materializeGateMirror();
+    // UNTOUCHED, byte for byte — the format-ahead contract, unbroken by the array requirement.
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture);
     c.close();
   });
 
@@ -2942,13 +5109,13 @@ describe("the sidecar generation contract", () => {
     const current = read(path);
 
     // Downgrade the file in place and change nothing else. Before format joined the replace
-    // decision, the skip-if-not-newer guard fired here and the v2 artifact survived indefinitely.
-    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    // decision, the skip-if-not-newer guard fired here and the v3 artifact survived indefinitely.
+    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
     expect(c.sidecarGeneration()).toBe(current.generation); // nothing about the store has changed
 
-    c.materializeBlockingSidecar();
-    expect(read(path).format).toBe(3);
-    expect(read(path).entries[0]).toMatchObject({ reasonMissing: false });
+    c.materializeGateMirror();
+    expect(read(path).format).toBe(4);
+    expect(read(path).entries[0]).toMatchObject({ reason: "there is no undo" });
     expect(c.isSidecarStale().stale).toBe(false);
     c.close();
   });
@@ -2967,12 +5134,12 @@ describe("the sidecar generation contract", () => {
     const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
     writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
 
-    c.materializeBlockingSidecar();
+    c.materializeGateMirror();
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture); // untouched, byte for byte
 
     // ...and NOT a silent no-op: the operator asking gets the direction of the skew, not just "bad".
     expect(c.isSidecarStale()).toMatchObject({
-      stale: true, reason: "format-ahead", fileFormat: 99, format: 3,
+      stale: true, reason: "format-ahead", fileFormat: 99, format: 4,
     });
     c.close();
   });
@@ -2994,10 +5161,10 @@ describe("the sidecar generation contract", () => {
     };
     writeFileSync(path, JSON.stringify(somebodyElses), "utf8");
 
-    c.materializeBlockingSidecar();
+    c.materializeGateMirror();
 
     const after = JSON.parse(readFileSync(path, "utf8"));
-    expect(after.format).toBe(3);
+    expect(after.format).toBe(4);
     expect(after.storeIdentity).toBe(current.storeIdentity);
     expect(after.entries).toHaveLength(1); // our deny, back on disk
     expect(c.isSidecarStale()).toMatchObject({ stale: false });
@@ -3018,21 +5185,21 @@ describe("the sidecar generation contract", () => {
     first.close();
 
     // The upgrade, exactly: the file on disk is the previous shape, and nothing about the store has
-    // changed or is about to. Before this, the next reader was a v3 hook rejecting a v2 file.
-    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    // changed or is about to. Before this, the next reader was a v4 build rejecting a v3 file.
+    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
 
     const reopened = new MonetCore(":memory:", {
       tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
     });
     // NOT a declaration, NOT a gate, NOT a graft — the constructor returning is the whole event.
-    expect(read(path).format).toBe(3);
+    expect(read(path).format).toBe(4);
     expect(reopened.isSidecarStale().stale).toBe(false);
     reopened.close();
   });
 
   /**
    * A WRITER THAT SAYS IT WROTE WHEN IT DID NOT is the same lie this module spends its length
-   * preventing everywhere else. materializeBlockingSidecar returned the freshly generated,
+   * preventing everywhere else. materializeGateMirror returned the freshly generated,
    * current-format sidecar whatever happened — so a DECLINED write was indistinguishable from a
    * successful one, and install or recovery tooling reported "mirror regenerated" over a file its
    * own hook rejects. The artifact it hands back is what it GENERATED; the outcome is what reached
@@ -3046,11 +5213,11 @@ describe("the sidecar generation contract", () => {
     const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
     writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
 
-    const result = c.materializeBlockingSidecar();
+    const result = c.materializeGateMirror();
     expect(result.outcome).toBe("skipped-format-ahead");
     // The generated mirror is still handed back — it is what WOULD have been written, and reading
     // it is legitimate. What is no longer possible is mistaking it for the file on disk.
-    expect(result.sidecar.format).toBe(3);
+    expect(result.sidecar.format).toBe(4);
     expect(result.sidecar.entries).toHaveLength(1);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(fromTheFuture);
     // The two agree, which is the property that makes either one safe to act on.
@@ -3066,14 +5233,14 @@ describe("the sidecar generation contract", () => {
     // Nothing has changed since the declaration auto-refreshed the file, so it already says what we
     // would say. The mirror is FINE — this is the one skip a caller may treat as success, and the
     // reason the two skips needed separate names rather than a single boolean.
-    const noop = c.materializeBlockingSidecar();
+    const noop = c.materializeGateMirror();
     expect(noop.outcome).toBe("skipped-current");
     expect(c.isSidecarStale().stale).toBe(false);
 
     // Recovery after the file is lost — the other documented reason this method is public. Here the
     // write really happens, and "written" is what entitles the caller to report a repaired mirror.
     rmSync(path);
-    const written = c.materializeBlockingSidecar();
+    const written = c.materializeGateMirror();
     expect(written.outcome).toBe("written");
     expect(written.sidecar.entries).toHaveLength(1);
     expect(read(path).entries).toHaveLength(1);
@@ -3085,7 +5252,7 @@ describe("the sidecar generation contract", () => {
    * AHEAD OF OUR SNAPSHOT IS AMBIGUOUS ON ITS OWN — rollback debris and a legitimate racing writer
    * produce the identical shape (same store, same format, `existing.generation > sidecar.generation`)
    * and only a fresh read of the store's CURRENT generation tells them apart. See
-   * materializeBlockingSidecar's own comment for the full split. This pins the ROLLBACK half: no
+   * materializeGateMirror's own comment for the full split. This pins the ROLLBACK half: no
    * concurrent writer exists in this test, so the fabricated file is ahead of the store's CURRENT
    * generation too, not merely ahead of what this call snapshotted — the only shape that is genuinely
    * debris of an abandoned lineage. Before this fix, `existing.generation >= sidecar.generation`
@@ -3109,7 +5276,7 @@ describe("the sidecar generation contract", () => {
     // — the fabricated file is ahead of THAT, which is what makes it rollback debris rather than a race.
     expect(c.sidecarGeneration()).toBe(current.generation);
 
-    const result = c.materializeBlockingSidecar();
+    const result = c.materializeGateMirror();
     expect(result.outcome).toBe("written");
     expect(read(path).generation).toBe(current.generation); // the store's own count, not the stale-ahead one
     expect(read(path).entries).toHaveLength(1); // the store's real deny is back, not the fabricated empty set
@@ -3165,7 +5332,7 @@ describe("the sidecar generation contract", () => {
     };
     let result: SidecarMaterialization;
     try {
-      result = c.materializeBlockingSidecar();
+      result = c.materializeGateMirror();
     } finally {
       db.prepare = original;
     }
@@ -3190,7 +5357,7 @@ describe("the sidecar generation contract", () => {
     //
     // This is a REGRESSION GUARD on the new trigger, not a pin on the rule itself: the rule is
     // pinned below by "REFUSES to overwrite a mirror written by a build AHEAD of this one", which is
-    // the test that fails if materializeBlockingSidecar's guard is removed. This one fails if the
+    // the test that fails if materializeGateMirror's guard is removed. This one fails if the
     // open-time path ever starts bypassing it.
     const fromTheFuture = { ...current, format: 99, entries: [{ somethingWeCannotRead: true }] };
     writeFileSync(path, JSON.stringify(fromTheFuture), "utf8");
@@ -3225,7 +5392,7 @@ describe("the sidecar generation contract", () => {
     first.close();
     // A file the served runtime would rewrite on sight — so if report-only mode writes at all, it
     // writes here.
-    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
 
     // `deferCreatedPin` is the EXISTING declaration that this caller is inspection or dry-run
     // tooling which must never write anything — the same flag that already stops a pin being minted.
@@ -3234,20 +5401,20 @@ describe("the sidecar generation contract", () => {
       tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
       deferCreatedPin: true,
     });
-    expect(read(path).format).toBe(2);
+    expect(read(path).format).toBe(3);
     // It can still SAY the mirror is stale — reporting is what this mode is for.
     expect(inspector.isSidecarStale()).toMatchObject({ stale: true, reason: "format" });
     // And an EXPLICIT call is the caller asking, which the suppression does not countermand.
-    expect(inspector.materializeBlockingSidecar().outcome).toBe("written");
-    expect(read(path).format).toBe(3);
+    expect(inspector.materializeGateMirror().outcome).toBe("written");
+    expect(read(path).format).toBe(4);
     inspector.close();
 
     // The served runtime, for contrast: same file, same staleness, repaired by opening.
-    writeFileSync(path, JSON.stringify({ ...current, format: 2 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...current, format: 3 }), "utf8");
     const served = new MonetCore(":memory:", {
       tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
     });
-    expect(read(path).format).toBe(3);
+    expect(read(path).format).toBe(4);
     served.close();
   });
 
@@ -3285,11 +5452,13 @@ describe("the sidecar generation contract", () => {
     if (deny.species !== "rule") throw new Error("unreachable");
     expect(read(path).entries).toHaveLength(1);
 
-    // B1's over-block case: withdrawing the deny must take it OUT of the file, without anyone
-    // remembering to re-materialize. Retirement alone is refused now, so the withdrawal is the
-    // declaration and the retire is cleanup afterwards.
+    // B1's over-block case: withdrawing the deny must take the DENY out of the file, without anyone
+    // remembering to re-materialize — but not the rule itself: format 4 mirrors every live rule, so
+    // the now-advisory rule stays visible until it is actually retired. Retirement alone is refused
+    // while blocking, so the withdrawal is the declaration and the retire is cleanup afterwards.
     await withdrawDeny(c, deny.conceptId, "rm -rf");
-    expect(read(path).entries).toEqual([]);
+    expect(read(path).entries).toHaveLength(1);
+    expect(read(path).entries[0]).toMatchObject({ conceptId: deny.conceptId, severity: "advisory" });
     c.retireConcept(deny.conceptId);
     expect(read(path).entries).toEqual([]);
     expect(c.isSidecarStale().stale).toBe(false);
@@ -3380,6 +5549,132 @@ describe("the sidecar generation contract", () => {
     src.close();
     dst.close();
     unwired.close();
+  });
+
+  /**
+   * mergeCircle COMMITS THE ALIAS AND RETURNS WITHOUT REFRESHING (Codex round 1, item 1). The
+   * per-concept reassignCircle() calls inside the merge loop each refresh on their own, but every
+   * one of those runs BEFORE the alias write lands — the alias is the LAST thing the transaction
+   * does — so a mirror rebuilt only from those calls never carries the fresh from→into row, and an
+   * EMPTY merge (nothing in `from` to reassign) calls reassignCircle zero times and refreshes
+   * NOTHING at all. 4b-C's failure policy deliberately keeps answering BLOCKING from a mirror that
+   * has gone stale; a mirror still missing this alias has no entry to answer FROM under the old name
+   * at all, so an offline query made under it reads as an ordinary miss instead of the deny the live
+   * gate delivers — fail toward allow, the one direction this whole subsystem exists to prevent.
+   * Same class, same fix, for archiveCircle/unarchiveCircle below (m5, closed for all three writers
+   * that lacked it — renameCircle and reassignCircle already had it).
+   */
+  it("mergeCircle refreshes the configured sidecar immediately — the alias itself, not just a rule move (Codex round 1, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", {
+      tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path, syncDeviceId: "machine-a",
+    });
+    const deny = await c.declare({
+      circle: "proj", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    await c.mergeCircle("proj", "project");
+
+    // ON DISK, IMMEDIATELY — no separate materialize call, no unrelated write to piggyback a
+    // refresh onto.
+    const onDisk = read(path);
+    expect(onDisk.circleAliases).toEqual([{ from: "proj", to: "project" }]);
+    expect(onDisk.entries[0]).toMatchObject({ conceptId: deny.conceptId, circle: "project" });
+
+    // Offline, under the OLD name, delivers exactly what the live gate delivers — the concrete
+    // 4b-C consequence Codex named: a mirror missing this alias would silently MISS this query.
+    const liveOld = c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "proj" });
+    const offlineOld = evaluateGateFromMirror(onDisk, { actionContext: "Bash:rm -rf /tmp/x", circle: "proj" });
+    expect(offlineOld.rules.map((r) => r.conceptId)).toEqual(liveOld.rules.map((r) => r.conceptId));
+    expect(offlineOld.rules.map((r) => r.conceptId)).toEqual([deny.conceptId]);
+    c.close();
+  });
+
+  it("mergeCircle refreshes even an EMPTY merge — zero concepts in `from`, so zero reassignCircle calls to piggyback a refresh on", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    await c.store("Anchor concept so 'keep' is a real circle.", { circle: "keep", kind: "fact" });
+    const before = read(path).generation;
+    // "empty-source" holds nothing at all — no concept, no prior alias — which mergeCircle allows
+    // (no existence check on `from`, unlike renameCircle's).
+    await c.mergeCircle("empty-source", "keep");
+    const after = read(path);
+    expect(after.generation).toBeGreaterThan(before);
+    expect(after.circleAliases).toEqual([{ from: "empty-source", to: "keep" }]);
+    c.close();
+  });
+
+  it("archiveCircle and unarchiveCircle refresh the configured sidecar too (Codex round 1, item 1 — same class, third writer)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    await c.store("Anchor concept.", { circle: "shelved", kind: "fact" });
+    const before = read(path).generation;
+
+    c.archiveCircle("shelved");
+    const afterArchive = read(path);
+    expect(afterArchive.generation).toBeGreaterThan(before);
+    expect(afterArchive.circles).toContain("shelved"); // an archived circle is still "known"
+
+    c.unarchiveCircle("shelved");
+    expect(read(path).generation).toBeGreaterThan(afterArchive.generation);
+    c.close();
+  });
+
+  /**
+   * synthesizeRow CAN RETITLE A BOUND RULE WITHOUT BUMPING (Codex round 2, item 4). A rule's TITLE
+   * is the text a gate delivers (GateRule.text / GateMirrorEntry.text both read `concepts.title`) —
+   * the sieve tier folding new evidence into a dirty rule's body can change `firstLine(body)`, and
+   * the live gate serves the new text immediately (a plain SQL read, always current) while a
+   * materialized mirror — nothing having told it anything changed — stayed CURRENT-AND-STALE
+   * indefinitely: the worst shape of staleness, since isSidecarStale reports it trustworthy.
+   */
+  it("synthesizing a bound advisory rule's title bumps the generation, refreshes the mirror, and the offline evaluator serves the new text (Codex round 2, item 4)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const rule = await c.store("Confirm the target path before deleting.", {
+      kind: "rule", rule: { stage: "rm -rf", instance: "Bash:rm -rf", ...AGENT_RULE },
+    });
+    const titleBefore = (await c.getConcept(rule.conceptId, { synthesize: false }))!.title;
+    expect(titleBefore).toBe("Confirm the target path before deleting");
+
+    // Force the sieve tier to have real, ORDER-CHANGING work: DeterministicSynthesizer joins
+    // observations oldest-first and the title is firstLine() of the join, so a new observation
+    // dated BEFORE the existing one is what actually changes `title` — appending one after would
+    // leave firstLine(body) reading the same original first line.
+    const originalObs = raw(c).prepare(`SELECT id, created_at, embedding FROM observations WHERE concept_id = ?`).get(rule.conceptId) as { id: string; created_at: number; embedding: string };
+    raw(c).prepare(
+      `INSERT INTO observations (id, content, embedding, concept_id, author_agent_id, circle, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("obs-earlier-evidence", "Always dry-run large deletes first.", originalObs.embedding, rule.conceptId, "local-agent", "default", originalObs.created_at - 1000);
+    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(rule.conceptId);
+
+    const genBefore = c.sidecarGeneration();
+    const synthesizedCount = await c.checkpoint("default");
+    expect(synthesizedCount).toBeGreaterThan(0);
+
+    const titleAfter = (await c.getConcept(rule.conceptId, { synthesize: false }))!.title;
+    expect(titleAfter).toBe("Always dry-run large deletes first");
+    expect(titleAfter).not.toBe(titleBefore);
+
+    // THE BUMP — this is the fix itself, not an incidental check.
+    expect(c.sidecarGeneration()).toBeGreaterThan(genBefore);
+
+    // THE MIRROR — materialized fresh, carries the NEW text.
+    const mirror = c.materializeGateMirror(path).sidecar;
+    const entry = mirror.entries.find((e) => e.conceptId === rule.conceptId);
+    expect(entry?.text).toBe(titleAfter);
+
+    // THE OFFLINE EVALUATOR — reading only the mirror, agrees with the live gate.
+    const live = c.gate({ actionContext: "Bash:rm -rf /tmp/x" });
+    const offline = evaluateGateFromMirror(mirror, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
+    expect(live.rules[0]?.text).toBe(titleAfter);
+    expect(offline.rules[0]?.text).toBe(titleAfter);
+    c.close();
   });
 });
 
@@ -3661,7 +5956,7 @@ describe("modelTag length bound — MODEL_TAG_MAX_CHARS", () => {
     // technique the "PATH 2" TOCTOU test above uses to prove a guard lives at the mutation itself,
     // not only at the API edge.
     expect(() => bindRule(deps, {
-      conceptId: rule.conceptId, stageId, scope: "agent", modelTag: overLong, origin: "correction",
+      conceptId: rule.conceptId, stageId, scope: "agent", modelTag: overLong, origin: "correction", circle: "default",
     }, "replace")).toThrow(new RegExp(`at most ${MODEL_TAG_MAX_CHARS} characters`));
     c.close();
   });
@@ -3986,6 +6281,1728 @@ describe("createGateSchema — concurrent-migrator race", () => {
 });
 
 // ---------------------------------------------------------------------------
+// createGateSchema — the circle column migration (BLOCKER B1)
+// ---------------------------------------------------------------------------
+/**
+ * The migration test the suite lacked. `idx_rule_bindings_circle` used to live inside
+ * GATE_SCHEMA_SQL, which execs unconditionally and FIRST on every open — including an upgraded
+ * store where `circle` does not exist as a column yet. `CREATE TABLE IF NOT EXISTS` degrades safely
+ * there; `CREATE INDEX ... ON rule_bindings(circle)` does not — it names a real column SQLite
+ * evaluates immediately, so every store that predates this slice failed to open with "no such
+ * column: circle" the instant this index sat ahead of the guarded ALTER that adds it. Fixed by
+ * moving the index to LAST in createGateSchema, after the ALTER and the backfill both complete.
+ *
+ * This block rebuilds a GENUINE pre-breadth `rule_bindings` — the real legacy DDL, not a stripped
+ * stand-in — so the open, the backfill, and the concurrent-migrator race are all proven against the
+ * actual shape a store that predates this slice has on disk.
+ */
+const LEGACY_RULE_BINDINGS_DDL = `
+  CREATE TABLE rule_bindings (
+    concept_id TEXT PRIMARY KEY,
+    stage_id TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('advisory','blocking')),
+    scope TEXT NOT NULL CHECK (scope IN ('domain','agent')),
+    model_tag TEXT,
+    origin TEXT NOT NULL CHECK (origin IN ('correction','declaration','projection','import')),
+    declared_by TEXT,
+    reason TEXT,
+    created_at INTEGER NOT NULL,
+    sync_updated_at INTEGER NOT NULL,
+    sync_revision INTEGER NOT NULL DEFAULT 0,
+    sync_writer TEXT,
+    CHECK (severity != 'blocking' OR origin = 'declaration'),
+    CHECK ((scope = 'agent') = (model_tag IS NOT NULL))
+  )`;
+
+/**
+ * Rebuilds `rule_bindings` to the EXACT pre-breadth shape, in place: rename, recreate the legacy
+ * DDL, copy every row across by an explicit column list (so `circle` cannot leak through), drop the
+ * rename. The index is dropped first — it names the column this is about to remove.
+ */
+function downgradeToPreBreadthSchema(path: string): void {
+  const db = new Database(path);
+  db.exec(`DROP INDEX IF EXISTS idx_rule_bindings_circle`);
+  // trg_rule_bindings_backfill_circle (round 5, ON rule_bindings) needs no explicit drop: SQLite
+  // rewrites a trigger's body to follow ALTER TABLE ... RENAME TO, so it survives the rename below as
+  // "ON rule_bindings_new" and is then dropped for real, automatically, by the final DROP TABLE
+  // rule_bindings_new — a genuinely pre-breadth store has no such trigger, and this reaches that
+  // state without help. trg_rule_bindings_follow_concept_circle (round 7, item 2, ON concepts) gets
+  // NO such help — it is scoped to a table this function never renames or drops, so it would
+  // otherwise survive this whole dance unchanged, still referencing rule_bindings.circle, and throw
+  // "no such column: circle" the moment anything updates a concept's circle against the
+  // no-circle-column LEGACY_RULE_BINDINGS_DDL shape this function is about to install. Dropped
+  // explicitly, for the identical reason: a genuinely pre-breadth store has none of this either.
+  db.exec(`DROP TRIGGER IF EXISTS trg_rule_bindings_follow_concept_circle`);
+  db.exec(`ALTER TABLE rule_bindings RENAME TO rule_bindings_new`);
+  db.exec(LEGACY_RULE_BINDINGS_DDL);
+  db.exec(`INSERT INTO rule_bindings
+             SELECT concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+                    created_at, sync_updated_at, sync_revision, sync_writer
+               FROM rule_bindings_new`);
+  db.exec(`DROP TABLE rule_bindings_new`);
+  db.close();
+}
+
+describe("createGateSchema — the circle column migration (BLOCKER B1)", () => {
+  it("opens a genuine pre-breadth store, backfills every binding to its concept's CURRENT circle (including one whose concept moved circles before the upgrade), idempotently, and survives the two-migrator race", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "store.db");
+
+    // Build a real, populated store on the CURRENT schema, then rebuild the table to the exact
+    // shape a pre-breadth store has on disk.
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    await built.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", circle: "alpha", ...AGENT_RULE,
+    });
+    const moved = await built.store("Confirm the target path first.", {
+      circle: "alpha", kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
+    });
+    await built.store("Prefer npm ci.", {
+      circle: "beta", kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", ...AGENT_RULE },
+    });
+    // This concept moves circles BEFORE the downgrade — the backfill must follow the CONCEPT's
+    // CURRENT circle ("gamma"), not whatever the binding might have remembered.
+    built.reassignCircle(moved.conceptId, "gamma");
+    const preDowngrade = raw(built)
+      .prepare(`SELECT concept_id, severity, circle FROM rule_bindings ORDER BY concept_id`)
+      .all() as Array<{ concept_id: string; severity: string; circle: string }>;
+    expect(preDowngrade.find((r) => r.concept_id === moved.conceptId)?.circle).toBe("gamma");
+    built.close();
+
+    downgradeToPreBreadthSchema(path);
+    const legacyCols = (new Database(path).prepare(`PRAGMA table_info(rule_bindings)`).all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(legacyCols).not.toContain("circle");
+
+    // A DANGLING binding with no concept at all — the one row the backfill genuinely cannot
+    // resolve, and must not crash on.
+    {
+      const legacy = new Database(path);
+      legacy.prepare(
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, declared_by,
+                                    reason, created_at, sync_updated_at, sync_revision, sync_writer)
+         VALUES ('ghost-concept', (SELECT id FROM stages LIMIT 1), 'blocking', 'domain', NULL, 'declaration', NULL, 'r', 1, 1, 0, 'x')`,
+      ).run();
+      // A SECOND row, non-blocking and non-declaration-origin, purely so the CHECK-enforcement
+      // assertion below tests the CIRCLE clause in isolation — attempting the same write against
+      // "ghost-concept" would ALSO trip the pre-existing severity/origin CHECK (blocking requires
+      // declaration origin), since that row's origin is already 'declaration'.
+      legacy.prepare(
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, declared_by,
+                                    reason, created_at, sync_updated_at, sync_revision, sync_writer)
+         VALUES ('check-test-row', (SELECT id FROM stages LIMIT 1), 'advisory', 'domain', NULL, 'projection', NULL, NULL, 1, 1, 0, 'x')`,
+      ).run();
+      legacy.close();
+    }
+
+    // THE UPGRADE: an ordinary open with the CURRENT build. Pre-fix, this line itself threw
+    // "no such column: circle" — the index sat ahead of the column that creates it.
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+
+    const postUpgrade = raw(upgraded)
+      .prepare(`SELECT concept_id, severity, circle FROM rule_bindings ORDER BY concept_id`)
+      .all() as Array<{ concept_id: string; severity: string; circle: string | null }>;
+    // Every real binding backfilled to its concept's CURRENT circle — "alpha" and "beta" unmoved,
+    // "gamma" (the one that moved pre-upgrade) following the MOVE, not the circle it was declared
+    // under. The dangling "ghost-concept" row has no concept to resolve against: left NULL, exactly
+    // as the backfill's own WHERE clause documents.
+    for (const row of preDowngrade) {
+      const after = postUpgrade.find((r) => r.concept_id === row.concept_id);
+      const conceptCircle = (raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(row.concept_id) as { circle: string }).circle;
+      expect(after?.circle, row.concept_id).toBe(conceptCircle);
+    }
+    expect(postUpgrade.find((r) => r.concept_id === "ghost-concept")?.circle).toBeNull();
+
+    // Gate delivery actually works post-upgrade, in every circle involved, including the moved one.
+    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "alpha" }).rules).toHaveLength(1);
+    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "gamma" }).rules).toHaveLength(1);
+    expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "beta" }).rules).toHaveLength(1);
+
+    // The CHECK constraint the guarded ALTER carried is actually enforced on the upgraded table —
+    // not merely present in the DDL text. 'projection' rather than 'correction' (review fix — Codex
+    // round 3, item 2a widened the CHECK to accept 'correction' too, for a governed successor
+    // inheriting breadth — 'projection' stays outside that widened set, so this still proves the
+    // CHECK rejects an origin with no legitimate claim to '*' at all).
+    expect(() =>
+      raw(upgraded).prepare(`UPDATE rule_bindings SET circle = '*' WHERE concept_id = 'check-test-row'`).run(),
+    ).toThrow(/CHECK constraint failed/);
+
+    // IDEMPOTENT: a second createGateSchema against the already-upgraded table changes nothing and
+    // does not throw (the guarded ALTER's own "duplicate column name" catch).
+    expect(() => createGateSchema((upgraded as unknown as { db: StoragePort }).db)).not.toThrow();
+    const secondPass = raw(upgraded).prepare(`SELECT concept_id, circle FROM rule_bindings ORDER BY concept_id`).all();
+    expect(secondPass).toEqual(postUpgrade.map(({ concept_id, circle }) => ({ concept_id, circle })));
+    upgraded.close();
+
+    // TWO MIGRATORS RACING: a fresh pre-breadth file, two live connections, both running
+    // createGateSchema without coordinating — the supported MCP+CLI multi-process topology
+    // storage.ts's WAL + busy_timeout setup exists for. Both must converge on the SAME backfilled
+    // state; neither may throw past the guarded ALTER's own duplicate-column catch.
+    const raceDir = mkTmp();
+    const racePath = join(raceDir, "race.db");
+    const seedForRace = new MonetCore(racePath, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    await seedForRace.store("Prefer npm ci.", {
+      circle: "beta", kind: "rule", rule: { stage: "npm install", instance: "Bash:npm install", ...AGENT_RULE },
+    });
+    seedForRace.close();
+    downgradeToPreBreadthSchema(racePath);
+
+    const portA = new BetterSqlitePort(racePath);
+    const portB = new BetterSqlitePort(racePath);
+    expect(() => createGateSchema(portA)).not.toThrow();
+    expect(() => createGateSchema(portB)).not.toThrow();
+    const raceRows = portA.prepare(`SELECT concept_id, circle FROM rule_bindings`).all() as Array<{ concept_id: string; circle: string }>;
+    expect(raceRows).toHaveLength(1);
+    expect(raceRows[0]!.circle).toBe("beta");
+    portA.close();
+    portB.close();
+  });
+
+  it("bumps the generation exactly once for a backfill that actually changes delivery, and not at all once there is nothing left to backfill (minor m3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "store2.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    await built.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking",
+      reason: "there is no undo", ...AGENT_RULE,
+    });
+    built.close();
+    downgradeToPreBreadthSchema(path);
+
+    const port = new BetterSqlitePort(path);
+    const genBefore = gateGeneration(port);
+    createGateSchema(port); // the guarded ALTER, plus a real backfill (one row: NULL -> 'default')
+    const genAfterBackfill = gateGeneration(port);
+    expect(genAfterBackfill).toBeGreaterThan(genBefore);
+
+    createGateSchema(port); // idempotent: the ALTER no-ops, and there is nothing left to backfill
+    expect(gateGeneration(port)).toBe(genAfterBackfill);
+    port.close();
+  });
+
+  /**
+   * LEGACY '*' CIRCLES (Codex round 1, item 4). 1.3.1 — RELEASED, predating breadth entirely —
+   * accepted any circle name a caller supplied, so a real store may hold concepts whose `circle`
+   * column is the literal string `*`. Left alone, those concepts are either STRANDED (every
+   * circle-minting surface now refuses `*`) or, worse, SEMANTICALLY REINTERPRETED as global breadth
+   * the moment a rule is ever bound to one. `createGateSchema`'s migration seam renames them to
+   * LEGACY_STAR_CIRCLE before the backfill runs, so neither failure mode is reachable.
+   */
+  it("a pre-breadth store with concepts in a circle literally named '*' upgrades cleanly — they land in legacy-star, remain fully searchable, and the backfill runs clean afterward (Codex round 1, item 4)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "legacy-star.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const legacyFact = await built.store("A fact filed under 1.3.1's arbitrary circle-name freedom.", {
+      circle: "an-ordinary-circle", kind: "fact",
+    });
+    built.close();
+
+    // Simulate 1.3.1 directly: hand-write the circle column to the literal string '*'. No current
+    // API can produce this any more — every minting surface refuses it — which is exactly why this
+    // row can only be simulated, not created honestly, on this build.
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
+    legacy.close();
+
+    // THE UPGRADE. Pre-fix, this concept stayed named '*' forever — stranded from every future
+    // minting surface, and one accidental declare() away from being reinterpreted as breadth.
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const migrated = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
+    expect(migrated.circle).toBe(LEGACY_STAR_CIRCLE);
+
+    // Fully searchable and usable — not stranded — in its new, ordinary circle.
+    expect((await upgraded.getConcept(legacyFact.conceptId))?.title).toContain("1.3.1's arbitrary circle-name freedom");
+    expect(upgraded.overview(LEGACY_STAR_CIRCLE).counts.concepts).toBe(1);
+
+    // Surfaced in curation attention (MemoryOverview.legacyStarConcepts), store-wide, from ANY
+    // circle's overview() — not merely visible to someone who already knows to look in legacy-star.
+    expect(upgraded.overview("an-ordinary-circle").legacyStarConcepts).toBe(1);
+
+    // The backfill ran clean afterward: opening at all (a fresh MonetCore always runs
+    // createGateSchema's full sequence — rename, guarded ALTER, backfill, index) completed without
+    // throwing, and an ordinary gate query in the new circle is a plain, correct miss.
+    expect(upgraded.gate({ actionContext: "Bash:anything", circle: LEGACY_STAR_CIRCLE }).silence).toBe(true);
+    upgraded.close();
+  });
+
+  it("a binding-carrying dev-main-shaped store — rule_bindings exists, no circle column yet — with a '*' concept ALSO migrates without tripping the CHECK, for both a blocking/declaration and an advisory/correction binding (Codex round 1, item 4)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "dev-main-legacy-star.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    // BLOCKING/DECLARATION — the "silently reinterpreted as breadth" risk: the CHECK
+    // (circle != '*' OR origin = 'declaration') would NOT reject this combination, so an unfixed
+    // backfill copying '*' straight onto it would succeed and mint an ACCIDENTAL global deny.
+    const deny = await built.declare({
+      circle: "an-ordinary-circle", species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    // ADVISORY/CORRECTION — the "crashes the backfill outright" risk: this CHECK combination WOULD
+    // be rejected, so an unfixed backfill copying '*' onto it would throw mid-migration.
+    const advisory = await built.store("Confirm before deleting.", {
+      circle: "an-ordinary-circle", kind: "rule", rule: { stage: "rm -rf", ...AGENT_RULE },
+    });
+    built.close();
+
+    downgradeToPreBreadthSchema(path); // strips rule_bindings.circle — the pre-breadth shape
+
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id IN (?, ?)`).run(deny.conceptId, advisory.conceptId);
+    legacy.close();
+
+    // THE UPGRADE. Neither failure mode is reachable: the rename lands before the backfill ever
+    // reads `concepts.circle`, so the backfill never sees '*' at all.
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    for (const [id, expectedOrigin] of [[deny.conceptId, "declaration"], [advisory.conceptId, "correction"]] as const) {
+      const conceptRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(id) as { circle: string };
+      const bindingRow = raw(upgraded).prepare(`SELECT circle, origin FROM rule_bindings WHERE concept_id = ?`).get(id) as { circle: string; origin: string };
+      expect(conceptRow.circle, id).toBe(LEGACY_STAR_CIRCLE);
+      expect(bindingRow.circle, id).toBe(LEGACY_STAR_CIRCLE); // NEVER '*' — never silently breadth
+      expect(bindingRow.origin, id).toBe(expectedOrigin); // unchanged — this was never a breadth mint
+    }
+    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: LEGACY_STAR_CIRCLE }).rules.map((r) => r.conceptId))
+      .toEqual([deny.conceptId, advisory.conceptId]);
+    // ...and it never fires as though either were global.
+    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "some-other-circle-entirely" }).rules).toEqual([]);
+    upgraded.close();
+  });
+
+  /**
+   * ROUND 1's OWN FIX MOVED ONLY concepts.circle (Codex round 2, item 2). A genuine 1.3.1-era store
+   * could have filed observations, First Block pins, and graph rows under '*' too — nothing
+   * distinguished it from any other circle name back then — and every one of those tables is
+   * circle/scope-keyed independently of `concepts.circle`. Left behind, scoped stats/overview for
+   * the migrated circle would undercount or read blank, and any join requiring `fb.circle =
+   * c.circle` (First Block's own reconciliation, elsewhere) would silently exclude an orphaned pin.
+   */
+  it("moves EVERY circle-scoped table, not just concepts.circle — observations and First Block follow the legacy-star migration too (Codex round 2, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "legacy-star-full.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const legacyFact = await built.store("Terraform state lives in the shared S3 bucket.", {
+      circle: "an-ordinary-circle", kind: "fact",
+    });
+    built.promoteToFirstBlock(legacyFact.conceptId, "Terraform state location.", "an-ordinary-circle");
+    built.close();
+
+    // Simulate 1.3.1 directly: hand-rewrite EVERY circle-scoped row this concept touches to '*' — a
+    // genuine 1.3.1-era store, unlike this describe block's OWN lighter fixtures above, could have
+    // filed observations/First Block there too.
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
+    legacy.prepare(`UPDATE observations SET circle = '*' WHERE concept_id = ?`).run(legacyFact.conceptId);
+    legacy.prepare(`UPDATE first_block SET circle = '*' WHERE concept_id = ?`).run(legacyFact.conceptId);
+    legacy.close();
+
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const conceptRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
+    const obsRow = raw(upgraded).prepare(`SELECT circle FROM observations WHERE concept_id = ?`).get(legacyFact.conceptId) as { circle: string };
+    expect(conceptRow.circle).toBe(LEGACY_STAR_CIRCLE);
+    expect(obsRow.circle).toBe(LEGACY_STAR_CIRCLE);
+    // listFirstBlock, not a raw `WHERE concept_id = ?` — the reconciliation this migration shares
+    // with renameCircle deliberately PRESERVES the source row as history rather than deleting it
+    // (confirmed via sync.test.ts's own "reconciles an existing future destination pin" test, which
+    // asserts exactly this for a rename), so a query with no circle filter could return either row.
+    // The LIVE view — what an ordinary caller sees — is the one that matters here.
+    expect(upgraded.listFirstBlock(LEGACY_STAR_CIRCLE)).toContainEqual(
+      expect.objectContaining({ conceptId: legacyFact.conceptId }),
+    );
+
+    // Scoped stats actually see it — proof observations really moved, not just the concept row:
+    // round 1's own fix would have left this undercounted (concept present, observations blank).
+    const ov = upgraded.overview(LEGACY_STAR_CIRCLE);
+    expect(ov.counts.concepts).toBe(1);
+    expect(ov.counts.observations).toBeGreaterThan(0);
+    upgraded.close();
+  });
+
+  /**
+   * 'legacy-star' CAN COLLIDE WITH A REAL USER CIRCLE (Codex round 2, item 3). A user who already
+   * has a circle named exactly "legacy-star" — coincidence, or a previous migration on a COPY of
+   * this store — must not have their content silently merged with whatever the CURRENT migration is
+   * moving: that is a silent namespace merge, indistinguishable from data loss until someone notices
+   * unrelated concepts mixed together.
+   */
+  it("probes for an unused destination when 'legacy-star' itself is already a real circle — advances to 'legacy-star-2' (Codex round 2, item 3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "legacy-star-collision.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    // A real user circle already named exactly "legacy-star" — coincidence, unrelated to any
+    // migration.
+    const userOwned = await built.store("A concept a user filed under a circle named 'legacy-star' on purpose.", {
+      circle: LEGACY_STAR_CIRCLE, kind: "fact",
+    });
+    const legacyFact = await built.store("A 1.3.1-era fact.", { circle: "an-ordinary-circle", kind: "fact" });
+    built.close();
+
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
+    legacy.close();
+
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
+    // NOT 'legacy-star' — that name was already taken — but the NEXT unused numbered variant.
+    expect(migratedRow.circle).toBe(`${LEGACY_STAR_CIRCLE}-2`);
+    // The pre-existing user circle is completely undisturbed: still exactly one concept, still its
+    // own — the collision this test exists to prevent, avoided.
+    const userRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(userOwned.conceptId) as { circle: string };
+    expect(userRow.circle).toBe(LEGACY_STAR_CIRCLE);
+    expect(upgraded.overview(LEGACY_STAR_CIRCLE).counts.concepts).toBe(1);
+    expect(upgraded.overview(`${LEGACY_STAR_CIRCLE}-2`).counts.concepts).toBe(1);
+    // The store-wide count (MemoryOverview.legacyStarConcepts) sees BOTH populations under the
+    // family GLOB, even though only one of them is actually a migration artifact — the field's own
+    // documented shape ("counts the family, not a specific name") accepted that imprecision
+    // deliberately; see its own comment.
+    expect(upgraded.overview("an-ordinary-circle").legacyStarConcepts).toBe(2);
+    upgraded.close();
+  });
+
+  /**
+   * THE COLLISION PROBE MISSED knowledge_sources (Codex round 5, item 2) — round 2's own probe
+   * checked `concepts` and `circle_aliases` only. A source registered at exactly 'legacy-star' with
+   * ZERO concepts sharing that circle (never ingested into) was invisible to it: `taken('legacy-star')`
+   * found no concept and no alias naming it, so the migration could pick 'legacy-star' as "unused"
+   * and land a SECOND, unrelated source's own migrated content under the SAME circle name as the
+   * first — two independent registry identities silently conflated, with no reconciliation
+   * (knowledge_sources has none: a raw circle overwrite, unlike first_block's own merge-aware write).
+   */
+  it("probes for an unused destination when 'legacy-star' is already taken by a registered SOURCE with zero concepts of its own — advances to 'legacy-star-2' (Codex round 5, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "legacy-star-source-collision.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    // A real source registered at exactly "legacy-star" on purpose — coincidence, unrelated to any
+    // migration — that has never ingested anything, so NO concept anywhere names this circle either.
+    const userOwnedSource = built.createSource({
+      id: "user-owned-source", type: "repo-md", name: "User's own docs",
+      repositoryIdentity: "github.com/Acme/UserOwned.git/", localPath: join(dir, "repo-a"),
+      circle: LEGACY_STAR_CIRCLE,
+      include: ["**/*.md"], exclude: [],
+      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
+      writeBack: "none", refresh: { mode: "manual" },
+    });
+    // A SECOND, unrelated source — about to be discovered living in circle '*' after the downgrade
+    // below, exactly like a genuine 1.3.1-era registration.
+    const legacySource = built.createSource({
+      id: "legacy-source", type: "repo-md", name: "Legacy docs",
+      repositoryIdentity: "github.com/Acme/Legacy.git/", localPath: join(dir, "repo-b"),
+      circle: "an-ordinary-circle",
+      include: ["**/*.md"], exclude: [],
+      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
+      writeBack: "none", refresh: { mode: "manual" },
+    });
+    built.close();
+
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE knowledge_sources SET circle = '*' WHERE id = ?`).run(legacySource.id);
+    // Confirm the premise directly: NOTHING in concepts or circle_aliases names either circle — the
+    // OLD probe's own two checks would both come back empty, exactly why it missed this.
+    expect(legacy.prepare(`SELECT 1 FROM concepts WHERE circle IN ('*', ?)`).get(LEGACY_STAR_CIRCLE)).toBeUndefined();
+    expect(legacy.prepare(`SELECT 1 FROM circle_aliases WHERE from_name IN ('*', ?) OR to_name IN ('*', ?)`).get(LEGACY_STAR_CIRCLE, LEGACY_STAR_CIRCLE)).toBeUndefined();
+    legacy.close();
+
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    // NOT 'legacy-star' — that name was already taken by the first source — but the NEXT unused
+    // numbered variant.
+    expect(upgraded.getSource(legacySource.id)?.circle).toBe(`${LEGACY_STAR_CIRCLE}-2`);
+    // The pre-existing user-owned source is completely undisturbed — the collision this test exists
+    // to prevent, avoided.
+    expect(upgraded.getSource(userOwnedSource.id)?.circle).toBe(LEGACY_STAR_CIRCLE);
+    upgraded.close();
+  });
+
+  /**
+   * ROUND 2's OWN SEAM REPRODUCED B1's CLASS ONE LAYER UP (Codex round 3, item 1). A genuine
+   * pre-gate 1.3.1 store has NO gate tables at all — not just no `circle` column, no `stages`,
+   * `rule_bindings`, `gate_events`, or `gate_meta` whatsoever. Round 2 ran the legacy-star migration
+   * BEFORE `createGateSchema` (which creates `gate_meta`), so its own `bumpGateGeneration` call
+   * threw "no such table: gate_meta" — AFTER the concept had already moved (no explicit transaction
+   * wraps `moveCircleScopedTables`) — aborting construction on the FIRST open and succeeding only on
+   * a retry, because the second attempt found nothing left to migrate. This is the exact scenario:
+   * no DROP-and-rebuild-the-legacy-DDL fixture (nothing to preserve — this store never had gate
+   * tables to begin with), just the four gate tables genuinely absent.
+   */
+  it("a pre-gate store — no gate tables at all — with a '*' circle opens successfully on the FIRST attempt (Codex round 3, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "pregate-star.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const legacyFact = await built.store("A fact from before gates existed.", {
+      circle: "an-ordinary-circle", kind: "fact",
+    });
+    built.close();
+
+    // Simulate a GENUINE pre-gate 1.3.1 store: every gate table absent, not merely missing a column.
+    const legacy = new Database(path);
+    legacy.exec(`DROP INDEX IF EXISTS idx_rule_bindings_circle`);
+    // trg_rule_bindings_backfill_circle (round 5, ON rule_bindings) is auto-dropped by the DROP
+    // TABLE rule_bindings below (a trigger dies with the table it is registered on). trg_rule_
+    // bindings_follow_concept_circle (round 7, item 2, ON concepts) is NOT — concepts is never
+    // touched here — so it survives, unchanged, still referencing rule_bindings, and throws "no such
+    // table: rule_bindings" the moment the UPDATE below fires it. A genuine pre-gate store has
+    // neither trigger; dropped explicitly to actually reach that state.
+    legacy.exec(`DROP TRIGGER IF EXISTS trg_rule_bindings_follow_concept_circle`);
+    legacy.exec(`DROP TABLE IF EXISTS rule_bindings`);
+    legacy.exec(`DROP TABLE IF EXISTS stages`);
+    legacy.exec(`DROP TABLE IF EXISTS gate_events`);
+    legacy.exec(`DROP TABLE IF EXISTS gate_meta`);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
+    legacy.close();
+
+    // THE FIRST ATTEMPT. Pre-fix, this line itself threw "no such table: gate_meta".
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+
+    // Migration completed: the concept moved.
+    const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
+    expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
+    // Every gate table now exists, backfill included — a fresh rule declared now works end to end.
+    const rule = await upgraded.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
+      scope: "domain",
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    // Generation is sane: positive, and advances on a further real mutation.
+    const genAfterOpen = upgraded.sidecarGeneration();
+    expect(genAfterOpen).toBeGreaterThan(0);
+    await upgraded.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Prefer npm ci.", severity: "advisory", scope: "domain",
+    });
+    expect(upgraded.sidecarGeneration()).toBeGreaterThan(genAfterOpen);
+    upgraded.close();
+  });
+
+  /**
+   * ROUND 3's OWN FIX HAD A GAP ONE LAYER DEEPER (Codex round 4, item 1). A genuinely pre-v8 store
+   * has the `sync_meta` TABLE (init()'s own CREATE TABLE IF NOT EXISTS, unconditional) but not yet
+   * its SINGLETON ROW — that is initSyncIdentity()'s job, and constructor order is init() (which
+   * reaches the legacy-star migration) THEN initSyncIdentity(). Pre-fix, migrateLegacyStarCircle's
+   * own `nextSyncTimestamp()` call dereferenced `.t` off the SELECT's `undefined` result — a
+   * TypeError, aborting construction on the FIRST attempt (moveCircleScopedTables having already
+   * auto-committed the concept's move, same shape as round 3's own finding one layer up). ALSO
+   * exercises the identical crash one call deeper: moveCircleScopedTables' own First Block
+   * reconciliation calls nextSyncTimestamp() a SECOND time, independently, when a moved concept
+   * carries a promotion — found while fixing this item, not asked for by name, and fixed the same
+   * way (nextSyncTimestampOrNow throughout).
+   */
+  it("a pre-v8 store — sync_meta exists, but its singleton row does not yet — with a '*' circle (and a First Block pin on it) opens successfully on the FIRST attempt (Codex round 4, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "pre-v8-no-singleton.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const legacyFact = await built.store("A fact promoted before breadth existed.", {
+      circle: "an-ordinary-circle", kind: "fact",
+    });
+    built.promoteToFirstBlock(legacyFact.conceptId, "Pinned back when this circle was named '*'.", "an-ordinary-circle");
+    built.close();
+
+    // Simulate the exact pre-v8 shape: the concept (and its First Block pin) already lived in '*',
+    // and — the novel part of this round's finding — sync_meta's singleton row has never been
+    // written, as if this were the very first open of a database sync-aware code has never touched.
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
+    legacy.prepare(`UPDATE first_block SET circle = '*' WHERE concept_id = ?`).run(legacyFact.conceptId);
+    legacy.prepare(`DELETE FROM sync_meta WHERE singleton = 1`).run();
+    expect(legacy.prepare(`SELECT 1 FROM sync_meta WHERE singleton = 1`).get()).toBeUndefined(); // the table exists; the row does not
+    legacy.close();
+
+    // THE FIRST ATTEMPT. Pre-fix, this line itself threw "Cannot read properties of undefined
+    // (reading 't')" out of nextSyncTimestamp's own SELECT.
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    // Deleting the singleton row also erased its embedder pin alongside device_id/last_mutation_at
+    // (one row, one atomic unit) — initSyncIdentity() correctly re-seeds it as UNPINNED (this store
+    // already has real vectors, so it is not "genuinely fresh"), which is a legitimate pre-pin state
+    // but one every served path must resolve via ensureEmbedderPin() before touching embeddings
+    // (the ADR-CONTRACT this file's own constructor comment states) — unrelated to this item's own
+    // fix, just a necessary consequence of simulating "no singleton row" by deleting the whole row.
+    await upgraded.ensureEmbedderPin();
+
+    // Migration completed: the concept moved, AND initSyncIdentity() ran normally moments later
+    // (the singleton row now exists, seeded rather than left to this migration to invent).
+    const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
+    expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
+    expect(raw(upgraded).prepare(`SELECT 1 FROM sync_meta WHERE singleton = 1`).get()).toBeDefined();
+
+    // THE SECOND, DEEPER CALL SITE: the First Block pin followed the concept, proving
+    // moveCircleScopedTables' own inner nextSyncTimestampOrNow() call (the First Block insert) also
+    // survived the same no-singleton condition.
+    const pins = upgraded.listFirstBlock(LEGACY_STAR_CIRCLE);
+    expect(pins.map((p) => p.conceptId)).toEqual([legacyFact.conceptId]);
+
+    // Generation is sane and the store is fully functional end to end.
+    expect(upgraded.sidecarGeneration()).toBeGreaterThan(0);
+    const rule = await upgraded.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo",
+      scope: "domain",
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    expect(upgraded.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    upgraded.close();
+  });
+
+  /**
+   * A REGISTERED SOURCE IS NOT EXEMPT FROM THE MOVE (Codex round 4, item 2). renameCircle's own guard
+   * (assertNoRegisteredSourceCircleParticipants) refuses to ever rename a circle a registered source
+   * participates in — "source circles are immutable registry identity" — but that is a policy for a
+   * DISCRETIONARY rename a user chose to run, not a technical requirement: it does not, and could not,
+   * apply to the legacy-star migration, which is mandatory and automatic. Left unfixed, a source
+   * registered under a circle literally named '*' would keep succeeding at registration while every
+   * ingestion into it threw forever at storeInternal's own concept guard — this test proves the whole
+   * round-trip closes, registration through a REAL ingestion, not merely that a column value changed.
+   */
+  it("the legacy-star migration also moves a registered source's own circle, alongside its already-ingested concepts, and ingestion into it works afterward (Codex round 4, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "legacy-star-source.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const source = built.createSource({
+      id: "legacy-source", type: "repo-md", name: "Legacy docs",
+      repositoryIdentity: "github.com/Acme/Legacy.git/", localPath: join(dir, "repo"),
+      circle: "an-ordinary-circle",
+      include: ["**/*.md"], exclude: [],
+      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
+      writeBack: "none", refresh: { mode: "manual" },
+    });
+    const ingested = await built.storeSource("Legacy content ingested before the upgrade.", {
+      circle: "an-ordinary-circle", sourceRefs: [`source://${source.id}/README.md`],
+    });
+    built.close();
+
+    // Simulate the legacy shape: BOTH the source's own registry row and a concept it did not (yet)
+    // touch already lived in '*'.
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE knowledge_sources SET circle = '*' WHERE id = ?`).run(source.id);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE circle = 'an-ordinary-circle'`).run();
+    legacy.close();
+
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+
+    // The registry row followed the concepts it owns, not left behind under the now-reserved name.
+    const migratedSource = upgraded.getSource(source.id);
+    expect(migratedSource?.circle).toBe(LEGACY_STAR_CIRCLE);
+    const migratedConcept = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(ingested.conceptId) as { circle: string };
+    expect(migratedConcept.circle).toBe(LEGACY_STAR_CIRCLE);
+
+    // THE ROUND-TRIP: a fresh ingestion into the migrated source succeeds — pre-fix, this would
+    // throw at storeInternal's own concept guard forever, because the source's OWN registered circle
+    // (still '*') fed straight into this call's `circle` option.
+    const secondIngest = await upgraded.storeSource("Content ingested after the upgrade.", {
+      circle: migratedSource!.circle, sourceRefs: [`source://${source.id}/CHANGELOG.md`],
+    });
+    // Raw SQL, not getConcept(): a source-connector-owned concept is authorization-fenced there
+    // (isConnectorOwnedRow + authorizedSourceProjection) — unrelated to this item, just the same
+    // direct-row-check convention migratedConcept above already uses.
+    const secondIngestRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(secondIngest.conceptId) as { circle: string };
+    expect(secondIngestRow.circle).toBe(LEGACY_STAR_CIRCLE);
+    upgraded.close();
+  });
+
+  it("moves a registered source's circle even when NO concept currently shares circle '*' at all — a source cannot be the only thing stranded (Codex round 4, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "legacy-star-source-only.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const source = built.createSource({
+      id: "orphaned-source", type: "repo-md", name: "Orphaned docs",
+      repositoryIdentity: "github.com/Acme/Orphaned.git/", localPath: join(dir, "repo"),
+      circle: "an-ordinary-circle",
+      include: ["**/*.md"], exclude: [],
+      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
+      writeBack: "none", refresh: { mode: "manual" },
+    });
+    built.close();
+
+    // ONLY the source's registry row is in '*' — it has never ingested anything, so there is no
+    // concept anywhere in this store's circle '*' at all. hasLegacyStar (concepts.circle = '*')
+    // would be false; gating the whole move on it alone would strand this source forever.
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE knowledge_sources SET circle = '*' WHERE id = ?`).run(source.id);
+    expect(legacy.prepare(`SELECT 1 FROM concepts WHERE circle = '*'`).get()).toBeUndefined();
+    legacy.close();
+
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    expect(upgraded.getSource(source.id)?.circle).toBe(LEGACY_STAR_CIRCLE);
+    upgraded.close();
+  });
+
+  /**
+   * A CIRCLE POPULATED ONLY BY NORMATIVE ROWS CAN BE THE ONLY THING STRANDED TOO (Codex round 9,
+   * item 3). Same shape as the source-only test just above, for lifecycle_edges/ratifications
+   * instead of knowledge_sources: `chooseLegacyStarDestination`'s own collision probe already
+   * checked both tables (round 5's own extension, cited in that method's own comment); the
+   * TRIGGER-CONDITION set here never gained the matching check, so a store whose ONLY '*'
+   * population was a ratification row hit this method every open and never migrated it — stranded
+   * exactly as permanently as the pre-round-4 source case was.
+   */
+  it("moves a normative-only circle even when NO concept, source, or alias shares circle '*' at all — a ratification row cannot be the only thing stranded (Codex round 9, item 3)", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const dir = mkTmp();
+      const path = join(dir, "legacy-star-normative-only.db");
+      const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+      built.close();
+
+      const legacy = new Database(path);
+      const now = Date.now();
+      // subject_concept_id carries no foreign key (lifecycle-edges.ts's own schema) — a ratification
+      // outliving the concept it once ratified is exactly the doctrine this item's own fix is about,
+      // so an arbitrary id here is the honest shape, not a shortcut.
+      legacy.prepare(
+        `INSERT INTO ratifications (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at, sync_updated_at)
+         VALUES ('rat-1', 'some-concept-elsewhere', 'approve', NULL, 'a-human', '*', ?, ?)`,
+      ).run(now, now);
+      // ONLY the ratification is in '*' — no concept, no source, no alias anywhere names it, so
+      // hasLegacyStar/hasLegacyStarSource/staleStarSource/staleStarTarget are all false; only
+      // hasLegacyStarNormative can be what triggers the migration here.
+      expect(legacy.prepare(`SELECT 1 FROM concepts WHERE circle = '*'`).get()).toBeUndefined();
+      expect(legacy.prepare(`SELECT 1 FROM knowledge_sources WHERE circle = '*'`).get()).toBeUndefined();
+      expect(legacy.prepare(`SELECT 1 FROM circle_aliases WHERE from_name = '*' OR to_name = '*'`).get()).toBeUndefined();
+      legacy.close();
+
+      const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+
+      // MIGRATION FIRED: the row landed at the destination, not stranded at '*' forever.
+      const moved = raw(upgraded).prepare(`SELECT circle FROM ratifications WHERE id = 'rat-1'`).get() as { circle: string };
+      expect(moved.circle).toBe(LEGACY_STAR_CIRCLE);
+
+      // DISCLOSURE COUNTS IT — the disclosure previously only ever mentioned concepts and sources;
+      // extended per this item's own ask (see migrateLegacyStarCircle's own comment for what changed).
+      const normativeDisclosure = consoleErrorSpy.mock.calls.map((args) => String(args[0])).find((msg) => msg.includes("normative history row(s)"));
+      expect(normativeDisclosure).toMatch(/1 normative history row\(s\)/);
+      expect(normativeDisclosure).toMatch(new RegExp(`moved to circle '${LEGACY_STAR_CIRCLE}'`));
+
+      upgraded.close();
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
+  });
+
+  /**
+   * LEGACY circle_aliases ROWS NAMING '*' ALSO SURVIVE UNTREATED WITHOUT THIS FIX (Codex round 4,
+   * item 4). Verified against resolveCircle's actual single-hop mechanics and DOOR 13 item 8's
+   * existing graft refusal before implementing (not assumed): a `to_name = '*'` row resolves an
+   * ordinary circle name INTO the breadth marker — RULE_LIVENESS_WHERE's own `(b.circle = ? OR
+   * b.circle = '*')` degenerates to matching ONLY global rules when `?` is bound to '*' itself — so
+   * gate queries through the alias would silently lose every local rule the resolved circle actually
+   * carries; a `from_name = '*'` row breaks resolveCircle('*') staying the passthrough every
+   * circle-minting guard assumes. The ruling: `to_name = '*'` rows are REPOINTED to the migration
+   * destination (queries through the original name must land where the content actually went); `from_name
+   * = '*'` rows are DELETED (that namespace was already fully vacated by the rename the row recorded,
+   * and '*' must stay unresolvable). Both directions, in one store, in one migration pass.
+   */
+  it("legacy circle_aliases rows naming '*' on either side are cleaned during migration: the TO side repoints to the destination and delivers the migrated LOCAL rule (not just the global one), the FROM side is deleted and '*' stays unresolvable, and disclosure counts both (Codex round 4, item 4)", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const dir = mkTmp();
+      const path = join(dir, "legacy-star-aliases.db");
+      const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+      // A LOCAL rule under "project" — this is what `project -> *` must still deliver after the fix,
+      // proving the resolution lands on the migrated destination rather than degenerating to
+      // global-only.
+      const localRule = await built.declare({
+        circle: "project", species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+        content: "Confirm the registry before installing.", severity: "advisory", scope: "domain",
+      });
+      if (localRule.species !== "rule") throw new Error("unreachable");
+      // A GENUINELY GLOBAL rule sharing the same stage — the control that makes "delivers the local
+      // rule too" distinguishable from "delivers only global rules regardless".
+      const globalRule = await built.declare({
+        circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+        content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
+      });
+      if (globalRule.species !== "rule") throw new Error("unreachable");
+      built.close();
+
+      const legacy = new Database(path);
+      // Simulate the LOCAL rule's concept having been renamed into '*' long ago (1.3.1-legal).
+      legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(localRule.conceptId);
+      // DANGLING (NULL), not literally '*' — matching round 1's own proven-safe shape ("a
+      // binding-carrying dev-main-shaped store", above): migrateGateColumns' backfill only fills
+      // `circle IS NULL` rows, from the CONCEPT's circle at backfill time, which by then is already
+      // `legacy-star` (concept moves BEFORE the backfill runs, per the (a)->(b)->(c) ordering this
+      // whole review series built). Setting this to a literal '*' here instead would simulate a
+      // DIFFERENT, narrower scenario this test is not about — a binding already backfilled to '*' by
+      // an even earlier, intermediate build that predates round 1's own fix — which the backfill's
+      // `WHERE circle IS NULL` guard would then skip entirely, leaving it stuck at '*' forever; a
+      // real gap, but a separate one from item 4's own circle_aliases concern, out of THIS round's
+      // scope and disclosed separately rather than conflated into this fixture.
+      legacy.prepare(`UPDATE rule_bindings SET circle = NULL WHERE concept_id = ?`).run(localRule.conceptId);
+      const now = Date.now();
+      // TO side: "project" was renamed into '*' — a legal 1.3.1 rename target, before '*' was reserved.
+      legacy.prepare(
+        `INSERT INTO circle_aliases (from_name, to_name, status, created_at, updated_at, sync_revision, sync_writer)
+         VALUES ('project', '*', 'active', ?, ?, 1, 'machine-a')`,
+      ).run(now, now);
+      // FROM side: an UNRELATED, older rename — '*' itself was once renamed away to a circle this
+      // store no longer has any other record of. Independent row (different from_name), same table.
+      legacy.prepare(
+        `INSERT INTO circle_aliases (from_name, to_name, status, created_at, updated_at, sync_revision, sync_writer)
+         VALUES ('*', 'some-ancient-destination-nobody-remembers', 'active', ?, ?, 1, 'machine-a')`,
+      ).run(now, now);
+      legacy.close();
+
+      const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+
+      // FROM side: deleted. '*' stays unresolvable — the single-hop passthrough every circle-minting
+      // guard assumes is restored, not merely "no longer obviously broken".
+      expect(raw(upgraded).prepare(`SELECT 1 FROM circle_aliases WHERE from_name = '*'`).get()).toBeUndefined();
+      expect(upgraded.resolveCircleName(BREADTH_CIRCLE)).toBe(BREADTH_CIRCLE);
+
+      // TO side: repointed to the ACTUAL destination, not left dangling and not simply removed.
+      const projectAlias = raw(upgraded).prepare(`SELECT to_name FROM circle_aliases WHERE from_name = 'project'`).get() as { to_name: string };
+      expect(projectAlias.to_name).toBe(LEGACY_STAR_CIRCLE);
+
+      // THE PAYOFF: querying through "project" delivers BOTH the migrated local rule and the global
+      // one — union, not global-only. A second, untouched circle proves the global rule alone is not
+      // what is doing the work here (it would fire there too, with or without this fix).
+      expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId).sort())
+        .toEqual([globalRule.conceptId, localRule.conceptId].sort());
+      expect(upgraded.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+        .toEqual([globalRule.conceptId]);
+
+      // DISCLOSURE counts both cleaned rows (1 deleted + 1 repointed = 2).
+      const aliasDisclosure = consoleErrorSpy.mock.calls.map((args) => String(args[0])).find((msg) => msg.includes("circle_aliases row(s)"));
+      expect(aliasDisclosure).toMatch(/cleaned 2 legacy circle_aliases row\(s\)/);
+      expect(aliasDisclosure).toMatch(/1 removed/);
+      expect(aliasDisclosure).toMatch(new RegExp(`1 repointed to '${LEGACY_STAR_CIRCLE}'`));
+
+      upgraded.close();
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
+  });
+
+  /**
+   * A LIVE COMPATIBILITY TRIGGER, NOT ONLY A RESTART-TIME BACKFILL (Codex round 5, item 4, P1). "This
+   * machine runs mixed builds against one store today": an OLDER build's own `bindRule`-equivalent
+   * INSERT was compiled before the `circle` column existed, so it omits the column entirely — a raw
+   * INSERT landing `circle = NULL`, invisible to RULE_LIVENESS_WHERE's `b.circle = ?` filter (NULL
+   * matches nothing, ever), including a FRESH DENY, until SOME process eventually restarts and reruns
+   * the backfill. A schema-level TRIGGER fires on ANY connection's INSERT regardless of which build
+   * issued it — closing the live gap between "an old build wrote this" and "the next restart notices".
+   */
+  it("a raw pre-breadth-shaped INSERT (old-build shape, no circle reference at all) on an upgraded store carries the concept's circle immediately, at insert time — no restart required (Codex round 5, item 4)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const oldBuildsRule = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+      circle: "project",
+    });
+    if (oldBuildsRule.species !== "rule") throw new Error("unreachable");
+    const stageId = c.ruleBinding(oldBuildsRule.conceptId)!.stage_id;
+
+    // SIMULATE: this binding arrived via an OLD BUILD's own bindRule-equivalent instead — the
+    // CONCEPT (kind='rule', active, RULE_LIVENESS_WHERE's own other requirements) was declared
+    // normally above and stays untouched; only the BINDING is replaced with the exact pre-breadth
+    // column shape LEGACY_RULE_BINDINGS_DDL declares (no `circle` anywhere in the INSERT) — the one
+    // column this fix is about.
+    raw(c).prepare(`DELETE FROM rule_bindings WHERE concept_id = ?`).run(oldBuildsRule.conceptId);
+    raw(c).prepare(
+      `INSERT INTO rule_bindings
+         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+          created_at, sync_updated_at, sync_revision, sync_writer)
+       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, 'an old-build reason', ?, ?, 0, 'old-build')`,
+    ).run(oldBuildsRule.conceptId, stageId, Date.now(), Date.now());
+
+    // IMMEDIATELY — no reopen, no restart, no call to migrateGateColumns again. The trigger fired
+    // synchronously inside the INSERT statement above, before it even returned.
+    const landed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(oldBuildsRule.conceptId) as { circle: string | null };
+    expect(landed.circle).toBe("project");
+    // And it actually delivers, live, in the SAME process that never restarted.
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+      .toContain(oldBuildsRule.conceptId);
+    c.close();
+  });
+
+  /**
+   * THE DANGLING COMPOSITION (Codex round 5, item 4): this trigger and BLOCKER B3 (engine.ts) heal
+   * the SAME symptom at two DIFFERENT moments and must not fight over the row in between. A binding
+   * whose concept has not landed on this device AT ALL yet — the sync-specific dangling-then-live
+   * gap — must stay genuinely NULL, not be resolved to a wrong guess, until the concept actually
+   * arrives; this trigger's own UPDATE subquery evaluates to NULL when no matching concept exists
+   * (a scalar subquery over zero rows), which is a real no-op, not a false resolution — verified
+   * directly, not merely asserted from reading the SQL.
+   */
+  it("the dangling composition: a binding whose concept has not arrived stays NULL (this trigger's own no-op), and BLOCKER B3 heals it when the concept lands via graft — composing rather than fighting (Codex round 5, item 4)", async () => {
+    const peer = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "peer" });
+    // kind='rule' on the CONCEPT — RULE_LIVENESS_WHERE requires it (this module's own doc comment:
+    // "active concept, kind='rule', not superseded"), so the concept side must satisfy it even
+    // though its OWN binding (created here too) never crosses to the receiver — stripped below.
+    const futureRule = await peer.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "A rule concept that has not arrived on the receiver yet.", severity: "advisory", scope: "domain",
+      circle: "project",
+    });
+    if (futureRule.species !== "rule") throw new Error("unreachable");
+    // Only the CONCEPT, deliberately — stripping ruleBindings isolates this test to BLOCKER B3's own
+    // concepts-loop healing, uncontaminated by the ordinary graft rule_bindings write path (which
+    // would ALSO resolve this correctly, but is not what this test is pinning).
+    const conceptOnlyPayload = { ...peer.exportDelta(0), ruleBindings: [] };
+
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Seed rule so a real stage exists on the receiver too.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    const stageId = c.ruleBinding(seed.conceptId)!.stage_id;
+
+    // A DANGLING binding, inserted BEFORE the concept it names has ever landed on this receiver.
+    raw(c).prepare(
+      `INSERT INTO rule_bindings
+         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+          created_at, sync_updated_at, sync_revision, sync_writer)
+       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, 'a reason', ?, ?, 0, 'peer')`,
+    ).run(futureRule.conceptId, stageId, Date.now(), Date.now());
+    expect(
+      (raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(futureRule.conceptId) as { circle: string | null }).circle,
+    ).toBeNull();
+    // Correctly invisible — a NULL circle matches no query's filter, live or offline.
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+      .not.toContain(futureRule.conceptId);
+
+    // THE CONCEPT ARRIVES — via graft, BLOCKER B3's own trigger condition ("this concept landing IS
+    // that binding's concept arriving: close the gap here, now, in the SAME transaction").
+    c.graftRows(conceptOnlyPayload as never);
+    const healed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(futureRule.conceptId) as { circle: string | null };
+    expect(healed.circle).toBe("project");
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+      .toContain(futureRule.conceptId);
+
+    peer.close(); c.close();
+  });
+
+  /**
+   * THE UPDATE SIDE OF THE COMPATIBILITY TRIGGER FAMILY (Codex round 7, item 2, P1). Round 5's own
+   * trigger closes the gap for an old build MINTING a binding (INSERT); this one closes the
+   * SYMMETRIC gap for an old build MOVING a concept that already has one — moveConcept/renameCircle's
+   * pre-breadth code UPDATEs `concepts.circle` directly with no idea `rule_bindings.circle` needs to
+   * follow, reopening the exact round-1, item-3 silent-divergence shape for any writer old enough to
+   * predate the keep-in-step convention.
+   */
+  it("a raw old-build-shaped UPDATE of a concept's circle (no rule_bindings touch at all) — the binding follows immediately, at update time; a '*' binding stays '*', untouched (Codex round 7, item 2)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const localRule = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+      circle: "project",
+    });
+    if (localRule.species !== "rule") throw new Error("unreachable");
+    const globalRule = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Never install without a lockfile.", severity: "advisory", scope: "domain",
+    });
+    if (globalRule.species !== "rule") throw new Error("unreachable");
+
+    // THE OLD BUILD'S OWN UPDATE — concepts.circle alone, exactly what moveConcept/renameCircle's
+    // pre-keep-in-step code issues; no rule_bindings statement anywhere near it.
+    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run("project-moved", localRule.conceptId);
+
+    // IMMEDIATELY — no second statement, no reopen. The trigger fired synchronously inside the very
+    // UPDATE above, before it even returned.
+    const followed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(localRule.conceptId) as { circle: string };
+    expect(followed.circle).toBe("project-moved");
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "project-moved" }).rules.map((r) => r.conceptId))
+      .toContain(localRule.conceptId);
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+      .not.toContain(localRule.conceptId);
+
+    // A '*' BINDING STAYS '*' — the same old-build UPDATE, against the GLOBAL rule's own concept.
+    // A global rule's reach is a property of the BINDING, independent of wherever its concept is
+    // filed — re-aligning it here would silently narrow a global rule to local.
+    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run("wherever-this-concept-ends-up", globalRule.conceptId);
+    const stayedGlobal = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(globalRule.conceptId) as { circle: string };
+    expect(stayedGlobal.circle).toBe(BREADTH_CIRCLE);
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      .toContain(globalRule.conceptId);
+    c.close();
+  });
+
+  /**
+   * THE BACKFILL TRIGGER BUMPS THE GENERATION TOO (Codex round 7, item 3, P2). Round 5's own trigger
+   * fixed the CIRCLE value; it never touched gate_meta, so an old build's own INSERT landed a live
+   * rule the on-disk mirror's own stamped generation had no way to know was now behind. isSidecarStale
+   * compares the file's own generation against gate_meta's current value — the bump is what makes
+   * that comparison catch this case at all.
+   */
+  it("an old-build-shaped INSERT bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 7, item 3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Seed rule so a real stage exists to bind against.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    const stageId = c.ruleBinding(seed.conceptId)!.stage_id;
+    // A fresh materialize so the ON-DISK file's own stamped generation is CURRENT before the probe —
+    // isolates this test to what the trigger itself does, not to whatever staleness already existed.
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    const oldBuildsRule = await c.store("Confirm the target path first.", { circle: "project", kind: "fact" });
+    // THE OLD BUILD'S OWN INSERT — the exact pre-circle-column column list, no circle anywhere in it.
+    raw(c).prepare(
+      `INSERT INTO rule_bindings
+         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+          created_at, sync_updated_at, sync_revision, sync_writer)
+       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, 'an old-build reason', ?, ?, 0, 'old-build')`,
+    ).run(oldBuildsRule.conceptId, stageId, Date.now(), Date.now());
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    // THE FILE ITSELF NEVER MOVED — an old build's own process has no JS hook to refresh it — so the
+    // comparison now disagrees: exactly the honest-stale contract, not a silent-fresh lie.
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
+    c.close();
+  });
+
+  /**
+   * THE UPDATE-SIDE TRIGGER BUMPS THE GENERATION TOO (Codex round 8, item 2, P2). The symmetric gap
+   * to round 7, item 3's own fix on the INSERT trigger: round 7, item 2 fixed the CIRCLE value for an
+   * old build's own concept move, but never touched gate_meta, so the move landed undetectably — the
+   * on-disk mirror's own stamped generation had no way to know it was now behind.
+   */
+  it("an old-build-shaped UPDATE of a concept's circle (with a live binding) bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 8, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+      circle: "project",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    // A fresh materialize so the ON-DISK file's own stamped generation is CURRENT before the probe —
+    // isolates this test to what the trigger itself does, not to whatever staleness already existed.
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN UPDATE — concepts.circle alone, exactly what moveConcept/renameCircle's
+    // pre-keep-in-step code issues; no rule_bindings statement anywhere near it (same shape as round
+    // 7, item 2's own test above, here probing the generation side rather than the circle value).
+    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run("project-moved", seed.conceptId);
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    // THE FILE ITSELF NEVER MOVED — an old build's own process has no JS hook to refresh it — so the
+    // comparison now disagrees: the same honest-stale contract item 3 established for the INSERT side.
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
+    c.close();
+  });
+
+  /**
+   * THE THIRD COMPATIBILITY TRIGGER, THE STATUS SIDE (Codex round 9, item 2, P2). Round 5's INSERT
+   * trigger and round 8's UPDATE-of-circle trigger say nothing about an old build RETIRING or
+   * RESTORING a concept — retireConcept/restoreConcept's own pre-mirror-widening code UPDATEs
+   * `concepts.status` directly, so an old build retiring an ADVISORY rule (its own era only tracked
+   * blocking, if it bumped status at all) leaves the new build's on-disk mirror serving the retired
+   * rule as current, indefinitely — nothing else ever re-triggers a refresh for a concept nobody
+   * touches again.
+   */
+  it("an old-build-shaped status UPDATE retiring a bound ADVISORY rule bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 9, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    expect((JSON.parse(readFileSync(path, "utf8")) as GateMirror).entries).toHaveLength(1); // live pre-retire
+    const generationBefore = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN UPDATE — concepts.status alone, exactly what retireConcept's pre-mirror-
+    // widening code issues; no gate_meta statement anywhere near it, and (its own era) no bump at
+    // all for an ADVISORY rule specifically, only ever for blocking.
+    raw(c).prepare(`UPDATE concepts SET status = 'retired' WHERE id = ?`).run(seed.conceptId);
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    // THE FILE ITSELF NEVER MOVED — still reports the retired rule as live — so the comparison now
+    // disagrees: the same honest-stale contract items 3 and round-8-item-2 established.
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
+    c.close();
+  });
+
+  it("does NOT bump for an ordinary fact's status churn — the EXISTS-on-rule_bindings scope holds, not a blanket status trigger (Codex round 9, item 2)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const fact = await c.store("A fact with no rule binding at all.", { kind: "fact" });
+    const before = c.sidecarGeneration();
+    c.retireConcept(fact.conceptId);
+    expect(c.sidecarGeneration()).toBe(before); // no rule_bindings row for this concept — no-op
+    c.restoreConcept(fact.conceptId);
+    expect(c.sidecarGeneration()).toBe(before);
+    c.close();
+  });
+
+  /**
+   * NEW-BUILD retireConcept/restoreConcept STILL BUMP EXACTLY ONCE (Codex round 9, item 2's own
+   * double-bump check — the round-8 lesson applied before shipping: an increment is not idempotent).
+   * `noteRuleTouched(id)` was REMOVED from both call sites (engine.ts) because
+   * trg_rule_bindings_follow_concept_status's own WHEN clause is `hasLiveBinding`'s EXACT predicate,
+   * not merely a superset — the broader "bumps exactly once per mutation class" test already covers
+   * retireConcept incidentally (step 5); this pins BOTH directions explicitly and by name.
+   */
+  it("retireConcept and restoreConcept each bump gate_meta exactly once for a bound rule, not twice (Codex round 9, item 2, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const deny = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    await withdrawDeny(c, deny.conceptId, "rm -rf");
+    const beforeRetire = c.sidecarGeneration();
+    c.retireConcept(deny.conceptId);
+    expect(c.sidecarGeneration()).toBe(beforeRetire + 1);
+
+    const beforeRestore = c.sidecarGeneration();
+    c.restoreConcept(deny.conceptId);
+    expect(c.sidecarGeneration()).toBe(beforeRestore + 1);
+    c.close();
+  });
+
+  /**
+   * CLOSING THE FAMILY, THE STAGE SIDE (Codex round 10, items 2+3, P2 — one of the two findings
+   * named by the coordinator). An old build's own upsertStage gated its bump on
+   * `liveBlockingRulesForStage(...).length > 0` — correct while the mirror was blocking-only,
+   * silently wrong once GateMirror.stages started carrying every stage, rule-bound or not. See
+   * `trg_stages_bump_on_trigger_patterns`'s own comment (gates.ts) for the full argument.
+   */
+  it("an old-build-shaped UPDATE of a stage's trigger_patterns bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 10, items 2+3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install"] });
+    const stageId = c.stages()[0]!.id;
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN UPDATE — trigger_patterns alone, exactly what an old, blocking-only-era
+    // upsertStage issues for a stage with no live blocking rule bound (its own gate: `if
+    // (liveBlockingRulesForStage(db, existing.id).length > 0) bumpGateGeneration(db)`, absent here).
+    raw(c).prepare(`UPDATE stages SET trigger_patterns = ? WHERE id = ?`).run(
+      JSON.stringify([{ tool: "bash", tokens: ["npm", "ci"] }]), stageId,
+    );
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
+    c.close();
+  });
+
+  it("does NOT bump for a same-value UPDATE of trigger_patterns — the OLD-IS-NOT-NEW guard holds, matching the sibling triggers (Codex round 10, items 2+3)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install"] });
+    const stageId = c.stages()[0]!.id;
+    const currentPatterns = raw(c).prepare(`SELECT trigger_patterns FROM stages WHERE id = ?`).get(stageId) as { trigger_patterns: string };
+    const before = c.sidecarGeneration();
+    raw(c).prepare(`UPDATE stages SET trigger_patterns = ? WHERE id = ?`).run(currentPatterns.trigger_patterns, stageId);
+    expect(c.sidecarGeneration()).toBe(before);
+    c.close();
+  });
+
+  /**
+   * NEW-BUILD stage re-authoring bumps EXACTLY ONCE, not twice (Codex round 10, items 2+3,
+   * exact-count) — upsertStage's own explicit bump was REMOVED (unlike bindRule's, kept — see
+   * that trigger's own comment for why the two cases differ), because upsertStage's own
+   * pre-existing no-op guard (`nextPatterns === existing.trigger_patterns → return existing`)
+   * already made its removed bump an EXACT match for `trg_stages_bump_on_trigger_patterns`'s own
+   * condition, not merely a superset.
+   */
+  it("declare({species:'stage'}) re-authoring patterns bumps gate_meta exactly once, not twice (Codex round 10, items 2+3, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install"] });
+    const before = c.sidecarGeneration();
+    await c.declare({ species: "stage", stage: "npm install", patterns: ["Bash:npm install", "Bash:npm ci"] });
+    expect(c.sidecarGeneration()).toBe(before + 1);
+    c.close();
+  });
+
+  /**
+   * CLOSING THE FAMILY, THE TITLE SIDE (Codex round 10, items 2+3, P2 — the other finding named by
+   * the coordinator). An old build's own retitling code (synthesizeRow and its three swept twins,
+   * engine.ts) predates knowing an ADVISORY rule's retitle is mirror-relevant at all — the mirror
+   * was blocking-only when those paths were first written. See
+   * `trg_rule_bindings_follow_concept_title`'s own comment (gates.ts) for the full argument.
+   */
+  it("an old-build-shaped UPDATE of a bound ADVISORY rule's title (a retitle) bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 10, items 2+3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    expect((JSON.parse(readFileSync(path, "utf8")) as GateMirror).entries[0]!.text).toBe("Confirm the lockfile before installing");
+    const generationBefore = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN UPDATE — title alone, exactly what old, blocking-only-era synthesis code
+    // (synthesizeRow, applySynthesis, resolveContradiction, detach()'s partial-detach — all
+    // predating the mirror widening) issues for an advisory rule's concept.
+    raw(c).prepare(`UPDATE concepts SET title = ? WHERE id = ?`).run("Confirm the lockfile is present before installing", seed.conceptId);
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
+    c.close();
+  });
+
+  it("does NOT bump for a same-value UPDATE of a concept's title — the OLD-IS-NOT-NEW guard holds (Codex round 10, items 2+3)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    const before = c.sidecarGeneration();
+    raw(c).prepare(`UPDATE concepts SET title = ? WHERE id = ?`).run("Confirm the lockfile before installing", seed.conceptId);
+    expect(c.sidecarGeneration()).toBe(before);
+    c.close();
+  });
+
+  it("does NOT bump for an ordinary fact's retitle — the EXISTS-on-rule_bindings scope holds, not a blanket title trigger (Codex round 10, items 2+3)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const fact = await c.store("A fact with no rule binding at all.", { kind: "fact" });
+    const before = c.sidecarGeneration();
+    raw(c).prepare(`UPDATE concepts SET title = ? WHERE id = ?`).run("A retitled fact.", fact.conceptId);
+    expect(c.sidecarGeneration()).toBe(before);
+    c.close();
+  });
+
+  /**
+   * NEW-BUILD retitling bumps EXACTLY ONCE, not twice (Codex round 10, items 2+3, exact-count) —
+   * all four `noteRuleTouched` calls tied to a title-only write were REMOVED (resolveContradiction,
+   * applySynthesis, detach()'s partial-detach, synthesizeRow — engine.ts, each site's own comment),
+   * because `hasLiveBinding` (what each called) is the EXACT condition
+   * `trg_rule_bindings_follow_concept_title`'s own WHEN clause tests, not merely a superset.
+   */
+  it("applySynthesis retitling a bound rule bumps gate_meta exactly once, not twice (Codex round 10, items 2+3, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    raw(c).prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(seed.conceptId); // force synthesis to actually run
+    const before = c.sidecarGeneration();
+    await c.applySynthesis(seed.conceptId, "Always confirm the lockfile is present and committed before installing.");
+    expect(c.sidecarGeneration()).toBe(before + 1);
+    c.close();
+  });
+
+  /**
+   * CLOSING THE FAMILY, THE THIRD GAP THE AUDIT ITSELF FOUND (Codex round 10, items 2+3 — beyond
+   * the two the coordinator named by name): stage_id/severity/scope/model_tag/origin/declared_by/
+   * reason all move together through bindRule's own "replace" branch (gates.ts), whose bump was
+   * ALSO historically gated on touching deny power. See
+   * `trg_rule_bindings_bump_on_reclassification`'s own comment (gates.ts) for the full argument,
+   * including why — unlike every other trigger in this family — bindRule's own JS-side bump is
+   * KEPT rather than removed, and the accepted double-bump that follows for a genuine new-build
+   * reclassification.
+   */
+  it("an old-build-shaped UPDATE of a bound ADVISORY rule's scope/model_tag/reason (staying advisory throughout) bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 10, items 2+3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "agent", modelTag: "old-model",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN UPDATE — scope/model_tag/reason, severity UNCHANGED (advisory throughout,
+    // so deny power is never in play) — exactly what an old, blocking-only-era bindRule's own
+    // "replace" branch issues, with its own bump gated on `touchesDenyPower` and so absent here.
+    raw(c).prepare(`UPDATE rule_bindings SET scope = 'domain', model_tag = NULL, reason = 'updated reason' WHERE concept_id = ?`)
+      .run(seed.conceptId);
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale()).toMatchObject({ stale: true, reason: "behind" });
+    c.close();
+  });
+
+  it("does NOT bump for a same-value UPDATE of rule_bindings' scope/model_tag/origin/declared_by/reason/stage_id — the OLD-IS-NOT-NEW guard holds across all seven (Codex round 10, items 2+3)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "agent", modelTag: "some-model",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    const current = raw(c).prepare(`SELECT stage_id, scope, model_tag, origin, declared_by, reason FROM rule_bindings WHERE concept_id = ?`)
+      .get(seed.conceptId) as { stage_id: string; scope: string; model_tag: string; origin: string; declared_by: string | null; reason: string };
+    const before = c.sidecarGeneration();
+    raw(c).prepare(
+      `UPDATE rule_bindings SET stage_id = ?, scope = ?, model_tag = ?, origin = ?, declared_by = ?, reason = ? WHERE concept_id = ?`,
+    ).run(current.stage_id, current.scope, current.model_tag, current.origin, current.declared_by, current.reason, seed.conceptId);
+    expect(c.sidecarGeneration()).toBe(before);
+    c.close();
+  });
+
+  /**
+   * THE ACCEPTED DOUBLE-BUMP, NAMED AND VERIFIED, NOT LEFT UNDOCUMENTED (Codex round 10, items 2+3):
+   * a genuine new-build reclassification (declare() re-aiming an already-advisory rule's scope,
+   * staying advisory throughout) bumps TWICE — once from bindRule's own kept, unconditional bump,
+   * once from `trg_rule_bindings_bump_on_reclassification`. Deliberately not "exactly once", unlike
+   * every sibling exact-count test above — see that trigger's own comment (gates.ts) for why
+   * bindRule's own call could not be safely removed the way every other one in this family was.
+   */
+  it("declare() re-aiming an already-advisory rule's scope bumps gate_meta TWICE — an accepted, documented double-bump, not an exact-count regression (Codex round 10, items 2+3)", async () => {
+    // DEFAULT (ENABLED) DEDUP, not this describe block's own disabled-dedup convention — deliberately:
+    // the second declare() call below must resolve to the SAME concept as the first (identical
+    // content), which enabled dedup guarantees and disabled dedup does not — the exact same
+    // consideration DOOR 13.11's own comment already verified against the working "PATH 1 — breadth"
+    // precedent test.
+    const c = new MonetCore(":memory:", {});
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "agent", modelTag: "some-model",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    const before = c.sidecarGeneration();
+    const reclassified = await c.declare({
+      species: "rule", stage: "npm install", content: "Confirm the lockfile before installing.",
+      severity: "advisory", scope: "domain",
+    });
+    if (reclassified.species !== "rule") throw new Error("unreachable");
+    expect(reclassified.conceptId).toBe(seed.conceptId);
+    expect(c.sidecarGeneration()).toBe(before + 2);
+    c.close();
+  });
+
+  /**
+   * CLOSING THE VERB DIMENSION (Codex round 11): round 10's own family table enumerated COLUMNS an
+   * old build's UPDATE could touch, but never asked what an old build's INSERT or DELETE against the
+   * SAME tables could miss. The next several tests close stages' own INSERT (item 1), concepts' own
+   * hard DELETE (item 2), and circle_aliases' full INSERT/UPDATE/DELETE (item 3) — the same
+   * old-build-shaped-raw-statement technique every trigger above already uses.
+   */
+  it("an old-build-shaped stage INSERT bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    // A fresh materialize so the ON-DISK file's own stamped generation is CURRENT before the probe —
+    // isolates this test to what the trigger itself does, matching this family's own established
+    // pattern (round 7, item 3's INSERT-bump test, above).
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN INSERT — a brand-new, RULE-LESS stage, exactly the shape upsertStage's own
+    // NEW-STAGE branch writes; no rule ever binds to it in this test, because the finding is about
+    // the STAGE'S OWN ARRIVAL being mirror content (GateMirror.stages carries the full registry,
+    // rule-less stages included — see listGateMirrorStages' own comment), not about anything
+    // rule-shaped.
+    raw(c).prepare(
+      `INSERT INTO stages (id, name, trigger_patterns, origin, verified, created_at, sync_updated_at, sync_revision, sync_writer)
+       VALUES ('old-build-stage', 'a rule-less stage', '[]', 'declaration', 0, ?, ?, 0, 'old-build')`,
+    ).run(Date.now(), Date.now());
+
+    // IMMEDIATELY — no reopen, no restart. The trigger fired synchronously inside the INSERT above.
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale().stale).toBe(true);
+    c.close();
+  });
+
+  it("declare({species:'stage'}) creating a BRAND NEW stage bumps gate_meta's generation exactly once — the trigger alone, now that upsertStage's own JS-side bump has been removed (Codex round 11, item 1, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const before = c.sidecarGeneration();
+    const registered = await c.declare({
+      species: "stage", stage: "a brand new rule-less stage", patterns: ["Bash:some new command"],
+    });
+    expect(registered.species).toBe("stage");
+    // Exactly once, not twice: upsertStage's own explicit bumpGateGeneration(db) call on this branch
+    // is GONE (removed — Codex round 11, item 1), an exact-match resolution against
+    // trg_stages_bump_on_insert, which now does this alone — a regression back to a JS-side call
+    // sitting alongside the trigger would show as +2 here, not +1.
+    expect(c.sidecarGeneration()).toBe(before + 1);
+    c.close();
+  });
+
+  /**
+   * THE DELETE SIDE, CONCEPTS (Codex round 11, item 2, P2). A hard-deleted concept's own rule
+   * binding disappears from listGateMirrorEntries' own result set (the INNER JOIN to concepts simply
+   * stops matching it) exactly like a retire, but via DELETE rather than UPDATE. An old build's own
+   * hard-delete code — its era: blocking-only bump gates — bumped nothing for an ADVISORY-bound
+   * concept's own hard delete.
+   */
+  it("an old-build-shaped hard DELETE of a concept carrying a live ADVISORY binding bumps gate_meta's generation too, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 2)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const advisoryRule = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+    });
+    if (advisoryRule.species !== "rule") throw new Error("unreachable");
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN HARD DELETE — its era's equivalent of hardDeleteNativeConcept, minus the
+    // noteRuleTouched call this fix removes and minus every OTHER bookkeeping statement this item
+    // does not concern (concept_deletions, first_block, etc.): isolates this test to the ONE
+    // statement whose trigger this item is about — the concepts row itself disappearing. The
+    // binding row is deliberately left behind, ORPHANED — verified by absence elsewhere in this
+    // codebase that rule_bindings is never explicitly deleted anywhere, so this is the REAL shape a
+    // hard delete leaves, old build or new.
+    raw(c).prepare(`DELETE FROM concepts WHERE id = ?`).run(advisoryRule.conceptId);
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale().stale).toBe(true);
+    c.close();
+  });
+
+  it("does NOT bump for hard-deleting an ordinary FACT concept with no rule binding at all — the EXISTS-on-rule_bindings scope holds, not a blanket delete trigger (Codex round 11, item 2)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const fact = await c.store("An ordinary fact, never a rule.", { kind: "fact" });
+    const before = c.sidecarGeneration();
+    raw(c).prepare(`DELETE FROM concepts WHERE id = ?`).run(fact.conceptId);
+    expect(c.sidecarGeneration()).toBe(before);
+    c.close();
+  });
+
+  it("a NEW-build hard delete of an advisory-bound concept (consolidating detach) bumps gate_meta's generation exactly once — the trigger alone, now that hardDeleteNativeConcept's own noteRuleTouched call has been removed (Codex round 11, item 2, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const advisoryRule = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+    });
+    if (advisoryRule.species !== "rule") throw new Error("unreachable");
+    const other = await c.store("An unrelated concept to consolidate onto.", { kind: "fact" });
+    const full = await c.getConcept(advisoryRule.conceptId);
+
+    const before = c.sidecarGeneration();
+    // Consolidating detach: ALL of the rule's observations move to `other`, so the emptied rule
+    // concept is hard-deleted — advisory, so assertBlockingRuleMutationAllowed lets it through.
+    await c.detach(advisoryRule.conceptId, full!.observations.map((o) => o.id), { destConceptId: other.conceptId });
+    // Exactly once, not twice: a regression re-adding hardDeleteNativeConcept's own JS-side bump
+    // alongside trg_concepts_bump_on_delete would show as +2 here, not +1.
+    expect(c.sidecarGeneration()).toBe(before + 1);
+    c.close();
+  });
+
+  /**
+   * THE CIRCLE_ALIASES VERBS (Codex round 11, item 3, P2). Unlike every trigger above, this gap is
+   * not "blocking-only vs widened" — circle_aliases/circles were ADDED to the mirror in format 4
+   * ITSELF, so ANY build predating that slice has no bump of any kind for an alias write, regardless
+   * of severity. All three verbs, tested directly against the raw table, matching this family's own
+   * established old-build-shaped-statement technique.
+   */
+  it("an old-build-shaped raw INSERT into circle_aliases bumps gate_meta's generation, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    raw(c).prepare(`INSERT INTO circle_aliases (from_name, to_name, status) VALUES ('old-from', 'old-to', 'active')`).run();
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale().stale).toBe(true);
+    c.close();
+  });
+
+  it("an old-build-shaped raw UPDATE of circle_aliases bumps gate_meta's generation, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    raw(c).prepare(`INSERT INTO circle_aliases (from_name, to_name, status) VALUES ('old-from', 'old-to', 'active')`).run();
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    raw(c).prepare(`UPDATE circle_aliases SET status = 'archived' WHERE from_name = 'old-from'`).run();
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale().stale).toBe(true);
+    c.close();
+  });
+
+  it("an old-build-shaped raw DELETE from circle_aliases bumps gate_meta's generation, and isSidecarStale reports the on-disk mirror stale (Codex round 11, item 3)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    raw(c).prepare(`INSERT INTO circle_aliases (from_name, to_name, status) VALUES ('old-from', 'old-to', 'active')`).run();
+    c.materializeGateMirror(path);
+    expect(c.isSidecarStale().stale).toBe(false);
+    const generationBefore = c.sidecarGeneration();
+
+    // No application code path ever issues this DELETE today (renameCircle/mergeCircle/
+    // archiveCircle/unarchiveCircle all upsert, never delete) — tested anyway, both because the
+    // trigger exists unconditionally and because a raw DELETE is exactly the class of statement this
+    // whole mixed-build family defends against, reachable or not through today's own app code.
+    raw(c).prepare(`DELETE FROM circle_aliases WHERE from_name = 'old-from'`).run();
+
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.isSidecarStale().stale).toBe(true);
+    c.close();
+  });
+
+  it("mergeCircle of an EMPTY circle (zero concepts in `from`) bumps gate_meta's generation exactly once — the circle_aliases trigger alone, now that mergeCircle's own JS-side bump has been removed (Codex round 11, item 3, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const before = c.sidecarGeneration();
+    // "empty-source" holds nothing at all — no concept, no prior alias — which mergeCircle allows
+    // (no existence check on `from`, unlike renameCircle's own). The for-loop over conceptRows is a
+    // clean no-op, isolating this test to the alias write alone.
+    await c.mergeCircle("empty-source", "keep");
+    expect(c.sidecarGeneration()).toBe(before + 1);
+    c.close();
+  });
+
+  it("archiveCircle of a brand-new (never-before-seen) circle name bumps gate_meta's generation exactly once — the circle_aliases trigger alone, now that archiveCircle's own JS-side bump has been removed (Codex round 11, item 3, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const before = c.sidecarGeneration();
+    // archiveCircle has no existence requirement at all (unlike renameCircle's own) — archiving a
+    // name with no prior alias row just upserts one, fresh.
+    c.archiveCircle("never-seen-before");
+    expect(c.sidecarGeneration()).toBe(before + 1);
+    c.close();
+  });
+
+  it("unarchiveCircle bumps gate_meta's generation exactly once when it actually flips a row back to active, and NOT AT ALL for its documented no-op (no alias row exists) — the trigger's own per-row firing is an exact match for the removed `changes > 0` gate (Codex round 11, item 3, exact-count)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    c.archiveCircle("shelved");
+    const before = c.sidecarGeneration();
+    c.unarchiveCircle("shelved");
+    expect(c.sidecarGeneration()).toBe(before + 1);
+
+    // THE DOCUMENTED NO-OP: no alias row exists for this name at all — the UPDATE's WHERE clause
+    // matches zero rows, so trg_circle_aliases_bump_on_update fires zero times too, exactly as the
+    // removed `if (r.changes > 0)` JS gate used to test.
+    const beforeNoop = c.sidecarGeneration();
+    c.unarchiveCircle("a-name-that-was-never-archived");
+    expect(c.sidecarGeneration()).toBe(beforeNoop);
+    c.close();
+  });
+
+  /**
+   * NEVER MINT BREADTH FROM A COMPATIBILITY MOVE (Codex round 12, P1 — found by review). Two
+   * triggers in this family copy a circle value verbatim from somewhere else; both had the same
+   * hole, both are fixed the same way, both get their own test here.
+   */
+  it("an old-build-shaped UPDATE of a concept's circle INTO the reserved '*' marker does NOT mint breadth on its binding — refused rather than treated as an ordinary move (Codex round 12, P1)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const localRule = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "blocking", scope: "domain",
+      reason: "an unlocked install can drift", circle: "project",
+    });
+    if (localRule.species !== "rule") throw new Error("unreachable");
+    const before = c.sidecarGeneration();
+
+    // THE OLD BUILD'S OWN UPDATE — moving the concept into a circle literally spelled "*", legal
+    // under its own pre-breadth freedom (arbitrary circle names), with zero awareness the marker is
+    // now reserved. Before this fix: the sibling trigger copied it straight into rule_bindings.circle
+    // — a BLOCKING rule silently made global, on the strength of an old process's ordinary move.
+    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run(BREADTH_CIRCLE, localRule.conceptId);
+
+    // THE BINDING STAYS PUT — no mint, no crash.
+    const afterMove = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(localRule.conceptId) as { circle: string };
+    expect(afterMove.circle).toBe("project");
+    // The CONCEPT itself did move (this trigger never touches `concepts`) — legacy-star cleanup is
+    // a separate, later concern (the next new-build open), unaffected by this fix either way.
+    expect(raw(c).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(localRule.conceptId)).toEqual({ circle: BREADTH_CIRCLE });
+    // NO BUMP either — nothing mirror-relevant changed (the binding, which is what the mirror reads
+    // for this rule, never moved).
+    expect(c.sidecarGeneration()).toBe(before);
+    // And the deny still fires from exactly where it always did.
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "project" }).rules.map((r) => r.conceptId))
+      .toContain(localRule.conceptId);
+    c.close();
+  });
+
+  it("an old-build-shaped raw INSERT into rule_bindings, whose concept already lives in the reserved '*' circle, resolves to NULL rather than minting breadth (Codex round 12, P1 — same audit, the backfill trigger)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Seed rule so a real stage exists to bind against.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    const stageId = c.ruleBinding(seed.conceptId)!.stage_id;
+
+    // A concept ALREADY sitting in the reserved circle (the legacy pre-breadth shape) — no binding
+    // yet.
+    const pathological = await c.store("A concept an old build already parked in '*'.", { kind: "fact" });
+    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run(BREADTH_CIRCLE, pathological.conceptId);
+
+    // THE OLD BUILD'S OWN INSERT — the pre-breadth column shape, binding this pathological concept.
+    raw(c).prepare(
+      `INSERT INTO rule_bindings
+         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+          created_at, sync_updated_at, sync_revision, sync_writer)
+       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, 'an old-build reason', ?, ?, 0, 'old-build')`,
+    ).run(pathological.conceptId, stageId, Date.now(), Date.now());
+
+    // NULL, not '*' — resolves the SAME way a genuinely dangling binding (no concept at all) already
+    // does, not minted.
+    const landed = raw(c).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(pathological.conceptId) as { circle: string | null };
+    expect(landed.circle).toBeNull();
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-nothing-else-touches" }).rules.map((r) => r.conceptId))
+      .not.toContain(pathological.conceptId);
+    c.close();
+  });
+
+  it("the bulk backfill does NOT bump when the only NULL-circle bindings are unresolvable — dangling (no concept at all) or parked in the reserved '*' circle — miscounting either as resolved was the exact review finding (Codex round 12, P2)", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const seed = await c.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Seed rule so a real stage exists to bind against.", severity: "advisory", scope: "domain",
+    });
+    if (seed.species !== "rule") throw new Error("unreachable");
+    const stageId = c.ruleBinding(seed.conceptId)!.stage_id;
+    const db = raw(c) as unknown as StoragePort;
+
+    // DANGLING: concept_id names no row in concepts at all.
+    db.prepare(
+      `INSERT INTO rule_bindings
+         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+          created_at, sync_updated_at, sync_revision, sync_writer)
+       VALUES ('dangling-nowhere', ?, 'advisory', 'domain', NULL, 'declaration', NULL, NULL, ?, ?, 0, 'old-build')`,
+    ).run(stageId, Date.now(), Date.now());
+
+    // PARKED IN '*': the concept exists, but sits in the reserved circle — the fixed INSERT trigger
+    // (its own test, above) already leaves such a binding's circle NULL rather than minting; this
+    // test is about the BULK backfill agreeing that it is NOT a resolution to count, not re-testing
+    // the trigger itself.
+    const parked = await c.store("A concept an old build already parked in '*'.", { kind: "fact" });
+    raw(c).prepare(`UPDATE concepts SET circle = ? WHERE id = ?`).run(BREADTH_CIRCLE, parked.conceptId);
+    db.prepare(
+      `INSERT INTO rule_bindings
+         (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+          created_at, sync_updated_at, sync_revision, sync_writer)
+       VALUES (?, ?, 'advisory', 'domain', NULL, 'declaration', NULL, NULL, ?, ?, 0, 'old-build')`,
+    ).run(parked.conceptId, stageId, Date.now(), Date.now());
+
+    const generationBefore = (db.prepare(`SELECT generation FROM gate_meta WHERE singleton = 1`).get() as { generation: number }).generation;
+
+    // Calling migrateGateColumns AGAIN, directly — the SAME idempotent re-entry this module's own
+    // "concurrent-migrator race"/"survives a second migration pass" tests already rely on, isolating
+    // this test to the bulk backfill's OWN behavior rather than construction's own two-call sequence
+    // (round 11, item 3).
+    migrateGateColumns(db);
+
+    // NO BUMP — neither row was actually resolvable (EXISTS fails for both, for different reasons),
+    // so neither is touched by the UPDATE's own WHERE clause, so neither is miscounted as resolved.
+    expect((db.prepare(`SELECT generation FROM gate_meta WHERE singleton = 1`).get() as { generation: number }).generation)
+      .toBe(generationBefore);
+    expect((db.prepare(`SELECT circle FROM rule_bindings WHERE concept_id = 'dangling-nowhere'`).get() as { circle: string | null }).circle)
+      .toBeNull();
+    expect((db.prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(parked.conceptId) as { circle: string | null }).circle)
+      .toBeNull();
+    c.close();
+  });
+
+  it("the trigger survives a second migration pass — idempotent CREATE TRIGGER IF NOT EXISTS, not merely accidentally harmless (Codex round 5, item 4)", () => {
+    const dir = mkTmp();
+    const path = join(dir, "trigger-idempotent.db");
+    const port = new BetterSqlitePort(path);
+    // A MINIMAL concepts table — just enough for the backfill's own "GUARDED ON concepts EXISTING"
+    // check to see it (the pure schema-race fixture above deliberately has none at all; this test is
+    // about a DIFFERENT concern, the trigger's own idempotent creation, which needs the guard to pass
+    // so the trigger actually gets created in the first place).
+    port.exec(`CREATE TABLE concepts (id TEXT PRIMARY KEY, circle TEXT NOT NULL DEFAULT 'default')`);
+    createGateSchema(port); // first pass: creates rule_bindings, adds circle, creates the trigger
+    createGateSchema(port); // second pass: must not throw, must not duplicate the trigger
+
+    const triggers = port.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_rule_bindings_backfill_circle'`,
+    ).all() as Array<{ name: string }>;
+    expect(triggers).toHaveLength(1);
+
+    // AND IT STILL WORKS after the second pass — not merely present, but functioning. No `stages`
+    // FK is enforced at the SQL layer (this table has none), so a dummy stage_id is enough to prove
+    // the INSERT itself does not throw — that the trigger body is valid SQL against this schema —
+    // without needing a real stage row. `concept_id` names nothing in the minimal `concepts` table
+    // above, exercising the SAME no-op path the dangling case does: circle stays NULL, silently.
+    expect(() =>
+      port.prepare(
+        `INSERT INTO rule_bindings
+           (concept_id, stage_id, severity, scope, model_tag, origin, declared_by, reason,
+            created_at, sync_updated_at, sync_revision, sync_writer)
+         VALUES ('trigger-survives-check', 'dummy-stage', 'advisory', 'domain', NULL, 'declaration', NULL, NULL, 1, 1, 0, 'x')`,
+      ).run(),
+    ).not.toThrow();
+    const stillDangling = port.prepare(`SELECT circle FROM rule_bindings WHERE concept_id = 'trigger-survives-check'`)
+      .get() as { circle: string | null };
+    expect(stillDangling.circle).toBeNull();
+    port.close();
+  });
+
+  /**
+   * ONE TRANSACTION FOR THE WHOLE MIGRATION (Codex round 7, item 1, P1). Before this fix, each write
+   * inside migrateLegacyStarCircle auto-committed on its own — concepts, then observations, then
+   * edges, then normative rows, then the source registry, then aliases, then the generation bump —
+   * so a crash between any two of them left a HALF-MOVED store: exactly the "concepts moved,
+   * sources/aliases not, or worse" shape this item names. Injected via a probe StoragePort (matching
+   * this describe block's own StaleMatcherProbeStorage precedent), throwing partway through
+   * moveCircleScopedTables itself — after concepts/observations/edges/normative rows have already
+   * been touched, before knowledge_sources, entities, first_block, alias cleanup, or the generation
+   * bump ever run — the worst-shaped partial failure available, not merely a clean early one.
+   */
+  it("a migration that throws mid-way (moveCircleScopedTables itself, after concepts have already moved) leaves the store byte-identical to pre-migration; the successful path is unchanged (Codex round 7, item 1)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "migration-atomicity.db");
+    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const legacyFact = await built.store("A fact from before gates existed.", {
+      circle: "an-ordinary-circle", kind: "fact",
+    });
+    built.close();
+
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
+    legacy.close();
+
+    // THE PRE-MIGRATION SNAPSHOT, byte for byte — not just "the concept's circle", the WHOLE file,
+    // so nothing this migration could possibly touch (aliases, sources, the generation counter,
+    // anything) can quietly slip through un-asserted.
+    const preMigrationBytes = readFileSync(path);
+
+    class ThrowingMidMigrationProbe extends BetterSqlitePort {
+      override prepare(sql: string): Statement {
+        // knowledge_sources.circle's own UPDATE (moveCircleScopedTables, engine.ts) — reached only
+        // after concepts/observations/moveEdgeScope/lifecycle_edges/ratifications have already run
+        // in this SAME call, and before entities/concept_entities/workstream slugs/first_block/the
+        // alias cleanup/the generation bump ever get a chance to.
+        if (/UPDATE knowledge_sources SET circle/.test(sql)) {
+          throw new Error("INJECTED CRASH — simulated failure partway through the legacy-star migration");
+        }
+        return super.prepare(sql);
+      }
+    }
+
+    // THE FIRST ATTEMPT, WITH THE FAULT INJECTED. Pre-fix, moveCircleScopedTables' own earlier
+    // statements (concepts, observations, edges, normative rows) would already have auto-committed
+    // by the time this throws — a half-moved store, permanently, since the concept's circle now
+    // fails BOTH `hasLegacyStar` (it moved) and the migration's own idempotent re-run guard.
+    expect(() => new MonetCore(new ThrowingMidMigrationProbe(path), { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" }))
+      .toThrow(/INJECTED CRASH/);
+
+    // BYTE-IDENTICAL. The whole migration rolled back as one unit — not merely "the concept is still
+    // in '*'" (which a partial rollback could also produce by coincidence), the entire file is
+    // unchanged, proving no partial write of ANY kind survived.
+    const postCrashBytes = readFileSync(path);
+    expect(postCrashBytes.equals(preMigrationBytes)).toBe(true);
+
+    // THE SUCCESSFUL PATH, UNCHANGED: reopening normally (no probe, no fault) migrates cleanly on
+    // this, genuinely, the FIRST successful attempt.
+    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
+    const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
+    expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
+    expect(upgraded.sidecarGeneration()).toBeGreaterThan(0);
+    upgraded.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // stageLookup (standalone) — transaction boundaries (Codex round 4, item 3)
 // ---------------------------------------------------------------------------
 
@@ -4090,8 +8107,8 @@ describe("liveStageIndex — one read transaction for names+total", () => {
          VALUES (?, ?, ?, ?, 'rule', 'active', 'default', '[]')`,
       ).run(conceptId, `bulk-slug-${i}`, `Bulk rule ${i}`, `Body ${i}`);
       setupDb.prepare(
-        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, created_at, sync_updated_at, sync_revision)
-         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', ?, ?, 0)`,
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, circle, created_at, sync_updated_at, sync_revision)
+         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', 'default', ?, ?, 0)`,
       ).run(conceptId, stage.id, Date.now(), Date.now());
     }
     setup.close();
@@ -4318,8 +8335,8 @@ describe("liveStageIndex — SQL-level retrieval bound", () => {
          VALUES (?, ?, ?, ?, 'rule', 'active', 'default', '[]')`,
       ).run(conceptId, `bulk-slug-${i}`, `Bulk rule ${i}`, `Body ${i}`);
       db.prepare(
-        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, created_at, sync_updated_at, sync_revision)
-         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', ?, ?, 0)`,
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, circle, created_at, sync_updated_at, sync_revision)
+         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', 'default', ?, ?, 0)`,
       ).run(conceptId, stage.id, Date.now(), Date.now());
     }
 
@@ -4364,14 +8381,14 @@ describe("gateStats byMatcher", () => {
 describe("MCP surface", () => {
   type McpContent = { content: Array<{ type: string; text: string }>; isError?: boolean };
 
-  async function harness(c: MonetCore, opts: { modelTag?: string } = {}) {
+  async function harness(c: MonetCore, opts: { modelTag?: string; autoPrewarm?: boolean } = {}) {
     const server = new McpServer({ name: "test", version: "0.0.0" }, { capabilities: { tools: {} } });
     registerMonetCoreTools(server, c, { autoPrewarm: false, checkpointNudge: false, ...opts });
     const [ct, st] = InMemoryTransport.createLinkedPair();
     await server.connect(st);
     const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
     await client.connect(ct);
-    const call = async (tool: string, args: Record<string, unknown>): Promise<{ json: Record<string, unknown>; isError: boolean; text: string }> => {
+    const call = async (tool: string, args: Record<string, unknown>): Promise<{ json: Record<string, unknown>; isError: boolean; text: string; prewarmText: string }> => {
       const r = (await client.callTool({ name: tool, arguments: args })) as McpContent;
       const text = r.content[0]!.text;
       let json: Record<string, unknown> = {};
@@ -4380,7 +8397,10 @@ describe("MCP surface", () => {
       } catch {
         // An error response is prose, not JSON — the caller asserts on `text` instead.
       }
-      return { json, isError: r.isError === true, text };
+      // content[1], when present, is the auto-prewarm block wrapSuccess appends (Codex round 3,
+      // item 3's own test needs to see whether one was attached, and against what).
+      const prewarmText = r.content[1]?.text ?? "";
+      return { json, isError: r.isError === true, text, prewarmText };
     };
     return { call, client };
   }
@@ -4408,6 +8428,144 @@ describe("MCP surface", () => {
     expect(declared.isError).toBe(false);
     expect(declared.json).toMatchObject({ species: "rule" });
     expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0]).toMatchObject({ severity: "blocking" });
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * BOTH DISCLOSURES, ONE CALL (Codex round 11, item 7, P2). The guidance string used to be built as
+   * an if/else-if chain — `r.downgraded ? "DENY REMOVED..." : r.narrowedFromBreadth ? "BREADTH
+   * NARROWED..." : ...` — so a single declare() that BOTH downgrades severity (blocking → advisory)
+   * AND narrows breadth (circle '*' → local) in the SAME call short-circuited past the narrowing
+   * branch the moment `downgraded` was true, silently swallowing the BREADTH NARROWED disclosure even
+   * though the underlying `narrowedFromBreadth` field itself (spread from declare()'s own response,
+   * computed independently of `downgraded` in engine.ts) was present and true the whole time.
+   */
+  it("a single declare() that BOTH downgrades severity AND narrows breadth in the SAME call discloses BOTH — DENY REMOVED first, then BREADTH NARROWED (Codex round 11, item 7)", async () => {
+    const c = new MonetCore(":memory:", {}); // dedup ENABLED — the second declare() must resolve onto the SAME concept by content match alone, matching round 10's own "re-aiming" test precedent
+    const { call, client } = await harness(c);
+
+    const first = await call("memory_declare", {
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a directory tree unattended.", severity: "blocking", reason: "there is no undo",
+      scope: "domain", // domain, not the "agent" default — sidesteps the modelTag requirement entirely, irrelevant to what this test targets
+    });
+    expect(first.isError).toBe(false);
+    // NOT `first.json.circle` — that field is deliberately the HOME circle for prewarm, never the
+    // breadth marker itself (Codex round 3, item 3's own fix; see that test's own comment: "the
+    // binding ruling still reaches declare() as '*'"). The true ruling is read directly off the
+    // engine, matching that test's own established pattern.
+    expect(c.ruleBinding((first.json as { conceptId: string }).conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    // ONE ACT, BOTH AXES: severity blocking → advisory (a downgrade) AND circle '*' → 'default' (a
+    // narrowing), in the identical call — nothing in declare() refuses combining the two. 'default'
+    // NAMED EXPLICITLY, not a DIFFERENT circle like 'project': the concept's own HOME already
+    // resolved to the constructor's implicit default ("default", no defaultCircle override above) the
+    // moment the first call declared it with circle: '*' — matching "PATH 1 — breadth"'s own
+    // established precedent test exactly (same construction, same resolved home). Naming a
+    // genuinely DIFFERENT circle here would resolve to a DIFFERENT concept's home instead of this
+    // one's, minting a second concept there rather than re-aiming this one — caught by this test's
+    // own first draft doing exactly that (action: "created" twice, not "created" then a re-aim).
+    const combined = await call("memory_declare", {
+      circle: "default", species: "rule", stage: "rm -rf",
+      content: "Never delete a directory tree unattended.", severity: "advisory", scope: "domain",
+    });
+    expect(combined.isError).toBe(false);
+    expect(combined.json.downgraded).toBe(true);
+    expect(combined.json.narrowedFromBreadth).toBe(true);
+    const guidance = combined.json.guidance as string;
+    expect(guidance).toContain("DENY REMOVED");
+    expect(guidance).toContain("BREADTH NARROWED");
+    // ORDER: severity's own disclosure first, matching the coordinator's own field precedence.
+    expect(guidance.indexOf("DENY REMOVED")).toBeLessThan(guidance.indexOf("BREADTH NARROWED"));
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE MCP-LAYER HALF OF THE BREADTH-NARROWING FIX (Codex round 2, item 1) — a DIFFERENT bug from a
+   * DIFFERENT layer than the engine-side "PATH 1 — breadth" tests above: this handler used to call
+   * `scope(circle)` unconditionally, which resolves an omitted circle to the session default BEFORE
+   * `core.declare()` is ever invoked — turning "the caller said nothing" into "the caller explicitly
+   * named the default" on the wire, which declare() then has no way to tell apart from a real
+   * ruling. Exercised over the actual MCP client/server transport, not a direct engine call, because
+   * that eager resolution lived in the handler, not in declare() itself.
+   */
+  it("memory_declare's own handler does not default-fill circle before declare() sees it — re-declaring a global rule over MCP, with no circle argument, keeps it global (Codex round 2, item 1)", async () => {
+    const c = new MonetCore(":memory:", {}); // dedup ENABLED — memory_declare exposes no attachTo, so a restatement must resolve onto the SAME concept by content match alone
+    const { call, client } = await harness(c);
+    const CONTENT = "Never install without a lockfile present.";
+
+    const first = await call("memory_declare", {
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"], scope: "domain",
+      content: CONTENT, severity: "blocking", reason: "an unlocked install can drift", circle: "*",
+    });
+    expect(first.isError).toBe(false);
+    const firstConceptId = (first.json as { conceptId: string }).conceptId;
+    expect(c.ruleBinding(firstConceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    // Re-declared over MCP with NO circle argument at all — the exact call shape a caller restating
+    // a rule's text (a typo fix, an added detail) would naturally make, with no reason to think
+    // "circle" is even relevant to what they are doing.
+    const again = await call("memory_declare", {
+      species: "rule", stage: "npm install", content: CONTENT, scope: "domain",
+      severity: "blocking", reason: "an unlocked install can drift",
+    });
+    expect(again.isError).toBe(false);
+    const againJson = again.json as { conceptId: string; narrowedFromBreadth?: boolean };
+    expect(againJson.conceptId).toBe(firstConceptId); // same rule, restated — not a new one
+    // STILL GLOBAL — the handler-level bug this fix closes would have silently narrowed this to the
+    // session default the moment `circle` was omitted from the wire call.
+    expect(c.ruleBinding(firstConceptId)!.circle).toBe(BREADTH_CIRCLE);
+    expect(againJson.narrowedFromBreadth).toBeUndefined();
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-this-test-never-otherwise-touches" }).rules.map((r) => r.conceptId))
+      .toEqual([firstConceptId]);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE HANDLER USED '*' FOR PREWARM AND THE RESPONSE'S OWN CIRCLE TOO (Codex round 3, item 3) — not
+   * only for the binding ruling (round 2, item 1 already fixed that half). '*' is a valid ruling for
+   * declare()'s own `circle` input, but it is never a real circle capturePrewarmSnapshot or a
+   * response's `circle` field can operate against: the rule's CONCEPT always lives at the caller's
+   * own default circle, never at the breadth marker. Verified here against a store with REAL prior
+   * content in the default circle — capturePrewarmSnapshot('*') would find nothing there (nothing
+   * can live in '*') and silently produce an empty block regardless of what the default circle
+   * holds, which is indistinguishable from "there was nothing to show" unless the test controls for
+   * it directly, as this one does.
+   */
+  it("memory_declare with circle '*' resolves a HOME circle for prewarm and the response, never '*' itself — the binding ruling still reaches declare() as '*' (Codex round 3, item 3)", async () => {
+    const c = new MonetCore(":memory:", { defaultCircle: "the-real-default" });
+    // Real prior content in the default circle, so a CORRECTLY-scoped prewarm has something to
+    // show — the control that makes "empty block" and "wrongly-scoped block" distinguishable.
+    await c.store("A fact prewarm should be able to find.", { kind: "fact" });
+    const { call, client } = await harness(c, { autoPrewarm: true });
+
+    const declared = await call("memory_declare", {
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"], scope: "domain",
+      content: "Never install without a lockfile present.", severity: "blocking",
+      reason: "an unlocked install can drift", circle: "*",
+    });
+    expect(declared.isError).toBe(false);
+    const conceptId = (declared.json as { conceptId: string }).conceptId;
+
+    // THE RULING still reaches declare() as '*' — round 2's own fix, unweakened by this one.
+    expect(c.ruleBinding(conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    expect(c.gate({ actionContext: "Bash:npm install", circle: "a-circle-this-test-never-configured" }).rules.map((r) => r.conceptId))
+      .toEqual([conceptId]);
+
+    // THE RESPONSE'S OWN `circle` FIELD names the HOME circle, honestly — where the CONCEPT
+    // actually lives — never the breadth marker.
+    expect(declared.json.circle).toBe("the-real-default");
+
+    // PREWARM WAS CAPTURED AGAINST THE HOME CIRCLE, not '*': non-empty, because the default circle
+    // genuinely has content. Pre-fix, capturePrewarmSnapshot('*') would have found nothing (nothing
+    // can live in '*') and this would be empty regardless of the real default circle's own content.
+    expect(declared.prewarmText.length).toBeGreaterThan(0);
 
     await client.close();
     c.close();

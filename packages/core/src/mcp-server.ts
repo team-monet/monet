@@ -15,6 +15,7 @@ import { z } from "zod";
 import { MonetCore, FIRST_BLOCK_SUMMARY_MAX_CHARS } from "./engine";
 import type { MergeConceptResult } from "./engine";
 import {
+  BREADTH_CIRCLE,
   MODEL_TAG_MAX_CHARS,
   STAGE_INDEX_CAP,
   STAGE_LOOKUP_BODY_CAP,
@@ -924,11 +925,40 @@ export function registerMonetCoreTools(
       modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
       reason: z.string().optional().describe('One line naming the failure this prevents — what the gate shows, and what earns compliance. REQUIRED when severity is "blocking": a deny nobody can explain is a deny people learn to route around. Ask the user for it rather than inventing one.'),
       declaredBy: z.string().optional().describe("Who ruled. Defaults to the calling agent id."),
-      circle: z.string().optional(),
+      circle: z
+        .string()
+        .optional()
+        .describe(
+          'Which circle this declaration lives in. Omit for the default. "*" is the reserved GLOBAL BREADTH declaration, species="rule" only: the rule delivers in every circle, unioned with whatever is local there, no shadowing — never a real circle name, and refused for species="stage" (a stage is store-global already; breadth is a property of the rule\'s BINDING, not an address).',
+        ),
       sourceRefs: z.array(z.string()).optional(),
     },
     async ({ species, stage, content, patterns, instance, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs, acknowledgeBlockingRules }) => {
-      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      // RAW, UNDISTORTED — memory_declare-scoped (review fix — Codex round 2, item 1). declare()
+      // itself must be able to tell "the caller said nothing about circle" (`undefined` — preserves
+      // an existing binding's circle, including breadth) from "the caller explicitly named the
+      // session default" (a REAL ruling that legitimately narrows an existing global rule, even
+      // though it happens to equal what scope() would already have produced). scope()'s own eager
+      // `?? dc` fallback collapsed that distinction before declare() ever saw it — this is the one
+      // seam that must not also default-fill. '*' passes through untouched: it is never a real
+      // circle name to alias-resolve, and resolving it through scope() would be the wrong kind of
+      // "helpful" even though (circle_aliases can never name '*') it would happen to be harmless
+      // today. Every OTHER tool in this file keeps calling scope(circle) exactly as before — this
+      // resolution is local to this one handler's call into core.declare().
+      const declareCircle = circle === undefined ? undefined : circle === BREADTH_CIRCLE ? BREADTH_CIRCLE : scope(circle);
+      // THE HOME CIRCLE — for prewarm snapshotting and the response's own `circle` field, NEVER '*'
+      // (review fix — Codex round 3, item 3). '*' is a valid RULING for `declareCircle` above (the
+      // BINDING's own locality, going into declare()'s `circle` input alone) but it is not a real
+      // circle anything else here can operate against: the rule's CONCEPT always lives at the
+      // caller's own circle, never at the breadth marker (declare()'s own `isBreadth` comment) — so
+      // capturePrewarmSnapshot('*') would burn the one-shot mechanism scanning a circle that holds
+      // no concepts, and a response claiming `circle: '*'` would misreport where the concept
+      // actually lives. Resolves to the session default whenever the caller named nothing OR named
+      // '*' explicitly; otherwise resolves the named circle exactly as before. The ruling itself is
+      // still fully visible — via `binding.circle` in the spread `...r` below, never hidden, just
+      // reported through the field that already exists for it rather than through this one.
+      const homeCircle = circle === undefined || circle === BREADTH_CIRCLE ? scope() : scope(circle);
+      const capturedBlock = capturePrewarmSnapshot(homeCircle);
       try {
         const r = await core.declare({
           species, stage, content, patterns, instance, severity, scope: ruleScope,
@@ -936,20 +966,55 @@ export function registerMonetCoreTools(
           // memory_store's own rule capture just above (Codex round 3).
           modelTag: core.getRuntimeModelTag() ?? modelTag, reason, declaredBy, sourceRefs,
           acknowledgeBlockingRules,
-          circle: scope(circle),
+          circle: declareCircle,
         });
+        // BOTH DISCLOSURES CAN APPLY TO ONE DECLARE (Codex round 11, item 7, P2 — found and fixed:
+        // the previous version chained these as an if/else-if, `r.downgraded ? ... : r.narrowedFromBreadth
+        // ? ... : ...`, so a single declare() that BOTH downgrades severity (blocking → advisory)
+        // AND narrows breadth (circle: '*' → local) in the SAME call — a legal, single-act
+        // re-declaration, nothing in declare() refuses combining the two — short-circuited past the
+        // narrowing branch entirely the moment `r.downgraded` was true, silently swallowing the
+        // BREADTH NARROWED disclosure. Each is its OWN mirror-changing act with its OWN "never
+        // something the user finds out later" obligation (see each string's own comment below); a
+        // ternary chain can only ever surface ONE winner, so it structurally cannot state two
+        // independent truths about the same response.
+        //
+        // AN IF/ELSE STATEMENT, NOT A NESTED TERNARY IN THE OBJECT LITERAL (as the array-building
+        // version of this fix first tried) — TypeScript narrows `r`'s discriminated union (`species
+        // === "stage"` vs. the rule-bound branch that alone carries `downgraded`/`narrowedFromBreadth`)
+        // only within a real conditional's own branch, not across a separately-computed `const` built
+        // before that check runs — caught immediately by `tsc`, not by inspection: "Property
+        // 'downgraded' does not exist on type '{ species: \"stage\"; ... }'". Restructured so the
+        // stage/rule split happens FIRST, matching the narrowing this union actually needs.
+        //
+        // ORDER: downgraded's own line first, per severity taking precedence over breadth in every
+        // other place this codebase orders the two (DOOR 12's own severity gate runs before the
+        // breadth boundary check, graftRows).
+        let guidance: string;
+        if (r.species === "stage") {
+          guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles.";
+        } else {
+          const disclosures = [
+            // A removed deny is never allowed to be something the user finds out later.
+            r.downgraded
+              ? "DENY REMOVED: this rule was blocking and is now advisory — the action it used to refuse will go through. Tell the user plainly. Re-declare with severity=\"blocking\" to restore it."
+              : null,
+            // Same discipline, one axis over (review fix — Codex round 2, item 1): a narrowed-away
+            // global rule is never something the user finds out later either. INDEPENDENT of
+            // `downgraded` above — checked unconditionally, not as an `else` branch, so this fires
+            // whether or not a downgrade also happened in the same call.
+            r.narrowedFromBreadth
+              ? "BREADTH NARROWED: this rule was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle=\"*\" to restore it."
+              : null,
+          ]
+            .filter((line): line is string => line !== null)
+            .join(" ");
+          guidance = disclosures !== ""
+            ? disclosures
+            : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.";
+        }
         return mutOk(
-          {
-            circle: scope(circle),
-            ...r,
-            guidance:
-              r.species === "stage"
-                ? "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles."
-                : r.downgraded
-                  // A removed deny is never allowed to be something the user finds out later.
-                  ? "DENY REMOVED: this rule was blocking and is now advisory — the action it used to refuse will go through. Tell the user plainly. Re-declare with severity=\"blocking\" to restore it."
-                  : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.",
-          },
+          { circle: homeCircle, ...r, guidance },
           "memory_declare",
           false,
           capturedBlock,

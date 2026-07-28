@@ -288,6 +288,16 @@ export interface SyncRuleBindingRow {
   origin: string;
   declared_by: string | null;
   reason: string | null;
+  /**
+   * OPTIONAL, not version-gated: absent means a pre-breadth peer's payload, and the receiver
+   * defaults it to the binding's own concept's circle (the same value it would have carried, had
+   * the field existed, since breadth ("*") could not have been declared before this shipped
+   * anywhere). Present and equal to the breadth marker means the sender is relaying a legitimately
+   * global rule VERBATIM — relay is not a second way to mint breadth (the receiver's own
+   * declaration-origin check still applies), but a peer that already holds one must not lose it on
+   * sync. See gates.ts's BREADTH_CIRCLE and RuleBindingRow.circle for the full story.
+   */
+  circle?: string;
   created_at: number;
   sync_updated_at: number;
   sync_revision?: number;

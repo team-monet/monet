@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { MonetCore } from "../engine";
+import { BREADTH_CIRCLE } from "../gates";
 import type { CreateGitMdSource, CreateRepoMdSource } from "../source-types";
 import type { StoragePort } from "../storage";
 
@@ -189,6 +190,27 @@ describe("source registry validation", () => {
       expect(() => core.createSource(repoInput("/tmp/repo", {
         access: { allowedCallerIds: ["caller-a"], allowedProjectIds: [] },
       }))).toThrow(/allowedProjectIds.*nonempty/);
+      expect(core.listSources()).toEqual([]);
+    } finally {
+      core.close();
+    }
+  });
+
+  /**
+   * THE 11th CIRCLE-MINTING SURFACE (Codex round 4, item 3; BREADTH_CIRCLE's own comment, gates.ts).
+   * Before this fix, registering a source under circle '*' succeeded outright — `circle` is one of
+   * IMMUTABLE_KEYS, so nothing could ever fix it afterward via updateSource — and the mistake stayed
+   * invisible until the FIRST ingestion attempt, which would throw forever at storeInternal's own
+   * concept guard (CIRCLE-MINTING GUARD 2 of N, engine.ts), because a source's registered circle
+   * feeds every storeSource() call's own `circle`. Refused here instead, immediately and actionably.
+   */
+  it("refuses to register a source under circle '*' — the reserved global-breadth marker, never a circle a source's concepts can live in", () => {
+    const core = new MonetCore(":memory:");
+    try {
+      expect(() => core.createSource(repoInput("/tmp/repo", { circle: BREADTH_CIRCLE })))
+        .toThrow(/reserved global-breadth marker/);
+      expect(() => core.createSource(gitInput({ circle: BREADTH_CIRCLE })))
+        .toThrow(/reserved global-breadth marker/);
       expect(core.listSources()).toEqual([]);
     } finally {
       core.close();

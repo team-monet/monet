@@ -108,8 +108,8 @@ describe("prewarm First Block section header framing (regression)", () => {
          VALUES (?, ?, ?, ?, 'rule', 'active', 'default', '[]')`,
       ).run(conceptId, `bulk-slug-${i}`, `Bulk rule ${i}`, `Body ${i}`);
       db.prepare(
-        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, created_at, sync_updated_at, sync_revision)
-         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', ?, ?, 0)`,
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, circle, created_at, sync_updated_at, sync_revision)
+         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', 'default', ?, ?, 0)`,
       ).run(conceptId, stage.id, Date.now(), Date.now());
     }
 

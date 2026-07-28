@@ -102,23 +102,85 @@
  * pattern surfaced in curation, never a wrong deny — blocking severity is declaration-only.
  *
  * ────────────────────────────────────────────────────────────────────────────────────────────────
- * THE BLOCKING SIDECAR IS A MIRROR, NOT A COPY
+ * THE GATE MIRROR IS A MIRROR, NOT A COPY
  * ────────────────────────────────────────────────────────────────────────────────────────────────
  *
- * `materializeBlockingSidecar` writes every live blocking rule to a local JSON file so a host hook
- * can deny without reaching the server ("blocking is enforceable without the server"; "a Monet
- * outage never *adds* blockage"). The design's own distinction applies verbatim: a source's copy
- * competes with the file as truth, while a MIRROR is a build artifact with an unambiguous master.
- * The store is master. The file is regenerated at every declaration — never edited, never read back
- * as authority, and safe to delete (the next declaration rebuilds it, and
- * `engine.materializeBlockingSidecar(path)` rebuilds it on demand).
+ * `materializeGateMirror` writes every LIVE RULE — advisory and blocking alike — plus the full
+ * stage registry to a local JSON file, so a host CLI can answer the WHOLE gate without reaching the
+ * server, not only the offline-deny case ("one artifact, one staleness contract... answerable with
+ * the server down" — docs/design/next-monet-tool-surface.md's `monet gate` row). The design's own
+ * distinction applies verbatim: a source's copy competes with the file as truth, while a MIRROR is
+ * a build artifact with an unambiguous master. The store is master. The file is regenerated at
+ * every declaration — never edited, never read back as authority, and safe to delete (the next
+ * declaration rebuilds it, and `engine.materializeGateMirror(path)` rebuilds it on demand).
+ *
+ * RULED 2026-07-28 (slice 4b-B): this artifact began as the "blocking sidecar" (slice 4a) — blocking
+ * rules only, deliberately kept small for the offline-deny case. That scope is superseded: extending
+ * the SAME artifact to carry every live rule (not shipping a second file) keeps one staleness
+ * contract instead of two, and is what makes `monet gate` answerable offline in full — see
+ * gate-boundary-statement.md's own dated supersession clause. The on-disk path and the
+ * `gateSidecarPath` config key are unchanged; only the entries widened and the names stopped saying
+ * "blocking" for an artifact that no longer only carries blocking rules.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { StoragePort } from "./storage";
 
 // ---- vocabulary -------------------------------------------------------------
+
+/**
+ * Breadth is a property of the BINDING, and `*` is a breadth, not a circle (ratified 2026-07-28,
+ * docs/design/next-monet-skeleton-gates-recall.md's "Breadth is a property of the binding" section).
+ * Stages are already store-global; only bindings carry a circle. A binding declared with circle
+ * `*` delivers in EVERY circle, unioned with the local circle's own rules at gate time — no
+ * shadowing, no precedence: a global deny and a local advisory on the same stage both arrive,
+ * blocking-first as always.
+ *
+ * `*` IS NEVER A CIRCLE A CONCEPT LIVES IN. It is a reserved breadth marker on a `rule_bindings`
+ * row alone, forbidden as a circle name at every circle-minting surface (the MonetCore constructor's
+ * `defaultCircle`, `store()`'s concept circle, `reassignCircle`'s `toCircle`, `renameCircle`'s
+ * `from`/`to`, a relayed CONCEPT row's circle, `createSource`'s registered circle — Codex round 4,
+ * item 3, `saveWorkstream`'s own explicit circle — Codex round 7, item 4) — see each surface's own
+ * guard. A relayed
+ * `rule_bindings` row, by contrast, carries breadth verbatim: relay is not a second way to mint it
+ * (sovereignty is unchanged — `*` enters only through the declaration surface, same as blocking
+ * severity), but a peer that already holds a legitimately-declared global rule must not lose it on
+ * sync.
+ */
+export const BREADTH_CIRCLE = "*";
+
+/**
+ * The PREFERRED (first-choice) destination for a concept that used to live in a circle literally
+ * named `*` (review fix — Codex round 1, item 4; the probing behavior below is round 2, item 3).
+ * 1.3.1 — RELEASED, predating breadth entirely — accepted any circle name a caller supplied (env
+ * var, constructor arg, folder derivation): a real store may hold concepts whose `circle` column is
+ * the literal string `*`, with no rule bindings at all (1.3.1 shipped before `rule_bindings`
+ * existed). Once breadth ships, every circle-minting surface refuses `*` (BREADTH_CIRCLE's own
+ * comment enumerates them) — so those concepts, left alone, are either STRANDED (nothing can create
+ * a sibling there, and a rule later bound to one would hit the `rule_bindings.circle` CHECK the
+ * moment the backfill tried to copy `*` onto it) or worse, SEMANTICALLY REINTERPRETED as global
+ * breadth the first time anything treats their circle name as meaningful rather than historical.
+ * `MonetCore`'s own construction sequence (`migrateLegacyStarCircle`, engine.ts — moved there from
+ * this module in round 2, item 2; see that method's own comment for why and for the seam decision)
+ * renames them to this name, or a numbered variant, before that can happen.
+ *
+ * NOT A GUARANTEED FINAL NAME (round 2, item 3): this literal string can collide with a circle a
+ * real user already named "legacy-star" on purpose, which would silently merge two unrelated
+ * populations into one namespace. The migration PROBES for an unused destination at migration
+ * time — this constant first, then `legacy-star-2`, `legacy-star-3`, … — and uses whichever is
+ * actually free. This constant therefore names the PREFERENCE, not a promise; a store-wide count of
+ * "how many concepts ended up somewhere in this family" (`MemoryOverview.legacyStarConcepts`,
+ * engine.ts) matches this string OR any numbered variant of it, by a GLOB pattern, rather than
+ * assuming this exact name was actually used.
+ *
+ * Whichever name is actually chosen, the destination is a raw column UPDATE, never `circle_aliases`
+ * (an alias entry would make `resolveCircle('*')` resolve, which would poison every breadth query:
+ * `*` must stay permanently unresolvable as a circle name, not merely unmintable as one). Ordinary
+ * in every other respect afterward — searchable, listable, renamable via the normal API.
+ */
+export const LEGACY_STAR_CIRCLE = "legacy-star";
 
 /**
  * Severity decides the FAILURE MODE, not the importance: advisory injects, blocking denies.
@@ -188,6 +250,15 @@ export interface RuleBindingRow {
   declared_by: string | null;
   /** The prevented-failure one-liner the gate renders. "The reason is what earns compliance." */
   reason: string | null;
+  /**
+   * Where this binding delivers — an ordinary circle name, or the breadth marker `BREADTH_CIRCLE`
+   * ("*"), meaning every circle. NOT the same field as `concepts.circle`: the rule's CONCEPT keeps
+   * living in its own real circle (searchable, listable there, exactly as before); this column is
+   * the binding's own, independent locality declaration, normally kept in sync with the concept's
+   * circle by every write path (bindRule, moveConcept, renameCircle) and ONLY diverges from it for
+   * a breadth binding. See BREADTH_CIRCLE's own comment.
+   */
+  circle: string;
   created_at: number;
   sync_updated_at: number;
   sync_revision: number;
@@ -205,8 +276,10 @@ export interface RuleBindingRow {
  * WHY STAGES ARE STORE-GLOBAL AND CARRY NO CIRCLE. A stage is a REGISTRY ENTRY (name + trigger
  * patterns), not memory — the design says so explicitly, and the mechanics agree: the stage set is
  * "the union of corrected actions", and `git push --force` is the same action whichever project you
- * are standing in. Locality lives on the RULE, which is an ordinary concept in an ordinary circle,
- * so `gateQuery` scopes by joining bindings to their concepts. One registry, many circles' rules.
+ * are standing in. Locality lives on the BINDING (`rule_bindings.circle`, added for breadth —
+ * see BREADTH_CIRCLE's own comment), normally kept equal to its rule's own concept circle, so
+ * `gateQuery` scopes by the binding directly rather than joining to the concept for locality. One
+ * registry, many circles' rules — plus the one reserved breadth marker that means every circle.
  *
  * WHY `verified` EXISTS. Declaration- and import-born stages author their patterns from a NAME
  * rather than from an observed instance, so nothing proves the pattern matches anything real. The
@@ -246,12 +319,32 @@ export const GATE_SCHEMA_SQL = `
     origin TEXT NOT NULL CHECK (origin IN ('correction','declaration','projection','import')),
     declared_by TEXT,
     reason TEXT,
+    -- Locality, and (as of breadth) the ONLY place a rule's locality is checked (RULE_LIVENESS_WHERE
+    -- reads this column, not the concept's own circle). Nullable at the SQL layer — same lattice as
+    -- model_tag above — because a store upgraded via the guarded ALTER below carries pre-existing
+    -- rows with no value until the one-time backfill runs; bindRule (the only writer of a NEW row)
+    -- never leaves it null. See RuleBindingRow.circle's own comment for why this diverges from
+    -- concepts.circle at all.
+    circle TEXT,
     created_at INTEGER NOT NULL,
     sync_updated_at INTEGER NOT NULL,
     sync_revision INTEGER NOT NULL DEFAULT 0,
     sync_writer TEXT,
     -- THE SAFETY BOUNDARY, in the schema. Blocking severity exists only by declaration.
     CHECK (severity != 'blocking' OR origin = 'declaration'),
+    -- THE SAME SAFETY BOUNDARY, for breadth: global reach exists only by declaration OR by a
+    -- GOVERNED INHERITANCE through supersession (review fix -- Codex round 3, item 2) -- exactly
+    -- parallel to blocking severity above, except correcting a global rule must be able to carry
+    -- its reach forward to the successor, the same way it already carries reason, scope, and model
+    -- tag forward. Refusing that would silently narrow a global rule to local the moment anyone
+    -- corrected it -- exactly the removed-by-accident failure this whole review series exists to
+    -- close, one mechanism over. bindRule's own predecessorCircle check (gates.ts) is the REAL
+    -- sovereignty boundary -- this CHECK alone cannot tell inheriting from minting, so it stays a
+    -- coarse backstop against capture/import specifically, wide enough for the app-level check to
+    -- do the precise work. NULL passes (a not-yet-backfilled legacy row is never '*', since '*' did
+    -- not exist before this slice), which is what lets the guarded ALTER below add this CHECK
+    -- without first requiring every existing row to already satisfy it.
+    CHECK (circle != '${BREADTH_CIRCLE}' OR origin IN ('declaration','correction')),
     -- An 'agent'-scoped rule is a compensation for a SPECIFIC model; without the tag, the "a new
     -- model retires the old model's compensations automatically" maintenance rule has nothing to
     -- read. A 'domain' rule claims to transfer, so a model tag on it would be a contradiction.
@@ -262,6 +355,14 @@ export const GATE_SCHEMA_SQL = `
   -- The sidecar regeneration query and the "is deny power in play" probe both scan this predicate.
   CREATE INDEX IF NOT EXISTS idx_rule_bindings_blocking ON rule_bindings(severity)
     WHERE severity = 'blocking';
+  -- idx_rule_bindings_circle is NOT here (review fix, BLOCKER B1). This whole string execs
+  -- unconditionally, first, on every open (see createGateSchema below) — including against an
+  -- UPGRADED store where circle does not exist as a column yet. CREATE TABLE IF NOT EXISTS
+  -- degrades safely into a no-op there, but CREATE INDEX ... ON rule_bindings(circle) does not:
+  -- it names a real column and SQLite evaluates that reference immediately, so every existing store
+  -- failed to open with "no such column: circle" the moment this index sat here. The index is
+  -- created in createGateSchema itself, AFTER the guarded ALTER, where the column is guaranteed to
+  -- exist under every path (fresh install via this CREATE TABLE, or upgrade via the ALTER).
 
   /*
    * GATE INSTRUMENTATION. The design names the empirical checks it wants on gates — "fire precision
@@ -361,7 +462,7 @@ export const GATE_SCHEMA_SQL = `
    * retired keeps blocking and a deny that was declared never starts. Both failures are silent.
    *
    * So: one monotonic counter, bumped IN THE SAME TRANSACTION as every mutation that can change
-   * what materializeBlockingSidecar would write, and stamped into the file's header. Comparing the
+   * what materializeGateMirror would write, and stamped into the file's header. Comparing the
    * header against the counter answers "is this mirror current" with no guessing and no hashing of
    * the world. Local and unsynced by construction (it counts THIS store's mutations, and a peer's
    * count means nothing here), which is why it is a singleton table rather than a synced column.
@@ -373,9 +474,35 @@ export const GATE_SCHEMA_SQL = `
   INSERT OR IGNORE INTO gate_meta (singleton, generation) VALUES (1, 0);
 `;
 
-/** Idempotent; safe on every open. */
-export function createGateSchema(db: StoragePort): void {
+/**
+ * PHASE (a): every gate table, `gate_meta` included — nothing but `db.exec(GATE_SCHEMA_SQL)`, split
+ * out on its own (review fix — Codex round 3, item 1). MonetCore's own construction calls this
+ * BEFORE `migrateLegacyStarCircle()` (engine.ts), which needs `gate_meta` to exist the moment it
+ * finds a '*' concept to move — see that method's own comment for the crash this closes: round 2's
+ * seam ran the legacy-star migration before ANY gate table existed on a genuine pre-gate 1.3.1
+ * store, so `bumpGateGeneration` threw "no such table: gate_meta" — AFTER `moveCircleScopedTables`
+ * had already auto-committed (no explicit transaction wraps it, by design — see that method's own
+ * comment), aborting construction on the first attempt and silently succeeding on a retry (nothing
+ * left to move the second time). Idempotent — every statement in GATE_SCHEMA_SQL is `IF NOT EXISTS`
+ * — so calling this again from `createGateSchema`'s own wrapper below costs nothing.
+ */
+export function createGateTables(db: StoragePort): void {
   db.exec(GATE_SCHEMA_SQL);
+}
+
+/**
+ * PHASE (c): every gate-substrate migration that is NOT table creation — the `gate_events.matcher`
+ * column guard, the `rule_bindings.circle` column guard, its backfill, and the circle index, in
+ * that order (review fix — Codex round 3, item 1; split out of createGateSchema, which used to run
+ * all of this immediately after its own `db.exec(GATE_SCHEMA_SQL)`). Requires every gate table to
+ * already exist — `createGateTables` must run first, in every caller — and, for the backfill to
+ * land the CURRENT circle rather than `*`, requires `migrateLegacyStarCircle()` (engine.ts, phase
+ * (b)) to already have run: the ordering invariant this whole round-3 split exists to enforce is
+ * (a) tables → (b) legacy-star move → (c) this function, and every one of the three remains
+ * independently idempotent and race-safe (see each guard's own comment) regardless of which
+ * concurrent migrator gets there first.
+ */
+export function migrateGateColumns(db: StoragePort): void {
   // COLUMN-GUARD PATTERN (SQLite has no ADD COLUMN IF NOT EXISTS), same convention as engine.ts's
   // own migrate(): PRAGMA table_info, then ALTER only if missing. Lives HERE, in the function that
   // owns gate_events' schema, rather than in engine.ts's migrate() — this module owns every
@@ -410,6 +537,667 @@ export function createGateSchema(db: StoragePort): void {
       if (!message.includes("duplicate column name")) throw error;
     }
   }
+  // SAME GUARD, for breadth (slice 4b-B follow-up): a store created before breadth shipped has a
+  // rule_bindings table with no `circle` column at all. UNLIKE `matcher`, there is no single
+  // constant default — the correct value is "whichever circle this binding's own concept already
+  // lives in", which is a per-row lookup, not a column DEFAULT. So the column is added nullable
+  // (the CREATE TABLE above declares it the same way, for a fresh install), and the backfill just
+  // below fills every pre-existing row from its concept — safe to run unconditionally, since
+  // `WHERE circle IS NULL` makes every call after the first a no-op scan.
+  const ruleBindingCols = db.prepare(`PRAGMA table_info(rule_bindings)`).all() as Array<{ name: string }>;
+  if (!ruleBindingCols.some((c) => c.name === "circle")) {
+    try {
+      // `origin IN ('declaration','correction')`, matching GATE_SCHEMA_SQL's own CHECK exactly
+      // (review fix — Codex round 3, item 2) — an upgraded store must enforce the SAME governed-
+      // inheritance boundary a fresh install gets from the CREATE TABLE, or a correction-origin '*'
+      // successor bind would pass bindRule's own app-level guard and still fail here at the SQL
+      // layer on an upgraded store specifically. See that CHECK's own comment for the full reasoning.
+      db.exec(
+        `ALTER TABLE rule_bindings ADD COLUMN circle TEXT CHECK (circle != '${BREADTH_CIRCLE}' OR origin IN ('declaration','correction'))`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("duplicate column name")) throw error;
+    }
+  }
+  // THE BACKFILL. A row with no circle yet is, by construction, a pre-breadth row — '*' did not
+  // exist as a value any build could have written before this slice, so "whichever circle the
+  // concept lives in today" is exactly right, not merely a reasonable guess. A dangling binding
+  // (concept not yet arrived — the dangling-then-live gap) leaves circle NULL for one more open,
+  // same tolerance the rest of this module already has for that case.
+  //
+  // GUARDED ON `concepts` EXISTING: this module's own header says it "owns every statement against
+  // stages/rule_bindings/gate_events" — deliberately NOT concepts, which lives in engine.ts's own
+  // schema — and createGateSchema is called standalone, against a bare rule_bindings/stages/
+  // gate_events fixture with no concepts table at all, by this file's own concurrent-migrator race
+  // tests. A backfill that assumed concepts always exists would turn a legitimate standalone call
+  // into a crash rather than the harmless no-op it should be when there is nothing yet to backfill.
+  // ════════════════════════════════════════════════════════════════════════════════════════════
+  // THE MIXED-BUILD COMPATIBILITY TRIGGER FAMILY — COMPLETE AND FROZEN (Codex round 12, ratified by
+  // John, 2026-07-28). Built across rounds 5–11 to close one problem: a build old enough to predate
+  // some mirror-widening event (blocking-only → both severities; stages/circle_aliases becoming
+  // mirror content) writes to stages/rule_bindings/concepts/circle_aliases with no idea the mirror
+  // now depends on what it just touched, and nothing bumps `gate_meta.generation` to make that
+  // staleness DETECTABLE. Round 11's own report closed the family with a verbs × tables matrix
+  // (INSERT/UPDATE/DELETE against rule_bindings, stages, concepts, circle_aliases) — every cell is
+  // now one of: covered-by-trigger, immutable, new-build-only-argued (a kept, deliberate JS-side
+  // superset — bindRule's own reclassification bump is the one member of this family), or
+  // verified-by-absence (rule_bindings/stages are never explicitly deleted anywhere in this
+  // codebase). That matrix is COMPLETE, not merely current — there is no known gap left to close.
+  //
+  // FROZEN: a new member should be RARE TO NEVER. Every trigger below exists because a SPECIFIC old
+  // writer, on a SPECIFIC table, touching a SPECIFIC mirror-relevant column or verb, needed exactly
+  // this mechanism — not because "another trigger, just in case" is ever free. Before adding one:
+  //   1. Name the OLD writer and the exact verb/column gap, the way every trigger below does in its
+  //      own comment — "unknown staleness risk" is not a finding, a cited call site is.
+  //   2. Run the SAME double-bump audit every trigger below already ran: does a NEW-build writer at
+  //      this same site already bump (JS-side)? If so, is the new trigger's own condition an EXACT
+  //      MATCH (remove the JS call — rounds 8–11's own resolution for every case but one) or a
+  //      SUPERSET (keep it, document the accepted double — bindRule's reclassification bump is the
+  //      only precedent for this). Round 11, item 3's own near-miss is the cautionary case: a
+  //      blanket `AFTER UPDATE` trigger cascaded with engine.ts's OWN pre-existing central
+  //      mutation-trigger mechanism (`sync_${table}_insert`/`_update`) and double-bumped in
+  //      production-shaped code before a test caught it — column-scope every UPDATE trigger to the
+  //      fields that actually feed the mirror, never a blanket `AFTER UPDATE ON table`.
+  //   3. Pin the exact count with a new-build exact-count test, the same way every removed JS bump
+  //      in this family has one, and re-run the full suite once — this family has changed a
+  //      pre-existing test's expected count in every round it has grown.
+  //
+  // THE RECORDED RETREAT LINE. This family's entire cost is bumping `gate_meta.generation` once (or
+  // occasionally twice, for an accepted superset) per already-happening write, on tables that are
+  // low-to-moderate volume compared to the store's own concept/observation traffic. If per-write
+  // trigger overhead ever actually shows up in profiling — not hypothetically, but measured — the
+  // deliberate alternative is DROPPING THIS ENTIRE FAMILY and accepting the failure mode it exists to
+  // prevent: an old-build write during a mixed-build upgrade window leaves the on-disk mirror
+  // silently stale until SOME process restarts on the new build and a routine mutation (or the next
+  // open's own backfill) re-triggers a refresh. That is a real regression — bounded to the upgrade
+  // window only, self-healing on restart, never permanent — not a silent one: whoever takes this
+  // retreat must add ONE LINE to docs/design/gate-boundary-statement.md's own "Binding consequences
+  // for 4b" numbered list (the same section `materializeGateMirror`'s own 0600 comment already cites)
+  // naming the tradeoff plainly, the same way every other binding consequence in that list is named.
+  // Nobody has taken this retreat; this paragraph exists so a future profiler finding one has the
+  // decision already made, not one to re-litigate from scratch.
+  // ════════════════════════════════════════════════════════════════════════════════════════════
+  const hasConceptsTable = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'concepts'`)
+    .get() !== undefined;
+  if (hasConceptsTable) {
+    // ALL COMPATIBILITY TRIGGERS CREATED FIRST, BEFORE THE BACKFILL BELOW (Codex round 11, item 4,
+    // P1 — reordered from the shape every trigger in this family was originally added in). The
+    // backfill trigger (the first one below) used to be created AFTER the bulk backfill UPDATE ran
+    // — a real window: a concurrent OLD writer (the MCP server and a `monet` CLI call sharing one
+    // `.monet` DB is the shipped, supported topology this module's own header already leans on
+    // elsewhere) inserting a rule_bindings row DURING that gap lands a NULL-circle row the
+    // just-finished backfill never saw and the not-yet-created trigger could not catch either —
+    // invisible until some LATER process happens to rerun this migration. Trigger creation order
+    // among themselves is free (every one is `CREATE TRIGGER IF NOT EXISTS`, and none of their
+    // bodies depends on another having run first), so moving all of them ahead of the backfill
+    // closes the window at zero cost: by the time the backfill's own UPDATE runs, every trigger
+    // that could ever need to react to a write during it already exists.
+    // SAME '*'-MINTING HOLE, SAME FIX FAMILY (Codex round 12, P1 — the review's own "same audit for
+    // every other compat trigger that copies a circle value"). If the concept THIS binding names
+    // already sits in a circle literally spelled `"*"` (the identical pre-breadth legacy shape the
+    // sibling trigger below now guards against), the subquery here would resolve to `'*'` and copy
+    // it straight into a brand-new binding — minting global reach (or crashing on the CHECK
+    // constraint for a non-declaration/correction origin) on nothing more than an old build's own
+    // ordinary INSERT. `CASE WHEN c.circle = '*' THEN NULL ELSE c.circle END`: when the concept is
+    // in the reserved circle, this resolves to NULL instead — the SAME value a genuinely dangling
+    // binding (no concept row at all) already gets, from the identical subquery pattern, one row
+    // down. Not a new state to reason about: NULL already means "not yet safely resolvable" in this
+    // exact column, healed later — here, by `migrateLegacyStarCircle` moving the concept out of
+    // `'*'` on the next new-build open, which lets this SAME trigger's WHEN-guarded UPDATE (it never
+    // stops firing; NULL still satisfies `NEW.circle IS NULL`) resolve it correctly the moment a
+    // later write touches this row, or the schema backfill below does on the next open regardless.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_backfill_circle
+      AFTER INSERT ON rule_bindings
+      FOR EACH ROW WHEN NEW.circle IS NULL
+      BEGIN
+        UPDATE rule_bindings SET circle = (
+          SELECT CASE WHEN c.circle = '${BREADTH_CIRCLE}' THEN NULL ELSE c.circle END
+            FROM concepts c WHERE c.id = NEW.concept_id
+        ) WHERE concept_id = NEW.concept_id;
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // A SECOND COMPATIBILITY TRIGGER, THE UPDATE SIDE (Codex round 7, item 2, P1). The INSERT trigger
+    // above closes the gap for an old build MINTING a new binding; it says nothing about an old
+    // build MOVING an existing concept — `moveConcept`/`renameCircle`'s own pre-breadth code UPDATEs
+    // `concepts.circle` directly and has no idea `rule_bindings.circle` exists at all, let alone that
+    // it must be kept in step (that rule postdates it) — reopening the exact round-1, item-3 shape
+    // (a binding silently pointing at a circle its own concept already left) for any writer old
+    // enough to predate the keep-in-step convention, exactly as the INSERT gap did for a fresh bind.
+    //
+    // FIRES ON EVERY concepts.circle UPDATE, new build or old — there is no way for a trigger to tell
+    // who issued the statement, and it does not need to: see below for why a NEW build's own
+    // explicit keep-in-step UPDATE colliding with this one is harmless.
+    //
+    // `circle IS NOT NULL AND circle != '*'` — both written out, even though `!= '*'` alone already
+    // excludes NULL under SQL's three-valued comparison logic (NULL != anything is NULL, never true),
+    // matching this codebase's own convention of stating an invariant explicitly rather than leaning
+    // on a reader's recall of NULL-comparison semantics. NEVER a dangling binding (nothing to
+    // re-align — B3, engine.ts, heals it separately when its own concept lands) and NEVER a breadth
+    // binding: `*` is the ONE circle value that must NOT follow its concept (BREADTH_CIRCLE's own
+    // comment — a global rule's reach is a property of the BINDING, independent of wherever its
+    // concept happens to be filed; re-aligning it here would silently narrow a global rule to local
+    // the moment its concept moved, exactly the "removed by accident" failure this whole review
+    // series exists to close, one mechanism over).
+    //
+    // DOES NOT FIGHT THE NEW BUILD'S OWN EXPLICIT keep-in-step UPDATE (moveConcept/renameCircle,
+    // engine.ts) — verified, not assumed. Both write the IDENTICAL new circle value: this trigger
+    // fires FIRST, synchronously, the instant `concepts.circle` commits (AFTER UPDATE, per row,
+    // before the statement that fired it even returns), landing the SAME value the engine's own
+    // subsequent explicit UPDATE (a separate statement, moments later) would also write — a same-
+    // value UPDATE, changing nothing the trigger had not already set. Neither can create a `changes()`-
+    // visible surprise or a second, different value winning a race: there is only ever one correct
+    // value in flight, written twice.
+    //
+    // NO RECURSION — CHECKED, NOT ASSUMED. This trigger's own write (`UPDATE rule_bindings ...`)
+    // cannot re-fire ITSELF (it is scoped to `concepts`, not `rule_bindings`), and no trigger in this
+    // codebase fires on an UPDATE to `rule_bindings` at all — the sibling trigger just above is
+    // INSERT-only. So there is no chain to recurse through even in principle. Independently confirmed
+    // `recursive_triggers` is OFF regardless (SQLite's own compiled-in default; BetterSqlitePort's
+    // constructor, storage.ts, sets `journal_mode`/`busy_timeout` explicitly and never touches this
+    // pragma) — queried directly against this exact dependency (better-sqlite3 11.10.0 / SQLite
+    // 3.49.2): `PRAGMA recursive_triggers` reads `0`. Recursive firing would require an AFTER UPDATE
+    // ON rule_bindings trigger that itself writes back to `concepts.circle` (none exists) AND an
+    // explicit `PRAGMA recursive_triggers = ON` this codebase never issues — both would have to be
+    // true at once, and neither is.
+    //
+    // THE GENERATION BUMP, HERE TOO (Codex round 8, item 2, P2) — the symmetric gap to round 7, item
+    // 3's fix on the INSERT trigger above: this trigger changes what the mirror should say (a bound
+    // rule's effective circle) exactly as an INSERT does, but had no bump of its own, so an old
+    // build's own `concepts.circle` UPDATE against a concept with a live binding moved that binding
+    // undetectably — the file would report CURRENT while quietly missing the move. Same statement
+    // shape, same reason `bumpGateGeneration()` itself cannot be called from inside a trigger body,
+    // same honest-stale contract argued in full at the sibling trigger's own comment above (a trigger
+    // cannot refresh the FILE; the bump only makes the staleness DETECTABLE) — not repeated here
+    // verbatim, but it applies identically.
+    //
+    // UNCONDITIONAL, and wasted MORE OFTEN than the sibling trigger above — said plainly rather than
+    // glossed over: this fires on EVERY `concepts.circle` UPDATE, not only one for a concept that
+    // carries a rule binding. A `WHEN` clause on `CREATE TRIGGER` itself can gate whether the trigger
+    // fires at all, but not which statements inside its own body run once it does — the rule_bindings
+    // UPDATE's WHERE clause decides which BINDING rows move, but the gate_meta UPDATE right after it
+    // is a separate statement, reached unconditionally the moment the trigger fires, whether or not
+    // the first statement matched anything. So an old build moving an ordinary fact, workstream, or
+    // correction between circles — the overwhelmingly common case, since most concepts are never
+    // rules — also ticks the generation, with nothing rule-relevant having changed. Same argument as
+    // the INSERT trigger's own dangling-row case (not a correctness gap, only an occasional wasted
+    // regeneration), just a wider door: `concepts` is a far busier table than `rule_bindings`.
+    //
+    // A PRECISE VERSION IS POSSIBLE HERE, unlike the INSERT trigger above — noted, not taken. That
+    // trigger's own `changes()` is unusable as a guard because its UPDATE's WHERE clause always
+    // matches the just-inserted row (a scalar subquery, not a real filter). This one's WHERE clause
+    // (`concept_id = NEW.id AND circle IS NOT NULL AND circle != '*'`) is a genuine filter, so
+    // `changes() > 0` on it WOULD reliably mean "a binding actually followed" and could gate the bump
+    // precisely. Left unconditional anyway: an occasional extra regeneration is cheap and self-
+    // limiting (materializeGateMirror compares before replacing), while a second, subtly different
+    // conditional-bump idiom sitting right next to this trigger's unconditional sibling is one more
+    // shape a future reader has to hold in their head for a savings that costs nothing to skip.
+    //
+    // NEVER MINT BREADTH FROM AN ORDINARY MOVE (Codex round 12, P1 — found by review, not
+    // self-discovered). This trigger's own WHERE clause guards the BINDING's CURRENT circle
+    // (`circle != '*'`, above) so it never re-narrows an ALREADY-global binding — but did nothing
+    // about the OPPOSITE direction: `NEW.circle` itself. `'*'` is reserved as a breadth marker only
+    // by NEW-build convention; an OLD build sharing this same upgraded database has no idea that
+    // convention exists, and can legitimately (from its own, pre-breadth perspective) rename or
+    // reassign a concept into an ordinary circle that happens to be spelled `"*"` — the exact legacy
+    // shape `migrateLegacyStarCircle` exists to clean up on the NEXT new-build open. Before this
+    // fix, that OLD write's own `concepts.circle` UPDATE fired this trigger with `NEW.circle = '*'`,
+    // and the body copied it verbatim into `rule_bindings.circle` — for a declaration/correction-
+    // origin binding, `rule_bindings`' own CHECK constraint (`circle != '*' OR origin IN
+    // ('declaration','correction')`) PASSES, so an ordinary local binding — a BLOCKING one included
+    // — silently became a live GLOBAL rule, firing in every circle, on the strength of an old
+    // process moving its concept into a circle name it has never heard is special. For any OTHER
+    // origin, the same write instead CRASHES the old process outright on the CHECK violation — worse
+    // than a security hole, but no fix at all.
+    //
+    // GUARDED AT THE TOP, `WHEN NEW.circle != '${BREADTH_CIRCLE}'` — the trigger simply does not
+    // fire at all when the concept's own new circle is the reserved marker, so NEITHER statement in
+    // its body runs: the binding is left exactly where it was (no mint, no crash), and no bump fires
+    // either — correctly, since nothing about the MIRROR changed (GateMirrorEntry.circle reads the
+    // BINDING, never the concept, so a binding that did not move is not mirror-relevant here). The
+    // concept itself still lands in `'*'` on this write (this trigger never touches `concepts` at
+    // all), so `migrateLegacyStarCircle`'s own next-open scan — which reads `concepts.circle`
+    // directly, not anything this trigger does or does not do to a binding — still finds and moves
+    // it exactly as it always has; this fix only stops the BINDING side from being corrupted while
+    // that concept sits in the pathological circle awaiting that migration.
+    //
+    // Same guard, same idempotent creation pattern as the trigger above.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_follow_concept_circle
+      AFTER UPDATE OF circle ON concepts
+      FOR EACH ROW WHEN NEW.circle != '${BREADTH_CIRCLE}'
+      BEGIN
+        UPDATE rule_bindings SET circle = NEW.circle
+         WHERE concept_id = NEW.id AND circle IS NOT NULL AND circle != '${BREADTH_CIRCLE}';
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // A THIRD COMPATIBILITY TRIGGER, THE STATUS SIDE (Codex round 9, item 2, P2). The two triggers
+    // above cover a MOVE (circle) and an INSERT; neither says anything about an old build RETIRING
+    // or RESTORING a concept — retireConcept/restoreConcept's own pre-mirror-widening code UPDATEs
+    // `concepts.status` directly with no idea the mirror needs to know. An old build retiring an
+    // ADVISORY rule (its own era only tracked blocking bumps, if it bumped status at all) leaves the
+    // new build's on-disk mirror serving that retired rule as live, indefinitely — nothing else ever
+    // re-triggers a refresh for a concept nobody touches again afterward.
+    //
+    // SCOPED, not blanket — `WHEN EXISTS (SELECT 1 FROM rule_bindings WHERE concept_id = NEW.id)`:
+    // an ordinary fact, workstream, or source's status churns constantly (dispute/resolve, retire/
+    // restore, connector lifecycle) and none of it is mirror content. A rule is the only kind that
+    // can carry a rule_bindings row at all — `flagContradiction` refuses `kind === 'rule'` outright
+    // (engine.ts), so a rule concept can never reach the dispute-status paths either, meaning this
+    // WHEN clause correctly no-ops for every one of them too, not only for non-rule concepts. Cheap:
+    // `rule_bindings.concept_id` is exactly what every rule/gate query already indexes.
+    //
+    // gate_meta bump: same statement shape, same reason it cannot call `bumpGateGeneration()` from
+    // JS, same honest-stale contract as the two triggers above — an old build's own process cannot
+    // refresh the sidecar FILE, but the bump makes the staleness DETECTABLE, which is what a NEW
+    // build's next refresh or open needs to heal it.
+    //
+    // COMPOSES WITH THE NEW BUILD'S OWN `noteRuleTouched` CALLS — verified, not assumed, the round-8
+    // lesson applied BEFORE shipping this time rather than found by a broken test afterward.
+    // retireConcept, restoreConcept, and their relay-graft twins (graftRows' own tombstone/
+    // restoration loop, engine.ts) each called `noteRuleTouched(id)` — `if (hasLiveBinding(db, id))
+    // bumpGateGeneration(db)` — immediately before the exact `status` UPDATE this trigger now also
+    // reacts to. `hasLiveBinding` IS `SELECT 1 FROM rule_bindings WHERE concept_id = ?`: the
+    // IDENTICAL predicate this trigger's own WHEN clause tests — not merely a superset of it the way
+    // round 8's circle-move fix was — so for a new build, this trigger and each of those four calls
+    // always agree on whether to bump, and both firing is a genuine double-count (an increment is
+    // not idempotent — round 8's own finding, reapplied). RESOLVED THE SAME WAY round 8 resolved
+    // `moveConcept`: removed, not gated — all four call sites' own `noteRuleTouched(id)` lines are
+    // gone (see each site's own comment in engine.ts), because the trigger's condition being an
+    // EXACT match, not merely a superset, means removal cannot leave a case where a bump was owed
+    // and nothing pays it.
+    //
+    // `OLD.status IS NOT NEW.status` IN THE WHEN CLAUSE — found by a FAILING TEST, not anticipated:
+    // `restoreConcept` (engine.ts) issues its own `status = 'active'` UPDATE, then immediately calls
+    // `recomputeNativeConceptProjection`, which — for a concept with no live observations, true for
+    // most declared rules — issues a SECOND UPDATE whose SET clause also NAMES `status`
+    // (`status = CASE WHEN ? THEN 'disputed' ELSE 'active' END`), unconditionally, even though the
+    // value it computes is the SAME 'active' the first UPDATE just set. A bare `WHEN EXISTS (...)`
+    // fires on BOTH statements — a real column-touch is a real column-touch, whether or not the
+    // value differs, exactly the `changes()`-counts-matched-not-changed lesson from round 7, item 3,
+    // in a new guise: this time inside a WHEN clause instead of a body statement's `changes()`. AN
+    // UPDATE TRIGGER carries BOTH row images, so — unlike round 7 item 3's INSERT trigger, which had
+    // no OLD row to compare against and had to accept the occasional wasted bump — this one CAN ask
+    // whether the value genuinely changed, and now does. `recomputeNativeConceptProjection` is called
+    // from several other sites (store(), detach(), a relay path) with no reason to audit each one
+    // individually: the fix belongs in the trigger, once, not in every caller that might incidentally
+    // re-touch `status` with its current value.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_follow_concept_status
+      AFTER UPDATE OF status ON concepts
+      FOR EACH ROW WHEN OLD.status IS NOT NEW.status AND EXISTS (SELECT 1 FROM rule_bindings WHERE concept_id = NEW.id)
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // A FOURTH COMPATIBILITY TRIGGER, THE TITLE SIDE (Codex round 10, items 2+3, P2). `GateMirrorEntry.text`
+    // (listGateMirrorEntries, this file) reads `c.title` directly — a rule's title IS the text a
+    // gate delivers — so a retitle is mirror content exactly as a status or circle change is. An old
+    // build's own retitling code (synthesizeRow, applySynthesis, resolveContradiction's
+    // explicit-body-override, detach()'s partial-detach branch — engine.ts, all four already fixed
+    // for the NEW build: review fix Codex round 2 item 4, plus round 6's own refreshGateSidecar
+    // sweep) predates knowing an ADVISORY rule's retitle is mirror-relevant AT ALL — the mirror was
+    // blocking-only when every one of those paths was first written. An old build retitling a bound
+    // advisory rule leaves the new build's on-disk mirror serving the old text indefinitely.
+    //
+    // SCOPED the same way the status trigger is, for the same reason: the overwhelming majority of
+    // concepts are not rules, and retitle constantly (every synthesis pass touches body+title
+    // together) — a blanket trigger would bump on nearly every mutation this store ever makes.
+    // `OLD.title IS NOT NEW.title` narrows further: several of the four retitling call sites
+    // explicitly preserve the existing title on an empty/whitespace body ("never blank it"), so
+    // their own UPDATE can reach this trigger with an unchanged value — a real column-touch, but not
+    // a real content change.
+    //
+    // COMPOSES WITH THE NEW BUILD'S OWN noteRuleTouched CALLS — verified, not assumed. All four
+    // retitling sites called `noteRuleTouched(id)` — the IDENTICAL `hasLiveBinding` predicate this
+    // trigger's own WHEN clause tests — immediately after their own title-touching UPDATE. Removed,
+    // not gated, the same way round 8/9 resolved every other exact-match case: see each site's own
+    // comment (engine.ts). TWO OTHER concepts.title writers were swept and found NOT to need this
+    // trigger at all: the workstream-save path (`WHERE ... AND kind='workstream'`, so it can never
+    // reach a rule concept) and the source-file recompute path (`storeSourceChunk`'s own recompute,
+    // `kind='source'`-only — a source can never carry a rule_bindings row, the same invariant
+    // assertGraftPayloadIsNativeOnly enforces at the sync boundary) — this trigger's own EXISTS
+    // clause would correctly no-op for both regardless, so their continued silence is independently
+    // re-verified here, not merely inherited from synthesizeRow's own historical sweep comment.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_follow_concept_title
+      AFTER UPDATE OF title ON concepts
+      FOR EACH ROW WHEN OLD.title IS NOT NEW.title AND EXISTS (SELECT 1 FROM rule_bindings WHERE concept_id = NEW.id)
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // A FIFTH COMPATIBILITY TRIGGER, RULE_BINDINGS' OWN REMAINING COLUMNS (Codex round 10, items
+    // 2+3). `stage_id`, `severity`, `scope`, `model_tag`, `origin`, `declared_by`, and `reason`
+    // all feed the mirror (listGateMirrorEntries' own SELECT) and all move together, in ONE UPDATE
+    // statement, through exactly one shared writer: `bindRule`'s own "replace" branch (this file) —
+    // the same single-writer shape `trigger_patterns` had, and the same historical gap: that
+    // branch's own bump (KEPT, not removed — see its own comment for why) was "UNCONDITIONAL, not
+    // gated on touchesDenyPower... [b]efore the mirror widened past blocking-only". An old build's
+    // bindRule, restating or re-aiming an ALREADY-ADVISORY rule's stage, scope, model tag, or reason
+    // (severity staying advisory throughout, so deny power is never in play), bumped nothing at
+    // all, because nothing about that change touched what its own era's mirror carried.
+    //
+    // ALL SEVEN COLUMNS IN ONE `UPDATE OF` LIST, one trigger — they all arrive in the SAME
+    // statement, so one trigger with an OR'd `OLD IS NOT NEW` guard across all seven is the natural
+    // shape, not seven separate triggers each re-testing the same row. NO EXISTS-ON-rule_bindings
+    // SCOPING NEEDED, unlike the concepts-table triggers above: this trigger is already ON
+    // rule_bindings — every row in that table already IS a rule binding, by definition.
+    //
+    // `circle` EXCLUDED FROM THIS LIST — NOT because it is already covered (it needs covering here
+    // too: bindRule's own direct write to it, on a LOCAL narrow/widen via declare(), is NOT reached
+    // by `trg_rule_bindings_follow_concept_circle`, which only fires from a `concepts.circle`
+    // UPDATE, never from a direct `rule_bindings.circle` one — this is why THAT bump stays, above).
+    // Excluded instead because including it here would create a DIFFERENT double-bump, discovered by
+    // direct empirical probe, not assumed: `trg_rule_bindings_follow_concept_circle`'s OWN body
+    // (`UPDATE rule_bindings SET circle = NEW.circle ...`) would then cascade into firing THIS
+    // trigger too, every time a concept moves circles — cross-trigger cascading that happens
+    // regardless of the `recursive_triggers` pragma (confirmed OFF for this project, but shown by a
+    // direct three-table probe to gate something narrower than "does trigger A's own write fire
+    // trigger B" — that fires either way). So `circle` stays out of this trigger's list, and its own
+    // JS-side bump (bindRule's, above) stays in, uninstructed by this one.
+    //
+    // COMPOSES WITH bindRule's OWN bump — verified, and DIFFERENT from every prior case in this
+    // family: its UPDATE branch's bump fires on EVERY reach of that branch ("replace" mode, or a
+    // binding's first write), a strict SUPERSET of "did any of these seven columns actually change"
+    // (reaching the branch is a PREREQUISITE for any of them to change at all), not an exact match
+    // the way round 8/9's JS-side calls were — so, UNLIKE every earlier trigger in this family, that
+    // call is kept rather than removed (see its own comment for the full reasoning), and this
+    // trigger deliberately DOUBLE-BUMPS alongside it for a genuine new-build reclassification. An
+    // accepted, harmless cost (one extra regeneration), checked against the full suite to confirm
+    // nothing depends on the OLD single-bump count for that case.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_rule_bindings_bump_on_reclassification
+      AFTER UPDATE OF stage_id, severity, scope, model_tag, origin, declared_by, reason ON rule_bindings
+      FOR EACH ROW WHEN
+        OLD.stage_id IS NOT NEW.stage_id OR OLD.severity IS NOT NEW.severity OR OLD.scope IS NOT NEW.scope OR
+        OLD.model_tag IS NOT NEW.model_tag OR OLD.origin IS NOT NEW.origin OR OLD.declared_by IS NOT NEW.declared_by OR
+        OLD.reason IS NOT NEW.reason
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // A SIXTH COMPATIBILITY TRIGGER, STAGE RE-AUTHORING (Codex round 10, items 2+3).
+    // `GateMirrorStage.triggerPatterns`
+    // (listGateMirrorStages, this file) reads `stages.trigger_patterns` directly — every stage is
+    // mirror content (the full registry, not only rule-bound stages), so a pattern re-authoring is
+    // mirror content whether or not anything is bound to that stage yet. See `upsertStage`'s own
+    // comment (this file) for the old build's exact gap: `liveBlockingRulesForStage(...).length >
+    // 0`, correct while the mirror was blocking-only, silently wrong once it widened. No EXISTS
+    // scoping needed — every row in `stages` is already mirror content, unconditionally. Placed
+    // inside this same `hasConceptsTable` block for locality with the rest of the trigger family,
+    // even though its own body needs nothing from `concepts` — `stages` itself is unconditionally
+    // guaranteed to exist by this point regardless (this module's own header: it owns every
+    // statement against stages/rule_bindings/gate_events, all created before this function runs).
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_stages_bump_on_trigger_patterns
+      AFTER UPDATE OF trigger_patterns ON stages
+      FOR EACH ROW WHEN OLD.trigger_patterns IS NOT NEW.trigger_patterns
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // A SEVENTH COMPATIBILITY TRIGGER, STAGE CREATION (Codex round 11, item 1, P2 — closing the
+    // VERB dimension round 10's own family table missed: it enumerated COLUMNS an old build's
+    // UPDATE could touch, but a brand-new stage arrives via INSERT, a different verb entirely).
+    // `GateMirrorStage` carries the FULL stage registry (listGateMirrorStages' own comment: a
+    // rule-less stage still matches and still answers stage-hit-no-rules, never silence) — a new
+    // stage with patterns changes what the mirror should contain the MOMENT it exists, before any
+    // rule ever binds to it. `upsertStage`'s own NEW-STAGE branch (this file) already bumps
+    // unconditionally for the current build ("A brand-new stage is new mirror content the moment it
+    // exists") — but that is CURRENT code; an old build's own stage-creation path, like every other
+    // writer in this family, predates the mirror needing to know about a rule-less stage at all
+    // (blocking-only era: nothing before a live deny bound was mirror content), so an old build's
+    // own INSERT never bumped for the stage's own arrival.
+    //
+    // UNCONDITIONAL, no WHEN clause: an INSERT trigger has no OLD row to compare against (the same
+    // reason the very first trigger in this file, the backfill one, has none either) — every INSERT
+    // is definitionally a new row, so there is nothing to gate on.
+    //
+    // COMPOSES WITH upsertStage's OWN bump — verified, EXACT MATCH, not a superset: that branch's
+    // INSERT statement runs, unconditionally, exactly once per new stage, with its own
+    // `bumpGateGeneration(db)` immediately after — the identical condition ("a new stage row was
+    // just inserted") this trigger's own unconditional AFTER INSERT tests. REMOVED, not kept,
+    // matching round 8/9's own resolution for every exact-match case in this family (contrast
+    // `trg_rule_bindings_bump_on_reclassification`'s own bindRule call, kept because IT is a
+    // superset, not an exact match — see that trigger's own comment for why the two differ).
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_stages_bump_on_insert
+      AFTER INSERT ON stages
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // AN EIGHTH COMPATIBILITY TRIGGER, CONCEPT DELETION (Codex round 11, item 2, P2 — the other half
+    // of the verb dimension: DELETE). A hard-deleted concept's own rule binding, if it had one,
+    // disappears from `listGateMirrorEntries`' own result set the moment the concept row is gone —
+    // the INNER JOIN to `concepts` simply stops matching it — exactly like a retire, but via a
+    // different verb. An old build's own hard-delete code (its era: `hasBlockingBinding`, bumping
+    // for blocking only — the same historical shape every trigger in this family closes) hard-
+    // deleting an ADVISORY-bound concept bumped nothing, leaving the new build's on-disk mirror
+    // serving a rule whose concept no longer exists, indefinitely.
+    //
+    // THE DELETION ORDER, verified directly against `hardDeleteNativeConcept` (engine.ts), not
+    // assumed: `rule_bindings` is NEVER explicitly deleted ANYWHERE in this codebase (grepped: zero
+    // `DELETE FROM rule_bindings` statements) — a hard-deleted concept's binding row is left
+    // ORPHANED, pointing at a `concept_id` `concepts` no longer has a row for, cleaned up by nothing
+    // and relied on by nothing (the INNER JOIN already makes it undeliverable, which is the entire
+    // reason no cleanup was ever needed). This trigger's own `EXISTS (SELECT 1 FROM rule_bindings
+    // WHERE concept_id = OLD.id)` check, evaluated AFTER the concept row is already gone (AFTER
+    // DELETE), still finds the orphaned binding row exactly as it was a moment before — the ORDER
+    // this comment exists to settle is therefore moot for correctness (the binding row's own
+    // continued, deliberate existence is what makes the EXISTS check work regardless of which row
+    // died "first"), but stated plainly rather than left for a future reader to have to re-derive:
+    // `concepts` is the only one of the two that ever actually dies.
+    //
+    // `stages` NEVER EXPLICITLY DELETED EITHER (grepped: zero `DELETE FROM stages` statements) — no
+    // trigger added for it; there is no verb×table cell to cover because the cell cannot fire. If a
+    // stage-deletion path is ever added, it needs the identical treatment this comment gives
+    // `concepts` here.
+    //
+    // COMPOSES WITH THE NEW BUILD'S OWN noteRuleTouched CALL — verified, EXACT MATCH:
+    // `hardDeleteNativeConcept`'s own `noteRuleTouched(conceptId)` (engine.ts) ran BEFORE its own
+    // `DELETE FROM concepts`, testing the IDENTICAL `hasLiveBinding` predicate this trigger's own
+    // EXISTS clause tests — the deletion-order question above is exactly why this is still an exact
+    // match despite firing at a different moment: the binding row neither call reads is ever
+    // deleted, so "does a live binding exist" reads the same whether asked immediately before or
+    // immediately after the concept row itself is gone. Removed, not gated, the same way as every
+    // other exact-match case in this family — see that call site's own comment (engine.ts).
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_concepts_bump_on_delete
+      AFTER DELETE ON concepts
+      FOR EACH ROW WHEN EXISTS (SELECT 1 FROM rule_bindings WHERE concept_id = OLD.id)
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+  }
+  // A NINTH, TENTH, AND ELEVENTH COMPATIBILITY TRIGGER, CIRCLE_ALIASES (Codex round 11, item 3, P2).
+  // `GateMirror.circleAliases`/`circles` (gateMirrorCircles, this file) read `circle_aliases`
+  // directly — every write to it (a rename, merge, archive, or unarchive publishing or retracting a
+  // from→to row) is mirror content, in EVERY format-4 build. The gap here is not "blocking-only vs
+  // widened" (this table's own mirror inclusion is not severity-gated at all) — it is that
+  // circle_aliases/circles were ADDED to the mirror in format 4 (slice 4b-B) ITSELF: an old build
+  // predating that slice has NO bump of any kind for an alias write, because in its own era
+  // circle_aliases was not mirror content YET, not because its own bump was scoped too narrowly.
+  // Any build old enough to lack this — running renameCircle/mergeCircle/archiveCircle/
+  // unarchiveCircle compiled before format 4 shipped — writes circle_aliases with zero awareness
+  // that the mirror now depends on it.
+  //
+  // GUARDED ON circle_aliases's OWN TABLE EXISTENCE — this table is created in engine.ts's own
+  // migrate(), which runs AFTER init() (the same construction-time gap `chooseLegacyStarDestination`
+  // and `migrateLegacyStarCircle` already guard against, engine.ts) — so on a genuinely first-ever
+  // construction this function can run before the table exists at all. THIS GUARD ALONE IS NOT
+  // ENOUGH, found by this item's own failing tests, not anticipated up front: an earlier version of
+  // this comment claimed "migrateGateColumns itself runs on EVERY open, not only the first, so a
+  // fresh install simply creates these triggers one open later" — true across a process RESTART
+  // against an on-disk store, but FALSE within one construction, which is the only kind of
+  // construction a `:memory:` store (or the current, live open of an on-disk one) ever gets. Nothing
+  // called migrateGateColumns a second time after migrate() created the table it needs, so this
+  // guard read false forever and the whole trigger family below was dead code. Fixed at the call
+  // site, not here — see MonetCore's own constructor (engine.ts), which now calls
+  // migrateGateColumns(this.db) a second time, immediately after this.migrate() creates the table.
+  //
+  // NOT NESTED INSIDE `hasConceptsTable` — deliberately: none of the three trigger bodies below
+  // reference `concepts` at all, only `gate_meta`, so nesting under a guard about a DIFFERENT
+  // table's existence would be an accidental dependency, not a real one.
+  const hasCircleAliasesTable = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'circle_aliases'`)
+    .get() !== undefined;
+  if (hasCircleAliasesTable) {
+    // INSERT: UNCONDITIONAL, no WHEN clause — an INSERT trigger has no OLD row to compare against,
+    // the same reason every other INSERT trigger in this family has none either.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_circle_aliases_bump_on_insert
+      AFTER INSERT ON circle_aliases
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // UPDATE: SCOPED TO `to_name, status` — NOT a blanket `AFTER UPDATE ON circle_aliases` (an
+    // earlier draft of this trigger was exactly that, and it double-bumped; found by this item's own
+    // exact-count tests failing at +2 where +1 was expected, not by inspection). `gateMirrorCircles`
+    // (this file) reads exactly `from_name, to_name, status` off this table — `from_name` is the
+    // PRIMARY KEY and no writer in this codebase ever UPDATEs it, so `to_name`/`status` are the only
+    // two columns whose value a mirror-relevant UPDATE can actually change.
+    //
+    // WHY THE BLANKET VERSION DOUBLE-BUMPED: this table also carries a "central mutation trigger"
+    // pair engine.ts installs for every synced table (sync_circle_aliases_insert/_update, engine.ts's
+    // own `trigger()` helper inside migrate()) — the mechanism that stamps sync_revision/sync_writer/
+    // updated_at on every LOCAL write so it replicates correctly. `sync_circle_aliases_insert` fires
+    // on the SAME INSERT this file's own trg_circle_aliases_bump_on_insert reacts to, and its OWN
+    // body is a SECOND statement: `UPDATE circle_aliases SET sync_revision = ..., sync_writer = ...,
+    // updated_at = ... WHERE from_name = NEW.from_name` — a genuine UPDATE against the row that was
+    // just inserted, fired from INSIDE another trigger's body. Cross-trigger cascading fires
+    // regardless of `recursive_triggers` (confirmed OFF for this project; round 10's own direct probe
+    // already established this pragma gates something narrower than "does trigger A's own write fire
+    // trigger B"), so a blanket `AFTER UPDATE ON circle_aliases` reacts to THAT stamp-update too — one
+    // logical alias write, two bumps, verified directly (a debug probe against a real renameCircle
+    // call showed generation advancing by 3 where 2 were expected: 1 for the concept's own circle
+    // move, 1 for the alias INSERT, and a spurious 1 more for the cascaded stamp-UPDATE).
+    //
+    // SCOPING TO `to_name, status` CLOSES IT AT THE SOURCE: the sync-cascade's own stamp-UPDATE never
+    // names either column in its SET clause (only sync_revision/sync_writer/updated_at), so an
+    // `UPDATE OF to_name, status` trigger — which SQLite fires based on which columns a statement's
+    // OWN SET clause syntactically names, not on whether any value differs — does not react to it at
+    // all, regardless of how many other triggers fire in between.
+    //
+    // `OLD IS NOT NEW` ON BOTH COLUMNS, same reasoning as every other UPDATE trigger in this family
+    // with row images to compare (concepts.status/title, above): a real column-touch is not
+    // necessarily a real content change (a rename re-issued with the identical destination, or a
+    // no-op unarchive-then-rearchive), and an UPDATE trigger — unlike an INSERT trigger — can tell
+    // the difference.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_circle_aliases_bump_on_update
+      AFTER UPDATE OF to_name, status ON circle_aliases
+      FOR EACH ROW WHEN OLD.to_name IS NOT NEW.to_name OR OLD.status IS NOT NEW.status
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+    // DELETE: UNCONDITIONAL — no application code path issues this today (every writer upserts,
+    // never deletes; see this trigger's own test, gates.test.ts), and engine.ts's own central
+    // mutation-trigger mechanism has no DELETE variant at all (only `_insert`/`_update` — see
+    // `trigger()`'s own definition), so there is no analogous cascade to guard against here.
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_circle_aliases_bump_on_delete
+      AFTER DELETE ON circle_aliases
+      BEGIN
+        UPDATE gate_meta SET generation = generation + 1 WHERE singleton = 1;
+      END;
+    `);
+  }
+  if (hasConceptsTable) {
+    // LEGACY '*' CIRCLES: moved to engine.ts (review fix — Codex round 2, item 2; originally landed
+    // HERE in round 1, item 4). Round 1's version moved only `concepts.circle` — this gates-layer
+    // position cannot reach the OTHER circle-scoped tables (observations, memory_edge, entities,
+    // first_block, lifecycle_edges/ratifications: this module's own header says it owns
+    // "stages/rule_bindings/gate_events" alone) without either duplicating renameCircle's full table
+    // list a second time or reaching across the module boundary into engine.ts's private methods.
+    // The honest seam is MonetCore's own construction: `migrateLegacyStarCircle()` (engine.ts) now
+    // runs inside `init()`, immediately before `createGateSchema(this.db)` is called — so the
+    // backfill ordering requirement THIS comment used to explain in full is unchanged in substance,
+    // only in which file states it: legacy-star move → THEN this column backfill, still true,
+    // enforced by call order rather than by both steps living in one function.
+    //
+    // BELOW EVERY TRIGGER IN THIS FUNCTION NOW (Codex round 11, item 4) — see the reordering
+    // comment at the top of this same `if` block for why: the trigger that reacts to THIS backfill's
+    // own shape (an old build's raw, pre-circle-column INSERT) must already exist before this
+    // backfill runs, not after, so a concurrent old writer during this exact window is caught too.
+    // RESTRICTED TO BINDINGS WITH A RESOLVABLE, SAFE CONCEPT (Codex round 12, P2 — review found;
+    // closes two problems in the SAME predicate). BEFORE: `WHERE circle IS NULL` alone matched every
+    // dangling binding too — one whose `concept_id` names NO row in `concepts` at all (the
+    // dangling-then-live gap) — and the UPDATE's own scalar subquery then evaluates to NULL,
+    // assigning NULL to a column that was ALREADY NULL. SQLite's own `changes()` counts ROWS THE
+    // WHERE CLAUSE MATCHED, not rows whose VALUE actually changed (the identical lesson this file's
+    // own INSERT trigger, above, already learned the hard way) — so a store with nothing but
+    // dangling bindings still reported `backfilled.changes > 0` and bumped the generation for a
+    // write that resolved nothing. Combined with round 11, item 3's own second `migrateGateColumns`
+    // call (this same function now runs twice per construction), a store in that shape bumped TWICE
+    // on EVERY open, rewriting the mirror on a read-only open with no delivery change at all — a
+    // report-only process now leaves other readers looking at a spuriously stale-flagged mirror for
+    // no reason.
+    //
+    // THE SAME AUDIT ALSO NAMES THIS STATEMENT: like the two triggers above, this UPDATE copies
+    // `concepts.circle` verbatim, so a concept an old build parked in the reserved `'*'` circle
+    // (legal in its own pre-breadth era) would have this bulk pass mint global breadth on a
+    // dangling-turned-live binding too — the identical hole, a different mechanism (a one-shot
+    // UPDATE, not a trigger).
+    //
+    // ONE PREDICATE closes both: `EXISTS (... AND c.circle != '*')`. A binding with no concept row
+    // at all fails the EXISTS outright — excluded from the WHERE clause entirely, never touched,
+    // never counted, exactly the dangling case staying dangling. A binding whose concept sits in
+    // `'*'` ALSO fails it — same exclusion, same reasoning as the sibling INSERT trigger's own CASE
+    // fix above, just expressed as a filter instead of a value substitution (this statement has no
+    // per-row body to fall back to NULL inside; skipping the row entirely achieves the identical
+    // outcome — it stays NULL because nothing here touches it). Only a binding whose concept EXISTS
+    // and carries an ordinary circle is actually resolved and counted, which is the one case this
+    // backfill was ever supposed to touch.
+    const backfilled = db
+      .prepare(
+        `UPDATE rule_bindings SET circle = (SELECT c.circle FROM concepts c WHERE c.id = rule_bindings.concept_id)
+          WHERE circle IS NULL
+            AND EXISTS (
+              SELECT 1 FROM concepts c
+               WHERE c.id = rule_bindings.concept_id AND c.circle != '${BREADTH_CIRCLE}'
+            )`,
+      )
+      .run();
+    // EXPLICIT BUMP (review fix — m3). A backfill that actually resolved a row is exactly the same
+    // event class as any other write that changes what materializeGateMirror would produce: a
+    // binding that could not be delivered (NULL circle matches nothing) becomes one that can. Before
+    // this, the ONLY thing that made an upgraded store's mirror end up correct was the FORMAT bump
+    // forcing a rewrite regardless of generation — true today, by coincidence, because breadth is
+    // also the first format bump this backfill ships alongside. That coincidence stops being true
+    // the next time a backfill-shaped migration lands without a format bump riding next to it, so
+    // the dependency is made real here instead of staying implicit. Gated on `changes > 0`: a store
+    // with nothing to backfill (already migrated, or a fresh install) must not bump on every open —
+    // and, as of this same round, a store whose only NULL-circle bindings are unresolvable (dangling
+    // or parked in `'*'`) is included in "nothing to backfill", not miscounted as something was.
+    if (backfilled.changes > 0) bumpGateGeneration(db);
+  }
+  // THE INDEX, LAST — see GATE_SCHEMA_SQL's own comment for why it cannot live there (BLOCKER B1):
+  // this line is only reachable once the ALTER above has guaranteed the column exists, under every
+  // path (fresh install already has it via the CREATE TABLE; an upgrade has just added it).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_rule_bindings_circle ON rule_bindings(circle)`);
+}
+
+/**
+ * Idempotent; safe on every open. Convenience wrapper over the two phases above, for callers that
+ * want the full gate-substrate sequence in ONE call and have no legacy-star migration to sandwich
+ * between them — this file's own standalone tests (the concurrent-migrator race, the pre-breadth
+ * migration battery) all call this directly, exactly as before the round-3 split. MonetCore's own
+ * construction does NOT call this: `init()` (engine.ts) calls `createGateTables`, then
+ * `migrateLegacyStarCircle()`, then `migrateGateColumns`, in that order, for the ordering reason
+ * each of those three functions' own comments explain.
+ */
+export function createGateSchema(db: StoragePort): void {
+  createGateTables(db);
+  migrateGateColumns(db);
 }
 
 // ---- the generation counter -------------------------------------------------
@@ -431,25 +1219,24 @@ export function bumpGateGeneration(db: StoragePort): number {
 }
 
 /**
- * Does this concept currently hold deny power? The predicate every bump site consults, so "what
- * counts as a blocking mutation" is decided in ONE place rather than re-derived per call site.
- * Deliberately reads the BINDING only: a retire or a supersession changes whether the rule is
- * DELIVERED, and the caller bumping for those already knows the binding is blocking.
+ * Does this concept currently hold ANY live rule binding, of either severity? The predicate every
+ * retire/supersede/move bump site consults, so "does touching this concept change the mirror" is
+ * decided in ONE place rather than re-derived per call site. Deliberately reads the BINDING only:
+ * a retire or a supersession changes whether the rule is DELIVERED, and the caller bumping for
+ * those already knows a binding exists.
+ *
+ * WAS `hasBlockingBinding`, scoped to `severity = 'blocking'` alone — correct while the mirror was
+ * blocking-only (slice 4a), and systematically wrong once it widened (slice 4b-B): an ADVISORY rule
+ * leaving the mirror (retire, supersession, a circle move that merges it away) changes
+ * `GateMirror.entries` exactly as a blocking one leaving it does, since entries now carries both
+ * severities. Renamed rather than merely widened, for the same reason `BlockingSidecar` became
+ * `GateMirror` — a predicate that decides bump timing for BOTH severities must not still say
+ * "Blocking" in its name.
  */
-export function hasBlockingBinding(db: StoragePort, conceptId: string): boolean {
+export function hasLiveBinding(db: StoragePort, conceptId: string): boolean {
   return db
-    .prepare(`SELECT 1 FROM rule_bindings WHERE concept_id = ? AND severity = 'blocking'`)
+    .prepare(`SELECT 1 FROM rule_bindings WHERE concept_id = ?`)
     .get(conceptId) !== undefined;
-}
-
-/** Does any concept in this circle hold deny power? Used by the circle-rename bump. */
-export function circleHasBlockingRule(db: StoragePort, circle: string): boolean {
-  return db
-    .prepare(
-      `SELECT 1 FROM rule_bindings b JOIN concepts c ON c.id = b.concept_id
-        WHERE b.severity = 'blocking' AND c.circle = ? LIMIT 1`,
-    )
-    .get(circle) !== undefined;
 }
 
 /**
@@ -1266,9 +2053,20 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
               sync_revision = sync_revision + 1, sync_writer = ?
         WHERE id = ?`,
     ).run(nextPatterns, input.origin, syncAt, deps.syncDeviceId, existing.id);
-    // Re-authoring the patterns of a stage that carries a deny CHANGES WHAT THE DENY BLOCKS, which
-    // is a change to the sidecar's content even though no binding was touched.
-    if (liveBlockingRulesForStage(db, existing.id).length > 0) bumpGateGeneration(db);
+    // NOT SOURCED FROM AN EXPLICIT bumpGateGeneration(db) CALL HERE ANY MORE (removed — Codex round
+    // 10, items 2+3): `trg_stages_bump_on_trigger_patterns` (this file, migrateGateColumns) now
+    // bumps unassisted on the `trigger_patterns` UPDATE above — its own `OLD IS NOT NEW` guard is the
+    // IDENTICAL condition the removed call relied on (the guard just above, `nextPatterns ===
+    // existing.trigger_patterns → return existing`, already proved this statement is reached only on
+    // a REAL change), so keeping both would double-count. Every stage is mirror content now
+    // (GateMirror.stages carries the full registry, not only stages with a live rule bound) — that
+    // widening is also WHY this needed its own trigger at all: an OLD build's own upsertStage
+    // (this exact function, at whatever vintage it was compiled from) gated its bump on
+    // `liveBlockingRulesForStage(db, existing.id).length > 0` — correct while the mirror was
+    // blocking-only, and silently wrong the moment it widened: an old build re-authoring an
+    // all-advisory or rule-less stage's patterns never bumped at all, leaving the new build's mirror
+    // serving stale patterns indefinitely for exactly the stage shapes the widening was supposed to
+    // start covering.
     return db.prepare(`SELECT * FROM stages WHERE id = ?`).get(existing.id) as StageRow;
   }
 
@@ -1312,6 +2110,21 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
     row.id, row.name, row.trigger_patterns, row.origin, row.verified,
     row.created_at, row.sync_updated_at, row.sync_revision, row.sync_writer,
   );
+  // A brand-new stage is new mirror content the moment it exists — GateMirror.stages carries the
+  // full registry regardless of whether any rule is bound yet (a rule-less stage still MATCHES and
+  // still answers stage-hit-no-rules; see GateMirror.stages' own comment). No caller of upsertStage
+  // creates a stage AND its first rule binding as a single atomic write with only one of the two
+  // owed a bump — bindRule bumps for the binding side, and this used to cover the stage side itself
+  // with its own explicit call, because a pattern-less, rule-less new stage could not yet hold a
+  // deny for the OLD blocking-only mirror to care about.
+  //
+  // NOT SOURCED FROM AN EXPLICIT bumpGateGeneration(db) CALL HERE ANY MORE (removed — Codex round
+  // 11, item 1): `trg_stages_bump_on_insert` (this file, migrateGateColumns) now bumps unassisted on
+  // the INSERT above — unconditionally, an EXACT match for this branch's own call, which also fired
+  // exactly once per new stage with no condition of its own to narrow it (an INSERT trigger has no
+  // OLD row to compare against, the same reason the rule_bindings backfill trigger above it in
+  // migrateGateColumns has none either). Same reasoning that removed the "replace" branch's own bump
+  // just above in this same function, one INSERT/UPDATE pair over.
   return row;
 }
 
@@ -1320,6 +2133,34 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
 export interface BindRuleInput {
   conceptId: string;
   stageId: string;
+  /**
+   * REQUIRED, NEVER DEFAULTED HERE — bindRule has no access to the concept row, so it cannot fall
+   * back to "whichever circle the concept lives in" on its own; the caller (captureRuleBinding)
+   * resolves that. Either an ordinary circle name (normally equal to the rule's own concept circle)
+   * or `BREADTH_CIRCLE` ("*"), meaning every circle — see that constant's own comment. A breadth
+   * value is refused below unless `origin` is `"declaration"`, OR this is a governed supersession
+   * legitimately inheriting one (see `predecessorCircle` below) — the same sovereignty boundary
+   * blocking severity already enforces, and enforced a second time at the schema level (the
+   * `circle != '*' OR origin IN ('declaration','correction')` CHECK on rule_bindings).
+   */
+  circle: string;
+  /**
+   * ONLY meaningful when `origin === "correction"` and `circle === BREADTH_CIRCLE` — the incumbent
+   * PREDECESSOR binding's own circle, supplied ONLY by succeedRule's own supersession write (review
+   * fix — Codex round 3, item 2). Threaded through rather than inferred: succeedRule already reads
+   * the predecessor's binding row before ever calling this (it needs it to carry stage/scope/tag
+   * forward regardless), so bindRule does not re-derive "is this a legitimate inheritance" by
+   * querying lifecycle_edges itself — it trusts the caller's own already-verified fact, the same
+   * "thread the context, do not re-infer it" shape `effectiveCircle`'s own fallback chain
+   * (engine.ts's graftRows) already uses. `undefined` (every OTHER caller — captureRuleBinding,
+   * memory_store's ordinary capture path — never sets this) means "no claim of inheritance", which
+   * is the safe default: a bare correction-origin '*' bind with no predecessor context stays refused
+   * by the SAME named error this fix does not weaken. Sovereignty is unchanged even when this
+   * unlocks a bind: the '*' already entered, legitimately, at the PREDECESSOR's own declaration —
+   * this carries it forward exactly as it already carries forward reason/scope/modelTag on an
+   * ordinary succession, never a second way to MINT one.
+   */
+  predecessorCircle?: string | null;
   /**
    * OMITTED MEANS "DO NOT DECIDE THIS", and that is a safety property rather than a convenience.
    *
@@ -1416,6 +2257,24 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
       "blocking severity is declaration-only: no agent, and no projection, can self-assign deny power",
     );
   }
+  // THE SAME BOUNDARY, for breadth — WITH ONE GOVERNED EXCEPTION (review fix — Codex round 3, item
+  // 2). Global reach is exactly as sovereign a claim as denial — "sovereignty is unchanged: `*`
+  // enters only through the declaration surface" — so an ORDINARY capture (correction-origin)
+  // binding can no more mint `circle: '*'` than it can mint blocking. But INHERITING an incumbent's
+  // breadth through supersession is not MINTING it: correcting a global rule births a successor that
+  // must carry the SAME reach forward, exactly as it already carries forward reason/scope/modelTag —
+  // "no shadowing, no precedence... withdrawing a global line is a global act" cuts both ways, and a
+  // correction silently NARROWING a global rule to local (by simply being refused, forcing the
+  // correction to roll back entirely) would be exactly the "removed by accident" failure this whole
+  // review series exists to close, one mechanism over. `predecessorCircle` (see its own comment) is
+  // how the ONE legitimate caller of this exception — succeedRule — proves it, rather than this
+  // function trusting a bare origin/circle pair from anyone claiming to be it.
+  const inheritsGlobalBreadth = input.origin === "correction" && input.predecessorCircle === BREADTH_CIRCLE;
+  if (input.circle === BREADTH_CIRCLE && input.origin !== "declaration" && !inheritsGlobalBreadth) {
+    throw new Error(
+      "circle '*' (global breadth) is declaration-only: no capture, and no projection, can self-assign global reach",
+    );
+  }
   // THE AUTHORITATIVE MISSING-REASON CHECK, keyed on the RESOLVED severity rather than the named
   // one. declare()'s copy of this can only see what the caller wrote: it validates before the embed,
   // so it does not yet know which concept it will land on and cannot consult the incumbent binding.
@@ -1492,20 +2351,46 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
 
   const previousSeverity = existing?.severity ?? null;
   const downgradedFromBlocking = previousSeverity === "blocking" && severity !== "blocking";
-  const touchesDenyPower = previousSeverity === "blocking" || severity === "blocking";
 
   const syncAt = deps.nextSyncTimestamp();
   if (existing) {
     db.prepare(
       `UPDATE rule_bindings
           SET stage_id = ?, severity = ?, scope = ?, model_tag = ?, origin = ?, declared_by = ?,
-              reason = ?, sync_updated_at = ?, sync_revision = sync_revision + 1, sync_writer = ?
+              reason = ?, circle = ?, sync_updated_at = ?, sync_revision = sync_revision + 1, sync_writer = ?
         WHERE concept_id = ?`,
     ).run(
       input.stageId, severity, input.scope, modelTag, input.origin,
-      input.declaredBy ?? null, reason, syncAt, deps.syncDeviceId, input.conceptId,
+      input.declaredBy ?? null, reason, input.circle, syncAt, deps.syncDeviceId, input.conceptId,
     );
-    if (touchesDenyPower) bumpGateGeneration(db);
+    // UNCONDITIONAL, not gated on touchesDenyPower. Before the mirror widened past blocking-only
+    // (slice 4b-B), a bump that did not touch deny power had nothing to tell the mirror — an
+    // advisory-to-advisory edit was invisible to it by construction. Now EVERY live rule is mirror
+    // content, so an edit that changes only severity-within-advisory, scope, modelTag, reason, or
+    // origin on an already-live binding is exactly as mirror-relevant as a blocking-power change —
+    // and this branch is only reached when mode is "replace" or this is the binding's first write,
+    // so it always represents a real, intended change reaching the row (see BindMode's own comment).
+    //
+    // KEPT, NOT REMOVED, despite `trg_rule_bindings_bump_on_reclassification` (Codex round 10, items
+    // 2+3) now ALSO watching most of these same columns — considered removing it, to match round
+    // 8/9's own "one bump source, not two" resolution, and deliberately did not: THIS call is also
+    // the ONLY thing that bumps for `circle` changing on THIS exact write (a local narrow/widen via
+    // declare() — captureRuleBinding's own three-state fallback chain feeds `input.circle` right
+    // above), and `circle` could not be added to that trigger's own column list to cover it, because
+    // `trg_rule_bindings_follow_concept_circle`'s OWN body (`UPDATE rule_bindings SET circle = ...`)
+    // would then cascade into firing it every time a concept moves circles — verified empirically,
+    // not assumed, and NOT prevented by `recursive_triggers` (confirmed OFF, but shown by direct
+    // probe to gate something narrower than cross-trigger cascading: a trigger's own write DOES
+    // fire a DIFFERENT trigger watching the column it touches, regardless of that pragma). So this
+    // call stays for circle's sake, and — since it cannot be split from the other seven columns in
+    // ONE UPDATE statement without a second, more invasive change to this branch's own shape — it
+    // ALSO still fires for THOSE seven, alongside the new trigger, on every genuine reclassification.
+    // A deliberate, accepted double bump for that case (an extra harmless regeneration — the SAME
+    // "occasional wasted bump" philosophy round 5's own INSERT trigger already established), traded
+    // against the larger, riskier change a truly precise fix would need: giving this "replace"
+    // branch its own upsertStage-style genuine-change pre-check across all eight columns, in a
+    // function this central and this heavily exercised, for a savings that costs nothing to skip.
+    bumpGateGeneration(db);
     return { row: getRuleBinding(db, input.conceptId)!, previousSeverity, downgradedFromBlocking };
   }
 
@@ -1518,6 +2403,7 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
     origin: input.origin,
     declared_by: input.declaredBy ?? null,
     reason,
+    circle: input.circle,
     created_at: syncAt,
     sync_updated_at: syncAt,
     sync_revision: 0,
@@ -1525,13 +2411,15 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
   };
   db.prepare(
     `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, declared_by,
-                                reason, created_at, sync_updated_at, sync_revision, sync_writer)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                reason, circle, created_at, sync_updated_at, sync_revision, sync_writer)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     row.concept_id, row.stage_id, row.severity, row.scope, row.model_tag, row.origin,
-    row.declared_by, row.reason, row.created_at, row.sync_updated_at, row.sync_revision, row.sync_writer,
+    row.declared_by, row.reason, row.circle, row.created_at, row.sync_updated_at, row.sync_revision, row.sync_writer,
   );
-  if (touchesDenyPower) bumpGateGeneration(db);
+  // UNCONDITIONAL — see the UPDATE branch's own comment above. A brand-new binding, of ANY severity,
+  // is a brand-new mirror entry.
+  bumpGateGeneration(db);
   return { row, previousSeverity, downgradedFromBlocking };
 }
 
@@ -1861,16 +2749,27 @@ interface BindingJoinRow {
 
 /**
  * THE shared liveness predicate every rule-delivery query in this module must agree on: active
- * concept, kind='rule', not superseded, in the caller's circle, respecting the model-tag filter.
- * A raw SQL fragment (not a function) because two DIFFERENT queries need to embed it verbatim in
- * their own WHERE clause — `rulesForStages` (full rule delivery, scoped to specific stage ids) and
- * `liveStageIdsWithRules` (liveStageIndex's own minimal existence check, over every stage) — and
- * "the same predicate, maintained as two copies" is exactly the drift risk this module's chokepoint
- * doctrine exists to close. Takes exactly 3 positional params, in order: circle, then the
- * model-tag filter's two placeholders (both the same value — `runtimeModelTag ?? null`).
+ * concept, kind='rule', not superseded, in the caller's circle (or breadth), respecting the
+ * model-tag filter. A raw SQL fragment (not a function) because two DIFFERENT queries need to embed
+ * it verbatim in their own WHERE clause — `rulesForStages` (full rule delivery, scoped to specific
+ * stage ids) and `liveStageIdsWithRules` (liveStageIndex's own minimal existence check, over every
+ * stage) — and "the same predicate, maintained as two copies" is exactly the drift risk this
+ * module's chokepoint doctrine exists to close. Takes exactly 3 positional params, in order: circle,
+ * then the model-tag filter's two placeholders (both the same value — `runtimeModelTag ?? null`) —
+ * UNCHANGED by breadth: `'${BREADTH_CIRCLE}'` is a FIXED literal interpolated from the exported
+ * constant at module load, never a bound value, so it adds no placeholder and every existing call
+ * site's param list/order stays exactly as it was (the positional-bind swap this module's own round
+ * 3 review already learned the hard way — see rulesForStages' own comment — is the reason this is
+ * called out explicitly rather than left to be discovered by a param miscount).
+ *
+ * THE COLUMN CHECKED IS `b.circle`, NOT `c.circle` — the concept's own circle is no longer what
+ * decides delivery (see RuleBindingRow.circle's own comment for why the two can diverge). Every
+ * write path that changes a rule's LOCAL circle (bindRule, moveConcept, renameCircle) keeps
+ * `rule_bindings.circle` in step with its concept's circle for an ordinary binding; only a breadth
+ * binding is allowed to disagree with its own concept's circle, on purpose.
  */
 const RULE_LIVENESS_WHERE = `
-          c.circle = ?
+          (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
           AND c.status = 'active'
           AND c.kind = 'rule'
           -- MODEL-TAG RETIREMENT. A domain rule always fires; an agent rule is a compensation for
@@ -2249,7 +3148,34 @@ export function gateQuery(db: StoragePort, opts: GateQueryOptions): GateResult {
   return result;
 }
 
+/**
+ * `*` is the breadth marker on a rule BINDING (BREADTH_CIRCLE's own comment), never a selectable
+ * circle a QUERY can be scoped to — refused at every gate-query entrance (Codex round 6, item 2), one
+ * shared message so the three call sites cannot drift apart. `RULE_LIVENESS_WHERE`'s own
+ * `(b.circle = ? OR b.circle = '*')` (and evaluateGateFromMirror's identical JS-side twin) degenerates
+ * to matching ONLY global rules the instant `?` itself is bound to '*' — both halves of the OR become
+ * the identical clause — silently dropping every LOCAL rule the caller actually meant to ask about,
+ * including a local DENY. Reachable only via a direct argument (a pre-breadth `MONET_CIRCLE=*` config,
+ * or any caller passing '*' straight through): `resolveCircle` can never PRODUCE '*' from an ordinary
+ * circle name post-migration (round 4, item 4 — no alias can ever hold '*' on either side once a
+ * store has been through it), so this is not a resolution bug to fix upstream, it is an input this
+ * layer must refuse outright rather than silently misinterpret. Called from gateInternal and
+ * evaluateStageLookup (both exported wrappers — gateQuery/stageLookup — and MonetCore's own
+ * gate()/stageLookup() funnel through these unchanged, so checking here covers all of them) and from
+ * evaluateGateFromMirror directly (the offline evaluator has no shared internal to funnel through).
+ */
+function assertQueryableCircle(circle: string): void {
+  if (circle === BREADTH_CIRCLE) {
+    throw new Error(
+      `circle '${BREADTH_CIRCLE}' is not a queryable circle: it is the reserved global-breadth marker ` +
+        `on a rule BINDING, never a circle a query can be scoped to. Name a real circle — a global ` +
+        `rule already delivers everywhere on its own, with no need to ask for it by this name.`,
+    );
+  }
+}
+
 function gateInternal(db: StoragePort, opts: GateQueryOptions): { result: GateResult; pending: PendingGateWrites | null } {
+  assertQueryableCircle(opts.circle);
   const startedAt = typeof process !== "undefined" && process.hrtime ? process.hrtime.bigint() : null;
   const now = opts.now ?? Date.now();
   const record = opts.record !== false;
@@ -2416,6 +3342,7 @@ export function evaluateStageLookup(
   db: StoragePort,
   opts: StageLookupOptions,
 ): { result: StageLookupResult; pending: PendingGateWrites | null } {
+  assertQueryableCircle(opts.circle);
   const startedAt = typeof process !== "undefined" && process.hrtime ? process.hrtime.bigint() : null;
   const now = opts.now ?? Date.now();
   const record = opts.record !== false;
@@ -2739,11 +3666,16 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
     malformedPatterns,
     retirementCandidates: opts.runtimeModelTag === undefined ? [] : (db
       .prepare(
+        // (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}'), matching RULE_LIVENESS_WHERE's own
+        // widening: a global agent-scoped compensation is exactly as real a retirement candidate
+        // when curating ANY circle it delivers in as a local one is when curating its own — c.circle
+        // alone (the concept's circle) would hide it everywhere except the one circle its CONCEPT
+        // happens to be filed in, which is not where it is firing.
         `SELECT b.concept_id AS conceptId, c.title AS title, b.model_tag AS modelTag, s.name AS stageName
            FROM rule_bindings b
            JOIN concepts c ON c.id = b.concept_id
            LEFT JOIN stages s ON s.id = b.stage_id
-          WHERE b.scope = 'agent' AND b.model_tag IS NOT ? AND c.circle = ?
+          WHERE b.scope = 'agent' AND b.model_tag IS NOT ? AND (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
             AND c.status = 'active' AND c.kind = 'rule'
             AND NOT EXISTS (
               SELECT 1 FROM lifecycle_edges e
@@ -2765,11 +3697,11 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
     //
     // So SQL narrows to the live denies and TypeScript asks the question — ONE implementation, no
     // equivalence to maintain between two dialects' idea of whitespace. The scan is bounded by the
-    // blocking population, which is the same set materializeBlockingSidecar already walks in full on
-    // every declaration, so this is not a new order of work.
+    // blocking population, which is the same set materializeGateMirror already walks (as a subset of
+    // every live rule) on every declaration, so this is not a new order of work.
     unexplainedDenies: (db
       .prepare(
-        // INNER JOIN, matching listBlockingRules and the stage-first path gateInternal takes. A
+        // INNER JOIN, matching listGateMirrorEntries and the stage-first path gateInternal takes. A
         // binding can land without its stage — an incremental graft that omits the stage row, or a
         // name collision that skips it — and graftRows documents that such a binding NEVER FIRES.
         // A LEFT JOIN here put it in the deny list anyway, so the overview named a live deny that
@@ -2782,12 +3714,15 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
         // built to close, self-healing on the graft that brings the stage. A standing curation item
         // for a state that resolves itself is noise, and this branch's subject is denies that cannot
         // explain themselves, not bindings that cannot fire.
+        // (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}'): a global reasonless deny is firing —
+        // unexplained — in EVERY circle, not only the one its concept happens to be filed in, and
+        // curation for any of them needs to see it. Same widening as retirementCandidates above.
         `SELECT b.concept_id AS conceptId, c.title AS title, s.name AS stageName, b.reason AS reason
            FROM rule_bindings b
            JOIN concepts c ON c.id = b.concept_id
            JOIN stages s ON s.id = b.stage_id
           WHERE b.severity = 'blocking'
-            AND c.circle = ?
+            AND (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
             AND c.status = 'active'
             AND c.kind = 'rule'
             AND NOT EXISTS (
@@ -2802,73 +3737,159 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
   };
 }
 
-// ---- the blocking sidecar ---------------------------------------------------
+// ---- the gate mirror ---------------------------------------------------------
 
-/** One blocking rule as the offline hook reads it. Carries the matcher's input, not prose. */
-export interface BlockingSidecarEntry {
-  stageId: string;
-  stageName: string;
-  /** Machine-readable, matched with this module's own `matchesTriggerPattern`. */
-  patterns: TriggerPattern[];
-  /** Human-readable renderings of the same patterns, for the deny message and for eyeballing. */
-  patternText: string[];
+/**
+ * One live rule as the offline evaluator reads it — the same projection the live gate delivers
+ * (see `toGateRule`), minus the parent-principle lookup (no `projectedFromPrincipleId`: that is a
+ * correlated join against `lifecycle_edges`, and nothing writes a derivation edge for a rule yet —
+ * see `evaluateGateFromMirror`'s own comment for the representation gap this leaves) and minus the
+ * body (hook injection is title+reason by budget; a rule's body is the recognized surface's own
+ * pull, `stage_lookup`'s alone — see StageLookupRule).
+ *
+ * NO `stageName`/`patterns` here: those live once each on the stage's own record (`GateMirrorStage`
+ * below) rather than repeated on every rule bound to it — a stage with ten rules used to carry its
+ * patterns ten times over. NO `reasonMissing`: computed at read time via `hasNoReason`, the same
+ * one predicate `toGateRule` uses, rather than persisted and risking drift from it. NO `declaredBy`:
+ * dropped along with everything else `GateRule` itself never delivers — this projection's whole
+ * promise is "the same projection the live gate delivers", and `declaredBy` was never part of that.
+ */
+export interface GateMirrorEntry {
   conceptId: string;
-  ruleText: string;
-  reason: string | null;
+  /** Which stage this rule is bound to — join against `GateMirror.stages` to match and to render. */
+  stageId: string;
+  severity: RuleSeverity;
   /**
-   * Same marker the live gate carries (see GateRule.reasonMissing), so the offline hook can say the
-   * same sentence. Without it the two disagree exactly where it matters least to be inconsistent
-   * and most to be honest: the hook runs when the server is unreachable, which is already the
-   * moment a user is least able to go and look the reason up.
-   *
-   * Every entry here is blocking by construction, so this is simply "no reason" — but it is
-   * computed, not implied, so a reader never has to know that `reason: "  "` meant absent.
-   */
-  reasonMissing: boolean;
-  declaredBy: string | null;
-  circle: string;
-  /**
-   * THE OFFLINE HOOK MUST APPLY THE SAME FILTER THE LIVE GATE DOES, and these two fields are what
-   * let it. `gateQuery` delivers an `agent`-scoped rule only when the runtime's model tag equals
-   * `modelTag` (see GateQueryOptions.runtimeModelTag); a mirror that omitted the scope made that
-   * impossible offline, so a compensation for a retired model kept denying whenever the server was
+   * THE OFFLINE EVALUATOR MUST APPLY THE SAME FILTER THE LIVE GATE DOES, and `scope` + `modelTag`
+   * are what let it. `gateQuery` delivers an `agent`-scoped rule only when the runtime's model tag
+   * equals `modelTag` (see GateQueryOptions.runtimeModelTag); a mirror that omitted either made that
+   * impossible offline, so a compensation for a retired model kept firing whenever the server was
    * unreachable — live and offline disagreeing exactly when the disagreement is hardest to notice.
    *
    * The rule for a reader: `scope === "domain"` always applies; `scope === "agent"` applies only
-   * when the running model's tag equals `modelTag`. Circle scoping is the reader's job too —
-   * `circle` above is the rule's locality, and the live gate matches it against the invoking one.
+   * when the running model's tag equals `modelTag`. `circle` below is the rule's locality, and the
+   * live gate matches it against the invoking one — the evaluator must too.
    */
   scope: RuleScope;
   modelTag: string | null;
+  reason: string | null;
+  /** The rule itself — the concept's title. Same field name as `GateRule.text`, never the body. */
+  text: string;
+  origin: RuleBindingOrigin;
+  /**
+   * NEVER NULL, deliberately narrower than the column it reads from (review fix — minor m1):
+   * `rule_bindings.circle` briefly holds NULL for a dangling binding whose concept has not arrived
+   * yet (the dangling-then-live gap), but such a row cannot deliver — RULE_LIVENESS_WHERE's
+   * `b.circle = ?` never matches NULL, and neither does this evaluator's own filter — so it is not a
+   * "rule with an unknown locality," it is not a live rule at all yet. `listGateMirrorEntries`
+   * excludes it at the query rather than admitting `string | null` here and pushing the "what does a
+   * null circle mean" question onto every reader. BLOCKER B3 closes the gap early (resolved the
+   * moment the concept lands, same transaction), and the schema migration backfill closes it on
+   * every store's next open regardless — so in steady state this column is never seen NULL by a
+   * mirror written after this slice; the exclusion is a floor under that transient window, not a
+   * routine filter.
+   */
+  circle: string;
 }
 
 /**
  * Bumped whenever an entry's SHAPE changes, so a reader can refuse a file it does not understand
  * rather than silently ignoring a field that decides whether a deny applies. Version 2 added
- * `scope` + `modelTag`; a version-1 file omits them and must not be trusted to filter.
+ * `scope` + `modelTag`; a version-1 file omits them and must not be trusted to filter. Version 3
+ * added `reasonMissing` (computed, not persisted, as of version 4 — see GateMirrorEntry's own
+ * comment for why).
  *
- * VERSION 3 added `reasonMissing`. Unlike `scope`, it does not decide WHETHER a deny applies — it
- * decides what the hook can honestly say while applying it. That still earns the bump: a v2 reader
- * pointed at a v3 file would render a reasonless deny as though nothing were wrong, which is the
- * silent-omission failure the version exists to make impossible. The rule stays "the entry shape
- * changed", not "the filter changed".
+ * VERSION 4 (slice 4b-B, 2026-07-28) is the artifact ceasing to be blocking-only: `entries` now
+ * carries every LIVE rule, both severities, and the mirror gained `stages` (the full stage
+ * registry, trigger patterns included — the projection-hook signal, "a stage matched and delivered
+ * nothing", cannot exist offline without knowing about rule-less stages too), `circleAliases` and
+ * `circles` (what a `--circle` resolver needs without touching the store). A v3 reader pointed at a
+ * v4 file would read `entries` as blocking-only and MISS every advisory rule silently — a wider
+ * failure than v3's own bump closed, which is exactly why this earns the same kind of refusal
+ * rather than a lenient partial read.
  */
-export const BLOCKING_SIDECAR_FORMAT = 3;
+export const GATE_MIRROR_FORMAT = 4;
 
-export interface BlockingSidecar {
-  /** Shape version of `entries` — see BLOCKING_SIDECAR_FORMAT. */
+/**
+ * One stage as the offline evaluator reads it — everything `matchesTriggerPattern` needs, and
+ * nothing `verified`/`origin` add, since a read-only evaluator never flips or reports on either.
+ *
+ * NO `circle`: stages are store-global and carry no circle column (see GATE_SCHEMA_SQL's own "WHY
+ * STAGES ARE STORE-GLOBAL AND CARRY NO CIRCLE" note) — locality lives entirely on the rule side
+ * (GateMirrorEntry.circle), so a stage record has none to mirror.
+ */
+export interface GateMirrorStage {
+  id: string;
+  name: string;
+  /**
+   * RAW JSON, the exact `stages.trigger_patterns` column — not the parsed `TriggerPattern[]` form —
+   * so the one parse chokepoint (`parseTriggerPatterns`) stays single: the evaluator calls it
+   * verbatim, the same function `gateInternal` calls, rather than this module shipping a second
+   * reader that could drift from it (a stage whose patterns fail to parse goes quiet the same
+   * tolerant way on both paths — see `parseTriggerPatterns`' own comment).
+   */
+  triggerPatterns: string;
+}
+
+/**
+ * An active circle rename, exactly as `resolveCircle` follows it (`status = 'active'` only — an
+ * archived alias is not a forwarding address). What a `--circle` resolver needs to canonicalize a
+ * renamed circle without a store round trip.
+ */
+export interface GateMirrorCircleAlias {
+  from: string;
+  to: string;
+}
+
+export interface GateMirror {
+  /** Shape version of `entries`/`stages` — see GATE_MIRROR_FORMAT. */
   format: number;
   generatedAt: number;
   /**
    * The gate-substrate generation this mirror was built from. THE field that makes the artifact
    * verifiable: comparing it against `gateGeneration(db)` answers "is this snapshot current" with
-   * no hashing and no guessing. A hook reading a file whose generation is behind knows it is
-   * holding a stale answer, which is the difference between failing loudly and denying wrongly.
+   * no hashing and no guessing. A reader holding a file whose generation is behind knows it is
+   * holding a stale answer, which is the difference between failing loudly and answering wrongly.
    */
   generation: number;
-  /** Which store produced this mirror — so a hook can notice it is reading someone else's. */
+  /** Which store produced this mirror — so a reader can notice it is reading someone else's. */
   storeIdentity?: string;
-  entries: BlockingSidecarEntry[];
+  /** Every live rule, both severities — the same projection the live gate delivers. */
+  entries: GateMirrorEntry[];
+  /**
+   * The full stage registry — every stage, not only ones with a live rule bound (a rule-less stage
+   * still MATCHES and still answers stage-hit-no-rules, never silence; see GateResult.silence).
+   */
+  stages: GateMirrorStage[];
+  /** Active circle renames only — see GateMirrorCircleAlias. */
+  circleAliases: GateMirrorCircleAlias[];
+  /**
+   * Every circle name this mirror has an opinion about: a circle carrying a live rule, plus every
+   * `from`/`to` name `circle_aliases` mentions (so an archived or renamed-away circle is still
+   * "known", not silently absent). NOT a general circle registry — the store keeps none (see
+   * `listCircles`, engine.ts, which derives its own top-N-by-activity view from `concepts` rather
+   * than reading a dedicated table) — this is deliberately narrower: only what the gate
+   * materializer itself already walked, per the ruling not to invent a mapping the store has no
+   * source for.
+   *
+   * WRITE-ONLY as of this slice (minor m4): nothing in this codebase reads it back yet. Its consumer
+   * is the offline CLI's `--circle` resolver, slice 4b-C, not yet built — this field exists now so
+   * that CLI can ship without a mirror-format bump of its own.
+   */
+  circles: string[];
+  /**
+   * sha256, hex, over the canonical JSON serialization of every OTHER field on this object — see
+   * `materializeGateMirror`'s own comment for the exact recipe. Closes the validation-depth category
+   * (Codex round 12, item 1): the shape checks in `readSidecarHeader` catch a wrong TYPE or a missing
+   * ARRAY, but a single flipped byte inside an otherwise well-typed string (a rule's title, a
+   * reason) passes every one of them silently — this is the field that actually detects it.
+   *
+   * ADDITIVE, NOT A FORMAT BUMP: optional, not required — `readSidecarHeader` verifies it WHEN
+   * PRESENT and skips verification entirely when absent, so a pre-checksum v4 file (a dev-window
+   * artifact from before this field existed) still reads exactly as it always has. Every file this
+   * build's own `materializeGateMirror` writes from now on carries one.
+   */
+  checksum?: string;
 }
 
 /** Why a mirror is (or is not) current. `missing` and `unreadable` are both stale — see below. */
@@ -2906,6 +3927,104 @@ export type SidecarStaleness =
  * the critical path of somebody's action.
  */
 /**
+ * Does this `entries[]` element have the shape `evaluateGateFromMirror`'s own filter and mapper
+ * actually dereference (Codex round 5, item 1), AND — for the two fields the evaluator BRANCHES on
+ * where a wrong-but-well-typed value silently changes the verdict rather than crashing — does it
+ * hold one of the VALUES that logic actually distinguishes (Codex round 9, item 4)?
+ * `Array.isArray(header.entries)` alone passed `entries: [null]` clean through — the array IS an
+ * array — and the crash lands one layer down, on the FIRST read of any element:
+ * `mirror.entries.filter((entry) => matchedStageIds.has(entry.stageId) && ...)` dereferences
+ * `entry.stageId` unconditionally, so `entry === null` throws "Cannot read properties of null"
+ * before the filter predicate's own logic ever runs.
+ *
+ * TWO DEPTHS, DELIBERATELY DIFFERENT SCOPE, both live in this one function:
+ *   - SHAPE (round 5): `conceptId`/`text` (passthrough display) and `stageId`/`circle` (the two
+ *     filter keys) are required to be STRINGS — enough to keep the reader from crashing on the way
+ *     to asking the store anything, never a semantic check (that authority stays with the store).
+ *   - VALUE (round 9, item 4 — a PR finding, not self-discovered: "removing `scope` from an
+ *     agent-scoped entry leaves the same-generation file classified as current, and
+ *     `ruleTagIsLive(undefined, ...)` then treats that rule as domain-scoped and fires it for the
+ *     wrong runtime model; an unrecognized severity can similarly make a cached deny appear
+ *     non-blocking to consumers"): `severity` must be one of `RULE_SEVERITIES`, not merely a
+ *     string — an unrecognized value does not crash `entry.severity === "blocking"`, it silently
+ *     answers false, the exact "appears non-blocking" the finding names. `scope` must be one of
+ *     `RULE_SCOPES` — newly checked here AT ALL, not merely compared — because `ruleTagIsLive`'s
+ *     own `scope !== "agent"` short-circuits to true for ANY non-"agent" value, missing or
+ *     malformed included, silently treating a corrupted agent-scoped rule as domain-scoped and
+ *     firing it for every model rather than only the one it was compensating for — the PR finding's
+ *     own worked example, verbatim.
+ *
+ * NOT EXTENDED TO `modelTag`, considered and rejected: unlike severity/scope, it has no closed
+ * vocabulary to validate a VALUE against — any string is a legitimate model tag, a fact of the
+ * deployment, not of this file. The only checkable thing about it is its TYPE (`string | null`),
+ * which is the SHAPE layer's job (round 5), not this one's, and round 5 already deliberately
+ * excluded it there too — a blanket "must be string" would reject a legitimate null and be WRONG,
+ * not merely stricter; `modelTag === runtimeModelTag` cannot crash on any input regardless of type,
+ * so a corrected "string or null" shape check would tighten nothing this round's own bar (silent
+ * verdict change) cares about, only defend against a crash that was never reachable to begin with.
+ * NOT EXTENDED TO `origin` either: the PR finding never named it, and it is compared with `===`
+ * only, never branched into a vocabulary the way severity/scope are.
+ *
+ * CALLED ONLY INSIDE `readSidecarHeader`'s format-bounded block, NOT unconditionally alongside the
+ * array-ness check — corrected within round 5 itself, disclosed in that round's report: entries
+ * genuinely exists in every format, but a FUTURE format's entries can legitimately carry a
+ * DIFFERENT shape this build has never heard of (the same reason stages/circleAliases' own element
+ * checks are bounded), and this module's own existing "REFUSES to overwrite a mirror written by a
+ * build AHEAD of this one" tests caught the unconditional version breaking that contract outright —
+ * a format-ahead file's `entries` failed this shape check, so the whole header read as `malformed`
+ * instead of `format-ahead`, and materializeGateMirror overwrote a file it must never touch. THE
+ * SAME MALFORMED-HEADER CONSEQUENCE applies to round 9's own tightening: a mirror failing the new
+ * severity/scope checks reads as `malformed`, exactly like a mirror failing the older shape checks
+ * — no new plumbing, the existing chokepoint already does the right thing with a stricter predicate.
+ */
+function hasMirrorEntryShape(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.conceptId === "string" &&
+    typeof entry.stageId === "string" &&
+    RULE_SEVERITIES.includes(entry.severity as RuleSeverity) &&
+    typeof entry.circle === "string" &&
+    typeof entry.text === "string" &&
+    RULE_SCOPES.includes(entry.scope as RuleScope)
+  );
+}
+
+/**
+ * Does this `stages[]` element have the shape `evaluateGateFromMirror`'s own matching loop
+ * dereferences (Codex round 5, item 1)? `stage.triggerPatterns` is read unconditionally
+ * (`parseTriggerPatterns(stage.triggerPatterns)`) before anything else about the stage is
+ * consulted, so `stage === null` throws there first, identically to the entries case above.
+ * `triggerPatterns` is required to be a STRING — the exact parameter type `parseTriggerPatterns`
+ * itself declares (`json: string`) and the exact column shape `GateMirrorStage.triggerPatterns`'s
+ * own comment documents ("the exact `stages.trigger_patterns` column... not the parsed form") —
+ * not "whatever JSON.parse tolerates": `readTriggerPatterns`'s own try/catch already absorbs a
+ * non-string value without throwing (JSON.parse coerces via ToString first), so a wrong-typed
+ * `triggerPatterns` would not itself crash the evaluator — but it WOULD make that stage silently
+ * carry zero usable patterns forever, an offline/live parity gap the mirror exists to prevent, not
+ * merely a crash to avoid. Treating it as malformed routes it through the same regeneration path a
+ * literal crash would, which is the more protective of the two available readings for a field the
+ * evaluator only ever reads as `string`.
+ */
+function hasMirrorStageShape(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const stage = value as Record<string, unknown>;
+  return typeof stage.id === "string" && typeof stage.name === "string" && typeof stage.triggerPatterns === "string";
+}
+
+/**
+ * Does this `circleAliases[]` element have the shape `evaluateGateFromMirror`'s own alias-resolution
+ * step dereferences (Codex round 5, item 1)? `mirror.circleAliases.find((row) => row.from ===
+ * opts.circle)` reads `row.from` unconditionally, on every element, before any match is decided —
+ * `row === null` throws there. Both fields are required strings, matching `GateMirrorCircleAlias`.
+ */
+function hasMirrorCircleAliasShape(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const alias = value as Record<string, unknown>;
+  return typeof alias.from === "string" && typeof alias.to === "string";
+}
+
+/**
  * Read a sidecar file's header WITHOUT trusting its shape.
  *
  * `JSON.parse` succeeding says nothing about structure — `null`, `[]`, `"a string"` and
@@ -2930,16 +4049,151 @@ function readSidecarHeader(path: string): { generation: number; storeIdentity: s
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
   const header = parsed as Record<string, unknown>;
   if (typeof header.generation !== "number" || !Number.isFinite(header.generation)) return null;
+  // ARRAY-NESS ONLY, here — element SHAPE is checked below, bounded to formats this build actually
+  // understands (Codex round 5, item 1 — corrected during that same round, disclosed in the report:
+  // an EARLIER version of this fix checked entries' element shape unconditionally, right here,
+  // reasoning that entries exists in every format so a malformed element is equally dangerous
+  // regardless of which format wrote it. That reasoning missed the FORMAT-AHEAD case: a genuinely
+  // newer build's `entries` shape can legitimately differ from this build's own `GateMirrorEntry` —
+  // exactly parallel to why stages/circleAliases' own element checks are format-bounded below — and
+  // the unconditional version broke the format-ahead preservation contract outright, caught by this
+  // module's own existing "REFUSES to overwrite a mirror written by a build AHEAD of this one" tests.
+  // `entries` still cannot be validated for ELEMENT shape here, unconditionally, for the identical
+  // reason stages/circleAliases cannot: doing so would misclassify a legitimate newer-format file as
+  // malformed and materializeGateMirror would overwrite it, the exact thrash format-ahead exists to
+  // prevent.
   if (!Array.isArray(header.entries)) return null;
   // FORMAT IS A DISCRETE VERSION NUMBER, not a magnitude to interpolate — there is no meaning between
-  // format 3 and format 4, so `3.5` is not "a number we can still compare", it is a corrupt header.
-  // Left unchecked, a fractional value greater than BLOCKING_SIDECAR_FORMAT passed `typeof === "number"`
+  // format 4 and format 5, so `4.5` is not "a number we can still compare", it is a corrupt header.
+  // Left unchecked, a fractional value greater than GATE_MIRROR_FORMAT passed `typeof === "number"`
   // and read as a genuine future format: `format-ahead` in inspectSidecar, `skipped-format-ahead`
-  // forever in materializeBlockingSidecar — preserved on the promise of an upgrade that fixes nothing,
+  // forever in materializeGateMirror — preserved on the promise of an upgrade that fixes nothing,
   // because no build, past or future, will ever actually write a fractional format. Rejecting the
   // whole header here (rather than coercing just this field to null) routes it through the SAME
   // `malformed` path as any other structurally-wrong file, in both consumers, from one place.
   if (typeof header.format === "number" && !Number.isInteger(header.format)) return null;
+  // FORMAT 4 REQUIRES stages/circleAliases TOO — ONLY FOR FORMATS THIS BUILD ACTUALLY UNDERSTANDS
+  // (review fix — Codex round 1, item 2; bounded in round 2, item 5). A header claiming format 4
+  // but omitting either — or carrying a non-array in their place — is not a v4 file with two empty
+  // sections, it is STRUCTURALLY WRONG: `{format:4, generation:n, entries:[]}` passed every check
+  // above (a valid generation, entries genuinely an array, format genuinely an integer) and read as
+  // CURRENT the moment its generation happened to match — inspectSidecar reported it trustworthy,
+  // materializeGateMirror skipped rewriting an "already current" file, and evaluateGateFromMirror
+  // then crashed the first time it iterated `mirror.stages` (undefined has no [Symbol.iterator]) —
+  // the read-path-throw class. Routed through the SAME `null` (malformed) return as any other
+  // structurally-wrong file, from this ONE parse chokepoint both inspectSidecar and
+  // materializeGateMirror already share (each calls readSidecarHeader directly, never re-deriving
+  // its own notion of "valid header") — so the two cannot independently drift: one reports
+  // malformed, the other regenerates, for the identical file.
+  //
+  // BOUNDED to the closed range [4, GATE_MIRROR_FORMAT] (review fix — Codex round 2, item 5: round
+  // 1's own `format >= 4` — no upper bound — applied this requirement to ANY number >= 4, INCLUDING
+  // a future format this build has never heard of. A legitimate same-store v5 file that legitimately
+  // restructured these fields would fail this check exactly like a truly corrupt one — MALFORMED,
+  // not FORMAT-AHEAD — and materializeGateMirror would then OVERWRITE it: the exact thrash the
+  // format-ahead machinery exists to prevent, broken by the very guard meant to strengthen it. For
+  // `header.format > GATE_MIRROR_FORMAT`, this check is skipped entirely and the header returns with
+  // only the fields every format has always carried (generation, storeIdentity, format) — the
+  // MINIMAL STABLE SHAPE — letting inspectSidecar's own `format !== GATE_MIRROR_FORMAT` compare
+  // (below) classify it `format-ahead` and preserve it untouched, exactly as an unknown format did
+  // before this array requirement existed at all. Grows to whatever range this build's OWN
+  // GATE_MIRROR_FORMAT actually covers as that constant advances — never wider than what this build
+  // can itself validate.
+  //
+  // `circles` is deliberately NOT checked here: nothing in this codebase reads it back yet (see its
+  // own "WRITE-ONLY as of this slice" comment on GateMirror.circles) — there is no reader for a
+  // malformed one to crash today. Revisit this the same day something starts reading it.
+  if (typeof header.format === "number" && header.format >= 4 && header.format <= GATE_MIRROR_FORMAT) {
+    // THIS BLOCK IS THE LAST OF ITS KIND (Codex round 12, item 1 — closing the validation-depth
+    // category, John's own ratification 2026-07-28). The shape checks below (element shape, then
+    // entries⊆stages) and the checksum verification that follows them exist at genuinely DIFFERENT
+    // depths, and the boundary between them is now fixed:
+    //   - SHAPE/REFERENTIAL (below, unchanged) stays for CHEAP FAST-FAIL — a wrong type or a missing
+    //     array is caught before spending a single hash computation on a file that was never going to
+    //     parse into a usable mirror anyway — and for the ONE case checksum verification cannot cover
+    //     at all: a file that predates the `checksum` field entirely (the dev-window case; see that
+    //     field's own comment on `GateMirror`).
+    //   - CORRUPTION — a byte flipped inside an otherwise well-typed, well-shaped value (a rule's
+    //     title, a reason, any string these shape checks pass straight through) — is now the
+    //     CHECKSUM's job, not this block's. No new per-field VALUE check should be added here going
+    //     forward on the theory that it might catch a corrupted byte: it will not catch more than the
+    //     checksum already does, at a fraction of the cost, and every one added here is one more
+    //     shape a future reader has to hold in their head for protection the checksum already
+    //     provides in full. A genuinely NEW structural/referential invariant (the entries⊆stages
+    //     shape below, or its future siblings) is still exactly the right kind of addition; a NEW
+    //     "is this string exactly what I expect" value check is not.
+    //
+    // ELEMENT SHAPE (Codex round 5, item 1), gated behind format >= 4 the same as the stages/
+    // circleAliases array-ness check just below it always was: none of the three can be validated
+    // for element shape outside a format range this build actually understands — see
+    // hasMirrorEntryShape/hasMirrorStageShape/hasMirrorCircleAliasShape's own comments for exactly
+    // which fields are checked and why. `entries` joins stages/circleAliases HERE, inside the bound,
+    // rather than staying unconditional up at the array-ness check — see that check's own comment
+    // for why the unconditional version broke the format-ahead contract and was corrected to this.
+    if (!header.entries.every(hasMirrorEntryShape)) return null;
+    if (!Array.isArray(header.stages) || !header.stages.every(hasMirrorStageShape)) return null;
+    if (!Array.isArray(header.circleAliases) || !header.circleAliases.every(hasMirrorCircleAliasShape)) return null;
+    // REFERENTIAL: entries⊆stages (Codex round 11, item 5, P2). `GateMirrorEntry.stageId`'s own
+    // comment says it plainly: "join against `GateMirror.stages` to match and to render" —
+    // evaluateGateFromMirror's own matching loop walks `mirror.stages` to decide which stage(s) a
+    // query action hits, then reads `entries` for whichever bindings apply. An entry naming a
+    // stageId absent from THIS SAME file's own `stages[]` can never be reached through that join —
+    // not a crash (both are plain array scans; a miss is silence, not a throw) — but a rule the file
+    // claims to carry that the offline evaluator can never actually deliver: unreachable the same way
+    // a version-1 file's missing scope/modelTag once left a rule un-filterable, this time via a
+    // dangling foreign key rather than a missing field.
+    //
+    // HOLDS BY CONSTRUCTION for any file THIS build's own materializeGateMirror writes:
+    // listGateMirrorEntries' own SELECT does `JOIN stages s ON s.id = b.stage_id` (INNER, no columns
+    // taken from it — see that join's own comment), so a stageId this build ever emits into `entries`
+    // is guaranteed, at write time, to name a row listGateMirrorStages' own unconditional `SELECT id,
+    // name, trigger_patterns FROM stages` would also have captured in the same materialization pass.
+    // A violation here can only mean a file this build did NOT honestly write in one pass —
+    // hand-edited, corrupted, or produced by a build with a since-fixed bug — exactly the class of
+    // file this whole function exists to refuse rather than trust.
+    //
+    // CHECKED HERE, not folded into hasMirrorEntryShape: that function validates ONE element in
+    // isolation (Array.prototype.every calls it per-entry, with no visibility into the rest of the
+    // file), while this check is inherently CROSS-array — it needs `header.stages` already known to
+    // be a well-shaped array, which the line above this one just established.
+    const knownStageIds = new Set((header.stages as Array<{ id: string }>).map((stage) => stage.id));
+    if (!(header.entries as Array<{ stageId: string }>).every((entry) => knownStageIds.has(entry.stageId))) {
+      return null;
+    }
+    // THE CHECKSUM, VERIFY-IF-PRESENT (Codex round 12, item 1). Absent entirely on a pre-checksum v4
+    // file (the dev-window case — see `GateMirror.checksum`'s own comment) — skipped, not treated as
+    // a failure, so such a file keeps reading exactly as it always has, on the shape checks above
+    // alone. Present on every file `materializeGateMirror` writes from now on, and verified here
+    // against the IDENTICAL recipe that function's own comment documents: strip `checksum` off the
+    // parsed header, re-serialize what remains with the same `JSON.stringify(_, null, 2)` call, sha256
+    // it, hex-encode, compare. `JSON.parse` preserves a plain object's own key order from the source
+    // text, so `{ checksum, ...rest }` recovers every OTHER field in the EXACT relative order the
+    // write-side recipe built them in, regardless of where in the file `checksum` itself sat — the
+    // recomputation reproduces the original `canonical` string byte for byte for any file this build
+    // (or a future one following the same recipe) honestly wrote.
+    //
+    // BOUNDED TO THIS SAME format >= 4 && format <= GATE_MIRROR_FORMAT RANGE, not unconditional —
+    // matching the array-ness and element-shape checks above for the identical reason: a genuinely
+    // FUTURE format's own canonicalization (field order, added fields, a different recipe entirely)
+    // is not something this build can know, and computing THIS build's own recipe over a file it
+    // cannot otherwise validate risks a false mismatch on a file that is perfectly legitimate —
+    // exactly the thrash the format-ahead preservation contract exists to prevent. A format-ahead
+    // file's checksum, if it even has one shaped the way this build expects, is simply never checked
+    // here; that build's own reader is the one positioned to verify it.
+    //
+    // MISMATCH → malformed (null) → regeneration, the SAME path every other structurally-wrong file
+    // in this function already takes — inspectSidecar and materializeGateMirror's own compare-before-
+    // replace both consume readSidecarHeader's return value with no notion of "checksum" at all, so
+    // neither needed a single line changed for this to reach them: a corrupted existing file simply
+    // reads as if it were not there, and gets overwritten on the next materialize like any other
+    // malformed one.
+    if (header.checksum !== undefined) {
+      if (typeof header.checksum !== "string") return null;
+      const { checksum, ...rest } = header;
+      const recomputed = createHash("sha256").update(JSON.stringify(rest, null, 2), "utf8").digest("hex");
+      if (recomputed !== checksum) return null;
+    }
+  }
   return {
     generation: header.generation,
     storeIdentity: typeof header.storeIdentity === "string" ? header.storeIdentity : null,
@@ -2978,13 +4232,13 @@ export function inspectSidecar(db: StoragePort, path: string, storeIdentity?: st
   // reject. The version number existed to make that impossible and, unchecked here, caused it.
   //
   // `null` covers a v1 file that predates the field entirely; it is not ours either.
-  if (header.format !== BLOCKING_SIDECAR_FORMAT) {
-    const ahead = header.format !== null && header.format > BLOCKING_SIDECAR_FORMAT;
+  if (header.format !== GATE_MIRROR_FORMAT) {
+    const ahead = header.format !== null && header.format > GATE_MIRROR_FORMAT;
     return {
       stale: true,
       reason: ahead ? "format-ahead" : "format",
       fileGeneration, generation,
-      fileFormat: header.format, format: BLOCKING_SIDECAR_FORMAT,
+      fileFormat: header.format, format: GATE_MIRROR_FORMAT,
     };
   }
   // Strict inequality, not `<`: a file claiming a generation AHEAD of the store is also not a
@@ -2993,49 +4247,120 @@ export function inspectSidecar(db: StoragePort, path: string, storeIdentity?: st
   return { stale: false, generation };
 }
 
-/** Every live blocking rule, in the gate's own order. Shared by the sidecar and any consumer. */
-export function listBlockingRules(db: StoragePort): BlockingSidecarEntry[] {
+/**
+ * Every live rule, both severities, in GATE-DELIVERY order — `(severity = 'blocking') DESC,
+ * created_at ASC, concept_id ASC`, the EXACT `ORDER BY` `rulesForStages` uses (copied verbatim, not
+ * re-derived, so the two cannot silently drift). That ordering choice is what lets
+ * `evaluateGateFromMirror` be a plain FILTER rather than a filter-then-sort: a total order (severity,
+ * then created_at, then the unique concept_id as tiebreak) restricted to any subset of rows is the
+ * same relative sequence you would get sorting that subset alone, so filtering this globally-ordered
+ * array down to one query's matched stages + live circle/tag scope reproduces `rulesForStages`' own
+ * per-query order with no second sort and no need to carry `created_at` into the serialized entry at
+ * all.
+ *
+ * STORE-WIDE ON PURPOSE — no circle, no model-tag scoping here, matching this function's v3
+ * ancestor (`listBlockingRules`): those two axes are the READER's job (GateMirrorEntry's own
+ * comment), because a mirror scoped to one circle or one tag at materialize time could not answer
+ * for any other, and a store-wide file already does.
+ */
+export function listGateMirrorEntries(db: StoragePort): GateMirrorEntry[] {
   const rows = db
     .prepare(
-      `SELECT b.concept_id, b.reason, b.declared_by, b.scope, b.model_tag, c.title, c.circle,
-              s.id AS stage_id, s.name AS stage_name, s.trigger_patterns
+      // b.circle, NOT c.circle: the mirror carries the BINDING's own locality — including the
+      // breadth marker verbatim, when a rule is global — exactly what RULE_LIVENESS_WHERE checks
+      // live. Selecting the concept's circle here would silently un-widen breadth in the one place
+      // that most needs to carry it: an offline reader with no other source for "this rule is global".
+      `SELECT b.concept_id, b.stage_id, b.severity, b.scope, b.model_tag, b.origin, b.reason,
+              c.title, b.circle
          FROM rule_bindings b
          JOIN concepts c ON c.id = b.concept_id
+         -- INNER JOIN stages, no columns selected from it: a binding whose stage does not exist yet
+         -- is ORPHANED — the dangling-then-live gap (an incremental graft can land a binding before
+         -- its stage row) — and graftRows documents that such a binding NEVER FIRES. v3's
+         -- listBlockingRules enforced exactly this via its own (then column-selecting) JOIN to
+         -- stages; dropping the columns must not silently drop the existence check along with them,
+         -- or an unfireable binding would appear in the mirror as a deliverable rule.
          JOIN stages s ON s.id = b.stage_id
-        WHERE b.severity = 'blocking'
-          AND c.status = 'active'
+        WHERE c.status = 'active'
           AND c.kind = 'rule'
+          -- b.circle IS NOT NULL (review fix — minor m1): a dangling binding whose concept has not
+          -- landed yet — see GateMirrorEntry.circle's own comment for why this is a floor under a
+          -- transient window (BLOCKER B3), not a routine filter, and for why the type stays a plain
+          -- string rather than admitting null.
+          AND b.circle IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM lifecycle_edges e
              WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
           )
-        ORDER BY s.name ASC, b.created_at ASC, b.concept_id ASC`,
+        ORDER BY (b.severity = 'blocking') DESC, b.created_at ASC, b.concept_id ASC`,
     )
     .all() as Array<{
-      concept_id: string; reason: string | null; declared_by: string | null; title: string; circle: string;
-      scope: RuleScope; model_tag: string | null;
-      stage_id: string; stage_name: string; trigger_patterns: string;
+      concept_id: string; stage_id: string; severity: RuleSeverity; scope: RuleScope;
+      model_tag: string | null; origin: RuleBindingOrigin; reason: string | null;
+      title: string; circle: string;
     }>;
-  return rows.map((row) => {
-    const patterns = parseTriggerPatterns(row.trigger_patterns);
-    return {
-      stageId: row.stage_id,
-      stageName: row.stage_name,
-      patterns,
-      patternText: patterns.map(formatTriggerPattern),
-      conceptId: row.concept_id,
-      ruleText: row.title,
-      // Same normalization as the live gate — and here it is also what keeps the file readable: a
-      // Buffer would serialize into the mirror as {"type":"Buffer","data":[...]}, which the hook
-      // would then have to parse around.
-      reason: typeof row.reason === "string" ? row.reason : null,
-      reasonMissing: hasNoReason(row.reason),
-      declaredBy: row.declared_by,
-      circle: row.circle,
-      scope: row.scope,
-      modelTag: row.model_tag,
-    };
-  });
+  return rows.map((row) => ({
+    conceptId: row.concept_id,
+    stageId: row.stage_id,
+    severity: row.severity,
+    scope: row.scope,
+    modelTag: row.model_tag,
+    // Same normalization as the live gate — and here it is also what keeps the file readable: a
+    // Buffer would serialize into the mirror as {"type":"Buffer","data":[...]}, which a reader
+    // would then have to parse around.
+    reason: typeof row.reason === "string" ? row.reason : null,
+    text: row.title,
+    origin: row.origin,
+    circle: row.circle,
+  }));
+}
+
+/**
+ * Every stage in the registry — deliberately ALL of them, not only stages with a live rule bound.
+ * Mirrors `listMatchableStages`' own reasoning exactly (every gate lookup reads every stage; "no
+ * index can help, so keep the row cheap"): a rule-less stage still MATCHES and still answers
+ * stage-hit-no-rules rather than silence, and that signal cannot exist offline unless the mirror
+ * knows the rule-less stage exists at all.
+ */
+export function listGateMirrorStages(db: StoragePort): GateMirrorStage[] {
+  const rows = db
+    .prepare(`SELECT id, name, trigger_patterns FROM stages ORDER BY created_at ASC, id ASC`)
+    .all() as Array<{ id: string; name: string; trigger_patterns: string }>;
+  return rows.map((row) => ({ id: row.id, name: row.name, triggerPatterns: row.trigger_patterns }));
+}
+
+/**
+ * `circleAliases` + `circles` for the mirror — see GateMirror's own comments for what each promises
+ * and why `circles` stops at "what the materializer already walked" rather than a general registry.
+ * Takes the already-materialized `entries` rather than re-querying: their `circle` field is the
+ * first half of "known circles", and threading the array through costs nothing a second SELECT
+ * would not (both are already resident, mid-transaction, in `materializeGateMirror`).
+ */
+function gateMirrorCircles(
+  db: StoragePort,
+  entries: readonly GateMirrorEntry[],
+): { circleAliases: GateMirrorCircleAlias[]; circles: string[] } {
+  const aliasRows = db
+    .prepare(`SELECT from_name, to_name, status FROM circle_aliases`)
+    .all() as Array<{ from_name: string; to_name: string; status: string }>;
+  const circleAliases = aliasRows
+    .filter((row) => row.status === "active")
+    .map((row) => ({ from: row.from_name, to: row.to_name }));
+  const circles = new Set<string>();
+  // BREADTH_CIRCLE EXCLUDED, deliberately: `entries[].circle` can now be "*", and "*" is not a
+  // circle a `--circle` resolver could ever be asked to resolve TO — it is a breadth marker on a
+  // rule, not a selectable project. Including it here would offer it up as though it were an
+  // ordinary (if odd-looking) circle name, the same confusion BREADTH_CIRCLE's own comment forbids
+  // at every circle-minting surface.
+  for (const entry of entries) if (entry.circle !== BREADTH_CIRCLE) circles.add(entry.circle);
+  // BOTH statuses, unlike circleAliases above: an ARCHIVED circle is still a circle this store has
+  // an opinion about (it is "known", just hidden) — only the RESOLUTION map (circleAliases) is
+  // active-only, because that is exactly what `resolveCircle` itself follows.
+  for (const row of aliasRows) {
+    circles.add(row.from_name);
+    circles.add(row.to_name);
+  }
+  return { circleAliases, circles: [...circles].sort() };
 }
 
 /**
@@ -3060,47 +4385,198 @@ export interface SidecarMaterialization {
    * The mirror this call GENERATED. On disk only when `outcome` is "written" — on a skip it is what
    * WOULD have been written, which is exactly the distinction the bare-sidecar return erased.
    */
-  sidecar: BlockingSidecar;
+  sidecar: GateMirror;
 }
 
 /**
- * Regenerate the blocking mirror at `path`, atomically.
+ * Regenerate the gate mirror at `path`, atomically.
  *
- * ATOMIC because the reader is a hook on the critical path of somebody's action: a torn file must
- * never be observable, and "the sidecar was half-written" must never be a way to lose a deny.
+ * ATOMIC because the reader is a CLI on the critical path of somebody's action: a torn file must
+ * never be observable, and "the mirror was half-written" must never be a way to lose a deny.
  * tmp-in-the-same-directory + rename, which is atomic within a filesystem.
  *
- * The write happens even when there are no blocking rules — an EMPTY entries array is the correct
- * mirror of a store with nothing blocking, and is meaningfully different from a missing file (which
- * a hook must treat as "no mirror, fail open loudly").
+ * The write happens even when there are no live rules at all — an EMPTY entries array is the
+ * correct mirror of a store with nothing governing, and is meaningfully different from a missing
+ * file (which a reader must treat as "no mirror, fail open loudly").
  *
- * RETURNS THE OUTCOME, NOT JUST THE ARTIFACT. This used to hand back the freshly generated sidecar
+ * RETURNS THE OUTCOME, NOT JUST THE ARTIFACT. This used to hand back the freshly generated mirror
  * whatever happened, so a declined write looked identical to a successful one: install and recovery
  * tooling reported "mirror regenerated" while the file on disk stayed `format-ahead` and unusable by
- * the hook. A function that says it wrote when it did not is the failure this module spends its
+ * a reader. A function that says it wrote when it did not is the failure this module spends its
  * length preventing everywhere else, committed by the writer itself.
  */
-export function materializeBlockingSidecar(
+export function materializeGateMirror(
   db: StoragePort,
   path: string,
   opts: { storeIdentity?: string; now?: number } = {},
 ): SidecarMaterialization {
   // ONE TRANSACTION over the generation and the entries. Read separately, a bump committing between
-  // them yields a file that stamps the NEW generation onto the OLD deny set — a mirror that claims
+  // them yields a file that stamps the NEW generation onto the OLD rule set — a mirror that claims
   // to be current while missing the very change that made it stale, which is worse than an honestly
   // stale one because `inspectSidecar` would agree with it.
-  const sidecar: BlockingSidecar = db.transaction((): BlockingSidecar => ({
-    format: BLOCKING_SIDECAR_FORMAT,
-    generatedAt: opts.now ?? Date.now(),
-    generation: gateGeneration(db),
-    ...(opts.storeIdentity ? { storeIdentity: opts.storeIdentity } : {}),
-    entries: listBlockingRules(db),
-  }))();
+  const sidecarWithoutChecksum: Omit<GateMirror, "checksum"> = db.transaction((): Omit<GateMirror, "checksum"> => {
+    const entries = listGateMirrorEntries(db);
+    const { circleAliases, circles } = gateMirrorCircles(db, entries);
+    return {
+      format: GATE_MIRROR_FORMAT,
+      generatedAt: opts.now ?? Date.now(),
+      generation: gateGeneration(db),
+      ...(opts.storeIdentity ? { storeIdentity: opts.storeIdentity } : {}),
+      entries,
+      stages: listGateMirrorStages(db),
+      circleAliases,
+      circles,
+    };
+  })();
+  // THE CHECKSUM RECIPE (Codex round 12, item 1 — John's own ratification, 2026-07-28; documented
+  // here in full so a reader can recompute it independently, matching this codebase's own convention
+  // of writing the exact SQL/algorithm inline rather than pointing at it from a distance):
+  //
+  //   1. Build the mirror object WITH EVERY FIELD EXCEPT `checksum` — exactly the object above.
+  //   2. canonical = JSON.stringify(thatObject, null, 2) — the SAME stringify call (same replacer,
+  //      same 2-space indent) this function already uses for the file it writes below, so there is
+  //      only ONE serialization convention in this function, not two.
+  //   3. checksum = sha256(canonical), hex-encoded.
+  //   4. The FINAL written object is { ...thatObject, checksum } — checksum spread in LAST.
+  //
+  // WHY THIS IS RECOMPUTABLE FROM A PARSED FILE, not merely from the in-memory object above:
+  // `JSON.parse` reconstructs a plain object's OWN string-keyed properties in the exact order they
+  // appeared in the source text (V8's own guarantee, not an assumption) — so a reader who destructures
+  // `{ checksum, ...rest }` off the parsed header recovers `rest` with every OTHER key in the IDENTICAL
+  // relative order this recipe built them in, regardless of where `checksum` itself sat in the file.
+  // `JSON.stringify(rest, null, 2)` therefore reproduces the exact `canonical` string from step 2,
+  // byte for byte, for any file this recipe honestly wrote — and reliably fails to for one that was
+  // not (see readSidecarHeader's own verification, below in this file).
+  const canonical = JSON.stringify(sidecarWithoutChecksum, null, 2);
+  const checksum = createHash("sha256").update(canonical, "utf8").digest("hex");
+  const sidecar: GateMirror = { ...sidecarWithoutChecksum, checksum };
   const dir = dirname(path);
-  mkdirSync(dir, { recursive: true });
-  const tmp = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
+  // SIDECAR AT 0600 (gate-boundary-statement.md, "Binding consequences for 4b", item 1) — reusing
+  // the source-materializer's own precedent MECHANISM: mode supplied at CREATION time, never a
+  // chmod-after-the-fact (see e.g. source-materializer.ts's `writeFileSync(target, bytes, { mode:
+  // ... })` and `openSync(..., O_CREAT | O_EXCL | O_WRONLY, 0o600)` call sites — none of them write
+  // at a default mode and tighten second; the window between "written" and "tightened" is exactly
+  // what that would leave briefly exposed). See the file write below for that half.
+  //
+  // WHAT THIS DEFENDS AGAINST, PRECISELY — the boundary doc's own words, verbatim: "other local
+  // accounts and backup tooling, NOT against the agent (same uid)". The mirror now carries every
+  // live rule and its reason, in full, on disk (slice 4b-B's widened blast radius, which the
+  // boundary doc calls out by name). This is a permission-BITS fix, not a trust-boundary one:
+  // unlike source-materializer's managed source roots — which ingest untrusted external repo
+  // content, and so also check uid + symlink + nlink before trusting a path at all, via
+  // `assertManagedDirectoryTrust` in source-safe-remove.ts — this directory holds nothing but our
+  // own derived output. Reusing that heavier machinery here would defend against a threat this
+  // file does not have; matching its PERMISSION-BITS mechanism is the right amount of precedent to
+  // borrow, not its entire trust check.
+  //
+  // THREE POSTURES FOR THE DIRECTORY, CONSIDERED IN ORDER (Codex round 8, item 1, P1 — correcting
+  // round 7's own choice here, on review):
+  //
+  //   1. REFUSE a pre-existing mismatch (`assertManagedDirectoryTrust`'s own posture — throws
+  //      "unsafe permissions" rather than correcting it). Right for source-materializer's own
+  //      managed roots, which this codebase always creates at 0700 from birth — a later mismatch
+  //      there signals tampering worth refusing outright. Wrong here: `dir` routinely PRE-DATES
+  //      this permission fix (an ordinary `.monet` directory created before it shipped, sitting at
+  //      whatever the process's umask left it), so refusing on mismatch would turn every upgrade of
+  //      an existing install into a hard failure of gate refresh on its very next mutation, for a
+  //      directory that was never wrong by this store's own doing.
+  //   2. TIGHTEN a pre-existing mismatch to 0700 (round 7's own choice here) — an OVERREACH,
+  //      corrected this round: `path` (and so `dir`) is caller-supplied
+  //      (`MonetCoreOptions.gateSidecarPath`), not a root this module mints itself the way
+  //      source-materializer's are. `dirname(path)` can be `$HOME`, a project directory, or any
+  //      other shared location the CALLER populated with content that has nothing to do with
+  //      Monet — seizing it to 0700 on this module's own say-so would silently break whatever else
+  //      already lives there (another account or process that needed to list or create alongside
+  //      it, sharing that same directory legitimately). Round 7's own error was treating "the
+  //      directory might be loose" as a defect to correct, when for a caller-supplied path it is
+  //      simply not this module's directory to tighten.
+  //   3. LEAVE a pre-existing directory exactly as it is — neither refused nor tightened — and set
+  //      `mode: 0o700` only on the directory THIS CALL actually creates (mkdir's own `mode` option
+  //      already applies only to a directory it creates — verified empirically in round 7, not
+  //      assumed — so this costs nothing beyond what round 7 already had for the fresh case). This
+  //      is the one used.
+  //
+  // WHY "LEAVE" DOES NOT REOPEN THE CONFIDENTIALITY GAP THIS FIX EXISTS TO CLOSE: directory
+  // permission bits govern LISTING (can another account enumerate what is in here) and CREATION
+  // (can another account add a new entry) — not READING an existing file whose own mode already
+  // restricts that. The mirror's actual confidentiality boundary is the FILE's own 0600, not the
+  // directory around it: mode-at-creation for a fresh path, inherited via rename for one that
+  // already existed (see below) — unconditional either way, regardless of `dir`'s own permissions.
+  // A looser `dir` lets another local account see THAT a file named `gate-sidecar.json` exists (and
+  // its size, mtime) but not read a byte of what it says — the rules and reasons themselves stay
+  // behind the file's own 0600.
+  //
+  // CORRECTION (Codex round 9, item 1) — this comment previously also claimed the one thing an 0700
+  // `dir` would additionally have bought, preplant resistance at the tmp path, was "already covered"
+  // by mode-at-birth alone. That was wrong, and round 7 + round 8 compose to show exactly why: round
+  // 7 considered `O_EXCL` for the tmp write and rejected it, reasoning the 0700 directory already
+  // closed the preplant window on its own (nothing else could create anything in a directory only we
+  // could write into) — a correct argument, AT THE TIME. Round 8 then removed that same directory
+  // tightening, correctly, on its own separate terms (a caller-supplied, possibly-shared `dir` is not
+  // this module's to seize). Neither round was wrong given what it alone changed; the composition of
+  // both left the tmp write with NEITHER protection: no directory exclusivity (round 8) AND no write
+  // exclusivity of its own (round 7's own rejected-but-never-added `O_EXCL`). What actually closes
+  // the preplant window now is EXCLUSIVITY AND UNPREDICTABILITY on the write itself, added below —
+  // not the directory's mode, which this comment no longer claims any confidentiality role for beyond
+  // LISTING and CREATION, stated plainly above.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // UNPREDICTABLE FROM BIRTH (Codex round 9, item 1) — a `randomUUID()` suffix APPENDED to the
+  // existing pid+timestamp shape, not a replacement for it: the prefix stays useful to a human
+  // debugging a stray tmp file ("which process, roughly when"), the suffix is what makes the FULL
+  // name unguessable in advance (~122 bits of entropy — computationally infeasible to pre-plant
+  // against, unlike the bare pid+millisecond-timestamp name this replaces, which a local attacker
+  // can observe or narrowly range). See the mkdir comment above for why unpredictability ALONE is
+  // not enough either — paired with `wx` below, not a substitute for it.
+  const tmp = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
   try {
-    writeFileSync(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, "utf8");
+    // EXCLUSIVE CREATION (Codex round 9, item 1) — reusing source-materializer's own precedent
+    // MECHANISM exactly: `writeFileSync(path, data, { flag: "wx", mode: 0o600 })`, the identical
+    // shape its own `writeOwner` helper uses for a fresh JSON payload written to a token-suffixed
+    // temp path ahead of an atomic rename (source-materializer.ts) — the closest analog to this
+    // function's own write-then-rename shape, of the several `O_CREAT | O_EXCL` call sites that
+    // file has.
+    //
+    // 'wx' = O_CREAT | O_EXCL | O_WRONLY, Node's flag-string shorthand for the identical numeric
+    // flags. FAILS on ANY existing path at `tmp`, including a symlink, WITHOUT following it — POSIX
+    // is explicit on exactly this point ("If O_CREAT and O_EXCL are set, and path names a symbolic
+    // link, open() shall fail and set errno to [EEXIST], regardless of the contents of the symbolic
+    // link"), so this is the LIGHTER of source-materializer's own two `O_CREAT | O_EXCL` shapes
+    // (plain, not the separate O_NOFOLLOW-carrying one a couple of its call sites also use) —
+    // deliberately: O_EXCL alone already provides no-follow-at-the-leaf here, so an explicit
+    // O_NOFOLLOW on top would be redundant, not additionally protective, for this specific write.
+    //
+    // MODE IS NOW ALWAYS HONORED, not merely "in practice" the way round 8's superseded comment put
+    // it: `wx` GUARANTEES this call either creates the inode fresh (mode 0600 live from the first
+    // byte) or writes nothing at all — there is no third outcome where it silently opens something
+    // that already existed.
+    writeFileSync(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (error) {
+    // `tmp` IS NOT OURS TO CLEAN UP HERE, for ANY failure creating it — `wx` failing means this call
+    // did not create the inode, so nothing below (including a pre-existing planted file or symlink)
+    // is ours to unlink. The generic cleanup a few lines down is only correct once creation has
+    // actually succeeded; reusing it here would delete whatever an attacker planted (destroying the
+    // evidence) or, for a planted symlink, remove the link itself — not a write into either, but
+    // still not this function's call to make on a path it never owned.
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      // ONE ATTEMPT, NOT A RETRY LOOP — deliberately (considered and rejected: a single retry with a
+      // second fresh random suffix, then throw). `tmp`'s name is already unpredictable (the
+      // `randomUUID()` suffix above), so a genuine collision here is not "unlucky" in the way a
+      // predictable-name collision would be — it is a signal, not routine contention: either
+      // something is enumerating this directory's contents against an infeasibly large guess space,
+      // or this process's own random source is broken. A second random name carries the identical
+      // risk calculus as the first with no new information gained from the retry, so this throws
+      // immediately, loudly, and by name — never silently falling through to a write that might
+      // land through whatever is already there.
+      throw new Error(
+        `gate mirror temp file already exists at a freshly-randomized path on the very first attempt ` +
+          `to create it exclusively (${tmp}): refused rather than written through. This should never ` +
+          `happen by chance — investigate ${dir} for a hostile actor, or this process's random source, ` +
+          `before retrying.`,
+      );
+    }
+    throw error;
+  }
+  try {
     // COMPARE BEFORE REPLACE. rename() is atomic, so no reader ever sees a torn file — but atomic
     // is not the same as ordered: two writers racing can land an OLDER snapshot on top of a newer
     // one, and the loser's generation then sits in the header claiming to be current. That is worse
@@ -3194,15 +4670,154 @@ export function materializeBlockingSidecar(
         : "skipped-superseded";
       return { outcome, sidecar };
     }
+    // TARGET INHERITS 0600 VIA RENAME — verified empirically, needing no separate action here: a
+    // rename onto an existing path replaces its inode outright, permission bits included, so `path`
+    // ends up at `tmp`'s mode (0600) regardless of what it was before — even a mirror written by a
+    // build that predates this fix, sitting at a wider default mode, is tightened the next time it
+    // is regenerated, with no extra chmod call needed on `path` itself.
     renameSync(tmp, path);
   } catch (error) {
+    // `tmp` IS OURS TO CLEAN UP HERE (Codex round 9, item 1 — narrowed from "gone or never created"):
+    // reaching this catch means the exclusive creation above already succeeded, so this path never
+    // races the "was it ever created at all" question the old comment hedged against — only whether
+    // it is STILL there (e.g. the skip branch above already removed it before an exception could
+    // occur here, or something unrelated did).
     try {
       unlinkSync(tmp);
     } catch {
-      // The temp file is already gone, or was never created. Either way the original error is the
-      // one worth reporting.
+      // Already gone. The original error is still the one worth reporting.
     }
     throw error;
   }
   return { outcome: "written", sidecar };
+}
+
+// ---- the offline evaluator ---------------------------------------------------
+
+/**
+ * THE OFFLINE EVALUATOR (4b-C's engine half) — answers the SAME five-outcome shape `gateInternal`
+ * does (silence / stage-hit-no-rules / advisory / blocking / overflow), from a materialized
+ * `GateMirror` alone. No db, no writes, no instrumentation: whether/how an offline call gets
+ * recorded is the CLI's own decision (4b-D), not this one — this function is a pure read over data
+ * the caller already holds in memory.
+ *
+ * REUSES THE LIVE MATCHER'S OWN FUNCTIONS, never a reimplementation: `clampActionContext`,
+ * `parseActionContext`, `parseTriggerPatterns` and `matchesTriggerPattern` below are the EXACT
+ * functions `gateInternal` calls — same module, same code, not a lookalike copy. The one-predicate
+ * discipline this whole file is built on means the offline answer IS the live answer, not a
+ * hand-tuned approximation of it.
+ *
+ * ORDERING NEEDS NO SORT HERE: `mirror.entries` already arrives in gate-delivery order
+ * (`listGateMirrorEntries`'s own `ORDER BY`) and `Array.prototype.filter` preserves relative order,
+ * so filtering down to one query's matched stages plus live circle/tag scope reproduces exactly the
+ * order `rulesForStages`' SQL would produce for that same subset — a total order via
+ * (severity, created_at, concept_id) restricted to any subset is that subset's own order (see
+ * `listGateMirrorEntries`'s own comment for the full argument).
+ *
+ * ONE DOCUMENTED REPRESENTATION GAP (owed to 4b-C's parity test, not swept under it): a delivered
+ * `GateRule.projectedFromPrincipleId` — the parent principle, when a rule was born of one — cannot
+ * be reproduced offline. `GateMirrorEntry` carries no parent-principle id (deliverable 1's field
+ * list has none, and nothing in this codebase writes a `family: 'derivation'` lifecycle edge for a
+ * rule yet — principles are a later slice), so this evaluator never sets the field, where the live
+ * path would if such an edge existed. The two are indistinguishable TODAY, because nothing produces
+ * the edge either way — but it is a real gap the day projection ships, named here so it has an owner
+ * rather than surfacing as a silent parity-test pass that stops meaning what it says.
+ */
+export function evaluateGateFromMirror(
+  mirror: GateMirror,
+  opts: { actionContext: string; circle: string; runtimeModelTag?: string; now?: number },
+): GateResult {
+  assertQueryableCircle(opts.circle);
+  const clamped = clampActionContext(opts.actionContext);
+  // Same short-circuit as gateInternal: overflow is a THIRD verdict, never silence, and nothing is
+  // matched against a context this long — see clampActionContext's own comment.
+  if (clamped.overflow) {
+    return { stage: null, stages: [], rules: [], silence: false, overflow: true, source: "sidecar" };
+  }
+  const context = parseActionContext(clamped.text);
+
+  // RESOLVE THE QUERY CIRCLE THROUGH THE ALIAS MAP FIRST (review fix — MATERIAL M3), matching
+  // `resolveCircle`'s (engine.ts) own semantics exactly: single-hop, active-only, name unchanged if
+  // absent. `mirror.circleAliases` already carries only active rows (see gateMirrorCircles), so no
+  // status check is needed here — presence in the array already means active. `entries[].circle` is
+  // always written at the CANONICAL name (bindRule/graftRows write whatever circle the store's own
+  // resolveCircle already settled on, never an alias's `from` side), while the live path
+  // (MonetCore.gate/stageLookup) resolves its query circle before ever reaching gateInternal's
+  // filter. Filtering `mirror.entries` against the UNRESOLVED `opts.circle` therefore silently
+  // stopped matching every entry the moment its circle was renamed away — live kept answering
+  // through the alias, offline went quiet. One hop only, never chased further — and the invariant
+  // is PARITY WITH THE LIVE RESOLVER, not totality: the local writers (renameCircle, mergeCircle)
+  // flatten chains at write time, but grafted aliases can genuinely chain across devices (A→B from
+  // one peer, B→C from another), and resolveCircle stops at one hop there too. Both sides stopping
+  // at the same place is what keeps offline ≡ live; "improving" this to multi-hop without changing
+  // resolveCircle in the same act would silently break the parity this comment exists to guard.
+  const alias = mirror.circleAliases.find((row) => row.from === opts.circle);
+  const resolvedCircle = alias ? alias.to : opts.circle;
+
+  const matched: GateMirrorStage[] = [];
+  for (const stage of mirror.stages) {
+    const patterns = parseTriggerPatterns(stage.triggerPatterns);
+    if (patterns.some((pattern) => matchesTriggerPattern(pattern, context))) matched.push(stage);
+  }
+
+  const matchedStageIds = new Set(matched.map((stage) => stage.id));
+  const rules: GateRule[] = mirror.entries
+    .filter((entry) =>
+      matchedStageIds.has(entry.stageId)
+      // UNIONED WITH BREADTH, identically to RULE_LIVENESS_WHERE's own
+      // `(b.circle = ? OR b.circle = '*')` — a global rule delivers in every circle, no shadowing,
+      // no precedence: it simply passes this filter alongside whatever is local here too.
+      && (entry.circle === resolvedCircle || entry.circle === BREADTH_CIRCLE)
+      && ruleTagIsLive(entry.scope, entry.modelTag, opts.runtimeModelTag),
+    )
+    .map(toGateRuleFromMirrorEntry);
+
+  const stages: GateStageRef[] = matched.map((stage) => ({ id: stage.id, name: stage.name }));
+  // SAME FALLBACK gateInternal USES: the rule that answered when there is one (rules[] is already
+  // in the right order), else the oldest matched stage — the projection-hook case with no severity
+  // to rank by. `mirror.stages` carries no `created_at`, so "oldest" here means "first in the
+  // registry-order array `listGateMirrorStages` already produced" — the same order gateInternal's
+  // own `listMatchableStages` uses (`created_at ASC, id ASC`), so this agrees with it exactly.
+  const primaryStageId = rules[0]?.stageId ?? stages[0]?.id ?? null;
+
+  return {
+    stage: stages.find((stage) => stage.id === primaryStageId) ?? null,
+    stages,
+    rules,
+    silence: matched.length === 0,
+    overflow: false,
+    source: "sidecar",
+  };
+}
+
+/**
+ * THE model-tag liveness clause, JS-side — bound BY THIS COMMENT to `RULE_LIVENESS_WHERE`'s own tag
+ * clause (`b.scope != 'agent' OR ? IS NULL OR b.model_tag = ?`, defined far above in this file):
+ * a domain rule always lives; an agent rule lives when the caller passed no runtime tag at all (the
+ * filter is OFF, not "reject everything"), or when its tag matches exactly. A raw SQL fragment and
+ * a JS predicate cannot literally share one function body, so the binding is this comment rather
+ * than an import — a change to one that is not mirrored in the other is a reviewer's job to catch.
+ */
+function ruleTagIsLive(scope: RuleScope, modelTag: string | null, runtimeModelTag: string | undefined): boolean {
+  return scope !== "agent" || runtimeModelTag === undefined || modelTag === runtimeModelTag;
+}
+
+/**
+ * `evaluateGateFromMirror`'s own `toGateRule` — same shape, same `reasonMissing` predicate
+ * (`severity === "blocking" && hasNoReason(reason)`) computed HERE rather than trusted from disk,
+ * for the exact reason `GateMirrorEntry` carries no such field (see its own comment). NO
+ * `projectedFromPrincipleId` — see `evaluateGateFromMirror`'s own comment for the documented gap.
+ */
+function toGateRuleFromMirrorEntry(entry: GateMirrorEntry): GateRule {
+  return {
+    conceptId: entry.conceptId,
+    text: entry.text,
+    reason: entry.reason,
+    reasonMissing: entry.severity === "blocking" && hasNoReason(entry.reason),
+    severity: entry.severity,
+    scope: entry.scope,
+    modelTag: entry.modelTag,
+    origin: entry.origin,
+    stageId: entry.stageId,
+  };
 }
