@@ -3319,8 +3319,24 @@ export interface LiveStageIndexResult {
  * already-open transaction (e.g. `evaluateStageLookup`'s own read transaction, from round 4's
  * `stageLookup` fix, or `MonetCore.stageLookup()`'s), so this is safe to call unconditionally —
  * standalone or nested, never a double-BEGIN.
+ *
+ * `assertQueryableCircle` GUARDED HERE TOO (post-merge review round, P2 — the SAME "guard once,
+ * every caller inherits it" principle the paragraph above already states for the transaction fix,
+ * applied to a DIFFERENT bug this function shares with `gateStats`). `liveStageNamesCapped`/
+ * `countLiveStages` (below) both embed `RULE_LIVENESS_WHERE` directly — the identical collapsed-OR
+ * predicate (`assertQueryableCircle`'s own doc comment) that degenerates to "global rules only" the
+ * instant `circle` itself is `'*'`. `evaluateStageLookup`'s own call into this function was already
+ * safe (guarded at ITS OWN entrance) — but `MonetCore.prewarm()`/`overview()` reach this function via
+ * `prewarmFromSourceProjections`, and NEITHER of those resolves circle through anything stronger than
+ * `resolveCircle` (which, by design — see `assertQueryableCircle`'s own comment — passes an explicit
+ * `'*'` straight through unchanged). An unguarded `prewarm('*')` therefore silently returned a stage
+ * index missing every stage whose only live rule was purely LOCAL — the exact "curation silently
+ * omits" failure class `gateStats`' own fix (this same round) closes one surface over. Guarded here,
+ * not at `prewarm()`/`overview()`'s own entrances, for the identical reason the transaction wrap
+ * above is here and not duplicated at every caller.
  */
 export function liveStageIndex(db: StoragePort, circle: string): LiveStageIndexResult {
+  assertQueryableCircle(circle);
   return db.transaction((): LiveStageIndexResult => {
     const capped = liveStageNamesCapped(db, circle, STAGE_INDEX_CAP + 1);
     if (capped.length <= STAGE_INDEX_CAP) return { names: capped };
@@ -3582,6 +3598,17 @@ export interface GateStatsOptions {
 }
 
 export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
+  // ROUND-6'S OWN MISSED ENTRANCE (post-merge review round, P2). `retirementCandidates` and
+  // `unexplainedDenies` (below) both embed `(b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')` —
+  // RULE_LIVENESS_WHERE's own collapsed-OR shape, restated inline at each — which degenerates to
+  // "global rules only" the instant `opts.circle` itself is `'*'`, per `assertQueryableCircle`'s own
+  // doc comment. Round 6 swept `gateInternal`/`evaluateStageLookup`/`evaluateGateFromMirror`, every
+  // caller of `RULE_LIVENESS_WHERE` at the time — but `gateStats` was written with its own two
+  // hand-rolled copies of the same predicate rather than the shared constant, so it never appeared
+  // in that sweep's own search surface. An unguarded `gateStats('*')` silently reported ZERO local
+  // retirement candidates and ZERO local unexplained denies for circle '*' — not an empty result
+  // (nothing wrong), a WRONG one (curation blind to exactly the rules a human most needs to see).
+  assertQueryableCircle(opts.circle);
   const now = opts.now ?? Date.now();
   const since = now - opts.windowDays * 24 * 60 * 60 * 1000;
   // MECHANICAL ONLY (see GateStats' own doc comment for why): a recognized lookup's `matched` is

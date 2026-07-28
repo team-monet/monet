@@ -38,6 +38,7 @@ import {
   formatTriggerPattern,
   gateGeneration,
   gateQuery,
+  gateStats,
   GATE_MIRROR_FORMAT,
   LEGACY_STAR_CIRCLE,
   migrateGateColumns,
@@ -1498,11 +1499,31 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
     const mirror = c.materializeGateMirror(join(mkTmp(), "s.json")).sidecar;
     expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: BREADTH_CIRCLE })).toThrow(message);
 
+    // THE CURATION FAMILY (post-merge review round, item 2) — round 6's OWN sweep missed these: NOT
+    // because they are a different mechanism, but because `gateStats` restated
+    // `(b.circle = ? OR b.circle = '*')` inline (twice) instead of the shared `RULE_LIVENESS_WHERE`
+    // constant, so it never surfaced in a search for that constant's own call sites, and
+    // `liveStageIndex` is reached from `MonetCore.prewarm()`/`overview()` via a path
+    // (`prewarmFromSourceProjections`) that resolves circle through `resolveCircle` alone — which, by
+    // design, passes an explicit '*' straight through rather than refusing it (see
+    // `assertQueryableCircle`'s own comment).
+    expect(() => gateStats(db, { circle: BREADTH_CIRCLE, windowDays: 30 })).toThrow(message);
+    expect(() => c.gateStats(BREADTH_CIRCLE)).toThrow(message);
+    expect(() => liveStageIndex(db, BREADTH_CIRCLE)).toThrow(message);
+    // MonetCore.prewarm()/overview() both reach liveStageIndex (and overview() also reaches
+    // gateStats) transitively through prewarmFromSourceProjections — the exact entrance the
+    // coordinator's own "overview's gate section path" concern named, verified here directly rather
+    // than only at the shared internal function.
+    expect(() => c.prewarm(BREADTH_CIRCLE)).toThrow(message);
+    expect(() => c.overview(BREADTH_CIRCLE)).toThrow(message);
+
     // AN ORDINARY CIRCLE IS UNAFFECTED — the refusal is specific to '*', not a general regression.
     // Stages are store-global (matched regardless of circle), so the stage itself still hits — the
     // circle scoping shows up in `rules`, not `silence` (the stage-hit-no-rules case, not a miss).
     expect(c.gate({ actionContext: "Bash:npm install", circle: "an-ordinary-circle" })).toMatchObject({ silence: false, rules: [] });
     expect(() => evaluateGateFromMirror(mirror, { actionContext: "Bash:npm install", circle: "default" })).not.toThrow();
+    expect(() => c.gateStats("an-ordinary-circle")).not.toThrow();
+    expect(() => c.prewarm("an-ordinary-circle")).not.toThrow();
     c.close();
   });
 });
@@ -4147,6 +4168,68 @@ describe("DOOR 13: the breadth graft surface", () => {
     src.close();
     dst.close();
   });
+
+  /**
+   * CASE (d) OF THE POST-MERGE MATRIX (P1): 13.12 above proves an admitted narrowing lands at the
+   * concept's TRUE circle when the concept already EXISTS on the receiver. This is the sibling case
+   * the coordinator's own re-derivation named: the concept has NOT arrived AT ALL when the admitted
+   * narrowing itself lands. Before this fix, that fallback chain's last resort was `row.circle ??
+   * current?.circle` — freezing the row's own unverifiable claim (or, worse, `current?.circle`,
+   * which is PROVABLY always '*' here by `admittedNarrowing`'s own definition, silently neutralizing
+   * the very narrowing just admitted). The fix: NULL, same as case (c) — preserves the narrowing's
+   * effect (NULL is not '*') without guessing, and lets BLOCKER B3 heal it to wherever the concept
+   * actually lands once it arrives.
+   */
+  it("13.13 an admitted narrowing arrives while its own concept is STILL dangling — the binding lands NULL (never the row's claim, never a frozen '*'), and heals to wherever the concept actually lands, even when that differs from the narrowing's own claim (post-merge review round, P1, item d)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const rule = await src.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a tree unattended.", severity: "advisory", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+
+    // BINDING-FIRST GRAFT, GLOBAL: dst has never heard of this concept OR binding before — the
+    // ordinary breadth regime (not yet an admitted narrowing; this is a fresh bind), unaffected by
+    // this round's fix: lands at '*', dangling.
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows({ ...src.exportDelta(0), concepts: [] } as never);
+    expect(dst.ruleBinding(rule.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    expect(raw(dst).prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(rule.conceptId)).toBeUndefined();
+
+    // MACHINE A NARROWS ITS OWN RULE TO 'claimed-by-narrow' — a legitimate M4-admitted act — relayed
+    // to B, STILL with no concept graft (deliberately withheld).
+    const bindingRow = dst.exportDelta(0).ruleBindings!.find((b) => b.concept_id === rule.conceptId)!;
+    const narrowedRow: Record<string, unknown> = {
+      ...bindingRow, circle: "claimed-by-narrow", origin: "declaration",
+      sync_revision: (bindingRow.sync_revision ?? 0) + 5, sync_writer: "machine-a",
+    };
+    const result = dst.graftRows({ ...dst.exportDelta(0), concepts: [], ruleBindings: [narrowedRow] } as never);
+    expect(result.skipped.rule_bindings).toBe(0); // ADMITTED, not skipped — M4's own boundary check.
+
+    // NULL — THE FIX. Never 'claimed-by-narrow' (unverifiable while the concept is absent) and never
+    // '*' (current?.circle, which would silently neutralize the very narrowing just admitted).
+    const stillDangling = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
+    expect(stillDangling.circle).toBeNull();
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
+      .not.toContain(rule.conceptId);
+
+    // A CONCURRENT MOVE WINS ELSEWHERE, before the concept ever reaches B: it lands at
+    // 'actual-circle' on the source — DIFFERENT from what the narrowing row claimed.
+    src.reassignCircle(rule.conceptId, "actual-circle");
+    // THE CONCEPT FINALLY ARRIVES — concept-only, matching the established B3 technique.
+    dst.graftRows({ ...src.exportDelta(0), ruleBindings: [] } as never);
+
+    // HEALS TO 'actual-circle' — the concept's own real circle — never 'claimed-by-narrow'.
+    const healed = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
+    expect(healed.circle).toBe("actual-circle");
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "actual-circle" }).rules.map((r) => r.conceptId))
+      .toContain(rule.conceptId);
+    expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "claimed-by-narrow" }).rules.map((r) => r.conceptId))
+      .not.toContain(rule.conceptId);
+
+    src.close();
+    dst.close();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4334,6 +4417,58 @@ describe("relayed circle divergence: the concept is authoritative", () => {
     expect(dst.ruleBinding(rule.conceptId)!.circle).toBe("circle-a");
     expect(dst.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "circle-a" }).rules.map((r) => r.conceptId))
       .toEqual([rule.conceptId]);
+    src.close();
+    dst.close();
+  });
+
+  /**
+   * THE THIRD CASE OF THIS SAME INVARIANT, NEVER EXERCISED ABOVE (post-merge review round, P1): both
+   * tests above hold `dst` already carrying the concept (case (a) — conceptCircle wins). This is
+   * case (c) — NEITHER the concept NOR any incumbent binding exists on `dst` yet when the BINDING
+   * itself arrives first. Before this fix, the non-breadth regime's own fallback chain's last resort
+   * was `row.circle` — freezing the sender's own claim into a REAL (non-NULL) value the moment the
+   * binding landed, which BLOCKER B3 (below, this same function) can never revisit once it holds
+   * anything but NULL. A concurrent move elsewhere, landing the concept at a DIFFERENT circle before
+   * it ever reaches this receiver, left the binding wrong FOREVER — silently, since a frozen non-NULL
+   * value is indistinguishable from a correctly-resolved one to every later read.
+   */
+  it("a binding-first graft: the row claims one circle while dangling, but its concept later lands in a DIFFERENT circle — the binding heals to the concept's ACTUAL circle, never freezing the row's stale claim (post-merge review round, P1)", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const rule = await src.declare({
+      species: "rule", stage: "npm install", patterns: ["Bash:npm install"],
+      content: "Confirm the lockfile before installing.", severity: "advisory", scope: "domain",
+      circle: "claimed",
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    expect(src.ruleBinding(rule.conceptId)!.circle).toBe("claimed");
+
+    // BINDING-FIRST GRAFT: only the rule_bindings row crosses, its own concept stripped — the
+    // dangling-then-live gap, deliberately provoked (mirroring the existing "dangling composition"
+    // test's own concept-only technique, in reverse).
+    const dst = core({ syncDeviceId: "machine-b" });
+    dst.graftRows({ ...src.exportDelta(0), concepts: [] } as never);
+
+    // NULL, not 'claimed' — the fix itself (was `row.circle` before this round).
+    const dangling = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
+    expect(dangling.circle).toBeNull();
+    expect(dst.gate({ actionContext: "Bash:npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
+      .not.toContain(rule.conceptId);
+
+    // A CONCURRENT MOVE WINS ELSEWHERE, before the receiver ever sees the concept at all.
+    src.reassignCircle(rule.conceptId, "actual");
+    expect(src.ruleBinding(rule.conceptId)!.circle).toBe("actual"); // the binding followed, on the source
+
+    // THE CONCEPT ARRIVES — concept-only, matching the established B3 technique — reflecting its
+    // NEW circle, never the one the earlier binding-first graft claimed.
+    dst.graftRows({ ...src.exportDelta(0), ruleBindings: [] } as never);
+
+    // HEALS TO 'actual' — the concept's own real circle — never 'claimed', the row's stale guess.
+    const healed = raw(dst).prepare(`SELECT circle FROM rule_bindings WHERE concept_id = ?`).get(rule.conceptId) as { circle: string | null };
+    expect(healed.circle).toBe("actual");
+    expect(dst.gate({ actionContext: "Bash:npm install", circle: "actual" }).rules.map((r) => r.conceptId))
+      .toContain(rule.conceptId);
+    expect(dst.gate({ actionContext: "Bash:npm install", circle: "claimed" }).rules.map((r) => r.conceptId))
+      .not.toContain(rule.conceptId);
     src.close();
     dst.close();
   });
@@ -6276,6 +6411,83 @@ describe("createGateSchema — concurrent-migrator race", () => {
     // not paper over a real schema problem.
     const cols = loser.prepare(`PRAGMA table_info(gate_events)`).all() as Array<{ name: string }>;
     expect(cols.filter((c) => c.name === "matcher")).toHaveLength(1);
+    loser.close();
+  });
+});
+
+/**
+ * SAME TECHNIQUE, A DIFFERENT TABLE (post-merge review round, P2): `StaleMatcherProbeStorage` above
+ * simulates the race for gate_events' own `matcher` column; this is its twin for
+ * `ingest_operations`' four receipt columns (`rule_previous_severity`, `rule_previous_circle`,
+ * `rule_circle`, `rule_severity`) — engine.ts's own `migrate()`, not gates.ts's `migrateGateColumns`,
+ * but the identical race shape: a second migrator's PRAGMA probe, taken before a first migrator's
+ * ALTER committed, reports a column absent regardless of what the REAL table underneath already has.
+ * `migrate()` is PRIVATE, reachable only through `MonetCore`'s own constructor — unlike
+ * `createGateSchema` above, there is no lighter-weight standalone entry point to call directly, so
+ * this constructs a full `MonetCore` against the probe port.
+ *
+ * FILTERS OUT ONLY THE FOUR TARGET COLUMNS, not the whole result — unlike `StaleMatcherProbeStorage`
+ * above (which can safely blank the ENTIRE result, since `matcher` is the only column that guard
+ * ever checks). `ingest_operations` carries OTHER guarded-but-uncaught ALTERs sharing this exact
+ * PRAGMA read (`writer_domain`, `source_concept_id` — a separate, out-of-scope observation; see the
+ * round's own report) — blanking the whole result made THOSE columns look stale too, so migrate()
+ * threw on `writer_domain` before ever reaching the four columns this test targets. Filtering the
+ * REAL result down to "everything except these four" keeps the race scoped to exactly what this
+ * round fixed.
+ */
+class StaleIngestOperationsColumnProbeStorage extends BetterSqlitePort {
+  private probeConsumed = false;
+  private static readonly TARGET_COLUMNS = new Set([
+    "rule_previous_severity", "rule_previous_circle", "rule_circle", "rule_severity",
+    // The two older siblings in the same guarded-ALTER cluster gained the identical catch (the
+    // worker's own flagged adjacency) — the probe hides them too, so the race is exercised across
+    // the WHOLE cluster rather than the four columns the finding happened to name.
+    "writer_domain", "source_concept_id",
+  ]);
+
+  override prepare(sql: string): Statement {
+    const statement = super.prepare(sql);
+    if (this.probeConsumed || !/^\s*PRAGMA table_info\(ingest_operations\)/.test(sql)) return statement;
+    this.probeConsumed = true;
+    return {
+      run: (...params: unknown[]) => statement.run(...params),
+      get: (...params: unknown[]) => statement.get(...params),
+      all: () =>
+        (statement.all() as Array<{ name: string }>).filter(
+          (c) => !StaleIngestOperationsColumnProbeStorage.TARGET_COLUMNS.has(c.name),
+        ),
+    };
+  }
+}
+
+describe("MonetCore construction — ingest_operations receipt-column concurrent-migrator race", () => {
+  it("a stale second-migrator probe hits REAL duplicate-column errors on all four receipt columns, caught as success — construction does not abort (post-merge review round, P2)", () => {
+    const dir = mkTmp();
+    const path = join(dir, "monet.db");
+
+    // FIRST MIGRATOR: an ordinary construction against a brand-new file. `ingest_operations`' own
+    // CREATE TABLE does NOT declare any of the four receipt columns inline (unlike gate_events'
+    // `matcher`) — so even this FIRST, uncontested construction reaches all four guarded ALTERs, and
+    // is the WINNER of the race regardless of file freshness.
+    const winner = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    winner.close();
+
+    // SECOND MIGRATOR: a fresh connection to the SAME (already-migrated) file, but its own PRAGMA
+    // probe is stale — the SAME supported MCP+CLI-sharing-one-`.monet`-DB topology
+    // `StaleMatcherProbeStorage`'s own comment names — and reports all four columns absent. Every one
+    // of the four guarded ALTERs proceeds exactly as the real guard would, and each hits SQLite's
+    // real "duplicate column name" error against the real, already-migrated table. BEFORE this
+    // round's fix, the FIRST of the four to throw aborted this process's entire construction —
+    // startup crashing on nothing more than losing a race the winner already resolved correctly.
+    const loser = new StaleIngestOperationsColumnProbeStorage(path);
+    expect(() => new MonetCore(loser, { tauAttach: 1.1, tauAmbiguous: 1.1 })).not.toThrow();
+
+    // NOT CORRUPTED: exactly one of each column, not two — the catch swallowed the race for all
+    // four; it did not paper over a real schema problem.
+    const cols = loser.prepare(`PRAGMA table_info(ingest_operations)`).all() as Array<{ name: string }>;
+    for (const name of ["rule_previous_severity", "rule_previous_circle", "rule_circle", "rule_severity"]) {
+      expect(cols.filter((c) => c.name === name), name).toHaveLength(1);
+    }
     loser.close();
   });
 });

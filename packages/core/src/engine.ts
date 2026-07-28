@@ -2365,29 +2365,69 @@ export class MonetCore {
     // Idempotency keys are writer-domain scoped. A native retry must never claim a connector
     // receipt (and vice versa), even if a caller accidentally reuses the same operation id.
     const operationCols = this.db.prepare(`PRAGMA table_info(ingest_operations)`).all() as Array<{ name: string }>;
+    // Same duplicate-column catch as the receipt columns below (and the matcher-column precedent):
+    // two processes first-opening a pre-column store concurrently can both cache `operationCols`
+    // before either ALTER lands — the loser must treat "duplicate column name" as someone else's
+    // success, not its own failure to construct.
     if (!operationCols.some((c) => c.name === "writer_domain")) {
-      this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN writer_domain TEXT NOT NULL DEFAULT 'native'`);
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN writer_domain TEXT NOT NULL DEFAULT 'native'`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
     }
     if (!operationCols.some((c) => c.name === "source_concept_id")) {
-      this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN source_concept_id TEXT`);
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN source_concept_id TEXT`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
     }
+    // THE SEVERITY/CIRCLE RECEIPT COLUMNS (four, added across three earlier rounds) NOW USE THE
+    // IDEMPOTENT-BY-CATCH PATTERN (post-merge review round, P2 — found by review, not
+    // self-discovered): each ALTER below used to be a bare `if (!has-column) exec(ALTER)`, with no
+    // catch — exactly the shape `migrateGateColumns`'s own matcher-column guard (gates.ts) already
+    // documents the danger of: the MCP server and a `monet` CLI call are a SUPPORTED topology
+    // sharing one `.monet` DB (storage.ts's own WAL + busy_timeout setup exists for this), so two
+    // processes can both open a pre-column store at once, both see a column absent via the SAME
+    // `operationCols` PRAGMA snapshot, and both attempt the SAME ALTER. The LOSER's ALTER throws
+    // SQLite's "duplicate column name" — unhandled, that aborts the LOSING process's entire
+    // construction over a race the WINNER already resolved correctly, a first-open crash for every
+    // upgrading install unlucky enough to race itself. Caught here AS SUCCESS
+    // (idempotent-by-catch, matching gates.ts's own established convention verbatim): the only thing
+    // each guard promises is "the column exists when this function returns", and a duplicate-column
+    // error is proof that promise is ALREADY kept by someone else's ALTER, not a real failure.
+    // Re-thrown for any OTHER error shape — those are real problems this guard has no business hiding.
+    //
     // The severity a rule write REPLACED. Everything else a receipt reports is a pointer it
     // rehydrates from the substrate at replay — but a transition's starting point is not a pointer
     // to anything: once the binding is overwritten, nothing in the store remembers what it was, and
     // a retried operationId would report `downgradedFromBlocking: false` where the first call
     // reported true. A caller branching on that would act differently on retry, which is the exact
-    // failure receipts exist to prevent. Local table, guarded ALTER, same as the two above.
+    // failure receipts exist to prevent.
     if (!operationCols.some((c) => c.name === "rule_previous_severity")) {
-      this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_previous_severity TEXT`);
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_previous_severity TEXT`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
     }
     // THE CIRCLE a rule write REPLACED (Codex round 10, item 4) — the exact same shape as
     // `rule_previous_severity` just above, for the identical reason: a narrowing (or widening) is
     // also a transition whose starting point stops existing anywhere in the store the moment the
     // binding is overwritten, so replay cannot re-derive `narrowedFromBreadth` from the CURRENT
     // binding alone any more than it can re-derive `downgradedFromBlocking` from the current
-    // severity alone. Guarded ALTER, same as the two above.
+    // severity alone.
     if (!operationCols.some((c) => c.name === "rule_previous_circle")) {
-      this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_previous_circle TEXT`);
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_previous_circle TEXT`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
     }
     // THE CIRCLE A RULE WRITE PRODUCED (Codex round 12, item 3 — found by review, not
     // self-discovered: "the new receipt stores only the previous circle and compares it with the
@@ -2401,22 +2441,30 @@ export class MonetCore {
     // FALSE, silently reporting A's own narrowing as though it had never happened. Same shape as
     // `rule_previous_circle`'s own comment two lines up: once B's write overwrites the binding, A's
     // own resulting circle is gone from everywhere else in the store, so it must be a value this
-    // receipt STORES, not one it re-derives from a row that keeps moving. Guarded ALTER, same as the
-    // others in this cluster.
+    // receipt STORES, not one it re-derives from a row that keeps moving.
     if (!operationCols.some((c) => c.name === "rule_circle")) {
-      this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_circle TEXT`);
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_circle TEXT`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
     }
-    // THE SEVERITY A RULE WRITE PRODUCED (Codex round 12, item 4 — the FINAL item, flagged during
-    // item 3's own implementation, not a separate review finding: `downgradedFromBlocking` shares
-    // the IDENTICAL bug `narrowedFromBreadth` just had. `rule_previous_severity`'s own comment,
-    // above, claimed comparing it against the CURRENT binding was as sound as this fix now proves it
-    // was not — round 10's `rule_previous_circle` was modeled on this column believing the pattern
-    // already worked; it did not, for either field). `rule_previous_severity` answers "what did this
-    // write replace"; this answers "what did this write PRODUCE" — the exact same PRODUCED/REPLACED
-    // pairing `rule_circle`/`rule_previous_circle` already establish, one column pair over. Guarded
-    // ALTER, same as the rest of this cluster.
+    // THE SEVERITY A RULE WRITE PRODUCED (Codex round 12, item 4 — flagged during item 3's own
+    // implementation, not a separate review finding: `downgradedFromBlocking` shares the IDENTICAL
+    // bug `narrowedFromBreadth` just had. `rule_previous_severity`'s own comment, above, claimed
+    // comparing it against the CURRENT binding was as sound as this fix now proves it was not —
+    // round 10's `rule_previous_circle` was modeled on this column believing the pattern already
+    // worked; it did not, for either field). `rule_previous_severity` answers "what did this write
+    // replace"; this answers "what did this write PRODUCE" — the exact same PRODUCED/REPLACED
+    // pairing `rule_circle`/`rule_previous_circle` already establish, one column pair over.
     if (!operationCols.some((c) => c.name === "rule_severity")) {
-      this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_severity TEXT`);
+      try {
+        this.db.exec(`ALTER TABLE ingest_operations ADD COLUMN rule_severity TEXT`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
     }
     // aliases: slugs/ids a concept ANSWERS TO after absorbing another on merge — so an asserted
     // reference to a merged-away slug (`supports: #old-slug`) still resolves to the survivor.
@@ -11572,24 +11620,56 @@ export class MonetCore {
         // 'y', not 'x' — the concept is the truth, exactly as it already is outside breadth.
         const admittedNarrowing =
           current?.circle === BREADTH_CIRCLE && row.circle !== undefined && row.circle !== BREADTH_CIRCLE;
+        // THE FINAL FALLBACK MATRIX (post-merge review round, P1 — corrects this comment's own prior
+        // reasoning in two places at once, found by review: round 11's "falling back to row.circle
+        // instead honors the admitted act" and round 1's "the incoming row's own claim matters when
+        // there is no incumbent either" were BOTH the same mistake, stated with confidence, in two
+        // different branches). The mistake: `row.circle` is not a fact, it is a CLAIM — the sender's
+        // own belief about where its concept lives, which can be stale or simply wrong the moment a
+        // CONCURRENT move happens elsewhere before the concept itself ever reaches this receiver.
+        // Freezing that claim into a real (non-NULL) circle value throws away the one thing that
+        // could have corrected it: BLOCKER B3 (below, this same function) heals a binding ONLY when
+        // its circle is NULL — never revisits one that already holds a value, guessed-right or
+        // guessed-wrong. A binding frozen at a wrong guess is not "eventually consistent," it is
+        // WRONG FOREVER, silently, until a human notices the deny fires in the wrong place (or does
+        // not fire in the right one). Re-derived, case by case, for every path that can reach this
+        // expression:
+        //   (a) the concept EXISTS on this store → `conceptCircle` wins, unconditionally — the
+        //       concept's circle is the truth, both regimes, no change from before.
+        //   (b) the concept does NOT exist, but an INCUMBENT binding already does → `current?.circle`
+        //       wins — UNCHANGED. (This is not "trusting a guess": by the time a binding exists on
+        //       this store at all, either the concept arrived and resolved it for real (case a, on
+        //       an earlier graft), or it is itself dangling at NULL — the ordinary NON-BREADTH
+        //       regime's own current?.circle read in that state is NULL, which the chain's own final
+        //       fallback already covers identically; this slot exists for the case current.circle
+        //       already holds a genuine value from having been properly resolved once.)
+        //   (c) NEITHER exists (a brand-new, non-breadth, dangling binding) → NULL, never
+        //       `row.circle` (THE FIX: was `row.circle` before this round). The binding stays
+        //       genuinely dangling — invisible everywhere, exactly like any other dangling binding —
+        //       until BLOCKER B3 resolves it to the concept's OWN circle the moment it actually
+        //       lands, whatever circle that turns out to be, even if a concurrent move elsewhere
+        //       means it differs from what this row happened to claim.
+        //   (d) an ADMITTED NARROWING (round 11's own M4 escape) with NO concept on this store yet →
+        //       ALSO NULL now (THE FIX: was `row.circle ?? current?.circle`, in that order, before
+        //       this round). `current?.circle` is providably always `'*'` here — `admittedNarrowing`
+        //       is defined as true only when `current?.circle === BREADTH_CIRCLE` — so it was never a
+        //       safe fallback (freezing it would silently neutralize the very narrowing just
+        //       admitted) and is now dropped entirely rather than merely deprioritized. NULL does
+        //       BOTH jobs case (c) already established: it preserves the narrowing's own effect
+        //       (NULL is not `'*'` — the binding does not deliver globally while dangling) without
+        //       needing to guess a specific local value, and it lets B3 heal the binding to the
+        //       concept's ACTUAL circle once it lands — which is what "the narrowing succeeded"
+        //       always meant, not "the narrowing froze onto whatever the sender happened to type".
+        //
+        // Verified against DOOR 13.12 (this file's own test suite): that test's own concept already
+        // EXISTS on the receiver before the narrowing graft arrives, so it exercises case (a) only —
+        // `conceptCircle` wins regardless of this change, unaffected. A NEW test (same suite) exercises
+        // case (d) directly: an admitted narrowing arrives for a concept that has not landed yet,
+        // the binding lands NULL, and heals to the concept's own circle — which a LATER graft
+        // deliberately sets to something OTHER than what the narrowing row claimed — once it arrives.
         const effectiveCircle = involvesBreadth
           ? admittedNarrowing
-            // conceptCircle FIRST — the fix itself. Falling back to row.circle, NOT current?.circle,
-            // when the concept is not yet resolvable here (the dangling-then-live gap: this admitted
-            // narrowing's own concept has not landed on this store yet either) is deliberate, not the
-            // ordinary BLOCKER B2 fallback order reused by coincidence: BLOCKER B3 (above, this same
-            // function) only ever heals a binding whose circle is NULL (`WHERE ... AND circle IS
-            // NULL`) — it does not, and structurally cannot, revisit a binding that already holds a
-            // real value. Falling back to `current?.circle` here would write the STALE '*' this
-            // narrowing was just admitted specifically to overturn, and — because that value is not
-            // NULL — B3 would never revisit it once the concept finally landed: the admission would
-            // be silently permanent-neutralized in exactly the one case (concept still dangling) it
-            // most needs to survive. Falling back to `row.circle` instead honors the admitted act
-            // immediately and leaves the identical residual gap the ordinary breadth regime already
-            // lives with for a first-ever binding (no healing path re-derives this later either) —
-            // narrower than a correctness regression, and consistent with every other fallback chain
-            // in this function preferring the freshest trusted claim over a value already known stale.
-            ? conceptCircle ?? row.circle ?? current?.circle ?? null
+            ? conceptCircle ?? null
             // BREADTH REGIME, EVERY OTHER CASE (BLOCKER B2, unchanged by this fix): the incoming
             // value when the sender is breadth-aware; else the INCUMBENT's own stored circle, never
             // silently narrowed by an old-protocol peer's silence; else, only for a binding this store
@@ -11598,26 +11678,26 @@ export class MonetCore {
             // undefined against a global incumbent — none of these is the local-claim-vs-concept
             // divergence `admittedNarrowing` exists to catch, so none of them changes here.
             : row.circle ?? current?.circle ?? conceptCircle ?? null
-          // NON-BREADTH REGIME (review fix — Codex round 1, item 3): THE CONCEPT'S CIRCLE IS THE
-          // TRUTH — restoring exactly the invariant that made pre-breadth delivery safe
-          // (RULE_LIVENESS_WHERE read c.circle via JOIN, never a binding-local value, before breadth
-          // existed). A relayed row can claim a DIFFERENT local circle than its own concept —
-          // declaration-origin, a legitimately higher revision, every DOOR 12 field unchanged, only
-          // circle diverging — and land untouched by every check above (the boundary check above
-          // watches for '*' crossing a boundary; this is local-to-local, neither side global) while
-          // silently moving the deny's delivery away from the circle its concept actually lives in.
-          // THIS IS NOT A RECLASSIFICATION ACT: the row is not escalating or demoting anything, it
-          // is simply WRONG about a fact the concept itself already settles — a stale or forged
-          // field, not a decision — so it converges SILENTLY, with no skip counter (contrast the
-          // boundary check immediately above, which HOLDS a genuine '*' crossing as an act). The
-          // concept's own circle wins whenever the concept exists, even over the incumbent binding's
-          // own recorded value — including when the concept moves circles in THIS SAME payload (the
-          // concepts loop above already landed it, so `conceptCircle` here already reads the NEW
-          // circle: the binding legitimately follows the move). Only when the concept does not exist
-          // at all does the incumbent's own value matter, and only when there is no incumbent EITHER
-          // does the incoming row's own claim matter — the dangling-then-live gap, healed by BLOCKER
-          // B3 the moment the concept lands.
-          : conceptCircle ?? current?.circle ?? row.circle ?? null;
+          // NON-BREADTH REGIME (review fix — Codex round 1, item 3; corrected post-merge, case (c)
+          // above): THE CONCEPT'S CIRCLE IS THE TRUTH — restoring exactly the invariant that made
+          // pre-breadth delivery safe (RULE_LIVENESS_WHERE read c.circle via JOIN, never a
+          // binding-local value, before breadth existed). A relayed row can claim a DIFFERENT local
+          // circle than its own concept — declaration-origin, a legitimately higher revision, every
+          // DOOR 12 field unchanged, only circle diverging — and land untouched by every check above
+          // (the boundary check above watches for '*' crossing a boundary; this is local-to-local,
+          // neither side global) while silently moving the deny's delivery away from the circle its
+          // concept actually lives in. THIS IS NOT A RECLASSIFICATION ACT: the row is not escalating
+          // or demoting anything, it is simply WRONG about a fact the concept itself already settles
+          // — a stale or forged field, not a decision — so it converges SILENTLY, with no skip
+          // counter (contrast the boundary check immediately above, which HOLDS a genuine '*'
+          // crossing as an act). The concept's own circle wins whenever the concept exists, even over
+          // the incumbent binding's own recorded value — including when the concept moves circles in
+          // THIS SAME payload (the concepts loop above already landed it, so `conceptCircle` here
+          // already reads the NEW circle: the binding legitimately follows the move). Only when the
+          // concept does not exist at all does the incumbent's own value matter (case (b) above); and
+          // when there is no incumbent EITHER, the binding stays NULL (case (c), THE FIX — no longer
+          // the incoming row's own claim) for BLOCKER B3 to heal the moment the concept lands.
+          : conceptCircle ?? current?.circle ?? null;
         // A RELAYED BLOCKING ROW WITH NO REASON IS ACCEPTED, AND FIRES. Local creation of one is
         // refused (bindRule requires the reason a deny promises), and it is tempting to refuse it
         // here too for symmetry. That would be the exact removal doors 9 and 10 established must
