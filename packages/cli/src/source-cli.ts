@@ -20,7 +20,12 @@ export interface SourceCore {
 
 export interface SourceCliDependencies {
   openCore(storageDir?: string): SourceCore;
-  deriveCircle(projectDir: string): string;
+  /** P1-2 (Codex round 3 on PR #42): `opts.storeDir` roots the SQLITE CONSULTATION separately from
+   *  `projectDir`'s GIT-IDENTITY root — see circle.ts's own deriveCircle for the full contract and
+   *  the final per-caller matrix. Used below at the two worktree (repo-md) call sites, where the
+   *  identity root (the worktree) and the store `createSource` actually writes into (the invoking
+   *  project) are genuinely different directories. */
+  deriveCircle(projectDir: string, opts?: { storeDir?: string }): string;
   projectDir(): string;
   /**
    * Source-authorization identity THIS machine's server will present when it calls `source_*`
@@ -419,7 +424,11 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
           type: "repo-md",
           name: originOrName,
           localPath,
-          circle: options.circle ?? dependencies.deriveCircle(localPath),
+          // P1-2 (Codex round 3 on PR #42): identity=localPath (the WORKTREE's own remote/
+          // folder-hash — correct, this is the repo actually being registered), storeDir=
+          // projectDir (the INVOKING project's store — where createSource below actually writes
+          // the resulting row; see circle.ts's own deriveCircle for the full matrix).
+          circle: options.circle ?? dependencies.deriveCircle(localPath, { storeDir: projectDir }),
           include: options.include,
           exclude: options.exclude,
           access: { allowedCallerIds: options.allowCaller, allowedProjectIds: options.allowProject },
@@ -482,7 +491,11 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
           type: "repo-md",
           name: options.name ?? path.basename(localPath),
           localPath,
-          circle: options.circle ?? dependencies.deriveCircle(localPath),
+          // P1-2 (Codex round 3 on PR #42): identity=localPath (the WORKTREE's own remote/
+          // folder-hash — correct, this is the repo actually being registered), storeDir=
+          // projectDir (the INVOKING project's store — where createSource below actually writes
+          // the resulting row; see circle.ts's own deriveCircle for the full matrix).
+          circle: options.circle ?? dependencies.deriveCircle(localPath, { storeDir: projectDir }),
           include: options.include ?? ["**/*.md"],
           exclude: options.exclude,
           access,

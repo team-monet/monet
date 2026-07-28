@@ -36,8 +36,16 @@ export function getMonetDir(baseDir: string = process.cwd()): string {
   return path.join(homeDir, MONET_DIR);
 }
 
-export function getDbPath(): string {
-  return path.join(getMonetDir(), DB_FILE);
+/**
+ * `baseDir` mirrors `getGateMirrorPath`'s own parameter exactly (added there in 4b-C) — forwards
+ * straight to `getMonetDir`, omitted defaults to cwd exactly as before, so every EXISTING caller
+ * that calls `getDbPath()` with no argument is behavior-identical. The parameter exists so a
+ * caller resolving a circle/store for a project that is NOT the OS cwd (P1-B, Codex round 1 on PR
+ * #42 — `monet install --project <dir>`) can open the SAME `.monet`-or-home resolution rooted at
+ * that project instead — see circle.ts's `openMapStore` for the caller this closes the gap for.
+ */
+export function getDbPath(baseDir?: string): string {
+  return path.join(getMonetDir(baseDir), DB_FILE);
 }
 
 /**
@@ -61,8 +69,20 @@ export function getGateMirrorPath(baseDir?: string): string {
   return path.join(getMonetDir(baseDir), GATE_MIRROR_FILE);
 }
 
-export function ensureMonetDir(): string {
-  const dir = getMonetDir();
+/**
+ * P1-1 (Codex round 3 on PR #42): `baseDir` mirrors `getDbPath`/`getGateMirrorPath`'s own optional
+ * parameter exactly — omitted, behavior-identical (cwd-rooted) for every EXISTING caller. Added
+ * because `start`/the stdio entry/`runInstall` all call `getDbPath(projectDir)` to open the served
+ * store at a specific resolved project directory, but were still calling this function BARE
+ * (cwd-rooted) beforehand — with `projectDir !== cwd` (a host spawning `monet` from elsewhere;
+ * cwd happening to have its own `.monet`, the target not), the PARENT DIRECTORY for the db path
+ * `getDbPath(projectDir)` resolves to never gets created, and better-sqlite3 fails to open it
+ * (SQLITE_CANTOPEN — it does not create missing parent directories, only the file itself). Every
+ * call site that opens a store at `getDbPath(projectDir)` must call `ensureMonetDir(projectDir)`
+ * with the SAME `projectDir` first, not a bare call.
+ */
+export function ensureMonetDir(baseDir?: string): string {
+  const dir = getMonetDir(baseDir);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }

@@ -3,7 +3,9 @@
  *
  * Ported from the standalone ~/code/monet-dashboard/server.mjs.
  * Changes from the original:
- *   1. Store path resolved via getDbPath() (honours MONET_STORAGE_DIR / --dir) instead of hardcoded ~/.monet.
+ *   1. Store path resolved via getDbPath(resolveProjectDir()) (honours MONET_STORAGE_DIR / --dir,
+ *      then MONET_PROJECT_DIR / CLAUDE_PROJECT_DIR, then cwd — see P1-B/P2-D, Codex round 4 on
+ *      PR #42) instead of hardcoded ~/.monet.
  *   2. Snapshot produced via better-sqlite3's online backup API instead of shelling to /usr/bin/sqlite3.
  *   3. Static assets served from dist/dashboard/ (resolve via import.meta.url) so they ship in the tarball.
  *   4. avgConfidence/graphDensity guard uses `!= null` (nullable-safe) instead of truthy `?:`.
@@ -29,6 +31,15 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
 import { getDbPath } from "../db/index.js";
+// P1-B/P2-D (Codex round 4 on PR #42): every getDbPath() call in this module was bare (cwd-
+// rooted) — diverging from resolveProjectDir() (MONET_PROJECT_DIR / CLAUDE_PROJECT_DIR, falling
+// back to cwd) whenever a host sets one of those env vars to something other than its own cwd,
+// exactly the shape `monet dashboard` can be launched under. Called independently at each call
+// site below rather than threaded as a parameter through startDashboard/handleGraph/etc: it is a
+// pure, side-effect-free function of process.env/cwd() within a single process invocation, so two
+// independent calls can never disagree — see cli.ts's own dashboard action, which calls it once
+// for ensureMonetDir() before this module is even imported, for the sibling half of this fix.
+import { resolveProjectDir } from "../project-dir.js";
 
 // ── Asset directory (resolved at runtime relative to the bundled cli.js) ────
 // dist/cli.js lives at <pkg_root>/dist/cli.js.
@@ -105,7 +116,7 @@ async function makeSnapshot(): Promise<string> {
   // mkdirSync with recursive:true is a no-op when the directory already exists.
   fs.mkdirSync(SNAP_DIR, { recursive: true, mode: 0o700 });
 
-  const liveDbPath = getDbPath();
+  const liveDbPath = getDbPath(resolveProjectDir());
   const snapName = `snap-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   const snapPath = path.join(SNAP_DIR, snapName);
 
@@ -679,7 +690,7 @@ function emptyGraphPayload(): unknown {
 }
 
 async function handleGraph(includeRetired: boolean): Promise<unknown> {
-  if (!fs.existsSync(getDbPath())) return emptyGraphPayload();
+  if (!fs.existsSync(getDbPath(resolveProjectDir()))) return emptyGraphPayload();
   const snap = await makeSnapshot();
   try {
     const concepts           = querySnap(snap, includeRetired ? SQL.conceptsIncludeRetired : SQL.concepts);
@@ -798,7 +809,7 @@ async function handleGraph(includeRetired: boolean): Promise<unknown> {
 }
 
 async function handleEntities(includeRetired: boolean): Promise<unknown> {
-  if (!fs.existsSync(getDbPath())) return { entities: [], links: [] };
+  if (!fs.existsSync(getDbPath(resolveProjectDir()))) return { entities: [], links: [] };
   const snap = await makeSnapshot();
   try {
     const entities = querySnap(snap, SQL.entities);
@@ -810,7 +821,7 @@ async function handleEntities(includeRetired: boolean): Promise<unknown> {
 }
 
 async function handleFirstBlock(circle: string | null, includeRetired: boolean): Promise<unknown> {
-  if (!fs.existsSync(getDbPath())) return { rows: [] };
+  if (!fs.existsSync(getDbPath(resolveProjectDir()))) return { rows: [] };
   const snap = await makeSnapshot();
   try {
     // The first_block table only exists in stores migrated by the new engine.
@@ -979,7 +990,7 @@ export function computeSourceSchedule(
 }
 
 async function handleSources(): Promise<unknown> {
-  if (!fs.existsSync(getDbPath())) return { sources: [], generatedAt: Date.now() };
+  if (!fs.existsSync(getDbPath(resolveProjectDir()))) return { sources: [], generatedAt: Date.now() };
   const snap = await makeSnapshot();
   try {
     // Stores written by engines without the source pipeline lack these tables;
@@ -1242,7 +1253,7 @@ export function startDashboard(port: number): void {
   server.listen(port, "127.0.0.1", () => {
     const serverUrl = `http://127.0.0.1:${port}`;
     console.log(`\n  Monet Dashboard  ${serverUrl}\n`);
-    console.log(`  Store:  ${getDbPath()}`);
+    console.log(`  Store:  ${getDbPath(resolveProjectDir())}`);
     console.log(`  Press Ctrl-C to stop.\n`);
     // Best-effort open in browser (macOS/Linux/Windows).
     try {

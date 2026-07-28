@@ -289,6 +289,60 @@ describe("deriveCircle — resolution order", () => {
   });
 });
 
+describe("deriveCircle — storeDir (P1-2, Codex round 3 on PR #42)", () => {
+  it("identity resolves from projectDir (the worktree); store consultation resolves from storeDir (the invoking project) — a DIFFERENT store's own row wins, never the identity root's own store", async () => {
+    // The follow-on to P1-B (round 1 on this PR): source-cli's `--path /other/repo` derives the
+    // circle against the WORKTREE's own store while createSource writes into the INVOKING
+    // project's store — circle from store B, row into store A. This proves the underlying
+    // resolution split directly: given the SAME remote (so the lookup KEY is identical either
+    // way — isolating "which store" as the only variable), two REAL, separate project-local
+    // stores each carry a DIFFERENT circle for that key, and deriveCircle(identity, {storeDir})
+    // must return the ONE living in storeDir, never identity's own.
+    const REMOTE_URL = "git@github.com:acme/p1-2-fixture.git";
+    const invokingProjectDir = makeRepo(REMOTE_URL, "p1-2-invoking"); // "store A"'s own identity dir
+    const worktreeDir = makeRepo(REMOTE_URL, "p1-2-worktree"); // "store B"'s own identity dir
+
+    // MONET_STORAGE_DIR (this file's own global beforeEach override) would force BOTH projectDir
+    // and storeDir onto the SAME single tmpHome store, masking the exact divergence under test —
+    // cleared here so each directory's own project-local .monet is what actually gets consulted.
+    const savedStorageDir = process.env.MONET_STORAGE_DIR;
+    delete process.env.MONET_STORAGE_DIR;
+    try {
+      const key = canonicalRemoteKey(REMOTE_URL);
+      const seedStore = (projectDir: string, circle: string): void => {
+        const storeDir = join(projectDir, ".monet");
+        mkdirSync(storeDir, { recursive: true });
+        const db = new Database(join(storeDir, "monet.db"));
+        db.pragma("journal_mode = WAL");
+        db.exec(`
+          CREATE TABLE remote_circle_map (
+            remote_url TEXT PRIMARY KEY, circle TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+          );
+        `);
+        db.prepare(`INSERT INTO remote_circle_map (remote_url, circle) VALUES (?, ?)`).run(key, circle);
+        db.close();
+      };
+      seedStore(invokingProjectDir, "circle-from-A-the-invoking-store");
+      seedStore(worktreeDir, "circle-from-B-the-worktree-store");
+
+      // Matches source-cli.ts's own two worktree call sites exactly: identity=worktreeDir,
+      // storeDir=invokingProjectDir.
+      const result = deriveCircle(worktreeDir, { storeDir: invokingProjectDir });
+      expect(result).toBe("circle-from-A-the-invoking-store"); // consulted A (storeDir) — the fix
+      expect(result).not.toBe("circle-from-B-the-worktree-store"); // never B (identity's own store)
+
+      // Sanity: WITHOUT storeDir (both roots = worktreeDir, the pre-P1-2 shape), B's own row wins
+      // instead — confirming the two stores really do disagree and this isn't a vacuous check.
+      const withoutStoreDir = deriveCircle(worktreeDir);
+      expect(withoutStoreDir).toBe("circle-from-B-the-worktree-store");
+    } finally {
+      if (savedStorageDir !== undefined) process.env.MONET_STORAGE_DIR = savedStorageDir;
+      else delete process.env.MONET_STORAGE_DIR;
+    }
+  });
+});
+
 describe("deriveCircle — backward-compat (anti-orphan)", () => {
   it("SSH and HTTPS checkouts of the same repo (same host) derive the same circle", () => {
     const sshRepo = makeRepo("git@github.com:acme/widgets.git", "aw-ssh");

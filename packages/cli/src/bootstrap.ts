@@ -7,6 +7,26 @@ import {
 export interface ServedCoreOptions {
   scopeContext: string;
   defaultCircle: string;
+  /**
+   * Where to materialize the gate mirror (4b-D, component B). OPTIONAL, deliberately — matching
+   * `MonetCoreOptions.gateSidecarPath`'s own "NO DEFAULT" stance (engine.ts: unset means
+   * declarations write no file at all): a caller that omits this gets exactly today's behavior
+   * (no mirror maintenance), which is the correct default for anything that ISN'T the one
+   * long-running serving process this option exists for.
+   *
+   * ONE WRITER SURFACE. This is the FIRST call site in this client that ever passes
+   * `gateSidecarPath` — before this, NOTHING materialized the mirror automatically (checked: no
+   * caller anywhere in this codebase passed the option; the live `~/.monet/gate-mirror.json` file
+   * that predates this change existed only because a script ran it by hand once). Callers of
+   * THIS function are cli.ts's `start` action and src/index.ts's stdio entry point — both are the
+   * same long-running MCP server, just two launch paths — never a short-lived command
+   * (status/doctor/source/gate all construct their OWN core through a DIFFERENT open* function in
+   * this same file, none of which gained this option). The core already owns WHEN to
+   * rematerialize (the generation-bump contract inside declare()/refreshGateSidecar — see
+   * engine.ts); this option only supplies WHERE, and only for the process actually positioned to
+   * keep that file honest on every gate-relevant write.
+   */
+  gateSidecarPath?: string;
 }
 
 type StoreEmbedderSelector = (dbPath: string) => Promise<EmbeddingProvider>;

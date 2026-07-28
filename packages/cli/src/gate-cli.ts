@@ -38,8 +38,15 @@ import { defaultNameFromRemote, getOriginRemote } from "./remote-circle.js";
  * whether a caught error is that SAME refusal reached some other way — and there, the real
  * thrown message is surfaced verbatim, never re-derived. Never used to pre-empt evaluation with a
  * fabricated verdict; only to recognize or restate the one refusal `assertQueryableCircle` owns.
+ *
+ * EXPORTED as of FIX 3 (Codex round 2 on PR #42): install-cli.ts's `runInstall` needs the SAME
+ * wildcard semantics to refuse pinning `--circle '*'` into a generated hook (see that file's own
+ * comment for why a permanently-pinned wildcard is worse than this command's own pre-mirror
+ * refusal — it never even reaches a fresh `monet gate` invocation to refuse loudly, since the
+ * refusal happens the FIRST time, at install time, then bakes in). One constant, one source of
+ * truth, matching GATE_FAIL_OPEN_MARKER's own export precedent immediately below in this file.
  */
-const QUERY_WILDCARD_CIRCLE = "*";
+export const QUERY_WILDCARD_CIRCLE = "*";
 
 /**
  * `monet gate <action-context>` — the offline hook binary (slice 4b-C).
@@ -97,11 +104,141 @@ export const GATE_EXIT_CODE = {
 /** Distinct from every outcome code above — a caller-input problem, not a gate verdict. */
 const USAGE_ERROR_EXIT_CODE = 1;
 
+/**
+ * P1-A (Codex round 1 on PR #42): the shared, load-bearing substring every fail-open diagnostic
+ * line below is built through — never a decorative alias. This is what lets a caller detect "monet
+ * gate answered exit 0 because it genuinely had nothing to say" from "it answered exit 0 because it
+ * COULD NOT EVALUATE AT ALL" WITHOUT parsing prose narrowly enough to break on a wording edit.
+ *
+ * CONSUMER: install-cli.ts's generated wrapper imports this constant at GENERATION time (build
+ * time for the wrapper source, not run time for the wrapper itself — the wrapper is a standalone
+ * script with no module graph back to this file) and bakes the literal into the wrapper. On the
+ * wrapper's own no-opinion path (exit 0, `main()`'s `default:` case) it greps the CAPTURED stderr
+ * for this marker: present → the fail-open is real and gets a `systemMessage` (still no
+ * `permissionDecision` — Monet still has no enforcement opinion); absent → genuine silence, stays
+ * completely empty. THE BUG THIS CLOSES: a fresh `monet install` (hook wired, no `monet start`
+ * session has EVER run to materialize the mirror) answers exit 0 identically to "nothing matched" —
+ * the one state every new user passes through was silently, invisibly wired, looking exactly like
+ * a working, ungoverned command. See buildWrapperScript's own comment for the wrapper-side half.
+ */
+export const GATE_FAIL_OPEN_MARKER = "failing OPEN";
+
 export class GateActionContextError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "GateActionContextError";
   }
+}
+
+/** Read chunk size for `readStdinSync`'s own `fs.readSync` loop — named so the cap formula below
+ *  can reference it directly instead of repeating the literal `65536` at each of its three uses
+ *  (the two `Buffer.alloc` calls and the "+ one chunk of slack" term). */
+const STDIN_CHUNK_SIZE = 65536;
+
+/**
+ * P1-A (Codex round 4 on PR #42) — SUPERSEDES P2-7's flat 5 MiB byte cap below, which was WRONG
+ * for a reason more serious than the memory-bound bug it fixed: it does not guarantee the
+ * ENGINE's own overflow verdict for a MULTIBYTE UTF-8 context.
+ *
+ * THE BUG: `evaluateGateFromMirror`'s own `text.length > MAX_CONTEXT_BYTES` check
+ * (`@team-monet/core/gates.ts`, `4 * 1024 * 1024`, not exported — see this module's own
+ * `QUERY_WILDCARD_CIRCLE` comment for the precedent of citing an unexported core internal by a
+ * stable literal) compares a DECODED JS STRING's `.length` — UTF-16 CODE UNITS — never raw bytes.
+ * A flat BYTE cap conflates the two. A 3-byte UTF-8 sequence (most CJK — Korean, Japanese kana,
+ * common Chinese hanzi, U+0800-U+FFFF) decodes to exactly ONE UTF-16 code unit: a 3:1 byte-to-unit
+ * ratio. Retaining a flat 5 MiB of BYTES from a pure 3-byte-sequence stream therefore decodes to
+ * only ~1.67 Mi UTF-16 units — comfortably UNDER the engine's 4 Mi-unit threshold — REGARDLESS of
+ * how much larger the genuine, un-truncated input actually was. The result is not merely "capped
+ * too early": it is a WRONG VERDICT of a DIFFERENT CLASS than the memory bug it replaced — a
+ * multi-hundred-MB multibyte command silently evaluates as an ordinary, in-bounds context (most
+ * likely "silence" — no stage matches truncated garbage) instead of the honest overflow-ask (exit
+ * 40) it must produce. Worse than losing bytes: losing the CORRECTNESS of the verdict itself.
+ *
+ * THE FIX: cap retained BYTES at `3 × the engine's own 4 Mi-unit threshold`, plus one chunk of
+ * slack. 3 is the TRUE worst case, not an approximation — 1-byte (ASCII) and 2-byte UTF-8
+ * sequences decode to one unit each (1:1 and 2:1 ratios, both lower), and 4-byte sequences
+ * (astral-plane / supplementary-plane characters, U+10000+) decode to a UTF-16 SURROGATE PAIR —
+ * TWO units — a 4:2 = 2:1 ratio, also lower than 3:1. No UTF-8 sequence has a higher bytes-per-unit
+ * ratio than 3. So retaining `3 × 4 Mi` bytes GUARANTEES the decoded string reaches AT LEAST 4 Mi
+ * units even in the worst (pure 3-byte-sequence) case — and the "+ one chunk of slack" is what
+ * pushes that guarantee from "reaches" to "exceeds", matching the engine's own strict `>`
+ * comparison (retention stops once `retainedBytes >= cap`, and the loop's own coarse,
+ * chunk-at-a-time granularity means the LAST retained chunk can carry retention slightly past the
+ * cap itself — see the loop's own comment below for why that overshoot is deliberate, not slop to
+ * eliminate). Still bounded, still flat RSS (~12 MiB instead of 5 MiB) — the trade this fix makes is
+ * a larger but FIXED constant for a provably correct verdict class, not an open-ended one.
+ *
+ * EXPORTED so a unit test can assert the retained-size bound directly (by mocking `fs.readSync`)
+ * without needing a real, multi-MB piped stdin.
+ */
+export const RETAINED_STDIN_CAP_BYTES = 3 * 4 * 1024 * 1024 + STDIN_CHUNK_SIZE;
+
+/**
+ * Synchronously read the WHOLE stdin stream (4b-D, component A).
+ *
+ * `fs.readFileSync(0, "utf8")` is Node's usual synchronous-stdin idiom, and this module's own
+ * existing style (readGateMirrorFile uses plain synchronous fs throughout) — but it has a
+ * well-known failure mode this slice hit EMPIRICALLY, not just in theory: when stdin is a PIPE
+ * that ends up in NON-BLOCKING mode (reproduced reliably here piping a multi-MB payload from
+ * another `node` process into this one on this platform — not a rare edge case for exactly the
+ * overflow-ask scenario --stdin exists to serve), a read attempted before the writer has more
+ * data ready fails with EAGAIN instead of blocking for it. `readFileSync` has no retry of its
+ * own for that, so the whole command would report "internal error (EAGAIN...)" — a wrapper-level
+ * failure indistinguishable from a real crash, for a perfectly ordinary large piped write.
+ *
+ * The fix: `fs.readSync` in a loop, retrying on EAGAIN after a short synchronous pause
+ * (`Atomics.wait` on a scratch `SharedArrayBuffer` — the standard technique for a blocking sleep
+ * in synchronous Node code with no native dependency), until genuine EOF (`bytesRead === 0`).
+ * Any other error is real and rethrown, surfacing through runGate's own outer catch-all exactly
+ * as before.
+ *
+ * P2-7 BOUNDED RETENTION (cap VALUE superseded by P1-A above — this paragraph documents the
+ * MECHANISM, which is unchanged): once `retainedBytes` reaches `RETAINED_STDIN_CAP_BYTES`,
+ * subsequent reads land in `scratch` (a SECOND, reused buffer) instead of being pushed onto
+ * `chunks` — the stream is still DRAINED all the way to EOF (a writer on the other end of the pipe
+ * still needs its own write to complete; leaving unread bytes behind risks EPIPE/a hung writer),
+ * the bytes themselves are just discarded rather than retained. The evaluator still sees the full
+ * capped payload (whatever was retained before the cap was crossed) — decoding to AT LEAST the
+ * engine's own 4 Mi-unit threshold in every case, per P1-A's own worst-case-ratio proof above, so
+ * the overflow outcome is unchanged; only the MEMORY this function itself commits to is bounded.
+ * Retained size can exceed the cap by up to one chunk (`STDIN_CHUNK_SIZE`, 65536 bytes) — the LAST
+ * chunk that pushes `retainedBytes` past the cap is still retained in full, since the boundary
+ * check happens once per iteration, before that iteration's own read; this is deliberate (a
+ * single read's worth of slop costs nothing worth avoiding the complexity of splitting a chunk to
+ * fit exactly) and is what this function's own tests pin as "cap + one chunk", not an exact cap —
+ * and is also EXACTLY the slack term P1-A's own cap formula adds on top of `3 × 4 Mi`, so this
+ * same slop is what turns "decodes to at least the threshold" into "decodes past it", matching the
+ * engine's strict `>` comparison instead of merely reaching equality in the worst case.
+ */
+export function readStdinSync(): string {
+  const chunks: Buffer[] = [];
+  let retainedBytes = 0;
+  const buffer = Buffer.alloc(STDIN_CHUNK_SIZE);
+  const scratch = Buffer.alloc(STDIN_CHUNK_SIZE); // reused every over-cap iteration; never retained
+  const pauseSignal = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    const underCap = retainedBytes < RETAINED_STDIN_CAP_BYTES;
+    const target = underCap ? buffer : scratch;
+    let bytesRead: number;
+    try {
+      bytesRead = fs.readSync(0, target, 0, target.length, null);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EAGAIN") {
+        Atomics.wait(pauseSignal, 0, 0, 5);
+        continue;
+      }
+      if (code === "EOF") break; // some platforms signal EOF as an error rather than bytesRead 0
+      throw error;
+    }
+    if (bytesRead === 0) break;
+    if (underCap) {
+      chunks.push(Buffer.from(target.subarray(0, bytesRead)));
+      retainedBytes += bytesRead;
+    }
+    // else: draining to EOF without retaining — target === scratch, its content is discarded.
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 // ── Step 4: the Tool: prefix is load-bearing ──────────────────────────────────────────────────
@@ -502,6 +639,24 @@ export interface GateCliDependencies {
   projectDir(): string;
   /** Resolves the effective mirror path from the `--mirror` option, applying the default when absent. */
   mirrorPath(explicitMirror?: string): string;
+  /**
+   * Reads the WHOLE stdin stream synchronously (4b-D, component A — the argv transport can never
+   * carry an over-threshold context; --stdin is how one actually reaches the gate instead of
+   * silently E2BIG-bypassing it in a wrapper before this CLI ever runs — see MAX_CONTEXT_BYTES /
+   * overflow-ask). Default implementation is `readStdinSync` (this module, below) — NOT plain
+   * `fs.readFileSync(0, "utf8")`, which fails with EAGAIN on a non-blocking piped stdin (a real,
+   * empirically-reproduced failure for exactly the large-payload case --stdin exists to serve —
+   * see readStdinSync's own comment).
+   */
+  readStdin(): string;
+  /**
+   * NIT (round-5 coordinator review): `--stdin` on an interactive terminal with nothing piped in
+   * hangs forever awaiting EOF that never comes (a human sitting at a TTY, not a pipe, has no way
+   * to signal end-of-input short of Ctrl-D). Checked BEFORE readStdin() is ever called so this
+   * command refuses with a usage error instead — the same "never silently guess, never hang"
+   * posture the rest of this file already applies to every other caller-input mistake.
+   */
+  isStdinTTY(): boolean;
   setExitCode(code: number): void;
 }
 
@@ -519,6 +674,8 @@ export function defaultGateCliDependencies(): GateCliDependencies {
     // its own cwd (exactly the shape a spawned hook process can have). See db/index.ts's
     // getMonetDir/getGateMirrorPath for the baseDir plumbing this relies on.
     mirrorPath: (explicitMirror) => (explicitMirror ? path.resolve(explicitMirror) : getGateMirrorPath(resolveProjectDir())),
+    readStdin: readStdinSync,
+    isStdinTTY: () => process.stdin.isTTY === true,
     setExitCode(code) {
       process.exitCode = code;
     },
@@ -527,8 +684,42 @@ export function defaultGateCliDependencies(): GateCliDependencies {
 
 interface GateCommandOptions {
   circle?: string;
+  stdin?: boolean;
   mirror?: string;
   tool?: string;
+}
+
+export type ActionContextSourceResult =
+  | { kind: "ok"; raw: string }
+  | { kind: "usage-error"; message: string };
+
+/**
+ * Which of {the positional argument, --stdin} supplies the raw action context text — resolved
+ * BEFORE any of the Tool:-prefix / mirror / circle logic runs, since this decides whether there
+ * is a raw context for that logic to run on at all (4b-D, component A).
+ *
+ * Exactly one of the two must be given: both present is refused (ambiguous — which one did the
+ * caller mean?), neither present is refused (nothing to evaluate) — both usage errors, exit 1,
+ * matching every other caller-input mistake this command already refuses rather than guesses at.
+ */
+export function resolveActionContextSource(
+  positional: string | undefined,
+  useStdin: boolean,
+  readStdin: () => string,
+): ActionContextSourceResult {
+  if (positional !== undefined && useStdin) {
+    return {
+      kind: "usage-error",
+      message: "action context given both as a positional argument and via --stdin; supply exactly one.",
+    };
+  }
+  if (positional === undefined && !useStdin) {
+    return {
+      kind: "usage-error",
+      message: "no action context given: supply it as a positional argument, or pass --stdin and pipe it in.",
+    };
+  }
+  return { kind: "ok", raw: useStdin ? readStdin() : positional! };
 }
 
 /**
@@ -538,32 +729,63 @@ interface GateCommandOptions {
  * "never fail closed on an unknown", applied to this command's own defects too).
  */
 export function runGate(
-  rawActionContext: string,
+  positionalActionContext: string | undefined,
   options: GateCommandOptions,
   deps: GateCliDependencies = defaultGateCliDependencies(),
 ): void {
   try {
-    runGateUnguarded(rawActionContext, options, deps);
+    runGateUnguarded(positionalActionContext, options, deps);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`monet gate: internal error (${message}) — failing OPEN (nothing blocked).`);
+    console.error(`monet gate: internal error (${message}) — ${GATE_FAIL_OPEN_MARKER} (nothing blocked).`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
   }
 }
 
-function runGateUnguarded(rawActionContext: string, options: GateCommandOptions, deps: GateCliDependencies): void {
+function runGateUnguarded(positionalActionContext: string | undefined, options: GateCommandOptions, deps: GateCliDependencies): void {
+  // NIT (round-5 coordinator review): refuse BEFORE resolveActionContextSource ever calls
+  // deps.readStdin() — on a real TTY (nothing piped), that call blocks forever waiting for input
+  // that will never arrive short of a manual Ctrl-D. A usage error is the honest answer; a hang
+  // is not.
+  if (options.stdin === true && deps.isStdinTTY()) {
+    console.error(
+      `monet gate: --stdin was given but stdin is a TTY (nothing is piped in) — refusing rather ` +
+        `than hanging until EOF. Pipe the action context in instead, e.g. ` +
+        `echo "Bash:git push --force" | monet gate --stdin.`,
+    );
+    deps.setExitCode(USAGE_ERROR_EXIT_CODE);
+    return;
+  }
+
+  // COMPONENT A (4b-D): resolve the raw context from EXACTLY ONE of {positional, --stdin} first.
+  // --stdin exists because argv can never carry an over-threshold context (Codex round-1
+  // deferral on 4b-C: this OS's ARG_MAX, ~1 MiB, is smaller than the engine's own 4 MiB overflow
+  // threshold — see this slice's report — so an oversized context passed as a bare positional
+  // argument never reaches this process at all; the shell/exec layer rejects it with E2BIG before
+  // `monet` even starts, which is a silent, wrapper-level "never asked" rather than the honest
+  // overflow-ask (exit 40) outcome 40 exists to name). Reading the WHOLE stream raw, no JSON
+  // parsing at this layer, mirrors argv's own contract exactly: the caller hands over the literal
+  // text to evaluate, nothing more.
+  const source = resolveActionContextSource(positionalActionContext, options.stdin === true, deps.readStdin);
+  if (source.kind === "usage-error") {
+    console.error(`monet gate: ${source.message}`);
+    deps.setExitCode(USAGE_ERROR_EXIT_CODE);
+    return;
+  }
+  const rawContext = source.raw;
+
   // Input-shape validation first: it is cheap, orthogonal to mirror/file state, and a caller bug
   // regardless of what the mirror looks like right now. Never "silently unmatched" — an
   // unprefixed context is refused (exit 1), not answered as if it were evaluated.
   let actionContext: string;
   try {
-    actionContext = ensureToolPrefixedContext(rawActionContext, options.tool);
+    actionContext = ensureToolPrefixedContext(rawContext, options.tool);
   } catch (error) {
     console.error(`monet gate: ${(error as Error).message}`);
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
     return;
   }
-  if (options.tool && parseActionContext(rawActionContext).tool !== null) {
+  if (options.tool && parseActionContext(rawContext).tool !== null) {
     console.error(`monet gate: --tool ignored — action context already carries a 'Tool:' prefix.`);
   }
 
@@ -609,16 +831,29 @@ function runGateUnguarded(rawActionContext: string, options: GateCommandOptions,
 
   // FAILURE POLICY (boundary statement, adapted to a store-less reader): missing or malformed
   // both fail OPEN, loudly, exit 0 — identical to silence from a host's point of view, distinguished
-  // only by the stderr line. Never fail closed on an unknown. No `monet materialize` command ships
-  // in this client yet (checked: neither this CLI nor any call site that constructs MonetCore passes
-  // `gateSidecarPath` today — see this slice's own report) — naming that honestly rather than
-  // pointing at a command that does not exist.
+  // only by the stderr line. Never fail closed on an unknown. REPAIR ADVICE UPDATED (4b-D,
+  // component D): this used to say no caller anywhere passed `gateSidecarPath`, so the only honest
+  // repair was a manual @team-monet/core API call — no longer true (component B wires it into
+  // `start`'s own MonetCore construction, the ONE serving-process writer surface — see
+  // bootstrap.ts's ServedCoreOptions.gateSidecarPath). The truer repair now is "is a `monet start`
+  // session actually running for this project" — there is still no ONE-SHOT `monet materialize`
+  // command for regenerating the file without a running server (unbuilt; see next-monet-tool-
+  // surface.md's own separate `monet materialize` row), so that honest gap remains named too.
+  //
+  // FRESH-INSTALL WORDING (P1-A, Codex round 1 on PR #42): this exact message is now ALSO what a
+  // brand-new user sees verbatim in Claude Code's own transcript (install-cli.ts's wrapper greps
+  // captured stderr for GATE_FAIL_OPEN_MARKER and surfaces a match as systemMessage) — "missing
+  // mirror" is the state EVERY new install passes through (hook wired, no `monet start` session
+  // has run yet), so the wording names that plainly rather than reading like an error report.
   if (read.kind !== "ok") {
     const problem = read.kind === "missing" ? `no readable mirror at ${mirrorPath}` : `mirror at ${mirrorPath} is unusable (${read.reason})`;
     console.error(
-      `monet gate: ${problem} — failing OPEN (nothing blocked). No 'monet materialize' command ships ` +
-        `in this CLI yet; regenerate via @team-monet/core's MonetCore#materializeGateMirror against ` +
-        `the live store until it does.`,
+      `monet gate: ${problem} — ${GATE_FAIL_OPEN_MARKER} (nothing blocked). This is expected right ` +
+        `after a fresh \`monet install\`: the hook is wired, but the mirror doesn't exist until a ` +
+        `\`monet start\` session has run at least once for this project — it materializes and ` +
+        `refreshes the file automatically from then on. Start one now, or re-run \`monet install\` ` +
+        `if you're unsure the hook itself is even wired. No one-shot ` +
+        `\`monet materialize\` command ships in this CLI yet for regenerating it without a server.`,
     );
     console.error(`monet gate: circle ${describeResolvedCircle(resolved, null)}`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
@@ -644,7 +879,7 @@ function runGateUnguarded(rawActionContext: string, options: GateCommandOptions,
     // Structurally, assertQueryableCircle's `circle === '*'` check is the only throw this function
     // has (see its source) — so resolved.circle !== '*' here means something unanticipated by this
     // command's own shape guard slipped through. Fail open rather than crash.
-    console.error(`monet gate: evaluation failed unexpectedly (${message}) — failing OPEN (nothing blocked).`);
+    console.error(`monet gate: evaluation failed unexpectedly (${message}) — ${GATE_FAIL_OPEN_MARKER} (nothing blocked).`);
     console.error(`monet gate: circle ${describeResolvedCircle(resolved, read.mirror)}`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
     return;
@@ -669,14 +904,16 @@ function runGateUnguarded(rawActionContext: string, options: GateCommandOptions,
       // SHOULD-FIX 5 (coordinator review round): the boundary statement requires naming the
       // staleness AND the repair command in the SAME breath as the reason (gate-boundary-
       // statement.md, "Binding consequences for 4b", item 2) — the missing/malformed path already
-      // does this; the deny path only disclosed age, not the repair. Same honest wording: no
-      // `monet materialize` command ships in this client yet (see readGateMirrorFile's own
-      // comment / this slice's report).
+      // does this; the deny path only disclosed age, not the repair. REPAIR ADVICE UPDATED (4b-D,
+      // component D) — same reasoning as the missing/malformed path above: a running `monet start`
+      // now keeps this file fresh on its own.
       const age = formatMirrorAge(read.mirror.generatedAt, deps.now());
       console.error(
         `monet gate: answering from a mirror generated ${age} ago — an offline answer is a cached ` +
-          `answer. No 'monet materialize' command ships in this CLI yet; regenerate via ` +
-          `@team-monet/core's MonetCore#materializeGateMirror against the live store to refresh it.`,
+          `answer. A running \`monet start\` session for this project refreshes this file on every ` +
+          `gate-relevant write; if none is running (or it targets a different project), start one, ` +
+          `or run \`monet install\` to wire the hook that depends on it. No one-shot ` +
+          `\`monet materialize\` command ships in this CLI yet.`,
       );
       break;
     }
@@ -697,7 +934,10 @@ export function registerGateCommands(
   deps: GateCliDependencies = defaultGateCliDependencies(),
 ): Command {
   program
-    .command("gate <action-context>")
+    // OPTIONAL positional (4b-D, component A): --stdin supplies the context instead, and exactly
+    // one of the two is required — enforced in resolveActionContextSource, not by commander's own
+    // required-argument machinery, since commander has no "required unless --flag" primitive.
+    .command("gate [action-context]")
     .description("Evaluate the offline gate mirror for an action context (no store, no network)")
     // SHOULD-FIX 3 (coordinator review round): commander's default silently binds only the FIRST
     // excess positional argument and drops the rest — an unquoted `monet gate Bash:terraform
@@ -708,6 +948,7 @@ export function registerGateCommands(
     .option("--circle <name>", "Circle to query (default: MONET_CIRCLE env, else the remote-derived default when the repo has an origin, else folder derivation; the evaluator applies the mirror's one-hop alias map to every input)")
     .option("--mirror <path>", "Path to the gate mirror file (default: .monet/gate-mirror.json or ~/.monet/gate-mirror.json)")
     .option("--tool <name>", "Synthesize the required 'Tool:' prefix from this tool name when the action context omits it")
+    .option("--stdin", "Read the action context from stdin instead of the positional argument (required for a context too large for argv — see overflow-ask; mutually exclusive with the positional)")
     .addHelpText("after", `
 Exit codes (the host maps these; this command never enforces any of them):
   0   silence              no stage matched — nothing governs this action
@@ -717,12 +958,18 @@ Exit codes (the host maps these; this command never enforces any of them):
                            mirror's age and the repair command (an offline deny is a cached deny)
   40  overflow-ask         action context past the refusal threshold; NEVER map this to allow
   1   usage error          --circle '*' (not a queryable circle), no 'Tool:' prefix and no --tool,
-                           or excess positional arguments (quote the action context)
+                           excess positional arguments (quote the action context), or the action
+                           context given both as a positional argument and via --stdin (or neither)
 
 --help/-h and --version exit 0 through commander's own paths, before any evaluation runs — the
 exit-code table above describes outcomes of an actual evaluation only.
+
+An oversized action context can never reach this command as a positional argument — the OS's own
+ARG_MAX (often ~1 MiB) is smaller than the engine's 4 MiB overflow threshold, so the shell/exec
+layer itself rejects it (E2BIG) before \`monet\` starts. Pipe it in instead:
+  echo "Bash:$LONG_COMMAND" | monet gate --stdin --tool Bash
 `)
-    .action((actionContext: string, options: GateCommandOptions) => {
+    .action((actionContext: string | undefined, options: GateCommandOptions) => {
       runGate(actionContext, options, deps);
     });
   return program;

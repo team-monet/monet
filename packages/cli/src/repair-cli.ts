@@ -17,6 +17,7 @@ import {
   type VerifiedBackupResult,
 } from "@team-monet/core";
 import { getDbPath } from "./db/index.js";
+import { resolveProjectDir } from "./project-dir.js";
 
 const RECOVERY_SCHEMA = "monet.recovery.v1";
 const PROBE_TEXT = "Monet embedding-provider recovery preflight";
@@ -832,8 +833,13 @@ function printRecoveryError(
 
 export function defaultRecoveryDependencies(): RecoveryCliDependencies {
   return {
+    // P1-B/P2-D (Codex round 4 on PR #42): the ELSE branch (no explicit -d/--dir — doctor and
+    // repair both have their own, checked FIRST via storageDir above) now roots at
+    // resolveProjectDir(), NOT bare cwd — matching status/dashboard/source's own fix in cli.ts.
+    // The storageDir-given branch already bypasses getDbPath/getMonetDir entirely (a direct
+    // path.join), so it was never affected by this bug and needs no change here.
     dbPath(storageDir) {
-      return storageDir ? path.join(path.resolve(storageDir), "monet.db") : path.resolve(getDbPath());
+      return storageDir ? path.join(path.resolve(storageDir), "monet.db") : path.resolve(getDbPath(resolveProjectDir()));
     },
     inspect: inspectStoredEmbedderState,
     instantiate: instantiateEmbedderForPin,

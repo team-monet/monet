@@ -362,7 +362,11 @@ describe("source CLI", () => {
       access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
       include: ["README.md", "docs/**/*.md"],
     });
-    expect(dependencies.deriveCircle).toHaveBeenCalledWith(canonicalProjectDir);
+    // P1-2 (Codex round 3 on PR #42): identity=canonicalProjectDir (the worktree, here the SAME
+    // dir as the invoking project since no --path override), storeDir=projectDir (the invoking
+    // project's own store — where createSource below actually writes). See circle.ts's own
+    // deriveCircle for the full matrix; source-cli.ts's own two worktree call sites for the fix.
+    expect(dependencies.deriveCircle).toHaveBeenCalledWith(canonicalProjectDir, { storeDir: projectDir });
     // The server identity is derived from the INVOCATION project dir (dependencies.projectDir()),
     // not the repo-md source's own root — those two can differ (e.g. a custom --path).
     expect(dependencies.deriveProjectId).toHaveBeenCalledWith(projectDir);
@@ -443,7 +447,12 @@ describe("source CLI", () => {
     const source = inspect((core) => core.listSources()[0]);
     expect(source.localPath).toBe(canonicalCustomRoot);
     expect(source.circle).toBe("derived-project-circle");
-    expect(dependencies.deriveCircle).toHaveBeenCalledWith(canonicalCustomRoot);
+    // P1-2 (Codex round 3 on PR #42): identity=canonicalCustomRoot (the WORKTREE — a genuinely
+    // DIFFERENT directory than the invoking project here, via --path), storeDir=projectDir (the
+    // invoking project's own store) — the exact divergence this fix exists for: the circle name
+    // is resolved from the worktree's own git identity, but consulted against the store
+    // createSource actually writes into.
+    expect(dependencies.deriveCircle).toHaveBeenCalledWith(canonicalCustomRoot, { storeDir: projectDir });
   });
 
   it("adds git-md with an explicit transport policy but does not create its allocated path", async () => {

@@ -1,19 +1,24 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MonetCore, deriveCircle as coreDeriveCircle } from "@team-monet/core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GATE_EXIT_CODE,
   GateActionContextError,
+  RETAINED_STDIN_CAP_BYTES,
   classifyGateResult,
   ensureToolPrefixedContext,
   formatMirrorAge,
   readGateMirrorFile,
+  readStdinSync,
   describeResolvedCircle,
+  resolveActionContextSource,
   resolveGateCircle,
   resolveRuntimeModelTag,
+  runGate,
 } from "../gate-cli";
 import { canonicalRemoteKey, defaultNameFromRemote, getOriginRemote } from "../remote-circle";
 import type { GateMirror, GateResult } from "@team-monet/core";
@@ -108,6 +113,17 @@ function spawnGateAt(cwd: string, args: string[], env: NodeJS.ProcessEnv = proce
   );
 }
 
+/** Like spawnGate, but pipes `stdinContent` in via spawnSync's own `input` option — component A's
+ *  --stdin transport, exercised through the REAL spawned CLI process (a real pipe, real EAGAIN
+ *  risk on this platform — see readStdinSync's own comment in gate-cli.ts). */
+function spawnGateStdin(stdinContent: string, args: string[], env: NodeJS.ProcessEnv = process.env) {
+  return spawnSync(
+    process.execPath,
+    ["--import", TSX_LOADER, "src/cli.ts", "gate", "--stdin", ...args],
+    { cwd: REPO_ROOT, encoding: "utf8", env, input: stdinContent },
+  );
+}
+
 /** Build a throwaway git repo with the given origin URL (config read only, no network) — the
  *  P1 fix (Codex round 2 on PR #40) needs a REAL repo with a REAL origin to reproduce the bug
  *  (getOriginRemote shells `git remote get-url origin`, which needs a real .git directory).
@@ -140,7 +156,8 @@ describe("monet gate CLI", () => {
   it("documents exit codes in --help through the real CLI process", () => {
     const result = spawnGate(["--help"]);
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("Usage: monet gate [options] <action-context>");
+    // [action-context] is OPTIONAL now (4b-D, component A: --stdin can supply it instead).
+    expect(result.stdout).toContain("Usage: monet gate [options] [action-context]");
     expect(result.stdout).toContain("0   silence");
     expect(result.stdout).toContain("10  stage-hit-no-rules");
     expect(result.stdout).toContain("20  advisory-inject");
@@ -600,14 +617,17 @@ describe("monet gate CLI", () => {
 
   // ── Coordinator review round: deny path also names the repair command (SHOULD-FIX 5) ─────────
 
-  it("SHOULD-FIX 5: the deny path names the same regeneration command the missing/malformed path names", async () => {
+  it("SHOULD-FIX 5: the deny path names the same regeneration advice the missing/malformed path names", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
     expect(result.stderr).toContain("generated");
-    expect(result.stderr).toContain("materializeGateMirror");
+    // Updated wording (4b-D, component D): now that `monet start` actually keeps the mirror
+    // fresh (component B), the honest repair line names THAT rather than a manual core API call.
+    expect(result.stderr).toContain("monet start");
+    expect(result.stderr).toContain("monet install");
   });
 
   // ── Coordinator review round: additional coverage gap — MONET_MODEL_TAG plumbing, end to end ─
@@ -727,13 +747,157 @@ describe("monet gate CLI", () => {
     expect(result.stdout).toContain("a stolen token can publish a malicious version");
     expect(result.stderr).toContain(`circle ${folderSlug} (resolved from folder)`);
   });
+
+  // ── Component A (4b-D): --stdin transport ─────────────────────────────────────────────────────
+
+  it("--stdin: a deny fires exactly as it would via the positional argument", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const result = spawnGateStdin("Bash:git push --force", ["--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    expect(result.stdout).toBe(
+      "Never force-push to main — a rewritten history cannot be recovered from a teammate's clone\n",
+    );
+  });
+
+  it("--stdin: an over-threshold context reaches the gate and yields a REAL exit 40 — finally reachable (argv never could carry this)", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    // Past @team-monet/core's own MAX_CONTEXT_BYTES (4 MiB). A 5 MiB argv element reliably fails
+    // with E2BIG on this OS before any process even starts (see the 4b-C report) — --stdin exists
+    // exactly so this class of context can still reach the gate and get an honest overflow-ask
+    // instead of silently never being asked at all.
+    const over = "Bash:" + "x".repeat(5 * 1024 * 1024);
+    const result = spawnGateStdin(over, ["--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(result.status).toBe(GATE_EXIT_CODE.OVERFLOW_ASK);
+    expect(result.stdout).toBe("");
+  });
+
+  it("P2-7 (Codex round 3 on PR #42): an input FAR past the retention cap (20 MiB, well beyond RETAINED_STDIN_CAP_BYTES) still yields the real exit 40 — draining-without-retaining does not lose the overflow outcome", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    // ~1.6x the retention cap (P1-A, round 4: cap is now 3*4MiB+64KiB ≈ 12.06 MiB, up from the
+    // original 5 MiB — see RETAINED_STDIN_CAP_BYTES's own comment) — proves the CAPPED (not full)
+    // retained payload, once bounded retention kicks in partway through, is STILL comfortably past
+    // the 4 MiB engine threshold for this ASCII (1 byte : 1 UTF-16 unit) content, so
+    // evaluateGateFromMirror's own length check still correctly reports overflow. Before P2-7's own
+    // bound existed, readStdinSync retained the WHOLE 20 MiB in heap; after, it retains only up to
+    // ~cap + one chunk and drains the rest. (For the DISTINCT multibyte-ratio bug this flat byte
+    // cap also had — a 3-byte-UTF-8 stream needing 3x the retained bytes to reach the same decoded
+    // length — see the dedicated P1-A test below.)
+    const over = "Bash:" + "x".repeat(20 * 1024 * 1024);
+    const result = spawnGateStdin(over, ["--circle", "acme-widgets", "--mirror", mirrorPath], {
+      ...process.env,
+      // spawnSync's OWN maxBuffer bounds READING the child's stdout/stderr back, not the `input`
+      // being WRITTEN to it — irrelevant to a large INPUT — left at the default deliberately, to
+      // also prove this test harness itself doesn't need raising (stdout stays empty either way).
+    });
+    expect(result.status).toBe(GATE_EXIT_CODE.OVERFLOW_ASK);
+    expect(result.stdout).toBe("");
+  });
+
+  it("P1-A (Codex round 4 on PR #42): a MULTIBYTE (3-byte UTF-8) context far past the retention cap still yields the real exit 40 — a flat BYTE cap alone would evaluate this as truncated-and-normal instead (fails before this fix)", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    // "가" (U+AC00, a common Korean syllable) encodes as EXACTLY 3 UTF-8 bytes and decodes to
+    // EXACTLY 1 UTF-16 code unit — the worst-case ratio RETAINED_STDIN_CAP_BYTES's own comment
+    // proves is the binding constraint (3-byte sequences: 3:1; 4-byte/astral sequences: 4:2 = 2:1,
+    // lower; 1- and 2-byte sequences: 1:1 and 2:1, lower still).
+    //
+    // 20 MiB of "가" is comfortably past BOTH the OLD flat 5 MiB byte cap AND the NEW ~12.06 MiB
+    // cap, so retention is bounded (capped, not full) under either — the POINT of this test is
+    // that the CAPPED retention itself must still decode past the engine's 4 Mi-unit threshold:
+    //   - OLD cap (5 MiB bytes): retains at most ~5 MiB + one chunk of "가", decoding to at most
+    //     ~1.75 Mi UTF-16 units — WELL UNDER the 4 Mi threshold. evaluateGateFromMirror sees a
+    //     TRUNCATED context that reports IN-BOUNDS — the wrong verdict CLASS the round-4 coordinator
+    //     flagged as worse than the memory bug: not "correctly flagged overflow, capped", but
+    //     "silently evaluated as if normal-sized", most likely landing on silence (exit 0) or
+    //     stage-hit-no-rules (exit 10) here — never the honest overflow-ask this input deserves.
+    //   - NEW cap (3*4MiB+64KiB bytes): retains at least that many bytes of "가", decoding to AT
+    //     LEAST ~4.02 Mi UTF-16 units — comfortably PAST the 4 Mi threshold, by construction (see
+    //     RETAINED_STDIN_CAP_BYTES's own worst-case-ratio proof) — correct exit 40 regardless of
+    //     how much further past the cap the genuine 20 MiB input actually goes.
+    const over = "Bash:" + "가".repeat(20 * 1024 * 1024 / 3);
+    const result = spawnGateStdin(over, ["--circle", "acme-widgets", "--mirror", mirrorPath], {
+      ...process.env,
+    });
+    expect(result.status).toBe(GATE_EXIT_CODE.OVERFLOW_ASK);
+    expect(result.stdout).toBe("");
+  });
+
+  it("--stdin + positional argument together: usage error, exit 1 (ambiguous — never guesses which one was meant)", () => {
+    const result = spawnGate(["Bash:git push --force", "--stdin"]);
+    expect(result.status).toBe(1);
+    expect(result.status).not.toBe(GATE_EXIT_CODE.SILENCE);
+    expect(result.stderr).toContain("given both as a positional argument and via --stdin");
+  });
+
+  it("neither positional nor --stdin: usage error, exit 1 (the pre-existing 'nothing to evaluate' refusal)", () => {
+    const result = spawnGate([]);
+    expect(result.status).toBe(1);
+    expect(result.status).not.toBe(GATE_EXIT_CODE.SILENCE);
+    expect(result.stderr).toContain("no action context given");
+  });
+
+  it("--stdin still refuses an unprefixed context, and --tool synthesis still works through it", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+
+    const unprefixed = spawnGateStdin("git push --force", ["--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(unprefixed.status).toBe(1);
+    expect(unprefixed.stderr).toContain("has no 'Tool:' prefix");
+
+    const synthesized = spawnGateStdin(
+      "git push --force",
+      ["--tool", "Bash", "--circle", "acme-widgets", "--mirror", mirrorPath],
+    );
+    expect(synthesized.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+  });
 });
 
 // ── Unit tests for the pure/near-pure helpers (fast, no process spawn) ──────────────────────────
 
 describe("gate-cli helpers", () => {
+  it("resolveActionContextSource: exactly one of {positional, --stdin} — both or neither is a usage error", () => {
+    const readStdin = () => "STDIN CONTENT";
+    expect(resolveActionContextSource("Bash:foo", false, readStdin)).toEqual({ kind: "ok", raw: "Bash:foo" });
+    expect(resolveActionContextSource(undefined, true, readStdin)).toEqual({ kind: "ok", raw: "STDIN CONTENT" });
+    expect(resolveActionContextSource("Bash:foo", true, readStdin)).toMatchObject({ kind: "usage-error" });
+    expect(resolveActionContextSource(undefined, false, readStdin)).toMatchObject({ kind: "usage-error" });
+  });
+
   it("ensureToolPrefixedContext passes a prefixed context through unchanged", () => {
     expect(ensureToolPrefixedContext("Bash:git push --force")).toBe("Bash:git push --force");
+  });
+
+  it("runGate: --stdin on a TTY refuses with a usage error instead of hanging (readStdin never called)", () => {
+    let exitCode: number | undefined;
+    const stderrLines: string[] = [];
+    const readStdin = () => {
+      throw new Error("must not be called — this is exactly the hang this NIT fixes");
+    };
+    const originalError = console.error;
+    console.error = (msg: string) => { stderrLines.push(msg); };
+    try {
+      runGate(undefined, { stdin: true }, {
+        now: () => Date.now(),
+        env: {},
+        projectDir: () => "/tmp",
+        mirrorPath: () => "/tmp/monet-gate-cli-test-does-not-exist.json",
+        readStdin,
+        isStdinTTY: () => true,
+        setExitCode: (code) => { exitCode = code; },
+      });
+    } finally {
+      console.error = originalError;
+    }
+    expect(exitCode).toBe(1); // the usage-error code, distinct from every GATE_EXIT_CODE outcome
+    expect(stderrLines.join("\n")).toContain("stdin is a TTY");
   });
 
   it("ensureToolPrefixedContext synthesizes from --tool", () => {
@@ -923,6 +1087,46 @@ describe("gate-cli helpers", () => {
     expect(bad.kind).toBe("malformed");
     if (bad.kind === "malformed") expect(bad.reason).toContain("checksum mismatch");
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("P2-7 (Codex round 3 on PR #42), unit: readStdinSync's own RETAINED size never exceeds RETAINED_STDIN_CAP_BYTES + one chunk (65536), however much is actually piped in", () => {
+    // Mocks fs.readSync (the SAME `fs` default-import object gate-cli.ts itself calls through —
+    // Node's module cache means both this test and gate-cli.ts hold the identical object
+    // reference, so a spy installed here intercepts gate-cli.ts's own calls too) to feed
+    // readStdinSync a CONTROLLED, effectively-unbounded stream (64 KiB chunks, "fed" forever)
+    // without needing a real multi-hundred-MB piped stdin — proving the RETENTION bound
+    // algorithmically, deterministically, and fast, rather than only inferring it from an
+    // external process's memory footprint.
+    const CHUNK = 65536;
+    const totalChunksToOffer = Math.ceil((RETAINED_STDIN_CAP_BYTES * 4) / CHUNK); // ~4x the cap
+    let chunksServed = 0;
+    const readSyncSpy = vi.spyOn(fs, "readSync").mockImplementation(((
+      _fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      _offset: number,
+      length: number,
+    ): number => {
+      if (chunksServed >= totalChunksToOffer) return 0; // EOF
+      chunksServed += 1;
+      // Fill with a recognizable byte; content doesn't matter, only length does for this test.
+      (buffer as Buffer).fill(0x78, 0, length); // 'x'
+      return length;
+    }) as typeof fs.readSync);
+
+    try {
+      const result = readStdinSync();
+      const retainedBytes = Buffer.byteLength(result, "utf8");
+      expect(retainedBytes).toBeLessThanOrEqual(RETAINED_STDIN_CAP_BYTES + CHUNK);
+      // Not vacuous: confirm the mock actually offered MORE than the cap (so bounding was
+      // genuinely exercised, not just "nothing was retained because nothing was fed").
+      expect(chunksServed * CHUNK).toBeGreaterThan(RETAINED_STDIN_CAP_BYTES + CHUNK);
+      // And confirm draining actually continued to true EOF (every offered chunk was consumed,
+      // not just abandoned mid-stream) — the mock only returns 0 once chunksServed reaches the
+      // total, so reaching this point at all proves the loop kept calling readSync past the cap.
+      expect(chunksServed).toBe(totalChunksToOffer);
+    } finally {
+      readSyncSpy.mockRestore();
+    }
   });
 });
 
