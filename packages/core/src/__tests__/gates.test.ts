@@ -1142,7 +1142,7 @@ describe("declaration — the sovereign entrance", () => {
         c.close();
       });
 
-      it("records the safety fork as fork-signal in the store packet, event, and overview stats", async () => {
+      it("records the safety fork as species-fork in the store packet, event, and overview stats", async () => {
         const c = new MonetCore(":memory:", {});
         const text = "Verify a prior step's success before depending on it.";
         const fact = await c.store(text);
@@ -1150,18 +1150,22 @@ describe("declaration — the sovereign entrance", () => {
 
         expect(forked).toMatchObject({
           action: "created",
-          resolutionMode: "fork-signal",
+          resolutionMode: "species-fork",
           nearMatchId: fact.conceptId,
         });
         expect(raw(c).prepare(
           `SELECT action, mode FROM resolution_events WHERE observation_id = ?`,
-        ).get(forked.observationId)).toEqual({ action: "created", mode: "fork-signal" });
+        ).get(forked.observationId)).toEqual({ action: "created", mode: "species-fork" });
 
+        const overview = c.overview("default");
         const resolutionCounts = Object.fromEntries(
-          c.overview("default").resolutionStats.byMode.map(({ mode, count }) => [mode, count]),
+          overview.resolutionStats.byMode.map(({ mode, count }) => [mode, count]),
         );
-        expect(resolutionCounts).toEqual({ "fork-signal": 1, new: 1 });
+        expect(resolutionCounts).toEqual({ "species-fork": 1, new: 1 });
+        expect(overview.resolutionStats.decidedTotal).toBe(2);
         expect(resolutionCounts).not.toHaveProperty("attach");
+        expect(resolutionCounts).not.toHaveProperty("fork-signal");
+        expect(renderOverview(overview)).toContain("2 decided · 50% surfaced a possible duplicate");
         c.close();
       });
 

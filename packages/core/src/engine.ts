@@ -1311,8 +1311,8 @@ export interface ConnectedConcept {
  *
  * READING IT — EVERY RATE DIVIDES BY `decidedTotal`, NEVER BY `windowTotal`:
  *
- *     fork rate               (fork-signal + ambiguous-fork) / decidedTotal
- *     duplicate-emission rate (fork-signal + ambiguous-fork + blur-duplicate) / decidedTotal
+ *     fork rate               (fork-signal + species-fork + ambiguous-fork) / decidedTotal
+ *     duplicate-emission rate (fork-signal + species-fork + ambiguous-fork + blur-duplicate) / decidedTotal
  *
  * `windowTotal` counts every write, including `direct-attach` and `force-new` — writes where the
  * caller named the target and resolution was never allowed to decide anything. A bulk import or a
@@ -1320,12 +1320,13 @@ export interface ConnectedConcept {
  * pushed toward zero by writes that could not possibly have forked. `decidedTotal` is the count of
  * events that actually ran the rule (DECIDED_RESOLUTION_MODES, src/resolution.ts).
  *
- * Fork rate is kept to the two EVIDENCE-found pairings, because that is what the spec's "fork rate"
+ * Fork rate is kept to the EVIDENCE-found pairings, because that is what the spec's "fork rate"
  * names. Duplicate-emission rate is the broader one: how often ANY store call put a new pair in
  * front of a human, blur-duplicate included. A fork-signal count climbing relative to attach says
- * concepts are going bimodal faster than they are consolidating; a blur-duplicate count climbing
- * says centroids are drifting away from the evidence under them. Both land in `possibleDuplicates`
- * awaiting mediation. A `new` rate near 1.0 on a mature circle says nothing is resolving at all.
+ * concepts are going bimodal faster than they are consolidating; species-fork says a normative
+ * kind guard kept coherent evidence separate; blur-duplicate says centroids are drifting away from
+ * the evidence under them. All land in `possibleDuplicates` awaiting mediation. A `new` rate near
+ * 1.0 on a mature circle says nothing is resolving at all.
  *
  * MISFILE RATE IS NOT HERE, deliberately: it is not observable at store time. It is derived later
  * by joining the durable `resolution_events` log against subsequent detach/reassign — a human
@@ -3513,7 +3514,7 @@ export class MonetCore {
             action = "created";
             if (
               (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind
-            ) mode = "fork-signal";
+            ) mode = "species-fork";
             // A refused CORRECTION keeps its own kind (it is evidence about something, not a rule);
             // a refused RULE capture is still a rule and must be born as one or it can never fire.
             row = this.create(content, emb, circle, opts.kind === "rule" ? "rule" : opts.kind);

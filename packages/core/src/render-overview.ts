@@ -206,7 +206,9 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
   if (rs && rs.decidedTotal > 0) {
     const decided = rs.byMode.filter((m) => DECIDED_RESOLUTION_MODES.includes(m.mode));
     const paired = decided
-      .filter((m) => m.mode === "fork-signal" || m.mode === "ambiguous-fork" || m.mode === "blur-duplicate")
+      .filter((m) =>
+        m.mode === "fork-signal" || m.mode === "species-fork" ||
+        m.mode === "ambiguous-fork" || m.mode === "blur-duplicate")
       .reduce((sum, m) => sum + m.count, 0);
     out.push(bold("RESOLUTION") + dim(`  — how new evidence landed, last ${rs.windowDays}d`));
     out.push(truncate(dim(`  ${decided.map((m) => `${m.mode} ${m.count}`).join(" · ")}`), width));

@@ -81,6 +81,7 @@
  *
  *   attach            evidence found and identity confirmed — absorbed into the nominated concept
  *   fork-signal       evidence found, identity DISAGREED — bimodal concept, forked for mediation
+ *   species-fork      evidence and identity agreed, but the nominated concept kind was incompatible
  *   ambiguous-fork    ambiguous-band evidence — forked with a possible_duplicate_of edge (status quo)
  *   correction-attach ambiguous-band kind="correction" — attached, contradiction machinery takes over
  *   blur-duplicate    identity matched, evidence DISAGREED — the blur attractor's own output, paired
@@ -91,6 +92,7 @@
 export type ResolutionMode =
   | "attach"
   | "fork-signal"
+  | "species-fork"
   | "ambiguous-fork"
   | "correction-attach"
   | "blur-duplicate"
@@ -105,7 +107,7 @@ export type ResolutionMode =
  * would otherwise show a fork rate diluted toward zero by writes that were never allowed to fork.
  */
 export const DECIDED_RESOLUTION_MODES: readonly ResolutionMode[] = [
-  "attach", "fork-signal", "ambiguous-fork", "correction-attach", "blur-duplicate", "new",
+  "attach", "fork-signal", "species-fork", "ambiguous-fork", "correction-attach", "blur-duplicate", "new",
 ];
 
 /** Whether `mode` recorded a resolution decision rather than a caller-directed bypass. */
