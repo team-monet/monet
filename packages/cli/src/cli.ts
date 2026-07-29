@@ -22,10 +22,29 @@ const { version } = _require("../package.json") as { version: string };
 
 const program = new Command();
 
+function selectedCommand(command: Command): Command {
+  const subcommandName = command.args[0];
+  const subcommand = command.commands.find(
+    (candidate) => candidate.name() === subcommandName || candidate.aliases().includes(subcommandName),
+  );
+  return subcommand === undefined ? command : selectedCommand(subcommand);
+}
+
+function commandPath(command: Command): string {
+  const names: string[] = [];
+  for (let current: Command | null = command; current !== null; current = current.parent) {
+    names.unshift(current.name());
+  }
+  return names.join(" ");
+}
+
 program
   .name("monet")
   .description("Monet — local-first memory for AI agents (state-centric substrate)")
-  .version(version);
+  .version(version)
+  .configureOutput({
+    outputError: (text, write) => write(text.replace(/^error:/, `${commandPath(selectedCommand(program))}:`)),
+  });
 
 program
   .command("start")

@@ -371,10 +371,7 @@ export function registerSourceCommands(program: Command, dependencies: SourceCli
   const source = program
     .command("source")
     .description("Configure registered Markdown sources (registry only; does not sync content)")
-    .option("-d, --dir <directory>", "Storage directory (default: .monet or ~/.monet)")
-    .configureOutput({
-      outputError: (text, write) => write(text.replace(/^error:/, "monet source:")),
-    });
+    .option("-d, --dir <directory>", "Storage directory (default: .monet or ~/.monet)");
 
   const add = source
     .command("add <origin-or-name>")
