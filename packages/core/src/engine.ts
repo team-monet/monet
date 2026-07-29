@@ -3511,6 +3511,9 @@ export class MonetCore {
           } else if (forkReason !== null) {
             landedOnExisting = false;
             action = "created";
+            if (
+              (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind
+            ) mode = "fork-signal";
             // A refused CORRECTION keeps its own kind (it is evidence about something, not a rule);
             // a refused RULE capture is still a rule and must be born as one or it can never fire.
             row = this.create(content, emb, circle, opts.kind === "rule" ? "rule" : opts.kind);

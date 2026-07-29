@@ -1142,6 +1142,29 @@ describe("declaration — the sovereign entrance", () => {
         c.close();
       });
 
+      it("records the safety fork as fork-signal in the store packet, event, and overview stats", async () => {
+        const c = new MonetCore(":memory:", {});
+        const text = "Verify a prior step's success before depending on it.";
+        const fact = await c.store(text);
+        const forked = await c.store(text, { kind: "principle" });
+
+        expect(forked).toMatchObject({
+          action: "created",
+          resolutionMode: "fork-signal",
+          nearMatchId: fact.conceptId,
+        });
+        expect(raw(c).prepare(
+          `SELECT action, mode FROM resolution_events WHERE observation_id = ?`,
+        ).get(forked.observationId)).toEqual({ action: "created", mode: "fork-signal" });
+
+        const resolutionCounts = Object.fromEntries(
+          c.overview("default").resolutionStats.byMode.map(({ mode, count }) => [mode, count]),
+        );
+        expect(resolutionCounts).toEqual({ "fork-signal": 1, new: 1 });
+        expect(resolutionCounts).not.toHaveProperty("attach");
+        c.close();
+      });
+
       it("ATTACHES when re-declaring the SAME principle — one concept, idempotent membership", async () => {
         const c = resolvingCore();
         const text = "A build/install artifact is a snapshot or a live link — know which you hold.";
