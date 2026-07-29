@@ -9090,6 +9090,32 @@ describe("MCP surface", () => {
     c.close();
   });
 
+  it.each(["principle", "preference"] as const)(
+    "memory_declare(species %s) does not inject the host modelTag, but still rejects one the caller supplied",
+    async (species) => {
+      const c = core();
+      const { call, client } = await harness(c, { modelTag: "host-model" });
+
+      const declared = await call("memory_declare", {
+        species,
+        content: `A ${species} survives a configured host model tag.`,
+      });
+      expect(declared.isError).toBe(false);
+      expect(declared.json).toMatchObject({ species });
+
+      const callerTagged = await call("memory_declare", {
+        species,
+        content: `A caller-tagged ${species} is invalid.`,
+        modelTag: "caller-model",
+      });
+      expect(callerTagged.isError).toBe(true);
+      expect(callerTagged.text).toMatch(new RegExp(`species '${species}' carries no modelTag`));
+
+      await client.close();
+      c.close();
+    },
+  );
+
   it("memory_ratify over MCP: approve with memberRuleIds, response carries edgeIds + in-band skeleton", async () => {
     const c = core();
     const { call, client } = await harness(c);

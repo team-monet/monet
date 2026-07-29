@@ -1008,8 +1008,11 @@ export function registerMonetCoreTools(
         const r = await core.declare({
           species, stage, content, exitsEvidence, patterns, instance, severity, scope: ruleScope,
           // LIVE, not the closure-captured `defaultModelTag` — same review-fix reasoning as
-          // memory_store's own rule capture just above (Codex round 3).
-          modelTag: core.getRuntimeModelTag() ?? modelTag, reason, declaredBy, sourceRefs,
+          // memory_store's own rule capture just above (Codex round 3). The HOST tag is injected
+          // for RULES only: principle/preference are momentless and reject modelTag, but a
+          // caller-supplied value must still reach declare() so that rejection is not bypassed.
+          modelTag: species === "rule" ? (core.getRuntimeModelTag() ?? modelTag) : modelTag,
+          reason, declaredBy, sourceRefs,
           acknowledgeBlockingRules,
           circle: declareCircle,
         });
