@@ -113,6 +113,15 @@ function spawnGateAt(cwd: string, args: string[], env: NodeJS.ProcessEnv = proce
   );
 }
 
+/** Preserve the developer's normal process environment without leaking unrelated Monet overrides
+ *  into a child whose Monet inputs are owned by the test. */
+function isolatedGateEnv(ownedMonetEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const envWithoutMonet = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.startsWith("MONET_")),
+  );
+  return { ...envWithoutMonet, ...ownedMonetEnv };
+}
+
 /** Like spawnGate, but pipes `stdinContent` in via spawnSync's own `input` option — component A's
  *  --stdin transport, exercised through the REAL spawned CLI process (a real pipe, real EAGAIN
  *  risk on this platform — see readStdinSync's own comment in gate-cli.ts). */
@@ -683,8 +692,9 @@ describe("monet gate CLI", () => {
     // No --circle, no MONET_CIRCLE, no --mirror (exercising the DEFAULT mirror-path resolution
     // too) — MONET_PROJECT_DIR is the only thing naming which project this is, exactly the shape
     // a spawned hook process has.
-    const { MONET_CIRCLE: _unused, ...envWithoutCircle } = process.env;
-    const env = { ...envWithoutCircle, MONET_PROJECT_DIR: repoDir };
+    const env = isolatedGateEnv({ MONET_PROJECT_DIR: repoDir });
+    expect(Object.keys(env).filter((name) => name.startsWith("MONET_"))).toEqual(["MONET_PROJECT_DIR"]);
+    expect(env.MONET_STORAGE_DIR).toBeUndefined();
     const result = spawnGateAt(repoDir, ["Bash:npm publish"], env);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
     expect(result.stdout).toContain("a stolen token can publish a malicious version");
@@ -716,8 +726,7 @@ describe("monet gate CLI", () => {
     const mirror = JSON.parse(readFileSync(mirrorPath, "utf8")) as GateMirror;
     expect(mirror.circles).toEqual(expect.arrayContaining([folderSlug, friendlyName]));
 
-    const { MONET_CIRCLE: _unused, ...envWithoutCircle } = process.env;
-    const env = { ...envWithoutCircle, MONET_PROJECT_DIR: repoDir };
+    const env = isolatedGateEnv({ MONET_PROJECT_DIR: repoDir });
     const result = spawnGateAt(repoDir, ["Bash:npm publish"], env);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
     expect(result.stdout).toContain("a stolen token can publish a malicious version");
@@ -740,8 +749,7 @@ describe("monet gate CLI", () => {
       reason: "a stolen token can publish a malicious version",
     }]);
 
-    const { MONET_CIRCLE: _unused, ...envWithoutCircle } = process.env;
-    const env = { ...envWithoutCircle, MONET_PROJECT_DIR: repoDir };
+    const env = isolatedGateEnv({ MONET_PROJECT_DIR: repoDir });
     const result = spawnGateAt(repoDir, ["Bash:npm publish"], env);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
     expect(result.stdout).toContain("a stolen token can publish a malicious version");
