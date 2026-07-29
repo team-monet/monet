@@ -149,6 +149,42 @@ function fitStringArray(
   return { fitted, omitted: items.length - fitted.length };
 }
 
+/**
+ * The object-array counterpart to fitStringArray — same incremental size-fit technique, generalized
+ * over a plain object rather than a string, for the skeleton-entrances slice's in-band skeleton
+ * delivery (memory_declare's principle/preference response, memory_ratify): a SkeletonEntry is a
+ * small structured record, not a bare string, so fitStringArray's own signature does not fit it. No
+ * maxIterate count-cap here (unlike fitStringArray/stage_lookup's rules): skeleton() is itself
+ * uncapped at the engine layer on the same "few, always present" reasoning stages()/liveStageIndex
+ * rely on for their own callers, so the O(n) JSON.stringify cost this loop pays is bounded by the
+ * same design property, not by a second, redundant iteration cap here.
+ *
+ * TAKES A BUILDER, NOT A PARTIAL ENVELOPE (review round 1, item 2 — this was a reproduced blocker,
+ * not a tidy-up). Measuring a PREFIX of the response and then appending more fields to it is not a
+ * budget, it is an estimate: the previous shape fitted against the fixed fields alone and then
+ * added `guidance` (~240 chars) plus `skeletonTruncated`/`skeletonOmitted` (~55) afterwards, so at
+ * realistic entry sizes the finished response crossed RESULT_MAX_CHARS and ok()'s last-resort
+ * slicer cut it mid-JSON — an isError:false payload that JSON.parse rejects, the exact failure the
+ * fitting loop exists to make impossible. The builder closes that by construction: what gets
+ * MEASURED is the same complete object that gets RETURNED, truncation signals and all. The two
+ * signals are themselves size-relevant and depend on how many entries fit, which is why the builder
+ * is told `omitted` rather than being called once up front.
+ */
+function fitObjectArray<T>(
+  buildEnvelope: (fitted: T[], omitted: number) => Record<string, unknown>,
+  items: T[],
+  budget: number,
+): { fitted: T[]; omitted: number } {
+  let fitted: T[] = [];
+  for (let n = 1; n <= items.length; n++) {
+    const candidate = items.slice(0, n);
+    const serialized = JSON.stringify(buildEnvelope(candidate, items.length - n), null, 2);
+    if (serialized.length > budget) break;
+    fitted = candidate;
+  }
+  return { fitted, omitted: items.length - fitted.length };
+}
+
 // ok() is the canonical serializer for successful tool results. content[0] is ALWAYS the
 // pure JSON payload — byte-identical to what callers (scripts/mcp-smoke.ts, test helpers)
 // expect to JSON.parse. Any lifecycle decorations (prewarm block, nudge line) are appended
@@ -889,16 +925,23 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_declare",
-    'Declare a rule or a stage on the user\'s authority. This is the SOVEREIGN entrance: unlike memory_store, which captures what a correction taught, this records what the user has decided — so it is the only surface that accepts severity="blocking" (deny the action, for safety boundaries where softness is dangerous) and the only one that may replace an existing rule\'s binding. NEVER declare on your own initiative: a declaration is the user legislating, so it needs the user to have said so. species="stage" creates or re-authors a gate address ("put a gate on terraform apply") — passing `patterns` REPLACES that stage\'s trigger patterns outright, which is how a mis-seeded pattern is fixed. species="rule" creates the rule and binds it to its stage, creating the stage if it does not exist. Standing grants and preferences are NOT a separate thing to declare: a gate returns what the rule says, so "proceed without asking" is a rule with permissive content. Principles (the always-on skeleton) are not declared here.',
+    'Declare a rule, a stage, a principle, or a preference on the user\'s authority. This is the SOVEREIGN entrance: unlike memory_store, which captures what a correction taught, this records what the user has decided — so it is the only surface that accepts severity="blocking" (deny the action, for safety boundaries where softness is dangerous) and the only one that may replace an existing rule\'s binding. NEVER declare on your own initiative: a declaration is the user legislating, so it needs the user to have said so. species="stage" creates or re-authors a gate address ("put a gate on terraform apply") — passing `patterns` REPLACES that stage\'s trigger patterns outright, which is how a mis-seeded pattern is fixed. species="rule" creates the rule and binds it to its stage, creating the stage if it does not exist. species="principle"/"preference" is the DECLARATION entrance into the always-on skeleton — sovereignty replaces the four-test extraction battery here, but the battery still runs as a non-blocking warning light: the response\'s `advisories` array names mechanical signals (content that looks like a rule bound to an existing gate, missing `exitsEvidence`, a near-match/resolution the write itself surfaced) and NEVER blocks the write. Momentless: do not pass stage/severity/patterns for these two species — a preference bound to a moment is just a rule. Pass `exitsEvidence` (what would prove it wrong) to skip that one advisory. The response also carries the circle\'s now-live `skeleton` (compact entries), so the session that births a principle is governed by it from that turn onward. Standing grants are NOT a separate thing to declare: a gate returns what the rule says, so "proceed without asking" is a rule with permissive content.',
     {
       species: z
-        .enum(["rule", "stage"])
-        .describe('"stage": create or re-author a gate address. "rule": create a rule and bind it to a stage.'),
+        .enum(["rule", "stage", "principle", "preference"])
+        .describe('"stage": create or re-author a gate address. "rule": create a rule and bind it to a stage. "principle"/"preference": declare directly into the always-on skeleton (momentless — no stage/severity/patterns).'),
       stage: z
         .string()
         .max(STAGE_NAME_MAX_CHARS)
-        .describe("The action the gate fires on — a stage name, or the id of an existing stage. Required for both species."),
-      content: z.string().optional().describe('What the rule says. Required for species="rule".'),
+        .optional()
+        .describe("The action the gate fires on — a stage name, or the id of an existing stage. Required for species \"rule\"/\"stage\"; must be omitted for \"principle\"/\"preference\", which are momentless."),
+      content: z.string().optional().describe('What it says. Required for every species.'),
+      exitsEvidence: z
+        .string()
+        .optional()
+        .describe(
+          'species "principle"/"preference" only: what evidence would prove this wrong (the extraction battery\'s Exits test). Omitting it never blocks the write — it only earns a warning-light advisory prompting for it.',
+        ),
       patterns: z
         .array(z.string())
         .optional()
@@ -924,7 +967,9 @@ export function registerMonetCoreTools(
       scope: z.enum(["domain", "agent"]).optional().describe('"domain": true for a perfect agent. "agent" (default): a compensation for this model.'),
       modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
       reason: z.string().optional().describe('One line naming the failure this prevents — what the gate shows, and what earns compliance. REQUIRED when severity is "blocking": a deny nobody can explain is a deny people learn to route around. Ask the user for it rather than inventing one.'),
-      declaredBy: z.string().optional().describe("Who ruled. Defaults to the calling agent id."),
+      // Bounded like memberRuleIds and ratifiedBy: this lands verbatim in fixed response fields and
+      // overview skeleton entries, which are not size-fitted — an actor "name" is never a document.
+      declaredBy: z.string().max(200).optional().describe("Who ruled. Defaults to the calling agent id."),
       circle: z
         .string()
         .optional()
@@ -933,7 +978,7 @@ export function registerMonetCoreTools(
         ),
       sourceRefs: z.array(z.string()).optional(),
     },
-    async ({ species, stage, content, patterns, instance, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs, acknowledgeBlockingRules }) => {
+    async ({ species, stage, content, exitsEvidence, patterns, instance, severity, scope: ruleScope, modelTag, reason, declaredBy, circle, sourceRefs, acknowledgeBlockingRules }) => {
       // RAW, UNDISTORTED — memory_declare-scoped (review fix — Codex round 2, item 1). declare()
       // itself must be able to tell "the caller said nothing about circle" (`undefined` — preserves
       // an existing binding's circle, including breadth) from "the caller explicitly named the
@@ -961,7 +1006,7 @@ export function registerMonetCoreTools(
       const capturedBlock = capturePrewarmSnapshot(homeCircle);
       try {
         const r = await core.declare({
-          species, stage, content, patterns, instance, severity, scope: ruleScope,
+          species, stage, content, exitsEvidence, patterns, instance, severity, scope: ruleScope,
           // LIVE, not the closure-captured `defaultModelTag` — same review-fix reasoning as
           // memory_store's own rule capture just above (Codex round 3).
           modelTag: core.getRuntimeModelTag() ?? modelTag, reason, declaredBy, sourceRefs,
@@ -990,37 +1035,148 @@ export function registerMonetCoreTools(
         // ORDER: downgraded's own line first, per severity taking precedence over breadth in every
         // other place this codebase orders the two (DOOR 12's own severity gate runs before the
         // breadth boundary check, graftRows).
-        let guidance: string;
-        if (r.species === "stage") {
-          guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles.";
+        // A REAL CONDITIONAL'S OWN BRANCHES, per the lesson the comment just above this one already
+        // states about this exact union: TypeScript narrows `r`'s discriminated union only within a
+        // real if/else's own branch, not by trusting a narrowing to persist past an early return out
+        // of a sibling, separately-checked `if`. species=="principle"/"preference" is therefore its
+        // own `if` arm with its own `return`, and the ENTIRE stage/rule split lives inside the paired
+        // `else`, so `r` stays narrowed to "stage" | "rule" for all of it, exactly as that split needs.
+        if (r.species === "principle" || r.species === "preference") {
+          // IN-BAND SKELETON DELIVERY (user-ratified, 2026-07-29): "the session that births a
+          // principle is governed by it from that turn onward." Cap-and-signal, the same discipline
+          // stage_lookup's own stageIndex uses (fitObjectArray is fitStringArray's object-array
+          // sibling) — never an unbounded array over the wire, even though skeleton() itself is
+          // uncapped at the engine layer on the same "few, always present" reasoning liveStageIndex
+          // relies on for its own callers.
+          const fixedFields = {
+            circle: homeCircle,
+            species: r.species,
+            conceptId: r.conceptId,
+            action: r.action,
+            advisories: r.advisories,
+          };
+          const guidance = r.advisories.length > 0
+            ? `This ${r.species} is now live in the skeleton for this circle, governing this session from this turn onward. See advisories for warning-light signals — informational only, nothing here was blocked.`
+            : `This ${r.species} is now live in the skeleton for this circle, governing this session from this turn onward.`;
+          // ONE BUILDER, USED FOR BOTH THE MEASUREMENT AND THE RESPONSE — see fitObjectArray's own
+          // comment. Anything added here is automatically inside the budget; anything added to the
+          // returned object instead of here would silently reopen the mid-JSON truncation blocker.
+          const envelope = (skeleton: typeof r.skeleton, omitted: number): Record<string, unknown> => ({
+            ...fixedFields,
+            skeleton,
+            ...(omitted > 0 ? { skeletonTruncated: true, skeletonOmitted: omitted } : {}),
+            guidance,
+          });
+          const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
+          const fit = fitObjectArray(envelope, r.skeleton, sizeBudget);
+          return mutOk(envelope(fit.fitted, fit.omitted), "memory_declare", false, capturedBlock);
         } else {
-          const disclosures = [
-            // A removed deny is never allowed to be something the user finds out later.
-            r.downgraded
-              ? "DENY REMOVED: this rule was blocking and is now advisory — the action it used to refuse will go through. Tell the user plainly. Re-declare with severity=\"blocking\" to restore it."
-              : null,
-            // Same discipline, one axis over (review fix — Codex round 2, item 1): a narrowed-away
-            // global rule is never something the user finds out later either. INDEPENDENT of
-            // `downgraded` above — checked unconditionally, not as an `else` branch, so this fires
-            // whether or not a downgrade also happened in the same call.
-            r.narrowedFromBreadth
-              ? "BREADTH NARROWED: this rule was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle=\"*\" to restore it."
-              : null,
-          ]
-            .filter((line): line is string => line !== null)
-            .join(" ");
-          guidance = disclosures !== ""
-            ? disclosures
-            : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.";
+          let guidance: string;
+          if (r.species === "stage") {
+            guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles.";
+          } else {
+            const disclosures = [
+              // A removed deny is never allowed to be something the user finds out later.
+              r.downgraded
+                ? "DENY REMOVED: this rule was blocking and is now advisory — the action it used to refuse will go through. Tell the user plainly. Re-declare with severity=\"blocking\" to restore it."
+                : null,
+              // Same discipline, one axis over (review fix — Codex round 2, item 1): a narrowed-away
+              // global rule is never something the user finds out later either. INDEPENDENT of
+              // `downgraded` above — checked unconditionally, not as an `else` branch, so this fires
+              // whether or not a downgrade also happened in the same call.
+              r.narrowedFromBreadth
+                ? "BREADTH NARROWED: this rule was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle=\"*\" to restore it."
+                : null,
+            ]
+              .filter((line): line is string => line !== null)
+              .join(" ");
+            guidance = disclosures !== ""
+              ? disclosures
+              : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.";
+          }
+          return mutOk(
+            { circle: homeCircle, ...r, guidance },
+            "memory_declare",
+            false,
+            capturedBlock,
+          );
         }
-        return mutOk(
-          { circle: homeCircle, ...r, guidance },
-          "memory_declare",
-          false,
-          capturedBlock,
-        );
       } catch (e) {
         return err(`declare failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_ratify",
+    'The human-approval surface — the OTHER skeleton entrance, alongside memory_declare\'s species="principle"/"preference". Records a ruling on a skeleton candidate (a concept of kind "principle" or "preference"): the lead runs the four-test battery (Generates/Covers/Transfers/Exits) conversationally, and this call is where the human\'s verdict on it becomes durable record. verdict="approve" or "re-ratify" with `memberRuleIds` writes a derivation edge from the principle to EACH named rule (bornOf "ratification") — this is the principle proving it can re-derive its member rules; member rule ids must share the candidate\'s circle. verdict="reject" records that the candidate does not enter. verdict="retire" ends a currently-live membership (an impeached principle\'s own use-maintenance) — every verdict is recorded regardless, since ratification history is append-only. Skeleton membership is ALWAYS derived from the LATEST ratification for a concept, never a stored flag: approve→retire takes something out, retire→re-ratify brings it back. `packet` is the evidence shown to the human (member rules + failures, a re-derivation, the uncovered situation) — stored OPAQUE and VERBATIM for audit fidelity; memberRuleIds is a separate typed field precisely so edge-writing never depends on parsing it. The response carries the circle\'s now-live `skeleton` (compact entries) — same in-band delivery memory_declare\'s principle/preference response carries.',
+    {
+      candidateId: z.string().describe("Concept id of the skeleton candidate. Must be kind 'principle' or 'preference' in the resolved circle."),
+      verdict: z
+        .enum(["approve", "reject", "retire", "re-ratify"])
+        .describe('"approve"/"re-ratify": skeleton entry (or re-entry) — memberRuleIds (if given) each get a derivation edge. "reject": never enters. "retire": ends a current membership.'),
+      memberRuleIds: z
+        .array(z.string())
+        // Bounded because the response echoes every id back as edgeIds, a fixed (un-fittable)
+        // field: ~890 ids push the finished payload past the result ceiling into a mid-JSON
+        // slice (recheck finding 2). 200 is far beyond any real principle's membership.
+        .max(200)
+        .optional()
+        .describe(
+          'Concept ids of the rules this principle generates. One derivation edge is written per id, ONLY when verdict is "approve" or "re-ratify" — ignored for "reject"/"retire". Every id must share the candidate\'s circle.',
+        ),
+      packet: z
+        .unknown()
+        .optional()
+        .describe(
+          "The evidence packet exactly as shown to the human who ruled (member rules + failures, a re-derivation, the uncovered situation) — stored verbatim for audit fidelity, never parsed to decide anything.",
+        ),
+      ratifiedBy: z.string().max(200).optional().describe("Who ruled. Defaults to the calling agent id."),
+      circle: z.string().optional().describe("Which circle the candidate lives in. Omit for the default."),
+    },
+    async ({ candidateId, verdict, memberRuleIds, packet, ratifiedBy, circle }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      try {
+        const resolvedCircle = scope(circle);
+        const r = await core.ratify({
+          candidateId,
+          verdict,
+          memberRuleIds,
+          // Pre-serialize here, at the wire boundary — core.ratify()/recordRatification store
+          // `packet` verbatim as a string and never inspect its shape (see RatifyInput's own
+          // comment: the decided deviation is that memberRuleIds is an explicit field precisely so
+          // edge-writing never has to parse this back out).
+          packet: packet !== undefined ? JSON.stringify(packet) : undefined,
+          ratifiedBy,
+          circle: resolvedCircle,
+        });
+        // IN-BAND SKELETON DELIVERY, same cap-and-signal discipline as memory_declare's own
+        // principle/preference response (fitObjectArray — fitStringArray's object-array sibling).
+        const fixedFields = {
+          circle: resolvedCircle,
+          ratificationId: r.ratificationId,
+          verdict: r.verdict,
+          conceptId: r.conceptId,
+          edgeIds: r.edgeIds,
+        };
+        const guidance = verdict === "approve" || verdict === "re-ratify"
+          ? "Recorded. If memberRuleIds was given, each now carries a derivation edge from this principle. It is live in the skeleton for this circle from this turn onward."
+          : verdict === "retire"
+            ? "Recorded. This concept no longer holds a live skeleton membership as of this call."
+            : "Recorded. This candidate does not enter the skeleton.";
+        // SAME BUILDER DISCIPLINE as memory_declare's own principle/preference response above:
+        // measure exactly what is returned, so no post-fit field can push it past the ceiling.
+        const envelope = (skeleton: typeof r.skeleton, omitted: number): Record<string, unknown> => ({
+          ...fixedFields,
+          skeleton,
+          ...(omitted > 0 ? { skeletonTruncated: true, skeletonOmitted: omitted } : {}),
+          guidance,
+        });
+        const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
+        const fit = fitObjectArray(envelope, r.skeleton, sizeBudget);
+        return mutOk(envelope(fit.fitted, fit.omitted), "memory_ratify", false, capturedBlock);
+      } catch (e) {
+        return err(`ratify failed: ${msg(e)}`);
       }
     },
   );
@@ -1058,7 +1214,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_overview",
-    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates), the living model (top concepts), where you left off (active threads), open contradictions, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. \'resolutionStats\' reports how store-time resolution has been deciding lately (counts by mode over the last 30 days, plus decidedTotal — the count of writes that actually ran the rule, excluding caller-directed attachTo/forceNew): divide by decidedTotal for a rate, and watch fork-signal (concepts going bimodal) and blur-duplicate (centroids drifting off their own evidence) as the health signals behind the duplicate pairs above. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub. otherCircles lists other circles in the store (name + concept count + last activity).',
+    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates/skeleton), the living model (top concepts), where you left off (active threads), open contradictions, the always-on skeleton, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. \'skeleton\' lists the circle\'s currently-ratified principles/preferences (compact entries, capped; counts.skeleton has the full total) — membership is always derived from each concept\'s latest ratification, so this list is live, not a cached flag. \'resolutionStats\' reports how store-time resolution has been deciding lately (counts by mode over the last 30 days, plus decidedTotal — the count of writes that actually ran the rule, excluding caller-directed attachTo/forceNew): divide by decidedTotal for a rate, and watch fork-signal (concepts going bimodal) and blur-duplicate (centroids drifting off their own evidence) as the health signals behind the duplicate pairs above. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub. otherCircles lists other circles in the store (name + concept count + last activity).',
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));

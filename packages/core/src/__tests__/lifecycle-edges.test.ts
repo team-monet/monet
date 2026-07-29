@@ -525,6 +525,214 @@ describe("lifecycle edge reads", () => {
 });
 
 // ---------------------------------------------------------------------------
+// memory_ratify (ratify()) — the human-approval surface, the OTHER skeleton entrance
+// ---------------------------------------------------------------------------
+describe("ratify() — the human-approval surface", () => {
+  it("validates candidateId existence, kind, and circle before recording anything", async () => {
+    const c = core();
+    const principle = await c.store("A principle awaiting ratification.", { kind: "principle" });
+    const fact = await c.store("An ordinary fact, not a skeleton candidate.");
+
+    await expect(c.ratify({ candidateId: "ghost", verdict: "approve" }))
+      .rejects.toThrow(/candidateId 'ghost' does not exist/);
+    await expect(c.ratify({ candidateId: fact.conceptId, verdict: "approve" }))
+      .rejects.toThrow(/is kind 'fact', not 'principle' or 'preference'/);
+    await expect(c.ratify({ candidateId: principle.conceptId, verdict: "approve", circle: "elsewhere" }))
+      .rejects.toThrow(/is in circle 'default', not 'elsewhere'/);
+    await expect(c.ratify({ candidateId: principle.conceptId, verdict: "maybe" as never }))
+      .rejects.toThrow(/verdict 'maybe' is not one of/);
+
+    // Nothing above should have recorded a ratification.
+    expect(c.getRatifications(principle.conceptId)).toHaveLength(0);
+    c.close();
+  });
+
+  it("approve with memberRuleIds writes one derivation edge per member, eventRef the ratification id", async () => {
+    const c = core();
+    const principle = await c.store("A principle with two member rules.", { kind: "principle" });
+    // REAL RULES: a derivation edge may only name kind "rule" (see the member-kind test below).
+    const ruleA = await c.store("Rule A, one member.", { kind: "rule", rule: { stage: "gate a", scope: "domain" } });
+    const ruleB = await c.store("Rule B, the other member.", { kind: "rule", rule: { stage: "gate b", scope: "domain" } });
+
+    const r = await c.ratify({
+      candidateId: principle.conceptId,
+      verdict: "approve",
+      memberRuleIds: [ruleA.conceptId, ruleB.conceptId],
+      ratifiedBy: "john",
+      // Engine-level packet is `string | null` (see RatifyInput's own comment: pre-serialized by
+      // the caller). The MCP layer (mcp-server.ts) does this JSON.stringify for a real tool call;
+      // calling ratify() directly here means the test must do it too.
+      packet: JSON.stringify({ rules: [ruleA.conceptId, ruleB.conceptId], reason: "shared root cause" }),
+    });
+    expect(r.verdict).toBe("approve");
+    expect(r.conceptId).toBe(principle.conceptId);
+    expect(r.edgeIds).toHaveLength(2);
+
+    const ratifications = c.getRatifications(principle.conceptId);
+    expect(ratifications).toHaveLength(1);
+    expect(ratifications[0]).toMatchObject({ verdict: "approve", ratified_by: "john" });
+    // Packet is stored OPAQUE and VERBATIM — the MCP layer JSON.stringifies it; the engine never
+    // inspects it, so what round-trips is exactly what was handed in.
+    expect(JSON.parse(ratifications[0]!.packet!)).toEqual({ rules: [ruleA.conceptId, ruleB.conceptId], reason: "shared root cause" });
+
+    const derived = c.walkDerivation(principle.conceptId, "out");
+    expect(derived.sort()).toEqual([ruleA.conceptId, ruleB.conceptId].sort());
+    for (const edge of c.getLifecycleEdges(principle.conceptId, { direction: "out", family: "derivation" })) {
+      expect(edge).toMatchObject({ born_of: "ratification", event_ref: r.ratificationId });
+    }
+    // In-band delivery: the just-ratified principle is already in the response's own skeleton.
+    expect(r.skeleton.some((e) => e.conceptId === principle.conceptId)).toBe(true);
+    c.close();
+  });
+
+  it("re-ratify with memberRuleIds ALSO writes edges; reject/retire never do, even when memberRuleIds is given", async () => {
+    const c = core();
+    const principle = await c.store("A principle re-ratified after doubt.", { kind: "principle" });
+    const rule = await c.store("Its one member rule.", { kind: "rule", rule: { stage: "some gate", scope: "domain" } });
+
+    await c.ratify({ candidateId: principle.conceptId, verdict: "retire" });
+    const reRatified = await c.ratify({ candidateId: principle.conceptId, verdict: "re-ratify", memberRuleIds: [rule.conceptId] });
+    expect(reRatified.edgeIds).toHaveLength(1);
+
+    const other = await c.store("A second principle, only ever rejected/retired.", { kind: "principle" });
+    const rejectResult = await c.ratify({ candidateId: other.conceptId, verdict: "reject", memberRuleIds: [rule.conceptId] });
+    expect(rejectResult.edgeIds).toHaveLength(0);
+    const retireResult = await c.ratify({ candidateId: other.conceptId, verdict: "retire", memberRuleIds: [rule.conceptId] });
+    expect(retireResult.edgeIds).toHaveLength(0);
+    // Ratification history is append-only regardless — every verdict is still recorded.
+    expect(c.getRatifications(other.conceptId).map((row) => row.verdict)).toEqual(["retire", "reject"]);
+    c.close();
+  });
+
+  it("refuses a memberRuleId that is not kind 'rule', before writing anything at all", async () => {
+    // The contract is "derivation edges principle → rule" (review round 1, item 3). addLifecycleEdge
+    // itself only enforces governability, so without this check a member id naming a fact minted an
+    // edge asserting the principle GENERATES that fact.
+    const c = core();
+    const principle = await c.store("A principle with a mis-typed member list.", { kind: "principle" });
+    const realRule = await c.store("A genuine member rule.", { kind: "rule", rule: { stage: "some gate", scope: "domain" } });
+    const fact = await c.store("An ordinary fact that is not a rule.");
+
+    await expect(
+      c.ratify({ candidateId: principle.conceptId, verdict: "approve", memberRuleIds: [fact.conceptId] }),
+    ).rejects.toThrow(new RegExp(`member rule '${fact.conceptId}' is kind 'fact', not 'rule'`));
+    await expect(
+      c.ratify({ candidateId: principle.conceptId, verdict: "approve", memberRuleIds: [realRule.conceptId, "ghost"] }),
+    ).rejects.toThrow(/member rule 'ghost' does not exist/);
+
+    // VALIDATED UP FRONT: the good id in position 1 of the second call left no edge behind, and
+    // neither call recorded a ratification.
+    expect(c.walkDerivation(principle.conceptId, "out")).toEqual([]);
+    expect(c.getRatifications(principle.conceptId)).toHaveLength(0);
+
+    // Control: the same call with only the real rule succeeds.
+    const ok = await c.ratify({ candidateId: principle.conceptId, verdict: "approve", memberRuleIds: [realRule.conceptId] });
+    expect(ok.edgeIds).toHaveLength(1);
+    c.close();
+  });
+
+  it("names the dated cross-circle deferral when a member rule lives in a different circle", async () => {
+    const c = core();
+    const principle = await c.store("A principle at home.", { circle: "home", kind: "principle" });
+    const rule = await c.store("A rule at work.", { circle: "work", kind: "rule", rule: { stage: "work gate", scope: "domain" } });
+    await expect(
+      c.ratify({ candidateId: principle.conceptId, verdict: "approve", memberRuleIds: [rule.conceptId], circle: "home" }),
+    ).rejects.toThrow(/Cross-circle skeleton membership is deliberately undecided \(dated deferral, 2026-07-29\)/);
+    // The refusal must not have left a partial edge behind.
+    expect(c.walkDerivation(principle.conceptId, "out")).toEqual([]);
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// skeleton() — derived membership, latest-ratification-wins
+// ---------------------------------------------------------------------------
+describe("skeleton() — derived membership, never a stored flag", () => {
+  it("two approves in a row is idempotent membership", async () => {
+    const c = core();
+    const principle = await c.store("Idempotent under repeated approval.", { kind: "principle" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve" });
+    const members = c.skeleton().filter((e) => e.conceptId === principle.conceptId);
+    expect(members).toHaveLength(1);
+    c.close();
+  });
+
+  it("approve then retire takes a concept OUT of the skeleton", async () => {
+    const c = core();
+    const principle = await c.store("Approved, then impeached.", { kind: "principle" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve" });
+    expect(c.skeleton().some((e) => e.conceptId === principle.conceptId)).toBe(true);
+    await c.ratify({ candidateId: principle.conceptId, verdict: "retire" });
+    expect(c.skeleton().some((e) => e.conceptId === principle.conceptId)).toBe(false);
+    c.close();
+  });
+
+  it("retire then re-ratify brings a concept BACK into the skeleton", async () => {
+    const c = core();
+    const principle = await c.store("Impeached, then reinstated.", { kind: "principle" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "retire" });
+    expect(c.skeleton().some((e) => e.conceptId === principle.conceptId)).toBe(false);
+    await c.ratify({ candidateId: principle.conceptId, verdict: "re-ratify" });
+    expect(c.skeleton().some((e) => e.conceptId === principle.conceptId)).toBe(true);
+    c.close();
+  });
+
+  it("a reject-only concept never enters the skeleton", async () => {
+    const c = core();
+    const principle = await c.store("Rejected outright, never approved.", { kind: "principle" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "reject" });
+    expect(c.skeleton().some((e) => e.conceptId === principle.conceptId)).toBe(false);
+    c.close();
+  });
+
+  it("delivers OLDEST ratification first, so truncation drops the newest, not the settled core", async () => {
+    // Delivery order IS truncation order — every consumer caps a prefix (review round 1, item 7).
+    const c = core();
+    const first = await c.store("The oldest principle, long settled.", { kind: "principle" });
+    const second = await c.store("A later principle.", { kind: "principle" });
+    const third = await c.store("The newest principle.", { kind: "principle" });
+    await c.ratify({ candidateId: first.conceptId, verdict: "approve" });
+    await c.ratify({ candidateId: second.conceptId, verdict: "approve" });
+    await c.ratify({ candidateId: third.conceptId, verdict: "approve" });
+
+    expect(c.skeleton().map((e) => e.conceptId))
+      .toEqual([first.conceptId, second.conceptId, third.conceptId]);
+
+    // RATIFICATION TIME, NOT CONCEPT AGE: re-ratifying the oldest moves it to the END, because its
+    // membership is only as old as the ruling that granted it.
+    await c.ratify({ candidateId: first.conceptId, verdict: "re-ratify" });
+    expect(c.skeleton().map((e) => e.conceptId))
+      .toEqual([second.conceptId, third.conceptId, first.conceptId]);
+    c.close();
+  });
+
+  it("is circle-scoped and covers both principle and preference kinds; no scalar flag anywhere", async () => {
+    const c = core();
+    const principle = await c.store("A principle at home.", { circle: "home", kind: "principle" });
+    const preference = await c.store("A preference at home.", { circle: "home", kind: "preference" });
+    const elsewhere = await c.store("A principle elsewhere.", { circle: "elsewhere", kind: "principle" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve", circle: "home" });
+    await c.ratify({ candidateId: preference.conceptId, verdict: "approve", circle: "home" });
+    await c.ratify({ candidateId: elsewhere.conceptId, verdict: "approve", circle: "elsewhere" });
+
+    const home = c.skeleton("home");
+    expect(home.map((e) => e.conceptId).sort()).toEqual([principle.conceptId, preference.conceptId].sort());
+    expect(home.find((e) => e.conceptId === principle.conceptId)!.species).toBe("principle");
+    expect(home.find((e) => e.conceptId === preference.conceptId)!.species).toBe("preference");
+    expect(c.skeleton("elsewhere").map((e) => e.conceptId)).toEqual([elsewhere.conceptId]);
+
+    // No scalar authority column anywhere on the concept row itself (the design's own
+    // implementation directive) — membership is derived solely from the ratifications join.
+    const raw = (c as unknown as { db: { prepare(sql: string): { get(...p: unknown[]): unknown } } }).db;
+    const row = raw.prepare(`SELECT * FROM concepts WHERE id = ?`).get(principle.conceptId) as Record<string, unknown>;
+    expect(Object.keys(row).some((k) => /ratif|approved|skeleton|authority/i.test(k))).toBe(false);
+    c.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // THE regression: graph maintenance cannot touch normative record
 // ---------------------------------------------------------------------------
 describe("wipe immunity", () => {
@@ -1036,13 +1244,17 @@ describe("dangling lifecycle edge sweep", () => {
     expect((raw(c).prepare(`SELECT COUNT(*) AS n FROM lifecycle_edges`).get() as { n: number }).n).toBe(2);
   });
 
-  it("flags rows stranded by a MERGING reassignCircle, which hard-deletes the source concept", async () => {
-    // The one orphan class reachable through an ordinary public operation, and therefore the shape
-    // slice 5 has to decide repair for (F4 — merge re-homing semantics — is explicitly NOT decided
-    // here). A merging reassignCircle folds the source into the target and hard-deletes the source
-    // row; every normative row naming the dead id is stranded, because append-only forbids
-    // rewriting src/dst and no consumer exists yet to say whether they should be re-pointed at the
-    // survivor, dropped, or kept as evidence the rule once existed.
+  it("REFUSES a MERGING reassignCircle that would strand normative record (was: flagged it afterwards)", async () => {
+    // SUPERSEDES THIS TEST'S ORIGINAL ASSERTION (skeleton-entrances slice, review round 1, item 4).
+    // It used to pin the merge SUCCEEDING and the rows being flagged as stranded afterwards, and its
+    // own comment named that "the shape slice 5 has to decide repair for". Slice 5 decided: refuse,
+    // do not re-home. hardDeleteNativeConcept's chokepoint now fires here, so this ordinary public
+    // operation can no longer silently destroy the endpoint of an append-only normative row.
+    //
+    // Reachable only through the ENGINE API on a non-normative kind: reassignCircle already refuses
+    // to auto-merge rule/principle/preference, and no MCP surface can ratify a fact — memory_ratify
+    // requires kind principle|preference. The sweep's own coverage for genuinely stranded rows
+    // (rows written by a build that predates this guard) is the test immediately below.
     const c = new MonetCore(":memory:"); // default thresholds so the merge branch is reachable
     const text = "Branch before committing, always, without exception.";
     const doomed = await c.store(text, { circle: "default" });
@@ -1054,15 +1266,43 @@ describe("dangling lifecycle edge sweep", () => {
     c.addLifecycleEdge({ family: "provenance", srcConceptId: doomed.conceptId, dstSpan: SPAN, bornOf: "correction", eventRef: "obs-1" });
     c.recordRatification({ subjectConceptId: doomed.conceptId, verdict: "approve" });
 
-    const result = c.reassignCircle(doomed.conceptId, "work");
-    expect(result).toMatchObject({ action: "merged", mergedIntoId: survivor.conceptId });
-    // The source concept row really is gone — this is a hard delete, not a retirement.
-    expect(raw(c).prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(doomed.conceptId)).toBeUndefined();
+    expect(() => c.reassignCircle(doomed.conceptId, "work"))
+      .toThrow(/cannot hard delete concept .*: it carries 1 ratification\(s\) and 2 lifecycle edge\(s\)/);
+
+    // ROLLED BACK WHOLE: the concept, its evidence and its normative rows are all exactly as before.
+    expect(raw(c).prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(doomed.conceptId)).toBeTruthy();
+    expect(raw(c).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(doomed.conceptId))
+      .toMatchObject({ circle: "default" });
+    expect(c.getLifecycleEdges(doomed.conceptId, { direction: "both" })).toHaveLength(2);
+    expect(c.getRatifications(doomed.conceptId)).toHaveLength(1);
+    // Nothing was tombstoned either — a refused delete is not a delete.
+    expect((raw(c).prepare(`SELECT concept_id FROM concept_deletions`).all() as Array<{ concept_id: string }>)
+      .map((r) => r.concept_id)).not.toContain(doomed.conceptId);
+    c.close();
+  });
+
+  it("flags — and still exports — rows stranded by a build that predates the chokepoint", async () => {
+    // The sweep's own regression, preserved from the test above after the guard closed the public
+    // path that used to produce this state. A store written by an older build can still HOLD it, so
+    // the report-only sweep and the relay behaviour both still have to work; the state is therefore
+    // constructed the way such a store would already contain it — the concept row gone, its
+    // tombstone recorded, the append-only normative rows left behind.
+    const c = core();
+    const doomed = await c.store("A rule that a pre-chokepoint build consolidated away.");
+    const successor = await c.store("A quite different rule that supersedes it.");
+    c.addLifecycleEdge({ family: "supersession", srcConceptId: doomed.conceptId, dstConceptId: successor.conceptId, bornOf: "correction" });
+    c.addLifecycleEdge({ family: "provenance", srcConceptId: doomed.conceptId, dstSpan: SPAN, bornOf: "correction", eventRef: "obs-1" });
+    c.recordRatification({ subjectConceptId: doomed.conceptId, verdict: "approve" });
+
+    raw(c).prepare(`DELETE FROM concepts WHERE id = ?`).run(doomed.conceptId);
+    raw(c).prepare(
+      `INSERT INTO concept_deletions (concept_id, deleted_at, updated_at, writer_id, concept_kind)
+       VALUES (?, 1, 1, 'older-build', 'native')`,
+    ).run(doomed.conceptId);
 
     // The normative rows survive the deletion (graph maintenance never touches them) and are now
     // genuinely stranded.
-    const stranded = c.getLifecycleEdges(doomed.conceptId, { direction: "both" });
-    expect(stranded).toHaveLength(2);
+    expect(c.getLifecycleEdges(doomed.conceptId, { direction: "both" })).toHaveLength(2);
     expect(c.getRatifications(doomed.conceptId)).toHaveLength(1);
 
     const sweep = c.lifecycleEdgeIntegrity();
@@ -1077,21 +1317,108 @@ describe("dangling lifecycle edge sweep", () => {
     // AND THEY STILL EXPORT. This follows necessarily from the relay rule above (the export joins
     // both endpoints LEFT so a dangling row can travel), and it is the right default even here:
     // distinguishing "endpoint absent because hard-deleted" from "endpoint absent because retired
-    // or not yet synced" is precisely the merge re-homing question deferred to slice 5, and
-    // silently withholding the record would destroy the evidence that slice needs to decide with.
-    // The peer is not left guessing — the hard deletion travels beside it in concept_deletions,
-    // so a receiving store has both facts and can apply whatever repair slice 5 settles on.
+    // or not yet synced" is precisely the merge re-homing question still deferred, and silently
+    // withholding the record would destroy the evidence a later slice needs to decide with. The
+    // peer is not left guessing — the hard deletion travels beside it in concept_deletions, so a
+    // receiving store has both facts and can apply whatever repair that slice settles on.
     const payload = c.exportDelta(0);
     expect(payload.lifecycleEdges).toHaveLength(2);
     expect(payload.ratifications).toHaveLength(1);
     expect((raw(c).prepare(`SELECT concept_id FROM concept_deletions`).all() as Array<{ concept_id: string }>)
       .map((r) => r.concept_id)).toContain(doomed.conceptId);
+    c.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // F4 GUARDS (skeleton-entrances slice, item 6): the SAME data-loss shape the test just above
+  // demonstrates for reassignCircle's merge — but through memory_detach's own full-consolidation
+  // path, which this slice actually closes (a refusal, not the deliberately-unbuilt re-homing).
+  // -------------------------------------------------------------------------
+  describe("F4 — detach's full-consolidation guard against stranding normative record", () => {
+    it("refuses to consolidate away a concept carrying ratifications", async () => {
+      const c = core();
+      const doomed = await c.store("A principle about to be wrongly consolidated.", { kind: "principle" });
+      const survivor = await c.store("A similar principle, the merge target.", { kind: "principle" });
+      await c.ratify({ candidateId: doomed.conceptId, verdict: "approve" });
+
+      await expect(
+        c.detach(doomed.conceptId, [doomed.observationId], { destConceptId: survivor.conceptId }),
+      ).rejects.toThrow(/it carries 1 ratification\(s\), which this hard delete would strand.*Retire it via memory_ratify/);
+
+      // Refused BEFORE any mutation — the concept and its ratification are both still there.
+      expect(c.getRatifications(doomed.conceptId)).toHaveLength(1);
+      expect(raw(c).prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(doomed.conceptId)).toBeTruthy();
+      c.close();
+    });
+
+    it("refuses to consolidate away a concept with a lifecycle edge attached, at EITHER endpoint", async () => {
+      const c = core();
+      const principle = await c.store("A principle with a member rule.", { kind: "principle" });
+      const rule = await c.store("Its member rule — about to be wrongly consolidated.");
+      const otherRule = await c.store("A different rule, the merge target.");
+      c.addLifecycleEdge({ family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
+
+      // As the SOURCE (src_concept_id) of the edge.
+      await expect(
+        c.detach(principle.conceptId, [principle.observationId], { destConceptId: otherRule.conceptId }),
+      ).rejects.toThrow(/1 lifecycle edge\(s\).*would strand/);
+
+      // As the DESTINATION (dst_concept_id) of the SAME edge.
+      const anotherPrinciple = await c.store("Another principle, a merge target for the rule.", { kind: "principle" });
+      await expect(
+        c.detach(rule.conceptId, [rule.observationId], { destConceptId: anotherPrinciple.conceptId }),
+      ).rejects.toThrow(/1 lifecycle edge\(s\).*would strand/);
+
+      // Refused before any mutation on either attempt.
+      expect(c.walkDerivation(principle.conceptId, "out")).toEqual([rule.conceptId]);
+      c.close();
+    });
+
+    it("does NOT refuse an ordinary consolidation with no normative record attached — the guard is scoped, not a blanket ban", async () => {
+      const c = core();
+      const plain = await c.store("An ordinary fact with nothing attached.");
+      const dest = await c.store("Its consolidation target.");
+      await expect(
+        c.detach(plain.conceptId, [plain.observationId], { destConceptId: dest.conceptId }),
+      ).resolves.toMatchObject({ sourceDeleted: true, destAction: "attached" });
+      c.close();
+    });
+
+    it("the chokepoint fires for a caller that never learned to ask — a peer's tombstone is SKIPPED, not thrown", async () => {
+      // The relayed half of the chokepoint's posture (review round 1, item 4), mirroring the deny
+      // guard's exactly: hardDeleteNativeConcept refuses on BOTH paths, and the graft deletion loop
+      // keeps that unreachable by pre-checking and counting the skip — a throw there would abort a
+      // whole graft over one row.
+      const a = core({ syncDeviceId: "machine-a" });
+      const b = core({ syncDeviceId: "machine-b" });
+      const shared = await a.store("A concept both machines hold.");
+      const other = await a.store("Another concept.");
+      b.graftRows(a.exportDelta(0));
+
+      // B ratifies it locally; A deletes it and relays the tombstone. (A itself is free to: its own
+      // copy carries no normative record — the ratification below is B's alone.)
+      b.recordRatification({ subjectConceptId: shared.conceptId, verdict: "approve" });
+      await a.detach(shared.conceptId, [shared.observationId], { destConceptId: other.conceptId });
+
+      // The graft SUCCEEDS as a whole — the deletion row lands, the local concept survives with the
+      // record that names it, and nothing throws.
+      const result = b.graftRows(a.exportDelta(0));
+      expect(result).toBeTruthy();
+      expect(raw(b).prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(shared.conceptId)).toBeTruthy();
+      expect(b.getRatifications(shared.conceptId)).toHaveLength(1);
+      // The peer's tombstone is still on file, so a later re-homing slice has both facts.
+      expect(raw(b).prepare(`SELECT 1 FROM concept_deletions WHERE concept_id = ?`).get(shared.conceptId)).toBeTruthy();
+      a.close();
+      b.close();
+    });
   });
 
   it("renames a circle held open by nothing but normative rows", async () => {
-    // Normative rows outlive their concepts by design (hard-delete consolidation strands them), so
-    // a circle can be populated by nothing else. Counting only concepts made "circle not found"
-    // fire for exactly the rows the rename-follows path exists to move.
+    // Normative rows outlive their concepts' PRESENCE IN A CIRCLE by design — an edge records the
+    // circle its act happened in and append-only forbids rewriting it, so an ordinary move leaves
+    // the row behind (see "keeps the edge's circle at its birth value across a concept move").
+    // Counting only concepts made "circle not found" fire for exactly the rows the rename-follows
+    // path exists to move.
     const c = new MonetCore(":memory:");
     const text = "Branch before committing, always, without exception.";
     const doomed = await c.store(text, { circle: "orphan-circle" });
@@ -1100,8 +1427,11 @@ describe("dangling lifecycle edge sweep", () => {
     c.addLifecycleEdge({ family: "supersession", srcConceptId: doomed.conceptId, dstConceptId: succ.conceptId, bornOf: "correction" });
     c.recordRatification({ subjectConceptId: doomed.conceptId, verdict: "approve" });
 
-    // Empty the circle of concepts: merge one away, move the other out.
-    expect(c.reassignCircle(doomed.conceptId, "elsewhere")).toMatchObject({ action: "merged" });
+    // Empty the circle of concepts: MOVE both out. `forceNew` on the first is load-bearing as of
+    // the chokepoint (review round 1, item 4) — an auto-merge here would hard-delete a concept
+    // carrying normative record, which is now refused outright. The rows this test is about are
+    // left behind by the move exactly as they were by the merge, so its subject is unchanged.
+    expect(c.reassignCircle(doomed.conceptId, "elsewhere", { resolution: "forceNew" })).toMatchObject({ action: "moved" });
     c.reassignCircle(succ.conceptId, "elsewhere");
     expect((raw(c).prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle = 'orphan-circle'`).get() as { n: number }).n).toBe(0);
     // ...but the normative rows are still there, holding the circle open.
@@ -1119,5 +1449,171 @@ describe("dangling lifecycle edge sweep", () => {
     expect(inspectLifecycleEdgeIntegrity(raw(c))).toEqual({
       tablesPresent: false, edgesChecked: 0, ratificationsChecked: 0, dangling: [], danglingRatifications: [],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex PR #102 round — verdict recording, actor default, retired candidates,
+// and normative locality under circle moves
+// ---------------------------------------------------------------------------
+
+describe("ratify() and reassignCircle() — Codex PR #102 fixes", () => {
+  it("reject and retire record even with a stale or invalid memberRuleIds list — only entry verdicts validate members", async () => {
+    const c = core();
+    const principle = await c.store("A principle judged on stale evidence.", { kind: "principle" });
+    const fact = await c.store("Not a rule at all.");
+
+    // The public contract says memberRuleIds is IGNORED for reject/retire — a bad list must never
+    // block recording the ruling itself.
+    const rejected = await c.ratify({
+      candidateId: principle.conceptId, verdict: "reject",
+      memberRuleIds: [fact.conceptId, "ghost-id"],
+    });
+    expect(rejected.verdict).toBe("reject");
+    expect(rejected.edgeIds).toHaveLength(0);
+    expect(c.getRatifications(principle.conceptId)).toHaveLength(1);
+
+    // The same list on an ENTRY verdict still refuses, before anything is written.
+    await expect(
+      c.ratify({ candidateId: principle.conceptId, verdict: "approve", memberRuleIds: [fact.conceptId] }),
+    ).rejects.toThrow(/is kind 'fact', not 'rule'/);
+    expect(c.getRatifications(principle.conceptId)).toHaveLength(1);
+    c.close();
+  });
+
+  it("ratifiedBy defaults to the calling agent, matching the declaration entrance", async () => {
+    const c = core();
+    const principle = await c.store("A principle ratified without naming the actor.", { kind: "principle" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve" });
+    const rows = c.getRatifications(principle.conceptId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.ratified_by).toBe("local-agent");
+    const entry = c.skeleton().find((e) => e.conceptId === principle.conceptId);
+    expect(entry?.ratifiedBy).toBe("local-agent");
+    c.close();
+  });
+
+  it("memberRuleIds is principle-only: a preference ratifies, but never as a parent of rules", async () => {
+    const c = core();
+    const preference = await c.store("Write as a peer, never assistant scaffolding.", { kind: "preference" });
+    const rule = await c.store("A rule someone tried to hang on it.", { kind: "rule", rule: { stage: "gate p", scope: "domain" } });
+
+    await expect(
+      c.ratify({ candidateId: preference.conceptId, verdict: "approve", memberRuleIds: [rule.conceptId] }),
+    ).rejects.toThrow(/memberRuleIds is principle-only/);
+    expect(c.getRatifications(preference.conceptId)).toHaveLength(0);
+
+    // Without the evidence list the preference enters the skeleton normally.
+    const r = await c.ratify({ candidateId: preference.conceptId, verdict: "approve" });
+    expect(r.edgeIds).toHaveLength(0);
+    expect(c.skeleton().some((e) => e.conceptId === preference.conceptId)).toBe(true);
+    c.close();
+  });
+
+  it("clamps a command-shaped advisory's tool name so the fixed advisory field stays bounded", async () => {
+    const c = core();
+    const d = await c.declare({
+      species: "principle",
+      content: `${"x".repeat(50_000)}: do the thing`,
+      exitsEvidence: "a counterexample",
+    });
+    if (d.species !== "principle") throw new Error("expected the principle declare variant");
+    const shaped = d.advisories.find((a) => a.kind === "stage_shaped");
+    expect(shaped).toBeDefined();
+    expect(shaped!.message.length).toBeLessThan(400);
+    c.close();
+  });
+
+  it("a duplicated member id mints exactly one derivation edge; a disputed candidate refuses entry verdicts until mediation", async () => {
+    const c = core();
+    const principle = await c.store("A principle with a doubled member.", { kind: "principle" });
+    const rule = await c.store("The one member.", { kind: "rule", rule: { stage: "gate d", scope: "domain" } });
+    const r = await c.ratify({
+      candidateId: principle.conceptId, verdict: "approve",
+      memberRuleIds: [rule.conceptId, rule.conceptId, rule.conceptId],
+    });
+    expect(r.edgeIds).toHaveLength(1);
+    expect(c.walkDerivation(principle.conceptId, "out")).toHaveLength(1);
+
+    const flagged = c.flagContradiction(principle.conceptId, { detail: "contested" });
+    await expect(c.ratify({ candidateId: principle.conceptId, verdict: "re-ratify" }))
+      .rejects.toThrow(/is disputed: an open contradiction contests it/);
+    c.resolveContradiction(flagged.id, { decision: "dismiss" });
+    const back = await c.ratify({ candidateId: principle.conceptId, verdict: "re-ratify" });
+    expect(back.verdict).toBe("re-ratify");
+    expect(c.skeleton().some((e) => e.conceptId === principle.conceptId)).toBe(true);
+    c.close();
+  });
+
+  it("a momentless declaration refuses an instance, like stage and patterns", async () => {
+    const c = core();
+    await expect(
+      c.declare({ species: "principle", content: "A principle.", instance: "Bash:git push --force" }),
+    ).rejects.toThrow(/carries no instance/);
+    c.close();
+  });
+
+  it("a disputed principle stops governing immediately; mediation restores membership", async () => {
+    const c = core();
+    const p = await c.store("Contested wisdom.", { kind: "principle" });
+    await c.ratify({ candidateId: p.conceptId, verdict: "approve" });
+    expect(c.skeleton().some((e) => e.conceptId === p.conceptId)).toBe(true);
+
+    const flagged = c.flagContradiction(p.conceptId, { detail: "reality disagrees" });
+    expect(c.skeleton().some((e) => e.conceptId === p.conceptId)).toBe(false);
+
+    c.resolveContradiction(flagged.id, { decision: "dismiss" });
+    expect(c.skeleton().some((e) => e.conceptId === p.conceptId)).toBe(true);
+    c.close();
+  });
+
+  it("an entry verdict cannot resurrect a retired candidate; retire itself still records", async () => {
+    const c = core();
+    const principle = await c.store("A principle that later retires.", { kind: "principle" });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve" });
+    c.retireConcept(principle.conceptId);
+    expect(c.skeleton().find((e) => e.conceptId === principle.conceptId)).toBeUndefined();
+
+    await expect(c.ratify({ candidateId: principle.conceptId, verdict: "approve" }))
+      .rejects.toThrow(/is retired: an entry verdict cannot resurrect it/);
+    await expect(c.ratify({ candidateId: principle.conceptId, verdict: "re-ratify" }))
+      .rejects.toThrow(/is retired/);
+    // A non-entry verdict on a retired concept is a legitimate durable ruling.
+    const retired = await c.ratify({ candidateId: principle.conceptId, verdict: "retire" });
+    expect(retired.verdict).toBe("retire");
+    c.close();
+  });
+
+  it("a moved principle's membership follows the CONCEPT while the ratification keeps its birth circle — the decided consumer contract", async () => {
+    // This is the deliberate decision the birth-value pin above demanded ("the slice that gives
+    // `circle` a consumer has to decide deliberately rather than inherit silently"): skeleton()
+    // became that consumer's neighbour in 5-A, and it reads the CONCEPT's circle, never the row's.
+    // So delivery follows a move; the append-only record stays where the act happened; and a
+    // ratified derivation surviving a move (members filed elsewhere) is the same cross-circle
+    // membership question ratify() already defers, dated 2026-07-29, to the materialization slice.
+    const c = core();
+    const d = await c.declare({ species: "principle", content: "Name what would prove you wrong." });
+    if (d.species !== "principle") throw new Error("expected the principle declare variant");
+    const id = d.conceptId;
+    expect(c.skeleton().some((e) => e.conceptId === id)).toBe(true);
+
+    const moved = c.reassignCircle(id, "work");
+    expect(moved!.action).toBe("moved");
+    expect(c.skeleton().some((e) => e.conceptId === id)).toBe(false);
+    expect(c.skeleton("work").some((e) => e.conceptId === id)).toBe(true);
+    // Birth locality, per the substrate's pinned doctrine — only a circle RENAME rewrites it.
+    const rows = c.getRatifications(id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.circle).toBe("default");
+
+    // And a ratified derivation does not block the move in either direction: the relationship is
+    // read by concept id, circle-blind, so it survives intact.
+    const principle = await c.store("A principle with one member.", { kind: "principle", circle: "work" });
+    const rule = await c.store("The member rule.", { kind: "rule", circle: "work", rule: { stage: "gate m", scope: "domain" } });
+    await c.ratify({ candidateId: principle.conceptId, verdict: "approve", memberRuleIds: [rule.conceptId], circle: "work" });
+    expect(c.reassignCircle(principle.conceptId, "elsewhere")!.action).toBe("moved");
+    expect(c.skeleton("elsewhere").some((e) => e.conceptId === principle.conceptId)).toBe(true);
+    expect(c.walkDerivation(principle.conceptId, "out")).toHaveLength(1);
+    c.close();
   });
 });

@@ -110,6 +110,59 @@ afterEach(() => {
 const AGENT_RULE = { scope: "agent", modelTag: "test-model-1" } as const;
 
 /**
+ * Seed `count` ratified principles as a RAW-SQL FIXTURE — rows shaped exactly as `skeleton()` reads
+ * them — rather than by driving `store()` + `ratify()` once per entry.
+ *
+ * WHY (CI fix): the truncation test needs a few hundred skeleton members purely as BULK, and its
+ * subject is the wire's own fit-and-signal, not the write pipeline. Seeding them for real ran the
+ * full resolution pipeline per entry, whose candidate scan grows with the store — effectively
+ * O(n²) per sweep step — and better-sqlite3 is synchronous, so on a slow runner that became a long
+ * near-synchronous stretch that starved the vitest worker's RPC timers: every assertion passed and
+ * the run still died with `[vitest-worker]: Timeout calling "onTaskUpdate"`. Raw inserts make the
+ * same fixture in one transaction. (Raw-SQL fixture building has precedent in
+ * lifecycle-edges.test.ts's own CHECK-constraint tests.)
+ *
+ * THE EMBEDDING IS BORROWED FROM A REAL WRITE, never hand-built: exactly ONE `store()` + `ratify()`
+ * pair runs for real, and that row's own embedding blob is reused for every raw row. This keeps the
+ * fixture's vector width and JSON encoding identical to what this engine actually writes — which
+ * matters, because a later REAL `memory_declare` against this store parses every one of them
+ * through `bestMatches`. Guessing that format is the one thing that would make the shortcut
+ * unsound. Both callers use dedup-disabled cores (`core()`: tauAttach/tauAmbiguous 1.1), so
+ * identical vectors never merge or pair.
+ *
+ * Returns the total number of ratified principles seeded, for the caller's own sanity assertion.
+ */
+async function seedRatifiedPrinciples(c: MonetCore, count: number, body: (i: number) => string): Promise<number> {
+  const db = (c as unknown as { db: StoragePort }).db;
+  // THE ONE REAL WRITE — the fixture's reference row, and the source of the embedding blob below.
+  const real = await c.store(body(0), { kind: "principle" });
+  await c.ratify({ candidateId: real.conceptId, verdict: "approve" });
+  const embedding = (db.prepare(`SELECT embedding FROM concepts WHERE id = ?`)
+    .get(real.conceptId) as { embedding: string }).embedding;
+
+  const insertConcept = db.prepare(
+    `INSERT INTO concepts (id, slug, title, body, kind, embedding, support_count, version, dirty, circle)
+     VALUES (?, ?, ?, ?, 'principle', ?, 1, 0, 1, 'default')`,
+  );
+  const insertRatification = db.prepare(
+    `INSERT INTO ratifications (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at, sync_updated_at)
+     VALUES (?, ?, 'approve', NULL, 'fixture', 'default', ?, ?)`,
+  );
+  // Column list mirrors `create()`'s own INSERT (engine.ts) minus the columns skeleton() cannot
+  // see; created_at is strictly increasing AND far below the engine's live sync clock, so every
+  // real write that follows sorts after the whole fixture under skeleton()'s oldest-first order.
+  db.transaction(() => {
+    for (let i = 1; i < count; i++) {
+      const conceptId = `fixture-concept-${i}`;
+      const text = body(i);
+      insertConcept.run(conceptId, `fixture-${i}`, text.slice(0, 80), text, embedding);
+      insertRatification.run(`fixture-ratification-${i}`, conceptId, i, i);
+    }
+  })();
+  return count;
+}
+
+/**
  * Withdraw a deny the way the doctrine says it must be withdrawn: an explicit declaration on THAT
  * rule. `declare` resolves its target by content, which forks on a dedup-disabled core, so this
  * names the concept directly — the same declaration write path, aimed rather than resolved.
@@ -937,14 +990,322 @@ describe("declaration — the sovereign entrance", () => {
     c.close();
   });
 
-  it("rejects a species beyond rule and stage, and a rule with no content", async () => {
+  it("rejects a genuinely unknown species, and a rule with no content", async () => {
     const c = core();
-    await expect(c.declare({ species: "principle" as unknown as "rule", stage: "x" }))
-      .rejects.toThrow(/declares 'rule' and 'stage'/);
+    // "principle" is legal as of the skeleton-entrances slice — a truly unknown value still rejects.
+    await expect(c.declare({ species: "grant" as unknown as "rule", stage: "x" }))
+      .rejects.toThrow(/declares 'rule', 'stage', 'principle' and 'preference'/);
     await expect(c.declare({ species: "rule", stage: "x", ...AGENT_RULE }))
       .rejects.toThrow(/requires `content`/);
     await expect(c.declare({ species: "stage", stage: "  " })).rejects.toThrow(/requires `stage`/);
     c.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // skeleton entrances (5-A): declare() species "principle"/"preference"
+  // -------------------------------------------------------------------------
+  describe("declaration entrance into the skeleton — species principle/preference", () => {
+    it("declares a principle: momentless, no stage/severity/patterns, live in the skeleton immediately", async () => {
+      const c = core();
+      const r = await c.declare({
+        species: "principle",
+        content: "A build/install artifact is a snapshot or a live link — know which you hold.",
+        declaredBy: "john",
+      });
+      if (r.species !== "principle") throw new Error("unreachable");
+      expect(r.action).toBe("created");
+      expect(r.conceptId).toBeTruthy();
+      expect(Array.isArray(r.advisories)).toBe(true);
+      // IN-BAND SAME-SESSION DELIVERY: the just-declared principle is already live.
+      const own = r.skeleton.find((e) => e.conceptId === r.conceptId);
+      expect(own).toMatchObject({ species: "principle", ratifiedBy: "john" });
+      // firstLine() strips the trailing sentence-ending period (title-extraction convention, same
+      // helper memory_fetch/overview titles already use) — content is the sentence, not the mark.
+      expect(own!.content).toBe("A build/install artifact is a snapshot or a live link — know which you hold");
+      c.close();
+    });
+
+    it("declares a preference the identical way — momentless, live immediately", async () => {
+      const c = core();
+      const r = await c.declare({ species: "preference", content: "Write as a peer, never assistant scaffolding." });
+      if (r.species !== "preference") throw new Error("unreachable");
+      expect(r.skeleton.some((e) => e.conceptId === r.conceptId && e.species === "preference")).toBe(true);
+      c.close();
+    });
+
+    it("defaults declaredBy/ratifiedBy to the agent id when omitted", async () => {
+      const c = core();
+      const r = await c.declare({ species: "principle", content: "Nothing waits on scheduled review; everything is maintained by use." });
+      if (r.species !== "principle") throw new Error("unreachable");
+      const own = r.skeleton.find((e) => e.conceptId === r.conceptId)!;
+      expect(own.ratifiedBy).toBe("local-agent"); // MonetCore's default agentId when unconfigured
+      c.close();
+    });
+
+    it("rejects stage/severity/patterns on species principle/preference — a preference bound to a moment is just a rule", async () => {
+      const c = core();
+      await expect(c.declare({ species: "principle", content: "x", stage: "git push" }))
+        .rejects.toThrow(/momentless and cannot bind to a stage.*use species:"rule"/);
+      await expect(c.declare({ species: "preference", content: "x", severity: "advisory" }))
+        .rejects.toThrow(/carries no severity.*use species:"rule"/);
+      await expect(c.declare({ species: "principle", content: "x", patterns: ["git push"] }))
+        .rejects.toThrow(/carries no trigger patterns.*use species:"rule"/);
+      c.close();
+    });
+
+    it("requires content for principle/preference", async () => {
+      const c = core();
+      await expect(c.declare({ species: "principle" })).rejects.toThrow(/declaring a principle requires `content`/);
+      await expect(c.declare({ species: "preference", content: "   " }))
+        .rejects.toThrow(/declaring a preference requires `content`/);
+      c.close();
+    });
+
+    it('rejects circle:"*" for principle/preference — residency is per-install, not a breadth question', async () => {
+      const c = core();
+      await expect(c.declare({ species: "principle", content: "x", circle: BREADTH_CIRCLE }))
+        .rejects.toThrow(/per-install.*materialization slice/);
+      c.close();
+    });
+
+    /**
+     * THE MISFILING BLOCKER (review round 1, item 1), at SHIPPING thresholds — `core()` above
+     * disables dedup (tauAttach 1.1), which is exactly why this class was invisible until a
+     * runtime reproduction. Resolution is kind-blind, so before the fork guard an incoming
+     * principle auto-attached to any governable concept above tauAttach and the declaration
+     * entrance then stamped "approve" onto that foreign row.
+     */
+    describe("cross-kind misfiling, at real dedup thresholds", () => {
+      it("FORKS off a similar existing FACT rather than attaching to it, and ratifies the new row", async () => {
+        const c = resolvingCore();
+        const text = "Verify a prior step's success before depending on it.";
+        const fact = await c.store(text); // an ordinary fact, same wording
+        const declared = await c.declare({ species: "principle", content: text });
+        if (declared.species !== "principle") throw new Error("unreachable");
+
+        // FORKED, not attached — the fact is untouched and a real principle now exists.
+        expect(declared.conceptId).not.toBe(fact.conceptId);
+        expect(declared.action).toBe("created");
+        expect(raw(c).prepare(`SELECT kind FROM concepts WHERE id = ?`).get(declared.conceptId))
+          .toMatchObject({ kind: "principle" });
+        expect(raw(c).prepare(`SELECT kind FROM concepts WHERE id = ?`).get(fact.conceptId))
+          .toMatchObject({ kind: "fact" });
+
+        // The ratification landed on the PRINCIPLE, never on the fact...
+        expect(c.getRatifications(declared.conceptId)).toHaveLength(1);
+        expect(c.getRatifications(fact.conceptId)).toHaveLength(0);
+        // ...and the skeleton actually delivers it, which is what the misfile silently prevented.
+        expect(declared.skeleton.some((e) => e.conceptId === declared.conceptId)).toBe(true);
+        // The near-match is still reported rather than swallowed by the fork.
+        expect(declared.advisories).toContainEqual(
+          expect.objectContaining({ kind: "near_match", conceptId: fact.conceptId }),
+        );
+        c.close();
+      });
+
+      it("ATTACHES when re-declaring the SAME principle — one concept, idempotent membership", async () => {
+        const c = resolvingCore();
+        const text = "A build/install artifact is a snapshot or a live link — know which you hold.";
+        const first = await c.declare({ species: "principle", content: text });
+        const second = await c.declare({ species: "principle", content: text });
+        if (first.species !== "principle" || second.species !== "principle") throw new Error("unreachable");
+
+        // SAME species resolves together — the correct semantics, and why this is a cross-kind
+        // guard rather than a blanket forceNew.
+        expect(second.conceptId).toBe(first.conceptId);
+        expect(second.action).toBe("attached");
+        // Two approves on one concept: membership is idempotent, not doubled.
+        expect(c.getRatifications(first.conceptId)).toHaveLength(2);
+        expect(second.skeleton.filter((e) => e.conceptId === first.conceptId)).toHaveLength(1);
+        c.close();
+      });
+
+      it("FORKS off a live BLOCKING RULE, leaving the rule and its deny completely untouched", async () => {
+        const c = resolvingCore();
+        const text = "Never delete a directory tree unattended.";
+        const deny = await c.declare({
+          species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+          content: text, severity: "blocking", reason: "there is no undo", ...AGENT_RULE,
+        });
+        if (deny.species !== "rule") throw new Error("unreachable");
+
+        const declared = await c.declare({ species: "principle", content: text });
+        if (declared.species !== "principle") throw new Error("unreachable");
+        expect(declared.conceptId).not.toBe(deny.conceptId);
+
+        // NO FOREIGN RATIFICATION on the rule, and the deny still fires exactly as before.
+        expect(c.getRatifications(deny.conceptId)).toHaveLength(0);
+        expect(raw(c).prepare(`SELECT kind FROM concepts WHERE id = ?`).get(deny.conceptId))
+          .toMatchObject({ kind: "rule" });
+        expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x" }).rules[0])
+          .toMatchObject({ severity: "blocking", reason: "there is no undo" });
+        c.close();
+      });
+
+      it("refuses an explicitly NAMED cross-kind target too — the other door into the same misfile", async () => {
+        const c = core();
+        const fact = await c.store("An ordinary fact.");
+        await expect(c.store("A principle aimed at a fact.", { kind: "principle", attachTo: fact.conceptId }))
+          .rejects.toThrow(/cannot attach principle evidence to concept .*: it is a 'fact', not a principle/);
+        expect(c.getRatifications(fact.conceptId)).toHaveLength(0);
+        c.close();
+      });
+    });
+
+    it("writes the concept and its ratification ATOMICALLY — no concept without its skeleton entry", async () => {
+      // Review round 1, item 6. The sibling precedent is the RULE branch, which composes
+      // store() + binding inside store()'s own transaction; the principle branch now rides the
+      // same seam. Proved by making the ratification write fail (a poisoned `ratifications` table)
+      // and observing that the CONCEPT did not survive either.
+      const c = core();
+      raw(c).prepare(`DROP TABLE ratifications`).run();
+      await expect(c.declare({ species: "principle", content: "A principle whose entry cannot be written." }))
+        .rejects.toThrow();
+      // THE WHOLE ACT ROLLED BACK: no orphan principle concept, which is what a non-atomic
+      // sequence would have left behind — invisible to skeleton(), un-retirable via memory_ratify.
+      expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'principle'`).get())
+        .toMatchObject({ n: 0 });
+      expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM observations`).get()).toMatchObject({ n: 0 });
+      c.close();
+    });
+
+    it("surfaces the skeleton in the rendered curation view, not only in JSON", async () => {
+      // Review round 1, item 5: renderOverview is the human curation surface (it is what the CLI
+      // prints), so contract 7 is not discharged by a JSON field alone.
+      const c = core();
+      await c.declare({ species: "principle", content: "Encode principles, not procedures.", declaredBy: "john" });
+      await c.declare({ species: "preference", content: "Write as a peer, never assistant scaffolding." });
+
+      // SCOPED TO THE SECTION, not the whole render: a retired principle is still an ordinary
+      // concept and legitimately keeps appearing in LIVING MODEL — what must change is its
+      // SKELETON membership, so asserting against the whole string would test the wrong thing.
+      const skeletonSection = (out: string): string =>
+        out.split("\n").reduce<{ lines: string[]; inside: boolean }>((acc, line) => {
+          if (line.startsWith("SKELETON")) return { lines: [line], inside: true };
+          if (acc.inside && line.trim() === "") return { ...acc, inside: false };
+          return acc.inside ? { lines: [...acc.lines, line], inside: true } : acc;
+        }, { lines: [], inside: false }).lines.join("\n");
+
+      const ov = c.overview("default");
+      expect(ov.counts.skeleton).toBe(2);
+      const before = skeletonSection(renderOverview(ov, { color: false }));
+      expect(before).toContain("SKELETON");
+      expect(before).toContain("Encode principles, not procedures");
+      expect(before).toContain("Write as a peer, never assistant scaffolding");
+      expect(before).toContain("john");
+
+      // Retiring one drops it from the rendered section, since membership is derived, not a flag.
+      const retired = ov.skeleton.find((e) => e.species === "preference")!;
+      await c.ratify({ candidateId: retired.conceptId, verdict: "retire" });
+      const after = skeletonSection(renderOverview(c.overview("default"), { color: false }));
+      expect(after).toContain("Encode principles, not procedures");
+      expect(after).not.toContain("Write as a peer, never assistant scaffolding");
+      c.close();
+    });
+
+    describe("warning-light advisories — mechanical only, NEVER block the write", () => {
+      it('advises when content matches an EXISTING stage\'s own trigger patterns, naming the stage', async () => {
+        const c = core();
+        await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
+        const r = await c.declare({
+          species: "principle",
+          content: "Always run terraform apply only after a clean plan.",
+        });
+        if (r.species !== "principle") throw new Error("unreachable");
+        // NEVER BLOCKS: the write proceeded despite looking rule-shaped.
+        expect(r.conceptId).toBeTruthy();
+        expect(r.advisories).toContainEqual(
+          expect.objectContaining({ kind: "stage_shaped", stage: "terraform apply" }),
+        );
+        c.close();
+      });
+
+      it("advises on command-shaped content (Tool:command convention) when no stage matches", async () => {
+        const c = core();
+        const r = await c.declare({
+          species: "preference",
+          // Deliberately shaped like the gate's own Tool:command convention (parseActionContext's
+          // `tool` field) to trigger the mechanical, no-new-machinery detection — not realistic
+          // principle prose, but exactly what the advisory exists to catch.
+          content: "Bash:always confirm before an irreversible delete",
+        });
+        if (r.species !== "preference") throw new Error("unreachable");
+        expect(r.advisories).toContainEqual(expect.objectContaining({ kind: "stage_shaped" }));
+        expect(r.advisories.find((a) => a.kind === "stage_shaped")!.stage).toBeUndefined();
+        c.close();
+      });
+
+      it("advises when exitsEvidence is absent, and not when it is given", async () => {
+        const c = core();
+        const withoutEvidence = await c.declare({ species: "principle", content: "Encode principles, not procedures." });
+        if (withoutEvidence.species !== "principle") throw new Error("unreachable");
+        expect(withoutEvidence.advisories).toContainEqual(expect.objectContaining({ kind: "missing_exits_evidence" }));
+
+        const withEvidence = await c.declare({
+          species: "principle",
+          content: "Write user-facing consequences before escalating a decision.",
+          exitsEvidence: "A decision escalated with no stated consequence, or a consequence that never happened.",
+        });
+        if (withEvidence.species !== "principle") throw new Error("unreachable");
+        expect(withEvidence.advisories.some((a) => a.kind === "missing_exits_evidence")).toBe(false);
+        c.close();
+      });
+
+      it("surfaces store()'s own near-match info when a declaration lands in the AMBIGUOUS band (fork, not attach)", async () => {
+        // A plain clean attach (score above tauAttach) does NOT set nearMatchId — verified against
+        // this engine directly: nearMatchId/nearMatchScore are only populated on the AMBIGUOUS
+        // pairing modes (ambiguous-fork/fork-signal/blur-duplicate), where resolution found a
+        // near neighbour but did NOT attach to it. A deterministic fixed-vector embedder (real
+        // HashingEmbeddingProvider similarity between two DIFFERENT sentences is not something a
+        // test can hand-pick a score for) puts the second write exactly in that band.
+        const theta = Math.acos(0.7);
+        const embedder = {
+          dim: 2,
+          modelId: "test-fixed-vectors",
+          embed: (text: string): Float32Array => {
+            if (text === "first") return new Float32Array([1, 0]);
+            if (text === "second") return new Float32Array([Math.cos(theta), Math.sin(theta)]);
+            throw new Error(`no fixed vector for ${JSON.stringify(text)}`);
+          },
+        };
+        const c = new MonetCore(":memory:", { embedder, tauAttach: 0.9, tauAmbiguous: 0.5 });
+        const first = await c.declare({ species: "principle", content: "first" });
+        if (first.species !== "principle") throw new Error("unreachable");
+        const second = await c.declare({ species: "principle", content: "second" });
+        if (second.species !== "principle") throw new Error("unreachable");
+        // Ambiguous band forks — two DIFFERENT concepts, not an attach.
+        expect(second.conceptId).not.toBe(first.conceptId);
+        expect(second.advisories).toContainEqual(
+          expect.objectContaining({ kind: "near_match", conceptId: first.conceptId, score: 0.699999988079071 }),
+        );
+        c.close();
+      });
+
+      it("does NOT advise near-match for an ordinary clean attach — only the ambiguous band is noteworthy", async () => {
+        const c = resolvingCore();
+        const first = await c.declare({ species: "principle", content: "Verify a prior step's success before depending on it." });
+        if (first.species !== "principle") throw new Error("unreachable");
+        const second = await c.declare({ species: "principle", content: "Verify a prior step's success before depending on it." });
+        if (second.species !== "principle") throw new Error("unreachable");
+        // Identical wording resolves onto the SAME concept — a routine attach, not a fork.
+        expect(second.conceptId).toBe(first.conceptId);
+        expect(second.advisories.some((a) => a.kind === "near_match" || a.kind === "resolution")).toBe(false);
+        c.close();
+      });
+
+      it("never blocks the write even when multiple advisories fire at once", async () => {
+        const c = core();
+        await c.declare({ species: "stage", stage: "terraform apply", patterns: ["terraform apply"] });
+        // Stage-shaped (matches the "terraform apply" stage) AND missing-exits-evidence (none
+        // given) both fire on this one write, and it still proceeds — advisories never block.
+        const r = await c.declare({ species: "principle", content: "Always run terraform apply only after a clean plan." });
+        if (r.species !== "principle") throw new Error("unreachable");
+        expect(r.conceptId).toBeTruthy();
+        expect(r.advisories.length).toBeGreaterThanOrEqual(2);
+        expect(r.advisories.map((a) => a.kind).sort()).toEqual(["missing_exits_evidence", "stage_shaped"]);
+        c.close();
+      });
+    });
   });
 });
 
@@ -8644,6 +9005,111 @@ describe("MCP surface", () => {
     await client.close();
     c.close();
   });
+
+  // -------------------------------------------------------------------------
+  // skeleton entrances over the real MCP wire: memory_declare (principle/preference) + memory_ratify
+  // -------------------------------------------------------------------------
+  it("memory_declare(species principle) over MCP: advisories + in-band skeleton, response shape", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const r = await call("memory_declare", {
+      species: "principle",
+      content: "Encode principles, not procedures.",
+    });
+    expect(r.isError).toBe(false);
+    expect(r.json).toMatchObject({ species: "principle" });
+    expect(Array.isArray(r.json.advisories)).toBe(true);
+    // Missing exitsEvidence is the one advisory this minimal call is guaranteed to carry.
+    expect((r.json.advisories as Array<{ kind: string }>).some((a) => a.kind === "missing_exits_evidence")).toBe(true);
+    expect(Array.isArray(r.json.skeleton)).toBe(true);
+    expect((r.json.skeleton as Array<{ conceptId: string }>).some((e) => e.conceptId === r.json.conceptId)).toBe(true);
+    expect(typeof r.json.guidance).toBe("string");
+    await client.close();
+    c.close();
+  });
+
+  it("memory_ratify over MCP: approve with memberRuleIds, response carries edgeIds + in-band skeleton", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const principle = await call("memory_declare", { species: "principle", content: "A principle to ratify with members." });
+    const rule = await call("memory_store", {
+      content: "A member rule.", kind: "rule",
+      rule: { stage: "some gate", scope: "domain" },
+    });
+    const r = await call("memory_ratify", {
+      candidateId: principle.json.conceptId,
+      verdict: "approve",
+      memberRuleIds: [rule.json.conceptId],
+      ratifiedBy: "john",
+    });
+    expect(r.isError).toBe(false);
+    expect(r.json).toMatchObject({ verdict: "approve", conceptId: principle.json.conceptId });
+    expect(r.json.edgeIds).toHaveLength(1);
+    expect((r.json.skeleton as Array<{ conceptId: string }>).some((e) => e.conceptId === principle.json.conceptId)).toBe(true);
+    await client.close();
+    c.close();
+  });
+
+  it("memory_ratify over MCP rejects a candidateId that is not kind principle/preference", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const fact = await call("memory_store", { content: "An ordinary fact." });
+    const r = await call("memory_ratify", { candidateId: fact.json.conceptId, verdict: "approve" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/not 'principle' or 'preference'/);
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE UNPARSEABLE-JSON BLOCKER (review round 1, item 2). The previous version of this test
+   * asserted `r.text.length <= 40_000`, which is UNFALSIFIABLE against this failure: ok()'s
+   * last-resort slicer enforces that ceiling by cutting mid-JSON, so the assertion passed on
+   * exactly the responses it was supposed to catch. The real contract is that the response PARSES,
+   * and it is asserted here directly, across entry sizes that span the reproduced failing range
+   * (the mid-JSON slice reproduced at several entry sizes — the exact crossing point is a
+   * knife-edge on fixed-field sizes, so the sweep spans 0–400 rather than trusting one threshold).
+   */
+  it("keeps the in-band skeleton response parseable at every entry size, with honest counts", async () => {
+    // Proof that the sweep is still doing its job: at least one step must actually TRUNCATE, or
+    // this test has quietly degraded into "small responses parse" and would stop catching the
+    // mid-JSON slice entirely. Asserted after the loop.
+    let sawTruncation = false;
+    for (const pad of [0, 40, 77, 120, 400]) {
+      const c = core();
+      const { call, client } = await harness(c);
+      const seeded = await seedRatifiedPrinciples(c, 300, (i) => `Principle number ${i} ${"x".repeat(pad)}`);
+
+      // THE FIXTURE MUST MATCH THE REAL WRITE PATH'S SHAPE, or a fast seed would quietly stop
+      // testing what a real store produces. Asserting the seeded rows are exactly what skeleton()
+      // returns is what makes the raw-SQL shortcut safe: any column skeleton()'s own query cares
+      // about that the fixture got wrong shows up here as a count mismatch, not as a silent pass.
+      expect(c.skeleton(), `pad=${pad}`).toHaveLength(seeded);
+
+      for (const r of [
+        await call("memory_declare", { species: "principle", content: `One more at pad ${pad}.` }),
+        await call("memory_ratify", { candidateId: c.skeleton()[0]!.conceptId, verdict: "re-ratify" }),
+      ]) {
+        expect(r.isError, `pad=${pad}`).toBe(false);
+        // THE ASSERTION THAT ACTUALLY CATCHES IT: a mid-JSON slice throws here.
+        const parsed = JSON.parse(r.text) as Record<string, unknown>;
+        expect(r.text.length, `pad=${pad} bytes=${r.text.length}`).toBeLessThanOrEqual(40_000);
+
+        // HONEST COUNTS: what was listed plus what was reported omitted is the true population, so
+        // a reader can always tell "this is all of it" from "there is more".
+        const listed = (parsed.skeleton as unknown[]).length;
+        const omitted = (parsed.skeletonOmitted as number | undefined) ?? 0;
+        const liveTotal = c.skeleton().length; // recomputed: the declare above added one
+        expect(listed + omitted, `pad=${pad}`).toBe(liveTotal);
+        expect(parsed.skeletonTruncated, `pad=${pad}`).toBe(omitted > 0 ? true : undefined);
+        expect(typeof parsed.guidance).toBe("string");
+        if (omitted > 0) sawTruncation = true;
+      }
+      await client.close();
+      c.close();
+    }
+    expect(sawTruncation, "no sweep step truncated — this test no longer exercises the ceiling").toBe(true);
+  }, 30_000);
 
   /**
    * BOTH DISCLOSURES, ONE CALL (Codex round 11, item 7, P2). The guidance string used to be built as

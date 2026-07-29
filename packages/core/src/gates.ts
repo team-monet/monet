@@ -4744,11 +4744,30 @@ export function materializeGateMirror(
  * ONE DOCUMENTED REPRESENTATION GAP (owed to 4b-C's parity test, not swept under it): a delivered
  * `GateRule.projectedFromPrincipleId` — the parent principle, when a rule was born of one — cannot
  * be reproduced offline. `GateMirrorEntry` carries no parent-principle id (deliverable 1's field
- * list has none, and nothing in this codebase writes a `family: 'derivation'` lifecycle edge for a
- * rule yet — principles are a later slice), so this evaluator never sets the field, where the live
- * path would if such an edge existed. The two are indistinguishable TODAY, because nothing produces
- * the edge either way — but it is a real gap the day projection ships, named here so it has an owner
- * rather than surfacing as a silent parity-test pass that stops meaning what it says.
+ * list has none), so this evaluator never sets the field, where the live path would if such an
+ * edge existed.
+ *
+ * ACTIVATED, NOT LATENT, as of the skeleton-entrances slice (2026-07-29): the gap above was written
+ * when nothing in this codebase wrote a `family: 'derivation'` lifecycle edge for a rule, so the two
+ * paths were indistinguishable only because neither one could diverge yet. `memory_ratify`'s
+ * approve/re-ratify path now writes exactly that edge (principle → each member rule, `bornOf:
+ * 'ratification'`), which means `rulesForStages`' own correlated subquery (this file) — the live
+ * path's source for the field — starts returning a parent for an ordinary extraction member the
+ * moment its first such edge lands, not only for a genuinely projected rule. The live gate mirror
+ * still never carries it, so this evaluator still never sets it: the gap is now a real, reachable
+ * divergence between live and offline, not a hypothetical one. Advisory-info-only (the field is
+ * disclosure, never a gate-firing input), so nothing is unsafe today — but widening `GateMirrorEntry`
+ * to carry it is owed, and belongs to whichever later slice ships the mirror's projection-aware
+ * write path, not this one.
+ *
+ * AND IT REACHES AN AGENT, not only this parity test: `stage_lookup` delivers the field on the wire
+ * (see its handler in mcp-server.ts), so an ORDINARY declared or correction-born rule that a human
+ * later names in `memory_ratify`'s `memberRuleIds` starts announcing a parent principle to every
+ * reading agent — the "derived from principle P" provenance line, now true of extraction members
+ * and not only of projections. That is correct as written (the rule genuinely IS derived from that
+ * principle, which is what the ratification recorded) and it is why the field's own doc comment says
+ * "derived from", never "projected from"; the naming is the only thing that still leans projection-
+ * ward, and renaming a shipped wire field belongs with the projection slice that owns it.
  */
 export function evaluateGateFromMirror(
   mirror: GateMirror,

@@ -59,6 +59,10 @@ const KIND_GLYPH: Record<string, string> = {
   fact: "✔",
   procedure: "▸",
   correction: "✎",
+  // The two normative kinds. `principle` reads as the skeleton's own mark; `preference` already had
+  // a glyph above and keeps it, since a declared preference IS the same kind this table named.
+  principle: "◈",
+  rule: "▸",
 };
 const glyph = (kind: string): string => KIND_GLYPH[kind] ?? "·";
 
@@ -162,6 +166,23 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
     out.push("");
   } else if (k.concepts > 0) {
     out.push(green("✓") + dim(" no open contradictions · nothing stale"));
+    out.push("");
+  }
+
+  // THE ALWAYS-ON SKELETON (skeleton-entrances slice, review round 1, item 5). This is the human
+  // curation surface, so a JSON field on the MCP response does not discharge contract 7's "minimal
+  // curation surfacing" — the same standard RESOLUTION and GATES below already hold themselves to.
+  // Placed above POSSIBLE DUPLICATES because it is what GOVERNS rather than what needs mediating.
+  // The header carries the true total whenever the list is capped, so a capped view shortens
+  // without ever understating the population — UNEXPLAINED_DENIES_SHOWN's own discipline.
+  if (o.skeleton?.length) {
+    const total = k.skeleton ?? o.skeleton.length;
+    const capped = total > o.skeleton.length ? dim(`  (showing ${o.skeleton.length} of ${total})`) : "";
+    out.push(bold("SKELETON") + dim("  — always-on, ratified") + capped);
+    for (const s of o.skeleton) {
+      const who = s.ratifiedBy ? dim(` · ${s.ratifiedBy}`) : "";
+      out.push(truncate(`  ${glyph(s.species)} ${s.content}${who}`, width));
+    }
     out.push("");
   }
 

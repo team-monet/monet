@@ -7,27 +7,29 @@
  * impeachment, audit, extraction-evidence exclusion and mirror regeneration all run on them.
  *
  * WHY A SEPARATE TABLE, NOT `memory_edge`. Two structural reasons, both verified against the live
- * code rather than assumed:
+ * code rather than assumed (cited by function/table name, not line number — a prior version of
+ * this comment cited absolute engine.ts line numbers, which drift the moment anything upstream of
+ * them changes; a name survives a refactor the way a line number cannot):
  *
  *  1. `memory_edge` is DERIVED state, and the maintenance path treats it as disposable.
- *     `unwindConceptGraph` (engine.ts:10463) runs an untyped
+ *     `unwindConceptGraph` runs an untyped
  *     `DELETE FROM memory_edge WHERE scope = ? AND (src_id = ? OR dst_id = ?)` — every edge type
- *     touching the concept — while `rederiveConceptGraph` (engine.ts:10526) recreates only the
+ *     touching the concept — while `rederiveConceptGraph` recreates only the
  *     types it can re-derive from body/observations. Anything not re-derivable must be manually
  *     snapshotted and restored around the unwind, which is what the `possible_duplicate_of`
- *     carve-out (engine.ts:5022-5087) does. That carve-out exists at 2 of the 7 unwind call sites;
- *     the other five (`recomputeSourceConceptBody` :3795, `retireConcept` :4251, the two sync-apply
- *     sites :8459/:8553, and `moveConcept` :10359 — the one `reassignCircle` reaches) have none.
+ *     carve-out in `reassignCircle` does. That carve-out exists at 2 of the 7 unwind call sites;
+ *     the other five (`recomputeSourceConceptBody`, `retireConcept`, the two sync-apply
+ *     sites, and `moveConcept` — the one `reassignCircle` reaches) have none.
  *     A normative edge living in `memory_edge` would therefore be silently destroyed by an ordinary
  *     retire or circle move, taking the provenance that impeachment and audit run on with it.
  *     A separate table is immune BY CONSTRUCTION: graph maintenance does not know it exists.
  *
- *  2. `memory_edge` already has `derived_from` and `supersedes` types (engine.ts:147), and they are
- *     HEURISTIC — "agent-asserted typed edges parsed from content" (engine.ts:9830), matched out of
- *     free text by `ASSERTED_RE` and fed into gather's spread activation. The edges here are born
- *     from ACTS (a correction, a declaration, a ratification), never parsed from prose. Sharing
- *     rows or type names would conflate heuristic association with normative authority — precisely
- *     the collapse the design directive forbids.
+ *  2. `memory_edge` already has `derived_from` and `supersedes` types (its own `type` column's
+ *     vocabulary), and they are HEURISTIC — "agent-asserted typed edges parsed from content" (that
+ *     column's own doc comment), matched out of free text by `ASSERTED_RE` and fed into gather's
+ *     spread activation. The edges here are born from ACTS (a correction, a declaration, a
+ *     ratification), never parsed from prose. Sharing rows or type names would conflate heuristic
+ *     association with normative authority — precisely the collapse the design directive forbids.
  *
  * Consequences of that separation, all deliberate:
  *   - These rows NEVER participate in gather spread, adjacency, hub filtering, or the similarity

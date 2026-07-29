@@ -153,11 +153,14 @@ import {
   hasNoReason,
   inspectSidecar,
   LEGACY_STAR_CIRCLE,
+  listMatchableStages,
   listStages,
   liveBlockingRulesForStage,
   liveStageIndex,
   materializeGateMirror,
+  matchesTriggerPattern,
   normalizeStageName,
+  parseActionContext,
   parseTriggerPatterns,
   upsertStage,
   MODEL_TAG_MAX_CHARS,
@@ -788,6 +791,44 @@ export interface StoreOpts {
   operationId?: string;
   /** Required when kind="rule": the stage this rule is bound to, and how it is scoped. */
   rule?: RuleCaptureOpts;
+  /**
+   * INTERNAL — declare()'s principle/preference entrance into this shared write path, never part of
+   * the agent-facing MCP surface (memory_store's schema does not expose it), exactly like
+   * `RuleCaptureOpts.declaration`. Requires kind "principle" or "preference".
+   *
+   * WHY IT RIDES store() RATHER THAN FOLLOWING IT (review round 1, item 6): the skeleton-entry
+   * ratification is written INSIDE this write's own transaction, so a concept and its entry commit
+   * together or not at all. The sibling precedent is the rule branch — `captureRuleBinding` runs in
+   * exactly this position for the identical reason ("ONE TRANSACTION ... there is no second write
+   * to be left standing when the first one fails"). Writing it after store() returned left a window
+   * where a crash produced a principle concept with no ratification: invisible to `skeleton()`,
+   * un-retirable through `memory_ratify` (that surface records verdicts, it does not repair), and
+   * indistinguishable from a rejected candidate.
+   */
+  skeletonEntry?: SkeletonEntryOpts;
+}
+
+/**
+ * INTERNAL. The skeleton-entry half of a principle/preference write — see `StoreOpts.skeletonEntry`.
+ */
+export interface SkeletonEntryOpts {
+  verdict: RatificationVerdict;
+  ratifiedBy?: string | null;
+  /**
+   * Called INSIDE the write transaction, with what resolution actually decided, to produce the
+   * packet stored verbatim on the ratification row. A builder rather than a plain string because
+   * the packet records the advisories that were shown, and two of those (near-match, resolution
+   * mode) are only knowable once this write has resolved — computing them after store() returned is
+   * exactly what forced the write to be non-atomic before.
+   */
+  buildPacket: (resolution: SkeletonEntryResolution) => string;
+}
+
+/** What `SkeletonEntryOpts.buildPacket` is told about the write it is riding. */
+export interface SkeletonEntryResolution {
+  nearMatchId?: string;
+  nearMatchScore?: number;
+  resolutionMode?: ResolutionMode;
 }
 
 /**
@@ -876,11 +917,25 @@ export interface StageView {
 
 /** Input to declare() — the sovereign entrance for rules and stages. */
 export interface DeclareInput {
-  species: "rule" | "stage";
-  /** The action this fires on: a stage name, or an existing stage id. Required for both species. */
-  stage: string;
-  /** What the rule says. Required for species "rule". */
+  species: "rule" | "stage" | "principle" | "preference";
+  /**
+   * The action this fires on: a stage name, or an existing stage id. Required for species "rule"
+   * and "stage". Species "principle"/"preference" are momentless and must NOT carry one — a
+   * preference bound to a moment is just a rule (use species:"rule" instead); see declare()'s own
+   * validation.
+   */
+  stage?: string;
+  /** What it says. Required for every species. */
   content?: string;
+  /**
+   * THE EXITS TEST'S OWN FIELD (species "principle"/"preference" only). What evidence would prove
+   * this wrong — "the unfalsifiable is inadmissible" (skeleton-gates-recall.md, Part 1: the Exits
+   * test). Optional because sovereignty replaces the battery on this entrance: omitting it never
+   * blocks the write, it only earns a warning-light advisory (see `DeclareAdvisory`) prompting for
+   * it, since an always-on entry with no stated way to impeach it is exactly the platitude risk the
+   * battery's Exits test exists to catch.
+   */
+  exitsEvidence?: string;
   /** Replaces the stage's trigger patterns outright. Each entry is seeded like a capture instance. */
   patterns?: string[];
   /** A concrete instance to seed from when the stage is new and no explicit patterns were given. */
@@ -891,7 +946,8 @@ export interface DeclareInput {
    * OMITTED IS NOT "advisory". On a rule that already has a binding, omitting this preserves the
    * severity already recorded — restating a rule's text or its gate is not a ruling on its failure
    * mode. Only an explicit value changes it, and an explicit downgrade of a blocking rule is
-   * reported back as `{ downgraded: true, from: "blocking" }`.
+   * reported back as `{ downgraded: true, from: "blocking" }`. Rule/stage species only — a
+   * principle/preference is momentless and carries no severity (see declare()'s validation).
    */
   severity?: RuleSeverity;
   scope?: RuleScope;
@@ -929,6 +985,31 @@ export type RuleCorrectionVerdict =
   /** Already superseded. History takes no corrections; the successor is the live rule. */
   | "superseded";
 
+/**
+ * A mechanical, non-blocking signal returned alongside a principle/preference declaration —
+ * "help the user make good judgments; NEVER block" (user-ratified, 2026-07-29). Purely
+ * informational: the write has ALREADY happened by the time these are computed, and sovereignty is
+ * final and quiet — nothing here is ever re-argued or re-shown after this response.
+ */
+export interface DeclareAdvisory {
+  kind: "stage_shaped" | "missing_exits_evidence" | "near_match" | "resolution";
+  message: string;
+  /** Present on "stage_shaped" when an existing registered stage's own trigger patterns matched. */
+  stage?: string;
+  /** Present on "near_match"/"resolution", echoing what store() itself already returned. */
+  conceptId?: string;
+  score?: number;
+  mode?: string;
+}
+
+/**
+ * `resolutionMode` values worth a declare() advisory — the AMBIGUOUS outcomes, not the routine
+ * "new"/"attach"/"direct-attach"/"force-new" ones store() reports on literally every write. The
+ * residency law applies to advisories too: an advisory that fired every time would be exactly the
+ * unrationed, zero-yield noise the design's own audit measured against the always-on layer.
+ */
+const AMBIGUOUS_RESOLUTION_MODES: ReadonlySet<string> = new Set(["fork-signal", "ambiguous-fork", "blur-duplicate"]);
+
 /** Outcome of declare(). */
 export type DeclareResult =
   | {
@@ -956,7 +1037,88 @@ export type DeclareResult =
        */
       narrowedFromBreadth?: true;
       previousCircle?: "*";
+    }
+  | {
+      /**
+       * The skeleton entrance — declaration side. See ratify() for the extraction-battery side.
+       * Deliberately its OWN literal ("principle"), not shared with "preference" below in one
+       * `species: "principle" | "preference"` member: TypeScript's discriminated-union EXCLUSION
+       * narrowing (the `else` of `if (r.species === "principle" || r.species === "preference")`)
+       * does not reliably distribute over a union-typed discriminant the way it does over two
+       * separate single-literal members — verified against this exact union in mcp-server.ts's
+       * memory_declare handler, which needs the "stage"/"rule" members narrowed cleanly in that
+       * `else`. Two members with identical shapes costs a little duplication for a narrowing
+       * guarantee that actually holds.
+       */
+      species: "principle";
+      conceptId: string;
+      action: IngestAction;
+      /** Warning-light signals only — see DeclareAdvisory. The write above has already happened. */
+      advisories: DeclareAdvisory[];
+      /**
+       * The now-live skeleton for this circle, in-band (user-ratified, 2026-07-29): "the session
+       * that births a principle is governed by it from that turn onward." Uncapped here — see
+       * skeleton()'s own comment; the wire layer applies the response-size fit-and-signal.
+       */
+      skeleton: SkeletonEntry[];
+    }
+  | {
+      /** Same shape as species "principle" above — see that member's own comment for why this is a
+       *  separate union member rather than `"principle" | "preference"` on one. */
+      species: "preference";
+      conceptId: string;
+      action: IngestAction;
+      advisories: DeclareAdvisory[];
+      skeleton: SkeletonEntry[];
     };
+
+/**
+ * One skeleton member: a principle or preference currently ratified into the always-on layer.
+ * See `MonetCore.skeleton()` for the derivation this projects (latest-ratification-wins; never a
+ * stored scalar flag).
+ */
+export interface SkeletonEntry {
+  conceptId: string;
+  species: "principle" | "preference";
+  /** First line only — the resident layer carries names, never bodies (the design's own residency
+   *  discipline: "the stage index — names only, never rule bodies" applies here on the same logic;
+   *  memory_fetch(conceptId) reads the rest). */
+  content: string;
+  ratifiedBy: string | null;
+  when: number;
+}
+
+/** Input to ratify() — the human-approval surface (memory_ratify). */
+export interface RatifyInput {
+  /** Must name a concept of kind principle|preference in the resolved circle. */
+  candidateId: string;
+  verdict: RatificationVerdict;
+  /**
+   * Explicit typed field, NOT parsed out of `packet` (decided deviation from the draft tool-surface
+   * doc, 2026-07-29): the packet is "JSON evidence packet exactly as shown to the human who ruled"
+   * (lifecycle-edges.ts's own RatificationRow/RecordRatificationInput doc) and stays
+   * opaque-verbatim for audit fidelity — an edge-writing decision must not depend on parsing it.
+   * Only consulted when `verdict` is "approve" or "re-ratify"; ignored otherwise.
+   */
+  memberRuleIds?: string[];
+  /** Opaque evidence packet, stored verbatim. Pre-serialized by the caller (the MCP layer
+   *  JSON.stringifies whatever the tool call received) — this method never inspects its shape. */
+  packet?: string | null;
+  ratifiedBy?: string;
+  circle?: string;
+}
+
+/** Outcome of ratify(). */
+export interface RatifyResult {
+  ratificationId: string;
+  verdict: RatificationVerdict;
+  conceptId: string;
+  /** Ids of the derivation edges written this call. Empty for reject/retire, and for approve/
+   *  re-ratify with no memberRuleIds. */
+  edgeIds: string[];
+  /** The now-live skeleton for this circle, in-band — same rationale as declare()'s own field. */
+  skeleton: SkeletonEntry[];
+}
 
 /** One stored observation as returned by getConcept (id needed to call detach). */
 export interface ObservationEntry {
@@ -1203,6 +1365,9 @@ export interface MemoryOverview {
     disputed: number;
     stale: number;
     possibleDuplicates: number;
+    /** Total skeleton membership (principles + preferences) for this circle — see `skeleton` below
+     *  for the (capped) list itself, same possibleDuplicates/counts.possibleDuplicates convention. */
+    skeleton: number;
   };
   health: { avgConfidence: number; graphDensity: number };
   /** How store-time resolution has been deciding in this circle — the design's own empirical check. */
@@ -1213,6 +1378,9 @@ export interface MemoryOverview {
   activeThreads: PrewarmState["activeWorkstreams"];
   openContradictions: PrewarmContradiction[];
   possibleDuplicates: PossibleDuplicatePair[];
+  /** Skeleton membership (principles + preferences) for this circle — capped; `counts.skeleton`
+   *  carries the true total the same way `counts.possibleDuplicates` does for its own list. */
+  skeleton: SkeletonEntry[];
   graph: {
     hubs: EntityHub[];
     connected: ConnectedConcept[];
@@ -3256,6 +3424,19 @@ export class MonetCore {
             `cannot attach rule evidence to concept '${attachTarget!.id}': ` +
               `${attachTarget!.kind === "rule" ? "it has been superseded and is retained as history" : `it is a '${attachTarget!.kind}', not a rule`}`,
           );
+        } else if (
+          (opts.kind === "principle" || opts.kind === "preference") && attachTarget!.kind !== opts.kind
+        ) {
+          // THE NAMED-TARGET HALF of the cross-kind guard above (skeleton-entrances slice, review
+          // round 1, item 1). memory_store exposes BOTH `kind` and `attachTo`, so the same
+          // misfiling is reachable by naming a target as by resolving to one. A caller error here,
+          // not something to fork around: on the nomination path resolution chose the concept, but
+          // here the caller did, so the mismatch is worth saying out loud — the same asymmetry the
+          // rule branch just above already draws between its own two paths.
+          throw new Error(
+            `cannot attach ${opts.kind} evidence to concept '${attachTarget!.id}': it is a ` +
+              `'${attachTarget!.kind}', not a ${opts.kind}`,
+          );
         } else {
           row = this.attach(attachTarget!, content, emb, sessionId, obsId);
           action = "attached";
@@ -3306,6 +3487,21 @@ export class MonetCore {
             verdict === "blocking" ? "blocking-rule"
             : verdict === "superseded" ? "superseded-rule"
             : opts.kind === "rule" && !this.canCarryRuleEvidence(landed) ? "species"
+            // A NORMATIVE SPECIES NEVER MISFILES ACROSS KINDS (skeleton-entrances slice, review
+            // round 1, item 1). Resolution is kind-blind, so without this an incoming principle
+            // auto-attached to ANY governable concept above tauAttach — a fact it paraphrases, or a
+            // live blocking RULE — and the declaration entrance then stamped verdict "approve" onto
+            // that foreign row: the skeleton stayed empty (membership reads kind principle|
+            // preference), the response still claimed success, and the misfiled row became
+            // un-consolidatable (F4 refuses to strand its ratification) while memory_ratify refused
+            // to retire it (not a skeleton candidate). Forking instead of attaching is the rule
+            // precedent applied one species over.
+            //
+            // SAME species still ATTACHES, deliberately: re-declaring the same principle is one
+            // concept gaining a second approve — idempotent membership, which is the correct
+            // semantics — so this narrows to a CROSS-kind guard, not a blanket forceNew. forceNew
+            // would abandon dedupe entirely and double the skeleton on every re-declaration.
+            : (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind ? "species"
             : null;
           if (verdict === "supersede") {
             supersededRule = landed;
@@ -3362,6 +3558,23 @@ export class MonetCore {
         ruleSuccession = this.succeedRule(supersededRule, row, obsId, opts);
       } else if (opts.kind === "rule") {
         ruleBindingChange = this.captureRuleBinding(row, opts);
+      }
+      // THE SKELETON-ENTRY HALF, in this same transaction and for the same reason the rule binding
+      // above is (review round 1, item 6): a principle concept without its ratification is a
+      // skeleton member nothing can see and no surface can repair. See StoreOpts.skeletonEntry.
+      // The packet is built HERE, inside the transaction, because it records the advisories that
+      // were shown and two of those are properties of how this very write resolved.
+      if (opts.skeletonEntry) {
+        this.ratifySkeletonMembership({
+          conceptId: row.id,
+          verdict: opts.skeletonEntry.verdict,
+          ratifiedBy: opts.skeletonEntry.ratifiedBy,
+          packet: opts.skeletonEntry.buildPacket({
+            ...(nearMatchId !== undefined ? { nearMatchId } : {}),
+            ...(nearMatchScore !== undefined ? { nearMatchScore } : {}),
+            resolutionMode: mode,
+          }),
+        });
       }
       // Provenance: a sourceRef in the span:// namespace is a transcript location, so it becomes a
       // first-class provenance edge as well as an ordinary ref ("every rule must trace to a
@@ -5434,19 +5647,35 @@ export class MonetCore {
     // Under forceNew: never merge; if score >= tauAmbiguous, record a possible_duplicate_of edge.
     const top = this.bestMatches(jsonToEmb(src.embedding), resolvedTo, 1)[0];
     let mergeInto: ConceptRow | null = null;
-    // A RULE IS NEVER CONSUMED BY AN AUTOMATIC MERGE. The candidate scan is kind-blind, so a rule
-    // moved between circles could be merged into a similar concept of ANY kind — a fact it
-    // paraphrases, most likely — which hard-deletes the rule, strands its binding, and makes a deny
-    // disappear as a side effect of an innocent circle move. Nobody declared anything.
+    // A RULE — OR A PRINCIPLE OR A PREFERENCE — IS NEVER CONSUMED BY AN AUTOMATIC MERGE. The
+    // candidate scan is kind-blind, so a normative concept moved between circles could be merged
+    // into a similar concept of ANY kind — a fact it paraphrases, most likely — which hard-deletes
+    // it, strands whatever lifecycle_edges/ratifications name it (a live deny, a skeleton
+    // membership), and makes either disappear as a side effect of an innocent circle move. Nobody
+    // declared or ratified anything. Widened from "rule" alone (skeleton-entrances slice,
+    // 2026-07-29) to cover principle/preference for the identical reason: both now carry
+    // ratifications from the moment they are declared or approved, so they are exactly as
+    // merge-unsafe as a rule from the moment they exist, not only once someone has ratified them.
     //
-    // Moving instead is always safe (the binding follows the concept, the gate re-scopes by the
-    // concept's circle), and the near-match is not thrown away: it records possible_duplicate_of,
-    // the same shape forceNew uses, so the pair still reaches curation. Rules merge only by
+    // Moving is always safe: bindings follow the concept (moveConcept), normative rows persist
+    // append-only at their birth locality and every reader walks them by concept id (see the
+    // wipe-immunity tests), and the near-match is not thrown away: it records possible_duplicate_of,
+    // the same shape forceNew uses, so the pair still reaches curation. These kinds merge only by
     // explicit human consolidation — which is the same boundary the whole severity tier rests on.
-    const rulesNeverAutoMerge = src.kind === "rule";
+    const rulesNeverAutoMerge = src.kind === "rule" || src.kind === "principle" || src.kind === "preference";
     if (opts.resolution !== "forceNew" && !rulesNeverAutoMerge) {
       mergeInto = (top && top.score >= this.tauAttach) ? top.match : null;
     }
+    // MOVES OF EDGE-CARRYING CONCEPTS STAY LEGAL, DELIBERATELY (Codex PR #102, P1 — decided against
+    // a refusal). The wipe-immunity battery pins move-survival of derivation/supersession-carrying
+    // concepts as a guarantee, and the substrate's own doctrine is that a lifecycle row's `circle`
+    // records where the ACT happened (rewritten only by a circle RENAME — see "keeps the edge's
+    // circle at its birth value across a concept move"). Every reader of the normative record walks
+    // by concept id, circle-blind, so a move severs nothing; the same-circle check at edge CREATION
+    // is act-time policy, not a read invariant. What a move CAN now produce is a skeleton member
+    // filed in another circle than its principle — the same cross-circle-membership question the
+    // ratify entrance already defers, dated 2026-07-29, to the materialization slice; that slice
+    // decides both together.
     const committed = this.db.immediateTransaction(() => {
       // Final durable identity + width proof at the mutation boundary. BEGIN IMMEDIATE freezes the
       // proof through the merge/blend or move, so a competing migration/corrupting writer cannot
@@ -5533,6 +5762,34 @@ export class MonetCore {
     const detachingSet = new Set(observationIds);
     const detachingRows = srcObsRows.filter((o) => detachingSet.has(o.id));
     const remainingRows = srcObsRows.filter((o) => !detachingSet.has(o.id));
+
+    // F4 GUARD (skeleton-entrances slice, 2026-07-29): remainingRows.length === 0 means this call
+    // WILL fully consolidate — the ALL-detached branch below hard-deletes sourceConceptId via
+    // hardDeleteNativeConcept. Append-only lifecycle_edges/ratifications cannot be rewritten to
+    // point at destConceptId (family/src/dst have no update path — see lifecycle-edges.ts's own
+    // header), and there is no re-homing surface yet: moving normative record onto a merge
+    // survivor is deliberately NOT built here, left to whichever later slice decides that
+    // semantics. Refusing loudly, before the transaction below ever starts, is the honest
+    // alternative to silently stranding a live deny or a skeleton membership as a side effect of an
+    // ordinary consolidation. Checked BEFORE any mutation (fast-fail, matching declare()'s own
+    // "must leave the store exactly as it found it" discipline) rather than deep inside the
+    // transaction next to the sibling assertBlockingRuleMutationAllowed check.
+    //
+    // hardDeleteNativeConcept now carries the SAME predicate as a last-line-of-defence chokepoint
+    // (review round 1, item 4). This copy is not redundant with it, for exactly the reason the deny
+    // guard keeps both: this one runs before any work and names the caller's own operation, while
+    // the chokepoint exists to catch a caller that never learned to ask.
+    if (remainingRows.length === 0) {
+      const stranded = conceptCarriesNormativeRecord(this.db, sourceConceptId);
+      if (stranded) {
+        throw new Error(
+          `cannot fully consolidate concept ${sourceConceptId}: ${stranded}, which this hard delete would ` +
+            `strand with no consumer told it happened. Retire it via memory_ratify (verdict "retire") if it ` +
+            `is a principle/preference, or let a correction supersede it if it is a rule, instead of ` +
+            `consolidating it away.`,
+        );
+      }
+    }
 
     // A SURVIVING SOURCE MUST KEEP LIVE EVIDENCE.
     //
@@ -6476,6 +6733,13 @@ export class MonetCore {
         WHERE (circle = ? OR circle GLOB ?) AND kind NOT IN ('workstream','source')
           AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`,
     ).get(LEGACY_STAR_CIRCLE, `${LEGACY_STAR_CIRCLE}-[0-9]*`) as { n: number }).n;
+    // MINIMAL CURATION SURFACING (skeleton-entrances slice, item 7): membership list + count, the
+    // SAME dual shape possibleDuplicates/counts.possibleDuplicates already uses just below — a
+    // small fixed cap rather than stage_lookup's byte-fit loop, proportionate to principles being
+    // "few, always present" by design (skeleton-gates-recall.md, Part 1) and preferences expected
+    // to stay in the same range.
+    const OVERVIEW_SKELETON_CAP = 25;
+    const skeletonMembers = this.skeleton(circle);
     return {
       circle,
       agentId: this.agentId,
@@ -6491,6 +6755,7 @@ export class MonetCore {
         disputed: this.disputedCount(circle),
         stale: nativeStale + authorizedSourceStale,
         possibleDuplicates: this.possibleDuplicateCount(circle),
+        skeleton: skeletonMembers.length,
       },
       health: {
         avgConfidence: Number(avgConfidence.toFixed(2)),
@@ -6502,6 +6767,7 @@ export class MonetCore {
       activeThreads: pre.activeWorkstreams,
       openContradictions: pre.openContradictions,
       possibleDuplicates: this.getPossibleDuplicatePairs(circle),
+      skeleton: skeletonMembers.slice(0, OVERVIEW_SKELETON_CAP),
       graph: {
         hubs: this.topEntityHubs(circle, { limit: opts.hubLimit ?? 6 }),
         connected: this.topConnectedConcepts(circle, opts.connectedLimit ?? 6),
@@ -8790,14 +9056,21 @@ export class MonetCore {
   // ---- normative substrate (lifecycle edges + ratifications) ---------------
   //
   // Thin delegation to src/lifecycle-edges.ts, which owns every statement against these tables.
-  // Engine-internal for now: no MCP tool surface exists, because no producer or consumer does
-  // either. Exported from index.ts so the slices that add rule capture and ratification flows have
-  // an API to build against.
+  // Was engine-internal-only through slice 4b (no MCP tool surface existed because no producer or
+  // consumer did either — exported from index.ts only so a later slice would have an API to build
+  // against). The skeleton-entrances slice (2026-07-29) is the first real consumer:
+  // declare()'s principle/preference branch and ratify() (memory_ratify) both write through
+  // ratifySkeletonMembership below, and skeleton() is a derived read over these same tables.
   //
-  // NOTE FOR THE MAINTENANCE PATH: nothing below is reachable from unwindConceptGraph,
-  // rederiveConceptGraph, detach, reassignCircle or the reembed path, and that is the design. These
+  // NOTE FOR THE MAINTENANCE PATH: nothing below is MUTATED by unwindConceptGraph,
+  // rederiveConceptGraph, reassignCircle or the reembed path, and that is the design. These
   // rows are normative record, not derived graph state; they must survive every operation that
   // rebuilds the similarity graph. Do not "tidy" them from a graph-maintenance call site.
+  // `detach`'s own F4 guard (skeleton-entrances slice) is worth naming explicitly here: it READS
+  // getRatifications/getLifecycleEdges, to REFUSE a hard-delete that would strand them — additive
+  // to this guarantee, not an exception to it, since refusing to destroy is exactly what "must
+  // survive every operation" requires. It still never mutates them, and neither does anything else
+  // reachable from detach/unwindConceptGraph/rederiveConceptGraph/reassignCircle/reembed.
 
   private lifecycleEdgeDeps(): LifecycleEdgeDeps {
     return {
@@ -8859,6 +9132,275 @@ export class MonetCore {
     return inspectLifecycleEdgeIntegrity(this.db);
   }
 
+  // ---- skeleton entrances (5-A: principles/preferences, ratification, derived membership) --
+  //
+  // Two entrances, one seam. Extraction: the lead runs the four-test battery conversationally, a
+  // human approves via memory_ratify (below). Declaration: user sovereignty via declare()'s
+  // principle/preference branch, battery reduced to a non-blocking warning light. Both funnel
+  // through ratifySkeletonMembership so skeleton entry is ONE derivation rule regardless of which
+  // door it came through — "two entrances, same layer, same downstream event."
+
+  /**
+   * THE SHARED SKELETON-ENTRY SEAM — the one internal helper both entrances funnel through:
+   * declare()'s principle/preference branch, and ratify()'s own verdict handling. Always records
+   * the ratification (append-only — every verdict, not only entry-shaped ones, is history); writes
+   * a derivation edge principle → each member rule ONLY for an entry-shaped verdict ("approve" or
+   * "re-ratify") when memberRuleIds is given — reject/retire are ratification history, never
+   * membership grants, so they never mint an edge no matter what memberRuleIds holds.
+   *
+   * SKELETON MATERIALIZATION SEAM (named, not built) — mirrors addLifecycleEdge's own
+   * refreshGateSidecar() precedent for the gate mirror: every call here is a ratification event,
+   * and per the design's materialized-mirror pattern the standing skeleton file must regenerate at
+   * every one of them (approve, reject, retire and re-ratify alike — a retire changes membership
+   * exactly as an approve does). That regeneration is the later materialization slice's (5-C) to
+   * build; this comment is its hook. Until then, skeleton() (below) stays a live derived read —
+   * correct, just not yet mirrored to a resident file.
+   *
+   * RECORDED AND DEFERRED, 2026-07-29 (review round 1, item 9) — CONTENT DRIFT ON A RATIFIED
+   * PRINCIPLE. Nothing here re-opens ratification when a ratified principle's BODY later changes.
+   * An ordinary same-species `memory_store` still resolves onto a ratified principle and accretes
+   * unratified text onto its body: delivery stays stable (skeleton() projects `firstLine`, so the
+   * governing line does not silently move under a reader), but `memory_fetch` then shows a body
+   * carrying sentences no human ever approved. The fork guard in storeInternal closed only the
+   * principle→fact DIRECTION (an incoming principle/preference no longer lands on another kind);
+   * an incoming FACT still resolves onto a ratified principle — through auto-resolution and an
+   * explicit attachTo alike — so the fact→principle path and the same-species path both remain
+   * open. The same-species case is legitimate evidence accretion and must not simply be refused;
+   * the fact→principle case rides the same drift signal.
+   * The right shape is a drift SIGNAL — flag the concept and ask for re-ratification, the analog of
+   * the mirror's own `--verify`/summaryDirty machinery — and it belongs to the materialization
+   * slice that builds that machinery, not to this one. Named here so it has an owner rather than
+   * being rediscovered as a surprise.
+   *
+   * SHARPENED (Codex PR #102, P1): accretion is the mild case — memory_synthesize can REWRITE the
+   * body wholesale under the old approval, including the projected first line, with no ratification
+   * event of any kind. The strongest repair shape is a SNAPSHOT: the approved text living in the
+   * ratification record itself, so delivery reads the ruling rather than the mutable body. Same
+   * owner (materialization slice); the option is recorded here so that slice weighs snapshot vs
+   * drift-signal with both named.
+   */
+  private ratifySkeletonMembership(input: {
+    conceptId: string;
+    verdict: RatificationVerdict;
+    ratifiedBy?: string | null;
+    packet?: string | null;
+    memberRuleIds?: string[];
+  }): { ratification: RatificationRow; edges: LifecycleEdgeRow[] } {
+    const result = this.db.transaction((): { ratification: RatificationRow; edges: LifecycleEdgeRow[] } => {
+      const isEntryVerdict = input.verdict === "approve" || input.verdict === "re-ratify";
+      // EVERY MEMBER MUST BE A RULE, CHECKED BEFORE ANYTHING IS WRITTEN (review round 1, item 3).
+      // The contract is "derivation edges principle → rule"; addLifecycleEdge enforces only
+      // governability, so without this a member id naming a fact minted a derivation edge that
+      // claims the principle generates it. Up here rather than inside the write loop so a bad id
+      // in position 2 cannot leave position 1's edge — and the ratification itself — behind.
+      // ENTRY VERDICTS ONLY (Codex PR #102): the public contract says memberRuleIds is IGNORED for
+      // reject/retire, and those verdicts must always be durably recordable — a stale evidence list
+      // must never block recording a retirement.
+      // DEDUPLICATED (round 4): the derivations table has no uniqueness constraint, so a repeated
+      // id in an assembled evidence packet would mint identical edges — inflating the audit record,
+      // the returned edgeIds, and the row counts the deletion guards weigh. One rule, one edge.
+      const memberRuleIds = input.memberRuleIds ? [...new Set(input.memberRuleIds)] : undefined;
+      if (isEntryVerdict && memberRuleIds && memberRuleIds.length > 0) {
+        for (const memberRuleId of memberRuleIds) {
+          const member = this.getRow(memberRuleId);
+          if (!member) {
+            throw new Error(`member rule '${memberRuleId}' does not exist`);
+          }
+          if (member.kind !== "rule") {
+            throw new Error(
+              `member rule '${memberRuleId}' is kind '${member.kind}', not 'rule': a principle derives ` +
+                `RULES, so a derivation edge may only name one.`,
+            );
+          }
+        }
+      }
+      const ratification = recordRatification(this.lifecycleEdgeDeps(), {
+        subjectConceptId: input.conceptId,
+        verdict: input.verdict,
+        packet: input.packet ?? null,
+        // Defaulting to the calling agent, as the tool schema documents — the same fallback the
+        // declaration entrance uses for declaredBy. NULL here lost the actor from an append-only
+        // audit row on the common call path (Codex PR #102).
+        ratifiedBy: input.ratifiedBy ?? this.agentId,
+      });
+      const edges: LifecycleEdgeRow[] = [];
+      if (isEntryVerdict && memberRuleIds && memberRuleIds.length > 0) {
+        for (const memberRuleId of memberRuleIds) {
+          try {
+            edges.push(
+              addLifecycleEdge(this.lifecycleEdgeDeps(), {
+                family: "derivation",
+                srcConceptId: input.conceptId,
+                dstConceptId: memberRuleId,
+                bornOf: "ratification",
+                eventRef: ratification.id,
+              }),
+            );
+          } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            // NAME THE DATED DEFERRAL rather than let addLifecycleEdge's own cross-circle message
+            // stand alone: cross-circle skeleton membership isn't a bug this call tripped over, it
+            // is a decision the design has explicitly not made yet (skeleton-gates-recall.md's
+            // materialization slice owns it), and a caller hitting this should be told that rather
+            // than left to guess whether it is a temporary validation gap.
+            if (message.includes("would cross circles")) {
+              throw new Error(
+                `member rule '${memberRuleId}' is in a different circle than principle '${input.conceptId}': ` +
+                  `${message}. Cross-circle skeleton membership is deliberately undecided (dated deferral, ` +
+                  `2026-07-29) until the materialization slice — ratify within one circle only.`,
+              );
+            }
+            throw e;
+          }
+        }
+      }
+      return { ratification, edges };
+    })();
+    // SKELETON MATERIALIZATION SEAM — see this method's own doc comment above. No-op today.
+    return result;
+  }
+
+  /**
+   * THE HUMAN-APPROVAL SURFACE (memory_ratify) — the extraction entrance's second half: the lead
+   * runs the four-test battery conversationally, and this call records the human's verdict on it.
+   * See declare()'s principle/preference branch for the OTHER entrance (user declaration); both
+   * funnel through ratifySkeletonMembership, "one seam, two entrances."
+   */
+  async ratify(input: RatifyInput): Promise<RatifyResult> {
+    if (!RATIFICATION_VERDICTS.includes(input.verdict)) {
+      throw new Error(`ratification verdict '${input.verdict}' is not one of ${RATIFICATION_VERDICTS.join(", ")}`);
+    }
+    const circle = this.resolveCircle(input.circle ?? this.defaultCircle);
+    const candidate = this.getRow(input.candidateId);
+    if (!candidate) {
+      throw new Error(`memory_ratify candidateId '${input.candidateId}' does not exist`);
+    }
+    if (candidate.kind !== "principle" && candidate.kind !== "preference") {
+      throw new Error(
+        `memory_ratify candidateId '${input.candidateId}' is kind '${candidate.kind}', not 'principle' or ` +
+          `'preference' — only a skeleton candidate can be ratified.`,
+      );
+    }
+    if (candidate.circle !== circle) {
+      throw new Error(
+        `memory_ratify candidateId '${input.candidateId}' is in circle '${candidate.circle}', not '${circle}'.`,
+      );
+    }
+    // A RETIRED CONCEPT CANNOT RE-ENTER THE SKELETON BY VERDICT ALONE (Codex PR #102): skeleton()
+    // unconditionally filters status='retired', so recording an entry verdict here would return a
+    // response claiming the candidate is live while its own skeleton payload omits it. Restore the
+    // concept first; then ratify.
+    if ((input.verdict === "approve" || input.verdict === "re-ratify") && candidate.status === "retired") {
+      throw new Error(
+        `memory_ratify candidateId '${input.candidateId}' is retired: an entry verdict cannot resurrect it. ` +
+          `Restore the concept first, then ratify.`,
+      );
+    }
+    // A DISPUTED CANDIDATE MEDIATES FIRST (Codex PR #102, round 4) — the symmetric case of the
+    // retired refusal above, created by round 3's active-only delivery: an entry verdict on a
+    // disputed concept would record success while the returned skeleton omits it. The contradiction
+    // is the open question; memory_resolve answers it, and membership follows.
+    if ((input.verdict === "approve" || input.verdict === "re-ratify") && candidate.status === "disputed") {
+      throw new Error(
+        `memory_ratify candidateId '${input.candidateId}' is disputed: an open contradiction contests it, ` +
+          `and a contested principle is not delivered. Mediate the contradiction (memory_resolve) first; ` +
+          `membership returns with active status.`,
+      );
+    }
+    // ONLY A PRINCIPLE DERIVES RULES (Codex PR #102, round 2). Derivation is principle → rule by
+    // contract, and gate delivery reports every derivation source as a parent principle — so member
+    // edges under a preference would misrepresent it as one. Preference ratification itself stays
+    // valid; only the evidence list is refused.
+    if (
+      (input.verdict === "approve" || input.verdict === "re-ratify") &&
+      input.memberRuleIds && input.memberRuleIds.length > 0 && candidate.kind !== "principle"
+    ) {
+      throw new Error(
+        `memory_ratify candidateId '${input.candidateId}' is a '${candidate.kind}': memberRuleIds is ` +
+          `principle-only, because derivation edges mean "this principle generates these rules" and a ` +
+          `preference generates nothing. Ratify the preference without memberRuleIds.`,
+      );
+    }
+    const { ratification, edges } = this.ratifySkeletonMembership({
+      conceptId: input.candidateId,
+      verdict: input.verdict,
+      ratifiedBy: input.ratifiedBy,
+      packet: input.packet ?? null,
+      memberRuleIds: input.memberRuleIds,
+    });
+    return {
+      ratificationId: ratification.id,
+      verdict: ratification.verdict,
+      conceptId: input.candidateId,
+      edgeIds: edges.map((e) => e.id),
+      skeleton: this.skeleton(circle),
+    };
+  }
+
+  /**
+   * SKELETON MEMBERSHIP — derived, never a scalar flag ("an implementation that stores authority as
+   * a scalar field has not implemented this design" — the spec's own implementation directive).
+   * Concepts of kind principle|preference whose LATEST ratification verdict is approve or
+   * re-ratify. LATEST-WINS: `ratifications` carries no uniqueness constraint
+   * (recordRatification's own doc comment — "append-only: a later verdict is a new row"), so a
+   * concept may be approved, retired, and re-ratified any number of times; only the most recent row
+   * (by created_at, id as the tiebreak — the SAME order getRatifications already returns) decides
+   * membership. Two approves in a row is therefore idempotent membership, approve→retire takes a
+   * concept out, retire→re-ratify brings it back, and a concept with only a reject verdict never
+   * entered at all.
+   *
+   * Uncapped, mirroring stages()'s own precedent below: principles are "few, always present" by
+   * design, and preferences are expected to stay in the same range — the response-side budget
+   * (where an actually large store would matter) is enforced at the wire layer, exactly as
+   * stageIndex's own cap-and-signal is, not here.
+   *
+   * OLDEST FIRST (review round 1, item 7). Delivery order IS truncation order: every consumer caps
+   * a prefix (the overview's own cap, the wire's size-fit), so whatever sorts last is what a large
+   * store drops. Newest-first dropped the LONGEST-STANDING principles — precisely the settled core
+   * of a governance layer, and the entries most likely to be load-bearing — while keeping whatever
+   * was declared minutes ago. Ascending inverts that: the stable core survives truncation and the
+   * newest entries are the ones that fall off, which is the failure a reader can actually notice
+   * (they just declared it). Ratification time, not concept age: re-ratifying moves an entry to the
+   * end, which is correct — its membership is only as old as the ruling that granted it.
+   */
+  skeleton(circle?: string): SkeletonEntry[] {
+    // ACTIVE ONLY (Codex PR #102, round 3, P1) — not merely non-retired. flagContradiction marks a
+    // contested concept 'disputed', and a disputed principle must stop governing IMMEDIATELY (the
+    // spec's principle-death clause: impeached → drops from delivery → human re-ratifies or
+    // retires). Same discipline the gate already applies to rules: contested is not delivered.
+    // Mediation (memory_resolve) or re-ratification restores 'active' and membership with it.
+    //
+    // KNOWN RESIDUAL (recorded, same owner as the drift signal above — the materialization slice's
+    // re-ratification machinery): a status round-trip through retireConcept/restoreConcept revives
+    // the OLD latest approval the moment restore lands, before the instructed follow-up ratify.
+    // "Membership is only as fresh as the ruling" needs a ruling-vs-status ordering record that
+    // does not exist yet; until it does, restore-then-ratify is instruction, not enforcement.
+    const resolvedCircle = this.resolveCircle(circle ?? this.defaultCircle);
+    const rows = this.db
+      .prepare(
+        `SELECT c.id AS concept_id, c.kind AS kind, c.body AS body,
+                lr.ratified_by AS ratified_by, lr.created_at AS ratified_at
+           FROM concepts c
+           JOIN ratifications lr ON lr.id = (
+             SELECT r.id FROM ratifications r WHERE r.subject_concept_id = c.id
+              ORDER BY r.created_at DESC, r.id DESC LIMIT 1
+           )
+          WHERE c.circle = ? AND c.kind IN ('principle','preference') AND c.status = 'active'
+            AND lr.verdict IN ('approve','re-ratify')
+          ORDER BY lr.created_at ASC, c.id ASC`,
+      )
+      .all(resolvedCircle) as Array<{
+        concept_id: string; kind: string; body: string; ratified_by: string | null; ratified_at: number;
+      }>;
+    return rows.map((row) => ({
+      conceptId: row.concept_id,
+      species: row.kind as "principle" | "preference",
+      content: firstLine(row.body),
+      ratifiedBy: row.ratified_by,
+      when: row.ratified_at,
+    }));
+  }
+
   // ---- gate substrate (stages, rule bindings, firing) -----------------------
   //
   // Thin delegation to src/gates.ts, which owns every statement against these tables. What lives
@@ -8881,6 +9423,13 @@ export class MonetCore {
    * layers down.
    */
   private validateRuleCapture(opts: StoreOpts): void {
+    // The skeleton-entry hook's own species guard, stated beside the rule hook's because they are
+    // the same class of mistake: an internal write-path option reaching a write it does not
+    // describe. A ratification on a fact would be a skeleton membership `skeleton()` can never
+    // read (it selects kind principle|preference) and `memory_ratify` can never retire.
+    if (opts.skeletonEntry !== undefined && opts.kind !== "principle" && opts.kind !== "preference") {
+      throw new Error('store option `skeletonEntry` requires kind "principle" or "preference"');
+    }
     if (opts.kind !== "rule") {
       if (opts.rule !== undefined) throw new Error('store option `rule` requires kind "rule"');
       return;
@@ -9203,10 +9752,15 @@ export class MonetCore {
    * existing binding. Both follow from the same fact: deny power and re-addressing are decisions,
    * and a decision needs somebody to make it.
    *
-   * `species` is deliberately a two-value vocabulary. Principle declaration belongs to the skeleton
-   * slice (it needs the battery, the ratification record and the materializer), and grants and
-   * preferences are NOT a third species — "a gate lookup returns what the rule says", so a standing
-   * order is a rule with permissive content.
+   * `species` is a FOUR-value vocabulary as of the skeleton-entrances slice (2026-07-29) —
+   * "rule"/"stage" (unchanged) plus "principle"/"preference": the declaration entrance into the
+   * skeleton, sovereignty replacing the battery exactly as the design names it ("the human running
+   * the extraction by hand"). Grant is still NOT a species — "a gate lookup returns what the rule
+   * says", so a standing order is a rule with permissive content; that part of this comment
+   * predates the widening and remains true unchanged. Principle/preference are momentless: no
+   * stage, no severity, no patterns (see the validation just below); they enter the skeleton via
+   * ratifySkeletonMembership, the SAME seam memory_ratify's approve/re-ratify path uses — "two
+   * entrances, same layer, same downstream event."
    */
   async declare(input: DeclareInput): Promise<DeclareResult> {
     // ---- VALIDATION, ENTIRELY BEFORE ANY WRITE ------------------------------
@@ -9214,21 +9768,27 @@ export class MonetCore {
     // as it went and wrote the stage first, so a rule declaration that failed downstream (a missing
     // model tag, an embedder outage) still left the stage RE-ADDRESSED — a half-applied sovereign
     // act, which is the one kind of act that must never be half-applied.
-    if (input.species !== "rule" && input.species !== "stage") {
+    if (
+      input.species !== "rule" && input.species !== "stage" &&
+      input.species !== "principle" && input.species !== "preference"
+    ) {
       throw new Error(
-        `species '${String(input.species)}' cannot be declared: this surface declares 'rule' and 'stage'. ` +
-          `A grant or preference is a rule with permissive content; principles arrive with the skeleton.`,
+        `species '${String(input.species)}' cannot be declared: this surface declares 'rule', 'stage', ` +
+          `'principle' and 'preference'. A grant is a rule with permissive content, not a separate species.`,
       );
     }
     // THE ONE BREADTH ENTRANCE. "`*` enters only through the declaration surface" — this is that
-    // surface, and it applies to species "rule" only: a stage has no circle to make global (stages
-    // are already store-global — see GATE_SCHEMA_SQL's own comment), so naming it here for a stage
-    // declaration is a caller error worth a named refusal rather than a silent no-op.
+    // surface, and it applies to species "rule" only.
     const isBreadth = input.circle === BREADTH_CIRCLE;
     if (isBreadth && input.species !== "rule") {
       throw new Error(
-        `circle '${BREADTH_CIRCLE}' (global breadth) applies to rule declarations only — a stage is ` +
-          `already store-global and carries no circle to make global.`,
+        input.species === "stage"
+          ? `circle '${BREADTH_CIRCLE}' (global breadth) applies to rule declarations only — a stage is ` +
+            `already store-global and carries no circle to make global.`
+          : `circle '${BREADTH_CIRCLE}' (global breadth) applies to rule declarations only — breadth is a ` +
+            `property of a rule's BINDING, not of a ${input.species}. A principle/preference's residency ` +
+            `is per-install, not a circle-breadth question, and belongs to the later skeleton-` +
+            `materialization slice, not this one — declare '${input.species}' at a real circle instead.`,
       );
     }
     // THE CONCEPT'S OWN CIRCLE — for a breadth declaration this is deliberately NOT `input.circle`
@@ -9238,8 +9798,47 @@ export class MonetCore {
     // BEFORE resolution (rather than resolving `'*'` and special-casing the result) means a breadth
     // declaration's concept circle is computed by the exact same path an ordinary declaration's is.
     const circle = this.resolveCircle(isBreadth ? this.defaultCircle : (input.circle ?? this.defaultCircle));
-    if (!input.stage || input.stage.trim().length === 0) {
+    if (
+      (input.species === "rule" || input.species === "stage") &&
+      (!input.stage || input.stage.trim().length === 0)
+    ) {
       throw new Error("declaring a rule or a stage requires `stage` — the action the gate fires on");
+    }
+    // PRINCIPLE/PREFERENCE ARE MOMENTLESS. A stage, severity or trigger pattern all address a GATE —
+    // a moment the agent (or a host hook) can be intercepted at — and a principle/preference has no
+    // moment by construction (Part 1's derivation: "is it binding? does a moment trigger it? — with
+    // a trigger → rule; without → principle"). Accepting any of the three here would silently let a
+    // caller mint a gate-bound item under the wrong species — exactly the mis-filing the design's
+    // derivation rule exists to make impossible by construction, not by caller discipline.
+    if (input.species === "principle" || input.species === "preference") {
+      if (input.stage !== undefined) {
+        throw new Error(
+          `species '${input.species}' is momentless and cannot bind to a stage ('${input.stage}'): a ` +
+            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
+        );
+      }
+      if (input.severity !== undefined) {
+        throw new Error(
+          `species '${input.species}' carries no severity: severity is a gate-firing property, and a ` +
+            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
+        );
+      }
+      if (input.patterns !== undefined) {
+        throw new Error(
+          `species '${input.species}' carries no trigger patterns: patterns address a gate, and a ` +
+            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
+        );
+      }
+      if (input.instance !== undefined) {
+        throw new Error(
+          `species '${input.species}' carries no instance: an instance is the concrete gate action ` +
+            `that seeds a trigger pattern, and a ${input.species} bound to a moment is just a rule — ` +
+            `use species:"rule" instead.`,
+        );
+      }
+      if (!input.content || input.content.trim().length === 0) {
+        throw new Error(`declaring a ${input.species} requires \`content\` — what it says`);
+      }
     }
     if (input.severity !== undefined && !RULE_SEVERITIES.includes(input.severity)) {
       throw new Error(`rule severity '${input.severity}' is not one of ${RULE_SEVERITIES.join(", ")}`);
@@ -9309,11 +9908,11 @@ export class MonetCore {
     const before = this.sidecarGeneration();
     let result: DeclareResult;
     if (input.species === "stage") {
-      const existing = findStage(this.db, input.stage);
+      const existing = findStage(this.db, input.stage!);
       const priorPatterns = existing ? this.toStageView(existing).patterns : [];
       const stage = this.db.immediateTransaction(() =>
         upsertStage(this.gateDeps(), {
-          stage: input.stage,
+          stage: input.stage!,
           patterns: input.patterns,
           instance: input.instance,
           acknowledgeBlockingRules: input.acknowledgeBlockingRules,
@@ -9331,6 +9930,52 @@ export class MonetCore {
         previousPatterns: priorPatterns.map(formatTriggerPattern),
         patterns: view.patterns.map(formatTriggerPattern),
       };
+    } else if (input.species === "principle" || input.species === "preference") {
+      // THE DECLARATION ENTRANCE — sovereignty replaces the battery. Net-new code: unlike the rule
+      // branch below, this never touches stages or rule_bindings (principles/preferences have no
+      // moment to bind to). Still funnels through ratifySkeletonMembership, the SAME seam ratify()'s
+      // approve/re-ratify path uses — "two entrances, same layer, same downstream event."
+      const declaredBy = input.declaredBy ?? this.agentId;
+      const species = input.species;
+      // THE DECLARATION ENTRANCE ALSO WRITES A RATIFICATION RECORD (decided 2026-07-29): verdict
+      // "approve", ratifiedBy = the declarer, packet = a declaration record carrying
+      // origin:"declaration", the declared content, exitsEvidence when given, and the advisories
+      // that were shown. This unifies skeleton membership onto ONE derivation rule regardless of
+      // which entrance it came through, faithful to "two entrances, same layer, same downstream
+      // event" — and gives the declaration path the SAME audit trail (who, when, what was shown)
+      // extraction's memory_ratify already gets, rather than a second, thinner provenance shape.
+      //
+      // ATOMIC WITH THE CONCEPT WRITE (review round 1, item 6), by riding store()'s own transaction
+      // through `skeletonEntry` — the same seam and the same reasoning as the rule branch's
+      // `rule` option below. `advisories` is assigned by the builder, which store() invokes inside
+      // that transaction; reading it afterwards is safe because store() cannot return without
+      // having run the builder (skeletonEntry is set on every call from this branch).
+      let advisories: DeclareAdvisory[] = [];
+      const stored = await this.store(input.content!, {
+        circle,
+        kind: species,
+        sourceRefs: input.sourceRefs,
+        skeletonEntry: {
+          verdict: "approve",
+          ratifiedBy: declaredBy,
+          buildPacket: (resolution) => {
+            advisories = this.declareAdvisories(input.content!, input.exitsEvidence, species, resolution);
+            return JSON.stringify({
+              origin: "declaration",
+              content: input.content,
+              ...(input.exitsEvidence !== undefined ? { exitsEvidence: input.exitsEvidence } : {}),
+              advisories,
+            });
+          },
+        },
+      });
+      result = {
+        species,
+        conceptId: stored.conceptId,
+        action: stored.action,
+        advisories,
+        skeleton: this.skeleton(circle),
+      };
     } else {
       // ONE TRANSACTION. The stage upsert now happens INSIDE store()'s transaction (patterns ride
       // through RuleCaptureOpts to captureRuleBinding's own upsertStage call), so there is no
@@ -9341,7 +9986,7 @@ export class MonetCore {
         kind: "rule",
         sourceRefs: input.sourceRefs,
         rule: {
-          stage: input.stage,
+          stage: input.stage!,
           instance: input.instance,
           patterns: input.patterns,
           acknowledgeBlockingRules: input.acknowledgeBlockingRules,
@@ -9442,9 +10087,101 @@ export class MonetCore {
    */
   private assertPatternReauthoringAcknowledged(input: DeclareInput): void {
     if (input.patterns === undefined) return;
-    const stage = findStage(this.db, input.stage);
+    const stage = findStage(this.db, input.stage!);
     if (!stage) return; // a stage being born carries no rules yet, so nothing can be rerouted
     assertNoUnacknowledgedDenies(this.db, stage, input.acknowledgeBlockingRules);
+  }
+
+  /**
+   * WARNING-LIGHT ADVISORIES for the declaration entrance (user-ratified requirement, 2026-07-29):
+   * "help the user make good judgments; NEVER block." Mechanical signals only. Never re-shown or
+   * re-argued afterwards — sovereignty is final and quiet; this is the one time these are surfaced.
+   *
+   * Called from INSIDE store()'s write transaction (via `StoreOpts.skeletonEntry.buildPacket`), so
+   * it is handed `resolution` — what this write actually decided — rather than an `IngestResult`
+   * that does not exist yet. That is what lets the packet record the advisories that were shown
+   * while the ratification stays atomic with the concept (review round 1, item 6).
+   */
+  private declareAdvisories(
+    content: string,
+    exitsEvidence: string | undefined,
+    species: "principle" | "preference",
+    resolution: SkeletonEntryResolution,
+  ): DeclareAdvisory[] {
+    const advisories: DeclareAdvisory[] = [];
+
+    // (a) STAGE-SHAPED CONTENT — reuses the SAME matcher the gate itself fires with (parseActionContext
+    // + matchesTriggerPattern, both from gates.ts): no new matching machinery, per the design's own
+    // residency law — a second classifier here would be exactly the kind of unrationed surface the
+    // design's own audit measured at zero behavioral yield. "Command-shaped" reuses the identical
+    // parse the live gate path uses to recognize a `Tool:command` context (context.tool !== null);
+    // a registered stage match is the stronger, more specific signal and is preferred in the message
+    // when both are true.
+    const context = parseActionContext(content);
+    const matchedStage = listMatchableStages(this.db).find((stage) =>
+      parseTriggerPatterns(stage.trigger_patterns).some((pattern) => matchesTriggerPattern(pattern, context)),
+    );
+    if (matchedStage) {
+      advisories.push({
+        kind: "stage_shaped",
+        stage: matchedStage.name,
+        message: `This looks like a rule — it matches stage "${matchedStage.name}"'s own trigger patterns. ` +
+          `Consider species:"rule" bound to that gate instead of an always-on ${species}.`,
+      });
+    } else if (context.tool !== null) {
+      // CLAMPED (Codex PR #102, round 2): `context.tool` is a verbatim prefix of caller content and
+      // advisories are a FIXED field of the wire response — fitObjectArray can only shrink the
+      // skeleton, so an unbounded tool name here could push even the empty-skeleton envelope past
+      // the result ceiling into a mid-JSON slice. 120 chars is ample for any real command head.
+      const toolShown = context.tool.length > 120 ? `${context.tool.slice(0, 120)}…` : context.tool;
+      advisories.push({
+        kind: "stage_shaped",
+        message: `This looks command-shaped ("${toolShown}:…") rather than a standing truth. Consider ` +
+          `species:"rule" bound to a gate instead of an always-on ${species}.`,
+      });
+    }
+
+    // (b) EXITS EVIDENCE — the battery's fourth test, reduced here to a warning light: "what cannot
+    // be wrong can never be removed by use-maintenance, so the unfalsifiable is inadmissible."
+    if (exitsEvidence === undefined || exitsEvidence.trim().length === 0) {
+      advisories.push({
+        kind: "missing_exits_evidence",
+        message: "No exitsEvidence given — name what evidence would prove this wrong (the Exits test), " +
+          "so it can be maintained by use rather than becoming a platitude nobody can ever retire.",
+      });
+    }
+
+    // (c) WHAT THIS WRITE'S OWN RESOLUTION DECIDED — surfaced here rather than silently dropped, now
+    // that this species does not ride memory_store's own response shape (resolutionMode/nearMatch)
+    // to carry it. `nearMatchId` is always worth a line for this species — whether a
+    // principle/preference consolidated onto an existing skeleton candidate rather than creating a
+    // new one is exactly the kind of judgment call these advisories exist to support. `resolutionMode`
+    // is gated to the AMBIGUOUS outcomes only: "new"/"attach" are the routine, unremarkable cases
+    // store() reports on every write and would just be noise here — the residency law applies to
+    // advisories too, not only to the always-on skeleton itself.
+    //
+    // NO CONTRADICTION BRANCH, and that is a property of the species rather than an omission:
+    // storeInternal opens a contradiction only for `kind === "correction"` landing on an existing
+    // concept, and this path always writes kind principle|preference, so one can never arise here.
+    if (resolution.nearMatchId) {
+      const scoreText = resolution.nearMatchScore !== undefined ? resolution.nearMatchScore.toFixed(3) : "unknown";
+      advisories.push({
+        kind: "near_match",
+        conceptId: resolution.nearMatchId,
+        score: resolution.nearMatchScore,
+        message: `A near-match existed at store time (score ${scoreText}) — ` +
+          `memory_fetch('${resolution.nearMatchId}') before treating this as a genuinely new ${species}.`,
+      });
+    }
+    if (resolution.resolutionMode && AMBIGUOUS_RESOLUTION_MODES.has(resolution.resolutionMode)) {
+      advisories.push({
+        kind: "resolution",
+        mode: resolution.resolutionMode,
+        message: `Store-time resolution reported "${resolution.resolutionMode}" for this write — see resolutionMode.`,
+      });
+    }
+
+    return advisories;
   }
 
   private toStageView(row: StageRow): StageView {
@@ -10561,7 +11298,18 @@ export class MonetCore {
         if (this.db.prepare(`SELECT 1 FROM concepts WHERE id = ?`).get(row.concept_id)) {
           // CHOKEPOINT. Same reasoning as the relayed retire: the deletion EVENT is recorded either
           // way, but a peer cannot delete a deny this machine is enforcing. Counted, not thrown.
-          if (blockingRuleMutationGuard(this.db, row.concept_id, "relayed delete").blocked) {
+          //
+          // The normative-record test rides the SAME shape for the same reason (skeleton-entrances
+          // slice, review round 1, item 4): hardDeleteNativeConcept now refuses outright for a
+          // concept whose ratifications or lifecycle edges the delete would strand, and letting
+          // that throw reach here would abort an entire graft over one row. Pre-checking and
+          // skipping keeps this loop's existing contract — the deletion event is still recorded
+          // above, the local concept simply survives with the record that names it, and the peer's
+          // tombstone stays on file so a later slice that builds re-homing can act on both facts.
+          if (
+            blockingRuleMutationGuard(this.db, row.concept_id, "relayed delete").blocked ||
+            conceptCarriesNormativeRecord(this.db, row.concept_id) !== null
+          ) {
             skipped.deletions++;
           } else {
             this.hardDeleteNativeConcept(row.concept_id, false, row.deleted_at);
@@ -14068,6 +14816,12 @@ export class MonetCore {
       `UPDATE rule_bindings SET circle = ?, sync_updated_at = ?, sync_revision = sync_revision + 1, sync_writer = ?
         WHERE concept_id = ? AND circle != ?`,
     ).run(toCircle, this.nextSyncTimestamp(), this.syncDeviceId, id, BREADTH_CIRCLE);
+    // NORMATIVE ROWS DO NOT FOLLOW A CONCEPT MOVE — deliberately (Codex PR #102 made this column's
+    // first consumer question live, and the answer is the substrate's own pinned doctrine: a
+    // lifecycle row's `circle` records where the act happened, rewritten only by a circle rename.
+    // skeleton() derives membership from the CONCEPT's circle, so delivery follows the move while
+    // the append-only record keeps its birth locality; the dangling-sweep and wipe-immunity tests
+    // both build on rows staying put.)
     const moved = this.db.prepare(`UPDATE observations SET circle = ? WHERE concept_id = ?`).run(toCircle, id);
     // Unwind the concept's footprint in the old circle (entity df + edges), then re-derive it inside
     // the new circle so it reconnects to whatever is already there. Cross-circle edges never survive:
@@ -14256,6 +15010,30 @@ export class MonetCore {
     // guard. Refusing at the delete itself is what makes that a loud failure rather than a
     // ninth door.
     assertBlockingRuleMutationAllowed(this.db, conceptId, replicate ? "hard delete" : "relayed delete");
+    // THE SAME CHOKEPOINT, ONE SUBSTRATE OVER (skeleton-entrances slice, review round 1, item 4).
+    // Normative record — ratifications and lifecycle edges — is append-only and cannot be re-pointed
+    // at a survivor (family/src/dst have no update path), so deleting the concept it names strands
+    // it with nothing told. Every legitimate caller is guarded ahead of this exactly as the deny
+    // guard's are: reassignCircle never auto-merges a normative KIND, consolidating detach refuses
+    // outright when either table names the concept, and the graft path below pre-checks and skips.
+    // Reaching here therefore means a new caller arrived without the guard, and that is precisely
+    // what this is for — the deny guard's own stated purpose, applied to the other substrate whose
+    // loss is silent and unrecoverable.
+    //
+    // POSTURE MIRRORS THE DENY GUARD EXACTLY, including toward peer tombstones: this THROWS on both
+    // the local and the relayed path (the label is the only thing `replicate` changes above), and
+    // the sync deletion-apply loop keeps it unreachable by testing the same predicate first and
+    // SKIPPING — counted, not thrown — because a throw there would abort an entire graft over one
+    // row. Re-homing normative record onto a merge survivor stays deliberately unbuilt (dated
+    // 2026-07-29): refusing loudly is the honest half of that deferral, not a substitute for it.
+    const strandedByDelete = conceptCarriesNormativeRecord(this.db, conceptId);
+    if (strandedByDelete) {
+      throw new Error(
+        `cannot ${replicate ? "hard delete" : "relayed delete"} concept '${conceptId}': ${strandedByDelete}. ` +
+          `Retire it via memory_ratify if it is a principle/preference, or let a correction supersede it ` +
+          `if it is a rule; re-homing normative record onto another concept is deliberately not built.`,
+      );
+    }
     this.db.prepare(`DELETE FROM concepts WHERE id = ?`).run(conceptId);
   }
 
@@ -15249,6 +16027,32 @@ function isConnectorOwnedRow(
   row: { kind: string; source_identity?: string | null; active_observation_id?: string | null } | null | undefined,
 ): boolean {
   return !!row && (row.kind === "source" || row.source_identity != null || row.active_observation_id != null);
+}
+
+/**
+ * THE NORMATIVE-RECORD PREDICATE — one source of truth for "would deleting this concept strand
+ * append-only normative rows", shared by every guard that asks (skeleton-entrances slice, review
+ * round 1, item 4): detach's pre-flight refusal, hardDeleteNativeConcept's last-line-of-defence
+ * chokepoint, and the graft deletion loop's skip-and-count. Modelled on `ungovernableReason`
+ * (lifecycle-edges.ts) rather than returning a bare boolean, for the same reason: every caller
+ * renders the diagnosis into its own sentence, so they must all be describing the same finding.
+ *
+ * Returns a reason fragment naming what was found, or null when the concept carries nothing.
+ * Counts EITHER endpoint of a lifecycle edge — a member rule is named by `dst_concept_id`, and its
+ * loss breaks the principle's derivation exactly as losing the principle would.
+ */
+function conceptCarriesNormativeRecord(db: StoragePort, conceptId: string): string | null {
+  const ratifications = (db
+    .prepare(`SELECT COUNT(*) AS n FROM ratifications WHERE subject_concept_id = ?`)
+    .get(conceptId) as { n: number }).n;
+  const edges = (db
+    .prepare(`SELECT COUNT(*) AS n FROM lifecycle_edges WHERE src_concept_id = ? OR dst_concept_id = ?`)
+    .get(conceptId, conceptId) as { n: number }).n;
+  if (ratifications === 0 && edges === 0) return null;
+  const parts: string[] = [];
+  if (ratifications > 0) parts.push(`${ratifications} ratification(s)`);
+  if (edges > 0) parts.push(`${edges} lifecycle edge(s) (derivation/provenance/supersession)`);
+  return `it carries ${parts.join(" and ")}`;
 }
 
 function toWorkstream(r: ConceptRow): Workstream {
