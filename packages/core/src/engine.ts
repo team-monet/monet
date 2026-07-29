@@ -3734,23 +3734,37 @@ export class MonetCore {
     const emb = await this.checkedEmbed(workstreamText(full), "native"); // column is NOT NULL; not used for dedup
 
     // TRANSACTION: workstream concept write + revision must be all-or-nothing.
+    // Acquire the write reservation before deciding whether to create or update: concurrent
+    // checkpoint writers for the same circle must not act on a stale workstream row snapshot.
     // endSession() lives OUTSIDE the envelope — it is session lifecycle and should proceed
     // regardless of the workstream write outcome (same reasoning as ensureSession in store()).
-    const result = this.db.immediateTransaction((): { id: string; proofToken?: EmbeddingWidthProofToken } => {
+    const result = this.db.immediateTransaction((): { row: ConceptRow; proofToken?: EmbeddingWidthProofToken } => {
       this.assertNoEmbedderMigrationReentry("save a workstream");
       this.assertPinSatisfied();
       this.assertEmbedderOutput(emb, "native");
       this.assertWriteWidthSatisfied(emb.length);
       const occupied = this.db
-        .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?`)
+        .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+          AND (source_identity IS NOT NULL OR active_observation_id IS NOT NULL)
+          ORDER BY updated_at DESC, version DESC, id ASC
+          LIMIT 1`)
         .get(circle, slug) as ConceptRow | undefined;
       if (occupied && isConnectorOwnedRow(occupied)) {
         throw new Error("cannot overwrite a connector-owned workstream row");
       }
+      // Archived rows sort last here for the same reason getActiveWorkstreams orders them last
+      // (Codex review, PR #100, P1): updated_at ties after a graft, and a higher-version ARCHIVED
+      // loser must not be the row a checkpoint resurrects while an active survivor sits beside it
+      // — that would mint a second active row for the slug. An all-archived group still picks its
+      // newest archived row and revives it in place: a deliberate revive-by-checkpoint, unchanged.
       const existing = this.db
         .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
-          AND source_identity IS NULL AND active_observation_id IS NULL`)
+          AND source_identity IS NULL AND active_observation_id IS NULL
+          ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC
+          LIMIT 1`)
         .get(circle, slug) as ConceptRow | undefined;
+
+
       let conceptId: string;
       let version: number;
       if (existing) {
@@ -3777,21 +3791,41 @@ export class MonetCore {
           .run(conceptId, slug, title, body, embToJson(emb), circle);
       }
       this.writeRevision(conceptId, version, body);
-      return { id: conceptId, proofToken: this.captureEmbeddingWidthProof(emb.length) };
+      const savedRow = this.getRow(conceptId);
+      if (!savedRow) throw new Error("workstream row missing after save");
+      return { row: savedRow, proofToken: this.captureEmbeddingWidthProof(emb.length) };
     })();
     this.endSession(opts.summary);
     this.installEmbeddingWidthProof(result.proofToken);
-    return toWorkstream(this.getRow(result.id)!);
+    return toWorkstream(result.row);
   }
 
   /** Restore a circle's active/paused workstreams (the read path prewarm #242 consumes). */
   getActiveWorkstreams(circle?: string): Workstream[] {
     circle ??= this.defaultCircle;
+    // ARCHIVED ROWS SORT LAST in the canonical pick (Codex review, PR #100, P1): the pick must not
+    // let an archived sibling outrank an active one on updated_at, because updated_at is NOT
+    // replicated state — graftRows rewrites every grafted concept's updated_at to one common
+    // relayAt, so after a graft the survivor and an archived loser tie on timestamp and the pick
+    // would fall to version DESC, where a higher-version archived loser wins the slug, gets
+    // filtered below, and the workstream silently vanishes from restore on the peer. status IS
+    // replicated (a semantic column), so archived-last keeps the pick deterministic across grafts
+    // — and matches canonicalizeWorkstreamSlug's own survivor rule ("an already-archived row never
+    // outranks an active one"). A slug whose EVERY row is archived still yields nothing: gone
+    // stays gone; only a live active sibling beats an archived row.
     const rows = this.db
       .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream'
-        AND source_identity IS NULL AND active_observation_id IS NULL AND status!='archived'`)
+        AND source_identity IS NULL AND active_observation_id IS NULL
+        ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC`)
       .all(circle) as ConceptRow[];
-    return rows.map(toWorkstream).filter((w) => w.payload.status !== "done");
+    const canonicalBySlug = new Map<string, ConceptRow>();
+    for (const row of rows) {
+      if (!canonicalBySlug.has(row.slug)) canonicalBySlug.set(row.slug, row);
+    }
+    return [...canonicalBySlug.values()]
+      .filter((row) => row.status !== "archived")
+      .map(toWorkstream)
+      .filter((w) => w.payload.status !== "done");
   }
 
   /**
@@ -12057,8 +12091,10 @@ export class MonetCore {
   /**
    * Atomically rename a circle: bulk-updates all five scope-bearing tables (concepts, observations,
    * memory_edge, entities, concept_entities) from→to; updates workstream slugs in the to-circle
-   * after the rename; upserts an active alias from→to; flattens chains (any alias that pointed
-   * to `from` is updated to point to `to`); renames the in-memory lastConceptByCircle key.
+   * after the rename, then canonicalizes that slug (see canonicalizeWorkstreamSlug) so a to-circle
+   * that already had its own workstream ends up with one active row, not two; upserts an active
+   * alias from→to; flattens chains (any alias that pointed to `from` is updated to point to `to`);
+   * renames the in-memory lastConceptByCircle key.
    * from===to → action "noop". Nonexistent from (no concepts AND no alias rows naming it) → throws.
    */
   renameCircle(from: string, to: string): RenameCircleResult {
@@ -12167,6 +12203,15 @@ export class MonetCore {
             WHERE concept_id IN (${placeholders}) AND circle != ?`,
         ).run(to, renameStamp, this.syncDeviceId, ...movedConceptIds, BREADTH_CIRCLE);
       }
+      // The workstream re-slug inside moveCircleScopedTables (above) can mint a second row sharing
+      // `workstream:${to}` when `to` already had its own workstream: the just-moved `from` row and
+      // to's pre-existing row now collide. Collapse the group to one non-archived row here, at the
+      // mint site — read-side canonicalization alone (getActiveWorkstreams) can only pick a
+      // deterministic row among duplicates that should never have existed. RENAME-SPECIFIC, like the
+      // alias write below: the shared helper's other caller (the legacy-star migration) keeps its
+      // historic behavior — its rare "'*' held a workstream" collision stays covered by the
+      // canonical read until that path earns its own dedup.
+      this.canonicalizeWorkstreamSlug(to, `workstream:${to}`);
       // OWED REGARDLESS — a rename that holds ANY live rule (either severity) rewrites the mirror's
       // content even though no binding was touched, and past that, this rename ALSO writes the
       // from→to row `GateMirror.circleAliases`/`circles` are derived from (below), which changes the
@@ -12783,6 +12828,52 @@ export class MonetCore {
           `${repointedStarTargets} repointed to '${destination}' ('${BREADTH_CIRCLE}' as the TO side — ` +
           `queries through the original name now land where the content actually lives).`,
       );
+    }
+  }
+
+  /**
+   * Collapse every ordinary (non-connector-owned) workstream row sharing (circle, slug) down to
+   * exactly one non-archived survivor. Called after renameCircle's slug UPDATE, the only place a
+   * duplicate for a slug can be minted. Survivor = the row getActiveWorkstreams' canonical pick
+   * would choose (updated_at DESC, version DESC, id ASC) among the NON-archived rows — an
+   * already-archived row never outranks an active one. Losers are archived, never deleted
+   * (history preserved). No-op below two rows, and a no-op if every row in the group is already
+   * archived (nothing non-archived to promote). Must run inside the caller's write transaction.
+   */
+  private canonicalizeWorkstreamSlug(circle: string, slug: string): void {
+    const group = this.db
+      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+        AND source_identity IS NULL AND active_observation_id IS NULL
+        ORDER BY updated_at DESC, version DESC, id ASC`)
+      .all(circle, slug) as ConceptRow[];
+    if (group.length < 2) return; // no collision — the common case stays a no-op
+
+    const survivor = group.find((row) => row.status !== "archived");
+    if (!survivor) return; // every row in the group is already archived — leave as-is
+
+    // Ordinary rows ONLY (Codex review, PR #100, P2) — repeat the group SELECT's ownership
+    // predicates: a connector-owned row sharing the slug is source-controlled state that a
+    // native-circle rename has no business archiving; saveWorkstream refuses to touch such rows
+    // and this pass must honor the same boundary.
+    const archived = this.db
+      .prepare(`UPDATE concepts SET status = 'archived'
+        WHERE circle=? AND kind='workstream' AND slug=? AND id != ? AND status != 'archived'
+          AND source_identity IS NULL AND active_observation_id IS NULL`)
+      .run(circle, slug, survivor.id);
+
+    // Two ways a loser can end up outranking the survivor on updated_at: (a) it was already
+    // archived, by something outside this pass, more recently than the survivor's last write; or
+    // (b) archiving it just now (above) is itself a change to a semantic column (status), so
+    // engine.ts's central sync trigger stamped IT with a fresh updated_at. The restore guarantee
+    // no longer rides on this bump — getActiveWorkstreams orders archived rows last in its
+    // canonical pick precisely because updated_at does not survive a graft (Codex review, PR #100,
+    // P1) — but local timestamp order should still tell the truth: the survivor IS the row this
+    // pass just ratified, and saveWorkstream's own canonical `existing` lookup ranks active rows
+    // by updated_at first. Re-stamp the survivor through the same sync clock the
+    // trigger uses (not a raw wall-clock read) so it comes out unambiguously newest even if
+    // several rows in this group were just touched within the same transaction.
+    if (archived.changes > 0 || group[0].id !== survivor.id) {
+      this.db.prepare(`UPDATE concepts SET updated_at = ? WHERE id = ?`).run(this.nextSyncTimestamp(), survivor.id);
     }
   }
 
