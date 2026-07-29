@@ -9804,6 +9804,16 @@ export class MonetCore {
     ) {
       throw new Error("declaring a rule or a stage requires `stage` — the action the gate fires on");
     }
+    if (
+      (input.species === "rule" || input.species === "stage") &&
+      input.exitsEvidence !== undefined
+    ) {
+      throw new Error(
+        `species '${input.species}' carries no exitsEvidence: exitsEvidence is a skeleton-entrance ` +
+          `field — a rule's impeachment evidence is its correction record, and a stage is trigger ` +
+          `vocabulary rather than an impeachable claim.`,
+      );
+    }
     // PRINCIPLE/PREFERENCE ARE MOMENTLESS. A stage, severity or trigger pattern all address a GATE —
     // a moment the agent (or a host hook) can be intercepted at — and a principle/preference has no
     // moment by construction (Part 1's derivation: "is it binding? does a moment trigger it? — with
@@ -9834,6 +9844,33 @@ export class MonetCore {
           `species '${input.species}' carries no instance: an instance is the concrete gate action ` +
             `that seeds a trigger pattern, and a ${input.species} bound to a moment is just a rule — ` +
             `use species:"rule" instead.`,
+        );
+      }
+      if (input.scope !== undefined) {
+        throw new Error(
+          `species '${input.species}' carries no scope: scope is a rule-binding property, and a ` +
+            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
+        );
+      }
+      if (input.modelTag !== undefined) {
+        throw new Error(
+          `species '${input.species}' carries no modelTag: modelTag names the model a rule ` +
+            `compensates for, and a ${input.species} bound to a moment is just a rule — use ` +
+            `species:"rule" instead.`,
+        );
+      }
+      if (input.reason !== undefined) {
+        throw new Error(
+          `species '${input.species}' carries no reason: reason explains a rule at the moment its ` +
+            `gate fires, and a ${input.species} bound to a moment is just a rule — use ` +
+            `species:"rule" instead.`,
+        );
+      }
+      if (input.acknowledgeBlockingRules !== undefined) {
+        throw new Error(
+          `species '${input.species}' carries no blocking-rule acknowledgement: ` +
+            `acknowledgeBlockingRules authorizes re-aiming a gate that carries live denies, and a ` +
+            `${input.species} bound to a moment is just a rule — use species:"rule" instead.`,
         );
       }
       if (!input.content || input.content.trim().length === 0) {

@@ -1001,6 +1001,27 @@ describe("declaration — the sovereign entrance", () => {
     c.close();
   });
 
+  it("rejects exitsEvidence on rule/stage — their impeachment semantics live elsewhere", async () => {
+    const c = core();
+    await expect(c.declare({
+      species: "rule",
+      stage: "git push",
+      content: "Never force-push a shared branch.",
+      exitsEvidence: "A force-push preserved every teammate's commit.",
+      ...AGENT_RULE,
+    })).rejects.toThrow(
+      /species 'rule' carries no exitsEvidence: exitsEvidence is a skeleton-entrance field.*correction record/,
+    );
+    await expect(c.declare({
+      species: "stage",
+      stage: "git push",
+      exitsEvidence: "The trigger vocabulary no longer denotes a push.",
+    })).rejects.toThrow(
+      /species 'stage' carries no exitsEvidence: exitsEvidence is a skeleton-entrance field.*trigger vocabulary/,
+    );
+    c.close();
+  });
+
   // -------------------------------------------------------------------------
   // skeleton entrances (5-A): declare() species "principle"/"preference"
   // -------------------------------------------------------------------------
@@ -1052,6 +1073,24 @@ describe("declaration — the sovereign entrance", () => {
         .rejects.toThrow(/carries no trigger patterns.*use species:"rule"/);
       c.close();
     });
+
+    it.each(["principle", "preference"] as const)(
+      "rejects rule-binding fields on species %s — momentless declarations cannot discard them",
+      async (species) => {
+        const c = core();
+        await expect(c.declare({ species, content: "x", scope: "domain" }))
+          .rejects.toThrow(new RegExp(`species '${species}' carries no scope: scope is a rule-binding property.*use species:"rule"`));
+        await expect(c.declare({ species, content: "x", modelTag: "model-1" }))
+          .rejects.toThrow(new RegExp(`species '${species}' carries no modelTag: modelTag names the model a rule.*use species:"rule"`));
+        await expect(c.declare({ species, content: "x", reason: "there is no undo" }))
+          .rejects.toThrow(new RegExp(`species '${species}' carries no reason: reason explains a rule.*use species:"rule"`));
+        await expect(c.declare({ species, content: "x", acknowledgeBlockingRules: ["rule-1"] }))
+          .rejects.toThrow(
+            new RegExp(`species '${species}' carries no blocking-rule acknowledgement: acknowledgeBlockingRules.*use species:"rule"`),
+          );
+        c.close();
+      },
+    );
 
     it("requires content for principle/preference", async () => {
       const c = core();
