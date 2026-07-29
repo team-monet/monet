@@ -1881,13 +1881,13 @@ describe("final cold-audit sync fixes", () => {
       vi.setSystemTime(dismissAt);
       try {
         a.resolveContradiction(dismissed.id, { decision: "dismiss", by: "reviewer" });
+        expect((projection(a, dismissBase.conceptId) as { last_confirmed_at: number }).last_confirmed_at).toBe(dismissBeforeSource.last_confirmed_at);
+        b.graftRows(a.exportDelta(dismissInitial.exportedAt));
+        expect((projection(b, dismissBase.conceptId) as { last_confirmed_at: number }).last_confirmed_at).toBe(dismissBeforeReceiver.last_confirmed_at);
+        expect(projection(b, dismissBase.conceptId)).toEqual(projection(a, dismissBase.conceptId));
       } finally {
         vi.useRealTimers();
       }
-      expect((projection(a, dismissBase.conceptId) as { last_confirmed_at: number }).last_confirmed_at).toBe(dismissBeforeSource.last_confirmed_at);
-      b.graftRows(a.exportDelta(dismissInitial.exportedAt));
-      expect((projection(b, dismissBase.conceptId) as { last_confirmed_at: number }).last_confirmed_at).toBe(dismissBeforeReceiver.last_confirmed_at);
-      expect(projection(b, dismissBase.conceptId)).toEqual(projection(a, dismissBase.conceptId));
     } finally {
       a.close(); b.close();
     }
