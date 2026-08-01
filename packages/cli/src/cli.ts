@@ -12,6 +12,7 @@ import { openServedCore, openSourceCore, openStatusCore } from "./bootstrap.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
 import { registerGateCommands } from "./gate-cli.js";
 import { registerInstallCommands } from "./install-cli.js";
+import { MaterializeCliError, registerMaterializeCommands } from "./materialize-cli.js";
 import { resolveProjectDir } from "./project-dir.js";
 
 // Read version from package.json so it can never drift from the published version.
@@ -238,12 +239,15 @@ registerSourceCommands(program, {
 registerRecoveryCommands(program);
 registerGateCommands(program);
 registerInstallCommands(program);
+registerMaterializeCommands(program);
 
 void program.parseAsync().catch((error: unknown) => {
   if (error instanceof FreshStoreEmbedderUnavailableError) {
     console.error(error.message);
   } else if (error instanceof SourceCliError) {
     console.error(`monet source: ${error.message}`);
+  } else if (error instanceof MaterializeCliError) {
+    console.error(`monet materialize: ${error.message}`);
   } else {
     console.error(error instanceof Error ? error.message : String(error));
   }

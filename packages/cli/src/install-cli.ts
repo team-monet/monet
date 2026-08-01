@@ -775,8 +775,18 @@ function resolveInstallTarget(options: InstallCommandOptions, deps: InstallCliDe
  * On any failure (including the exclusive-create itself), the tmp file is best-effort cleaned up
  * and the ORIGINAL error is rethrown — this function adds a safety property, it does not change
  * runInstall's existing behavior of letting a write failure propagate to the top-level handler.
+ *
+ * `verifyBeforeRename`, when supplied, runs after the complete temporary file is durable enough for
+ * this helper's existing contract and immediately before the rename. A thrown verification error
+ * aborts replacement and follows the same cleanup/rethrow path. Materialization uses this as a
+ * best-effort snapshot compare-and-swap; existing install callers omit it and are unchanged.
  */
-export function atomicWriteFile(targetPath: string, data: string, mode?: number): void {
+export function atomicWriteFile(
+  targetPath: string,
+  data: string,
+  mode?: number,
+  verifyBeforeRename?: () => void,
+): void {
   let resolvedPath = targetPath;
   try {
     resolvedPath = realpathSync(targetPath);
@@ -797,6 +807,7 @@ export function atomicWriteFile(targetPath: string, data: string, mode?: number)
   const tmp = join(dir, `.${basename(resolvedPath)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
   try {
     writeFileSync(tmp, data, effectiveMode !== undefined ? { flag: "wx", mode: effectiveMode } : { flag: "wx" });
+    verifyBeforeRename?.();
     renameSync(tmp, resolvedPath);
   } catch (error) {
     try {

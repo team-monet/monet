@@ -836,9 +836,9 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
   // repair was a manual @team-monet/core API call — no longer true (component B wires it into
   // `start`'s own MonetCore construction, the ONE serving-process writer surface — see
   // bootstrap.ts's ServedCoreOptions.gateSidecarPath). The truer repair now is "is a `monet start`
-  // session actually running for this project" — there is still no ONE-SHOT `monet materialize`
-  // command for regenerating the file without a running server (unbuilt; see next-monet-tool-
-  // surface.md's own separate `monet materialize` row), so that honest gap remains named too.
+  // session actually running for this project" — the one-shot `monet materialize` command now
+  // regenerates registered standing-file skeleton blocks only; it deliberately does not regenerate
+  // the separate gate mirror, so that honest gap remains named too.
   //
   // FRESH-INSTALL WORDING (P1-A, Codex round 1 on PR #42): this exact message is now ALSO what a
   // brand-new user sees verbatim in Claude Code's own transcript (install-cli.ts's wrapper greps
@@ -852,8 +852,8 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
         `after a fresh \`monet install\`: the hook is wired, but the mirror doesn't exist until a ` +
         `\`monet start\` session has run at least once for this project — it materializes and ` +
         `refreshes the file automatically from then on. Start one now, or re-run \`monet install\` ` +
-        `if you're unsure the hook itself is even wired. No one-shot ` +
-        `\`monet materialize\` command ships in this CLI yet for regenerating it without a server.`,
+        `if you're unsure the hook itself is even wired. The separate \`monet materialize\` command ` +
+        `regenerates registered standing-file skeleton blocks, not this gate mirror.`,
     );
     console.error(`monet gate: circle ${describeResolvedCircle(resolved, null)}`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
@@ -912,8 +912,8 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
         `monet gate: answering from a mirror generated ${age} ago — an offline answer is a cached ` +
           `answer. A running \`monet start\` session for this project refreshes this file on every ` +
           `gate-relevant write; if none is running (or it targets a different project), start one, ` +
-          `or run \`monet install\` to wire the hook that depends on it. No one-shot ` +
-          `\`monet materialize\` command ships in this CLI yet.`,
+          `or run \`monet install\` to wire the hook that depends on it. The separate ` +
+          `\`monet materialize\` command regenerates standing-file skeleton blocks, not this mirror.`,
       );
       break;
     }

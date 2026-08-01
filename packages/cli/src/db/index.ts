@@ -9,6 +9,7 @@ import fs from "node:fs";
 const MONET_DIR = ".monet";
 const DB_FILE = "monet.db";
 const GATE_MIRROR_FILE = "gate-mirror.json";
+const MATERIALIZE_FILE = "materialize.json";
 
 /**
  * `baseDir` defaults to `process.cwd()` — behavior-identical for every EXISTING caller (getDbPath,
@@ -67,6 +68,11 @@ export function getDbPath(baseDir?: string): string {
  */
 export function getGateMirrorPath(baseDir?: string): string {
   return path.join(getMonetDir(baseDir), GATE_MIRROR_FILE);
+}
+
+/** The materialize registry/manifest shares the store home's established resolution chain. */
+export function getMaterializePath(baseDir?: string): string {
+  return path.join(getMonetDir(baseDir), MATERIALIZE_FILE);
 }
 
 /**
