@@ -486,6 +486,11 @@ function buildCurationAdvisory(
   const signals: string[] = [];
   if (ov.counts.possibleDuplicates >= 3)
     signals.push(`possibleDuplicates=${ov.counts.possibleDuplicates}`);
+  // Threshold 1, not possibleDuplicates' 3 (review fix — Codex 5-B round 5, R5-2): each candidate
+  // is a battery waiting for a human, and force-new births — the richest source — write no
+  // possible_duplicate_of edge at all, so nothing else would surface them at session start.
+  if (ov.counts.extractionCandidates >= 1)
+    signals.push(`extractionCandidates=${ov.counts.extractionCandidates}`);
   if (ov.counts.disputed >= 1)
     signals.push(`disputed=${ov.counts.disputed}`);
   if (ov.counts.stale >= 5)
@@ -875,6 +880,12 @@ export function registerMonetCoreTools(
             .string()
             .optional()
             .describe("One line naming the failure this prevents. This is what the gate shows, and the reason is what earns compliance."),
+          projectedFromPrincipleId: z
+            .string()
+            .optional()
+            .describe(
+              "The skeleton principle this rule is PROJECTED from — for the empty-gate moment (\"stage X, no cached rules — skeleton applies\"): you are at a gate with nothing bound to it, the skeleton in your context speaks to it, so you write down the rule it implies here and it becomes a cache hit next time. The parent must be a ratified, undisputed skeleton principle in the same circle (a preference derives no rules, and neither does a principle that is retired or currently under impeachment). Records a derivation edge, so the rule announces \"derived from principle P\" whenever it fires — a wrong projection misfires in front of the user, which is exactly why this needs no approval step. Projected rules are advisory-only and are excluded from extraction evidence: a principle must not manufacture its own support.",
+            ),
         })
         .optional()
         .describe(
@@ -915,7 +926,14 @@ export function registerMonetCoreTools(
           ...(r.nearMatchId ? { nearMatchId: r.nearMatchId, nearMatchScore: r.nearMatchScore } : {}),
           // A correction that overturned a rule did not attach to it — it birthed the rule's
           // successor and superseded the incumbent. `conceptId` above is the successor.
+          // `ruleSuccession.impeachedPrincipleIds` (slice 5-B) rides along when the correction also
+          // cast doubt up a parent edge — the principles that just left the skeleton because of it.
           ...(r.ruleSuccession ? { ruleSuccession: r.ruleSuccession } : {}),
+          // EXTRACTION CANDIDATE (slice 5-B), omitted when this write flagged none: the rule just
+          // born looks like a rule at ANOTHER stage, which is the breadth precondition for
+          // extracting a principle. A flag, not an extraction — the four-test battery and the human
+          // ratification stay explicit (memory_ratify).
+          ...(r.extractionCandidate ? { extractionCandidate: r.extractionCandidate } : {}),
         }, "memory_store", false, capturedBlock);
       } catch (e) {
         return err(`store failed: ${msg(e)}`);
@@ -1155,12 +1173,22 @@ export function registerMonetCoreTools(
         });
         // IN-BAND SKELETON DELIVERY, same cap-and-signal discipline as memory_declare's own
         // principle/preference response (fitObjectArray — fitStringArray's object-array sibling).
+        // THE TWO IN-BAND OUTCOME DISCLOSURES (slice 5-B; review fix — Codex round 4, R4-2 and
+        // R4-4). Both are the whole reason their engine fields exist: they distinguish a ratification
+        // that CHANGED something beyond the verdict — closed an impeachment the human re-ruled on,
+        // resolved an extraction candidate the human just answered — from one that changed nothing,
+        // and a wire that rebuilds its response from a fixed list silently made those two look
+        // identical to every MCP caller. Spread here, inside `fixedFields`, so the size fit measures
+        // them like every other fixed field; omitted-when-absent, matching the engine's own shape
+        // (never reported as 0), so their presence alone is the signal.
         const fixedFields = {
           circle: resolvedCircle,
           ratificationId: r.ratificationId,
           verdict: r.verdict,
           conceptId: r.conceptId,
           edgeIds: r.edgeIds,
+          ...(r.impeachmentsClosed !== undefined ? { impeachmentsClosed: r.impeachmentsClosed } : {}),
+          ...(r.extractionFlagsResolved !== undefined ? { extractionFlagsResolved: r.extractionFlagsResolved } : {}),
         };
         const guidance = verdict === "approve" || verdict === "re-ratify"
           ? "Recorded. If memberRuleIds was given, each now carries a derivation edge from this principle. It is live in the skeleton for this circle from this turn onward."
@@ -1217,7 +1245,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_overview",
-    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates/skeleton), the living model (top concepts), where you left off (active threads), open contradictions, the always-on skeleton, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. \'skeleton\' lists the circle\'s currently-ratified principles/preferences (compact entries, capped; counts.skeleton has the full total) — membership is always derived from each concept\'s latest ratification, so this list is live, not a cached flag. \'resolutionStats\' reports how store-time resolution has been deciding lately (counts by mode over the last 30 days, plus decidedTotal — the count of writes that actually ran the rule, excluding caller-directed attachTo/forceNew): divide by decidedTotal for a rate, and watch fork-signal (concepts going bimodal) and blur-duplicate (centroids drifting off their own evidence) as the health signals behind the duplicate pairs above. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub. otherCircles lists other circles in the store (name + concept count + last activity).',
+    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates/skeleton), the living model (top concepts), where you left off (active threads), open contradictions, the always-on skeleton, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. Open extraction-candidate pairs — two RULES bound to DIFFERENT stages that near-matched at rule birth, i.e. a pair that may share one reason worth extracting into a principle — are surfaced the same way in \'extractionCandidates\' (counts.extractionCandidates has the full total); that is a different question from duplication ("do these share a reason?" rather than "are these one thing?"), so it gets its own list, and the answer to it is a conversation ending in memory_ratify, not a merge. Either kind of pair is retired with memory_resolve (conceptAId + conceptBId) — one dismissal clears every flag between the two. \'skeleton\' lists the circle\'s currently-ratified principles/preferences (compact entries, capped; counts.skeleton has the full total) — membership is always derived from each concept\'s latest ratification, so this list is live, not a cached flag. \'resolutionStats\' reports how store-time resolution has been deciding lately (counts by mode over the last 30 days, plus decidedTotal — the count of writes that actually ran the rule, excluding caller-directed attachTo/forceNew): divide by decidedTotal for a rate, and watch fork-signal (concepts going bimodal) and blur-duplicate (centroids drifting off their own evidence) as the health signals behind the duplicate pairs above. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub. otherCircles lists other circles in the store (name + concept count + last activity).',
     { circle: z.string().optional(), entity: z.string().optional() },
     async ({ circle, entity }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1551,6 +1579,14 @@ export function registerMonetCoreTools(
             ...(rule.modelTag !== null ? { modelTag: rule.modelTag } : {}),
             ...(bodyClip ? { body: bodyClip.text } : {}),
             ...(rule.projectedFromPrincipleId !== undefined ? { projectedFromPrincipleId: rule.projectedFromPrincipleId } : {}),
+            // FIRE-TIME DOUBT DISCLOSURE (slice 5-B, D5) — present (always `true`) only when the
+            // parent principle named just above is currently disputed: a correction overturned one
+            // of its rules, it has dropped out of the skeleton, and a human is being asked to
+            // re-ratify or retire it. Same omit-when-absent discipline as every optional field on
+            // this response, and for a stronger reason than budget: `false` on every rule of every
+            // lookup would be the resident cost with none of the signal. Disclosure only — this
+            // rule still delivers, at its own severity, on its own evidence.
+            ...(rule.parentDisputed ? { parentDisputed: true } : {}),
           };
           const candidate = [...fitRules, candidateRule];
           const serialized = JSON.stringify({ ...fixedFields, rules: candidate }, null, 2);
@@ -1742,14 +1778,15 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_resolve",
-    "Mediate a contradiction OR dismiss a possible-duplicate pair — two verdict families, one tool. " +
+    "Mediate a contradiction OR dismiss a flagged pair (possible-duplicate OR extraction-candidate) — two verdict families, one tool. " +
     "CONTRADICTION VERDICT: pass `contradictionId` + `decision` ('accept-new' / 'keep-current' / 'dismiss'). " +
     "accept-new: the correcting evidence wins; keep-current: the prior wins; dismiss: not a real conflict. " +
     "WHAT GETS SUPERSEDED: pass `contradictedObservationId` to name the observation the correction contradicted — you already have the evidence in front of you at this point, so a name given HERE is not a guess. accept-new then supersedes EXACTLY that observation (successor: the correcting observation), no matter how many other live observations the concept holds. keep-current records it as the prior being kept; it does not change what gets superseded (the correction is still retired with no successor — see below). The name is validated: it must exist, belong to the same concept as the contradiction, be live (not already superseded), predate the correcting observation (a later observation was never in dispute with it — naming one is refused, not silently accepted), and not be the correcting observation itself. It also requires the contradiction to actually HAVE a correcting observation — a bare contradiction (flagged without one, e.g. via memory_flag_contradiction with no observationId) contradicted nothing, so naming a loser for it is refused for every decision, not only accept-new. " +
     "Omit `contradictedObservationId` and the conservative fallback applies, because nothing else records WHICH prior a correction contradicted: accept-new supersedes the single prior ONLY when exactly one live observation predates the correction; with several it supersedes NOTHING and REQUIRES `body`, which is then the only record of the verdict — the contradicted claim stays live evidence INDEFINITELY — nothing retires it automatically (memory_synthesize only rewrites the body), so it keeps contributing to support and the concept embedding until something explicitly supersedes or detaches it. keep-current (named or not) retires the correction terminally, naming no successor. For accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain. " +
-    "DUPLICATE-PAIR DISMISSAL: pass `conceptAId` + `conceptBId` (omit contradictionId/decision). " +
-    "Asserts these two concepts are NOT duplicates — they leave the possibleDuplicates list and survive any future detach/rederive cycle. " +
-    "Dismissing a pair where no live possible_duplicate_of edge exists succeeds idempotently with rowsUpdated: 0 (\"nothing to dismiss\" signal). " +
+    "PAIR-FLAG DISMISSAL: pass `conceptAId` + `conceptBId` (omit contradictionId/decision). " +
+    "This is the exit for BOTH pair flags memory_overview surfaces — possibleDuplicates (\"are these one thing?\") and extractionCandidates (\"do these two rules share one reason?\"). " +
+    "ONE DISMISSAL ANSWERS BOTH: asserting that these two concepts are unrelated retires every flag between them, so the pair leaves possibleDuplicates AND extractionCandidates together and survives any future detach/rederive cycle. That is deliberate, not a limitation — a human saying \"these two are unrelated\" has answered both questions in one breath, and there is no per-flag argument to split them. If the two really are related in one sense but not the other, correct or detach them instead of dismissing. " +
+    "Dismissing a pair with no live flag edge of either type succeeds idempotently with rowsUpdated: 0 (\"nothing to dismiss\" signal); rowsUpdated counts edge ROWS, and each flag is stored in both directions. " +
     "Pass `resolvedBy` / `circle` for either family. Existing contradiction-path callers are unaffected.",
     {
       // Contradiction-resolution fields (existing — backward compatible).
@@ -1767,23 +1804,23 @@ export function registerMonetCoreTools(
       ),
       resolvedBy: z.string().optional(),
       circle: z.string().optional().describe("The circle the contradiction or concepts belong to (defaults to this session's circle)."),
-      // Duplicate-pair dismissal fields (new in 0.6.0).
-      conceptAId: z.string().optional().describe("First concept of a possible-duplicate pair to dismiss. Required for duplicate-pair dismissal; omit for contradiction verdicts."),
-      conceptBId: z.string().optional().describe("Second concept of a possible-duplicate pair to dismiss. Required for duplicate-pair dismissal; omit for contradiction verdicts."),
+      // Pair-flag dismissal fields (new in 0.6.0; widened from possible-duplicate only in 5-B).
+      conceptAId: z.string().optional().describe("First concept of the flagged pair to dismiss — a possible-duplicate pair or an extraction-candidate pair, from memory_overview. Required for pair-flag dismissal; omit for contradiction verdicts."),
+      conceptBId: z.string().optional().describe("Second concept of the flagged pair to dismiss — a possible-duplicate pair or an extraction-candidate pair, from memory_overview. One dismissal clears every flag between the two. Required for pair-flag dismissal; omit for contradiction verdicts."),
     },
     async ({ contradictionId, decision, body, contradictedObservationId, resolvedBy, circle, conceptAId, conceptBId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
-        // --- Duplicate-pair dismissal path ---
+        // --- Pair-flag dismissal path (possible-duplicate AND extraction-candidate) ---
         if (conceptAId !== undefined || conceptBId !== undefined) {
-          if (!conceptAId || !conceptBId) return err("duplicate-pair dismissal requires both conceptAId and conceptBId");
-          if (contradictionId !== undefined) return err("provide either contradictionId (contradiction verdict) or conceptAId+conceptBId (duplicate-pair dismissal), not both");
+          if (!conceptAId || !conceptBId) return err("pair-flag dismissal requires both conceptAId and conceptBId");
+          if (contradictionId !== undefined) return err("provide either contradictionId (contradiction verdict) or conceptAId+conceptBId (pair-flag dismissal), not both");
           // Reject contradiction-path-only fields: an agent passing `decision` or `body` alongside
-          // conceptAId+conceptBId is attempting a contradiction verdict on a duplicate pair, which
+          // conceptAId+conceptBId is attempting a contradiction verdict on a flagged pair, which
           // would silently hide the pair instead. Name the conflict and point at both valid shapes.
-          if (decision !== undefined) return err("field 'decision' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
-          if (body !== undefined) return err("field 'body' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
-          if (contradictedObservationId !== undefined) return err("field 'contradictedObservationId' belongs to the contradiction verdict path (requires contradictionId); for duplicate-pair dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
+          if (decision !== undefined) return err("field 'decision' belongs to the contradiction verdict path (requires contradictionId); for pair-flag dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
+          if (body !== undefined) return err("field 'body' belongs to the contradiction verdict path (requires contradictionId); for pair-flag dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
+          if (contradictedObservationId !== undefined) return err("field 'contradictedObservationId' belongs to the contradiction verdict path (requires contradictionId); for pair-flag dismissal pass only conceptAId + conceptBId (and optionally resolvedBy/circle)");
           // Scope enforcement: both concepts must live in the caller-named circle.
           const circleA = core.circleOf(conceptAId);
           const circleB = core.circleOf(conceptBId);
@@ -1793,7 +1830,18 @@ export function registerMonetCoreTools(
           if (circleB !== scope(circle)) return err(`concept not found: ${conceptBId}`);
           const r = core.dismissPossibleDuplicate(conceptAId, conceptBId, resolvedBy);
           if (!r.dismissed) return err(r.error);
-          return mutOk({ circle: scope(circle), action: "duplicate-pair-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated }, "memory_resolve", false, capturedBlock);
+          // RENAMED FROM "duplicate-pair-dismissed" (review fix — Codex 5-B round 1, F5). 5-B
+          // widened the engine call to every PAIR_FLAG_EDGE_TYPE, so this one call now also retires
+          // an extraction_candidate — and an action string naming only duplicates was the wire
+          // reporting the wrong act, on the one field an agent logs and branches on. Renamed rather
+          // than joined by a per-type list: every other `action` on this server is one short
+          // past-tense phrase naming what happened (archived / unarchived / renamed / noop), and a
+          // generic name that is always true stays inside that convention where a new
+          // `dismissedFlagTypes` array would invent a shape nothing else here uses. Checked before
+          // renaming: the exact string is asserted in two of this repo's own tests (updated with
+          // this change) and nowhere else — no CLI, renderer, doc or persisted row reads it, and the
+          // package is private and pre-1.0, so no external client contract depends on it.
+          return mutOk({ circle: scope(circle), action: "pair-flags-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated }, "memory_resolve", false, capturedBlock);
         }
         // --- Contradiction verdict path (original, unchanged) ---
         if (!contradictionId) return err("contradictionId is required for contradiction verdicts");

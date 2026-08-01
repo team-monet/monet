@@ -196,6 +196,20 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
     out.push("");
   }
 
+  // EXTRACTION CANDIDATES (slice 5-B) — its own heading, beside the duplicates rather than folded
+  // into them, because it asks a different question of the reader: not "are these one thing?" but
+  // "do these share one reason?" The subtitle carries the answer to "so what do I do with it",
+  // since the battery is a conversation the human runs, not something the store can offer a verb for.
+  if (o.extractionCandidates?.length) {
+    out.push(yellow(bold("EXTRACTION CANDIDATES")) + dim("  — rules at different stages that may share one reason"));
+    for (const ec of o.extractionCandidates as PossibleDuplicatePair[]) {
+      const aId = dim(`[${ec.conceptAId.slice(0, 8)}]`);
+      const bId = dim(`[${ec.conceptBId.slice(0, 8)}]`);
+      out.push(truncate(`  · ${ec.conceptATitle} ${aId} / ${ec.conceptBTitle} ${bId}  (score: ${ec.score.toFixed(3)})`, width));
+    }
+    out.push("");
+  }
+
   // HOW RESOLUTION HAS BEEN DECIDING (src/resolution.ts). The design's empirical check on "find by
   // evidence, confirm by identity" is fork rate and misfile rate "visible in curation" — and this
   // is the human curation surface, so a JSON field on the MCP response does not discharge it.
@@ -207,7 +221,7 @@ export function renderOverview(o: MemoryOverview, opts: RenderOpts = {}): string
     const decided = rs.byMode.filter((m) => DECIDED_RESOLUTION_MODES.includes(m.mode));
     const paired = decided
       .filter((m) =>
-        m.mode === "fork-signal" || m.mode === "species-fork" ||
+        m.mode === "fork-signal" || m.mode === "species-fork" || m.mode === "stage-fork" ||
         m.mode === "ambiguous-fork" || m.mode === "blur-duplicate")
       .reduce((sum, m) => sum + m.count, 0);
     out.push(bold("RESOLUTION") + dim(`  — how new evidence landed, last ${rs.windowDays}d`));

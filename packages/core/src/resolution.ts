@@ -82,17 +82,25 @@
  *   attach            evidence found and identity confirmed — absorbed into the nominated concept
  *   fork-signal       evidence found, identity DISAGREED — bimodal concept, forked for mediation
  *   species-fork      evidence and identity agreed, but the nominated concept kind was incompatible
+ *   stage-fork        evidence and identity agreed, but the nominated RULE is bound to another stage
  *   ambiguous-fork    ambiguous-band evidence — forked with a possible_duplicate_of edge (status quo)
  *   correction-attach ambiguous-band kind="correction" — attached, contradiction machinery takes over
  *   blur-duplicate    identity matched, evidence DISAGREED — the blur attractor's own output, paired
  *   new               no support from either signal — a genuinely new concept
  *   direct-attach     attachTo bypassed scoring entirely
  *   force-new         resolution:"forceNew" bypassed scoring entirely
+ *
+ * `species-fork` and `stage-fork` are DECIDED HERE ONLY IN NAME: both are properties of the concept
+ * resolution nominated (its kind; its rule binding), which this pure function has no db handle to
+ * read. The engine overrides the mode at the write site — see storeInternal's `forkReason` — and
+ * these two values live in this vocabulary so that everything reading it downstream (rate
+ * denominators, the overview's mode histogram, the declare advisories) sees one closed set.
  */
 export type ResolutionMode =
   | "attach"
   | "fork-signal"
   | "species-fork"
+  | "stage-fork"
   | "ambiguous-fork"
   | "correction-attach"
   | "blur-duplicate"
@@ -107,7 +115,7 @@ export type ResolutionMode =
  * would otherwise show a fork rate diluted toward zero by writes that were never allowed to fork.
  */
 export const DECIDED_RESOLUTION_MODES: readonly ResolutionMode[] = [
-  "attach", "fork-signal", "species-fork", "ambiguous-fork", "correction-attach", "blur-duplicate", "new",
+  "attach", "fork-signal", "species-fork", "stage-fork", "ambiguous-fork", "correction-attach", "blur-duplicate", "new",
 ];
 
 /** Whether `mode` recorded a resolution decision rather than a caller-directed bypass. */

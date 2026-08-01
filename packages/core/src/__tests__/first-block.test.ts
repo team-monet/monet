@@ -532,6 +532,42 @@ describe("Step 4: prewarm injection + render", () => {
     expect(payload.curationAttention).toMatch(/firstBlockDisputed=1/);
     core.close();
   });
+
+  /**
+   * Review fix — Codex 5-B round 5, R5-2: extraction candidates reach the session-start surface.
+   * Threshold 1 (like disputed, unlike possibleDuplicates' 3): each candidate is a battery waiting
+   * for a human, and force-new births — the richest source — write no possible_duplicate_of edge,
+   * so nothing else would surface them. Two cross-stage near-match rules are the ONLY pending
+   * curation work here, which is exactly the case the finding named as silently invisible.
+   */
+  it("curationAttention includes extractionCandidates when a flagged pair is the only pending work", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
+    await core.store("Verify the built artifact after the source changes.", {
+      kind: "rule", circle: "default",
+      rule: { stage: "docker build", instance: "Bash:docker build .", scope: "domain" },
+    });
+    const second = await core.store("After the source changes, verify the artifact itself.", {
+      kind: "rule", circle: "default",
+      rule: { stage: "npm install", instance: "Bash:npm install", scope: "domain" },
+    });
+    expect(second.extractionCandidate).toBeDefined();
+    const ov = core.overview("default");
+    expect(ov.counts.extractionCandidates).toBe(1);
+    // The premise "only pending work": none of the advisory's other signals is over its threshold.
+    expect(ov.counts.possibleDuplicates).toBeLessThan(3);
+    expect(ov.counts.disputed).toBe(0);
+
+    const server = new McpServer({ name: "test", version: "0.0.0" }, { capabilities: { tools: {} } });
+    registerMonetCoreTools(server, core, { autoPrewarm: false, checkpointNudge: false });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    const client4 = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    await client4.connect(ct);
+    const result = (await client4.callTool({ name: "agent_context", arguments: {} })) as McpContent;
+    const payload = JSON.parse(result.content[0]!.text) as { curationAttention?: string };
+    expect(payload.curationAttention).toMatch(/extractionCandidates=1/);
+    core.close();
+  });
 });
 
 // ==============================================================================

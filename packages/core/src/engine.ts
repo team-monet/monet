@@ -221,6 +221,49 @@ const RRF_K = 60; // RRF constant for seed fusion
 // total of 255, and none of them were used. The count keeps "how much provenance exists" — the
 // only part the ranking view ever needed — at a fixed cost per card.
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
+/**
+ * The live different-stage test for an extraction-candidate pair (review fix — Codex 5-B round 2,
+ * R2-4). Shared verbatim by the list and the count so a human can never read a total that disagrees
+ * with the rows under it. See `getExtractionCandidatePairs` for why this is judged at READ time.
+ */
+const EXTRACTION_PAIR_STAGES_JOIN =
+  `JOIN rule_bindings ba ON ba.concept_id = ca.id
+           JOIN rule_bindings bb ON bb.concept_id = cb.id AND bb.stage_id != ba.stage_id`;
+/**
+ * The live NEITHER-SIDE-IS-PROJECTION-BORN test for the same pair (review fix — Codex 5-B round 3,
+ * R3-2), shared by the list and the count for the same reason the stage join above is: one text, so
+ * a total can never disagree with the rows under it.
+ *
+ * `flagExtractionCandidate` excludes both endpoints at rule BIRTH — "a principle must not manufacture
+ * its own support" — but bornness is no more frozen than the binding is: `recordProjectionEdge` runs
+ * on the ATTACH path too (deliberately, so a re-projection is a cache hit rather than a second rule),
+ * and a graft can land the same edge, so a pair flagged while both rules were ordinary becomes
+ * self-manufactured evidence afterwards. Same semantics as `isProjectionBorn`, deliberately verbatim —
+ * an INCOMING `derivation` edge with `born_of = 'projection'` — because the two must answer the same
+ * question or a pair could be refused at one end and reported at the other.
+ */
+const EXTRACTION_PAIR_NOT_PROJECTION_BORN =
+  `AND NOT EXISTS (SELECT 1 FROM lifecycle_edges pa
+                            WHERE pa.family = 'derivation' AND pa.born_of = 'projection' AND pa.dst_concept_id = ca.id)
+            AND NOT EXISTS (SELECT 1 FROM lifecycle_edges pb
+                            WHERE pb.family = 'derivation' AND pb.born_of = 'projection' AND pb.dst_concept_id = cb.id)`;
+/**
+ * The live NEITHER-SIDE-IS-SUPERSEDED test for the same pair (review fix — Codex 5-B round 5,
+ * R5-1), shared by the list and the count for the same reason its two siblings above are.
+ *
+ * A superseded rule deliberately stays `status='active'` and keeps its binding — it is history, and
+ * the impeachment evidence traveling up the parent edge — but the GATE stopped delivering it the
+ * moment its supersession edge landed (`RULE_LIVENESS_WHERE`'s own NOT EXISTS, same shape as this
+ * one). A pair whose endpoint no longer fires at any gate cannot evidence breadth: the battery
+ * would be proposing a principle over a rule the gates permanently stopped delivering. Judged at
+ * read time like the other two conditions because supersession, like a binding move or a later
+ * projection, happens AFTER an honestly-flagged birth.
+ */
+const EXTRACTION_PAIR_NOT_SUPERSEDED =
+  `AND NOT EXISTS (SELECT 1 FROM lifecycle_edges sa
+                            WHERE sa.family = 'supersession' AND sa.src_concept_id = ca.id)
+            AND NOT EXISTS (SELECT 1 FROM lifecycle_edges sb
+                            WHERE sb.family = 'supersession' AND sb.src_concept_id = cb.id)`;
 /** Window for overview's resolution-mode counts. 30 days = the staleness horizon this store already
  *  uses for "recent" (staleAfterMs default), so curation reads one consistent notion of lately. */
 const RESOLUTION_STATS_WINDOW_DAYS = 30;
@@ -231,6 +274,32 @@ const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "der
 // Edges that may BOOST a similarity hit's rank: the "worked-on-together / causal" signals.
 // about/related are excluded — they re-encode similarity and would reorder single-fact hits.
 const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"]);
+/**
+ * PAIR FLAGS — `memory_edge` types that put TWO concepts in front of a human as an open question,
+ * carry `dismissed_at`/`dismissed_by`, and are never re-derivable from content (so graph
+ * maintenance must snapshot them around an unwind rather than rebuild them).
+ *
+ * `extraction_candidate` joined `possible_duplicate_of` here in slice 5-B, and this constant exists
+ * because it joined it in FOUR places at once — the dismissal path, the detach snapshot/restore
+ * carve-out, and the two overview readers — where four hand-written type lists would be four
+ * chances for the set to drift apart. The two are deliberately treated ALIKE everywhere the
+ * substrate handles a pair flag as a pair flag.
+ *
+ * DELIBERATELY NOT IN `DIRECTED_TYPES` OR `THREAD_TYPES` above, exactly as `possible_duplicate_of`
+ * has never been: those two decide gather's spread activation and rank boosting, and a pair flag is
+ * a CURATION question, not a "these were worked on together" signal — boosting a hit because
+ * something near it is an unresolved question would let unmediated noise reorder recall. Same
+ * reason neither appears in `memory_edge.type`'s own column comment, which enumerates the
+ * derived/asserted graph vocabulary rather than every value the column can hold.
+ *
+ * DELIBERATELY NOT EMITTED BY `batchDedup` either (the post-sync cross-machine sweep, which does
+ * emit `possible_duplicate_of`): an extraction candidate is flagged AT RULE BIRTH by the design's
+ * own timing clause, and a dedup sweep is not a birth. Flagging there would invent extraction
+ * evidence out of a replication event.
+ */
+const PAIR_FLAG_EDGE_TYPES = ["possible_duplicate_of", "extraction_candidate"] as const;
+/** The same set as a literal SQL IN-list. Fixed literals, never interpolated caller data. */
+const PAIR_FLAG_EDGE_TYPES_SQL = PAIR_FLAG_EDGE_TYPES.map((t) => `'${t}'`).join(", ");
 const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s*:\s*#?([\w:-]+)/gi;
 const GRAPH_SCHEMA_VERSION = 1; // PRAGMA user_version gate for the one-time graph backfill (P2)
 const TEMPORAL_SCHEMA_VERSION = 2; // PRAGMA user_version gate for the temporal layer (0.6.0)
@@ -683,8 +752,17 @@ export interface IngestResult {
   score: number;
   concept: Concept;
   contradiction?: Contradiction; // set when a kind="correction" attaches to an existing concept
-  nearMatchId?: string; // set on any pairing mode: the existing concept this was linked to
-  nearMatchScore?: number; // the score that TRIGGERED the pairing — obs-level for the fork modes, centroid for blur-duplicate
+  /**
+   * The existing concept this write was LINKED to — set on any pairing mode, and (slice 5-B round 4,
+   * R4-3) on a force-new rule birth whose centroid nearest neighbour earned an `extraction_candidate`
+   * edge. Force-new records no `possible_duplicate_of` edge and never will — the caller asserted
+   * distinctness — but an extraction flag IS a durable relation to that neighbour, so the pair is
+   * named here for the same reason every other pairing mode names one, and the receipt freezes it so
+   * a replay can reproduce `extractionCandidate`. Still absent on a force-new write that flagged
+   * nothing.
+   */
+  nearMatchId?: string;
+  nearMatchScore?: number; // the score that TRIGGERED the pairing — obs-level for the fork modes, centroid for blur-duplicate (and for a force-new extraction flag)
   /**
    * HOW this write resolved — the finer-grained companion to `action` (see ResolutionMode,
    * src/resolution.ts). Additive: `action`'s three values are a public contract and are unchanged,
@@ -705,6 +783,16 @@ export interface IngestResult {
   ruleSuccession?: RuleSuccession;
   /** Set on a kind="rule" write: what the binding ended up as, and what it replaced. */
   ruleBindingChange?: RuleBindingChange;
+  /**
+   * EXTRACTION CANDIDATE (slice 5-B) — set when THIS write flagged one: a newly created rule whose
+   * near-match is another rule bound to a DIFFERENT stage. "Extraction candidates are flagged at
+   * rule-birth by the substrate's near-match" (design of record, *Timing rides existing machinery*),
+   * and the breadth precondition the flag stands for is "member rules from ≥2 stages".
+   *
+   * The FLAG IS THE WHOLE DELIVERABLE: no battery runs, no principle is created, nothing is
+   * extracted. The lead runs the battery in conversation and records the outcome via memory_ratify.
+   */
+  extractionCandidate?: { pairedRuleId: string; score: number };
 }
 
 /**
@@ -773,6 +861,17 @@ export interface RuleSuccession {
   supersessionEdgeId: string;
   /** The stage both rules are bound to. Succession never moves a gate. */
   stageId: string;
+  /**
+   * IMPEACHMENT, DISCLOSED (slice 5-B). "Correcting a rule casts doubt on the principle that derived
+   * it" — the principles this correction just marked disputed, walked from the superseded rule's
+   * incoming derivation edges in the SAME transaction as the supersession. Omitted when the walk
+   * impeached nothing (the ordinary case: most rules have no parent).
+   *
+   * Present because an always-on principle silently leaving the skeleton is exactly the class of
+   * consequence this codebase refuses to perform without saying so — the same reasoning
+   * `RuleBindingChange.downgradedFromBlocking` states for deny power.
+   */
+  impeachedPrincipleIds?: string[];
 }
 
 /** Options for store() — resolution mode and direct attachment. */
@@ -885,6 +984,27 @@ export interface RuleCaptureOpts {
   modelTag?: string;
   /** The prevented-failure one-liner the gate renders beside the rule. */
   reason?: string;
+  /**
+   * PROJECTION — the second way a rule is born (slice 5-B). "A principle can produce the rule for a
+   * gate nobody has visited — same object, different parent." Names the skeleton principle this rule
+   * was derived from at the empty-gate moment ("stage X, no cached rules — skeleton applies").
+   *
+   * Two effects, both inside the rule-birth transaction: the binding's origin becomes `projection`,
+   * and ONE derivation edge (principle → this rule, `bornOf: 'projection'`, `eventRef` = the write's
+   * observation id) is recorded. Nothing else — "Projection needs no approval gate": per-projection
+   * approval would kill projection's value, and the four guards the design names in its place
+   * (transcript audit, extraction-evidence exclusion, provenance announced at fire time, and
+   * structurally advisory-only) are already carried elsewhere.
+   *
+   * VALIDATED, not trusted: the parent must exist, be kind `principle` (a preference is momentless
+   * and derives no gate rules), be `active`, be a CURRENT skeleton member (latest ratification
+   * verdict approve|re-ratify — the same derivation `skeleton()` reads), and live in the rule
+   * concept's own circle. Every failure is a named error, refused before anything is written.
+   *
+   * ADVISORY-ONLY, restated: combining this with `severity: "blocking"` is refused outright, even
+   * on the declaration path — "no agent, and NO PROJECTION, can self-assign deny power".
+   */
+  projectedFromPrincipleId?: string;
   /**
    * INTERNAL — declare()'s entrance into this shared write path, never part of the agent-facing
    * MCP surface (memory_store's schema does not expose it). It flips the binding's origin to
@@ -1007,6 +1127,17 @@ export interface DeclareAdvisory {
  * "new"/"attach"/"direct-attach"/"force-new" ones store() reports on literally every write. The
  * residency law applies to advisories too: an advisory that fired every time would be exactly the
  * unrationed, zero-yield noise the design's own audit measured against the always-on layer.
+ *
+ * NEITHER FORK NAMED FOR A REFUSED LANDING IS IN HERE, and that is reachability rather than
+ * judgment. This set has ONE reader — `declareAdvisories`, whose `species` parameter is typed
+ * `"principle" | "preference"` and whose only caller is declare()'s skeleton branch. `species-fork`
+ * was already outside for that reason and `stage-fork` joins it (review fix — Codex 5-B round 2,
+ * R2-6): a stage fork requires `kind: "rule"` AND a non-declaration capture, and declare()'s rule
+ * branch always passes `declaration: true`, so no declare() call can ever produce one. Adding it
+ * would be an advisory for a mode this surface cannot observe. `memory_store` reports every mode on
+ * its own response (`IngestResult.resolutionMode`) regardless, and the overview's mode histogram
+ * counts them all — a fork is disclosed either way; this set only rations declare()'s warning
+ * lights. If declare() ever gains a rule-species advisory path, revisit this line, not just the set.
  */
 const AMBIGUOUS_RESOLUTION_MODES: ReadonlySet<string> = new Set(["fork-signal", "ambiguous-fork", "blur-duplicate"]);
 
@@ -1037,6 +1168,14 @@ export type DeclareResult =
        */
       narrowedFromBreadth?: true;
       previousCircle?: "*";
+      /**
+       * SAME FLAG THE CAPTURE PATH REPORTS (slice 5-B) — see `IngestResult.extractionCandidate`.
+       * A declared rule is still a rule BIRTH, and the breadth precondition does not care which
+       * entrance a rule came through: two rules at different stages restating one reason are
+       * extraction evidence whether a correction or a human put them there. Omitted when this write
+       * flagged nothing, which is the ordinary case.
+       */
+      extractionCandidate?: { pairedRuleId: string; score: number };
     }
   | {
       /**
@@ -1118,6 +1257,19 @@ export interface RatifyResult {
   edgeIds: string[];
   /** The now-live skeleton for this circle, in-band — same rationale as declare()'s own field. */
   skeleton: SkeletonEntry[];
+  /**
+   * How many OPEN impeachment contradictions this verdict closed (slice 5-B). Omitted when none —
+   * the ordinary case. See `closeImpeachments` for which verdicts close them and why the ordinary
+   * impeachment path resolves through memory_resolve instead.
+   */
+  impeachmentsClosed?: number;
+  /**
+   * How many open `extraction_candidate` PAIRS this verdict resolved (slice 5-B, review fix — Codex
+   * round 4, R4-4): pairs whose two rules were BOTH named in `memberRuleIds`, i.e. the pair's own
+   * question answered by the human who ruled. Omitted when none, same omit-when-absent discipline as
+   * `impeachmentsClosed` above. See `resolveExtractionFlags`.
+   */
+  extractionFlagsResolved?: number;
 }
 
 /** One stored observation as returned by getConcept (id needed to call detach). */
@@ -1311,8 +1463,8 @@ export interface ConnectedConcept {
  *
  * READING IT — EVERY RATE DIVIDES BY `decidedTotal`, NEVER BY `windowTotal`:
  *
- *     fork rate               (fork-signal + species-fork + ambiguous-fork) / decidedTotal
- *     duplicate-emission rate (fork-signal + species-fork + ambiguous-fork + blur-duplicate) / decidedTotal
+ *     fork rate               (fork-signal + species-fork + stage-fork + ambiguous-fork) / decidedTotal
+ *     duplicate-emission rate (fork-signal + species-fork + stage-fork + ambiguous-fork + blur-duplicate) / decidedTotal
  *
  * `windowTotal` counts every write, including `direct-attach` and `force-new` — writes where the
  * caller named the target and resolution was never allowed to decide anything. A bulk import or a
@@ -1324,9 +1476,11 @@ export interface ConnectedConcept {
  * names. Duplicate-emission rate is the broader one: how often ANY store call put a new pair in
  * front of a human, blur-duplicate included. A fork-signal count climbing relative to attach says
  * concepts are going bimodal faster than they are consolidating; species-fork says a normative
- * kind guard kept coherent evidence separate; blur-duplicate says centroids are drifting away from
- * the evidence under them. All land in `possibleDuplicates` awaiting mediation. A `new` rate near
- * 1.0 on a mature circle says nothing is resolving at all.
+ * kind guard kept coherent evidence separate; stage-fork says one reason is being restated at more
+ * and more moments, which is the extraction signal itself (every one of those pairs is also an
+ * `extractionCandidates` row); blur-duplicate says centroids are drifting away from the evidence
+ * under them. All land in `possibleDuplicates` awaiting mediation. A `new` rate near 1.0 on a
+ * mature circle says nothing is resolving at all.
  *
  * MISFILE RATE IS NOT HERE, deliberately: it is not observable at store time. It is derived later
  * by joining the durable `resolution_events` log against subsequent detach/reassign — a human
@@ -1366,6 +1520,9 @@ export interface MemoryOverview {
     disputed: number;
     stale: number;
     possibleDuplicates: number;
+    /** Total open extraction-candidate pairs for this circle — see `extractionCandidates` below for
+     *  the (capped) list itself, same possibleDuplicates/counts.possibleDuplicates convention. */
+    extractionCandidates: number;
     /** Total skeleton membership (principles + preferences) for this circle — see `skeleton` below
      *  for the (capped) list itself, same possibleDuplicates/counts.possibleDuplicates convention. */
     skeleton: number;
@@ -1379,6 +1536,16 @@ export interface MemoryOverview {
   activeThreads: PrewarmState["activeWorkstreams"];
   openContradictions: PrewarmContradiction[];
   possibleDuplicates: PossibleDuplicatePair[];
+  /**
+   * EXTRACTION CANDIDATES (slice 5-B) — pairs of rules from DIFFERENT stages that near-matched at
+   * rule birth, so they may share one reason and be extractable into a principle. Capped like
+   * `possibleDuplicates`; `counts.extractionCandidates` carries the true total.
+   *
+   * Curation, not automation: "the battery and approval run explicitly, not silently." The lead runs
+   * the four tests in conversation over these pairs and records the outcome via memory_ratify;
+   * memory_resolve's pair dismissal is how one leaves the list unextracted.
+   */
+  extractionCandidates: PossibleDuplicatePair[];
   /** Skeleton membership (principles + preferences) for this circle — capped; `counts.skeleton`
    *  carries the true total the same way `counts.possibleDuplicates` does for its own list. */
   skeleton: SkeletonEntry[];
@@ -3236,7 +3403,7 @@ export class MonetCore {
       if (opts.sourceRefs?.some((ref) => ref.startsWith("source://"))) {
         throw new Error("source:// provenance is reserved to the source connector");
       }
-      this.validateRuleCapture(opts);
+      this.validateRuleCapture(opts, circle);
     }
     this.assertPinSatisfied();
     this.requireStableEmbedderIdentity();
@@ -3300,6 +3467,7 @@ export class MonetCore {
       contradiction?: Contradiction;
       ruleSuccession?: RuleSuccession;
       ruleBindingChange?: RuleBindingChange;
+      extractionCandidate?: { pairedRuleId: string; score: number };
       prior?: IngestResult;
       proofToken?: EmbeddingWidthProofToken;
     } => {
@@ -3447,6 +3615,8 @@ export class MonetCore {
       } else if (opts.resolution === "forceNew") {
         // Always create a new concept regardless of similarity.
         // forceNew intentionally records no possible_duplicate_of edge — the caller asserts distinctness (bulk import); the returned score still reports the nearest neighbor.
+        // That same nearest neighbour is what the extraction flag reads for a RULE birth below (round
+        // 4, R4-3) — distinctness is asserted, the shared-reason question is not.
         row = this.create(content, emb, circle, opts.kind, sourceIdentity, sourceConnector ? obsId : null);
         action = "created";
         mode = "force-new";
@@ -3478,13 +3648,13 @@ export class MonetCore {
           // the landed concept's kind is what keeps those two questions separate.
           const landed = this.getRow(decision.attachToConceptId)!;
           const verdict = this.ruleCorrectionVerdict(opts.kind, landed);
-          // FOUR WAYS A NOMINATED LANDING CAN BE REFUSED, and all of them fork rather than fail.
+          // FIVE WAYS A NOMINATED LANDING CAN BE REFUSED, and all of them fork rather than fail.
           // Resolution chose this concept, not the caller: refusing the WRITE because the concept
-          // resolution picked turns out to be a deny, or dead, or the wrong species, would discard
-          // an observation the agent never asked to put there. Forking keeps the evidence and puts
-          // the near-match in front of a human, which is what the substrate already does whenever
-          // it declines to merge.
-          const forkReason: "blocking-rule" | "superseded-rule" | "species" | null =
+          // resolution picked turns out to be a deny, or dead, or the wrong species, or bound to
+          // another moment, would discard an observation the agent never asked to put there.
+          // Forking keeps the evidence and puts the near-match in front of a human, which is what
+          // the substrate already does whenever it declines to merge.
+          const forkReason: "blocking-rule" | "superseded-rule" | "species" | "stage" | null =
             verdict === "blocking" ? "blocking-rule"
             : verdict === "superseded" ? "superseded-rule"
             : opts.kind === "rule" && !this.canCarryRuleEvidence(landed) ? "species"
@@ -3503,6 +3673,18 @@ export class MonetCore {
             // semantics — so this narrows to a CROSS-kind guard, not a blanket forceNew. forceNew
             // would abandon dedupe entirely and double the skeleton on every re-declaration.
             : (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind ? "species"
+            // A RULE REPEATING ACROSS STAGES IS STILL A RULE (review fix — Codex 5-B round 2, R2-6),
+            // and this is the species guard one property over: resolution is ADDRESS-blind exactly
+            // as it is kind-blind, so an incoming capture for stage B above tauAttach against a rule
+            // bound to stage A used to attach — and `captureRuleBinding` then KEPT the stage-A
+            // binding, deliberately ("a rule's address does not move because an incidental repeat
+            // named a different stage"). The result was the worst outcome available: stage B got no
+            // rule, and because `landedOnExisting` went true the extraction flag — which rides rule
+            // BIRTH — never ran either. The strongest evidence of one reason repeating across
+            // moments produced nothing, while the WEAKER ambiguous-band version of the same event
+            // forked and flagged correctly. Forking here creates stage B's rule and hands the pair
+            // to the battery, which is what the design asks the substrate to notice.
+            : this.capturesAtADifferentStage(opts, landed) ? "stage"
             : null;
           if (verdict === "supersede") {
             supersededRule = landed;
@@ -3515,6 +3697,7 @@ export class MonetCore {
             if (
               (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind
             ) mode = "species-fork";
+            else if (forkReason === "stage") mode = "stage-fork";
             // A refused CORRECTION keeps its own kind (it is evidence about something, not a rule);
             // a refused RULE capture is still a rule and must be born as one or it can never fire.
             row = this.create(content, emb, circle, opts.kind === "rule" ? "rule" : opts.kind);
@@ -3558,10 +3741,104 @@ export class MonetCore {
       // the state "a gate never returns two contradicting rules" forbids.
       let ruleSuccession: RuleSuccession | undefined;
       let ruleBindingChange: RuleBindingChange | undefined;
+      let extractionCandidate: { pairedRuleId: string; score: number } | undefined;
       if (supersededRule !== null) {
         ruleSuccession = this.succeedRule(supersededRule, row, obsId, opts);
       } else if (opts.kind === "rule") {
         ruleBindingChange = this.captureRuleBinding(row, opts);
+        // PROJECTION (slice 5-B), in this same transaction and for the same reason the binding
+        // above is: a projected rule whose derivation edge failed to land is a rule that claims no
+        // parent — it would announce nothing at fire time, be admissible as extraction evidence it
+        // must never be (a principle manufacturing its own support), and be indistinguishable from
+        // an ordinary capture. The edge IS the projection; the binding origin is only its label.
+        if (opts.rule?.projectedFromPrincipleId !== undefined) {
+          // THE AUTHORITATIVE CHECK, RE-RUN HERE (review fix — Codex 5-B round 1, F2). The copy in
+          // `validateRuleCapture` runs before `await checkedEmbed(...)` and therefore before this
+          // transaction exists — it is the FAST one, the one that tells a caller which of the five
+          // properties failed before it pays for an embed. It is not a guard, because everything it
+          // judges can change during that await: another call disputing the parent, retiring it, or
+          // recording a `retire` verdict on it lands in the window, and `recordProjectionEdge`
+          // delegates to `addLifecycleEdge`, which rechecks endpoint existence, governability and
+          // circle but knows nothing about kind `principle`, active status or the latest
+          // ratification. Every projection guard this entrance advertises could be walked around by
+          // losing that race. Re-reading here refuses with the SAME named errors, inside the
+          // envelope that already froze the candidate scan — and the throw takes the rule concept,
+          // its binding and its stage down with it, so ordering within this block does not matter.
+          this.validateProjectionParent(opts.rule.projectedFromPrincipleId, circle);
+          // THE RESOLVED BINDING, NOT THE REQUESTED SEVERITY (review fix — Codex 5-B round 2, R2-5).
+          // `validateRuleCapture`'s own blocking refusal reads `rule.severity`, which closes only the
+          // case where the caller ASKED for blocking. An OMITTED severity is not a value — it is the
+          // absence of a ruling, and the incumbent's ruling stands (bindRule) — so a projection
+          // landing on an existing declaration-born deny passed every stated-severity check,
+          // `captureRuleBinding` returned the incumbent blocking binding untouched, and the edge
+          // below minted exactly the object the whole guard exists to forbid: a rule that is blocking
+          // AND projection-born. Only the POST-write binding can answer this, which is why it lives
+          // here rather than beside its preflight twin.
+          //
+          // REFUSING THE WHOLE WRITE, not downgrading it to a plain attach: the caller asked for a
+          // projection and the projection is illegal, so an attach that would otherwise have been
+          // legal fails wholesale rather than succeeding as something other than what was requested.
+          // The throw aborts this transaction, taking the observation with it.
+          if (ruleBindingChange.severity === "blocking") {
+            throw new Error(
+              `rule '${row.id}' cannot be projected onto: it is a blocking rule, and blocking severity is ` +
+                `declaration-only — a projection edge on it would mint a rule that is both blocking and ` +
+                `projection-born, which no path may create (no agent, and no projection, can self-assign ` +
+                `deny power). Store this evidence without rule.projectedFromPrincipleId, or project onto ` +
+                `an advisory rule.`,
+            );
+          }
+          this.recordProjectionEdge(opts.rule.projectedFromPrincipleId, row.id, obsId);
+        }
+        // EXTRACTION-CANDIDATE FLAGGING (slice 5-B), after the binding exists — the cross-stage test
+        // reads it. See flagExtractionCandidate for every condition and why each one is there.
+        //
+        // FORCE-NEW REACHES IT TOO (review fix — Codex 5-B round 4, R4-3). The force-new branch
+        // assigns no `nearMatchId`/`nearMatchScore` — it makes no pairing decision, by construction —
+        // so this condition could never run on that path, and a bulk/import caller silently lost the
+        // candidates an automatic or declared birth reports. The two questions are separate and only
+        // one of them is force-new's to answer: DISTINCTNESS is exactly what the caller asserted (and
+        // still is — no `possible_duplicate_of` edge is recorded here, unchanged), while EXTRACTION
+        // asks whether two distinct rules at different stages share one REASON. Asserting the first
+        // says nothing about the second; a bulk import of one team's rules is if anything the richest
+        // source of cross-stage repetition there is.
+        //
+        // The neighbour fed in is the same `liveMatches[0]` that force-new's own `returnScore`
+        // already reports — the "informational CENTROID nearest-neighbour" the branch's original
+        // comment promised was still being computed. `flagExtractionCandidate` re-tests every
+        // qualifier itself (both rules, both bound, different stages, neither projection-born), so
+        // this widens WHICH births are asked, never what qualifies.
+        // THE FORCE-NEW FEED CARRIES THE SAME FLOOR THE AUTOMATIC PATH ALREADY HAS (review fix —
+        // Codex 5-B round 5, R5-3). Every auto-path `nearMatchId` is >= tauAmbiguous by
+        // construction — the decision table's nearMatch-bearing modes are fork-signal
+        // (obsScore >= tauAttach), correction-attach/ambiguous-fork (>= tauAmbiguous),
+        // blur-duplicate (centroidScore >= tauAttach) and stage-fork (intercepted attach,
+        // >= tauAttach), while mode "new" carries none — but `liveMatches[0]` is the raw centroid
+        // ranking, where ANY positive cosine appears, so an unfloored force-new import in a
+        // populated circle would flag near-noise pairs. Same floor the OTHER force-new pair edge
+        // already uses (`possible_duplicate_of` in the circle-merge path: "if score >=
+        // tauAmbiguous, record").
+        const nearestForExtraction: { id: string; score: number } | undefined =
+          nearMatchId !== undefined && nearMatchScore !== undefined
+            ? { id: nearMatchId, score: nearMatchScore }
+            : opts.resolution === "forceNew" && liveMatches[0] !== undefined && liveMatches[0].score >= this.tauAmbiguous
+              ? { id: liveMatches[0].match.id, score: liveMatches[0].score }
+              : undefined;
+        if (!landedOnExisting && nearestForExtraction !== undefined) {
+          extractionCandidate = this.flagExtractionCandidate(row.id, nearestForExtraction.id, nearestForExtraction.score, circle);
+          // FREEZE THE PAIR ONTO THE RECEIPT when force-new's neighbour actually produced a flag, so
+          // an idempotent replay is still "indistinguishable from the first call" (the discipline
+          // round 1's F3 states for this very field): `replayRuleOutcome` reconstructs
+          // `extractionCandidate` from the receipt's frozen `near_match_id`/`near_match_score` plus
+          // the edge's existence, and a NULL near_match_id makes that reconstruction impossible.
+          // Set only when a flag was written — a force-new that paired with nothing durable still
+          // reports no near match, exactly as before, so this discloses the neighbour precisely when
+          // a relation to it exists.
+          if (extractionCandidate !== undefined && nearMatchId === undefined) {
+            nearMatchId = nearestForExtraction.id;
+            nearMatchScore = nearestForExtraction.score;
+          }
+        }
       }
       // THE SKELETON-ENTRY HALF, in this same transaction and for the same reason the rule binding
       // above is (review round 1, item 6): a principle concept without its ratification is a
@@ -3670,7 +3947,7 @@ export class MonetCore {
       }
 
       const proofToken = this.captureEmbeddingWidthProof(emb.length);
-      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, proofToken };
+      return { action, row, observationId: obsId, score: returnScore, nearMatchId, nearMatchScore, resolutionMode: mode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate, proofToken };
     })();
 
     if (txResult.prior) return txResult.prior;
@@ -3681,7 +3958,7 @@ export class MonetCore {
       this.lastConceptByCircle.set(circle, txResult.row.id);
     }
 
-    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction, ruleSuccession, ruleBindingChange } = txResult;
+    const { action, row, observationId, nearMatchId, nearMatchScore, resolutionMode, contradiction, ruleSuccession, ruleBindingChange, extractionCandidate } = txResult;
 
     // forceNew score is informational nearest-neighbor; attachTo score is cosine(new obs, target concept).
     const returnScore = txResult.score;
@@ -3701,6 +3978,7 @@ export class MonetCore {
       ...(resolutionMode !== undefined ? { resolutionMode } : {}),
       ...(ruleSuccession !== undefined ? { ruleSuccession } : {}),
       ...(ruleBindingChange !== undefined ? { ruleBindingChange } : {}),
+      ...(extractionCandidate !== undefined ? { extractionCandidate } : {}),
     };
   }
 
@@ -6215,69 +6493,67 @@ export class MonetCore {
 
       // 6. Graph: unwind source + rederive (source already handled above in the deletion path).
       //
-      // Preserve possible_duplicate_of edges: unwindConceptGraph erases ALL edges touching a
-      // concept, but rederiveConceptGraph never recreates possible_duplicate_of (those are
-      // recorded only at store-time).  Snapshot each unwound concept's duplicate-pair edges BEFORE
-      // the unwind and re-insert them AFTER the rederive.
+      // Preserve PAIR-FLAG edges: unwindConceptGraph erases ALL edges touching a concept, but
+      // rederiveConceptGraph never recreates them (they are recorded only at store-time). Snapshot
+      // each unwound concept's pair edges BEFORE the unwind and re-insert them AFTER the rederive.
       //
-      // Exclusion rule: when a destConceptId is present, the possible_duplicate_of edge connecting
-      // sourceConceptId ↔ destConceptId must NOT be restored — detaching into the suspected
-      // duplicate resolves that pair (mirrors the existing consolidation behaviour).
+      // BOTH PAIR-FLAG TYPES, not `possible_duplicate_of` alone (slice 5-B — see
+      // PAIR_FLAG_EDGE_TYPES): an `extraction_candidate` is exactly as un-re-derivable and exactly
+      // as human-facing, so leaving it out would have made an ordinary detach silently delete a
+      // flagged extraction pair while preserving the duplicate pair sitting beside it. `type` is
+      // carried through the snapshot rather than hardcoded on restore, so the restore cannot
+      // re-file one type as the other.
+      //
+      // Exclusion rule: when a destConceptId is present, a pair edge connecting sourceConceptId ↔
+      // destConceptId must NOT be restored — consolidating the two answers the question the flag was
+      // asking, in both its senses (they were one concept; there is no cross-stage pair left).
       //
       // When the source is fully deleted its edges die with it — correct, don't restore those.
-      type DupEdge = { src_id: string; dst_id: string; weight: number; origin: string; dismissed_at: number | null; dismissed_by: string | null };
-      const snapDupEdges = (conceptId: string): DupEdge[] =>
+      type PairEdge = { src_id: string; dst_id: string; type: string; weight: number; origin: string; dismissed_at: number | null; dismissed_by: string | null };
+      const snapPairEdges = (conceptId: string): PairEdge[] =>
         this.db
           .prepare(
-            `SELECT src_id, dst_id, weight, origin, dismissed_at, dismissed_by FROM memory_edge
-              WHERE scope = ? AND type = 'possible_duplicate_of' AND (src_id = ? OR dst_id = ?)`,
+            `SELECT src_id, dst_id, type, weight, origin, dismissed_at, dismissed_by FROM memory_edge
+              WHERE scope = ? AND type IN (${PAIR_FLAG_EDGE_TYPES_SQL}) AND (src_id = ? OR dst_id = ?)`,
           )
-          .all(circle, conceptId, conceptId) as DupEdge[];
-      const isDupPair = (e: DupEdge, a: string, b: string) =>
+          .all(circle, conceptId, conceptId) as PairEdge[];
+      const isDupPair = (e: PairEdge, a: string, b: string) =>
         (e.src_id === a && e.dst_id === b) || (e.src_id === b && e.dst_id === a);
 
-      let srcDupSnapshot: DupEdge[] = [];
-      let dstDupSnapshot: DupEdge[] = [];
+      let srcDupSnapshot: PairEdge[] = [];
+      let dstDupSnapshot: PairEdge[] = [];
 
-      if (!sourceDeleted) {
-        srcDupSnapshot = snapDupEdges(sourceConceptId);
-        this.unwindConceptGraph(sourceConceptId, circle);
-        this.rederiveConceptGraph(sourceConceptId, circle);
-        // Restore surviving duplicate-pair edges on the source (exclude src↔dest pair).
-        // Carry dismissed_at/dismissed_by so a dismissed pair is not un-dismissed by a detach/rederive cycle.
-        for (const e of srcDupSnapshot) {
+      // Restore surviving pair-flag edges (exclude the src↔dest pair). Carries the edge's own `type`
+      // and its dismissed_at/dismissed_by, so neither the flag's meaning nor a human's dismissal of
+      // it is lost to a detach/rederive cycle.
+      const restorePairEdges = (snapshot: PairEdge[]): void => {
+        for (const e of snapshot) {
           if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
-          this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
+          this.upsertEdge(e.src_id, e.dst_id, e.type, e.weight, e.origin, circle);
           if (e.dismissed_at !== null) {
             this.db
               .prepare(
                 `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?
-                  WHERE scope = ? AND type = 'possible_duplicate_of' AND src_id = ? AND dst_id = ?`,
+                  WHERE scope = ? AND type = ? AND src_id = ? AND dst_id = ?`,
               )
-              .run(e.dismissed_at, e.dismissed_by, circle, e.src_id, e.dst_id);
+              .run(e.dismissed_at, e.dismissed_by, circle, e.type, e.src_id, e.dst_id);
           }
         }
+      };
+
+      if (!sourceDeleted) {
+        srcDupSnapshot = snapPairEdges(sourceConceptId);
+        this.unwindConceptGraph(sourceConceptId, circle);
+        this.rederiveConceptGraph(sourceConceptId, circle);
+        restorePairEdges(srcDupSnapshot);
       }
       if (destAction === "created") {
         this.rederiveConceptGraph(destConceptId, circle);
       } else {
-        dstDupSnapshot = snapDupEdges(destConceptId);
+        dstDupSnapshot = snapPairEdges(destConceptId);
         this.unwindConceptGraph(destConceptId, circle);
         this.rederiveConceptGraph(destConceptId, circle);
-        // Restore surviving duplicate-pair edges on the destination (exclude src↔dest pair).
-        // Carry dismissed_at/dismissed_by so a dismissed pair is not un-dismissed by a detach/rederive cycle.
-        for (const e of dstDupSnapshot) {
-          if (opts.destConceptId && isDupPair(e, sourceConceptId, opts.destConceptId)) continue;
-          this.upsertEdge(e.src_id, e.dst_id, "possible_duplicate_of", e.weight, e.origin, circle);
-          if (e.dismissed_at !== null) {
-            this.db
-              .prepare(
-                `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?
-                  WHERE scope = ? AND type = 'possible_duplicate_of' AND src_id = ? AND dst_id = ?`,
-              )
-              .run(e.dismissed_at, e.dismissed_by, circle, e.src_id, e.dst_id);
-          }
-        }
+        restorePairEdges(dstDupSnapshot);
       }
 
       const updatedSrc = sourceDeleted ? null : this.getRow(sourceConceptId);
@@ -6632,16 +6908,111 @@ export class MonetCore {
     return r.n;
   }
 
+  /**
+   * OPEN EXTRACTION-CANDIDATE PAIRS (slice 5-B) — two rules from different stages that near-matched
+   * at rule birth, awaiting the four-test battery and a human ratification.
+   *
+   * SAME SHAPE, SAME CAP, SAME UNDISMISSED FILTER as `getPossibleDuplicatePairs` above, and
+   * deliberately a SEPARATE list rather than a mixed one: a duplicate pair asks "are these one
+   * thing?" and is answered by memory_detach, while an extraction candidate asks "do these share a
+   * reason?" and is answered by memory_ratify. Merging them onto one curation line would hand a
+   * human two different questions under one heading.
+   *
+   * Both queries filter their own `type`, so a pair that is BOTH (two near-identical rules at
+   * different stages earn both edges — one write, one weight, two relations) appears once in each
+   * list, which is correct: both questions really are open about it.
+   *
+   * THE DIFFERENT-STAGE CONDITION IS RE-TESTED AT READ TIME (review fix — Codex 5-B round 2, R2-4),
+   * which is what `EXTRACTION_PAIR_STAGES_JOIN` below adds. `flagExtractionCandidate` judged it at
+   * rule BIRTH, but a binding is not immutable: a later re-declaration re-addresses a live rule
+   * (`bindRule` mode "replace"), and moving either side onto the other's stage leaves an undismissed
+   * edge whose defining precondition — "member rules from ≥2 stages" — has become false. Joining
+   * only the concepts, this surface went on asking a human to run the battery on a pair that no
+   * longer evidences breadth at all.
+   *
+   * READ-SIDE RATHER THAN RETIRING THE EDGE ON A BINDING MOVE, deliberately. The edge is an honest
+   * record of something that happened (these two really did near-match at that birth), the
+   * dismissal machinery already covers it, and a binding can move BACK — at which point the pair
+   * qualifies again and the flag should return, which a retirement would have destroyed. So the
+   * stored fact is left alone and the REPORT is what must not lie. The alternative would also have
+   * needed a new hook on every path that can move a binding, which is the door-by-door shape this
+   * codebase has repeatedly found to be the wrong one.
+   *
+   * A MISSING BINDING FAILS THE JOIN, and that is the same rule stated at the other end: a rule with
+   * no binding "has no stage to be different from, so it cannot evidence breadth in either
+   * direction" (flagExtractionCandidate). An INNER join is therefore the condition, not a shortcut.
+   *
+   * AND SO IS THE NOT-PROJECTION-BORN CONDITION (review fix — Codex 5-B round 3, R3-2), for exactly
+   * the same reason and by exactly the same means: `EXTRACTION_PAIR_NOT_PROJECTION_BORN` below. A
+   * pair flagged while both rules were ordinary becomes self-manufactured evidence the moment a
+   * projection later attaches to either one, and the stage recheck alone could not see it. See that
+   * constant for why the edge, not the binding's origin column, is what is asked.
+   *
+   * AND THE NOT-SUPERSEDED CONDITION (review fix — Codex 5-B round 5, R5-1):
+   * `EXTRACTION_PAIR_NOT_SUPERSEDED` below, third of the set — see that constant for why a
+   * superseded endpoint, though deliberately still `active`, cannot evidence breadth.
+   */
+  private getExtractionCandidatePairs(circle: string): PossibleDuplicatePair[] {
+    return this.db
+      .prepare(
+        `SELECT e.src_id AS conceptAId, ca.title AS conceptATitle,
+                e.dst_id AS conceptBId, cb.title AS conceptBTitle,
+                e.weight AS score
+           FROM memory_edge e
+           JOIN concepts ca ON ca.id = e.src_id
+           JOIN concepts cb ON cb.id = e.dst_id
+           ${EXTRACTION_PAIR_STAGES_JOIN}
+          WHERE e.scope = ? AND e.type = 'extraction_candidate'
+            AND e.dismissed_at IS NULL
+            AND e.src_id < e.dst_id
+            AND ca.kind NOT IN ('workstream', 'source') AND ca.source_identity IS NULL AND ca.active_observation_id IS NULL AND ca.status != 'retired'
+            AND cb.kind NOT IN ('workstream', 'source') AND cb.source_identity IS NULL AND cb.active_observation_id IS NULL AND cb.status != 'retired'
+            ${EXTRACTION_PAIR_NOT_PROJECTION_BORN}
+            ${EXTRACTION_PAIR_NOT_SUPERSEDED}
+          ORDER BY e.weight DESC
+          LIMIT ${OVERVIEW_DUP_PAIRS_MAX}`,
+      )
+      .all(circle) as PossibleDuplicatePair[];
+  }
+
+  private extractionCandidateCount(circle: string): number {
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM memory_edge e
+          JOIN concepts ca ON ca.id = e.src_id
+          JOIN concepts cb ON cb.id = e.dst_id
+          ${EXTRACTION_PAIR_STAGES_JOIN}
+         WHERE e.scope = ? AND e.type = 'extraction_candidate'
+           AND e.dismissed_at IS NULL
+           AND e.src_id < e.dst_id
+           AND ca.kind NOT IN ('workstream', 'source') AND ca.source_identity IS NULL AND ca.active_observation_id IS NULL AND ca.status != 'retired'
+           AND cb.kind NOT IN ('workstream', 'source') AND cb.source_identity IS NULL AND cb.active_observation_id IS NULL AND cb.status != 'retired'
+           ${EXTRACTION_PAIR_NOT_PROJECTION_BORN}
+           ${EXTRACTION_PAIR_NOT_SUPERSEDED}`,
+      )
+      .get(circle) as { n: number };
+    return r.n;
+  }
+
   private scopedCount(sql: string, circle: string): number {
     return (this.db.prepare(sql).get(circle) as { n: number }).n;
   }
 
   /**
-   * Dismiss a possible-duplicate pair — the agent asserts these two concepts are NOT duplicates.
-   * Sets dismissed_at + dismissed_by on all possible_duplicate_of edges between the pair (both
-   * directions are stored by upsertEdgeBoth, so both rows are updated). The dismissal survives
-   * a detach/rederive cycle (snapDupEdges carries dismissed_at/dismissed_by through restore).
+   * Dismiss a flagged pair — the agent asserts these two concepts are not the thing the flag says.
+   * Sets dismissed_at + dismissed_by on all PAIR-FLAG edges between them (both directions are stored
+   * by upsertEdgeBoth, so both rows are updated). The dismissal survives a detach/rederive cycle
+   * (snapPairEdges carries dismissed_at/dismissed_by through restore).
    * A reinforcing near-miss (ON CONFLICT path in upsertEdge) does NOT clear dismissed fields.
+   *
+   * WIDENED FROM `possible_duplicate_of` ALONE to the full `PAIR_FLAG_EDGE_TYPES` set (slice 5-B),
+   * because the alternative was a flag with no exit: `extraction_candidate` reaches curation through
+   * the same overview surface and the same undismissed filter, and every process element must carry
+   * the mechanism of its own death. One dismissal answers both questions about a pair at once —
+   * accepted deliberately over a per-type argument the wire has no field to carry: a human saying
+   * "these two are unrelated" has answered "are they duplicates?" and "do they share a reason?"
+   * with the same breath, and a pair that survives one question but not the other is a re-flag
+   * away at the next rule birth.
    *
    * Scope gate: mirrors the circle/scope validation that single-concept mutation ops perform —
    * both concept ids must exist and live in the same circle (the scope of the edge).
@@ -6669,7 +7040,7 @@ export class MonetCore {
     return this.db.transaction(() => {
       const pending = this.db.prepare(
         `SELECT 1 FROM memory_edge
-          WHERE scope = ? AND type = 'possible_duplicate_of' AND dismissed_at IS NULL
+          WHERE scope = ? AND type IN (${PAIR_FLAG_EDGE_TYPES_SQL}) AND dismissed_at IS NULL
             AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?)) LIMIT 1`,
       ).get(circle, conceptAId, conceptBId, conceptBId, conceptAId);
       if (!pending) return { dismissed: true as const, conceptAId, conceptBId, rowsUpdated: 0 };
@@ -6677,7 +7048,7 @@ export class MonetCore {
       const result = this.db
         .prepare(
           `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?, sync_updated_at = ?
-            WHERE scope = ? AND type = 'possible_duplicate_of'
+            WHERE scope = ? AND type IN (${PAIR_FLAG_EDGE_TYPES_SQL})
               AND dismissed_at IS NULL
               AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))`,
         )
@@ -6759,6 +7130,7 @@ export class MonetCore {
         disputed: this.disputedCount(circle),
         stale: nativeStale + authorizedSourceStale,
         possibleDuplicates: this.possibleDuplicateCount(circle),
+        extractionCandidates: this.extractionCandidateCount(circle),
         skeleton: skeletonMembers.length,
       },
       health: {
@@ -6771,6 +7143,7 @@ export class MonetCore {
       activeThreads: pre.activeWorkstreams,
       openContradictions: pre.openContradictions,
       possibleDuplicates: this.getPossibleDuplicatePairs(circle),
+      extractionCandidates: this.getExtractionCandidatePairs(circle),
       skeleton: skeletonMembers.slice(0, OVERVIEW_SKELETON_CAP),
       graph: {
         hubs: this.topEntityHubs(circle, { limit: opts.hubLimit ?? 6 }),
@@ -9105,6 +9478,15 @@ export class MonetCore {
       // Superseding a rule ends its delivery, so doing it to a rule whose deny was already
       // withdrawn still changes the mirror.
       if (written.family === "supersession") this.noteRuleTouched(written.src_concept_id);
+      // A DERIVATION EDGE IS MIRROR CONTENT TOO (slice 5-B, D4) — `GateMirrorEntry` carries the
+      // parent principle now, so an edge landing on a bound rule changes what the mirror would
+      // write. The DESTINATION is the rule (derivation runs principle → rule), so this reads
+      // dst_concept_id where supersession above reads src. Same trigger the two in-engine entrances
+      // (`recordProjectionEdge`, `ratifySkeletonMembership`) call, restated here because this
+      // exported method is a third door: a caller writing the edge directly gets the same refresh.
+      if (written.family === "derivation" && written.dst_concept_id !== null) {
+        this.noteRuleTouched(written.dst_concept_id);
+      }
       return written;
     })();
     this.refreshGateSidecar();
@@ -9189,8 +9571,8 @@ export class MonetCore {
     ratifiedBy?: string | null;
     packet?: string | null;
     memberRuleIds?: string[];
-  }): { ratification: RatificationRow; edges: LifecycleEdgeRow[] } {
-    const result = this.db.transaction((): { ratification: RatificationRow; edges: LifecycleEdgeRow[] } => {
+  }): { ratification: RatificationRow; edges: LifecycleEdgeRow[]; extractionFlagsResolved: number } {
+    const result = this.db.transaction((): { ratification: RatificationRow; edges: LifecycleEdgeRow[]; extractionFlagsResolved: number } => {
       const isEntryVerdict = input.verdict === "approve" || input.verdict === "re-ratify";
       // EVERY MEMBER MUST BE A RULE, CHECKED BEFORE ANYTHING IS WRITTEN (review round 1, item 3).
       // The contract is "derivation edges principle → rule"; addLifecycleEdge enforces only
@@ -9240,6 +9622,13 @@ export class MonetCore {
                 eventRef: ratification.id,
               }),
             );
+            // THE SHARED MIRROR TRIGGER (slice 5-B, D4) — the same call `recordProjectionEdge` makes
+            // for the projection entrance. `GateMirrorEntry` now carries the parent principle, so
+            // BOTH ways a derivation edge reaches a bound rule change mirror content, and both must
+            // bump the generation or the offline evaluator answers from a file that predates the
+            // parent. Inside the transaction, like every other noteRuleTouched call; the
+            // re-materialization itself runs in ratify(), after the commit.
+            this.noteRuleTouched(memberRuleId);
           } catch (e) {
             const message = e instanceof Error ? e.message : String(e);
             // NAME THE DATED DEFERRAL rather than let addLifecycleEdge's own cross-circle message
@@ -9258,10 +9647,70 @@ export class MonetCore {
           }
         }
       }
-      return { ratification, edges };
+      // THE HUMAN ANSWERED THE PAIR'S QUESTION (review fix — Codex 5-B round 4, R4-4). An extraction
+      // candidate asks "do these two rules share one reason?", and naming both of them as member
+      // rules of one principle is the ADVERTISED successful answer to it — memory_overview's own
+      // guidance says the answer "is a conversation ending in memory_ratify, not a merge". Until
+      // this, that conversation ended and the flag stayed open, so the overview kept prompting the
+      // same battery a human had just completed; the only exit was pair dismissal, which asserts the
+      // two are unrelated and would flatly contradict the ratification that had just related them.
+      //
+      // INSIDE THE SAME ENVELOPE as the verdict and its edges, for round 1 F4's reason exactly: a
+      // resolution that commits without its verdict claims a human answered a question they did not,
+      // and a verdict that commits without the resolution leaves the state this fix exists to
+      // remove. `ratify()` wraps this whole method in its own immediateTransaction, and this runs
+      // after the member edges above so a refused member id (or a cross-circle one) resolves nothing.
+      //
+      // ALL PAIRS, not adjacent ones: a principle may enter with three or more member rules, and the
+      // flagged pair among them is wherever the two births happened to near-match.
+      const extractionFlagsResolved = isEntryVerdict && memberRuleIds && memberRuleIds.length > 1
+        ? this.resolveExtractionFlags(memberRuleIds, input.conceptId, ratification.ratified_by)
+        : 0;
+      return { ratification, edges, extractionFlagsResolved };
     })();
     // SKELETON MATERIALIZATION SEAM — see this method's own doc comment above. No-op today.
     return result;
+  }
+
+  /**
+   * DISMISS THE `extraction_candidate` FLAGS A RATIFICATION HAS NOW ANSWERED (slice 5-B, review fix
+   * — Codex round 4, R4-4). Every unordered pair within `memberRuleIds` whose flag is still open is
+   * stamped dismissed by the ratifier, through the same two columns and the same both-directions
+   * shape `dismissPossibleDuplicate` uses (`upsertEdgeBoth` stores each pair twice, so a resolved
+   * pair is two rows).
+   *
+   * DELIBERATELY NARROWER THAN THAT PATH, which dismisses every `PAIR_FLAG_EDGE_TYPES` value at
+   * once: a ratification answers "do these share a reason?" and says nothing about "are these one
+   * thing?" — two rules a principle derives are emphatically NOT one concept — so any
+   * `possible_duplicate_of` edge between the same two is left open for the surface that mediates it.
+   * The widening in `dismissPossibleDuplicate` is sound for its own trigger (a human declaring the
+   * pair unrelated has answered both questions at once) and would be wrong here.
+   *
+   * SCOPED TO THE RATIFICATION'S OWN CIRCLE, read from the candidate rather than from a member: the
+   * edges live in exactly one scope, member edges cannot cross circles (addLifecycleEdge refuses it,
+   * and the caller re-raises that refusal by name), and naming the scope keeps this from ever
+   * reaching a same-id pair some other circle happens to hold.
+   *
+   * Returns how many PAIRS were resolved (not rows), for disclosure.
+   */
+  private resolveExtractionFlags(memberRuleIds: string[], candidateId: string, dismissedBy: string | null): number {
+    const circle = this.getRow(candidateId)?.circle;
+    if (circle === undefined) return 0;
+    const stamp = this.nextSyncTimestamp();
+    const dismiss = this.db.prepare(
+      `UPDATE memory_edge SET dismissed_at = ?, dismissed_by = ?, sync_updated_at = ?
+        WHERE scope = ? AND type = 'extraction_candidate' AND dismissed_at IS NULL
+          AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))`,
+    );
+    let pairs = 0;
+    for (let i = 0; i < memberRuleIds.length; i++) {
+      for (let j = i + 1; j < memberRuleIds.length; j++) {
+        const a = memberRuleIds[i]!;
+        const b = memberRuleIds[j]!;
+        if (dismiss.run(stamp, dismissedBy, stamp, circle, a, b, b, a).changes > 0) pairs++;
+      }
+    }
+    return pairs;
   }
 
   /**
@@ -9325,20 +9774,98 @@ export class MonetCore {
           `preference generates nothing. Ratify the preference without memberRuleIds.`,
       );
     }
-    const { ratification, edges } = this.ratifySkeletonMembership({
-      conceptId: input.candidateId,
-      verdict: input.verdict,
-      ratifiedBy: input.ratifiedBy,
-      packet: input.packet ?? null,
-      memberRuleIds: input.memberRuleIds,
-    });
+    // ONE TRANSACTION FOR THE WHOLE VERDICT (review fix — Codex 5-B round 1, F4). The verdict, its
+    // derivation edges and the impeachment closure it rules on are one act, and they used to commit
+    // in two: `ratifySkeletonMembership` returned committed, then `closeImpeachments` opened its
+    // own. A failure in the second — or a crash between them — left the caller a durable ruling that
+    // says the human answered the impeachment beside an impeachment still open, and an error
+    // telling them the call failed. Same reasoning, same shape as `StoreOpts.skeletonEntry` riding
+    // store()'s own transaction: the dependent write goes INSIDE the primary act's envelope.
+    // Both callees keep their own `db.transaction` (better-sqlite3 flattens those to savepoints), so
+    // each remains correct if ever called alone. `refreshGateSidecar()` stays OUTSIDE, below — it is
+    // a file materialization, not a row, and must never run for a verdict that did not commit.
+    const { ratification, edges, impeachmentsClosed, extractionFlagsResolved } = this.db.immediateTransaction((): {
+      ratification: RatificationRow; edges: LifecycleEdgeRow[]; impeachmentsClosed: number; extractionFlagsResolved: number;
+    } => {
+      const recorded = this.ratifySkeletonMembership({
+        conceptId: input.candidateId,
+        verdict: input.verdict,
+        ratifiedBy: input.ratifiedBy,
+        packet: input.packet ?? null,
+        memberRuleIds: input.memberRuleIds,
+      });
+      return {
+        ...recorded,
+        impeachmentsClosed: this.closeImpeachments(input.candidateId, recorded.ratification.ratified_by, input.verdict),
+      };
+    })();
+    // A DERIVATION EDGE CHANGES WHAT THE MIRROR WOULD WRITE (slice 5-B, D4): GateMirrorEntry now
+    // carries the parent principle, so a ratification that names member rules moves mirror content
+    // without touching any binding. `ratifySkeletonMembership` bumps the generation per member
+    // (noteRuleTouched); this is the re-materialization that bump exists for — the same
+    // pairing every other generation-changing path in this file keeps, and a no-op when nothing
+    // moved (refreshGateSidecar's own staleness compare).
+    if (edges.length > 0) this.refreshGateSidecar();
     return {
       ratificationId: ratification.id,
       verdict: ratification.verdict,
       conceptId: input.candidateId,
       edgeIds: edges.map((e) => e.id),
       skeleton: this.skeleton(circle),
+      ...(impeachmentsClosed > 0 ? { impeachmentsClosed } : {}),
+      ...(extractionFlagsResolved > 0 ? { extractionFlagsResolved } : {}),
     };
+  }
+
+  /**
+   * CLOSE THE IMPEACHMENTS A HUMAN HAS NOW RULED ON (slice 5-B) — "an impeachment the human has
+   * re-ruled on must not stay open."
+   *
+   * Scoped to `kind = 'impeachment'` contradictions, which are exactly the ones this ratification
+   * answers: an ordinary value-conflict on a principle is a different dispute about its content and
+   * belongs to memory_resolve, which is where mediation lives. Closed as `resolved` (a verdict was
+   * reached — the human ruled), never `dismissed` (which means "not a real conflict"): the
+   * impeachment WAS real in both directions, and re-ratification is the human overruling it rather
+   * than declaring it never happened.
+   *
+   * REACHABILITY, stated because it is narrower than it looks and the honest version matters:
+   * `ratify()` REFUSES approve/re-ratify on a candidate whose status is 'disputed' (the guard just
+   * above, Codex PR #102 round 4) — so on the ordinary impeachment path the human mediates through
+   * memory_resolve FIRST, and that path already closes the contradiction and restores status
+   * itself. What remains reachable here is (a) `retire`, which is not refused on a disputed
+   * candidate and until now left the impeachment open forever as unread curation noise, and (b) the
+   * residual skeleton() already records — a retire/restore status round-trip can leave a concept
+   * 'active' with an open contradiction, at which point re-ratify passes the guard and this closes
+   * what it re-ruled on. Both are real; neither is the common path, and this deliberately does NOT
+   * relax the disputed guard to widen itself.
+   *
+   * Recomputes the concept's projection afterwards, the same call `resolveContradiction` ends with,
+   * so status returns to 'active' when nothing contested is left — closing a contradiction while
+   * leaving the concept marked disputed would be a state no reader could interpret. "Nothing
+   * contested" is `open_count = 0` over ALL contradictions, so a principle carrying a second, still-
+   * open impeachment from another superseded child stays disputed here (see propagateImpeachment's
+   * own STATUS clause, review fix — Codex 5-B round 1, F1) — this closes what THIS verdict answered,
+   * never everything on the row.
+   *
+   * RUNS INSIDE ratify()'s TRANSACTION (review fix — Codex 5-B round 1, F4), so it commits with the
+   * verdict and the derivation edges or not at all; its own `db.transaction` becomes a savepoint
+   * there and keeps it correct if it is ever called standalone.
+   *
+   * Returns how many rows closed, for disclosure.
+   */
+  private closeImpeachments(conceptId: string, resolvedBy: string | null, verdict: RatificationVerdict): number {
+    if (verdict !== "approve" && verdict !== "re-ratify" && verdict !== "retire") return 0;
+    return this.db.transaction((): number => {
+      const nowMs = Date.now();
+      const closed = this.db
+        .prepare(
+          `UPDATE contradictions SET status = 'resolved', resolved_at = ?, resolved_by = ?
+            WHERE concept_id = ? AND kind = 'impeachment' AND status = 'open'`,
+        )
+        .run(nowMs, resolvedBy, conceptId);
+      if (closed.changes > 0) this.recomputeNativeConceptProjection(conceptId, this.nextSyncTimestamp());
+      return closed.changes;
+    })();
   }
 
   /**
@@ -9426,7 +9953,7 @@ export class MonetCore {
    * get an error naming where deny power actually comes from, not a constraint violation from four
    * layers down.
    */
-  private validateRuleCapture(opts: StoreOpts): void {
+  private validateRuleCapture(opts: StoreOpts, circle: string): void {
     // The skeleton-entry hook's own species guard, stated beside the rule hook's because they are
     // the same class of mistake: an internal write-path option reaching a write it does not
     // describe. A ratification on a fact would be a skeleton membership `skeleton()` can never
@@ -9447,6 +9974,28 @@ export class MonetCore {
         `severity '${rule.severity}' cannot be captured: blocking is declaration-only (no agent, and no ` +
           `projection, can self-assign deny power). Use memory_declare to declare a blocking rule.`,
       );
+    }
+    // THE OTHER HALF OF THE SAME SENTENCE (slice 5-B). The check just above closes the CAPTURE path
+    // by requiring `declaration`; this one closes the case that clause names explicitly and the
+    // check above cannot see — a DECLARATION that also claims a principle parent. "No agent, and no
+    // projection, can self-assign deny power" is one guard with two doors, and a projected rule is
+    // "structurally advisory-only" by the design's own list of what stands in for an approval gate.
+    //
+    // AND THE THIRD DOOR IS NOT HERE (review fix — Codex 5-B round 2, R2-5), named so the next
+    // reader does not conclude this check is the whole guard: an OMITTED severity preserves the
+    // incumbent binding's ruling, so a projection can resolve onto an existing blocking rule without
+    // ever mentioning severity. Only the POST-write binding can answer that, so the refusal lives in
+    // storeInternal beside `recordProjectionEdge`. This one stays because it is the FAST one.
+    if (rule.projectedFromPrincipleId !== undefined && rule.severity === "blocking") {
+      throw new Error(
+        `a projected rule cannot be blocking: projection is structurally advisory-only (no agent, and no ` +
+          `projection, can self-assign deny power) — it is one of the four guards that let projection ` +
+          `skip an approval gate at all. Declare the deny on its own authority, without ` +
+          `projectedFromPrincipleId.`,
+      );
+    }
+    if (rule.projectedFromPrincipleId !== undefined) {
+      this.validateProjectionParent(rule.projectedFromPrincipleId, circle);
     }
     const scope: RuleScope = rule.scope ?? "agent";
     if (!RULE_SCOPES.includes(scope)) {
@@ -9536,10 +10085,295 @@ export class MonetCore {
       .get(row.id) === undefined;
   }
 
+  /**
+   * THE STAGE-FORK PREDICATE (slice 5-B, review round 2, R2-6) — would this rule capture land at an
+   * address the nominated rule does not hold? See the `forkReason` chain in storeInternal for why a
+   * different address is a fork rather than an attach.
+   *
+   * TWO CALLERS ARE EXCLUDED, both because they ASSERTED the identity rather than having it
+   * nominated, which is the same line the whole fork family is drawn on:
+   *   attachTo     — never reaches here at all (the auto branch is the only call site).
+   *   DECLARATION  — excluded here, explicitly. Declaration is the ONE act that may re-address a live
+   *                  rule (`bindRule` mode "replace"; see captureRuleBinding), and it is a human
+   *                  naming both the rule and its new moment. Forking it would make "move this rule
+   *                  to that stage" unreachable and would turn every sovereign re-address into a
+   *                  duplicate pair. The finding's own subject is the CAPTURE path anyway: a
+   *                  declaration never reaches the keep branch that preserves the incumbent address.
+   *
+   * THE REQUESTED STAGE IS RESOLVED READ-ONLY, by `findStage` — the same id-then-normalized-name
+   * lookup `upsertStage` performs, minus the creation. A stage that does not exist yet resolves to
+   * null and TRIVIALLY differs, which is correct: a rule for a moment nothing is registered at is by
+   * definition not at the incumbent's moment.
+   *
+   * NO INCUMBENT BINDING MEANS NO DISAGREEMENT. A nominated rule with no binding has no address to
+   * differ from, and this capture is about to give it one through the ordinary path.
+   */
+  private capturesAtADifferentStage(opts: StoreOpts, landed: ConceptRow): boolean {
+    if (opts.kind !== "rule" || landed.kind !== "rule") return false;
+    const rule = opts.rule;
+    if (!rule || rule.declaration === true) return false;
+    const incumbent = getRuleBinding(this.db, landed.id);
+    if (!incumbent) return false;
+    return findStage(this.db, rule.stage)?.id !== incumbent.stage_id;
+  }
+
+  /**
+   * EXTRACTION-CANDIDATE FLAGGING (slice 5-B) — "extraction candidates are flagged at rule-birth by
+   * the substrate's near-match; the battery and approval run explicitly, not silently."
+   *
+   * THE FLAG IS THE WHOLE DELIVERABLE. Nothing here runs the four-test battery, creates a principle,
+   * or extracts anything: it records that two rules from DIFFERENT stages look like the same reason,
+   * and puts the pair in front of a human through memory_overview exactly the way a possible
+   * duplicate is. The battery stays a conversation and the approval stays memory_ratify, because
+   * "approving skeleton entry is approving a permanent always-on tax."
+   *
+   * FOUR CONDITIONS, each one a clause of the design's own breadth precondition:
+   *
+   *   BOTH ARE RULES — a principle is extracted from RULES that share a reason. A rule near-matching
+   *   a fact it paraphrases is the possible-duplicate machinery's business, not this one's.
+   *
+   *   DIFFERENT STAGES — "member rules from ≥2 stages". Two rules at ONE stage sharing a reason are
+   *   a duplicate or a supersession, not an extraction: the abstraction they would share is the
+   *   stage itself, and "a rule repeating across stages is still a rule" only becomes a principle
+   *   when the stages actually differ. A rule with no binding does not qualify at all — it has no
+   *   stage to be different from, so it cannot evidence breadth in either direction.
+   *
+   *   NEITHER IS PROJECTION-BORN — "derivation-born (projected) rules are EXCLUDED from extraction
+   *   evidence, since a principle must not manufacture its own support." Checked on the EDGE
+   *   (`born_of = 'projection'`), never on the binding's origin column: the edge is the record of
+   *   the act, and the spec's implementation directive is explicit that an implementation storing
+   *   authority as a scalar field has not implemented this design. Both sides are checked, not only
+   *   the new one — a projected rule sitting on the OTHER end of the pair is exactly as
+   *   self-manufactured as one on this end.
+   *
+   *   A NEW CONCEPT — the caller's `!landedOnExisting` gate. Evidence absorbed into an existing rule
+   *   is not a rule BIRTH, and this flag rides birth by design. Every resolution mode that BIRTHS a
+   *   rule qualifies, including force-new (round 4, R4-3 — see the call site for why asserting
+   *   distinctness does not answer the shared-reason question).
+   *
+   * TWO ANSWER SHAPES, ONE EXIT. The question this edge asks — "do these two share a reason?" — has
+   * exactly two closing answers, and BOTH land as a dismissal on this same row because both answer
+   * it: "no, unrelated" through pair dismissal (`dismissPossibleDuplicate`), and "yes, they share
+   * THIS principle" through a ratification naming both rules (`resolveExtractionFlags`, round 4,
+   * R4-4). The flag records an open question, not a claim, so retiring it is what an answer of
+   * either shape means — and a flag whose successful path left it open would keep asking a human to
+   * redo a battery they had already finished. What distinguishes the two is the SURROUNDING record
+   * (a derivation edge exists, or it does not), never the dismissal itself.
+   *
+   * Returns what to report, or undefined when the pair did not qualify. Never throws: a flag is an
+   * annotation on a write, never its purpose.
+   */
+  private flagExtractionCandidate(
+    newRuleId: string,
+    nearMatchId: string,
+    score: number,
+    circle: string,
+  ): { pairedRuleId: string; score: number } | undefined {
+    if (!this.graphEnabled) return undefined;
+    const paired = this.getRow(nearMatchId);
+    if (!paired || paired.kind !== "rule") return undefined;
+    const newBinding = getRuleBinding(this.db, newRuleId);
+    const pairedBinding = getRuleBinding(this.db, nearMatchId);
+    if (!newBinding || !pairedBinding) return undefined;
+    if (newBinding.stage_id === pairedBinding.stage_id) return undefined;
+    if (this.isProjectionBorn(newRuleId) || this.isProjectionBorn(nearMatchId)) return undefined;
+    // NEITHER SIDE SUPERSEDED (review fix — Codex 5-B round 5, R5-1). A superseded rule keeps
+    // `status='active'` and its binding on purpose — it is history — but the gate stopped delivering
+    // it (RULE_LIVENESS_WHERE's supersession NOT EXISTS), so it cannot evidence breadth. The
+    // new-rule check is unreachable today (a rule born this instant has no successor) but costs one
+    // indexed probe and keeps the two endpoints under one predicate, like the projection pair above.
+    if (this.isSuperseded(newRuleId) || this.isSuperseded(nearMatchId)) return undefined;
+    this.upsertEdgeBoth(newRuleId, nearMatchId, "extraction_candidate", score, "cheap", circle);
+    return { pairedRuleId: nearMatchId, score };
+  }
+
+  /** Has this rule been overturned — i.e. does an outgoing supersession edge name its successor?
+   *  Same predicate shape as RULE_LIVENESS_WHERE's own supersession exclusion (gates.ts). */
+  private isSuperseded(conceptId: string): boolean {
+    return this.db
+      .prepare(
+        `SELECT 1 FROM lifecycle_edges
+          WHERE family = 'supersession' AND src_concept_id = ? LIMIT 1`,
+      )
+      .get(conceptId) !== undefined;
+  }
+
+  /** Was this rule born by projection — i.e. does a principle claim to have generated it? */
+  private isProjectionBorn(conceptId: string): boolean {
+    return this.db
+      .prepare(
+        `SELECT 1 FROM lifecycle_edges
+          WHERE family = 'derivation' AND born_of = 'projection' AND dst_concept_id = ? LIMIT 1`,
+      )
+      .get(conceptId) !== undefined;
+  }
+
+  /**
+   * THE PROJECTION PARENT (slice 5-B) — every refusal named, none of them a constraint violation
+   * from four layers down.
+   *
+   * CALLED TWICE, DELIBERATELY (review fix — Codex 5-B round 1, F2). `validateRuleCapture` calls it
+   * as a PREFLIGHT, before the embed, so a caller learns which of the five properties failed without
+   * paying for one; `storeInternal` calls it AGAIN inside the write transaction, and THAT call is
+   * the guard. The two are not redundant: the preflight runs before `await checkedEmbed(...)`, and
+   * every property it judges is mutable during that await — a concurrent dispute, retire, or
+   * `retire` verdict lands in the window and the transaction would otherwise write the projection
+   * anyway, because `addLifecycleEdge` rechecks only existence, governability and circle. This
+   * method is a pure read, so running it twice costs a handful of indexed lookups.
+   *
+   * WHY EACH ONE:
+   *   EXISTS       — an edge to a missing concept is a provenance claim citing nothing.
+   *   PRINCIPLE    — "principles derive rules downward"; a PREFERENCE is momentless and generates
+   *                  nothing ("sovereignty needs no generativity"), so it can father no gate rule.
+   *                  memory_ratify already refuses memberRuleIds under a preference for this exact
+   *                  reason; projection is the same claim written from the other end.
+   *   ACTIVE       — a disputed or retired principle is not governing anything, so it cannot be the
+   *                  authority a fresh rule claims to descend from. (D5 discloses the case where a
+   *                  parent goes disputed AFTER the projection; this refuses starting there.)
+   *   SKELETON     — membership is the LIVE derived read, latest ratification wins: the exact
+   *                  subquery shape skeleton() uses, restated here rather than shared as SQL text
+   *                  because this one asks about a single subject. A concept that was ratified and
+   *                  later retired-by-verdict is still `active` and still kind `principle`; only the
+   *                  verdict says it no longer governs, so status alone is not this check.
+   *   CIRCLE       — addLifecycleEdge refuses a cross-circle edge anyway; this precedes it to say
+   *                  WHICH circles disagreed, and (on the preflight call) to fail before the embed
+   *                  rather than after it.
+   */
+  private validateProjectionParent(principleId: string, circle: string): void {
+    const parent = this.getRow(principleId);
+    if (!parent) {
+      throw new Error(
+        `rule.projectedFromPrincipleId '${principleId}' does not exist: a projected rule names the ` +
+          `skeleton principle it was derived from.`,
+      );
+    }
+    if (parent.kind !== "principle") {
+      throw new Error(
+        `rule.projectedFromPrincipleId '${principleId}' is kind '${parent.kind}', not 'principle': only a ` +
+          `principle derives rules downward. A preference is momentless and generates nothing.`,
+      );
+    }
+    if (parent.status !== "active") {
+      throw new Error(
+        `rule.projectedFromPrincipleId '${principleId}' is '${parent.status}', not active: a contested or ` +
+          `retired principle governs nothing, so nothing may be projected from it.`,
+      );
+    }
+    if (parent.circle !== circle) {
+      throw new Error(
+        `rule.projectedFromPrincipleId '${principleId}' is in circle '${parent.circle}', but the rule is ` +
+          `being written to '${circle}': a derivation edge may not cross circles.`,
+      );
+    }
+    const latest = this.latestRatificationVerdict(principleId);
+    if (latest === undefined || (latest !== "approve" && latest !== "re-ratify")) {
+      throw new Error(
+        `rule.projectedFromPrincipleId '${principleId}' is not a current skeleton member` +
+          `${latest === undefined ? " (no ratification on record)" : ` (latest verdict '${latest}')`}: ` +
+          `projection derives from the ratified skeleton, so the parent must be an approved or ` +
+          `re-ratified principle. Ratify it first (memory_ratify), then project.`,
+      );
+    }
+  }
+
+  /**
+   * THE LIVE MEMBERSHIP READ FOR ONE SUBJECT — latest ratification wins, `undefined` when nobody has
+   * ever ruled. The exact subquery shape `skeleton()` uses, narrowed to a single concept.
+   *
+   * SHARED BY THE TWO GUARDS THAT ASK THE SAME QUESTION FROM OPPOSITE ENDS (review fix — Codex 5-B
+   * round 2, R2-3): `validateProjectionParent` refuses to derive a rule DOWNWARD from a parent that
+   * is not a current member, and `propagateImpeachment` refuses to send doubt UPWARD to one. They
+   * were one duplicated SQL literal away from drifting, and a drift would be silent in both
+   * directions — a projection admitted from a retired principle, or an impeachment withheld from a
+   * live one. Extracted rather than restated for that reason alone; neither caller's behavior on the
+   * verdict it reads is changed by sharing the read.
+   */
+  private latestRatificationVerdict(subjectConceptId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT r.verdict AS verdict FROM ratifications r
+          WHERE r.subject_concept_id = ?
+          ORDER BY r.created_at DESC, r.id DESC LIMIT 1`,
+      )
+      .get(subjectConceptId) as { verdict: string } | undefined;
+    return row?.verdict;
+  }
+
+  /** Does this concept's latest ruling grant membership? The verdict half of `skeleton()`'s filter. */
+  private isCurrentSkeletonMember(subjectConceptId: string): boolean {
+    const verdict = this.latestRatificationVerdict(subjectConceptId);
+    return verdict === "approve" || verdict === "re-ratify";
+  }
+
+  /**
+   * THE PROJECTION EDGE (slice 5-B) — principle → rule, `bornOf: 'projection'`, inside the same
+   * transaction as the rule's own birth. "Governs/informs is edges, not a flag."
+   *
+   * IDEMPOTENT ACROSS RE-PROJECTION, which is the point of the attach case: "a projected rule is
+   * stored as an ordinary rule (principle as parent) and IS A CACHE HIT next firing" — so the same
+   * projection arriving twice must resolve onto the same rule concept and leave ONE edge, not two.
+   *
+   * THE DEDUPE IS PER `born_of`, NOT PER (src, dst) PAIR (review fix — Codex 5-B round 4, R4-1). It
+   * used to skip on ANY existing derivation edge between the two, so a rule a human had already
+   * named in memory_ratify's memberRuleIds swallowed the projection entirely: nothing durable
+   * recorded that a principle had since projected onto it. That is not a cosmetic loss, because the
+   * slice's operative semantics are EVER PROJECTED ONTO = EXCLUDED FROM EXTRACTION EVIDENCE, and
+   * both readers of it ask for `born_of = 'projection'` specifically — `isProjectionBorn` at flag
+   * time and `EXTRACTION_PAIR_NOT_PROJECTION_BORN` on the live read side (round 3, R3-2). With the
+   * projection act unrecorded, a later cross-stage rule could use that swallowed cache hit as
+   * extraction evidence and ratify circular support back onto the very principle that generated it.
+   * Exclusion must not depend on WHICH edge landed first.
+   *
+   * TWO EDGES FOR ONE (src, dst) WITH DIFFERENT `born_of` ARE TWO ACTS, NOT A DUPLICATE RELATION.
+   * `lifecycle_edges` is append-only and carries no uniqueness constraint outside supersession's
+   * own (see its schema), and both consumers of the relationship collapse the multiplicity anyway,
+   * which was checked rather than assumed: `parent_concept_id` is a CORRELATED SCALAR SUBQUERY with
+   * `ORDER BY p.created_at ASC, p.id ASC LIMIT 1` (gates.ts, in both the live pick and the mirror's
+   * verbatim copy of it), so the parent a rule reports is still exactly one id — the earlier act's,
+   * which here is the human's ratification; and `walkDerivation` selects DISTINCT, so a principle's
+   * member list cannot repeat a rule either. The human's ruling is not downgraded by recording the
+   * projection beside it; it stays the FIRST act on the log and the one delivery names.
+   *
+   * Returns the edge id when one was written, null when this projection was already on record.
+   */
+  private recordProjectionEdge(principleId: string, ruleConceptId: string, observationId: string): string | null {
+    const existing = this.db
+      .prepare(
+        `SELECT id FROM lifecycle_edges
+          WHERE family = 'derivation' AND born_of = 'projection'
+            AND src_concept_id = ? AND dst_concept_id = ? LIMIT 1`,
+      )
+      .get(principleId, ruleConceptId) as { id: string } | undefined;
+    if (existing) return null;
+    const edge = addLifecycleEdge(this.lifecycleEdgeDeps(), {
+      family: "derivation",
+      srcConceptId: principleId,
+      dstConceptId: ruleConceptId,
+      bornOf: "projection",
+      eventRef: observationId,
+    });
+    // MIRROR CONTENT NOW (slice 5-B, D4): GateMirrorEntry carries the parent principle, so a
+    // derivation edge landing on a bound rule changes what materializeGateMirror would write even
+    // though nothing about the binding moved. Shared with the ratification edge write
+    // (ratifySkeletonMembership) so both entrances into the derivation family trigger identically.
+    this.noteRuleTouched(ruleConceptId);
+    return edge.id;
+  }
+
   /** Rule capture: birth the stage if the action has none, then bind the rule to it. */
   private captureRuleBinding(row: ConceptRow, opts: StoreOpts): RuleBindingChange {
     const rule = opts.rule!;
     const declaration = rule.declaration === true;
+    // THE BINDING'S ORIGIN (slice 5-B). Declaration outranks projection: it is the sovereignty
+    // boundary bindRule's own guard reads, and a human declaring a rule that also cites a principle
+    // is still declaring it. Everything else that is not a projection is a correction, unchanged —
+    // this widens a two-value expression into a three-value one, it does not re-decide either
+    // existing case. The STAGE's origin (upsertStage, below) stays correction/declaration: a stage
+    // is born of a correction or a declaration, and `StageOrigin` has no projection value because
+    // projection aims at a moment that already exists ("the rule for a gate nobody has visited"
+    // still needs the gate to be registered before anyone can stand at it).
+    const bindingOrigin: RuleBindingOrigin =
+      declaration ? "declaration" : rule.projectedFromPrincipleId !== undefined ? "projection" : "correction";
     // THE ONLY LEGAL VALUES ARE ABSENCE, BREADTH, OR THE CONCEPT'S OWN CIRCLE. `rule.circle` exists
     // to carry a RULING through from declare() (see RuleCaptureOpts.circle's own comment for the
     // three-state contract, review fix — Codex round 2, item 1) — never an arbitrary OTHER circle
@@ -9598,7 +10432,7 @@ export class MonetCore {
         severity: rule.severity,
         scope: rule.scope ?? "agent",
         modelTag: rule.modelTag ?? null,
-        origin: declaration ? "declaration" : "correction",
+        origin: bindingOrigin,
         declaredBy: declaration ? (rule.declaredBy ?? this.agentId) : null,
         reason: rule.reason ?? null,
         // THE THREE-STATE FALLBACK CHAIN (review fix — Codex round 2, item 1). `rule.circle` wins
@@ -9654,12 +10488,14 @@ export class MonetCore {
    *   - The successor is ALWAYS advisory-born. It cannot inherit blocking severity, because the
    *     incumbent could never have been blocking (isRuleCorrectionTarget refuses that case).
    *
-   * DOUBT TRAVELS UP THE PARENT EDGE, and this slice deliberately builds no machinery for it.
-   * "Correcting a rule casts doubt on the principle that derived it" — but the supersession edge IS
-   * that evidence: a later pass reads `lifecycle_edges` for supersessions whose source has an
-   * incoming derivation edge and marks the parent principle disputed. Adding an impeachment queue
-   * here would be a second record of a fact the substrate already holds. CONSUMER: the principle /
-   * skeleton slice.
+   * DOUBT TRAVELS UP THE PARENT EDGE, and as of slice 5-B it travels here, in band, in this same
+   * transaction — see `propagateImpeachment` just below for the walk and every condition on it.
+   * The earlier shape of this comment deferred the work to "a later pass ... reads lifecycle_edges
+   * for supersessions whose source has an incoming derivation edge"; that pass would have been a
+   * scheduled review, and "nothing waits on scheduled review; everything is maintained by use."
+   * The correction IS the event that happens anyway, so the propagation rides it: a rule dying at a
+   * gate is exactly the moment its parent principle became doubtful, and the human hears about it
+   * on the write that caused it rather than whenever a sweep next runs.
    */
   private succeedRule(
     incumbent: ConceptRow,
@@ -9712,12 +10548,132 @@ export class MonetCore {
       bornOf: "correction",
       eventRef: correctionObservationId,
     });
+    // AFTER the supersession edge, deliberately: the edge is the impeaching evidence, so a
+    // contradiction naming it must not exist in a state where the edge does not.
+    const impeachedPrincipleIds = this.propagateImpeachment(incumbent, successor, correctionObservationId);
     return {
       supersededRuleId: incumbent.id,
       successorRuleId: successor.id,
       supersessionEdgeId: edge.id,
       stageId: binding?.stage_id ?? "",
+      ...(impeachedPrincipleIds.length > 0 ? { impeachedPrincipleIds } : {}),
     };
+  }
+
+  /**
+   * IMPEACHMENT PROPAGATION (slice 5-B) — "correcting a rule casts doubt on the principle that
+   * derived it (doubt travels the parent edge, TO PROJECTED CHILDREN TOO)."
+   *
+   * Walks the dying rule's INCOMING derivation edges and marks each live parent principle disputed.
+   * `flagContradiction` does the structural half it already does everywhere else (status →
+   * 'disputed', confidence decayed, First Block entry invalidated), and skeleton() — which filters
+   * `status = 'active'` — then drops the principle from delivery at the next read. There is no
+   * second mechanism and no queue: "adding an impeachment queue here would be a second record of a
+   * fact the substrate already holds."
+   *
+   * PROJECTED CHILDREN NEED NO SPECIAL CASE, which is the design's own promise made mechanical: a
+   * projection's parent edge is an ordinary `family: 'derivation'` row (`bornOf: 'projection'`), so
+   * correcting a projected rule impeaches its principle through this one walk. That is the third of
+   * the four guards standing in for projection's missing approval gate — "a wrong projection
+   * misfires in front of the human, and its correction births a correction-born successor while
+   * impeaching the parent" — and it holds here without a line of code that knows what a projection
+   * is.
+   *
+   * FIVE CONDITIONS ON A PARENT, each one a silent-failure otherwise:
+   *   RESOLVES LOCALLY — normative rows replicate independently of endpoint liveness, so a synced
+   *     store can hold an edge whose principle has not arrived. walkDerivation's own doc comment
+   *     says callers must handle the miss; flagContradiction would throw "concept not found" and
+   *     roll back the whole correction over a row this machine was never sent.
+   *   KIND 'principle' — derivation is principle → rule by contract, but the edge table enforces
+   *     only governability, so a malformed or relayed row could name something else. Impeaching a
+   *     fact would dispute a concept no skeleton read will ever look at.
+   *   STATUS 'active' OR 'disputed', NOT RETIRED — a retired principle cannot be mutated at all
+   *     (flagContradiction refuses) and governs nothing either way. A DISPUTED one still needs its
+   *     own impeachment for each superseded child (review fix — Codex 5-B round 1, F1). The earlier
+   *     active-only guard reasoned that a disputed principle is already out of delivery and already
+   *     in front of the human, which is true of its STATUS and false of the QUESTION being asked:
+   *     two derived siblings corrected before either impeachment is mediated — or a principle
+   *     already disputed over an unrelated value-conflict — silently dropped every impeachment after
+   *     the first. Mediating that one recorded contradiction then restored the principle outright,
+   *     because `recomputeNativeConceptProjection` decides status from `open_count` alone: one open
+   *     row closed means zero open rows means 'active', and the skeleton got back a principle whose
+   *     OTHER derived rule had also just been overturned with nothing anywhere saying so. One
+   *     contradiction per superseded child; the last one closed is what restores membership.
+   *   A CURRENT SKELETON MEMBER — latest ratification 'approve' or 're-ratify' (review fix — Codex
+   *     5-B round 2, R2-3), the SAME live membership read `validateProjectionParent` applies on the
+   *     projection entrance, shared through `isCurrentSkeletonMember` so the two cannot drift.
+   *     STATUS IS NOT MEMBERSHIP, and this is the exact gap the status clause above cannot see: a
+   *     `retire` or `reject` verdict removes a principle from the skeleton and leaves its concept
+   *     row untouched — still 'active', still kind 'principle'. Derivation edges are append-only
+   *     history, so every rule that principle ever derived still names it forever; without this,
+   *     correcting any one of them re-opened a dispute about a principle the human had already ruled
+   *     out, on a curation surface whose whole value is that everything on it is still a question.
+   *     A parent with NO ratification at all skips for the same reason it can never be projected
+   *     from: never a member, so doubt about its membership is noise. This does NOT re-close F1's
+   *     widening — a DISPUTED principle whose latest verdict is still 'approve' is a member and is
+   *     still impeached, which is precisely the state F1 exists for (an entry verdict is refused on
+   *     a disputed candidate, so 'approve' + disputed is the ordinary mid-impeachment state).
+   *   NOT ALREADY IMPEACHED BY THIS SAME CHILD — idempotency. A rule can be corrected, its
+   *     successor corrected in turn, and so on down a chain; each act is a different child and
+   *     earns its own contradiction, but re-deriving the SAME (parent, superseded child) pair must
+   *     not stack duplicates on a curation surface a human has to read.
+   *
+   * NO `observationId` ON THE CONTRADICTION, deliberately. The correcting observation belongs to the
+   * SUCCESSOR RULE's concept, not to the principle — resolveContradiction validates exactly that
+   * (`correcting.concept_id !== conceptId` → "does not belong to concept"), so wiring it through
+   * would leave every impeachment resolvable only by `dismiss`. The evidence lives in `detail`
+   * instead, which is where a human reads it anyway, and the bare form keeps all three verdicts
+   * available.
+   *
+   * NOT ON THE GRAFT PATH. `succeedRule` is reachable only from `storeInternal`; a relayed
+   * supersession lands through `graftRows`, which deliberately does not propagate — reconciling a
+   * divergent succession across replicas is an act-relay question that slice's own comments already
+   * date and defer, and impeaching a principle on the strength of a peer's row would let one machine
+   * silently remove another's skeleton entry.
+   */
+  private propagateImpeachment(
+    incumbent: ConceptRow,
+    successor: ConceptRow,
+    correctionObservationId: string,
+  ): string[] {
+    const impeached: string[] = [];
+    const parents = getLifecycleEdges(this.db, incumbent.id, { direction: "in", family: "derivation" });
+    // THE STABLE NEEDLE the idempotency probe looks for, and the first thing a human reads. Built
+    // once so the two uses cannot drift: a probe searching for a substring the detail does not
+    // actually contain would silently re-flag forever.
+    const evidence = `superseded rule '${incumbent.id}'`;
+    const detail =
+      `impeachment: ${evidence} ("${firstLine(incumbent.body)}") was corrected — ` +
+      `successor rule '${successor.id}', ${impeachmentCorrectionNeedle(correctionObservationId)}`;
+    for (const edge of parents) {
+      const parentId = edge.src_concept_id;
+      if (impeached.includes(parentId)) continue; // one principle, two edges to the same child
+      const parent = this.getRow(parentId);
+      if (!parent || parent.kind !== "principle") continue;
+      // RETIRED IS THE ONLY STATUS THAT SKIPS (review fix — Codex 5-B round 1, F1) — see this
+      // method's own STATUS clause. Disputed parents still earn a distinct impeachment per
+      // superseded child; the (parent, child) probe below, not the status, is what stops duplicates.
+      if (parent.status !== "active" && parent.status !== "disputed") continue;
+      // ...AND STATUS IS NOT MEMBERSHIP (review fix — Codex 5-B round 2, R2-3) — see this method's
+      // own CURRENT MEMBER clause. This runs AFTER the status test, not instead of it: the two
+      // exclude different things and F1's widening to `disputed` survives intact, because a disputed
+      // principle whose latest verdict is still 'approve' passes both.
+      if (!this.isCurrentSkeletonMember(parentId)) continue;
+      const already = this.db
+        .prepare(
+          `SELECT 1 FROM contradictions
+            WHERE concept_id = ? AND kind = 'impeachment' AND status = 'open'
+              AND instr(detail, ?) > 0 LIMIT 1`,
+        )
+        .get(parentId, evidence);
+      if (already !== undefined) continue;
+      // `kind` is free TEXT on this table (no CHECK constraint) — 'impeachment' is a new value in a
+      // column whose only prior inhabitant is 'value-conflict', and it is worth its own name: an
+      // impeachment is not two claims disagreeing, it is a governing rule having been overturned.
+      this.flagContradiction(parentId, { kind: "impeachment", detail });
+      impeached.push(parentId);
+    }
+    return impeached;
   }
 
   /**
@@ -10077,6 +11033,9 @@ export class MonetCore {
         ...(change?.narrowedFromBreadth
           ? { narrowedFromBreadth: true as const, previousCircle: "*" as const }
           : {}),
+        // Straight through from the shared write path (slice 5-B) — flagged by the same near-match
+        // hook regardless of entrance, and disclosed here for the same reason it is on memory_store.
+        ...(stored.extractionCandidate ? { extractionCandidate: stored.extractionCandidate } : {}),
       };
     }
 
@@ -12152,6 +13111,19 @@ export class MonetCore {
           // A supersession edge stops its source being delivered. Landing one on a rule this store
           // blocks on removes that deny from the mirror without any binding changing.
           if (row.family === "supersession") this.noteRuleTouched(row.src_concept_id);
+          // THE FOURTH DOOR INTO THE DERIVATION FAMILY (review fix — Codex 5-B round 2, R2-1), and
+          // the same trigger the three local ones use (`addLifecycleEdge`, `recordProjectionEdge`,
+          // `ratifySkeletonMembership`). `GateMirrorEntry` carries the parent principle as of slice
+          // 5-B (D4), so a relayed projection or ratification edge landing on an ALREADY-BOUND rule
+          // changes what the mirror would write while nothing about the binding moves — and this
+          // loop's own `supersession` line above could not see that, because it was written when a
+          // derivation edge was mirror-irrelevant. Without it, graftRows' closing
+          // `refreshGateSidecar()` compares an unmoved generation, keeps the PARENTLESS file, and
+          // the offline reader disagrees with the live gate about who a rule descends from.
+          // DESTINATION, not source: derivation runs principle → rule, so the bound rule is `dst`.
+          if (row.family === "derivation" && row.dst_concept_id !== null) {
+            this.noteRuleTouched(row.dst_concept_id);
+          }
         } else skipped.lifecycle_edges++;
       }
       // 8b. GATE SUBSTRATE. Stages first, then the bindings that name them: the reference direction
@@ -15921,6 +16893,21 @@ export class MonetCore {
    * and `rule_previous_circle` (Codex round 10, item 4) are the two fields this receipt STORES
    * rather than points at (see their guarded ALTERs above).
    *
+   * THE TWO 5-B OUTCOMES ARE POINTED AT, NOT STORED (review fix — Codex 5-B round 1, F3), because
+   * both leave a durable row of their own and the receipt is a pointer set by construction:
+   *   `ruleSuccession.impeachedPrincipleIds` ← the impeachment CONTRADICTIONS this correction
+   *     opened, found by the needle their detail carries (`impeachmentCorrectionNeedle`). Never
+   *     re-derived by re-walking the derivation edges: that would answer "who WOULD be impeached
+   *     now", and edges, statuses and verdicts all move afterwards.
+   *   `extractionCandidate` ← the `extraction_candidate` EDGE, which exists only where a rule birth
+   *     flagged one; the receipt's own frozen `near_match_id`/`near_match_score` say which pair and
+   *     at what score. The edge is the existence proof and the receipt is the value, deliberately:
+   *     an edge weight is reinforced by later near-misses (upsertEdge's ON CONFLICT), and a replay
+   *     owes what THIS write reported, not what the pair scores today — the same frozen-not-live
+   *     discipline `ruleSeverity`/`ruleCircle` below already carry.
+   * Neither reads status: a resolved impeachment and a dismissed pair were both still what this
+   * operation produced, and "indistinguishable from the first call" is a claim about the act.
+   *
    * Returns nothing for writes that were not rule writes — which is also what the fresh path
    * returns for them, so the replay matches it.
    */
@@ -15935,12 +16922,41 @@ export class MonetCore {
       | { id: string; src_concept_id: string; dst_concept_id: string }
       | undefined;
     if (edge) {
+      // ROWID ORDER IS INSERTION ORDER, which is the order `propagateImpeachment` walked the parent
+      // edges in — so a replay lists the impeached principles exactly as the fresh call did.
+      const impeachedPrincipleIds = (
+        this.db
+          .prepare(
+            `SELECT concept_id FROM contradictions
+              WHERE kind = 'impeachment' AND instr(detail, ?) > 0 ORDER BY rowid`,
+          )
+          .all(impeachmentCorrectionNeedle(operation.observation_id)) as Array<{ concept_id: string }>
+      ).map((r) => r.concept_id);
       out.ruleSuccession = {
         supersededRuleId: edge.src_concept_id,
         successorRuleId: edge.dst_concept_id,
         supersessionEdgeId: edge.id,
         stageId: getRuleBinding(this.db, edge.dst_concept_id)?.stage_id ?? "",
+        // OMITTED WHEN EMPTY, matching the fresh path's own omit-when-absent shape exactly — a
+        // replay returning `impeachedPrincipleIds: []` where the first call returned nothing would
+        // fail "field for field" on the one field this fix exists for.
+        ...(impeachedPrincipleIds.length > 0 ? { impeachedPrincipleIds } : {}),
       };
+    }
+    // THE EXTRACTION FLAG. `near_match_id` alone is not enough — every fork records one, and only a
+    // fork that ALSO passed flagExtractionCandidate's four conditions produced this field — so the
+    // edge is what distinguishes "near-matched something" from "flagged an extraction candidate".
+    if (operation.near_match_id !== null) {
+      const flagged = this.db
+        .prepare(
+          `SELECT 1 FROM memory_edge
+            WHERE type = 'extraction_candidate'
+              AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?)) LIMIT 1`,
+        )
+        .get(operation.concept_id, operation.near_match_id, operation.near_match_id, operation.concept_id);
+      if (flagged !== undefined) {
+        out.extractionCandidate = { pairedRuleId: operation.near_match_id, score: operation.near_match_score ?? 0 };
+      }
     }
     const previousSeverity = (operation as { rule_previous_severity?: string | null }).rule_previous_severity ?? null;
     // CLOSES THE KNOWN GAP (Codex round 10, item 4) review fix — Codex round 2, item 1 originally
@@ -16205,6 +17221,23 @@ function toContradiction(r: ContradictionRow): Contradiction {
     resolvedAt: r.resolved_at,
     resolvedBy: r.resolved_by,
   };
+}
+
+/**
+ * THE CORRECTION NEEDLE inside an impeachment's `detail` — the substring that says WHICH write
+ * opened it. `propagateImpeachment` writes it; `replayRuleOutcome` reads it back to reconstruct
+ * `ruleSuccession.impeachedPrincipleIds` on a retried operation. Shared for the same reason the
+ * `superseded rule '…'` needle beside it is: a probe searching for a substring the detail does not
+ * actually contain fails silently, and a receipt replay that silently found nothing would report
+ * "this write impeached no principle" — the exact under-disclosure it exists to prevent.
+ *
+ * `contradictions` has no column for the act that opened a bare (observationId-less) contradiction,
+ * and giving one an `observation_id` is refused on purpose — see `propagateImpeachment`'s own NO
+ * `observationId` clause. The detail is therefore where this lives until the substrate grows a
+ * record for it.
+ */
+function impeachmentCorrectionNeedle(correctionObservationId: string): string {
+  return `correction observation '${correctionObservationId}'`;
 }
 
 function firstLine(content: string): string {

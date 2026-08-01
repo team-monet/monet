@@ -2530,6 +2530,23 @@ export interface GateRule {
    * human" — which only works if the gate response carries the parent.
    */
   projectedFromPrincipleId?: string;
+  /**
+   * THE PARENT IS UNDER IMPEACHMENT (slice 5-B) — set only when `projectedFromPrincipleId` names a
+   * principle whose status is `disputed`, omitted otherwise. Never `false`: absence is the ordinary
+   * case, and a field that said `false` on every rule in every fire would be pure resident cost.
+   *
+   * DISCLOSURE ONLY. Delivery, severity and firing are unchanged by it: the rule was born of a
+   * correction or a projection and stands on its own evidence, so a doubtful parent does not
+   * silently withdraw a rule an agent is relying on. What it changes is what the agent knows —
+   * "the rule I am about to follow descends from a principle a human is currently re-ruling on" —
+   * which is exactly the "misfires in front of the human" loop projection's missing approval gate
+   * rests on, extended from the projection itself to its parent.
+   *
+   * LIVE PATH ONLY. `status` is live state, and a frozen copy in the gate mirror would keep
+   * announcing doubt after the human resolved it (or, worse, stay silent after they opened it) —
+   * see `evaluateGateFromMirror`'s own comment.
+   */
+  parentDisputed?: true;
 }
 
 export interface GateStageRef {
@@ -2745,6 +2762,16 @@ interface BindingJoinRow {
   body: string | null;
   created_at: number;
   parent_concept_id: string | null;
+  /**
+   * The parent principle's LIVE status, from the same correlated pick `parent_concept_id` comes
+   * from — null whenever there is no parent (and, defensively, when the edge names a concept this
+   * store has not received: normative rows replicate independently of endpoint liveness).
+   *
+   * Only `'disputed'` means anything to a caller here (see GateRule.parentDisputed); the raw column
+   * is carried rather than a boolean so the mapper does the interpreting in one place, and so a
+   * future status this file has not heard of arrives rather than being flattened away in SQL.
+   */
+  parent_status: string | null;
 }
 
 /**
@@ -2856,7 +2883,23 @@ function rulesForStages(
               -- and one round trip for the whole answer instead of one per delivered rule.
               (SELECT p.src_concept_id FROM lifecycle_edges p
                 WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
-                ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_concept_id
+                ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_concept_id,
+              -- FIRE-TIME DOUBT DISCLOSURE (slice 5-B): is that same parent under impeachment right
+              -- now? A SECOND correlated scalar rather than a join back to concepts, for the reason
+              -- the first one is a scalar — and byte-for-byte the SAME subquery body (family,
+              -- correlation column, ORDER BY, LIMIT), so the status reported can only ever belong
+              -- to the principle whose id is reported beside it. Two subqueries that could drift
+              -- apart would be worse than one join; two that are literally identical except for the
+              -- projected column cannot.
+              --
+              -- NULL when there is no parent, AND when the parent concept does not resolve locally
+              -- (LEFT JOIN, not INNER): a normative edge relays independently of its endpoints, so
+              -- an INNER JOIN here would silently drop parent_status for a rule whose parent has
+              -- not arrived — reporting "not disputed" about a principle this store cannot see.
+              (SELECT pc.status FROM lifecycle_edges p
+                LEFT JOIN concepts pc ON pc.id = p.src_concept_id
+                WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
+                ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_status
          FROM rule_bindings b
          JOIN concepts c ON c.id = b.concept_id
         WHERE b.stage_id IN (${placeholders})
@@ -3024,6 +3067,11 @@ function toGateRule(row: BindingJoinRow): GateRule {
     origin: row.origin,
     stageId: row.stage_id,
     ...(row.parent_concept_id !== null ? { projectedFromPrincipleId: row.parent_concept_id } : {}),
+    // SET ONLY WHEN TRUE, and only alongside a parent — a `parentDisputed` with no
+    // `projectedFromPrincipleId` beside it would be a claim about a principle the response never
+    // names. The two come from one correlated pick, so this pairing holds by construction; the
+    // explicit conjunction says so rather than leaving it to be re-derived from the SQL.
+    ...(row.parent_concept_id !== null && row.parent_status === "disputed" ? { parentDisputed: true as const } : {}),
   };
 }
 
@@ -3768,11 +3816,9 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
 
 /**
  * One live rule as the offline evaluator reads it — the same projection the live gate delivers
- * (see `toGateRule`), minus the parent-principle lookup (no `projectedFromPrincipleId`: that is a
- * correlated join against `lifecycle_edges`, and nothing writes a derivation edge for a rule yet —
- * see `evaluateGateFromMirror`'s own comment for the representation gap this leaves) and minus the
- * body (hook injection is title+reason by budget; a rule's body is the recognized surface's own
- * pull, `stage_lookup`'s alone — see StageLookupRule).
+ * (see `toGateRule`), minus the body (hook injection is title+reason by budget; a rule's body is the
+ * recognized surface's own pull, `stage_lookup`'s alone — see StageLookupRule) and minus
+ * `parentDisputed` (live status, deliberately not frozen — see `evaluateGateFromMirror`).
  *
  * NO `stageName`/`patterns` here: those live once each on the stage's own record (`GateMirrorStage`
  * below) rather than repeated on every rule bound to it — a stage with ten rules used to carry its
@@ -3817,6 +3863,28 @@ export interface GateMirrorEntry {
    * routine filter.
    */
   circle: string;
+  /**
+   * THE PARENT PRINCIPLE (slice 5-B, D4) — closes the parity gap `evaluateGateFromMirror`'s own
+   * comment recorded and assigned to "whichever later slice ships the mirror's projection-aware
+   * write path". Same correlated pick the live path uses (`rulesForStages`), so the offline answer
+   * carries the same "derived from principle P" provenance a live fire announces.
+   *
+   * OPTIONAL, OMIT-WHEN-ABSENT, AND NO FORMAT BUMP. `GATE_MIRROR_FORMAT` is bumped when an entry's
+   * shape change could make a reader answer WRONGLY about whether a rule applies (v2's scope/
+   * modelTag, v4's both-severities widening are both exactly that). This field decides nothing: it
+   * is disclosure carried beside a verdict the reader reaches without it, so a v4 file written
+   * before this slice — with no `projectedFromPrincipleId` on any entry — parses and evaluates
+   * IDENTICALLY under this build, and a v4 file written after it is read correctly by an older
+   * build that simply ignores the key. Bumping would have refused both directions to gain nothing.
+   *
+   * THE COST OF NOT BUMPING, stated rather than left to be discovered: `inspectSidecar` decides
+   * staleness on identity + format + generation, never on content, so an install that upgrades to
+   * this build with a mirror already at the current generation keeps that (parentless) file until
+   * the next gate-relevant write regenerates it. Accepted — the field is disclosure, so a mirror
+   * missing it answers every verdict identically; a format bump would instead have made that same
+   * file REFUSED, taking the whole offline gate down for the sake of an annotation.
+   */
+  projectedFromPrincipleId?: string;
 }
 
 /**
@@ -4298,7 +4366,15 @@ export function listGateMirrorEntries(db: StoragePort): GateMirrorEntry[] {
       // live. Selecting the concept's circle here would silently un-widen breadth in the one place
       // that most needs to carry it: an offline reader with no other source for "this rule is global".
       `SELECT b.concept_id, b.stage_id, b.severity, b.scope, b.model_tag, b.origin, b.reason,
-              c.title, b.circle
+              c.title, b.circle,
+              -- THE SAME CORRELATED PICK THE LIVE PATH USES (slice 5-B, D4) — copied from
+              -- rulesForStages verbatim (family, correlation column, ORDER BY, LIMIT) so the mirror
+              -- and the live gate cannot name different parents for one rule. Deliberately NOT
+              -- accompanied by the parent's STATUS: see evaluateGateFromMirror's own comment for
+              -- why a frozen parentDisputed would lie.
+              (SELECT p.src_concept_id FROM lifecycle_edges p
+                WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
+                ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_concept_id
          FROM rule_bindings b
          JOIN concepts c ON c.id = b.concept_id
          -- INNER JOIN stages, no columns selected from it: a binding whose stage does not exist yet
@@ -4324,7 +4400,7 @@ export function listGateMirrorEntries(db: StoragePort): GateMirrorEntry[] {
     .all() as Array<{
       concept_id: string; stage_id: string; severity: RuleSeverity; scope: RuleScope;
       model_tag: string | null; origin: RuleBindingOrigin; reason: string | null;
-      title: string; circle: string;
+      title: string; circle: string; parent_concept_id: string | null;
     }>;
   return rows.map((row) => ({
     conceptId: row.concept_id,
@@ -4339,6 +4415,9 @@ export function listGateMirrorEntries(db: StoragePort): GateMirrorEntry[] {
     text: row.title,
     origin: row.origin,
     circle: row.circle,
+    // OMITTED, never `null` — the serialized file's own budget discipline, and what makes an older
+    // reader's "key absent" and this build's "no parent" the same thing on disk.
+    ...(row.parent_concept_id !== null ? { projectedFromPrincipleId: row.parent_concept_id } : {}),
   }));
 }
 
@@ -4741,33 +4820,35 @@ export function materializeGateMirror(
  * (severity, created_at, concept_id) restricted to any subset is that subset's own order (see
  * `listGateMirrorEntries`'s own comment for the full argument).
  *
- * ONE DOCUMENTED REPRESENTATION GAP (owed to 4b-C's parity test, not swept under it): a delivered
- * `GateRule.projectedFromPrincipleId` — the parent principle, when a rule was born of one — cannot
- * be reproduced offline. `GateMirrorEntry` carries no parent-principle id (deliverable 1's field
- * list has none), so this evaluator never sets the field, where the live path would if such an
- * edge existed.
+ * THE PARENT-PRINCIPLE GAP IS CLOSED (slice 5-B, D4). Through 5-A this evaluator could not reproduce
+ * `GateRule.projectedFromPrincipleId` at all — `GateMirrorEntry` carried no parent id — and that was
+ * recorded here as a real, reachable divergence the moment `memory_ratify` started writing
+ * derivation edges. `GateMirrorEntry.projectedFromPrincipleId` now carries it, populated by the SAME
+ * correlated pick `rulesForStages` uses, so the offline answer announces the same provenance a live
+ * fire does. `listGateMirrorEntries` is the write path that gap was waiting on; the two entrances
+ * that mint a derivation edge (projection at rule birth, ratification at approve/re-ratify) both
+ * bump the mirror generation, so the file does not sit stale behind an edge that just landed.
  *
- * ACTIVATED, NOT LATENT, as of the skeleton-entrances slice (2026-07-29): the gap above was written
- * when nothing in this codebase wrote a `family: 'derivation'` lifecycle edge for a rule, so the two
- * paths were indistinguishable only because neither one could diverge yet. `memory_ratify`'s
- * approve/re-ratify path now writes exactly that edge (principle → each member rule, `bornOf:
- * 'ratification'`), which means `rulesForStages`' own correlated subquery (this file) — the live
- * path's source for the field — starts returning a parent for an ordinary extraction member the
- * moment its first such edge lands, not only for a genuinely projected rule. The live gate mirror
- * still never carries it, so this evaluator still never sets it: the gap is now a real, reachable
- * divergence between live and offline, not a hypothetical one. Advisory-info-only (the field is
- * disclosure, never a gate-firing input), so nothing is unsafe today — but widening `GateMirrorEntry`
- * to carry it is owed, and belongs to whichever later slice ships the mirror's projection-aware
- * write path, not this one.
+ * ONE REPRESENTATION GAP REMAINS, AND IT IS DELIBERATE, NOT OWED: `GateRule.parentDisputed` (slice
+ * 5-B, D5) is NEVER set offline. Every other field on a mirror entry is a property of an ACT — a
+ * binding, a title, an edge — and acts are append-only, so a frozen copy of one stays true until
+ * something writes another act and regenerates the file. `status` is not an act: a principle goes
+ * disputed the moment a correction impeaches it and returns to active the moment a human mediates,
+ * and neither transition need touch a rule binding. A `parentDisputed` frozen into the mirror would
+ * therefore keep announcing doubt after the human resolved it, or stay silent after they opened it —
+ * a stale flag that LIES rather than merely omits. Omitting is the honest failure: the offline
+ * answer says what the rule is and who it descends from, and stops short of claiming to know the
+ * parent's current standing, which is exactly what a server-unreachable caller cannot know anyway.
+ * This is disclosure-only in both paths, so no verdict, severity or firing decision differs.
  *
- * AND IT REACHES AN AGENT, not only this parity test: `stage_lookup` delivers the field on the wire
- * (see its handler in mcp-server.ts), so an ORDINARY declared or correction-born rule that a human
- * later names in `memory_ratify`'s `memberRuleIds` starts announcing a parent principle to every
- * reading agent — the "derived from principle P" provenance line, now true of extraction members
- * and not only of projections. That is correct as written (the rule genuinely IS derived from that
+ * AND IT REACHES AN AGENT, not only this parity test: `stage_lookup` delivers the parent field on
+ * the wire (see its handler in mcp-server.ts), so an ORDINARY declared or correction-born rule that
+ * a human later names in `memory_ratify`'s `memberRuleIds` announces a parent principle to every
+ * reading agent — the "derived from principle P" provenance line, now true of extraction members and
+ * not only of projections. That is correct as written (the rule genuinely IS derived from that
  * principle, which is what the ratification recorded) and it is why the field's own doc comment says
  * "derived from", never "projected from"; the naming is the only thing that still leans projection-
- * ward, and renaming a shipped wire field belongs with the projection slice that owns it.
+ * ward, and renaming a shipped wire field is not worth a compatibility break on its own.
  */
 export function evaluateGateFromMirror(
   mirror: GateMirror,
@@ -4851,8 +4932,13 @@ function ruleTagIsLive(scope: RuleScope, modelTag: string | null, runtimeModelTa
 /**
  * `evaluateGateFromMirror`'s own `toGateRule` — same shape, same `reasonMissing` predicate
  * (`severity === "blocking" && hasNoReason(reason)`) computed HERE rather than trusted from disk,
- * for the exact reason `GateMirrorEntry` carries no such field (see its own comment). NO
- * `projectedFromPrincipleId` — see `evaluateGateFromMirror`'s own comment for the documented gap.
+ * for the exact reason `GateMirrorEntry` carries no such field (see its own comment).
+ *
+ * `projectedFromPrincipleId` passes through from the entry as of slice 5-B (D4), preserving the
+ * omit-when-absent shape on both sides — an entry from a mirror written before that slice has no
+ * such key, and the rule it produces has no such field, exactly as a parentless rule does. NO
+ * `parentDisputed`, ever: see `evaluateGateFromMirror`'s own comment for why a frozen status flag
+ * would lie rather than merely omit.
  */
 function toGateRuleFromMirrorEntry(entry: GateMirrorEntry): GateRule {
   return {
@@ -4865,5 +4951,8 @@ function toGateRuleFromMirrorEntry(entry: GateMirrorEntry): GateRule {
     modelTag: entry.modelTag,
     origin: entry.origin,
     stageId: entry.stageId,
+    ...(entry.projectedFromPrincipleId !== undefined
+      ? { projectedFromPrincipleId: entry.projectedFromPrincipleId }
+      : {}),
   };
 }

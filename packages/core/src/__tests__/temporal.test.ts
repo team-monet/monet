@@ -753,7 +753,9 @@ describe("8. memory_resolve MCP — contradiction path regression + dismissal pa
       arguments: { conceptAId: a.conceptId, conceptBId: b.conceptId },
     });
     const parsed = parseResult(result as { content: Array<{ type: string; text: string }> });
-    expect(parsed.action).toBe("duplicate-pair-dismissed");
+    // RENAMED from "duplicate-pair-dismissed" (review fix — Codex 5-B round 1, F5): the same call
+    // now retires extraction-candidate flags too, so the action names the pair flags generically.
+    expect(parsed.action).toBe("pair-flags-dismissed");
     expect(parsed.conceptAId).toBe(a.conceptId);
     expect(parsed.conceptBId).toBe(b.conceptId);
 
@@ -1501,7 +1503,7 @@ describe("Fix C — dismissal branch rejects contradiction-path-only fields", ()
 
     expect(result.isError).toBeFalsy();
     const parsed = parseResult(result);
-    expect(parsed.action).toBe("duplicate-pair-dismissed");
+    expect(parsed.action).toBe("pair-flags-dismissed"); // renamed in 5-B review round 1, F5 — see above
 
     const ov = core.overview("default");
     expect(ov.counts.possibleDuplicates).toBe(0);
