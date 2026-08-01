@@ -26,6 +26,7 @@ import {
 } from "./gates";
 import type { SourceAuthorizationContext } from "./source-types";
 import { sanitizeSourceError } from "./source-errors";
+import { MIRROR_STALE_INSTRUCTION } from "./skeleton-mirror";
 import { createSourceScheduler } from "./source-scheduler";
 import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-scheduler";
 
@@ -2298,7 +2299,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleCount` (how many concepts are unconfirmed past the staleness window — pass includeStale:true for the cards themselves, which is a curation pass, not session restore), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules.",
+    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `firstBlock` (BINDING: user-curated governing workflows and preferences — treat every entry as a constraint you MUST satisfy unless a system/developer instruction or an explicit user instruction overrides it; fetch by conceptId for full detail), `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleCount` (how many concepts are unconfirmed past the staleness window — pass includeStale:true for the cards themselves, which is a curation pass, not session restore), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. Skeleton delivery has three states: absence means the standing files you already loaded are current; `mirrorStale` + `instruction` appears only when a standing file diverged and needs user-confirmed reconciliation; `skeleton` appears only for members not covered by a standing file. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules.",
     {
       circle: z.string().optional(),
       includeStale: z
@@ -2340,9 +2341,17 @@ export function registerMonetCoreTools(
       // stageIndex/stageIndexTotal are ALSO pulled out here (review fix, items 1 and 3) rather than
       // left in restState's raw spread — they get their own bounded, honesty-checked replacement
       // below instead of an unbounded original and an un-recomputed raw total.
-      const { staleConcepts, stageIndex: stageIndexFull, stageIndexTotal, ...restState } = state;
+      const {
+        staleConcepts,
+        stageIndex: stageIndexFull,
+        stageIndexTotal,
+        skeleton,
+        mirrorStale,
+        instruction,
+        ...restState
+      } = state;
 
-      const baseContent = {
+      const baseContentWithoutMirrorOrSkeleton = {
         agentId: core.getAgentId(),
         mode: "local",
         circle: resolvedCircle,
@@ -2357,29 +2366,52 @@ export function registerMonetCoreTools(
         ...(advisory !== null ? { curationAttention: advisory } : {}),
         ...(others.length > 0 ? { otherCircles: others } : {}),
       };
+      const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
+      const stageIndexItems = stageIndexFull?.slice(0, STAGE_INDEX_CAP);
+      const stageIndexTrueTotal = stageIndexFull === undefined ? 0 : stageIndexTotal ?? stageIndexFull.length;
+      type AgentContextFit = { mirrorCount: number; stageCount: number; skeletonCount: number };
+      const buildContent = ({ mirrorCount, stageCount, skeletonCount }: AgentContextFit): Record<string, unknown> => {
+        const fittedMirror = mirrorStale?.slice(0, mirrorCount);
+        const mirrorOmitted = mirrorStale === undefined ? 0 : mirrorStale.length - mirrorCount;
+        const fittedStages = stageIndexItems?.slice(0, stageCount);
+        const stageOmitted = stageIndexFull === undefined ? 0 : stageIndexTrueTotal - stageCount;
+        const fittedSkeleton = skeleton?.slice(0, skeletonCount);
+        const skeletonOmitted = skeleton === undefined ? 0 : skeleton.length - skeletonCount;
+        return {
+          ...baseContentWithoutMirrorOrSkeleton,
+          ...(fittedMirror !== undefined ? {
+            mirrorStale: fittedMirror,
+            instruction: instruction ?? MIRROR_STALE_INSTRUCTION,
+            ...(mirrorOmitted > 0 ? { mirrorStaleTruncated: true, mirrorStaleOmitted: mirrorOmitted } : {}),
+          } : {}),
+          ...(fittedStages !== undefined ? {
+            stageIndex: fittedStages,
+            ...(stageOmitted > 0 ? { stageIndexTruncated: true, stageIndexOmitted: stageOmitted } : {}),
+          } : {}),
+          ...(fittedSkeleton !== undefined ? {
+            skeleton: fittedSkeleton,
+            ...(skeletonOmitted > 0 ? { skeletonTruncated: true, skeletonOmitted } : {}),
+          } : {}),
+        };
+      };
 
-      // SIZE-FIT (review fix — Codex named this surface too, the same class as stage_lookup's own
-      // rules/stageIndex blocker): fit against what's ACTUALLY left once everything ELSE in this
-      // payload is accounted for (firstBlock/topConcepts/workstreams can themselves be sizeable),
-      // not a bare fixed count assumed safe in the worst case — stage creation imposes no aggregate
-      // bound on how many stages, or STAGE_NAME_MAX_CHARS-worth of characters, a store can hold.
-      let stageIndexFit: { fitted: string[]; omitted: number } | null = null;
-      if (stageIndexFull !== undefined) {
-        const fit = fitStringArray(baseContent, "stageIndex", stageIndexFull, STAGE_INDEX_CAP, RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length);
-        // HONEST TOTAL (review fix — Codex round 3): `stageIndexTotal`, when present, means
-        // liveStageIndex's OWN retrieval was capped — `stageIndexFull.length` alone would understate
-        // how many live stages truly exist, not just how many the wire chose to show.
-        const stageIndexTrueTotal = stageIndexTotal ?? stageIndexFull.length;
-        stageIndexFit = { fitted: fit.fitted, omitted: stageIndexTrueTotal - fit.fitted.length };
-      }
+      // One builder owns the complete final envelope. Preserve uncovered governing members first,
+      // then stale-path detail, then the stage cue; every candidate includes all three arrays'
+      // zero-item metadata, so no later signal can invalidate an earlier fit.
+      const fit: AgentContextFit = { mirrorCount: 0, stageCount: 0, skeletonCount: 0 };
+      const grow = (key: keyof AgentContextFit, total: number): void => {
+        for (let count = 1; count <= total; count++) {
+          const candidate = { ...fit, [key]: count };
+          if (JSON.stringify(buildContent(candidate), null, 2).length > sizeBudget) break;
+          fit[key] = count;
+        }
+      };
+      grow("skeletonCount", skeleton?.length ?? 0);
+      grow("mirrorCount", mirrorStale?.length ?? 0);
+      grow("stageCount", stageIndexItems?.length ?? 0);
+      const content = buildContent(fit);
 
-      return wrapSuccess(ok({
-        ...baseContent,
-        ...(stageIndexFit ? {
-          stageIndex: stageIndexFit.fitted,
-          ...(stageIndexFit.omitted > 0 ? { stageIndexTruncated: true, stageIndexOmitted: stageIndexFit.omitted } : {}),
-        } : {}),
-      }), { isMutating: false, isCheckpointWithWorkstream: false, toolName: "agent_context" });
+      return wrapSuccess(ok(content), { isMutating: false, isCheckpointWithWorkstream: false, toolName: "agent_context" });
     },
   );
 

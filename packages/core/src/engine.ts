@@ -18,8 +18,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { StoragePort, BetterSqlitePort, StorageExclusiveLockError } from "./storage";
+import { inspectSkeletonMirrors } from "./skeleton-mirror";
 import { SourceRegistry } from "./source-registry";
 import { SourceLedger } from "./source-ledger";
 import type { SourceScheduleBasis } from "./source-ledger";
@@ -1243,6 +1244,34 @@ export interface SkeletonEntry {
   when: number;
 }
 
+/** Full-body skeleton projection for standing-file rendering and freshness hashing. */
+export interface SkeletonBody {
+  conceptId: string;
+  species: "principle" | "preference";
+  body: string;
+  breadth: SkeletonBreadth;
+}
+
+interface SkeletonMemberRow {
+  concept_id: string;
+  kind: string;
+  body: string;
+  breadth: SkeletonBreadth;
+  ratified_by: string | null;
+  ratified_at: number;
+}
+
+function toSkeletonEntry(row: SkeletonMemberRow): SkeletonEntry {
+  return {
+    conceptId: row.concept_id,
+    species: row.kind as "principle" | "preference",
+    content: firstLine(row.body),
+    breadth: row.breadth,
+    ratifiedBy: row.ratified_by,
+    when: row.ratified_at,
+  };
+}
+
 /** Input to ratify() — the human-approval surface (memory_ratify). */
 export interface RatifyInput {
   /** Must name a concept of kind principle|preference in the resolved circle. */
@@ -1433,6 +1462,15 @@ export interface PrewarmState {
    * true total.
    */
   stageIndexTotal?: number;
+  /** Members delivered in-band only for halves without a registered standing surface. */
+  skeleton?: SkeletonEntry[];
+  /** Registered surfaces that diverged from their materialized manifest state. */
+  mirrorStale?: Array<{
+    path: string;
+    reason: "block-missing" | "block-edited" | "store-moved";
+  }>;
+  /** Fixed reconciliation instruction, present exactly when mirrorStale is present. */
+  instruction?: string;
 }
 
 /** A gather result row: a search card plus why it was pulled in (#245, ADR §4.7). */
@@ -1870,6 +1908,8 @@ interface RelatedGraphTarget {
 
 export class MonetCore {
   private db: StoragePort;
+  /** Parent directory of the file-backed SQLite path; null for :memory: and custom storage ports. */
+  private readonly storeHome: string | null;
   private embedder: EmbeddingProvider;
   /** Strict pin-satisfaction loader for ensureEmbedderPin() — see MonetCoreOptions.embedderLoader. */
   private embedderLoader: (modelId: string) => Promise<EmbeddingProvider>;
@@ -1956,6 +1996,7 @@ export class MonetCore {
    * call can share one .monet DB without an immediate SQLITE_BUSY) lives in BetterSqlitePort.
    */
   constructor(db: string | StoragePort = ":memory:", opts: MonetCoreOptions = {}) {
+    this.storeHome = typeof db === "string" && db !== ":memory:" ? dirname(resolve(db)) : null;
     this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
@@ -4362,7 +4403,30 @@ export class MonetCore {
     const rawCircle = circle ?? this.defaultCircle;
     const resolved = this.resolveCircle(rawCircle);
     const sourceProjections = this.authorizedSourceProjections(opts.sourceAuthorizationContext, resolved);
-    return this.prewarmFromSourceProjections(rawCircle, resolved, opts.conceptLimit ?? 7, sourceProjections);
+    const state = this.prewarmFromSourceProjections(rawCircle, resolved, opts.conceptLimit ?? 7, sourceProjections);
+    const skeletonRows = this.skeletonMemberRows(resolved);
+    const skeleton = skeletonRows.map(toSkeletonEntry);
+    const mirror = inspectSkeletonMirrors(
+      this.storeHome,
+      resolved,
+      skeletonRows.map(({ concept_id: conceptId, kind: species, body, breadth }) => ({
+        conceptId,
+        species: species as "principle" | "preference",
+        body,
+        breadth,
+      })),
+      (surfaceCircle) => this.resolveCircle(surfaceCircle),
+    );
+    const inBandSkeleton = skeleton.filter((member) =>
+      member.breadth === "global" ? !mirror.globalCovered : !mirror.localCovered,
+    );
+    return {
+      ...state,
+      ...(inBandSkeleton.length > 0 ? { skeleton: inBandSkeleton } : {}),
+      ...(mirror.mirrorStale !== undefined
+        ? { mirrorStale: mirror.mirrorStale, instruction: mirror.instruction }
+        : {}),
+    };
   }
 
   /** Build prewarm from one caller-frozen authorized source snapshot. */
@@ -10108,6 +10172,26 @@ export class MonetCore {
    * end, which is correct — its membership is only as old as the ruling that granted it.
    */
   skeleton(circle?: string): SkeletonEntry[] {
+    return this.skeletonMemberRows(this.resolveCircle(circle ?? this.defaultCircle)).map(toSkeletonEntry);
+  }
+
+  /**
+   * Full-body, non-touch skeleton read. The monet-client `monet materialize` renderer consumes this
+   * instead of getConcept(), whose usefulness bump would make regeneration mutate ranking; prewarm's
+   * mirror skeletonState hashing consumes the same rows. Membership and order are identical to
+   * skeleton(), and this pure SELECT records no usefulness touch.
+   */
+  skeletonBodies(circle?: string): SkeletonBody[] {
+    return this.skeletonMemberRows(this.resolveCircle(circle ?? this.defaultCircle)).map((row) => ({
+      conceptId: row.concept_id,
+      species: row.kind as "principle" | "preference",
+      body: row.body,
+      breadth: row.breadth,
+    }));
+  }
+
+  /** Shared skeleton derivation for compact delivery and full-body materialization state hashing. */
+  private skeletonMemberRows(resolvedCircle: string): SkeletonMemberRow[] {
     // ACTIVE ONLY (Codex PR #102, round 3, P1) — not merely non-retired. flagContradiction marks a
     // contested concept 'disputed', and a disputed principle must stop governing IMMEDIATELY (the
     // spec's principle-death clause: impeached → drops from delivery → human re-ratifies or
@@ -10119,8 +10203,7 @@ export class MonetCore {
     // the OLD latest approval the moment restore lands, before the instructed follow-up ratify.
     // "Membership is only as fresh as the ruling" needs a ruling-vs-status ordering record that
     // does not exist yet; until it does, restore-then-ratify is instruction, not enforcement.
-    const resolvedCircle = this.resolveCircle(circle ?? this.defaultCircle);
-    const rows = this.db
+    return this.db
       .prepare(
         `SELECT c.id AS concept_id, c.kind AS kind, c.body AS body,
                 c.skeleton_breadth AS breadth,
@@ -10135,18 +10218,7 @@ export class MonetCore {
             AND lr.verdict IN ('approve','re-ratify')
           ORDER BY lr.created_at ASC, c.id ASC`,
       )
-      .all(resolvedCircle) as Array<{
-        concept_id: string; kind: string; body: string; breadth: SkeletonBreadth;
-        ratified_by: string | null; ratified_at: number;
-      }>;
-    return rows.map((row) => ({
-      conceptId: row.concept_id,
-      species: row.kind as "principle" | "preference",
-      content: firstLine(row.body),
-      breadth: row.breadth,
-      ratifiedBy: row.ratified_by,
-      when: row.ratified_at,
-    }));
+      .all(resolvedCircle) as SkeletonMemberRow[];
   }
 
   // ---- gate substrate (stages, rule bindings, firing) -----------------------
