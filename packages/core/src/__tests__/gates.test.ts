@@ -1472,6 +1472,298 @@ describe("5-B: impeachment propagation — doubt travels the parent edge", () =>
     c.close();
   });
 
+  it("a raw correction-born supersession opens one impeachment and stays idempotent without an eventRef", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation.");
+    const incumbent = await c.store("Never force-push to a shared branch.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+    });
+    const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force-with-lease", ...AGENT_RULE },
+    });
+    await c.ratify({
+      candidateId: principle, verdict: "re-ratify", memberRuleIds: [incumbent.conceptId], ratifiedBy: "john",
+    });
+
+    const edge = c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId,
+      bornOf: "correction",
+    });
+    expect((await c.getConcept(principle))!.status).toBe("disputed");
+    expect(c.skeleton("default").map((entry) => entry.conceptId)).not.toContain(principle);
+    const [impeachment] = openImpeachments(c, principle);
+    expect(impeachment!.detail).toContain(`supersession edge '${edge.id}' (no event_ref supplied)`);
+
+    expect(() => c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId,
+      bornOf: "correction",
+    })).toThrow(/is already superseded/);
+    expect(openImpeachments(c, principle)).toHaveLength(1);
+    c.close();
+  });
+
+  it("refuses fact-to-fact supersession before it can impeach a governing principle", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation.");
+    const incumbent = await c.store("The current release points at image A.");
+    const successor = await c.store("The current release points at image B.");
+    c.addLifecycleEdge({
+      family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction",
+    });
+
+    expect(() => c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId,
+      bornOf: "correction",
+    })).toThrow(/supersession requires rule → rule endpoints: source .* has kind 'fact', destination .* has kind 'fact'/);
+    expect(c.getLifecycleEdges(incumbent.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
+    expect(openImpeachments(c, principle)).toEqual([]);
+    expect((await c.getConcept(principle))!.status).toBe("active");
+    expect(c.skeleton("default").map((entry) => entry.conceptId)).toContain(principle);
+    c.close();
+  });
+
+  it("a raw supersession eventRef uses the correction-observation needle shared with store replay", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation.");
+    const incumbent = await c.store("Never force-push to a shared branch.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+    });
+    const successor = await c.store("Force-push is fine on your own branch; never on a shared one.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force-with-lease", ...AGENT_RULE },
+    });
+    c.addLifecycleEdge({
+      family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction",
+    });
+
+    c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId,
+      bornOf: "correction", eventRef: successor.observationId,
+    });
+    const detail = openImpeachments(c, principle)[0]!.detail;
+    expect(detail).toContain(`correction observation '${successor.observationId}'`);
+    // The store replay path reconstructs from this exact shared substring.
+    expect((raw(c).prepare(
+      `SELECT COUNT(*) AS n FROM contradictions WHERE kind = 'impeachment' AND instr(detail, ?) > 0`,
+    ).get(`correction observation '${successor.observationId}'`) as { n: number }).n).toBe(1);
+    c.close();
+  });
+
+  /**
+   * CITE ONLY WHAT IS PROVEN (review fix — PR #112 round 4). The substrate accepts any string as
+   * eventRef, and the impeachment detail is now audit evidence memory_fetch exposes — so a bogus
+   * ref, or a real observation belonging to some OTHER concept, must not be rendered as a
+   * correction observation that never corrected anything. Unproven refs fall back to the honest
+   * supersession-edge wording.
+   */
+  it("does NOT cite an unproven raw eventRef as a correction observation — edge wording instead", async () => {
+    const c = core();
+    const scenarios = [
+      { name: "bogus ref", ref: () => "not-an-observation-id" },
+      // A real observation that belongs to the PRINCIPLE, not the successor rule.
+      { name: "foreign observation", ref: (ids: { principleObs: string }) => ids.principleObs },
+    ] as const;
+    for (const scenario of scenarios) {
+      const principle = await principleOf(c, `Irreversible acts get a confirmation (${scenario.name}).`);
+      const principleObs = (raw(c).prepare(
+        `SELECT id FROM observations WHERE concept_id = ? LIMIT 1`,
+      ).get(principle) as { id: string }).id;
+      const incumbent = await c.store(`Never force-push to a shared branch (${scenario.name}).`, {
+        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, instance: `Bash:${scenario.name}`, ...AGENT_RULE },
+      });
+      const successor = await c.store(`Lease-push instead on shared branches (${scenario.name}).`, {
+        kind: "rule", rule: { stage: `raw guard ${scenario.name}`, instance: `Bash:s-${scenario.name}`, ...AGENT_RULE },
+      });
+      c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
+      c.addLifecycleEdge({
+        family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId,
+        bornOf: "correction", eventRef: scenario.ref({ principleObs }),
+      });
+      const detail = openImpeachments(c, principle)[0]!.detail;
+      expect(detail).not.toContain("correction observation");
+      expect(detail).toContain("supersession edge");
+    }
+    c.close();
+  });
+
+  /**
+   * A LIVE SUCCESSOR, OR NO SUCCESSION (review fix — PR #112 round 5). The store path's successor
+   * is freshly created and always active; the raw writer could nominate a retired or disputed rule,
+   * removing the incumbent from delivery (and impeaching its parent) for a replacement that cannot
+   * fire. Refused, whole write rolled back: no edge, no impeachment, parent untouched.
+   */
+  it("refuses a raw supersession whose successor cannot fire — retired and disputed alike", async () => {
+    const c = core();
+    for (const shape of ["retired", "disputed"] as const) {
+      const principle = await principleOf(c, `Irreversible acts get a confirmation (${shape}).`);
+      const incumbent = await c.store(`Never force-push to a shared branch (${shape}).`, {
+        kind: "rule", rule: { stage: `live successor ${shape}`, instance: `Bash:${shape}`, ...AGENT_RULE },
+      });
+      const successor = await c.store(`Lease-push instead on shared branches (${shape}).`, {
+        kind: "rule", rule: { stage: `live successor ${shape}`, instance: `Bash:s-${shape}`, ...AGENT_RULE },
+      });
+      c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
+      if (shape === "retired") {
+        c.retireConcept(successor.conceptId);
+      } else {
+        // Rules reject flagContradiction directly; the supported route to a disputed advisory rule
+        // is detach carrying an already-open dispute onto it (the same fixture the extraction
+        // read-side test uses — and the exact route the finding named).
+        const contested = await c.store(`A separate evidence packet is contested (${shape}).`, { kind: "fact", resolution: "forceNew" });
+        const conflicting = await c.store(`That packet reads two ways (${shape}).`, { kind: "correction", attachTo: contested.conceptId });
+        c.flagContradiction(contested.conceptId, { observationId: conflicting.observationId, kind: "value-conflict", detail: "contested" });
+        await c.detach(contested.conceptId, [
+          (await c.getConcept(contested.conceptId, { synthesize: false }))!.observations[0]!.id,
+          conflicting.observationId,
+        ], { destConceptId: successor.conceptId });
+        expect((await c.getConcept(successor.conceptId))!.status).toBe("disputed");
+      }
+
+      expect(() => c.addLifecycleEdge({
+        family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId, bornOf: "correction",
+      })).toThrow(/not active: a rule that cannot fire cannot replace/);
+      expect(c.getLifecycleEdges(incumbent.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
+      expect(openImpeachments(c, principle)).toEqual([]);
+      expect((await c.getConcept(principle))!.status).toBe("active");
+    }
+    c.close();
+  });
+
+  /**
+   * AND AT THE SAME GATE (review fix — PR #112 round 6). succeedRule CARRIES the binding onto its
+   * fresh successor; the raw writer records a succession between existing rules, so it validates
+   * instead of performing — an active successor firing only at another stage would leave the
+   * incumbent's gate without the replacement that justifies the removal (and the upward doubt).
+   */
+  it("refuses a raw supersession whose successor stands at a DIFFERENT gate", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation (cross-stage).");
+    const incumbent = await c.store("Never force-push to a shared branch (cross-stage).", {
+      kind: "rule", rule: { stage: "cross-stage gate", instance: "Bash:cross-stage", ...AGENT_RULE },
+    });
+    const elsewhere = await c.store("Snapshot volumes before stateful deletes (cross-stage).", {
+      kind: "rule", rule: { stage: "cross-stage other gate", instance: "Bash:cross-stage-other", ...AGENT_RULE },
+    });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
+
+    expect(() => c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: elsewhere.conceptId, bornOf: "correction",
+    })).toThrow(/does not stand where the incumbent stands/);
+    expect(c.getLifecycleEdges(incumbent.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
+    expect(openImpeachments(c, principle)).toEqual([]);
+    // The incumbent still fires at its own gate — nothing was removed without a replacement.
+    expect(c.gate({ actionContext: "Bash:cross-stage", record: false }).rules.map((r) => r.conceptId)).toContain(incumbent.conceptId);
+    c.close();
+  });
+
+  /**
+   * THE WHOLE DELIVERY ADDRESS, NOT JUST THE STAGE (review fix — PR #112 round 7). Gate delivery
+   * routes on stage AND circle AND scope AND model tag; a domain incumbent "replaced" by one
+   * model's compensation leaves every other model uncovered.
+   */
+  it("refuses a raw supersession whose successor serves a different AUDIENCE at the same gate", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation (audience).");
+    const incumbent = await c.store("Never force-push to a shared branch (audience).", {
+      kind: "rule", rule: { stage: "audience gate", instance: "Bash:audience", scope: "domain" },
+    });
+    const narrower = await c.store("Lease-push instead on shared branches (audience).", {
+      kind: "rule", rule: { stage: "audience gate", instance: "Bash:audience-2", ...AGENT_RULE },
+    });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
+
+    expect(() => c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: narrower.conceptId, bornOf: "correction",
+    })).toThrow(/scope 'domain' vs 'agent'/);
+    expect(c.getLifecycleEdges(incumbent.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
+    expect(openImpeachments(c, principle)).toEqual([]);
+    c.close();
+  });
+
+  /**
+   * A RETIRED INCUMBENT HAS NOTHING TO OVERTURN (review fix — PR #112 round 8). The ordinary
+   * correction path refuses a retired target; the raw writer validated only the successor's side,
+   * so a supersession of a rule that already stopped governing still disputed its live parents.
+   */
+  it("refuses a raw supersession whose incumbent is retired — no doubt from a dead rule", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation (retired incumbent).");
+    const incumbent = await c.store("Never force-push to a shared branch (retired incumbent).", {
+      kind: "rule", rule: { stage: "retired incumbent gate", instance: "Bash:ri", ...AGENT_RULE },
+    });
+    const successor = await c.store("Lease-push instead on shared branches (retired incumbent).", {
+      kind: "rule", rule: { stage: "retired incumbent gate", instance: "Bash:ri-2", ...AGENT_RULE },
+    });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
+    c.retireConcept(incumbent.conceptId);
+
+    expect(() => c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId, bornOf: "correction",
+    })).toThrow(/incumbent .* is 'retired', not active/);
+    expect(openImpeachments(c, principle)).toEqual([]);
+    expect((await c.getConcept(principle))!.status).toBe("active");
+    c.close();
+  });
+
+  /**
+   * AND A DISPUTED INCUMBENT TOO (review fix — PR #112 round 9): gate liveness delivers only
+   * active rules, so a disputed incumbent — reachable through the detach route — was not governing
+   * either; its exit is mediation first, then the ordinary correction.
+   */
+  it("refuses a raw supersession whose incumbent is disputed — mediate first, then correct", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation (disputed incumbent).");
+    const incumbent = await c.store("Never force-push to a shared branch (disputed incumbent).", {
+      kind: "rule", rule: { stage: "disputed incumbent gate", instance: "Bash:di", ...AGENT_RULE },
+    });
+    const successor = await c.store("Lease-push instead on shared branches (disputed incumbent).", {
+      kind: "rule", rule: { stage: "disputed incumbent gate", instance: "Bash:di-2", ...AGENT_RULE },
+    });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: incumbent.conceptId, bornOf: "extraction" });
+    // The supported route to a disputed advisory rule: detach carries an open dispute onto it.
+    const contested = await c.store("A separate evidence packet is contested (di).", { kind: "fact", resolution: "forceNew" });
+    const conflicting = await c.store("That packet reads two ways (di).", { kind: "correction", attachTo: contested.conceptId });
+    c.flagContradiction(contested.conceptId, { observationId: conflicting.observationId, kind: "value-conflict", detail: "contested" });
+    await c.detach(contested.conceptId, [
+      (await c.getConcept(contested.conceptId, { synthesize: false }))!.observations[0]!.id,
+      conflicting.observationId,
+    ], { destConceptId: incumbent.conceptId });
+    expect((await c.getConcept(incumbent.conceptId))!.status).toBe("disputed");
+
+    expect(() => c.addLifecycleEdge({
+      family: "supersession", srcConceptId: incumbent.conceptId, dstConceptId: successor.conceptId, bornOf: "correction",
+    })).toThrow(/incumbent .* is 'disputed', not active/);
+    expect(c.getLifecycleEdges(incumbent.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
+    expect(openImpeachments(c, principle)).toEqual([]);
+    c.close();
+  });
+
+  /**
+   * AND NOT ITSELF ALREADY SUPERSEDED (review fix — PR #112 round 7). A superseded rule keeps
+   * status 'active' by design, but no gate delivers it — the status check alone accepted a
+   * replacement that cannot fire.
+   */
+  it("refuses a raw supersession whose successor is itself already superseded", async () => {
+    const c = core();
+    const principle = await principleOf(c, "Irreversible acts get a confirmation (chained).");
+    const other = await c.store("Never force-push to a shared branch (chained).", {
+      kind: "rule", rule: { stage: "chained gate", instance: "Bash:chained", ...AGENT_RULE },
+    });
+    const dead = await c.store("Lease-push instead on shared branches (chained).", {
+      kind: "rule", rule: { stage: "chained gate", instance: "Bash:chained-2", ...AGENT_RULE },
+    });
+    // Overturn `dead` through the ordinary path: still active, still bound, but no gate delivers it.
+    await c.store("Force-push freely on throwaway spikes (chained).", { kind: "correction", attachTo: dead.conceptId });
+    expect((await c.getConcept(dead.conceptId))!.status).toBe("active");
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: principle, dstConceptId: other.conceptId, bornOf: "extraction" });
+
+    expect(() => c.addLifecycleEdge({
+      family: "supersession", srcConceptId: other.conceptId, dstConceptId: dead.conceptId, bornOf: "correction",
+    })).toThrow(/itself already superseded/);
+    expect(c.getLifecycleEdges(other.conceptId, { direction: "out", family: "supersession" })).toEqual([]);
+    expect(openImpeachments(c, principle)).toEqual([]);
+    c.close();
+  });
+
   it("impeaches through a PROJECTION edge too — 'doubt travels the parent edge, to projected children too'", async () => {
     const c = core();
     const principle = await principleOf(c, "A build artifact is a snapshot — re-materialize after the source changes.");
@@ -1948,6 +2240,57 @@ describe("5-B: the projection write path", () => {
     c.close();
   });
 
+  it("the public raw projection writer enforces the parent, destination, severity, and mirror invariants", async () => {
+    const c = core();
+    const legalParent = await principleOf(c, "Irreversible acts get a confirmation.");
+    const legalRule = await c.store("Confirm the target namespace before deleting a release.", {
+      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+    });
+    const generationBefore = c.sidecarGeneration();
+    c.addLifecycleEdge({
+      family: "derivation", srcConceptId: legalParent, dstConceptId: legalRule.conceptId,
+      bornOf: "projection", eventRef: legalRule.observationId,
+    });
+    expect(c.sidecarGeneration()).toBeGreaterThan(generationBefore);
+    expect(c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0])
+      .toMatchObject({ conceptId: legalRule.conceptId, projectedFromPrincipleId: legalParent });
+
+    const project = (srcConceptId: string, dstConceptId: string) => () => c.addLifecycleEdge({
+      family: "derivation", srcConceptId, dstConceptId, bornOf: "projection",
+    });
+    const preference = await c.declare({ species: "preference", content: "Write as a peer." });
+    if (preference.species !== "preference") throw new Error("unreachable");
+    expect(project(preference.conceptId, legalRule.conceptId))
+      .toThrow(/is kind 'preference', not 'principle': only a principle derives rules downward/);
+
+    const disputed = await principleOf(c, "Prefer the smallest reversible step.");
+    c.flagContradiction(disputed, { kind: "impeachment", detail: "under review" });
+    expect(project(disputed, legalRule.conceptId))
+      .toThrow(/is 'disputed', not active: a contested or retired principle governs nothing/);
+
+    const retiredByVerdict = await principleOf(c, "Nothing waits on scheduled review.");
+    await c.ratify({ candidateId: retiredByVerdict, verdict: "retire", ratifiedBy: "john" });
+    expect(project(retiredByVerdict, legalRule.conceptId))
+      .toThrow(/is not a current skeleton member \(latest verdict 'retire'\)/);
+
+    const neverRatified = await c.store("A candidate principle awaits a ruling.", { kind: "principle" });
+    expect(project(neverRatified.conceptId, legalRule.conceptId))
+      .toThrow(/is not a current skeleton member \(no ratification on record\)/);
+
+    const deny = await c.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"], scope: "domain",
+      content: "Never delete a directory tree unattended.", severity: "blocking",
+      reason: "there is no undo", declaredBy: "john",
+    });
+    if (deny.species !== "rule") throw new Error("unreachable");
+    expect(project(legalParent, deny.conceptId)).toThrow(/cannot be projected onto: it is a blocking rule/);
+
+    const fact = await c.store("SQLite is the storage backend.");
+    expect(project(legalParent, fact.conceptId))
+      .toThrow(/cannot be projection-born: projection births gate rules, but it is kind 'fact'/);
+    c.close();
+  });
+
   it("re-projection is a cache hit: attaching to the existing rule adds no second edge and does not rewrite its binding", async () => {
     // SHIPPING THRESHOLDS: identical evidence must resolve onto the one rule concept, which is
     // exactly what "a projected rule is a cache hit next firing" means at the store.
@@ -2329,6 +2672,78 @@ describe("5-B: extraction-candidate flagging", () => {
     expect(restored.counts.extractionCandidates).toBe(1);
     expect([restored.extractionCandidates[0]!.conceptAId, restored.extractionCandidates[0]!.conceptBId].sort())
       .toEqual([first.conceptId, second.conceptId].sort());
+    c.close();
+  });
+
+  it("stops reporting a pair while either endpoint is disputed, then restores it after mediation", async () => {
+    const c = bandCore();
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    expect(second.extractionCandidate).toMatchObject({ pairedRuleId: first.conceptId });
+    expect(c.overview("default").counts.extractionCandidates).toBe(1);
+
+    // Rules reject flagContradiction directly, but detach can carry an already-open dispute onto an
+    // advisory rule while preserving that rule's pair-flag edges. Exercise that supported route.
+    const disputedEvidence = await c.store("A separate evidence packet is internally contested.", {
+      kind: "fact", resolution: "forceNew",
+    });
+    const correctionEvidence = await c.store("That evidence packet has a conflicting interpretation.", {
+      kind: "correction", attachTo: disputedEvidence.conceptId,
+    });
+    c.flagContradiction(disputedEvidence.conceptId, {
+      observationId: correctionEvidence.observationId, kind: "value-conflict", detail: "the evidence is contested",
+    });
+    await c.detach(disputedEvidence.conceptId, [
+      (await c.getConcept(disputedEvidence.conceptId, { synthesize: false }))!.observations[0]!.id,
+      correctionEvidence.observationId,
+    ], {
+      destConceptId: first.conceptId,
+    });
+    expect((await c.getConcept(first.conceptId))!.status).toBe("disputed");
+    const hidden = c.overview("default");
+    expect(hidden.extractionCandidates).toEqual([]);
+    expect(hidden.counts.extractionCandidates).toBe(0);
+
+    const movedContradictions = raw(c).prepare(
+      `SELECT id FROM contradictions WHERE concept_id = ? AND status = 'open'`,
+    ).all(first.conceptId) as Array<{ id: string }>;
+    expect(movedContradictions.length).toBeGreaterThan(0);
+    for (const moved of movedContradictions) {
+      c.resolveContradiction(moved.id, { decision: "dismiss", by: "john" });
+    }
+    expect((await c.getConcept(first.conceptId))!.status).toBe("active");
+    expect((await c.getConcept(second.conceptId))!.status).toBe("active");
+    expect(edgeTypesBetween(c, first.conceptId, second.conceptId)).toContain("extraction_candidate");
+    expect(c.ruleBinding(first.conceptId)!.stage_id).not.toBe(c.ruleBinding(second.conceptId)!.stage_id);
+    const restored = c.overview("default");
+    expect(restored.extractionCandidates).toHaveLength(1);
+    expect(restored.counts.extractionCandidates).toBe(1);
+    c.close();
+  });
+
+  it("refuses to flag a new pair when the near-match rule is already disputed", async () => {
+    const c = bandCore();
+    const first = await ruleAt(c, "Verify the built artifact after the source changes.", "docker build", "Bash:docker build .");
+    const disputedEvidence = await c.store("A separate evidence packet is internally contested.", {
+      kind: "fact", resolution: "forceNew",
+    });
+    const correctionEvidence = await c.store("That evidence packet has a conflicting interpretation.", {
+      kind: "correction", attachTo: disputedEvidence.conceptId,
+    });
+    c.flagContradiction(disputedEvidence.conceptId, {
+      observationId: correctionEvidence.observationId, kind: "value-conflict", detail: "the evidence is contested",
+    });
+    await c.detach(disputedEvidence.conceptId, [
+      (await c.getConcept(disputedEvidence.conceptId, { synthesize: false }))!.observations[0]!.id,
+      correctionEvidence.observationId,
+    ], {
+      destConceptId: first.conceptId,
+    });
+    expect((await c.getConcept(first.conceptId))!.status).toBe("disputed");
+    const second = await ruleAt(c, "After the source changes, verify the artifact itself.", "npm install", "Bash:npm install");
+    expect(second.nearMatchId).toBe(first.conceptId);
+    expect(second.extractionCandidate).toBeUndefined();
+    expect(c.overview("default").counts.extractionCandidates).toBe(0);
     c.close();
   });
 
@@ -2988,6 +3403,121 @@ describe("5-B: fire-time doubt disclosure", () => {
     expect(c.stageLookup({ stage: "helm delete" }).rules[0]).toMatchObject({
       conceptId: projected.conceptId, parentDisputed: true,
     });
+    c.close();
+  });
+
+  it("keeps the earliest display parent but discloses when a later derivation parent is disputed", async () => {
+    const c = core();
+    const earliest = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
+    const later = await c.declare({ species: "principle", content: "Risk belongs with the actor who can reverse it." });
+    if (earliest.species !== "principle" || later.species !== "principle") throw new Error("unreachable");
+    const shared = await c.store("Confirm the target namespace before deleting a release.", {
+      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+    });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: earliest.conceptId, dstConceptId: shared.conceptId, bornOf: "extraction" });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: later.conceptId, dstConceptId: shared.conceptId, bornOf: "extraction" });
+    const laterSibling = await c.store("Snapshot the volume before deleting a stateful set.", {
+      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain" },
+    });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: later.conceptId, dstConceptId: laterSibling.conceptId, bornOf: "extraction" });
+
+    await c.store("Snapshot the volume AND drain the node before deleting a stateful set.", {
+      kind: "correction", attachTo: laterSibling.conceptId,
+    });
+    expect((await c.getConcept(earliest.conceptId))!.status).toBe("active");
+    expect((await c.getConcept(later.conceptId))!.status).toBe("disputed");
+    const firing = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    expect(firing.projectedFromPrincipleId).toBe(earliest.conceptId);
+    expect(firing.parentDisputed).toBe(true);
+    // THE PATH SPLIT (PR #112 round 8): the mechanical gate carries the flag alone — the hook
+    // renders title + reason and never these ids, so the hot path pays no identity aggregation.
+    expect(firing.disputedParentIds).toBeUndefined();
+    // The recovery path the flag advertises (PR #112 round 2): WHICH parent, not just "one of
+    // them" — delivered where the recovery lives, on the budget-fitted lookup path.
+    const looked = c.stageLookup({ stage: "helm delete" }).rules[0]!;
+    expect(looked.parentDisputed).toBe(true);
+    expect(looked.disputedParentIds).toEqual([later.conceptId]);
+
+    const impeachmentId = (raw(c).prepare(
+      `SELECT id FROM contradictions WHERE concept_id = ? AND kind = 'impeachment' AND status = 'open'`,
+    ).get(later.conceptId) as { id: string }).id;
+    c.resolveContradiction(impeachmentId, { decision: "dismiss", by: "john" });
+    const mediated = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    expect(mediated.projectedFromPrincipleId).toBe(earliest.conceptId);
+    expect(mediated.parentDisputed).toBeUndefined();
+    expect(mediated.disputedParentIds).toBeUndefined();
+    c.close();
+  });
+
+  /**
+   * A SETTLED PARENT IS NOT A PENDING MEDIATION (review fix — PR #112 round 5), two halves:
+   * `reject` now closes open impeachments exactly as `retire` does (it ends membership by
+   * latest-wins and is reachable on a disputed candidate), and the disclosure's read side is
+   * membership-restricted like the impeachment write side — so a parent disputed over a plain
+   * value-conflict whose latest verdict is `reject` stops appearing in `disputedParentIds` even
+   * though its concept status is still disputed.
+   */
+  it("drops a REJECTED parent from the disclosure — reject closes impeachments and ends membership", async () => {
+    const c = core();
+    const parent = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
+    if (parent.species !== "principle") throw new Error("unreachable");
+    const child = await c.store("Confirm the target namespace before deleting a release.", {
+      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain", projectedFromPrincipleId: parent.conceptId },
+    });
+    // Half 1: an impeachment answered by REJECT closes, and the projection recomputes to active.
+    const sibling = await c.store("Snapshot the volume before deleting a stateful set.", {
+      kind: "rule", rule: { stage: "kubectl delete", instance: "Bash:kubectl delete sts x", scope: "domain", projectedFromPrincipleId: parent.conceptId },
+    });
+    await c.store("Snapshot AND drain before deleting a stateful set.", { kind: "correction", attachTo: sibling.conceptId });
+    expect((await c.getConcept(parent.conceptId))!.status).toBe("disputed");
+    const rejected = await c.ratify({ candidateId: parent.conceptId, verdict: "reject", ratifiedBy: "john" });
+    expect(rejected.impeachmentsClosed).toBe(1);
+    expect((await c.getConcept(parent.conceptId))!.status).toBe("active");
+    const afterReject = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    expect(afterReject.conceptId).toBe(child.conceptId);
+    expect(afterReject.parentDisputed).toBeUndefined();
+
+    // Half 2: a parent still DISPUTED (ordinary value-conflict) whose latest verdict is reject is
+    // a settled membership question — the read side must not direct anyone to mediate it as doubt.
+    c.flagContradiction(parent.conceptId, { detail: "content dispute, not an impeachment" });
+    expect((await c.getConcept(parent.conceptId))!.status).toBe("disputed");
+    const stillSettled = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    expect(stillSettled.parentDisputed).toBeUndefined();
+    expect(stillSettled.disputedParentIds).toBeUndefined();
+    c.close();
+  });
+
+  /**
+   * BOUNDED ON THE HOT PATH (review fix — PR #112 round 5): the disputed-parents scalar rides the
+   * mechanical gate, derivation rows are append-only with no per-rule cap, so the aggregation
+   * fetches at most DISPUTED_PARENTS_CAP + 1 ids and the mapper delivers the cap plus a
+   * truncation signal.
+   */
+  it("caps disputedParentIds and signals truncation past the cap", async () => {
+    const c = core();
+    const child = await c.store("Confirm the target namespace before deleting a release.", {
+      kind: "rule", rule: { stage: "helm delete", instance: "Bash:helm delete my-release", scope: "domain" },
+    });
+    const parents: string[] = [];
+    for (let i = 0; i < 9; i++) {
+      const p = await c.declare({ species: "principle", content: `Distinct governing principle number ${i} about irreversible acts.` });
+      if (p.species !== "principle") throw new Error("unreachable");
+      c.addLifecycleEdge({ family: "derivation", srcConceptId: p.conceptId, dstConceptId: child.conceptId, bornOf: "extraction" });
+      c.flagContradiction(p.conceptId, { kind: "impeachment", detail: `impeachment evidence for parent ${i}` });
+      parents.push(p.conceptId);
+    }
+    // The mechanical gate carries the flag alone (PR #112 round 8's path split)…
+    const firing = c.gate({ actionContext: "Bash:helm delete my-release", record: false }).rules[0]!;
+    expect(firing.parentDisputed).toBe(true);
+    expect(firing.disputedParentIds).toBeUndefined();
+    // …and the lookup path pays for — and caps — the identity aggregation.
+    const looked = c.stageLookup({ stage: "helm delete" }).rules[0]!;
+    expect(looked.parentDisputed).toBe(true);
+    expect(looked.disputedParentIds).toHaveLength(8);
+    expect(looked.disputedParentsTruncated).toBe(true);
+    // DETERMINISTIC PREFIX (PR #112 round 7, P3): the capped subset is the lexically-smallest ids,
+    // not an insert-order accident — two replicas holding the same edges disclose the same parents.
+    expect(looked.disputedParentIds).toEqual([...parents].sort().slice(0, 8));
     c.close();
   });
 
@@ -11512,9 +12042,22 @@ describe("MCP surface", () => {
     c.close();
   });
 
-  it("announces a disputed parent principle on stage_lookup, and omits the key when the parent is fine (5-B)", async () => {
+  it("announces a disputed parent principle on stage_lookup, and documents its any-parent meaning (5-B)", async () => {
     const c = core();
     const { call, client } = await harness(c, { modelTag: "m1" });
+    const { tools } = await client.listTools();
+    const lookupDescription = tools.find((tool) => tool.name === "stage_lookup")!.description;
+    expect(lookupDescription).toContain("one of this rule's derivation parents is currently disputed");
+    // PR #112 round 2: the advertised recovery step must be one an MCP caller can actually take —
+    // the ids are carried, not a pointer at an engine-only edge read.
+    expect(lookupDescription).toContain("disputedParentIds names exactly which");
+    expect(lookupDescription).toContain(
+      "projectedFromPrincipleId is the earliest/display parent, not necessarily a disputed one",
+    );
+    // PR #112 round 10: the fetch tool's own contract names the exact resolver call shape — an
+    // ambiguous "id" failed memory_resolve's schema before the corrected response note was ever read.
+    expect(tools.find((tool) => tool.name === "memory_fetch")!.description)
+      .toContain("memory_resolve({ contradictionId: openContradictions[i].id })");
     const principle = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (principle.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
@@ -11542,7 +12085,58 @@ describe("MCP surface", () => {
     const after = await call("stage_lookup", { stage: "helm delete" });
     expect((after.json.rules as Array<Record<string, unknown>>)[0]).toMatchObject({
       conceptId: projected.conceptId, projectedFromPrincipleId: principle.conceptId, parentDisputed: true,
+      disputedParentIds: [principle.conceptId],
     });
+
+    // THE FULL ADVERTISED RECOVERY LOOP, END TO END (PR #112 round 3): the flag names the parent,
+    // fetching the parent shows the dispute AND the contradiction id, and mediating that id clears
+    // the flag. Every hop is an MCP call — no engine-only read anywhere on the path.
+    const fetched = await call("memory_fetch", { id: principle.conceptId });
+    expect(fetched.json.status).toBe("disputed");
+    const open = fetched.json.openContradictions as Array<{ id: string; kind: string; detail: string }>;
+    expect(open).toHaveLength(1);
+    expect(open[0]!.kind).toBe("impeachment");
+    const mediated = await call("memory_resolve", { contradictionId: open[0]!.id, decision: "dismiss", resolvedBy: "john" });
+    expect(mediated.json.status).toBe("active");
+    const cleared = await call("stage_lookup", { stage: "helm delete" });
+    const clearedRule = (cleared.json.rules as Array<Record<string, unknown>>)[0]!;
+    expect(Object.keys(clearedRule)).not.toContain("parentDisputed");
+    expect(Object.keys(clearedRule)).not.toContain("disputedParentIds");
+    // And a clean concept's fetch carries neither key — the common case pays nothing.
+    const clean = await call("memory_fetch", { id: principle.conceptId });
+    expect(Object.keys(clean.json)).not.toContain("status");
+    expect(Object.keys(clean.json)).not.toContain("openContradictions");
+    await client.close();
+    c.close();
+  });
+
+  it("caps fetched open contradictions and discloses the omitted count (PR #112 round 4)", async () => {
+    const c = core();
+    const { call, client } = await harness(c, { modelTag: "m1" });
+    const principle = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
+    if (principle.species !== "principle") throw new Error("unreachable");
+    // One impeachment per corrected child is the accumulation shape the cap exists for; direct
+    // flags with distinct details reproduce it without seven corrected rules of fixture.
+    for (let i = 0; i < 7; i++) {
+      c.flagContradiction(principle.conceptId, { kind: "impeachment", detail: `impeachment evidence #${i}` });
+    }
+    const fetched = await call("memory_fetch", { id: principle.conceptId });
+    expect(fetched.json.status).toBe("disputed");
+    expect(fetched.json.openContradictions as unknown[]).toHaveLength(5);
+    expect(fetched.json.openContradictionsOmitted).toBe(2);
+    // The note names the EXACT parameter (PR #112 round 8): "id" is ambiguous against the
+    // concept's own, and memory_resolve accepts only contradictionId.
+    expect(fetched.json.contradictionsNote).toContain("contradictionId");
+
+    // TIE-BREAK (PR #112 round 8, P3): with every row landing in the same millisecond — rapid
+    // corrections or sync — the page must still be one deterministic subset on every replica.
+    raw(c).prepare(`UPDATE contradictions SET detected_at = 1234567890 WHERE concept_id = ?`).run(principle.conceptId);
+    const allIds = (raw(c).prepare(
+      `SELECT id FROM contradictions WHERE concept_id = ? AND status = 'open'`,
+    ).all(principle.conceptId) as Array<{ id: string }>).map((r) => r.id);
+    const tied = await call("memory_fetch", { id: principle.conceptId });
+    expect((tied.json.openContradictions as Array<{ id: string }>).map((k) => k.id))
+      .toEqual([...allIds].sort().reverse().slice(0, 5));
     await client.close();
     c.close();
   });

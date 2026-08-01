@@ -3780,13 +3780,7 @@ export class MonetCore {
           // legal fails wholesale rather than succeeding as something other than what was requested.
           // The throw aborts this transaction, taking the observation with it.
           if (ruleBindingChange.severity === "blocking") {
-            throw new Error(
-              `rule '${row.id}' cannot be projected onto: it is a blocking rule, and blocking severity is ` +
-                `declaration-only — a projection edge on it would mint a rule that is both blocking and ` +
-                `projection-born, which no path may create (no agent, and no projection, can self-assign ` +
-                `deny power). Store this evidence without rule.projectedFromPrincipleId, or project onto ` +
-                `an advisory rule.`,
-            );
+            throw new Error(projectionBlockingDestinationError(row.id));
           }
           this.recordProjectionEdge(opts.rule.projectedFromPrincipleId, row.id, obsId);
         }
@@ -4842,9 +4836,43 @@ export class MonetCore {
         `SELECT k.id AS id, k.concept_id AS conceptId, c.title AS conceptTitle, k.kind AS kind, k.detail AS detail
            FROM contradictions k JOIN concepts c ON c.id = k.concept_id
           WHERE k.status = 'open' AND c.circle = ? AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL
-          ORDER BY k.detected_at DESC`,
+          ORDER BY k.detected_at DESC, k.id DESC`,
       )
       .all(circle) as PrewarmContradiction[];
+  }
+
+  /**
+   * The open contradictions on ONE concept (review fix — PR #112 round 3). A fetched concept that
+   * is disputed must be able to SHOW its dispute: `memory_fetch` is the advertised recovery step
+   * for a doubt disclosure (`disputedParentIds` → fetch the parent), and a response that hides the
+   * open contradiction — including the id `memory_resolve` needs — made that step a dead end.
+   * Same projection as the circle-wide prewarm read above, keyed by concept instead.
+   */
+  getOpenContradictionsForConcept(conceptId: string, limit?: number): PrewarmContradiction[] {
+    return this.db
+      .prepare(
+        `SELECT k.id AS id, k.concept_id AS conceptId, c.title AS conceptTitle, k.kind AS kind, k.detail AS detail
+           FROM contradictions k JOIN concepts c ON c.id = k.concept_id
+          WHERE k.status = 'open' AND k.concept_id = ?
+          -- id as the tiebreak (review fix — PR #112 round 8, P3): rapid corrections and sync can
+          -- land several rows in one millisecond, and memory_fetch slices the first page — without
+          -- a stable secondary order, replicas could expose different subsets of the same rows.
+          ORDER BY k.detected_at DESC, k.id DESC
+          ${limit !== undefined ? "LIMIT ?" : ""}`,
+      )
+      .all(...(limit !== undefined ? [conceptId, limit] : [conceptId])) as PrewarmContradiction[];
+  }
+
+  /**
+   * Exact open count for one concept, paid only when the capped fetch's probe row proved more
+   * exist (review fix — PR #112 round 9) — the same rare-case-COUNT shape stage_lookup's
+   * rulesTotal uses. Without the SQL-side LIMIT above, a heavily contested concept materialized
+   * every detail row on each fetch just to be sliced to a page downstream.
+   */
+  countOpenContradictionsForConcept(conceptId: string): number {
+    return (this.db
+      .prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE status = 'open' AND concept_id = ?`)
+      .get(conceptId) as { n: number }).n;
   }
 
   /** Active concepts unconfirmed past staleAfterMs (ADR §4.4) — detectable + surfaced at prewarm. */
@@ -6951,6 +6979,11 @@ export class MonetCore {
    * AND THE NOT-SUPERSEDED CONDITION (review fix — Codex 5-B round 5, R5-1):
    * `EXTRACTION_PAIR_NOT_SUPERSEDED` below, third of the set — see that constant for why a
    * superseded endpoint, though deliberately still `active`, cannot evidence breadth.
+   *
+   * BOTH ENDPOINTS MUST ALSO BE ACTIVE. The gate's own liveness predicate excludes disputed rules,
+   * so a pair cannot propose a principle while either endpoint currently fires nowhere. Like stage,
+   * projection-bornness and supersession, status can move after the flag lands; the edge remains the
+   * honest historical record and the report returns if mediation restores both endpoints to active.
    */
   private getExtractionCandidatePairs(circle: string): PossibleDuplicatePair[] {
     return this.db
@@ -6965,8 +6998,8 @@ export class MonetCore {
           WHERE e.scope = ? AND e.type = 'extraction_candidate'
             AND e.dismissed_at IS NULL
             AND e.src_id < e.dst_id
-            AND ca.kind NOT IN ('workstream', 'source') AND ca.source_identity IS NULL AND ca.active_observation_id IS NULL AND ca.status != 'retired'
-            AND cb.kind NOT IN ('workstream', 'source') AND cb.source_identity IS NULL AND cb.active_observation_id IS NULL AND cb.status != 'retired'
+            AND ca.kind NOT IN ('workstream', 'source') AND ca.source_identity IS NULL AND ca.active_observation_id IS NULL AND ca.status = 'active'
+            AND cb.kind NOT IN ('workstream', 'source') AND cb.source_identity IS NULL AND cb.active_observation_id IS NULL AND cb.status = 'active'
             ${EXTRACTION_PAIR_NOT_PROJECTION_BORN}
             ${EXTRACTION_PAIR_NOT_SUPERSEDED}
           ORDER BY e.weight DESC
@@ -6985,8 +7018,8 @@ export class MonetCore {
          WHERE e.scope = ? AND e.type = 'extraction_candidate'
            AND e.dismissed_at IS NULL
            AND e.src_id < e.dst_id
-           AND ca.kind NOT IN ('workstream', 'source') AND ca.source_identity IS NULL AND ca.active_observation_id IS NULL AND ca.status != 'retired'
-           AND cb.kind NOT IN ('workstream', 'source') AND cb.source_identity IS NULL AND cb.active_observation_id IS NULL AND cb.status != 'retired'
+           AND ca.kind NOT IN ('workstream', 'source') AND ca.source_identity IS NULL AND ca.active_observation_id IS NULL AND ca.status = 'active'
+           AND cb.kind NOT IN ('workstream', 'source') AND cb.source_identity IS NULL AND cb.active_observation_id IS NULL AND cb.status = 'active'
            ${EXTRACTION_PAIR_NOT_PROJECTION_BORN}
            ${EXTRACTION_PAIR_NOT_SUPERSEDED}`,
       )
@@ -9475,6 +9508,128 @@ export class MonetCore {
         assertBlockingRuleMutationAllowed(this.db, input.srcConceptId, "supersession");
       }
       const written = addLifecycleEdge(this.lifecycleEdgeDeps(), input);
+
+      // SUPERSESSION'S PUBLIC CONTRACT IS RULE → RULE. The substrate is intentionally generic: it
+      // validates endpoint existence, governability and circle agreement, but a fact can satisfy all
+      // three. Refuse that shape here, at the public engine seam, before correction-born propagation
+      // can mistake an ordinary fact replacement for an overturned governing rule. Validate after the
+      // substrate write so its generic endpoint errors remain authoritative; this transaction rolls the
+      // temporary row back on refusal. Graft stays structural: a peer's row relays regardless, through
+      // graftRows' separate raw loop rather than this public writer.
+      let supersessionEndpoints: { incumbent: ConceptRow; successor: ConceptRow } | undefined;
+      if (written.family === "supersession" && written.dst_concept_id !== null) {
+        const incumbent = this.getRow(written.src_concept_id)!;
+        const successor = this.getRow(written.dst_concept_id)!;
+        if (incumbent.kind !== "rule" || successor.kind !== "rule") {
+          throw new Error(
+            `supersession requires rule → rule endpoints: source '${incumbent.id}' has kind ` +
+              `'${incumbent.kind}', destination '${successor.id}' has kind '${successor.kind}'`,
+          );
+        }
+        // A LIVE SUCCESSOR, OR NO SUCCESSION (review fix — PR #112 round 5). Superseding removes
+        // the incumbent from gate delivery on the strength of a replacement standing at the gate;
+        // a retired or disputed successor cannot fire, so committing the edge would leave the
+        // stage without the very replacement that justified the removal — and then cast doubt on
+        // the parent for an overturning nothing replaced. The store path cannot produce this (its
+        // successor is freshly created, always active); the raw writer is held to the same state.
+        if (successor.status !== "active") {
+          throw new Error(
+            `supersession successor '${successor.id}' is '${successor.status}', not active: a rule ` +
+              `that cannot fire cannot replace the one being overturned.`,
+          );
+        }
+        // AN INACTIVE INCUMBENT HAS NOTHING TO OVERTURN (review fixes — PR #112 rounds 8 and 9).
+        // Gate liveness delivers only active rules, so a retired incumbent — or a DISPUTED one,
+        // reachable through the detach path that carries an open contradiction onto an advisory
+        // rule — was not governing anything; superseding it would still have disputed its live
+        // parents over a rule no gate was firing. Symmetric with the successor's own active
+        // check below. A disputed rule's exit is mediation first (memory_resolve), then the
+        // ordinary correction.
+        if (incumbent.status !== "active") {
+          throw new Error(
+            `supersession incumbent '${incumbent.id}' is '${incumbent.status}', not active: a rule ` +
+              `no gate delivers cannot be overturned, and its parents carry no doubt from its replacement.`,
+          );
+        }
+        // AND NOT ITSELF ALREADY SUPERSEDED (review fix — PR #112 round 7). A superseded rule
+        // deliberately keeps status 'active', but RULE_LIVENESS_WHERE excludes it from every gate —
+        // the status check alone accepted a replacement no gate will ever deliver.
+        if (this.isSuperseded(successor.id)) {
+          throw new Error(
+            `supersession successor '${successor.id}' is itself already superseded: a rule no gate ` +
+              `delivers cannot replace the one being overturned.`,
+          );
+        }
+        // AND AT THE SAME GATE, FOR THE SAME AUDIENCE (review fixes — PR #112 rounds 6 and 7).
+        // succeedRule CARRIES the incumbent's binding onto its freshly-created successor; the raw
+        // writer records a succession between rules that already exist, so it validates instead of
+        // performing. Gate delivery routes on stage AND circle AND scope AND model tag
+        // (RULE_LIVENESS_WHERE), so all four must match — a breadth incumbent replaced by a local
+        // successor, or a domain rule by one model's compensation, would remove the incumbent for
+        // audiences its "replacement" never reaches. An unbound incumbent guards nothing, so it
+        // constrains nothing.
+        const incumbentBinding = getRuleBinding(this.db, incumbent.id);
+        if (incumbentBinding) {
+          const successorBinding = getRuleBinding(this.db, successor.id);
+          const mismatches: string[] = [];
+          if (!successorBinding) {
+            mismatches.push("no binding");
+          } else {
+            if (successorBinding.stage_id !== incumbentBinding.stage_id) mismatches.push(`stage '${incumbentBinding.stage_id}' vs '${successorBinding.stage_id}'`);
+            if (successorBinding.circle !== incumbentBinding.circle) mismatches.push(`circle '${incumbentBinding.circle}' vs '${successorBinding.circle}'`);
+            if (successorBinding.scope !== incumbentBinding.scope) mismatches.push(`scope '${incumbentBinding.scope}' vs '${successorBinding.scope}'`);
+            if ((successorBinding.model_tag ?? null) !== (incumbentBinding.model_tag ?? null)) mismatches.push(`model tag '${incumbentBinding.model_tag ?? "none"}' vs '${successorBinding.model_tag ?? "none"}'`);
+          }
+          if (mismatches.length > 0) {
+            throw new Error(
+              `supersession successor '${successor.id}' does not stand where the incumbent stands ` +
+                `(${mismatches.join("; ")}): record the succession through memory_store ` +
+                `kind="correction", which carries the binding across, or bind the successor to the ` +
+                `incumbent's full delivery address first.`,
+            );
+          }
+        }
+        supersessionEndpoints = { incumbent, successor };
+      }
+
+      // THE ENGINE SEAM OWNS PROJECTION'S ENGINE-LEVEL INVARIANTS. lifecycle-edges.ts is deliberately
+      // engine-free: it can validate endpoint existence, governability and circle agreement, but it
+      // does not own live skeleton membership or rule bindings. This public wrapper is the shared
+      // entrance where those reads and `this` context coexist. Validate after the substrate row lands
+      // so its generic shape/endpoint errors stay authoritative; any refusal still rolls that row back
+      // inside this transaction.
+      if (written.family === "derivation" && written.born_of === "projection" && written.dst_concept_id !== null) {
+        this.validateProjectionParent(written.src_concept_id, written.circle);
+        this.validateProjectionDestination(written.dst_concept_id);
+      }
+
+      // A correction-born supersession written through the supported raw API is no less real an
+      // overturning than succeedRule's store path. Route it through the SAME propagation choke point,
+      // after the edge exists as evidence and inside this method's transaction. Graft remains outside
+      // this method and deliberately structural; its raw lifecycle INSERT loop is unchanged.
+      if (written.family === "supersession" && written.born_of === "correction" && supersessionEndpoints) {
+        // CITE ONLY WHAT IS PROVEN (review fix — PR #112 round 4). The substrate accepts any string
+        // as eventRef, but the impeachment detail renders it as a real correction observation — the
+        // exact substring replay reconstruction matches on — and memory_fetch now exposes that
+        // detail as audit evidence. On the store path succeedRule passes an observation it just
+        // wrote onto the successor, so the raw path is held to the same provenance: an eventRef
+        // that does not name an observation ON THE SUCCESSOR falls back to the supersession-edge
+        // wording rather than minting an auditable-looking citation of nothing.
+        const provenRef =
+          written.event_ref !== null &&
+          this.db
+            .prepare(`SELECT 1 FROM observations WHERE id = ? AND concept_id = ?`)
+            .get(written.event_ref, supersessionEndpoints.successor.id) !== undefined
+            ? written.event_ref
+            : null;
+        this.propagateImpeachment(
+          supersessionEndpoints.incumbent,
+          supersessionEndpoints.successor,
+          provenRef,
+          written.id,
+        );
+      }
+
       // Superseding a rule ends its delivery, so doing it to a rule whose deny was already
       // withdrawn still changes the mirror.
       if (written.family === "supersession") this.noteRuleTouched(written.src_concept_id);
@@ -9854,7 +10009,13 @@ export class MonetCore {
    * Returns how many rows closed, for disclosure.
    */
   private closeImpeachments(conceptId: string, resolvedBy: string | null, verdict: RatificationVerdict): number {
-    if (verdict !== "approve" && verdict !== "re-ratify" && verdict !== "retire") return 0;
+    // EVERY verdict closes (review fix — PR #112 round 5): `reject` ends membership by latest-wins
+    // exactly as `retire` does, and it is reachable on a disputed candidate (the 5-A guard refuses
+    // only entry verdicts there) — so excluding it left the same open-forever impeachment noise the
+    // retire closure was added to end, and kept the settled principle in `disputedParentIds`.
+    // The vocabulary is a closed set of four, all now closing; the guard stays as a typed gate
+    // should the vocabulary ever widen.
+    if (verdict !== "approve" && verdict !== "re-ratify" && verdict !== "retire" && verdict !== "reject") return 0;
     return this.db.transaction((): number => {
       const nowMs = Date.now();
       const closed = this.db
@@ -10127,7 +10288,7 @@ export class MonetCore {
    * duplicate is. The battery stays a conversation and the approval stays memory_ratify, because
    * "approving skeleton entry is approving a permanent always-on tax."
    *
-   * FOUR CONDITIONS, each one a clause of the design's own breadth precondition:
+   * FIVE CONDITIONS, each one a clause of the design's own breadth precondition and gate liveness:
    *
    *   BOTH ARE RULES — a principle is extracted from RULES that share a reason. A rule near-matching
    *   a fact it paraphrases is the possible-duplicate machinery's business, not this one's.
@@ -10137,6 +10298,8 @@ export class MonetCore {
    *   stage itself, and "a rule repeating across stages is still a rule" only becomes a principle
    *   when the stages actually differ. A rule with no binding does not qualify at all — it has no
    *   stage to be different from, so it cannot evidence breadth in either direction.
+   *
+   *   BOTH ARE ACTIVE — disputed rules fire nowhere, so they cannot be live evidence for breadth.
    *
    *   NEITHER IS PROJECTION-BORN — "derivation-born (projected) rules are EXCLUDED from extraction
    *   evidence, since a principle must not manufacture its own support." Checked on the EDGE
@@ -10170,8 +10333,13 @@ export class MonetCore {
     circle: string,
   ): { pairedRuleId: string; score: number } | undefined {
     if (!this.graphEnabled) return undefined;
+    const fresh = this.getRow(newRuleId);
     const paired = this.getRow(nearMatchId);
-    if (!paired || paired.kind !== "rule") return undefined;
+    // Gate liveness is active-only. A disputed rule fires nowhere, so it cannot be live breadth
+    // evidence at flag time any more than a superseded rule can; the overview re-tests this same
+    // condition because either endpoint may become disputed after the edge is honestly recorded.
+    if (!fresh || fresh.kind !== "rule" || fresh.status !== "active") return undefined;
+    if (!paired || paired.kind !== "rule" || paired.status !== "active") return undefined;
     const newBinding = getRuleBinding(this.db, newRuleId);
     const pairedBinding = getRuleBinding(this.db, nearMatchId);
     if (!newBinding || !pairedBinding) return undefined;
@@ -10239,6 +10407,20 @@ export class MonetCore {
    *                  WHICH circles disagreed, and (on the preflight call) to fail before the embed
    *                  rather than after it.
    */
+  private validateProjectionDestination(ruleConceptId: string): void {
+    const destination = this.getRow(ruleConceptId);
+    // addLifecycleEdge already proved existence and governability before this engine-level check.
+    if (!destination) throw new Error(`projection destination concept '${ruleConceptId}' does not exist`);
+    if (destination.kind !== "rule") {
+      throw new Error(
+        `lifecycle edge projection destination '${ruleConceptId}' cannot be projection-born: projection births ` +
+          `gate rules, but it is kind '${destination.kind}', not 'rule'.`,
+      );
+    }
+    const binding = getRuleBinding(this.db, ruleConceptId);
+    if (binding?.severity === "blocking") throw new Error(projectionBlockingDestinationError(ruleConceptId));
+  }
+
   private validateProjectionParent(principleId: string, circle: string): void {
     const parent = this.getRow(principleId);
     if (!parent) {
@@ -10550,7 +10732,7 @@ export class MonetCore {
     });
     // AFTER the supersession edge, deliberately: the edge is the impeaching evidence, so a
     // contradiction naming it must not exist in a state where the edge does not.
-    const impeachedPrincipleIds = this.propagateImpeachment(incumbent, successor, correctionObservationId);
+    const impeachedPrincipleIds = this.propagateImpeachment(incumbent, successor, correctionObservationId, edge.id);
     return {
       supersededRuleId: incumbent.id,
       successorRuleId: successor.id,
@@ -10623,28 +10805,37 @@ export class MonetCore {
    * (`correcting.concept_id !== conceptId` → "does not belong to concept"), so wiring it through
    * would leave every impeachment resolvable only by `dismiss`. The evidence lives in `detail`
    * instead, which is where a human reads it anyway, and the bare form keeps all three verdicts
-   * available.
+   * available. A raw writer may supply no eventRef; that detail names the supersession edge honestly
+   * instead, while the `(parent, superseded child)` evidence needle still supplies idempotency.
    *
-   * NOT ON THE GRAFT PATH. `succeedRule` is reachable only from `storeInternal`; a relayed
-   * supersession lands through `graftRows`, which deliberately does not propagate — reconciling a
-   * divergent succession across replicas is an act-relay question that slice's own comments already
-   * date and defer, and impeaching a principle on the strength of a peer's row would let one machine
-   * silently remove another's skeleton entry.
+   * TWO LOCAL ENTRANCES, NOT THE GRAFT PATH. `succeedRule` routes store corrections here, and the
+   * public MonetCore.addLifecycleEdge wrapper now routes correction-born raw supersessions here too.
+   * A relayed supersession still lands through graftRows' own raw INSERT loop, which deliberately
+   * does not propagate — reconciling a divergent succession across replicas is an act-relay question
+   * that slice's own comments already date and defer, and impeaching a principle on the strength of a
+   * peer's row would let one machine silently remove another's skeleton entry.
    */
   private propagateImpeachment(
     incumbent: ConceptRow,
     successor: ConceptRow,
-    correctionObservationId: string,
+    correctionObservationId: string | null,
+    supersessionEdgeId: string,
   ): string[] {
     const impeached: string[] = [];
     const parents = getLifecycleEdges(this.db, incumbent.id, { direction: "in", family: "derivation" });
-    // THE STABLE NEEDLE the idempotency probe looks for, and the first thing a human reads. Built
-    // once so the two uses cannot drift: a probe searching for a substring the detail does not
-    // actually contain would silently re-flag forever.
+    // THE STABLE NEEDLE the idempotency probe looks for, and the first thing a human reads. It is
+    // intentionally the (parent, superseded child) identity rather than an event reference: the raw
+    // public writer permits correction-born edges without eventRef, and replaying the same real
+    // overturning must still not stack a second question on the human. When an eventRef is supplied,
+    // retain the store path's exact correction-observation substring so replayRuleOutcome keeps its
+    // existing durable reconstruction contract.
     const evidence = `superseded rule '${incumbent.id}'`;
+    const act = correctionObservationId !== null
+      ? impeachmentCorrectionNeedle(correctionObservationId)
+      : `supersession edge '${supersessionEdgeId}' (no event_ref supplied)`;
     const detail =
       `impeachment: ${evidence} ("${firstLine(incumbent.body)}") was corrected — ` +
-      `successor rule '${successor.id}', ${impeachmentCorrectionNeedle(correctionObservationId)}`;
+      `successor rule '${successor.id}', ${act}`;
     for (const edge of parents) {
       const parentId = edge.src_concept_id;
       if (impeached.includes(parentId)) continue; // one principle, two edges to the same child
@@ -17238,6 +17429,15 @@ function toContradiction(r: ContradictionRow): Contradiction {
  */
 function impeachmentCorrectionNeedle(correctionObservationId: string): string {
   return `correction observation '${correctionObservationId}'`;
+}
+
+/** One named refusal shared by both projection entrances after their resolved binding is known. */
+function projectionBlockingDestinationError(ruleConceptId: string): string {
+  return `rule '${ruleConceptId}' cannot be projected onto: it is a blocking rule, and blocking severity is ` +
+    `declaration-only — a projection edge on it would mint a rule that is both blocking and ` +
+    `projection-born, which no path may create (no agent, and no projection, can self-assign ` +
+    `deny power). Store this evidence without rule.projectedFromPrincipleId, or project onto ` +
+    `an advisory rule.`;
 }
 
 function firstLine(content: string): string {

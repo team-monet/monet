@@ -1919,6 +1919,15 @@ export const STAGE_LOOKUP_BODY_CAP = 6_000;
 export const STAGE_LOOKUP_REASON_CAP = 1_200;
 export const STAGE_LOOKUP_OUTLINE_CAP = 500;
 export const STAGE_INDEX_CAP = 2_000;
+/**
+ * Most disputed derivation parents one delivered rule will name (review fix — PR #112 round 5).
+ * The disputed-parents scalar rides the mechanical gate path, and derivation rows are append-only
+ * with no per-rule cap, so the aggregation is bounded here; the query fetches one extra id as the
+ * truncation signal and the mapper delivers at most this many plus `disputedParentsTruncated`.
+ * Several simultaneously-disputed parents on one rule is already pathological — the disclosure's
+ * job (go mediate) survives a cap comfortably above anything real.
+ */
+export const DISPUTED_PARENTS_CAP = 8;
 
 /** The engine-owned collaborators this module needs — same seam shape as LifecycleEdgeDeps. */
 export interface GateDeps {
@@ -2531,9 +2540,10 @@ export interface GateRule {
    */
   projectedFromPrincipleId?: string;
   /**
-   * THE PARENT IS UNDER IMPEACHMENT (slice 5-B) — set only when `projectedFromPrincipleId` names a
-   * principle whose status is `disputed`, omitted otherwise. Never `false`: absence is the ordinary
-   * case, and a field that said `false` on every rule in every fire would be pure resident cost.
+   * A PARENT IS UNDER IMPEACHMENT (slice 5-B) — set when one of this rule's derivation parents is a
+   * principle whose status is `disputed`, omitted otherwise. `projectedFromPrincipleId` remains the
+   * earliest stable display parent and need not be the disputed one. Never `false`: absence is the
+   * ordinary case, and a field that said `false` on every rule in every fire would be pure resident cost.
    *
    * DISCLOSURE ONLY. Delivery, severity and firing are unchanged by it: the rule was born of a
    * correction or a projection and stands on its own evidence, so a doubtful parent does not
@@ -2547,6 +2557,20 @@ export interface GateRule {
    * see `evaluateGateFromMirror`'s own comment.
    */
   parentDisputed?: true;
+  /**
+   * The disputed parents' identities, present exactly when `parentDisputed` is (review fix — PR
+   * #112 round 2). The flag alone advertised a recovery step no MCP caller could take: the wire
+   * said "inspect the rule's lifecycle edges", but edge reads are engine-only, so an agent could
+   * not learn WHICH parent needs mediation. Carried only in the rare disputed state — the
+   * common-case payload cost stays zero — and sorted lexically for deterministic output (the
+   * order carries no meaning; a parent's dispute is not ranked). At most `DISPUTED_PARENTS_CAP`
+   * entries; membership-restricted like the impeachment write side (a parent the human already
+   * rejected or retired is a settled question, not a pending mediation).
+   */
+  disputedParentIds?: string[];
+  /** Present (always `true`) only when disputedParentIds hit its cap — more disputed parents
+   *  exist than delivered; memory_overview's open contradictions list the rest. */
+  disputedParentsTruncated?: true;
 }
 
 export interface GateStageRef {
@@ -2762,17 +2786,23 @@ interface BindingJoinRow {
   body: string | null;
   created_at: number;
   parent_concept_id: string | null;
-  /**
-   * The parent principle's LIVE status, from the same correlated pick `parent_concept_id` comes
-   * from — null whenever there is no parent (and, defensively, when the edge names a concept this
-   * store has not received: normative rows replicate independently of endpoint liveness).
-   *
-   * Only `'disputed'` means anything to a caller here (see GateRule.parentDisputed); the raw column
-   * is carried rather than a boolean so the mapper does the interpreting in one place, and so a
-   * future status this file has not heard of arrives rather than being flattened away in SQL.
-   */
-  parent_status: string | null;
+  /** 1 when any locally resolved derivation parent is a disputed, still-member principle. */
+  parent_disputed: number;
+  /** Comma-joined disputed-member-parent ids, capped and lexically ordered; NULL on the
+   *  mechanical gate path (only the stage_lookup path pays for the aggregation) and when none. */
+  disputed_parent_ids: string | null;
 }
+
+/**
+ * THE one disputed-member-parent predicate — shared verbatim by the hot path's EXISTS and the
+ * lookup path's id aggregation (rulesForStages), so the flag and the ids can never answer
+ * different questions. Status first: the verdict subquery only runs for rows already disputed.
+ */
+const DISPUTED_MEMBER_PARENT_WHERE = `p.family = 'derivation' AND p.dst_concept_id = b.concept_id
+                  AND pc.kind = 'principle' AND pc.status = 'disputed'
+                  AND (SELECT r.verdict FROM ratifications r
+                        WHERE r.subject_concept_id = pc.id
+                        ORDER BY r.created_at DESC, r.id DESC LIMIT 1) IN ('approve','re-ratify')`;
 
 /**
  * THE shared liveness predicate every rule-delivery query in this module must agree on: active
@@ -2846,6 +2876,7 @@ function rulesForStages(
   limit?: number,
   bodyMaxChars?: number,
   reasonMaxChars?: number,
+  withDisputedParentIds = false,
 ): BindingJoinRow[] {
   if (stageIds.length === 0) return [];
   const placeholders = stageIds.map(() => "?").join(",");
@@ -2884,22 +2915,45 @@ function rulesForStages(
               (SELECT p.src_concept_id FROM lifecycle_edges p
                 WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
                 ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_concept_id,
-              -- FIRE-TIME DOUBT DISCLOSURE (slice 5-B): is that same parent under impeachment right
-              -- now? A SECOND correlated scalar rather than a join back to concepts, for the reason
-              -- the first one is a scalar — and byte-for-byte the SAME subquery body (family,
-              -- correlation column, ORDER BY, LIMIT), so the status reported can only ever belong
-              -- to the principle whose id is reported beside it. Two subqueries that could drift
-              -- apart would be worse than one join; two that are literally identical except for the
-              -- projected column cannot.
-              --
-              -- NULL when there is no parent, AND when the parent concept does not resolve locally
-              -- (LEFT JOIN, not INNER): a normative edge relays independently of its endpoints, so
-              -- an INNER JOIN here would silently drop parent_status for a rule whose parent has
-              -- not arrived — reporting "not disputed" about a principle this store cannot see.
-              (SELECT pc.status FROM lifecycle_edges p
-                LEFT JOIN concepts pc ON pc.id = p.src_concept_id
-                WHERE p.family = 'derivation' AND p.dst_concept_id = b.concept_id
-                ORDER BY p.created_at ASC, p.id ASC LIMIT 1) AS parent_status
+              -- FIRE-TIME DOUBT DISCLOSURE (slice 5-B): ANY derivation parent principle currently
+              -- disputed, not only the earliest parent selected for stable display above.
+              -- MEMBERS ONLY (review fix — PR #112 round 5): the latest-ratification check is the
+              -- same latest-wins read the impeachment WRITE side applies — without it, a disputed
+              -- parent the human then REJECTED kept appearing as a pending mediation. The EXISTS
+              -- short-circuits at the first qualifying row, and its per-edge cost is one status
+              -- probe (the verdict subquery runs only on rows the status filter already passed),
+              -- so the mechanical gate pays no aggregation, no DISTINCT, no temp B-tree (review
+              -- fix — PR #112 round 8: the previous shape bounded the RESULT but not the WORK).
+              EXISTS (
+                SELECT 1 FROM lifecycle_edges p
+                JOIN concepts pc ON pc.id = p.src_concept_id
+                WHERE ${DISPUTED_MEMBER_PARENT_WHERE}
+              ) AS parent_disputed,
+              -- THE IDS, ON THE LOOKUP PATH ONLY (review fixes — PR #112 rounds 2, 7 and 8): the
+              -- identity aggregation (DISTINCT + ORDER BY + LIMIT = temp B-tree over the rule's
+              -- whole parent set) exists for the RECOVERY path, which is an agent affordance —
+              -- stage_lookup, budget-fitted and latency-tolerant — while the mechanical hook
+              -- renders title + reason and never these ids. So the hot path selects literal NULL
+              -- and only evaluateStageLookup pays for the aggregation, the same caller split
+              -- withBody already draws for the same reason. Ordered before the cap (round 7,
+              -- P3) so the capped subset is one deterministic lexical prefix on every replica;
+              -- DISTINCT because one parent can hold two edges to the same rule (projection +
+              -- ratification); the shared WHERE keeps the flag and the ids answering the same
+              -- question. LIMIT is the cap + 1 — the extra id is the mapper's truncation signal,
+              -- never delivered.
+              ${
+                withDisputedParentIds
+                  ? `(SELECT group_concat(m.src_id)
+                 FROM (SELECT DISTINCT p.src_concept_id AS src_id
+                         FROM lifecycle_edges p
+                         JOIN concepts pc ON pc.id = p.src_concept_id
+                        WHERE ${DISPUTED_MEMBER_PARENT_WHERE}
+                        ORDER BY p.src_concept_id ASC
+                        LIMIT ${DISPUTED_PARENTS_CAP + 1}
+                 ) AS m
+              )`
+                  : "NULL"
+              } AS disputed_parent_ids
          FROM rule_bindings b
          JOIN concepts c ON c.id = b.concept_id
         WHERE b.stage_id IN (${placeholders})
@@ -3067,11 +3121,18 @@ function toGateRule(row: BindingJoinRow): GateRule {
     origin: row.origin,
     stageId: row.stage_id,
     ...(row.parent_concept_id !== null ? { projectedFromPrincipleId: row.parent_concept_id } : {}),
-    // SET ONLY WHEN TRUE, and only alongside a parent — a `parentDisputed` with no
-    // `projectedFromPrincipleId` beside it would be a claim about a principle the response never
-    // names. The two come from one correlated pick, so this pairing holds by construction; the
-    // explicit conjunction says so rather than leaving it to be re-derived from the SQL.
-    ...(row.parent_concept_id !== null && row.parent_status === "disputed" ? { parentDisputed: true as const } : {}),
+    // SET ONLY WHEN TRUE, and only alongside a display parent. The EXISTS probe may find a later
+    // disputed parent while `projectedFromPrincipleId` deliberately stays the earliest stable one;
+    // the field documents that one of the rule's actual parents is disputed, not which one.
+    ...(row.parent_concept_id !== null && row.parent_disputed === 1 ? { parentDisputed: true as const } : {}),
+    ...(row.parent_concept_id !== null && row.parent_disputed === 1 && row.disputed_parent_ids !== null
+      ? (() => {
+          const ids = row.disputed_parent_ids.split(",").sort();
+          return ids.length > DISPUTED_PARENTS_CAP
+            ? { disputedParentIds: ids.slice(0, DISPUTED_PARENTS_CAP), disputedParentsTruncated: true as const }
+            : { disputedParentIds: ids };
+        })()
+      : {}),
   };
 }
 
@@ -3454,6 +3515,9 @@ export function evaluateStageLookup(
   const primaryRows = rulesForStages(
     db, [stage.id], opts.circle, opts.runtimeModelTag, true,
     STAGE_LOOKUP_RULES_CAP + 1, STAGE_LOOKUP_BODY_CAP + 1, STAGE_LOOKUP_REASON_CAP + 1,
+    // The lookup path pays for the disputed-parent ids (PR #112 round 8); the mechanical gate
+    // carries the flag alone — see rulesForStages' own column comment for the split.
+    true,
   );
   const capped = primaryRows.length > STAGE_LOOKUP_RULES_CAP;
   const shownRows = capped ? primaryRows.slice(0, STAGE_LOOKUP_RULES_CAP) : primaryRows;

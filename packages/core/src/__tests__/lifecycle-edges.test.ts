@@ -34,6 +34,10 @@ function core(opts: { syncDeviceId?: string; embedder?: EmbeddingProvider } = {}
   });
 }
 
+/** A real rule endpoint for supersession-family tests; plain store() creates a fact. */
+const storeRule = (c: MonetCore, content: string, stage: string, circle?: string) =>
+  c.store(content, { circle, kind: "rule", rule: { stage, scope: "domain" } });
+
 type RawDb = { prepare(sql: string): { run(...p: unknown[]): unknown; get(...p: unknown[]): unknown; all(...p: unknown[]): unknown[] } };
 const raw = (c: MonetCore): RawDb => (c as unknown as { db: RawDb }).db;
 
@@ -284,9 +288,9 @@ describe("lifecycle_edges schema constraints", () => {
 describe("addLifecycleEdge validation", () => {
   it("names the incumbent successor when a second one is attempted", async () => {
     const c = core();
-    const a = await c.store("Rule A: always branch before committing.");
-    const b = await c.store("Rule B: branch, then commit, then push.");
-    const d = await c.store("Rule D: a third, unrelated rule.");
+    const a = await storeRule(c, "Rule A: always branch before committing.", "commit rule");
+    const b = await storeRule(c, "Rule B: branch, then commit, then push.", "commit rule");
+    const d = await storeRule(c, "Rule D: a third, unrelated rule.", "commit rule");
     const first = c.addLifecycleEdge({
       family: "supersession", srcConceptId: a.conceptId, dstConceptId: b.conceptId, bornOf: "correction",
     });
@@ -299,9 +303,9 @@ describe("addLifecycleEdge validation", () => {
 
   it("permits a chain: A→B then B→C", async () => {
     const c = core();
-    const a = await c.store("Rule A, the original.");
-    const b = await c.store("Rule B, its successor.");
-    const d = await c.store("Rule C, the successor's successor.");
+    const a = await storeRule(c, "Rule A, the original.", "chain rule");
+    const b = await storeRule(c, "Rule B, its successor.", "chain rule");
+    const d = await storeRule(c, "Rule C, the successor's successor.", "chain rule");
     c.addLifecycleEdge({ family: "supersession", srcConceptId: a.conceptId, dstConceptId: b.conceptId, bornOf: "correction" });
     expect(() =>
       c.addLifecycleEdge({ family: "supersession", srcConceptId: b.conceptId, dstConceptId: d.conceptId, bornOf: "correction" }),
@@ -314,10 +318,10 @@ describe("addLifecycleEdge validation", () => {
     // every other check. A ring makes "every rule is ultimately superseded by itself" true and
     // breaks resolving the currently governing rule by walking to the end of a chain.
     const c = core();
-    const a = await c.store("Rule A.");
-    const b = await c.store("Rule B.");
-    const d = await c.store("Rule C.");
-    const e = await c.store("Rule D.");
+    const a = await storeRule(c, "Rule A.", "cycle rule");
+    const b = await storeRule(c, "Rule B.", "cycle rule");
+    const d = await storeRule(c, "Rule C.", "cycle rule");
+    const e = await storeRule(c, "Rule D.", "cycle rule");
     const sup = (src: string, dst: string) =>
       c.addLifecycleEdge({ family: "supersession", srcConceptId: src, dstConceptId: dst, bornOf: "correction" });
 
@@ -475,9 +479,9 @@ describe("lifecycle edge reads", () => {
   it("round-trips edges by direction and family, and walks one derivation hop", async () => {
     const c = core();
     const principle = await c.store("Encode principles, not procedures.");
-    const rule1 = await c.store("Rule one under that principle.");
+    const rule1 = await storeRule(c, "Rule one under that principle.", "read rule");
     const rule2 = await c.store("Rule two under that principle.");
-    const successor = await c.store("The rule that replaces rule one.");
+    const successor = await storeRule(c, "The rule that replaces rule one.", "read rule");
 
     const d1 = c.addLifecycleEdge({ family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule1.conceptId, bornOf: "extraction" });
     const d2 = c.addLifecycleEdge({ family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule2.conceptId, bornOf: "extraction" });
@@ -741,8 +745,8 @@ describe("wipe immunity", () => {
     // Related concepts stored in one (implicit) session, so the similarity graph really does carry
     // `related`/`co_occurred` edges for the operations below to destroy.
     const principle = await c.store("Encode principles, not procedures, when writing rules.");
-    const rule = await c.store("Encode principles, not procedures, in the rule capture path.");
-    const successor = await c.store("Encode principles, not procedures — revised wording.");
+    const rule = await storeRule(c, "Encode principles, not procedures, in the rule capture path.", "capture rule");
+    const successor = await storeRule(c, "Encode principles, not procedures — revised wording.", "capture rule");
     await c.store("A second observation on the rule concept.", { attachTo: rule.conceptId });
 
     c.addLifecycleEdge({ family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule.conceptId, bornOf: "extraction" });
@@ -793,8 +797,8 @@ describe("wipe immunity", () => {
     // rewrites it when the concept later moves, and no consumer reads it yet. Pinned here so the
     // slice that gives `circle` a consumer has to decide deliberately rather than inherit silently.
     const c = core();
-    const a = await c.store("A rule that will move house.");
-    const b = await c.store("The rule that replaces it.");
+    const a = await storeRule(c, "A rule that will move house.", "moving rule");
+    const b = await storeRule(c, "The rule that replaces it.", "moving rule");
     const edge = c.addLifecycleEdge({ family: "supersession", srcConceptId: a.conceptId, dstConceptId: b.conceptId, bornOf: "correction" });
     expect(edge.circle).toBe("default");
     c.reassignCircle(a.conceptId, "work");
@@ -808,8 +812,8 @@ describe("wipe immunity", () => {
     // (concepts, observations, memory_edge, entities, concept_entities) follows it — so a normative
     // row left behind would name a circle that is gone and read as empty forever.
     const c = core();
-    const a = await c.store("A rule in a circle about to be renamed.", { circle: "old-name" });
-    const b = await c.store("Its successor, same circle.", { circle: "old-name" });
+    const a = await storeRule(c, "A rule in a circle about to be renamed.", "rename rule", "old-name");
+    const b = await storeRule(c, "Its successor, same circle.", "rename rule", "old-name");
     c.addLifecycleEdge({ family: "supersession", srcConceptId: a.conceptId, dstConceptId: b.conceptId, bornOf: "correction" });
     c.addLifecycleEdge({ family: "provenance", srcConceptId: a.conceptId, dstSpan: SPAN, bornOf: "correction", eventRef: "obs-1" });
     c.recordRatification({ subjectConceptId: a.conceptId, verdict: "approve" });
@@ -834,8 +838,8 @@ describe("lifecycle edge sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const principle = await src.store("Encode principles, not procedures.");
-    const rule = await src.store("A rule derived from that principle.");
-    const successor = await src.store("The rule that supersedes it.");
+    const rule = await storeRule(src, "A rule derived from that principle.", "sync rule");
+    const successor = await storeRule(src, "The rule that supersedes it.", "sync rule");
     const ratification = src.recordRatification({ subjectConceptId: principle.conceptId, verdict: "approve", packet: "{}", ratifiedBy: "john" });
     const derivation = src.addLifecycleEdge({
       family: "derivation", srcConceptId: principle.conceptId, dstConceptId: rule.conceptId,
@@ -878,9 +882,9 @@ describe("lifecycle edge sync", () => {
 
   it("keeps a graft atomic when two replicas name different successors for one rule", async () => {
     const local = core({ syncDeviceId: "machine-a" });
-    const a = await local.store("The rule everyone is trying to replace.");
-    const b = await local.store("Successor chosen on this machine.");
-    const peerChoice = await local.store("Successor chosen on the other machine.");
+    const a = await storeRule(local, "The rule everyone is trying to replace.", "divergent rule");
+    const b = await storeRule(local, "Successor chosen on this machine.", "divergent rule");
+    const peerChoice = await storeRule(local, "Successor chosen on the other machine.", "divergent rule");
     const mine = local.addLifecycleEdge({ family: "supersession", srcConceptId: a.conceptId, dstConceptId: b.conceptId, bornOf: "correction" });
 
     // A peer's payload naming a DIFFERENT successor for the same rule. The partial unique index
@@ -904,8 +908,8 @@ describe("lifecycle edge sync", () => {
     const b = core({ syncDeviceId: "machine-b" });
     const cc = core({ syncDeviceId: "machine-c" });
 
-    const rule = await a.store("The rule that will be retired on machine A.");
-    const successor = await a.store("Its successor, which stays active.");
+    const rule = await storeRule(a, "The rule that will be retired on machine A.", "retired sync rule");
+    const successor = await storeRule(a, "Its successor, which stays active.", "retired sync rule");
     const ratification = a.recordRatification({ subjectConceptId: rule.conceptId, verdict: "retire", ratifiedBy: "john" });
     a.addLifecycleEdge({ family: "supersession", srcConceptId: rule.conceptId, dstConceptId: successor.conceptId, bornOf: "correction" });
     a.addLifecycleEdge({ family: "provenance", srcConceptId: rule.conceptId, dstSpan: SPAN, bornOf: "correction", eventRef: "obs-1" });
@@ -977,8 +981,8 @@ describe("lifecycle edge sync", () => {
     // holding the dead circle name.
     const a = core({ syncDeviceId: "machine-a" });
     const b = core({ syncDeviceId: "machine-b" });
-    const rule = await a.store("A rule in a circle about to be renamed.", { circle: "old-name" });
-    const succ = await a.store("Its successor.", { circle: "old-name" });
+    const rule = await storeRule(a, "A rule in a circle about to be renamed.", "replica rename rule", "old-name");
+    const succ = await storeRule(a, "Its successor.", "replica rename rule", "old-name");
     a.addLifecycleEdge({ family: "supersession", srcConceptId: rule.conceptId, dstConceptId: succ.conceptId, bornOf: "correction" });
     a.recordRatification({ subjectConceptId: rule.conceptId, verdict: "approve" });
     b.graftRows(a.exportDelta(0));
@@ -1100,9 +1104,9 @@ describe("lifecycle edge sync", () => {
     // The local walk guards addLifecycleEdge, but the graft loop inserts raw rows: an incoming B→A
     // could land beside a local A→B, or one payload could carry a whole ring.
     const local = core({ syncDeviceId: "machine-a" });
-    const a = await local.store("Rule A.");
-    const b = await local.store("Rule B.");
-    const d = await local.store("Rule C.");
+    const a = await storeRule(local, "Rule A.", "graft cycle rule");
+    const b = await storeRule(local, "Rule B.", "graft cycle rule");
+    const d = await storeRule(local, "Rule C.", "graft cycle rule C");
     const mine = local.addLifecycleEdge({
       family: "supersession", srcConceptId: a.conceptId, dstConceptId: b.conceptId, bornOf: "correction",
     });
@@ -1261,8 +1265,8 @@ describe("dangling lifecycle edge sweep", () => {
     const survivor = await c.store(text, { circle: "work" });
     expect(doomed.conceptId).not.toBe(survivor.conceptId);
 
-    const successor = await c.store("A quite different rule that supersedes it.", { circle: "default" });
-    c.addLifecycleEdge({ family: "supersession", srcConceptId: doomed.conceptId, dstConceptId: successor.conceptId, bornOf: "correction" });
+    const successor = await c.store("A quite different concept it derives.", { circle: "default" });
+    c.addLifecycleEdge({ family: "derivation", srcConceptId: doomed.conceptId, dstConceptId: successor.conceptId, bornOf: "extraction" });
     c.addLifecycleEdge({ family: "provenance", srcConceptId: doomed.conceptId, dstSpan: SPAN, bornOf: "correction", eventRef: "obs-1" });
     c.recordRatification({ subjectConceptId: doomed.conceptId, verdict: "approve" });
 
@@ -1288,8 +1292,8 @@ describe("dangling lifecycle edge sweep", () => {
     // constructed the way such a store would already contain it — the concept row gone, its
     // tombstone recorded, the append-only normative rows left behind.
     const c = core();
-    const doomed = await c.store("A rule that a pre-chokepoint build consolidated away.");
-    const successor = await c.store("A quite different rule that supersedes it.");
+    const doomed = await storeRule(c, "A rule that a pre-chokepoint build consolidated away.", "stranded rule");
+    const successor = await storeRule(c, "A quite different rule that supersedes it.", "stranded rule");
     c.addLifecycleEdge({ family: "supersession", srcConceptId: doomed.conceptId, dstConceptId: successor.conceptId, bornOf: "correction" });
     c.addLifecycleEdge({ family: "provenance", srcConceptId: doomed.conceptId, dstSpan: SPAN, bornOf: "correction", eventRef: "obs-1" });
     c.recordRatification({ subjectConceptId: doomed.conceptId, verdict: "approve" });
@@ -1421,9 +1425,9 @@ describe("dangling lifecycle edge sweep", () => {
     // path exists to move.
     const c = new MonetCore(":memory:");
     const text = "Branch before committing, always, without exception.";
-    const doomed = await c.store(text, { circle: "orphan-circle" });
+    const doomed = await storeRule(c, text, "orphan circle rule", "orphan-circle");
     await c.store(text, { circle: "elsewhere" });
-    const succ = await c.store("A different rule.", { circle: "orphan-circle" });
+    const succ = await storeRule(c, "A different rule.", "orphan circle rule", "orphan-circle");
     c.addLifecycleEdge({ family: "supersession", srcConceptId: doomed.conceptId, dstConceptId: succ.conceptId, bornOf: "correction" });
     c.recordRatification({ subjectConceptId: doomed.conceptId, verdict: "approve" });
 

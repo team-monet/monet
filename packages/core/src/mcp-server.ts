@@ -45,6 +45,8 @@ const RESULT_MAX_CHARS = 40_000; // hard ceiling on any serialized tool result
 const FETCH_MAX_OBS = 20; // most-recent observations returned by memory_fetch
 const FETCH_OBS_MAX_CHARS = 1_200; // per-observation cap
 const FETCH_BODY_MAX_CHARS = 6_000; // concept body cap
+const FETCH_CONTRADICTION_MAX_CHARS = 400; // per-open-contradiction detail cap (PR #112 round 3)
+const FETCH_CONTRADICTIONS_MAX = 5; // newest-first open-contradiction entries per fetch (round 4)
 // REVIEW FIX (MINOR): source concept outline cap (file=concept, Ruling 9). A cheap upper bound on
 // how many entries the size-fit loop below ever iterates over — NOT the real guarantee (see that
 // loop's own comment). 500 was unsound on its own: headingPath is caller/document content with no
@@ -1339,7 +1341,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_fetch",
-    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them. Source concepts (kind='source', file=concept) are different: they return STRUCTURE, not content, by default — `title`, `sourcePath` + `sourceId` (pass sourceId to the source_path tool for the on-disk location, then grep the path for detail), and an `outline` of every active section (headingPath, occurrence, observationId), never `observations`/needsSynthesis. Pass includeBody:true for the full concatenated file body if you need it read inline instead of via the path.",
+    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. A contested concept shows it: `status` (when not active) and `openContradictions` [{id, kind, detail}] — mediate with memory_resolve({ contradictionId: openContradictions[i].id }); this is the recovery step a stage_lookup doubt disclosure (disputedParentIds) points at. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them. Source concepts (kind='source', file=concept) are different: they return STRUCTURE, not content, by default — `title`, `sourcePath` + `sourceId` (pass sourceId to the source_path tool for the on-disk location, then grep the path for detail), and an `outline` of every active section (headingPath, occurrence, observationId), never `observations`/needsSynthesis. Pass includeBody:true for the full concatenated file body if you need it read inline instead of via the path.",
     {
       id: z.string(),
       circle: z.string().optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
@@ -1445,10 +1447,40 @@ export function registerMonetCoreTools(
         // for it explicitly with includeBody:false.
         const sendBody = includeBody !== false;
         const sendObservations = !sendBody || !body.clipped;
+        // A DISPUTED CONCEPT'S FETCH SHOWS ITS DISPUTE (review fix — PR #112 round 3). This is the
+        // advertised recovery surface for the doubt disclosure (disputedParentIds → fetch the
+        // parent), and it previously carried neither the status nor the open contradiction — so a
+        // caller could identify the disputed principle but still not reach the contradiction id
+        // memory_resolve mediates by. Omit-when-absent both ways: an active concept with nothing
+        // open pays zero.
+        // Newest-first, CAPPED IN SQL (review fixes — PR #112 rounds 4 and 9): the cap + 1 probe
+        // bounds what the database materializes (round 9: slicing after an unbounded .all() bounded
+        // the response but not the work), and the exact omitted count is a separate COUNT paid only
+        // when the probe row proved more exist — the stage_lookup rulesTotal shape. Cap-and-
+        // disclose on the wire, same as every other potentially-large field on this server.
+        const openContradictions = core.getOpenContradictionsForConcept(id, FETCH_CONTRADICTIONS_MAX + 1);
+        const shownContradictions = openContradictions.slice(0, FETCH_CONTRADICTIONS_MAX);
         return readOk({
           id: c.id,
           circle: c.circle, // pass this back to memory_synthesize if it isn't your session default
           kind: c.kind,
+          ...(c.status !== "active" ? { status: c.status } : {}),
+          ...(shownContradictions.length > 0
+            ? {
+                openContradictions: shownContradictions.map((k) => ({
+                  id: k.id,
+                  kind: k.kind,
+                  detail: clip(k.detail, FETCH_CONTRADICTION_MAX_CHARS).text,
+                })),
+                ...(openContradictions.length > shownContradictions.length
+                  ? { openContradictionsOmitted: core.countOpenContradictionsForConcept(id) - shownContradictions.length }
+                  : {}),
+                // The exact parameter name, because "id" is ambiguous against the concept's own and
+                // memory_resolve accepts only `contradictionId` (review fix — PR #112 round 8).
+                contradictionsNote:
+                  "Open contradictions contest this concept — mediate each with memory_resolve, passing contradictionId: openContradictions[i].id.",
+              }
+            : {}),
           ...(sendBody ? { body: body.text, ...(body.clipped ? { bodyTruncated: true } : {}) } : { bodyOmitted: true }),
           ...(sendObservations
             ? { observations: kept.map((o) => ({ id: o.id, content: clip(o.content, FETCH_OBS_MAX_CHARS).text })) }
@@ -1518,7 +1550,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "stage_lookup",
-    "You are at a named moment (see the stage index from agent_context): ask for that stage's rules before proceeding. Advisory delivery — rules arrive with the reason that earns compliance. A miss returns the live index.",
+    "You are at a named moment (see the stage index from agent_context): ask for that stage's rules before proceeding. Advisory delivery — rules arrive with the reason that earns compliance. When parentDisputed is true, one of this rule's derivation parents is currently disputed — disputedParentIds names exactly which (memory_fetch them to see the impeachment; the named projectedFromPrincipleId is the earliest/display parent, not necessarily a disputed one). A miss returns the live index.",
     {
       stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("The stage name (or id) you recognize — from the stage index agent_context/prewarm carries."),
       circle: z.string().optional(),
@@ -1579,14 +1611,21 @@ export function registerMonetCoreTools(
             ...(rule.modelTag !== null ? { modelTag: rule.modelTag } : {}),
             ...(bodyClip ? { body: bodyClip.text } : {}),
             ...(rule.projectedFromPrincipleId !== undefined ? { projectedFromPrincipleId: rule.projectedFromPrincipleId } : {}),
-            // FIRE-TIME DOUBT DISCLOSURE (slice 5-B, D5) — present (always `true`) only when the
-            // parent principle named just above is currently disputed: a correction overturned one
-            // of its rules, it has dropped out of the skeleton, and a human is being asked to
-            // re-ratify or retire it. Same omit-when-absent discipline as every optional field on
-            // this response, and for a stronger reason than budget: `false` on every rule of every
-            // lookup would be the resident cost with none of the signal. Disclosure only — this
-            // rule still delivers, at its own severity, on its own evidence.
+            // FIRE-TIME DOUBT DISCLOSURE (slice 5-B, D5) — present (always `true`) only when one of
+            // this rule's derivation parents is currently disputed. The named
+            // `projectedFromPrincipleId` just above is the earliest stable display parent and need
+            // not be the disputed one; lifecycle-edge reads carry the full parent identities. Same
+            // omit-when-absent discipline as every optional field on this response, and for a
+            // stronger reason than budget: `false` on every rule of every lookup would be the
+            // resident cost with none of the signal. Disclosure only — this rule still delivers, at
+            // its own severity, on its own evidence.
             ...(rule.parentDisputed ? { parentDisputed: true } : {}),
+            // The recovery path the flag advertises (review fix — PR #112 round 2): the ids of the
+            // disputed parent(s), present exactly when the flag is, so a caller can memory_fetch
+            // the principle under impeachment instead of being told to read edges no MCP tool
+            // exposes. Rare-state-only: the common case pays nothing.
+            ...(rule.disputedParentIds !== undefined ? { disputedParentIds: rule.disputedParentIds } : {}),
+            ...(rule.disputedParentsTruncated ? { disputedParentsTruncated: true } : {}),
           };
           const candidate = [...fitRules, candidateRule];
           const serialized = JSON.stringify({ ...fixedFields, rules: candidate }, null, 2);
