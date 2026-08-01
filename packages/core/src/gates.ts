@@ -131,23 +131,21 @@ import type { StoragePort } from "./storage";
 // ---- vocabulary -------------------------------------------------------------
 
 /**
- * Breadth is a property of the BINDING, and `*` is a breadth, not a circle (ratified 2026-07-28,
+ * Breadth is a property of the MEMBER, and `*` is a breadth, not a circle (ratified 2026-07-28,
  * docs/design/next-monet-skeleton-gates-recall.md's "Breadth is a property of the binding" section).
- * Stages are already store-global; only bindings carry a circle. A binding declared with circle
- * `*` delivers in EVERY circle, unioned with the local circle's own rules at gate time — no
- * shadowing, no precedence: a global deny and a local advisory on the same stage both arrive,
- * blocking-first as always.
+ * A rule carries it on its binding; a principle/preference carries it on its concept membership
+ * metadata. A global member delivers in EVERY circle, unioned with the local circle's own members —
+ * no shadowing or precedence. Stages are already store-global and therefore carry no breadth.
  *
- * `*` IS NEVER A CIRCLE A CONCEPT LIVES IN. It is a reserved breadth marker on a `rule_bindings`
- * row alone, forbidden as a circle name at every circle-minting surface (the MonetCore constructor's
+ * `*` IS NEVER A CIRCLE A CONCEPT LIVES IN. It is a reserved breadth marker forbidden as a circle
+ * name at every circle-minting surface (the MonetCore constructor's
  * `defaultCircle`, `store()`'s concept circle, `reassignCircle`'s `toCircle`, `renameCircle`'s
  * `from`/`to`, a relayed CONCEPT row's circle, `createSource`'s registered circle — Codex round 4,
  * item 3, `saveWorkstream`'s own explicit circle — Codex round 7, item 4) — see each surface's own
- * guard. A relayed
- * `rule_bindings` row, by contrast, carries breadth verbatim: relay is not a second way to mint it
- * (sovereignty is unchanged — `*` enters only through the declaration surface, same as blocking
- * severity), but a peer that already holds a legitimately-declared global rule must not lose it on
- * sync.
+ * guard. Relayed `rule_bindings.circle` and `concepts.skeleton_breadth` values, by contrast, carry
+ * breadth verbatim: relay is not a second way to mint it (sovereignty is unchanged — `*` enters
+ * only through the declaration surface), but a peer that already holds a legitimately-declared
+ * global member must not lose it on sync.
  */
 export const BREADTH_CIRCLE = "*";
 

@@ -994,7 +994,7 @@ export function registerMonetCoreTools(
         .string()
         .optional()
         .describe(
-          'Which circle this declaration lives in. Omit for the default. "*" is the reserved GLOBAL BREADTH declaration, species="rule" only: the rule delivers in every circle, unioned with whatever is local there, no shadowing — never a real circle name, and refused for species="stage" (a stage is store-global already; breadth is a property of the rule\'s BINDING, not an address).',
+          'Which circle this declaration lives in. Omit for the default. "*" is the reserved GLOBAL BREADTH declaration for species="rule", "principle", or "preference": the member keeps its ordinary home circle and delivers in every circle, unioned with whatever is local there, no shadowing — never a real circle name. Refused for species="stage" because a stage is store-global already.',
         ),
       sourceRefs: z.array(z.string()).optional(),
     },
@@ -1013,9 +1013,9 @@ export function registerMonetCoreTools(
       const declareCircle = circle === undefined ? undefined : circle === BREADTH_CIRCLE ? BREADTH_CIRCLE : scope(circle);
       // THE HOME CIRCLE — for prewarm snapshotting and the response's own `circle` field, NEVER '*'
       // (review fix — Codex round 3, item 3). '*' is a valid RULING for `declareCircle` above (the
-      // BINDING's own locality, going into declare()'s `circle` input alone) but it is not a real
-      // circle anything else here can operate against: the rule's CONCEPT always lives at the
-      // caller's own circle, never at the breadth marker (declare()'s own `isBreadth` comment) — so
+      // member's own delivery breadth, going into declare()'s `circle` input alone) but it is not a
+      // real circle anything else here can operate against: the rule/principle/preference CONCEPT
+      // always lives at the caller's own circle, never at the breadth marker — so
       // capturePrewarmSnapshot('*') would burn the one-shot mechanism scanning a circle that holds
       // no concepts, and a response claiming `circle: '*'` would misreport where the concept
       // actually lives. Resolves to the session default whenever the caller named nothing OR named
@@ -1078,9 +1078,13 @@ export function registerMonetCoreTools(
             action: r.action,
             advisories: r.advisories,
           };
-          const guidance = r.advisories.length > 0
+          const baseGuidance = r.advisories.length > 0
             ? `This ${r.species} is now live in the skeleton for this circle, governing this session from this turn onward. See advisories for warning-light signals — informational only, nothing here was blocked.`
             : `This ${r.species} is now live in the skeleton for this circle, governing this session from this turn onward.`;
+          // Conditional text in the EXISTING guidance field, never another payload field (#113).
+          const guidance = r.narrowedFromBreadth
+            ? `BREADTH NARROWED: this ${r.species} was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle="*" to restore it. ${baseGuidance}`
+            : baseGuidance;
           // ONE BUILDER, USED FOR BOTH THE MEASUREMENT AND THE RESPONSE — see fitObjectArray's own
           // comment. Anything added here is automatically inside the budget; anything added to the
           // returned object instead of here would silently reopen the mid-JSON truncation blocker.

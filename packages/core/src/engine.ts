@@ -320,7 +320,7 @@ const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
  * rows silently dropped while its cursor advanced, losing them permanently. A receiver must be able
  * to say "this is newer than I understand" instead. Bump this whenever the payload gains a table.
  */
-const SYNC_PAYLOAD_PROTOCOL_VERSION = 12; // 11: + lifecycle_edges, ratifications; 12: + stages, rule_bindings
+const SYNC_PAYLOAD_PROTOCOL_VERSION = 13; // 11: + lifecycle_edges, ratifications; 12: + stages, rule_bindings; 13: + concepts.skeleton_breadth
 const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/activation ledger
 // PRAGMA user_version gate for the file=concept reshape (Phase 1, ratified): the
 // uq_source_chunks_active_concept -> uq_source_chunks_active_concept_slot index swap and the
@@ -896,8 +896,9 @@ export interface StoreOpts {
    * `RuleCaptureOpts.declaration`. Requires kind "principle" or "preference".
    *
    * WHY IT RIDES store() RATHER THAN FOLLOWING IT (review round 1, item 6): the skeleton-entry
-   * ratification is written INSIDE this write's own transaction, so a concept and its entry commit
-   * together or not at all. The sibling precedent is the rule branch — `captureRuleBinding` runs in
+   * ratification and any explicit breadth ruling are written INSIDE this write's own transaction,
+   * so a concept and its entry commit together or not at all. The sibling precedent is the rule
+   * branch — `captureRuleBinding` runs in
    * exactly this position for the identical reason ("ONE TRANSACTION ... there is no second write
    * to be left standing when the first one fails"). Writing it after store() returned left a window
    * where a crash produced a principle concept with no ratification: invisible to `skeleton()`,
@@ -913,6 +914,13 @@ export interface StoreOpts {
 export interface SkeletonEntryOpts {
   verdict: RatificationVerdict;
   ratifiedBy?: string | null;
+  /**
+   * An explicit breadth ruling from declare(). Undefined preserves an incumbent member's current
+   * breadth, exactly as an omitted rule-binding circle preserves an incumbent rule's reach.
+   */
+  breadth?: SkeletonBreadth;
+  /** Internal transition disclosure hook; called only for global → local. */
+  onBreadthNarrowed?: () => void;
   /**
    * Called INSIDE the write transaction, with what resolution actually decided, to produce the
    * packet stored verbatim on the ratification row. A builder rather than a plain string because
@@ -1194,6 +1202,8 @@ export type DeclareResult =
       action: IngestAction;
       /** Warning-light signals only — see DeclareAdvisory. The write above has already happened. */
       advisories: DeclareAdvisory[];
+      /** Internal transition signal for the wire's conditional guidance; omitted ordinarily. */
+      narrowedFromBreadth?: true;
       /**
        * The now-live skeleton for this circle, in-band (user-ratified, 2026-07-29): "the session
        * that births a principle is governed by it from that turn onward." Uncapped here — see
@@ -1208,8 +1218,12 @@ export type DeclareResult =
       conceptId: string;
       action: IngestAction;
       advisories: DeclareAdvisory[];
+      /** Internal transition signal for the wire's conditional guidance; omitted ordinarily. */
+      narrowedFromBreadth?: true;
       skeleton: SkeletonEntry[];
     };
+
+export type SkeletonBreadth = "global" | "local";
 
 /**
  * One skeleton member: a principle or preference currently ratified into the always-on layer.
@@ -1223,6 +1237,8 @@ export interface SkeletonEntry {
    *  discipline: "the stage index — names only, never rule bodies" applies here on the same logic;
    *  memory_fetch(conceptId) reads the rest). */
   content: string;
+  /** Where this member delivers; its home remains the concept's ordinary circle either way. */
+  breadth: SkeletonBreadth;
   ratifiedBy: string | null;
   when: number;
 }
@@ -1751,6 +1767,7 @@ interface ConceptRow {
   /** The sole source-ledger observation currently published to this concept's read model. */
   active_observation_id: string | null;
   aliases: string | null;
+  skeleton_breadth: SkeletonBreadth;
   last_confirmed_at: number | null;
   last_confirmed_session_id: string | null;
   sync_revision: number;
@@ -1969,15 +1986,15 @@ export class MonetCore {
     this.sourceLedger = new SourceLedger(this.db, { idGen: this.newId, now: this.sourceClock });
     this.scopeContext = opts.scopeContext ?? null;
     // CIRCLE-MINTING GUARD 1 of N (see BREADTH_CIRCLE's own comment, gates.ts): the session/store
-    // entry point. '*' is a breadth marker on a RULE BINDING, never a circle a concept — or a whole
+    // entry point. '*' is a member-delivery breadth marker, never a circle a concept — or a whole
     // store's default — lives in; a MONET_CIRCLE=* misconfiguration (or an explicit defaultCircle)
     // must fail LOUDLY at construction, not silently file every circle-less write into a circle that
-    // would make it a global rule, or a global anything else, by accident.
+    // would make it global by accident.
     if (opts.defaultCircle === BREADTH_CIRCLE) {
       throw new Error(
-        `defaultCircle may not be '${BREADTH_CIRCLE}': that is the reserved global-breadth marker for ` +
-          `a rule BINDING (declare a rule with circle: '${BREADTH_CIRCLE}' for that), never a circle a ` +
-          `store or a concept lives in.`,
+        `defaultCircle may not be '${BREADTH_CIRCLE}': that is the reserved global-breadth marker ` +
+          `(declare a rule, principle, or preference with circle: '${BREADTH_CIRCLE}' for that reach), ` +
+          `never a circle a store or concept lives in.`,
       );
     }
     this.defaultCircle = opts.defaultCircle ?? "default";
@@ -2019,9 +2036,9 @@ export class MonetCore {
     if (versionAfterLedger >= SYNC_CLOSURE_SCHEMA_VERSION && versionAfterLedger < SOURCE_LEDGER_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${SOURCE_LEDGER_SCHEMA_VERSION}`);
     }
-    // SOURCE_FILE_CONCEPT_SCHEMA_VERSION = 10: no additional work beyond what SourceLedger.ensureSchema()
-    // already did idempotently above (column-guards + the index swap). Pure sentinel, same pattern
-    // as every version gate above it.
+    // SOURCE_FILE_CONCEPT_SCHEMA_VERSION now also carries the additive skeleton_breadth column added
+    // by migrate(); SourceLedger.ensureSchema still owns the prior file-concept column/index work.
+    // Pure sentinel, same pattern as every version gate above it.
     const versionAfterSourceLedger = this.db.pragma("user_version", { simple: true }) as number;
     if (versionAfterSourceLedger >= SOURCE_LEDGER_SCHEMA_VERSION && versionAfterSourceLedger < SOURCE_FILE_CONCEPT_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
@@ -2313,6 +2330,7 @@ export class MonetCore {
         source_identity TEXT,
         active_observation_id TEXT,
         aliases TEXT,
+        skeleton_breadth TEXT NOT NULL DEFAULT 'local' CHECK (skeleton_breadth IN ('local','global')),
         created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
         sync_revision INTEGER NOT NULL DEFAULT 1,
@@ -2814,6 +2832,20 @@ export class MonetCore {
     if (!conceptCols.some((c) => c.name === "active_observation_id")) {
       this.db.exec(`ALTER TABLE concepts ADD COLUMN active_observation_id TEXT`);
     }
+    // Skeleton breadth is a property of a member, not a synthetic home circle. Existing members are
+    // local by construction: global principle/preference declarations did not exist before this
+    // column, so the additive default is the complete migration.
+    if (!conceptCols.some((c) => c.name === "skeleton_breadth")) {
+      try {
+        this.db.exec(
+          `ALTER TABLE concepts ADD COLUMN skeleton_breadth TEXT NOT NULL DEFAULT 'local' ` +
+          `CHECK (skeleton_breadth IN ('local','global'))`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("duplicate column name")) throw error;
+      }
+    }
     // Legacy source rows predate explicit identity/currentness. Backfill only when the source://
     // references agree on one canonical authority; ambiguous legacy rows remain fenced from new
     // connector updates rather than guessing their owner.
@@ -3249,7 +3281,7 @@ export class MonetCore {
     // an activity-only row. `IS NOT` is SQLite's null-safe distinctness test.
     const conceptSemanticChange = [
       "slug", "title", "body", "kind", "status", "confidence", "version", "circle",
-      "embedding", "support_count", "dirty", "source_refs", "aliases", "last_confirmed_at",
+      "embedding", "support_count", "dirty", "source_refs", "aliases", "skeleton_breadth", "last_confirmed_at",
       "last_confirmed_session_id", "source_identity", "active_observation_id", "created_at",
     ].map((column) => `NEW.${column} IS NOT OLD.${column}`).join(" OR ");
     trigger("concepts", "id", conceptSemanticChange);
@@ -3376,8 +3408,8 @@ export class MonetCore {
     if (circle === BREADTH_CIRCLE) {
       throw new Error(
         `a concept may not live in circle '${BREADTH_CIRCLE}': that is the reserved global-breadth ` +
-          `marker for a rule BINDING, not a circle a concept lives in. Declare the rule at your own ` +
-          `circle and pass circle: '${BREADTH_CIRCLE}' to memory_declare instead.`,
+          `marker for member delivery, not a circle a concept lives in. Declare the member at its home ` +
+          `circle, or pass circle: '${BREADTH_CIRCLE}' to memory_declare for global reach.`,
       );
     }
     const sourceIdentity = sourceConnector ? canonicalSourceIdentity(opts.sourceRefs ?? []) : null;
@@ -3844,6 +3876,8 @@ export class MonetCore {
           conceptId: row.id,
           verdict: opts.skeletonEntry.verdict,
           ratifiedBy: opts.skeletonEntry.ratifiedBy,
+          breadth: opts.skeletonEntry.breadth,
+          onBreadthNarrowed: opts.skeletonEntry.onBreadthNarrowed,
           packet: opts.skeletonEntry.buildPacket({
             ...(nearMatchId !== undefined ? { nearMatchId } : {}),
             ...(nearMatchScore !== undefined ? { nearMatchScore } : {}),
@@ -4206,12 +4240,12 @@ export class MonetCore {
     // already safe on its own — this closes the explicit-argument side, the one path guard 1 does
     // not reach. Left unguarded, a workstream CONCEPT would land with `circle = '*'`, exactly the
     // accident every other concept-creating surface already refuses: a workstream is a concept like
-    // any other (kind='workstream'), never a rule binding, so it has no more business living in the
-    // breadth marker's circle than a fact or a rule's own concept does.
+    // any other (kind='workstream'), so it has no more business living in the breadth marker's
+    // synthetic circle than a fact, rule, principle, or preference concept does.
     if (circle === BREADTH_CIRCLE) {
       throw new Error(
         `a workstream may not live in circle '${BREADTH_CIRCLE}': that is the reserved global-breadth ` +
-          `marker for a rule BINDING, not a circle a concept — workstream or otherwise — lives in. ` +
+          `marker for member delivery, not a circle a concept — workstream or otherwise — lives in. ` +
           `Save it at an ordinary circle.`,
       );
     }
@@ -5944,7 +5978,7 @@ export class MonetCore {
     if (toCircle === BREADTH_CIRCLE) {
       throw new Error(
         `a concept may not be reassigned into circle '${BREADTH_CIRCLE}': that is the reserved ` +
-          `global-breadth marker for a rule BINDING, not a circle a concept lives in.`,
+          `global-breadth marker for member delivery, not a circle a concept lives in.`,
       );
     }
     const fromCircle = src.circle;
@@ -7498,7 +7532,7 @@ export class MonetCore {
     if (this.resolveCircle(input.circle) === BREADTH_CIRCLE) {
       throw new Error(
         `a source may not be registered under circle '${BREADTH_CIRCLE}': that is the reserved ` +
-          `global-breadth marker for a rule BINDING, never a circle a source's concepts can live in ` +
+          `global-breadth marker for member delivery, never a circle a source's concepts can live in ` +
           `— and a source's circle can never be changed after creation. Register it at an ordinary circle.`,
       );
     }
@@ -9726,6 +9760,8 @@ export class MonetCore {
     ratifiedBy?: string | null;
     packet?: string | null;
     memberRuleIds?: string[];
+    breadth?: SkeletonBreadth;
+    onBreadthNarrowed?: () => void;
   }): { ratification: RatificationRow; edges: LifecycleEdgeRow[]; extractionFlagsResolved: number } {
     const result = this.db.transaction((): { ratification: RatificationRow; edges: LifecycleEdgeRow[]; extractionFlagsResolved: number } => {
       const isEntryVerdict = input.verdict === "approve" || input.verdict === "re-ratify";
@@ -9764,6 +9800,19 @@ export class MonetCore {
         // audit row on the common call path (Codex PR #102).
         ratifiedBy: input.ratifiedBy ?? this.agentId,
       });
+      // Breadth is mutable membership metadata, separate from the append-only ruling. This write
+      // happens in the SAME transaction as declaration's new ratification, so re-declaring an
+      // existing local member as global cannot leave either half behind. Ratify() omits breadth and
+      // therefore leaves it unchanged: latest-ratification-wins still decides membership alone.
+      if (input.breadth !== undefined) {
+        const previous = this.db.prepare(`SELECT skeleton_breadth FROM concepts WHERE id = ?`)
+          .get(input.conceptId) as { skeleton_breadth: SkeletonBreadth } | undefined;
+        this.db.prepare(`UPDATE concepts SET skeleton_breadth = ? WHERE id = ?`)
+          .run(input.breadth, input.conceptId);
+        if (previous?.skeleton_breadth === "global" && input.breadth === "local") {
+          input.onBreadthNarrowed?.();
+        }
+      }
       const edges: LifecycleEdgeRow[] = [];
       if (isEntryVerdict && memberRuleIds && memberRuleIds.length > 0) {
         for (const memberRuleId of memberRuleIds) {
@@ -10032,8 +10081,11 @@ export class MonetCore {
   /**
    * SKELETON MEMBERSHIP — derived, never a scalar flag ("an implementation that stores authority as
    * a scalar field has not implemented this design" — the spec's own implementation directive).
-   * Concepts of kind principle|preference whose LATEST ratification verdict is approve or
-   * re-ratify. LATEST-WINS: `ratifications` carries no uniqueness constraint
+   * The queried circle's local principle/preference members UNION every global-breadth member.
+   * Because this is one row predicate rather than two concatenated result sets, a global member
+   * whose home is the queried circle is delivered once, with no shadowing or double-delivery.
+   * Membership still requires the LATEST ratification verdict to be approve or re-ratify.
+   * LATEST-WINS: `ratifications` carries no uniqueness constraint
    * (recordRatification's own doc comment — "append-only: a later verdict is a new row"), so a
    * concept may be approved, retired, and re-ratified any number of times; only the most recent row
    * (by created_at, id as the tiebreak — the SAME order getRatifications already returns) decides
@@ -10071,23 +10123,27 @@ export class MonetCore {
     const rows = this.db
       .prepare(
         `SELECT c.id AS concept_id, c.kind AS kind, c.body AS body,
+                c.skeleton_breadth AS breadth,
                 lr.ratified_by AS ratified_by, lr.created_at AS ratified_at
            FROM concepts c
            JOIN ratifications lr ON lr.id = (
              SELECT r.id FROM ratifications r WHERE r.subject_concept_id = c.id
               ORDER BY r.created_at DESC, r.id DESC LIMIT 1
            )
-          WHERE c.circle = ? AND c.kind IN ('principle','preference') AND c.status = 'active'
+          WHERE (c.circle = ? OR c.skeleton_breadth = 'global')
+            AND c.kind IN ('principle','preference') AND c.status = 'active'
             AND lr.verdict IN ('approve','re-ratify')
           ORDER BY lr.created_at ASC, c.id ASC`,
       )
       .all(resolvedCircle) as Array<{
-        concept_id: string; kind: string; body: string; ratified_by: string | null; ratified_at: number;
+        concept_id: string; kind: string; body: string; breadth: SkeletonBreadth;
+        ratified_by: string | null; ratified_at: number;
       }>;
     return rows.map((row) => ({
       conceptId: row.concept_id,
       species: row.kind as "principle" | "preference",
       content: firstLine(row.body),
+      breadth: row.breadth,
       ratifiedBy: row.ratified_by,
       when: row.ratified_at,
     }));
@@ -10928,26 +10984,21 @@ export class MonetCore {
           `'principle' and 'preference'. A grant is a rule with permissive content, not a separate species.`,
       );
     }
-    // THE ONE BREADTH ENTRANCE. "`*` enters only through the declaration surface" — this is that
-    // surface, and it applies to species "rule" only.
+    // THE ONE BREADTH ENTRANCE. "`*` enters only through the declaration surface" — rules carry it
+    // on their binding; principles/preferences carry it on the member itself. Stages remain refused:
+    // their registry is already store-global and has no circle-scoped delivery to widen.
     const isBreadth = input.circle === BREADTH_CIRCLE;
-    if (isBreadth && input.species !== "rule") {
+    if (isBreadth && input.species === "stage") {
       throw new Error(
-        input.species === "stage"
-          ? `circle '${BREADTH_CIRCLE}' (global breadth) applies to rule declarations only — a stage is ` +
-            `already store-global and carries no circle to make global.`
-          : `circle '${BREADTH_CIRCLE}' (global breadth) applies to rule declarations only — breadth is a ` +
-            `property of a rule's BINDING, not of a ${input.species}. A principle/preference's residency ` +
-            `is per-install, not a circle-breadth question, and belongs to the later skeleton-` +
-            `materialization slice, not this one — declare '${input.species}' at a real circle instead.`,
+        `circle '${BREADTH_CIRCLE}' (global breadth) cannot apply to a stage declaration — a stage is ` +
+        `already store-global and carries no circle to make global.`,
       );
     }
-    // THE CONCEPT'S OWN CIRCLE — for a breadth declaration this is deliberately NOT `input.circle`
-    // (which is the breadth marker itself): the rule's CONCEPT still lives, is searched, and is
-    // listed at the caller's own circle exactly as any other concept; only its BINDING's delivery
-    // becomes global, threaded separately below via `rule.circle`. Substituting `defaultCircle`
-    // BEFORE resolution (rather than resolving `'*'` and special-casing the result) means a breadth
-    // declaration's concept circle is computed by the exact same path an ordinary declaration's is.
+    // THE MEMBER'S HOME CIRCLE — for any breadth declaration this is deliberately NOT `input.circle`
+    // (which is the breadth marker itself): the concept still lives, is searched, and is listed at
+    // the caller's ordinary default circle. Breadth is threaded separately onto the rule binding or
+    // skeleton member. Substituting `defaultCircle` before resolution keeps home-circle derivation
+    // identical to an ordinary declaration.
     const circle = this.resolveCircle(isBreadth ? this.defaultCircle : (input.circle ?? this.defaultCircle));
     if (
       (input.species === "rule" || input.species === "stage") &&
@@ -11139,6 +11190,7 @@ export class MonetCore {
       // that transaction; reading it afterwards is safe because store() cannot return without
       // having run the builder (skeletonEntry is set on every call from this branch).
       let advisories: DeclareAdvisory[] = [];
+      let narrowedFromBreadth = false;
       const stored = await this.store(input.content!, {
         circle,
         kind: species,
@@ -11146,6 +11198,10 @@ export class MonetCore {
         skeletonEntry: {
           verdict: "approve",
           ratifiedBy: declaredBy,
+          // Omitted circle means no breadth ruling, preserving an incumbent member's reach. An
+          // explicit ordinary circle makes it local; '*' makes it global.
+          breadth: input.circle === undefined ? undefined : (isBreadth ? "global" : "local"),
+          onBreadthNarrowed: () => { narrowedFromBreadth = true; },
           buildPacket: (resolution) => {
             advisories = this.declareAdvisories(input.content!, input.exitsEvidence, species, resolution);
             return JSON.stringify({
@@ -11162,6 +11218,7 @@ export class MonetCore {
         conceptId: stored.conceptId,
         action: stored.action,
         advisories,
+        ...(narrowedFromBreadth ? { narrowedFromBreadth: true as const } : {}),
         skeleton: this.skeleton(circle),
       };
     } else {
@@ -12438,7 +12495,7 @@ export class MonetCore {
         // CIRCLE-MINTING GUARD (review fix — DOOR 13 item 8, coordinator's ruling): circle_aliases
         // rows are the circle NAMESPACE itself — every from_name/to_name this table has ever held is
         // an ordinary circle a rename or merge produced. '*' is not a circle; it is the reserved
-        // global-breadth marker for a rule BINDING (BREADTH_CIRCLE's own comment). A relayed alias
+        // global-breadth marker for member delivery (BREADTH_CIRCLE's own comment). A relayed alias
         // naming it on either side cannot be an honest peer's rename/archive/merge — every local
         // writer of this table (renameCircle, archiveCircle, unarchiveCircle, mergeCircle) already
         // refuses it — so this is the same named refusal, at the one remaining door it was not yet
@@ -12446,7 +12503,7 @@ export class MonetCore {
         if (row.from_name === BREADTH_CIRCLE || row.to_name === BREADTH_CIRCLE) {
           throw new Error(
             `graftRows circle_aliases row ('${row.from_name}' -> '${row.to_name}') names ` +
-              `'${BREADTH_CIRCLE}': that is the reserved global-breadth marker for a rule BINDING, ` +
+              `'${BREADTH_CIRCLE}': that is the reserved global-breadth marker for member delivery, ` +
               `never a circle name an alias can hold on either side.`,
           );
         }
@@ -12756,16 +12813,24 @@ export class MonetCore {
         if (row.circle === BREADTH_CIRCLE) {
           throw new Error(
             `graftRows concept '${row.id}' has circle '${BREADTH_CIRCLE}': that is the reserved ` +
-              `global-breadth marker for a rule BINDING, never a circle a concept lives in.`,
+              `global-breadth marker for member delivery, never a circle a concept lives in.`,
+          );
+        }
+        if (
+          row.skeleton_breadth !== undefined &&
+          row.skeleton_breadth !== "local" && row.skeleton_breadth !== "global"
+        ) {
+          throw new Error(
+            `graftRows concept '${row.id}' has unknown skeleton breadth '${String(row.skeleton_breadth)}'`,
           );
         }
         const current = this.db.prepare(
-          `SELECT sync_revision, circle, title, body, source_refs, aliases,
+          `SELECT sync_revision, circle, title, body, source_refs, aliases, skeleton_breadth,
                   usefulness_last_fetched_at, arousal_last_updated_at
              FROM concepts WHERE id = ?`,
         ).get(row.id) as {
           sync_revision: number; circle: string; title: string; body: string;
-          source_refs: string | null; aliases: string | null;
+          source_refs: string | null; aliases: string | null; skeleton_breadth: SkeletonBreadth;
           usefulness_last_fetched_at: number | null; arousal_last_updated_at: number | null;
         } | undefined;
         const [revision, writer] = incomingMeta(row, "concepts", row.id, current?.sync_revision);
@@ -12775,14 +12840,15 @@ export class MonetCore {
                (id, slug, title, body, kind, status, confidence, version, circle, embedding,
                 support_count, dirty, updated_at, created_at, usefulness_score,
                 usefulness_last_fetched_at, arousal_score, arousal_last_updated_at,
-                source_refs, aliases, last_confirmed_at, last_confirmed_session_id,
+                source_refs, aliases, skeleton_breadth, last_confirmed_at, last_confirmed_session_id,
                 sync_revision, sync_writer)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                slug = excluded.slug, title = excluded.title, body = excluded.body,
                kind = excluded.kind, status = excluded.status, confidence = excluded.confidence,
                version = excluded.version, circle = excluded.circle, embedding = excluded.embedding,
                support_count = excluded.support_count, dirty = excluded.dirty,
+               skeleton_breadth = excluded.skeleton_breadth,
                updated_at = excluded.updated_at, created_at = excluded.created_at,
                usefulness_last_fetched_at = CASE
                  WHEN usefulness_last_fetched_at IS NULL THEN excluded.usefulness_last_fetched_at
@@ -12806,7 +12872,7 @@ export class MonetCore {
             relayAt, row.created_at ?? now, row.usefulness_score,
             row.usefulness_last_fetched_at ?? null, row.arousal_score,
             row.arousal_last_updated_at ?? null, row.source_refs ?? null,
-            row.aliases ?? null, row.last_confirmed_at ?? null,
+            row.aliases ?? null, row.skeleton_breadth ?? current?.skeleton_breadth ?? "local", row.last_confirmed_at ?? null,
             row.last_confirmed_session_id ?? null, revision, writer,
           );
         if (r.changes > 0) {
@@ -14063,8 +14129,8 @@ export class MonetCore {
       // passthrough everywhere else in this file (declare()'s own breadth path included).
       if (from === BREADTH_CIRCLE || to === BREADTH_CIRCLE) {
         throw new Error(
-          `'${BREADTH_CIRCLE}' cannot be a circle name: it is the reserved global-breadth marker for ` +
-            `a rule BINDING, never a circle a concept lives in or a rename can target.`,
+          `'${BREADTH_CIRCLE}' cannot be a circle name: it is the reserved global-breadth marker ` +
+            `for member delivery, never a circle a concept lives in or a rename can target.`,
         );
       }
       if (from === to) return { from, to, action: "noop", conceptsUpdated: 0, observationsUpdated: 0, edgesUpdated: 0, entitiesUpdated: 0 };
@@ -14861,7 +14927,7 @@ export class MonetCore {
         if (from === BREADTH_CIRCLE || into === BREADTH_CIRCLE) {
           throw new Error(
             `'${BREADTH_CIRCLE}' cannot be a circle name: it is the reserved global-breadth marker ` +
-              `for a rule BINDING, never a circle a concept lives in or a merge can target.`,
+              `for member delivery, never a circle a concept lives in or a merge can target.`,
           );
         }
         this.assertSameSharingScope(from, into);
@@ -14974,7 +15040,7 @@ export class MonetCore {
     // renameCircle — see that method's own comment for why keeping '*' out of this table entirely
     // is what makes resolveCircle('*') a safe passthrough everywhere.
     if (name === BREADTH_CIRCLE) {
-      throw new Error(`'${BREADTH_CIRCLE}' cannot be archived: it is not a circle, it is the reserved global-breadth marker for a rule binding.`);
+      throw new Error(`'${BREADTH_CIRCLE}' cannot be archived: it is not a circle, it is the reserved global-breadth marker for member delivery.`);
     }
     const existing = this.db
       .prepare(`SELECT to_name, status FROM circle_aliases WHERE from_name = ?`)
@@ -15017,7 +15083,7 @@ export class MonetCore {
   unarchiveCircle(name: string): void {
     this.assertNoEmbedderMigrationReentry("unarchive a circle");
     if (name === BREADTH_CIRCLE) {
-      throw new Error(`'${BREADTH_CIRCLE}' cannot be unarchived: it is not a circle, it is the reserved global-breadth marker for a rule binding.`);
+      throw new Error(`'${BREADTH_CIRCLE}' cannot be unarchived: it is not a circle, it is the reserved global-breadth marker for member delivery.`);
     }
     const existing = this.db
       .prepare(`SELECT to_name, status FROM circle_aliases WHERE from_name = ?`)

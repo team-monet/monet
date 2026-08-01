@@ -35,6 +35,8 @@ export interface SyncConceptRow {
   source_identity?: string | null;
   active_observation_id?: string | null;
   aliases: string | null; // JSON string[]
+  /** Where a skeleton member delivers. Absent on payloads from before global skeleton breadth. */
+  skeleton_breadth?: "local" | "global";
   last_confirmed_at: number | null;
   last_confirmed_session_id: string | null;
   /** v8 row-convergence clock. Missing on legacy payloads. */

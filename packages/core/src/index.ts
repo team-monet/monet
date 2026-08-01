@@ -34,6 +34,7 @@ export type {
   RatifyInput,
   RatifyResult,
   SkeletonEntry,
+  SkeletonBreadth,
   StageView,
   SourceStoreOpts,
   MonetCoreOptions,

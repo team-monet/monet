@@ -1117,10 +1117,29 @@ describe("declaration — the sovereign entrance", () => {
       c.close();
     });
 
-    it('rejects circle:"*" for principle/preference — residency is per-install, not a breadth question', async () => {
-      const c = core();
-      await expect(c.declare({ species: "principle", content: "x", circle: BREADTH_CIRCLE }))
-        .rejects.toThrow(/per-install.*materialization slice/);
+    it('accepts circle:"*" for principle/preference, keeps an ordinary home, and refuses it for stage', async () => {
+      const c = core({ circle: "home" });
+      const principle = await c.declare({
+        species: "principle", content: "A global principle.", circle: BREADTH_CIRCLE,
+      });
+      const preference = await c.declare({
+        species: "preference", content: "A global preference.", circle: BREADTH_CIRCLE,
+      });
+      if (principle.species !== "principle" || preference.species !== "preference") {
+        throw new Error("unreachable");
+      }
+
+      expect(raw(c).prepare(`SELECT circle, skeleton_breadth FROM concepts WHERE id = ?`).get(principle.conceptId))
+        .toEqual({ circle: "home", skeleton_breadth: "global" });
+      expect(raw(c).prepare(`SELECT circle, skeleton_breadth FROM concepts WHERE id = ?`).get(preference.conceptId))
+        .toEqual({ circle: "home", skeleton_breadth: "global" });
+      expect(principle.skeleton.find((entry) => entry.conceptId === principle.conceptId)?.breadth).toBe("global");
+      expect(preference.skeleton.find((entry) => entry.conceptId === preference.conceptId)?.breadth).toBe("global");
+      expect(preference.skeleton.map((entry) => entry.conceptId).sort())
+        .toEqual([principle.conceptId, preference.conceptId].sort());
+
+      await expect(c.declare({ species: "stage", stage: "git push", circle: BREADTH_CIRCLE }))
+        .rejects.toThrow(/cannot apply to a stage declaration.*already store-global/);
       c.close();
     });
 
@@ -1200,6 +1219,34 @@ describe("declaration — the sovereign entrance", () => {
         // Two approves on one concept: membership is idempotent, not doubled.
         expect(c.getRatifications(first.conceptId)).toHaveLength(2);
         expect(second.skeleton.filter((e) => e.conceptId === first.conceptId)).toHaveLength(1);
+        c.close();
+      });
+
+      it("re-declaration marks an existing member global without replacing ratification history", async () => {
+        const c = resolvingCore();
+        const content = "A build artifact is a snapshot; re-materialize after its source changes.";
+        const local = await c.declare({ species: "principle", content, declaredBy: "first" });
+        if (local.species !== "principle") throw new Error("unreachable");
+        const historyBefore = c.getRatifications(local.conceptId).map((row) => ({
+          id: row.id, verdict: row.verdict, packet: row.packet, ratifiedBy: row.ratified_by,
+          createdAt: row.created_at,
+        }));
+
+        const migrated = await c.declare({
+          species: "principle", content, circle: BREADTH_CIRCLE, declaredBy: "migration",
+        });
+        if (migrated.species !== "principle") throw new Error("unreachable");
+        expect(migrated.conceptId).toBe(local.conceptId);
+        expect(migrated.action).toBe("attached");
+        expect(c.skeleton("a-different-circle").find((entry) => entry.conceptId === local.conceptId)?.breadth)
+          .toBe("global");
+
+        const historyAfter = c.getRatifications(local.conceptId);
+        expect(historyAfter).toHaveLength(2);
+        expect(historyAfter.map((row) => ({
+          id: row.id, verdict: row.verdict, packet: row.packet, ratifiedBy: row.ratified_by,
+          createdAt: row.created_at,
+        }))).toContainEqual(historyBefore[0]);
         c.close();
       });
 
@@ -4532,7 +4579,7 @@ describe("gate substrate sync", () => {
     });
 
     const payload = src.exportDelta(0);
-    expect(payload.schemaVersion).toBe(12);
+    expect(payload.schemaVersion).toBe(13);
     expect(payload.stages?.map((s) => s.name)).toEqual(["git force push"]);
     expect(payload.ruleBindings?.map((b) => b.concept_id)).toEqual([rule.conceptId]);
 
@@ -5270,8 +5317,8 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const payload = src.exportDelta(0);
-    expect(() => dst.graftRows({ ...payload, schemaVersion: 13 }))
-      .toThrow(/this build understands up to 12/);
+    expect(() => dst.graftRows({ ...payload, schemaVersion: 14 }))
+      .toThrow(/this build understands up to 13/);
     src.close();
     dst.close();
   });
@@ -11544,6 +11591,43 @@ describe("MCP surface", () => {
     await client.close();
     c.close();
   });
+
+  it.each(["principle", "preference"] as const)(
+    "memory_declare(species %s) discloses only an actual global-to-local narrowing in existing guidance",
+    async (species) => {
+      const c = resolvingCore();
+      const { call, client } = await harness(c);
+      const content = `A ${species} with an explicitly governed breadth transition.`;
+
+      const global = await call("memory_declare", { species, content, circle: "*" });
+      expect(global.isError).toBe(false);
+      expect(global.json.guidance).not.toContain("BREADTH NARROWED");
+      expect(global.json).not.toHaveProperty("narrowedFromBreadth");
+
+      const omitted = await call("memory_declare", { species, content });
+      expect(omitted.isError).toBe(false);
+      expect(omitted.json.conceptId).toBe(global.json.conceptId);
+      expect(omitted.json.guidance).not.toContain("BREADTH NARROWED");
+      expect(c.skeleton("elsewhere").some((entry) => entry.conceptId === global.json.conceptId)).toBe(true);
+
+      const stillGlobal = await call("memory_declare", { species, content, circle: "*" });
+      expect(stillGlobal.isError).toBe(false);
+      expect(stillGlobal.json.guidance).not.toContain("BREADTH NARROWED");
+
+      const narrowed = await call("memory_declare", { species, content, circle: "default" });
+      expect(narrowed.isError).toBe(false);
+      expect(narrowed.json.guidance).toContain(
+        `BREADTH NARROWED: this ${species} was global (every circle) and now delivers only in its own circle — ` +
+        `every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle="*" to restore it.`,
+      );
+      // The transition signal is internal plumbing; #113 keeps it out of the wire payload.
+      expect(narrowed.json).not.toHaveProperty("narrowedFromBreadth");
+      expect(c.skeleton("elsewhere").some((entry) => entry.conceptId === global.json.conceptId)).toBe(false);
+
+      await client.close();
+      c.close();
+    },
+  );
 
   it.each(["principle", "preference"] as const)(
     "memory_declare(species %s) does not inject the host modelTag, but still rejects one the caller supplied",

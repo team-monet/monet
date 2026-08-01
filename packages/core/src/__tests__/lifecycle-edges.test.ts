@@ -589,6 +589,23 @@ describe("ratify() — the human-approval surface", () => {
     c.close();
   });
 
+  it("ratifies a global-breadth candidate without changing its breadth", async () => {
+    const c = core();
+    const declared = await c.declare({
+      species: "principle", content: "A globally governing principle.", circle: "*",
+    });
+    if (declared.species !== "principle") throw new Error("unreachable");
+
+    const ratified = await c.ratify({
+      candidateId: declared.conceptId, verdict: "re-ratify", circle: "default", ratifiedBy: "john",
+    });
+    expect(ratified.skeleton.find((entry) => entry.conceptId === declared.conceptId))
+      .toMatchObject({ breadth: "global", ratifiedBy: "john" });
+    expect(c.skeleton("another-circle").find((entry) => entry.conceptId === declared.conceptId))
+      .toMatchObject({ breadth: "global" });
+    c.close();
+  });
+
   it("re-ratify with memberRuleIds ALSO writes edges; reject/retire never do, even when memberRuleIds is given", async () => {
     const c = core();
     const principle = await c.store("A principle re-ratified after doubt.", { kind: "principle" });
@@ -712,26 +729,73 @@ describe("skeleton() — derived membership, never a stored flag", () => {
     c.close();
   });
 
-  it("is circle-scoped and covers both principle and preference kinds; no scalar flag anywhere", async () => {
+  it("unions local and global members, with no shadowing or double-delivery in the home circle", async () => {
+    const c = core();
+    const localHome = await c.declare({
+      species: "principle", content: "A local principle at home.", circle: "home",
+    });
+    const localElsewhere = await c.declare({
+      species: "principle", content: "A local principle elsewhere.", circle: "elsewhere",
+    });
+    // A global declaration keeps the default circle as its home.
+    const global = await c.declare({
+      species: "preference", content: "A preference delivered everywhere.", circle: "*",
+    });
+    if (localHome.species !== "principle" || localElsewhere.species !== "principle" || global.species !== "preference") {
+      throw new Error("unreachable");
+    }
+
+    expect(c.skeleton("home").map((entry) => entry.conceptId).sort())
+      .toEqual([localHome.conceptId, global.conceptId].sort());
+    expect(c.skeleton("elsewhere").map((entry) => entry.conceptId).sort())
+      .toEqual([localElsewhere.conceptId, global.conceptId].sort());
+    expect(c.skeleton("unseen").map((entry) => entry.conceptId)).toEqual([global.conceptId]);
+
+    // The global member's home is "default" and the union predicate returns it once there, not once
+    // through each side of the union. Local members remain explicitly distinguishable to renderers.
+    expect(c.skeleton("default").filter((entry) => entry.conceptId === global.conceptId)).toHaveLength(1);
+    expect(c.skeleton("default").find((entry) => entry.conceptId === global.conceptId)?.breadth).toBe("global");
+    expect(c.skeleton("home").find((entry) => entry.conceptId === localHome.conceptId)?.breadth).toBe("local");
+    expect(c.overview("elsewhere").skeleton.map((entry) => entry.conceptId).sort())
+      .toEqual([localElsewhere.conceptId, global.conceptId].sort());
+    c.close();
+  });
+
+  it("re-declaration preserves existing breadth when circle is omitted and narrows it when local is explicit", async () => {
+    const c = new MonetCore(":memory:");
+    const content = "An explicitly global preference whose wording is restated.";
+    const global = await c.declare({ species: "preference", content, circle: "*" });
+    if (global.species !== "preference") throw new Error("unreachable");
+
+    const preserved = await c.declare({ species: "preference", content });
+    if (preserved.species !== "preference") throw new Error("unreachable");
+    expect(preserved.conceptId).toBe(global.conceptId);
+    expect(c.skeleton("elsewhere").find((entry) => entry.conceptId === global.conceptId)?.breadth).toBe("global");
+
+    const narrowed = await c.declare({ species: "preference", content, circle: "default" });
+    if (narrowed.species !== "preference") throw new Error("unreachable");
+    expect(narrowed.conceptId).toBe(global.conceptId);
+    expect(c.skeleton("elsewhere").some((entry) => entry.conceptId === global.conceptId)).toBe(false);
+    expect(c.skeleton("default").find((entry) => entry.conceptId === global.conceptId)?.breadth).toBe("local");
+    c.close();
+  });
+
+  it("keeps authority derived from ratifications rather than a scalar membership flag", async () => {
     const c = core();
     const principle = await c.store("A principle at home.", { circle: "home", kind: "principle" });
     const preference = await c.store("A preference at home.", { circle: "home", kind: "preference" });
-    const elsewhere = await c.store("A principle elsewhere.", { circle: "elsewhere", kind: "principle" });
     await c.ratify({ candidateId: principle.conceptId, verdict: "approve", circle: "home" });
     await c.ratify({ candidateId: preference.conceptId, verdict: "approve", circle: "home" });
-    await c.ratify({ candidateId: elsewhere.conceptId, verdict: "approve", circle: "elsewhere" });
 
     const home = c.skeleton("home");
     expect(home.map((e) => e.conceptId).sort()).toEqual([principle.conceptId, preference.conceptId].sort());
     expect(home.find((e) => e.conceptId === principle.conceptId)!.species).toBe("principle");
     expect(home.find((e) => e.conceptId === preference.conceptId)!.species).toBe("preference");
-    expect(c.skeleton("elsewhere").map((e) => e.conceptId)).toEqual([elsewhere.conceptId]);
 
-    // No scalar authority column anywhere on the concept row itself (the design's own
-    // implementation directive) — membership is derived solely from the ratifications join.
-    const raw = (c as unknown as { db: { prepare(sql: string): { get(...p: unknown[]): unknown } } }).db;
-    const row = raw.prepare(`SELECT * FROM concepts WHERE id = ?`).get(principle.conceptId) as Record<string, unknown>;
-    expect(Object.keys(row).some((k) => /ratif|approved|skeleton|authority/i.test(k))).toBe(false);
+    // skeleton_breadth controls delivery scope only. Membership itself remains derived solely from
+    // the latest ratification join; no scalar ratified/approved/authority flag exists.
+    const row = raw(c).prepare(`SELECT * FROM concepts WHERE id = ?`).get(principle.conceptId) as Record<string, unknown>;
+    expect(Object.keys(row).some((key) => /ratif|approved|authority/i.test(key))).toBe(false);
     c.close();
   });
 });
@@ -834,6 +898,22 @@ describe("wipe immunity", () => {
 // sync
 // ---------------------------------------------------------------------------
 describe("lifecycle edge sync", () => {
+  it("syncs global skeleton breadth with the concept so peers deliver the same union", async () => {
+    const src = core({ syncDeviceId: "machine-a" });
+    const dst = core({ syncDeviceId: "machine-b" });
+    const global = await src.declare({
+      species: "principle", content: "A global principle survives relay.", circle: "*",
+    });
+    if (global.species !== "principle") throw new Error("unreachable");
+
+    const payload = src.exportDelta(0);
+    expect(payload.schemaVersion).toBe(13);
+    expect(payload.concepts.find((row) => row.id === global.conceptId)?.skeleton_breadth).toBe("global");
+    dst.graftRows(payload);
+    expect(dst.skeleton("a-circle-with-no-local-members").find((entry) => entry.conceptId === global.conceptId))
+      .toMatchObject({ breadth: "global" });
+  });
+
   it("carries both tables across export → graft, and dedupes on a replay", async () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });

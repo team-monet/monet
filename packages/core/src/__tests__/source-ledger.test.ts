@@ -1556,7 +1556,7 @@ describe("source ledger schema migration", () => {
     }
   });
 
-  it("serially repairs partial v9 registry and ledger columns across two open connections, landing on v10", () => {
+  it("serially repairs partial v9 registry and ledger columns across two open connections, landing on current schema", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-v9-partial-race-"));
     const path = join(dir, "monet.db");
     try {
@@ -1588,7 +1588,7 @@ describe("source ledger schema migration", () => {
       left.close();
 
       const again = new MonetCore(path);
-      expect(((again as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(10);
+      expect(((again as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(11);
       again.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -1642,7 +1642,7 @@ describe("source ledger schema migration", () => {
     }
   });
 
-  it("bumps v8 stores to v10 idempotently while graph-disabled fresh stores remain v0", () => {
+  it("bumps v8 stores to current schema idempotently while graph-disabled fresh stores remain v0", () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-source-ledger-migrate-"));
     const path = join(dir, "monet.db");
     try {
@@ -1657,7 +1657,7 @@ describe("source ledger schema migration", () => {
 
       const migrated = new MonetCore(path);
       const migratedDb = (migrated as unknown as { db: StoragePort }).db;
-      expect(migratedDb.pragma("user_version", { simple: true })).toBe(10);
+      expect(migratedDb.pragma("user_version", { simple: true })).toBe(11);
       for (const table of ["source_sync_runs", "source_snapshots", "source_staged_files", "source_files", "source_staged_chunks", "source_chunks", "source_cleanup_items", "source_removals", "source_removal_items"]) {
         expect(migratedDb.prepare(`PRAGMA table_info(${table})`).all()).not.toEqual([]);
       }
@@ -1668,7 +1668,7 @@ describe("source ledger schema migration", () => {
       expect((migratedDb.prepare(`SELECT sql FROM sqlite_master WHERE name='source_cleanup_items'`).get() as { sql: string }).sql).toContain("quarantine-non-authorizing");
       migrated.close();
       const reopened = new MonetCore(path);
-      expect(((reopened as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(10);
+      expect(((reopened as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(11);
       reopened.close();
       const disabled = new MonetCore(":memory:", { graphEnabled: false });
       expect(((disabled as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(0);
