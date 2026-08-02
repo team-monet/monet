@@ -7,9 +7,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MonetCore, type SkeletonEntry } from "../engine";
+import type { EmbeddingProvider } from "../embedding";
 import { upsertStage } from "../gates";
 import { registerMonetCoreTools } from "../mcp-server";
-import { MIRROR_STALE_INSTRUCTION } from "../skeleton-mirror";
+import { MIRROR_STALE_INSTRUCTION, SKELETON_CHANGED_INSTRUCTION } from "../skeleton-mirror";
 
 const cores: MonetCore[] = [];
 type RawDb = {
@@ -23,6 +24,30 @@ const raw = (core: MonetCore): RawDb => (core as unknown as { db: RawDb }).db;
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
 const block = (scope: string, body = "# Standing skeleton") =>
   `<!-- BEGIN monet:skeleton scope=${scope} -->\n${body}\n<!-- END monet:skeleton -->`;
+
+type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
+async function withServer<T>(core: MonetCore, fn: (client: Client) => Promise<T>): Promise<T> {
+  const server = new McpServer({ name: "mirror-test", version: "1" }, { capabilities: { tools: {} } });
+  registerMonetCoreTools(server, core, { autoPrewarm: false, checkpointNudge: false });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  const client = new Client({ name: "mirror-client", version: "1" });
+  await client.connect(clientTransport);
+  try {
+    return await fn(client);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
+const payload = (result: unknown): Record<string, unknown> =>
+  JSON.parse((result as ToolResult).content[0]!.text) as Record<string, unknown>;
+
+class ConstantEmbeddingProvider implements EmbeddingProvider {
+  readonly dim = 2;
+  readonly modelId = "test:constant";
+  embed(): Float32Array { return new Float32Array([1, 0]); }
+}
 
 function fixture(): { root: string; db: string; core: MonetCore } {
   const root = mkdtempSync(join(tmpdir(), "monet-skeleton-mirror-"));
@@ -329,6 +354,157 @@ describe("prewarm skeleton mirror delivery", () => {
     await core.declare({ species: "principle", content: "New local member.", circle: "new" });
     expect(core.prewarm("old").mirrorStale).toEqual([{ path, reason: "store-moved" }]);
     expect(core.prewarm("new").mirrorStale).toEqual([{ path, reason: "store-moved" }]);
+  });
+
+  it("write acknowledgements instruct only when semantic change intersects a registered covering surface", async () => {
+    const { root, core } = fixture();
+    const globalPath = join(root, "global.md");
+    const alphaPath = join(root, "alpha.md");
+    register(root, [
+      { path: globalPath, scope: "global" },
+      { path: alphaPath, scope: { circle: "alpha" } },
+    ], { global: stateHash([]), circles: { alpha: stateHash([]) } });
+
+    await withServer(core, async (client) => {
+      const global = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "A global member.", circle: "*" },
+      }));
+      expect(global.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+      expect(global).not.toHaveProperty("skeleton");
+
+      const local = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "preference", content: "An alpha member.", circle: "alpha" },
+      }));
+      expect(local.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+      expect(local).not.toHaveProperty("skeleton");
+
+      const reratified = payload(await client.callTool({
+        name: "memory_ratify",
+        arguments: { candidateId: local.conceptId, verdict: "re-ratify", circle: "alpha" },
+      }));
+      expect(reratified).not.toHaveProperty("instruction");
+      expect(reratified).not.toHaveProperty("skeleton");
+
+      const rejectedLive = payload(await client.callTool({
+        name: "memory_ratify",
+        arguments: { candidateId: local.conceptId, verdict: "reject", circle: "alpha" },
+      }));
+      expect(rejectedLive.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+      expect(core.skeleton("alpha").some((entry) => entry.conceptId === local.conceptId)).toBe(false);
+
+      const rejectedAgain = payload(await client.callTool({
+        name: "memory_ratify",
+        arguments: { candidateId: local.conceptId, verdict: "reject", circle: "alpha" },
+      }));
+      expect(rejectedAgain).not.toHaveProperty("instruction");
+    });
+  });
+
+  it("covered re-declaration instructs only when attachment changed the mirror body", async () => {
+    const root = mkdtempSync(join(tmpdir(), "monet-skeleton-mirror-body-"));
+    const db = join(root, "monet.db");
+    const core = new MonetCore(db, {
+      embedder: new ConstantEmbeddingProvider(),
+      tauAttach: 0.5,
+      tauAmbiguous: 0.2,
+      sourceStorageDir: join(root, "sources"),
+    });
+    cores.push(core);
+    const path = join(root, "default.md");
+    register(root, [{ path, scope: { circle: "default" } }], {
+      global: stateHash([]), circles: { default: stateHash([]) },
+    });
+
+    await withServer(core, async (client) => {
+      const firstResult = await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "Keep the governing claim concise.", exitsEvidence: "The detail becomes necessary." },
+      });
+      if ((firstResult as ToolResult).isError) throw new Error((firstResult as ToolResult).content[0]!.text);
+      const first = payload(firstResult);
+      expect(first.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+
+      const identical = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "Keep the governing claim concise.", exitsEvidence: "The detail becomes necessary." },
+      }));
+      expect(identical.conceptId).toBe(first.conceptId);
+      expect(identical.action).toBe("attached");
+      expect(identical).not.toHaveProperty("instruction");
+
+      const changed = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "Keep the governing claim concise and auditable.", exitsEvidence: "The detail becomes necessary." },
+      }));
+      expect(changed.conceptId).toBe(first.conceptId);
+      expect(changed.action).toBe("attached");
+      expect(changed.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+      expect(core.skeletonBodies()[0]!.body).toContain("concise and auditable");
+    });
+  });
+
+  it("bootstrap writes and registered non-covering surfaces omit the instruction", async () => {
+    const bootstrap = fixture();
+    await withServer(bootstrap.core, async (client) => {
+      const declared = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "Bootstrap member.", circle: "alpha" },
+      }));
+      expect(declared).not.toHaveProperty("instruction");
+      expect(declared).not.toHaveProperty("skeleton");
+    });
+
+    const covered = fixture();
+    const betaPath = join(covered.root, "beta.md");
+    register(covered.root, [{ path: betaPath, scope: { circle: "beta" } }], {
+      global: stateHash([]), circles: { beta: stateHash([]) },
+    });
+    await withServer(covered.core, async (client) => {
+      const declared = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "preference", content: "Alpha only.", circle: "alpha" },
+      }));
+      expect(declared).not.toHaveProperty("instruction");
+    });
+  });
+
+  it("breadth widening and narrowing each instruct when their affected scopes are covered", async () => {
+    const { root, db, core: fixtureCore } = fixture();
+    fixtureCore.close();
+    cores.pop();
+    const core = new MonetCore(db, { sourceStorageDir: join(root, "sources") });
+    cores.push(core);
+    const globalPath = join(root, "global.md");
+    const localPath = join(root, "local.md");
+    register(root, [
+      { path: globalPath, scope: "global" },
+      { path: localPath, scope: { circle: "default" } },
+    ], { global: stateHash([]), circles: { default: stateHash([]) } });
+
+    await withServer(core, async (client) => {
+      const local = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "A rescopable member.", circle: "default", sourceRefs: ["same-member"] },
+      }));
+      expect(local.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+
+      const widened = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "A rescopable member.", circle: "*", sourceRefs: ["same-member"] },
+      }));
+      expect(widened.conceptId).toBe(local.conceptId);
+      expect(widened.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+      expect(widened).not.toHaveProperty("guidance");
+
+      const narrowed = payload(await client.callTool({
+        name: "memory_declare",
+        arguments: { species: "principle", content: "A rescopable member.", circle: "default", sourceRefs: ["same-member"] },
+      }));
+      expect(narrowed.instruction).toBe(SKELETON_CHANGED_INSTRUCTION);
+      expect(narrowed.guidance).toContain("BREADTH NARROWED");
+    });
   });
 
   it("bounds oversized mirrorStale on agent_context without corrupting JSON", async () => {

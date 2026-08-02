@@ -13,7 +13,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore } from "./engine";
-import type { MemoryOverview, MergeConceptResult, SearchCard } from "./engine";
+import type { MemoryOverview, MergeConceptResult, RuleSuccession, SearchCard, StageView } from "./engine";
 import {
   BREADTH_CIRCLE,
   MODEL_TAG_MAX_CHARS,
@@ -26,7 +26,7 @@ import {
 } from "./gates";
 import type { SourceAuthorizationContext } from "./source-types";
 import { sanitizeSourceError } from "./source-errors";
-import { MIRROR_STALE_INSTRUCTION } from "./skeleton-mirror";
+import { MIRROR_STALE_INSTRUCTION, SKELETON_CHANGED_INSTRUCTION } from "./skeleton-mirror";
 import { createSourceScheduler } from "./source-scheduler";
 import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-scheduler";
 
@@ -122,6 +122,55 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
  */
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
 const RECALL_EMPTY_LINE = "Nothing matched.";
+/** Circle names are routing identifiers, not prose; bound every caller-controlled echo before writes. */
+export const CIRCLE_NAME_MAX_CHARS = 256;
+const WRITE_ACK_LIST_MAX = 25;
+const STAGE_ACK_PATTERNS_MAX = 8;
+const STAGE_ACK_TOKEN_MAX_CHARS = 80;
+const STAGE_ACK_PATTERN_MAX_CHARS = 300;
+const WRITE_ACK_TEXT_MAX_CHARS = 1_000;
+const ANOMALOUS_STORE_RESOLUTION_MODES = new Set([
+  "ambiguous-fork",
+  "fork-signal",
+  "blur-duplicate",
+  "species-fork",
+  "stage-fork",
+]);
+
+function fitWriteAckList<T>(items: readonly T[]): { items: T[]; omitted: number } {
+  const fitted = items.slice(0, WRITE_ACK_LIST_MAX);
+  return { items: fitted, omitted: items.length - fitted.length };
+}
+
+function fitRuleSuccessionForAck(succession: RuleSuccession): Record<string, unknown> {
+  const { impeachedPrincipleIds, ...fixed } = succession;
+  if (impeachedPrincipleIds === undefined) return fixed;
+  const fit = fitWriteAckList(impeachedPrincipleIds);
+  return {
+    ...fixed,
+    impeachedPrincipleIds: fit.items,
+    ...(fit.omitted > 0 ? { impeachedPrincipleIdsOmitted: fit.omitted } : {}),
+  };
+}
+
+function fitStageViewForAck(stage: StageView): Record<string, unknown> {
+  const fitted = stage.patterns.slice(0, STAGE_ACK_PATTERNS_MAX).map((pattern) => ({
+    tool: pattern.tool === null ? null : clip(pattern.tool, STAGE_ACK_TOKEN_MAX_CHARS).text,
+    tokens: pattern.tokens.map((token) => clip(token, STAGE_ACK_TOKEN_MAX_CHARS).text),
+  }));
+  return {
+    ...stage,
+    name: clip(stage.name, WRITE_ACK_TEXT_MAX_CHARS).text,
+    patterns: fitted,
+    ...(stage.patterns.length > fitted.length ? { patternsOmitted: stage.patterns.length - fitted.length } : {}),
+  };
+}
+
+function fitRenderedPatternsForAck(patterns: readonly string[]): { items: string[]; omitted: number } {
+  const fitted = patterns.slice(0, STAGE_ACK_PATTERNS_MAX)
+    .map((pattern) => clip(pattern, STAGE_ACK_PATTERN_MAX_CHARS).text);
+  return { items: fitted, omitted: patterns.length - fitted.length };
+}
 
 /**
  * Search and gather cards are pointers, so their wire contract is deliberately smaller than the
@@ -191,25 +240,9 @@ function fitStringArray(
 }
 
 /**
- * The object-array counterpart to fitStringArray — same incremental size-fit technique, generalized
- * over a plain object rather than a string, for the skeleton-entrances slice's in-band skeleton
- * delivery (memory_declare's principle/preference response, memory_ratify): a SkeletonEntry is a
- * small structured record, not a bare string, so fitStringArray's own signature does not fit it. No
- * maxIterate count-cap here (unlike fitStringArray/stage_lookup's rules): skeleton() is itself
- * uncapped at the engine layer on the same "few, always present" reasoning stages()/liveStageIndex
- * rely on for their own callers, so the O(n) JSON.stringify cost this loop pays is bounded by the
- * same design property, not by a second, redundant iteration cap here.
- *
- * TAKES A BUILDER, NOT A PARTIAL ENVELOPE (review round 1, item 2 — this was a reproduced blocker,
- * not a tidy-up). Measuring a PREFIX of the response and then appending more fields to it is not a
- * budget, it is an estimate: the previous shape fitted against the fixed fields alone and then
- * added `guidance` (~240 chars) plus `skeletonTruncated`/`skeletonOmitted` (~55) afterwards, so at
- * realistic entry sizes the finished response crossed RESULT_MAX_CHARS and ok()'s last-resort
- * slicer cut it mid-JSON — an isError:false payload that JSON.parse rejects, the exact failure the
- * fitting loop exists to make impossible. The builder closes that by construction: what gets
- * MEASURED is the same complete object that gets RETURNED, truncation signals and all. The two
- * signals are themselves size-relevant and depend on how many entries fit, which is why the builder
- * is told `omitted` rather than being called once up front.
+ * The object-array counterpart to fitStringArray — same incremental size-fit technique for response
+ * envelopes that carry arrays of structured records. The builder owns every returned field, so the
+ * object measured against the budget is exactly the object returned.
  */
 function fitObjectArray<T>(
   buildEnvelope: (fitted: T[], omitted: number) => Record<string, unknown>,
@@ -294,10 +327,9 @@ export function fitOverviewEnvelope(overview: MemoryOverview & { resolvedFrom?: 
 
 // ok() is the canonical serializer for successful tool results. content[0] is ALWAYS the
 // pure JSON payload — byte-identical to what callers (scripts/mcp-smoke.ts, test helpers)
-// expect to JSON.parse. Any lifecycle decorations (prewarm block, nudge line) are appended
-// as ADDITIONAL content items by wrapSuccess so they never interfere with content[0].
+// expect to JSON.parse. The optional prewarm block is appended as a separate content item.
 // Per-item bounds: ok()'s JSON is capped at RESULT_MAX_CHARS; the prewarm block is capped
-// at PREWARM_BLOCK_MAX_CHARS; the nudge line is short and uncapped (its fixed text is ~80 chars).
+// at PREWARM_BLOCK_MAX_CHARS.
 export function ok(content: object): CallToolResult {
   const serialized = JSON.stringify(content, null, 2);
   const text = serialized.length <= RESULT_MAX_CHARS
@@ -466,11 +498,10 @@ type CircleListResponse = {
  * autoPrewarm: prepend a compact session context block on the first successful non-agent_context
  *   tool response in this server process. Useful for agents that don't explicitly call agent_context.
  *
- * checkpointNudge: append a reminder line when the session accumulates ≥10 unsaved mutations
- *   (and every 20 more) without a memory_checkpoint with a workstream payload.
  */
 export interface RegisterMonetCoreToolsOpts {
   autoPrewarm?: boolean;
+  /** Deprecated compatibility option. Checkpoint response nags are no longer emitted. */
   checkpointNudge?: boolean;
   /** Host-injected identity; never accepted from tool arguments. */
   sourceAuthorizationContext?: Readonly<SourceAuthorizationContext>;
@@ -493,7 +524,6 @@ export function registerMonetCoreTools(
   opts?: RegisterMonetCoreToolsOpts,
 ): McpServer {
   const autoPrewarm = opts?.autoPrewarm ?? true;
-  const checkpointNudge = opts?.checkpointNudge ?? true;
   const sourceAuthorizationContext = opts?.sourceAuthorizationContext
     ? Object.freeze({ ...opts.sourceAuthorizationContext })
     : undefined;
@@ -530,9 +560,6 @@ export function registerMonetCoreTools(
   // --- lifecycle closure state ---
   // Auto-prewarm: one-shot per server process.
   let prewarmed = false;
-  // Checkpoint nudge: count mutating calls; track last nudge position.
-  let mutatingCalls = 0;
-  let lastNudgeAt = 0;
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
@@ -635,17 +662,11 @@ export function registerMonetCoreTools(
    * byte-identical to what it was before any lifecycle decoration. This preserves every
    * consumer that does JSON.parse(content[0].text) (scripts/mcp-smoke.ts, test helpers).
    *
-   * When decorations apply:
-   *  - The prewarm block ships as content[1] (a separate text item).
-   *  - The nudge line ships as the final content item (content[1] or content[2] depending
-   *    on whether a prewarm block is also present).
+   * When it applies, the prewarm block ships as content[1] (a separate text item). A host that drops
+   * extra content items degrades to no-prewarm — acceptable best-effort. No combined-ceiling math:
+   * each item is independently bounded (ok()'s result at RESULT_MAX_CHARS via ok(); the block at
+   * PREWARM_BLOCK_MAX_CHARS via buildPrewarmBlock()).
    *
-   * A host that drops extra content items degrades to no-prewarm/no-nudge — acceptable
-   * best-effort. No combined-ceiling math: each item is independently bounded (ok()'s result
-   * at RESULT_MAX_CHARS via ok(); the block at PREWARM_BLOCK_MAX_CHARS via buildPrewarmBlock()).
-   *
-   * `isMutating`: was this a mutating tool call?
-   * `isCheckpointWithWorkstream`: was this a successful memory_checkpoint with a workstream?
    * `toolName`: name of the tool (to suppress prewarm block for agent_context).
    * `capturedBlock`: pre-captured prewarm block string from capturePrewarmSnapshot(), or null if
    *   the caller is agent_context (which handles its own lifecycle) or autoPrewarm is off. When
@@ -654,17 +675,13 @@ export function registerMonetCoreTools(
   function wrapSuccess(
     result: CallToolResult,
     {
-      isMutating,
-      isCheckpointWithWorkstream,
       toolName,
       capturedBlock,
-    }: { isMutating: boolean; isCheckpointWithWorkstream: boolean; toolName: string; capturedBlock?: string | null },
+    }: { toolName: string; capturedBlock?: string | null },
   ): CallToolResult {
     if (result.content[0]?.type !== "text") return result;
 
     let prewarmBlock = "";
-    let nudgeLine = "";
-    let carryingPrewarm = false;
 
     // --- auto-prewarm ---
     if (autoPrewarm && !prewarmed) {
@@ -676,7 +693,6 @@ export function registerMonetCoreTools(
         consumePrewarmSnapshot();
         if (capturedBlock.length > 0) {
           prewarmBlock = capturedBlock;
-          carryingPrewarm = true;
         }
       } else {
         // Fallback: no pre-captured block supplied (should not happen for well-formed callers).
@@ -686,41 +702,15 @@ export function registerMonetCoreTools(
         prewarmed = true;
         if (block.length > 0) {
           prewarmBlock = block;
-          carryingPrewarm = true;
         }
       }
     }
 
-    // --- checkpoint nudge ---
-    if (checkpointNudge && isMutating && !isCheckpointWithWorkstream && !carryingPrewarm) {
-      mutatingCalls += 1;
-      const shouldNudge =
-        mutatingCalls >= 10 && (lastNudgeAt === 0 || mutatingCalls - lastNudgeAt >= 20);
-      if (shouldNudge) {
-        nudgeLine =
-          "[monet] Session has unsaved state — call memory_checkpoint with a workstream snapshot to preserve it.";
-        lastNudgeAt = mutatingCalls;
-      }
-    } else if (checkpointNudge && isMutating && isCheckpointWithWorkstream) {
-      // Successful checkpoint-with-workstream resets the counter.
-      mutatingCalls = 0;
-      lastNudgeAt = 0;
-    } else if (checkpointNudge && isMutating && !isCheckpointWithWorkstream && carryingPrewarm) {
-      // Mutating call that carries the prewarm block: count it but don't nudge.
-      mutatingCalls += 1;
-    }
-
-    if (prewarmBlock === "" && nudgeLine === "") return result;
-
-    // content[0] is always the pure result from ok() — never modified.
-    // Lifecycle items are appended as additional content items.
-    const extra: Array<{ type: "text"; text: string }> = [];
-    if (prewarmBlock !== "") extra.push({ type: "text", text: prewarmBlock });
-    if (nudgeLine !== "") extra.push({ type: "text", text: nudgeLine });
+    if (prewarmBlock === "") return result;
 
     return {
       ...result,
-      content: [result.content[0], ...result.content.slice(1), ...extra],
+      content: [result.content[0], ...result.content.slice(1), { type: "text", text: prewarmBlock }],
     };
   }
 
@@ -738,22 +728,21 @@ export function registerMonetCoreTools(
     toolName: string,
     capturedBlock?: string | null,
   ): CallToolResult =>
-    wrapSuccess(ok(content), { isMutating: false, isCheckpointWithWorkstream: false, toolName, capturedBlock });
+    wrapSuccess(ok(content), { toolName, capturedBlock });
 
   const mutOk = (
     content: object,
     toolName: string,
-    isCheckpointWithWorkstream = false,
     capturedBlock?: string | null,
   ): CallToolResult =>
-    wrapSuccess(ok(content), { isMutating: true, isCheckpointWithWorkstream, toolName, capturedBlock });
+    wrapSuccess(ok(content), { toolName, capturedBlock });
 
   server.tool(
     "memory_store",
     'Store something worth remembering. By default the substrate deduplicates automatically: similar evidence resolves into an existing concept; novel evidence creates a new one. It finds by evidence and confirms by identity — an existing concept is nominated by how well its own stored observations match yours, then kept only if the concept as a whole is still coherent with what you wrote; when those two disagree the concept is bimodal, so instead of absorbing your evidence the substrate forks it and flags the pair as a possible duplicate for you to mediate (that is a fork signal, reported as resolutionMode="fork-signal"). The mirror case is reported as resolutionMode="blur-duplicate": a concept looked like an exact match as a whole but none of its stored evidence agreed, so your memory was kept separate and the pair flagged rather than silently absorbed. Pass resolution="forceNew" to always create a new concept (useful for bulk import flows where each item is known to be distinct). Pass attachTo=<conceptId> to attach directly to a specific concept, bypassing automatic scoring. Cheap and instant — synthesis happens later, on read. Use kind="procedure" for behavioral rules and kind="preference" for style/voice/format preferences.',
     {
       content: z.string(),
-      circle: z.string().optional(),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       kind: z
         .string()
         .optional()
@@ -838,15 +827,15 @@ export function registerMonetCoreTools(
           // stamped for the model running NOW, not the one running at MCP registration time.
           ...(rule ? { rule: { ...rule, modelTag: core.getRuntimeModelTag() ?? rule.modelTag } } : {}),
         });
-        return mutOk({
+        const anomalousResolution = r.resolutionMode !== undefined &&
+          ANOMALOUS_STORE_RESOLUTION_MODES.has(r.resolutionMode);
+        const envelope = {
           circle: scope(circle), // the circle these ids live in — pass it to id-based tools if it isn't your session default
           action: r.action,
           conceptId: r.conceptId,
-          score: Number(r.score.toFixed(3)),
-          // Additive companion to `action` — tells apart the two ways a store can report
-          // "ambiguous": an ordinary near-miss fork, and a fork SIGNAL (the evidence matched but the
-          // target concept is bimodal). See the tool description above.
-          ...(r.resolutionMode ? { resolutionMode: r.resolutionMode } : {}),
+          ...(anomalousResolution
+            ? { resolutionMode: r.resolutionMode, score: Number(r.score.toFixed(3)) }
+            : {}),
           ...(r.contradiction
             ? { contradiction: { id: r.contradiction.id, status: r.contradiction.status, detail: r.contradiction.detail } }
             : {}),
@@ -855,13 +844,14 @@ export function registerMonetCoreTools(
           // successor and superseded the incumbent. `conceptId` above is the successor.
           // `ruleSuccession.impeachedPrincipleIds` (slice 5-B) rides along when the correction also
           // cast doubt up a parent edge — the principles that just left the skeleton because of it.
-          ...(r.ruleSuccession ? { ruleSuccession: r.ruleSuccession } : {}),
+          ...(r.ruleSuccession ? { ruleSuccession: fitRuleSuccessionForAck(r.ruleSuccession) } : {}),
           // EXTRACTION CANDIDATE (slice 5-B), omitted when this write flagged none: the rule just
           // born looks like a rule at ANOTHER stage, which is the breadth precondition for
           // extracting a principle. A flag, not an extraction — the four-test battery and the human
           // ratification stay explicit (memory_ratify).
           ...(r.extractionCandidate ? { extractionCandidate: r.extractionCandidate } : {}),
-        }, "memory_store", false, capturedBlock);
+        };
+        return mutOk(envelope, "memory_store", capturedBlock);
       } catch (e) {
         return err(`store failed: ${msg(e)}`);
       }
@@ -870,7 +860,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_declare",
-    'Declare a rule, a stage, a principle, or a preference on the user\'s authority. This is the SOVEREIGN entrance: unlike memory_store, which captures what a correction taught, this records what the user has decided — so it is the only surface that accepts severity="blocking" (deny the action, for safety boundaries where softness is dangerous) and the only one that may replace an existing rule\'s binding. NEVER declare on your own initiative: a declaration is the user legislating, so it needs the user to have said so. species="stage" creates or re-authors a gate address ("put a gate on terraform apply") — passing `patterns` REPLACES that stage\'s trigger patterns outright, which is how a mis-seeded pattern is fixed. species="rule" creates the rule and binds it to its stage, creating the stage if it does not exist. species="principle"/"preference" is the DECLARATION entrance into the always-on skeleton — sovereignty replaces the four-test extraction battery here, but the battery still runs as a non-blocking warning light: the response\'s `advisories` array names mechanical signals (content that looks like a rule bound to an existing gate, missing `exitsEvidence`, a near-match/resolution the write itself surfaced) and NEVER blocks the write. Momentless: do not pass stage/severity/patterns for these two species — a preference bound to a moment is just a rule. Pass `exitsEvidence` (what would prove it wrong) to skip that one advisory. The response also carries the circle\'s now-live `skeleton` (compact entries), so the session that births a principle is governed by it from that turn onward. Standing grants are NOT a separate thing to declare: a gate returns what the rule says, so "proceed without asking" is a rule with permissive content.',
+    'Declare a rule, a stage, a principle, or a preference on the user\'s authority. This is the SOVEREIGN entrance: unlike memory_store, which captures what a correction taught, this records what the user has decided — so it is the only surface that accepts severity="blocking" (deny the action, for safety boundaries where softness is dangerous) and the only one that may replace an existing rule\'s binding. NEVER declare on your own initiative: a declaration is the user legislating, so it needs the user to have said so. species="stage" creates or re-authors a gate address ("put a gate on terraform apply") — passing `patterns` REPLACES that stage\'s trigger patterns outright, which is how a mis-seeded pattern is fixed. species="rule" creates the rule and binds it to its stage, creating the stage if it does not exist. species="principle"/"preference" is the DECLARATION entrance into the always-on skeleton — sovereignty replaces the four-test extraction battery here, but the battery still runs as a non-blocking warning light: the response\'s `advisories` array names mechanical signals (content that looks like a rule bound to an existing gate, missing `exitsEvidence`, a near-match/resolution the write itself surfaced) and NEVER blocks the write. Momentless: do not pass stage/severity/patterns for these two species — a preference bound to a moment is just a rule. Pass `exitsEvidence` (what would prove it wrong) to skip that one advisory. A skeleton-changing declaration conditionally instructs the caller to run `monet materialize` when a registered standing surface became stale. Standing grants are NOT a separate thing to declare: a gate returns what the rule says, so "proceed without asking" is a rule with permissive content.',
     {
       species: z
         .enum(["rule", "stage", "principle", "preference"])
@@ -917,6 +907,7 @@ export function registerMonetCoreTools(
       declaredBy: z.string().max(200).optional().describe("Who ruled. Defaults to the calling agent id."),
       circle: z
         .string()
+        .max(CIRCLE_NAME_MAX_CHARS)
         .optional()
         .describe(
           'Which circle this declaration lives in. Omit for the default. "*" is the reserved GLOBAL BREADTH declaration for species="rule", "principle", or "preference": the member keeps its ordinary home circle and delivers in every circle, unioned with whatever is local there, no shadowing — never a real circle name. Refused for species="stage" because a stage is store-global already.',
@@ -990,42 +981,35 @@ export function registerMonetCoreTools(
         // own `if` arm with its own `return`, and the ENTIRE stage/rule split lives inside the paired
         // `else`, so `r` stays narrowed to "stage" | "rule" for all of it, exactly as that split needs.
         if (r.species === "principle" || r.species === "preference") {
-          // IN-BAND SKELETON DELIVERY (user-ratified, 2026-07-29): "the session that births a
-          // principle is governed by it from that turn onward." Cap-and-signal, the same discipline
-          // stage_lookup's own stageIndex uses (fitObjectArray is fitStringArray's object-array
-          // sibling) — never an unbounded array over the wire, even though skeleton() itself is
-          // uncapped at the engine layer on the same "few, always present" reasoning liveStageIndex
-          // relies on for its own callers.
-          const fixedFields = {
+          const guidance = r.narrowedFromBreadth
+            ? `BREADTH NARROWED: this ${r.species} was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle="*" to restore it.`
+            : undefined;
+          const envelope = {
             circle: homeCircle,
             species: r.species,
             conceptId: r.conceptId,
             action: r.action,
-            advisories: r.advisories,
+            ...(r.advisories.length > 0 ? { advisories: r.advisories } : {}),
+            ...(guidance !== undefined ? { guidance } : {}),
+            ...(r.materializeRequired ? { instruction: SKELETON_CHANGED_INSTRUCTION } : {}),
           };
-          const baseGuidance = r.advisories.length > 0
-            ? `This ${r.species} is now live in the skeleton for this circle, governing this session from this turn onward. See advisories for warning-light signals — informational only, nothing here was blocked.`
-            : `This ${r.species} is now live in the skeleton for this circle, governing this session from this turn onward.`;
-          // Conditional text in the EXISTING guidance field, never another payload field (#113).
-          const guidance = r.narrowedFromBreadth
-            ? `BREADTH NARROWED: this ${r.species} was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle="*" to restore it. ${baseGuidance}`
-            : baseGuidance;
-          // ONE BUILDER, USED FOR BOTH THE MEASUREMENT AND THE RESPONSE — see fitObjectArray's own
-          // comment. Anything added here is automatically inside the budget; anything added to the
-          // returned object instead of here would silently reopen the mid-JSON truncation blocker.
-          const envelope = (skeleton: typeof r.skeleton, omitted: number): Record<string, unknown> => ({
-            ...fixedFields,
-            skeleton,
-            ...(omitted > 0 ? { skeletonTruncated: true, skeletonOmitted: omitted } : {}),
-            guidance,
-          });
-          const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
-          const fit = fitObjectArray(envelope, r.skeleton, sizeBudget);
-          return mutOk(envelope(fit.fitted, fit.omitted), "memory_declare", false, capturedBlock);
+          return mutOk(envelope, "memory_declare", capturedBlock);
         } else {
           let guidance: string;
           if (r.species === "stage") {
             guidance = "The stage is registered. It fires nothing until a rule is bound to it — until then a matching action reports the stage with no rules, which is the signal to reason from principles.";
+            const previous = fitRenderedPatternsForAck(r.previousPatterns);
+            const patterns = fitRenderedPatternsForAck(r.patterns);
+            return mutOk({
+              circle: homeCircle,
+              species: r.species,
+              stage: fitStageViewForAck(r.stage),
+              previousPatterns: previous.items,
+              ...(previous.omitted > 0 ? { previousPatternsOmitted: previous.omitted } : {}),
+              patterns: patterns.items,
+              ...(patterns.omitted > 0 ? { patternsOmitted: patterns.omitted } : {}),
+              guidance,
+            }, "memory_declare", capturedBlock);
           } else {
             const disclosures = [
               // A removed deny is never allowed to be something the user finds out later.
@@ -1047,9 +1031,19 @@ export function registerMonetCoreTools(
               : "The rule is bound. It will be returned at that gate the next time the action is intercepted; its patterns show as unverified until the first real fire.";
           }
           return mutOk(
-            { circle: homeCircle, ...r, guidance },
+            {
+              circle: homeCircle,
+              ...r,
+              stage: fitStageViewForAck(r.stage),
+              binding: {
+                ...r.binding,
+                ...(r.binding.reason !== null
+                  ? { reason: clip(r.binding.reason, WRITE_ACK_TEXT_MAX_CHARS).text }
+                  : {}),
+              },
+              guidance,
+            },
             "memory_declare",
-            false,
             capturedBlock,
           );
         }
@@ -1061,7 +1055,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_ratify",
-    'The human-approval surface — the OTHER skeleton entrance, alongside memory_declare\'s species="principle"/"preference". Records a ruling on a skeleton candidate (a concept of kind "principle" or "preference"): the lead runs the four-test battery (Generates/Covers/Transfers/Exits) conversationally, and this call is where the human\'s verdict on it becomes durable record. verdict="approve" or "re-ratify" with `memberRuleIds` writes a derivation edge from the principle to EACH named rule (bornOf "ratification") — this is the principle proving it can re-derive its member rules; member rule ids must share the candidate\'s circle. verdict="reject" records that the candidate does not enter. verdict="retire" ends a currently-live membership (an impeached principle\'s own use-maintenance) — every verdict is recorded regardless, since ratification history is append-only. Skeleton membership is ALWAYS derived from the LATEST ratification for a concept, never a stored flag: approve→retire takes something out, retire→re-ratify brings it back. `packet` is the evidence shown to the human (member rules + failures, a re-derivation, the uncovered situation) — stored OPAQUE and VERBATIM for audit fidelity; memberRuleIds is a separate typed field precisely so edge-writing never depends on parsing it. The response carries the circle\'s now-live `skeleton` (compact entries) — same in-band delivery memory_declare\'s principle/preference response carries.',
+    'The human-approval surface — the OTHER skeleton entrance, alongside memory_declare\'s species="principle"/"preference". Records a ruling on a skeleton candidate (a concept of kind "principle" or "preference"): the lead runs the four-test battery (Generates/Covers/Transfers/Exits) conversationally, and this call is where the human\'s verdict on it becomes durable record. verdict="approve" or "re-ratify" with `memberRuleIds` writes a derivation edge from the principle to EACH named rule (bornOf "ratification") — this is the principle proving it can re-derive its member rules; member rule ids must share the candidate\'s circle. verdict="reject" records that the candidate does not enter. verdict="retire" ends a currently-live membership (an impeached principle\'s own use-maintenance) — every verdict is recorded regardless, since ratification history is append-only. Skeleton membership is ALWAYS derived from the LATEST ratification for a concept, never a stored flag: approve→retire takes something out, retire→re-ratify brings it back. `packet` is the evidence shown to the human (member rules + failures, a re-derivation, the uncovered situation) — stored OPAQUE and VERBATIM for audit fidelity; memberRuleIds is a separate typed field precisely so edge-writing never depends on parsing it. A membership-changing verdict conditionally instructs the caller to run `monet materialize` when a registered standing surface became stale.',
     {
       candidateId: z.string().describe("Concept id of the skeleton candidate. Must be kind 'principle' or 'preference' in the resolved circle."),
       verdict: z
@@ -1084,7 +1078,7 @@ export function registerMonetCoreTools(
           "The evidence packet exactly as shown to the human who ruled (member rules + failures, a re-derivation, the uncovered situation) — stored verbatim for audit fidelity, never parsed to decide anything.",
         ),
       ratifiedBy: z.string().max(200).optional().describe("Who ruled. Defaults to the calling agent id."),
-      circle: z.string().optional().describe("Which circle the candidate lives in. Omit for the default."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Which circle the candidate lives in. Omit for the default."),
     },
     async ({ candidateId, verdict, memberRuleIds, packet, ratifiedBy, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1102,17 +1096,7 @@ export function registerMonetCoreTools(
           ratifiedBy,
           circle: resolvedCircle,
         });
-        // IN-BAND SKELETON DELIVERY, same cap-and-signal discipline as memory_declare's own
-        // principle/preference response (fitObjectArray — fitStringArray's object-array sibling).
-        // THE TWO IN-BAND OUTCOME DISCLOSURES (slice 5-B; review fix — Codex round 4, R4-2 and
-        // R4-4). Both are the whole reason their engine fields exist: they distinguish a ratification
-        // that CHANGED something beyond the verdict — closed an impeachment the human re-ruled on,
-        // resolved an extraction candidate the human just answered — from one that changed nothing,
-        // and a wire that rebuilds its response from a fixed list silently made those two look
-        // identical to every MCP caller. Spread here, inside `fixedFields`, so the size fit measures
-        // them like every other fixed field; omitted-when-absent, matching the engine's own shape
-        // (never reported as 0), so their presence alone is the signal.
-        const fixedFields = {
+        const envelope = {
           circle: resolvedCircle,
           ratificationId: r.ratificationId,
           verdict: r.verdict,
@@ -1120,23 +1104,9 @@ export function registerMonetCoreTools(
           edgeIds: r.edgeIds,
           ...(r.impeachmentsClosed !== undefined ? { impeachmentsClosed: r.impeachmentsClosed } : {}),
           ...(r.extractionFlagsResolved !== undefined ? { extractionFlagsResolved: r.extractionFlagsResolved } : {}),
+          ...(r.materializeRequired ? { instruction: SKELETON_CHANGED_INSTRUCTION } : {}),
         };
-        const guidance = verdict === "approve" || verdict === "re-ratify"
-          ? "Recorded. If memberRuleIds was given, each now carries a derivation edge from this principle. It is live in the skeleton for this circle from this turn onward."
-          : verdict === "retire"
-            ? "Recorded. This concept no longer holds a live skeleton membership as of this call."
-            : "Recorded. This candidate does not enter the skeleton.";
-        // SAME BUILDER DISCIPLINE as memory_declare's own principle/preference response above:
-        // measure exactly what is returned, so no post-fit field can push it past the ceiling.
-        const envelope = (skeleton: typeof r.skeleton, omitted: number): Record<string, unknown> => ({
-          ...fixedFields,
-          skeleton,
-          ...(omitted > 0 ? { skeletonTruncated: true, skeletonOmitted: omitted } : {}),
-          guidance,
-        });
-        const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
-        const fit = fitObjectArray(envelope, r.skeleton, sizeBudget);
-        return mutOk(envelope(fit.fitted, fit.omitted), "memory_ratify", false, capturedBlock);
+        return mutOk(envelope, "memory_ratify", capturedBlock);
       } catch (e) {
         return err(`ratify failed: ${msg(e)}`);
       }
@@ -1148,7 +1118,7 @@ export function registerMonetCoreTools(
     "Locate memories by query similarity. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to search across all circles; pass circle to restrict.",
     {
       query: z.string(),
-      circle: z.string().optional().describe("Restrict search to this circle. Omit to search across all circles — cards include each memory's home circle."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Restrict search to this circle. Omit to search across all circles — cards include each memory's home circle."),
       limit: z.number().int().positive().optional(),
     },
     async ({ query, circle, limit }) => {
@@ -1180,7 +1150,7 @@ export function registerMonetCoreTools(
     "memory_overview",
     "Curation workbench for one circle: compact counts plus bounded actionable queues for possibleDuplicates, extractionCandidates, openContradictions, gate exceptions, and the ratified skeleton. The livingModel shows the top 5 current concepts by default. Pass includeDirty:true for the highest-evidence pending-synthesis cards; pass includeStale:true for the stalest re-confirmation cards. Both lists are capped and carry honest omission signals. Read-only; never returns memory bodies. Fetch an id to inspect evidence, resolve contradictions/pair flags with memory_resolve, and consolidate a true duplicate with memory_detach(destConceptId). Pass entity to list memories tied to one hub.",
     {
-      circle: z.string().optional(),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       entity: z.string().optional(),
       conceptLimit: z.number().int().min(0).optional().describe("Override the living-model card limit (default 5)."),
       includeDirty: z.boolean().optional().describe("Include the capped pending-synthesis worklist; absent by default."),
@@ -1207,7 +1177,7 @@ export function registerMonetCoreTools(
     "memory_list",
     "Enumerate a circle's memories as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` for the project path(s) each memory's evidence came from. PAGINATED with a KEYSET cursor: returns up to `limit` (default 50) plus a `nextCursor` when more remain; pass it back as `cursor` to continue, until it's absent. The cursor walks a stable order, so it's SAFE to reassign each page out of the circle before fetching the next (an offset would skip rows as the circle shrinks). Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
     {
-      circle: z.string().optional(),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       withProvenance: z
         .boolean()
         .optional()
@@ -1250,7 +1220,7 @@ export function registerMonetCoreTools(
     "Rebuild working context around an intent via graph spread. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to gather across all circles; pass circle to restrict.",
     {
       intent: z.string(),
-      circle: z.string().optional().describe("Restrict gathering to this circle. Omit to gather across all circles — cards include each memory's home circle (spreading stays within each seed's home circle)."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Restrict gathering to this circle. Omit to gather across all circles — cards include each memory's home circle (spreading stays within each seed's home circle)."),
       limit: z.number().int().positive().optional(),
       depth: z.enum(["1", "2"]).optional().describe("Graph hops from the seeds (default 2)."),
     },
@@ -1285,7 +1255,7 @@ export function registerMonetCoreTools(
     "Read a concept by id. For normal concepts, `body` is the payload; observations never ride by default. Pass observations:true only when you need the evidence for synthesis or curation; observations are {id, content} and page newest→oldest with observationsOffset (0 = newest page, normally 20 at a time). `observationCount` is the full count. When `observationsOmitted` appears, the requested page was size-fitted; advance observationsOffset by the number of observations actually returned to continue without gaps. `needsSynthesis:true` means new evidence has not been synthesized: explicitly pull every observation page, write one coherent body, then call memory_synthesize(id, body). `bodyTruncated:true` means the body was clipped; use the observations pull to recover the evidence. A disputed concept adds `status` and `openContradictions` [{id, kind, detail}]; mediate with memory_resolve({ contradictionId: openContradictions[i].id }). Source concepts (kind='source', file=concept) keep their structure-first contract unchanged: title, sourcePath + sourceId, and an outline by default, never observations/needsSynthesis; pass includeBody:true to read the concatenated file body inline.",
     {
       id: z.string(),
-      circle: z.string().optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
       observations: z.boolean().optional().describe("Normal concepts only: include one newest-first page of observations for synthesis or curation. Default false. Source concepts keep their structure-first response and ignore this parameter."),
       observationsOffset: z.number().int().min(0).optional().describe("When observations:true, skip this many observations from the newest end before applying the 20-entry page cap. Start at 0. Normally increment by 20; if observationsOmitted appears, increment by observations.length instead so size-fitting cannot create gaps. Paging metadata appears only when observations were requested."),
       includeBody: z.boolean().optional().describe("Source concepts only: include the full concatenated file body. Default false because a source concept's body can span the whole file. Ignored for normal concepts, whose body is always the payload."),
@@ -1444,7 +1414,7 @@ export function registerMonetCoreTools(
     "You are at a named moment (see the stage index from agent_context): ask for that stage's rules before proceeding. Advisory delivery — rules arrive with the reason that earns compliance. When parentDisputed is true, one of this rule's derivation parents is currently disputed — disputedParentIds names exactly which (memory_fetch them to see the impeachment; the named projectedFromPrincipleId is the earliest/display parent, not necessarily a disputed one). A miss returns the live index.",
     {
       stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("The stage name (or id) you recognize — from the stage index agent_context/prewarm carries."),
-      circle: z.string().optional(),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
     },
     async ({ stage, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1628,14 +1598,14 @@ export function registerMonetCoreTools(
   server.tool(
     "memory_synthesize",
     "Write back a synthesized body for a concept — you, the agent, are the synthesizer. Reconcile the concept's observations into one coherent statement. Clears the dirty flag and records a revision.",
-    { id: z.string(), body: z.string(), circle: z.string().optional().describe("The circle the id belongs to (defaults to this session's circle).") },
+    { id: z.string(), body: z.string(), circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the id belongs to (defaults to this session's circle).") },
     async ({ id, body, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         if (core.circleOf(id) !== scope(circle)) return err(`concept not found: ${id}`); // scope enforcement
         const c = await core.applySynthesis(id, body);
         if (!c) return err(`concept not found: ${id}`);
-        return mutOk({ id: c.id, circle: scope(circle), version: c.version, dirty: c.dirty, message: "synthesis stored" }, "memory_synthesize", false, capturedBlock);
+        return mutOk({ id: c.id, circle: scope(circle), version: c.version, dirty: c.dirty, message: "synthesis stored" }, "memory_synthesize", capturedBlock);
       } catch (e) {
         return err(`synthesize failed: ${msg(e)}`);
       }
@@ -1646,7 +1616,7 @@ export function registerMonetCoreTools(
     "memory_checkpoint",
     "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives for a later continuation request through memory_workstreams. This call only preserves session state; synthesis is handled at read time.",
     {
-      circle: z.string().optional(),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       summary: z.string().optional(),
       workstream: z
         .object({
@@ -1665,12 +1635,10 @@ export function registerMonetCoreTools(
       try {
         const resolvedCircle = scope(circle);
         const saved = workstream ? await core.saveWorkstream(workstream, { circle: resolvedCircle, summary }) : null;
-        // A successful checkpoint WITH a workstream payload resets the nudge counter.
-        const isCheckpointWithWorkstream = saved !== null;
         return mutOk({
           circle: resolvedCircle,
           workstream: saved ? { id: saved.id, status: saved.payload.status, version: saved.version } : null,
-        }, "memory_checkpoint", isCheckpointWithWorkstream, capturedBlock);
+        }, "memory_checkpoint", capturedBlock);
       } catch (e) {
         return err(`checkpoint failed: ${msg(e)}`);
       }
@@ -1682,7 +1650,7 @@ export function registerMonetCoreTools(
     "Pull active/paused workstreams ONLY when the user expresses continuation intent. For “let's continue”, call with no id to get the compact list, then confirm with the user which thread to resume. For “continue <X>”, list first; if exactly one confident match exists, call again with that id for full detail, otherwise confirm. Full detail pages entries in this fixed order: openQuestions, decisions, discardedAlternatives, confirmedContext, importantEntities, nextSteps; entries retain stored order within each slot. Start detailOffset at 0, then add the number of entries actually returned across all slots; detailOmitted is the true number remaining. A session opened with a fresh directive never calls this tool.",
     {
       id: z.string().optional().describe("Workstream id from the compact list. Omit to list active/paused workstreams."),
-      circle: z.string().optional(),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       detailOffset: z.number().int().min(0).optional().describe("With id: skip this many entries in the documented cross-slot order. Start at 0; continue by adding the number of entries actually returned across all slots."),
     },
     async ({ id, circle, detailOffset }) => {
@@ -1810,14 +1778,14 @@ export function registerMonetCoreTools(
       detail: z.string(),
       observationId: z.string().optional(),
       kind: z.enum(["value-conflict", "staleness", "scope-conflict"]).optional(),
-      circle: z.string().optional().describe("The circle the conceptId belongs to (defaults to this session's circle)."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the conceptId belongs to (defaults to this session's circle)."),
     },
     async ({ conceptId, detail, observationId, kind, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         if (core.circleOf(conceptId) !== scope(circle)) return err(`concept not found: ${conceptId}`); // scope enforcement
         const c = core.flagContradiction(conceptId, { detail, observationId, kind });
-        return mutOk({ circle: scope(circle), contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail }, "memory_flag_contradiction", false, capturedBlock);
+        return mutOk({ circle: scope(circle), contradictionId: c.id, conceptId: c.conceptId, status: c.status, detail: c.detail }, "memory_flag_contradiction", capturedBlock);
       } catch (e) {
         return err(`flag failed: ${msg(e)}`);
       }
@@ -1851,7 +1819,7 @@ export function registerMonetCoreTools(
         "decision:\"dismiss\" (a dismissal reaches no verdict, so naming a loser is meaningless).",
       ),
       resolvedBy: z.string().optional(),
-      circle: z.string().optional().describe("The circle the contradiction or concepts belong to (defaults to this session's circle)."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the contradiction or concepts belong to (defaults to this session's circle)."),
       // Pair-flag dismissal fields (new in 0.6.0; widened from possible-duplicate only in 5-B).
       conceptAId: z.string().optional().describe("First concept of the flagged pair to dismiss — a possible-duplicate pair or an extraction-candidate pair, from memory_overview. Required for pair-flag dismissal; omit for contradiction verdicts."),
       conceptBId: z.string().optional().describe("Second concept of the flagged pair to dismiss — a possible-duplicate pair or an extraction-candidate pair, from memory_overview. One dismissal clears every flag between the two. Required for pair-flag dismissal; omit for contradiction verdicts."),
@@ -1889,7 +1857,7 @@ export function registerMonetCoreTools(
           // renaming: the exact string is asserted in two of this repo's own tests (updated with
           // this change) and nowhere else — no CLI, renderer, doc or persisted row reads it, and the
           // package is private and pre-1.0, so no external client contract depends on it.
-          return mutOk({ circle: scope(circle), action: "pair-flags-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated }, "memory_resolve", false, capturedBlock);
+          return mutOk({ circle: scope(circle), action: "pair-flags-dismissed", conceptAId, conceptBId, rowsUpdated: r.rowsUpdated }, "memory_resolve", capturedBlock);
         }
         // --- Contradiction verdict path (original, unchanged) ---
         if (!contradictionId) return err("contradictionId is required for contradiction verdicts");
@@ -1898,8 +1866,8 @@ export function registerMonetCoreTools(
         const c = core.resolveContradiction(contradictionId, { decision, body, by: resolvedBy, contradictedObservationId });
         if (!c) return err(`contradiction not found: ${contradictionId}`);
         // Idempotent no-op: contradiction already resolved or dismissed — zero mutations occurred.
-        if ("alreadyClosed" in c) return mutOk({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus }, "memory_resolve", false, capturedBlock);
-        return mutOk({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) }, "memory_resolve", false, capturedBlock);
+        if ("alreadyClosed" in c) return mutOk({ circle: scope(circle), contradictionId, alreadyClosed: true, contradictionStatus: c.contradictionStatus }, "memory_resolve", capturedBlock);
+        return mutOk({ circle: scope(circle), conceptId: c.id, status: c.status, version: c.version, confidence: Number(c.confidence.toFixed(2)) }, "memory_resolve", capturedBlock);
       } catch (e) {
         return err(`resolve failed: ${msg(e)}`);
       }
@@ -1920,6 +1888,7 @@ export function registerMonetCoreTools(
         ),
       circle: z
         .string()
+        .max(CIRCLE_NAME_MAX_CHARS)
         .optional()
         .describe("The circle the conceptId belongs to (defaults to this session's circle). Pass it when working with an explicit circle."),
     },
@@ -1941,7 +1910,7 @@ export function registerMonetCoreTools(
             : r.destAction === "created"
               ? `Created new concept ${r.destConceptId} from the detached observations. The source concept has been recomputed.`
               : `Attached detached observations to existing concept ${r.destConceptId}. The source concept has been recomputed.`,
-        }, "memory_detach", false, capturedBlock);
+        }, "memory_detach", capturedBlock);
       } catch (e) {
         return err(`detach failed: ${msg(e)}`);
       }
@@ -1954,8 +1923,8 @@ export function registerMonetCoreTools(
     {
       id: z.string().optional().describe("Single concept id to move. Exactly one of `id` or `ids` is required."),
       ids: z.array(z.string()).optional().describe("Batch of concept ids to move (each individually atomic; errors captured per item without aborting the batch). Exactly one of `id` or `ids` is required."),
-      toCircle: z.string().describe("The destination circle (e.g. the project's per-project circle)."),
-      circle: z.string().optional().describe("The id's CURRENT circle (defaults to this session's circle). Pass \"default\" when migrating legacy unscoped memory."),
+      toCircle: z.string().max(CIRCLE_NAME_MAX_CHARS).describe("The destination circle (e.g. the project's per-project circle)."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The id's CURRENT circle (defaults to this session's circle). Pass \"default\" when migrating legacy unscoped memory."),
       resolution: z
         .enum(["auto", "forceNew"])
         .optional()
@@ -2011,13 +1980,13 @@ export function registerMonetCoreTools(
               counts: totalCounts,
               errors: errorItems,
               note: `per-item results elided for ${mergedResults.length - errorItems.length} items — all non-error items succeeded with the actions in counts`,
-            }, "memory_reassign_circle", false, capturedBlock);
+            }, "memory_reassign_circle", capturedBlock);
           }
           return mutOk({
             toCircle: r.toCircle,
             counts: totalCounts,
             results: mergedResults,
-          }, "memory_reassign_circle", false, capturedBlock);
+          }, "memory_reassign_circle", capturedBlock);
         }
 
         // Single mode.
@@ -2038,7 +2007,7 @@ export function registerMonetCoreTools(
               : r.action === "moved"
                 ? `Moved to ${r.toCircle}. It now lives in that circle — fetch/search it there.`
                 : `Already in ${r.toCircle}; nothing to do.`,
-        }, "memory_reassign_circle", false, capturedBlock);
+        }, "memory_reassign_circle", capturedBlock);
       } catch (e) {
         return err(`reassign failed: ${msg(e)}`);
       }
@@ -2050,8 +2019,8 @@ export function registerMonetCoreTools(
     "Create, rename, merge, or archive project-locality circles. RENAME establishes a stable alias so sessions that derive the old name keep resolving. MERGE moves every concept from one circle into another (default resolution forceNew: near-matches are kept distinct and linked with a possible_duplicate_of edge for later mediation). ARCHIVE hides a circle from store-wide recall and listings without deleting or sealing it. LIST enumerates the store's circles including archived ones. Topic organization belongs to the entity/edge graph — circles are write-home/project locality.",
     {
       action: z.enum(["rename", "merge", "archive", "unarchive", "list"]),
-      circle: z.string().optional().describe("The circle to act on (rename/merge source, archive/unarchive target). Required for rename, merge, archive, unarchive."),
-      to: z.string().optional().describe("Destination circle name for rename or merge."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle to act on (rename/merge source, archive/unarchive target). Required for rename, merge, archive, unarchive."),
+      to: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Destination circle name for rename or merge."),
       resolution: z
         .enum(["auto", "forceNew"])
         .optional()
@@ -2076,7 +2045,7 @@ export function registerMonetCoreTools(
             edgesUpdated: r.edgesUpdated,
             entitiesUpdated: r.entitiesUpdated,
           };
-          return mutOk(response, "memory_circle_manage", false, capturedBlock);
+          return mutOk(response, "memory_circle_manage", capturedBlock);
         }
         if (action === "merge") {
           if (!circle) return err("merge requires `circle`");
@@ -2088,19 +2057,19 @@ export function registerMonetCoreTools(
             conceptResults: r.conceptResults,
             counts: r.counts,
           };
-          return mutOk(response, "memory_circle_manage", false, capturedBlock);
+          return mutOk(response, "memory_circle_manage", capturedBlock);
         }
         if (action === "archive") {
           if (!circle) return err("archive requires `circle`");
           core.archiveCircle(circle);
           const response: CircleArchiveResponse = { action: "archived", circle };
-          return mutOk(response, "memory_circle_manage", false, capturedBlock);
+          return mutOk(response, "memory_circle_manage", capturedBlock);
         }
         if (action === "unarchive") {
           if (!circle) return err("unarchive requires `circle`");
           core.unarchiveCircle(circle);
           const response: CircleUnarchiveResponse = { action: "unarchived", circle };
-          return mutOk(response, "memory_circle_manage", false, capturedBlock);
+          return mutOk(response, "memory_circle_manage", capturedBlock);
         }
         // list — read-only (enumerate circles)
         const response: CircleListResponse = {
@@ -2152,7 +2121,7 @@ export function registerMonetCoreTools(
     { sourceId: z.string().min(1) },
     async ({ sourceId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope());
-      try { return mutOk(await core.syncSource(sourceId, sourceAuthorizationContext), "source_sync", false, capturedBlock); }
+      try { return mutOk(await core.syncSource(sourceId, sourceAuthorizationContext), "source_sync", capturedBlock); }
       catch (e) { return err(`source_sync failed: ${sanitizeSourceError(e)}`); }
     },
   );
@@ -2160,7 +2129,7 @@ export function registerMonetCoreTools(
   server.tool(
     "agent_context",
     "Session-start orientation only. Call FIRST with no arguments. Returns the resolved `circle`; `resolvedFrom` appears when the requested circle was an alias. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules. Skeleton delivery has three states: absence means the standing files you already loaded are current; `mirrorStale` + `instruction` appears only when a standing file diverged and needs user-confirmed reconciliation; `skeleton` appears only for members not covered by a standing file.",
-    { circle: z.string().optional() },
+    { circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);
       const state = core.prewarm(circle ?? dc);
@@ -2222,7 +2191,7 @@ export function registerMonetCoreTools(
       grow("stageCount", stageIndexItems?.length ?? 0);
       const content = buildContent(fit);
 
-      return wrapSuccess(ok(content), { isMutating: false, isCheckpointWithWorkstream: false, toolName: "agent_context" });
+      return wrapSuccess(ok(content), { toolName: "agent_context" });
     },
   );
 
@@ -2233,14 +2202,12 @@ export function registerMonetCoreTools(
  * Derive RegisterMonetCoreToolsOpts from environment variables.
  * Exported for testing — lets tests verify the env-var mapping without spawning a process.
  * MONET_NO_AUTOPREWARM=1  → autoPrewarm:false
- * MONET_NO_CHECKPOINT_NUDGE=1 → checkpointNudge:false
  */
 export function deriveOptsFromEnv(env: NodeJS.ProcessEnv = process.env): RegisterMonetCoreToolsOpts {
   const callerId = env.MONET_CALLER_ID;
   const projectId = env.MONET_PROJECT_ID;
   return {
     autoPrewarm: env.MONET_NO_AUTOPREWARM !== "1",
-    checkpointNudge: env.MONET_NO_CHECKPOINT_NUDGE !== "1",
     ...(callerId && projectId ? { sourceAuthorizationContext: { callerId, projectId } } : {}),
   };
 }

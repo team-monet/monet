@@ -9,6 +9,9 @@ const END_MARKER = "<!-- END monet:skeleton -->";
 export const MIRROR_STALE_INSTRUCTION =
   "Report the divergence to the user and ask which side is the truth. If the store is the truth, run `monet materialize`; if a hand-edit to the file is the truth, re-declare that edit through memory_declare, then run `monet materialize`. Never repair without the user's confirmation.";
 
+export const SKELETON_CHANGED_INSTRUCTION =
+  "The skeleton changed; standing files are now stale — run `monet materialize`.";
+
 export type MirrorStaleReason = "block-missing" | "block-edited" | "store-moved";
 
 export interface MirrorStaleEntry {
@@ -83,6 +86,34 @@ function parseManifest(text: string): MaterializeManifest | null {
 
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+/**
+ * Whether any registered standing surface delivers a member of this breadth and home circle. An
+ * absent or invalid registry is bootstrap and therefore uncovered. Registry paths and materialized
+ * bytes are irrelevant here: the caller has just changed the store, so coverage alone determines
+ * whether a standing file became stale at that moment.
+ */
+export function hasCoveringSkeletonSurface(
+  storeHome: string | null,
+  circle: string,
+  breadth: "global" | "local",
+  resolveCircle: (circle: string) => string = (value) => value,
+): boolean {
+  if (storeHome === null) return false;
+
+  let manifestText: string;
+  try {
+    manifestText = readFileSync(join(storeHome, MATERIALIZE_MANIFEST), "utf8");
+  } catch {
+    return false;
+  }
+  const manifest = parseManifest(manifestText);
+  if (manifest === null) return false;
+
+  return manifest.surfaces.some((surface) => breadth === "global"
+    ? surface.scope === "global"
+    : surface.scope !== "global" && resolveCircle(surface.scope.circle) === circle);
 }
 
 /**

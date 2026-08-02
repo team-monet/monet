@@ -60,6 +60,7 @@ import {
   STAGE_NAME_MAX_CHARS,
 } from "../gates";
 import type { GateMirror, SidecarMaterialization } from "../gates";
+import type { EmbeddingProvider } from "../embedding";
 import type { StoragePort } from "../storage";
 import { BetterSqlitePort, type Statement } from "../storage";
 import { formatSpan } from "../spans";
@@ -92,6 +93,12 @@ function core(opts: { syncDeviceId?: string; circle?: string } = {}): MonetCore 
 /** Dedup ENABLED at the embedder's own calibrated thresholds — identical text resolves together. */
 function resolvingCore(opts: { syncDeviceId?: string } = {}): MonetCore {
   return new MonetCore(":memory:", { syncDeviceId: opts.syncDeviceId });
+}
+
+class ConstantEmbeddingProvider implements EmbeddingProvider {
+  readonly dim = 2;
+  readonly modelId = "test:constant";
+  embed(): Float32Array { return new Float32Array([1, 0]); }
 }
 
 type RawDb = { prepare(sql: string): { run(...p: unknown[]): unknown; get(...p: unknown[]): unknown; all(...p: unknown[]): unknown[] } };
@@ -1004,8 +1011,8 @@ describe("declaration — the sovereign entrance", () => {
       expect(r.action).toBe("created");
       expect(r.conceptId).toBeTruthy();
       expect(Array.isArray(r.advisories)).toBe(true);
-      // IN-BAND SAME-SESSION DELIVERY: the just-declared principle is already live.
-      const own = r.skeleton.find((e) => e.conceptId === r.conceptId);
+      // Delivery is read from the standing skeleton surface, not repeated in the write acknowledgement.
+      const own = c.skeleton().find((e) => e.conceptId === r.conceptId);
       expect(own).toMatchObject({ species: "principle", ratifiedBy: "john" });
       // firstLine() strips the trailing sentence-ending period (title-extraction convention, same
       // helper memory_fetch/overview titles already use) — content is the sentence, not the mark.
@@ -1017,7 +1024,7 @@ describe("declaration — the sovereign entrance", () => {
       const c = core();
       const r = await c.declare({ species: "preference", content: "Write as a peer, never assistant scaffolding." });
       if (r.species !== "preference") throw new Error("unreachable");
-      expect(r.skeleton.some((e) => e.conceptId === r.conceptId && e.species === "preference")).toBe(true);
+      expect(c.skeleton().some((e) => e.conceptId === r.conceptId && e.species === "preference")).toBe(true);
       c.close();
     });
 
@@ -1025,7 +1032,7 @@ describe("declaration — the sovereign entrance", () => {
       const c = core();
       const r = await c.declare({ species: "principle", content: "Nothing waits on scheduled review; everything is maintained by use." });
       if (r.species !== "principle") throw new Error("unreachable");
-      const own = r.skeleton.find((e) => e.conceptId === r.conceptId)!;
+      const own = c.skeleton().find((e) => e.conceptId === r.conceptId)!;
       expect(own.ratifiedBy).toBe("local-agent"); // MonetCore's default agentId when unconfigured
       c.close();
     });
@@ -1083,9 +1090,9 @@ describe("declaration — the sovereign entrance", () => {
         .toEqual({ circle: "home", skeleton_breadth: "global" });
       expect(raw(c).prepare(`SELECT circle, skeleton_breadth FROM concepts WHERE id = ?`).get(preference.conceptId))
         .toEqual({ circle: "home", skeleton_breadth: "global" });
-      expect(principle.skeleton.find((entry) => entry.conceptId === principle.conceptId)?.breadth).toBe("global");
-      expect(preference.skeleton.find((entry) => entry.conceptId === preference.conceptId)?.breadth).toBe("global");
-      expect(preference.skeleton.map((entry) => entry.conceptId).sort())
+      expect(c.skeleton().find((entry) => entry.conceptId === principle.conceptId)?.breadth).toBe("global");
+      expect(c.skeleton().find((entry) => entry.conceptId === preference.conceptId)?.breadth).toBe("global");
+      expect(c.skeleton().map((entry) => entry.conceptId).sort())
         .toEqual([principle.conceptId, preference.conceptId].sort());
 
       await expect(c.declare({ species: "stage", stage: "git push", circle: BREADTH_CIRCLE }))
@@ -1120,7 +1127,7 @@ describe("declaration — the sovereign entrance", () => {
         expect(c.getRatifications(declared.conceptId)).toHaveLength(1);
         expect(c.getRatifications(fact.conceptId)).toHaveLength(0);
         // ...and the skeleton actually delivers it, which is what the misfile silently prevented.
-        expect(declared.skeleton.some((e) => e.conceptId === declared.conceptId)).toBe(true);
+        expect(c.skeleton().some((e) => e.conceptId === declared.conceptId)).toBe(true);
         // The near-match is still reported rather than swallowed by the fork.
         expect(declared.advisories).toContainEqual(
           expect.objectContaining({ kind: "near_match", conceptId: fact.conceptId }),
@@ -1167,7 +1174,7 @@ describe("declaration — the sovereign entrance", () => {
         expect(second.action).toBe("attached");
         // Two approves on one concept: membership is idempotent, not doubled.
         expect(c.getRatifications(first.conceptId)).toHaveLength(2);
-        expect(second.skeleton.filter((e) => e.conceptId === first.conceptId)).toHaveLength(1);
+        expect(c.skeleton().filter((e) => e.conceptId === first.conceptId)).toHaveLength(1);
         c.close();
       });
 
@@ -11519,10 +11526,83 @@ describe("MCP surface", () => {
     c.close();
   });
 
+  it("rejects an oversized store circle before mutation", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const before = c.conceptCount("default");
+    const result = await call("memory_store", { content: "Must never be written.", circle: "x".repeat(257) });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("String must contain at most 256 character(s)");
+    expect(c.conceptCount("default")).toBe(before);
+    expect(raw(c).prepare(`SELECT COUNT(*) AS n FROM observations`).get()).toEqual({ n: 0 });
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_store omits resolutionMode and score for normal modes, but includes both for an ambiguous fork", async () => {
+    const c = new MonetCore(":memory:", { tauAttach: 0.99, tauAmbiguous: 0.1 });
+    const { call, client } = await harness(c);
+
+    const fresh = await call("memory_store", { content: "Verify the built artifact after source changes." });
+    expect(fresh.isError).toBe(false);
+    expect(fresh.json).not.toHaveProperty("resolutionMode");
+    expect(fresh.json).not.toHaveProperty("score");
+
+    const attached = await call("memory_store", { content: "Verify the built artifact after source changes." });
+    expect(attached.isError).toBe(false);
+    expect(attached.json.action).toBe("attached");
+    expect(attached.json).not.toHaveProperty("resolutionMode");
+    expect(attached.json).not.toHaveProperty("score");
+
+    const direct = await call("memory_store", {
+      content: "A second observation attached intentionally.", attachTo: fresh.json.conceptId,
+    });
+    expect(direct.isError).toBe(false);
+    expect(direct.json).not.toHaveProperty("resolutionMode");
+    expect(direct.json).not.toHaveProperty("score");
+
+    const forced = await call("memory_store", { content: "Known distinct import row.", resolution: "forceNew" });
+    expect(forced.isError).toBe(false);
+    expect(forced.json).not.toHaveProperty("resolutionMode");
+    expect(forced.json).not.toHaveProperty("score");
+
+    const forked = await call("memory_store", { content: "After source changes, verify the artifact itself." });
+    expect(forked.isError).toBe(false);
+    expect(forked.json.resolutionMode).toBe("ambiguous-fork");
+    expect(typeof forked.json.score).toBe("number");
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_store reports species-fork when rule evidence forks from a near-match fact", async () => {
+    const c = new MonetCore(":memory:", {
+      embedder: new ConstantEmbeddingProvider(), tauAttach: 0.5, tauAmbiguous: 0.2,
+    });
+    const { call, client } = await harness(c);
+    const fact = await call("memory_store", { content: "Verify the artifact before promotion." });
+    const rule = await call("memory_store", {
+      content: "Verify the artifact before promotion.",
+      kind: "rule",
+      rule: { stage: "release promotion", scope: "domain" },
+    });
+
+    expect(rule.isError).toBe(false);
+    expect(rule.json).toMatchObject({ action: "created", resolutionMode: "species-fork" });
+    expect(typeof rule.json.score).toBe("number");
+    expect(rule.json.nearMatchId).toBe(fact.json.conceptId);
+    expect(rule.json.conceptId).not.toBe(fact.json.conceptId);
+
+    await client.close();
+    c.close();
+  });
+
   // -------------------------------------------------------------------------
   // skeleton entrances over the real MCP wire: memory_declare (principle/preference) + memory_ratify
   // -------------------------------------------------------------------------
-  it("memory_declare(species principle) over MCP: advisories + in-band skeleton, response shape", async () => {
+  it("memory_declare(species principle) over MCP: advisory acknowledgement without skeleton payload", async () => {
     const c = core();
     const { call, client } = await harness(c);
     const r = await call("memory_declare", {
@@ -11534,9 +11614,11 @@ describe("MCP surface", () => {
     expect(Array.isArray(r.json.advisories)).toBe(true);
     // Missing exitsEvidence is the one advisory this minimal call is guaranteed to carry.
     expect((r.json.advisories as Array<{ kind: string }>).some((a) => a.kind === "missing_exits_evidence")).toBe(true);
-    expect(Array.isArray(r.json.skeleton)).toBe(true);
-    expect((r.json.skeleton as Array<{ conceptId: string }>).some((e) => e.conceptId === r.json.conceptId)).toBe(true);
-    expect(typeof r.json.guidance).toBe("string");
+    expect(r.json).not.toHaveProperty("skeleton");
+    expect(r.json).not.toHaveProperty("skeletonTruncated");
+    expect(r.json).not.toHaveProperty("skeletonOmitted");
+    expect(r.json).not.toHaveProperty("guidance");
+    expect(r.json).not.toHaveProperty("instruction");
     await client.close();
     c.close();
   });
@@ -11550,18 +11632,18 @@ describe("MCP surface", () => {
 
       const global = await call("memory_declare", { species, content, circle: "*" });
       expect(global.isError).toBe(false);
-      expect(global.json.guidance).not.toContain("BREADTH NARROWED");
+      expect(global.json).not.toHaveProperty("guidance");
       expect(global.json).not.toHaveProperty("narrowedFromBreadth");
 
       const omitted = await call("memory_declare", { species, content });
       expect(omitted.isError).toBe(false);
       expect(omitted.json.conceptId).toBe(global.json.conceptId);
-      expect(omitted.json.guidance).not.toContain("BREADTH NARROWED");
+      expect(omitted.json).not.toHaveProperty("guidance");
       expect(c.skeleton("elsewhere").some((entry) => entry.conceptId === global.json.conceptId)).toBe(true);
 
       const stillGlobal = await call("memory_declare", { species, content, circle: "*" });
       expect(stillGlobal.isError).toBe(false);
-      expect(stillGlobal.json.guidance).not.toContain("BREADTH NARROWED");
+      expect(stillGlobal.json).not.toHaveProperty("guidance");
 
       const narrowed = await call("memory_declare", { species, content, circle: "default" });
       expect(narrowed.isError).toBe(false);
@@ -11604,7 +11686,7 @@ describe("MCP surface", () => {
     },
   );
 
-  it("memory_ratify over MCP: approve with memberRuleIds, response carries edgeIds + in-band skeleton", async () => {
+  it("memory_ratify over MCP: approve with memberRuleIds returns an acknowledgement without skeleton", async () => {
     const c = core();
     const { call, client } = await harness(c);
     const principle = await call("memory_declare", { species: "principle", content: "A principle to ratify with members." });
@@ -11621,7 +11703,11 @@ describe("MCP surface", () => {
     expect(r.isError).toBe(false);
     expect(r.json).toMatchObject({ verdict: "approve", conceptId: principle.json.conceptId });
     expect(r.json.edgeIds).toHaveLength(1);
-    expect((r.json.skeleton as Array<{ conceptId: string }>).some((e) => e.conceptId === principle.json.conceptId)).toBe(true);
+    expect(r.json).not.toHaveProperty("skeleton");
+    expect(r.json).not.toHaveProperty("skeletonTruncated");
+    expect(r.json).not.toHaveProperty("skeletonOmitted");
+    expect(r.json).not.toHaveProperty("guidance");
+    expect(r.json).not.toHaveProperty("instruction");
     await client.close();
     c.close();
   });
@@ -11700,54 +11786,24 @@ describe("MCP surface", () => {
     c.close();
   });
 
-  /**
-   * THE UNPARSEABLE-JSON BLOCKER (review round 1, item 2). The previous version of this test
-   * asserted `r.text.length <= 40_000`, which is UNFALSIFIABLE against this failure: ok()'s
-   * last-resort slicer enforces that ceiling by cutting mid-JSON, so the assertion passed on
-   * exactly the responses it was supposed to catch. The real contract is that the response PARSES,
-   * and it is asserted here directly, across entry sizes that span the reproduced failing range
-   * (the mid-JSON slice reproduced at several entry sizes — the exact crossing point is a
-   * knife-edge on fixed-field sizes, so the sweep spans 0–400 rather than trusting one threshold).
-   */
-  it("keeps the in-band skeleton response parseable at every entry size, with honest counts", async () => {
-    // Proof that the sweep is still doing its job: at least one step must actually TRUNCATE, or
-    // this test has quietly degraded into "small responses parse" and would stop catching the
-    // mid-JSON slice entirely. Asserted after the loop.
-    let sawTruncation = false;
-    for (const pad of [0, 40, 77, 120, 400]) {
-      const c = core();
-      const { call, client } = await harness(c);
-      const seeded = await seedRatifiedPrinciples(c, 300, (i) => `Principle number ${i} ${"x".repeat(pad)}`);
+  it("measures declare and ratify as complete acknowledgement envelopes", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    await seedRatifiedPrinciples(c, 300, (i) => `Principle number ${i} ${"x".repeat(400)}`);
 
-      // THE FIXTURE MUST MATCH THE REAL WRITE PATH'S SHAPE, or a fast seed would quietly stop
-      // testing what a real store produces. Asserting the seeded rows are exactly what skeleton()
-      // returns is what makes the raw-SQL shortcut safe: any column skeleton()'s own query cares
-      // about that the fixture got wrong shows up here as a count mismatch, not as a silent pass.
-      expect(c.skeleton(), `pad=${pad}`).toHaveLength(seeded);
-
-      for (const r of [
-        await call("memory_declare", { species: "principle", content: `One more at pad ${pad}.` }),
-        await call("memory_ratify", { candidateId: c.skeleton()[0]!.conceptId, verdict: "re-ratify" }),
-      ]) {
-        expect(r.isError, `pad=${pad}`).toBe(false);
-        // THE ASSERTION THAT ACTUALLY CATCHES IT: a mid-JSON slice throws here.
-        const parsed = JSON.parse(r.text) as Record<string, unknown>;
-        expect(r.text.length, `pad=${pad} bytes=${r.text.length}`).toBeLessThanOrEqual(40_000);
-
-        // HONEST COUNTS: what was listed plus what was reported omitted is the true population, so
-        // a reader can always tell "this is all of it" from "there is more".
-        const listed = (parsed.skeleton as unknown[]).length;
-        const omitted = (parsed.skeletonOmitted as number | undefined) ?? 0;
-        const liveTotal = c.skeleton().length; // recomputed: the declare above added one
-        expect(listed + omitted, `pad=${pad}`).toBe(liveTotal);
-        expect(parsed.skeletonTruncated, `pad=${pad}`).toBe(omitted > 0 ? true : undefined);
-        expect(typeof parsed.guidance).toBe("string");
-        if (omitted > 0) sawTruncation = true;
-      }
-      await client.close();
-      c.close();
+    for (const r of [
+      await call("memory_declare", { species: "principle", content: "One more principle." }),
+      await call("memory_ratify", { candidateId: c.skeleton()[0]!.conceptId, verdict: "re-ratify" }),
+    ]) {
+      expect(r.isError).toBe(false);
+      const parsed = JSON.parse(r.text) as Record<string, unknown>;
+      expect(r.text.length).toBeLessThanOrEqual(40_000);
+      expect(parsed).not.toHaveProperty("skeleton");
+      expect(parsed).not.toHaveProperty("skeletonTruncated");
+      expect(parsed).not.toHaveProperty("skeletonOmitted");
     }
-    expect(sawTruncation, "no sweep step truncated — this test no longer exercises the ceiling").toBe(true);
+    await client.close();
+    c.close();
   }, 30_000);
 
   /**
@@ -12071,6 +12127,49 @@ describe("MCP surface", () => {
     expect(dismissed.json.action).toBe("pair-flags-dismissed");
     expect(c.overview("default").counts.extractionCandidates).toBe(0);
     expect(c.overview("default").counts.possibleDuplicates).toBe(0);
+
+    await client.close();
+    c.close();
+  });
+
+  it("bounds a correction acknowledgement with many impeached parents and reports the omitted count", async () => {
+    const c = new MonetCore(":memory:", { embedder: new ConstantEmbeddingProvider() });
+    const { call, client } = await harness(c);
+    const rule = await c.store("Never promote an unverified artifact.", {
+      kind: "rule", rule: { stage: "release promotion", scope: "domain" },
+    });
+    const db = raw(c);
+    const embedding = (db.prepare(`SELECT embedding FROM concepts WHERE id = ?`).get(rule.conceptId) as { embedding: string }).embedding;
+    const insertConcept = db.prepare(
+      `INSERT INTO concepts (id, slug, title, body, kind, embedding, support_count, version, dirty, circle)
+       VALUES (?, ?, ?, ?, 'principle', ?, 1, 0, 1, 'default')`,
+    );
+    const insertRatification = db.prepare(
+      `INSERT INTO ratifications (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at, sync_updated_at)
+       VALUES (?, ?, 'approve', NULL, 'fixture', 'default', ?, ?)`,
+    );
+    for (let i = 0; i < 80; i++) {
+      const id = `many-parent-${String(i).padStart(3, "0")}`;
+      insertConcept.run(id, id, `Parent ${i}`, `Parent principle ${i}`, embedding);
+      insertRatification.run(`many-parent-rat-${i}`, id, i + 1, i + 1);
+      c.addLifecycleEdge({
+        family: "derivation", srcConceptId: id, dstConceptId: rule.conceptId,
+        bornOf: "extraction", eventRef: `fixture-${i}`,
+      });
+    }
+
+    const corrected = await call("memory_store", {
+      content: "Verify the artifact, then promote it.", kind: "correction", attachTo: rule.conceptId,
+    });
+    if (corrected.isError) throw new Error(corrected.text);
+    expect(corrected.json.action).toBe("created");
+    const succession = corrected.json.ruleSuccession as {
+      successorRuleId: string; impeachedPrincipleIds: string[]; impeachedPrincipleIdsOmitted?: number;
+    };
+    expect(succession.impeachedPrincipleIds).toHaveLength(25);
+    expect(succession.impeachedPrincipleIdsOmitted).toBe(55);
+    expect(await c.getConcept(succession.successorRuleId)).toBeDefined();
+    expect(JSON.stringify(corrected.json).length).toBeLessThan(40_000);
 
     await client.close();
     c.close();

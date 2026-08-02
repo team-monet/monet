@@ -584,8 +584,8 @@ describe("ratify() — the human-approval surface", () => {
     for (const edge of c.getLifecycleEdges(principle.conceptId, { direction: "out", family: "derivation" })) {
       expect(edge).toMatchObject({ born_of: "ratification", event_ref: r.ratificationId });
     }
-    // In-band delivery: the just-ratified principle is already in the response's own skeleton.
-    expect(r.skeleton.some((e) => e.conceptId === principle.conceptId)).toBe(true);
+    // Delivery is read from the skeleton surface, not repeated in the write acknowledgement.
+    expect(c.skeleton().some((e) => e.conceptId === principle.conceptId)).toBe(true);
     c.close();
   });
 
@@ -599,7 +599,7 @@ describe("ratify() — the human-approval surface", () => {
     const ratified = await c.ratify({
       candidateId: declared.conceptId, verdict: "re-ratify", circle: "default", ratifiedBy: "john",
     });
-    expect(ratified.skeleton.find((entry) => entry.conceptId === declared.conceptId))
+    expect(c.skeleton().find((entry) => entry.conceptId === declared.conceptId))
       .toMatchObject({ breadth: "global", ratifiedBy: "john" });
     expect(c.skeleton("another-circle").find((entry) => entry.conceptId === declared.conceptId))
       .toMatchObject({ breadth: "global" });

@@ -8,12 +8,11 @@
  *  4. Empty store → no block, one-shot consumed.
  *  6. Per-item ceiling: content[0] (JSON result) stays ≤ RESULT_MAX_CHARS;
  *     content[1] (prewarm block) stays ≤ PREWARM_BLOCK_MAX_CHARS.
- *  7. Nudge: 10th mutating call triggers, 30th triggers, not in-between; checkpoint-with-workstream
- *     resets; nudge text never on checkpoint-with-workstream's own response.
- *  8. Opt-out: autoPrewarm:false → no block; checkpointNudge:false → no nudge.
+ *  7. Checkpoint nag removal: no tool response appends the retired unsaved-state string.
+ *  8. Opt-out: autoPrewarm:false → no block.
  *  9. Server instructions: factory options include the instructions string.
  * 10. Fix 1 regression: JSON.parse(content[0].text) always succeeds on prewarm-carrying responses.
- * 12. Fix 5a env-var opt-out: MONET_NO_AUTOPREWARM/MONET_NO_CHECKPOINT_NUDGE mapping.
+ * 12. Fix 5a env-var opt-out: MONET_NO_AUTOPREWARM mapping.
  */
 import { describe, it, expect } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -28,7 +27,7 @@ import { registerMonetCoreTools, createMonetCoreMcpServer, deriveOptsFromEnv } f
 
 const PREWARM_HEADER = "=== MONET SESSION CONTEXT (auto-prewarm) ===";
 const PREWARM_FOOTER = "=== END SESSION CONTEXT ===";
-const NUDGE_TEXT = "[monet] Session has unsaved state";
+const RETIRED_NAG_TEXT = "[monet] Session has unsaved state";
 const RESULT_MAX_CHARS = 40_000;
 const PREWARM_BLOCK_MAX_CHARS = 2_500;
 
@@ -69,12 +68,6 @@ function rawText(result: unknown): string {
 /** content[1].text — the prewarm block, when present. */
 function prewarmText(result: unknown): string {
   return ((result as McpResult).content[1]?.text) ?? "";
-}
-
-/** The last content item's text — the nudge line, when present. */
-function lastItemText(result: unknown): string {
-  const items = (result as McpResult).content;
-  return items[items.length - 1]?.text ?? "";
 }
 
 function isError(result: unknown): boolean {
@@ -309,93 +302,18 @@ describe("6. per-item ceiling: content[0] ≤ RESULT_MAX_CHARS; prewarm block �
 });
 
 // ---------------------------------------------------------------------------
-// 7. Checkpoint nudge behavior
+// 7. Retired checkpoint nag
 // ---------------------------------------------------------------------------
 
-describe("7. checkpoint nudge", () => {
-  it("nudge appears at the 10th mutating call, not before", async () => {
+describe("7. retired checkpoint nag", () => {
+  it("never appends the nag across a checkpoint-less store session", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const { client, cleanup } = await makePair(core, { autoPrewarm: false });
     try {
-      // Do 9 mutating calls — no nudge.
-      for (let i = 0; i < 9; i++) {
+      for (let i = 0; i < 35; i++) {
         const result = await client.callTool({ name: "memory_store", arguments: { content: `Fact ${i}.` } });
-        expect(lastItemText(result)).not.toContain(NUDGE_TEXT);
+        expect((result as McpResult).content.map((part) => part.text).join("\n")).not.toContain(RETIRED_NAG_TEXT);
       }
-      // 10th mutating call — nudge appears as a separate content item.
-      const tenth = await client.callTool({ name: "memory_store", arguments: { content: "Tenth fact." } });
-      expect(lastItemText(tenth)).toContain(NUDGE_TEXT);
-      // content[0] must still be pure JSON.
-      expect(() => JSON.parse(rawText(tenth))).not.toThrow();
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("nudge appears again at the 30th mutating call, not between 11th and 29th", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      // First 10 calls to get past first nudge.
-      for (let i = 0; i < 10; i++) {
-        await client.callTool({ name: "memory_store", arguments: { content: `Fact ${i}.` } });
-      }
-      // Calls 11–29: no nudge.
-      for (let i = 10; i < 29; i++) {
-        const result = await client.callTool({ name: "memory_store", arguments: { content: `Fact ${i}.` } });
-        expect(lastItemText(result)).not.toContain(NUDGE_TEXT);
-      }
-      // 30th mutating call — nudge.
-      const thirtieth = await client.callTool({ name: "memory_store", arguments: { content: "Thirtieth fact." } });
-      expect(lastItemText(thirtieth)).toContain(NUDGE_TEXT);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("checkpoint-with-workstream resets counter; no nudge soon after", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      // 10 mutating calls to trigger the first nudge.
-      for (let i = 0; i < 10; i++) {
-        await client.callTool({ name: "memory_store", arguments: { content: `Fact ${i}.` } });
-      }
-      // Checkpoint with workstream payload — should NOT nudge and resets counter.
-      const ckResult = await client.callTool({
-        name: "memory_checkpoint",
-        arguments: {
-          workstream: { status: "active", nextSteps: ["continue tomorrow"] },
-        },
-      });
-      expect(lastItemText(ckResult)).not.toContain(NUDGE_TEXT);
-
-      // After reset, 9 more mutating calls should not nudge (counter back to 0).
-      for (let i = 0; i < 9; i++) {
-        const result = await client.callTool({ name: "memory_store", arguments: { content: `Post-ck fact ${i}.` } });
-        expect(lastItemText(result)).not.toContain(NUDGE_TEXT);
-      }
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("nudge text is never on the response that carries the prewarm block", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    // Pre-populate so the block is non-empty.
-    await core.store("SQLite for storage.");
-    const { client, cleanup } = await makePair(core);
-    try {
-      // First call: memory_search → prewarm block attached (not mutating).
-      await client.callTool({ name: "memory_search", arguments: { query: "SQLite" } });
-      // Then 9 mutating calls.
-      for (let i = 0; i < 9; i++) {
-        await client.callTool({ name: "memory_store", arguments: { content: `Fact ${i}.` } });
-      }
-      // 10th mutating call: nudge should appear, but no prewarm block (already consumed).
-      const tenth = await client.callTool({ name: "memory_store", arguments: { content: "Tenth." } });
-      expect(lastItemText(tenth)).toContain(NUDGE_TEXT);
-      expect(prewarmText(tenth)).not.toContain(PREWARM_HEADER);
     } finally {
       await cleanup();
     }
@@ -417,19 +335,6 @@ describe("8. opt-out flags", () => {
 
       const second = await client.callTool({ name: "memory_overview", arguments: {} });
       expect(prewarmText(second)).not.toContain(PREWARM_HEADER);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("checkpointNudge:false → no nudge on the 10th mutating call", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false, checkpointNudge: false });
-    try {
-      for (let i = 0; i < 15; i++) {
-        const result = await client.callTool({ name: "memory_store", arguments: { content: `Fact ${i}.` } });
-        expect(lastItemText(result)).not.toContain(NUDGE_TEXT);
-      }
     } finally {
       await cleanup();
     }
@@ -507,24 +412,6 @@ describe("10. Fix 1 regression: content[0].text is always valid JSON on prewarm-
       await cleanup();
     }
   });
-
-  it("memory_store response with nudge: content[0].text parses as JSON", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      // Get to the 10th mutating call to trigger the nudge.
-      for (let i = 0; i < 9; i++) {
-        await client.callTool({ name: "memory_store", arguments: { content: `Fact ${i}.` } });
-      }
-      const tenth = await client.callTool({ name: "memory_store", arguments: { content: "Tenth." } });
-      expect(lastItemText(tenth)).toContain(NUDGE_TEXT);
-      // content[0] must still be pure JSON.
-      const parsed = JSON.parse(rawText(tenth)) as Record<string, unknown>;
-      expect(parsed).toHaveProperty("conceptId");
-    } finally {
-      await cleanup();
-    }
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -535,25 +422,19 @@ describe("12. Fix 5a: deriveOptsFromEnv env-var mapping", () => {
   it("MONET_NO_AUTOPREWARM=1 → autoPrewarm:false", () => {
     const opts = deriveOptsFromEnv({ MONET_NO_AUTOPREWARM: "1" });
     expect(opts.autoPrewarm).toBe(false);
-    expect(opts.checkpointNudge).toBe(true);
+    expect(opts).not.toHaveProperty("checkpointNudge");
   });
 
-  it("MONET_NO_CHECKPOINT_NUDGE=1 → checkpointNudge:false", () => {
+  it("the retired nudge env variable has no response option", () => {
     const opts = deriveOptsFromEnv({ MONET_NO_CHECKPOINT_NUDGE: "1" });
     expect(opts.autoPrewarm).toBe(true);
-    expect(opts.checkpointNudge).toBe(false);
+    expect(opts).not.toHaveProperty("checkpointNudge");
   });
 
-  it("both vars set → both false", () => {
-    const opts = deriveOptsFromEnv({ MONET_NO_AUTOPREWARM: "1", MONET_NO_CHECKPOINT_NUDGE: "1" });
-    expect(opts.autoPrewarm).toBe(false);
-    expect(opts.checkpointNudge).toBe(false);
-  });
-
-  it("neither var set → both default to true", () => {
+  it("neither var set → auto-prewarm defaults to true", () => {
     const opts = deriveOptsFromEnv({});
     expect(opts.autoPrewarm).toBe(true);
-    expect(opts.checkpointNudge).toBe(true);
+    expect(opts).not.toHaveProperty("checkpointNudge");
   });
 
   it("MONET_NO_AUTOPREWARM=0 → autoPrewarm:true (not '1' string)", () => {

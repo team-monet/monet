@@ -20,7 +20,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { StoragePort, BetterSqlitePort, StorageExclusiveLockError } from "./storage";
-import { inspectSkeletonMirrors } from "./skeleton-mirror";
+import { hasCoveringSkeletonSurface, inspectSkeletonMirrors } from "./skeleton-mirror";
 import { SourceRegistry } from "./source-registry";
 import { SourceLedger } from "./source-ledger";
 import type { SourceScheduleBasis } from "./source-ledger";
@@ -942,6 +942,11 @@ export interface SkeletonEntryOpts {
   /** Internal transition disclosure hook; called only for global → local. */
   onBreadthNarrowed?: () => void;
   /**
+   * Internal semantic-change hook. The callback runs inside the write transaction after membership
+   * and breadth land, with the member's exact before/after state.
+   */
+  onDeliveryChanged?: (change: SkeletonDeliveryChange) => void;
+  /**
    * Called INSIDE the write transaction, with what resolution actually decided, to produce the
    * packet stored verbatim on the ratification row. A builder rather than a plain string because
    * the packet records the advisories that were shown, and two of those (near-match, resolution
@@ -956,6 +961,18 @@ export interface SkeletonEntryResolution {
   nearMatchId?: string;
   nearMatchScore?: number;
   resolutionMode?: ResolutionMode;
+}
+
+interface SkeletonDeliveryState {
+  member: boolean;
+  breadth: SkeletonBreadth;
+  body: string;
+}
+
+interface SkeletonDeliveryChange {
+  circle: string;
+  before: SkeletonDeliveryState;
+  after: SkeletonDeliveryState;
 }
 
 /**
@@ -1222,14 +1239,10 @@ export type DeclareResult =
       action: IngestAction;
       /** Warning-light signals only — see DeclareAdvisory. The write above has already happened. */
       advisories: DeclareAdvisory[];
-      /** Internal transition signal for the wire's conditional guidance; omitted ordinarily. */
+      /** Internal transition signal for the wire's conditional breadth disclosure; omitted ordinarily. */
       narrowedFromBreadth?: true;
-      /**
-       * The now-live skeleton for this circle, in-band (user-ratified, 2026-07-29): "the session
-       * that births a principle is governed by it from that turn onward." Uncapped here — see
-       * skeleton()'s own comment; the wire layer applies the response-size fit-and-signal.
-       */
-      skeleton: SkeletonEntry[];
+      /** A changed delivery scope has at least one registered standing surface. */
+      materializeRequired?: true;
     }
   | {
       /** Same shape as species "principle" above — see that member's own comment for why this is a
@@ -1238,9 +1251,10 @@ export type DeclareResult =
       conceptId: string;
       action: IngestAction;
       advisories: DeclareAdvisory[];
-      /** Internal transition signal for the wire's conditional guidance; omitted ordinarily. */
+      /** Internal transition signal for the wire's conditional breadth disclosure; omitted ordinarily. */
       narrowedFromBreadth?: true;
-      skeleton: SkeletonEntry[];
+      /** A changed delivery scope has at least one registered standing surface. */
+      materializeRequired?: true;
     };
 
 export type SkeletonBreadth = "global" | "local";
@@ -1319,8 +1333,8 @@ export interface RatifyResult {
   /** Ids of the derivation edges written this call. Empty for reject/retire, and for approve/
    *  re-ratify with no memberRuleIds. */
   edgeIds: string[];
-  /** The now-live skeleton for this circle, in-band — same rationale as declare()'s own field. */
-  skeleton: SkeletonEntry[];
+  /** This verdict changed membership and at least one registered standing surface covers it. */
+  materializeRequired?: true;
   /**
    * How many OPEN impeachment contradictions this verdict closed (slice 5-B). Omitted when none —
    * the ordinary case. See `closeImpeachments` for which verdicts close them and why the ordinary
@@ -3696,6 +3710,10 @@ export class MonetCore {
        * supersession edge can be written once, below, on either path.
        */
       let supersededRule: ConceptRow | null = null;
+      // A skeleton declaration may attach to an existing member and mutate its full body before the
+      // shared ratification seam runs. Preserve the exact pre-attach mirror state here so the seam's
+      // before/after comparison observes that content change rather than sampling "before" too late.
+      let skeletonDeliveryBefore: SkeletonDeliveryState | undefined;
 
       if (opts.attachTo) {
         // Direct attach: bypass scoring, land on named concept. (sourceConnector calls never reach
@@ -3828,9 +3846,7 @@ export class MonetCore {
           } else if (forkReason !== null) {
             landedOnExisting = false;
             action = "created";
-            if (
-              (opts.kind === "principle" || opts.kind === "preference") && landed.kind !== opts.kind
-            ) mode = "species-fork";
+            if (forkReason === "species") mode = "species-fork";
             else if (forkReason === "stage") mode = "stage-fork";
             // A refused CORRECTION keeps its own kind (it is evidence about something, not a rule);
             // a refused RULE capture is still a rule and must be born as one or it can never fire.
@@ -3847,6 +3863,13 @@ export class MonetCore {
             }
           } else {
             landedOnExisting = true;
+            if (opts.skeletonEntry !== undefined) {
+              skeletonDeliveryBefore = {
+                member: landed.status === "active" && this.isCurrentSkeletonMember(landed.id),
+                breadth: landed.skeleton_breadth,
+                body: landed.body,
+              };
+            }
             row = this.attach(landed, content, emb, sessionId, obsId);
           }
         } else {
@@ -3980,6 +4003,8 @@ export class MonetCore {
           ratifiedBy: opts.skeletonEntry.ratifiedBy,
           breadth: opts.skeletonEntry.breadth,
           onBreadthNarrowed: opts.skeletonEntry.onBreadthNarrowed,
+          onDeliveryChanged: opts.skeletonEntry.onDeliveryChanged,
+          deliveryBefore: skeletonDeliveryBefore,
           packet: opts.skeletonEntry.buildPacket({
             ...(nearMatchId !== undefined ? { nearMatchId } : {}),
             ...(nearMatchScore !== undefined ? { nearMatchScore } : {}),
@@ -9949,9 +9974,18 @@ export class MonetCore {
     memberRuleIds?: string[];
     breadth?: SkeletonBreadth;
     onBreadthNarrowed?: () => void;
+    onDeliveryChanged?: (change: SkeletonDeliveryChange) => void;
+    deliveryBefore?: SkeletonDeliveryState;
   }): { ratification: RatificationRow; edges: LifecycleEdgeRow[]; extractionFlagsResolved: number } {
     const result = this.db.transaction((): { ratification: RatificationRow; edges: LifecycleEdgeRow[]; extractionFlagsResolved: number } => {
       const isEntryVerdict = input.verdict === "approve" || input.verdict === "re-ratify";
+      const subject = this.getRow(input.conceptId);
+      if (!subject) throw new Error(`concept not found: ${input.conceptId}`);
+      const before: SkeletonDeliveryState = input.deliveryBefore ?? {
+        member: subject.status === "active" && this.isCurrentSkeletonMember(input.conceptId),
+        breadth: subject.skeleton_breadth,
+        body: subject.body,
+      };
       // EVERY MEMBER MUST BE A RULE, CHECKED BEFORE ANYTHING IS WRITTEN (review round 1, item 3).
       // The contract is "derivation edges principle → rule"; addLifecycleEdge enforces only
       // governability, so without this a member id naming a fact minted a derivation edge that
@@ -10057,6 +10091,15 @@ export class MonetCore {
       const extractionFlagsResolved = isEntryVerdict && memberRuleIds && memberRuleIds.length > 1
         ? this.resolveExtractionFlags(memberRuleIds, input.conceptId, ratification.ratified_by)
         : 0;
+      const delivered = this.getRow(input.conceptId)!;
+      const after: SkeletonDeliveryState = {
+        member: delivered.status === "active" && isEntryVerdict,
+        breadth: delivered.skeleton_breadth,
+        body: delivered.body,
+      };
+      if (before.member !== after.member || before.breadth !== after.breadth || before.body !== after.body) {
+        input.onDeliveryChanged?.({ circle: subject.circle, before, after });
+      }
       return { ratification, edges, extractionFlagsResolved };
     })();
     // SKELETON MATERIALIZATION SEAM — see this method's own doc comment above. No-op today.
@@ -10175,6 +10218,7 @@ export class MonetCore {
     // Both callees keep their own `db.transaction` (better-sqlite3 flattens those to savepoints), so
     // each remains correct if ever called alone. `refreshGateSidecar()` stays OUTSIDE, below — it is
     // a file materialization, not a row, and must never run for a verdict that did not commit.
+    let materializeRequired = false;
     const { ratification, edges, impeachmentsClosed, extractionFlagsResolved } = this.db.immediateTransaction((): {
       ratification: RatificationRow; edges: LifecycleEdgeRow[]; impeachmentsClosed: number; extractionFlagsResolved: number;
     } => {
@@ -10184,6 +10228,14 @@ export class MonetCore {
         ratifiedBy: input.ratifiedBy,
         packet: input.packet ?? null,
         memberRuleIds: input.memberRuleIds,
+        onDeliveryChanged: ({ circle: memberCircle, before, after }) => {
+          const scopes = new Set<SkeletonBreadth>();
+          if (before.member) scopes.add(before.breadth);
+          if (after.member) scopes.add(after.breadth);
+          materializeRequired = [...scopes].some((breadth) =>
+            this.skeletonDeliveryCovered(memberCircle, breadth)
+          );
+        },
       });
       return {
         ...recorded,
@@ -10202,7 +10254,7 @@ export class MonetCore {
       verdict: ratification.verdict,
       conceptId: input.candidateId,
       edgeIds: edges.map((e) => e.id),
-      skeleton: this.skeleton(circle),
+      ...(materializeRequired ? { materializeRequired: true as const } : {}),
       ...(impeachmentsClosed > 0 ? { impeachmentsClosed } : {}),
       ...(extractionFlagsResolved > 0 ? { extractionFlagsResolved } : {}),
     };
@@ -10281,9 +10333,8 @@ export class MonetCore {
    * entered at all.
    *
    * Uncapped, mirroring stages()'s own precedent below: principles are "few, always present" by
-   * design, and preferences are expected to stay in the same range — the response-side budget
-   * (where an actually large store would matter) is enforced at the wire layer, exactly as
-   * stageIndex's own cap-and-signal is, not here.
+   * design, and preferences are expected to stay in the same range. Each delivery surface owns its
+   * own envelope budget; write acknowledgements do not repeat this projection.
    *
    * OLDEST FIRST (review round 1, item 7). Delivery order IS truncation order: every consumer caps
    * a prefix (the overview's own cap, the wire's size-fit), so whatever sorts last is what a large
@@ -10736,6 +10787,16 @@ export class MonetCore {
   private isCurrentSkeletonMember(subjectConceptId: string): boolean {
     const verdict = this.latestRatificationVerdict(subjectConceptId);
     return verdict === "approve" || verdict === "re-ratify";
+  }
+
+  /** Whether a changed skeleton member's delivery scope is backed by a registered standing file. */
+  private skeletonDeliveryCovered(circle: string, breadth: SkeletonBreadth): boolean {
+    return hasCoveringSkeletonSurface(
+      this.storeHome,
+      circle,
+      breadth,
+      (surfaceCircle) => this.resolveCircle(surfaceCircle),
+    );
   }
 
   /**
@@ -11386,6 +11447,7 @@ export class MonetCore {
       // having run the builder (skeletonEntry is set on every call from this branch).
       let advisories: DeclareAdvisory[] = [];
       let narrowedFromBreadth = false;
+      let materializeRequired = false;
       const stored = await this.store(input.content!, {
         circle,
         kind: species,
@@ -11397,6 +11459,14 @@ export class MonetCore {
           // explicit ordinary circle makes it local; '*' makes it global.
           breadth: input.circle === undefined ? undefined : (isBreadth ? "global" : "local"),
           onBreadthNarrowed: () => { narrowedFromBreadth = true; },
+          onDeliveryChanged: ({ circle: memberCircle, before, after }) => {
+            const scopes = new Set<SkeletonBreadth>();
+            if (before.member) scopes.add(before.breadth);
+            if (after.member) scopes.add(after.breadth);
+            materializeRequired = [...scopes].some((breadth) =>
+              this.skeletonDeliveryCovered(memberCircle, breadth)
+            );
+          },
           buildPacket: (resolution) => {
             advisories = this.declareAdvisories(input.content!, input.exitsEvidence, species, resolution);
             return JSON.stringify({
@@ -11414,7 +11484,7 @@ export class MonetCore {
         action: stored.action,
         advisories,
         ...(narrowedFromBreadth ? { narrowedFromBreadth: true as const } : {}),
-        skeleton: this.skeleton(circle),
+        ...(materializeRequired ? { materializeRequired: true as const } : {}),
       };
     } else {
       // ONE TRANSACTION. The stage upsert now happens INSIDE store()'s transaction (patterns ride
@@ -11573,9 +11643,8 @@ export class MonetCore {
       });
     } else if (context.tool !== null) {
       // CLAMPED (Codex PR #102, round 2): `context.tool` is a verbatim prefix of caller content and
-      // advisories are a FIXED field of the wire response — fitObjectArray can only shrink the
-      // skeleton, so an unbounded tool name here could push even the empty-skeleton envelope past
-      // the result ceiling into a mid-JSON slice. 120 chars is ample for any real command head.
+      // advisories are a fixed field of the acknowledgement, so an unbounded tool name could push the
+      // complete envelope past the result ceiling. 120 chars is ample for any real command head.
       const toolShown = context.tool.length > 120 ? `${context.tool.slice(0, 120)}…` : context.tool;
       advisories.push({
         kind: "stage_shaped",
