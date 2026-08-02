@@ -13,7 +13,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore } from "./engine";
-import type { MergeConceptResult } from "./engine";
+import type { MergeConceptResult, SearchCard } from "./engine";
 import {
   BREADTH_CIRCLE,
   MODEL_TAG_MAX_CHARS,
@@ -121,6 +121,47 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
  * alter non-pathological fitted responses that already honor the ceiling.
  */
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
+const RECALL_EMPTY_LINE = "Nothing matched.";
+
+/**
+ * Search and gather cards are pointers, so their wire contract is deliberately smaller than the
+ * engine's ranking record. Keep ranking inputs inside the engine; the array order is the only rank
+ * signal a caller needs. This projection is shared by both tools so their key contracts cannot drift.
+ * Circle stays exact because it is a routing key; an oversized card is omitted whole by the envelope
+ * fitter below rather than returning a value memory_fetch's scope gate cannot use.
+ */
+type RecallWireCard = Pick<SearchCard, "id" | "slug" | "kind" | "circle"> & {
+  observationCount: number;
+  contradictions?: number;
+};
+function recallWireCard(card: SearchCard, observationCount: number): RecallWireCard {
+  return {
+    id: card.id,
+    slug: card.slug,
+    kind: card.kind,
+    circle: card.circle,
+    observationCount,
+    ...(card.contradictions > 0 ? { contradictions: card.contradictions } : {}),
+  };
+}
+
+/**
+ * Fit a recall card array against one COMPLETE serialized response envelope. The builder owns every
+ * returned field, including empty-result teaching and omission signals, so the measured object is the
+ * returned object and ok()'s oversized fallback is unreachable by construction. Cards are indivisible
+ * pointers: when the next one does not fit, omit it honestly rather than clipping identity fields.
+ */
+function fitRecallEnvelope(
+  buildEnvelope: (cards: RecallWireCard[], omitted: number) => Record<string, unknown>,
+  cards: RecallWireCard[],
+): Record<string, unknown> {
+  const emptyEnvelope = buildEnvelope([], cards.length);
+  if (JSON.stringify(emptyEnvelope, null, 2).length > RESULT_MAX_CHARS) {
+    throw new Error("recall response fixed fields exceed the host tool-result limit");
+  }
+  const fit = fitObjectArray(buildEnvelope, cards, RESULT_MAX_CHARS);
+  return buildEnvelope(fit.fitted, fit.omitted);
+}
 
 /**
  * Fit as many strings from `items` into `envelope[key]` as fit within `budget` once the WHOLE
@@ -1038,7 +1079,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_search",
-    "Search memory. Returns structural CARDS — what each memory is about and how much is in it (kind, support count, confidence, fetch hint) — but NEVER the content. To actually read a memory you MUST call memory_fetch; the answer is never in the search result. Omit circle to search across all circles — cards include each memory's home circle; pass circle to restrict.",
+    "Locate memories by query similarity. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to search across all circles; pass circle to restrict.",
     {
       query: z.string(),
       circle: z.string().optional().describe("Restrict search to this circle. Omit to search across all circles — cards include each memory's home circle."),
@@ -1055,12 +1096,14 @@ export function registerMonetCoreTools(
           sourceAuthorizationContext,
         });
         const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
-        return readOk({
+        const cards = results.map((card) => recallWireCard(card, core.countObservationsForConcept(card.id)));
+        const envelope = (fitted: RecallWireCard[], omitted: number): Record<string, unknown> => ({
           circle: circleLabel,
-          results,
-          guidance:
-            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read it — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle). `matchedObservationId` (when present) names WHICH observation matched, not what it said — still fetch to read. Fewer results than `limit` (or none) means nothing in your own memories scored above the relevance floor, not that the search failed; that floor applies to your memories only, so a connected source file can still appear on a query none of them answered.",
-        }, "memory_search", capturedBlock);
+          results: fitted,
+          ...(omitted > 0 ? { resultsTruncated: true, resultsOmitted: omitted } : {}),
+          ...(cards.length === 0 ? { note: RECALL_EMPTY_LINE } : {}),
+        });
+        return readOk(fitRecallEnvelope(envelope, cards), "memory_search", capturedBlock);
       } catch (e) {
         return err(`search failed: ${msg(e)}`);
       }
@@ -1127,7 +1170,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_gather",
-    "Rebuild the FULL working context for an intent — not just the most-similar few. Seeds from the intent, then spreads across the connection graph (entity, causal, and same-session co-occurrence edges, ≤2 hops) and stops when evidence saturates. Use at the start of a task or when resuming a thread: it recovers the related concepts — decisions, open questions, files worked on together — that a plain memory_search misses because they're worded differently. Returns structural cards (ranked); call memory_fetch(id) to read one. Omit circle to search across all circles — cards include each memory's home circle; pass circle to restrict (spreading stays within each seed's home circle).",
+    "Rebuild working context around an intent via graph spread. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to gather across all circles; pass circle to restrict.",
     {
       intent: z.string(),
       circle: z.string().optional().describe("Restrict gathering to this circle. Omit to gather across all circles — cards include each memory's home circle (spreading stays within each seed's home circle)."),
@@ -1146,15 +1189,14 @@ export function registerMonetCoreTools(
           sourceAuthorizationContext,
         });
         const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
-        return readOk({
+        const cards = r.ranked.map((card) => recallWireCard(card, core.countObservationsForConcept(card.id)));
+        const envelope = (fitted: RecallWireCard[], omitted: number): Record<string, unknown> => ({
           circle: circleLabel,
-          ranked: r.ranked,
-          seed: r.seed,
-          stopReason: r.stopReason,
-          reachableByType: r.reachableByType,
-          guidance:
-            "Cards show what a memory is about, not what it says. Call memory_fetch(id) to read one — if the card's `circle` isn't your session default, pass it: memory_fetch(id, circle). `matchedObservationId` (on ranked cards, when present) names WHICH observation matched, not what it said — still fetch to read; its absence means the card was reached by the graph or by wording overlap rather than by a direct match. A ranked card's `score` is its fused rank (similarity combined with graph activation), NOT that observation's own similarity. An empty `ranked` (or fewer than `limit`) means the intent matched nothing to build a context from, not that gather failed.",
-        }, "memory_gather", capturedBlock);
+          ranked: fitted,
+          ...(omitted > 0 ? { rankedTruncated: true, rankedOmitted: omitted } : {}),
+          ...(cards.length === 0 ? { note: RECALL_EMPTY_LINE } : {}),
+        });
+        return readOk(fitRecallEnvelope(envelope, cards), "memory_gather", capturedBlock);
       } catch (e) {
         return err(`gather failed: ${msg(e)}`);
       }

@@ -168,7 +168,7 @@ describe("payload noise — canonical success serializer", () => {
 });
 
 describe("payload noise — gather cards", () => {
-  it("carries a source-ref count and never the refs themselves", async () => {
+  it("never returns source provenance metadata", async () => {
     const core = newCore();
     const ref = "/work/secret-project/DESIGN.md";
     await core.store("Cache invalidation uses a per-tenant version stamp.", { circle, sourceRefs: [ref] });
@@ -179,11 +179,11 @@ describe("payload noise — gather cards", () => {
 
     expect(wire(res)).not.toContain(ref);
     const payload = parse(res);
-    const card = [...payload.ranked, ...payload.seed].find((x: { sourceRefsCount?: number }) => x.sourceRefsCount !== undefined);
-    expect(card, "the stored concept should surface with a ref count").toBeDefined();
-    expect(card.sourceRefsCount).toBe(1);
-    expect(card).not.toHaveProperty("sourceRefs");
-    expect(card).not.toHaveProperty("sourceRefsTotal");
+    expect(payload).not.toHaveProperty("seed");
+    expect(payload.ranked).toHaveLength(1);
+    expect(payload.ranked[0]).not.toHaveProperty("sourceRefsCount");
+    expect(payload.ranked[0]).not.toHaveProperty("sourceRefs");
+    expect(payload.ranked[0]).not.toHaveProperty("sourceRefsTotal");
     core.close();
   });
 });

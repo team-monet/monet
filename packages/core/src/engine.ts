@@ -4959,6 +4959,17 @@ export class MonetCore {
       .get(conceptId) as { n: number }).n;
   }
 
+  /**
+   * Full evidence-ledger count for one concept. Recall-card wire shaping uses this instead of the
+   * card's `supportCount`, which counts only live evidence; memory_fetch reports the full ledger under
+   * the same `observationCount` name, so the two pointer/read surfaces must agree after supersession.
+   */
+  countObservationsForConcept(conceptId: string): number {
+    return (this.db
+      .prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = ?`)
+      .get(conceptId) as { n: number }).n;
+  }
+
   /** Active native concepts unconfirmed past staleAfterMs (ADR §4.4). */
   getStaleConcepts(circle?: string): LivingModelCard[] {
     circle ??= this.defaultCircle;
