@@ -63,6 +63,8 @@ export interface MaterializeCliDependencies {
   now(): number;
   /** Test seam for a write racing after the surface snapshot but before the atomic CAS check. */
   beforeSurfaceWrite?(path: string): void;
+  /** Test seam for a registry mutation after the run snapshot but before its atomic CAS check. */
+  beforeRegistryWrite?(path: string): void;
   setExitCode(code: number): void;
 }
 
@@ -70,6 +72,34 @@ export class MaterializeCliError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "MaterializeCliError";
+  }
+}
+
+export class MaterializeRegistryConflictError extends MaterializeCliError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MaterializeRegistryConflictError";
+  }
+}
+
+export class MaterializeMarkerCollisionError extends MaterializeCliError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MaterializeMarkerCollisionError";
+  }
+}
+
+export class MaterializeDestinationAliasError extends MaterializeCliError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MaterializeDestinationAliasError";
+  }
+}
+
+export class MaterializeLossyDecodeError extends MaterializeCliError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MaterializeLossyDecodeError";
   }
 }
 
@@ -120,18 +150,23 @@ function isMaterializedSurface(value: unknown): value is MaterializedSurface {
   );
 }
 
-export function readMaterializeManifest(filePath: string): MaterializeRegistryManifest {
-  let raw: string;
+interface MaterializeManifestSnapshot {
+  manifest: MaterializeRegistryManifest;
+  bytes: Buffer | null;
+}
+
+function readMaterializeManifestSnapshot(filePath: string): MaterializeManifestSnapshot {
+  let bytes: Buffer;
   try {
-    raw = fs.readFileSync(filePath, "utf8");
+    bytes = fs.readFileSync(filePath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyManifest();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { manifest: emptyManifest(), bytes: null };
     throw new MaterializeCliError(`cannot read registry ${filePath}: ${messageFrom(error)}`);
   }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(bytes.toString("utf8"));
   } catch {
     throw new MaterializeCliError(`registry ${filePath} is not valid JSON`);
   }
@@ -165,12 +200,45 @@ export function readMaterializeManifest(filePath: string): MaterializeRegistryMa
     }
     materialized[surfacePath] = value;
   }
-  return { surfaces, materialized };
+  return { manifest: { surfaces, materialized }, bytes };
 }
 
-function writeMaterializeManifest(filePath: string, manifest: MaterializeRegistryManifest): void {
+export function readMaterializeManifest(filePath: string): MaterializeRegistryManifest {
+  return readMaterializeManifestSnapshot(filePath).manifest;
+}
+
+function byteSnapshotStillMatches(pathname: string, snapshot: Buffer | null): boolean {
+  if (snapshot !== null) {
+    try {
+      return fs.readFileSync(pathname).equals(snapshot);
+    } catch {
+      return false;
+    }
+  }
+  try {
+    fs.lstatSync(pathname);
+    return false; // Something now exists — notably a newly-created dangling link.
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+function writeMaterializeManifest(
+  filePath: string,
+  manifest: MaterializeRegistryManifest,
+  expectedSnapshot?: Buffer | null,
+): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  atomicWriteFile(filePath, `${JSON.stringify(manifest, null, 2)}\n`);
+  // Bare materialization uses the same best-effort snapshot CAS as standing files. The comparison is
+  // immediately before rename; the remaining check-to-rename window is accepted for this single-user
+  // CLI because closing it requires cross-process locking and persistent lock-recovery state.
+  atomicWriteFile(filePath, `${JSON.stringify(manifest, null, 2)}\n`, undefined, expectedSnapshot === undefined ? undefined : () => {
+    if (!byteSnapshotStillMatches(filePath, expectedSnapshot)) {
+      throw new MaterializeRegistryConflictError(
+        `registry conflict at ${filePath}: materialize.json changed after this run started; refusing to overwrite a concurrent add/remove. Surfaces already materialized remain materialized; rerun monet materialize`,
+      );
+    }
+  });
 }
 
 function messageFrom(error: unknown): string {
@@ -181,12 +249,60 @@ function scopeLabel(scope: MaterializeScope): string {
   return scope === "global" ? "global" : `circle:${scope.circle}`;
 }
 
+function assertMarkerSafeScope(scope: MaterializeScope): void {
+  if (scope === "global") return;
+  const label = scopeLabel(scope);
+  if (label.includes(BEGIN_MARKER) || label.includes(END_MARKER)) {
+    throw new MaterializeMarkerCollisionError(
+      `marker collision in circle scope ${JSON.stringify(scope.circle)}: scope label contains a monet:skeleton control-marker substring; refusing to render a poisoned block`,
+    );
+  }
+}
+
 function assertQueryableMaterializeScope(surface: MaterializeSurface): void {
   if (surface.scope !== "global" && surface.scope.circle === "*") {
     throw new MaterializeCliError(
       "circle '*' is the reserved global-breadth marker, never a queryable circle; register this surface with --global instead",
     );
   }
+  assertMarkerSafeScope(surface.scope);
+}
+
+function canonicalSurfaceDestination(surfacePath: string): string | null {
+  let ancestor = surfacePath;
+  const unresolvedSuffix: string[] = [];
+  while (true) {
+    try {
+      return path.join(fs.realpathSync.native(ancestor), ...unresolvedSuffix);
+    } catch {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return null;
+      unresolvedSuffix.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
+
+function sameDestinationRefusals(surfaces: MaterializeSurface[]): Map<string, MaterializeDestinationAliasError> {
+  const pathsByDestination = new Map<string, string[]>();
+  for (const surface of surfaces) {
+    const destination = canonicalSurfaceDestination(surface.path);
+    if (destination === null) continue;
+    const paths = pathsByDestination.get(destination) ?? [];
+    paths.push(surface.path);
+    pathsByDestination.set(destination, paths);
+  }
+
+  const refusals = new Map<string, MaterializeDestinationAliasError>();
+  for (const [destination, paths] of pathsByDestination) {
+    if (paths.length < 2) continue;
+    for (const surfacePath of paths) {
+      refusals.set(surfacePath, new MaterializeDestinationAliasError(
+        `same-destination aliases ${paths.map((alias) => JSON.stringify(alias)).join(", ")} resolve to ${JSON.stringify(destination)}; refusing every alias in this group`,
+      ));
+    }
+  }
+  return refusals;
 }
 
 function resolveSurfacePath(input: string, projectDir: string): string {
@@ -215,6 +331,16 @@ function deliveredMembers(core: MaterializeSkeletonCore, scope: MaterializeScope
   return skeleton.filter((entry) => scope === "global" ? entry.breadth === "global" : entry.breadth === "local");
 }
 
+function assertMarkerSafeMembers(members: DeliveredMember[]): void {
+  for (const member of members) {
+    if (member.body.includes(BEGIN_MARKER) || member.body.includes(END_MARKER)) {
+      throw new MaterializeMarkerCollisionError(
+        `marker collision in conceptId ${JSON.stringify(member.conceptId)}: delivered body contains a monet:skeleton control-marker substring; refusing to write a block that would poison the next run`,
+      );
+    }
+  }
+}
+
 function renderSection(title: "Principles" | "Preferences", bodies: string[]): string {
   return `# ${title}\n\n${bodies.join("\n\n")}`;
 }
@@ -225,15 +351,37 @@ export function renderSkeletonBlock(
   generated: string,
   skeletonState = canonicalSkeletonState(members),
 ): string {
+  assertMarkerSafeScope(scope);
   const sections: string[] = [];
   const principles = members.filter((member) => member.species === "principle").map((member) => member.body);
   const preferences = members.filter((member) => member.species === "preference").map((member) => member.body);
   if (principles.length > 0) sections.push(renderSection("Principles", principles));
   if (preferences.length > 0) sections.push(renderSection("Preferences", preferences));
   const begin = `${BEGIN_MARKER} scope=${scopeLabel(scope)} state=${skeletonState} generated=${generated} -->`;
-  return sections.length > 0
+  const block = sections.length > 0
     ? `${begin}\n${sections.join("\n\n")}\n${END_MARKER}`
     : `${begin}\n${END_MARKER}`;
+  // Belt-and-braces postcondition: future interpolations must not bypass the specific body/scope guards.
+  assertSingleMarkerPair(block);
+  return block;
+}
+
+function markerCount(text: string, marker: string): number {
+  let count = 0;
+  for (let offset = text.indexOf(marker); offset !== -1; offset = text.indexOf(marker, offset + marker.length)) {
+    count += 1;
+  }
+  return count;
+}
+
+function assertSingleMarkerPair(block: string): void {
+  const beginCount = markerCount(block, BEGIN_MARKER);
+  const endCount = markerCount(block, END_MARKER);
+  if (beginCount !== 1 || endCount !== 1) {
+    throw new MaterializeMarkerCollisionError(
+      `marker collision in rendered block: expected exactly one monet:skeleton marker pair, found ${beginCount} BEGIN and ${endCount} END markers; refusing to write a poisoned block`,
+    );
+  }
 }
 
 interface MarkerSpan {
@@ -273,10 +421,25 @@ function currentMembersForSurface(core: MaterializeSkeletonCore, surface: Materi
   return deliveredMembers(core, surface.scope);
 }
 
-function readSurface(pathname: string): string | null {
+interface SurfaceSnapshot {
+  text: string;
+  bytes: Buffer;
+}
+
+function readSurfaceSnapshot(pathname: string): SurfaceSnapshot | null {
   try {
-    return fs.readFileSync(pathname, "utf8");
+    const bytes = fs.readFileSync(pathname);
+    const text = bytes.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(bytes)) {
+      // Byte-level block splicing could preserve an arbitrary surrounding encoding, but refusal is the
+      // deliberately smaller first step: never rewrite hand-authored bytes through U+FFFD replacement.
+      throw new MaterializeLossyDecodeError(
+        `${pathname}: surface is not losslessly UTF-8-decodable; refusing to rewrite bytes outside the managed block`,
+      );
+    }
+    return { text, bytes };
   } catch (error) {
+    if (error instanceof MaterializeCliError) throw error;
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       try {
         if (fs.lstatSync(pathname).isSymbolicLink()) {
@@ -295,21 +458,11 @@ function readSurface(pathname: string): string | null {
   }
 }
 
-function snapshotStillMatches(pathname: string, snapshot: string | null): boolean {
-  try {
-    return fs.readFileSync(pathname, "utf8") === snapshot;
-  } catch (error) {
-    if (snapshot !== null || (error as NodeJS.ErrnoException).code !== "ENOENT") return false;
-    try {
-      fs.lstatSync(pathname);
-      return false; // Something exists but cannot be followed — notably a newly-created dangling link.
-    } catch (linkError) {
-      return (linkError as NodeJS.ErrnoException).code === "ENOENT";
-    }
-  }
+function readSurface(pathname: string): string | null {
+  return readSurfaceSnapshot(pathname)?.text ?? null;
 }
 
-function writeSurface(pathname: string, text: string, snapshot: string | null): void {
+function writeSurface(pathname: string, text: string, snapshot: Buffer | null): void {
   fs.mkdirSync(path.dirname(pathname), { recursive: true });
   // Reuse install's same-directory atomic writer: it follows a deliberate live dotfile symlink and
   // preserves an existing target's mode. Immediately before its rename, compare the destination to
@@ -318,7 +471,7 @@ function writeSurface(pathname: string, text: string, snapshot: string | null): 
   // A small compare-to-rename window remains; closing it needs locking and is disproportionate for
   // this single-user CLI. The best-effort CAS still catches the practical race without new lock state.
   atomicWriteFile(pathname, text, undefined, () => {
-    if (!snapshotStillMatches(pathname, snapshot)) {
+    if (!byteSnapshotStillMatches(pathname, snapshot)) {
       throw new MaterializeCliError(`${pathname}: changed after it was read; refusing to overwrite concurrent edits (rerun materialize)`);
     }
   });
@@ -331,9 +484,11 @@ async function materializeOne(
   prior?: MaterializedSurface,
   beforeSurfaceWrite?: (path: string) => void,
 ): Promise<MaterializedSurface> {
-  const existing = readSurface(surface.path);
+  const snapshot = readSurfaceSnapshot(surface.path);
+  const existing = snapshot?.text ?? null;
   const span = existing === null ? null : findSkeletonBlock(existing, surface.path);
   const members = currentMembersForSurface(core, surface);
+  assertMarkerSafeMembers(members);
   const skeletonState = canonicalSkeletonState(members);
 
   // `generated` and `when` describe a materialization event, not an invocation. If both the store
@@ -350,7 +505,7 @@ async function materializeOne(
   const block = renderSkeletonBlock(surface.scope, members, new Date(now).toISOString(), skeletonState);
   const output = nextSurfaceText(existing, surface.path, block);
   beforeSurfaceWrite?.(surface.path);
-  writeSurface(surface.path, output, existing);
+  writeSurface(surface.path, output, snapshot?.bytes ?? null);
   return { blockHash: sha256(block), skeletonState, when: now };
 }
 
@@ -412,18 +567,22 @@ export function registerMaterializeCommands(
     .description("Regenerate registered standing-file skeleton blocks from the store")
     .action(async () => {
       const filePath = manifestPath(deps);
-      const manifest = readMaterializeManifest(filePath);
+      const { manifest, bytes: registrySnapshot } = readMaterializeManifestSnapshot(filePath);
       const next: MaterializeRegistryManifest = { surfaces: manifest.surfaces, materialized: { ...manifest.materialized } };
+      const aliasRefusals = sameDestinationRefusals(manifest.surfaces);
       let failed = false;
       const now = deps.now();
       if (manifest.surfaces.length === 0) {
-        writeMaterializeManifest(filePath, next);
+        deps.beforeRegistryWrite?.(filePath);
+        writeMaterializeManifest(filePath, next, registrySnapshot);
         return;
       }
       console.error(`store: ${path.resolve(deps.dbPath())}`);
       await openForSkeleton(deps, async (core) => {
         for (const surface of manifest.surfaces) {
           try {
+            const aliasRefusal = aliasRefusals.get(surface.path);
+            if (aliasRefusal !== undefined) throw aliasRefusal;
             assertQueryableMaterializeScope(surface);
             next.materialized[surface.path] = await materializeOne(
               surface,
@@ -439,7 +598,8 @@ export function registerMaterializeCommands(
           }
         }
       });
-      writeMaterializeManifest(filePath, next);
+      deps.beforeRegistryWrite?.(filePath);
+      writeMaterializeManifest(filePath, next, registrySnapshot);
       if (failed) deps.setExitCode(1);
     });
 
@@ -462,11 +622,21 @@ export function registerMaterializeCommands(
           "circle '*' is the reserved global-breadth marker, never a queryable circle; use --global instead",
         );
       }
+      if (circle !== undefined) assertMarkerSafeScope({ circle });
       const surfacePath = resolveSurfacePath(inputPath, deps.projectDir());
       const filePath = manifestPath(deps);
       const manifest = readMaterializeManifest(filePath);
       if (manifest.surfaces.some((surface) => surface.path === surfacePath)) {
         throw new MaterializeCliError(`surface already registered: ${surfacePath}`);
+      }
+      const destination = canonicalSurfaceDestination(surfacePath);
+      if (destination !== null) {
+        const existing = manifest.surfaces.find((surface) => canonicalSurfaceDestination(surface.path) === destination);
+        if (existing !== undefined) {
+          throw new MaterializeDestinationAliasError(
+            `same-destination aliases ${JSON.stringify(surfacePath)} and ${JSON.stringify(existing.path)} resolve to ${JSON.stringify(destination)}; refusing registration`,
+          );
+        }
       }
       manifest.surfaces.push({ path: surfacePath, scope: options.global === true ? "global" : { circle: circle! } });
       writeMaterializeManifest(filePath, manifest);
@@ -494,6 +664,7 @@ export function registerMaterializeCommands(
     .action(async () => {
       const manifest = readMaterializeManifest(manifestPath(deps));
       if (manifest.surfaces.length === 0) return;
+      const aliasRefusals = sameDestinationRefusals(manifest.surfaces);
 
       // Three states require no store consultation. Compute those first and open the database only
       // if at least one intact, previously materialized block needs its skeletonState checked.
@@ -501,6 +672,8 @@ export function registerMaterializeCommands(
       let needsStore = false;
       for (const surface of manifest.surfaces) {
         try {
+          const aliasRefusal = aliasRefusals.get(surface.path);
+          if (aliasRefusal !== undefined) throw aliasRefusal;
           assertQueryableMaterializeScope(surface);
           const state = freshnessWithoutStore(surface, manifest.materialized[surface.path]);
           states.push(state);

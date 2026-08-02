@@ -9,8 +9,12 @@ import { MonetCore, type SkeletonBody } from "@team-monet/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   MaterializeCliError,
+  MaterializeDestinationAliasError,
+  MaterializeMarkerCollisionError,
+  MaterializeRegistryConflictError,
   readMaterializeManifest,
   registerMaterializeCommands,
+  renderSkeletonBlock,
   type MaterializeCliDependencies,
   type MaterializeRegistryManifest,
   type MaterializeSkeletonCore,
@@ -136,6 +140,13 @@ describe("materialize CLI", () => {
     expect((wildcard.error as Error).message).toContain("reserved global-breadth marker");
     expect((wildcard.error as Error).message).toContain("--global");
 
+    for (const markerCircle of ["team<!-- BEGIN monet:skeleton", "team<!-- END monet:skeleton -->"]) {
+      const collision = await run(["materialize", "add", "other.md", "--circle", markerCircle], f.deps);
+      expect(collision.error).toBeInstanceOf(MaterializeMarkerCollisionError);
+      expect((collision.error as Error).message).toContain("marker collision in circle scope");
+      expect((collision.error as Error).message).toContain(JSON.stringify(markerCircle));
+    }
+
     const removed = await run(["materialize", "remove", "CLAUDE.md"], f.deps);
     expect(removed.error).toBeUndefined();
     expect(readMaterializeManifest(f.manifestPath)).toEqual({ surfaces: [], materialized: {} });
@@ -168,6 +179,140 @@ describe("materialize CLI", () => {
       expect.objectContaining({ path: wildcard, scope: { circle: "*" } }),
       { path: valid, scope: { circle: "project" } },
     ]);
+  });
+
+  it("refuses a missing-leaf alias at add by canonicalizing its nearest existing ancestor", async () => {
+    const f = fixture();
+    roots.push(f.root);
+    const realParent = join(f.projectDir, "real");
+    const aliasParent = join(f.projectDir, "alias");
+    fs.mkdirSync(realParent);
+    fs.symlinkSync(realParent, aliasParent);
+    const real = join(realParent, "new.md");
+    const alias = join(aliasParent, "new.md");
+
+    const added = await run(["materialize", "add", real, "--circle", "project"], f.deps);
+    expect(added.error).toBeUndefined();
+    const refused = await run(["materialize", "add", alias, "--global"], f.deps);
+
+    expect(refused.error).toBeInstanceOf(MaterializeDestinationAliasError);
+    expect((refused.error as Error).message).toContain(JSON.stringify(real));
+    expect((refused.error as Error).message).toContain(JSON.stringify(alias));
+    expect(fs.existsSync(real)).toBe(false);
+    expect(readMaterializeManifest(f.manifestPath).surfaces).toEqual([
+      { path: real, scope: { circle: "project" } },
+    ]);
+  });
+
+  it("allows unrelated missing-leaf surfaces to register", async () => {
+    const f = fixture();
+    roots.push(f.root);
+    const first = join(f.projectDir, "one", "new.md");
+    const second = join(f.projectDir, "two", "new.md");
+
+    expect((await run(["materialize", "add", first, "--circle", "project"], f.deps)).error).toBeUndefined();
+    expect((await run(["materialize", "add", second, "--global"], f.deps)).error).toBeUndefined();
+    expect(readMaterializeManifest(f.manifestPath).surfaces.map((surface) => surface.path)).toEqual([first, second]);
+  });
+
+  it("refuses a real-path/symlink duplicate at add and names both paths", async () => {
+    const f = fixture();
+    roots.push(f.root);
+    const real = join(f.projectDir, "real.md");
+    const alias = join(f.projectDir, "alias.md");
+    fs.writeFileSync(real, "Standing text.\n", "utf8");
+    fs.symlinkSync(real, alias);
+
+    const added = await run(["materialize", "add", real, "--circle", "project"], f.deps);
+    expect(added.error).toBeUndefined();
+    const refused = await run(["materialize", "add", alias, "--global"], f.deps);
+
+    expect(refused.error).toBeInstanceOf(MaterializeDestinationAliasError);
+    expect((refused.error as Error).message).toContain("same-destination aliases");
+    expect((refused.error as Error).message).toContain(JSON.stringify(real));
+    expect((refused.error as Error).message).toContain(JSON.stringify(alias));
+    expect(readMaterializeManifest(f.manifestPath).surfaces).toEqual([
+      { path: real, scope: { circle: "project" } },
+    ]);
+  });
+
+  it("refuses every missing-leaf alias in a hand-edited registry at run/list and continues an unrelated surface", async () => {
+    const core = fakeCore({ project: [member("p", "principle", "Valid principle.", "local")] });
+    const f = fixture(core);
+    roots.push(f.root);
+    const realParent = join(f.root, "real");
+    const aliasParent = join(f.root, "alias");
+    fs.mkdirSync(realParent);
+    fs.symlinkSync(realParent, aliasParent);
+    const real = join(realParent, "new.md");
+    const alias = join(aliasParent, "new.md");
+    const good = join(f.root, "good.md");
+    writeManifest(f.manifestPath, {
+      surfaces: [
+        { path: real, scope: { circle: "project" } },
+        { path: alias, scope: "global" },
+        { path: good, scope: { circle: "project" } },
+      ],
+      materialized: {},
+    });
+
+    const result = await run(["materialize"], f.deps);
+
+    expect(result.error).toBeUndefined();
+    expect(f.exits).toEqual([1]);
+    expect(result.stderr).toContain(JSON.stringify(real));
+    expect(result.stderr).toContain(JSON.stringify(alias));
+    expect(fs.existsSync(real)).toBe(false);
+    expect(fs.readFileSync(good, "utf8")).toContain("Valid principle.");
+
+    f.exits.length = 0;
+    const listed = await run(["materialize", "list"], f.deps);
+    expect(listed.error).toBeUndefined();
+    expect(f.exits).toEqual([1, 1]);
+    expect(listed.stderr).toContain(`monet materialize list: ${real}:`);
+    expect(listed.stderr).toContain(`monet materialize list: ${alias}:`);
+    expect(listed.stdout).toBe(`fresh\tcircle:project\t${good}\n`);
+  });
+
+  it("refuses every same-destination alias in a hand-edited registry and continues an unrelated surface", async () => {
+    const core = fakeCore({ project: [member("p", "principle", "Valid principle.", "local")] });
+    const f = fixture(core);
+    roots.push(f.root);
+    const real = join(f.root, "real.md");
+    const alias = join(f.root, "alias.md");
+    const good = join(f.root, "good.md");
+    fs.writeFileSync(real, "Alias target stays untouched.\n", "utf8");
+    fs.symlinkSync(real, alias);
+    writeManifest(f.manifestPath, {
+      surfaces: [
+        { path: real, scope: { circle: "project" } },
+        { path: alias, scope: "global" },
+        { path: good, scope: { circle: "project" } },
+      ],
+      materialized: {},
+    });
+
+    const result = await run(["materialize"], f.deps);
+
+    expect(result.error).toBeUndefined();
+    expect(f.exits).toEqual([1]);
+    expect(result.stderr).toContain("same-destination aliases");
+    expect(result.stderr).toContain(JSON.stringify(real));
+    expect(result.stderr).toContain(JSON.stringify(alias));
+    expect(fs.readFileSync(real, "utf8")).toBe("Alias target stays untouched.\n");
+    expect(fs.readFileSync(good, "utf8")).toContain("Valid principle.");
+    const manifest = readMaterializeManifest(f.manifestPath);
+    expect(manifest.materialized[real]).toBeUndefined();
+    expect(manifest.materialized[alias]).toBeUndefined();
+    expect(manifest.materialized[good]).toBeDefined();
+
+    f.exits.length = 0;
+    const listed = await run(["materialize", "list"], f.deps);
+    expect(listed.error).toBeUndefined();
+    expect(f.exits).toEqual([1, 1]);
+    expect(listed.stderr).toContain(`monet materialize list: ${real}:`);
+    expect(listed.stderr).toContain(`monet materialize list: ${alias}:`);
+    expect(listed.stdout).toBe(`fresh\tcircle:project\t${good}\n`);
   });
 
   it("renders global and circle scopes as disjoint blocks with full bodies in ratification order", async () => {
@@ -269,6 +414,69 @@ describe("materialize CLI", () => {
     expect(fs.readFileSync(good, "utf8")).toContain("Good principle.");
   });
 
+  it("refuses a marker-bearing scope from a hand-edited registry and continues a sibling", async () => {
+    const core = fakeCore({ good: [member("good", "principle", "Good principle.", "local")] });
+    const f = fixture(core);
+    roots.push(f.root);
+    const poisoned = join(f.root, "poisoned.md");
+    const good = join(f.root, "good.md");
+    const circle = "poisoned<!-- BEGIN monet:skeleton";
+    writeManifest(f.manifestPath, {
+      surfaces: [
+        { path: poisoned, scope: { circle } },
+        { path: good, scope: { circle: "good" } },
+      ],
+      materialized: {},
+    });
+
+    const result = await run(["materialize"], f.deps);
+
+    expect(result.error).toBeUndefined();
+    expect(f.exits).toEqual([1]);
+    expect(result.stderr).toContain(poisoned);
+    expect(result.stderr).toContain("marker collision in circle scope");
+    expect(result.stderr).toContain(JSON.stringify(circle));
+    expect(fs.existsSync(poisoned)).toBe(false);
+    expect(fs.readFileSync(good, "utf8")).toContain("Good principle.");
+  });
+
+  it("enforces exactly one marker pair on a synthetic multi-marker render", () => {
+    expect(() => renderSkeletonBlock("global", [
+      member("synthetic", "principle", "<!-- BEGIN monet:skeleton synthetic -->", "global"),
+    ], "2026-08-02T01:02:03.004Z")).toThrowError(MaterializeMarkerCollisionError);
+  });
+
+  it.each([
+    ["BEGIN", "collision-begin", "Body before <!-- BEGIN monet:skeleton injected --> body after"],
+    ["END", "collision-end", "Body before <!-- END monet:skeleton --> body after"],
+  ])("refuses a delivered body containing the %s marker before writing and continues a sibling", async (_variant, conceptId, body) => {
+    const core = fakeCore({
+      poisoned: [member(conceptId, "principle", body, "local")],
+      good: [member("good", "principle", "Good principle.", "local")],
+    });
+    const f = fixture(core);
+    roots.push(f.root);
+    const poisoned = join(f.root, "poisoned.md");
+    const good = join(f.root, "good.md");
+    const original = Buffer.from("Hand-written text stays untouched.\n", "utf8");
+    fs.writeFileSync(poisoned, original);
+    await run(["materialize", "add", poisoned, "--circle", "poisoned"], f.deps);
+    await run(["materialize", "add", good, "--circle", "good"], f.deps);
+
+    const result = await run(["materialize"], f.deps);
+
+    expect(result.error).toBeUndefined();
+    expect(f.exits).toEqual([1]);
+    expect(result.stderr).toContain(poisoned);
+    expect(result.stderr).toContain("marker collision");
+    expect(result.stderr).toContain(`conceptId ${JSON.stringify(conceptId)}`);
+    expect(fs.readFileSync(poisoned)).toEqual(original);
+    expect(fs.readFileSync(good, "utf8")).toContain("Good principle.");
+    const manifest = readMaterializeManifest(f.manifestPath);
+    expect(manifest.materialized[poisoned]).toBeUndefined();
+    expect(manifest.materialized[good]).toBeDefined();
+  });
+
   it.each([
     ["begin without end", "Before\n<!-- BEGIN monet:skeleton old -->\nbody"],
     ["reversed", "<!-- END monet:skeleton -->\n<!-- BEGIN monet:skeleton old -->"],
@@ -291,6 +499,30 @@ describe("materialize CLI", () => {
     expect(fs.readFileSync(good, "utf8")).toContain("Good principle.");
     const manifest = readMaterializeManifest(f.manifestPath);
     expect(manifest.materialized[bad]).toBeUndefined();
+    expect(manifest.materialized[good]).toBeDefined();
+  });
+
+  it("refuses a Latin-1 surface as not losslessly decodable, preserves bytes, and continues a sibling", async () => {
+    const core = fakeCore({ project: [member("p", "principle", "Rendered principle.", "local")] });
+    const f = fixture(core);
+    roots.push(f.root);
+    const latin1 = join(f.root, "latin1.md");
+    const good = join(f.root, "good.md");
+    const original = Buffer.from([0x43, 0x61, 0x66, 0xe9, 0x0a]);
+    fs.writeFileSync(latin1, original);
+    await run(["materialize", "add", latin1, "--circle", "project"], f.deps);
+    await run(["materialize", "add", good, "--circle", "project"], f.deps);
+
+    const result = await run(["materialize"], f.deps);
+
+    expect(result.error).toBeUndefined();
+    expect(f.exits).toEqual([1]);
+    expect(result.stderr).toContain(latin1);
+    expect(result.stderr).toContain("not losslessly UTF-8-decodable");
+    expect(fs.readFileSync(latin1)).toEqual(original);
+    expect(fs.readFileSync(good, "utf8")).toContain("Rendered principle.");
+    const manifest = readMaterializeManifest(f.manifestPath);
+    expect(manifest.materialized[latin1]).toBeUndefined();
     expect(manifest.materialized[good]).toBeDefined();
   });
 
@@ -324,7 +556,36 @@ describe("materialize CLI", () => {
     expect(manifest.materialized[good]).toBeDefined();
   });
 
-  it("keeps hashes and files byte-identical across unchanged runs", async () => {
+  it("refuses a concurrent registry change before rename without reverting it and leaves completed surfaces materialized", async () => {
+    const core = fakeCore({ project: [member("p", "principle", "Rendered principle.", "local")] });
+    const f = fixture(core);
+    roots.push(f.root);
+    const surface = join(f.root, "surface.md");
+    const concurrentlyAdded = join(f.root, "concurrent.md");
+    await run(["materialize", "add", surface, "--circle", "project"], f.deps);
+    f.deps.beforeRegistryWrite = (registryPath) => {
+      const concurrent = readMaterializeManifest(registryPath);
+      concurrent.surfaces.push({ path: concurrentlyAdded, scope: "global" });
+      writeManifest(registryPath, concurrent);
+    };
+
+    const result = await run(["materialize"], f.deps);
+
+    expect(result.error).toBeInstanceOf(MaterializeRegistryConflictError);
+    expect((result.error as Error).message).toContain("registry conflict");
+    expect((result.error as Error).message).toContain("Surfaces already materialized remain materialized");
+    expect((result.error as Error).message).toContain("rerun monet materialize");
+    expect(fs.readFileSync(surface, "utf8")).toContain("Rendered principle.");
+    expect(readMaterializeManifest(f.manifestPath)).toEqual({
+      surfaces: [
+        { path: surface, scope: { circle: "project" } },
+        { path: concurrentlyAdded, scope: "global" },
+      ],
+      materialized: {},
+    });
+  });
+
+  it("keeps surface and registry bytes identical across clean reruns with all four guards active", async () => {
     const core = fakeCore({ project: [member("b", "principle", "Stable body.", "local")] });
     const f = fixture(core);
     roots.push(f.root);
@@ -332,14 +593,17 @@ describe("materialize CLI", () => {
     await run(["materialize", "add", surface, "--circle", "project"], f.deps);
     await run(["materialize"], f.deps);
     const firstFile = fs.readFileSync(surface, "utf8");
+    const firstRegistry = fs.readFileSync(f.manifestPath);
     const firstState = readMaterializeManifest(f.manifestPath).materialized[surface];
 
     f.deps.now = () => Date.parse("2026-08-03T09:08:07.006Z");
     await run(["materialize"], f.deps);
     const secondFile = fs.readFileSync(surface, "utf8");
+    const secondRegistry = fs.readFileSync(f.manifestPath);
     const secondState = readMaterializeManifest(f.manifestPath).materialized[surface];
 
     expect(secondFile).toBe(firstFile);
+    expect(secondRegistry).toEqual(firstRegistry);
     expect(secondState).toEqual(firstState);
     expect(firstState.blockHash).toBe(hash(firstFile));
     const expectedCanonical = JSON.stringify([{ conceptId: "b", body: "Stable body.", breadth: "local" }]);
