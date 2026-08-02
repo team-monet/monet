@@ -77,15 +77,15 @@ describe("contradiction detection on store", () => {
   });
 });
 
-describe("contradictions are surfaced (prewarm + search card)", () => {
-  it("an open contradiction shows in getOpenContradictions, prewarm, and the search card count", async () => {
+describe("contradictions are surfaced (overview + search card)", () => {
+  it("an open contradiction shows in getOpenContradictions, overview, and the search card count", async () => {
     const { core, conceptId } = await disputed();
     expect(core.getOpenContradictions()).toHaveLength(1);
 
-    const pw = core.prewarm();
-    expect(pw.openContradictions).toHaveLength(1);
-    expect(pw.openContradictions[0].conceptId).toBe(conceptId);
-    expect(pw.topConcepts.map((t) => t.id)).not.toContain(conceptId); // disputed ⇒ not in the living-model top
+    const overview = core.overview();
+    expect(overview.openContradictions).toHaveLength(1);
+    expect(overview.openContradictions[0].conceptId).toBe(conceptId);
+    expect(overview.livingModel.map((t) => t.id)).not.toContain(conceptId); // disputed ⇒ not in the living-model top
 
     const hits = await core.search("sqlite storage backend");
     expect(hits.find((h) => h.id === conceptId)?.contradictions).toBe(1);
@@ -377,9 +377,7 @@ describe("staleness (#240 / #179 class)", () => {
     await new Promise((r) => setTimeout(r, 25)); // age past the 5ms staleness window
 
     expect(core.getStaleConcepts()).toHaveLength(1);
-    const pw = core.prewarm();
-    expect(pw.staleConcepts).toHaveLength(1);
-    expect(pw.topConcepts).toHaveLength(0); // stale is partitioned out of the fresh living model
+    expect(core.overview().livingModel).toHaveLength(0); // stale is partitioned out of the fresh living model
     core.close();
   });
 });

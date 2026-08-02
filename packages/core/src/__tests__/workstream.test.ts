@@ -2,14 +2,45 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MonetCore } from "../engine";
 import { BREADTH_CIRCLE } from "../gates";
+import { registerMonetCoreTools } from "../mcp-server";
 import { BetterSqlitePort } from "../storage";
 import type { EmbeddingProvider } from "../embedding";
 import type { PragmaOptions, Statement, StoragePort } from "../storage";
 
 function rawDb(core: MonetCore): StoragePort {
   return (core as unknown as { db: StoragePort }).db;
+}
+
+async function withWorkstreamServer<T>(
+  core: MonetCore,
+  fn: (client: Client) => Promise<T>,
+  opts: { autoPrewarm?: boolean } = {},
+): Promise<T> {
+  const server = new McpServer({ name: "workstream-tool-test", version: "1" });
+  registerMonetCoreTools(server, core, { autoPrewarm: opts.autoPrewarm ?? false, checkpointNudge: false });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "workstream-tool-client", version: "1" });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    return await fn(client);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
+
+function toolJson(result: unknown): Record<string, unknown> {
+  return JSON.parse((result as { content: Array<{ text: string }> }).content[0]!.text) as Record<string, unknown>;
+}
+
+function toolExtraText(result: unknown): string {
+  return (result as { content: Array<{ text: string }> }).content.slice(1).map((item) => item.text).join("\n");
 }
 
 class StaticEmbeddingProvider implements EmbeddingProvider {
@@ -203,6 +234,189 @@ function workstreamStatuses(db: StoragePort, circle: string): Array<{ id: string
   ).all(circle) as Array<{ id: string; status: string; updated_at: number }>)
     .map((row) => ({ id: row.id, status: row.status, updatedAt: row.updated_at }));
 }
+
+describe("memory_workstreams MCP tool", () => {
+  it("suppresses auto-prewarm for default and explicit-circle continuation pulls", async () => {
+    for (const { args, stage } of [
+      { args: {}, stage: "default continuation stage" },
+      { args: { circle: "explicit" }, stage: "explicit continuation stage" },
+    ]) {
+      const core = new MonetCore(":memory:");
+      await core.store(`Rule for ${stage}.`, {
+        circle: "circle" in args ? args.circle : "default",
+        kind: "rule",
+        rule: { stage, scope: "domain" },
+      });
+      const result = await withWorkstreamServer(
+        core,
+        (client) => client.callTool({ name: "memory_workstreams", arguments: args }),
+        { autoPrewarm: true },
+      );
+      expect(toolExtraText(result)).toBe("");
+      core.close();
+    }
+  });
+
+  it("keeps sibling memory_search auto-prewarm enabled as the control", async () => {
+    const core = new MonetCore(":memory:");
+    await core.store("Check the control stage before continuing.", {
+      kind: "rule",
+      rule: { stage: "control search stage", scope: "domain" },
+    });
+    const result = await withWorkstreamServer(
+      core,
+      (client) => client.callTool({ name: "memory_search", arguments: { query: "control" } }),
+      { autoPrewarm: true },
+    );
+    expect(toolExtraText(result)).toContain("Stages you can recognize (ask stage_lookup): control search stage");
+    core.close();
+  });
+
+  it("lists only id, title, and status, then returns full detail for one id", async () => {
+    const core = new MonetCore(":memory:");
+    const saved = await core.saveWorkstream({
+      status: "paused",
+      openQuestions: ["Which threshold should move?"],
+      confirmedContext: ["The serial runner is authoritative."],
+      decisions: ["Keep resident context minimal."],
+      discardedAlternatives: ["Push every workstream at session start."],
+      importantEntities: ["src/mcp-server.ts"],
+      nextSteps: ["Run the serial suite."],
+    });
+
+    const { list, detail } = await withWorkstreamServer(core, async (client) => ({
+      list: toolJson(await client.callTool({ name: "memory_workstreams", arguments: {} })),
+      detail: toolJson(await client.callTool({ name: "memory_workstreams", arguments: { id: saved.id } })),
+    }));
+
+    expect(list).toEqual({ workstreams: [{ id: saved.id, title: saved.title, status: "paused" }] });
+    expect(detail).toEqual({ id: saved.id, title: saved.title, ...saved.payload });
+    expect(JSON.stringify(list)).not.toContain("Which threshold should move?");
+    core.close();
+  });
+
+  it("walks fat detail pages without gaps or duplicates in the documented slot order", async () => {
+    const core = new MonetCore(":memory:");
+    const expected = [
+      ...Array.from({ length: 10 }, (_, index) => ({ slot: "openQuestions", value: `question-${index}-${"q".repeat(1_500)}` })),
+      ...Array.from({ length: 10 }, (_, index) => ({ slot: "decisions", value: `decision-${index}-${"d".repeat(1_500)}` })),
+      ...Array.from({ length: 10 }, (_, index) => ({ slot: "discardedAlternatives", value: `discarded-${index}-${"a".repeat(1_500)}` })),
+      ...Array.from({ length: 10 }, (_, index) => ({ slot: "confirmedContext", value: `context-${index}-${"c".repeat(1_500)}` })),
+      ...Array.from({ length: 10 }, (_, index) => ({ slot: "importantEntities", value: `entity-${index}-${"e".repeat(1_500)}` })),
+      ...Array.from({ length: 10 }, (_, index) => ({ slot: "nextSteps", value: `step-${index}-${"s".repeat(1_500)}` })),
+    ] as const;
+    const payload = Object.fromEntries(
+      ["openQuestions", "decisions", "discardedAlternatives", "confirmedContext", "importantEntities", "nextSteps"]
+        .map((slot) => [slot, expected.filter((entry) => entry.slot === slot).map((entry) => entry.value)]),
+    );
+    const saved = await core.saveWorkstream({ status: "active", ...payload } as Parameters<MonetCore["saveWorkstream"]>[0]);
+
+    const recovered: Array<{ slot: string; value: string }> = [];
+    await withWorkstreamServer(core, async (client) => {
+      let detailOffset = 0;
+      do {
+        const detail = toolJson(await client.callTool({
+          name: "memory_workstreams",
+          arguments: { id: saved.id, detailOffset },
+        }));
+        const pageEntries = ["openQuestions", "decisions", "discardedAlternatives", "confirmedContext", "importantEntities", "nextSteps"]
+          .flatMap((slot) => ((detail[slot] as string[] | undefined) ?? []).map((value) => ({ slot, value })));
+        expect(pageEntries.length).toBeGreaterThan(0);
+        recovered.push(...pageEntries);
+        detailOffset += pageEntries.length;
+        if (detail.detailOmitted === undefined) break;
+        expect(detail.detailOmitted).toBe(expected.length - detailOffset);
+      } while (true);
+    });
+
+    expect(recovered).toEqual(expected);
+    core.close();
+  });
+
+  it("delivers one oversized entry alone with clipping and an honest continuation offset", async () => {
+    const core = new MonetCore(":memory:");
+    const oversized = `oversized-${"z".repeat(80_000)}`;
+    const saved = await core.saveWorkstream({
+      status: "active",
+      openQuestions: [oversized],
+      nextSteps: ["recover me next"],
+    });
+
+    const first = await withWorkstreamServer(core, (client) =>
+      client.callTool({ name: "memory_workstreams", arguments: { id: saved.id, detailOffset: 0 } }),
+    ) as { content: Array<{ text: string }> };
+    const firstDetail = toolJson(first);
+    expect(first.content[0]!.text.length).toBeLessThanOrEqual(40_000);
+    expect((firstDetail.openQuestions as string[])).toHaveLength(1);
+    expect((firstDetail.openQuestions as string[])[0]).toContain("…[truncated");
+    expect(firstDetail).toMatchObject({
+      detailOffset: 0,
+      detailTruncated: true,
+      detailValuesClipped: true,
+      detailOmitted: 1,
+    });
+
+    const second = await withWorkstreamServer(core, (client) =>
+      client.callTool({ name: "memory_workstreams", arguments: { id: saved.id, detailOffset: 1 } }),
+    );
+    expect(toolJson(second)).toMatchObject({ detailOffset: 1, nextSteps: ["recover me next"] });
+    core.close();
+  });
+
+  it("keeps offset-zero default behavior unchanged for small details", async () => {
+    const core = new MonetCore(":memory:");
+    const saved = await core.saveWorkstream({
+      status: "active",
+      openQuestions: ["small question"],
+      decisions: ["small decision"],
+      nextSteps: ["small step"],
+    });
+    const detail = await withWorkstreamServer(core, (client) =>
+      client.callTool({ name: "memory_workstreams", arguments: { id: saved.id } }),
+    );
+    expect(toolJson(detail)).toEqual({ id: saved.id, title: saved.title, ...saved.payload });
+    core.close();
+  });
+
+  it("returns a named error for an unknown id", async () => {
+    const core = new MonetCore(":memory:");
+    const result = await withWorkstreamServer(core, (client) =>
+      client.callTool({ name: "memory_workstreams", arguments: { id: "missing-workstream" } }),
+    ) as { content: Array<{ text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toBe("workstream not found: missing-workstream");
+    core.close();
+  });
+
+  it("size-fits an oversized compact list to valid JSON with honest omission signals", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    for (let index = 0; index < 500; index++) {
+      insertWorkstreamRow(db, {
+        id: `large-${String(index).padStart(3, "0")}`,
+        circle: "large",
+        slug: `workstream:large-${index}`,
+        nextStep: `${index}-${"x".repeat(300)}`,
+      });
+    }
+
+    const result = await withWorkstreamServer(core, (client) =>
+      client.callTool({ name: "memory_workstreams", arguments: { circle: "large" } }),
+    ) as { content: Array<{ text: string }> };
+    const text = result.content[0]!.text;
+    const payload = JSON.parse(text) as {
+      workstreams: Array<{ id: string; title: string; status: string }>;
+      workstreamsTruncated?: boolean;
+      workstreamsOmitted?: number;
+    };
+    expect(text.length).toBeLessThanOrEqual(40_000);
+    expect(payload.workstreams.length).toBeGreaterThan(0);
+    expect(payload.workstreamsTruncated).toBe(true);
+    expect(payload.workstreamsOmitted).toBe(500 - payload.workstreams.length);
+    expect(Object.keys(payload.workstreams[0]!)).toEqual(["id", "title", "status"]);
+    core.close();
+  });
+});
 
 /**
  * Session-state survival (#241, ADR §3.6/§4.3): the agent compresses a session into a

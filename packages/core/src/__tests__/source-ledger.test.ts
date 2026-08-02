@@ -1818,7 +1818,7 @@ describe("source ledger schema migration", () => {
         expect(await core.getConcept(source.stored.conceptId)).toBeNull();
         expect((await core.gather("source sentinel knowledge", { circle: "source-a", limit: 20 })).ranked.map((card) => card.id)).not.toContain(source.stored.conceptId);
         expect(core.listMemories("source-a").map((card) => card.id)).toEqual([native.conceptId]);
-        expect(core.prewarm("source-a").topConcepts.map((card) => card.id)).toEqual([native.conceptId]);
+        expect(core.overview("source-a").livingModel.map((card) => card.id)).toEqual([native.conceptId]);
         expect(core.conceptCount("source-a")).toBe(1);
         expect(core.observationCount()).toBe(1);
         expect(core.stats("source-a")).toMatchObject({ concepts: 1, observations: 1, dirty: 1 });

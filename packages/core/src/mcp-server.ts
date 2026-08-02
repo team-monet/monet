@@ -32,11 +32,11 @@ import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-sch
 
 /**
  * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions`
- * option. Tells the agent to call agent_context first, use memory_store/search/gather during
- * the session, and close with memory_checkpoint.
+ * option. Tells the agent to orient with agent_context, pull workstreams only on continuation
+ * intent, use memory_store/search/gather during the session, and close with memory_checkpoint.
  */
 export const MONET_SERVER_INSTRUCTIONS =
-  "Monet is the user's persistent memory substrate; start by calling agent_context (no arguments) to restore active workstreams, the living model, and open contradictions from prior sessions; during the session use memory_store to record durable knowledge and memory_search/memory_gather (cards) + memory_fetch (content) to recall; end by calling memory_checkpoint with a workstream snapshot (open questions, decisions, next steps) so the session survives; without a checkpoint, session state is lost.";
+  "Monet is the user's persistent memory substrate; start by calling agent_context (no arguments) for orientation; only on continuation intent use memory_workstreams to list active/paused threads and confirm which to resume before pulling detail; use memory_store for durable knowledge and memory_search/memory_gather (cards) + memory_fetch (content) to recall; end with memory_checkpoint and a workstream snapshot (open questions, decisions, next steps); without it, session state is lost.";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
 // concept — long body + many observations — otherwise serializes to tens of thousands of chars and
@@ -257,28 +257,18 @@ const STAGE_INDEX_PREWARM_TAIL_MARGIN_CHARS = 20;
 
 /**
  * Build the compact prewarm block to prepend on the first successful tool response.
- * Calls core.prewarm(circle) + core.overview(circle); renders non-empty sections only.
+ * Calls core.prewarm(circle); renders the stage-index recognition cue only.
  * Returns the full delimited block string, or an empty string if the store is empty.
  *
  */
 function buildPrewarmBlock(
   core: MonetCore,
   circle: string,
-  sourceAuthorizationContext?: Readonly<SourceAuthorizationContext>,
 ): string {
-  const state = core.prewarm(circle, { sourceAuthorizationContext });
-  const ov = core.overview(circle, { sourceAuthorizationContext });
+  const state = core.prewarm(circle);
 
   // === LOWER-PRIORITY SECTIONS (subject to truncation) ===
   const lowerLines: string[] = [];
-
-  // Curation attention line — placed FIRST in the lower-priority block so that long
-  // workstream/top-concept/stale/contradiction content cannot exhaust the budget and drop it.
-  // (Finding B — Codex round-5: advisory must survive even when lower content is large.)
-  const advisory = buildCurationAdvisory(ov);
-  if (advisory !== null) {
-    lowerLines.push(`Curation attention: ${advisory}.`);
-  }
 
   // Stage index (review fix, item 5b): the recognition cue MUST actually reach a worker that never
   // calls agent_context explicitly — auto-prewarm is the only in-flight delivery into that
@@ -317,44 +307,6 @@ function buildPrewarmBlock(
     lowerLines.push(`${label}${shown.join(", ")}${more > 0 ? ` (+${more} more)` : ""}`);
   }
 
-  // Active workstreams — up to 5.
-  const workstreams = state.activeWorkstreams.slice(0, 5);
-  if (workstreams.length > 0) {
-    lowerLines.push("Active workstreams:");
-    for (const ws of workstreams) {
-      const next = ws.nextSteps[0] ? ` | next: ${ws.nextSteps[0]}` : "";
-      lowerLines.push(`  • [${ws.status}] ${ws.title}${next}`);
-    }
-  }
-
-  // Top concepts — up to 7.
-  const topConcepts = state.topConcepts.slice(0, 7);
-  if (topConcepts.length > 0) {
-    lowerLines.push("Top concepts:");
-    for (const c of topConcepts) {
-      lowerLines.push(`  • ${c.title} (${c.kind}, conf ${c.confidence.toFixed(2)})`);
-    }
-  }
-
-  // Stale concepts — up to 5.
-  const stale = state.staleConcepts.slice(0, 5);
-  if (stale.length > 0) {
-    lowerLines.push("Stale (needs re-confirmation):");
-    for (const c of stale) {
-      lowerLines.push(`  • ${c.title}`);
-    }
-  }
-
-  // Open contradictions — up to 5.
-  const contras = state.openContradictions.slice(0, 5);
-  if (contras.length > 0) {
-    lowerLines.push("Open contradictions:");
-    for (const c of contras) {
-      const detail = c.detail ? ` — ${c.detail.slice(0, 80)}` : "";
-      lowerLines.push(`  • ${c.conceptTitle}${detail}`);
-    }
-  }
-
   // Nothing stored at all → empty render → no block.
   if (lowerLines.length === 0) return "";
 
@@ -373,34 +325,6 @@ function buildPrewarmBlock(
     lowerFitted = candidate;
   }
   return HEADER + lowerFitted + FOOTER;
-}
-
-/**
- * Build the curation advisory string when thresholds trip.
- * Returns a non-empty string (for injection into the prewarm block or agent_context payload)
- * when any threshold is met, or null when none trip.
- * Thresholds: possibleDuplicates>=3, extractionCandidates>=1, disputed>=1, stale>=5, dirty>=10.
- * Single source of truth — used by both buildPrewarmBlock and the agent_context tool handler.
- */
-function buildCurationAdvisory(
-  ov: ReturnType<MonetCore["overview"]>,
-): string | null {
-  const signals: string[] = [];
-  if (ov.counts.possibleDuplicates >= 3)
-    signals.push(`possibleDuplicates=${ov.counts.possibleDuplicates}`);
-  // Threshold 1, not possibleDuplicates' 3 (review fix — Codex 5-B round 5, R5-2): each candidate
-  // is a battery waiting for a human, and force-new births — the richest source — write no
-  // possible_duplicate_of edge at all, so nothing else would surface them at session start.
-  if (ov.counts.extractionCandidates >= 1)
-    signals.push(`extractionCandidates=${ov.counts.extractionCandidates}`);
-  if (ov.counts.disputed >= 1)
-    signals.push(`disputed=${ov.counts.disputed}`);
-  if (ov.counts.stale >= 5)
-    signals.push(`stale=${ov.counts.stale}`);
-  if (ov.counts.dirty >= 10)
-    signals.push(`dirty=${ov.counts.dirty}`);
-  if (signals.length === 0) return null;
-  return `${signals.join(", ")} — run the curate-memory ritual`;
 }
 
 /**
@@ -578,7 +502,7 @@ export function registerMonetCoreTools(
    */
   function capturePrewarmSnapshot(resolvedCircle: string): string | null {
     if (!autoPrewarm || prewarmed) return null;
-    const block = buildPrewarmBlock(core, resolvedCircle, sourceAuthorizationContext);
+    const block = buildPrewarmBlock(core, resolvedCircle);
     return block; // empty string = nothing to restore, but the snapshot was taken
   }
 
@@ -638,7 +562,7 @@ export function registerMonetCoreTools(
     // --- auto-prewarm ---
     if (autoPrewarm && !prewarmed) {
       if (toolName === "agent_context") {
-        // First call is agent_context: its payload IS the prewarm — no double-inject.
+        // First call is agent_context: its payload IS the orientation — no double-inject.
         prewarmed = true;
       } else if (capturedBlock !== null && capturedBlock !== undefined) {
         // Pre-captured block provided (Fix A + Fix B): consume the one-shot and attach if non-empty.
@@ -651,7 +575,7 @@ export function registerMonetCoreTools(
         // Fallback: no pre-captured block supplied (should not happen for well-formed callers).
         // Build inline as before so existing agent_context and legacy paths degrade gracefully.
         const resolvedCircle = scope();
-        const block = buildPrewarmBlock(core, resolvedCircle, sourceAuthorizationContext);
+        const block = buildPrewarmBlock(core, resolvedCircle);
         prewarmed = true;
         if (block.length > 0) {
           prewarmBlock = block;
@@ -1601,7 +1525,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_checkpoint",
-    "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives as a workstream that next session's agent_context restores. This call only preserves session state; synthesis is handled at read time.",
+    "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives for a later continuation request through memory_workstreams. This call only preserves session state; synthesis is handled at read time.",
     {
       circle: z.string().optional(),
       summary: z.string().optional(),
@@ -1630,6 +1554,131 @@ export function registerMonetCoreTools(
         }, "memory_checkpoint", isCheckpointWithWorkstream, capturedBlock);
       } catch (e) {
         return err(`checkpoint failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_workstreams",
+    "Pull active/paused workstreams ONLY when the user expresses continuation intent. For “let's continue”, call with no id to get the compact list, then confirm with the user which thread to resume. For “continue <X>”, list first; if exactly one confident match exists, call again with that id for full detail, otherwise confirm. Full detail pages entries in this fixed order: openQuestions, decisions, discardedAlternatives, confirmedContext, importantEntities, nextSteps; entries retain stored order within each slot. Start detailOffset at 0, then add the number of entries actually returned across all slots; detailOmitted is the true number remaining. A session opened with a fresh directive never calls this tool.",
+    {
+      id: z.string().optional().describe("Workstream id from the compact list. Omit to list active/paused workstreams."),
+      circle: z.string().optional(),
+      detailOffset: z.number().int().min(0).optional().describe("With id: skip this many entries in the documented cross-slot order. Start at 0; continue by adding the number of entries actually returned across all slots."),
+    },
+    async ({ id, circle, detailOffset }) => {
+      const resolvedCircle = scope(circle);
+      // A continuation pull must not re-inject session-start orientation. Passing an explicit empty
+      // snapshot consumes auto-prewarm deterministically instead of falling through to wrapSuccess's
+      // default-circle fallback (which would also ignore an explicit circle argument here).
+      const suppressPrewarm = "";
+      try {
+        const workstreams = core.getActiveWorkstreams(resolvedCircle);
+        if (id === undefined) {
+          const items = workstreams.map((workstream) => ({
+            id: workstream.id,
+            title: workstream.title,
+            status: workstream.payload.status,
+          }));
+          const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
+          const envelope = (fitted: typeof items, omitted: number): Record<string, unknown> => ({
+            workstreams: fitted,
+            ...(omitted > 0 ? { workstreamsTruncated: true, workstreamsOmitted: omitted } : {}),
+          });
+          const fit = fitObjectArray(envelope, items, sizeBudget);
+          if (items.length > 0 && fit.fitted.length === 0) {
+            return readOk({
+              workstreams: [],
+              workstreamsTruncated: true,
+              workstreamsOmitted: items.length,
+            }, "memory_workstreams", suppressPrewarm);
+          }
+          return readOk(envelope(fit.fitted, fit.omitted), "memory_workstreams", suppressPrewarm);
+        }
+
+        const workstream = workstreams.find((candidate) => candidate.id === id);
+        if (!workstream) return err(`workstream not found: ${id}`);
+        const arraySlots = [
+          "openQuestions",
+          "decisions",
+          "discardedAlternatives",
+          "confirmedContext",
+          "importantEntities",
+          "nextSteps",
+        ] as const;
+        type ArraySlot = typeof arraySlots[number];
+        type DetailEntry = { slot: ArraySlot; value: string };
+        const allEntries: DetailEntry[] = arraySlots.flatMap((slot) =>
+          (workstream.payload[slot] ?? []).map((value) => ({ slot, value })),
+        );
+        const offsetRequested = detailOffset !== undefined;
+        const offset = Math.min(detailOffset ?? 0, allEntries.length);
+        const remaining = allEntries.slice(offset);
+        const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
+        const buildDetail = (
+          entries: DetailEntry[],
+          valueClipped: boolean,
+        ): Record<string, unknown> => {
+          const grouped = new Map<ArraySlot, string[]>();
+          for (const entry of entries) {
+            const values = grouped.get(entry.slot) ?? [];
+            values.push(entry.value);
+            grouped.set(entry.slot, values);
+          }
+          const omitted = allEntries.length - offset - entries.length;
+          return {
+            id: workstream.id,
+            title: workstream.title,
+            status: workstream.payload.status,
+            ...Object.fromEntries(arraySlots.flatMap((slot) => {
+              const values = grouped.get(slot);
+              return values === undefined ? [] : [[slot, values]];
+            })),
+            ...(workstream.payload.lastSessionId !== undefined
+              ? { lastSessionId: workstream.payload.lastSessionId }
+              : {}),
+            ...(offsetRequested || omitted > 0 || valueClipped ? { detailOffset: offset } : {}),
+            ...(omitted > 0 || valueClipped ? {
+              detailTruncated: true,
+              ...(omitted > 0 ? { detailOmitted: omitted } : {}),
+              ...(valueClipped ? { detailValuesClipped: true } : {}),
+            } : {}),
+          };
+        };
+        const fitted: DetailEntry[] = [];
+        for (const entry of remaining) {
+          const candidate = [...fitted, entry];
+          if (JSON.stringify(buildDetail(candidate, false), null, 2).length > sizeBudget) break;
+          fitted.push(entry);
+        }
+        if (remaining.length > 0 && fitted.length === 0) {
+          // A page can never be a recovery dead end. Clip the single entry against the COMPLETE
+          // response envelope, then return it alone; only a value larger than the whole budget loses
+          // bytes, and advancing by one reaches the next deterministic entry.
+          const first = remaining[0]!;
+          let low = 0;
+          let high = first.value.length;
+          while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            const candidate = { ...first, value: first.value.slice(0, mid) };
+            if (JSON.stringify(buildDetail([candidate], mid < first.value.length), null, 2).length <= sizeBudget) low = mid;
+            else high = mid - 1;
+          }
+          const valueClipped = low < first.value.length;
+          let clippedValue = first.value;
+          if (valueClipped) {
+            let prefixLength = low;
+            do {
+              clippedValue = `${first.value.slice(0, prefixLength)}\n…[truncated ${first.value.length - prefixLength} chars]`;
+              if (JSON.stringify(buildDetail([{ ...first, value: clippedValue }], true), null, 2).length <= sizeBudget) break;
+              prefixLength--;
+            } while (prefixLength >= 0);
+          }
+          return readOk(buildDetail([{ ...first, value: clippedValue }], valueClipped), "memory_workstreams", suppressPrewarm);
+        }
+        return readOk(buildDetail(fitted, false), "memory_workstreams", suppressPrewarm);
+      } catch (e) {
+        return err(`workstreams failed: ${msg(e)}`);
       }
     },
   );
@@ -1991,55 +2040,23 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Identity + query-independent session restore (PREWARM). Call FIRST, at session start — with NO query — to resume: `activeWorkstreams` (where you left off), `topConcepts` (your living model, ranked by confidence/usefulness/recency — identity + shape only, fetch by id for content), `staleCount` (how many concepts are unconfirmed past the staleness window — pass includeStale:true for the cards themselves, which is a curation pass, not session restore), and `openContradictions` (resolve with memory_resolve). Replaces guessing a search query to rebuild context. Skeleton delivery has three states: absence means the standing files you already loaded are current; `mirrorStale` + `instruction` appears only when a standing file diverged and needs user-confirmed reconciliation; `skeleton` appears only for members not covered by a standing file. otherCircles (when present) names other circles — call memory_search/memory_gather without a circle arg to recall across all of them. `resolvedFrom` (when present) indicates the requested circle was an alias and shows the original name. `curationAttention` (when present) signals that the store has items needing curation — run the curate-memory ritual. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules.",
-    {
-      circle: z.string().optional(),
-      includeStale: z
-        .boolean()
-        .optional()
-        .describe(
-          "Include the full staleConcepts card list. OFF by default: the list is titles plus a confidence number with no indication of why the caller should care, and it is not what session restore is for. The response always carries staleCount; pass true when you are actually doing a re-confirmation pass.",
-        ),
-    },
-    async ({ circle, includeStale }) => {
+    "Session-start orientation only. Call FIRST with no arguments. Returns the resolved `circle`; `resolvedFrom` appears when the requested circle was an alias. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules. Skeleton delivery has three states: absence means the standing files you already loaded are current; `mirrorStale` + `instruction` appears only when a standing file diverged and needs user-confirmed reconciliation; `skeleton` appears only for members not covered by a standing file.",
+    { circle: z.string().optional() },
+    async ({ circle }) => {
       const resolvedCircle = scope(circle);
-      const state = core.prewarm(resolvedCircle, { sourceAuthorizationContext });
-      const ov = core.overview(resolvedCircle, { sourceAuthorizationContext });
-      const advisory = buildCurationAdvisory(ov);
-      const others = core.listCircles(resolvedCircle, { sourceAuthorizationContext })
-        .slice(0, 5).map(({ circle: c, concepts }) => ({ circle: c, concepts }));
+      const state = core.prewarm(circle ?? dc);
 
-      // staleConcepts is a CURATION list, not session-restore context, and it was the largest
-      // never-consumed block in the prewarm payload — 20 cards of title + confidence with nothing
-      // saying why the caller should act on any of them. Session restore now carries the COUNT
-      // (store-wide and honest, unlike the capped list length); an agent actually running a
-      // re-confirmation pass asks for the cards with includeStale:true.
-      // stageIndex/stageIndexTotal are ALSO pulled out here (review fix, items 1 and 3) rather than
-      // left in restState's raw spread — they get their own bounded, honesty-checked replacement
-      // below instead of an unbounded original and an un-recomputed raw total.
       const {
-        staleConcepts,
         stageIndex: stageIndexFull,
         stageIndexTotal,
         skeleton,
         mirrorStale,
         instruction,
-        ...restState
       } = state;
 
       const baseContentWithoutMirrorOrSkeleton = {
-        agentId: core.getAgentId(),
-        mode: "local",
         circle: resolvedCircle,
         ...(state.resolvedFrom !== undefined ? { resolvedFrom: state.resolvedFrom } : {}),
-        ...restState,
-        ...(includeStale ? { staleConcepts } : {}),
-        // Unconditional: a caller must be able to read staleCount as a stable number and tell
-        // "zero stale" apart from "server predates this field". Conditioning it on >0 would make
-        // the absent case ambiguous, and one integer is not the noise this pass is about.
-        staleCount: ov.counts.stale,
-        ...(advisory !== null ? { curationAttention: advisory } : {}),
-        ...(others.length > 0 ? { otherCircles: others } : {}),
       };
       const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
       const stageIndexItems = stageIndexFull?.slice(0, STAGE_INDEX_CAP);

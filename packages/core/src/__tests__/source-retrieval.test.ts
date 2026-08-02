@@ -108,7 +108,7 @@ describe("authorized source-backed generic retrieval", () => {
     expect(gathered.ranked).toContainEqual(expect.objectContaining({
       id: stored.conceptId, viaSeed: true, sourceRefsCount: 1,
     }));
-    expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).topConcepts).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
+    expect(core.overview(circle, { sourceAuthorizationContext: auth }).livingModel).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
     expect(core.overview(circle, { sourceAuthorizationContext: auth })).toMatchObject({
       counts: { concepts: 1, observations: 1 }, livingModel: [expect.objectContaining({ id: stored.conceptId })],
     });
@@ -120,7 +120,7 @@ describe("authorized source-backed generic retrieval", () => {
       expect(core.circleOf(stored.conceptId, sourceAuthorizationContext)).toBeNull();
       expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext })).toBeNull();
       expect(await core.gather("cobalt walruses", { circle, sourceAuthorizationContext })).toEqual({ seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} });
-      expect(core.prewarm(circle, { sourceAuthorizationContext }).topConcepts).toEqual([]);
+      expect(core.overview(circle, { sourceAuthorizationContext }).livingModel).toEqual([]);
       expect(core.overview(circle, { sourceAuthorizationContext }).counts).toMatchObject({ concepts: 0, observations: 0 });
     }
     expect(await core.getConcept("nonexistent", { sourceAuthorizationContext: auth })).toBeNull();
@@ -411,7 +411,7 @@ describe("authorized source-backed generic retrieval", () => {
         ...(await core.search("corrupt", { circle, sourceAuthorizationContext })).map((row) => row.id),
         ...core.listMemories(circle, { sourceAuthorizationContext }).map((row) => row.id),
         ...(await core.gather("corrupt", { circle, sourceAuthorizationContext })).ranked.map((row) => row.id),
-        ...core.prewarm(circle, { sourceAuthorizationContext }).topConcepts.map((row) => row.id),
+        ...core.overview(circle, { sourceAuthorizationContext }).livingModel.map((row) => row.id),
       ];
       for (const id of hidden) expect(surfacedIds).not.toContain(id);
       expect(core.conceptCount(circle, sourceAuthorizationContext)).toBe(0);
@@ -434,7 +434,6 @@ describe("authorized source-backed generic retrieval", () => {
     const before = db.prepare(`SELECT body,version FROM concepts WHERE id=?`).get(workstream.id);
 
     expect(core.getActiveWorkstreams(circle)).toEqual([]);
-    expect(core.prewarm(circle).activeWorkstreams).toEqual([]);
     expect(core.stats(circle).workstreams).toBe(0);
     expect(core.stats().workstreams).toBe(0);
     expect(core.overview(circle).counts.workstreams).toBe(0);
@@ -448,9 +447,9 @@ describe("authorized source-backed generic retrieval", () => {
     const client = new Client({ name: "workstream-marker-client", version: "1" });
     await server.connect(serverTransport); await client.connect(clientTransport);
     try {
-      const context = await client.callTool({ name: "agent_context", arguments: { circle } }) as { content: Array<{ type: string; text: string }> };
-      expect(JSON.parse(context.content[0].text)).toMatchObject({ activeWorkstreams: [] });
-      expect(context.content.map((item) => item.text).join("\n")).not.toContain("secret connector task");
+      const list = await client.callTool({ name: "memory_workstreams", arguments: { circle } }) as { content: Array<{ type: string; text: string }> };
+      expect(JSON.parse(list.content[0].text)).toEqual({ workstreams: [] });
+      expect(list.content.map((item) => item.text).join("\n")).not.toContain("secret connector task");
     } finally {
       await client.close(); await server.close();
     }
@@ -506,7 +505,7 @@ describe("authorized source-backed generic retrieval", () => {
       } else {
         await expect(core.gather("cobalt", { circle, sourceAuthorizationContext: auth })).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
       }
-      expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).topConcepts.map((row) => row.id)).not.toContain(stored.conceptId);
+      expect(core.overview(circle, { sourceAuthorizationContext: auth }).livingModel.map((row) => row.id)).not.toContain(stored.conceptId);
       expect(core.conceptCount(circle, auth)).toBe(1);
       expect(core.listCircles(undefined, { sourceAuthorizationContext: auth })).toContainEqual(expect.objectContaining({ circle, concepts: 1 }));
     }
@@ -601,8 +600,7 @@ describe("authorized source-backed generic retrieval", () => {
     const initialEntry = initialList.find((entry) => entry.id === initial.stored.conceptId)!;
     const initialUpdatedAt = initialEntry.updatedAt;
     const initialLastConfirmedAt = initialEntry.lastConfirmedAt!;
-    // staleAfterMs: -1 — anything already confirmed is stale as of now, regardless of clock resolution.
-    expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).staleConcepts.map((entry) => entry.id)).toContain(initial.stored.conceptId);
+    expect(initialLastConfirmedAt).toBeGreaterThan(0);
 
     const replacement = core.beginSourceRun({ sourceId: "source-a", snapshotId: "timestamp-replacement" });
     if (replacement.kind !== "started") throw new Error("expected replacement run");
@@ -648,18 +646,12 @@ describe("authorized source-backed generic retrieval", () => {
     const refetched = await core.getConcept(initial.stored.conceptId, { sourceAuthorizationContext: auth, includeBody: true });
     expect(refetched).toMatchObject({ body: manifest.chunks[0].content });
     expect(refetched!.lastConfirmedAt).toBeGreaterThan(initialLastConfirmedAt);
-    // staleAfterMs: -1 means everything is perpetually stale (by design, asserted above at
-    // publish time too) — so recompute can never promote this concept into topConcepts. What
-    // "ages ... by their own recompute time" actually buys here is a re-ranking within
-    // staleConcepts itself: that list sorts stalest (oldest confirmation) first, and the source
-    // concept was just reconfirmed while native never was, so it now sorts strictly after native
-    // instead of tying/leading it.
-    const finalStale = core.prewarm(circle, { sourceAuthorizationContext: auth }).staleConcepts.map((entry) => entry.id);
-    expect(finalStale).toEqual(expect.arrayContaining([initial.stored.conceptId, native.conceptId]));
-    expect(finalStale.indexOf(native.conceptId)).toBeLessThan(finalStale.indexOf(initial.stored.conceptId));
+    // Source projections are authorized read views; overview's exact stale count remains the owner
+    // of their stale classification after resident prewarm stopped carrying stale cards.
+    expect(core.overview(circle, { sourceAuthorizationContext: auth }).counts.stale).toBe(2);
   });
 
-  it("reports exact stale counts beyond the prewarm cap and paginates mixed native/source rows", async () => {
+  it("reports exact stale counts and paginates mixed native/source rows", async () => {
     const core = makeCore();
     for (let index = 0; index < 25; index++) {
       await core.store(`stale native ${index}`, { circle, resolution: "forceNew" });
@@ -671,7 +663,7 @@ describe("authorized source-backed generic retrieval", () => {
     // sourced from run.published_at), so this raw UPDATE affects the published source concept
     // too, same as any native one — 26 stale (25 native + the 1 source), not 25.
     rawDb(core).prepare(`UPDATE concepts SET last_confirmed_at=1 WHERE circle=?`).run(circle);
-    expect(core.prewarm(circle, { sourceAuthorizationContext: auth }).staleConcepts).toHaveLength(20);
+    expect(core.overview(circle, { sourceAuthorizationContext: auth }).livingModel).toHaveLength(0);
     expect(core.overview(circle, { sourceAuthorizationContext: auth }).counts.stale).toBe(26);
 
     const seen = new Set<string>();
@@ -687,7 +679,7 @@ describe("authorized source-backed generic retrieval", () => {
     expect(core.conceptCount(circle, auth)).toBe(26);
   });
 
-  it("threads only the registration-bound identity through MCP reads, agent_context and auto-prewarm", async () => {
+  it("threads only the registration-bound identity through MCP reads while orientation stays source-independent", async () => {
     const core = makeCore();
     core.createSource(sourceInput());
     const { stored } = await publish(core);
@@ -702,7 +694,7 @@ describe("authorized source-backed generic retrieval", () => {
       // File=concept (Phase 1), item 1: title is frontmatter title else filename-basename now
       // (never firstLine(chunk content)) — oneChunkManifest's file entry has no frontmatter
       // title, so README.md falls back to "README".
-      expect(search.content.slice(1).map((item) => item.text).join("\n")).toContain("README");
+      expect(search.content.slice(1).map((item) => item.text).join("\n")).not.toContain("README");
       const listed = await client.callTool({ name: "memory_list", arguments: { circle } }) as { content: Array<{ type: string; text: string }> };
       expect(JSON.parse(listed.content[0].text)).toMatchObject({ total: 1, memories: [expect.objectContaining({ id: stored.conceptId })] });
       // Ruling 9: source concepts return structure (outline), not observations, by default.
@@ -723,8 +715,8 @@ describe("authorized source-backed generic retrieval", () => {
         return originalProjection(...args);
       };
       const context = await client.callTool({ name: "agent_context", arguments: { circle } }) as { content: Array<{ type: string; text: string }> };
-      expect(JSON.parse(context.content[0].text).topConcepts).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
-      expect(projectionScans).toBe(2);
+      expect(JSON.parse(context.content[0].text)).toEqual({ circle });
+      expect(projectionScans).toBe(0);
     } finally {
       await client.close(); await server.close();
     }

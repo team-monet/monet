@@ -105,7 +105,7 @@ describe("source-pipeline core prerequisites", () => {
       });
       expect(first.concept.kind).toBe("source");
       expect(first.concept.dirty).toBe(false);
-      expect(core.prewarm().topConcepts.map((c) => c.id)).not.toContain(first.conceptId);
+      expect(core.overview().livingModel.map((c) => c.id)).not.toContain(first.conceptId);
       expect(core.listDirty()).toEqual([]);
       expect(await core.checkpoint()).toBe(0);
 
@@ -392,7 +392,7 @@ describe("source-pipeline core prerequisites", () => {
       await expect(core.supersedeSourceChunkObservation(source.conceptId, source.observationId, source.observationId)).rejects.toThrow("non-active source concept");
       expect((await core.search("retire source retrieval")).map((c) => c.id)).not.toContain(source.conceptId);
       expect((await core.gather("retire source retrieval")).ranked.map((c) => c.id)).not.toContain(source.conceptId);
-      expect(core.prewarm().topConcepts.map((c) => c.id)).not.toContain(source.conceptId);
+      expect(core.overview().livingModel.map((c) => c.id)).not.toContain(source.conceptId);
 
       expect(() => core.restoreConcept(source.conceptId)).toThrow(/source sync\/rebuild owns restoration/);
       expect((await core.search("retire source retrieval")).map((c) => c.id)).not.toContain(source.conceptId);
@@ -599,7 +599,6 @@ describe("source-pipeline core prerequisites", () => {
       expect(() => core.retireConcept(workstream.id)).toThrow("workstream concept");
       expect(() => core.restoreConcept(workstream.id)).toThrow("workstream concept");
       expect(core.getActiveWorkstreams().map((item) => item.id)).toContain(workstream.id);
-      expect(core.prewarm().activeWorkstreams.map((item) => item.id)).toContain(workstream.id);
     } finally {
       core.close();
     }

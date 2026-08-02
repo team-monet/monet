@@ -31,7 +31,7 @@ async function makeMcpPair(core: MonetCore): Promise<{ client: Client; cleanup: 
 }
 
 describe("tool roster — drift gate", () => {
-  it("registers exactly the 21 documented tools (sorted)", async () => {
+  it("registers exactly the 22 documented tools (sorted)", async () => {
     const core = new MonetCore(":memory:");
     const { client, cleanup } = await makeMcpPair(core);
     try {
@@ -57,12 +57,31 @@ describe("tool roster — drift gate", () => {
         "memory_search",
         "memory_store",
         "memory_synthesize",
+        "memory_workstreams",
         "source_list",
         "source_path",
         "source_status",
         "source_sync",
         "stage_lookup",
       ]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("describes agent_context as orientation and memory_workstreams as continuation-only", async () => {
+    const core = new MonetCore(":memory:");
+    const { client, cleanup } = await makeMcpPair(core);
+    try {
+      const byName = new Map((await client.listTools()).tools.map((tool) => [tool.name, tool]));
+      expect(byName.get("agent_context")?.description).toBe(
+        "Session-start orientation only. Call FIRST with no arguments. Returns the resolved `circle`; `resolvedFrom` appears when the requested circle was an alias. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules. Skeleton delivery has three states: absence means the standing files you already loaded are current; `mirrorStale` + `instruction` appears only when a standing file diverged and needs user-confirmed reconciliation; `skeleton` appears only for members not covered by a standing file.",
+      );
+      expect(byName.get("memory_workstreams")?.description).toBe(
+        "Pull active/paused workstreams ONLY when the user expresses continuation intent. For “let's continue”, call with no id to get the compact list, then confirm with the user which thread to resume. For “continue <X>”, list first; if exactly one confident match exists, call again with that id for full detail, otherwise confirm. Full detail pages entries in this fixed order: openQuestions, decisions, discardedAlternatives, confirmedContext, importantEntities, nextSteps; entries retain stored order within each slot. Start detailOffset at 0, then add the number of entries actually returned across all slots; detailOmitted is the true number remaining. A session opened with a fresh directive never calls this tool.",
+      );
+      const contextSchema = byName.get("agent_context")?.inputSchema as { properties?: Record<string, unknown> };
+      expect(contextSchema.properties).not.toHaveProperty("includeStale");
     } finally {
       await cleanup();
     }

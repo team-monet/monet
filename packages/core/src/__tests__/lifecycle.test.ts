@@ -6,7 +6,6 @@
  *  2. First call agent_context → NO block anywhere in the session.
  *  3. Error-first: failing call carries no block; next successful call does.
  *  4. Empty store → no block, one-shot consumed.
- *  5. Curation line appears only when thresholds trip.
  *  6. Per-item ceiling: content[0] (JSON result) stays ≤ RESULT_MAX_CHARS;
  *     content[1] (prewarm block) stays ≤ PREWARM_BLOCK_MAX_CHARS.
  *  7. Nudge: 10th mutating call triggers, 30th triggers, not in-between; checkpoint-with-workstream
@@ -14,9 +13,7 @@
  *  8. Opt-out: autoPrewarm:false → no block; checkpointNudge:false → no nudge.
  *  9. Server instructions: factory options include the instructions string.
  * 10. Fix 1 regression: JSON.parse(content[0].text) always succeeds on prewarm-carrying responses.
- * 11. Fix 2 curationAttention: agent_context payload gains optional field when thresholds trip.
  * 12. Fix 5a env-var opt-out: MONET_NO_AUTOPREWARM/MONET_NO_CHECKPOINT_NUDGE mapping.
- * 13. Fix 5b stale/dirty thresholds: dedicated tests for stale>=5 and dirty>=10.
  */
 import { describe, it, expect } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -96,7 +93,7 @@ function parsePayload(result: unknown): unknown {
 describe("1. auto-prewarm: block appears on first non-agent_context call, then never again", () => {
   it("second call (same tool) carries no block", async () => {
     const core = new MonetCore(":memory:");
-    await core.store("SQLite is the local storage engine.");
+    await core.store("Check SQLite before migration.", { kind: "rule", rule: { stage: "database migration", scope: "domain" } });
     const { client, cleanup } = await makePair(core);
     try {
       // First call: memory_search — should carry the prewarm block in content[1].
@@ -114,7 +111,7 @@ describe("1. auto-prewarm: block appears on first non-agent_context call, then n
 
   it("different-tool second call also carries no block", async () => {
     const core = new MonetCore(":memory:");
-    await core.store("Auth uses jose for JWT.");
+    await core.store("Check auth before release.", { kind: "rule", rule: { stage: "auth release", scope: "domain" } });
     const { client, cleanup } = await makePair(core);
     try {
       const first = await client.callTool({ name: "memory_search", arguments: { query: "auth" } });
@@ -129,7 +126,7 @@ describe("1. auto-prewarm: block appears on first non-agent_context call, then n
 
   it("content[0] always contains the pure JSON payload", async () => {
     const core = new MonetCore(":memory:");
-    await core.store("SQLite is the local storage engine.");
+    await core.store("Check SQLite before migration.", { kind: "rule", rule: { stage: "database migration", scope: "domain" } });
     const { client, cleanup } = await makePair(core);
     try {
       const result = await client.callTool({ name: "memory_search", arguments: { query: "SQLite" } });
@@ -151,7 +148,7 @@ describe("1. auto-prewarm: block appears on first non-agent_context call, then n
 describe("2. first call agent_context → no block ever in session", () => {
   it("agent_context first → its own response has no block, subsequent calls have no block", async () => {
     const core = new MonetCore(":memory:");
-    await core.store("SQLite is the local storage engine.");
+    await core.store("Check SQLite before migration.", { kind: "rule", rule: { stage: "database migration", scope: "domain" } });
     const { client, cleanup } = await makePair(core);
     try {
       const ctx = await client.callTool({ name: "agent_context", arguments: {} });
@@ -172,7 +169,7 @@ describe("2. first call agent_context → no block ever in session", () => {
 describe("3. error-first: block deferred to first successful call", () => {
   it("a failing call (malformed) carries no block; the next successful call carries it", async () => {
     const core = new MonetCore(":memory:");
-    await core.store("SQLite storage.");
+    await core.store("Check storage before release.", { kind: "rule", rule: { stage: "storage release", scope: "domain" } });
     const { client, cleanup } = await makePair(core);
     try {
       // memory_store with no content → should fail.
@@ -211,63 +208,54 @@ describe("4. empty store → no block, one-shot consumed", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Curation line appears only when thresholds trip
+// 5. Auto-prewarm uses the operation's resolved circle
 // ---------------------------------------------------------------------------
 
-describe("5. curation line appears only on tripped thresholds", () => {
-  it("no curation line when no threshold is tripped", async () => {
+describe("5. auto-prewarm circle fidelity", () => {
+  it("first-call memory_search with an explicit circle emits that circle's stage cue", async () => {
     const core = new MonetCore(":memory:");
-    await core.store("SQLite for storage.");
+    await core.store("Default stage rule.", {
+      kind: "rule",
+      rule: { stage: "default-only stage", scope: "domain" },
+    });
+    await core.store("Project stage rule.", {
+      circle: "project-x",
+      kind: "rule",
+      rule: { stage: "project-x stage", scope: "domain" },
+    });
     const { client, cleanup } = await makePair(core);
     try {
-      const result = await client.callTool({ name: "memory_search", arguments: { query: "SQLite" } });
-      expect(prewarmText(result)).toContain(PREWARM_HEADER); // block present
-      expect(prewarmText(result)).not.toContain("Curation attention:");
+      const result = await client.callTool({
+        name: "memory_search",
+        arguments: { query: "project", circle: "project-x" },
+      });
+      expect(prewarmText(result)).toContain("Stages you can recognize (ask stage_lookup): project-x stage");
+      expect(prewarmText(result)).not.toContain("default-only stage");
     } finally {
       await cleanup();
     }
   });
 
-  it("curation line appears when disputed>=1", async () => {
-    // Build a store with at least one disputed concept.
+  it("omit-circle memory_fetch emits the fetched concept's home-circle stage cue", async () => {
     const core = new MonetCore(":memory:");
-    const r = await core.store("We use SQLite for storage.");
-    core.flagContradiction(r.conceptId, { detail: "actually we use Postgres" });
-    // Verify it is disputed.
-    const ov = core.overview("default");
-    expect(ov.counts.disputed).toBeGreaterThanOrEqual(1);
-
+    await core.store("Default stage rule.", {
+      kind: "rule",
+      rule: { stage: "default-only stage", scope: "domain" },
+    });
+    const stored = await core.store("Home-circle concept to fetch.", { circle: "home-circle" });
+    await core.store("Home-circle stage rule.", {
+      circle: "home-circle",
+      kind: "rule",
+      rule: { stage: "home-circle stage", scope: "domain" },
+    });
     const { client, cleanup } = await makePair(core);
     try {
-      const result = await client.callTool({ name: "memory_search", arguments: { query: "SQLite" } });
-      expect(prewarmText(result)).toContain(PREWARM_HEADER);
-      expect(prewarmText(result)).toContain("Curation attention:");
-      expect(prewarmText(result)).toContain("curate-memory ritual");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("curation line appears when possibleDuplicates>=3", async () => {
-    // Build a store with 3+ possible duplicate pairs.
-    const core = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
-    const pairs = [
-      ["We use SQLite for local persistence in Monet.", "Monet persists data locally with SQLite storage."],
-      ["Auth tokens are signed using the jose library.", "The jose library signs authentication tokens here."],
-      ["The CI pipeline runs on GitHub Actions.", "GitHub Actions is used for our continuous integration."],
-    ];
-    for (const [a, b] of pairs) {
-      await core.store(a);
-      await core.store(b);
-    }
-    const ov = core.overview("default");
-    expect(ov.counts.possibleDuplicates).toBeGreaterThanOrEqual(3);
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      const result = await client.callTool({ name: "memory_search", arguments: { query: "SQLite" } });
-      expect(prewarmText(result)).toContain(PREWARM_HEADER);
-      expect(prewarmText(result)).toContain("Curation attention:");
+      const result = await client.callTool({
+        name: "memory_fetch",
+        arguments: { id: stored.conceptId },
+      });
+      expect(prewarmText(result)).toContain("Stages you can recognize (ask stage_lookup): home-circle stage");
+      expect(prewarmText(result)).not.toContain("default-only stage");
     } finally {
       await cleanup();
     }
@@ -297,22 +285,23 @@ describe("6. per-item ceiling: content[0] ≤ RESULT_MAX_CHARS; prewarm block �
     }
   });
 
-  it("prewarm block stays ≤ PREWARM_BLOCK_MAX_CHARS even when many concepts trip all lines", async () => {
+  it("prewarm block stays ≤ PREWARM_BLOCK_MAX_CHARS with the stage cue present", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    // Store many concepts to push block rendering to its cap.
     for (let i = 0; i < 30; i++) {
-      await core.store(`Concept ${i}: ${"y".repeat(100)}`, { resolution: "forceNew" });
+      await core.store(`Rule ${i}: ${"y".repeat(100)}`, {
+        kind: "rule",
+        rule: { stage: `stage-${i}`, scope: "domain" },
+        resolution: "forceNew",
+      });
     }
     const { client, cleanup } = await makePair(core);
     try {
       const result = await client.callTool({ name: "memory_search", arguments: { query: "Concept" } });
       const block = prewarmText(result);
-      if (block.includes(PREWARM_HEADER)) {
-        expect(block.length).toBeLessThanOrEqual(PREWARM_BLOCK_MAX_CHARS);
-        // Delimiters must both be present (intact block structure).
-        expect(block).toContain(PREWARM_HEADER);
-        expect(block).toContain(PREWARM_FOOTER);
-      }
+      expect(block.length).toBeLessThanOrEqual(PREWARM_BLOCK_MAX_CHARS);
+      expect(block).toContain(PREWARM_HEADER);
+      expect(block).toContain(PREWARM_FOOTER);
+      expect(block).toContain("Stages you can recognize");
     } finally {
       await cleanup();
     }
@@ -458,7 +447,7 @@ describe("9. server factory instructions", () => {
       { name: "monet-core", version: "0.7.0" },
       {
         capabilities: { tools: {} },
-        instructions: "Monet is the user's persistent memory substrate; start by calling agent_context (no arguments) to restore active workstreams, the living model, and open contradictions from prior sessions; during the session use memory_store to record durable knowledge and memory_search/memory_gather (cards) + memory_fetch (content) to recall; end by calling memory_checkpoint with a workstream snapshot (open questions, decisions, next steps) so the session survives; without a checkpoint, session state is lost.",
+        instructions: "Monet is the user's persistent memory substrate; start by calling agent_context (no arguments) for orientation; only on continuation intent use memory_workstreams to list active/paused threads and confirm which to resume before pulling detail; use memory_store for durable knowledge and memory_search/memory_gather (cards) + memory_fetch (content) to recall; end with memory_checkpoint and a workstream snapshot (open questions, decisions, next steps); without it, session state is lost.",
       },
     );
     registerMonetCoreTools(server, core, { autoPrewarm: false, checkpointNudge: false });
@@ -469,8 +458,10 @@ describe("9. server factory instructions", () => {
     try {
       const { MONET_SERVER_INSTRUCTIONS } = await import("../mcp-server");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("start by calling agent_context");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("only on continuation intent");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("memory_workstreams");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("memory_checkpoint");
-      expect(MONET_SERVER_INSTRUCTIONS).toContain("without a checkpoint, session state is lost");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("without it, session state is lost");
     } finally {
       await client.close();
       core.close();
@@ -486,7 +477,7 @@ describe("10. Fix 1 regression: content[0].text is always valid JSON on prewarm-
   it("memory_store response with prewarm block: content[0].text parses as JSON", async () => {
     // Populated store — prewarm block will be non-empty.
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await core.store("SQLite is the local storage engine.");
+    await core.store("Check SQLite before migration.", { kind: "rule", rule: { stage: "database migration", scope: "domain" } });
     await core.store("Auth uses jose for JWT.", { resolution: "forceNew" });
     const { client, cleanup } = await makePair(core);
     try {
@@ -505,7 +496,7 @@ describe("10. Fix 1 regression: content[0].text is always valid JSON on prewarm-
 
   it("memory_search response with prewarm block: content[0].text parses as JSON", async () => {
     const core = new MonetCore(":memory:");
-    await core.store("SQLite is the local storage engine.");
+    await core.store("Check SQLite before migration.", { kind: "rule", rule: { stage: "database migration", scope: "domain" } });
     const { client, cleanup } = await makePair(core);
     try {
       const result = await client.callTool({ name: "memory_search", arguments: { query: "SQLite" } });
@@ -530,77 +521,6 @@ describe("10. Fix 1 regression: content[0].text is always valid JSON on prewarm-
       // content[0] must still be pure JSON.
       const parsed = JSON.parse(rawText(tenth)) as Record<string, unknown>;
       expect(parsed).toHaveProperty("conceptId");
-    } finally {
-      await cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 11. Fix 2: curationAttention field on agent_context
-// ---------------------------------------------------------------------------
-
-describe("11. Fix 2: agent_context curationAttention field", () => {
-  it("tripping store → curationAttention present in agent_context payload with correct text", async () => {
-    // Build a store with at least one disputed concept (disputed>=1 is the lowest threshold to trip).
-    const core = new MonetCore(":memory:");
-    const r = await core.store("We use SQLite for storage.");
-    core.flagContradiction(r.conceptId, { detail: "actually Postgres" });
-    const ov = core.overview("default");
-    expect(ov.counts.disputed).toBeGreaterThanOrEqual(1);
-
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: {} });
-      const parsed = JSON.parse(rawText(result)) as Record<string, unknown>;
-      expect(parsed).toHaveProperty("curationAttention");
-      const advisory = parsed.curationAttention as string;
-      expect(advisory).toContain("curate-memory ritual");
-      expect(advisory).toContain("disputed=1");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("non-tripping store → curationAttention ABSENT (not null, not empty string)", async () => {
-    const core = new MonetCore(":memory:");
-    await core.store("SQLite for storage.");
-    // No contradictions, no duplicates, no stale, no dirty.
-    const ov = core.overview("default");
-    expect(ov.counts.disputed).toBe(0);
-    expect(ov.counts.possibleDuplicates).toBe(0);
-
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: {} });
-      const parsed = JSON.parse(rawText(result)) as Record<string, unknown>;
-      // Must be absent entirely — not null, not empty string.
-      expect("curationAttention" in parsed).toBe(false);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("possibleDuplicates>=3 → curationAttention present in agent_context", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
-    const pairs = [
-      ["We use SQLite for local persistence in Monet.", "Monet persists data locally with SQLite storage."],
-      ["Auth tokens are signed using the jose library.", "The jose library signs authentication tokens here."],
-      ["The CI pipeline runs on GitHub Actions.", "GitHub Actions is used for our continuous integration."],
-    ];
-    for (const [a, b] of pairs) {
-      await core.store(a);
-      await core.store(b);
-    }
-    const ov = core.overview("default");
-    expect(ov.counts.possibleDuplicates).toBeGreaterThanOrEqual(3);
-
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: {} });
-      const parsed = JSON.parse(rawText(result)) as Record<string, unknown>;
-      expect("curationAttention" in parsed).toBe(true);
-      expect((parsed.curationAttention as string)).toContain("possibleDuplicates=");
     } finally {
       await cleanup();
     }
@@ -643,60 +563,6 @@ describe("12. Fix 5a: deriveOptsFromEnv env-var mapping", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 14. Fix A: prewarm block reflects the CALL'S resolved circle (not the default)
-// ---------------------------------------------------------------------------
-
-describe("14. Fix A: prewarm block reflects the call's explicit circle, not the session default", () => {
-  it("memory_search({circle:'foo'}) on populated foo / empty default → block contains foo content", async () => {
-    // Setup: "foo" has content; default is empty.
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await core.store("Foo circle concept: GraphQL used for API.", { circle: "foo" });
-
-    // Confirm: foo is populated, default is empty.
-    expect(core.conceptCount("foo")).toBeGreaterThan(0);
-    expect(core.conceptCount("default")).toBe(0);
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      const result = await client.callTool({
-        name: "memory_search",
-        arguments: { query: "GraphQL", circle: "foo" },
-      });
-
-      // Block must be present (foo has content).
-      const block = prewarmText(result);
-      expect(block).toContain(PREWARM_HEADER);
-      // Block must mention foo's content — the concept title or keyword.
-      expect(block).toContain("GraphQL");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("memory_search({circle:'foo'}) on populated foo / empty default → block does NOT reflect default (which has nothing)", async () => {
-    // The key correctness check: default is empty, so if the block were built from default
-    // it would be empty entirely — no PREWARM_HEADER at all. The block being present with
-    // foo content proves we snapshotted foo, not default.
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await core.store("Foo circle concept: Redis used for caching.", { circle: "foo" });
-    expect(core.conceptCount("default")).toBe(0);
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      const result = await client.callTool({
-        name: "memory_search",
-        arguments: { query: "Redis", circle: "foo" },
-      });
-      // If bug is present: scope() resolves default → default is empty → block is empty → no PREWARM_HEADER.
-      // After fix: scope("foo") → foo is populated → block present.
-      expect(prewarmText(result)).toContain(PREWARM_HEADER);
-    } finally {
-      await cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
 // 15. Fix B — test 1: fresh empty store, first call memory_store → NO block
 // ---------------------------------------------------------------------------
 
@@ -728,290 +594,10 @@ describe("15. Fix B: first call memory_store on empty store → no block (nothin
 });
 
 // ---------------------------------------------------------------------------
-// 16. Fix B — THE KILLER: prior concept A in circle, first call memory_store(B) →
-//     block present (mentions A), does NOT mention B
+// 18. memory_fetch read-path sanity
 // ---------------------------------------------------------------------------
 
-describe("16. Fix B (killer): first call memory_store(B) → block shows prior A, not B", () => {
-  it("circle has concept A; first MCP call is memory_store(B) → block mentions A title, NOT B", async () => {
-    // Setup: circle already has concept A from a prior session.
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await core.store("Prior concept A: the project uses TypeScript strictly.", { resolution: "forceNew" });
-    expect(core.conceptCount("default")).toBe(1);
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      // First MCP call is a MUTATION — storing new fact B.
-      const result = await client.callTool({
-        name: "memory_store",
-        arguments: { content: "New fact B: switched to Bun runtime from Node." },
-      });
-
-      // Block must be present: the store had prior context.
-      const block = prewarmText(result);
-      expect(block).toContain(PREWARM_HEADER);
-
-      // Block must mention A (the pre-existing concept).
-      expect(block).toContain("TypeScript");
-
-      // Block must NOT mention B (the fact just written in this same call).
-      // If the block was built AFTER the mutation, B might appear — that's the bug.
-      expect(block).not.toContain("Bun runtime");
-    } finally {
-      await cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 17. Fix B: error-first with explicit circle → one-shot not consumed;
-//     next success carries correctly-circled block
-// ---------------------------------------------------------------------------
-
-describe("17. Fix B: error-first with explicit circle → one-shot survives, next success carries circled block", () => {
-  it("failing memory_store (no content) leaves one-shot unconsumed; next success (same circle) carries block", async () => {
-    // Setup: "bar" has content; default is empty.
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await core.store("Bar circle concept: Postgres for persistence.", { circle: "bar" });
-    expect(core.conceptCount("bar")).toBeGreaterThan(0);
-    expect(core.conceptCount("default")).toBe(0);
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      // First call: memory_store with no content → error.
-      const failResult = await client.callTool({
-        name: "memory_store",
-        arguments: { circle: "bar" }, // missing required `content`
-      });
-      expect(isError(failResult)).toBe(true);
-      // One-shot must NOT be consumed on error.
-      expect(prewarmText(failResult)).not.toContain(PREWARM_HEADER);
-
-      // Second call: memory_search with explicit circle "bar" → success → block from bar.
-      const okResult = await client.callTool({
-        name: "memory_search",
-        arguments: { query: "Postgres", circle: "bar" },
-      });
-      const block = prewarmText(okResult);
-      expect(block).toContain(PREWARM_HEADER);
-      // Block must reflect bar's content, not the empty default.
-      expect(block).toContain("Postgres");
-    } finally {
-      await cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 13. Fix 5b: stale>=5 and dirty>=10 curation thresholds
-// ---------------------------------------------------------------------------
-
-describe("13. Fix 5b: stale>=5 and dirty>=10 curation thresholds", () => {
-  it("stale>=5 (exactly 5) trips curation advisory in agent_context", async () => {
-    // staleAfterMs=0 makes everything stale immediately.
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, staleAfterMs: 0 });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const db = (core as any).db as import("../storage").StoragePort;
-
-    // Create exactly 5 concepts and age their last_confirmed_at so they are stale.
-    const ids: string[] = [];
-    for (let i = 0; i < 5; i++) {
-      const r = await core.store(`Stale concept ${i} — distinct enough to not merge.`, { resolution: "forceNew" });
-      ids.push(r.conceptId);
-    }
-    // Age all to 2× staleAfterMs in the past (staleAfterMs=0, so any past timestamp works).
-    for (const id of ids) {
-      db.prepare(`UPDATE concepts SET last_confirmed_at = 1 WHERE id = ?`).run(id);
-    }
-
-    // Verify overview.counts.stale >= 5.
-    const ov = core.overview("default");
-    expect(ov.counts.stale).toBeGreaterThanOrEqual(5);
-
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: {} });
-      const parsed = JSON.parse(rawText(result)) as Record<string, unknown>;
-      expect("curationAttention" in parsed).toBe(true);
-      expect((parsed.curationAttention as string)).toContain("stale=");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("stale=4 does NOT trip curation advisory", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, staleAfterMs: 0 });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const db = (core as any).db as import("../storage").StoragePort;
-
-    for (let i = 0; i < 4; i++) {
-      const r = await core.store(`Stale concept ${i} — distinct.`, { resolution: "forceNew" });
-      db.prepare(`UPDATE concepts SET last_confirmed_at = 1 WHERE id = ?`).run(r.conceptId);
-    }
-
-    const ov = core.overview("default");
-    expect(ov.counts.stale).toBe(4);
-
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: {} });
-      const parsed = JSON.parse(rawText(result)) as Record<string, unknown>;
-      // No other threshold tripped — curationAttention must be absent.
-      expect("curationAttention" in parsed).toBe(false);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("dirty>=10 (exactly 10) trips curation advisory in agent_context", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const db = (core as any).db as import("../storage").StoragePort;
-
-    // Create 10 distinct concepts and mark them dirty.
-    for (let i = 0; i < 10; i++) {
-      const r = await core.store(`Dirty concept ${i} — distinct.`, { resolution: "forceNew" });
-      db.prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(r.conceptId);
-    }
-
-    const ov = core.overview("default");
-    expect(ov.counts.dirty).toBeGreaterThanOrEqual(10);
-
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: {} });
-      const parsed = JSON.parse(rawText(result)) as Record<string, unknown>;
-      expect("curationAttention" in parsed).toBe(true);
-      expect((parsed.curationAttention as string)).toContain("dirty=");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("dirty=9 does NOT trip curation advisory", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const db = (core as any).db as import("../storage").StoragePort;
-
-    for (let i = 0; i < 9; i++) {
-      const r = await core.store(`Dirty concept ${i} — distinct.`, { resolution: "forceNew" });
-      db.prepare(`UPDATE concepts SET dirty = 1 WHERE id = ?`).run(r.conceptId);
-    }
-
-    const ov = core.overview("default");
-    expect(ov.counts.dirty).toBe(9);
-
-    const { client, cleanup } = await makePair(core, { autoPrewarm: false });
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: {} });
-      const parsed = JSON.parse(rawText(result)) as Record<string, unknown>;
-      expect("curationAttention" in parsed).toBe(false);
-    } finally {
-      await cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 18. memory_fetch deferred snapshot — circle-omitted fetch uses homeCircle
-// ---------------------------------------------------------------------------
-
-describe("18. memory_fetch: prewarm snapshot deferred to after homeCircle resolution", () => {
-  /**
-   * Test 1: concept lives in "foo"; default is empty; first call memory_fetch(id) with NO circle.
-   * Pre-fix: capturePrewarmSnapshot(scope(undefined)) = scope of default = empty → no block.
-   * Post-fix: snapshot deferred; homeCircle = "foo" → block built from "foo" → block present.
-   */
-  it("fetch omit-circle → block reflects homeCircle content (pre-fix: no/wrong block)", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const r = await core.store("Foo circle concept: Kafka used for event streaming.", { circle: "foo" });
-    const conceptId = r.conceptId;
-
-    // Confirm: "foo" is populated; default is empty.
-    expect(core.conceptCount("foo")).toBeGreaterThan(0);
-    expect(core.conceptCount("default")).toBe(0);
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      // First call: memory_fetch with circle omitted → store-wide lookup → homeCircle = "foo".
-      const result = await client.callTool({
-        name: "memory_fetch",
-        arguments: { id: conceptId }, // no circle
-      });
-      expect(isError(result)).toBe(false);
-
-      // Block must be present and reflect "foo"'s content.
-      const block = prewarmText(result);
-      expect(block).toContain(PREWARM_HEADER);
-      expect(block).toContain("Kafka");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  /**
-   * Test 2: same setup but explicit circle:"foo" passed.
-   * This path was already correct (scope(circle) resolves to "foo").
-   * Regression: must still work after the fix.
-   */
-  it("fetch explicit circle:'foo' → block reflects foo content (regression guard)", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const r = await core.store("Foo concept: Redis used for caching.", { circle: "foo" });
-    const conceptId = r.conceptId;
-
-    expect(core.conceptCount("foo")).toBeGreaterThan(0);
-    expect(core.conceptCount("default")).toBe(0);
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      const result = await client.callTool({
-        name: "memory_fetch",
-        arguments: { id: conceptId, circle: "foo" },
-      });
-      expect(isError(result)).toBe(false);
-
-      const block = prewarmText(result);
-      expect(block).toContain(PREWARM_HEADER);
-      expect(block).toContain("Redis");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  /**
-   * Test 3: fetch with a nonexistent id → error; one-shot NOT consumed.
-   * Next successful call must still carry the block.
-   */
-  it("fetch nonexistent id → error; one-shot survives; next success carries block", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    await core.store("Some concept for later recall.", { circle: "foo" });
-
-    const { client, cleanup } = await makePair(core);
-    try {
-      // First call: fetch a nonexistent id → error.
-      const failResult = await client.callTool({
-        name: "memory_fetch",
-        arguments: { id: "nonexistent-id-000000" },
-      });
-      expect(isError(failResult)).toBe(true);
-      // One-shot must NOT be consumed on error.
-      expect(prewarmText(failResult)).not.toContain(PREWARM_HEADER);
-
-      // Second call: a successful read → block must be present.
-      const okResult = await client.callTool({
-        name: "memory_search",
-        arguments: { query: "concept", circle: "foo" },
-      });
-      const block = prewarmText(okResult);
-      expect(block).toContain(PREWARM_HEADER);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  /**
-   * Test 4 (sanity): fetch with omitted circle still returns the concept body (read path unchanged).
-   */
+describe("18. memory_fetch read-path sanity", () => {
   it("fetch omit-circle still returns the concept data (read path sanity)", async () => {
     const core = new MonetCore(":memory:");
     const r = await core.store("Sanity check: concept body is always returned.", { circle: "foo" });

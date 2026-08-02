@@ -456,47 +456,21 @@ describe("6a. detach-consolidation — FULL consolidation MAX-carries last_confi
   });
 });
 
-// ---- Fix 2 — staleConcepts cap keeps the STALEST, deterministically ---------
+// ---- stale concept query ----------------------------------------------------
 
-describe("Fix 2 — staleConcepts cap keeps the stalest concepts, not arbitrary rows", () => {
-  it(">20 stale concepts with distinct ages → the oldest 20 survive the cap, deterministically", async () => {
-    // tauAttach=1.1 prevents any auto-merging so each store() creates a distinct concept.
-    // staleAfterMs=0 makes everything stale immediately (any lca in the past is stale).
+describe("stale concept query", () => {
+  it("returns every stale native concept", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1, staleAfterMs: 0 });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const db = (core as any).db as import("../storage").StoragePort;
-
-    const TOTAL = 25; // >20 = STALE_CONCEPTS_PREWARM_LIMIT
+    const TOTAL = 25;
     const ids: string[] = [];
-
-    // Create 25 concepts with distinct last_confirmed_at values spread over time.
     for (let i = 0; i < TOTAL; i++) {
-      const r = await core.store(`Distinct concept number ${i} for staleness cap test.`);
+      const r = await core.store(`Distinct concept number ${i} for staleness query test.`);
       ids.push(r.conceptId);
-      // Assign explicitly ordered timestamps so we know the expected survivors.
-      // Concept i gets timestamp = 1000 * (i+1) so concept 0 is oldest, concept 24 is newest.
-      db.prepare(`UPDATE concepts SET last_confirmed_at = ?, updated_at = ? WHERE id = ?`).run(1000 * (i + 1), 1000 * (i + 1), r.conceptId);
     }
 
-    // Run prewarm twice to assert determinism.
-    const prewarm1 = core.prewarm("default");
-    const prewarm2 = core.prewarm("default");
-
-    expect(prewarm1.staleConcepts).toHaveLength(20);
-    expect(prewarm2.staleConcepts).toHaveLength(20);
-
-    // The 20 survivors must be the 20 OLDEST (ids[0]..ids[19]).
-    const expectedSurvivorIds = new Set(ids.slice(0, 20));
-    const actualIds1 = new Set(prewarm1.staleConcepts.map((c) => c.id));
-    const actualIds2 = new Set(prewarm2.staleConcepts.map((c) => c.id));
-
-    expect(actualIds1).toEqual(expectedSurvivorIds);
-    expect(actualIds2).toEqual(expectedSurvivorIds);
-
-    // Both runs must return identical ordering (determinism).
-    const order1 = prewarm1.staleConcepts.map((c) => c.id);
-    const order2 = prewarm2.staleConcepts.map((c) => c.id);
-    expect(order1).toEqual(order2);
+    const stale = core.getStaleConcepts("default");
+    expect(stale).toHaveLength(TOTAL);
+    expect(new Set(stale.map((concept) => concept.id))).toEqual(new Set(ids));
 
     core.close();
   });

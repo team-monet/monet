@@ -51,12 +51,12 @@ const HIGH_USEFULNESS = 20;
 const LOW_USEFULNESS = 3;
 const OLD_AGE_DAYS = 120;
 
-describe("D.1 — livingModelScore usefulness decay discriminates (prewarm.topConcepts)", () => {
+describe("D.1 — livingModelScore usefulness decay discriminates (overview.livingModel)", () => {
   it("old high-usefulness concept ranks BELOW freshly-confirmed low-usefulness concept after decay", async () => {
     const core = new MonetCore(":memory:", {
       tauAttach: 1.1,
       tauAmbiguous: 1.1,
-      staleAfterMs: 365 * 86_400_000, // 1 year — keep both concepts in topConcepts
+      staleAfterMs: 365 * 86_400_000, // 1 year — keep both concepts in livingModel
     });
     const db = rawDb(core);
 
@@ -77,7 +77,7 @@ describe("D.1 — livingModelScore usefulness decay discriminates (prewarm.topCo
       now, now, LOW_USEFULNESS, rB.conceptId,
     );
 
-    const top = core.prewarm("default").topConcepts;
+    const top = core.overview("default").livingModel;
     const ids = top.map((c) => c.id);
 
     // Both concepts are within the 1-year stale window.
@@ -124,7 +124,7 @@ describe("D.1 — livingModelScore usefulness decay discriminates (prewarm.topCo
       thirtyDaysAgo, thirtyDaysAgo, LOW_USEFULNESS, rB.conceptId,
     );
 
-    const top = core.prewarm("default").topConcepts;
+    const top = core.overview("default").livingModel;
     const ids = top.map((c) => c.id);
 
     // Same-age, high usefulness still dominates: A before B.

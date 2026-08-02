@@ -677,7 +677,6 @@ export class EmbedderMigrationAbandonUnsupportedError extends Error {
   }
 }
 
-const STALE_CONCEPTS_PREWARM_LIMIT = 20; // cap on staleConcepts in prewarm — a list serialized into a capped response gets a bound at birth
 const USEFULNESS_DECAY_TAU_DAYS = 60; // usefulness decays slower than recency (14-day / 30-day taus) — once-useful concepts fade but are not penalised as sharply as staleness
 // ---- V-A arousal tunables (slice 2) -------------------------------------------
 // Arousal is a decay-resistant signal: contradictions and cross-session confirmations
@@ -1373,7 +1372,7 @@ export interface DetachResult {
 /**
  * The typed payload of a `workstream` concept (ADR §3.6) — the session-state survival
  * policy made concrete. The agent compresses a session into this at `checkpoint`; it
- * survives to the next session's prewarm. These slots SURVIVE; raw turns are EPHEMERAL.
+ * survives for explicit continuation through memory_workstreams. These slots SURVIVE; raw turns are EPHEMERAL.
  */
 export interface WorkstreamPayload {
   status: "active" | "paused" | "done";
@@ -1437,19 +1436,8 @@ export interface PrewarmContradiction {
   detail: string;
 }
 
-/** Query-independent session-start state (ADR §4.2) returned by `prewarm` / `agent_context`. */
+/** Query-independent session-start orientation returned by `prewarm` / `agent_context`. */
 export interface PrewarmState {
-  activeWorkstreams: Array<{
-    id: string;
-    title: string;
-    status: string;
-    openQuestions: string[];
-    nextSteps: string[];
-    decisions: string[];
-  }>;
-  topConcepts: LivingModelCard[];
-  staleConcepts: LivingModelCard[]; // active but unconfirmed past staleAfterMs — surfaced for re-confirmation
-  openContradictions: PrewarmContradiction[];
   /**
    * The resident stage index (liveStageIndex): names of stages with at least one live rule, never
    * rule bodies (residency law). The recognition cue — "you are at a named moment; ask stage_lookup
@@ -1558,7 +1546,7 @@ export interface ResolutionStats {
 
 /**
  * A glanceable, read-only snapshot of everything stored for a circle (the "what your agent
- * knows" view). Composes prewarm (living model + threads + contradictions) + scoped counts +
+ * knows" view). Composes the living model, threads, contradictions, scoped counts, and
  * the connection-graph shape. Carries identity/shape only — never concept bodies (§4.5).
  */
 export interface MemoryOverview {
@@ -1589,7 +1577,14 @@ export interface MemoryOverview {
   /** How the gates have been firing — fire precision, silence rate, and the dead-pattern watchlist. */
   gateStats: GateStats;
   livingModel: LivingModelCard[];
-  activeThreads: PrewarmState["activeWorkstreams"];
+  activeThreads: Array<{
+    id: string;
+    title: string;
+    status: string;
+    openQuestions: string[];
+    nextSteps: string[];
+    decisions: string[];
+  }>;
   openContradictions: PrewarmContradiction[];
   possibleDuplicates: PossibleDuplicatePair[];
   /**
@@ -4325,7 +4320,7 @@ export class MonetCore {
    * Session-state survival (ADR §4.3): the agent compresses a session into a workstream
    * payload; this elevates it into the circle's `workstream` concept (create or update —
    * versioned, with a revision) and ends the current session. Agent-authored, so it is
-   * never marked dirty. Restored next session via getActiveWorkstreams / prewarm (#242).
+   * never marked dirty. Restored on continuation intent via getActiveWorkstreams (#242).
    */
   async saveWorkstream(payload: WorkstreamPayload, opts: { circle?: string; summary?: string } = {}): Promise<Workstream> {
     this.assertNoEmbedderMigrationReentry("save a workstream");
@@ -4424,7 +4419,7 @@ export class MonetCore {
     return toWorkstream(result.row);
   }
 
-  /** Restore a circle's active/paused workstreams (the read path prewarm #242 consumes). */
+  /** Restore a circle's active/paused workstreams for an explicit continuation request. */
   getActiveWorkstreams(circle?: string): Workstream[] {
     circle ??= this.defaultCircle;
     // ARCHIVED ROWS SORT LAST in the canonical pick (Codex review, PR #100, P1): the pick must not
@@ -4453,17 +4448,20 @@ export class MonetCore {
   }
 
   /**
-   * Prewarm (ADR §4.2): query-independent session-start state for a circle. Returns
-   * SYNTHESIZED state, not a query — where you left off (active workstreams), the living
-   * model (top concepts ranked by confidence × usefulness × recency), and open
-   * contradictions. Bounded + ranked. Carries identity/shape, never concept bodies
-   * (the no-answer-leak rule, §4.5) — the agent fetches a concept when it needs content.
+   * Prewarm (ADR §4.2): query-independent session-start orientation for a circle. The resident
+   * payload is deliberately limited to the stage recognition cue and conditional skeleton mirror
+   * state; task context stays behind intent-specific read surfaces.
    */
-  prewarm(circle?: string, opts: { conceptLimit?: number } & SourceAwareReadOptions = {}): PrewarmState & { resolvedFrom?: string } {
+  prewarm(circle?: string): PrewarmState & { resolvedFrom?: string } {
     const rawCircle = circle ?? this.defaultCircle;
     const resolved = this.resolveCircle(rawCircle);
-    const sourceProjections = this.authorizedSourceProjections(opts.sourceAuthorizationContext, resolved);
-    const state = this.prewarmFromSourceProjections(rawCircle, resolved, opts.conceptLimit ?? 7, sourceProjections);
+    const resolvedFrom = resolved !== rawCircle ? rawCircle : undefined;
+    const stageIndexResult = liveStageIndex(this.db, resolved);
+    const state: PrewarmState & { resolvedFrom?: string } = {
+      ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
+      ...(stageIndexResult.names.length > 0 ? { stageIndex: stageIndexResult.names } : {}),
+      ...(stageIndexResult.total !== undefined ? { stageIndexTotal: stageIndexResult.total } : {}),
+    };
     const skeletonRows = this.skeletonMemberRows(resolved);
     const skeleton = skeletonRows.map(toSkeletonEntry);
     const mirror = inspectSkeletonMirrors(
@@ -4486,65 +4484,6 @@ export class MonetCore {
       ...(mirror.mirrorStale !== undefined
         ? { mirrorStale: mirror.mirrorStale, instruction: mirror.instruction }
         : {}),
-    };
-  }
-
-  /** Build prewarm from one caller-frozen authorized source snapshot. */
-  private prewarmFromSourceProjections(
-    rawCircle: string,
-    circle: string,
-    conceptLimit: number,
-    sourceProjections: AuthorizedSourceProjection[],
-  ): PrewarmState & { resolvedFrom?: string } {
-    const resolvedFrom = circle !== rawCircle ? rawCircle : undefined;
-    const now = Date.now();
-
-    const activeWorkstreams = this.getActiveWorkstreams(circle).map((w) => ({
-      id: w.id,
-      title: w.title,
-      status: w.payload.status,
-      openQuestions: w.payload.openQuestions ?? [],
-      nextSteps: w.payload.nextSteps ?? [],
-      decisions: w.payload.decisions ?? [],
-    }));
-
-    // Living model = ACTIVE concepts only, partitioned fresh (ranked top) vs stale (surfaced for
-    // re-confirmation). Disputed concepts are surfaced via openContradictions, not the top list.
-    const nativeActive = this.db
-      .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status = 'active'`)
-      .all(circle) as ConceptRow[];
-    const active = nativeActive.concat(sourceProjections.map((projection) => projection.row));
-    const isStale = (r: ConceptRow): boolean => now - (r.last_confirmed_at ?? r.updated_at) > this.staleAfterMs;
-    const topConcepts = active
-      .filter((r) => !isStale(r))
-      .map((r) => ({ r, score: livingModelScore(r, now) }))
-      // Deterministic tiebreak on id prevents non-determinism (ordering non-determinism has
-      // shipped real bugs in this repo — sibling staleConcepts sort).
-      .sort((a, b) => b.score !== a.score ? b.score - a.score : (a.r.id < b.r.id ? -1 : 1))
-      .slice(0, conceptLimit)
-      .map(({ r }) => livingModelCard(r));
-    const staleConcepts = active
-      .filter(isStale)
-      // Sort stalest-first (ascending confirmation age) so the cap keeps the oldest, not an
-      // arbitrary rowid-order slice.  Deterministic tiebreak on id prevents non-determinism
-      // (ordering non-determinism has shipped real bugs in this repo — sibling topConcepts sorts).
-      .sort((a, b) => {
-        const aTs = a.last_confirmed_at ?? a.updated_at;
-        const bTs = b.last_confirmed_at ?? b.updated_at;
-        return aTs !== bTs ? aTs - bTs : a.id < b.id ? -1 : 1;
-      })
-      .slice(0, STALE_CONCEPTS_PREWARM_LIMIT)
-      .map(livingModelCard);
-
-    const stageIndexResult = liveStageIndex(this.db, circle);
-    return {
-      activeWorkstreams,
-      topConcepts,
-      staleConcepts,
-      openContradictions: this.getOpenContradictions(circle),
-      ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
-      ...(stageIndexResult.names.length > 0 ? { stageIndex: stageIndexResult.names } : {}),
-      ...(stageIndexResult.total !== undefined ? { stageIndexTotal: stageIndexResult.total } : {}),
     };
   }
 
@@ -5020,7 +4959,7 @@ export class MonetCore {
       .get(conceptId) as { n: number }).n;
   }
 
-  /** Active concepts unconfirmed past staleAfterMs (ADR §4.4) — detectable + surfaced at prewarm. */
+  /** Active native concepts unconfirmed past staleAfterMs (ADR §4.4). */
   getStaleConcepts(circle?: string): LivingModelCard[] {
     circle ??= this.defaultCircle;
     const now = Date.now();
@@ -7252,7 +7191,8 @@ export class MonetCore {
 
   /**
    * The "what your agent knows" snapshot (ADR §4.7 read surface). READ-ONLY: opens no session,
-   * triggers no synthesis, never returns bodies. Composes prewarm + scoped counts + graph shape.
+   * triggers no synthesis, never returns bodies. Composes ranked knowledge, session threads,
+   * contradictions, scoped counts, and graph shape.
    */
   overview(
     circle?: string,
@@ -7262,7 +7202,26 @@ export class MonetCore {
     circle = this.resolveCircle(rawCircle);
     const resolvedFrom = circle !== rawCircle ? rawCircle : undefined;
     const sourceProjections = this.authorizedSourceProjections(opts.sourceAuthorizationContext, circle);
-    const pre = this.prewarmFromSourceProjections(rawCircle, circle, opts.conceptLimit ?? 6, sourceProjections);
+    const now = Date.now();
+    const nativeActive = this.db
+      .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status = 'active'`)
+      .all(circle) as ConceptRow[];
+    const livingModel = nativeActive
+      .concat(sourceProjections.map((projection) => projection.row))
+      .filter((row) => now - (row.last_confirmed_at ?? row.updated_at) <= this.staleAfterMs)
+      .map((row) => ({ row, score: livingModelScore(row, now) }))
+      .sort((a, b) => b.score !== a.score ? b.score - a.score : (a.row.id < b.row.id ? -1 : 1))
+      .slice(0, opts.conceptLimit ?? 6)
+      .map(({ row }) => livingModelCard(row));
+    const activeThreads = this.getActiveWorkstreams(circle).map((workstream) => ({
+      id: workstream.id,
+      title: workstream.title,
+      status: workstream.payload.status,
+      openQuestions: workstream.payload.openQuestions ?? [],
+      nextSteps: workstream.payload.nextSteps ?? [],
+      decisions: workstream.payload.decisions ?? [],
+    }));
+    const openContradictions = this.getOpenContradictions(circle);
     const edgesByType = this.edgeCountsByType(circle);
     const edges = edgesByType.reduce((a, e) => a + e.count, 0);
     const nativeConcepts = (this.db.prepare(
@@ -7332,9 +7291,9 @@ export class MonetCore {
       },
       resolutionStats: this.resolutionStats(circle),
       gateStats: this.gateStats(circle),
-      livingModel: pre.topConcepts,
-      activeThreads: pre.activeWorkstreams,
-      openContradictions: pre.openContradictions,
+      livingModel,
+      activeThreads,
+      openContradictions,
       possibleDuplicates: this.getPossibleDuplicatePairs(circle),
       extractionCandidates: this.getExtractionCandidatePairs(circle),
       skeleton: skeletonMembers.slice(0, OVERVIEW_SKELETON_CAP),

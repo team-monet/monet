@@ -12,7 +12,7 @@
  * B. Ranking divergence (livingModelScore uses last_confirmed_at).
  *    6. Concept A: confirmed long ago but structurally touched recently (updated_at fresh,
  *       last_confirmed_at old). Concept B: confirmed recently. Under new source B outranks A
- *       in prewarm.topConcepts; under old source A would have ranked higher.
+ *       in overview.livingModel; under old source A would have ranked higher.
  *
  * C. nodePrior path (last_confirmed_at fallback).
  *    7. Direct divergence test via (core as any).nodePrior(): two concepts with equal structural
@@ -190,9 +190,9 @@ describe("A.5 — workstream split correct per circle", () => {
 // ---- B. Ranking divergence (livingModelScore uses last_confirmed_at) ---------
 
 describe("B.6 — livingModelScore ranking divergence: confirmed-recently beats structurally-touched-recently", () => {
-  it("concept B (confirmed recently) outranks concept A (confirmed long ago but updated recently) in prewarm.topConcepts", async () => {
+  it("concept B (confirmed recently) outranks concept A (confirmed long ago but updated recently) in overview.livingModel", async () => {
     // Staleness window must be LARGER than concept A's confirmation age so both A and B stay
-    // in the fresh (non-stale) pool and compete in topConcepts. With a 14-day decay half-life,
+    // in the fresh (non-stale) pool and compete in livingModel. With a 14-day decay half-life,
     // 5 days of confirmation age gives meaningful decay (exp(-5/14) ≈ 0.70) but stays well
     // inside a 90-day stale window.
     const STALE_AFTER_MS = 90 * 86_400_000; // 90 days
@@ -223,10 +223,10 @@ describe("B.6 — livingModelScore ranking divergence: confirmed-recently beats 
       now, now, rB.conceptId,
     );
 
-    const top = core.prewarm("default").topConcepts;
+    const top = core.overview("default").livingModel;
     const ids = top.map((c) => c.id);
 
-    // Both concepts are non-stale (last_confirmed_at < 90 days old) → both in topConcepts.
+    // Both concepts are non-stale (last_confirmed_at < 90 days old) → both in livingModel.
     expect(ids).toContain(rA.conceptId);
     expect(ids).toContain(rB.conceptId);
 
@@ -235,8 +235,8 @@ describe("B.6 — livingModelScore ranking divergence: confirmed-recently beats 
     const slightlyOlder = now - 1000; // 1 second older updated_at for B
     db.prepare(`UPDATE concepts SET updated_at = ? WHERE id = ?`).run(slightlyOlder, rB.conceptId);
 
-    // Re-run prewarm with the updated timestamps.
-    const top2 = core.prewarm("default").topConcepts;
+    // Re-run overview with the updated timestamps.
+    const top2 = core.overview("default").livingModel;
     const ids2 = top2.map((c) => c.id);
 
     // Under OLD source (updated_at): A.updated_at=now > B.updated_at=now-1s → A ranks first.

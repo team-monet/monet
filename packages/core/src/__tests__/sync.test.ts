@@ -798,8 +798,7 @@ describe("contradiction curation round-trip", () => {
     await src.store("Actually we use Postgres.", { kind: "correction", attachTo: a.conceptId });
 
     // Resolve the contradiction manually via the engine's resolveContradiction
-    const prewarm = await src.prewarm("default");
-    const contradiction = prewarm.openContradictions[0];
+    const contradiction = src.getOpenContradictions("default")[0];
     if (contradiction) {
       await src.resolveContradiction(contradiction.id, { decision: "keep-current", body: "Confirmed: SQLite stays." });
     }

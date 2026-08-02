@@ -328,14 +328,14 @@ describe("A.2 — Arousal decay-resistance: floor at score * AROUSAL_FLOOR_FRAC"
    * 0.5 * score * 0.1 = 0.05 * score, i.e. ~40% above the unfloored value — well outside 2%.
    *
    * Technique: pin arousal_score and arousal_last_updated_at directly, then read
-   * prewarm().topConcepts order to confirm the floored concept outranks an identical
+   * overview().livingModel order to confirm the floored concept outranks an identical
    * zero-arousal sibling, even at extreme age.
    */
   it("effectiveArousal floors at score * 0.1 after extreme idle — mutation-check for the floor", async () => {
     const core = new MonetCore(":memory:", {
       tauAttach: 1.1,
       tauAmbiguous: 1.1,
-      staleAfterMs: 365 * 10 * 86_400_000, // 10 years — keep both in topConcepts
+      staleAfterMs: 365 * 10 * 86_400_000, // 10 years — keep both in livingModel
     });
     const db = rawDb(core);
 
@@ -363,7 +363,7 @@ describe("A.2 — Arousal decay-resistance: floor at score * AROUSAL_FLOOR_FRAC"
       `UPDATE concepts SET arousal_score = 0, arousal_last_updated_at = NULL, last_confirmed_at = ?, updated_at = ? WHERE id = ?`,
     ).run(now, now, rB.conceptId);
 
-    const top = core.prewarm("default").topConcepts;
+    const top = core.overview("default").livingModel;
     const ids = top.map((c) => c.id);
 
     expect(ids).toContain(rA.conceptId);
@@ -641,13 +641,13 @@ describe("G.1 — gather byte-identical gate: age~0 + zero arousal → identity 
       `UPDATE concepts SET last_confirmed_at = ?, updated_at = ?, usefulness_score = 5, arousal_score = 0, arousal_last_updated_at = NULL WHERE id = ?`,
     ).run(now, now, rB.conceptId);
 
-    const top = core.prewarm("default").topConcepts;
+    const top = core.overview("default").livingModel;
     const ids = top.map((c) => c.id);
     // Both must appear; the ordering is deterministic by id tiebreak (no arousal noise).
     expect(ids).toContain(rA.conceptId);
     expect(ids).toContain(rB.conceptId);
     // Calling twice must give the same order (zero-arousal identity).
-    const top2 = core.prewarm("default").topConcepts;
+    const top2 = core.overview("default").livingModel;
     expect(top2.map((c) => c.id)).toEqual(ids);
 
     core.close();

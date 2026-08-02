@@ -3433,14 +3433,13 @@ export interface LiveStageIndexResult {
  * `countLiveStages` (below) both embed `RULE_LIVENESS_WHERE` directly — the identical collapsed-OR
  * predicate (`assertQueryableCircle`'s own doc comment) that degenerates to "global rules only" the
  * instant `circle` itself is `'*'`. `evaluateStageLookup`'s own call into this function was already
- * safe (guarded at ITS OWN entrance) — but `MonetCore.prewarm()`/`overview()` reach this function via
- * `prewarmFromSourceProjections`, and NEITHER of those resolves circle through anything stronger than
+ * safe (guarded at ITS OWN entrance) — but `MonetCore.prewarm()` reaches this function after only
  * `resolveCircle` (which, by design — see `assertQueryableCircle`'s own comment — passes an explicit
  * `'*'` straight through unchanged). An unguarded `prewarm('*')` therefore silently returned a stage
  * index missing every stage whose only live rule was purely LOCAL — the exact "curation silently
  * omits" failure class `gateStats`' own fix (this same round) closes one surface over. Guarded here,
- * not at `prewarm()`/`overview()`'s own entrances, for the identical reason the transaction wrap
- * above is here and not duplicated at every caller.
+ * not at `prewarm()`'s own entrance, for the identical reason the transaction wrap above is here and
+ * not duplicated at every caller.
  */
 export function liveStageIndex(db: StoragePort, circle: string): LiveStageIndexResult {
   assertQueryableCircle(circle);

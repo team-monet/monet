@@ -4216,17 +4216,14 @@ describe("circle '*' is refused as query input, everywhere a gate query can be s
     // because they are a different mechanism, but because `gateStats` restated
     // `(b.circle = ? OR b.circle = '*')` inline (twice) instead of the shared `RULE_LIVENESS_WHERE`
     // constant, so it never surfaced in a search for that constant's own call sites, and
-    // `liveStageIndex` is reached from `MonetCore.prewarm()`/`overview()` via a path
-    // (`prewarmFromSourceProjections`) that resolves circle through `resolveCircle` alone — which, by
-    // design, passes an explicit '*' straight through rather than refusing it (see
-    // `assertQueryableCircle`'s own comment).
+    // `liveStageIndex` is reached from `MonetCore.prewarm()` after `resolveCircle`, which by design
+    // passes an explicit '*' straight through rather than refusing it (see `assertQueryableCircle`'s
+    // own comment).
     expect(() => gateStats(db, { circle: BREADTH_CIRCLE, windowDays: 30 })).toThrow(message);
     expect(() => c.gateStats(BREADTH_CIRCLE)).toThrow(message);
     expect(() => liveStageIndex(db, BREADTH_CIRCLE)).toThrow(message);
-    // MonetCore.prewarm()/overview() both reach liveStageIndex (and overview() also reaches
-    // gateStats) transitively through prewarmFromSourceProjections — the exact entrance the
-    // coordinator's own "overview's gate section path" concern named, verified here directly rather
-    // than only at the shared internal function.
+    // MonetCore.prewarm() reaches liveStageIndex, while overview() reaches gateStats; verify both
+    // public entrances directly rather than only the shared internal functions.
     expect(() => c.prewarm(BREADTH_CIRCLE)).toThrow(message);
     expect(() => c.overview(BREADTH_CIRCLE)).toThrow(message);
 
@@ -11842,9 +11839,11 @@ describe("MCP surface", () => {
    */
   it("memory_declare with circle '*' resolves a HOME circle for prewarm and the response, never '*' itself — the binding ruling still reaches declare() as '*' (Codex round 3, item 3)", async () => {
     const c = new MonetCore(":memory:", { defaultCircle: "the-real-default" });
-    // Real prior content in the default circle, so a CORRECTLY-scoped prewarm has something to
-    // show — the control that makes "empty block" and "wrongly-scoped block" distinguishable.
-    await c.store("A fact prewarm should be able to find.", { kind: "fact" });
+    // A live stage in the default circle gives resident prewarm an orientation cue to render.
+    await c.store("Check the lockfile before installing.", {
+      kind: "rule",
+      rule: { stage: "dependency install", scope: "domain" },
+    });
     const { call, client } = await harness(c, { autoPrewarm: true });
 
     const declared = await call("memory_declare", {
@@ -11864,9 +11863,8 @@ describe("MCP surface", () => {
     // actually lives — never the breadth marker.
     expect(declared.json.circle).toBe("the-real-default");
 
-    // PREWARM WAS CAPTURED AGAINST THE HOME CIRCLE, not '*': non-empty, because the default circle
-    // genuinely has content. Pre-fix, capturePrewarmSnapshot('*') would have found nothing (nothing
-    // can live in '*') and this would be empty regardless of the real default circle's own content.
+    // PREWARM WAS CAPTURED AGAINST THE HOME CIRCLE, not '*': non-empty because the default circle
+    // has a live stage cue. Pre-fix, capturePrewarmSnapshot('*') would find no home-circle stages.
     expect(declared.prewarmText.length).toBeGreaterThan(0);
 
     await client.close();

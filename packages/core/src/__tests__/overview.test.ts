@@ -1,6 +1,6 @@
 /**
- * overview() — the "what your agent knows" snapshot: composition (single source of truth with
- * prewarm), the read-only invariant (inspecting never mutates), no-answer-leak (§4.5), and
+ * overview() — the "what your agent knows" snapshot: living-model/thread/contradiction composition,
+ * the read-only invariant (inspecting never mutates), no-answer-leak (§4.5), and
  * scope isolation.
  */
 import { describe, it, expect } from "vitest";
@@ -12,16 +12,19 @@ function core(): MonetCore {
 }
 
 describe("overview composition + invariants", () => {
-  it("draws living model / threads / contradictions from prewarm (one source of truth)", async () => {
+  it("applies a meaningful living-model limit while preserving ranking and other sections", async () => {
     const c = core();
-    await c.store("Auth tokens signed with jose in the AuthService.", { kind: "decision" });
-    await c.store("The AuthService lives in src/auth/service.ts.", { kind: "fact" });
+    for (let index = 0; index < 6; index++) {
+      await c.store(`Distinct overview concept ${index}.`, { kind: "fact", resolution: "forceNew" });
+    }
     await c.saveWorkstream({ status: "active", nextSteps: ["wire rotation"] });
-    const o = c.overview("default");
-    const pre = c.prewarm("default", { conceptLimit: 6 });
-    expect(o.livingModel).toEqual(pre.topConcepts);
-    expect(o.activeThreads).toEqual(pre.activeWorkstreams);
-    expect(o.openContradictions).toEqual(pre.openContradictions);
+    const full = c.overview("default");
+    const limited = c.overview("default", { conceptLimit: 3 });
+    expect(full.livingModel).toHaveLength(6);
+    expect(limited.livingModel).toHaveLength(3);
+    expect(limited.livingModel).toEqual(full.livingModel.slice(0, 3));
+    expect(limited.activeThreads).toEqual(full.activeThreads);
+    expect(limited.openContradictions).toEqual(full.openContradictions);
     c.close();
   });
 

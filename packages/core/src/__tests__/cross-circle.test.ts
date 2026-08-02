@@ -13,7 +13,6 @@
  *   (f) fetch with WRONG explicit circle → still errors
  *   (g) listCircles — counts + exclusion
  *   (h) overview.otherCircles present/correct; ABSENT when store has one circle
- *   (i) agent_context otherCircles capped at 5 (seed 6+ circles)
  *   (render) otherCircles section renders in renderOverview
  */
 import { describe, it, expect } from "vitest";
@@ -333,23 +332,6 @@ describe("overview — otherCircles", () => {
 
     const o = core.overview("only");
     expect(o.otherCircles).toBeUndefined();
-
-    core.close();
-  });
-});
-
-// ---- (i) agent_context otherCircles capped at 5 ----------------------------
-
-describe("listCircles — cap at 5 for agent_context", () => {
-  it("(i) capped at 5 when store has 6+ circles", async () => {
-    const core = new MonetCore(":memory:", { idGen: seq("i"), defaultCircle: "home" });
-    // Create 7 side circles (1 home + 7 others = 8 total)
-    for (let i = 1; i <= 7; i++) {
-      await core.store(`Concept in circle side${i}.`, { circle: `side${i}` });
-    }
-
-    const others = core.listCircles("home").slice(0, 5);
-    expect(others.length).toBe(5);
 
     core.close();
   });

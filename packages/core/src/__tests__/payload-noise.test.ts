@@ -134,8 +134,8 @@ describe("payload noise — memory_checkpoint", () => {
     expect(firstPayload.workstream.id).toBe(secondPayload.workstream.id);
     expect(secondPayload.workstream.version).toBeGreaterThan(firstPayload.workstream.version);
 
-    const restored = core.prewarm(circle).activeWorkstreams.find((w) => w.id === firstPayload.workstream.id);
-    expect(restored).toMatchObject({
+    const restored = core.getActiveWorkstreams(circle).find((w) => w.id === firstPayload.workstream.id);
+    expect(restored?.payload).toMatchObject({
       status: workstream.status,
       openQuestions: workstream.openQuestions,
       decisions: ["A stable replay updates the same workstream."],
@@ -189,40 +189,18 @@ describe("payload noise — gather cards", () => {
 });
 
 describe("payload noise — agent_context", () => {
-  it("omits staleConcepts by default, carries staleCount, and returns them on request", async () => {
+  it("never delivers stale state", async () => {
     const core = newCore({ staleAfterMs: 5 });
-    const staleTitle = "Retries use exponential backoff capped at thirty seconds.";
-    await core.store(staleTitle, { circle });
-    await new Promise((resolve) => setTimeout(resolve, 30)); // cross the 5ms staleness window
-
-    const { byDefault, onRequest } = await withServer(core, async (c) => ({
-      byDefault: await c.callTool({ name: "agent_context", arguments: { circle } }),
-      onRequest: await c.callTool({ name: "agent_context", arguments: { circle, includeStale: true } }),
-    }));
-
-    const restored = parse(byDefault);
-    expect(restored).not.toHaveProperty("staleConcepts");
-    expect(restored.staleCount).toBeGreaterThan(0);
-
-    const curating = parse(onRequest);
-    expect(Array.isArray(curating.staleConcepts)).toBe(true);
-    expect(curating.staleConcepts.length).toBeGreaterThan(0);
-    expect(curating.staleCount).toBe(restored.staleCount);
-    core.close();
-  });
-
-  it("carries staleCount even when it is zero (Codex P2)", async () => {
-    // The contract says the field is always present. Omitting it at zero makes "no stale concepts"
-    // indistinguishable from "server predates the field", so a consumer cannot read it as a number.
-    const core = newCore({ staleAfterMs: 10 * 60 * 1000 }); // nothing can go stale inside the test
-    await core.store("Feature flags are evaluated once per request.", { circle });
+    await core.store("Retries use exponential backoff capped at thirty seconds.", { circle });
+    await new Promise((resolve) => setTimeout(resolve, 30));
 
     const restored = await withServer(core, (c) =>
-      c.callTool({ name: "agent_context", arguments: { circle } }).then(parse),
+      c.callTool({ name: "agent_context", arguments: { circle } }),
     );
 
-    expect(restored).toHaveProperty("staleCount");
-    expect(restored.staleCount).toBe(0);
+    const payload = parse(restored);
+    expect(payload).not.toHaveProperty("staleConcepts");
+    expect(payload).not.toHaveProperty("staleCount");
     core.close();
   });
 });

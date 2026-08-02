@@ -354,10 +354,9 @@ describe("prewarm skeleton mirror delivery", () => {
       expect(payload.mirrorStaleOmitted).toBeGreaterThan(0);
       expect(payload.mirrorStale.length).toBeGreaterThan(0);
       expect(payload.instruction).toBe(MIRROR_STALE_INSTRUCTION);
-      expect(payload).toHaveProperty("activeWorkstreams");
-      expect(payload).toHaveProperty("topConcepts");
-      expect(payload).toHaveProperty("staleCount");
-      expect(payload).not.toHaveProperty("firstBlock");
+      for (const key of ["activeWorkstreams", "topConcepts", "staleCount", "openContradictions", "firstBlock"]) {
+        expect(payload).not.toHaveProperty(key);
+      }
       expect(result.content[0]!.text.length).toBeLessThanOrEqual(40_000);
     } finally {
       await client.close();

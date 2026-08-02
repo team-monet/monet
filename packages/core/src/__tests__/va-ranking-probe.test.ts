@@ -6,7 +6,7 @@
  *             The static coding-eval couldn't test this: it seeded a fresh store where
  *             usefulness/arousal were always 0 by the time any ranking ran.
  *
- *   Group 2 — the V-A signals reorder prewarm().topConcepts as designed when every other
+ *   Group 2 — the V-A signals reorder overview().livingModel as designed when every other
  *             input is held equal between siblings (confound closure).  A separate mutation
  *             pass that zeros AROUSAL_WEIGHT_LIVING and neutralises the usefulness term MUST
  *             cause these tests to FAIL — if they wouldn't, the isolation is broken.
@@ -168,10 +168,10 @@ describe("Group 1 — DRIVERS: real API moves V-A columns off zero", () => {
 // ---------------------------------------------------------------------------
 // Group 2 — RANKING EFFECT
 // Siblings A and B are pinned to identical baseline values; only the tested
-// V-A dimension differs.  prewarm.topConcepts ordering reflects V-A.
+// V-A dimension differs.  overview.livingModel ordering reflects V-A.
 // ---------------------------------------------------------------------------
 
-describe("Group 2 — RANKING EFFECT: V-A signals reorder prewarm.topConcepts", () => {
+describe("Group 2 — RANKING EFFECT: V-A signals reorder overview.livingModel", () => {
   /**
    * 2.1 — Usefulness BOOST
    *
@@ -234,7 +234,7 @@ describe("Group 2 — RANKING EFFECT: V-A signals reorder prewarm.topConcepts", 
       arousalUpdatedAt: null,
     });
 
-    const top = core.prewarm("default", { conceptLimit: 10 }).topConcepts;
+    const top = core.overview("default", { conceptLimit: 10 }).livingModel;
     const ids = top.map((c) => c.id);
 
     console.log(
@@ -314,7 +314,7 @@ describe("Group 2 — RANKING EFFECT: V-A signals reorder prewarm.topConcepts", 
       arousalUpdatedAt: null,
     });
 
-    const top = core.prewarm("default", { conceptLimit: 10 }).topConcepts;
+    const top = core.overview("default", { conceptLimit: 10 }).livingModel;
     const ids = top.map((c) => c.id);
 
     console.log(
@@ -387,7 +387,7 @@ describe("Group 2 — RANKING EFFECT: V-A signals reorder prewarm.topConcepts", 
       arousalUpdatedAt: now,
     });
 
-    const top = core.prewarm("default", { conceptLimit: 10 }).topConcepts;
+    const top = core.overview("default", { conceptLimit: 10 }).livingModel;
     const ids = top.map((c) => c.id);
 
     console.log(
@@ -477,7 +477,7 @@ describe("Group 2 — RANKING EFFECT: V-A signals reorder prewarm.topConcepts", 
       arousalUpdatedAt: arousalTs400dAgo, // 400d idle — past the ~276d floor crossover
     });
 
-    const topBefore = core.prewarm("default", { conceptLimit: 10 }).topConcepts;
+    const topBefore = core.overview("default", { conceptLimit: 10 }).livingModel;
     const idsBefore = topBefore.map((c) => c.id);
     console.log(
       `[2.4 arousal floor] ordering AFTER 400d idle (floor should dominate): ${idsBefore

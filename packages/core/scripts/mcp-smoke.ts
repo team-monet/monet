@@ -64,7 +64,7 @@ async function main(): Promise<void> {
   const fetched2 = parse(await client.callTool({ name: "memory_fetch", arguments: { id: a.conceptId } }));
   console.log(`re-fetch → needsSynthesis=${fetched2.needsSynthesis}  body="${fetched2.body}"`);
 
-  // Session survival (#241): checkpoint a compressed workstream, then restore it via agent_context.
+  // Session survival (#241): checkpoint a compressed workstream, then pull it on continuation intent.
   const ck = parse(
     await client.callTool({
       name: "memory_checkpoint",
@@ -72,8 +72,8 @@ async function main(): Promise<void> {
         summary: "smoke session",
         workstream: {
           status: "active",
-          openQuestions: ["does prewarm restore this next session?"],
-          nextSteps: ["call agent_context at session start"],
+          openQuestions: ["does continuation restore this next session?"],
+          nextSteps: ["call memory_workstreams on continuation intent"],
           decisions: [a.conceptId],
         },
       },
@@ -83,26 +83,26 @@ async function main(): Promise<void> {
   console.log(`\ncheckpoint → workstream ${ckWs?.id.slice(0, 8)} (status ${ckWs?.status}), dirtyCount=${ck.dirtyCount}`);
 
   const ctx = parse(await client.callTool({ name: "agent_context", arguments: {} }));
-  const wss = (ctx.activeWorkstreams as Array<{ id: string; nextSteps?: string[] }> | undefined) ?? [];
-  const living = (ctx.topConcepts as Array<{ id: string; title: string; kind: string }> | undefined) ?? [];
-  const firstCard = living[0];
+  if (typeof ctx.circle !== "string" || ctx.circle.length === 0) throw new Error("agent_context did not return session orientation");
+  const workstreamList = parse(await client.callTool({ name: "memory_workstreams", arguments: {} }));
+  const wss = (workstreamList.workstreams as Array<{ id: string; title: string; status: string }> | undefined) ?? [];
+  const detail = parse(await client.callTool({ name: "memory_workstreams", arguments: { id: wss[0]?.id } }));
   console.log(
-    `agent_context (prewarm) → ${wss.length} workstream(s); nextSteps=${JSON.stringify(wss[0]?.nextSteps)}; ` +
-      `${living.length} living-model concept(s), top="${firstCard?.title}" (body in card? ${firstCard ? "body" in firstCard : false})`,
+    `agent_context → circle=${ctx.circle}; memory_workstreams → ${wss.length} thread(s); ` +
+      `nextSteps=${JSON.stringify(detail.nextSteps)}`,
   );
-  if (wss.length !== 1 || ckWs?.id !== wss[0]?.id) throw new Error("workstream did not round-trip through checkpoint → agent_context");
-  if (!living.some((c) => c.id === a.conceptId)) throw new Error("prewarm topConcepts missing the stored concept");
+  if (wss.length !== 1 || ckWs?.id !== wss[0]?.id) throw new Error("workstream did not round-trip through checkpoint → memory_workstreams");
 
-  // Contradiction lifecycle (#240): flag drift, see it in prewarm, then mediate it away.
+  // Contradiction lifecycle (#240): flag drift, see it in overview, then mediate it away.
   const flag = parse(
     await client.callTool({
       name: "memory_flag_contradiction",
       arguments: { conceptId: a.conceptId, detail: "a newer note claims it is NOT SQLite" },
     }),
   );
-  const ctxDisputed = parse(await client.callTool({ name: "agent_context", arguments: {} }));
-  const openBefore = ((ctxDisputed.openContradictions as unknown[]) ?? []).length;
-  console.log(`\nflag → contradiction ${String(flag.contradictionId).slice(0, 8)}; prewarm openContradictions=${openBefore}`);
+  const overviewDisputed = parse(await client.callTool({ name: "memory_overview", arguments: {} }));
+  const openBefore = ((overviewDisputed.openContradictions as unknown[]) ?? []).length;
+  console.log(`\nflag → contradiction ${String(flag.contradictionId).slice(0, 8)}; overview openContradictions=${openBefore}`);
 
   const res = parse(
     await client.callTool({
@@ -115,13 +115,13 @@ async function main(): Promise<void> {
       },
     }),
   );
-  const ctxResolved = parse(await client.callTool({ name: "agent_context", arguments: {} }));
-  const openAfter = ((ctxResolved.openContradictions as unknown[]) ?? []).length;
-  console.log(`resolve(accept-new) → concept status=${res.status}; prewarm openContradictions=${openAfter}`);
+  const overviewResolved = parse(await client.callTool({ name: "memory_overview", arguments: {} }));
+  const openAfter = ((overviewResolved.openContradictions as unknown[]) ?? []).length;
+  console.log(`resolve(accept-new) → concept status=${res.status}; overview openContradictions=${openAfter}`);
   if (openBefore !== 1 || openAfter !== 0 || res.status !== "active") throw new Error("contradiction lifecycle did not round-trip");
 
   await client.close();
-  console.log("\n✓ full MCP dance ran end-to-end (store → search → fetch → synthesize → checkpoint → prewarm → flag → resolve)");
+  console.log("\n✓ full MCP dance ran end-to-end (store → search → fetch → synthesize → checkpoint → orient → continue → flag → resolve)");
 }
 
 main().catch((e) => {
