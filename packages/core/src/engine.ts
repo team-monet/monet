@@ -1709,6 +1709,9 @@ export interface BatchReassignResult {
   counts: { moved: number; merged: number; noop: number; error: number };
 }
 
+/** Maximum pending-synthesis entries returned by one checkpoint worklist. */
+export const CHECKPOINT_DIRTY_WORKLIST_LIMIT = 20;
+
 export interface MonetCoreOptions {
   embedder?: EmbeddingProvider;
   /**
@@ -5875,7 +5878,6 @@ export class MonetCore {
     return result;
   }
 
-  /** Concepts with unsynthesized evidence + their raw observations (for the agent to synthesize). */
   /**
    * The dirty (pending-synthesis) worklist as IDENTITY ONLY — never observation text.
    *
@@ -5885,20 +5887,46 @@ export class MonetCore {
    * tool-result limit twice in one session on a store with 167 dirty concepts, some carrying 130+
    * observations. observationCount preserves the only thing the worklist actually needed the
    * evidence for: how much work each entry represents.
+   *
+   * Retrieval is deliberately bounded in SQL, not after materialization. Highest observation count
+   * comes first because the concepts carrying the most unsynthesized evidence are the highest-value
+   * debts to reconcile; id breaks ties so repeated checkpoints over unchanged data stay stable.
+   * The true total remains separately available through dirtyCount().
    */
-  listDirty(circle?: string): Array<{ id: string; slug: string; title: string; kind: string; observationCount: number }> {
-    circle ??= this.defaultCircle; // honor the per-project default; pass a circle explicitly to scope elsewhere
+  listDirty(
+    circle?: string,
+    limit = CHECKPOINT_DIRTY_WORKLIST_LIMIT,
+  ): Array<{ id: string; slug: string; title: string; kind: string; observationCount: number }> {
+    circle = this.resolveCircle(circle ?? this.defaultCircle);
+    const boundedLimit = Math.max(0, Math.floor(limit));
     // status != 'retired' (not the implicit retired⟹dirty=0 invariant): retireConcept no longer zeros
     // dirty, so a retired concept's stale pending-synthesis state must be filtered here explicitly.
-    const rows = this.db.prepare(`SELECT * FROM concepts WHERE dirty = 1 AND circle = ? AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`).all(circle) as ConceptRow[];
-    const countObs = this.db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = ?`);
-    return rows.map((r) => ({
-      id: r.id,
-      slug: r.slug,
-      title: r.title,
-      kind: r.kind,
-      observationCount: (countObs.get(r.id) as { n: number }).n,
-    }));
+    return this.db.prepare(`
+      SELECT c.id, c.slug, c.title, c.kind, COUNT(o.id) AS observationCount
+        FROM concepts c
+        LEFT JOIN observations o ON o.concept_id = c.id
+       WHERE c.dirty = 1
+         AND c.circle = ?
+         AND c.kind != 'source'
+         AND c.source_identity IS NULL
+         AND c.active_observation_id IS NULL
+         AND c.status != 'retired'
+       GROUP BY c.id
+       ORDER BY observationCount DESC, c.id ASC
+       LIMIT ?
+    `).all(circle, boundedLimit) as Array<{
+      id: string;
+      slug: string;
+      title: string;
+      kind: string;
+      observationCount: number;
+    }>;
+  }
+
+  /** True pending-synthesis total for checkpoint honesty; intentionally independent of the worklist cap. */
+  dirtyCount(circle?: string): number {
+    circle = this.resolveCircle(circle ?? this.defaultCircle);
+    return this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND dirty = 1 AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`, circle);
   }
 
   /**

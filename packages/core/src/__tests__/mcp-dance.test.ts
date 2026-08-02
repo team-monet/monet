@@ -46,6 +46,7 @@ describe("agent-driven synthesis (the MCP dance)", () => {
     await core.store("The team prefers pytest for testing.");
     const dirty = core.listDirty();
     expect(dirty).toHaveLength(2);
+    expect(core.dirtyCount()).toBe(2);
     // Enough to decide what to work on: which concept, and how much evidence is waiting.
     expect(dirty[0]!.id).toBeTruthy();
     expect(dirty[0]!.title).toBeTruthy();

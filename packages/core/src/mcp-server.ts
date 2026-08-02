@@ -116,12 +116,9 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
 }
 
 /**
- * THE canonical "we had to cut this short" note — ok()'s own last-resort slicer and every size-fit
- * loop in this file (stage_lookup's rules/stageIndex, agent_context's stageIndex) reserve the SAME
- * number of characters for it, so none of them can under-reserve and let a caller-visible response
- * tip past RESULT_MAX_CHARS by the difference. One constant rather than several copies, because a
- * copy that drifted from ok()'s own text is exactly the inconsistency a shared-budget fix must not
- * reintroduce at the very field (the truncation note itself) that proves the budget was honored.
+ * Size-fit loops keep their existing reservation below the hard ceiling. ok() no longer appends this
+ * text: its last resort is a small valid-JSON envelope, but changing these established budgets would
+ * alter non-pathological fitted responses that already honor the ceiling.
  */
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
 
@@ -194,12 +191,15 @@ function fitObjectArray<T>(
 // as ADDITIONAL content items by wrapSuccess so they never interfere with content[0].
 // Per-item bounds: ok()'s JSON is capped at RESULT_MAX_CHARS; the prewarm block is capped
 // at PREWARM_BLOCK_MAX_CHARS; the nudge line is short and uncapped (its fixed text is ~80 chars).
-function ok(content: object): CallToolResult {
-  let text = JSON.stringify(content, null, 2);
-  if (text.length > RESULT_MAX_CHARS) {
-    // Reserve room for the note so the FINAL payload stays at/under the hard ceiling, not over it.
-    text = text.slice(0, Math.max(0, RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length)) + RESULT_TRUNCATE_NOTE;
-  }
+export function ok(content: object): CallToolResult {
+  const serialized = JSON.stringify(content, null, 2);
+  const text = serialized.length <= RESULT_MAX_CHARS
+    ? serialized
+    : JSON.stringify({
+        truncated: true,
+        originalChars: serialized.length,
+        note: "Result exceeded the host tool-result limit; the original payload was omitted.",
+      }, null, 2);
   return { content: [{ type: "text", text }] };
 }
 function err(message: string): CallToolResult {
@@ -1758,7 +1758,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_checkpoint",
-    "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives as a workstream that next session's agent_context restores. Also returns the concepts still needing synthesis as a WORKLIST — id, title, kind and observationCount only, never the observation text. memory_fetch(id) the one you decide to synthesize.",
+    "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives as a workstream that next session's agent_context restores. This call only preserves session state; synthesis is handled at read time.",
     {
       circle: z.string().optional(),
       summary: z.string().optional(),
@@ -1777,20 +1777,13 @@ export function registerMonetCoreTools(
     async ({ circle, summary, workstream }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
-        const saved = workstream ? await core.saveWorkstream(workstream, { circle: scope(circle), summary }) : null;
-        const dirty = core.listDirty(scope(circle));
+        const resolvedCircle = scope(circle);
+        const saved = workstream ? await core.saveWorkstream(workstream, { circle: resolvedCircle, summary }) : null;
         // A successful checkpoint WITH a workstream payload resets the nudge counter.
         const isCheckpointWithWorkstream = saved !== null;
         return mutOk({
-          circle: scope(circle),
+          circle: resolvedCircle,
           workstream: saved ? { id: saved.id, status: saved.payload.status, version: saved.version } : null,
-          dirtyCount: dirty.length,
-          dirty,
-          guidance: dirty.length
-            ? "For each dirty concept you choose to work: memory_fetch(id) to read its observations → write a coherent body → memory_synthesize(id, body). If `circle` above isn't your session default, pass it: memory_synthesize(id, body, circle)."
-            : saved
-              ? "Workstream saved — next session's agent_context will restore it. Nothing left to synthesize."
-              : "Nothing to synthesize.",
         }, "memory_checkpoint", isCheckpointWithWorkstream, capturedBlock);
       } catch (e) {
         return err(`checkpoint failed: ${msg(e)}`);

@@ -20,7 +20,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it } from "vitest";
 import { MonetCore } from "../engine";
-import { registerMonetCoreTools } from "../mcp-server";
+import { ok, registerMonetCoreTools } from "../mcp-server";
+import { BetterSqlitePort } from "../storage";
 
 const circle = "noise-circle";
 /** tauAttach/tauAmbiguous > 1 keeps every store() a distinct concept, so counts are predictable. */
@@ -49,7 +50,7 @@ const parse = (r: unknown) => JSON.parse((r as ToolResult).content[0]!.text);
 const wire = (r: unknown) => (r as ToolResult).content.map((p) => p.text).join("\n");
 
 describe("payload noise — memory_checkpoint", () => {
-  it("returns the dirty list as a worklist (id/title/count), never observation text", async () => {
+  it("returns only the session-state acknowledgement, never stored evidence or curation state", async () => {
     const core = newCore();
     const evidence = "Postgres beat DynamoDB here because the reporting path is join-heavy.";
     await core.store(evidence, { circle });
@@ -61,16 +62,108 @@ describe("payload noise — memory_checkpoint", () => {
       }),
     );
 
-    // The load-bearing assertion first: a checkpoint must never carry the evidence itself.
     expect(wire(res)).not.toContain(evidence);
-
-    const payload = parse(res);
-    expect(payload.dirtyCount).toBeGreaterThan(0);
-    expect(payload.dirty[0]).not.toHaveProperty("observations");
-    expect(payload.dirty[0].id).toBeTruthy();
-    expect(payload.dirty[0].title).toBeTruthy();
-    expect(payload.dirty[0].observationCount).toBeGreaterThan(0);
+    expect(parse(res)).toEqual({
+      circle,
+      workstream: expect.objectContaining({ id: expect.any(String), status: "active", version: expect.any(Number) }),
+    });
     core.close();
+  });
+
+  it("keeps a 200+ dirty-concept checkpoint parseable and limited to the workstream ack", async () => {
+    const store = new BetterSqlitePort(":memory:");
+    const core = new MonetCore(store, { deferCreatedPin: true });
+    const totalDirty = 205;
+    const conceptInsert = store.prepare(`
+      INSERT INTO concepts (id, slug, title, body, embedding, dirty, circle)
+      VALUES (?, ?, ?, ?, ?, 1, ?)
+    `);
+    const observationInsert = store.prepare(`
+      INSERT INTO observations (id, content, embedding, concept_id, author_agent_id, circle)
+      VALUES (?, ?, ?, ?, 'checkpoint-fixture', ?)
+    `);
+    const workstream = {
+      status: "active" as const,
+      openQuestions: ["Does the checkpoint preserve this workstream?"],
+      decisions: ["Synthesis debt is ordered by evidence volume."],
+      nextSteps: ["Continue after this checkpoint."],
+    };
+    // Seed the workstream before fixture SQL adds the bulk concepts; a real checkpoint updates this
+    // row and therefore proves the primary contract survives under the large dirty population.
+    await core.saveWorkstream(workstream, { circle });
+    const fixtureEmbedding = JSON.stringify(Array(256).fill(0));
+    store.transaction(() => {
+      for (let n = 0; n < totalDirty; n++) {
+        const conceptId = `dirty-${String(n).padStart(3, "0")}`;
+        conceptInsert.run(conceptId, conceptId, `Dirty concept ${n}`, `Body ${n}`, fixtureEmbedding, circle);
+        const observationCount = n < 25 ? 3 : n < 100 ? 2 : 1;
+        for (let obs = 0; obs < observationCount; obs++) {
+          observationInsert.run(`${conceptId}-obs-${obs}`, `Evidence ${n}/${obs}`, fixtureEmbedding, conceptId, circle);
+        }
+      }
+    })();
+
+    const { first, second } = await withServer(core, async (c) => ({
+      first: await c.callTool({ name: "memory_checkpoint", arguments: { circle, workstream } }),
+      second: await c.callTool({ name: "memory_checkpoint", arguments: { circle, workstream: { ...workstream, decisions: ["A stable replay updates the same workstream."] } } }),
+    }));
+
+    const firstText = (first as ToolResult).content[0]!.text;
+    const secondText = (second as ToolResult).content[0]!.text;
+    if ((first as { isError?: boolean }).isError || (second as { isError?: boolean }).isError) {
+      throw new Error(`checkpoint fixture failed: first=${firstText}; second=${secondText}`);
+    }
+    expect(firstText.length).toBeLessThanOrEqual(40_000);
+    expect(secondText.length).toBeLessThanOrEqual(40_000);
+    const firstPayload = JSON.parse(firstText);
+    const secondPayload = JSON.parse(secondText);
+    for (const payload of [firstPayload, secondPayload]) {
+      expect(payload).not.toHaveProperty("dirty");
+      expect(payload).not.toHaveProperty("dirtyCount");
+      expect(payload).not.toHaveProperty("dirtyTruncated");
+      expect(payload).not.toHaveProperty("dirtyOmitted");
+      expect(payload).toEqual({
+        circle,
+        workstream: expect.objectContaining({
+          id: expect.any(String),
+          status: workstream.status,
+          version: expect.any(Number),
+        }),
+      });
+    }
+    expect(firstPayload.workstream.id).toBe(secondPayload.workstream.id);
+    expect(secondPayload.workstream.version).toBeGreaterThan(firstPayload.workstream.version);
+
+    const restored = core.prewarm(circle).activeWorkstreams.find((w) => w.id === firstPayload.workstream.id);
+    expect(restored).toMatchObject({
+      status: workstream.status,
+      openQuestions: workstream.openQuestions,
+      decisions: ["A stable replay updates the same workstream."],
+      nextSteps: workstream.nextSteps,
+    });
+    core.close();
+  });
+});
+
+// Cross-tool defense: per-tool fitters should prevent this path, but no successful tool may ever
+// produce the old raw mid-string slice when a future or synthetic payload escapes those fitters.
+describe("payload noise — canonical success serializer", () => {
+  it("keeps an ordinary payload byte-identical to the established pretty-printed JSON", () => {
+    const payload = { status: "ok", items: [1, 2, 3] };
+    const result = ok(payload);
+    expect((result.content[0] as { type: "text"; text: string }).text)
+      .toBe(JSON.stringify(payload, null, 2));
+  });
+
+  it("degrades a synthetic oversized payload to a valid JSON envelope under the ceiling", () => {
+    const result = ok({ payload: "x".repeat(50_000) });
+    const text = (result.content[0] as { type: "text"; text: string }).text;
+    expect(text.length).toBeLessThanOrEqual(40_000);
+    expect(JSON.parse(text)).toEqual({
+      truncated: true,
+      originalChars: 50_019,
+      note: "Result exceeded the host tool-result limit; the original payload was omitted.",
+    });
   });
 });
 
