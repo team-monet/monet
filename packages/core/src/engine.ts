@@ -4195,6 +4195,9 @@ export class MonetCore {
     id: string,
     opts: {
       synthesize?: boolean; observationsOffset?: number; pageSize?: number;
+      /** Native concepts: skip observation content materialization when the caller only needs the
+       *  body and full observation count. Defaults true for existing in-process callers. */
+      includeObservations?: boolean;
       /** File=concept (ratified, Phase 1), Ruling 9: source concepts omit `body` by default (it
        *  can run to the whole file) — pass true to include it. Ignored for native concepts,
        *  which always include body. */
@@ -4268,23 +4271,24 @@ export class MonetCore {
       this.refreshGateSidecar();
     }
 
-    const allObs = this.db
-      .prepare(`SELECT id, content FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
-      .all(id) as Array<{ id: string; content: string }>;
-    const totalObservations = allObs.length;
+    const totalObservations = (this.db
+      .prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = ?`)
+      .get(id) as { n: number }).n;
     // observationsOffset pages newest-first: offset 0 = newest PAGE_SIZE observations,
-    // offset PAGE_SIZE = next-older PAGE_SIZE, etc. Keeps the default page (offset 0)
-    // identical to the pre-pagination behaviour (newest observations visible first).
-    // pageSize=0 means "return all" (used by internal callers that don't page).
+    // offset PAGE_SIZE = next-older PAGE_SIZE, etc. pageSize=0 means "return all" for internal
+    // callers. MCP body-only fetches set includeObservations=false so observation content is not
+    // materialized merely to report the count.
     const observationsOffset = opts.observationsOffset ?? 0;
     const pageSize = opts.pageSize ?? 0;
-    const obs =
-      pageSize > 0
-        ? allObs.slice(
-            Math.max(0, totalObservations - pageSize - observationsOffset),
-            Math.max(0, totalObservations - observationsOffset),
-          )
-        : allObs;
+    const obs = opts.includeObservations === false
+      ? []
+      : pageSize > 0
+        ? (this.db
+            .prepare(`SELECT id, content FROM observations WHERE concept_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`)
+            .all(id, pageSize, observationsOffset) as Array<{ id: string; content: string }>).reverse()
+        : this.db
+            .prepare(`SELECT id, content FROM observations WHERE concept_id = ? ORDER BY created_at, rowid`)
+            .all(id) as Array<{ id: string; content: string }>;
     const revs = this.db.prepare(`SELECT COUNT(*) AS n FROM concept_revisions WHERE concept_id = ?`).get(id) as {
       n: number;
     };

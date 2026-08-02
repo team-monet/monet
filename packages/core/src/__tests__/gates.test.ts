@@ -12074,8 +12074,13 @@ describe("MCP surface", () => {
     );
     // PR #112 round 10: the fetch tool's own contract names the exact resolver call shape — an
     // ambiguous "id" failed memory_resolve's schema before the corrected response note was ever read.
-    expect(tools.find((tool) => tool.name === "memory_fetch")!.description)
-      .toContain("memory_resolve({ contradictionId: openContradictions[i].id })");
+    const fetchDescription = tools.find((tool) => tool.name === "memory_fetch")!.description;
+    expect(fetchDescription).toContain("memory_resolve({ contradictionId: openContradictions[i].id })");
+    expect(fetchDescription).toContain("`body` is the payload");
+    expect(fetchDescription).toContain("observations never ride by default");
+    expect(fetchDescription).toContain("observations:true");
+    expect(fetchDescription).toContain("`needsSynthesis:true`");
+    expect(fetchDescription).toContain("structure-first contract unchanged");
     const principle = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (principle.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
@@ -12142,9 +12147,8 @@ describe("MCP surface", () => {
     expect(fetched.json.status).toBe("disputed");
     expect(fetched.json.openContradictions as unknown[]).toHaveLength(5);
     expect(fetched.json.openContradictionsOmitted).toBe(2);
-    // The note names the EXACT parameter (PR #112 round 8): "id" is ambiguous against the
-    // concept's own, and memory_resolve accepts only contradictionId.
-    expect(fetched.json.contradictionsNote).toContain("contradictionId");
+    // Recovery teaching lives in the tool description; the fetch payload carries only doubt state.
+    expect(fetched.json).not.toHaveProperty("contradictionsNote");
 
     // TIE-BREAK (PR #112 round 8, P3): with every row landing in the same millisecond — rapid
     // corrections or sync — the page must still be one deterministic subset on every replica.

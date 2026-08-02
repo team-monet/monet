@@ -1,8 +1,8 @@
 /**
  * monet-core MCP server — exposes the engine over MCP so a host agent (Stig/claude)
- * drives it live (ADR §4.5/§4.6). The agent is the Synthesizer: on `memory_fetch`, a
- * dirty concept comes back with its raw observations + a synthesis instruction; the
- * agent writes a coherent body and calls `memory_synthesize` to store it.
+ * drives it live (ADR §4.5/§4.6). The agent is the Synthesizer: `memory_fetch` flags
+ * a dirty concept with `needsSynthesis`; the agent explicitly pulls its observations,
+ * writes a coherent body, and calls `memory_synthesize` to store it.
  *
  * This is a NEW contract (concept model, structural cards, no prose summary) — it does
  * not touch the legacy flat @monet/mcp-tools contract.
@@ -1239,14 +1239,15 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_fetch",
-    "Read the full content of a concept by id. If `needsSynthesis` is true, the concept has new raw evidence: read `observations`, write ONE coherent `body` that reconciles them, and call memory_synthesize(id, body). You are the synthesizer. Each entry in `observations` is {id, content}. The id is needed to call memory_detach. A contested concept shows it: `status` (when not active) and `openContradictions` [{id, kind, detail}] — mediate with memory_resolve({ contradictionId: openContradictions[i].id }); this is the recovery step a stage_lookup doubt disclosure (disputedParentIds) points at. Concepts with many observations: page newest→oldest with observationsOffset (0 = newest page, step by 20); totalObservations tells you when you have reached all of them. Source concepts (kind='source', file=concept) are different: they return STRUCTURE, not content, by default — `title`, `sourcePath` + `sourceId` (pass sourceId to the source_path tool for the on-disk location, then grep the path for detail), and an `outline` of every active section (headingPath, occurrence, observationId), never `observations`/needsSynthesis. Pass includeBody:true for the full concatenated file body if you need it read inline instead of via the path.",
+    "Read a concept by id. For normal concepts, `body` is the payload; observations never ride by default. Pass observations:true only when you need the evidence for synthesis or curation; observations are {id, content} and page newest→oldest with observationsOffset (0 = newest page, normally 20 at a time). `observationCount` is the full count. When `observationsOmitted` appears, the requested page was size-fitted; advance observationsOffset by the number of observations actually returned to continue without gaps. `needsSynthesis:true` means new evidence has not been synthesized: explicitly pull every observation page, write one coherent body, then call memory_synthesize(id, body). `bodyTruncated:true` means the body was clipped; use the observations pull to recover the evidence. A disputed concept adds `status` and `openContradictions` [{id, kind, detail}]; mediate with memory_resolve({ contradictionId: openContradictions[i].id }). Source concepts (kind='source', file=concept) keep their structure-first contract unchanged: title, sourcePath + sourceId, and an outline by default, never observations/needsSynthesis; pass includeBody:true to read the concatenated file body inline.",
     {
       id: z.string(),
       circle: z.string().optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
-      observationsOffset: z.number().int().min(0).optional().describe("Page through observations newest-first: skip this many from the newest end before applying the per-page cap (default 20). offset=0 returns the newest page. Increment by 20 each request. Use with totalObservations to know when you've retrieved all pages. Not used for source concepts (they return an outline instead — see includeBody)."),
-      includeBody: z.boolean().optional().describe("Source concepts (kind='source'): include the full concatenated file body. Default false — the response returns structure (title, sourcePath, outline) instead, since a source concept's body can run to the whole file. Normal concepts: the body is included by default; pass false to get the OBSERVATIONS instead of the body. That matters only when the body is long enough to be truncated — the response then carries the body alone, and includeBody:false is how you ask for the evidence instead."),
+      observations: z.boolean().optional().describe("Normal concepts only: include one newest-first page of observations for synthesis or curation. Default false. Source concepts keep their structure-first response and ignore this parameter."),
+      observationsOffset: z.number().int().min(0).optional().describe("When observations:true, skip this many observations from the newest end before applying the 20-entry page cap. Start at 0. Normally increment by 20; if observationsOmitted appears, increment by observations.length instead so size-fitting cannot create gaps. Paging metadata appears only when observations were requested."),
+      includeBody: z.boolean().optional().describe("Source concepts only: include the full concatenated file body. Default false because a source concept's body can span the whole file. Ignored for normal concepts, whose body is always the payload."),
     },
-    async ({ id, circle, observationsOffset, includeBody }) => {
+    async ({ id, circle, observations, observationsOffset, includeBody }) => {
       // memory_fetch is READ-ONLY — the pre-mutation capture rule (Fix B) does not apply here.
       // We defer capturePrewarmSnapshot until after homeCircle is resolved so that an omit-circle
       // call (store-wide lookup) snapshots the concept's actual home circle rather than the
@@ -1265,12 +1266,13 @@ export function registerMonetCoreTools(
         // Snapshot circle: explicit caller circle wins; else use the fetched concept's homeCircle.
         const snapshotCircle = circle !== undefined ? scope(circle) : homeCircle;
         const capturedBlock = capturePrewarmSnapshot(snapshotCircle);
-        // pageSize=FETCH_MAX_OBS: the engine slices exactly one page newest-first from the offset,
-        // so the MCP layer receives at most FETCH_MAX_OBS observations with no secondary cap needed.
+        // Only an explicit observations pull asks the engine to materialize one newest-first page.
+        // A default body read still counts the evidence but does not load any observation content.
         const c = await core.getConcept(id, {
           synthesize: false,
-          observationsOffset: observationsOffset ?? 0,
-          pageSize: FETCH_MAX_OBS,
+          observationsOffset: observations ? observationsOffset ?? 0 : 0,
+          pageSize: observations ? FETCH_MAX_OBS : 0,
+          includeObservations: observations === true,
           includeBody,
           sourceAuthorizationContext,
         });
@@ -1329,41 +1331,31 @@ export function registerMonetCoreTools(
           }, "memory_fetch", capturedBlock);
         }
 
-        const total = c.totalObservations;
-        const offset = c.observationsOffset;
-        // Engine already returned exactly one page; all observations in c.observations are kept.
-        const kept = c.observations;
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
-        // BODY OR OBSERVATIONS — NEVER BOTH ONCE THE BODY NO LONGER FITS.
-        // A clipped body means this concept has already spent the response budget. Appending an
-        // observation page on top spends what is left on newest-first churn (commit hashes, test
-        // counts, transport fixes) while the durable synthesized claim is the part that just got
-        // cut — the high-value half truncated to pay for the low-value half. Measured on a concept
-        // whose body clipped at 191,120 chars: ~200 useful tokens inside ~10K of response.
-        // So the default view serves the BODY, and a caller that wants the evidence instead asks
-        // for it explicitly with includeBody:false.
-        const sendBody = includeBody !== false;
-        const sendObservations = !sendBody || !body.clipped;
-        // A DISPUTED CONCEPT'S FETCH SHOWS ITS DISPUTE (review fix — PR #112 round 3). This is the
-        // advertised recovery surface for the doubt disclosure (disputedParentIds → fetch the
-        // parent), and it previously carried neither the status nor the open contradiction — so a
-        // caller could identify the disputed principle but still not reach the contradiction id
-        // memory_resolve mediates by. Omit-when-absent both ways: an active concept with nothing
-        // open pays zero.
-        // Newest-first, CAPPED IN SQL (review fixes — PR #112 rounds 4 and 9): the cap + 1 probe
-        // bounds what the database materializes (round 9: slicing after an unbounded .all() bounded
-        // the response but not the work), and the exact omitted count is a separate COUNT paid only
-        // when the probe row proved more exist — the stage_lookup rulesTotal shape. Cap-and-
-        // disclose on the wire, same as every other potentially-large field on this server.
-        const openContradictions = core.getOpenContradictionsForConcept(id, FETCH_CONTRADICTIONS_MAX + 1);
+        const observationPage = observations
+          ? c.observations.map((o) => {
+              const content = clip(o.content, FETCH_OBS_MAX_CHARS);
+              return { id: o.id, content: content.text, clipped: content.clipped };
+            })
+          : [];
+        // A disputed concept's fetch is the primary consumption-time doubt channel. Keep its open
+        // contradictions capped in SQL; active concepts do not pay even the query cost.
+        const openContradictions = c.status === "disputed"
+          ? core.getOpenContradictionsForConcept(id, FETCH_CONTRADICTIONS_MAX + 1)
+          : [];
         const shownContradictions = openContradictions.slice(0, FETCH_CONTRADICTIONS_MAX);
-        return readOk({
+        const fixedFields = {
           id: c.id,
-          circle: c.circle, // pass this back to memory_synthesize if it isn't your session default
+          circle: c.circle,
           kind: c.kind,
-          ...(c.status !== "active" ? { status: c.status } : {}),
-          ...(shownContradictions.length > 0
+          body: body.text,
+          observationCount: c.totalObservations,
+          lastConfirmedAt: c.lastConfirmedAt,
+          ...(body.clipped ? { bodyTruncated: true } : {}),
+          ...(c.needsSynthesis ? { needsSynthesis: true } : {}),
+          ...(c.status === "disputed"
             ? {
+                status: c.status,
                 openContradictions: shownContradictions.map((k) => ({
                   id: k.id,
                   kind: k.kind,
@@ -1372,73 +1364,32 @@ export function registerMonetCoreTools(
                 ...(openContradictions.length > shownContradictions.length
                   ? { openContradictionsOmitted: core.countOpenContradictionsForConcept(id) - shownContradictions.length }
                   : {}),
-                // The exact parameter name, because "id" is ambiguous against the concept's own and
-                // memory_resolve accepts only `contradictionId` (review fix — PR #112 round 8).
-                contradictionsNote:
-                  "Open contradictions contest this concept — mediate each with memory_resolve, passing contradictionId: openContradictions[i].id.",
               }
             : {}),
-          ...(sendBody ? { body: body.text, ...(body.clipped ? { bodyTruncated: true } : {}) } : { bodyOmitted: true }),
-          ...(sendObservations
-            ? { observations: kept.map((o) => ({ id: o.id, content: clip(o.content, FETCH_OBS_MAX_CHARS).text })) }
-            : {}),
-          totalObservations: total,
-          observationsOffset: offset,
-          // Note: omitted is always 0 (engine returns exactly one page). Use kept.length vs total
-          // to detect whether more pages exist. Offset here is newest-first (offset 0 = newest page).
-          ...(!sendObservations
-            ? {
-                observationsNote: `Body truncated, so its ${total} observation(s) were withheld — sending both would cut the synthesized body further to pay for newest-first evidence. Re-fetch with includeBody:false to get the observations instead.`,
-              }
-            : kept.length === 0 && offset > 0
-            ? {
-                observationsNote: `No observations at offset ${offset} of ${total}.`,
-              }
-            : offset > 0
-              ? {
-                  observationsNote: `Showing observations ${offset + 1}–${offset + kept.length} of ${total} (newest-first). Page forward: increment offset by ${FETCH_MAX_OBS}.`,
-                }
-              : total > kept.length
-                ? {
-                    observationsNote: `Showing the ${kept.length} newest of ${total} observations. Use observationsOffset to page older ones (step by ${FETCH_MAX_OBS}).`,
-                  }
-                : {}),
-          supportCount: c.supportCount,
-          confidence: c.confidence,
-          version: c.version,
-          lastConfirmedAt: c.lastConfirmedAt,
-          needsSynthesis: c.needsSynthesis,
-          // Synthesis routing. memory_synthesize clears `dirty` with the body the agent writes, so
-          // synthesizing from a partial view would discard unseen observations — hence the
-          // offset=0 AND total-fits-one-page gate. But "no observations in THIS response" has two
-          // very different causes and only one of them is permanent:
-          //   (a) all evidence is here                        → synthesize now
-          //   (b) evidence withheld so the truncated body fit, yet it WOULD all fit in one page
-          //                                                   → say so, and name the one re-fetch
-          //   (c) genuinely more observations than a page     → defer, leave dirty
-          // Case (b) is created by the body-or-observations trim above, and without its own branch
-          // it fell into (c) — whose message both misstates the reason ("more observations than
-          // shown") and says to leave the concept dirty. That permanently strands exactly the
-          // concepts the checkpoint worklist points at: 52 of them in the live store at the time of
-          // this change, every one synthesizable after a single includeBody:false fetch. Deepening
-          // the synthesis debt is the one outcome this whole pass must not produce.
-          ...(c.needsSynthesis && offset === 0 && total <= FETCH_MAX_OBS
-            ? sendObservations
-              ? {
-                  synthesisInstruction:
-                    "This concept has unsynthesized evidence. Read `observations`, write a single coherent `body`, then call memory_synthesize(id, body) — pass this concept's `circle` (above) if it isn't your session default.",
-                }
-              : {
-                  synthesisInstruction:
-                    `This concept has unsynthesized evidence, withheld here so the truncated body could fit. All ${total} observation(s) fit in a single page — re-fetch with includeBody:false to read them, then write a coherent body and call memory_synthesize(id, body), passing this concept's \`circle\` (above) if it isn't your session default. Do NOT synthesize from the body alone.`,
-                }
-            : c.needsSynthesis
-              ? {
-                  synthesisDeferred:
-                    "This concept needs synthesis but has more observations than shown — do NOT call memory_synthesize from this partial view (it would drop the omitted evidence). Leave it dirty.",
-                }
-              : {}),
-        }, "memory_fetch", capturedBlock);
+        };
+        if (!observations) return readOk(fixedFields, "memory_fetch", capturedBlock);
+
+        // ONE BUILDER FOR MEASUREMENT AND RESPONSE: the body and every conditional fixed field stay
+        // in every candidate, so an escaping-heavy evidence page cannot push the completed response
+        // into ok()'s generic replacement envelope. The observations page is the only degrading axis.
+        // The engine page is oldest→newest within the selected newest-first window. Fit a prefix in
+        // newest-first traversal order, then reverse it back for the wire; advancing the offset by
+        // observations.length therefore continues into older evidence without gaps.
+        type WireObservation = { id: string; content: string };
+        const newestFirst: WireObservation[] = observationPage.map(({ id: observationId, content }) => ({
+          id: observationId,
+          content,
+        })).reverse();
+        const pageHasClippedContent = observationPage.some((observation) => observation.clipped);
+        const envelope = (fittedNewestFirst: WireObservation[], omitted: number): Record<string, unknown> => ({
+          ...fixedFields,
+          observations: [...fittedNewestFirst].reverse(),
+          observationsOffset: c.observationsOffset,
+          ...(pageHasClippedContent ? { observationsTruncated: true } : {}),
+          ...(omitted > 0 ? { observationsOmitted: omitted } : {}),
+        });
+        const fit = fitObjectArray(envelope, newestFirst, RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length);
+        return readOk(envelope(fit.fitted, fit.omitted), "memory_fetch", capturedBlock);
       } catch (e) {
         return err(`fetch failed: ${msg(e)}`);
       }

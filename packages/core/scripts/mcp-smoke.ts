@@ -49,8 +49,9 @@ async function main(): Promise<void> {
   console.log(`\nsearch top card → kind=${top.kind} support=${top.supportCount}  "body" in card? ${"body" in top}`);
 
   const fetched = parse(await client.callTool({ name: "memory_fetch", arguments: { id: a.conceptId } }));
-  console.log(`\nfetch → needsSynthesis=${fetched.needsSynthesis}  observations=${(fetched.observations as string[]).length}`);
-  console.log(`  instruction: ${fetched.synthesisInstruction}`);
+  const evidence = parse(await client.callTool({ name: "memory_fetch", arguments: { id: a.conceptId, observations: true } }));
+  console.log(`\nfetch → needsSynthesis=${fetched.needsSynthesis}  observationCount=${fetched.observationCount}`);
+  console.log(`  explicit evidence page → observations=${(evidence.observations as string[]).length}`);
 
   const syn = parse(
     await client.callTool({

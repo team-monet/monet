@@ -709,7 +709,10 @@ describe("authorized source-backed generic retrieval", () => {
       const fetched = await client.callTool({ name: "memory_fetch", arguments: { id: stored.conceptId, circle } }) as { content: Array<{ type: string; text: string }> };
       expect(JSON.parse(fetched.content[0].text)).toMatchObject({
         id: stored.conceptId, title: "README", outline: [expect.objectContaining({ observationId: stored.observationId })],
+        totalObservations: 1, supportCount: 1, confidence: expect.any(Number), version: expect.any(Number),
+        bodyOmitted: true,
       });
+      expect(JSON.parse(fetched.content[0].text)).not.toHaveProperty("needsSynthesis");
       const gathered = await client.callTool({ name: "memory_gather", arguments: { intent: "cobalt", circle } }) as { content: Array<{ type: string; text: string }> };
       expect(JSON.parse(gathered.content[0].text).ranked).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
       const instrumented = core as unknown as { authorizedSourceProjections: (...args: unknown[]) => unknown[] };

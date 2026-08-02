@@ -228,7 +228,7 @@ describe("payload noise — agent_context", () => {
 });
 
 describe("payload noise — memory_fetch body vs observations", () => {
-  it("sends the body OR the observations once the body is truncated, never both", async () => {
+  it("keeps observations absent by default even when the body is truncated", async () => {
     const core = newCore();
     const evidence = "Rollback drill on 2026-03-02 took forty-one minutes end to end.";
     const stored = await core.store(evidence, { circle });
@@ -241,54 +241,26 @@ describe("payload noise — memory_fetch body vs observations", () => {
       return {
         byDefault: parse(await c.callTool({ name: "memory_fetch", arguments: { id: stored.conceptId, circle } })),
         evidenceView: parse(
-          await c.callTool({ name: "memory_fetch", arguments: { id: stored.conceptId, circle, includeBody: false } }),
+          await c.callTool({ name: "memory_fetch", arguments: { id: stored.conceptId, circle, observations: true } }),
         ),
       };
     });
 
-    // Default view: the durable claim, and nothing else.
     expect(byDefault.bodyTruncated).toBe(true);
     expect(byDefault.body).toBeTruthy();
     expect(byDefault).not.toHaveProperty("observations");
-    expect(byDefault.totalObservations).toBeGreaterThan(0);
-    expect(byDefault.observationsNote).toMatch(/includeBody:false/);
+    expect(byDefault).not.toHaveProperty("observationsOffset");
     expect(JSON.stringify(byDefault)).not.toContain(evidence);
 
-    // Opt-in view: the evidence, and not the body it would have displaced.
-    expect(evidenceView.bodyOmitted).toBe(true);
-    expect(evidenceView).not.toHaveProperty("body");
-    expect(evidenceView.observations.length).toBeGreaterThan(0);
+    expect(evidenceView.bodyTruncated).toBe(true);
+    expect(evidenceView.body).toBeTruthy();
+    expect(evidenceView.observations).toHaveLength(1);
+    expect(evidenceView.observationsOffset).toBe(0);
     expect(JSON.stringify(evidenceView)).toContain(evidence);
     core.close();
   });
 
-  it("keeps a clipped-body dirty concept synthesizable instead of stranding it (Codex P2)", async () => {
-    // The trim withholds observations when the body is clipped. For a DIRTY concept whose evidence
-    // would nonetheless fit one page, the response must still route to synthesis — naming the one
-    // re-fetch that exposes it — rather than to the permanent "leave it dirty" defer. Getting this
-    // wrong makes the checkpoint worklist unworkable and deepens the synthesis debt.
-    const core = newCore();
-    const stored = await core.store("Blue-green cutover needs the drain step before the flip.", { circle });
-    // A long body that is ALSO still dirty: synthesize, then attach new evidence.
-    const longBody = "Durable synthesized claim. ".repeat(400);
-    await core.applySynthesis(stored.conceptId, longBody);
-    await core.store("Follow-up: the drain step timed out once at 90s.", { circle, attachTo: stored.conceptId });
-
-    const fetched = await withServer(core, (c) =>
-      c.callTool({ name: "memory_fetch", arguments: { id: stored.conceptId, circle } }).then(parse),
-    );
-
-    expect(fetched.needsSynthesis).toBe(true);
-    expect(fetched.bodyTruncated).toBe(true);
-    expect(fetched).not.toHaveProperty("observations");
-    expect(fetched.totalObservations).toBeLessThanOrEqual(20);
-    // Actionable, not abandoned.
-    expect(fetched).not.toHaveProperty("synthesisDeferred");
-    expect(fetched.synthesisInstruction).toMatch(/includeBody:false/);
-    core.close();
-  });
-
-  it("still sends both when the body fits — the trim is triggered by truncation, not by default", async () => {
+  it("keeps observations absent by default when the body fits", async () => {
     const core = newCore();
     const stored = await core.store("Feature flags are evaluated once per request.", { circle });
 
@@ -299,7 +271,8 @@ describe("payload noise — memory_fetch body vs observations", () => {
 
     expect(fetched).not.toHaveProperty("bodyTruncated");
     expect(fetched.body).toBe("Short durable claim.");
-    expect(fetched.observations.length).toBeGreaterThan(0);
+    expect(fetched).not.toHaveProperty("observations");
+    expect(fetched).not.toHaveProperty("observationsOffset");
     core.close();
   });
 });
