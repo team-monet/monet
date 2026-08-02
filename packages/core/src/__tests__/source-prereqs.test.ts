@@ -567,7 +567,6 @@ describe("source-pipeline core prerequisites", () => {
       expect(core.edges({ circle: "default" }).some((edge) => edge.srcId === referrer.conceptId || edge.dstId === referrer.conceptId)).toBe(false);
       expect(core.topConnectedConcepts().map((concept) => concept.id)).not.toContain(referrer.conceptId);
       expect(core.topThread()?.members.map((concept) => concept.id) ?? []).not.toContain(referrer.conceptId);
-      expect(core.overview().graph.connected.map((concept) => concept.id)).not.toContain(referrer.conceptId);
 
       const retired = await core.store("Retired mutable source.", { resolution: "forceNew" });
       core.retireConcept(retired.conceptId);

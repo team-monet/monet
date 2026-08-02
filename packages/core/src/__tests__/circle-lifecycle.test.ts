@@ -370,8 +370,7 @@ describe("archiveCircle / unarchiveCircle", () => {
     await core.store("Fact in archived.", { circle: "archived-side" });
     core.archiveCircle("archived-side");
 
-    const ov = core.overview("main");
-    const otherNames = (ov.otherCircles ?? []).map((c) => c.circle);
+    const otherNames = core.listCircles("main").map((c) => c.circle);
     expect(otherNames).not.toContain("archived-side");
 
     core.close();

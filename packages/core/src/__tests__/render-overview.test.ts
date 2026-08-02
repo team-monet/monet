@@ -48,39 +48,23 @@ describe("renderOverview", () => {
     c.close();
   });
 
-  it("renders the knowledge-graph box + worked-together footer when the graph has substance", async () => {
-    const c = populated();
-    await c.store("AuthService validates requests in src/auth/service.ts.", { kind: "fact" });
-    await c.store("AuthService rotates jose keys in src/auth/service.ts.", { kind: "decision" });
-    const out = renderOverview(c.overview("default"));
-    expect(out).toContain("LIVING MODEL");
-    expect(out).toContain("KNOWLEDGE GRAPH");
-    expect(out).toContain("worked together");
-    c.close();
-  });
-
   it("omits empty sections and renders an empty store without throwing or leaking a body", async () => {
     const c = populated();
     const out = renderOverview(c.overview("default"));
-    expect(out).toContain("what your agent knows");
-    expect(out).not.toContain("LIVING MODEL"); // nothing stored ⇒ section omitted
-    expect(out).not.toContain("KNOWLEDGE GRAPH");
-    expect(out).not.toContain("NEEDS ATTENTION");
-    expect(out).not.toContain("RESOLUTION"); // no decided writes ⇒ a row of zeros, omitted
+    expect(out).toContain("curation workbench");
+    expect(out).not.toContain("LIVING MODEL");
+    expect(out).not.toContain("OPEN CONTRADICTIONS");
+    expect(out).toContain("no curation work queued");
     c.close();
   });
 
-  it("RESOLUTION section reports the decided modes and the duplicate-emission rate", async () => {
-    // The design's empirical check is "visible in curation", and THIS is the human curation
-    // surface — a field on the MCP JSON response does not discharge it.
+  it("renders legacy-star migration debt instead of claiming the workbench is empty", async () => {
     const c = populated();
-    await c.store("AuthService validates requests in src/auth/service.ts.", { kind: "fact" });
-    await c.store("Deploys are gated on a green canary.", { kind: "decision" });
-    const out = renderOverview(c.overview("default"));
-    expect(out).toContain("RESOLUTION");
-    expect(out).toContain("how new evidence landed, last 30d");
-    expect(out).toContain("new 2");
-    expect(out).toContain("2 decided · 0% surfaced a possible duplicate");
+    await c.store("Migrated memory awaiting filing.", { circle: "legacy-star", resolution: "forceNew" });
+    const out = renderOverview(c.overview("ordinary"), { color: false });
+    expect(out).toContain("LEGACY-STAR FILING");
+    expect(out).toContain("1 migrated memories still need a human filing decision");
+    expect(out).not.toContain("no curation work queued");
     c.close();
   });
 
@@ -106,34 +90,7 @@ describe("renderOverview", () => {
     expect(out).toContain(`[${shortA}]`);
     expect(out).toContain(`[${shortB}]`);
 
-    // The row must also still contain the score.
-    expect(out).toContain("score:");
-    c.close();
-  });
-
-  it("GATES section surfaces recognized-lookup activity even with zero mechanical fires IN THE WINDOW (review fix, item 4)", async () => {
-    const c = populated();
-    const longAgo = Date.now() - 40 * 24 * 60 * 60 * 1000; // outside the default 30-day stats window
-    await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "domain" },
-    });
-    // A mechanical fire OUTSIDE the stats window: verifies the pattern PERMANENTLY (verified is not
-    // time-windowed) without contributing to windowTotal (which is), isolating "recognized activity
-    // in the window" as the only thing this store has to report — proving the suppression condition
-    // needed widening, not just that the new line can render alongside other reasons to show GATES.
-    c.gate({ actionContext: "Bash:git push --force", now: longAgo });
-    c.stageLookup({ stage: "git force push" });
-    c.stageLookup({ stage: "git force push" });
-    c.stageLookup({ stage: "no such stage" });
-
-    const gs = c.gateStats();
-    expect(gs.windowTotal).toBe(0); // the old mechanical fire falls outside the window
-    expect(gs.unverifiedPatterns).toEqual([]); // ...but it verified the pattern permanently
-    expect(gs.byMatcher.find((m) => m.matcher === "recognized")?.count).toBe(3);
-
-    const out = renderOverview(c.overview("default"), { color: false });
-    expect(out).toContain("GATES");
-    expect(out).toContain("3 asked by recognition (stage_lookup)");
+    expect(out).toContain(pd.score.toFixed(3));
     c.close();
   });
 

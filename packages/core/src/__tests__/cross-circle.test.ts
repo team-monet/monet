@@ -12,12 +12,10 @@
  *   (e) fetch without circle → resolves a foreign-circle id and reports its home circle
  *   (f) fetch with WRONG explicit circle → still errors
  *   (g) listCircles — counts + exclusion
- *   (h) overview.otherCircles present/correct; ABSENT when store has one circle
- *   (render) otherCircles section renders in renderOverview
+ *   (h) overview excludes circle inventory; listCircles remains the dedicated surface
  */
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
-import { renderOverview } from "../render-overview";
 
 // ---- helpers -----------------------------------------------------------------
 
@@ -306,63 +304,18 @@ describe("listCircles", () => {
   });
 });
 
-// ---- (h) overview.otherCircles present/correct; absent when one circle -------
+// ---- (h) overview leaves circle inventory to listCircles --------------------
 
-describe("overview — otherCircles", () => {
-  it("(h) present and correct when store has multiple circles", async () => {
+describe("overview — circle inventory separation", () => {
+  it("omits otherCircles while listCircles remains complete", async () => {
     const core = new MonetCore(":memory:", { idGen: seq("h"), defaultCircle: "main" });
     await core.store("Main circle concept.", { circle: "main" });
     await core.store("Side circle concept.", { circle: "side" });
 
-    const o = core.overview("main");
-    expect(o.otherCircles).toBeDefined();
-    expect(o.otherCircles!.length).toBeGreaterThan(0);
-    const sideEntry = o.otherCircles!.find((c) => c.circle === "side")!;
-    expect(sideEntry.concepts).toBe(1);
-    expect(sideEntry.lastActivity).toBeGreaterThan(0);
-    // The overview's own circle is excluded
-    expect(o.otherCircles!.map((c) => c.circle)).not.toContain("main");
-
-    core.close();
-  });
-
-  it("(h) absent when store has only one circle", async () => {
-    const core = new MonetCore(":memory:", { idGen: seq("h1"), defaultCircle: "only" });
-    await core.store("Only circle.", { circle: "only" });
-
-    const o = core.overview("only");
-    expect(o.otherCircles).toBeUndefined();
-
-    core.close();
-  });
-});
-
-// ---- (render) otherCircles section renders ----------------------------------
-
-describe("renderOverview — OTHER ROOMS section", () => {
-  it("renders OTHER ROOMS when otherCircles is present", async () => {
-    const core = new MonetCore(":memory:", { idGen: seq("r"), defaultCircle: "main" });
-    await core.store("Main project concept.", { circle: "main" });
-    await core.store("Side project concept.", { circle: "side" });
-
-    const o = core.overview("main");
-    expect(o.otherCircles).toBeDefined();
-
-    const out = renderOverview(o, { color: false });
-    expect(out).toContain("OTHER ROOMS");
-    expect(out).toContain("side");
-
-    core.close();
-  });
-
-  it("omits OTHER ROOMS when store has only one circle", async () => {
-    const core = new MonetCore(":memory:", { idGen: seq("r1"), defaultCircle: "only" });
-    await core.store("Only circle concept.", { circle: "only" });
-
-    const o = core.overview("only");
-    const out = renderOverview(o, { color: false });
-    expect(out).not.toContain("OTHER ROOMS");
-
+    expect(core.overview("main")).not.toHaveProperty("otherCircles");
+    expect(core.listCircles("main")).toEqual([
+      expect.objectContaining({ circle: "side", concepts: 1 }),
+    ]);
     core.close();
   });
 });

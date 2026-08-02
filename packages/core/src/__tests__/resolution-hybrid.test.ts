@@ -716,7 +716,7 @@ describe("resolution — the instrumentation log", () => {
       await core.store("the ferry to the island leaves at quarter past every hour", { circle: CIRCLE }); // new
       await core.store("a memory in another circle entirely", { circle: "elsewhere" });
 
-      const stats = core.overview(CIRCLE).resolutionStats;
+      const stats = core.resolutionStats(CIRCLE);
       expect(stats.windowDays).toBe(30);
       expect(Object.fromEntries(stats.byMode.map((m) => [m.mode, m.count]))).toEqual({
         "force-new": 1, "direct-attach": 5, "fork-signal": 1, new: 1,
@@ -728,7 +728,7 @@ describe("resolution — the instrumentation log", () => {
       expect(stats.decidedTotal).toBe(2);
       expect(stats.total).toBe(8); // the other circle's write is not counted here
       expect(stats.byMode.map((m) => m.count)).toEqual([...stats.byMode.map((m) => m.count)].sort((a, b) => b - a));
-      expect(core.overview("elsewhere").resolutionStats.total).toBe(1);
+      expect(core.resolutionStats("elsewhere").total).toBe(1);
       expect(bimodal).toBeDefined();
     } finally {
       core.close();

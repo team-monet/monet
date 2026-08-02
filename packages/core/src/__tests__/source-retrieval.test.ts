@@ -651,6 +651,26 @@ describe("authorized source-backed generic retrieval", () => {
     expect(core.overview(circle, { sourceAuthorizationContext: auth }).counts.stale).toBe(2);
   });
 
+  it("counts observations only for the retained stale-source page", async () => {
+    const core = makeCore();
+    const sourceCount = 205;
+    for (let index = 0; index < sourceCount; index++) {
+      const sourceId = `stale-source-${index}`;
+      core.createSource(sourceInput(sourceId));
+      await publish(core, sourceId, `stale source content ${index}`);
+    }
+    rawDb(core).prepare(`UPDATE concepts SET last_confirmed_at=1 WHERE circle=?`).run(circle);
+
+    let countCalls = 0;
+    const cards = core.listStale(circle, 20, auth, (conceptId) => {
+      countCalls++;
+      return core.countObservationsForConcept(conceptId);
+    });
+    expect(cards).toHaveLength(20);
+    expect(cards.map((card) => card.id)).toEqual([...cards.map((card) => card.id)].sort());
+    expect(countCalls).toBeLessThanOrEqual(20);
+  }, 30_000);
+
   it("reports exact stale counts and paginates mixed native/source rows", async () => {
     const core = makeCore();
     for (let index = 0; index < 25; index++) {

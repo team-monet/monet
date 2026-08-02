@@ -13,7 +13,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore } from "./engine";
-import type { MergeConceptResult, SearchCard } from "./engine";
+import type { MemoryOverview, MergeConceptResult, SearchCard } from "./engine";
 import {
   BREADTH_CIRCLE,
   MODEL_TAG_MAX_CHARS,
@@ -224,6 +224,72 @@ function fitObjectArray<T>(
     fitted = candidate;
   }
   return { fitted, omitted: items.length - fitted.length };
+}
+
+/** Fit memory_overview as one envelope, degrading only the ratified low-priority worklists. */
+export function fitOverviewEnvelope(overview: MemoryOverview & { resolvedFrom?: string }): Record<string, unknown> {
+  const result = structuredClone(overview) as MemoryOverview & { resolvedFrom?: string };
+  const fits = (): boolean => JSON.stringify(result, null, 2).length <= RESULT_MAX_CHARS;
+  if (fits()) return { ...result };
+
+  const removeOptInList = (key: "dirty" | "stale", truncatedKey: "dirtyTruncated" | "staleTruncated", omittedKey: "dirtyOmitted" | "staleOmitted", total: number): void => {
+    const shown = result[key]?.length ?? 0;
+    if (shown === 0) return;
+    delete result[key];
+    result[truncatedKey] = true;
+    result[omittedKey] = Math.max(total, (result[omittedKey] ?? 0) + shown);
+  };
+  removeOptInList("dirty", "dirtyTruncated", "dirtyOmitted", result.counts.dirty);
+  removeOptInList("stale", "staleTruncated", "staleOmitted", result.counts.stale);
+  if (fits()) return { ...result };
+
+  result.possibleDuplicates = [];
+  if (fits()) return { ...result };
+  result.livingModel = [];
+  if (fits()) return { ...result };
+
+  if (result.openContradictions.length > 0) {
+    result.openContradictionsOmitted = (result.openContradictionsOmitted ?? 0) + result.openContradictions.length;
+    result.openContradictions = [];
+  }
+  if (fits()) return { ...result };
+
+  if (result.gateStats.retirementCandidates?.length) {
+    result.gateStats.retirementCandidatesOmitted =
+      (result.gateStats.retirementCandidatesOmitted ?? 0) + result.gateStats.retirementCandidates.length;
+    delete result.gateStats.retirementCandidates;
+  }
+  if (result.gateStats.unexplainedDenies?.length) {
+    result.gateStats.unexplainedDeniesOmitted =
+      (result.gateStats.unexplainedDeniesOmitted ?? 0) + result.gateStats.unexplainedDenies.length;
+    delete result.gateStats.unexplainedDenies;
+  }
+  if (fits()) return { ...result };
+
+  // FINAL RUNG: skeleton identity and membership always survive. Only its user-authored resident
+  // name (`content`) may shrink, and the complete envelope is measured after every shrink. The
+  // metadata is fixed-size; empty content is therefore the constructive proof that this loop ends
+  // below the ceiling for the source-capped envelope rather than falling through to ok()'s fallback.
+  if (result.skeleton.length > 0) {
+    const original = result.skeleton.map((member) => member.content);
+    let contentLimit = Math.max(...original.map((content) => content.length));
+    while (!fits() && contentLimit > 0) {
+      contentLimit = Math.floor(contentLimit / 2);
+      result.skeleton = result.skeleton.map((member, index) => ({
+        ...member,
+        content: original[index]!.length > contentLimit
+          ? `${original[index]!.slice(0, Math.max(0, contentLimit - 1))}…`
+          : original[index]!,
+      }));
+      result.skeletonClipped = true;
+    }
+    if (!fits()) {
+      result.skeleton = result.skeleton.map((member) => ({ ...member, content: "" }));
+      result.skeletonClipped = true;
+    }
+  }
+  if (fits()) return { ...result };
+  throw new Error("memory_overview fixed fields exceeded the tool-result limit");
 }
 
 // ok() is the canonical serializer for successful tool results. content[0] is ALWAYS the
@@ -1112,14 +1178,25 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_overview",
-    'A glanceable, read-only snapshot of everything stored for a circle — counts (incl. dirty/disputed/stale/possibleDuplicates/skeleton), the living model (top concepts), where you left off (active threads), open contradictions, the always-on skeleton, and the connection-graph shape (entity hubs, most-connected memories, edge-type histogram). Open possible-duplicate pairs (concepts that nearly matched at store time and were forked instead of merged) are surfaced in \'possibleDuplicates\' — the list shows the top 10 pairs by score; counts.possibleDuplicates has the full total. Review with memory_fetch (using the conceptAId / conceptBId shown), then use memory_detach with destConceptId to consolidate if they are the same concept. Open extraction-candidate pairs — two RULES bound to DIFFERENT stages that near-matched at rule birth, i.e. a pair that may share one reason worth extracting into a principle — are surfaced the same way in \'extractionCandidates\' (counts.extractionCandidates has the full total); that is a different question from duplication ("do these share a reason?" rather than "are these one thing?"), so it gets its own list, and the answer to it is a conversation ending in memory_ratify, not a merge. Either kind of pair is retired with memory_resolve (conceptAId + conceptBId) — one dismissal clears every flag between the two. \'skeleton\' lists the circle\'s currently-ratified principles/preferences (compact entries, capped; counts.skeleton has the full total) — membership is always derived from each concept\'s latest ratification, so this list is live, not a cached flag. \'resolutionStats\' reports how store-time resolution has been deciding lately (counts by mode over the last 30 days, plus decidedTotal — the count of writes that actually ran the rule, excluding caller-directed attachTo/forceNew): divide by decidedTotal for a rate, and watch fork-signal (concepts going bimodal) and blur-duplicate (centroids drifting off their own evidence) as the health signals behind the duplicate pairs above. Use to answer "what do you actually know about this?" or to report memory health. Read-only — never mutates, never returns memory bodies; fetch by id to read one. Pass `entity` to list the memories tied to one hub. otherCircles lists other circles in the store (name + concept count + last activity).',
-    { circle: z.string().optional(), entity: z.string().optional() },
-    async ({ circle, entity }) => {
+    "Curation workbench for one circle: compact counts plus bounded actionable queues for possibleDuplicates, extractionCandidates, openContradictions, gate exceptions, and the ratified skeleton. The livingModel shows the top 5 current concepts by default. Pass includeDirty:true for the highest-evidence pending-synthesis cards; pass includeStale:true for the stalest re-confirmation cards. Both lists are capped and carry honest omission signals. Read-only; never returns memory bodies. Fetch an id to inspect evidence, resolve contradictions/pair flags with memory_resolve, and consolidate a true duplicate with memory_detach(destConceptId). Pass entity to list memories tied to one hub.",
+    {
+      circle: z.string().optional(),
+      entity: z.string().optional(),
+      conceptLimit: z.number().int().min(0).optional().describe("Override the living-model card limit (default 5)."),
+      includeDirty: z.boolean().optional().describe("Include the capped pending-synthesis worklist; absent by default."),
+      includeStale: z.boolean().optional().describe("Include the capped re-confirmation worklist; absent by default."),
+    },
+    async ({ circle, entity, conceptLimit, includeDirty, includeStale }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         if (entity) return readOk({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) }, "memory_overview", capturedBlock);
-        const ov = core.overview(scope(circle), { sourceAuthorizationContext });
-        return readOk({ ...ov, ...(ov.resolvedFrom !== undefined ? { resolvedFrom: ov.resolvedFrom } : {}) }, "memory_overview", capturedBlock);
+        const ov = core.overview(scope(circle), {
+          sourceAuthorizationContext,
+          conceptLimit,
+          includeDirty,
+          includeStale,
+        });
+        return readOk(fitOverviewEnvelope(ov), "memory_overview", capturedBlock);
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
       }

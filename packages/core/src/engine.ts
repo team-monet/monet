@@ -222,6 +222,12 @@ const RRF_K = 60; // RRF constant for seed fusion
 // total of 255, and none of them were used. The count keeps "how much provenance exists" — the
 // only part the ranking view ever needed — at a fixed cost per card.
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
+/** Pair/contradiction/gate-exception queues stay top-10; counts or omission fields carry true totals. */
+export const OVERVIEW_EXCEPTION_LIMIT = 10;
+/** Opt-in dirty/stale enumeration reuses the existing checkpoint-scale worklist bound. */
+export const OVERVIEW_ENUMERATION_LIMIT = 20;
+/** Contradiction detail is user-authored and unbounded at rest; overview carries only enough to identify the conflict. */
+export const OVERVIEW_CONTRADICTION_DETAIL_MAX_CHARS = 200;
 /**
  * The live different-stage test for an extraction-candidate pair (review fix — Codex 5-B round 2,
  * R2-4). Shared verbatim by the list and the count so a human can never read a total that disagrees
@@ -1544,15 +1550,17 @@ export interface ResolutionStats {
   total: number;
 }
 
-/**
- * A glanceable, read-only snapshot of everything stored for a circle (the "what your agent
- * knows" view). Composes the living model, threads, contradictions, scoped counts, and
- * the connection-graph shape. Carries identity/shape only — never concept bodies (§4.5).
- */
+/** One identity-and-size card in an opt-in overview curation queue. */
+export interface OverviewWorklistCard {
+  id: string;
+  slug: string;
+  kind: string;
+  observationCount: number;
+}
+
+/** The actionable curation workbench for one circle. Identity and shape only — never concept bodies. */
 export interface MemoryOverview {
   circle: string;
-  agentId: string;
-  generatedAt: number;
   counts: {
     concepts: number;
     observations: number;
@@ -1571,21 +1579,24 @@ export interface MemoryOverview {
      *  for the (capped) list itself, same possibleDuplicates/counts.possibleDuplicates convention. */
     skeleton: number;
   };
-  health: { avgConfidence: number; graphDensity: number };
-  /** How store-time resolution has been deciding in this circle — the design's own empirical check. */
-  resolutionStats: ResolutionStats;
-  /** How the gates have been firing — fire precision, silence rate, and the dead-pattern watchlist. */
-  gateStats: GateStats;
+  /** Aggregate gate activity plus actionable exceptions only. Empty exception lists are omitted. */
+  gateStats: Pick<GateStats, "fires" | "silences" | "overflows" | "delivered" | "windowDays" | "windowTotal" | "total"> & {
+    retirementCandidates?: GateStats["retirementCandidates"];
+    retirementCandidatesOmitted?: number;
+    unexplainedDenies?: GateStats["unexplainedDenies"];
+    unexplainedDeniesOmitted?: number;
+  };
   livingModel: LivingModelCard[];
-  activeThreads: Array<{
-    id: string;
-    title: string;
-    status: string;
-    openQuestions: string[];
-    nextSteps: string[];
-    decisions: string[];
-  }>;
   openContradictions: PrewarmContradiction[];
+  openContradictionsOmitted?: number;
+  /** Opt-in synthesis worklist; absent unless overview() receives includeDirty. */
+  dirty?: OverviewWorklistCard[];
+  dirtyTruncated?: true;
+  dirtyOmitted?: number;
+  /** Opt-in re-confirmation worklist; absent unless overview() receives includeStale. */
+  stale?: OverviewWorklistCard[];
+  staleTruncated?: true;
+  staleOmitted?: number;
   possibleDuplicates: PossibleDuplicatePair[];
   /**
    * EXTRACTION CANDIDATES (slice 5-B) — pairs of rules from DIFFERENT stages that near-matched at
@@ -1600,23 +1611,15 @@ export interface MemoryOverview {
   /** Skeleton membership (principles + preferences) for this circle — capped; `counts.skeleton`
    *  carries the true total the same way `counts.possibleDuplicates` does for its own list. */
   skeleton: SkeletonEntry[];
-  graph: {
-    hubs: EntityHub[];
-    connected: ConnectedConcept[];
-    edgesByType: Array<{ type: string; count: number }>;
-    thread: { label: string; size: number; members: Array<{ id: string; title: string; kind: string }> } | null;
-  };
-  /** Other circles present in the store (name + concept count + last activity). Omitted when the store has only one circle. */
-  otherCircles?: Array<{ circle: string; concepts: number; lastActivity: number }>;
+  /** One or more skeleton `content` strings were clipped solely to fit the MCP envelope. */
+  skeletonClipped?: true;
   /**
-   * Store-wide, not scoped to the queried circle — matching `otherCircles`' own convention of
-   * surfacing whole-store facts through every circle's overview. Omitted when zero, present while
+   * Store-wide, not scoped to the queried circle. Omitted when zero, present while
    * any concept lives in `LEGACY_STAR_CIRCLE` OR a numbered variant of it (Codex round 1, item 4's
    * migration target; round 2, item 3 added the numbered-variant probe): a durable "this needs a
    * human decision eventually" signal, unlike the one-time `console.error` at open, which is easy to
-   * miss on a headless server and impossible to see again afterward. `otherCircles` alone would ALSO
-   * list these circles once they hold concepts, but indistinguishably from any circle a user named
-   * on purpose — this field is what says "some of these arrived here by migration, not by choice."
+   * miss on a headless server and impossible to see again afterward. This field says that content
+   * arrived by migration rather than by an ordinary user-chosen circle name.
    *
    * COUNTS THE WHOLE FAMILY, NOT PROVABLY-MIGRATED CONTENT ONLY — the smallest honest shape, not a
    * precise audit trail (round 2, item 3's own tradeoff): if a user's OWN circle happens to already
@@ -4912,17 +4915,36 @@ export class MonetCore {
     return result;
   }
 
-  /** Open contradictions in a circle, joined with concept titles (prewarm + listing). */
-  getOpenContradictions(circle?: string): PrewarmContradiction[] {
+  /** Open contradictions in a circle, joined with concept titles (overview listing). */
+  getOpenContradictions(circle?: string, limit?: number): PrewarmContradiction[] {
     circle ??= this.defaultCircle;
-    return this.db
+    const boundedLimit = limit === undefined ? undefined : Math.max(0, Math.floor(limit));
+    const rows = this.db
       .prepare(
         `SELECT k.id AS id, k.concept_id AS conceptId, c.title AS conceptTitle, k.kind AS kind, k.detail AS detail
            FROM contradictions k JOIN concepts c ON c.id = k.concept_id
           WHERE k.status = 'open' AND c.circle = ? AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL
-          ORDER BY k.detected_at DESC, k.id DESC`,
+          ORDER BY k.detected_at ASC, k.id ASC
+          ${boundedLimit !== undefined ? "LIMIT ?" : ""}`,
       )
-      .all(circle) as PrewarmContradiction[];
+      .all(...(boundedLimit !== undefined ? [circle, boundedLimit] : [circle])) as PrewarmContradiction[];
+    if (boundedLimit === undefined) return rows;
+    return rows.map((row) => ({
+      ...row,
+      detail: row.detail.length > OVERVIEW_CONTRADICTION_DETAIL_MAX_CHARS
+        ? `${row.detail.slice(0, OVERVIEW_CONTRADICTION_DETAIL_MAX_CHARS)}…[truncated]`
+        : row.detail,
+    }));
+  }
+
+  /** True open-contradiction total for a circle; independent of overview's capped worklist. */
+  countOpenContradictions(circle?: string): number {
+    circle ??= this.defaultCircle;
+    return this.scopedCount(
+      `SELECT COUNT(*) AS n FROM contradictions k JOIN concepts c ON c.id = k.concept_id
+        WHERE k.status = 'open' AND c.circle = ? AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL`,
+      circle,
+    );
   }
 
   /**
@@ -4978,6 +5000,41 @@ export class MonetCore {
       .prepare(`SELECT * FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status = 'active'`)
       .all(circle) as ConceptRow[];
     return rows.filter((r) => now - (r.last_confirmed_at ?? r.updated_at) > this.staleAfterMs).map(livingModelCard);
+  }
+
+  /** Stale curation worklist, stalest evidence first; identity/size only and SQL-bounded. */
+  listStale(
+    circle?: string,
+    limit = OVERVIEW_ENUMERATION_LIMIT,
+    sourceAuthorizationContext?: Readonly<SourceAuthorizationContext>,
+    countObservations: (conceptId: string) => number = (conceptId) => this.countObservationsForConcept(conceptId),
+  ): OverviewWorklistCard[] {
+    circle = this.resolveCircle(circle ?? this.defaultCircle);
+    const staleBefore = Date.now() - this.staleAfterMs;
+    const boundedLimit = Math.max(0, Math.floor(limit));
+    const native = this.db.prepare(`
+      SELECT c.id, c.slug, c.kind,
+             COALESCE(c.last_confirmed_at,c.updated_at) AS staleAt
+        FROM concepts c
+       WHERE c.circle = ? AND c.kind NOT IN ('workstream','source')
+         AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND c.status = 'active'
+         AND COALESCE(c.last_confirmed_at,c.updated_at) < ?
+       ORDER BY staleAt ASC, c.id ASC
+       LIMIT ?
+    `).all(circle, staleBefore, boundedLimit) as Array<Omit<OverviewWorklistCard, "observationCount"> & { staleAt: number }>;
+    const source = this.authorizedStaleSourceWorklist(
+      sourceAuthorizationContext,
+      circle,
+      staleBefore,
+      boundedLimit,
+    );
+    return native.concat(source)
+      .sort((a, b) => a.staleAt - b.staleAt || a.id.localeCompare(b.id))
+      .slice(0, boundedLimit)
+      .map(({ staleAt: _staleAt, ...card }) => ({
+        ...card,
+        observationCount: countObservations(card.id),
+      }));
   }
 
   /**
@@ -5886,7 +5943,7 @@ export class MonetCore {
   listDirty(
     circle?: string,
     limit = CHECKPOINT_DIRTY_WORKLIST_LIMIT,
-  ): Array<{ id: string; slug: string; title: string; kind: string; observationCount: number }> {
+  ): Array<OverviewWorklistCard & { title: string }> {
     circle = this.resolveCircle(circle ?? this.defaultCircle);
     const boundedLimit = Math.max(0, Math.floor(limit));
     // status != 'retired' (not the implicit retired⟹dirty=0 invariant): retireConcept no longer zeros
@@ -6941,7 +6998,10 @@ export class MonetCore {
   }
 
   /** The single largest "worked together" cluster (co_occurred connected component), or null. */
-  topThread(circle?: string, minSize = 2): MemoryOverview["graph"]["thread"] {
+  topThread(
+    circle?: string,
+    minSize = 2,
+  ): { label: string; size: number; members: Array<{ id: string; title: string; kind: string }> } | null {
     circle ??= this.defaultCircle;
     const edges = this.edges({ circle, type: "co_occurred" });
     if (edges.length === 0) return null;
@@ -7201,13 +7261,12 @@ export class MonetCore {
   }
 
   /**
-   * The "what your agent knows" snapshot (ADR §4.7 read surface). READ-ONLY: opens no session,
-   * triggers no synthesis, never returns bodies. Composes ranked knowledge, session threads,
-   * contradictions, scoped counts, and graph shape.
+   * The circle's curation workbench. READ-ONLY: opens no session, triggers no synthesis, never
+   * returns bodies. Fixed counts anchor bounded actionable queues and the compact living model.
    */
   overview(
     circle?: string,
-    opts: { conceptLimit?: number; hubLimit?: number; connectedLimit?: number } & SourceAwareReadOptions = {},
+    opts: { conceptLimit?: number; includeDirty?: boolean; includeStale?: boolean } & SourceAwareReadOptions = {},
   ): MemoryOverview & { resolvedFrom?: string } {
     const rawCircle = circle ?? this.defaultCircle;
     circle = this.resolveCircle(rawCircle);
@@ -7222,17 +7281,10 @@ export class MonetCore {
       .filter((row) => now - (row.last_confirmed_at ?? row.updated_at) <= this.staleAfterMs)
       .map((row) => ({ row, score: livingModelScore(row, now) }))
       .sort((a, b) => b.score !== a.score ? b.score - a.score : (a.row.id < b.row.id ? -1 : 1))
-      .slice(0, opts.conceptLimit ?? 6)
+      .slice(0, opts.conceptLimit ?? 5)
       .map(({ row }) => livingModelCard(row));
-    const activeThreads = this.getActiveWorkstreams(circle).map((workstream) => ({
-      id: workstream.id,
-      title: workstream.title,
-      status: workstream.payload.status,
-      openQuestions: workstream.payload.openQuestions ?? [],
-      nextSteps: workstream.payload.nextSteps ?? [],
-      decisions: workstream.payload.decisions ?? [],
-    }));
-    const openContradictions = this.getOpenContradictions(circle);
+    const openContradictions = this.getOpenContradictions(circle, OVERVIEW_EXCEPTION_LIMIT);
+    const openContradictionsTotal = this.countOpenContradictions(circle);
     const edgesByType = this.edgeCountsByType(circle);
     const edges = edgesByType.reduce((a, e) => a + e.count, 0);
     const nativeConcepts = (this.db.prepare(
@@ -7240,14 +7292,6 @@ export class MonetCore {
         AND source_identity IS NULL AND active_observation_id IS NULL AND status!='retired'`,
     ).get(circle) as { n: number }).n;
     const concepts = nativeConcepts + sourceProjections.length;
-    const visibleRows = (this.db.prepare(
-      `SELECT confidence FROM concepts WHERE circle=? AND kind NOT IN ('workstream','source') AND source_identity IS NULL AND active_observation_id IS NULL AND status='active'`,
-    ).all(circle) as Array<{ confidence: number }>).concat(
-      sourceProjections.map(({ row }) => ({ confidence: row.confidence })),
-    );
-    const avgConfidence = visibleRows.length === 0
-      ? 0
-      : visibleRows.reduce((sum, row) => sum + row.confidence, 0) / visibleRows.length;
     const sourceObservations = sourceProjections.length;
     const staleBefore = Date.now() - this.staleAfterMs;
     const nativeStale = (this.db.prepare(
@@ -7278,10 +7322,21 @@ export class MonetCore {
     // to stay in the same range.
     const OVERVIEW_SKELETON_CAP = 25;
     const skeletonMembers = this.skeleton(circle);
+    const fullGateStats = this.gateStats(circle, GATE_STATS_WINDOW_DAYS, undefined, OVERVIEW_EXCEPTION_LIMIT);
+    const retirementCandidates = fullGateStats.retirementCandidates;
+    const unexplainedDenies = fullGateStats.unexplainedDenies;
+    const dirtyTotal = opts.includeDirty ? this.dirtyCount(circle) : 0;
+    const dirty = opts.includeDirty
+      ? this.listDirty(circle, OVERVIEW_ENUMERATION_LIMIT).map(({ title: _title, ...card }) => ({
+          ...card,
+          observationCount: this.countObservationsForConcept(card.id),
+        }))
+      : undefined;
+    const stale = opts.includeStale
+      ? this.listStale(circle, OVERVIEW_ENUMERATION_LIMIT, opts.sourceAuthorizationContext)
+      : undefined;
     return {
       circle,
-      agentId: this.agentId,
-      generatedAt: Date.now(),
       counts: {
         concepts,
         observations: this.scopedCount(`SELECT COUNT(*) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE o.circle = ? AND c.status != 'retired' AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL`, circle) + sourceObservations,
@@ -7296,28 +7351,47 @@ export class MonetCore {
         extractionCandidates: this.extractionCandidateCount(circle),
         skeleton: skeletonMembers.length,
       },
-      health: {
-        avgConfidence: Number(avgConfidence.toFixed(2)),
-        graphDensity: nativeConcepts === 0 ? 0 : Number((edges / nativeConcepts).toFixed(2)),
+      gateStats: {
+        fires: fullGateStats.fires,
+        silences: fullGateStats.silences,
+        overflows: fullGateStats.overflows,
+        delivered: fullGateStats.delivered,
+        windowDays: fullGateStats.windowDays,
+        windowTotal: fullGateStats.windowTotal,
+        total: fullGateStats.total,
+        ...(retirementCandidates.length > 0 ? {
+          retirementCandidates,
+          ...(fullGateStats.retirementCandidatesOmitted !== undefined
+            ? { retirementCandidatesOmitted: fullGateStats.retirementCandidatesOmitted }
+            : {}),
+        } : {}),
+        ...(unexplainedDenies.length > 0 ? {
+          unexplainedDenies,
+          ...(fullGateStats.unexplainedDeniesOmitted !== undefined
+            ? { unexplainedDeniesOmitted: fullGateStats.unexplainedDeniesOmitted }
+            : {}),
+        } : {}),
       },
-      resolutionStats: this.resolutionStats(circle),
-      gateStats: this.gateStats(circle),
       livingModel,
-      activeThreads,
       openContradictions,
+      ...(openContradictionsTotal > openContradictions.length
+        ? { openContradictionsOmitted: openContradictionsTotal - openContradictions.length }
+        : {}),
+      ...(dirty !== undefined ? {
+        dirty,
+        ...(dirtyTotal > dirty.length
+          ? { dirtyTruncated: true as const, dirtyOmitted: dirtyTotal - dirty.length }
+          : {}),
+      } : {}),
+      ...(stale !== undefined ? {
+        stale,
+        ...(nativeStale + authorizedSourceStale > stale.length
+          ? { staleTruncated: true as const, staleOmitted: nativeStale + authorizedSourceStale - stale.length }
+          : {}),
+      } : {}),
       possibleDuplicates: this.getPossibleDuplicatePairs(circle),
       extractionCandidates: this.getExtractionCandidatePairs(circle),
       skeleton: skeletonMembers.slice(0, OVERVIEW_SKELETON_CAP),
-      graph: {
-        hubs: this.topEntityHubs(circle, { limit: opts.hubLimit ?? 6 }),
-        connected: this.topConnectedConcepts(circle, opts.connectedLimit ?? 6),
-        edgesByType,
-        thread: this.topThread(circle),
-      },
-      ...((): { otherCircles?: Array<{ circle: string; concepts: number; lastActivity: number }> } => {
-        const others = this.listCircles(circle, { sourceAuthorizationContext: opts.sourceAuthorizationContext });
-        return others.length > 0 ? { otherCircles: others } : {};
-      })(),
       ...(legacyStarConcepts > 0 ? { legacyStarConcepts } : {}),
       ...(resolvedFrom !== undefined ? { resolvedFrom } : {}),
     };
@@ -7543,6 +7617,23 @@ export class MonetCore {
           ${scope}
         ${tail}`,
     ).all(trusted.callerId, trusted.projectId, this.embedder.dim, Number.MAX_VALUE, Number.MAX_VALUE, ...scopeParams) as T[];
+  }
+
+  /** Authorized stale source identities only, ordered and capped before per-card ledger counts. */
+  private authorizedStaleSourceWorklist(
+    context: Readonly<SourceAuthorizationContext> | undefined,
+    circle: string,
+    staleBefore: number,
+    limit: number,
+  ): Array<Omit<OverviewWorklistCard, "observationCount"> & { staleAt: number }> {
+    return this.queryAuthorizedSourcePublications(
+      context,
+      `concept.id AS id,concept.slug AS slug,concept.kind AS kind,
+       COALESCE(concept.last_confirmed_at,concept.updated_at) AS staleAt`,
+      ` AND concept.circle=? AND COALESCE(concept.last_confirmed_at,concept.updated_at)<?`,
+      [circle, staleBefore, limit],
+      `ORDER BY staleAt ASC,concept.id ASC LIMIT ?`,
+    );
   }
 
   /**
@@ -11707,11 +11798,17 @@ export class MonetCore {
   }
 
   /** How the gates have been firing — fire precision and silence rate, the design's own measures. */
-  gateStats(circle?: string, windowDays = GATE_STATS_WINDOW_DAYS, runtimeModelTag?: string): GateStats {
+  gateStats(
+    circle?: string,
+    windowDays = GATE_STATS_WINDOW_DAYS,
+    runtimeModelTag?: string,
+    exceptionLimit?: number,
+  ): GateStats {
     return gateStats(this.db, {
       circle: this.resolveCircle(circle ?? this.defaultCircle),
       windowDays,
       runtimeModelTag: runtimeModelTag ?? this.runtimeModelTag ?? undefined,
+      exceptionLimit,
     });
   }
 

@@ -1143,15 +1143,14 @@ describe("declaration — the sovereign entrance", () => {
           `SELECT action, mode FROM resolution_events WHERE observation_id = ?`,
         ).get(forked.observationId)).toEqual({ action: "created", mode: "species-fork" });
 
-        const overview = c.overview("default");
+        const resolutionStats = c.resolutionStats("default");
         const resolutionCounts = Object.fromEntries(
-          overview.resolutionStats.byMode.map(({ mode, count }) => [mode, count]),
+          resolutionStats.byMode.map(({ mode, count }) => [mode, count]),
         );
         expect(resolutionCounts).toEqual({ "species-fork": 1, new: 1 });
-        expect(overview.resolutionStats.decidedTotal).toBe(2);
+        expect(resolutionStats.decidedTotal).toBe(2);
         expect(resolutionCounts).not.toHaveProperty("attach");
         expect(resolutionCounts).not.toHaveProperty("fork-signal");
-        expect(renderOverview(overview)).toContain("2 decided · 50% surfaced a possible duplicate");
         c.close();
       });
 
@@ -3294,10 +3293,9 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
 
     // COUNTED AS A FORK by the health signal, the same as species-fork — the mode is in
     // DECIDED_RESOLUTION_MODES, so it lands in the denominator too.
-    const stats = o.resolutionStats!;
+    const stats = c.resolutionStats("default");
     expect(stats.byMode.find((m) => m.mode === "stage-fork")).toMatchObject({ count: 1 });
     expect(stats.decidedTotal).toBe(2);
-    expect(renderOverview(o, { color: false, width: 200 })).toContain("stage-fork 1");
     c.close();
   });
 
@@ -3343,7 +3341,7 @@ describe("5-B: a rule repeating across stages forks instead of absorbing", () =>
     if (moved.species !== "rule") throw new Error("unreachable");
     expect(moved.conceptId).toBe(first.conceptId);
     expect(c.ruleBinding(first.conceptId)!.stage_id).toBe(c.stages().find((s) => s.name === "npm install")!.id);
-    expect(c.overview("default").resolutionStats!.byMode.some((m) => m.mode === "stage-fork")).toBe(false);
+    expect(c.resolutionStats("default").byMode.some((m) => m.mode === "stage-fork")).toBe(false);
     c.close();
   });
 
@@ -4425,11 +4423,9 @@ describe("gate instrumentation", () => {
     const ov = c.overview("default");
     expect(ov.gateStats).toMatchObject({ fires: 1, silences: 1, delivered: 1 });
     const rendered = renderOverview(ov, { color: false });
-    expect(rendered).toContain("GATES");
-    expect(rendered).toContain("2 asked · 1 matched a stage · 1 silent · 1 delivered a rule");
-    expect(rendered).toContain("git force push");
-    expect(rendered).toContain("1 pattern(s) never fired");
-    expect(rendered).toContain("*: frobnicate --hard");
+    expect(rendered).toContain("GATE EXCEPTIONS");
+    expect(rendered).toContain("2 asked · 1 fires · 1 silences · 0 overflows · 1 delivered");
+    expect(rendered).not.toContain("frobnicate --hard");
     c.close();
   });
 
@@ -4776,7 +4772,7 @@ describe("gate substrate sync", () => {
         .toMatchObject({ reasonMissing: true });
       expect(dst.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId, stageName: "rm -rf" }]);
       const rendered = renderOverview(dst.overview("default"), { color: false });
-      expect(rendered).toContain("1 deny(s) arrived with no reason");
+      expect(rendered).toContain("repair [");
       expect(rendered).toContain("rm -rf  ·  Never delete a tree unattended");
       src.close();
       dst.close();
@@ -4828,7 +4824,7 @@ describe("gate substrate sync", () => {
       const offlineFired = evaluateGateFromMirror(mirrored, { actionContext: "Bash:rm -rf /tmp/x", circle: "default" });
       expect(offlineFired.rules[0]).toMatchObject({ reasonMissing: true });
       expect(c.gateStats("default").unexplainedDenies).toMatchObject([{ conceptId: deny.conceptId }]);
-      expect(renderOverview(c.overview("default"), { color: false })).toContain("arrived with no reason");
+      expect(renderOverview(c.overview("default"), { color: false })).toContain("repair [");
       // Delivered as NULL, not as the raw value: `reason` is declared `string | null`, and handing a
       // caller a Buffer moves the crash from this module into theirs. The mirror stays readable JSON
       // for the same reason.
@@ -5062,7 +5058,7 @@ describe("gate substrate sync", () => {
     // redeclaration would CREATE the missing stage and change what the store does — a repair queue
     // giving advice that alters behaviour rather than restoring it.
     expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
-    expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("arrived with no reason");
+    expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("repair [");
 
     // And once the stage lands, the SAME binding is a live reasonless deny on every surface at once.
     dst.graftRows(payload);
@@ -5082,7 +5078,7 @@ describe("gate substrate sync", () => {
       reason: "  there is no undo  ", reasonMissing: false,
     });
     expect(dst.gateStats("default").unexplainedDenies).toEqual([]);
-    expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("arrived with no reason");
+    expect(renderOverview(dst.overview("default"), { color: false })).not.toContain("repair [");
     expect(conceptId).toBeTruthy();
     src.close();
     dst.close();
@@ -5133,13 +5129,8 @@ describe("gate substrate sync", () => {
     expect(ov.gateStats).toMatchObject({ windowTotal: 0 });
     expect(ov.gateStats!.unexplainedDenies).toHaveLength(1);
     const rendered = renderOverview(ov, { color: false });
-    expect(rendered).toContain("GATES");
-    expect(rendered).toContain("1 deny(s) arrived with no reason");
-    // Named as a repair with the actual next action, not as an alarm: these denies are working, and
-    // only a human can supply what is missing.
-    expect(rendered).toContain("declare the same rule with a reason to repair");
-    // THE RULE ITSELF, on the line: the stage to declare at and the text to declare. A disclosure
-    // whose purpose is repair has to say what to repair, or it is an alarm wearing its clothes.
+    expect(rendered).toContain("GATE EXCEPTIONS");
+    expect(rendered).toContain("repair [");
     expect(rendered).toContain("rm -rf  ·  Never delete a tree unattended");
     // ...and the ID, so the exact rule can be FETCHED before it is redeclared. Titles are a concept's
     // first line, not its content, and nothing makes them unique — repairing by title alone is how
@@ -5153,9 +5144,7 @@ describe("gate substrate sync", () => {
   it("summarizes rather than becoming a wall of text when many denies arrive unexplained", async () => {
     const dst = core({ syncDeviceId: "machine-b" });
     const src = core({ syncDeviceId: "machine-a" });
-    // Seven, against a cap of five. The population is small BY CONSTRUCTION — local creation is
-    // refused, so every one of these arrived by relay — but "small by construction" is an argument,
-    // not a guarantee, and a curation view people stop reading discloses nothing.
+    // Seven entries remain compact in the overview's source-capped exception queue.
     for (let i = 0; i < 7; i++) {
       await src.declare({
         species: "rule", stage: `gate-${i}`, patterns: [`Bash:tool${i} run`],
@@ -5169,13 +5158,8 @@ describe("gate substrate sync", () => {
     const stats = dst.gateStats("default");
     expect(stats.unexplainedDenies).toHaveLength(7);
     const rendered = renderOverview(dst.overview("default"), { color: false });
-    // The HEADER carries the true total — capping shortens the view, and must never understate the
-    // population, which is the one thing this disclosure cannot afford to do.
-    expect(rendered).toContain("7 deny(s) arrived with no reason");
     expect(rendered).toContain("gate-0  ·  Never run tool 0 unattended");
-    expect(rendered).toContain("gate-4  ·  Never run tool 4 unattended");
-    expect(rendered).not.toContain("gate-5  ·");
-    expect(rendered).toContain("… and 2 more");
+    expect(rendered).toContain("gate-6  ·  Never run tool 6 unattended");
     // Every named row is fetchable, not just the first — the id is part of the row shape rather
     // than a decoration on the example.
     for (const ud of stats.unexplainedDenies.slice(0, 5)) {
@@ -11347,6 +11331,40 @@ describe("liveStageIndex — SQL-level retrieval bound", () => {
 // ---------------------------------------------------------------------------
 // gateStats byMatcher
 // ---------------------------------------------------------------------------
+describe("gateStats retirement-candidate ordering", () => {
+  function seededStore(): MonetCore {
+    const c = core();
+    const db = raw(c);
+    let stageSeq = 0;
+    const deps = { db: db as never, newId: () => `stable-stage-${stageSeq++}`, nextSyncTimestamp: () => 1, syncDeviceId: "d" };
+    const stage = upsertStage(deps, { stage: "same-stage", origin: "declaration" });
+    for (let index = 12; index >= 0; index--) {
+      const conceptId = `stable-concept-${String(index).padStart(2, "0")}`;
+      db.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, circle, embedding)
+         VALUES (?, ?, 'Same title', 'Same body', 'rule', 'active', 'default', '[]')`,
+      ).run(conceptId, `stable-${index}`);
+      db.prepare(
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, circle, created_at, sync_updated_at, sync_revision)
+         VALUES (?, ?, 'advisory', 'agent', 'old-model', 'import', 'default', 1, 1, 0)`,
+      ).run(conceptId, stage.id);
+    }
+    return c;
+  }
+
+  it("selects the same capped prefix under duplicate model tags and titles", () => {
+    const first = seededStore();
+    const second = seededStore();
+    const ids = (c: MonetCore) => gateStats(raw(c) as never, {
+      circle: "default", windowDays: 30, runtimeModelTag: "current-model", exceptionLimit: 10,
+    }).retirementCandidates.map((candidate) => candidate.conceptId);
+    expect(ids(first)).toEqual(ids(second));
+    expect(ids(first)).toEqual(Array.from({ length: 10 }, (_, index) => `stable-concept-${String(index).padStart(2, "0")}`));
+    first.close();
+    second.close();
+  });
+});
+
 describe("gateStats byMatcher", () => {
   it("counts fires per matcher in the window; every other field stays mechanical-only (additive)", async () => {
     const c = core();

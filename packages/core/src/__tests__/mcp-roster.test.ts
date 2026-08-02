@@ -80,6 +80,9 @@ describe("tool roster — drift gate", () => {
       expect(byName.get("memory_workstreams")?.description).toBe(
         "Pull active/paused workstreams ONLY when the user expresses continuation intent. For “let's continue”, call with no id to get the compact list, then confirm with the user which thread to resume. For “continue <X>”, list first; if exactly one confident match exists, call again with that id for full detail, otherwise confirm. Full detail pages entries in this fixed order: openQuestions, decisions, discardedAlternatives, confirmedContext, importantEntities, nextSteps; entries retain stored order within each slot. Start detailOffset at 0, then add the number of entries actually returned across all slots; detailOmitted is the true number remaining. A session opened with a fresh directive never calls this tool.",
       );
+      expect(byName.get("memory_overview")?.description).toBe(
+        "Curation workbench for one circle: compact counts plus bounded actionable queues for possibleDuplicates, extractionCandidates, openContradictions, gate exceptions, and the ratified skeleton. The livingModel shows the top 5 current concepts by default. Pass includeDirty:true for the highest-evidence pending-synthesis cards; pass includeStale:true for the stalest re-confirmation cards. Both lists are capped and carry honest omission signals. Read-only; never returns memory bodies. Fetch an id to inspect evidence, resolve contradictions/pair flags with memory_resolve, and consolidate a true duplicate with memory_detach(destConceptId). Pass entity to list memories tied to one hub.",
+      );
       const contextSchema = byName.get("agent_context")?.inputSchema as { properties?: Record<string, unknown> };
       expect(contextSchema.properties).not.toHaveProperty("includeStale");
     } finally {

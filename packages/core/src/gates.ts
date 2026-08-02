@@ -3678,6 +3678,8 @@ export interface GateStats {
    * because without one there is nothing to be a candidate against.
    */
   retirementCandidates: Array<{ conceptId: string; title: string; modelTag: string; stageName: string }>;
+  /** True number omitted after the source cap; absent when the list is complete. */
+  retirementCandidatesOmitted?: number;
   /**
    * Live denies in this circle carrying no reason — see GateRule.reasonMissing for how one exists
    * at all (relay from an older peer; local creation is refused).
@@ -3696,6 +3698,8 @@ export interface GateStats {
    * later is how a disclosure ends up narrower than the thing it discloses.
    */
   unexplainedDenies: Array<{ conceptId: string; title: string; stageName: string }>;
+  /** True number omitted after the source cap; absent when the list is complete. */
+  unexplainedDeniesOmitted?: number;
 }
 
 export interface GateStatsOptions {
@@ -3704,6 +3708,8 @@ export interface GateStatsOptions {
   now?: number;
   /** The model now running. Rules tagged for a different one are reported as retirement candidates. */
   runtimeModelTag?: string;
+  /** Optional curation-surface cap; omit for the full diagnostic lists used by CLI/dashboard consumers. */
+  exceptionLimit?: number;
 }
 
 export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
@@ -3781,6 +3787,65 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
     }
   }
 
+  const exceptionLimit = opts.exceptionLimit === undefined
+    ? undefined
+    : Math.max(0, Math.floor(opts.exceptionLimit));
+  const retirementCandidatesAll = opts.runtimeModelTag === undefined ? [] : (db
+    .prepare(
+      `SELECT b.concept_id AS conceptId, c.title AS title, b.model_tag AS modelTag, s.name AS stageName
+         FROM rule_bindings b
+         JOIN concepts c ON c.id = b.concept_id
+         LEFT JOIN stages s ON s.id = b.stage_id
+        WHERE b.scope = 'agent' AND b.model_tag IS NOT ? AND (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
+          AND c.status = 'active' AND c.kind = 'rule'
+          AND NOT EXISTS (
+            SELECT 1 FROM lifecycle_edges e
+             WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
+          )
+        ORDER BY b.model_tag ASC, c.title ASC, b.concept_id ASC
+        ${exceptionLimit !== undefined ? "LIMIT ?" : ""}`,
+    )
+    .all(...(exceptionLimit !== undefined
+      ? [opts.runtimeModelTag, opts.circle, exceptionLimit + 1]
+      : [opts.runtimeModelTag, opts.circle])) as GateStats["retirementCandidates"]);
+  const retirementCandidates = exceptionLimit === undefined
+    ? retirementCandidatesAll
+    : retirementCandidatesAll.slice(0, exceptionLimit);
+  const retirementCandidatesOmitted = exceptionLimit !== undefined && retirementCandidatesAll.length > exceptionLimit
+    ? (db.prepare(
+        `SELECT COUNT(*) AS n
+           FROM rule_bindings b
+           JOIN concepts c ON c.id = b.concept_id
+          WHERE b.scope = 'agent' AND b.model_tag IS NOT ? AND (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
+            AND c.status = 'active' AND c.kind = 'rule'
+            AND NOT EXISTS (
+              SELECT 1 FROM lifecycle_edges e
+               WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
+            )`,
+      ).get(opts.runtimeModelTag, opts.circle) as { n: number }).n - retirementCandidates.length
+    : 0;
+  const unexplainedDeniesAll = (db
+    .prepare(
+      `SELECT b.concept_id AS conceptId, c.title AS title, s.name AS stageName, b.reason AS reason
+         FROM rule_bindings b
+         JOIN concepts c ON c.id = b.concept_id
+         JOIN stages s ON s.id = b.stage_id
+        WHERE b.severity = 'blocking'
+          AND (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
+          AND c.status = 'active'
+          AND c.kind = 'rule'
+          AND NOT EXISTS (
+            SELECT 1 FROM lifecycle_edges e
+             WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
+          )
+        ORDER BY s.name ASC, c.title ASC, b.concept_id ASC`,
+    )
+    .all(opts.circle) as Array<GateStats["unexplainedDenies"][number] & { reason: string | null }>)
+    .filter((row) => hasNoReason(row.reason))
+    .map(({ conceptId, title, stageName }) => ({ conceptId, title, stageName }));
+  const unexplainedDenies = exceptionLimit === undefined
+    ? unexplainedDeniesAll
+    : unexplainedDeniesAll.slice(0, exceptionLimit);
   const fires = window.fires ?? 0;
   const overflows = window.overflows ?? 0;
   return {
@@ -3800,26 +3865,8 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
       patterns: parseTriggerPatterns(stage.trigger_patterns).map(formatTriggerPattern),
     })),
     malformedPatterns,
-    retirementCandidates: opts.runtimeModelTag === undefined ? [] : (db
-      .prepare(
-        // (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}'), matching RULE_LIVENESS_WHERE's own
-        // widening: a global agent-scoped compensation is exactly as real a retirement candidate
-        // when curating ANY circle it delivers in as a local one is when curating its own — c.circle
-        // alone (the concept's circle) would hide it everywhere except the one circle its CONCEPT
-        // happens to be filed in, which is not where it is firing.
-        `SELECT b.concept_id AS conceptId, c.title AS title, b.model_tag AS modelTag, s.name AS stageName
-           FROM rule_bindings b
-           JOIN concepts c ON c.id = b.concept_id
-           LEFT JOIN stages s ON s.id = b.stage_id
-          WHERE b.scope = 'agent' AND b.model_tag IS NOT ? AND (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
-            AND c.status = 'active' AND c.kind = 'rule'
-            AND NOT EXISTS (
-              SELECT 1 FROM lifecycle_edges e
-               WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
-            )
-          ORDER BY b.model_tag ASC, c.title ASC`,
-      )
-      .all(opts.runtimeModelTag, opts.circle) as GateStats["retirementCandidates"]),
+    retirementCandidates,
+    ...(retirementCandidatesOmitted > 0 ? { retirementCandidatesOmitted } : {}),
     // Deliberately NOT filtered by runtime model tag: a compensation for another model still holds
     // deny power the moment that model runs, and a count that hid it would report zero on exactly
     // the machine best placed to repair it. Same liveness predicate the gate and the sidecar use.
@@ -3835,41 +3882,10 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
     // equivalence to maintain between two dialects' idea of whitespace. The scan is bounded by the
     // blocking population, which is the same set materializeGateMirror already walks (as a subset of
     // every live rule) on every declaration, so this is not a new order of work.
-    unexplainedDenies: (db
-      .prepare(
-        // INNER JOIN, matching listGateMirrorEntries and the stage-first path gateInternal takes. A
-        // binding can land without its stage — an incremental graft that omits the stage row, or a
-        // name collision that skips it — and graftRows documents that such a binding NEVER FIRES.
-        // A LEFT JOIN here put it in the deny list anyway, so the overview named a live deny that
-        // cannot deny anything and told the user to redeclare it: advice that would CREATE the
-        // missing stage and change what the store does. The disclosure surface has to ask the same
-        // question the delivery surface asks, or it describes a store nobody is running.
-        //
-        // Left out rather than given its own name. An orphaned binding is a different signal from a
-        // reasonless deny, and it is an expected TRANSIENT — the dangling-then-live case relay is
-        // built to close, self-healing on the graft that brings the stage. A standing curation item
-        // for a state that resolves itself is noise, and this branch's subject is denies that cannot
-        // explain themselves, not bindings that cannot fire.
-        // (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}'): a global reasonless deny is firing —
-        // unexplained — in EVERY circle, not only the one its concept happens to be filed in, and
-        // curation for any of them needs to see it. Same widening as retirementCandidates above.
-        `SELECT b.concept_id AS conceptId, c.title AS title, s.name AS stageName, b.reason AS reason
-           FROM rule_bindings b
-           JOIN concepts c ON c.id = b.concept_id
-           JOIN stages s ON s.id = b.stage_id
-          WHERE b.severity = 'blocking'
-            AND (b.circle = ? OR b.circle = '${BREADTH_CIRCLE}')
-            AND c.status = 'active'
-            AND c.kind = 'rule'
-            AND NOT EXISTS (
-              SELECT 1 FROM lifecycle_edges e
-               WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
-            )
-          ORDER BY s.name ASC, c.title ASC, b.concept_id ASC`,
-      )
-      .all(opts.circle) as Array<GateStats["unexplainedDenies"][number] & { reason: string | null }>)
-      .filter((row) => hasNoReason(row.reason))
-      .map(({ conceptId, title, stageName }) => ({ conceptId, title, stageName })),
+    unexplainedDenies,
+    ...(unexplainedDeniesAll.length > unexplainedDenies.length
+      ? { unexplainedDeniesOmitted: unexplainedDeniesAll.length - unexplainedDenies.length }
+      : {}),
   };
 }
 

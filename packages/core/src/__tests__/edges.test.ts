@@ -202,8 +202,8 @@ describe("codex-review fixes", () => {
     }
     // The plan's only thread edges are 3 INCOMING resolves (0 outgoing) — pre-fix it was omitted entirely.
     expect(core.edges({ type: "resolves" }).filter((e) => e.dstId === plan.conceptId)).toHaveLength(3);
-    const planRow = core.overview().graph.connected.find((c) => c.id === plan.conceptId);
-    expect(planRow, "incoming-only hub must appear in the connected overview").toBeTruthy();
+    const planRow = core.topConnectedConcepts().find((c) => c.id === plan.conceptId);
+    expect(planRow, "incoming-only hub must appear in connected diagnostics").toBeTruthy();
     expect(planRow!.degree).toBe(3);
     core.close();
   });
