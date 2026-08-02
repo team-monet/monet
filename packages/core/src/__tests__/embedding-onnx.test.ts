@@ -7,10 +7,13 @@
 // (no network, no real model load — "constructor/dispatch logic and injected fakes", per the
 // brief). MonetCore.ensureEmbedderPin's own ONNX-satisfying path is additionally covered at the
 // engine level via an injected fake loader (see embedder-pin.test.ts, Shape 2).
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import {
   createLocalEmbedderWithProvenance,
   instantiateEmbedderForPin,
+  resolveModelCacheDir,
   UnsatisfiableEmbedderError,
   LEGACY_ONNX_DEFAULT_MODEL_ID,
 } from "../embedding-onnx";
@@ -19,9 +22,16 @@ import { HashingEmbeddingProvider } from "../embedding";
 // Hoisted by vitest above these imports — intercepts OnnxEmbeddingProvider's dynamic
 // `import("@huggingface/transformers")` (embedding-onnx.ts's `load()`) so the ONNX branch's real
 // dispatch/warmup/error-wrapping code runs unmodified, but never touches the network or a real
-// model. `pipeline` is the ONLY export transformers.js's feature-extraction path actually uses.
+// model. `pipeline` is the ONLY export transformers.js's feature-extraction path actually uses —
+// deliberately, including for #90's cache location, which is passed as a pipeline() option rather
+// than set on the module's `env` global (see the model-cache describe block at the bottom).
+// Hoisted so the mock factory (itself hoisted above the imports) can close over it: it records the
+// `cache_dir` production actually passed to pipeline(), which is what #90's fix consists of.
+const transformers = vi.hoisted(() => ({ cacheDirPassedToPipeline: undefined as string | undefined }));
+
 vi.mock("@huggingface/transformers", () => ({
-  pipeline: vi.fn(async (_task: string, model: string) => {
+  pipeline: vi.fn(async (_task: string, model: string, opts?: { cache_dir?: string }) => {
+    transformers.cacheDirPassedToPipeline = opts?.cache_dir;
     if (model === "Xenova/mock-ok-model") {
       // 384-long (matching OnnxEmbeddingProvider's declared default dim — the ordinary, no-mismatch
       // case): a distinctive first three values, zero-padded, so tests can still assert on real
@@ -266,4 +276,58 @@ describe("instantiateEmbedderForPin — unrecognized format (no instantiation at
       await expect(instantiateEmbedderForPin(modelId)).rejects.toThrow(UnsatisfiableEmbedderError);
     }
   });
+});
+
+// #90: the model cache must not live inside the install. transformers.js defaults its cache to a
+// path derived from its OWN directory (node_modules/@huggingface/transformers/.cache), so a global
+// reinstall deletes a ~480MB download. On a store that has minted an embedder pin, a missing model
+// is not a slow start but a refusal to serve (instantiateEmbedderForPin never substitutes), so the
+// cache surviving reinstall is what keeps `npm i -g` from being an outage on a slow or offline link.
+describe("model cache location (#90)", () => {
+  const priorOverride = process.env.MONET_MODEL_CACHE;
+  afterEach(() => {
+    if (priorOverride === undefined) delete process.env.MONET_MODEL_CACHE;
+    else process.env.MONET_MODEL_CACHE = priorOverride;
+  });
+
+  it("defaults to ~/.monet/models — beside the store, not inside the install", () => {
+    delete process.env.MONET_MODEL_CACHE;
+    expect(resolveModelCacheDir()).toBe(resolve(homedir(), ".monet", "models"));
+    expect(resolveModelCacheDir()).not.toContain("node_modules");
+  });
+
+  it("MONET_MODEL_CACHE overrides it, resolved to an absolute path", () => {
+    process.env.MONET_MODEL_CACHE = "./relative-cache";
+    expect(resolveModelCacheDir()).toBe(resolve("./relative-cache"));
+    process.env.MONET_MODEL_CACHE = "/srv/shared/models";
+    expect(resolveModelCacheDir()).toBe("/srv/shared/models");
+  });
+
+  it("a whitespace-only override is ignored rather than caching into the process cwd", () => {
+    process.env.MONET_MODEL_CACHE = "   ";
+    expect(resolveModelCacheDir()).toBe(resolve(homedir(), ".monet", "models"));
+  });
+
+  // THE load-bearing property: the resolved directory reaches the actual load. Delete the
+  // `cache_dir` argument in load() and only these two fail — the helper still returns the right
+  // string while every download goes back into node_modules, which is #90 reopened.
+  it("passes the resolved cache dir to pipeline() on the real load path", async () => {
+    delete process.env.MONET_MODEL_CACHE;
+    transformers.cacheDirPassedToPipeline = undefined;
+    await instantiateEmbedderForPin("Xenova/mock-ok-model");
+    expect(transformers.cacheDirPassedToPipeline).toBe(resolve(homedir(), ".monet", "models"));
+  });
+
+  it("honors MONET_MODEL_CACHE on the real load path, not just in the helper", async () => {
+    process.env.MONET_MODEL_CACHE = "/srv/shared/models";
+    transformers.cacheDirPassedToPipeline = undefined;
+    await instantiateEmbedderForPin("Xenova/mock-ok-model");
+    expect(transformers.cacheDirPassedToPipeline).toBe("/srv/shared/models");
+  });
+
+  // "Never touches the shared global" is asserted by this file's MOCK, not by a case here: it
+  // declares `pipeline` and nothing else, and vitest throws on any access to an undeclared export.
+  // So if production ever read or wrote `env`, every ONNX test above would fail with that error —
+  // which is exactly what happened while the fix did use the global. A case cannot restate it,
+  // because reaching for `mod.env` to prove its absence is itself the throwing access.
 });

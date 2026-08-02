@@ -1,5 +1,36 @@
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+
 import type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
 import { HashingEmbeddingProvider, validateEmbeddingProviderOutput } from "./embedding";
+
+/**
+ * Where the ONNX model files are cached on disk (#90).
+ *
+ * transformers.js defaults `env.cacheDir` to `<the library's own directory>/.cache`, which for a
+ * global install resolves INSIDE node_modules. The model is then part of the install rather than
+ * part of the user's data, so every reinstall deletes ~480MB that took minutes to acquire and the
+ * next start has to fetch it again. It belongs next to the store, in ~/.monet, where a reinstall
+ * cannot reach it.
+ *
+ * This is not merely a slow-start annoyance. A store that has minted an embedder pin does not serve
+ * at all while the pinned model is unloadable (instantiateEmbedderForPin refuses to substitute; see
+ * MonetCore.ensureEmbedderPin), so on a machine that is offline or behind a slow link, a wiped cache
+ * is an outage. Keeping the cache outside the install is what makes reinstall a no-op for it.
+ *
+ * `MONET_MODEL_CACHE` overrides the location (shared cache, non-standard home, read-only ~).
+ */
+export function resolveModelCacheDir(): string {
+  const override = process.env.MONET_MODEL_CACHE?.trim();
+  return override ? resolve(override) : resolve(homedir(), ".monet", "models");
+}
+
+// NOT DONE, deliberately: adopting an existing in-install cache instead of re-downloading it once.
+// It would be dead code on the only path that matters. The new location ships inside a new package
+// version, and installing that version is what deletes node_modules — so by the time this code first
+// runs, the cache it would adopt is already gone. It would fire only for a developer who swaps source
+// without reinstalling deps. Not worth carrying a renameSync, whose blast radius is a directory move,
+// for that. The upgrade therefore pays one final download; every reinstall after it pays none.
 
 /**
  * Real semantic embeddings via a bundled ONNX model (transformers.js) — in-process,
@@ -22,7 +53,7 @@ interface FeatureExtractor {
 }
 
 interface TransformersModule {
-  pipeline: (task: string, model: string) => Promise<unknown>;
+  pipeline: (task: string, model: string, opts: { cache_dir: string }) => Promise<unknown>;
 }
 
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
@@ -61,7 +92,24 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
               "or use the default HashingEmbeddingProvider.",
           );
         }
-        return (await mod.pipeline("feature-extraction", this.model)) as FeatureExtractor;
+        // #90: transformers.js otherwise caches into a path derived from its OWN directory, i.e.
+        // inside node_modules, where the next reinstall deletes it. `cache_dir` is passed per call
+        // rather than set on the module's `env` global, because monet-core is a library: a host
+        // that embeds it may have configured transformers for its own models, and overwriting a
+        // process-wide setting would silently redirect that host's unrelated loads into ~/.monet
+        // (Codex review, PR #130).
+        //
+        // Verified against 3.8.1, not assumed: pipeline() forwards its options to loadItems(),
+        // which hands the SAME pretrainedOptions to every class it constructs — tokenizer, model
+        // and processor alike (pipelines.js `loadItems(classes, model, pretrainedOptions)`). A
+        // probe confirmed the behavior end to end: with the global left at its package default
+        // (which does not hold the model) and `allowRemoteModels` disabled, a load with only
+        // `cache_dir` set succeeded, so no sub-fetch silently fell back to the global. Being an
+        // argument rather than a global also removes the ordering hazard entirely — there is no
+        // "set it too late" state to get wrong.
+        return (await mod.pipeline("feature-extraction", this.model, {
+          cache_dir: resolveModelCacheDir(),
+        })) as FeatureExtractor;
       })();
     }
     return this.extractor;
@@ -239,7 +287,13 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
         modelId,
         `This store is pinned to '${modelId}', but this Monet instance could not load that model ` +
           `(${why}). The store may have been created by a NEWER version of Monet, or the model failed ` +
-          `to download — upgrade the shipped \`@team-monet/monet\` package and/or check network access.`,
+          `to download — upgrade the shipped \`@team-monet/monet\` package and/or check network access. ` +
+          // Naming the directory is what makes an interrupted download recoverable: the cache records
+          // a hit by path existence alone (no temp-file rename upstream), so a truncated file stays a
+          // hit forever, and this store does not serve until someone deletes it. Before #90 a
+          // reinstall cleared it by accident; now nothing does.
+          `Models are cached in ${resolveModelCacheDir()} — if a download was interrupted, delete that ` +
+          `directory to force a clean re-fetch.`,
         { cause: e },
       );
     }

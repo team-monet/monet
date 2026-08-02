@@ -41,14 +41,16 @@ jobs:
       - name: Install dependencies (incl. optional @huggingface/transformers)
         run: pnpm install --frozen-lockfile
 
-      # transformers.js v3 ignores cache-dir env vars and caches the model INSIDE node_modules,
-      # so this targets that path (after install, which recreates node_modules). Best-effort: a
-      # miss just re-downloads the model. Any pnpm-lock.yaml change busts the exact key, but the
-      # restore-keys prefix still reuses the previous cache, so a full re-download is rare.
+      # embedding-onnx.ts pins transformers.js's cache to ~/.monet/models (#90), so cache THAT path.
+      # It used to point inside node_modules, which is where transformers defaults on its own; after
+      # the pin that path is never written and this step would silently cache nothing, re-downloading
+      # ~450MB every night. Unlike the node_modules path this one survives install, so it no longer
+      # depends on step ordering. Best-effort: a miss just re-downloads. Any pnpm-lock.yaml change
+      # busts the exact key, but the restore-keys prefix still reuses the previous cache.
       - name: Cache the MiniLM model
         uses: actions/cache@v4
         with:
-          path: node_modules/.pnpm/@huggingface+transformers@*/node_modules/@huggingface/transformers/.cache
+          path: ~/.monet/models
           key: minilm-model-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
             minilm-model-${{ runner.os }}-
