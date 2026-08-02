@@ -12098,7 +12098,7 @@ describe("MCP surface", () => {
 
     const { tools } = await client.listTools();
     const resolve = tools.find((t) => t.name === "memory_resolve")!;
-    expect(resolve.description).toMatch(/PAIR-FLAG DISMISSAL/);
+    expect(resolve.description).toMatch(/PAIR-FLAG DISMISSAL/i);
     expect(resolve.description).toMatch(/extraction[- ]candidate/i);
     // One dismissal answers both questions about a pair, and the description says so rather than
     // leaving an agent to discover it.
@@ -12180,22 +12180,17 @@ describe("MCP surface", () => {
     const { call, client } = await harness(c, { modelTag: "m1" });
     const { tools } = await client.listTools();
     const lookupDescription = tools.find((tool) => tool.name === "stage_lookup")!.description;
-    expect(lookupDescription).toContain("one of this rule's derivation parents is currently disputed");
-    // PR #112 round 2: the advertised recovery step must be one an MCP caller can actually take —
-    // the ids are carried, not a pointer at an engine-only edge read.
-    expect(lookupDescription).toContain("disputedParentIds names exactly which");
-    expect(lookupDescription).toContain(
-      "projectedFromPrincipleId is the earliest/display parent, not necessarily a disputed one",
-    );
+    expect(lookupDescription).toContain("`parentDisputed:true` means `disputedParentIds` should be memory_fetched");
+    // The named ids provide an MCP recovery path; the projected parent remains display-only.
+    expect(lookupDescription).toContain("projectedFromPrincipleId is only the display parent");
     // PR #112 round 10: the fetch tool's own contract names the exact resolver call shape — an
     // ambiguous "id" failed memory_resolve's schema before the corrected response note was ever read.
     const fetchDescription = tools.find((tool) => tool.name === "memory_fetch")!.description;
     expect(fetchDescription).toContain("memory_resolve({ contradictionId: openContradictions[i].id })");
-    expect(fetchDescription).toContain("`body` is the payload");
-    expect(fetchDescription).toContain("observations never ride by default");
-    expect(fetchDescription).toContain("observations:true");
+    expect(fetchDescription).toContain("Normal concepts return `body` and `observationCount`");
+    expect(fetchDescription).toContain("evidence appears only with observations:true");
     expect(fetchDescription).toContain("`needsSynthesis:true`");
-    expect(fetchDescription).toContain("structure-first contract unchanged");
+    expect(fetchDescription).toContain("Source concepts instead return title, sourcePath/sourceId, and outline");
     const principle = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (principle.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {

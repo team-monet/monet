@@ -36,7 +36,7 @@ import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-sch
  * intent, use memory_store/search/gather during the session, and close with memory_checkpoint.
  */
 export const MONET_SERVER_INSTRUCTIONS =
-  "Monet is the user's persistent memory substrate; start by calling agent_context (no arguments) for orientation; only on continuation intent use memory_workstreams to list active/paused threads and confirm which to resume before pulling detail; use memory_store for durable knowledge and memory_search/memory_gather (cards) + memory_fetch (content) to recall; end with memory_checkpoint and a workstream snapshot (open questions, decisions, next steps); without it, session state is lost.";
+  "Monet is persistent memory. Start each project session with agent_context. Call memory_workstreams only when the user intends to continue prior work; list and confirm the thread before fetching detail. Recall with memory_search/memory_gather pointer cards, then memory_fetch content. Store durable knowledge with memory_store. End with memory_checkpoint and a compressed workstream snapshot; without it, session state is lost.";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
 // concept — long body + many observations — otherwise serializes to tens of thousands of chars and
@@ -739,7 +739,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_store",
-    'Store something worth remembering. By default the substrate deduplicates automatically: similar evidence resolves into an existing concept; novel evidence creates a new one. It finds by evidence and confirms by identity — an existing concept is nominated by how well its own stored observations match yours, then kept only if the concept as a whole is still coherent with what you wrote; when those two disagree the concept is bimodal, so instead of absorbing your evidence the substrate forks it and flags the pair as a possible duplicate for you to mediate (that is a fork signal, reported as resolutionMode="fork-signal"). The mirror case is reported as resolutionMode="blur-duplicate": a concept looked like an exact match as a whole but none of its stored evidence agreed, so your memory was kept separate and the pair flagged rather than silently absorbed. Pass resolution="forceNew" to always create a new concept (useful for bulk import flows where each item is known to be distinct). Pass attachTo=<conceptId> to attach directly to a specific concept, bypassing automatic scoring. Cheap and instant — synthesis happens later, on read. Use kind="procedure" for behavioral rules and kind="preference" for style/voice/format preferences.',
+    'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
     {
       content: z.string(),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
@@ -747,25 +747,25 @@ export function registerMonetCoreTools(
         .string()
         .optional()
         .describe(
-          'Observation kind. Use "correction" when this overrides/contradicts a prior memory — if it lands on an existing concept the substrate opens a contradiction and marks it disputed for mediation.',
+          'Observation kind. Use "correction" when this challenges prior memory; a matching concept becomes disputed until memory_resolve mediates it. Use "procedure" for behavior and "preference" for style, voice, or format.',
         ),
       sourceRefs: z
         .array(z.string())
         .optional()
         .describe(
-          "Pointer(s) HOME to the source (file paths, URLs, tool calls, prior concept/observation ids) — never a copy. Lets memories that share a source link up, and enables later return-to-source re-reading.",
+          "Pointers to the source, such as paths, URLs, tool calls, or concept/observation ids. Store pointers, not copied source content.",
         ),
       resolution: z
         .enum(["auto", "forceNew"])
         .optional()
         .describe(
-          'Resolution mode. "auto" (default): the substrate resolves similar evidence into an existing concept automatically. "forceNew": always create a new concept, bypassing deduplication — use for bulk import or migration flows where each item is known to be distinct.',
+          '"auto" (default) deduplicates similar evidence. "forceNew" always creates a concept; use only for known-distinct items.',
         ),
       attachTo: z
         .string()
         .optional()
         .describe(
-          "Concept id to attach this observation to directly, bypassing automatic deduplication. The concept must exist in the same circle. Mutually exclusive with resolution=\"forceNew\". Useful for manually consolidating a possible-duplicate pair surfaced by memory_overview.",
+          'Known concept id to attach to directly. It must share the circle. Mutually exclusive with resolution="forceNew".',
         ),
       rule: z
         .object({
@@ -773,39 +773,39 @@ export function registerMonetCoreTools(
             .string()
             .max(STAGE_NAME_MAX_CHARS)
             .describe(
-              "The action this rule fires at — a stage name, or the id of an existing stage. If no stage exists for this action yet, storing the rule CREATES it: a correction landing on an unstaged action is that stage's birth.",
+              "Stage name or id where the rule fires. A missing stage is created.",
             ),
           instance: z
             .string()
             .optional()
             .describe(
-              'The concrete action you just watched go wrong, e.g. "Bash:git push --force origin main". Seeds the stage\'s trigger pattern when the stage is new — pass it whenever you have it.',
+              'Concrete action that failed, such as "Bash:git push --force origin main". Seeds a new stage pattern.',
             ),
           scope: z
             .enum(["domain", "agent"])
             .optional()
             .describe(
-              'Who this binds. "domain": it would still be true for a perfect agent (it describes the world). "agent" (default): it compensates for THIS model\'s failure habits. When uncertain, use "agent" — a wrong agent tag merely re-verifies on a model change, while a wrong domain tag shackles the next model.',
+              '"domain" describes reality even for a perfect agent. "agent" (default) compensates for this model. When uncertain use "agent": a wrong agent tag only re-verifies later; a wrong domain tag binds later models.',
             ),
           modelTag: z
             .string()
             .max(MODEL_TAG_MAX_CHARS)
             .optional()
-            .describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
+            .describe('Model compensated for. Required for agent scope unless MONET_MODEL_TAG supplies it.'),
           reason: z
             .string()
             .optional()
-            .describe("One line naming the failure this prevents. This is what the gate shows, and the reason is what earns compliance."),
+            .describe("One line naming the failure this prevents; shown when the gate fires."),
           projectedFromPrincipleId: z
             .string()
             .optional()
             .describe(
-              "The skeleton principle this rule is PROJECTED from — for the empty-gate moment (\"stage X, no cached rules — skeleton applies\"): you are at a gate with nothing bound to it, the skeleton in your context speaks to it, so you write down the rule it implies here and it becomes a cache hit next time. The parent must be a ratified, undisputed skeleton principle in the same circle (a preference derives no rules, and neither does a principle that is retired or currently under impeachment). Records a derivation edge, so the rule announces \"derived from principle P\" whenever it fires — a wrong projection misfires in front of the user, which is exactly why this needs no approval step. Projected rules are advisory-only and are excluded from extraction evidence: a principle must not manufacture its own support.",
+              'Ratified, active, undisputed same-circle principle that implies this rule at an empty gate. Preferences cannot parent rules. The derivation is disclosed when the rule fires. Projected rules stay advisory and do not count as extraction evidence.',
             ),
         })
         .optional()
         .describe(
-          'Required when kind="rule". Binds the rule to the action it governs. Severity is always advisory here — blocking (deny) is declaration-only and lives in memory_declare.',
+          'Required for kind="rule". Binds an advisory rule to its stage. Only memory_declare can create blocking rules.',
         ),
     },
     async ({ content, circle, kind, sourceRefs, resolution, attachTo, rule }) => {
@@ -860,57 +860,57 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_declare",
-    'Declare a rule, a stage, a principle, or a preference on the user\'s authority. This is the SOVEREIGN entrance: unlike memory_store, which captures what a correction taught, this records what the user has decided — so it is the only surface that accepts severity="blocking" (deny the action, for safety boundaries where softness is dangerous) and the only one that may replace an existing rule\'s binding. NEVER declare on your own initiative: a declaration is the user legislating, so it needs the user to have said so. species="stage" creates or re-authors a gate address ("put a gate on terraform apply") — passing `patterns` REPLACES that stage\'s trigger patterns outright, which is how a mis-seeded pattern is fixed. species="rule" creates the rule and binds it to its stage, creating the stage if it does not exist. species="principle"/"preference" is the DECLARATION entrance into the always-on skeleton — sovereignty replaces the four-test extraction battery here, but the battery still runs as a non-blocking warning light: the response\'s `advisories` array names mechanical signals (content that looks like a rule bound to an existing gate, missing `exitsEvidence`, a near-match/resolution the write itself surfaced) and NEVER blocks the write. Momentless: do not pass stage/severity/patterns for these two species — a preference bound to a moment is just a rule. Pass `exitsEvidence` (what would prove it wrong) to skip that one advisory. A skeleton-changing declaration conditionally instructs the caller to run `monet materialize` when a registered standing surface became stale. Standing grants are NOT a separate thing to declare: a gate returns what the rule says, so "proceed without asking" is a rule with permissive content.',
+    'Declare a user-authorized rule, stage, principle, or preference. Never call on agent initiative. This is the only tool that may create blocking rules or replace a rule binding. Stages address gates; rules bind content to stages. Principles and preferences enter the always-on skeleton without stage, severity, or patterns; mechanical concerns return as non-blocking `advisories`. Skeleton changes include `instruction` only when a registered standing surface became stale. A permissive standing grant is a rule, not another species.',
     {
       species: z
         .enum(["rule", "stage", "principle", "preference"])
-        .describe('"stage": create or re-author a gate address. "rule": create a rule and bind it to a stage. "principle"/"preference": declare directly into the always-on skeleton (momentless — no stage/severity/patterns).'),
+        .describe('"stage" creates or re-authors a gate; "rule" binds to a stage; "principle"/"preference" enter the momentless skeleton.'),
       stage: z
         .string()
         .max(STAGE_NAME_MAX_CHARS)
         .optional()
-        .describe("The action the gate fires on — a stage name, or the id of an existing stage. Required for species \"rule\"/\"stage\"; must be omitted for \"principle\"/\"preference\", which are momentless."),
-      content: z.string().optional().describe('What it says. Required for every species.'),
+        .describe('Gate stage name or id. Required for "rule"/"stage"; omit for momentless "principle"/"preference".'),
+      content: z.string().optional().describe("Declaration text. Required for rule, principle, and preference; omit for stage."),
       exitsEvidence: z
         .string()
         .optional()
         .describe(
-          'species "principle"/"preference" only: what evidence would prove this wrong (the extraction battery\'s Exits test). Omitting it never blocks the write — it only earns a warning-light advisory prompting for it.',
+          'For principle/preference: evidence that would disprove it. Omission advises but never blocks.',
         ),
       patterns: z
         .array(z.string())
         .optional()
         .describe(
-          'Trigger patterns as concrete command shapes, e.g. ["terraform apply", "Bash:git push --force"]. REPLACES the stage\'s existing patterns entirely — including an empty array, which makes the stage fire on nothing. Each is reduced to a tool constraint plus an ordered word run, and fires when those words appear in order anywhere in the intercepted action. Omit the field to leave the patterns alone.',
+          'Concrete command shapes, such as ["terraform apply", "Bash:git push --force"]. Replaces all existing patterns; [] disables firing. Omit to preserve them. Words match in order; an optional tool prefix constrains the tool.',
         ),
       instance: z
         .string()
         .optional()
-        .describe("A concrete instance to seed the pattern from, when the stage is new and no explicit patterns are given."),
+        .describe("Concrete action used to seed a new stage when patterns are omitted."),
       severity: z
         .enum(["advisory", "blocking"])
         .optional()
         .describe(
-          'OMIT THIS unless the user is ruling on the failure mode. Omitted PRESERVES whatever the rule already has (restating a rule\'s text or its gate is not a decision about whether it denies); on a brand-new rule, omitted means "advisory". "advisory": the rule is injected at the gate. "blocking": the action is DENIED — this exists only here, no agent and no projection can self-assign deny power, and only where softness is genuinely dangerous. Passing "advisory" for a rule that is currently blocking REMOVES the deny; that is allowed but it is the user\'s call, and the response reports it as downgraded.',
+          'Pass only when the user rules on enforcement. Omit to preserve existing severity or default a new rule to advisory. "blocking" denies the action and is for safety boundaries. Changing blocking to advisory removes the deny and is disclosed.',
         ),
       acknowledgeBlockingRules: z
         .array(z.string())
         .optional()
         .describe(
-          "Required when `patterns` would re-author a stage that has blocking rules bound to it: list every one of their concept ids. Changing a stage's patterns changes what its denies deny, so this confirms you have seen them. The error names the ids you are missing — show them to the user before acknowledging.",
+          "When replacing patterns on a stage with blocking rules, list every blocking rule id after showing the user any ids reported missing.",
         ),
-      scope: z.enum(["domain", "agent"]).optional().describe('"domain": true for a perfect agent. "agent" (default): a compensation for this model.'),
-      modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Which model this compensates for. Required when scope is "agent"; defaults from MONET_MODEL_TAG when set.'),
-      reason: z.string().optional().describe('One line naming the failure this prevents — what the gate shows, and what earns compliance. REQUIRED when severity is "blocking": a deny nobody can explain is a deny people learn to route around. Ask the user for it rather than inventing one.'),
+      scope: z.enum(["domain", "agent"]).optional().describe('"domain" binds any agent; "agent" (default) compensates for this model.'),
+      modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Model compensated for. Required for agent scope unless MONET_MODEL_TAG supplies it.'),
+      reason: z.string().optional().describe('One-line failure prevented, shown at the gate. Required for blocking severity; ask the user rather than inventing it.'),
       // Bounded like memberRuleIds and ratifiedBy: this lands verbatim in fixed response fields and
       // overview skeleton entries, which are not size-fitted — an actor "name" is never a document.
-      declaredBy: z.string().max(200).optional().describe("Who ruled. Defaults to the calling agent id."),
+      declaredBy: z.string().max(200).optional().describe("Ruling actor; defaults to caller id."),
       circle: z
         .string()
         .max(CIRCLE_NAME_MAX_CHARS)
         .optional()
         .describe(
-          'Which circle this declaration lives in. Omit for the default. "*" is the reserved GLOBAL BREADTH declaration for species="rule", "principle", or "preference": the member keeps its ordinary home circle and delivers in every circle, unioned with whatever is local there, no shadowing — never a real circle name. Refused for species="stage" because a stage is store-global already.',
+          'Home circle; omit for default. "*" gives a rule/principle/preference global delivery while retaining its home circle. Invalid for store-global stages.',
         ),
       sourceRefs: z.array(z.string()).optional(),
     },
@@ -1055,12 +1055,12 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_ratify",
-    'The human-approval surface — the OTHER skeleton entrance, alongside memory_declare\'s species="principle"/"preference". Records a ruling on a skeleton candidate (a concept of kind "principle" or "preference"): the lead runs the four-test battery (Generates/Covers/Transfers/Exits) conversationally, and this call is where the human\'s verdict on it becomes durable record. verdict="approve" or "re-ratify" with `memberRuleIds` writes a derivation edge from the principle to EACH named rule (bornOf "ratification") — this is the principle proving it can re-derive its member rules; member rule ids must share the candidate\'s circle. verdict="reject" records that the candidate does not enter. verdict="retire" ends a currently-live membership (an impeached principle\'s own use-maintenance) — every verdict is recorded regardless, since ratification history is append-only. Skeleton membership is ALWAYS derived from the LATEST ratification for a concept, never a stored flag: approve→retire takes something out, retire→re-ratify brings it back. `packet` is the evidence shown to the human (member rules + failures, a re-derivation, the uncovered situation) — stored OPAQUE and VERBATIM for audit fidelity; memberRuleIds is a separate typed field precisely so edge-writing never depends on parsing it. A membership-changing verdict conditionally instructs the caller to run `monet materialize` when a registered standing surface became stale.',
+    'Record a human verdict on a principle or preference candidate after conversational review against the skeleton battery (Generates/Covers/Transfers/Exits). Approve/re-ratify enters the candidate in the skeleton and can link generated rules; reject keeps it out; retire ends current membership. The latest verdict governs membership, while every verdict remains in history. `packet` preserves exactly what the human saw. Membership changes include `instruction` only when a registered standing surface became stale.',
     {
-      candidateId: z.string().describe("Concept id of the skeleton candidate. Must be kind 'principle' or 'preference' in the resolved circle."),
+      candidateId: z.string().describe("Same-circle principle or preference concept id."),
       verdict: z
         .enum(["approve", "reject", "retire", "re-ratify"])
-        .describe('"approve"/"re-ratify": skeleton entry (or re-entry) — memberRuleIds (if given) each get a derivation edge. "reject": never enters. "retire": ends a current membership.'),
+        .describe('"approve"/"re-ratify" enters; "reject" keeps out; "retire" ends current membership.'),
       memberRuleIds: z
         .array(z.string())
         // Bounded because the response echoes every id back as edgeIds, a fixed (un-fittable)
@@ -1069,16 +1069,16 @@ export function registerMonetCoreTools(
         .max(200)
         .optional()
         .describe(
-          'Concept ids of the rules this principle generates. One derivation edge is written per id, ONLY when verdict is "approve" or "re-ratify" — ignored for "reject"/"retire". Every id must share the candidate\'s circle.',
+          'Same-circle rule ids generated by a principle. Linked only for approve/re-ratify; invalid for preferences.',
         ),
       packet: z
         .unknown()
         .optional()
         .describe(
-          "The evidence packet exactly as shown to the human who ruled (member rules + failures, a re-derivation, the uncovered situation) — stored verbatim for audit fidelity, never parsed to decide anything.",
+          "Evidence shown to the human, stored verbatim and never parsed for decisions.",
         ),
-      ratifiedBy: z.string().max(200).optional().describe("Who ruled. Defaults to the calling agent id."),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Which circle the candidate lives in. Omit for the default."),
+      ratifiedBy: z.string().max(200).optional().describe("Ruling actor; defaults to caller id."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Candidate's circle; omit for default."),
     },
     async ({ candidateId, verdict, memberRuleIds, packet, ratifiedBy, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1115,10 +1115,10 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_search",
-    "Locate memories by query similarity. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to search across all circles; pass circle to restrict.",
+    "Find memories by similarity. Returns ranked pointer cards, not content; call memory_fetch with a card's id and non-default circle to read it. Omit circle for store-wide search. Empty results mean no match.",
     {
       query: z.string(),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Restrict search to this circle. Omit to search across all circles — cards include each memory's home circle."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Restrict to one circle; omit for all. Cards include their home circle."),
       limit: z.number().int().positive().optional(),
     },
     async ({ query, circle, limit }) => {
@@ -1148,13 +1148,13 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_overview",
-    "Curation workbench for one circle: compact counts plus bounded actionable queues for possibleDuplicates, extractionCandidates, openContradictions, gate exceptions, and the ratified skeleton. The livingModel shows the top 5 current concepts by default. Pass includeDirty:true for the highest-evidence pending-synthesis cards; pass includeStale:true for the stalest re-confirmation cards. Both lists are capped and carry honest omission signals. Read-only; never returns memory bodies. Fetch an id to inspect evidence, resolve contradictions/pair flags with memory_resolve, and consolidate a true duplicate with memory_detach(destConceptId). Pass entity to list memories tied to one hub.",
+    "Read-only curation workbench for one circle: compact counts, livingModel cards, bounded queues for possibleDuplicates, extractionCandidates, openContradictions and gate exceptions, plus the ratified skeleton. Opt into dirty or stale worklists; truncation fields report omissions. It never returns bodies: memory_fetch an id, use memory_resolve for contradictions or pair flags, and memory_detach with destConceptId to consolidate a duplicate. Pass entity to list one hub's memories.",
     {
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       entity: z.string().optional(),
-      conceptLimit: z.number().int().min(0).optional().describe("Override the living-model card limit (default 5)."),
-      includeDirty: z.boolean().optional().describe("Include the capped pending-synthesis worklist; absent by default."),
-      includeStale: z.boolean().optional().describe("Include the capped re-confirmation worklist; absent by default."),
+      conceptLimit: z.number().int().min(0).optional().describe("Living-model card limit; default 5."),
+      includeDirty: z.boolean().optional().describe("Include the bounded pending-synthesis worklist."),
+      includeStale: z.boolean().optional().describe("Include the bounded re-confirmation worklist."),
     },
     async ({ circle, entity, conceptLimit, includeDirty, includeStale }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1175,15 +1175,15 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_list",
-    "Enumerate a circle's memories as structural cards — id, title, kind, support count, confidence, open contradictions — optionally with `withProvenance` for the project path(s) each memory's evidence came from. PAGINATED with a KEYSET cursor: returns up to `limit` (default 50) plus a `nextCursor` when more remain; pass it back as `cursor` to continue, until it's absent. The cursor walks a stable order, so it's SAFE to reassign each page out of the circle before fetching the next (an offset would skip rows as the circle shrinks). Read-only; never returns bodies (memory_fetch reads one). Built for organizing/migrating memory: list a circle (e.g. the legacy \"default\"), group by content + where it came from, then memory_reassign_circle each into its project's circle.",
+    "List one circle's memories as structural cards, never bodies; use memory_fetch to read one. Returns up to `limit` plus `nextCursor`; pass that as `cursor` until absent. Keyset pagination stays valid while earlier pages are reassigned. Use `withProvenance` to group memories by evidence paths, then memory_reassign_circle to migrate them.",
     {
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       withProvenance: z
         .boolean()
         .optional()
-        .describe("Include each memory's `provenance`: the distinct working-dir paths its observations were recorded under (the strongest signal for which project it belongs to)."),
-      limit: z.number().int().positive().max(200).optional().describe("Max memories to return (default 50)."),
-      cursor: z.string().optional().describe("Opaque keyset cursor from the prior response's `nextCursor`; omit for the first page."),
+        .describe("Include distinct working-directory paths recorded for each memory's evidence."),
+      limit: z.number().int().positive().max(200).optional().describe("Page size; default 50, maximum 200."),
+      cursor: z.string().optional().describe("Prior `nextCursor`; omit for the first page."),
     },
     async ({ circle, withProvenance, limit, cursor }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1217,12 +1217,12 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_gather",
-    "Rebuild working context around an intent via graph spread. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to gather across all circles; pass circle to restrict.",
+    "Gather context for an intent through graph spread. Returns ranked pointer cards, not content; call memory_fetch with a card's id and non-default circle to read it. Omit circle to gather store-wide. Empty results mean no match.",
     {
       intent: z.string(),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Restrict gathering to this circle. Omit to gather across all circles — cards include each memory's home circle (spreading stays within each seed's home circle)."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Restrict to one circle; omit for all. Cards include home circles; spread stays within each seed's circle."),
       limit: z.number().int().positive().optional(),
-      depth: z.enum(["1", "2"]).optional().describe("Graph hops from the seeds (default 2)."),
+      depth: z.enum(["1", "2"]).optional().describe("Graph hops from seeds; default 2."),
     },
     async ({ intent, circle, limit, depth }) => {
       // Fix A: snapshot uses the call's resolved circle; fall back to session default for all-circle gathers.
@@ -1252,13 +1252,13 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_fetch",
-    "Read a concept by id. For normal concepts, `body` is the payload; observations never ride by default. Pass observations:true only when you need the evidence for synthesis or curation; observations are {id, content} and page newest→oldest with observationsOffset (0 = newest page, normally 20 at a time). `observationCount` is the full count. When `observationsOmitted` appears, the requested page was size-fitted; advance observationsOffset by the number of observations actually returned to continue without gaps. `needsSynthesis:true` means new evidence has not been synthesized: explicitly pull every observation page, write one coherent body, then call memory_synthesize(id, body). `bodyTruncated:true` means the body was clipped; use the observations pull to recover the evidence. A disputed concept adds `status` and `openContradictions` [{id, kind, detail}]; mediate with memory_resolve({ contradictionId: openContradictions[i].id }). Source concepts (kind='source', file=concept) keep their structure-first contract unchanged: title, sourcePath + sourceId, and an outline by default, never observations/needsSynthesis; pass includeBody:true to read the concatenated file body inline.",
+    "Read a concept by id. Normal concepts return `body` and `observationCount`; evidence appears only with observations:true as newest-first pages. If `needsSynthesis:true`, pull every page, reconcile one body, then call memory_synthesize. `bodyTruncated` means recover from observations. A disputed concept adds `status` and `openContradictions`; mediate with memory_resolve({ contradictionId: openContradictions[i].id }). Source concepts instead return title, sourcePath/sourceId, and outline; includeBody:true adds the concatenated file body.",
     {
       id: z.string(),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the id belongs to. Omit to look the id up store-wide (the response includes its home circle); if provided, the id must live in that circle."),
-      observations: z.boolean().optional().describe("Normal concepts only: include one newest-first page of observations for synthesis or curation. Default false. Source concepts keep their structure-first response and ignore this parameter."),
-      observationsOffset: z.number().int().min(0).optional().describe("When observations:true, skip this many observations from the newest end before applying the 20-entry page cap. Start at 0. Normally increment by 20; if observationsOmitted appears, increment by observations.length instead so size-fitting cannot create gaps. Paging metadata appears only when observations were requested."),
-      includeBody: z.boolean().optional().describe("Source concepts only: include the full concatenated file body. Default false because a source concept's body can span the whole file. Ignored for normal concepts, whose body is always the payload."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Expected home circle. Omit for store-wide id lookup; the response includes the home circle."),
+      observations: z.boolean().optional().describe("Normal concepts: include one newest-first evidence page. Default false; ignored for sources."),
+      observationsOffset: z.number().int().min(0).optional().describe("With observations:true, skip this many newest entries. Start at 0. Advance by observations.length, especially when observationsOmitted appears."),
+      includeBody: z.boolean().optional().describe("Source concepts: include the concatenated file body. Default false; ignored for normal concepts."),
     },
     async ({ id, circle, observations, observationsOffset, includeBody }) => {
       // memory_fetch is READ-ONLY — the pre-mutation capture rule (Fix B) does not apply here.
@@ -1411,9 +1411,9 @@ export function registerMonetCoreTools(
 
   server.tool(
     "stage_lookup",
-    "You are at a named moment (see the stage index from agent_context): ask for that stage's rules before proceeding. Advisory delivery — rules arrive with the reason that earns compliance. When parentDisputed is true, one of this rule's derivation parents is currently disputed — disputedParentIds names exactly which (memory_fetch them to see the impeachment; the named projectedFromPrincipleId is the earliest/display parent, not necessarily a disputed one). A miss returns the live index.",
+    "At a stage named by agent_context, fetch its rules before acting. A hit returns bounded rules with reasons and omission recovery fields. `parentDisputed:true` means `disputedParentIds` should be memory_fetched; projectedFromPrincipleId is only the display parent. A miss returns the live stage index.",
     {
-      stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("The stage name (or id) you recognize — from the stage index agent_context/prewarm carries."),
+      stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("Stage name or id from agent_context/prewarm."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
     },
     async ({ stage, circle }) => {
@@ -1597,8 +1597,8 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_synthesize",
-    "Write back a synthesized body for a concept — you, the agent, are the synthesizer. Reconcile the concept's observations into one coherent statement. Clears the dirty flag and records a revision.",
-    { id: z.string(), body: z.string(), circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the id belongs to (defaults to this session's circle).") },
+    "Store one coherent body synthesized from all of a concept's observations. Clears `needsSynthesis` and records a revision.",
+    { id: z.string(), body: z.string(), circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Concept's circle; defaults to session circle.") },
     async ({ id, body, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
@@ -1614,7 +1614,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_checkpoint",
-    "End of session — preserve where you left off. Pass `workstream`: a COMPRESSED snapshot of this session (open questions, decisions, discarded alternatives, important entities/files, next steps) — many raw turns distilled into a few durable slots. It survives for a later continuation request through memory_workstreams. This call only preserves session state; synthesis is handled at read time.",
+    "At session end, preserve a compressed `workstream` snapshot: open questions, confirmed context, decisions, discarded alternatives, important entities/files, next steps, and status. Later continuation retrieves it through memory_workstreams. This does not synthesize memories.",
     {
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       summary: z.string().optional(),
@@ -1647,11 +1647,11 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_workstreams",
-    "Pull active/paused workstreams ONLY when the user expresses continuation intent. For “let's continue”, call with no id to get the compact list, then confirm with the user which thread to resume. For “continue <X>”, list first; if exactly one confident match exists, call again with that id for full detail, otherwise confirm. Full detail pages entries in this fixed order: openQuestions, decisions, discardedAlternatives, confirmedContext, importantEntities, nextSteps; entries retain stored order within each slot. Start detailOffset at 0, then add the number of entries actually returned across all slots; detailOmitted is the true number remaining. A session opened with a fresh directive never calls this tool.",
+    "Call only on continuation intent, never for a fresh directive. Omit id to list compact active/paused workstreams, then confirm which to resume unless the user named one unambiguously. Pass its id for detail. Detail pages preserve slot order: openQuestions, decisions, discardedAlternatives, confirmedContext, importantEntities, nextSteps. Advance detailOffset by entries actually returned; detailOmitted is the true remainder.",
     {
-      id: z.string().optional().describe("Workstream id from the compact list. Omit to list active/paused workstreams."),
+      id: z.string().optional().describe("Workstream id for detail; omit to list active/paused workstreams."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
-      detailOffset: z.number().int().min(0).optional().describe("With id: skip this many entries in the documented cross-slot order. Start at 0; continue by adding the number of entries actually returned across all slots."),
+      detailOffset: z.number().int().min(0).optional().describe("With id, skip this many cross-slot entries; advance by entries returned."),
     },
     async ({ id, circle, detailOffset }) => {
       const resolvedCircle = scope(circle);
@@ -1772,13 +1772,13 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_flag_contradiction",
-    "Flag that a concept now holds conflicting information (model drift). Opens a contradiction, marks the concept `disputed`, and decays its confidence until you mediate it with memory_resolve. Use when you notice a stored memory is contradicted by newer evidence. (Storing the new evidence with kind=\"correction\" does this automatically.)",
+    "Open a contradiction when stored memory conflicts with newer evidence. The concept becomes disputed until memory_resolve mediates it. Prefer memory_store kind=\"correction\" when also storing the correcting evidence.",
     {
       conceptId: z.string(),
       detail: z.string(),
       observationId: z.string().optional(),
       kind: z.enum(["value-conflict", "staleness", "scope-conflict"]).optional(),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the conceptId belongs to (defaults to this session's circle)."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Concept's circle; defaults to session circle."),
     },
     async ({ conceptId, detail, observationId, kind, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1794,35 +1794,20 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_resolve",
-    "Mediate a contradiction OR dismiss a flagged pair (possible-duplicate OR extraction-candidate) — two verdict families, one tool. " +
-    "CONTRADICTION VERDICT: pass `contradictionId` + `decision` ('accept-new' / 'keep-current' / 'dismiss'). " +
-    "accept-new: the correcting evidence wins; keep-current: the prior wins; dismiss: not a real conflict. " +
-    "WHAT GETS SUPERSEDED: pass `contradictedObservationId` to name the observation the correction contradicted — you already have the evidence in front of you at this point, so a name given HERE is not a guess. accept-new then supersedes EXACTLY that observation (successor: the correcting observation), no matter how many other live observations the concept holds. keep-current records it as the prior being kept; it does not change what gets superseded (the correction is still retired with no successor — see below). The name is validated: it must exist, belong to the same concept as the contradiction, be live (not already superseded), predate the correcting observation (a later observation was never in dispute with it — naming one is refused, not silently accepted), and not be the correcting observation itself. It also requires the contradiction to actually HAVE a correcting observation — a bare contradiction (flagged without one, e.g. via memory_flag_contradiction with no observationId) contradicted nothing, so naming a loser for it is refused for every decision, not only accept-new. " +
-    "Omit `contradictedObservationId` and the conservative fallback applies, because nothing else records WHICH prior a correction contradicted: accept-new supersedes the single prior ONLY when exactly one live observation predates the correction; with several it supersedes NOTHING and REQUIRES `body`, which is then the only record of the verdict — the contradicted claim stays live evidence INDEFINITELY — nothing retires it automatically (memory_synthesize only rewrites the body), so it keeps contributing to support and the concept embedding until something explicitly supersedes or detaches it. keep-current (named or not) retires the correction terminally, naming no successor. For accept/keep, pass the reconciled `body`. The concept restores to active once no conflicts remain. " +
-    "PAIR-FLAG DISMISSAL: pass `conceptAId` + `conceptBId` (omit contradictionId/decision). " +
-    "This is the exit for BOTH pair flags memory_overview surfaces — possibleDuplicates (\"are these one thing?\") and extractionCandidates (\"do these two rules share one reason?\"). " +
-    "ONE DISMISSAL ANSWERS BOTH: asserting that these two concepts are unrelated retires every flag between them, so the pair leaves possibleDuplicates AND extractionCandidates together and survives any future detach/rederive cycle. That is deliberate, not a limitation — a human saying \"these two are unrelated\" has answered both questions in one breath, and there is no per-flag argument to split them. If the two really are related in one sense but not the other, correct or detach them instead of dismissing. " +
-    "Dismissing a pair with no live flag edge of either type succeeds idempotently with rowsUpdated: 0 (\"nothing to dismiss\" signal); rowsUpdated counts edge ROWS, and each flag is stored in both directions. " +
-    "Pass `resolvedBy` / `circle` for either family. Existing contradiction-path callers are unaffected.",
+    "Mediate a contradiction or dismiss a flagged pair. CONTRADICTION: pass contradictionId, decision, and a reconciled body for accept-new/keep-current. accept-new keeps the correction; keep-current retires it; dismiss records no conflict. Name contradictedObservationId (a live, older, same-concept observation): on accept-new it is superseded exactly; on keep-current it is recorded as the kept prior while the correction is retired either way. Without it, accept-new supersedes only a sole older live observation; if several exist, none is retired and body is required. PAIR-FLAG DISMISSAL: pass conceptAId + conceptBId only. One dismissal clears both possible-duplicate and extraction-candidate flags between the pair; if only one relation is wrong, correct or detach instead. rowsUpdated:0 is an idempotent no-op.",
     {
       // Contradiction-resolution fields (existing — backward compatible).
-      contradictionId: z.string().optional().describe("The contradiction to mediate. Required for contradiction verdicts; omit for duplicate-pair dismissal."),
-      decision: z.enum(["accept-new", "keep-current", "dismiss"]).optional().describe("Verdict for a contradiction. Required when contradictionId is present."),
+      contradictionId: z.string().optional().describe("Contradiction to mediate; omit for pair dismissal."),
+      decision: z.enum(["accept-new", "keep-current", "dismiss"]).optional().describe("Required contradiction verdict."),
       body: z.string().optional(),
       contradictedObservationId: z.string().optional().describe(
-        "The observation the correction contradicted — the loser (accept-new) or the prior being kept " +
-        "(keep-current). Must exist, belong to the same concept as the contradiction, be live, predate the " +
-        "correcting observation (evidence added AFTER the correction was never in dispute with it), and not be the " +
-        "correcting observation itself; violating any of these throws rather than guessing. Also requires the " +
-        "contradiction to have a real correcting observation — invalid on one flagged without one (nothing to have " +
-        "contradicted). Optional; omitting it falls back to the conservative default described above. Invalid with " +
-        "decision:\"dismiss\" (a dismissal reaches no verdict, so naming a loser is meaningless).",
+        "Exact prior observation challenged by the correction. It must be live, older, same-concept, and distinct from a real correcting observation. Omit for conservative fallback; invalid with dismiss.",
       ),
       resolvedBy: z.string().optional(),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle the contradiction or concepts belong to (defaults to this session's circle)."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Circle containing the contradiction or pair; defaults to the session circle."),
       // Pair-flag dismissal fields (new in 0.6.0; widened from possible-duplicate only in 5-B).
-      conceptAId: z.string().optional().describe("First concept of the flagged pair to dismiss — a possible-duplicate pair or an extraction-candidate pair, from memory_overview. Required for pair-flag dismissal; omit for contradiction verdicts."),
-      conceptBId: z.string().optional().describe("Second concept of the flagged pair to dismiss — a possible-duplicate pair or an extraction-candidate pair, from memory_overview. One dismissal clears every flag between the two. Required for pair-flag dismissal; omit for contradiction verdicts."),
+      conceptAId: z.string().optional().describe("First possible-duplicate or extraction-candidate concept from memory_overview. Required with conceptBId for pair dismissal."),
+      conceptBId: z.string().optional().describe("Second possible-duplicate or extraction-candidate concept. Dismissal clears both flag types between the pair."),
     },
     async ({ contradictionId, decision, body, contradictedObservationId, resolvedBy, circle, conceptAId, conceptBId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1876,21 +1861,21 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_detach",
-    "Split one or more observations out of a concept. The named observations are moved out of their source concept and either create a new concept (default) or are attached to an existing concept you specify with destConceptId. The source concept is recomputed (embedding, support count, confidence, body) from its remaining evidence and marked for re-synthesis. Use to undo a wrong merge, or to consolidate a possible-duplicate pair: memory_fetch both concepts, pick the observations to move, call memory_detach with destConceptId to fold them into the keeper. Detaching ALL observations into a destConceptId consolidates the source away (it is deleted). Cannot detach the last observation without destConceptId — move the whole concept with memory_reassign_circle instead.",
+    "Move observations out of a concept to undo a wrong merge. By default they form a new concept; destConceptId attaches them to an existing same-circle concept. The source is recomputed and marked for synthesis. Moving all observations into a destination deletes the source, consolidating a duplicate. Without a destination, at least one observation must remain; use memory_reassign_circle to move a whole concept across circles.",
     {
-      conceptId: z.string().describe("The concept to detach observations FROM."),
-      observationIds: z.array(z.string()).min(1).describe("Ids of the observations to detach (from memory_fetch's observations[].id)."),
+      conceptId: z.string().describe("Source concept."),
+      observationIds: z.array(z.string()).min(1).describe("Observation ids from memory_fetch observations."),
       destConceptId: z
         .string()
         .optional()
         .describe(
-          "Attach the detached observations TO this existing concept instead of creating a new one. Must be in the same circle. Used to consolidate a possible-duplicate pair. Detaching ALL observations with this set removes the source concept entirely.",
+          "Existing same-circle destination. If all observations move, the source is deleted.",
         ),
       circle: z
         .string()
         .max(CIRCLE_NAME_MAX_CHARS)
         .optional()
-        .describe("The circle the conceptId belongs to (defaults to this session's circle). Pass it when working with an explicit circle."),
+        .describe("Source concept's circle; defaults to the session circle."),
     },
     async ({ conceptId, observationIds, destConceptId, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
@@ -1919,16 +1904,16 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_reassign_circle",
-    "Move a memory — its concept, its observations, and its graph membership — from its current circle into another. The apply step of a memory migration: home a piece of unscoped \"default\" memory into its project's circle. Dedupes: if the target circle already holds a matching memory, the two MERGE (no duplicate, no re-embedding) and `action` comes back \"merged\". Pass `ids` (array) for a batch move; pass `id` (string) for a single move — exactly one of `id`/`ids` is required. Pass `circle` = the id's CURRENT circle if it isn't your session default. resolution: \"auto\" (default) merges into a matching destination concept. \"forceNew\": always keep distinct, recording a possible_duplicate_of edge on near-match — use for curation batch moves.",
+    "Move a concept, its observations, and graph membership to another circle. Pass exactly one of id or ids; batches are per-item atomic and report errors without aborting. `circle` is the current home. `auto` merges a destination match; `forceNew` keeps it distinct and flags a near match as possible_duplicate. Use this to home legacy default memory in its project circle.",
     {
-      id: z.string().optional().describe("Single concept id to move. Exactly one of `id` or `ids` is required."),
-      ids: z.array(z.string()).optional().describe("Batch of concept ids to move (each individually atomic; errors captured per item without aborting the batch). Exactly one of `id` or `ids` is required."),
-      toCircle: z.string().max(CIRCLE_NAME_MAX_CHARS).describe("The destination circle (e.g. the project's per-project circle)."),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The id's CURRENT circle (defaults to this session's circle). Pass \"default\" when migrating legacy unscoped memory."),
+      id: z.string().optional().describe("Single concept id; mutually exclusive with ids."),
+      ids: z.array(z.string()).optional().describe("Batch concept ids; mutually exclusive with id."),
+      toCircle: z.string().max(CIRCLE_NAME_MAX_CHARS).describe("Destination circle."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Current circle; defaults to session circle. Use \"default\" for legacy unscoped memory."),
       resolution: z
         .enum(["auto", "forceNew"])
         .optional()
-        .describe('"auto" (default): merge into a matching destination concept. "forceNew": always keep distinct, recording a possible_duplicate_of edge on near-match — use for curation batch moves.'),
+        .describe('"auto" (default when omitted) merges into a destination match, removing the source concept; "forceNew" keeps distinct and flags a near match — choose it when identity is uncertain.'),
     },
     async ({ id, ids, toCircle, circle, resolution }) => {
       // memory_reassign_circle is a multi-circle op (source + dest). Snapshot uses the session
@@ -2016,15 +2001,15 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_circle_manage",
-    "Create, rename, merge, or archive project-locality circles. RENAME establishes a stable alias so sessions that derive the old name keep resolving. MERGE moves every concept from one circle into another (default resolution forceNew: near-matches are kept distinct and linked with a possible_duplicate_of edge for later mediation). ARCHIVE hides a circle from store-wide recall and listings without deleting or sealing it. LIST enumerates the store's circles including archived ones. Topic organization belongs to the entity/edge graph — circles are write-home/project locality.",
+    "Manage project-locality circles. Rename preserves the old name as an alias. Merge moves all concepts; forceNew (default) keeps near matches distinct and flags them, while auto deduplicates. Archive hides a circle from store-wide recall/listing without deleting it; unarchive restores it. List includes archived circles. Use entities/edges, not circles, for topics.",
     {
       action: z.enum(["rename", "merge", "archive", "unarchive", "list"]),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("The circle to act on (rename/merge source, archive/unarchive target). Required for rename, merge, archive, unarchive."),
-      to: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Destination circle name for rename or merge."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Rename/merge source or archive/unarchive target; required for those actions."),
+      to: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Rename or merge destination."),
       resolution: z
         .enum(["auto", "forceNew"])
         .optional()
-        .describe('For merge: "auto" deduplicates into existing concepts; "forceNew" (default) keeps all distinct and records possible_duplicate_of edges for near-matches.'),
+        .describe('Merge mode: "auto" deduplicates; "forceNew" (default) keeps distinct and flags near matches.'),
     },
     async ({ action, circle, to, resolution }) => {
       // memory_circle_manage is a multi-circle op (rename/merge touch source+dest circles; archive/
@@ -2084,7 +2069,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "source_list",
-    "List knowledge sources authorized for this host runtime. Access identity is bound by the server and cannot be supplied as tool arguments.",
+    "List sources authorized for this host. Access identity is server-bound, never a tool argument.",
     {},
     async () => {
       const capturedBlock = capturePrewarmSnapshot(scope());
@@ -2095,7 +2080,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "source_status",
-    "Return active published status for one authorized source. Counts never include partial or unpublished runs.",
+    "Return one authorized source's active published status; counts exclude partial and unpublished runs.",
     { sourceId: z.string().min(1) },
     async ({ sourceId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope());
@@ -2106,7 +2091,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "source_path",
-    "Return the sealed read-only path for the exact active indexed repo-md or git-md snapshot. Never returns a working tree or bare repository.",
+    "Return the sealed read-only path to an authorized source's active indexed snapshot, never a working tree or bare repository.",
     { sourceId: z.string().min(1) },
     async ({ sourceId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope());
@@ -2117,7 +2102,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "source_sync",
-    "Synchronize one authorized active repo-md or git-md source. Remote git-md sync is noninteractive and pins one configured branch.",
+    "Synchronize one authorized active source. Remote git sync is noninteractive and uses its configured branch.",
     { sourceId: z.string().min(1) },
     async ({ sourceId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope());
@@ -2128,7 +2113,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Session-start orientation only. Call FIRST with no arguments. Returns the resolved `circle`; `resolvedFrom` appears when the requested circle was an alias. `stageIndex` (when present) names stages you can recognize; call stage_lookup(stage) for that moment's rules. Skeleton delivery has three states: absence means the standing files you already loaded are current; `mirrorStale` + `instruction` appears only when a standing file diverged and needs user-confirmed reconciliation; `skeleton` appears only for members not covered by a standing file.",
+    "Session-start orientation. Call first. Returns resolved `circle`; `resolvedFrom` marks an alias. `stageIndex` names moments whose rules require stage_lookup. Skeleton delivery has three states: no mirror fields means loaded standing files are current; `mirrorStale` + `instruction` requires user-confirmed reconciliation; `skeleton` contains members not covered by a standing file.",
     { circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);

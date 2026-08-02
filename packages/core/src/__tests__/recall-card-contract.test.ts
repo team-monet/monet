@@ -8,9 +8,9 @@ import { registerMonetCoreTools } from "../mcp-server";
 const circle = "recall-card-contract";
 const RESULT_MAX_CHARS = 40_000;
 const SEARCH_DESCRIPTION =
-  "Locate memories by query similarity. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to search across all circles; pass circle to restrict.";
+  "Find memories by similarity. Returns ranked pointer cards, not content; call memory_fetch with a card's id and non-default circle to read it. Omit circle for store-wide search. Empty results mean no match.";
 const GATHER_DESCRIPTION =
-  "Rebuild working context around an intent via graph spread. Results are ranked pointer cards, not content: call memory_fetch(id) to read one, and pass the card's circle when it differs from the session's. An empty result means nothing matched, not failure. Omit circle to gather across all circles; pass circle to restrict.";
+  "Gather context for an intent through graph spread. Returns ranked pointer cards, not content; call memory_fetch with a card's id and non-default circle to read it. Omit circle to gather store-wide. Empty results mean no match.";
 
 const removedCardKeys = [
   "supportCount",

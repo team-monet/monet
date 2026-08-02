@@ -352,7 +352,7 @@ describe("9. server factory instructions", () => {
       { name: "monet-core", version: "0.7.0" },
       {
         capabilities: { tools: {} },
-        instructions: "Monet is the user's persistent memory substrate; start by calling agent_context (no arguments) for orientation; only on continuation intent use memory_workstreams to list active/paused threads and confirm which to resume before pulling detail; use memory_store for durable knowledge and memory_search/memory_gather (cards) + memory_fetch (content) to recall; end with memory_checkpoint and a workstream snapshot (open questions, decisions, next steps); without it, session state is lost.",
+        instructions: "Monet is persistent memory. Start each project session with agent_context. Call memory_workstreams only when the user intends to continue prior work; list and confirm the thread before fetching detail. Recall with memory_search/memory_gather pointer cards, then memory_fetch content. Store durable knowledge with memory_store. End with memory_checkpoint and a compressed workstream snapshot; without it, session state is lost.",
       },
     );
     registerMonetCoreTools(server, core, { autoPrewarm: false, checkpointNudge: false });
@@ -362,8 +362,8 @@ describe("9. server factory instructions", () => {
     await client.connect(clientTransport);
     try {
       const { MONET_SERVER_INSTRUCTIONS } = await import("../mcp-server");
-      expect(MONET_SERVER_INSTRUCTIONS).toContain("start by calling agent_context");
-      expect(MONET_SERVER_INSTRUCTIONS).toContain("only on continuation intent");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("Start each project session with agent_context");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("only when the user intends to continue prior work");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("memory_workstreams");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("memory_checkpoint");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("without it, session state is lost");

@@ -609,9 +609,9 @@ describe("prewarm skeleton mirror delivery", () => {
       const payload = JSON.parse(result.content[0]!.text);
       expect(payload.skeleton.map((entry: SkeletonEntry) => entry.conceptId)).toEqual([global.conceptId, alpha.conceptId]);
       const description = (await client.listTools()).tools.find((tool) => tool.name === "agent_context")!.description!;
-      expect(description).toContain("absence means the standing files you already loaded are current");
-      expect(description).toContain("`mirrorStale` + `instruction` appears only");
-      expect(description).toContain("`skeleton` appears only");
+      expect(description).toContain("no mirror fields means loaded standing files are current");
+      expect(description).toContain("`mirrorStale` + `instruction` requires user-confirmed reconciliation");
+      expect(description).toContain("`skeleton` contains members not covered by a standing file");
     } finally {
       await client.close();
       await server.close();
