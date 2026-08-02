@@ -1588,7 +1588,7 @@ describe("source ledger schema migration", () => {
       left.close();
 
       const again = new MonetCore(path);
-      expect(((again as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(11);
+      expect(((again as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(12);
       again.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -1657,7 +1657,7 @@ describe("source ledger schema migration", () => {
 
       const migrated = new MonetCore(path);
       const migratedDb = (migrated as unknown as { db: StoragePort }).db;
-      expect(migratedDb.pragma("user_version", { simple: true })).toBe(11);
+      expect(migratedDb.pragma("user_version", { simple: true })).toBe(12);
       for (const table of ["source_sync_runs", "source_snapshots", "source_staged_files", "source_files", "source_staged_chunks", "source_chunks", "source_cleanup_items", "source_removals", "source_removal_items"]) {
         expect(migratedDb.prepare(`PRAGMA table_info(${table})`).all()).not.toEqual([]);
       }
@@ -1668,7 +1668,7 @@ describe("source ledger schema migration", () => {
       expect((migratedDb.prepare(`SELECT sql FROM sqlite_master WHERE name='source_cleanup_items'`).get() as { sql: string }).sql).toContain("quarantine-non-authorizing");
       migrated.close();
       const reopened = new MonetCore(path);
-      expect(((reopened as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(11);
+      expect(((reopened as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(12);
       reopened.close();
       const disabled = new MonetCore(":memory:", { graphEnabled: false });
       expect(((disabled as unknown as { db: StoragePort }).db.pragma("user_version", { simple: true }))).toBe(0);

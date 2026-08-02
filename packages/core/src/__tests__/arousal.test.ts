@@ -54,7 +54,7 @@ describe("M.1 — Migration: 3 new columns added with correct backfill", () => {
       expect(cols.some((c) => c.name === "arousal_peak")).toBe(false);
 
       const version = db.pragma("user_version", { simple: true }) as number;
-      expect(version).toBe(11); // SOURCE_FILE_CONCEPT_SCHEMA_VERSION (latest)
+      expect(version).toBe(12); // MONET_SCHEMA_VERSION (latest)
 
       core.close();
     } finally {

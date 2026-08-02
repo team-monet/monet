@@ -31,7 +31,7 @@ async function makeMcpPair(core: MonetCore): Promise<{ client: Client; cleanup: 
 }
 
 describe("tool roster — drift gate", () => {
-  it("registers exactly the 22 documented tools (sorted)", async () => {
+  it("registers exactly the 21 documented tools (sorted)", async () => {
     const core = new MonetCore(":memory:");
     const { client, cleanup } = await makeMcpPair(core);
     try {
@@ -47,7 +47,6 @@ describe("tool roster — drift gate", () => {
         "memory_declare",
         "memory_detach",
         "memory_fetch",
-        "memory_first_block",
         "memory_flag_contradiction",
         "memory_gather",
         "memory_list",

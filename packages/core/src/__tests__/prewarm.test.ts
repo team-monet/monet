@@ -12,6 +12,7 @@ describe("prewarm — query-independent session start (#242)", () => {
     await core.store("We decided to use SQLite as the storage backend for Monet Local.", { kind: "decision" });
 
     const state = core.prewarm(); // <- no query argument at all
+    expect(state).not.toHaveProperty("firstBlock");
     expect(Array.isArray(state.activeWorkstreams)).toBe(true);
     expect(state.topConcepts.length).toBe(1);
     expect(state.openContradictions).toEqual([]); // pending #240

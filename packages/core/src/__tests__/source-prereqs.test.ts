@@ -143,7 +143,6 @@ describe("source-pipeline core prerequisites", () => {
       expect(() => core.flagContradiction(first.conceptId, { detail: "Forged contradiction." })).toThrow("source concept");
       expect(core.dismissPossibleDuplicate(first.conceptId, first.conceptId)).toMatchObject({ dismissed: false });
       await expect(core.applySynthesis(first.conceptId, "Forged body.")).rejects.toThrow("source concept");
-      expect(() => core.promoteToFirstBlock(first.conceptId, "Forged pin", "default")).toThrow("source concept");
     } finally {
       core.close();
     }
@@ -544,7 +543,6 @@ describe("source-pipeline core prerequisites", () => {
       const original = await core.store("Retired native concept.", { resolution: "forceNew" });
       core.retireConcept(original.conceptId);
       await expect(core.getConcept(original.conceptId)).resolves.toBeNull();
-      expect(() => core.promoteToFirstBlock(original.conceptId, "Attempted re-pin", "default")).toThrow("retired concept");
       await expect(core.store("Attempted revive.", { attachTo: original.conceptId })).rejects.toThrow("retired concept");
       expect(() => core.flagContradiction(original.conceptId, { detail: "Attempted revive." })).toThrow("retired concept");
       const replacement = await core.store("Retired native concept.");

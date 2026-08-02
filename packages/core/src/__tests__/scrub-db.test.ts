@@ -229,9 +229,7 @@ async function buildFixtureDb(path: string): Promise<{ conceptIds: string[] }> {
       "Prior version: reach me at jane.doe@example.com or ~/.monet/monet.db.",
     );
 
-    // Round 5, H2: promoted_by seeded with a hostile-shaped (/Users/ path) caller-supplied label —
-    // promoteToFirstBlock's `opts.promotedBy` / mcp-server.ts's `promotedBy` tool field have no
-    // format constraint.
+    // Legacy first_block audit label: scrub before a pre-schema-12 fixture is published or migrated.
     db.prepare(`INSERT INTO first_block (id, concept_id, circle, summary, position, promoted_by) VALUES (?, ?, ?, ?, 0, ?)`).run(
       "fb-1",
       conceptIds[0],

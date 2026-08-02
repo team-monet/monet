@@ -1,11 +1,17 @@
+import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   anySourceRefreshFailure,
   formatEmbeddingMigrationReport,
   runEmbeddingMigration,
+  withReportOnlyStore,
   type SourceRefreshReport,
 } from "../../scripts/migrate-file-concept";
-import { EmbedderMigrationFailedError, type EmbeddingMigrationReport } from "../engine";
+import { EmbedderMigrationFailedError, MonetCore, type EmbeddingMigrationReport } from "../engine";
+import type { StoragePort } from "../storage";
 
 function sourceReport(error: string | null): SourceRefreshReport {
   return {
@@ -92,5 +98,41 @@ describe("migrate-file-concept thin migration harness", () => {
   it("source refresh remains per-item resilient but produces a fail-hard end decision", () => {
     expect(anySourceRefreshFailure([sourceReport(null)])).toBe(false);
     expect(anySourceRefreshFailure([sourceReport(null), sourceReport("ENOENT")])).toBe(true);
+  });
+
+  it("opens report-only schema-11 stores through a disposable backup and leaves the original byte-identical", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "monet-report-only-copy-"));
+    const dbPath = join(directory, "monet.db");
+    try {
+      const seed = new MonetCore(dbPath);
+      const stored = await seed.store("Report-only migration target.", { resolution: "forceNew" });
+      const db = (seed as unknown as { db: StoragePort }).db;
+      db.prepare(
+        `INSERT INTO first_block
+           (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by,
+            updated_at, sync_revision, sync_writer, deleted_at)
+         VALUES ('report-pin', ?, 'default', 'Report-only pin.', 0, 0, 1700000000000, NULL,
+                 1700000000000, 1, 'schema-11-fixture', NULL)`,
+      ).run(stored.conceptId);
+      db.pragma("user_version = 11");
+      db.pragma("wal_checkpoint(TRUNCATE)");
+      db.pragma("journal_mode = DELETE");
+      seed.close();
+      const before = readFileSync(dbPath);
+
+      await withReportOnlyStore(dbPath, async (copyPath) => {
+        const reportCore = new MonetCore(copyPath);
+        const reportDb = (reportCore as unknown as { db: StoragePort }).db;
+        expect(reportDb.pragma("user_version", { simple: true })).toBe(12);
+        reportCore.close();
+      });
+
+      expect(readFileSync(dbPath)).toEqual(before);
+      const verify = new Database(dbPath, { readonly: true });
+      expect(verify.pragma("user_version", { simple: true })).toBe(11);
+      verify.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

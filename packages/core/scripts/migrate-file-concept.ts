@@ -45,6 +45,10 @@
  *   tsx scripts/migrate-file-concept.ts <db-path> --refresh-sources --storage-dir <dir>
  *     [--source <sourceId>] [--embedder hashing|onnx --apply]
  */
+import Database from "better-sqlite3";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { HashingEmbeddingProvider, type EmbeddingProvider } from "../src/embedding";
 import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
 import {
@@ -223,6 +227,26 @@ function printMigrationProgress(event: EmbeddingMigrationProgress): void {
   );
 }
 
+/**
+ * Run a report-only operation against a SQLite snapshot. MonetCore always upgrades an older store on
+ * open, so a dry-run must never construct it over the operator's original database.
+ */
+export async function withReportOnlyStore<T>(dbPath: string, operation: (copyPath: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "monet-migration-report-"));
+  const copyPath = join(directory, basename(dbPath));
+  const source = new Database(dbPath, { readonly: true, fileMustExist: true });
+  try {
+    await source.backup(copyPath);
+  } finally {
+    source.close();
+  }
+  try {
+    return await operation(copyPath);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function refreshSources(
   dbPath: string,
   storageDir: string | undefined,
@@ -308,24 +332,28 @@ async function main(): Promise<void> {
 
   const targetModelId = targetEmbedder.modelId;
   if (targetModelId === undefined) throw new Error("The selected migration embedder has no persistable modelId.");
-  const core = new MonetCore(dbPath, {
-    embedder: targetEmbedder,
-    ...(storageDir ? { sourceStorageDir: storageDir } : {}),
-    deferCreatedPin: !applyFlag,
-  });
-  try {
+  const runAgainst = async (migrationDbPath: string): Promise<void> => {
+    const core = new MonetCore(migrationDbPath, {
+      embedder: targetEmbedder,
+      ...(storageDir ? { sourceStorageDir: storageDir } : {}),
+      deferCreatedPin: !applyFlag,
+    });
     try {
-      const report = await runEmbeddingMigration(core, targetModelId, applyFlag, printMigrationProgress);
-      console.log(formatEmbeddingMigrationReport(report));
-    } catch (error) {
-      if (error instanceof EmbedderMigrationFailedError) {
-        console.error(formatEmbeddingMigrationReport(error.report));
+      try {
+        const report = await runEmbeddingMigration(core, targetModelId, applyFlag, printMigrationProgress);
+        console.log(formatEmbeddingMigrationReport(report));
+      } catch (error) {
+        if (error instanceof EmbedderMigrationFailedError) {
+          console.error(formatEmbeddingMigrationReport(error.report));
+        }
+        throw error;
       }
-      throw error;
+    } finally {
+      core.close();
     }
-  } finally {
-    core.close();
-  }
+  };
+  if (applyFlag || refreshSourcesFlag) await runAgainst(dbPath);
+  else await withReportOnlyStore(dbPath, runAgainst);
 
   if (anySourceRefreshFailure(sourceReports)) {
     throw new Error(

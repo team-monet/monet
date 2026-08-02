@@ -283,11 +283,11 @@
  *      memory_edge.dismissed_by, first_block.promoted_by. All three are a DIFFERENT caller-supplied-
  *      identifier family than G2/H1 above (a session-scoped agentId set ONCE at MonetCore
  *      construction and stamped onto every row that instance writes) — these are PER-ACTION labels,
- *      supplied fresh on each individual resolve/dismiss/promote call: `resolvedBy`
- *      (resolveContradiction's `opts.by`, mcp-server.ts's `resolvedBy` tool field, engine.ts),
+ *      supplied fresh on each individual resolve/dismiss call: `resolvedBy`
+ *      (resolveContradiction's `opts.by`, mcp-server.ts's `resolvedBy` tool field, engine.ts) and
  *      `dismissedBy` (dismissPossibleDuplicate's own param, engine.ts, same mcp-server.ts
- *      `resolvedBy` field routed through the duplicate-pair-dismissal branch), and `promotedBy`
- *      (promoteToFirstBlock's `opts.promotedBy`, mcp-server.ts's dedicated `promotedBy` tool field).
+ *      `resolvedBy` field routed through the duplicate-pair-dismissal branch). Legacy
+ *      `first_block.promoted_by` values came from the retired promotion surface.
  *      None of the three has ANY format constraint in the engine — a caller can pass literally any
  *      string. UNLIKE sessions.agent_id/observations.author_agent_id (both 0 rows in this corpus
  *      today), contradictions.resolved_by and memory_edge.dismissed_by are NOT hypothetical: this
@@ -313,9 +313,9 @@
  *      'open'-status row (resolved_by is NULL by construction at that point — a contradiction cannot
  *      be resolved before it exists). resolveContradiction's own MCP-visible return (mcp-server.ts:
  *      885) is a concept-shaped object (conceptId/status/version/confidence) — never the
- *      Contradiction/resolvedBy shape. getFirstBlock (engine.ts:2748, the actual prewarm firstBlock
- *      read) selects only id/conceptId/summary/summaryDirty/position/conceptStatus — never
- *      promoted_by. memory_edge is never read by mcp-server.ts at all — topEntityHubs/topThread
+ *      Contradiction/resolvedBy shape. `first_block` is dormant after schema 12 but can still exist
+ *      in older inputs, so its text is scrubbed before migration. memory_edge is never read by
+ *      mcp-server.ts at all — topEntityHubs/topThread
  *      (the "#245 what your agent knows" overview surface) read only entities/concept_entities,
  *      never memory_edge rows or its dismissed_at/dismissed_by columns. So, same as G2/H1: no live
  *      verbatim-read-to-caller path today for any of the three, closed defensively on the "no shape
@@ -405,11 +405,8 @@
  *                                            section header, exposed via `overview()`/agent_context
  *                                            and the CLI's render-overview.ts), a real, callable
  *                                            read path.
- *   - first_block.summary                 → getFirstBlock, included in PrewarmState.firstBlock,
- *                                            rendered FIRST and UNTRUNCATED into the prewarm block
- *                                            (mcp-server.ts:133-143) — the single highest-priority
- *                                            section of the entire prewarm surface. 0 rows in this
- *                                            corpus today; scrubbed as future-proofing (finding #5).
+ *   - first_block.summary                 → dormant legacy text after schema 12; retained here so
+ *                                            pre-schema-12 stores are safe to scrub before migration.
  *   - sessions.scope_context              → listMemories()'s `withProvenance` path
  *                                            (engine.ts:1474-1493) joins observations→sessions and
  *                                            surfaces scope_context verbatim as
@@ -456,13 +453,8 @@
  *                                            see "AUDIT FINDINGS, ROUND 5" H2 for the full list).
  *                                            Scrubbed defensively on the same no-format-constraint
  *                                            basis.
- *   - first_block.promoted_by             → getFirstBlock (engine.ts:2748-2761, the actual prewarm
- *                                            firstBlock read) never selects this column. 0 rows in
- *                                            this corpus (first_block itself is 0 rows today).
- *                                            ROUND 5 FINDING (H2): grouped with resolved_by/
- *                                            dismissed_by as the third member of the same
- *                                            caller-supplied-audit-label family; scrubbed on the
- *                                            same future-proofing basis as first_block.summary.
+ *   - first_block.promoted_by             → dormant legacy audit text after schema 12; scrubbed
+ *                                            with first_block.summary before migration.
  *
  *   - concept_revisions.body               → NEVER reaches a caller (COUNT/DELETE only, finding #4
  *                                            above) — EMPTIED rather than scrubbed.
@@ -1651,10 +1643,9 @@ function emptyConceptRevisions(db) {
  *     row where resolved_by is still NULL by construction (a contradiction cannot be resolved before
  *     it exists); resolveContradiction's own MCP return (mcp-server.ts:885) is a concept-shaped
  *     object (conceptId/status/version/confidence), never the Contradiction/resolvedBy shape at
- *     all. getFirstBlock (engine.ts:2748, the actual prewarm firstBlock read) selects only
- *     id/conceptId/summary/summaryDirty/position/conceptStatus, never promoted_by (first_block also
- *     included below since it's the same audit-label family and shares this function's transaction
- *     already). memory_edge is never read by mcp-server.ts at all (topEntityHubs/topThread read
+ *     all. `first_block` is dormant after schema 12, but legacy stores may still carry its summary
+ *     and promoted_by text, so both stay in this scrub pass before migration. memory_edge is never
+ *     read by mcp-server.ts at all (topEntityHubs/topThread read
  *     only entities/concept_entities, never memory_edge rows). All four are closed on the same
  *     "don't rely on today's exact reachability, the column is caller-suppliable text with no shape
  *     constraint" basis as sessions.summary/first_block.summary/author_agent_id before them, not

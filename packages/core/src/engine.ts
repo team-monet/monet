@@ -321,7 +321,7 @@ const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
  * rows silently dropped while its cursor advanced, losing them permanently. A receiver must be able
  * to say "this is newer than I understand" instead. Bump this whenever the payload gains a table.
  */
-const SYNC_PAYLOAD_PROTOCOL_VERSION = 13; // 11: + lifecycle_edges, ratifications; 12: + stages, rule_bindings; 13: + concepts.skeleton_breadth
+const SYNC_PAYLOAD_PROTOCOL_VERSION = 14; // 11: + lifecycle_edges, ratifications; 12: + stages, rule_bindings; 13: + concepts.skeleton_breadth; 14: first_block retired
 const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/activation ledger
 // PRAGMA user_version gate for the file=concept reshape (Phase 1, ratified): the
 // uq_source_chunks_active_concept -> uq_source_chunks_active_concept_slot index swap and the
@@ -329,8 +329,24 @@ const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/a
 // The ticket that authorized this migration named "SOURCE_SCHEMA_VERSION 6→7", but 7 is already
 // SOURCE_REGISTRY_SCHEMA_VERSION (a prior, unrelated migration) — reusing it would corrupt that
 // gate, so this is the next free sequential slot after SOURCE_LEDGER_SCHEMA_VERSION instead.
-const SOURCE_FILE_CONCEPT_SCHEMA_VERSION = MONET_SCHEMA_VERSION;
-export const FIRST_BLOCK_SUMMARY_MAX_CHARS = 800; // hard cap on a first_block summary (cost signal)
+const SOURCE_FILE_CONCEPT_SCHEMA_VERSION = 11;
+const FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION = MONET_SCHEMA_VERSION;
+const FIRST_BLOCK_OBSERVATION_AUTHOR = "schema-12-first-block-migration";
+const FIRST_BLOCK_OBSERVATION_PREFIX = "First Block pin (surface retired 2026-08-02): ";
+
+function firstBlockObservationContent(summary: string): string {
+  return `${FIRST_BLOCK_OBSERVATION_PREFIX}${summary}`;
+}
+
+function firstBlockObservationId(pinId: string, summary: string): string {
+  const summaryHash = createHash("sha256").update(summary).digest("hex");
+  return `fb-migration:${createHash("sha256")
+    .update(pinId)
+    .update("\0")
+    .update(summaryHash)
+    .digest("hex")
+    .slice(0, 32)}`;
+}
 
 /**
  * Thrown by graftRows() when the exporting engine used a different embedding model than the
@@ -661,8 +677,6 @@ export class EmbedderMigrationAbandonUnsupportedError extends Error {
   }
 }
 
-/** Promote boosts usefulness so the promoted concept ranks higher in the living model. */
-const FIRST_BLOCK_PROMOTION_USEFULNESS_BOOST = 10;
 const STALE_CONCEPTS_PREWARM_LIMIT = 20; // cap on staleConcepts in prewarm — a list serialized into a capped response gets a bound at birth
 const USEFULNESS_DECAY_TAU_DAYS = 60; // usefulness decays slower than recency (14-day / 30-day taus) — once-useful concepts fade but are not penalised as sharply as staleness
 // ---- V-A arousal tunables (slice 2) -------------------------------------------
@@ -1436,18 +1450,6 @@ export interface PrewarmState {
   topConcepts: LivingModelCard[];
   staleConcepts: LivingModelCard[]; // active but unconfirmed past staleAfterMs — surfaced for re-confirmation
   openContradictions: PrewarmContradiction[];
-  /** User-curated always-first section. Each entry is a generous summary of a specific concept.
-   *  Summaries are user-maintained; summaryDirty=true means the underlying concept changed and the
-   *  summary should be refreshed via memory_first_block action="update_summary". Disputed concepts are
-   *  excluded from injection but counted in curationAttention. */
-  firstBlock: Array<{
-    id: string;
-    conceptId: string;
-    summary: string;
-    summaryDirty: boolean;
-    position: number;
-    conceptStatus: "active" | "disputed";
-  }>;
   /**
    * The resident stage index (liveStageIndex): names of stages with at least one live rule, never
    * rule bodies (residency law). The recognition cue — "you are at a named moment; ask stage_lookup
@@ -2087,6 +2089,7 @@ export class MonetCore {
     if (versionAfterSourceLedger >= SOURCE_LEDGER_SCHEMA_VERSION && versionAfterSourceLedger < SOURCE_FILE_CONCEPT_SCHEMA_VERSION) {
       this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
     }
+    this.migrateFirstBlockPins();
     // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
     // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
     // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
@@ -2230,7 +2233,6 @@ export class MonetCore {
       concept_restorations: ["restored_at", "updated_at"],
       concept_deletions: ["deleted_at", "updated_at"],
       memory_edge: ["created_at", "last_reinforced_at", "dismissed_at", "sync_updated_at"],
-      first_block: ["promoted_at", "updated_at", "deleted_at"],
       circle_aliases: ["created_at", "updated_at"],
       memory_edge_components: ["created_at", "last_reinforced_at", "updated_at"],
       concept_activity_components: ["usefulness_last_at", "arousal_last_at", "updated_at"],
@@ -2501,10 +2503,8 @@ export class MonetCore {
       CREATE INDEX IF NOT EXISTS idx_ce_entity ON concept_entities(entity_key, scope);
       CREATE INDEX IF NOT EXISTS idx_ce_concept ON concept_entities(concept_id);
 
-      -- First Block: user-curated, always-injected-first section of agent_context / prewarm output.
-      -- Each entry = a generous summary + reference to the underlying concept (concept_id, circle).
-      -- Never auto-populated; promoted only by the user via memory_first_block action="promote".
-      -- summary_dirty=1 when the underlying concept changed (invalidate hook) — user refreshes manually.
+      -- Retired First Block storage. Kept dormant after schema 12 to avoid a destructive table-drop
+      -- migration; the 11→12 migration preserves live summaries as observations, then empties it.
       CREATE TABLE IF NOT EXISTS first_block (
         id TEXT PRIMARY KEY,
         concept_id TEXT NOT NULL,
@@ -3138,6 +3138,66 @@ export class MonetCore {
     this.ensureSyncClosureSchema();
   }
 
+  /**
+   * Schema 11 → 12: preserve each First Block row whose concept still exists as recallable evidence
+   * on that concept, including soft-deleted history, then empty the retired surface. Rows whose
+   * concepts were hard-deleted have no target to append to and are cleared with the dormant table.
+   * The schema-version gate makes the conversion idempotent on reopen; the deterministic observation
+   * id also makes the insertion safe if a prior attempt inserted evidence before its transaction
+   * rolled back. Any tooling that opens an older store with a newer core runs migrations like this
+   * unconditionally, so report-only paths must open a temporary copy rather than the original store.
+   */
+  private migrateFirstBlockPins(): void {
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version < SOURCE_FILE_CONCEPT_SCHEMA_VERSION || version >= FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION) return;
+
+    this.db.immediateTransaction(() => {
+      const pins = this.db.prepare(
+        `SELECT fb.id, fb.concept_id, fb.summary, fb.promoted_at, c.circle, c.embedding
+           FROM first_block fb
+           JOIN concepts c ON c.id = fb.concept_id
+          WHERE c.kind NOT IN ('source', 'workstream')
+            AND c.source_identity IS NULL AND c.active_observation_id IS NULL`,
+      ).all() as Array<{
+        id: string;
+        concept_id: string;
+        summary: string;
+        promoted_at: number;
+        circle: string;
+        embedding: string;
+      }>;
+
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO observations
+           (id, content, embedding, kind, circle, concept_id, author_agent_id, created_at, updated_at,
+            sync_revision, sync_writer)
+         VALUES (?, ?, ?, 'statement', ?, ?, ?, ?, ?, 1, ?)`,
+      );
+      for (const pin of pins) {
+        const content = firstBlockObservationContent(pin.summary);
+        const observationId = firstBlockObservationId(pin.id, pin.summary);
+        const inserted = insert.run(
+          observationId,
+          content,
+          pin.embedding,
+          pin.circle,
+          pin.concept_id,
+          FIRST_BLOCK_OBSERVATION_AUTHOR,
+          pin.promoted_at,
+          pin.promoted_at,
+          this.syncDeviceId,
+        );
+        if (inserted.changes > 0) {
+          this.db.prepare(
+            `UPDATE concepts SET support_count = support_count + 1, dirty = 1 WHERE id = ?`,
+          ).run(pin.concept_id);
+        }
+      }
+      this.db.prepare(`DELETE FROM first_block`).run();
+      this.db.pragma(`user_version = ${FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION}`);
+    })();
+  }
+
   /** v8: replay-safe row clocks and per-writer edge components. */
   private ensureSyncClosureSchema(): void {
     const addColumn = (table: string, name: string, definition: string): boolean => {
@@ -3622,8 +3682,8 @@ export class MonetCore {
       let nearMatchId: string | undefined;
       let nearMatchScore: number | undefined;
       let mode: ResolutionMode;
-      /** Did this write land on an ALREADY-EXISTING concept? The First Block and contradiction
-       *  hooks below both key on this rather than on the coarse `action` string: since the fork
+      /** Did this write land on an ALREADY-EXISTING concept? The contradiction hook below keys on
+       *  this rather than on the coarse `action` string: since the fork
        *  signal, action="ambiguous" + kind="correction" no longer implies an attach (a correction
        *  whose target is bimodal FORKS), so the old string test would open a contradiction against
        *  a concept created microseconds earlier — one with nothing to contradict. */
@@ -3634,8 +3694,8 @@ export class MonetCore {
       /**
        * RULE DEATH. Set when this correction landed on a live RULE concept: instead of attaching,
        * the correction births the rule's successor and supersedes the incumbent in the same act.
-       * Held here so the post-branch hooks (First Block, contradiction) can see that nothing
-       * attached, and so the supersession edge can be written once, below, on either path.
+       * Held here so the post-branch contradiction hook can see that nothing attached, and so the
+       * supersession edge can be written once, below, on either path.
        */
       let supersededRule: ConceptRow | null = null;
 
@@ -3936,13 +3996,6 @@ export class MonetCore {
       // to offer must still be allowed to store the rule.
       if (opts.kind === "rule" || ruleSuccession !== undefined) {
         this.recordRuleProvenance(row.id, sourceRefs, obsId);
-      }
-
-      // First Block hook: any path that ATTACHED to an EXISTING concept invalidates its summary.
-      // New-concept branches (create / forceNew / either fork mode) do NOT set dirty — there is no
-      // existing summary to invalidate for a brand-new concept.
-      if (landedOnExisting) {
-        this.invalidateFirstBlockEntry(row.id);
       }
 
       // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
@@ -4481,7 +4534,6 @@ export class MonetCore {
 
     const stageIndexResult = liveStageIndex(this.db, circle);
     return {
-      firstBlock: this.getFirstBlock(circle),
       activeWorkstreams,
       topConcepts,
       staleConcepts,
@@ -4543,10 +4595,6 @@ export class MonetCore {
             WHERE id = ?`,
         )
         .run(nowMs, conceptId);
-      // First Block hook: status flipped to 'disputed' — invalidate the summary.
-      // flagContradiction does NOT set dirty=1 (it writes status + decays confidence), so this
-      // cannot rely on a dirty-based trigger; the hook must be explicit here.
-      this.invalidateFirstBlockEntry(conceptId);
       return this.db.prepare(`SELECT * FROM contradictions WHERE id = ?`).get(id) as ContradictionRow;
     })();
     return toContradiction(contraRow);
@@ -4843,11 +4891,6 @@ export class MonetCore {
             `UPDATE observations SET superseded_by = ?, superseded_at = ? WHERE id = ? AND concept_id = ?`,
           );
           for (const x of supersessions) supersede.run(x.successor, nowMs, x.loser, conceptId);
-          // First Block hook: winner supersedes losers → effective content changes even without an
-          // explicit body. Invalidate so the user refreshes the pinned summary.
-          // dismiss never reaches this branch; the hook is safe to fire unconditionally here.
-          this.invalidateFirstBlockEntry(conceptId);
-
           // POSTCONDITION, mirroring detach()'s "a surviving source must keep live evidence" guard
           // (src/engine.ts:4326-4358): a verdict must never leave a native concept with ZERO live
           // observations — that would present a fully-retired concept as active, resting on
@@ -4879,9 +4922,6 @@ export class MonetCore {
             .prepare(`UPDATE concepts SET body = ?, title = ?, version = ?, updated_at = unixepoch() * 1000 WHERE id = ?`)
             .run(opts.body, nextTitle, version, conceptId);
           this.writeRevision(conceptId, version, opts.body);
-          // First Block hook: body explicitly changed — invalidate regardless of supersede path.
-          // Idempotent if the supersede branch already fired above (dirty=1 twice is harmless).
-          this.invalidateFirstBlockEntry(conceptId);
           // MIRROR CONTENT (review fix — Codex round 2, item 4): a rule's TITLE is the text a gate
           // delivers (GateRule.text, GateMirrorEntry.text both read `concepts.title`) — resolving a
           // contradiction with an explicit body override can retitle a bound rule exactly as
@@ -5743,7 +5783,6 @@ export class MonetCore {
       this.db
         .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = ?, resolved_by = 'retireConcept' WHERE concept_id = ? AND status = 'open'`)
         .run(retiredAt, id);
-      this.deleteFirstBlockEntry(id);
       this.unwindConceptGraph(id, row.circle);
       // dirty is NOT zeroed here: pending-synthesis state must survive a retire/restore round-trip.
       // listDirty/checkpoint filter retired concepts out explicitly (status != 'retired') instead of
@@ -5859,9 +5898,6 @@ export class MonetCore {
         .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
         .run(body, nextTitle, id);
       this.writeRevision(id, row.version, body);
-      // First Block hook: the body the summary distilled from just changed — invalidate it.
-      // Mirror synthesizeRow exactly: plain UPDATE on the concept row, no re-read → no recursion risk.
-      this.invalidateFirstBlockEntry(id);
       // MIRROR CONTENT (review fix — Codex round 2, item 4) — mirror synthesizeRow's own fix here
       // too: this is the AGENT-FACING (MCP) twin of the sieve tier's own retitling, no less able to
       // retitle a bound rule and leave a materialized mirror stale. NOT sourced from
@@ -6541,8 +6577,6 @@ export class MonetCore {
         assertBlockingRuleMutationAllowed(this.db, sourceConceptId, "consolidating detach");
         // Consolidation: all observations moved to an existing dest — delete the source concept.
         // Graph must be unwound first; no rederive since the concept no longer exists.
-        // First Block hook: source is deleted — remove its entry (referential integrity — no dangling row).
-        // Mirrors mergeConceptInto's deleteFirstBlockEntry(src.id) before DELETE FROM concepts.
         this.hardDeleteNativeConcept(sourceConceptId);
         sourceDeleted = true;
       } else {
@@ -6600,8 +6634,6 @@ export class MonetCore {
           // If recomputedLca === srcPreSplitLca, the remaining evidence supports the existing
           // stamp — no change needed.
         }
-        // First Block hook (source survives): source body changed — invalidate its summary.
-        this.invalidateFirstBlockEntry(sourceConceptId);
       }
 
       // 5. Destination finalize.
@@ -6641,8 +6673,6 @@ export class MonetCore {
           const currentDest = this.getRow(destConceptId)!;
           this.attach(currentDest, obs.content, jsonToEmb(obs.embedding), null, obs.id);
         }
-        // First Block hook (destination received new observations): invalidate its summary.
-        this.invalidateFirstBlockEntry(destConceptId);
       }
 
       // 6. Graph: unwind source + rederive (source already handled above in the deletion path).
@@ -10818,8 +10848,8 @@ export class MonetCore {
    * across and records the act.
    *
    * WHAT DOES NOT HAPPEN HERE IS THE POINT:
-   *   - No contradiction is opened and no First Block entry is invalidated — the caller's
-   *     `landedOnExisting` is false on this path, so the ordinary correction machinery never runs.
+   *   - No contradiction is opened — the caller's `landedOnExisting` is false on this path, so the
+   *     ordinary correction machinery never runs.
    *     A superseded rule is not disputed evidence awaiting mediation; it is settled history.
    *   - The old concept is NOT retired. It stays active and searchable on purpose: it is the
    *     impeachment evidence, and the gate excludes it via the supersession edge alone.
@@ -10904,7 +10934,7 @@ export class MonetCore {
    *
    * Walks the dying rule's INCOMING derivation edges and marks each live parent principle disputed.
    * `flagContradiction` does the structural half it already does everywhere else (status →
-   * 'disputed', confidence decayed, First Block entry invalidated), and skeleton() — which filters
+   * 'disputed', confidence decayed), and skeleton() — which filters
    * `status = 'active'` — then drops the principle from delivery at the next read. There is no
    * second mechanism and no queue: "adding an impeachment queue here would be a second record of a
    * fact the substrate already holds."
@@ -11868,13 +11898,6 @@ export class MonetCore {
         )
         .all(since, cutoff);
 
-      const firstBlock = this.db
-        .prepare(`SELECT fb.* FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
-                   WHERE fb.updated_at >= ? AND fb.updated_at <= ?
-                     AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND c.status != 'retired'
-                     AND (fb.circle = c.circle OR fb.deleted_at IS NOT NULL)`)
-        .all(since, cutoff);
-
       const tombstones = this.db
       // Lifecycle events replay at an equality boundary. Grafting is idempotent and chooses the
       // latest event, so >= avoids permanently missing an event in the caller watermark's ms.
@@ -12055,7 +12078,6 @@ export class MonetCore {
         edgeComponents: edgeComponents as NonNullable<GraftPayload["edgeComponents"]>,
         deletions: deletions as NonNullable<GraftPayload["deletions"]>,
         conceptActivity: conceptActivity as NonNullable<GraftPayload["conceptActivity"]>,
-        firstBlock: firstBlock as GraftPayload["firstBlock"],
         circleAliases: circleAliases as GraftPayload["circleAliases"],
         entities: entities as GraftPayload["entities"],
         conceptEntities: conceptEntities as GraftPayload["conceptEntities"],
@@ -12102,7 +12124,7 @@ export class MonetCore {
         (row.observation_id !== null && localSourceObservationIds.has(row.observation_id)) ||
         (row.resolution_obs_id !== null && localSourceObservationIds.has(row.resolution_obs_id)) ||
         (row.contradicted_observation_id != null && localSourceObservationIds.has(row.contradicted_observation_id))) ||
-      payload.firstBlock.some((row) => localSourceIds.has(row.concept_id)) ||
+      (payload.firstBlock ?? []).some((row) => localSourceIds.has(row.concept_id)) ||
       payload.conceptEntities.some((row) => localSourceIds.has(row.concept_id)) ||
       payload.edges.some((row) => localSourceIds.has(row.src_id) || localSourceIds.has(row.dst_id)) ||
       (payload.edgeComponents ?? []).some((row) => localSourceIds.has(row.src_id) || localSourceIds.has(row.dst_id)) ||
@@ -12506,6 +12528,7 @@ export class MonetCore {
 
     const tables = ["sessions", "circle_aliases", "tombstones", "restorations", "deletions", "concepts", "concept_activity", "observations", "concept_revisions", "contradictions", "memory_edge", "memory_edge_components", "first_block", "entities", "concept_entities", "lifecycle_edges", "ratifications", "stages", "rule_bindings"] as const;
     const inserted: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
+    const converted: Record<string, number> = { first_block: 0 };
     const skipped: Record<string, number> = Object.fromEntries(tables.map((t) => [t, 0]));
     const conceptsWithChangedBindings = new Set<string>();
     const conceptsMarkedDirty = new Set<string>();
@@ -12518,7 +12541,6 @@ export class MonetCore {
       lastConfirmedAt: number | null;
       lastConfirmedSessionId: string | null;
       dirty: number;
-      summarySourceChanged: boolean;
     }>();
     const now = Date.now();
     let relayAt = 0;
@@ -12728,135 +12750,6 @@ export class MonetCore {
           WHERE concept_id = ? AND circle IS NOT ?`,
       ).run(circle, relayAt, conceptId, circle).changes;
 
-      type FirstBlockDbRow = {
-        id: string; concept_id: string; circle: string; summary: string; summary_dirty: number;
-        position: number; promoted_at: number; promoted_by: string | null; updated_at: number;
-        sync_revision: number; sync_writer: string | null; deleted_at: number | null;
-      };
-      const firstBlockSemanticKey = (row: FirstBlockDbRow): string => JSON.stringify([
-        row.summary,
-        row.summary_dirty,
-        row.position,
-        row.promoted_at,
-        row.promoted_by,
-        row.deleted_at,
-      ]);
-      const firstBlockWins = (left: FirstBlockDbRow, right: FirstBlockDbRow): FirstBlockDbRow => {
-        if (left.sync_revision !== right.sync_revision) return left.sync_revision > right.sync_revision ? left : right;
-        const leftWriter = left.sync_writer ?? "";
-        const rightWriter = right.sync_writer ?? "";
-        const leftDerived = leftWriter.startsWith("rehome:");
-        const rightDerived = rightWriter.startsWith("rehome:");
-        if (leftDerived !== rightDerived) return leftDerived ? right : left;
-        // Synthetic rehomes from different prior circles do not carry authoritative writer order.
-        // Resolve those equal-revision collisions semantically; real direct writers retain LWW.
-        if (!leftDerived && leftWriter !== rightWriter) return leftWriter > rightWriter ? left : right;
-        if ((left.deleted_at === null) !== (right.deleted_at === null)) return left.deleted_at !== null ? left : right;
-        const leftSemanticKey = firstBlockSemanticKey(left);
-        const rightSemanticKey = firstBlockSemanticKey(right);
-        if (leftSemanticKey !== rightSemanticKey) return leftSemanticKey > rightSemanticKey ? left : right;
-        if (leftWriter !== rightWriter) return leftWriter > rightWriter ? left : right;
-        // Ownership and relay timestamps are derived receiver-local state. On a semantic tie,
-        // preserve the first candidate (existing rows precede incoming) so replay is a no-op.
-        return left;
-      };
-      const insertFirstBlockRow = (row: FirstBlockDbRow): void => {
-        this.db.prepare(
-          `INSERT INTO first_block
-             (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by,
-              updated_at, sync_revision, sync_writer, deleted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(row.id, row.concept_id, row.circle, row.summary, row.summary_dirty, row.position,
-          row.promoted_at, row.promoted_by, row.updated_at, row.sync_revision, row.sync_writer,
-          row.deleted_at);
-      };
-      const mergeFirstBlockNaturalRow = (
-        incoming: FirstBlockDbRow,
-      ): { changed: boolean; incomingWon: boolean } => {
-        const existing = this.db.prepare(
-          `SELECT * FROM first_block WHERE concept_id = ? AND circle = ?`,
-        ).get(incoming.concept_id, incoming.circle) as FirstBlockDbRow | undefined;
-        if (!existing) {
-          insertFirstBlockRow(incoming);
-          return { changed: true, incomingWon: true };
-        }
-        const winner = firstBlockWins(existing, incoming);
-        if (winner === existing) return { changed: false, incomingWon: false };
-        this.db.prepare(`DELETE FROM first_block WHERE id = ?`).run(existing.id);
-        insertFirstBlockRow(incoming);
-        return { changed: true, incomingWon: true };
-      };
-      const rehomeFirstBlockWriter = (conceptId: string, originCircle: string): string =>
-        `rehome:${stableFingerprint([conceptId, originCircle])}`;
-      const normalizeFirstBlockOwnership = (conceptId: string, ownershipChanged = false): boolean => {
-        const concept = activeNativeConcept(conceptId);
-        if (!concept) return false;
-        const canonicalId = deterministicFirstBlockId(conceptId, concept.circle);
-        // First Block revisions are clocks for (concept_id, circle), not for concept_id globally.
-        // A canonical-circle row — active or tombstoned — is therefore authoritative without any
-        // comparison to historical rows from prior circles.
-        const canonical = this.db.prepare(
-          `SELECT * FROM first_block WHERE concept_id = ? AND circle = ?`,
-        ).get(conceptId, concept.circle) as FirstBlockDbRow | undefined;
-        if (canonical) {
-          // A row may have arrived while its circle was not yet the concept winner. Once the
-          // concept move lands, relay-stamp that already-converged natural-key row without
-          // manufacturing a new causal revision/writer.
-          if (ownershipChanged) {
-            this.db.prepare(`UPDATE first_block SET updated_at = ? WHERE id = ?`)
-              .run(relayAt, canonical.id);
-          }
-          // A derived rehome remains linked to its historical active row until the canonical key is
-          // edited/promoted/deleted directly. This lets equal-clock semantic collisions converge in
-          // the origin clock domain without treating the origin revision as a canonical revision.
-          const priorActive = this.db.prepare(
-            `SELECT * FROM first_block
-              WHERE concept_id = ? AND circle != ? AND deleted_at IS NULL
-              ORDER BY promoted_at DESC, circle DESC, id DESC`,
-          ).all(conceptId, concept.circle) as FirstBlockDbRow[];
-          const origin = priorActive.find(
-            (row) => canonical.sync_writer === rehomeFirstBlockWriter(conceptId, row.circle),
-          );
-          if (!origin) return false;
-          const derivedSummaryDirty = Math.max(canonical.summary_dirty, origin.summary_dirty);
-          const derivedChanged = canonical.summary !== origin.summary
-            || canonical.summary_dirty !== derivedSummaryDirty
-            || canonical.promoted_at !== origin.promoted_at
-            || canonical.promoted_by !== origin.promoted_by;
-          if (!derivedChanged) return false;
-          this.db.prepare(
-            `UPDATE first_block SET summary = ?, summary_dirty = ?, promoted_at = ?,
-                    promoted_by = ?, updated_at = ? WHERE id = ?`,
-          ).run(origin.summary, derivedSummaryDirty, origin.promoted_at, origin.promoted_by,
-            relayAt, canonical.id);
-          return true;
-        }
-        // A concept-only move still carries a receiver-local active pin forward. Tombstones remain
-        // in their historical circle and are never re-homed or compared across clock domains.
-        const prior = this.db.prepare(
-          `SELECT * FROM first_block
-            WHERE concept_id = ? AND circle != ? AND deleted_at IS NULL
-            ORDER BY promoted_at DESC, circle DESC, id DESC LIMIT 1`,
-        ).get(conceptId, concept.circle) as FirstBlockDbRow | undefined;
-        if (!prior) return false;
-        const { m: destMax } = this.db.prepare(
-          `SELECT COALESCE(MAX(fb.position), -1) AS m
-             FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
-            WHERE fb.circle = ? AND c.circle = fb.circle AND fb.deleted_at IS NULL`,
-        ).get(concept.circle) as { m: number };
-        const rehomed: FirstBlockDbRow = {
-          ...prior,
-          id: canonicalId,
-          circle: concept.circle,
-          position: destMax + 1,
-          updated_at: relayAt,
-          // Start the destination natural-key clock independently of the prior circle's revision.
-          sync_revision: 1,
-          sync_writer: rehomeFirstBlockWriter(conceptId, prior.circle),
-        };
-        insertFirstBlockRow(rehomed);
-        return true;
-      };
       for (const conceptId of lifecycleConceptIds) {
         const { retiredAt, restoredAt } = lifecycle(conceptId);
         const local = this.getRow(conceptId);
@@ -12883,7 +12776,6 @@ export class MonetCore {
           this.db
             .prepare(`UPDATE contradictions SET status = 'dismissed', resolved_at = ?, resolved_by = 'sync-tombstone' WHERE concept_id = ? AND status = 'open'`)
             .run(retiredAt, local.id);
-          this.deleteFirstBlockEntry(local.id);
           this.unwindConceptGraph(local.id, local.circle);
           // dirty is NOT zeroed here: mirrors local retireConcept, which preserves pending-synthesis
           // state across a retire/restore round-trip (see its comment). listDirty/checkpoint/stats
@@ -13042,17 +12934,12 @@ export class MonetCore {
             lastConfirmedAt: row.last_confirmed_at ?? null,
             lastConfirmedSessionId: row.last_confirmed_session_id ?? null,
             dirty: row.dirty,
-            summarySourceChanged: !!current && (current.title !== row.title || current.body !== row.body),
           });
           conceptsNeedingProjection.add(row.id);
         }
         if (winner && !isConnectorOwnedRow(winner) && winner.status !== "retired") {
           this.cleanupConceptMembershipScopes(row.id, winner.circle);
           normalizeBoundObservationCircles(row.id, winner.circle);
-          normalizeFirstBlockOwnership(
-            row.id,
-            r.changes > 0 && !!current && current.circle !== winner.circle,
-          );
         }
         if ((payload.schemaVersion ?? 0) < SYNC_CLOSURE_SCHEMA_VERSION) {
           const activity = this.db.prepare(
@@ -13921,40 +13808,47 @@ export class MonetCore {
           .run(importedHigh);
       }
 
-      // 9. first_block — versioned convergence, including soft deletion
-      for (const row of payload.firstBlock) {
-        const concept = activeNativeConcept(row.concept_id);
-        if (!concept) {
-          skipped.first_block++;
-          continue;
-        }
-        const current = this.db.prepare(
-          `SELECT sync_revision FROM first_block WHERE concept_id = ? AND circle = ?`,
-        ).get(row.concept_id, row.circle) as { sync_revision: number } | undefined;
-        const [revision, writer] = incomingMeta(
-          row,
-          "first_block",
-          `${row.concept_id}\0${row.circle}`,
-          current?.sync_revision,
+      // 9. first_block — retired protocol field. A protocol-13-or-older peer can still export pins,
+      // and the caller advances its watermark after this graft. Convert each row to the same evidence
+      // minted by the local schema-12 migration so that retirement cannot strand it behind that cursor.
+      if ((payload.schemaVersion ?? 0) <= 13) {
+        const insertFirstBlockObservation = this.db.prepare(
+          `INSERT OR IGNORE INTO observations
+             (id, content, embedding, kind, circle, concept_id, author_agent_id, created_at, updated_at,
+              sync_revision, sync_writer)
+           VALUES (?, ?, ?, 'statement', ?, ?, ?, ?, ?, 1, ?)`,
         );
-        const incoming: FirstBlockDbRow = {
-          id: deterministicFirstBlockId(row.concept_id, row.circle),
-          concept_id: row.concept_id,
-          circle: row.circle,
-          summary: row.summary,
-          summary_dirty: row.summary_dirty ?? 0,
-          position: row.position ?? 0,
-          promoted_at: row.promoted_at,
-          promoted_by: row.promoted_by ?? null,
-          updated_at: relayAt,
-          sync_revision: revision,
-          sync_writer: writer,
-          deleted_at: row.deleted_at ?? null,
-        };
-        const merged = mergeFirstBlockNaturalRow(incoming);
-        normalizeFirstBlockOwnership(row.concept_id);
-        if (merged.changed && merged.incomingWon) inserted.first_block++;
-        else skipped.first_block++;
+        for (const row of payload.firstBlock ?? []) {
+          const concept = this.db.prepare(
+            `SELECT circle, embedding, kind, status, source_identity, active_observation_id
+               FROM concepts WHERE id = ?`,
+          ).get(row.concept_id) as Pick<ConceptRow,
+            "circle" | "embedding" | "kind" | "status" | "source_identity" | "active_observation_id"> | undefined;
+          if (!concept || isConnectorOwnedRow(concept) || concept.kind === "workstream") {
+            skipped.first_block++;
+            continue;
+          }
+          const r = insertFirstBlockObservation.run(
+            firstBlockObservationId(row.id, row.summary),
+            firstBlockObservationContent(row.summary),
+            concept.embedding,
+            concept.circle,
+            row.concept_id,
+            FIRST_BLOCK_OBSERVATION_AUTHOR,
+            row.promoted_at,
+            relayAt,
+            this.syncDeviceId,
+          );
+          if (r.changes > 0) {
+            converted.first_block++;
+            conceptsNeedingProjection.add(row.concept_id);
+            conceptsWithChangedBindings.add(row.concept_id);
+          } else {
+            skipped.first_block++;
+          }
+        }
+      } else {
+        skipped.first_block += (payload.firstBlock ?? []).length;
       }
 
       const validMemberships = new Set<string>();
@@ -14001,7 +13895,7 @@ export class MonetCore {
       // hold additional evidence or contradictions whose shells legitimately lose replay LWW. Once
       // every ledger row has converged, keep semantic envelope fields while deriving the read model
       // from the receiver's complete union. A mismatch means the winning body cannot cover all
-      // receiver evidence, so schedule synthesis and invalidate only the canonical active pin.
+      // receiver evidence, so schedule synthesis.
       for (const [id, imported] of importedConceptProjections) {
         const derived = this.db.prepare(
           `SELECT support_count, embedding, confidence, status, last_confirmed_at,
@@ -14023,18 +13917,10 @@ export class MonetCore {
           this.db.prepare(`UPDATE concepts SET dirty = ?, updated_at = ? WHERE id = ?`)
             .run(targetDirty, relayAt, id);
         }
-        if (projectionDiffers || imported.summarySourceChanged) {
-          this.db.prepare(
-            `UPDATE first_block SET summary_dirty = 1, updated_at = ?
-              WHERE concept_id = ?
-                AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
-                AND deleted_at IS NULL AND summary_dirty != 1`,
-          ).run(relayAt, id);
-        }
       }
       // Projection may legitimately clear `dirty` for an empty endpoint, so binding changes mark
       // both winning non-source endpoints only after projection. Replay/losing shells never enter
-      // this set. Mirror local attach/detach invalidation for active First Block summaries.
+      // this set.
       for (const id of conceptsWithChangedBindings) {
         const concept = activeNativeConcept(id);
         if (!concept) continue;
@@ -14044,13 +13930,6 @@ export class MonetCore {
         ).run(relayAt, id);
         if (dirtied.changes === 0) continue;
         conceptsMarkedDirty.add(id);
-        this.db.prepare(
-          `UPDATE first_block
-              SET summary_dirty = 1, updated_at = ?
-            WHERE concept_id = ?
-              AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
-              AND deleted_at IS NULL AND summary_dirty != 1`,
-        ).run(relayAt, id);
       }
       this.db.prepare(`UPDATE sync_meta SET applying_remote = 0 WHERE singleton = 1`).run();
       return this.captureEmbeddingWidthProof(this.embedder.dim, sortedIncomingWidths.length > 0);
@@ -14062,7 +13941,7 @@ export class MonetCore {
     // A graft can land, remove, or reroute deny power (a blocking binding, a stage's patterns, a
     // tombstone or a supersession on a blocking rule). No-op unless the generation actually moved.
     this.refreshGateSidecar();
-    return { inserted, skipped, conceptsMarkedDirty: [...conceptsMarkedDirty] };
+    return { inserted, converted, skipped, conceptsMarkedDirty: [...conceptsMarkedDirty] };
   }
 
   /**
@@ -14267,7 +14146,7 @@ export class MonetCore {
       // no longer needed at all.
       // THE MECHANICAL CORE (review fix — Codex round 2, item 2): concepts, observations, memory_edge
       // (via moveEdgeScope), lifecycle_edges/ratifications, entities/concept_entities, workstream
-      // slugs, and First Block — every circle-scoped table EXCEPT circle_aliases (this method's own
+      // slugs — every circle-scoped table EXCEPT circle_aliases (this method's own
       // job, immediately below — an alias write is a RENAME-specific act, not a mechanical move) and
       // rule_bindings (this method's own job too, just below, for the opposite reason: it is kept
       // here rather than pulled into the shared helper only because the helper's OTHER caller — the
@@ -14276,7 +14155,7 @@ export class MonetCore {
       // backfill that runs immediately after it is what propagates the renamed concept's circle onto
       // any binding, exactly as it always has). Extracted into moveCircleScopedTables so the
       // migration cannot silently touch a narrower table list than a rename does — see that method's
-      // own comment for the full shape and the entities/first_block merge-safety argument.
+      // own comment for the full shape.
       const { conceptsUpdated, observationsUpdated, edgesUpdated, entitiesUpdated, movedConceptIds } =
         this.moveCircleScopedTables(from, to, renameStamp, this.syncDeviceId);
       // KEEP rule_bindings.circle IN STEP with the rename — same reasoning as moveConcept's own
@@ -14286,7 +14165,7 @@ export class MonetCore {
       // binding was never "in" `from` in the delivery sense (it already applies to `to` too), and
       // renaming a circle its CONCEPT happens to live in must not narrow its reach. `rule_bindings`
       // carries NO automatic sync trigger (unlike concepts/observations/circle_aliases/
-      // contradictions/first_block/sessions, each wired one by one, above, in the v7-migration
+      // contradictions/sessions, each wired one by one, above, in the v7-migration
       // section of this file) — a raw UPDATE against it is invisible to sync unless it stamps
       // sync_updated_at/sync_revision/sync_writer itself, exactly as bindRule's own UPDATE branch
       // already does (gates.ts).
@@ -14387,8 +14266,8 @@ export class MonetCore {
    * that field a real value (still `""`, its class-field default) and must resolve a writer id some
    * other way — see that migration's own comment.
    *
-   * `to` is assumed FRESH relative to `from`'s content for the entities/first_block merge logic
-   * below to be PROVABLY correct in every case, not merely the common one — true for both callers:
+   * `to` is assumed FRESH relative to `from`'s content for the entity merge logic below to be
+   * PROVABLY correct in every case, not merely the common one — true for both callers:
    * renameCircle's own destination may already hold unrelated content (the merge/reconcile logic
    * below handles that regardless), and the migration's destination is guaranteed unused by
    * construction (Codex round 2, item 3's own probe).
@@ -14498,79 +14377,6 @@ export class MonetCore {
       .prepare(`UPDATE concepts SET slug='workstream:' || ? WHERE kind='workstream' AND circle=?
         AND source_identity IS NULL AND active_observation_id IS NULL`)
       .run(to, to);
-    // First Block revisions are scoped to (concept_id, circle). Reconcile each moved concept instead
-    // of bulk-updating A rows into B, which would collide with a future B row that arrived before
-    // the move. Existing B rows are authoritative and only need a relay stamp. Otherwise seed B from
-    // A with a fresh destination clock and append active pins in A's relative order.
-    let destMax = (this.db.prepare(
-      `SELECT COALESCE(MAX(fb.position), -1) AS m
-         FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
-        WHERE fb.circle = ? AND c.circle = fb.circle AND fb.deleted_at IS NULL`
-    ).get(to) as { m: number }).m;
-    type MovedFirstBlockRow = {
-      id: string; concept_id: string; circle: string; summary: string; summary_dirty: number;
-      position: number; promoted_at: number; promoted_by: string | null;
-      sync_writer: string | null; deleted_at: number | null;
-    };
-    const sourceRows: MovedFirstBlockRow[] = [];
-    for (const conceptId of movedConceptIds) {
-      const destination = this.db.prepare(
-        `SELECT id FROM first_block WHERE concept_id = ? AND circle = ?`,
-      ).get(conceptId, to) as { id: string } | undefined;
-      if (destination) {
-        // Unreachable for the migration caller (its destination is guaranteed fresh — nothing can
-        // already be pinned there); exercised only by renameCircle, where `this.syncDeviceId` is
-        // always real by the time a caller can reach it.
-        this.relayStampFirstBlockEntry(destination.id);
-        continue;
-      }
-      const source = this.db.prepare(
-        `SELECT id, concept_id, circle, summary, summary_dirty, position, promoted_at,
-                promoted_by, sync_writer, deleted_at
-           FROM first_block WHERE concept_id = ? AND circle = ?`,
-      ).get(conceptId, from) as MovedFirstBlockRow | undefined;
-      if (source) sourceRows.push(source);
-    }
-    sourceRows.sort((left, right) => left.position - right.position || left.concept_id.localeCompare(right.concept_id));
-    const insertMovedPin = this.db.prepare(
-      `INSERT INTO first_block
-         (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by,
-          updated_at, sync_revision, sync_writer, deleted_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
-    );
-    for (const source of sourceRows) {
-      const position = source.deleted_at === null ? ++destMax : source.position;
-      insertMovedPin.run(
-        deterministicFirstBlockId(source.concept_id, to), source.concept_id, to,
-        source.summary, source.summary_dirty, position, source.promoted_at, source.promoted_by,
-        // A fresh tick, not the shared `stamp` — unchanged from the pre-extraction original: this
-        // was never folded into "one stamp for the whole rename" and this extraction preserves that
-        // rather than silently changing it. Safe at construction time too: neither nextSyncTimestamp()
-        // nor nextSyncTimestampOrNow() touches `this.syncDeviceId`. THE "OrNow" VARIANT (Codex round
-        // 4, item 1 follow-up, found while fixing that item): reachable from the SAME pre-v8,
-        // no-singleton-row construction-time path migrateLegacyStarCircle's own top-level stamp is —
-        // a legacy '*' concept that ALSO carries a First Block promotion (First Block predates
-        // breadth too) walks this exact line before initSyncIdentity() has ever run. Left as the
-        // plain form, this would reproduce the identical "no such table: gate_meta"-shaped crash
-        // (here: dereferencing sync_meta's absent singleton row) one call deeper into the same
-        // migration this round's item 1 already fixed one level up — see that method's own doc
-        // comment and nextSyncTimestampOrNow's own comment for the full mechanism.
-        this.nextSyncTimestampOrNow(),
-        // A deterministic "rehome:" marker, not a real writer id — unchanged from the original, and
-        // notably NOT `this.syncDeviceId` either, which is what makes this line safe to run before
-        // `initSyncIdentity()` for the migration caller too.
-        `rehome:${stableFingerprint([source.concept_id, from])}`, source.deleted_at,
-      );
-    }
-    // THE SOURCE ROW IS DELIBERATELY NOT DELETED (confirmed, not merely assumed: reverted an
-    // over-eager DELETE here after sync.test.ts's own "renameCircle reconciles an existing future
-    // destination pin without a natural-key collision" caught it — that test asserts BOTH the old
-    // and new circle's rows survive, deleted_at IS NULL, after a rename whose destination already
-    // had a relayed row waiting). `listFirstBlock`/the normal read path already stop surfacing the
-    // source row (it joins fb.circle = c.circle, and the concept itself has moved), so it is
-    // unreachable via any live query without being destroyed — a real distinction from the
-    // entities/concept_entities cleanup just above, which have no comparable "surviving history"
-    // requirement documented anywhere. Left exactly as the pre-extraction original had it.
     // Update in-memory lastConceptByCircle if the key matches `from`. Safe at construction time:
     // it is a class-field initializer (an empty Map), assigned before ANY constructor statement runs.
     const prev = this.lastConceptByCircle.get(from);
@@ -14604,7 +14410,7 @@ export class MonetCore {
    * 'legacy-star' as "unused" and silently land a SECOND, unrelated source's own migrated content
    * under the same circle name as the first — two independent registry identities conflated with no
    * reconciliation (knowledge_sources has none: moveCircleScopedTables does a raw `UPDATE ... circle
-   * = ?`, unlike first_block's own merge-aware branch below). Swept the full table set
+   * = ?`). Swept the full table set
    * moveCircleScopedTables itself writes to, applying one test: does an unchecked collision here
    * cause SILENT, UNRECONCILED conflation, or does the write already handle "destination not empty"
    * explicitly?
@@ -14617,14 +14423,6 @@ export class MonetCore {
    *     normative history instead of a source registration. Guarded on nothing: createLifecycleEdgeSchema
    *     runs earlier in this SAME init() call, unconditionally, before the gate-substrate section
    *     this method is called from — these tables always already exist here.
-   *   - EXCLUDED: `first_block`. It DOES carry independent-of-concept identity (a source row can
-   *     survive as history after its concept moves — moveCircleScopedTables's own "SOURCE ROW IS
-   *     DELIBERATELY NOT DELETED" comment), but unlike the three above, its OWN write path in
-   *     moveCircleScopedTables already reconciles a non-empty destination explicitly (the
-   *     destMax/relay-stamp-or-seed branch, keyed per (concept_id, circle) so unrelated rows simply
-   *     coexist rather than conflate) — a collision here is handled, not silent. Left out rather than
-   *     checked redundantly; revisit if that reconciliation logic ever stops assuming a possibly-
-   *     nonempty destination.
    *   - EXCLUDED: `observations`, `memory_edge` (column `scope`), `entities`/`concept_entities`
    *     (column `scope`). All three are DERIVED FROM a concept's own existence (evidence, an edge
    *     between two concepts, and content-indexing artifacts respectively) — none is documented, or
@@ -14779,7 +14577,7 @@ export class MonetCore {
    * VERIFIED TO NEST SAFELY, not assumed (this method's own moveCircleScopedTables was deliberately
    * left un-wrapped — see that method's own comment — specifically so a caller could compose it into
    * a larger transaction later; this is that caller). Read moveCircleScopedTables's own body plus
-   * every method it calls (moveEdgeScope, relayStampFirstBlockEntry, nextSyncTimestamp/
+   * every method it calls (moveEdgeScope, nextSyncTimestamp/
    * nextSyncTimestampOrNow, chooseLegacyStarDestination) end to end: NONE of them call `.transaction(`
    * or `.immediateTransaction(` anywhere — the whole call graph is plain prepared statements, so there
    * is nothing to nest in the first place. Independently, empirically confirmed that nesting would
@@ -15042,15 +14840,9 @@ export class MonetCore {
           .get(from, into) as { id: string } | undefined;
         if (retiredParticipant) throw new Error("cannot merge circles containing retired concepts");
 
-        // Pinned concepts preserve curated order; the unpinned tail uses rowid so forceNew/auto
-        // survivor selection is deterministic even when created_at timestamps tie.
+        // Rowid keeps forceNew/auto survivor selection deterministic when created_at timestamps tie.
         const conceptRows = this.db
-          .prepare(
-            `SELECT c.id, c.kind FROM concepts c
-             LEFT JOIN first_block fb ON fb.concept_id = c.id AND fb.circle = c.circle
-             WHERE c.circle = ?
-             ORDER BY (fb.concept_id IS NULL), fb.position ASC, c.rowid ASC`,
-          )
+          .prepare(`SELECT id, kind FROM concepts WHERE circle = ? ORDER BY rowid ASC`)
           .all(from) as Array<{ id: string; kind: string }>;
 
         const conceptResults: MergeConceptResult[] = [];
@@ -15239,272 +15031,6 @@ export class MonetCore {
       }
     }
     return { toCircle: resolvedTo, results, counts: { moved, merged, noop, error } };
-  }
-
-  // ---- First Block: user-curated always-first prewarm section ----------------
-
-  /**
-   * Read the first_block entries for a circle, joined to their concept's status.
-   * Ordered by (position ASC, concept_id ASC) for determinism.
-   * Private — callers use prewarm() for injection; public surface is the five MCP tools.
-   */
-  private getFirstBlock(circle: string): Array<{
-    id: string;
-    conceptId: string;
-    summary: string;
-    summaryDirty: boolean;
-    position: number;
-    conceptStatus: "active" | "disputed";
-  }> {
-    const rows = this.db
-      .prepare(
-        `SELECT fb.id AS id, fb.concept_id AS conceptId, fb.summary AS summary,
-                fb.summary_dirty AS summaryDirty, fb.position AS position,
-                c.status AS conceptStatus
-           FROM first_block fb
-           JOIN concepts c ON c.id = fb.concept_id
-          WHERE c.circle = ? AND fb.circle = c.circle
-            AND c.status != 'retired' AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND fb.deleted_at IS NULL
-          ORDER BY fb.position ASC, fb.concept_id ASC`,
-      )
-      .all(circle) as Array<{
-        id: string; conceptId: string; summary: string;
-        summaryDirty: number; position: number; conceptStatus: string;
-      }>;
-    return rows.map((r) => ({
-      id: r.id,
-      conceptId: r.conceptId,
-      summary: r.summary,
-      summaryDirty: r.summaryDirty === 1,
-      position: r.position,
-      conceptStatus: r.conceptStatus as "active" | "disputed",
-    }));
-  }
-
-  /** Mark the first_block entry for a concept as summary_dirty=1 (underlying concept changed). */
-  private invalidateFirstBlockEntry(conceptId: string): void {
-    this.db.prepare(
-      `UPDATE first_block SET summary_dirty = 1
-        WHERE concept_id = ?
-          AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
-          AND deleted_at IS NULL`,
-    ).run(conceptId);
-  }
-
-  /** Make an already-converged First Block row visible to the next incremental export. */
-  private relayStampFirstBlockEntry(id: string): void {
-    const relayAt = this.nextSyncTimestamp();
-    const { applying_remote: previous } = this.db.prepare(
-      `SELECT applying_remote FROM sync_meta WHERE singleton = 1`,
-    ).get() as { applying_remote: number };
-    this.db.prepare(`UPDATE sync_meta SET applying_remote = 1 WHERE singleton = 1`).run();
-    try {
-      this.db.prepare(`UPDATE first_block SET updated_at = ? WHERE id = ?`).run(relayAt, id);
-    } finally {
-      this.db.prepare(`UPDATE sync_meta SET applying_remote = ? WHERE singleton = 1`).run(previous);
-    }
-  }
-
-  /** Soft-delete the replicated First Block entry. */
-  private deleteFirstBlockEntry(conceptId: string): void {
-    this.db.prepare(`UPDATE first_block SET deleted_at = ? WHERE concept_id = ? AND deleted_at IS NULL`).run(this.nextSyncTimestamp(), conceptId);
-  }
-
-  /**
-   * Re-home a first_block pin when its concept SURVIVES a circle move (moveConcept path).
-   * Updates the pin's circle column to `toCircle` and offsets its position to land AFTER the
-   * destination circle's existing pins, preserving the pin's existence for agent_context/prewarm.
-   *
-   * This mirrors the round-3 position-offset fix already applied to renameCircle: both operations
-   * move a surviving concept and must keep its pin reachable in the destination.
-   *
-   * PRINCIPLE: a concept that survives a circle move keeps its pin (re-homed to the destination);
-   * only DELETE the pin when the concept ITSELF is deleted (use deleteFirstBlockEntry for that).
-   *
-   * Must be called BEFORE the concept row's circle column is updated (or within the same
-   * transaction), because the destination max-position query filters by fb.circle directly.
-   * (Finding 2 — Codex PR-32)
-   */
-  private rehomeFirstBlockEntry(conceptId: string, toCircle: string): void {
-    // A future-circle row may have arrived before this local move. It is already authoritative for
-    // the destination natural key, so do not overwrite it with the current-circle pin.
-    const destination = this.db.prepare(
-      `SELECT id FROM first_block WHERE concept_id = ? AND circle = ? LIMIT 1`,
-    ).get(conceptId, toCircle) as { id: string } | undefined;
-    if (destination) {
-      this.relayStampFirstBlockEntry(destination.id);
-      return;
-    }
-    // Only act if the concept actually has a pin.
-    const row = this.db
-      .prepare(`SELECT fb.id FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
-                 WHERE fb.concept_id = ? AND fb.circle = c.circle AND fb.deleted_at IS NULL`)
-      .get(conceptId) as { id: string } | undefined;
-    if (!row) return;
-    // Find the highest position already in the destination circle so we can append after it.
-    const { m: destMax } = this.db
-      .prepare(`SELECT COALESCE(MAX(fb.position), -1) AS m
-                  FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
-                 WHERE fb.circle = ? AND c.circle = fb.circle AND fb.deleted_at IS NULL`)
-      .get(toCircle) as { m: number };
-    this.db
-      .prepare(`UPDATE first_block SET id = ?, circle = ?, position = ? WHERE id = ?`)
-      .run(deterministicFirstBlockId(conceptId, toCircle), toCircle, destMax + 1, row.id);
-  }
-
-  // ---- First Block: public surface (called by MCP tools) ------------------
-
-  /**
-   * Promote a concept into the First Block. The summary is the user-authored always-injected
-   * description. Idempotent on concept_id+circle (UNIQUE constraint → error on double-promote).
-   * Position = MAX(position)+1 in the same circle, atomically with the insert.
-   * Boost the concept's usefulness so it surfaces higher in the living model.
-   * Returns the new entry + total summary chars across the circle (cost signal).
-   */
-  promoteToFirstBlock(
-    conceptId: string,
-    summary: string,
-    circle: string,
-    opts: { promotedBy?: string } = {},
-  ): { id: string; conceptId: string; summary: string; position: number; totalSummaryChars: number } {
-    this.assertNoEmbedderMigrationReentry("promote a First Block entry");
-    if (summary.length > FIRST_BLOCK_SUMMARY_MAX_CHARS) {
-      throw new Error(`summary exceeds ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars (got ${summary.length})`);
-    }
-    const concept = this.getRow(conceptId);
-    if (!concept) throw new Error(`concept not found: ${conceptId}`);
-    if (concept.kind === "workstream") throw new Error("cannot pin a workstream concept to the First Block");
-    if (isConnectorOwnedRow(concept)) throw new Error("cannot pin a source concept to the First Block");
-    if (concept.status === "retired") throw new Error("cannot pin a retired concept to the First Block");
-    if (concept.circle !== circle) throw new Error(`concept ${conceptId} is in circle '${concept.circle}' not '${circle}'`);
-
-    const id = deterministicFirstBlockId(conceptId, circle);
-    const now = Date.now();
-
-    return this.db.transaction(() => {
-      const maxPos = (this.db.prepare(`SELECT COALESCE(MAX(fb.position), -1) AS m FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND fb.deleted_at IS NULL`).get(circle) as { m: number }).m;
-      const position = maxPos + 1;
-      const existing = this.db.prepare(`SELECT id, deleted_at FROM first_block WHERE concept_id = ? AND circle = ?`).get(conceptId, circle) as { id: string; deleted_at: number | null } | undefined;
-      if (existing && existing.deleted_at === null) throw new Error(`concept ${conceptId} is already pinned in circle '${circle}'`);
-      const entryId = existing?.id ?? id;
-      this.db
-        .prepare(
-          `INSERT INTO first_block (id, concept_id, circle, summary, summary_dirty, position, promoted_at, promoted_by)
-           VALUES (?, ?, ?, ?, 0, ?, ?, ?)
-           ON CONFLICT(concept_id, circle) DO UPDATE SET
-             summary = excluded.summary, summary_dirty = 0, position = excluded.position,
-             promoted_at = excluded.promoted_at, promoted_by = excluded.promoted_by,
-             deleted_at = NULL`,
-        )
-        .run(entryId, conceptId, circle, summary, position, now, opts.promotedBy ?? null);
-      // Boost usefulness — same columns getConcept writes, the ground-truth usefulness signal.
-      this.db
-        .prepare(
-          `UPDATE concepts SET usefulness_score = usefulness_score + ?, usefulness_last_fetched_at = ? WHERE id = ?`,
-        )
-        .run(FIRST_BLOCK_PROMOTION_USEFULNESS_BOOST, now, conceptId);
-      // Total summary chars across the circle (cost feedback for the user).
-      const totalRow = this.db
-        .prepare(`SELECT COALESCE(SUM(LENGTH(fb.summary)), 0) AS total FROM first_block fb JOIN concepts c ON c.id = fb.concept_id WHERE c.circle = ? AND fb.circle = c.circle AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND fb.deleted_at IS NULL`)
-        .get(circle) as { total: number };
-      return { id: entryId, conceptId, summary, position, totalSummaryChars: totalRow.total };
-    })();
-  }
-
-  /** Remove a concept from the First Block. Does NOT touch the concept itself. */
-  removeFromFirstBlock(conceptId: string, circle: string): { removed: boolean } {
-    this.assertNoEmbedderMigrationReentry("remove a First Block entry");
-    const r = this.db.prepare(
-      `UPDATE first_block SET deleted_at = ?
-        WHERE concept_id = ? AND circle = ?
-          AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
-          AND EXISTS (SELECT 1 FROM concepts c WHERE c.id=first_block.concept_id
-            AND c.kind!='source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL)
-          AND deleted_at IS NULL`,
-    ).run(this.nextSyncTimestamp(), conceptId, circle);
-    return { removed: r.changes > 0 };
-  }
-
-  /** List the First Block entries for a circle, position-ordered. */
-  listFirstBlock(circle: string): ReturnType<MonetCore["getFirstBlock"]> {
-    return this.getFirstBlock(circle);
-  }
-
-  /**
-   * Atomically reorder the First Block by assigning new positions matching `orderedConceptIds`.
-   * All ids must already be in the first_block for this circle.
-   */
-  reorderFirstBlock(orderedConceptIds: string[], circle: string): void {
-    this.assertNoEmbedderMigrationReentry("reorder First Block entries");
-    this.db.transaction(() => {
-      // Validate: the supplied list must exactly equal the circle's currently-pinned set.
-      // A partial list or unknown/wrong-circle id yields silent colliding positions or a no-op,
-      // both of which are bugs the caller cannot detect without this guard.
-      const pinned = (
-        this.db
-          .prepare(`SELECT fb.concept_id FROM first_block fb JOIN concepts c ON c.id = fb.concept_id
-                     WHERE fb.circle = ? AND c.circle = fb.circle
-                       AND c.status != 'retired' AND c.kind!='source'
-                       AND c.source_identity IS NULL AND c.active_observation_id IS NULL
-                       AND fb.deleted_at IS NULL
-                     ORDER BY fb.position`)
-          .all(circle) as Array<{ concept_id: string }>
-      ).map((r) => r.concept_id);
-
-      if (orderedConceptIds.length !== pinned.length) {
-        throw new Error(
-          `reorderFirstBlock: supplied ${orderedConceptIds.length} id(s) but circle '${circle}' has ${pinned.length} pinned concept(s)`,
-        );
-      }
-      const pinnedSet = new Set(pinned);
-      for (const id of orderedConceptIds) {
-        if (!pinnedSet.has(id)) {
-          throw new Error(
-            `reorderFirstBlock: id '${id}' is not pinned in circle '${circle}'`,
-          );
-        }
-      }
-
-      // Distinctness check: length-equal + all-members + distinct together prove exact set-equality.
-      // Without this, [a, a, b] passes the above checks when pinned = {a, b, c} and silently
-      // corrupts positions (a→0, a→1, b→2; c never written).
-      if (new Set(orderedConceptIds).size !== orderedConceptIds.length) {
-        throw new Error(
-          `reorderFirstBlock: orderedConceptIds contains duplicate ids — each pinned concept must appear exactly once`,
-        );
-      }
-
-      for (let i = 0; i < orderedConceptIds.length; i++) {
-        this.db
-          .prepare(`UPDATE first_block SET position = ? WHERE concept_id = ? AND circle = ? AND deleted_at IS NULL`)
-          .run(i, orderedConceptIds[i]!, circle);
-      }
-    })();
-  }
-
-  /**
-   * Update the summary for a First Block entry and clear summary_dirty.
-   * Returns the updated entry, or null if the concept is not in the block for this circle.
-   */
-  updateFirstBlockSummary(
-    conceptId: string,
-    newSummary: string,
-    circle: string,
-  ): { conceptId: string; summary: string; summaryDirty: boolean } | null {
-    this.assertNoEmbedderMigrationReentry("update a First Block summary");
-    if (newSummary.length > FIRST_BLOCK_SUMMARY_MAX_CHARS) {
-      throw new Error(`summary exceeds ${FIRST_BLOCK_SUMMARY_MAX_CHARS} chars (got ${newSummary.length})`);
-    }
-    const r = this.db
-      .prepare(`UPDATE first_block SET summary = ?, summary_dirty = 0
-                 WHERE concept_id = ? AND circle = ?
-                   AND circle = (SELECT circle FROM concepts WHERE id = first_block.concept_id)
-                   AND EXISTS (SELECT 1 FROM concepts c WHERE c.id=first_block.concept_id
-                     AND c.kind!='source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL)
-                   AND deleted_at IS NULL`)
-      .run(newSummary, conceptId, circle);
-    if (r.changes === 0) return null;
-    return { conceptId, summary: newSummary, summaryDirty: false };
   }
 
   // ---- internals ---------------------------------------------------------
@@ -16141,11 +15667,6 @@ export class MonetCore {
     this.assertActiveMutableConcept(src, "move");
     const id = src.id;
     const fromCircle = src.circle;
-    // First Block hook: re-home the pin BEFORE updating the concept row so that rehomeFirstBlockEntry
-    // can query the destination max-position while the concept's circle column still reads fromCircle
-    // (the query is on fb.circle, not c.circle, so this ordering is safe). The concept SURVIVES this
-    // move, so its pin must survive too — UPDATE circle+position rather than DELETE. (Finding 2 — Codex PR-32)
-    this.rehomeFirstBlockEntry(id, toCircle);
     // Every sidecar entry names the circle its rule lives in, so moving a deny between circles
     // rewrites the mirror even though the binding is untouched — a bump is owed here. NOT sourced
     // from `noteRuleTouched(id)` any more (removed here — Codex round 8, item 2 fallout, found and
@@ -16286,10 +15807,6 @@ export class MonetCore {
         mergedArousalScore, mergedArousalTs,
         target.id,
       );
-    // First Block hooks (merge):
-    //   target mutated → invalidate its summary so the user knows to refresh it.
-    //   source deleted → remove its entry (referential integrity — no dangling row to a deleted concept).
-    this.invalidateFirstBlockEntry(target.id);
     // 4) Drop the source and publish a durable hard-deletion event so an out-of-order stale
     // concept payload can never recreate the absorbed id on another replica.
     this.hardDeleteNativeConcept(src.id);
@@ -16346,10 +15863,6 @@ export class MonetCore {
            writer_id = excluded.writer_id, concept_kind = excluded.concept_kind`,
       ).run(conceptId, stamp, stamp, this.syncDeviceId);
     }
-    this.db.prepare(
-      `UPDATE first_block SET deleted_at = COALESCE(deleted_at, ?), updated_at = ?
-        WHERE concept_id = ?`,
-    ).run(stamp, stamp, conceptId);
     const memberships = this.db.prepare(
       `SELECT entity_key, scope FROM concept_entities WHERE concept_id = ?`,
     ).all(conceptId) as Array<{ entity_key: string; scope: string }>;
@@ -17142,9 +16655,6 @@ export class MonetCore {
       .prepare(`UPDATE concepts SET body = ?, title = ?, dirty = 0, updated_at = unixepoch() * 1000 WHERE id = ?`)
       .run(body, nextTitle, concept.id);
     this.writeRevision(concept.id, concept.version, body);
-    // First Block hook: the body the summary distilled from just changed — invalidate it.
-    // Plain UPDATE on the concept row, no re-read → no recursion risk.
-    this.invalidateFirstBlockEntry(concept.id);
     // MIRROR CONTENT (review fix — Codex round 2, item 4): a rule's TITLE is the text a gate
     // delivers (GateRule.text, GateMirrorEntry.text both read `concepts.title`) — this sieve-tier
     // retitling could leave a bound rule's live gate serving new text while a materialized mirror

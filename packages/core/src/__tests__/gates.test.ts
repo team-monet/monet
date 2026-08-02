@@ -514,56 +514,6 @@ describe("rule capture", () => {
 // rule death
 // ---------------------------------------------------------------------------
 describe("rule death — a correction supersedes rather than attaches", () => {
-  it("births the successor, records the supersession, and leaves the incumbent as history", async () => {
-    const c = core();
-    const rule = await c.store("Never force-push to a shared branch.", {
-      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", reason: "destroys commits", ...AGENT_RULE },
-    });
-    c.promoteToFirstBlock(rule.conceptId, "force-push rule", "default");
-    const blockBefore = c.listFirstBlock("default");
-
-    const correction = await c.store("Force-push is fine on your own branch; never on a shared one.", {
-      kind: "correction",
-      attachTo: rule.conceptId,
-    });
-
-    // The correction did NOT land on the rule — it created the rule that replaces it.
-    expect(correction.conceptId).not.toBe(rule.conceptId);
-    expect(correction.action).toBe("created");
-    expect(correction.concept.kind).toBe("rule");
-    expect(correction.ruleSuccession).toMatchObject({
-      supersededRuleId: rule.conceptId,
-      successorRuleId: correction.conceptId,
-      stageId: c.ruleBinding(rule.conceptId)!.stage_id,
-    });
-
-    // The act is on the record, as a supersession edge born of the correction that caused it.
-    const edges = c.getLifecycleEdges(rule.conceptId, { direction: "out", family: "supersession" });
-    expect(edges).toHaveLength(1);
-    expect(edges[0]).toMatchObject({
-      src_concept_id: rule.conceptId,
-      dst_concept_id: correction.conceptId,
-      born_of: "correction",
-      event_ref: correction.observationId,
-    });
-
-    // The successor holds the same gate, advisory-born, with the reason carried forward.
-    expect(c.ruleBinding(correction.conceptId)).toMatchObject({
-      stage_id: c.ruleBinding(rule.conceptId)!.stage_id,
-      severity: "advisory",
-      origin: "correction",
-      reason: "destroys commits",
-    });
-
-    // NO contradiction opened: a superseded rule is settled history, not disputed evidence...
-    expect(correction.contradiction).toBeUndefined();
-    // ...and the First Block was not invalidated, because nothing attached to the pinned concept.
-    // (Read before any getConcept below: fetching a dirty concept SYNTHESIZES it, which legitimately
-    // invalidates its pinned summary — that would be this assertion measuring the test, not the code.)
-    expect(c.listFirstBlock("default")).toEqual(blockBefore);
-    expect((await c.getConcept(rule.conceptId))!.status).toBe("active");
-    c.close();
-  });
 
   it("treats a NOMINATED landing on a rule exactly like a named one", async () => {
     const c = resolvingCore();
@@ -4579,7 +4529,7 @@ describe("gate substrate sync", () => {
     });
 
     const payload = src.exportDelta(0);
-    expect(payload.schemaVersion).toBe(13);
+    expect(payload.schemaVersion).toBe(14);
     expect(payload.stages?.map((s) => s.name)).toEqual(["git force push"]);
     expect(payload.ruleBindings?.map((b) => b.concept_id)).toEqual([rule.conceptId]);
 
@@ -5317,8 +5267,8 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const payload = src.exportDelta(0);
-    expect(() => dst.graftRows({ ...payload, schemaVersion: 14 }))
-      .toThrow(/this build understands up to 13/);
+    expect(() => dst.graftRows({ ...payload, schemaVersion: 15 }))
+      .toThrow(/this build understands up to 14/);
     src.close();
     dst.close();
   });
@@ -9708,55 +9658,6 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
   });
 
   /**
-   * ROUND 1's OWN FIX MOVED ONLY concepts.circle (Codex round 2, item 2). A genuine 1.3.1-era store
-   * could have filed observations, First Block pins, and graph rows under '*' too — nothing
-   * distinguished it from any other circle name back then — and every one of those tables is
-   * circle/scope-keyed independently of `concepts.circle`. Left behind, scoped stats/overview for
-   * the migrated circle would undercount or read blank, and any join requiring `fb.circle =
-   * c.circle` (First Block's own reconciliation, elsewhere) would silently exclude an orphaned pin.
-   */
-  it("moves EVERY circle-scoped table, not just concepts.circle — observations and First Block follow the legacy-star migration too (Codex round 2, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "legacy-star-full.db");
-    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    const legacyFact = await built.store("Terraform state lives in the shared S3 bucket.", {
-      circle: "an-ordinary-circle", kind: "fact",
-    });
-    built.promoteToFirstBlock(legacyFact.conceptId, "Terraform state location.", "an-ordinary-circle");
-    built.close();
-
-    // Simulate 1.3.1 directly: hand-rewrite EVERY circle-scoped row this concept touches to '*' — a
-    // genuine 1.3.1-era store, unlike this describe block's OWN lighter fixtures above, could have
-    // filed observations/First Block there too.
-    const legacy = new Database(path);
-    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
-    legacy.prepare(`UPDATE observations SET circle = '*' WHERE concept_id = ?`).run(legacyFact.conceptId);
-    legacy.prepare(`UPDATE first_block SET circle = '*' WHERE concept_id = ?`).run(legacyFact.conceptId);
-    legacy.close();
-
-    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    const conceptRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
-    const obsRow = raw(upgraded).prepare(`SELECT circle FROM observations WHERE concept_id = ?`).get(legacyFact.conceptId) as { circle: string };
-    expect(conceptRow.circle).toBe(LEGACY_STAR_CIRCLE);
-    expect(obsRow.circle).toBe(LEGACY_STAR_CIRCLE);
-    // listFirstBlock, not a raw `WHERE concept_id = ?` — the reconciliation this migration shares
-    // with renameCircle deliberately PRESERVES the source row as history rather than deleting it
-    // (confirmed via sync.test.ts's own "reconciles an existing future destination pin" test, which
-    // asserts exactly this for a rename), so a query with no circle filter could return either row.
-    // The LIVE view — what an ordinary caller sees — is the one that matters here.
-    expect(upgraded.listFirstBlock(LEGACY_STAR_CIRCLE)).toContainEqual(
-      expect.objectContaining({ conceptId: legacyFact.conceptId }),
-    );
-
-    // Scoped stats actually see it — proof observations really moved, not just the concept row:
-    // round 1's own fix would have left this undercounted (concept present, observations blank).
-    const ov = upgraded.overview(LEGACY_STAR_CIRCLE);
-    expect(ov.counts.concepts).toBe(1);
-    expect(ov.counts.observations).toBeGreaterThan(0);
-    upgraded.close();
-  });
-
-  /**
    * 'legacy-star' CAN COLLIDE WITH A REAL USER CIRCLE (Codex round 2, item 3). A user who already
    * has a circle named exactly "legacy-star" — coincidence, or a previous migration on a COPY of
    * this store — must not have their content silently merged with whatever the CURRENT migration is
@@ -9781,7 +9682,7 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
 
     const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
     const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
-    // NOT 'legacy-star' — that name was already taken — but the NEXT unused numbered variant.
+    // NOT "legacy-star" — that name was already taken — but the NEXT unused numbered variant.
     expect(migratedRow.circle).toBe(`${LEGACY_STAR_CIRCLE}-2`);
     // The pre-existing user circle is completely undisturbed: still exactly one concept, still its
     // own — the collision this test exists to prevent, avoided.
@@ -9797,15 +9698,6 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     upgraded.close();
   });
 
-  /**
-   * THE COLLISION PROBE MISSED knowledge_sources (Codex round 5, item 2) — round 2's own probe
-   * checked `concepts` and `circle_aliases` only. A source registered at exactly 'legacy-star' with
-   * ZERO concepts sharing that circle (never ingested into) was invisible to it: `taken('legacy-star')`
-   * found no concept and no alias naming it, so the migration could pick 'legacy-star' as "unused"
-   * and land a SECOND, unrelated source's own migrated content under the SAME circle name as the
-   * first — two independent registry identities silently conflated, with no reconciliation
-   * (knowledge_sources has none: a raw circle overwrite, unlike first_block's own merge-aware write).
-   */
   it("probes for an unused destination when 'legacy-star' is already taken by a registered SOURCE with zero concepts of its own — advances to 'legacy-star-2' (Codex round 5, item 2)", async () => {
     const dir = mkTmp();
     const path = join(dir, "legacy-star-source-collision.db");
@@ -9913,62 +9805,31 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
   });
 
   /**
-   * ROUND 3's OWN FIX HAD A GAP ONE LAYER DEEPER (Codex round 4, item 1). A genuinely pre-v8 store
-   * has the `sync_meta` TABLE (init()'s own CREATE TABLE IF NOT EXISTS, unconditional) but not yet
-   * its SINGLETON ROW — that is initSyncIdentity()'s job, and constructor order is init() (which
-   * reaches the legacy-star migration) THEN initSyncIdentity(). Pre-fix, migrateLegacyStarCircle's
-   * own `nextSyncTimestamp()` call dereferenced `.t` off the SELECT's `undefined` result — a
-   * TypeError, aborting construction on the FIRST attempt (moveCircleScopedTables having already
-   * auto-committed the concept's move, same shape as round 3's own finding one layer up). ALSO
-   * exercises the identical crash one call deeper: moveCircleScopedTables' own First Block
-   * reconciliation calls nextSyncTimestamp() a SECOND time, independently, when a moved concept
-   * carries a promotion — found while fixing this item, not asked for by name, and fixed the same
-   * way (nextSyncTimestampOrNow throughout).
+   * A genuinely pre-v8 store has the sync_meta table but not necessarily its singleton row yet:
+   * constructor order reaches the legacy-star migration before initSyncIdentity. The migration must
+   * therefore use nextSyncTimestampOrNow rather than dereference a missing persisted clock.
    */
-  it("a pre-v8 store — sync_meta exists, but its singleton row does not yet — with a '*' circle (and a First Block pin on it) opens successfully on the FIRST attempt (Codex round 4, item 1)", async () => {
+  it("a pre-v8 store — sync_meta exists, but its singleton row does not yet — with a '*' circle opens successfully on the FIRST attempt (Codex round 4, item 1)", async () => {
     const dir = mkTmp();
     const path = join(dir, "pre-v8-no-singleton.db");
     const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    const legacyFact = await built.store("A fact promoted before breadth existed.", {
+    const legacyFact = await built.store("A fact stored before breadth existed.", {
       circle: "an-ordinary-circle", kind: "fact",
     });
-    built.promoteToFirstBlock(legacyFact.conceptId, "Pinned back when this circle was named '*'.", "an-ordinary-circle");
     built.close();
 
-    // Simulate the exact pre-v8 shape: the concept (and its First Block pin) already lived in '*',
-    // and — the novel part of this round's finding — sync_meta's singleton row has never been
-    // written, as if this were the very first open of a database sync-aware code has never touched.
     const legacy = new Database(path);
     legacy.prepare(`UPDATE concepts SET circle = '*' WHERE id = ?`).run(legacyFact.conceptId);
-    legacy.prepare(`UPDATE first_block SET circle = '*' WHERE concept_id = ?`).run(legacyFact.conceptId);
     legacy.prepare(`DELETE FROM sync_meta WHERE singleton = 1`).run();
-    expect(legacy.prepare(`SELECT 1 FROM sync_meta WHERE singleton = 1`).get()).toBeUndefined(); // the table exists; the row does not
+    expect(legacy.prepare(`SELECT 1 FROM sync_meta WHERE singleton = 1`).get()).toBeUndefined();
     legacy.close();
 
-    // THE FIRST ATTEMPT. Pre-fix, this line itself threw "Cannot read properties of undefined
-    // (reading 't')" out of nextSyncTimestamp's own SELECT.
     const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    // Deleting the singleton row also erased its embedder pin alongside device_id/last_mutation_at
-    // (one row, one atomic unit) — initSyncIdentity() correctly re-seeds it as UNPINNED (this store
-    // already has real vectors, so it is not "genuinely fresh"), which is a legitimate pre-pin state
-    // but one every served path must resolve via ensureEmbedderPin() before touching embeddings
-    // (the ADR-CONTRACT this file's own constructor comment states) — unrelated to this item's own
-    // fix, just a necessary consequence of simulating "no singleton row" by deleting the whole row.
     await upgraded.ensureEmbedderPin();
 
-    // Migration completed: the concept moved, AND initSyncIdentity() ran normally moments later
-    // (the singleton row now exists, seeded rather than left to this migration to invent).
     const migratedRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(legacyFact.conceptId) as { circle: string };
     expect(migratedRow.circle).toBe(LEGACY_STAR_CIRCLE);
     expect(raw(upgraded).prepare(`SELECT 1 FROM sync_meta WHERE singleton = 1`).get()).toBeDefined();
-
-    // THE SECOND, DEEPER CALL SITE: the First Block pin followed the concept, proving
-    // moveCircleScopedTables' own inner nextSyncTimestampOrNow() call (the First Block insert) also
-    // survived the same no-singleton condition.
-    const pins = upgraded.listFirstBlock(LEGACY_STAR_CIRCLE);
-    expect(pins.map((p) => p.conceptId)).toEqual([legacyFact.conceptId]);
-
-    // Generation is sane and the store is fully functional end to end.
     expect(upgraded.sidecarGeneration()).toBeGreaterThan(0);
     const rule = await upgraded.declare({
       species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
@@ -11541,6 +11402,79 @@ describe("MCP surface", () => {
     };
     return { call, client };
   }
+
+  it("auto-prewarm carries the stage-index recognition cue with a capped honest tail", async () => {
+    const c = core();
+    for (let i = 0; i < 18; i++) {
+      await c.store(`Rule number ${i}.`, {
+        kind: "rule", resolution: "forceNew",
+        rule: { stage: `stage-${String(i).padStart(2, "0")}`, scope: "domain" },
+      });
+    }
+    const { call, client } = await harness(c, { autoPrewarm: true });
+    const result = await call("memory_overview", {});
+
+    expect(result.prewarmText).toContain("Stages you can recognize (ask stage_lookup): ");
+    expect(result.prewarmText).toContain("stage-00");
+    expect(result.prewarmText).toContain("(+3 more)");
+    expect(result.prewarmText.length).toBeLessThan(1_500);
+
+    await client.close();
+    c.close();
+  });
+
+  it("auto-prewarm stage tail reports the true total past STAGE_INDEX_CAP", async () => {
+    const c = core();
+    let n = 0;
+    const deps = { db: raw(c) as never, newId: () => `extra-stage-${n++}`, nextSyncTimestamp: () => Date.now(), syncDeviceId: "d" };
+    const db = raw(c);
+    const STAGE_COUNT = STAGE_INDEX_CAP + 100;
+    for (let i = 0; i < STAGE_COUNT; i++) {
+      const stage = upsertStage(deps, { stage: `bulk stage ${String(i).padStart(5, "0")}`, origin: "declaration" });
+      const conceptId = `bulk-concept-${i}`;
+      db.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, circle, embedding)
+         VALUES (?, ?, ?, ?, 'rule', 'active', 'default', '[]')`,
+      ).run(conceptId, `bulk-slug-${i}`, `Bulk rule ${i}`, `Body ${i}`);
+      db.prepare(
+        `INSERT INTO rule_bindings (concept_id, stage_id, severity, scope, model_tag, origin, circle, created_at, sync_updated_at, sync_revision)
+         VALUES (?, ?, 'advisory', 'domain', NULL, 'import', 'default', ?, ?, 0)`,
+      ).run(conceptId, stage.id, Date.now(), Date.now());
+    }
+    const { call, client } = await harness(c, { autoPrewarm: true });
+    const result = await call("memory_overview", {});
+
+    expect(result.prewarmText).toContain("Stages you can recognize (ask stage_lookup): ");
+    expect(result.prewarmText).toContain(`(+${STAGE_COUNT - 15} more)`);
+    expect(result.prewarmText).not.toContain("(+1985 more)");
+
+    await client.close();
+    c.close();
+  }, 30_000);
+
+  it("auto-prewarm preserves a non-empty stage cue for pathologically long names", async () => {
+    const c = core();
+    for (let i = 0; i < 15; i++) {
+      const name = `stage-${String(i).padStart(2, "0")}-${"x".repeat(480)}`;
+      await c.store(`Rule for stage ${i}.`, {
+        kind: "rule", resolution: "forceNew", rule: { stage: name, scope: "domain" },
+      });
+    }
+    const { call, client } = await harness(c, { autoPrewarm: true });
+    const result = await call("memory_overview", {});
+
+    expect(result.prewarmText).toContain("Stages you can recognize (ask stage_lookup): ");
+    expect(result.prewarmText).toContain("stage-00");
+    const tailMatch = result.prewarmText.match(/\(\+(\d+) more\)/);
+    expect(tailMatch).not.toBeNull();
+    const more = Number(tailMatch![1]);
+    expect(more).toBeGreaterThan(0);
+    expect(more).toBeLessThan(15);
+    expect(result.prewarmText.length).toBeLessThanOrEqual(2_500);
+
+    await client.close();
+    c.close();
+  });
 
   it("captures a rule and declares a blocking one, end to end", async () => {
     const c = core();

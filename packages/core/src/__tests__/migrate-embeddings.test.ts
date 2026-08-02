@@ -247,7 +247,6 @@ describe("MonetCore.migrateEmbeddings", () => {
             ["pin/adopt", () => core.adoptEmbedderPin()],
             ["source/create", () => core.createSource({} as never)],
             ["source/run", () => core.beginSourceRun({} as never)],
-            ["first-block/promote", () => core.promoteToFirstBlock("missing", "summary", "default")],
           ];
           for (const [name, mutate] of mutations) {
             expect(mutate, name).toThrow(EmbedderMigrationReentryError);
@@ -261,7 +260,7 @@ describe("MonetCore.migrateEmbeddings", () => {
         },
       });
       expect(report.failures).toEqual([]);
-      expect(blocked).toHaveLength(10);
+      expect(blocked).toHaveLength(9);
       await expect(receiptRetry).resolves.toMatchObject({
         conceptId: committed.conceptId,
         observationId: committed.observationId,

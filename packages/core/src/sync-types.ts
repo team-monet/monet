@@ -330,7 +330,8 @@ export interface GraftPayload {
   deletions?: SyncConceptDeletionRow[];
   /** v8 commutative activity inputs. */
   conceptActivity?: SyncConceptActivityRow[];
-  firstBlock: SyncFirstBlockRow[];
+  /** Legacy protocol field. Schema-12 receivers convert eligible rows to observations without reviving pins. */
+  firstBlock?: SyncFirstBlockRow[];
   circleAliases: SyncCircleAliasRow[];
   entities: SyncEntityRow[];
   conceptEntities: SyncConceptEntityRow[];
@@ -350,6 +351,8 @@ export interface GraftPayload {
 export interface GraftResult {
   /** Per-table count of rows that were newly inserted. */
   inserted: Record<string, number>;
+  /** Count of legacy rows converted into their retired-surface replacement. */
+  converted: Record<string, number>;
   /** Per-table count of rows that already existed and were skipped or merged. */
   skipped: Record<string, number>;
   /** Active native endpoint ids whose winning observation binding changed and were marked dirty. */

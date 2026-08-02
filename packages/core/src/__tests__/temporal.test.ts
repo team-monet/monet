@@ -102,9 +102,9 @@ describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () 
       expect(edgeCols.some((c) => c.name === "dismissed_at")).toBe(true);
       expect(edgeCols.some((c) => c.name === "dismissed_by")).toBe(true);
 
-      // Verify user_version == SOURCE_FILE_CONCEPT_SCHEMA_VERSION (11) — fully migrated through all versions.
+      // Verify user_version == MONET_SCHEMA_VERSION (12) — fully migrated through all versions.
       const version = db.pragma("user_version", { simple: true }) as number;
-      expect(version).toBe(11);
+      expect(version).toBe(12);
 
       core.close();
     } finally {
@@ -134,7 +134,7 @@ describe("1. Migration — pre-0.6.0 store → temporal columns + backfill", () 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db2 = (coreB as any).db as import("../storage").StoragePort;
       const version2 = db2.pragma("user_version", { simple: true }) as number;
-      expect(version2).toBe(11); // SOURCE_FILE_CONCEPT_SCHEMA_VERSION — fully migrated
+      expect(version2).toBe(12); // MONET_SCHEMA_VERSION — fully migrated
       coreB.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -198,7 +198,7 @@ describe("1b. Migration ordering — graph-disabled open does not consume graph 
       const dbEnabled = (coreEnabled as any).db as import("../storage").StoragePort;
 
       const versionAfterEnabled = dbEnabled.pragma("user_version", { simple: true }) as number;
-      expect(versionAfterEnabled).toBe(11); // SOURCE_FILE_CONCEPT_SCHEMA_VERSION
+      expect(versionAfterEnabled).toBe(12); // MONET_SCHEMA_VERSION
 
       const rowAfterEnabled = dbEnabled
         .prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
@@ -1334,7 +1334,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       const db2 = (core2 as any).db as import("../storage").StoragePort;
 
       const version2 = db2.pragma("user_version", { simple: true }) as number;
-      expect(version2).toBe(11); // SOURCE_FILE_CONCEPT_SCHEMA_VERSION
+      expect(version2).toBe(12); // MONET_SCHEMA_VERSION
 
       const rowAfterGraphEnabled = db2.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
         .get(r1.conceptId) as { last_confirmed_at: number | null };
@@ -1401,7 +1401,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db0 = (core0 as any).db as import("../storage").StoragePort;
       const version0 = db0.pragma("user_version", { simple: true }) as number;
-      expect(version0).toBe(11); // fully migrated (SOURCE_FILE_CONCEPT_SCHEMA_VERSION)
+      expect(version0).toBe(12); // fully migrated (MONET_SCHEMA_VERSION)
       const lcaBefore = (db0.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
       expect(lcaBefore).not.toBeNull();
       core0.close();
@@ -1412,7 +1412,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       const db1 = (core1 as any).db as import("../storage").StoragePort;
 
       const version1 = db1.pragma("user_version", { simple: true }) as number;
-      expect(version1).toBe(11); // SOURCE_FILE_CONCEPT_SCHEMA_VERSION — unchanged on re-open
+      expect(version1).toBe(12); // MONET_SCHEMA_VERSION — unchanged on re-open
 
       const lcaAfter = (db1.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`).get(r0.conceptId) as { last_confirmed_at: number | null }).last_confirmed_at;
       // Must be byte-identical — no spurious update.

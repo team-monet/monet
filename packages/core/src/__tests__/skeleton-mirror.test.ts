@@ -357,7 +357,7 @@ describe("prewarm skeleton mirror delivery", () => {
       expect(payload).toHaveProperty("activeWorkstreams");
       expect(payload).toHaveProperty("topConcepts");
       expect(payload).toHaveProperty("staleCount");
-      expect(payload).toHaveProperty("firstBlock");
+      expect(payload).not.toHaveProperty("firstBlock");
       expect(result.content[0]!.text.length).toBeLessThanOrEqual(40_000);
     } finally {
       await client.close();
@@ -365,45 +365,6 @@ describe("prewarm skeleton mirror delivery", () => {
     }
   });
 
-  it("keeps instruction when a near-budget base forces every stale path out", async () => {
-    const { root, core } = fixture();
-    for (let i = 0; i < 40; i++) {
-      const stored = await core.store(`Pinned context ${i}.`, { circle: "alpha", resolution: "forceNew" });
-      core.promoteToFirstBlock(stored.conceptId, `${i}:${"p".repeat(790)}`, "alpha");
-    }
-    for (let i = 0; i < 5; i++) {
-      await core.saveWorkstream({
-        status: "active",
-        openQuestions: [`question-${i}-${"q".repeat(1_500)}`],
-        decisions: [`decision-${i}-${"d".repeat(1_500)}`],
-        nextSteps: [`next-${i}-${"n".repeat(1_500)}`],
-      }, { circle: "alpha" });
-    }
-    const path = join(root, `${"oversized-".repeat(5_000)}.md`);
-    writeFileSync(join(root, "materialize.json"), JSON.stringify({
-      surfaces: [{ path, scope: "global" }],
-      materialized: {},
-    }));
-    const server = new McpServer({ name: "mirror-test", version: "1" }, { capabilities: { tools: {} } });
-    registerMonetCoreTools(server, core, { autoPrewarm: false, checkpointNudge: false });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    const client = new Client({ name: "mirror-client", version: "1" });
-    await client.connect(clientTransport);
-    try {
-      const result = await client.callTool({ name: "agent_context", arguments: { circle: "alpha" } }) as {
-        content: Array<{ type: string; text: string }>;
-      };
-      const payload = JSON.parse(result.content[0]!.text);
-      expect(payload.mirrorStale).toEqual([]);
-      expect(payload.mirrorStaleTruncated).toBe(true);
-      expect(payload.mirrorStaleOmitted).toBe(1);
-      expect(payload.instruction).toBe(MIRROR_STALE_INSTRUCTION);
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
 
   it("measures the final mirror + stage + skeleton envelope at the boundary", async () => {
     const { root, core } = fixture();
