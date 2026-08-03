@@ -12,7 +12,13 @@ import { createHash } from "node:crypto";
 // short-circuit AND materializeStagedBindings' (source-sync.ts) per-chunk unchanged-content skip on
 // the very next sync of any existing source — forcing one full, real re-scan and re-materialization
 // pass regardless of whether the underlying file bytes changed at all.
-export const SOURCE_CHUNKER_VERSION = "v4";
+// v5 (#135): chunk embedding input now carries the file title and heading path
+// (contextualizeSourceChunk, engine.ts). The stored content is unchanged, so nothing below would
+// notice on its own — an unchanged revision takes the source-level noop path and a rescan carries
+// matching fingerprints through materializeStagedBindings' per-chunk skip, leaving every existing
+// chunk on its old body-only vector until someone edited the file. Bumping the version is what
+// forces one full re-materialization and repairs the stores this change targets (Codex review).
+export const SOURCE_CHUNKER_VERSION = "v5";
 
 const CONTENT_HASH_PREFIX = "monet-src-content/v1:sha256:";
 const CHUNK_FINGERPRINT_DOMAIN = "monet-src-ingest/v1";

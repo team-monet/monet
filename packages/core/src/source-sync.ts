@@ -79,7 +79,7 @@ export interface SourceSyncCorePort {
   acknowledgeSourceCleanup(itemId: string): SourceCleanupItem;
   storeSource(content: string, opts: {
     circle: string; sourceRefs: string[]; operationId: string;
-    resolution?: "forceNew"; attachTo?: string;
+    resolution?: "forceNew"; attachTo?: string; headingPath?: readonly string[]; fileTitle?: string;
   }): Promise<IngestResult>;
   /** File=concept (ratified, Phase 1): supersedes ONE chunk's observation pair. Replaces the
    *  retired refreshSourceConcept (a concept-level active-observation-pointer swap that only
@@ -687,6 +687,12 @@ async function materializeStagedBindings(
     if (chunk.conceptId) priorFileConceptByPath.set(chunk.relativePath, chunk.conceptId);
   }
   const stagedChunks = core.listSourceChunks(run.id);
+  // Display title per file, for the chunk embedding context only (#135). It lives on the file
+  // record — deriveSourceFileTitle takes it from frontmatter, else the filename — and never in the
+  // heading hierarchy, so a document with no `#` heading has no other way to say what it is.
+  const fileTitleByPath = new Map(
+    core.listSourceFiles(run.id).map((file) => [file.relativePath, file.title.trim()] as const),
+  );
 
   // Resolve/create the file concept ONCE per file (per CURRENT relativePath in this run), from
   // ALL of that file's staged chunks together, upfront — never from just the first chunk the
@@ -760,6 +766,12 @@ async function materializeStagedBindings(
         circle: source.circle,
         sourceRefs: [staged.sourceRef],
         operationId: staged.operationId,
+        // Embedded, not stored: what a query naming this document has to match against. The title
+        // is passed separately because it comes from frontmatter or the filename, never from the
+        // heading hierarchy — a document with no `#` heading has no other way to say what it is
+        // (see contextualizeSourceChunk).
+        headingPath: staged.headingPath,
+        ...(fileTitleByPath.get(staged.relativePath) ? { fileTitle: fileTitleByPath.get(staged.relativePath) } : {}),
         ...(attachTo ? { attachTo } : { resolution: "forceNew" as const }),
       });
       options.fault?.("after-store");

@@ -72,7 +72,11 @@ describe("source scanner configuration and glob semantics", () => {
     // Frontmatter array tolerance (ratified): bumped v3->v4 for the classification change (a flat
     // scalar list is now accepted for any key, not just tags) — see SOURCE_CHUNKER_VERSION's own
     // comment (source-chunker.ts) for why a classification change requires this.
-    expect(SOURCE_CHUNKER_VERSION).toBe("v4");
+    // #135: bumped v4->v5 for the chunk EMBEDDING INPUT change (file title + heading path). The
+    // stored content is byte-identical, so nothing else in the pipeline would notice on its own —
+    // the version is the only thing that forces existing chunks to be re-materialized onto the new
+    // vectors instead of sitting on their old body-only ones until someone edits the file.
+    expect(SOURCE_CHUNKER_VERSION).toBe("v5");
   });
 
   it("matches conservative anchored POSIX globs with segment-aware **", () => {

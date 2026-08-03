@@ -1064,7 +1064,80 @@ export interface RuleCaptureOpts {
 }
 
 /** Connector-only source ingestion options. `storeSource` is deliberately not exposed over MCP. */
-export type SourceStoreOpts = Omit<StoreOpts, "kind" | "rule">;
+export type SourceStoreOpts = Omit<StoreOpts, "kind" | "rule"> & {
+  /**
+   * The chunk's document and section titles, used ONLY to build the text that gets embedded — never
+   * stored, never hashed, never part of the ledger's content comparison.
+   *
+   * A chunk's body is a section stripped of the headings that say what it is about, and those
+   * headings were parsed, stored in `source_chunks.heading_path_json`, and then dropped before
+   * embed(). So a query naming a document had nothing to match: on the live store, a file's own
+   * exact title scored 0.414 against its best chunk, against an unrelated-pair median of 0.328.
+   * Prepending the path costs ~20-40 tokens where chunk medians are 165, and moved that fixture to
+   * 0.600 (measured, scripts/repros/heading-gain.mjs).
+   *
+   * Kept out of the stored content deliberately: `contentHash`, `ingestFingerprint` and
+   * source-ledger's durable receipt validation are all computed from the exact chunker output, so
+   * changing what is stored would churn every fingerprint in the store to fix a retrieval problem.
+   */
+  headingPath?: readonly string[];
+  /** The document's display title (frontmatter or filename). Embed-only, like `headingPath`. */
+  fileTitle?: string;
+};
+
+/**
+ * The text actually handed to the embedder for a source chunk: what the section is about, then what
+ * it says. Falls back to the body alone when a chunk has neither title nor headings (a file with no
+ * frontmatter title and no ATX headings), which is the previous behavior and stays correct.
+ *
+ * The FILE TITLE is included separately from `headingPath` (Codex review, PR #136): a document's
+ * display title comes from frontmatter or its filename via deriveSourceFileTitle and is stored on
+ * the file record, NOT in the heading hierarchy. A document with no `#` heading, or a chunk under
+ * only `##` headings, would otherwise still be embedded with no idea which document it belongs to —
+ * which is the exact miss this change exists to remove. Deduped when it already equals the first
+ * heading, which is the common case for files whose H1 repeats their title.
+ *
+ * BOUNDED, because a heading is source-controlled text of unbounded length (review, same pass):
+ * `maxChunkBytes` bounds only the body, since heading lines are removed before segmentSection. An
+ * unbounded prefix could push a previously-fitting embedding input past the model's window — the
+ * body would be the part discarded, inverting the fix. Each heading is truncated, and an
+ * over-budget trail keeps its two most useful ends (the document, and the most specific section)
+ * and elides the middle.
+ */
+/** Tolerant on purpose: a malformed or absent heading path degrades to no context, never a throw. */
+function parseHeadingPathJson(json: string | null): string[] {
+  if (!json) return [];
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((h): h is string => typeof h === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+const MAX_CONTEXT_HEADING_CHARS = 120;
+const MAX_CONTEXT_PREFIX_CHARS = 300;
+
+export function contextualizeSourceChunk(
+  content: string,
+  headingPath: readonly string[] | undefined,
+  fileTitle?: string,
+): string {
+  const clip = (h: string) => (h.length > MAX_CONTEXT_HEADING_CHARS ? `${h.slice(0, MAX_CONTEXT_HEADING_CHARS)}…` : h);
+  const headings = (headingPath ?? []).map((h) => h.trim()).filter(Boolean).map(clip);
+  const title = fileTitle?.trim();
+  // Deduped against the first heading only: an H1 that repeats the title is the common case, and a
+  // deeper heading that happens to match it is a different section that still deserves its name.
+  const trail = title && title !== headings[0] ? [clip(title), ...headings] : headings;
+  if (trail.length === 0) return content;
+
+  let prefix = trail.join(" > ");
+  if (prefix.length > MAX_CONTEXT_PREFIX_CHARS && trail.length > 2) {
+    prefix = `${trail[0]} > … > ${trail[trail.length - 1]}`;
+  }
+  if (prefix.length > MAX_CONTEXT_PREFIX_CHARS) prefix = `${prefix.slice(0, MAX_CONTEXT_PREFIX_CHARS)}…`;
+  return `${prefix}\n\n${content}`;
+}
 
 /**
  * A stage as read back: the registry entry, with its patterns already parsed. A stage is store-
@@ -9074,13 +9147,29 @@ export class MonetCore {
     if (!row || !isConnectorOwnedRow(row)) return 0;
     const rows = this.db
       .prepare(
-        `SELECT o.id AS id, o.content AS content
+        // Heading path and file title joined deliberately (Codex review, PR #136): the chunk's
+        // embedding input is contextualized at ingest and that context is NOT in `content` by
+        // design. Re-embedding from content alone would overwrite every contextualized vector with
+        // a body-only one, and the next sync would skip those chunks as unchanged — making the
+        // regression permanent until someone edited the file. A migration must reproduce the
+        // ingest-time input, not just the stored text.
+        `SELECT o.id AS id, o.content AS content, sc.heading_path_json AS headingPathJson,
+                (SELECT sf.title FROM source_files sf
+                  WHERE sf.source_id = sc.source_id AND sf.relative_path = sc.relative_path
+                  ORDER BY sf.rowid DESC LIMIT 1) AS fileTitle
            FROM source_chunks sc JOIN observations o ON o.id = sc.observation_id
           WHERE sc.concept_id = ? AND sc.lifecycle = 'active' ORDER BY o.id`,
       )
-      .all(conceptId) as Array<{ id: string; content: string }>;
+      .all(conceptId) as Array<{ id: string; content: string; headingPathJson: string | null; fileTitle: string | null }>;
     if (rows.length === 0) return 0;
-    const embedded = await Promise.all(rows.map(async (r) => ({ id: r.id, content: r.content, embedding: await this.checkedEmbed(r.content, "source") })));
+    const embedded = await Promise.all(rows.map(async (r) => ({
+      id: r.id,
+      content: r.content,
+      embedding: await this.checkedEmbed(
+        contextualizeSourceChunk(r.content, parseHeadingPathJson(r.headingPathJson), r.fileTitle ?? undefined),
+        "source",
+      ),
+    })));
     this.db.transaction((): void => {
       this.assertRepairOwnershipUnchanged(run, "reembedSourceChunkObservations");
       const current = this.db
@@ -16656,7 +16745,7 @@ export class MonetCore {
     // actually rewrites this content (a real edit, or a classification-affecting version bump).
     let rawChunkEmbedding: unknown;
     try {
-      rawChunkEmbedding = await this.embedder.embed(content);
+      rawChunkEmbedding = await this.embedder.embed(contextualizeSourceChunk(content, opts.headingPath, opts.fileTitle));
     } catch (error) {
       console.error(
         `[monet-core] embedding failed for a source chunk (${sourceRefs[0] ?? sourceIdentity}); ` +

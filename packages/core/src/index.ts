@@ -1,6 +1,7 @@
 export {
   MonetCore,
   EmbedderMismatchError,
+  contextualizeSourceChunk,
   EmbedderPinUnsatisfiedError,
   EmbedderWidthConflictError,
   MalformedEmbeddingStoreError,
