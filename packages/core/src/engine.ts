@@ -355,6 +355,56 @@ function firstBlockObservationId(pinId: string, summary: string): string {
 }
 
 /**
+ * Thrown when content is longer than the embedder actually reads.
+ *
+ * The alternative is what shipped until now: the provider silently drops everything past its window,
+ * the write succeeds, and the tail is stored, returned on fetch, and unreachable by search forever —
+ * with no error, no warning, and nothing downstream able to notice. Measured on a real store, that
+ * was 19.2% of all stored text.
+ *
+ * Refusing is the cheapest honest outcome available at this layer, and the message carries what the
+ * caller needs to succeed on the retry rather than only what went wrong: the count, the limit, and
+ * the smaller figure past which retrieval degrades even without truncation. The caller splitting its
+ * own content also produces better units than any machine split would — it knows where its claims
+ * end.
+ */
+export class ContentExceedsEmbedderWindowError extends Error {
+  constructor(
+    public readonly tokens: number,
+    public readonly maxInputTokens: number,
+    public readonly reliableTokens: number,
+  ) {
+    // The reliability target is a property of the CORPUS it was calibrated on, not of the model, so
+    // it only means anything while it sits below the SELECTED model's window (Codex review, PR
+    // #134). A provider reporting 128 would otherwise be told "below about 280 is reliable" and then
+    // reject the 200-token retry that advice invited. Where the window is the tighter constraint,
+    // the window is the only advice worth giving.
+    const target = reliableTokens < maxInputTokens
+      ? `below about ${reliableTokens} tokens retrieval is measurably reliable, and above it ` +
+        `similarity degrades even before the window is reached`
+      : `this model's window is the binding constraint here, so stay well inside it`;
+    super(
+      `This content is ${tokens} tokens; the embedding model reads ${maxInputTokens}. The remainder ` +
+        `would be stored but absent from every vector — searchable by nobody, with no error at write ` +
+        `time. Split it into separate observations, each a single claim: ${target}.`,
+    );
+    this.name = "ContentExceedsEmbedderWindowError";
+  }
+}
+
+/**
+ * The size below which retrieval measures reliable on this store: unrelated pairs shorter than this
+ * score 0.0% at or above tauAttach, while pairs three times longer cross it 93.3% of the time
+ * (scripts/repros — the length-band table in docs/design/bounded-retrieval-unit.md).
+ *
+ * ADVISORY, never enforced. It is guidance in an error the caller is already reading, not a second
+ * limit: rejecting at this number would refuse a large share of legitimate single-claim writes to
+ * buy a quality gradient, and a refusal has its own cost. The enforced line stays at the window,
+ * where the failure is irreversible data loss rather than degraded ranking.
+ */
+export const RELIABLE_EMBED_TOKENS = 280;
+
+/**
  * Thrown by graftRows() when the exporting engine used a different embedding model than the
  * receiving engine. Embeddings from different model spaces are incompatible: cosine similarity
  * comparisons (bestMatches, batchDedup) would produce garbage.
@@ -3576,6 +3626,31 @@ export class MonetCore {
   }
 
   /**
+   * Refuse content the embedder would silently half-read. Deliberately callable on its own, before
+   * anything touches the store: counting tokens needs no database, no transaction, and no model —
+   * only the tokenizer's vocabulary — so the MCP layer runs it ahead of every read this write would
+   * otherwise perform. Failing costs something too; this is the cheapest place it can fail.
+   *
+   * A provider that declares no window (the lexical embedder, which hashes everything it is handed)
+   * or no `countTokens` is unbounded by its own account and passes. Never guess from string length:
+   * the character-to-token ratio moves with script, so an estimate would refuse legitimate Korean
+   * writes while waving through English ones of the same real size.
+   *
+   * NOT applied to storeSource: a source chunk is materialized from a file that cannot be asked to
+   * write differently, so its budget belongs in the chunker that produces it, not in a refusal
+   * handed to a connector with no author to relay it to.
+   */
+  async assertWithinEmbedderWindow(content: string): Promise<void> {
+    const window = this.embedder.inputWindow?.bind(this.embedder);
+    const count = this.embedder.countTokens?.bind(this.embedder);
+    if (window === undefined || count === undefined) return;
+    const limit = await window();
+    if (limit === null) return; // provider reports no window, or could not determine one — never guess
+    const tokens = await count(content);
+    if (tokens > limit) throw new ContentExceedsEmbedderWindowError(tokens, limit, RELIABLE_EMBED_TOKENS);
+  }
+
+  /**
    * Connector-only source ingest. Source concepts are isolated from every generic mutation API:
    * creation is always force-new and an update may attach only to an existing source concept.
    * This method intentionally has no MCP binding.
@@ -3663,6 +3738,15 @@ export class MonetCore {
     if (sourceConnector) {
       return this.storeSourceChunk(content, opts as SourceStoreOpts, sourceIdentity!, receiptExpectation, validateWriteSpace);
     }
+
+    // Window guard sits HERE, and the position is load-bearing in both directions (Codex review,
+    // PR #134). Above it: the idempotency receipt lookup, which must stay first — a retry of an
+    // already-committed operationId is a no-op success, and rejecting the replay of a body that was
+    // accepted and stored would turn a settled write into an error. Also above it: the source
+    // branch, which returns before this line, so a chunk materialized from a file is never refused
+    // (its budget belongs in the chunker). Below it: the embed this guard exists to keep from
+    // producing a vector that silently omits half its input.
+    await this.assertWithinEmbedderWindow(content);
 
     // Two phase write: async embedding first, then durable space validation and mutation under one
     // BEGIN IMMEDIATE transaction. Never hold SQLite's write reservation across await.

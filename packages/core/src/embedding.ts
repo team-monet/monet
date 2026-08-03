@@ -35,6 +35,28 @@ export interface EmbeddingProvider {
    * requires a non-empty, non-synthetic modelId before the first write.
    */
   readonly modelId?: string;
+  /**
+   * How much text this provider actually reads, in its own tokens; null when it reads everything.
+   *
+   * A transformer embedder reads a fixed window and DISCARDS the rest without erroring — the vector
+   * for a 700-token input is byte-identical to the vector for its first 512 tokens (measured; see
+   * scripts/repros/tail-blindness.mjs). Nothing downstream can detect that, so text past the window
+   * is stored, served on fetch, and unreachable by search, with no signal anywhere. Reporting the
+   * window is what lets a caller refuse the write instead of accepting a silent hole.
+   *
+   * A METHOD, not a constant, and asynchronous — because the window is a property of the SELECTED
+   * MODEL, not of the provider class. An ONNX provider accepts any hub id or local path, and those
+   * models' windows differ; a class-level constant would accept content a smaller-window model
+   * truncates (the exact bug this exists to prevent) and refuse valid writes to a larger one.
+   */
+  inputWindow?(): number | null | Promise<number | null>;
+  /**
+   * Token count under THIS provider's tokenizer — the only count that predicts truncation. Callers
+   * must not estimate from character length: the ratio moves with script (Korean and CJK tokenize
+   * far denser than English), so a byte or character budget is a different limit wearing this one's
+   * name. Omitted whenever `inputWindow` is.
+   */
+  countTokens?(text: string): number | Promise<number>;
   /** May be sync (lexical) or async (a real model). The engine always awaits it. */
   embed(text: string): Float32Array | Promise<Float32Array>;
 }

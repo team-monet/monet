@@ -20,6 +20,18 @@ import { HashingEmbeddingProvider, validateEmbeddingProviderOutput } from "./emb
  *
  * `MONET_MODEL_CACHE` overrides the location (shared cache, non-standard home, read-only ~).
  */
+/**
+ * A model id that transformers.js will load straight off disk rather than fetch and cache. Kept
+ * deliberately loose, matching the loader's own recognizer: a hub id is "owner/repo" with no leading
+ * or absolute path shape, and everything else path-flavoured — relative, POSIX-absolute, Windows,
+ * UNC — is local. Wrong in the harmless direction if a future id shape fools it: the caller is told
+ * to check a path instead of a cache, not told to delete something.
+ */
+export function isLocalModelPath(modelId: string): boolean {
+  return modelId.startsWith(".") || modelId.startsWith("/") || modelId.startsWith("~")
+    || modelId.includes("\\") || /^[A-Za-z]:/.test(modelId);
+}
+
 export function resolveModelCacheDir(): string {
   const override = process.env.MONET_MODEL_CACHE?.trim();
   return override ? resolve(override) : resolve(homedir(), ".monet", "models");
@@ -52,9 +64,23 @@ interface FeatureExtractor {
   (text: string, opts: { pooling: "mean"; normalize: boolean }): Promise<{ data: Float32Array }>;
 }
 
+interface Tokenizer {
+  encode: (text: string) => unknown[];
+  /** The selected model's own declared window; absent or non-finite on checkpoints that omit it. */
+  model_max_length?: number;
+}
+
 interface TransformersModule {
   pipeline: (task: string, model: string, opts: { cache_dir: string }) => Promise<unknown>;
+  AutoTokenizer: { from_pretrained: (model: string, opts: { cache_dir: string }) => Promise<Tokenizer> };
 }
+
+/**
+ * A tokenizer that refuses everything, used when a model ships no usable `model_max_length`. Better
+ * to report "unknown window" than to invent one: a guessed number is exactly the failure mode this
+ * whole guard exists to prevent, one layer up.
+ */
+const UNKNOWN_WINDOW = null;
 
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
@@ -71,6 +97,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly modelId: string;
   private readonly model: string;
   private extractor: Promise<FeatureExtractor> | null = null;
+  private tokenizer: Promise<Tokenizer> | null = null;
 
   constructor(opts: { model?: string; dim?: number } = {}) {
     this.model = opts.model ?? "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
@@ -119,6 +146,49 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
     const extractor = await this.load();
     const output = await extractor(text, { pooling: "mean", normalize: true });
     return Float32Array.from(output.data);
+  }
+
+  /**
+   * Loads the tokenizer ALONE — a few hundred KB of vocab, not the ~480MB model. That separation is
+   * what makes refusing a write cheap: the budget check never pays for a model load, so a caller can
+   * be told its content is too long without the store ever warming an embedder. It also serves
+   * `inputWindow`, so both answers come from one lazy load of the SELECTED model's own files.
+   */
+  private loadTokenizer(): Promise<Tokenizer> {
+    if (!this.tokenizer) {
+      this.tokenizer = (async () => {
+        // Non-literal specifier, same as load() above and for the same reason (Codex review, PR
+        // #134): `@huggingface/transformers` is an OPTIONAL dependency, and TypeScript resolves a
+        // string-literal dynamic import at compile time — so a literal here reports TS2307 and
+        // breaks typecheck in exactly the dependency-free, hashing-only configuration this file
+        // goes out of its way to support.
+        const specifier = "@huggingface/transformers";
+        const mod = (await import(specifier)) as TransformersModule;
+        return mod.AutoTokenizer.from_pretrained(this.model, { cache_dir: resolveModelCacheDir() });
+      })();
+    }
+    return this.tokenizer;
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return (await this.loadTokenizer()).encode(text).length;
+  }
+
+  /**
+   * The window of the model THIS instance was constructed for, read from that model's own tokenizer
+   * config (`model_max_length`) rather than assumed. `model` is caller-supplied — any hub id or
+   * local path — so a class constant would be right only for the default checkpoint and silently
+   * wrong for every other one, in both directions.
+   *
+   * A non-finite or absent value reports unknown rather than a guess, which callers treat as
+   * unbounded: refusing writes against an invented number would be the same silent-wrongness this
+   * guard exists to remove.
+   */
+  async inputWindow(): Promise<number | null> {
+    const declared = (await this.loadTokenizer()).model_max_length;
+    return typeof declared === "number" && Number.isFinite(declared) && declared > 0
+      ? declared
+      : UNKNOWN_WINDOW;
   }
 }
 
@@ -288,12 +358,27 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
         `This store is pinned to '${modelId}', but this Monet instance could not load that model ` +
           `(${why}). The store may have been created by a NEWER version of Monet, or the model failed ` +
           `to download — upgrade the shipped \`@team-monet/monet\` package and/or check network access. ` +
-          // Naming the directory is what makes an interrupted download recoverable: the cache records
-          // a hit by path existence alone (no temp-file rename upstream), so a truncated file stays a
+          // Naming the path is what makes an interrupted download recoverable: the cache records a
+          // hit by path existence alone (no temp-file rename upstream), so a truncated file stays a
           // hit forever, and this store does not serve until someone deletes it. Before #90 a
           // reinstall cleared it by accident; now nothing does.
-          `Models are cached in ${resolveModelCacheDir()} — if a download was interrupted, delete that ` +
-          `directory to force a clean re-fetch.`,
+          //
+          // THIS MODEL's directory, never the cache root (Codex review, PR #130 — landed after that
+          // PR merged and carried here). MONET_MODEL_CACHE may point at a cache shared with other
+          // consumers, which this provider's own documentation offers as a supported setup; telling
+          // an operator to delete the root would destroy every other model there to recover one
+          // truncated file.
+          // Only for a HUB id (Codex review, PR #134). transformers.js loads a local path — "./models/foo",
+          // "/opt/models/foo", a Windows path — directly from disk and never caches it here, so the
+          // cleanup line would name a directory that does not exist and cannot recover anything. The
+          // recognizer is the same forward-or-back-slash test the loader itself uses, inverted: a bare
+          // "owner/repo" is a hub id, anything path-shaped is not.
+          (isLocalModelPath(modelId)
+            ? `'${modelId}' is a local path, so nothing was cached for it — check that the path exists ` +
+              `and holds a complete model.`
+            : `This model is cached in ${resolveModelCacheDir()}/${modelId} — if its download was ` +
+              `interrupted, delete that model's directory (not the cache root, which may be shared) to ` +
+              `force a clean re-fetch.`),
         { cause: e },
       );
     }

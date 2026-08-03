@@ -14,6 +14,7 @@ import {
   createLocalEmbedderWithProvenance,
   instantiateEmbedderForPin,
   resolveModelCacheDir,
+  isLocalModelPath,
   UnsatisfiableEmbedderError,
   LEGACY_ONNX_DEFAULT_MODEL_ID,
 } from "../embedding-onnx";
@@ -330,4 +331,30 @@ describe("model cache location (#90)", () => {
   // So if production ever read or wrote `env`, every ONNX test above would fail with that error —
   // which is exactly what happened while the fix did use the global. A case cannot restate it,
   // because reaching for `mod.env` to prove its absence is itself the throwing access.
+});
+
+// Codex review, PR #134 — twice over. transformers.js loads a local path straight off disk and never
+// caches it under MONET_MODEL_CACHE, so pointing an operator at a cache directory names something
+// that does not exist. And these assertions live HERE, not in write-budget.test.ts, because this
+// file already mocks the transformers module: the same tests against the real loader would reach the
+// network for a deliberately nonexistent hub id, making a unit test depend on connectivity — the
+// exact failure mode the committed probes were just fixed for.
+describe("unsatisfiable-pin recovery advice (mocked, no network)", () => {
+  it("classifies hub ids and local paths apart", () => {
+    expect(isLocalModelPath("Xenova/all-MiniLM-L6-v2")).toBe(false);
+    expect(isLocalModelPath("./models/foo")).toBe(true);
+    expect(isLocalModelPath("/opt/models/foo")).toBe(true);
+    expect(isLocalModelPath("~/models/foo")).toBe(true);
+    expect(isLocalModelPath("C:\\models\\foo")).toBe(true);
+  });
+
+  it("offers cache cleanup for a hub id, and a path check for a local one", async () => {
+    const hub = (await instantiateEmbedderForPin("Xenova/mock-missing-model").catch((e: Error) => e)) as Error;
+    expect(hub.message).toMatch(/cached in .*mock-missing-model/);
+    expect(hub.message).toContain("delete that model's directory");
+
+    const local = (await instantiateEmbedderForPin("/opt/models/mock-missing").catch((e: Error) => e)) as Error;
+    expect(local.message).toContain("is a local path, so nothing was cached");
+    expect(local.message).not.toContain("delete that model's directory");
+  });
 });

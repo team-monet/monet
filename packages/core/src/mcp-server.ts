@@ -741,7 +741,21 @@ export function registerMonetCoreTools(
     "memory_store",
     'Store durable knowledge. Similar evidence normally attaches to an existing concept; novel, incoherent, species-mismatched, or stage-mismatched evidence creates a concept. The acknowledgement returns `circle`, `action`, and `conceptId`; anomalous forks also return `resolutionMode` and `score`, flagged pairs add `nearMatchId`/`nearMatchScore`, and correction/rule outcomes add `contradiction`, `ruleSuccession`, or `extractionCandidate` only when present. Use `attachTo` only when identity is known, or `resolution="forceNew"` for known-distinct items. Use kind="correction" to challenge prior memory. Use kind="rule" with `rule`; stored rules are advisory because blocking severity is declaration-only in memory_declare. Synthesis happens later on explicit read.',
     {
-      content: z.string(),
+      content: z
+        .string()
+        // No number here on purpose (Codex review, PR #134): enforcement reads the SELECTED model's
+        // own window, which differs across the hub ids and local paths a custom install may pin, so
+        // a figure baked into this description would be wrong for exactly those installs — telling
+        // the agent to split when it need not, or not to when it must. The refusal carries the real
+        // count and the real limit at the moment it fires, which is where a precise number belongs.
+        .describe(
+          "One claim. Shorter is better: retrieval measures reliable well under the embedder's " +
+            "window, and longer content is both harder to find and more likely to attach to the " +
+            "wrong concept. Content past the window is refused outright — the remainder would be " +
+            "stored yet absent from every vector — and the error names the exact limits. Several " +
+            "claims in one observation is one blurred vector standing for all of them; store them " +
+            "separately.",
+        ),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       kind: z
         .string()
@@ -809,6 +823,15 @@ export function registerMonetCoreTools(
         ),
     },
     async ({ content, circle, kind, sourceRefs, resolution, attachTo, rule }) => {
+      // Budget check FIRST — ahead of the snapshot below, which reads the store. Content the
+      // embedder cannot fully read is refused before this call costs a query, and the message tells
+      // the caller how to succeed on the retry (see ContentExceedsEmbedderWindowError). core.store()
+      // enforces the same rule for non-MCP callers; this placement only makes the failure cheaper.
+      try {
+        await core.assertWithinEmbedderWindow(content);
+      } catch (e) {
+        return err(msg(e));
+      }
       // Fix A + Fix B: capture the snapshot BEFORE the mutation so the block reflects prior state.
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
