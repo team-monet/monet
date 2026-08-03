@@ -294,11 +294,31 @@ function main() {
     }
     return;
   }
-  if (!hookInput || typeof hookInput !== "object" || hookInput.tool_name !== "Bash") return;
+  if (!hookInput || typeof hookInput !== "object") return;
+  const toolName = hookInput.tool_name;
+  if (toolName !== "Bash" && toolName !== "Task") return;
 
-  const command = hookInput.tool_input && typeof hookInput.tool_input.command === "string"
-    ? hookInput.tool_input.command
-    : null;
+  // Task (monet-client#56): the ONE interception that is pre-cognition rather than post — every
+  // other tool call is late with respect to the agent making it, because the approach was chosen
+  // and the artifact drafted before the call was formed, while a spawn CREATES the reasoner the
+  // rule governs. The context is "Task:<subagent_type> <description>" and deliberately NOT the
+  // brief's prompt: matching on prompt text would be guessing at what a delegation is about, which
+  // is the heuristic interception the boundary statement rejects by name. A pattern names a
+  // moment; it does not sniff a payload.
+  let command = null;
+  if (toolName === "Task") {
+    const input = hookInput.tool_input && typeof hookInput.tool_input === "object" ? hookInput.tool_input : {};
+    const kind = typeof input.subagent_type === "string" ? input.subagent_type.trim() : "";
+    const what = typeof input.description === "string" ? input.description.trim() : "";
+    // Both absent means there is nothing a pattern could match, and an empty context would parse
+    // as a bare prefix rather than as a delegation — silence is the honest outcome.
+    if (!kind && !what) return;
+    command = [kind, what].filter(Boolean).join(" ");
+  } else {
+    command = hookInput.tool_input && typeof hookInput.tool_input.command === "string"
+      ? hookInput.tool_input.command
+      : null;
+  }
   if (command === null) return;
 
   // P1-3 (Codex round 3 on PR #42): build the FULLY-PREFIXED action context OURSELVES — never
@@ -318,7 +338,7 @@ function main() {
   // name, so the first colon in the whole string is unambiguous. gate-cli's own --tool contract
   // stays exactly as documented for other callers (general convenience, correct on its own terms);
   // this wrapper simply stops being one of the callers relying on it.
-  const actionContext = "Bash:" + command;
+  const actionContext = toolName + ":" + command;
 
   const forwardedArgs = process.argv.slice(2);
   const circleArgIndex = forwardedArgs.indexOf("--circle");
@@ -551,6 +571,9 @@ export function isMonetGateHandler(value: unknown, wrapperPath: string): value i
  * `--dry-run` caller computes this same result purely to print it, and must not have silently
  * mutated the in-memory object it read either way.
  */
+/** The tool surfaces this install intercepts. See upsertMonetGateHook for why the list is short. */
+export const GATED_TOOL_MATCHERS = ["Bash", "Task"] as const;
+
 export function upsertMonetGateHook(settings: SettingsFile, handler: HookHandler, wrapperPath: string): SettingsFile {
   const next = structuredClone(settings ?? {}) as SettingsFile;
   const hooks = (next.hooks ?? {}) as NonNullable<SettingsFile["hooks"]>;
@@ -568,11 +591,14 @@ export function upsertMonetGateHook(settings: SettingsFile, handler: HookHandler
     // ours; dropping it avoids leaving a pointless empty group behind.
   }
 
-  const bashGroup = cleaned.find((g) => g.matcher === "Bash");
-  if (bashGroup) {
-    bashGroup.hooks = [...bashGroup.hooks, handler];
-  } else {
-    cleaned.push({ matcher: "Bash", hooks: [handler] });
+  // Bash and Task, and deliberately nothing else (monet-client#56). Every other tool is
+  // post-cognition — intercepting it delivers a rule to an agent that has already decided — and
+  // high-frequency, which is how gate trust dies. Task earns its place by being a juncture: the
+  // call creates the reasoner the rule governs.
+  for (const matcher of GATED_TOOL_MATCHERS) {
+    const group = cleaned.find((g) => g.matcher === matcher);
+    if (group) group.hooks = [...group.hooks, handler];
+    else cleaned.push({ matcher, hooks: [handler] });
   }
 
   hooks.PreToolUse = cleaned;
@@ -631,6 +657,12 @@ WIRED
   Bash, via PreToolUse — every blocking/advisory rule declared against a "Bash:..." action
   context is enforced for every Bash command Claude Code runs under this hook.
 
+  Task, via PreToolUse — a delegation is intercepted BEFORE the worker reasons, with the action
+  context "Task:<subagent_type> <description>". This is the only pre-cognition interception in
+  the set: every other tool call is late with respect to the agent making it, while a spawn
+  creates the reasoner the rule governs. The brief's PROMPT is deliberately not in the context —
+  matching on it would be guessing at what a delegation is about rather than naming a moment.
+
   CAVEAT — the matcher sees only a CONTIGUOUS run of tokens: the exact spelling a pattern was
   declared from. Inserting arguments BETWEEN a pattern's own tokens breaks the match — a pattern
   seeded from "git push --force" does NOT match "git push origin main --force" ("push" and
@@ -638,8 +670,11 @@ WIRED
   you fear as separate patterns.
 
 NOT WIRED — the accepted hole, named rather than left silent
-  - Every OTHER Claude Code tool (Read, Write, Edit, Task, WebFetch, MCP tools, ...): no hook is
-    installed for them; a rule bound to a non-Bash Tool: prefix never fires through this install.
+  - Every OTHER Claude Code tool (Read, Write, Edit, WebFetch, MCP tools, ...): no hook is
+    installed for them; a rule bound to one of those Tool: prefixes never fires through this
+    install. Deliberate, not pending — they are post-cognition (the agent has already decided by
+    the time the call is formed) and high-frequency, and noise is the fastest way to kill gate
+    trust.
   - Within Bash itself: sh -c, an inline script, a shell alias or function, a short flag (-f vs
     --force), reordered arguments, or padded whitespace all reach the same effect without
     tripping a pattern — by design (boundary statement, "CANNOT promise" #1: heuristic

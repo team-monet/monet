@@ -15,6 +15,7 @@ import {
   isMonetGateHandler,
   runInstall,
   upsertMonetGateHook,
+  GATED_TOOL_MATCHERS,
   type HookHandler,
   type InstallCliDependencies,
   type SettingsFile,
@@ -85,11 +86,21 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     expect(isMonetGateHandler("a string", wrapperPath)).toBe(false);
   });
 
-  it("upsertMonetGateHook: adds a fresh Bash matcher group when none exists", () => {
+  it("upsertMonetGateHook: adds fresh matcher groups for every gated surface when none exist", () => {
     const wrapperPath = "/x/.monet/gate-hook.mjs";
     const handler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
     const result = upsertMonetGateHook({}, handler, wrapperPath);
-    expect(result.hooks?.PreToolUse).toEqual([{ matcher: "Bash", hooks: [handler] }]);
+    expect(result.hooks?.PreToolUse).toEqual([
+      { matcher: "Bash", hooks: [handler] },
+      { matcher: "Task", hooks: [handler] },
+    ]);
+  });
+
+  // The list is short on purpose (monet-client#56). Every other tool is post-cognition — the agent
+  // has already decided by the time the call is formed — and high-frequency; Task is in because a
+  // spawn creates the reasoner the rule governs.
+  it("upsertMonetGateHook: gates Bash and Task, and nothing else", () => {
+    expect([...GATED_TOOL_MATCHERS]).toEqual(["Bash", "Task"]);
   });
 
   it("upsertMonetGateHook: reuses an existing Bash group, preserving any OTHER handler already in it", () => {
@@ -98,7 +109,10 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     const settings: SettingsFile = { hooks: { PreToolUse: [{ matcher: "Bash", hooks: [preexisting] }] } };
     const handler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
     const result = upsertMonetGateHook(settings, handler, wrapperPath);
-    expect(result.hooks?.PreToolUse).toEqual([{ matcher: "Bash", hooks: [preexisting, handler] }]);
+    expect(result.hooks?.PreToolUse).toEqual([
+      { matcher: "Bash", hooks: [preexisting, handler] },
+      { matcher: "Task", hooks: [handler] },
+    ]);
   });
 
   it("upsertMonetGateHook: idempotent — updates its own prior entry in place, never duplicates", () => {
@@ -107,7 +121,10 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     const settings: SettingsFile = { hooks: { PreToolUse: [{ matcher: "Bash", hooks: [oldHandler] }] } };
     const newHandler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath, "--circle", "new-circle"] };
     const result = upsertMonetGateHook(settings, newHandler, wrapperPath);
-    expect(result.hooks?.PreToolUse).toEqual([{ matcher: "Bash", hooks: [newHandler] }]);
+    expect(result.hooks?.PreToolUse).toEqual([
+      { matcher: "Bash", hooks: [newHandler] },
+      { matcher: "Task", hooks: [newHandler] },
+    ]);
   });
 
   it("upsertMonetGateHook: never touches an UNRELATED matcher group or event", () => {
@@ -124,6 +141,7 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     expect(result.hooks?.PreToolUse).toEqual([
       { matcher: "Write|Edit", hooks: [{ type: "command", command: "./format-check.sh" }] },
       { matcher: "Bash", hooks: [handler] },
+      { matcher: "Task", hooks: [handler] },
     ]);
     expect((result.hooks as Record<string, unknown>).PostToolUse).toEqual(settings.hooks!.PostToolUse);
     expect(result.someOtherTopLevelKey).toBe("preserved verbatim");
