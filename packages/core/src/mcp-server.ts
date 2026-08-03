@@ -1145,6 +1145,14 @@ export function registerMonetCoreTools(
       limit: z.number().int().positive().optional(),
     },
     async ({ query, circle, limit }) => {
+      // Refused before the snapshot below, which reads the store — the same placement memory_store
+      // uses, and for the same reason: counting tokens needs no database and no model load, so a
+      // query the embedder cannot fully read costs nothing to reject (#137).
+      try {
+        await core.assertWithinEmbedderWindow(query, "query");
+      } catch (e) {
+        return err(msg(e));
+      }
       // Fix A: snapshot uses the call's resolved circle; fall back to session default for all-circle searches.
       const capturedBlock = capturePrewarmSnapshot(circle !== undefined ? scope(circle) : scope());
       try {
@@ -1248,6 +1256,14 @@ export function registerMonetCoreTools(
       depth: z.enum(["1", "2"]).optional().describe("Graph hops from seeds; default 2."),
     },
     async ({ intent, circle, limit, depth }) => {
+      // Refused before the snapshot below, which reads the store — the same placement memory_store
+      // uses, and for the same reason: counting tokens needs no database and no model load, so a
+      // query the embedder cannot fully read costs nothing to reject (#137).
+      try {
+        await core.assertWithinEmbedderWindow(intent, "query");
+      } catch (e) {
+        return err(msg(e));
+      }
       // Fix A: snapshot uses the call's resolved circle; fall back to session default for all-circle gathers.
       const capturedBlock = capturePrewarmSnapshot(circle !== undefined ? scope(circle) : scope());
       try {

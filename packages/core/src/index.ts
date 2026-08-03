@@ -3,6 +3,7 @@ export {
   EmbedderMismatchError,
   contextualizeSourceChunk,
   ContentExceedsEmbedderWindowError,
+  type EmbedderWindowSubject,
   RELIABLE_EMBED_TOKENS,
   EmbedderPinUnsatisfiedError,
   EmbedderWidthConflictError,

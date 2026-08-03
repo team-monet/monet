@@ -368,26 +368,39 @@ function firstBlockObservationId(pinId: string, summary: string): string {
  * own content also produces better units than any machine split would — it knows where its claims
  * end.
  */
+export type EmbedderWindowSubject = "content" | "query";
+
 export class ContentExceedsEmbedderWindowError extends Error {
   constructor(
     public readonly tokens: number,
     public readonly maxInputTokens: number,
     public readonly reliableTokens: number,
+    public readonly subject: EmbedderWindowSubject = "content",
   ) {
-    // The reliability target is a property of the CORPUS it was calibrated on, not of the model, so
-    // it only means anything while it sits below the SELECTED model's window (Codex review, PR
-    // #134). A provider reporting 128 would otherwise be told "below about 280 is reliable" and then
-    // reject the 200-token retry that advice invited. Where the window is the tighter constraint,
-    // the window is the only advice worth giving.
+    // Two independent corrections, both kept (Codex review, PR #134 and #137).
+    //
+    // The SUBJECT decides the remedy. The diagnosis is identical on both sides — the tail is
+    // discarded and nothing says so — but a write splits into separate observations while a query
+    // has nothing to split, and one that long is usually several questions wearing one sentence.
+    // Naming the wrong remedy wastes the one moment the caller is actually reading.
+    //
+    // The WINDOW bounds the advisory. The reliability target is a property of the corpus it was
+    // calibrated on, not of the model, so a provider reporting 128 would otherwise be told "below
+    // about 280 is reliable" and then reject the 200-token retry that advice invited.
+    const what = subject === "query" ? "This query" : "This content";
+    const consequence = subject === "query"
+      ? `terms past that point would not participate in scoring at all, and the miss they cause is ` +
+        `indistinguishable from the memory not existing`
+      : `the remainder would be stored but absent from every vector — searchable by nobody, with no ` +
+        `error at write time`;
+    const remedy = subject === "query"
+      ? `Ask the narrower question you actually need`
+      : `Split it into separate observations, each a single claim`;
     const target = reliableTokens < maxInputTokens
       ? `below about ${reliableTokens} tokens retrieval is measurably reliable, and above it ` +
         `similarity degrades even before the window is reached`
       : `this model's window is the binding constraint here, so stay well inside it`;
-    super(
-      `This content is ${tokens} tokens; the embedding model reads ${maxInputTokens}. The remainder ` +
-        `would be stored but absent from every vector — searchable by nobody, with no error at write ` +
-        `time. Split it into separate observations, each a single claim: ${target}.`,
-    );
+    super(`${what} is ${tokens} tokens; the embedding model reads ${maxInputTokens}. So ${consequence}. ${remedy}: ${target}.`);
     this.name = "ContentExceedsEmbedderWindowError";
   }
 }
@@ -3640,14 +3653,14 @@ export class MonetCore {
    * write differently, so its budget belongs in the chunker that produces it, not in a refusal
    * handed to a connector with no author to relay it to.
    */
-  async assertWithinEmbedderWindow(content: string): Promise<void> {
+  async assertWithinEmbedderWindow(content: string, subject: EmbedderWindowSubject = "content"): Promise<void> {
     const window = this.embedder.inputWindow?.bind(this.embedder);
     const count = this.embedder.countTokens?.bind(this.embedder);
     if (window === undefined || count === undefined) return;
     const limit = await window();
     if (limit === null) return; // provider reports no window, or could not determine one — never guess
     const tokens = await count(content);
-    if (tokens > limit) throw new ContentExceedsEmbedderWindowError(tokens, limit, RELIABLE_EMBED_TOKENS);
+    if (tokens > limit) throw new ContentExceedsEmbedderWindowError(tokens, limit, RELIABLE_EMBED_TOKENS, subject);
   }
 
   /**
@@ -4298,6 +4311,12 @@ export class MonetCore {
    */
   async search(query: string, opts: { circle?: string; limit?: number; includeArchived?: boolean } & SourceAwareReadOptions = {}): Promise<SearchCard[]> {
     this.assertPinSatisfied(); // embedder-pin ADR
+    // #137, the read side of the defect the write path refuses. A query past the window has its tail
+    // discarded before scoring, so the terms that were cut do not participate at all — and the miss
+    // they cause is indistinguishable from the memory not existing, which is the one failure this
+    // whole line of work exists to remove. Unlike a write there is nothing to split: a query that
+    // long is usually several questions, and asking them separately is the better search anyway.
+    await this.assertWithinEmbedderWindow(query, "query");
     const limit = opts.limit ?? 5;
     const emb = await this.checkedEmbed(query, "native");
     return this.db.transaction((): SearchCard[] => {
@@ -16323,6 +16342,7 @@ export class MonetCore {
     const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };
     const resolvedCircle = opts.circle !== undefined ? this.resolveCircle(opts.circle) : undefined;
 
+    await this.assertWithinEmbedderWindow(intent, "query"); // #137 — see search() for why refusing beats truncating
     const emb = await this.checkedEmbed(intent, "native");
     return this.db.transaction((): GatherResult => {
     this.assertReadSpaceSatisfied(emb.length);
