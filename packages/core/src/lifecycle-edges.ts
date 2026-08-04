@@ -78,6 +78,16 @@ export const RATIFICATION_VERDICTS: readonly RatificationVerdict[] = [
   "re-ratify",
 ] as const;
 
+/**
+ * Which entrance a verdict came through (monet-core#142). The two are not two flavours of one act:
+ * on `extraction` the four-gate battery is the gate and a human approves shown its evidence; on
+ * `declaration` sovereignty REPLACES the battery, by right. Recording which one ran is what makes
+ * "entered untested" readable instead of buried — it never makes it wrong.
+ */
+export type RatificationEntrance = "extraction" | "declaration";
+
+export const RATIFICATION_ENTRANCES: readonly RatificationEntrance[] = ["extraction", "declaration"] as const;
+
 // ---- row shapes (column names match the DB schema exactly) ------------------
 
 export interface LifecycleEdgeRow {
@@ -106,6 +116,17 @@ export interface RatificationRow {
   verdict: RatificationVerdict;
   /** JSON evidence packet exactly as shown to the human who ruled. Null when none was recorded. */
   packet: string | null;
+  /**
+   * Which entrance this verdict came through (monet-core#142). NULL on every row written before the
+   * field existed — never inferred, see migrateRatificationColumns.
+   *
+   * With `verdict`, this is what separates #142's three indistinguishable states: never-ran is
+   * `declaration` (sovereignty replaces the battery, by right), ran-and-passed is `extraction` +
+   * approve, ran-and-rejected is `extraction` + reject.
+   */
+  entrance: RatificationEntrance | null;
+  /** JSON `BatteryVerdict[]`. Non-null exactly on extraction rows; declaration rows carry none, by right. */
+  battery: string | null;
   ratified_by: string | null;
   /** Locality metadata, and the ONE mutable column: a circle rename rewrites it. */
   circle: string;
@@ -135,6 +156,17 @@ export interface RecordRatificationInput {
   /** The evidence packet as shown to the human. Serialized by the caller; stored verbatim. */
   packet?: string | null;
   ratifiedBy?: string | null;
+  /**
+   * Which entrance this verdict came through. Omitted only by callers that predate the field — new
+   * code names it, because the whole point is that it stops being guessable after the fact.
+   */
+  entrance?: RatificationEntrance;
+  /**
+   * The four gates' answers. REQUIRED on an extraction approval and refused on a declaration:
+   * sovereignty replaces the battery on the declaration entrance, so a battery recorded there would
+   * be a test nobody ran. Rejections keep theirs — a rejection's value IS which gate it failed.
+   */
+  battery?: readonly BatteryVerdict[];
 }
 
 export type LifecycleEdgeDirection = "out" | "in" | "both";
@@ -235,6 +267,211 @@ export const LIFECYCLE_EDGE_SCHEMA_SQL = `
 /** Idempotent; safe on every open. */
 export function createLifecycleEdgeSchema(db: StoragePort): void {
   db.exec(LIFECYCLE_EDGE_SCHEMA_SQL);
+  migrateRatificationColumns(db);
+}
+
+/**
+ * THE FIRST ALTER THIS TABLE HAS EVER TAKEN — monet-core#142, `normative-hierarchy-2026-08-03.md`
+ * §5. `ratifications` was born carrying every column it had; the bare `CREATE TABLE IF NOT EXISTS`
+ * above was enough because nothing was ever added. These two are added, so the guard is needed for
+ * every store that already exists.
+ *
+ * WHY THESE COLUMNS AND NOT A PARSE OF `packet`: #142's defect is that three states are one
+ * observable — the battery ran and passed, it ran and rejected, it never ran. The information is
+ * not entirely absent today; it is unaskable. A live store's own rows prove it: three carry
+ * `battery: "Generates / Covers / Transfers / Exits — all four passed, run conversationally with
+ * John"` inside `packet` — true, human, and impossible to query for whether Exits passed. `packet`
+ * is contractually "stored verbatim and never parsed for decisions", and mining prose out of it
+ * would make it retroactively load-bearing while manufacturing a precision the record never had.
+ *
+ * NULLABLE, AND LEGACY ROWS ARE LEFT NULL. No backfill, deliberately. For declaration-born rows an
+ * `origin: "declaration"` key does sit in packet and could be read — but the extraction path has no
+ * entrance marker at all, so "extraction wherever origin is absent" would be a guess dressed as a
+ * record. NULL says the true thing: this verdict predates the field, and how it entered was never
+ * recorded structurally. That is exactly #142's finding, preserved rather than papered over.
+ */
+function migrateRatificationColumns(db: StoragePort): void {
+  const cols = db.prepare(`PRAGMA table_info(ratifications)`).all() as Array<{ name: string }>;
+  const addColumn = (name: string, definition: string): void => {
+    if (cols.some((c) => c.name === name)) return;
+    try {
+      db.exec(`ALTER TABLE ratifications ADD COLUMN ${name} ${definition}`);
+    } catch (error) {
+      // Concurrent opens race here; a duplicate column is the benign outcome, anything else is not.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("duplicate column name")) throw error;
+    }
+  };
+  addColumn("entrance", `TEXT CHECK (entrance IS NULL OR entrance IN ('extraction','declaration'))`);
+  addColumn("battery", "TEXT");
+}
+
+/**
+ * The four gates a principle must pass to enter the skeleton by extraction
+ * (`next-monet-skeleton-gates-recall.md`, Part 1). Ordered as the doc states them; the order is
+ * the record's, not an evaluation sequence — all four are answered together.
+ */
+export const BATTERY_GATES = ["generates", "covers", "transfers", "exits"] as const;
+export type BatteryGate = (typeof BATTERY_GATES)[number];
+
+/**
+ * One gate's answer. `passed` is the verdict; `evidenceRef` is how it was reached — a pointer
+ * (concept id, observation id, path, URL), never copied evidence content.
+ *
+ * THE POINT OF THE SHAPE: today this lives as a prose sentence inside `packet` and cannot be asked
+ * which gate failed. Structured, "which principles entered on a failed Exits" becomes a query, and
+ * the doc's own worked rejection — *"verify a prior step's success before depending on it"* fails
+ * Exits, "inadmissible mechanically, no human judgment needed" — becomes a record rather than an
+ * anecdote.
+ */
+export interface BatteryVerdict {
+  gate: BatteryGate;
+  passed: boolean;
+  evidenceRef?: string;
+}
+
+/**
+ * Refuses on FORM, never on content — the #134 write-refusal doctrine, and §2's "stubbornness":
+ * Monet cannot know whether an answer is true, only whether one exists. All four gates must be
+ * answered, each exactly once. It never asks whether the answer is a good one.
+ */
+/**
+ * The entrance's own rules, enforced on FORM alone (monet-core#142, §5).
+ *
+ *  - An EXTRACTION approval must carry the battery. That entrance's whole claim is that four gates
+ *    were answered; approving through it with no answers on file is the exact state #142 found —
+ *    a skeleton whose entries cannot be asked whether anything gated them. A rejection must carry it
+ *    too, and for a better reason: a rejection's entire value is WHICH gate it failed.
+ *  - A DECLARATION must NOT carry one. Sovereignty replaces the battery there, by right — a battery
+ *    recorded on that entrance would be a test nobody ran, which is worse than an admitted absence.
+ *  - `retire` answers to neither: it ends a membership rather than judging a candidate.
+ *
+ * None of this judges an answer. It makes not-answering impossible, which is all a checklist can do.
+ */
+/**
+ * THE ONE PLACE THE (verdict, entrance, battery) RULES LIVE.
+ *
+ * WHY IT IS ONE PLACE, and this is a design change rather than another patch: the same defect
+ * arrived three times on PR #144 — a rule added to the local write path and not to the relay path,
+ * or the reverse. Each fix was correct and each left the pair able to drift again, because the
+ * invariant was written twice. Three occurrences of one shape is a class, and the house principle
+ * says stop patching a class and return to design.
+ *
+ * The two callers differ only in what they DO about a violation, never in what counts as one:
+ *   - a local write throws, because the author is present and can fix it;
+ *   - a relayed row degrades to "unrecorded", because one bad ratification must not stop a sync and
+ *     a fabricated entrance could never be told from a real one afterwards.
+ */
+export type RatificationPairVerdict = { ok: true } | { ok: false; reason: string };
+
+export function classifyRatificationPair(
+  verdict: RatificationVerdict,
+  entrance: RatificationEntrance | null | undefined,
+  battery: readonly BatteryVerdict[] | null | undefined,
+): RatificationPairVerdict {
+  const hasEntrance = entrance !== undefined && entrance !== null;
+  const hasBattery = battery !== undefined && battery !== null;
+
+  if (hasEntrance && !RATIFICATION_ENTRANCES.includes(entrance)) {
+    return { ok: false, reason: `ratification entrance '${entrance}' is not one of ${RATIFICATION_ENTRANCES.join(", ")}` };
+  }
+
+  // A RETIREMENT ANSWERS TO NEITHER ENTRANCE. It ends a membership rather than judging a candidate,
+  // and the entrance describes how a candidate was judged.
+  if (verdict === "retire" && (hasEntrance || hasBattery)) {
+    return { ok: false, reason: "a retirement carries no entrance or battery: it ends a membership rather than judging a candidate" };
+  }
+
+  // A BATTERY WITH NO ENTRANCE IS AN IMPOSSIBLE PAIR: curation reads the ruling as unrecorded while
+  // the evidence sits right there, and replication drops the evidence entirely.
+  if (hasBattery && !hasEntrance) {
+    return { ok: false, reason: 'a battery needs its entrance named: pass entrance "extraction" alongside it' };
+  }
+
+  // SOVEREIGNTY REPLACES THE TEST on the declaration entrance, so a battery recorded there would be
+  // a test nobody ran.
+  if (entrance === "declaration" && hasBattery) {
+    return { ok: false, reason: 'a declaration carries no battery: on that entrance sovereignty replaces the test' };
+  }
+
+  const judged = verdict === "approve" || verdict === "re-ratify" || verdict === "reject";
+  if (entrance === "extraction" && judged) {
+    if (!hasBattery) {
+      return {
+        ok: false,
+        reason:
+          `an extraction verdict must carry the battery it was reached through — all four of ` +
+          `${BATTERY_GATES.join(", ")}. Without it the row is indistinguishable from one where the ` +
+          `battery never ran (monet-core#142).`,
+      };
+    }
+    try {
+      assertBatteryShape(battery);
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+    // A FAILED GATE IS MECHANICALLY INADMISSIBLE on this entrance (Codex P1 on PR #144, and it was
+    // right). The battery IS the gate here — the design's own worked example rejects a candidate for
+    // failing Exits, "inadmissible mechanically, no human judgment needed" — so entering the
+    // always-on skeleton over a failed answer would make the record say the battery passed something
+    // it refused. A sovereign override has its own explicit route: the declaration entrance.
+    //
+    // Rejections keep their failed answers, and must: which gate refused is the whole value of one.
+    if (verdict !== "reject") {
+      const failed = battery.filter((gate) => !gate.passed).map((gate) => gate.gate);
+      if (failed.length > 0) {
+        return {
+          ok: false,
+          reason:
+            `this battery failed ${failed.join(", ")}, so it cannot enter by extraction — a failed ` +
+            `gate is inadmissible mechanically. Record the rejection with its battery, or enter by ` +
+            `declaration if you are overriding the test on your own authority.`,
+        };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+/** The local write path: the author is present, so a violation is refused rather than degraded. */
+export function assertRatificationEntranceRules(input: RecordRatificationInput): void {
+  const verdict = classifyRatificationPair(input.verdict, input.entrance, input.battery);
+  if (!verdict.ok) throw new Error(verdict.reason);
+}
+
+export function assertBatteryShape(battery: readonly BatteryVerdict[]): void {
+  const seen = new Set<string>();
+  for (const verdict of battery) {
+    // SHAPE, NOT JUST MEMBERSHIP (Codex P1 on PR #144, and it was right). Checking gate names and
+    // duplicates alone accepted `[{gate:"generates"}, …, {gate:"exits", passed:"yes"}]` — four
+    // recognized gates and not one actual answer — which a relaying peer could then present as an
+    // extraction-backed ruling. "All four gates are answered" has to mean answered.
+    if (verdict === null || typeof verdict !== "object") {
+      throw new Error("a battery verdict must be an object naming a gate and its answer");
+    }
+    if (typeof verdict.passed !== "boolean") {
+      throw new Error(
+        `battery gate '${String(verdict.gate)}' has no boolean answer: \`passed\` is required, and a ` +
+          `gate that was not actually answered is the state this field exists to make visible.`,
+      );
+    }
+    if (verdict.evidenceRef !== undefined && typeof verdict.evidenceRef !== "string") {
+      throw new Error(`battery gate '${String(verdict.gate)}' has a non-string evidenceRef`);
+    }
+    if (!BATTERY_GATES.includes(verdict.gate)) {
+      throw new Error(`battery gate '${verdict.gate}' is not one of ${BATTERY_GATES.join(", ")}`);
+    }
+    if (seen.has(verdict.gate)) throw new Error(`battery gate '${verdict.gate}' is answered twice`);
+    seen.add(verdict.gate);
+  }
+  const missing = BATTERY_GATES.filter((gate) => !seen.has(gate));
+  if (missing.length > 0) {
+    throw new Error(
+      `the battery is incomplete: ${missing.join(", ")} unanswered. All four gates are answered ` +
+        `together or the record cannot say which one gated the entry — which is the whole defect ` +
+        `this field exists to close (monet-core#142).`,
+    );
+  }
 }
 
 // ---- writes -----------------------------------------------------------------
@@ -509,6 +746,7 @@ export function recordRatification(deps: LifecycleEdgeDeps, input: RecordRatific
     throw new Error(`ratification subject concept '${input.subjectConceptId}' does not exist`);
   }
   assertGovernableEndpoint(subject, input.subjectConceptId, "subject");
+  assertRatificationEntranceRules(input);
   const circle = subject.circle;
   const syncAt = deps.nextSyncTimestamp();
   const row: RatificationRow = {
@@ -516,6 +754,8 @@ export function recordRatification(deps: LifecycleEdgeDeps, input: RecordRatific
     subject_concept_id: input.subjectConceptId,
     verdict: input.verdict,
     packet: input.packet ?? null,
+    entrance: input.entrance ?? null,
+    battery: input.battery === undefined ? null : JSON.stringify(input.battery),
     ratified_by: input.ratifiedBy ?? null,
     circle,
     created_at: syncAt,
@@ -525,11 +765,11 @@ export function recordRatification(deps: LifecycleEdgeDeps, input: RecordRatific
   };
   db.prepare(
     `INSERT INTO ratifications
-       (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at, sync_updated_at,
-        sync_revision, sync_writer)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, subject_concept_id, verdict, packet, entrance, battery, ratified_by, circle, created_at,
+        sync_updated_at, sync_revision, sync_writer)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    row.id, row.subject_concept_id, row.verdict, row.packet,
+    row.id, row.subject_concept_id, row.verdict, row.packet, row.entrance, row.battery,
     row.ratified_by, row.circle, row.created_at, row.sync_updated_at,
     row.sync_revision, row.sync_writer,
   );

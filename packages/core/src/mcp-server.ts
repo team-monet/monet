@@ -31,12 +31,26 @@ import { createSourceScheduler } from "./source-scheduler";
 import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-scheduler";
 
 /**
- * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions`
- * option. Tells the agent to orient with agent_context, pull workstreams only on continuation
- * intent, use memory_store/search/gather during the session, and close with memory_checkpoint.
+ * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions` option.
+ *
+ * CORRECTED 2026-08-03 (normative-hierarchy-2026-08-03.md §8, which required this before any code):
+ * the old text closed with "End with memory_checkpoint... without it, session state is lost", and
+ * that promise had stopped being true. Monet is the normative system of record; generic memory and
+ * workstreams are ruled out, and a session-end ritual is exactly the shape §6 rejects — every record
+ * Monet keeps is written by the mechanism that made it, at the moment it made it, riding an event
+ * that already happens. An instruction demanding a closing ceremony taught every agent to believe a
+ * mechanism that no longer exists, and to blame itself for state loss it never caused.
+ *
+ * This text is re-sent on every request, so it is the most expensive standing surface Monet has:
+ * it says what Monet IS and the two moments a session actually touches it, and stops. The tools
+ * carry their own descriptions; restating them here would bill every turn for it.
+ *
+ * The tool REMOVALS §8 also rules (memory_workstreams, memory_checkpoint, the generic store path)
+ * belong to the MCP surface redesign, deliberately not done here. Text that lies is corrected now
+ * because it costs nothing to correct and misleads every session until it is.
  */
 export const MONET_SERVER_INSTRUCTIONS =
-  "Monet is persistent memory. Start each project session with agent_context. Call memory_workstreams only when the user intends to continue prior work; list and confirm the thread before fetching detail. Recall with memory_search/memory_gather pointer cards, then memory_fetch content. Store durable knowledge with memory_store. End with memory_checkpoint and a compressed workstream snapshot; without it, session state is lost.";
+  "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. Start each project session with agent_context. Recall with memory_search/memory_gather pointer cards, then memory_fetch content. Write with memory_store when a norm changes — a correction, a rule, a principle candidate — never a narrative summary of work whose artifact already exists. Nothing is owed at session end: every record Monet keeps is written by the mechanism that made it, as it happens.";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
 // concept — long body + many observations — otherwise serializes to tens of thousands of chars and
@@ -164,6 +178,48 @@ function fitStageViewForAck(stage: StageView): Record<string, unknown> {
     patterns: fitted,
     ...(stage.patterns.length > fitted.length ? { patternsOmitted: stage.patterns.length - fitted.length } : {}),
   };
+}
+
+/**
+ * The declare-time firing test's finding, rendered for the one channel a caller cannot skim past
+ * (monet-client#59, `normative-hierarchy-2026-08-03.md` §2).
+ *
+ * WHY THIS IS GUIDANCE AND NOT JUST AN ADVISORY ENTRY: the write went through — sovereignty, and
+ * that is correct — so the only thing standing between the author and a gate that never fires is
+ * whether they read this. A rule the user believes protects them and does not is the same class of
+ * surprise as a silently removed deny, and the downgrade disclosure right beside this one already
+ * settled how that class is handled: say it plainly, in band, at the moment it happens.
+ *
+ * Returns null when nothing fired, so an ordinary declaration reads exactly as it did before.
+ */
+function firingWarning(advisories: readonly { kind: string; message: string }[] | undefined): string | null {
+  const inert = (advisories ?? []).filter((advisory) => advisory.kind === "pattern_never_matches");
+  const mismatch = (advisories ?? []).filter((advisory) => advisory.kind === "pattern_matches_no_example");
+  if (inert.length === 0 && mismatch.length === 0) return null;
+
+  // TWO DIFFERENT FINDINGS, SAID DIFFERENTLY (Codex P2 on PR #144, and it was right). One wording
+  // covered both and overstated the weaker one: a pattern that misses its example may still govern
+  // other action contexts perfectly well, and telling the author it "governs nothing" invites them
+  // to replace a good pattern when the EXAMPLE was the wrong thing. Only a pattern that seeds to an
+  // empty token run is inert everywhere, and only that one gets the absolute claim.
+  const parts: string[] = [];
+  if (inert.length > 0) {
+    parts.push(
+      `PATTERN WILL NOT FIRE: it matches no action at all, so the gate it addresses is inert. It is ` +
+        `written anyway — you declared it — but it governs nothing until the patterns are fixed. ` +
+        `Tell the user plainly. ${inert.map((advisory) => advisory.message).join(" ")}`,
+    );
+  }
+  if (mismatch.length > 0) {
+    parts.push(
+      `EXAMPLE MISMATCH: checked with the gate's own matcher, these patterns did not match the ` +
+        `example you gave — so this gate would not have fired on the very action it was authored ` +
+        `from. They may still match other actions; what is established is that the pattern and the ` +
+        `example disagree, and one of the two is wrong. Tell the user plainly. ` +
+        `${mismatch.map((advisory) => advisory.message).join(" ")}`,
+    );
+  }
+  return parts.join(" ");
 }
 
 function fitRenderedPatternsForAck(patterns: readonly string[]): { items: string[]; omitted: number } {
@@ -1031,7 +1087,8 @@ export function registerMonetCoreTools(
               ...(previous.omitted > 0 ? { previousPatternsOmitted: previous.omitted } : {}),
               patterns: patterns.items,
               ...(patterns.omitted > 0 ? { patternsOmitted: patterns.omitted } : {}),
-              guidance,
+              ...(r.advisories && r.advisories.length > 0 ? { advisories: r.advisories } : {}),
+              guidance: firingWarning(r.advisories) ?? guidance,
             }, "memory_declare", capturedBlock);
           } else {
             const disclosures = [
@@ -1046,6 +1103,11 @@ export function registerMonetCoreTools(
               r.narrowedFromBreadth
                 ? "BREADTH NARROWED: this rule was global (every circle) and now delivers only in its own circle — every OTHER circle stops receiving it. Tell the user plainly. Re-declare with circle=\"*\" to restore it."
                 : null,
+              // THE DECLARE-TIME FIRING TEST (monet-client#59). Same discipline, one axis over: a
+              // rule that will never fire is a rule the user believes is protecting them and is
+              // not — which is the same class of surprise as a silently removed deny, and belongs
+              // on the same loud channel rather than in an advisories array a caller may not read.
+              firingWarning(r.advisories),
             ]
               .filter((line): line is string => line !== null)
               .join(" ");
@@ -1078,7 +1140,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_ratify",
-    'Record a human verdict on a principle or preference candidate after conversational review against the skeleton battery (Generates/Covers/Transfers/Exits). Approve/re-ratify enters the candidate in the skeleton and can link generated rules; reject keeps it out; retire ends current membership. The latest verdict governs membership, while every verdict remains in history. `packet` preserves exactly what the human saw. Membership changes include `instruction` only when a registered standing surface became stale.',
+    'Record a human verdict on a principle or preference candidate after conversational review against the skeleton battery (Generates/Covers/Transfers/Exits). Approve/re-ratify enters the candidate in the skeleton and can link generated rules; reject keeps it out; retire ends current membership. The latest verdict governs membership, while every verdict remains in history. `packet` preserves exactly what the human saw. Name `entrance` so the record can later say whether anything gated this entry: "extraction" requires `battery` (all four gates answered), "declaration" forbids it because sovereignty replaced the test. Membership changes include `instruction` only when a registered standing surface became stale.',
     {
       candidateId: z.string().describe("Same-circle principle or preference concept id."),
       verdict: z
@@ -1100,10 +1162,33 @@ export function registerMonetCoreTools(
         .describe(
           "Evidence shown to the human, stored verbatim and never parsed for decisions.",
         ),
+      entrance: z
+        .enum(["extraction", "declaration"])
+        .optional()
+        .describe(
+          'How this ruling was reached. "extraction" means the four-gate battery ran and must carry ' +
+            '`battery`; "declaration" means sovereignty replaced the battery and must NOT carry one. ' +
+            "Omit only when you genuinely do not know — it records as unknown rather than guessing, " +
+            "and unknown is what makes a skeleton entry unauditable later.",
+        ),
+      battery: z
+        .array(
+          z.object({
+            gate: z.enum(["generates", "covers", "transfers", "exits"]),
+            passed: z.boolean(),
+            evidenceRef: z.string().max(500).optional(),
+          }),
+        )
+        .optional()
+        .describe(
+          "All four gates' answers, required with entrance=\"extraction\". evidenceRef points at " +
+            "evidence (concept id, path, URL) — never copied content. Refused if a gate is missing: " +
+            "the record must be able to say WHICH gate decided, not just that something did.",
+        ),
       ratifiedBy: z.string().max(200).optional().describe("Ruling actor; defaults to caller id."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Candidate's circle; omit for default."),
     },
-    async ({ candidateId, verdict, memberRuleIds, packet, ratifiedBy, circle }) => {
+    async ({ candidateId, verdict, memberRuleIds, packet, entrance, battery, ratifiedBy, circle }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         const resolvedCircle = scope(circle);
@@ -1116,6 +1201,11 @@ export function registerMonetCoreTools(
           // comment: the decided deviation is that memberRuleIds is an explicit field precisely so
           // edge-writing never has to parse this back out).
           packet: packet !== undefined ? JSON.stringify(packet) : undefined,
+          // Typed and explicit, NOT parsed back out of `packet` — same decided deviation
+          // memberRuleIds already follows: a decision must never depend on reading the packet,
+          // which stays opaque-verbatim for audit fidelity (monet-core#142).
+          entrance,
+          battery,
           ratifiedBy,
           circle: resolvedCircle,
         });

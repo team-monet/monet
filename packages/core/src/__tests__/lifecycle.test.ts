@@ -352,7 +352,7 @@ describe("9. server factory instructions", () => {
       { name: "monet-core", version: "0.7.0" },
       {
         capabilities: { tools: {} },
-        instructions: "Monet is persistent memory. Start each project session with agent_context. Call memory_workstreams only when the user intends to continue prior work; list and confirm the thread before fetching detail. Recall with memory_search/memory_gather pointer cards, then memory_fetch content. Store durable knowledge with memory_store. End with memory_checkpoint and a compressed workstream snapshot; without it, session state is lost.",
+        instructions: (await import("../mcp-server")).MONET_SERVER_INSTRUCTIONS,
       },
     );
     registerMonetCoreTools(server, core, { autoPrewarm: false, checkpointNudge: false });
@@ -363,10 +363,17 @@ describe("9. server factory instructions", () => {
     try {
       const { MONET_SERVER_INSTRUCTIONS } = await import("../mcp-server");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("Start each project session with agent_context");
-      expect(MONET_SERVER_INSTRUCTIONS).toContain("only when the user intends to continue prior work");
-      expect(MONET_SERVER_INSTRUCTIONS).toContain("memory_workstreams");
-      expect(MONET_SERVER_INSTRUCTIONS).toContain("memory_checkpoint");
-      expect(MONET_SERVER_INSTRUCTIONS).toContain("without it, session state is lost");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("normative system of record");
+      // CORRECTED 2026-08-03 (normative-hierarchy §8). These used to assert the OPPOSITE — that the
+      // text demanded a memory_checkpoint at session end, "without it, session state is lost". That
+      // promise stopped being true, and this test was pinning the lie in place: the surface it
+      // guards is re-sent on every request, so a stale assertion here bills every turn for it.
+      // Asserted as ABSENCE now, because a closing ritual is the specific shape §6 rejects — every
+      // record Monet keeps rides an event that already happens.
+      expect(MONET_SERVER_INSTRUCTIONS).not.toContain("memory_checkpoint");
+      expect(MONET_SERVER_INSTRUCTIONS).not.toContain("memory_workstreams");
+      expect(MONET_SERVER_INSTRUCTIONS).not.toContain("session state is lost");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("Nothing is owed at session end");
     } finally {
       await client.close();
       core.close();

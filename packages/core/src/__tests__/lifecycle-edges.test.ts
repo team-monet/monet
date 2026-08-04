@@ -907,7 +907,7 @@ describe("lifecycle edge sync", () => {
     if (global.species !== "principle") throw new Error("unreachable");
 
     const payload = src.exportDelta(0);
-    expect(payload.schemaVersion).toBe(14);
+    expect(payload.schemaVersion).toBe(15);
     expect(payload.concepts.find((row) => row.id === global.conceptId)?.skeleton_breadth).toBe("global");
     dst.graftRows(payload);
     expect(dst.skeleton("a-circle-with-no-local-members").find((entry) => entry.conceptId === global.conceptId))

@@ -250,6 +250,14 @@ export interface SyncRatificationRow {
   subject_concept_id: string;
   verdict: string;
   packet: string | null;
+  /**
+   * Added by ALTER (monet-core#142), so nullable per this file's own header rule: rows written
+   * before the column existed carry NULL, and NULL is never backfilled — it means "how this entered
+   * was never recorded", which is the truthful answer for those rows.
+   */
+  entrance?: string | null;
+  /** JSON BatteryVerdict[]; same ALTER, same nullability reasoning. */
+  battery?: string | null;
   ratified_by: string | null;
   circle: string;
   created_at: number;

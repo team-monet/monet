@@ -4529,7 +4529,7 @@ describe("gate substrate sync", () => {
     });
 
     const payload = src.exportDelta(0);
-    expect(payload.schemaVersion).toBe(14);
+    expect(payload.schemaVersion).toBe(15);
     expect(payload.stages?.map((s) => s.name)).toEqual(["git force push"]);
     expect(payload.ruleBindings?.map((b) => b.concept_id)).toEqual([rule.conceptId]);
 
@@ -5255,8 +5255,8 @@ describe("gate substrate sync", () => {
     const src = core({ syncDeviceId: "machine-a" });
     const dst = core({ syncDeviceId: "machine-b" });
     const payload = src.exportDelta(0);
-    expect(() => dst.graftRows({ ...payload, schemaVersion: 15 }))
-      .toThrow(/this build understands up to 14/);
+    expect(() => dst.graftRows({ ...payload, schemaVersion: 16 }))
+      .toThrow(/this build understands up to 15/);
     src.close();
     dst.close();
   });

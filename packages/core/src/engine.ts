@@ -129,6 +129,8 @@ import type {
   LifecycleEdgeFamily,
   LifecycleEdgeRow,
   RatificationRow,
+  BatteryVerdict,
+  RatificationEntrance,
   RatificationVerdict,
   RecordRatificationInput,
 } from "./lifecycle-edges";
@@ -159,9 +161,11 @@ import {
   liveBlockingRulesForStage,
   liveStageIndex,
   materializeGateMirror,
+  assertPatternCountWithinCap,
   matchesTriggerPattern,
   normalizeStageName,
   parseActionContext,
+  seedTriggerPattern,
   parseTriggerPatterns,
   upsertStage,
   MODEL_TAG_MAX_CHARS,
@@ -186,6 +190,12 @@ import type {
   StageRow,
   TriggerPattern,
 } from "./gates";
+import { readFileSync } from "node:fs";
+import { appendConformanceAnnotations, computeConformance } from "./conformance";
+import type { ConformanceAnnotation, JournalDispositionLine } from "./conformance";
+import { clipActionContext, closeGateJournalEvent, gateJournalDisposition, openGateJournalEvent } from "./gate-journal";
+import type { GateJournalClaimType, GateJournalDisposition, GateJournalMouth } from "./gate-journal";
+import { RATIFICATION_ENTRANCES, classifyRatificationPair } from "./lifecycle-edges";
 import { inspectLifecycleEdgeIntegrity } from "./diagnostics";
 import type { LifecycleEdgeIntegrityReport } from "./diagnostics";
 import {
@@ -326,8 +336,18 @@ const SYNC_CLOSURE_SCHEMA_VERSION = 8; // replay-safe multi-writer sync contract
  * all was treated as v8: a sender carrying tables the receiver had never heard of would have its
  * rows silently dropped while its cursor advanced, losing them permanently. A receiver must be able
  * to say "this is newer than I understand" instead. Bump this whenever the payload gains a table.
+ *
+ * "OR A COLUMN THAT CARRIES AN ACT", which the changelog below has always shown even where the
+ * sentence above did not say it: entry 13 is `concepts.skeleton_breadth`, a column. The rule that
+ * actually governs is the one the refusal exists for — bump whenever a receiver on the old build
+ * would silently drop something a sender considers written. An older receiver destructures each
+ * graft row by explicit column name, so a new column is dropped in silence and its cursor still
+ * advances; that is precisely the permanent loss this ceiling exists to convert into a loud refusal.
+ * Entry 15 is such a column pair: a ratification's entrance and battery are the act itself, not
+ * metadata about it, and a skeleton member that silently loses how it entered is monet-core#142
+ * reintroduced by transport.
  */
-const SYNC_PAYLOAD_PROTOCOL_VERSION = 14; // 11: + lifecycle_edges, ratifications; 12: + stages, rule_bindings; 13: + concepts.skeleton_breadth; 14: first_block retired
+const SYNC_PAYLOAD_PROTOCOL_VERSION = 15; // 11: + lifecycle_edges, ratifications; 12: + stages, rule_bindings; 13: + concepts.skeleton_breadth; 14: first_block retired; 15: + ratifications.entrance/battery
 const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/activation ledger
 // PRAGMA user_version gate for the file=concept reshape (Phase 1, ratified): the
 // uq_source_chunks_active_concept -> uq_source_chunks_active_concept_slot index swap and the
@@ -997,6 +1017,10 @@ export interface StoreOpts {
 export interface SkeletonEntryOpts {
   verdict: RatificationVerdict;
   ratifiedBy?: string | null;
+  /** Which entrance the ruling came through (monet-core#142). */
+  entrance?: RatificationEntrance;
+  /** The four gates' answers, on the extraction entrance only. */
+  battery?: readonly BatteryVerdict[];
   /**
    * An explicit breadth ruling from declare(). Undefined preserves an incumbent member's current
    * breadth, exactly as an omitted rule-binding circle preserves an incumbent rule's reach.
@@ -1293,7 +1317,14 @@ export type RuleCorrectionVerdict =
  * final and quiet — nothing here is ever re-argued or re-shown after this response.
  */
 export interface DeclareAdvisory {
-  kind: "stage_shaped" | "missing_exits_evidence" | "near_match" | "resolution";
+  kind:
+    | "stage_shaped"
+    | "missing_exits_evidence"
+    | "near_match"
+    | "resolution"
+    /** THE DECLARE-TIME FIRING TEST (monet-client#59). See `patternFiringAdvisories`. */
+    | "pattern_never_matches"
+    | "pattern_matches_no_example";
   message: string;
   /** Present on "stage_shaped" when an existing registered stage's own trigger patterns matched. */
   stage?: string;
@@ -1320,6 +1351,71 @@ export interface DeclareAdvisory {
  * counts them all — a fork is disclosed either way; this set only rations declare()'s warning
  * lights. If declare() ever gains a rule-species advisory path, revisit this line, not just the set.
  */
+/**
+ * Caller text echoed back inside a declare advisory — an instance, a pattern — is bounded here.
+ * Neither is capped by the MCP schema, and an unbounded echo can grow the acknowledgement past the
+ * envelope's own limit, which replaces the entire response (warning included) with a truncation
+ * notice. Generous enough that a real pattern or a real command is never touched.
+ */
+const ADVISORY_ECHO_MAX_CHARS = 300;
+function clipAdvisoryEcho(text: string): string {
+  return text.length <= ADVISORY_ECHO_MAX_CHARS
+    ? text
+    : `${text.slice(0, ADVISORY_ECHO_MAX_CHARS)}… (+${text.length - ADVISORY_ECHO_MAX_CHARS} chars)`;
+}
+
+/**
+ * Per-item clipping is not enough on its own (Codex P2 on PR #144, and it was right): 32 allowed
+ * patterns each surviving the per-echo clip still join to roughly 19 KB, and the message is carried
+ * twice — in `advisories` and again in `guidance` — so the acknowledgement could still cross its
+ * 40,000-character ceiling and be replaced wholesale by a truncation envelope, deleting the warning
+ * it existed to deliver. The aggregate is capped and the omission is stated rather than hidden.
+ */
+const ADVISORY_ECHO_MAX_ITEMS = 8;
+function joinAdvisoryEchoes(items: readonly string[]): string {
+  const shown = items.slice(0, ADVISORY_ECHO_MAX_ITEMS).map((item) => JSON.stringify(clipAdvisoryEcho(item)));
+  const omitted = items.length - shown.length;
+  return omitted > 0 ? `${shown.join(", ")} (+${omitted} more)` : shown.join(", ");
+}
+
+/**
+ * The relayed pair, reduced to what it can prove — through the SAME rules the local write uses
+ * (`classifyRatificationPair`), never a second copy of them.
+ *
+ * The two paths differed three times on this PR, each time because the invariant was written twice.
+ * Here the only difference that remains is the consequence: a local write throws, and a relayed row
+ * degrades to "unrecorded" — a state the schema already means something honest by. Refusing the
+ * whole payload would be wrong (one bad ratification must not stop a sync) and trusting it would be
+ * worse (a fabricated entrance could never be told from a real one again).
+ */
+function relayedEntrancePair(row: {
+  verdict: string;
+  entrance?: string | null;
+  battery?: string | null;
+}): [string | null, string | null] {
+  const entrance = row.entrance ?? null;
+  const battery = row.battery ?? null;
+  if (entrance === null && battery === null) return [null, null]; // a legacy row, legally
+
+  let parsed: BatteryVerdict[] | null = null;
+  if (battery !== null) {
+    try {
+      const candidate = JSON.parse(battery) as BatteryVerdict[];
+      if (!Array.isArray(candidate)) return [null, null];
+      parsed = candidate;
+    } catch {
+      return [null, null];
+    }
+  }
+  if (!RATIFICATION_VERDICTS.includes(row.verdict as RatificationVerdict)) return [null, null];
+  const classified = classifyRatificationPair(
+    row.verdict as RatificationVerdict,
+    entrance as RatificationEntrance | null,
+    parsed,
+  );
+  return classified.ok ? [entrance, battery] : [null, null];
+}
+
 const AMBIGUOUS_RESOLUTION_MODES: ReadonlySet<string> = new Set(["fork-signal", "ambiguous-fork", "blur-duplicate"]);
 
 /** Outcome of declare(). */
@@ -1331,6 +1427,8 @@ export type DeclareResult =
       previousPatterns: string[];
       /** Rendered patterns after. Equal to `previousPatterns` when nothing changed. */
       patterns: string[];
+      /** Warning-light only; the write above has already happened. Omitted when nothing fired. */
+      advisories?: DeclareAdvisory[];
     }
   | {
       species: "rule";
@@ -1357,6 +1455,8 @@ export type DeclareResult =
        * flagged nothing, which is the ordinary case.
        */
       extractionCandidate?: { pairedRuleId: string; score: number };
+      /** Warning-light only; the write above has already happened. Omitted when nothing fired. */
+      advisories?: DeclareAdvisory[];
     }
   | {
       /**
@@ -1428,6 +1528,75 @@ interface SkeletonMemberRow {
   breadth: SkeletonBreadth;
   ratified_by: string | null;
   ratified_at: number;
+  /** From the latest ratification (monet-core#142). NULL on rows written before the column existed. */
+  entrance: RatificationEntrance | null;
+  /** JSON BatteryVerdict[] from the latest ratification; null unless it entered by extraction. */
+  battery: string | null;
+}
+
+/**
+ * A skeleton member as CURATION sees it — the ordinary entry plus how it entered.
+ *
+ * DELIBERATELY NOT `SkeletonEntry`, and this is the whole reason the two types exist separately:
+ * `SkeletonEntry` is what `agent_context` ships on every session start, where the minimization law
+ * governs absolutely ("deliver the minimum payload, and only when it is actually needed"). How a
+ * principle entered changes nothing for the agent about to obey it — it is a question for the human
+ * deciding what to re-examine. So it rides the on-demand curation surface and never the always-on
+ * one. A field with no answer to "who consumes it, on which turn" does not ship; this one's answer
+ * is "the human, at curation", and that is not the agent's turn.
+ */
+export interface SkeletonCurationEntry extends SkeletonEntry {
+  /**
+   * The four gates' answers, when this member entered by extraction (Codex P2 on PR #144).
+   *
+   * Structuring the battery was pointless if the only way to read it was the in-process TypeScript
+   * API: "which gate failed" was in the database and on no surface anybody uses. It rides the
+   * ON-DEMAND curation projection for the same reason `entrance` does — it is a question for the
+   * human deciding what to re-examine, never for the agent about to obey the principle.
+   */
+  battery?: BatteryVerdict[];
+  /**
+   * `declaration` — entered by sovereignty; the battery never ran, by right (#142's "never-ran").
+   * `extraction` — the battery ran and this passed it.
+   * `null` — the verdict predates the field. Never inferred; see migrateRatificationColumns.
+   */
+  entrance: RatificationEntrance | null;
+}
+
+/** Curation's view: everything the agent gets, plus the entrance the agent has no use for. */
+/**
+ * Evidence references are caller text bounded only by the MCP schema's own 500 characters, and the
+ * overview carries up to 25 members with four gates each — 50,000 characters against a 40,000
+ * ceiling (Codex P2 on PR #144, and it was right). The envelope fitter blanks each member's
+ * `content` and then throws that its fixed fields still do not fit, so a store with enough
+ * extraction members would have made `memory_overview` FAIL rather than return curation data.
+ *
+ * Clipped here, on the projection, because what curation needs from a battery is which gate decided
+ * — a pointer's tail is recoverable from the ratification itself, a broken overview is not.
+ */
+const CURATION_EVIDENCE_REF_MAX_CHARS = 120;
+
+function toSkeletonCurationEntry(row: SkeletonMemberRow): SkeletonCurationEntry {
+  let battery: BatteryVerdict[] | undefined;
+  if (typeof row.battery === "string") {
+    try {
+      const parsed = JSON.parse(row.battery) as BatteryVerdict[];
+      if (Array.isArray(parsed)) {
+        battery = parsed.map((verdict) => {
+          if (typeof verdict?.evidenceRef !== "string") return verdict;
+          if (verdict.evidenceRef.length <= CURATION_EVIDENCE_REF_MAX_CHARS) return verdict;
+          const kept = verdict.evidenceRef.slice(0, CURATION_EVIDENCE_REF_MAX_CHARS);
+          return {
+            ...verdict,
+            evidenceRef: `${kept}… (+${verdict.evidenceRef.length - CURATION_EVIDENCE_REF_MAX_CHARS} chars)`,
+          };
+        });
+      }
+    } catch {
+      // An unreadable battery is left absent rather than surfaced as a broken one.
+    }
+  }
+  return { ...toSkeletonEntry(row), entrance: row.entrance, ...(battery === undefined ? {} : { battery }) };
 }
 
 function toSkeletonEntry(row: SkeletonMemberRow): SkeletonEntry {
@@ -1457,6 +1626,18 @@ export interface RatifyInput {
   /** Opaque evidence packet, stored verbatim. Pre-serialized by the caller (the MCP layer
    *  JSON.stringifies whatever the tool call received) — this method never inspects its shape. */
   packet?: string | null;
+  /**
+   * Which entrance this ruling came through (monet-core#142). Defaults to "extraction" — this
+   * surface IS the battery entrance — so an ordinary caller never restates it. Naming
+   * "declaration" here is the sovereign escape: the human ruled directly, and no battery is owed.
+   */
+  entrance?: RatificationEntrance;
+  /**
+   * The four gates' answers. Required alongside an extraction approve/re-ratify/reject, refused on
+   * a declaration. Explicit and typed for the same reason `memberRuleIds` is: a decision must never
+   * depend on parsing `packet`, which stays opaque-verbatim for audit fidelity.
+   */
+  battery?: readonly BatteryVerdict[];
   ratifiedBy?: string;
   circle?: string;
 }
@@ -1760,7 +1941,12 @@ export interface MemoryOverview {
   extractionCandidates: PossibleDuplicatePair[];
   /** Skeleton membership (principles + preferences) for this circle — capped; `counts.skeleton`
    *  carries the true total the same way `counts.possibleDuplicates` does for its own list. */
-  skeleton: SkeletonEntry[];
+  /**
+   * Curation's view of the skeleton — each member plus the entrance it came through. This is the
+   * ON-DEMAND surface, which is why it may carry `entrance` at all; `agent_context`'s always-on
+   * skeleton stays the narrower `SkeletonEntry`.
+   */
+  skeleton: SkeletonCurationEntry[];
   /** One or more skeleton `content` strings were clipped solely to fit the MCP envelope. */
   skeletonClipped?: true;
   /**
@@ -1925,6 +2111,17 @@ export interface MonetCoreOptions {
    * when given an explicit path.
    */
   gateSidecarPath?: string;
+  /**
+   * Where to append the gate journal (`docs/design/normative-hierarchy-2026-08-03.md` §1/§5) — the
+   * record of what every governing mechanism actually did, including its declines. NO DEFAULT, for
+   * exactly the reason `gateSidecarPath` has none: a default would make every MonetCore ever
+   * constructed append into the user's real store. Unset means core's own two mouths write nothing;
+   * the host-side mouths (the hook wrapper, the gate CLI) name the path themselves.
+   *
+   * This does NOT replace `gate_events`. That table stays, unchanged, feeding `gateStats` — see
+   * gate-journal.ts's own comment for the two reasons a verdict row cannot be this record.
+   */
+  gateJournalPath?: string;
   /**
    * Which model this runtime is serving. Agent-scoped rules — compensations for one model's failure
    * habits — are delivered only when their tag matches this one, which is the mechanism behind "a
@@ -2127,6 +2324,8 @@ export class MonetCore {
   private sourceClock: () => number;
   /** Where declarations re-materialize the blocking mirror. Null = nobody wired a hook to read it. */
   private gateSidecarPath: string | null;
+  /** Gate journal sink; null (the default) makes every journal call a no-op. See gate-journal.ts. */
+  private gateJournalPath: string | null;
   /**
    * Which model this runtime is serving — the default `gate()`/`stageLookup()`/`gateStats()` all
    * fall back to when a call omits an explicit `runtimeModelTag`. Set at construction (the
@@ -2169,6 +2368,7 @@ export class MonetCore {
     this.sourceGit = opts.sourceGit ?? {};
     this.sourceClock = opts.sourceClock ?? (() => Date.now());
     this.gateSidecarPath = opts.gateSidecarPath ?? null;
+    this.gateJournalPath = opts.gateJournalPath ?? null;
     this.runtimeModelTag = opts.runtimeModelTag ?? null;
     this.sourcePathValidationCheck = opts.sourcePathValidationCheck ?? (() => undefined);
     this.sourceRegistry = new SourceRegistry(this.db, {
@@ -4171,6 +4371,8 @@ export class MonetCore {
           conceptId: row.id,
           verdict: opts.skeletonEntry.verdict,
           ratifiedBy: opts.skeletonEntry.ratifiedBy,
+          entrance: opts.skeletonEntry.entrance,
+          battery: opts.skeletonEntry.battery,
           breadth: opts.skeletonEntry.breadth,
           onBreadthNarrowed: opts.skeletonEntry.onBreadthNarrowed,
           onDeliveryChanged: opts.skeletonEntry.onDeliveryChanged,
@@ -7522,7 +7724,9 @@ export class MonetCore {
     // "few, always present" by design (skeleton-gates-recall.md, Part 1) and preferences expected
     // to stay in the same range.
     const OVERVIEW_SKELETON_CAP = 25;
-    const skeletonMembers = this.skeleton(circle);
+    // Curation's view — carries how each member entered (monet-core#142). The always-on
+    // agent_context path deliberately keeps the narrower `skeleton()`; see SkeletonCurationEntry.
+    const skeletonMembers = this.skeletonForCuration(circle);
     const fullGateStats = this.gateStats(circle, GATE_STATS_WINDOW_DAYS, undefined, OVERVIEW_EXCEPTION_LIMIT);
     const retirementCandidates = fullGateStats.retirementCandidates;
     const unexplainedDenies = fullGateStats.unexplainedDenies;
@@ -10163,6 +10367,12 @@ export class MonetCore {
     verdict: RatificationVerdict;
     ratifiedBy?: string | null;
     packet?: string | null;
+    /**
+     * monet-core#142. Named by the caller, never inferred here: this seam serves BOTH entrances —
+     * declare() and ratify() — which is exactly why it must not guess which one it is serving.
+     */
+    entrance?: RatificationEntrance;
+    battery?: readonly BatteryVerdict[];
     memberRuleIds?: string[];
     breadth?: SkeletonBreadth;
     onBreadthNarrowed?: () => void;
@@ -10212,6 +10422,8 @@ export class MonetCore {
         // declaration entrance uses for declaredBy. NULL here lost the actor from an append-only
         // audit row on the common call path (Codex PR #102).
         ratifiedBy: input.ratifiedBy ?? this.agentId,
+        entrance: input.entrance,
+        battery: input.battery,
       });
       // Breadth is mutable membership metadata, separate from the append-only ruling. This write
       // happens in the SAME transaction as declaration's new ratification, so re-declaring an
@@ -10419,6 +10631,14 @@ export class MonetCore {
         verdict: input.verdict,
         ratifiedBy: input.ratifiedBy,
         packet: input.packet ?? null,
+        // NO DEFAULT, and the reason is the same one that forbids backfilling legacy rows: whether
+        // the battery ran is a FACT about a human's ruling, not something this surface may assume.
+        // Defaulting to "extraction" would have every caller silently claim a test they may never
+        // have run — manufacturing exactly the certainty monet-core#142 is about the absence of.
+        // Unnamed stays NULL, which says the true thing: not recorded. A caller that CLAIMS the
+        // battery ran must then show it (assertRatificationEntranceRules).
+        entrance: input.entrance,
+        battery: input.battery,
         memberRuleIds: input.memberRuleIds,
         onDeliveryChanged: ({ circle: memberCircle, before, after }) => {
           const scopes = new Set<SkeletonBreadth>();
@@ -10542,6 +10762,84 @@ export class MonetCore {
   }
 
   /**
+   * The same membership, for the human deciding what to re-examine — each member plus how it
+   * entered (monet-core#142).
+   *
+   * THE QUESTION THIS ANSWERS, which the store could not be asked before: "which principles entered
+   * untested?" A member whose latest verdict came through `declaration` was never gated by the
+   * battery — legitimately, sovereignty replaces it there — and one through `extraction` was. Before
+   * this, both looked identical, and so did a third state: a verdict recorded before the field
+   * existed, which stays `null` here rather than being guessed into one of the other two.
+   *
+   * Separate from `skeleton()` on purpose. See SkeletonCurationEntry for why the extra field must
+   * not reach the always-on delivery path.
+   */
+  /**
+   * Runs the conformance pass over this store's gate journal and appends what it found
+   * (`normative-hierarchy-2026-08-03.md` §4/§7.3). Returns the annotations written.
+   *
+   * NOT WIRED TO ANY TRIGGER, deliberately. §7 leaves the pass's trigger open in its own words —
+   * "'rides the next session start' names the event, not the payer: agent_context is
+   * latency-sensitive" — and this journal is capped at 64 MiB, so reading it whole on a hot path is
+   * exactly the unmeasured cost that section flags. Inventing a trigger here would decide something
+   * the design deliberately left open. Callable now; scheduled when the consumer that pays for it
+   * (curation, and the judgment half beside it) exists.
+   *
+   * Idempotent, so it is safe under whatever eventually calls it, however often.
+   */
+  runConformancePass(): ConformanceAnnotation[] {
+    if (this.gateJournalPath === null) return [];
+    const lines: JournalDispositionLine[] = [];
+    const seenEventLines = new Map<string, number>();
+    // THE RETAINED GENERATION IS READ TOO (Codex P2 on PR #144, and it was right). Rotation moves
+    // unprocessed events into `.prev`, and this pass is deliberately not on a timer — so the very
+    // first run can easily land after a rotation, at which point a whole generation of fires would
+    // be silently absent from every tally and could never be annotated afterwards. Oldest first, so
+    // recurrence ordering across the boundary stays chronological.
+    for (const path of [`${this.gateJournalPath}.prev`, this.gateJournalPath]) {
+      let raw: string;
+      try {
+        raw = readFileSync(path, "utf8");
+      } catch {
+        continue; // no such generation yet is not an error
+      }
+      for (const line of raw.split("\n")) {
+        if (line.trim().length === 0) continue;
+        // A truncated final line (a kill mid-append) must not cost the whole pass its input.
+        let parsed: JournalDispositionLine;
+        try {
+          parsed = JSON.parse(line) as JournalDispositionLine;
+        } catch {
+          continue; // skip the unreadable line, keep the rest
+        }
+        // Rotation can leave one line in both generations; an id+phase pair identifies it.
+        const dedupeKey = `${parsed.phase ?? ""}:${parsed.id ?? ""}:${String(parsed.fireEventId ?? "")}`;
+        if (parsed.id !== undefined || parsed.fireEventId !== undefined) {
+          const seenAt = seenEventLines.get(dedupeKey);
+          if (seenAt !== undefined) {
+            // NEWEST WINS FOR A CONFORMANCE LINE (Codex P2 on PR #144, and it was right). Keeping
+            // the first occurrence meant a stale `retriedUnchanged: false` in `.prev` outranked its
+            // own monotone upgrade in the active file — so every later pass concluded the prior
+            // value was still false and appended another identical annotation, breaking the
+            // idempotence this dedupe exists to protect and growing the journal until rotation.
+            if (parsed.phase === "conformance") lines[seenAt] = parsed;
+            continue;
+          }
+          seenEventLines.set(dedupeKey, lines.length);
+        }
+        lines.push(parsed);
+      }
+    }
+    const annotations = computeConformance(lines);
+    appendConformanceAnnotations(this.gateJournalPath, annotations);
+    return annotations;
+  }
+
+  skeletonForCuration(circle?: string): SkeletonCurationEntry[] {
+    return this.skeletonMemberRows(this.resolveCircle(circle ?? this.defaultCircle)).map(toSkeletonCurationEntry);
+  }
+
+  /**
    * Full-body, non-touch skeleton read. The monet-client `monet materialize` renderer consumes this
    * instead of getConcept(), whose usefulness bump would make regeneration mutate ranking; prewarm's
    * mirror skeletonState hashing consumes the same rows. Membership and order are identical to
@@ -10573,7 +10871,8 @@ export class MonetCore {
       .prepare(
         `SELECT c.id AS concept_id, c.kind AS kind, c.body AS body,
                 c.skeleton_breadth AS breadth,
-                lr.ratified_by AS ratified_by, lr.created_at AS ratified_at
+                lr.ratified_by AS ratified_by, lr.created_at AS ratified_at, lr.entrance AS entrance,
+          lr.battery AS battery
            FROM concepts c
            JOIN ratifications lr ON lr.id = (
              SELECT r.id FROM ratifications r WHERE r.subject_concept_id = c.id
@@ -11591,6 +11890,7 @@ export class MonetCore {
       }
     }
     this.assertPatternReauthoringAcknowledged(input);
+    const firingAdvisories = this.patternFiringAdvisories(input);
 
     const before = this.sidecarGeneration();
     let result: DeclareResult;
@@ -11616,6 +11916,9 @@ export class MonetCore {
         // afterwards. Worth building when there is a second consumer of the history.
         previousPatterns: priorPatterns.map(formatTriggerPattern),
         patterns: view.patterns.map(formatTriggerPattern),
+        // Omitted when nothing fired, per the residency law that governs advisories: an always-
+        // present empty array is a field every reader pays for and no reader learns from.
+        ...(firingAdvisories.length > 0 ? { advisories: firingAdvisories } : {}),
       };
     } else if (input.species === "principle" || input.species === "preference") {
       // THE DECLARATION ENTRANCE — sovereignty replaces the battery. Net-new code: unlike the rule
@@ -11647,6 +11950,10 @@ export class MonetCore {
         skeletonEntry: {
           verdict: "approve",
           ratifiedBy: declaredBy,
+          // THE DECLARATION ENTRANCE, said structurally rather than left to packet prose
+          // (monet-core#142). It carries no battery, by right: sovereignty replaces the test here,
+          // and "entered untested" becomes readable instead of buried.
+          entrance: "declaration" as const,
           // Omitted circle means no breadth ruling, preserving an incumbent member's reach. An
           // explicit ordinary circle makes it local; '*' makes it global.
           breadth: input.circle === undefined ? undefined : (isBreadth ? "global" : "local"),
@@ -11741,6 +12048,10 @@ export class MonetCore {
         // Straight through from the shared write path (slice 5-B) — flagged by the same near-match
         // hook regardless of entrance, and disclosed here for the same reason it is on memory_store.
         ...(stored.extractionCandidate ? { extractionCandidate: stored.extractionCandidate } : {}),
+        // THE DECLARE-TIME FIRING TEST's finding, on the entrance that can actually carry patterns.
+        // Same disclosure discipline as the two above: legal, sovereign, and never something the
+        // caller should discover later rather than see reported here.
+        ...(firingAdvisories.length > 0 ? { advisories: firingAdvisories } : {}),
       };
     }
 
@@ -11748,6 +12059,9 @@ export class MonetCore {
     // what makes this precise: an unconditional rebuild on every declaration was the cheap version
     // of this check, and it could not tell a caller — or the 4b hook — whether anything changed.
     if (this.sidecarGeneration() !== before) this.refreshGateSidecar();
+    // Recorded only now: the declaration is committed, so `admitted: true` is a fact rather than a
+    // prediction. See journalFiringAdvisories.
+    this.journalFiringAdvisories(input, firingAdvisories);
     return result;
   }
 
@@ -11795,6 +12109,144 @@ export class MonetCore {
     const stage = findStage(this.db, input.stage!);
     if (!stage) return; // a stage being born carries no rules yet, so nothing can be rerouted
     assertNoUnacknowledgedDenies(this.db, stage, input.acknowledgeBlockingRules);
+  }
+
+  /**
+   * THE DECLARE-TIME FIRING TEST — monet-client#59, `normative-hierarchy-2026-08-03.md` §2:
+   * "a pattern is admitted with at least one example action context it matches, verified at declare
+   * time by the same evaluator the gate runs."
+   *
+   * SAME EVALUATOR, NOT A SECOND ONE. `seedTriggerPattern` (exactly what upsertStage will store),
+   * `parseActionContext` and `matchesTriggerPattern` (exactly what gateInternal fires with). A
+   * declare-time check that used its own matching machinery could pass while the gate fails, which
+   * would be a worse lie than no check — it would say "verified" about a pattern that never fires.
+   * The stage-shaped advisory below already set this precedent; this reuses the same three.
+   *
+   * THE EXAMPLE IS `instance`, and no new field is added for it. `instance` already means "the
+   * concrete action this is about": when no patterns are given it SEEDS one, and when patterns are
+   * given it now VERIFIES them. One field, one meaning, two uses.
+   *
+   * WARNED, NEVER REFUSED — and that is the entrance, not timidity. §2 rules that a non-matching
+   * pattern is "refused on extraction-quality writes and warned-and-recorded on sovereign ones",
+   * and `patterns` is reachable from `memory_declare` ALONE (the capture path derives a pattern
+   * from the instance itself, so it is self-matching by construction and has nothing to verify).
+   * Every pattern this check can see therefore arrived through the sovereign entrance, where
+   * sovereignty replaces the battery. There is no extraction-quality pattern write to refuse, so no
+   * refusal path is built for one; if such an entrance is ever added, this is where its refusal goes.
+   *
+   * WHAT THIS DELIBERATELY DOES NOT DO: flip the stage's `verified` flag. That flag means "these
+   * patterns matched a REAL action at least once, anywhere", and a real fire proves a HOST actually
+   * produced that context. An author-supplied example proves only that the author wrote a string
+   * that matches their own pattern — the `Agent:` trap is exactly a pair of matching fictions.
+   * Letting an example counterfeit a fire would weaken an existing safety property to decorate a
+   * new one.
+   *
+   * RATIONED, per the residency law that governs advisories. "Patterns given, no example" is NOT
+   * advised: it would fire on nearly every pattern declaration there has ever been, and that signal
+   * already has two homes — `gateStats().unverifiedPatterns`, and now the gate journal.
+   */
+  private patternFiringAdvisories(input: DeclareInput): DeclareAdvisory[] {
+    // Everything echoed below is CALLER TEXT, and the MCP schema bounds neither `instance` nor a
+    // pattern (Codex P2 on PR #144, and it was right). A ~40k-character mismatching declaration
+    // would produce a message so large that the acknowledgement envelope replaced the whole
+    // response with its truncation notice — deleting the very warning the caller needed. Clipped
+    // here, at the source, so both the response and the journal stay bounded.
+    if (input.patterns === undefined || input.patterns.length === 0) return [];
+    // COUNT FIRST (Codex P2 on PR #144, and it was right). upsertStage refuses past
+    // MAX_STAGE_PATTERNS in constant time, but this analysis ran BEFORE it and tokenized every entry
+    // — so an arbitrarily large array was fully seeded just to be thrown away, on a path any MCP
+    // caller can reach with no `.max()` on the schema. Work proportional to a payload already known
+    // to be refused.
+    assertPatternCountWithinCap(input.patterns);
+    const seeded = input.patterns.map((pattern) => seedTriggerPattern(pattern));
+    const advisories: DeclareAdvisory[] = [];
+
+    // (a) INERT BY CONSTRUCTION — no example needed to know it. Seeding yields an empty token run
+    // for a segment that is nothing but flags ("a stage that means 'some command, somewhere, with
+    // this flag' is noise wearing a gate's clothes"), and matchesTriggerPattern returns false for
+    // an empty run unconditionally. The stage is born addressing nothing. This is a FORM defect —
+    // knowable without judging content, which is the only kind this layer is allowed to raise.
+    const inert = input.patterns.filter((_, index) => seeded[index]!.tokens.length === 0);
+    if (inert.length > 0) {
+      advisories.push({
+        kind: "pattern_never_matches",
+        message:
+          `These patterns can never match any action, so the gate they address is inert: ` +
+          `${joinAdvisoryEchoes(inert)}. A pattern seeds to its ` +
+          `command word through its last flag, and a run of nothing but flags addresses nothing. ` +
+          `Name the command the flag belongs to.`,
+      });
+    }
+
+    // (b) THE FIRING TEST ITSELF. An example was supplied and nothing declared here matches it.
+    if (typeof input.instance === "string" && input.instance.trim().length > 0) {
+      const context = parseActionContext(input.instance);
+      if (!seeded.some((pattern) => matchesTriggerPattern(pattern, context))) {
+        advisories.push({
+          kind: "pattern_matches_no_example",
+          message:
+            `None of these patterns match the example action given as \`instance\` ` +
+            `(${JSON.stringify(clipAdvisoryEcho(input.instance))}), evaluated with the gate's own matcher — so this ` +
+            `gate would not have fired on the very action it was authored from. The usual cause is ` +
+            `a tool prefix: a "Bash:" pattern can never match a "Task:" context, and a host's name ` +
+            `for a tool is a variable, not a constant (monet-client#58). Declared: ` +
+            `${joinAdvisoryEchoes(seeded.map(formatTriggerPattern))}.`,
+        });
+      }
+    }
+
+    return advisories;
+  }
+
+  /**
+   * WARNED **AND RECORDED** (§2) — the recording half, run only once the declaration has actually
+   * landed (Codex P2 on PR #144, and it was right).
+   *
+   * It used to append inside the check itself, before the write. When a declaration then failed —
+   * an embedder throw, a rolled-back transaction — the store correctly kept nothing while the
+   * journal kept `admitted: true` forever, claiming an inert pattern was let through that never
+   * existed. A record of an act that did not happen is worse than no record, and this journal's
+   * entire argument is that its events are acts.
+   */
+  private journalFiringAdvisories(input: DeclareInput, advisories: readonly DeclareAdvisory[]): void {
+    // ONE EVENT PER CHECK THAT RAN, not one per warning (Codex P2 on PR #144, and it was right —
+    // and it is the principle ratified 2026-08-04 catching this very code). Writing only on failure
+    // left a passing check, a check with no example, and a code path that never ran as one
+    // observable: precisely the ambiguity this journal's arrival/outcome contract exists to remove,
+    // reproduced inside the record that was supposed to remove it.
+    //
+    // No patterns means no check to record — the species carries no firing surface at all, which is
+    // a different thing from a check that ran and found nothing.
+    if (input.patterns === undefined || input.patterns.length === 0) return;
+
+    const handle = openGateJournalEvent(this.gateJournalPath, {
+      mouth: "declare-check",
+      claimType: "source-observed",
+      stage: input.stage,
+      patterns: input.patterns.map((pattern) => clipAdvisoryEcho(pattern)),
+      instance: input.instance === undefined ? undefined : clipAdvisoryEcho(input.instance),
+    });
+    if (advisories.length === 0) {
+      const hasExample = typeof input.instance === "string" && input.instance.trim().length > 0;
+      closeGateJournalEvent(this.gateJournalPath, handle, {
+        mouth: "declare-check",
+        // Checked and clean, versus checked as far as it could be. The second is not a failure and
+        // not a pass; saying so is the whole point.
+        disposition: hasExample ? "silent" : "declined: no-example",
+        claimType: hasExample ? "source-observed" : "unavailable",
+        admitted: true,
+      });
+      return;
+    }
+    closeGateJournalEvent(this.gateJournalPath, handle, {
+      mouth: "declare-check",
+      disposition: `declined: ${advisories[0]!.kind.replace(/_/g, "-")}`,
+      // The check ran and observed the result directly; only the ADMISSION is sovereign.
+      claimType: "source-observed",
+      admitted: true, // sovereignty: warned, written anyway
+      findings: advisories.map((advisory) => advisory.kind),
+      message: advisories.map((advisory) => advisory.message).join(" "),
+    });
   }
 
   /**
@@ -11989,7 +12441,76 @@ export class MonetCore {
    * Writes, despite reading like a query: one instrumentation row per call (the fire-precision and
    * silence-rate measures the design asks for), and the first match verifies a stage's pattern.
    */
+  /**
+   * Opens a journal event at the mouth of a gate-family call and returns a closer that must run on
+   * EVERY exit, including throws. §1: a mechanism that declines still witnesses.
+   *
+   * The closer is deliberately shaped so a caller cannot forget the failure path — see gate()'s own
+   * try/catch, where an exception is journaled as a decline and then re-thrown unchanged. Nothing
+   * here alters what the caller sees: the journal observes, it never participates.
+   */
+  private beginGateJournal(
+    mouth: GateJournalMouth,
+    arrival: Record<string, unknown>,
+    record = true,
+  ): (disposition: GateJournalDisposition, claimType: GateJournalClaimType, extra?: Record<string, unknown>) => void {
+    // `record: false` MEANS ASKING WITHOUT IT COUNTING (Codex P1 on PR #144, and it was right). That
+    // is the existing GateQueryOptions contract for benchmarks and previews, and journaling them
+    // anyway put previews into the fire record where the conformance pass could not tell them from
+    // real interceptions — crediting a benchmark's blocking preview as an observed `changed`, and
+    // letting a benchmark loop fill a production journal. An option that means "do not count this"
+    // has to mean it on every counter.
+    const path = record ? this.gateJournalPath : null;
+    if (path === null) return () => undefined; // no sink configured: the whole path costs one null check
+    const handle = openGateJournalEvent(path, { mouth, claimType: "source-observed", ...arrival });
+    return (disposition, claimType, extra) =>
+      closeGateJournalEvent(path, handle, { mouth, disposition, claimType, ...(extra ?? {}) });
+  }
+
   gate(opts: {
+    actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+  }): GateResult {
+    // At the mouth: before the circle is resolved, because resolveCircle can throw and a call that
+    // died on an unqueryable circle is an arrival that must not vanish.
+    const closeJournal = this.beginGateJournal("core-gate", clipActionContext(opts.actionContext), opts.record !== false);
+    try {
+      const result = this.gateUnjournaled(opts);
+      closeJournal(
+        gateJournalDisposition(result),
+        // `source: "live"` means the store itself answered; a sidecar answer is a claim from a
+        // frozen artifact and is typed weaker. gate() is always live, but the mapping is written
+        // out rather than hardcoded so the two paths stay comparable in one stream.
+        result.source === "live" ? "source-observed" : "parsed",
+        {
+          stageIds: result.stages.map((stage) => stage.id),
+          stageNames: result.stages.map((stage) => stage.name),
+          // THE FIELD #62 NEEDS. `gate_events` records rule_count and stage ids but no rule
+          // identity, so "declared but never fired" has never been answerable from it. Here the
+          // ids are named, which is the whole query.
+          ruleIds: result.rules.map((rule) => rule.conceptId),
+          // WHICH OF THEM ACTUALLY BLOCKED (Codex P1 on PR #144, and it was right). One evaluation
+          // can match a blocking rule and an advisory one; the event is a `deny` as a whole, and a
+          // conformance pass reading ids alone would credit the advisory rules with an interception
+          // they had no part in. Recorded only when the distinction exists to be made.
+          ...(result.rules.some((rule) => rule.severity === "blocking")
+            ? {
+                blockingRuleIds: result.rules
+                  .filter((rule) => rule.severity === "blocking")
+                  .map((rule) => rule.conceptId),
+              }
+            : {}),
+        },
+      );
+      return result;
+    } catch (error) {
+      closeJournal("declined: internal-error", "unavailable", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error; // observed, never absorbed — the caller's contract is unchanged
+    }
+  }
+
+  private gateUnjournaled(opts: {
     actionContext: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
   }): GateResult {
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
@@ -12034,6 +12555,47 @@ export class MonetCore {
    * returned first, and the gate_events write is separate and allowed to fail silently.
    */
   stageLookup(opts: {
+    stage: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
+  }): StageLookupResult {
+    // §1's honest limit, recorded rather than papered over: this path can witness an EMPTY answer,
+    // but nothing can witness a recognition that never happened. A `declined: stage-miss` here says
+    // "an agent named a stage that does not exist" — it says nothing about the moments no agent
+    // recognized at all, and the design's own caveat ("its silence proves nothing") still governs
+    // the advisory path. The record shrinks the undecidable to that core and no further.
+    const closeJournal = this.beginGateJournal("stage-lookup", { stage: opts.stage }, opts.record !== false);
+    try {
+      const result = this.stageLookupUnjournaled(opts);
+      closeJournal(
+        !result.matched
+          ? "declined: stage-miss"
+          : result.rules.length === 0
+            ? "stage-hit-no-rules"
+            : result.rules.some((rule) => rule.severity === "blocking")
+              ? "deny"
+              : "advisory",
+        "source-observed",
+        {
+          // A lookup names ONE stage, so this is a one-or-zero list rather than gate()'s set —
+          // kept as a list anyway so both mouths' events are read by the same query.
+          stageIds: result.stage ? [result.stage.id] : [],
+          stageNames: result.stage ? [result.stage.name] : [],
+          ruleIds: result.rules.map((rule) => rule.conceptId),
+          // Advisory-only by design: a blocking severity is DELIVERED here, never enforced. The
+          // disposition above says "deny" because that is what was delivered; this says the gate
+          // did not act on it, so a conformance pass never reads an enforcement that never happened.
+          enforced: false,
+        },
+      );
+      return result;
+    } catch (error) {
+      closeJournal("declined: internal-error", "unavailable", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  private stageLookupUnjournaled(opts: {
     stage: string; circle?: string; now?: number; record?: boolean; runtimeModelTag?: string;
   }): StageLookupResult {
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
@@ -13599,9 +14161,9 @@ export class MonetCore {
         const r = this.db
           .prepare(
             `INSERT INTO ratifications
-               (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at,
-                sync_updated_at, sync_revision, sync_writer)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               (id, subject_concept_id, verdict, packet, entrance, battery, ratified_by, circle,
+                created_at, sync_updated_at, sync_revision, sync_writer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                circle = excluded.circle,
                sync_updated_at = excluded.sync_updated_at,
@@ -13612,6 +14174,19 @@ export class MonetCore {
           )
           .run(
             row.id, row.subject_concept_id, row.verdict, row.packet ?? null,
+            // A ratification is an IMMUTABLE ACT, so these follow the same rule every other act
+            // column here follows: written once on insert, never in the ON CONFLICT update. A peer
+            // relaying a row from before the column existed sends nothing, and NULL is the correct
+            // landing — the act genuinely has no recorded entrance, and inventing one on receipt
+            // would fabricate provenance out of a transport detail (monet-core#142).
+            //
+            // AND THE PAIR IS VALIDATED, not trusted (Codex P1 on PR #144, and it was right). A
+            // v15 payload can claim `entrance: "extraction"` with a null, partial, duplicated or
+            // malformed battery. Writing that verbatim would let a peer mint an extraction-backed
+            // ruling with no four-gate evidence behind it — corrupting exactly the audit
+            // distinction this release adds, from the one direction that skips every local check.
+            // Absent on both is still legal: that is what a legacy row looks like.
+            ...relayedEntrancePair(row),
             row.ratified_by ?? null, row.circle, row.created_at, relayAt, revision, writer,
           );
         if (r.changes > 0) inserted.ratifications++;

@@ -12,6 +12,7 @@ import { MonetCore } from "../src/engine";
 import { chooseStoreEmbedder } from "../src/store-embedder";
 import type { EmbeddingProvider } from "../src/embedding";
 import { createMonetCoreMcpServer } from "../src/mcp-server";
+import { GATE_JOURNAL_FILENAME } from "../src/gate-journal";
 import { deriveCircle } from "../src/circle";
 
 function resolveDbPath(): string {
@@ -36,6 +37,15 @@ async function main(): Promise<void> {
     embedder: await chooseStartupEmbedder(dbPath),
     scopeContext: process.cwd(),
     defaultCircle: circle,
+    // THE JOURNAL'S ONLY PRODUCTION WIRING (Codex P1 on PR #144, and it was right). `gateJournalPath`
+    // has no default — deliberately, so no MonetCore ever built by a test or a one-off script writes
+    // into a real store — but that meant nothing anywhere set it, and core's own mouths journaled
+    // nothing in a normal MCP session. The never-fired query and the conformance pass had no
+    // production input at all: a record layer that existed only in its tests.
+    //
+    // Beside the resolved database, so it follows the store it describes rather than the process's
+    // cwd — the same reasoning that keeps the host-side hook off the cwd rung.
+    gateJournalPath: path.join(path.dirname(dbPath), GATE_JOURNAL_FILENAME),
   });
   await createMonetCoreMcpServer(core);
   // stderr so it doesn't corrupt the stdio MCP channel

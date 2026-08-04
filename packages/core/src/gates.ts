@@ -1440,7 +1440,25 @@ const MAX_PATTERN_TOKENS = 12;
  * and small enough that the worst case stays bounded. Declaration REJECTS beyond it, so a human
  * finds out immediately; graft CLAMPS and counts, because an incoming row must never abort a graft.
  */
-const MAX_STAGE_PATTERNS = 32;
+export const MAX_STAGE_PATTERNS = 32;
+
+/**
+ * The pattern-count refusal, in ONE place so there is one wording for one rule.
+ *
+ * Exported because the declare-time firing test has to apply it BEFORE it tokenizes anything
+ * (Codex P2 on PR #144): that analysis ran ahead of this check and seeded every entry of an
+ * arbitrarily large array just to have it refused a moment later. Re-typing the message at the
+ * second call site would have been two refusals that could drift; this is the same refusal, raised
+ * earlier.
+ */
+export function assertPatternCountWithinCap(patterns: readonly string[] | undefined): void {
+  if (patterns === undefined || patterns.length <= MAX_STAGE_PATTERNS) return;
+  throw new Error(
+    `a stage may carry at most ${MAX_STAGE_PATTERNS} trigger patterns (got ${patterns.length}): ` +
+      `every gate lookup scans every pattern of every stage, so this is a per-action cost. Split the ` +
+      `action into separate stages, or use shorter patterns that cover more shapes.`,
+  );
+}
 
 /**
  * MATCHING IS ALWAYS OVER THE FULL CONTEXT. There is no cap that silently shortens what gets
@@ -2027,13 +2045,7 @@ export function upsertStage(deps: GateDeps, input: UpsertStageInput): StageRow {
   // silently ignored, which meant a declarer could not make a stage inert — and, worse, that the
   // one input shape most obviously aimed at disarming a gate slipped past the acknowledgement guard
   // entirely. Only `undefined` means "I am not authoring patterns".
-  if (input.patterns !== undefined && input.patterns.length > MAX_STAGE_PATTERNS) {
-    throw new Error(
-      `a stage may carry at most ${MAX_STAGE_PATTERNS} trigger patterns (got ${input.patterns.length}): ` +
-        `every gate lookup scans every pattern of every stage, so this is a per-action cost. Split the ` +
-        `action into separate stages, or use shorter patterns that cover more shapes.`,
-    );
-  }
+  assertPatternCountWithinCap(input.patterns);
   const declaredPatterns = input.patterns === undefined
     ? null
     : input.patterns.map((pattern) => seedTriggerPattern(pattern));

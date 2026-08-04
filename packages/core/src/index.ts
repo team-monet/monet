@@ -369,3 +369,42 @@ export type {
   SyncStageRow,
   SyncRuleBindingRow,
 } from "./sync-types";
+
+/** The gate journal (`docs/design/normative-hierarchy-2026-08-03.md` §1/§5) — the record every
+ *  governing mechanism appends what it actually did to, including its declines. Exported because
+ *  the mouths live in two repos: core's own gate and stage-lookup write it here, and the host-side
+ *  CLI writes it from monet-client. One stream, or the correlation between them is guesswork. */
+export {
+  GATE_JOURNAL_CONTEXT_MAX_CHARS,
+  GATE_JOURNAL_FILENAME,
+  GATE_JOURNAL_FORMAT,
+  GATE_JOURNAL_MAX_BYTES,
+  appendGateJournalLine,
+  clipActionContext,
+  closeGateJournalEvent,
+  gateJournalDisposition,
+  openGateJournalEvent,
+} from "./gate-journal";
+export type {
+  GateJournalArrival,
+  GateJournalClaimType,
+  GateJournalDisposition,
+  GateJournalDispositionFields,
+  GateJournalHandle,
+  GateJournalMouth,
+} from "./gate-journal";
+
+/** The conformance pass, cheap half (`normative-hierarchy-2026-08-03.md` §4/§7.3) — what the gate
+ *  journal can say about whether a rule changed anything, claiming only what it observes. */
+export {
+  appendConformanceAnnotations,
+  computeConformance,
+  retirementCandidates,
+  tallyByRule,
+} from "./conformance";
+export type {
+  ConformanceAnnotation,
+  ConformanceVerdict,
+  JournalDispositionLine,
+  RuleConformanceTally,
+} from "./conformance";
