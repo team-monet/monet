@@ -1,14 +1,22 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import {
   GATE_MIRROR_FORMAT,
   RULE_SCOPES,
   RULE_SEVERITIES,
+  GATE_JOURNAL_FILENAME,
+  clipActionContext,
+  closeGateJournalEvent,
   deriveCircle as coreDeriveCircle,
   evaluateGateFromMirror,
+  gateJournalDisposition,
+  openGateJournalEvent,
   parseActionContext,
+  type GateJournalClaimType,
+  type GateJournalDisposition,
   type GateMirror,
   type GateResult,
   type GateRule,
@@ -658,6 +666,14 @@ export interface GateCliDependencies {
    */
   isStdinTTY(): boolean;
   setExitCode(code: number): void;
+  /**
+   * Where to append the gate journal, or null to write none (`normative-hierarchy-2026-08-03.md`
+   * §1/§5). Resolved the same way the hook wrapper resolves it — MONET_STORAGE_DIR, else ~/.monet —
+   * and deliberately NOT via the project dir: a gate's cwd is whatever directory the host happened
+   * to spawn it from, and a record that lands in a random project's .monet is worse than one that
+   * always lands in the home store. Same reasoning the wrapper's own DENY_LOG_PATH comment gives.
+   */
+  journalPath(): string | null;
 }
 
 export function defaultGateCliDependencies(): GateCliDependencies {
@@ -676,6 +692,8 @@ export function defaultGateCliDependencies(): GateCliDependencies {
     mirrorPath: (explicitMirror) => (explicitMirror ? path.resolve(explicitMirror) : getGateMirrorPath(resolveProjectDir())),
     readStdin: readStdinSync,
     isStdinTTY: () => process.stdin.isTTY === true,
+    journalPath: () =>
+      path.join(process.env.MONET_STORAGE_DIR || path.join(os.homedir(), ".monet"), GATE_JOURNAL_FILENAME),
     setExitCode(code) {
       process.exitCode = code;
     },
@@ -728,21 +746,71 @@ export function resolveActionContextSource(
  * leans: fail OPEN, loudly, rather than crash or silently answer wrong (the boundary statement's
  * "never fail closed on an unknown", applied to this command's own defects too).
  */
+/**
+ * Records what this invocation actually did. Handed down into runGateUnguarded so that every one of
+ * its exits — the deliberate refusals as much as the verdicts — names its own outcome.
+ *
+ * §1: "every early return is an outcome, not an exemption from recording". A guard that declines to
+ * evaluate writes `declined: <reason>`. Had that line existed one layer up, monet-client#58's
+ * host rename would have surfaced as `declined: foreign-tool` on day one instead of by hand-probing
+ * months of silence.
+ */
+type GateJournalRecorder = (
+  disposition: GateJournalDisposition,
+  claimType: GateJournalClaimType,
+  extra?: Record<string, unknown>,
+) => void;
+
 export function runGate(
   positionalActionContext: string | undefined,
   options: GateCommandOptions,
   deps: GateCliDependencies = defaultGateCliDependencies(),
 ): void {
+  const journalPath = deps.journalPath();
+  // The parent interception, when a host hook spawned this process. Passed by ENV rather than a
+  // flag on purpose (see the wrapper's own comment): an older `monet` reached through the hook's
+  // PATH fallback would reject an unknown flag as a usage error and report a broken install, while
+  // an unknown env var has been ignored by every version there has ever been.
+  const parentId = deps.env.MONET_GATE_JOURNAL_PARENT ?? null;
+  // At the mouth — before the TTY guard, before stdin is read, before anything can refuse.
+  const handle = openGateJournalEvent(journalPath, {
+    mouth: "gate-cli",
+    parentId,
+    claimType: "source-observed",
+  });
+
+  // DEFAULTS TO A COMPLAINT, deliberately. If some path added later returns without recording, the
+  // journal says so in as many words rather than quietly attributing the wrong outcome to it — a
+  // record that guesses is worse than one that admits a gap, which is this whole design's thesis.
+  let disposition: GateJournalDisposition = "declined: unrecorded-exit";
+  let claimType: GateJournalClaimType = "unavailable";
+  let extra: Record<string, unknown> = {};
+  const record: GateJournalRecorder = (d, c, e) => {
+    disposition = d;
+    claimType = c;
+    extra = e ?? {};
+  };
+
   try {
-    runGateUnguarded(positionalActionContext, options, deps);
+    runGateUnguarded(positionalActionContext, options, deps, record);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`monet gate: internal error (${message}) — ${GATE_FAIL_OPEN_MARKER} (nothing blocked).`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
+    record("declined: internal-error", "unavailable", { error: message });
+  } finally {
+    // In a finally so that a throw this function did not anticipate still closes its own event.
+    // An arrival with no disposition would then mean what it should: the process died mid-evaluation.
+    closeGateJournalEvent(journalPath, handle, { mouth: "gate-cli", disposition, claimType, parentId, ...extra });
   }
 }
 
-function runGateUnguarded(positionalActionContext: string | undefined, options: GateCommandOptions, deps: GateCliDependencies): void {
+function runGateUnguarded(
+  positionalActionContext: string | undefined,
+  options: GateCommandOptions,
+  deps: GateCliDependencies,
+  record: GateJournalRecorder,
+): void {
   // NIT (round-5 coordinator review): refuse BEFORE resolveActionContextSource ever calls
   // deps.readStdin() — on a real TTY (nothing piped), that call blocks forever waiting for input
   // that will never arrive short of a manual Ctrl-D. A usage error is the honest answer; a hang
@@ -754,6 +822,7 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
         `echo "Bash:git push --force" | monet gate --stdin.`,
     );
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
+    record("declined: stdin-is-tty", "unavailable");
     return;
   }
 
@@ -770,6 +839,7 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
   if (source.kind === "usage-error") {
     console.error(`monet gate: ${source.message}`);
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
+    record("declined: no-action-context", "unavailable", { detail: source.message });
     return;
   }
   const rawContext = source.raw;
@@ -783,6 +853,7 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
   } catch (error) {
     console.error(`monet gate: ${(error as Error).message}`);
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
+    record("declined: unprefixed-context", "unavailable", { detail: (error as Error).message });
     return;
   }
   if (options.tool && parseActionContext(rawContext).tool !== null) {
@@ -810,6 +881,7 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
         `rule already delivers everywhere on its own, with no need to ask for it by this name.`,
     );
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
+    record("declined: wildcard-circle", "unavailable", clipActionContext(actionContext));
     return;
   }
 
@@ -857,6 +929,12 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
     );
     console.error(`monet gate: circle ${describeResolvedCircle(resolved, null)}`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
+    // THE EXIT CODE IS 0 — INDISTINGUISHABLE FROM SILENCE TO THE HOST, by the failure policy, and
+    // that stays true. The record is where the difference survives: no rule set was ever consulted,
+    // so nothing is known about whether this act is governed. "unavailable", never "silent".
+    record("declined: mirror-unreadable", "unavailable", {
+      ...clipActionContext(actionContext), circle: resolved.circle, mirrorPath, reason: read.kind,
+    });
     return;
   }
 
@@ -874,6 +952,7 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
       // and its thrown message is surfaced verbatim if it ever fires first.
       console.error(`monet gate: ${message}`);
       deps.setExitCode(USAGE_ERROR_EXIT_CODE);
+      record("declined: wildcard-circle", "unavailable", { ...clipActionContext(actionContext), detail: message });
       return;
     }
     // Structurally, assertQueryableCircle's `circle === '*'` check is the only throw this function
@@ -882,6 +961,9 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
     console.error(`monet gate: evaluation failed unexpectedly (${message}) — ${GATE_FAIL_OPEN_MARKER} (nothing blocked).`);
     console.error(`monet gate: circle ${describeResolvedCircle(resolved, read.mirror)}`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
+    record("declined: evaluation-failed", "unavailable", {
+      ...clipActionContext(actionContext), circle: resolved.circle, error: message,
+    });
     return;
   }
 
@@ -927,6 +1009,23 @@ function runGateUnguarded(positionalActionContext: string | undefined, options: 
       break;
   }
   deps.setExitCode(outcome.code);
+  // The verdict, and the rule ids that produced it — the field #62's "declared but never fired"
+  // query needs and that `gate_events` has never carried (it records rule_COUNT, not identity).
+  //
+  // claimType is `parsed`, NOT `source-observed`, and the distinction is the honest one: this
+  // command answers from a materialized mirror by construction (it must work with the store down),
+  // so every verdict it reports is true as of a frozen generation rather than as of the store. A
+  // later pass reading this stream can tell a live answer from a cached one without guessing, which
+  // is exactly what claim typing is for (§9.1).
+  record(gateJournalDisposition(result), result.source === "live" ? "source-observed" : "parsed", {
+    ...clipActionContext(actionContext),
+    circle: resolved.circle,
+    stageIds: result.stages.map((stage) => stage.id),
+    stageNames: result.stages.map((stage) => stage.name),
+    ruleIds: result.rules.map((rule) => rule.conceptId),
+    gateExitCode: outcome.code,
+    mirrorGeneratedAt: read.mirror.generatedAt,
+  });
 }
 
 export function registerGateCommands(

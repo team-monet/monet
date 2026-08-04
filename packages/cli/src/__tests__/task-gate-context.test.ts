@@ -39,7 +39,8 @@ function runHook(hookInput: unknown): string | null {
     execFileSync(process.execPath, [wrapperPath], {
       input: JSON.stringify(hookInput),
       encoding: "utf8",
-      env: { ...process.env, CAPTURE_PATH: capturePath },
+      // The real wrapper journals every arrival; keep fixture actions out of ~/.monet by default.
+      env: { ...process.env, CAPTURE_PATH: capturePath, MONET_STORAGE_DIR: dir },
     });
   } catch {
     // A non-zero exit is still a completed decision path for this test's purposes.
@@ -103,5 +104,61 @@ describe("Task action context", () => {
   it("stays silent for every surface outside the gated set", () => {
     expect(runHook({ tool_name: "Write", tool_input: { file_path: "/x", content: "y" } })).toBeNull();
     expect(runHook({ tool_name: "WebFetch", tool_input: { url: "https://example.com" } })).toBeNull();
+  });
+});
+
+/**
+ * The host's name for the delegation tool is a HOST VARIABLE (monet-client#58, 2026-08-03).
+ *
+ * THE REGRESSION THESE PIN: Claude Code renamed the tool to `Agent`. The guard spelled `"Task"`,
+ * so the wrapper returned before spawning the gate — and the delegation surface was
+ * invoked-but-inert for months while every observable stayed byte-identical to healthy silence.
+ * Measured against cc 2.1.220: the dispatched `tool_name` is `Agent`, and `tool_input` still
+ * carries `subagent_type` and `description`, so only the NAME moved.
+ *
+ * Nothing below asserts an `Agent:` context. That is the point: `Task:` is Monet's canonical
+ * spelling for this surface, and every already-declared pattern uses it — a wrapper that faithfully
+ * forwarded the host's new name would swap one silent-inert failure for another (gate spawns,
+ * matches nothing, looks exactly like healthy silence again).
+ */
+describe("delegation surface: the host's tool name is a variable", () => {
+  it("accepts the host's current name (Agent) and canonicalizes it to Task:", () => {
+    const ctx = runHook({
+      tool_name: "Agent",
+      tool_input: { subagent_type: "verifier", description: "check the migration path", prompt: "…a long brief…" },
+    });
+    expect(ctx).toBe("Task:verifier check the migration path");
+  });
+
+  it("still accepts the host's older name (Task), so a pinned older host keeps its gate", () => {
+    expect(runHook({ tool_name: "Task", tool_input: { subagent_type: "developer", description: "apply the fix" } }))
+      .toBe("Task:developer apply the fix");
+  });
+
+  it("never leaks the brief's prompt on the renamed tool either", () => {
+    const ctx = runHook({
+      tool_name: "Agent",
+      tool_input: { subagent_type: "developer", description: "apply the fix", prompt: "SECRET-CANARY-STRING" },
+    });
+    expect(ctx).not.toContain("SECRET-CANARY-STRING");
+  });
+
+  it("stays silent when the renamed tool carries neither usable field", () => {
+    expect(runHook({ tool_name: "Agent", tool_input: {} })).toBeNull();
+  });
+
+  // tool_name is untrusted host input reaching an object-literal lookup. A bare index would return
+  // a FUNCTION for these — truthy, so the guard would pass and the gate would be handed a context
+  // prefixed with a stringified function.
+  it("treats inherited Object.prototype keys as ungated, not as surfaces", () => {
+    expect(runHook({ tool_name: "constructor", tool_input: { command: "rm -rf /" } })).toBeNull();
+    expect(runHook({ tool_name: "toString", tool_input: { command: "rm -rf /" } })).toBeNull();
+    expect(runHook({ tool_name: "__proto__", tool_input: { command: "rm -rf /" } })).toBeNull();
+  });
+
+  it("stays silent when tool_name is not a string at all", () => {
+    expect(runHook({ tool_name: 42, tool_input: { command: "echo hi" } })).toBeNull();
+    expect(runHook({ tool_name: null, tool_input: { command: "echo hi" } })).toBeNull();
+    expect(runHook({ tool_input: { command: "echo hi" } })).toBeNull();
   });
 });

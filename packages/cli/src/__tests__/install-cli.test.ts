@@ -25,6 +25,12 @@ const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const CLI_ENTRY = join(REPO_ROOT, "src/cli.ts");
 const TSX_LOADER = join(REPO_ROOT, "node_modules/tsx/dist/loader.mjs");
 
+// Every test below that merely needs to FIND the groups this command writes follows the constant
+// rather than re-typing its values; the one test that pins the literal strings is the contract test
+// ("gates the Bash and delegation surfaces, and nothing else"). Re-typing them everywhere is how a
+// matcher change turns into a dozen unrelated-looking failures that get "fixed" by search-replace.
+const [BASH_MATCHER, DELEGATION_MATCHER] = GATED_TOOL_MATCHERS;
+
 /** Declaration-1-shaped fixture, matching gate-cli.test.ts's own — a global blocking deny. */
 async function buildFixtureMirror(mirrorPath: string, circle = "*"): Promise<void> {
   const core = new MonetCore(":memory:", { gateSidecarPath: mirrorPath, defaultCircle: "acme-widgets" });
@@ -91,39 +97,92 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     const handler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
     const result = upsertMonetGateHook({}, handler, wrapperPath);
     expect(result.hooks?.PreToolUse).toEqual([
-      { matcher: "Bash", hooks: [handler] },
-      { matcher: "Task", hooks: [handler] },
+      { matcher: BASH_MATCHER, hooks: [handler] },
+      { matcher: DELEGATION_MATCHER, hooks: [handler] },
     ]);
   });
 
   // The list is short on purpose (monet-client#56). Every other tool is post-cognition — the agent
-  // has already decided by the time the call is formed — and high-frequency; Task is in because a
-  // spawn creates the reasoner the rule governs.
-  it("upsertMonetGateHook: gates Bash and Task, and nothing else", () => {
-    expect([...GATED_TOOL_MATCHERS]).toEqual(["Bash", "Task"]);
+  // has already decided by the time the call is formed — and high-frequency; delegation is in
+  // because a spawn creates the reasoner the rule governs.
+  //
+  // The exact STRINGS are pinned here, not derived, so that changing them is a deliberate act with
+  // a test to update. Each is load-bearing and each was measured against cc 2.1.220 (see
+  // GATED_TOOL_MATCHERS' own comment): matchers are regexes; the delegation matcher must name
+  // `Agent` outright rather than trusting the host's `Task` alias to survive; both spellings must
+  // sit in ONE group, because two groups that both match fire both their handlers; and both are
+  // anchored so `Bash` cannot substring-match `BashOutput`.
+  it("upsertMonetGateHook: gates the Bash and delegation surfaces, and nothing else", () => {
+    expect([...GATED_TOOL_MATCHERS]).toEqual(["^Bash$", "^(Task|Agent)$"]);
+  });
+
+  /**
+   * THE UPGRADE PATH every already-installed machine takes, and the specific way it could go wrong.
+   *
+   * A pre-patch install left literal `Bash` and `Task` groups holding this command's handler. If
+   * re-installing merely ADDED the new groups, the stale `Task` group would keep its live handler
+   * alongside the new `^(Task|Agent)$` group — and since BOTH match an `Agent` dispatch (measured,
+   * cc 2.1.220), every delegation would spawn the gate twice, inject any advisory twice, and write
+   * two journal lines per deny. The strip-then-add order is what prevents that, so it is asserted
+   * rather than assumed: the old groups must be GONE, not merely joined.
+   */
+  it("upsertMonetGateHook: upgrading from the pre-patch literal `Bash`/`Task` groups leaves no stale group behind", () => {
+    const wrapperPath = "/x/.monet/gate-hook.mjs";
+    const installed: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
+    const settings: SettingsFile = {
+      hooks: { PreToolUse: [{ matcher: "Bash", hooks: [installed] }, { matcher: "Task", hooks: [installed] }] },
+    };
+    const result = upsertMonetGateHook(settings, installed, wrapperPath);
+    expect(result.hooks?.PreToolUse).toEqual([
+      { matcher: BASH_MATCHER, hooks: [installed] },
+      { matcher: DELEGATION_MATCHER, hooks: [installed] },
+    ]);
+    // Said twice on purpose: the assertion above already implies it, but THIS is the property that
+    // fails loudly if the strip step ever regresses to an additive upsert.
+    const matchers = (result.hooks?.PreToolUse ?? []).map((g) => g.matcher);
+    expect(matchers).not.toContain("Task");
+    expect(matchers).not.toContain("Bash");
+  });
+
+  // The same upgrade, but the user had their OWN handler sharing the old `Bash` group. Their group
+  // survives (it still holds their handler); only ours is stripped out of it. No monet handler is
+  // left in a group that would double-match, which is the property that actually matters.
+  it("upsertMonetGateHook: upgrading past a pre-patch group that ALSO held a foreign handler keeps theirs and moves only ours", () => {
+    const wrapperPath = "/x/.monet/gate-hook.mjs";
+    const installed: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
+    const foreign: HookHandler = { type: "command", command: "./their-own-check.sh" };
+    const settings: SettingsFile = {
+      hooks: { PreToolUse: [{ matcher: "Task", hooks: [foreign, installed] }] },
+    };
+    const result = upsertMonetGateHook(settings, installed, wrapperPath);
+    expect(result.hooks?.PreToolUse).toEqual([
+      { matcher: "Task", hooks: [foreign] }, // theirs, untouched, ours removed
+      { matcher: BASH_MATCHER, hooks: [installed] },
+      { matcher: DELEGATION_MATCHER, hooks: [installed] },
+    ]);
   });
 
   it("upsertMonetGateHook: reuses an existing Bash group, preserving any OTHER handler already in it", () => {
     const wrapperPath = "/x/.monet/gate-hook.mjs";
     const preexisting: HookHandler = { type: "command", command: "./unrelated-check.sh" };
-    const settings: SettingsFile = { hooks: { PreToolUse: [{ matcher: "Bash", hooks: [preexisting] }] } };
+    const settings: SettingsFile = { hooks: { PreToolUse: [{ matcher: BASH_MATCHER, hooks: [preexisting] }] } };
     const handler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath] };
     const result = upsertMonetGateHook(settings, handler, wrapperPath);
     expect(result.hooks?.PreToolUse).toEqual([
-      { matcher: "Bash", hooks: [preexisting, handler] },
-      { matcher: "Task", hooks: [handler] },
+      { matcher: BASH_MATCHER, hooks: [preexisting, handler] },
+      { matcher: DELEGATION_MATCHER, hooks: [handler] },
     ]);
   });
 
   it("upsertMonetGateHook: idempotent — updates its own prior entry in place, never duplicates", () => {
     const wrapperPath = "/x/.monet/gate-hook.mjs";
     const oldHandler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath, "--circle", "old-circle"] };
-    const settings: SettingsFile = { hooks: { PreToolUse: [{ matcher: "Bash", hooks: [oldHandler] }] } };
+    const settings: SettingsFile = { hooks: { PreToolUse: [{ matcher: BASH_MATCHER, hooks: [oldHandler] }] } };
     const newHandler: HookHandler = { type: "command", command: "/usr/bin/node", args: [wrapperPath, "--circle", "new-circle"] };
     const result = upsertMonetGateHook(settings, newHandler, wrapperPath);
     expect(result.hooks?.PreToolUse).toEqual([
-      { matcher: "Bash", hooks: [newHandler] },
-      { matcher: "Task", hooks: [newHandler] },
+      { matcher: BASH_MATCHER, hooks: [newHandler] },
+      { matcher: DELEGATION_MATCHER, hooks: [newHandler] },
     ]);
   });
 
@@ -140,8 +199,8 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     const result = upsertMonetGateHook(settings, handler, wrapperPath);
     expect(result.hooks?.PreToolUse).toEqual([
       { matcher: "Write|Edit", hooks: [{ type: "command", command: "./format-check.sh" }] },
-      { matcher: "Bash", hooks: [handler] },
-      { matcher: "Task", hooks: [handler] },
+      { matcher: BASH_MATCHER, hooks: [handler] },
+      { matcher: DELEGATION_MATCHER, hooks: [handler] },
     ]);
     expect((result.hooks as Record<string, unknown>).PostToolUse).toEqual(settings.hooks!.PostToolUse);
     expect(result.someOtherTopLevelKey).toBe("preserved verbatim");
@@ -153,7 +212,7 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     const settings: SettingsFile = {
       hooks: {
         PreToolUse: [
-          { matcher: "Bash", hooks: [oldHandler] },
+          { matcher: BASH_MATCHER, hooks: [oldHandler] },
           { matcher: "Write", hooks: [{ type: "command", command: "./other.sh" }] },
         ],
       },
@@ -179,7 +238,7 @@ describe("install-cli: settings.json shapes (pure, no fs)", () => {
     const result = upsertMonetGateHook(settings, handler, wrapperPath);
     const writeGroup = result.hooks?.PreToolUse?.find((g) => g.matcher === "Write");
     expect(writeGroup).toEqual({ matcher: "Write", hooks: [] }); // preserved exactly, not dropped
-    const bashGroup = result.hooks?.PreToolUse?.find((g) => g.matcher === "Bash");
+    const bashGroup = result.hooks?.PreToolUse?.find((g) => g.matcher === BASH_MATCHER);
     expect(bashGroup?.hooks).toEqual([handler]);
   });
 
@@ -208,12 +267,17 @@ describe("install-cli: buildWrapperScript", () => {
     expect(script).toContain('"/opt/monet/dist/cli.js"');
     expect(script).toContain('"gate", "--stdin"');
     // P1-3 (Codex round 3 on PR #42): --tool Bash is GONE — the wrapper now builds the fully
-    // prefixed context itself ("Bash:" + command) rather than relying on gate-cli's own --tool
-    // synthesis, which a prefix-grammar-shaped command could silently bypass. See main()'s own
-    // comment (right above `const actionContext = "Bash:" + command;`) for the full bypass this
-    // closes, and the dedicated P1-3 rehearsal test below for the actual exploit reproduced.
+    // prefixed context itself rather than relying on gate-cli's own --tool synthesis, which a
+    // prefix-grammar-shaped command could silently bypass. See main()'s own comment (right above
+    // `const actionContext = surface + ":" + command;`) for the full bypass this closes, and the
+    // dedicated P1-3 rehearsal test below for the actual exploit reproduced.
+    //
+    // CORRECTED (host-tool-name patch): this assertion used to read `"Bash:" + command`, which
+    // matched only the PROSE of the comment above that line — the code itself has never said that
+    // — so it would have kept passing through any rewrite of the expression it claims to pin.
+    // It now names the actual statement.
     expect(script).not.toContain('"--tool", "Bash"');
-    expect(script).toContain('"Bash:" + command');
+    expect(script).toContain('const actionContext = surface + ":" + command;');
     expect(script).toContain('"deny"');
     expect(script).toContain('"ask"');
     expect(script).toContain("additionalContext");
@@ -247,6 +311,21 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
+  // Every real wrapper journals before it decides; this helper owns the default storage isolation so
+  // a new rehearsal cannot silently append fixture actions to the developer's live ~/.monet journal.
+  function spawnWrapper(
+    wrapperPath: string,
+    args: string[],
+    dir: string,
+    options: Parameters<typeof spawnSync>[2] & { encoding?: BufferEncoding | "buffer" | null } = {},
+  ): ReturnType<typeof spawnSync> & { stdout: string; stderr: string } {
+    return spawnSync(process.execPath, [wrapperPath, ...args], {
+      encoding: "utf8",
+      ...options,
+      env: options.env ?? { ...process.env, MONET_STORAGE_DIR: dir },
+    }) as ReturnType<typeof spawnSync> & { stdout: string; stderr: string };
+  }
+
   function writeRealWrapper(dir: string): string {
     // The REAL monet invocation this repo's own tests use elsewhere (tsx against src/cli.ts) —
     // the actual command a hook would run, not a stand-in.
@@ -279,7 +358,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // very test appended one REAL line to ~/.monet/gate-denies.log on every suite run — found as
     // 13 synthetic lines in the live journal during the round-5 integration pass. The wrapper
     // resolves the journal at run time (env first, home fallback) precisely so tests can do this.
-    const result = spawnSync(process.execPath, [wrapperPath, "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("git push --force"),
       env: { ...process.env, MONET_STORAGE_DIR: dir },
@@ -313,7 +392,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     await buildFixtureMirror(mirrorPath);
     const wrapperPath = writeRealWrapper(dir);
 
-    const result = spawnSync(process.execPath, [wrapperPath, "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("git push --force"),
       env: { ...process.env, MONET_STORAGE_DIR: dir },
@@ -353,7 +432,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     await buildFixtureMirror(mirrorPath);
     const wrapperPath = writeRealWrapper(dir);
 
-    const result = spawnSync(process.execPath, [wrapperPath, "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("x: || true; git push --force"),
       env: { ...process.env, MONET_STORAGE_DIR: dir }, // a deny fires below — isolate the journal
@@ -374,7 +453,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     await buildFixtureMirror(mirrorPath);
     const wrapperPath = writeRealWrapper(dir);
 
-    const result = spawnSync(process.execPath, [wrapperPath, "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("git push --force-with-lease"),
     });
@@ -398,7 +477,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     core.close();
     const wrapperPath = writeRealWrapper(dir);
 
-    const result = spawnSync(process.execPath, [wrapperPath, "--circle", "acme-widgets", "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--circle", "acme-widgets", "--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("terraform apply"),
     });
@@ -422,7 +501,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     const wrapperPath = writeRealWrapper(dir);
 
     const over = "x".repeat(5 * 1024 * 1024);
-    const result = spawnSync(process.execPath, [wrapperPath, "--circle", "acme-widgets", "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--circle", "acme-widgets", "--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson(over),
     });
@@ -447,7 +526,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // "overflow-ask maps to..." test just above, where the envelope parses FINE and it is `monet
     // gate` itself (spawned successfully) that reports exit 40 for an over-threshold COMMAND.
     const over = "x".repeat(17 * 1024 * 1024);
-    const result = spawnSync(process.execPath, [wrapperPath, "--circle", "acme-widgets", "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--circle", "acme-widgets", "--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson(over),
     });
@@ -466,7 +545,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
   it("malformed hook input (not JSON) produces empty stdout and exit 0, never crashes", () => {
     const dir = mkTmp();
     const wrapperPath = writeRealWrapper(dir);
-    const result = spawnSync(process.execPath, [wrapperPath], { encoding: "utf8", input: "not json at all" });
+    const result = spawnWrapper(wrapperPath, [], dir, { encoding: "utf8", input: "not json at all" });
     expect(result.status).toBe(0);
     expect(result.stdout).toBe("");
   });
@@ -474,7 +553,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
   it("a non-Bash tool_name produces empty stdout and exit 0 (defense in depth — the settings matcher is already Bash-only)", () => {
     const dir = mkTmp();
     const wrapperPath = writeRealWrapper(dir);
-    const result = spawnSync(process.execPath, [wrapperPath], {
+    const result = spawnWrapper(wrapperPath, [], dir, {
       encoding: "utf8",
       input: JSON.stringify({ tool_name: "Read", tool_input: { file_path: "/tmp/x" } }),
     });
@@ -485,7 +564,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
   it("a Bash tool_input with no .command string produces empty stdout and exit 0", () => {
     const dir = mkTmp();
     const wrapperPath = writeRealWrapper(dir);
-    const result = spawnSync(process.execPath, [wrapperPath], {
+    const result = spawnWrapper(wrapperPath, [], dir, {
       encoding: "utf8",
       input: JSON.stringify({ tool_name: "Bash", tool_input: { not_command: "echo hi" } }),
     });
@@ -504,13 +583,13 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     const wrapperPath = join(dir, "gate-hook.mjs");
     writeFileSync(wrapperPath, script, { mode: 0o755 });
 
-    const result = spawnSync(process.execPath, [wrapperPath], {
+    const result = spawnWrapper(wrapperPath, [], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("echo hello"),
       // Strip PATH so the round-5 PATH-fallback (`spawnSync("monet", ...)`) ALSO fails to
       // resolve — proving this reaches emitSpawnFailureWarning rather than silently succeeding
       // via a real `monet` this test machine happens to have installed.
-      env: { ...process.env, PATH: join(dir, "empty-path-for-testing") },
+      env: { ...process.env, MONET_STORAGE_DIR: dir, PATH: join(dir, "empty-path-for-testing") },
     });
     expect(result.status).toBe(0); // still fail OPEN — never block because the HOOK is broken
     const output = JSON.parse(result.stdout) as {
@@ -541,10 +620,10 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     mkdirSync(stubBin, { recursive: true });
     writeFileSync(join(stubBin, "monet"), `#!/bin/sh\necho "monet source: unknown command 'gate'" >&2\nexit 1\n`, { mode: 0o755 });
 
-    const result = spawnSync(process.execPath, [wrapperPath], {
+    const result = spawnWrapper(wrapperPath, [], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("echo hello"),
-      env: { ...process.env, PATH: stubBin },
+      env: { ...process.env, MONET_STORAGE_DIR: dir, PATH: stubBin },
     });
     expect(result.status).toBe(0);
     const output = JSON.parse(result.stdout) as {
@@ -584,7 +663,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // journal write lands in this test's own tmp dir, never the real ~/.monet/gate-denies.log
     // (see this file's deny-journal test above for the established convention).
     const fakeHome = mkTmp();
-    const result = spawnSync(process.execPath, [wrapperPath], {
+    const result = spawnWrapper(wrapperPath, [], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("echo hello"),
       maxBuffer: 32 * 1024 * 1024, // this OUTER spawnSync (test harness → wrapper) also needs headroom
@@ -609,7 +688,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // run yet to materialize the mirror.
     const missingMirrorPath = join(dir, "never-materialized", "gate-mirror.json");
 
-    const result = spawnSync(process.execPath, [wrapperPath, "--mirror", missingMirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--mirror", missingMirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("echo hello"),
     });
@@ -643,7 +722,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     const directResult = spawnSync(
       process.execPath,
       ["--import", TSX_LOADER, "src/cli.ts", "gate", "Bash:echo hello, this matches no declared rule at all", "--mirror", mirrorPath],
-      { cwd: REPO_ROOT, encoding: "utf8" },
+      { cwd: REPO_ROOT, encoding: "utf8", env: { ...process.env, MONET_STORAGE_DIR: dir } },
     );
     expect(directResult.status).toBe(0);
     expect(directResult.stderr).toContain("circle");
@@ -654,7 +733,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // silent on stdout, exactly as before this fix (this fix only ADDS detection on the fail-open
     // path; it must not start emitting on the ordinary, nothing-to-report path).
     const wrapperPath = writeRealWrapper(dir);
-    const result = spawnSync(process.execPath, [wrapperPath, "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("echo hello, this matches no declared rule at all"),
     });
@@ -696,7 +775,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     const wrapperPath = writeRealWrapper(dir);
     const { MONET_STORAGE_DIR: _stripped, ...envWithoutStorageDir } = process.env;
 
-    const result = spawnSync(process.execPath, [wrapperPath, "--mirror", mirrorPath], {
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("git push --force"),
       env: { ...envWithoutStorageDir, HOME: fakeHome },
@@ -713,12 +792,230 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     expect(lines[0]).toContain("Never force-push to main");
 
     // A second deny appends a SECOND line — never overwrites.
-    spawnSync(process.execPath, [wrapperPath, "--mirror", mirrorPath], {
+    spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
       encoding: "utf8",
       input: claudeCodeHookJson("git push --force"),
       env: { ...envWithoutStorageDir, HOME: fakeHome },
     });
     expect(readFileSync(logPath, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  /**
+   * THE REGRESSION TEST FOR monet-client#58 — the whole chain, no stubs: a rule declared against a
+   * `Task:` pattern, dispatched under the host's CURRENT tool name (`Agent`), evaluated by the real
+   * `monet gate` against a real mirror.
+   *
+   * This is the test whose absence let the delegation surface sit invoked-but-inert for months. The
+   * unit-level context tests (task-gate-context.test.ts) pin the wrapper's canonicalization against
+   * a gate STUB; only this one proves the canonical spelling is the one the engine actually matches
+   * — which is the entire reason `Agent` maps to the surface named `Task` rather than to itself.
+   */
+  it("monet-client#58: a Task:-declared rule DENIES a delegation the host dispatches as `Agent`", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    const core = new MonetCore(":memory:", { gateSidecarPath: mirrorPath, defaultCircle: "acme-widgets" });
+    await core.declare({
+      species: "rule", stage: "worker delegation", patterns: ["Task:verifier"],
+      content: "Never delegate verification without naming the lens.",
+      severity: "blocking", scope: "domain",
+      reason: "an unlensed verification returns agreement, not proof",
+      circle: "*",
+    });
+    core.materializeGateMirror();
+    core.close();
+    const wrapperPath = writeRealWrapper(dir);
+
+    const dispatch = (toolName: string) => spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: JSON.stringify({
+        session_id: "s", transcript_path: "/tmp/t.jsonl", cwd: "/tmp", hook_event_name: "PreToolUse",
+        tool_name: toolName,
+        // Verbatim shape observed from cc 2.1.220: only the tool NAME moved in the rename.
+        tool_input: { subagent_type: "verifier", description: "confirm the fix", prompt: "…brief…", run_in_background: false },
+      }),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+
+    for (const hostToolName of ["Agent", "Task"]) {
+      const result = dispatch(hostToolName);
+      expect(result.status).toBe(0); // the wrapper always exits 0 — the decision rides the JSON
+      // BEFORE THE PATCH this stdout was EMPTY for "Agent" — byte-identical to "no rule governs
+      // this", which is exactly why nothing surfaced for months.
+      expect(result.stdout, `host tool name ${hostToolName} produced no decision`).not.toBe("");
+      const output = JSON.parse(result.stdout) as {
+        hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
+      };
+      expect(output.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
+        "an unlensed verification returns agreement, not proof",
+      );
+    }
+  });
+
+  /**
+   * THE GATE JOURNAL, END TO END — `normative-hierarchy-2026-08-03.md` §1/§5.
+   *
+   * Two mouths write one stream: the hook records what the HOOK did, the gate records what the GATE
+   * did. Neither is redundant, and that is the point — when they disagree, or when one exists
+   * without the other, THAT is the finding. Collapsing them into a single event would rebuild the
+   * "one observable for three states" defect this whole design exists to remove.
+   */
+  it("gate journal: an interception writes both mouths' events, correlated, with the rule ids that fired", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.status).toBe(0);
+
+    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
+      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const hook = lines.filter((l) => l.mouth === "host-hook");
+    const gate = lines.filter((l) => l.mouth === "gate-cli");
+    expect(hook).toHaveLength(2); // arrival + disposition
+    expect(gate).toHaveLength(2);
+
+    // The correlation: the gate the hook spawned names the hook's event as its parent. This is what
+    // makes "the hook arrived but the gate never evaluated" a query rather than an inference.
+    expect(gate[0].parentId).toBe(hook[0].id);
+    expect(gate[0].phase).toBe("arrival");
+    expect(gate[1].phase).toBe("disposition");
+
+    // Both agree on the verdict, from their own vantage points.
+    expect(hook[1].disposition).toBe("deny");
+    expect(gate[1].disposition).toBe("deny");
+    // Rule identity — the thing gate_events has never carried, and #62's whole query.
+    expect(Array.isArray(gate[1].ruleIds) && (gate[1].ruleIds as string[]).length).toBe(1);
+    // A mirror answer is true as of a frozen generation, not as of the store. Typed honestly.
+    expect(gate[1].claimType).toBe("parsed");
+    expect(hook[1].claimType).toBe("source-observed");
+  });
+
+  /**
+   * THE §0 EVENT, AND ITS ABSENCE OF A SIBLING.
+   *
+   * This is the exact incident the design is an answer to, now leaving a trace: a tool_name the
+   * guard does not recognize. The hook declines — correctly, it is not a gated surface — and the
+   * gate is never spawned. So the journal shows a hook event with `declined: foreign-tool` and NO
+   * gate-cli event at all, which is precisely the shape a months-dark surface would have had.
+   */
+  it("gate journal: a foreign tool_name is recorded as a decline, and the gate leaves no event because it never ran", () => {
+    const dir = mkTmp();
+    const wrapperPath = writeRealWrapper(dir);
+
+    const result = spawnWrapper(wrapperPath, [], dir, {
+      encoding: "utf8",
+      input: JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "SomeToolTheHostRenamed", tool_input: { command: "x" } }),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(""); // the agent-facing signal is unchanged: still silence
+
+    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
+      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(lines.filter((l) => l.mouth === "gate-cli")).toHaveLength(0); // never spawned
+    const hook = lines.filter((l) => l.mouth === "host-hook");
+    expect(hook).toHaveLength(2);
+    expect(hook[1].disposition).toBe("declined: foreign-tool");
+    // Recorded verbatim and unmapped: the question this answers months later is "what did the host
+    // actually call it", and any normalization here would destroy the only evidence of a rename.
+    expect(hook[1].hostToolName).toBe("SomeToolTheHostRenamed");
+  });
+
+  /**
+   * CODEX P2 ON PR #63, and it was right on both counts. Two ways this journal was quietly lying
+   * about the very ambiguity it exists to remove.
+   */
+  it("gate journal: an unrecognized gate exit code is declined, never written down as silence", () => {
+    const dir = mkTmp();
+    // A gate that exits 7 — not one of the five documented outcomes. The wrapper still fails open;
+    // what must change is that the RECORD stops claiming a healthy evaluation happened.
+    const stubPath = join(dir, "gate-7.cjs");
+    writeFileSync(stubPath, '#!/usr/bin/env node\nprocess.stdin.resume();process.stdin.on("end",()=>process.exit(7));\n');
+    const wrapperPath = join(dir, "gate-hook.mjs");
+    writeFileSync(wrapperPath, buildWrapperScript({ execPath: process.execPath, scriptPath: stubPath }), { mode: 0o755 });
+
+    const result = spawnSync(process.execPath, [wrapperPath], {
+      encoding: "utf8",
+      input: claudeCodeHookJson("echo hi"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.stdout).toBe(""); // fail-open is unchanged
+
+    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const disposition = lines[1]!;
+    expect(disposition.disposition).toBe("declined: gate-unknown-status");
+    expect(disposition.claimType).toBe("unavailable"); // never a verdict about an evaluation we did not see
+    expect(disposition.gateExitCode).toBe(7);
+  });
+
+  // The arrival must be on disk BEFORE stdin is read, not merely before it is parsed: reading is
+  // where a monster payload exhausts memory and where a stalled producer never sends EOF, and those
+  // are exactly the failures a two-phase journal exists to make visible.
+  it("gate journal: the arrival is written before stdin is read", () => {
+    const dir = mkTmp();
+    const wrapperPath = writeRealWrapper(dir);
+    spawnSync(process.execPath, [wrapperPath], {
+      encoding: "utf8",
+      input: claudeCodeHookJson("echo hi"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    // Filtered by mouth: the real gate this spawns journals into the SAME stream, so the raw line
+    // order interleaves two mouths' events.
+    const hook = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.mouth === "host-hook");
+    // Nothing about the payload can be on the arrival line, because nothing had been read yet.
+    expect(hook[0]!.phase).toBe("arrival");
+    expect(hook[0]!.stdinBytes).toBeUndefined();
+    // It lands on the disposition, where it is actually known.
+    expect(hook[1]!.stdinBytes).toBeGreaterThan(0);
+  });
+
+  // CODEX P2 ON PR #63: a MONET_STORAGE_DIR that does not exist yet made every append throw into a
+  // swallowing catch — silently, and precisely on a fresh install or a direct gate call before the
+  // store was initialised. The first invocations are the ones a record most needs to have. (Hit for
+  // real during development, which is how the swallow got noticed at all.)
+  it("gate journal: creates the configured storage directory rather than losing the first events", () => {
+    const dir = join(mkTmp(), "deep", "nested", "never-created");
+    const wrapperPath = writeRealWrapper(mkTmp());
+    spawnSync(process.execPath, [wrapperPath], {
+      encoding: "utf8",
+      input: claudeCodeHookJson("echo hi"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(existsSync(join(dir, "gate-journal.jsonl"))).toBe(true);
+  });
+
+  // Silence is still silence to the agent — and now it is an EVENT, so its absence means something.
+  it("gate journal: an ungoverned command produces no agent-facing signal and a full pair of events", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const wrapperPath = writeRealWrapper(dir);
+
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force-with-lease"), // deliberately NOT the denied pattern
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.stdout).toBe(""); // unchanged: nothing is delivered
+
+    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
+      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const hookDisposition = lines.filter((l) => l.mouth === "host-hook")[1];
+    const gateDisposition = lines.filter((l) => l.mouth === "gate-cli")[1];
+    expect(hookDisposition.disposition).toBe("silent");
+    expect(gateDisposition.disposition).toBe("silent");
+    expect(gateDisposition.ruleIds).toEqual([]);
   });
 });
 
@@ -835,7 +1132,7 @@ describe("install-cli: runInstall (real fs, isolated tmp dirs — never the real
 
     const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as SettingsFile;
     const groups = settings.hooks?.PreToolUse ?? [];
-    const bashGroup = groups.find((g) => g.matcher === "Bash")!;
+    const bashGroup = groups.find((g) => g.matcher === BASH_MATCHER)!;
     expect(bashGroup.hooks).toHaveLength(1); // updated, not duplicated
     expect(bashGroup.hooks[0].args).toContain("circle-two"); // the SECOND run's value won
     expect(bashGroup.hooks[0].args).not.toContain("circle-one");
@@ -853,13 +1150,13 @@ describe("install-cli: runInstall (real fs, isolated tmp dirs — never the real
     // substring match deleted exactly this.
     const foreignHandler = { type: "command", command: "/home/someone/my-own-scripts/gate-hook.mjs --verbose" };
     writeFileSync(settingsPath, JSON.stringify({
-      hooks: { PreToolUse: [{ matcher: "Bash", hooks: [foreignHandler] }] },
+      hooks: { PreToolUse: [{ matcher: BASH_MATCHER, hooks: [foreignHandler] }] },
     }));
 
     runInstall({}, fakeDeps({ homeDir: () => home, projectDir: () => project, deriveCircle: () => "acme-widgets" }));
 
     const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as SettingsFile;
-    const bashGroup = settings.hooks?.PreToolUse?.find((g) => g.matcher === "Bash");
+    const bashGroup = settings.hooks?.PreToolUse?.find((g) => g.matcher === BASH_MATCHER);
     expect(bashGroup?.hooks).toContainEqual(foreignHandler); // untouched, still present
     expect(bashGroup?.hooks).toHaveLength(2); // the foreign one PLUS the newly-installed one
   });
@@ -1338,7 +1635,7 @@ describe("install-cli: FIX 5 (Codex round 2 on PR #42) — atomic write-then-ren
     expect(statSync(settingsPath).mode & 0o777).toBe(0o600); // preserved, not widened
     // Content genuinely updated too — this isn't "the write silently no-op'd".
     const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as SettingsFile;
-    expect(settings.hooks?.PreToolUse?.some((g) => g.matcher === "Bash")).toBe(true);
+    expect(settings.hooks?.PreToolUse?.some((g) => g.matcher === BASH_MATCHER)).toBe(true);
   });
 
   it("P2-4: the WRAPPER's own mode (0755) is unaffected by mode preservation — it is FORCED, never preserved, since a caller passes an explicit mode", () => {
@@ -1384,7 +1681,7 @@ describe("install-cli: FIX 5 (Codex round 2 on PR #42) — atomic write-then-ren
     expect(realpathSync(settingsPath)).toBe(realpathSync(realSettingsPath));
     // The REAL file carries the new content (not a new plain file replacing the symlink).
     const settings = JSON.parse(readFileSync(realSettingsPath, "utf8")) as SettingsFile;
-    expect(settings.hooks?.PreToolUse?.some((g) => g.matcher === "Bash")).toBe(true);
+    expect(settings.hooks?.PreToolUse?.some((g) => g.matcher === BASH_MATCHER)).toBe(true);
     // The tmp file lived in the REAL file's own directory (dotfilesDir), never project/.claude —
     // no stray .tmp residue in either.
     expect(readdirSync(dotfilesDir).some((n) => n.endsWith(".tmp"))).toBe(false);
@@ -1424,7 +1721,7 @@ describe("install-cli: P2-6 (Codex round 3 on PR #42) — isMonetGateHandler bou
     const wrapperPath = join(home, ".monet", "gate-hook.mjs");
     const foreignHandler = { type: "command", command: `/usr/bin/node '${wrapperPath}.backup'` };
     writeFileSync(settingsPath, JSON.stringify({
-      hooks: { PreToolUse: [{ matcher: "Bash", hooks: [foreignHandler] }] },
+      hooks: { PreToolUse: [{ matcher: BASH_MATCHER, hooks: [foreignHandler] }] },
     }));
 
     runInstall({}, {
@@ -1435,7 +1732,7 @@ describe("install-cli: P2-6 (Codex round 3 on PR #42) — isMonetGateHandler bou
     });
 
     const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as SettingsFile;
-    const bashGroup = settings.hooks?.PreToolUse?.find((g) => g.matcher === "Bash");
+    const bashGroup = settings.hooks?.PreToolUse?.find((g) => g.matcher === BASH_MATCHER);
     expect(bashGroup?.hooks).toContainEqual(foreignHandler); // untouched, still present
     expect(bashGroup?.hooks).toHaveLength(2); // the foreign one PLUS the newly-installed one
   });
