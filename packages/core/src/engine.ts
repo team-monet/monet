@@ -88,6 +88,9 @@ import {
   type ResolutionNomination,
 } from "./resolution";
 export type { ResolutionMode } from "./resolution";
+import { RELIABLE_EMBED_TOKENS } from "./embed-budget";
+import { segmentObservation, segmentTokenBudget } from "./observation-segmenter";
+import { lexicalTokens } from "./lexical-overlap";
 import {
   inspectLiveEmbeddingPopulations,
   parseFiniteEmbeddingJson,
@@ -390,6 +393,38 @@ function firstBlockObservationId(pinId: string, summary: string): string {
  */
 export type EmbedderWindowSubject = "content" | "query";
 
+/**
+ * Share of a text's LETTERS that may sit outside Latin script before an English-only embedder
+ * refuses it (#155).
+ *
+ * MEASURED, NOT PICKED. On the live store, 65 of 1,791 observations contain some Hangul but only 22
+ * are more than 20% Hangul, and those 22 are wholly-Korean rules — genuine content, not a quotation.
+ * The band between is English prose quoting a Korean phrase, which must keep working: an English
+ * observation that cites what its author actually said is exactly the kind of evidence this store is
+ * for. So the line sits where the corpus itself separates "written in another script" from "mentions
+ * another script".
+ *
+ * Letters only. Punctuation, digits and the em-dashes and arrows this codebase writes in quantity are
+ * script-neutral and would otherwise dilute the ratio into uselessness on short text.
+ */
+export const NON_LATIN_LETTER_TOLERANCE = 0.2;
+
+/** Thrown when an English-only embedder is handed text it cannot read. */
+export class ContentScriptUnsupportedError extends Error {
+  constructor(
+    readonly nonLatinShare: number,
+    readonly subject: EmbedderWindowSubject,
+  ) {
+    super(
+      `${subject === "query" ? "This query" : "This content"} is ${(nonLatinShare * 100).toFixed(0)}% ` +
+        `non-Latin script; the embedding model reads only Latin script, so it would be stored and then ` +
+        `never found. Write it in English — and note the store is pinned to this model, so re-embedding ` +
+        `later cannot recover it.`,
+    );
+    this.name = "ContentScriptUnsupportedError";
+  }
+}
+
 export class ContentExceedsEmbedderWindowError extends Error {
   constructor(
     public readonly tokens: number,
@@ -426,16 +461,11 @@ export class ContentExceedsEmbedderWindowError extends Error {
 }
 
 /**
- * The size below which retrieval measures reliable on this store: unrelated pairs shorter than this
- * score 0.0% at or above tauAttach, while pairs three times longer cross it 93.3% of the time
- * (scripts/repros — the length-band table in docs/design/bounded-retrieval-unit.md).
- *
- * ADVISORY, never enforced. It is guidance in an error the caller is already reading, not a second
- * limit: rejecting at this number would refuse a large share of legitimate single-claim writes to
- * buy a quality gradient, and a refusal has its own cost. The enforced line stays at the window,
- * where the failure is irreversible data loss rather than degraded ranking.
+ * Re-exported from its own module so that `observation-segmenter.ts` — the place this number is
+ * actually ENFORCED — can read it without importing the engine. See `embed-budget.ts` for why the
+ * write boundary keeps it advisory and the segmenter does not.
  */
-export const RELIABLE_EMBED_TOKENS = 280;
+export { RELIABLE_EMBED_TOKENS };
 
 /**
  * Thrown by graftRows() when the exporting engine used a different embedding model than the
@@ -3085,6 +3115,58 @@ export class MonetCore {
         centroid_score REAL
       );
       CREATE INDEX IF NOT EXISTS idx_resolution_events_circle_ts ON resolution_events(circle, ts);
+
+      /*
+       * THE BOUNDED RETRIEVAL UNIT (#155, docs/design/bounded-retrieval-unit.md). The recall split
+       * moved ranking off concept centroids onto observations; this is the same defect one level
+       * down — an observation is too big to be a retrieval unit. A segment is a bounded span
+       * carrying a vector and nothing else: no provenance, no identity anything outside retrieval
+       * refers to. Delete every row here and the store is intact; only the index is gone.
+       *
+       * NO LIFECYCLE COLUMN, DELIBERATELY. Ranking excludes an observation unless
+       * superseded_by IS NULL AND superseded_at IS NULL, and a segment layer carrying its own
+       * liveness could be live while its observation is not — a second truth about what exists. The
+       * scorer JOINs observations and applies that one predicate in that one place, so a new
+       * retirement path cannot forget to update a mirror that does not exist.
+       *
+       * NATIVE ONLY. Rows here cover kind != 'source' observations, mirroring the predicate
+       * scoreNativeConceptsByObservation already applies. Source concepts keep source_chunks and
+       * scoreSourceConcepts unchanged, which is what keeps authorizedSourceProjections out of this
+       * path entirely: a UNIFIED layer that ranked everything and deduped afterwards could disclose
+       * ACL-denied or staged-but-unpublished source evidence, and a native-only one cannot reach it.
+       *
+       * (observation_id, segment_index) is the PRIMARY KEY rather than a surrogate id because the
+       * unit of replacement is the OBSERVATION: writing segments deletes that observation's rows and
+       * inserts the new set in one transaction, so a rerun replaces rather than appends and an
+       * interrupted backfill leaves each observation either fully re-segmented or untouched.
+       */
+      CREATE TABLE IF NOT EXISTS observation_segments (
+        observation_id TEXT NOT NULL,
+        segment_index INTEGER NOT NULL CHECK (segment_index >= 1),
+        content TEXT NOT NULL,
+        embedding TEXT NOT NULL,
+        PRIMARY KEY (observation_id, segment_index)
+      );
+
+      /*
+       * THE LEXICAL ARM's posting list (#155, src/lexical-overlap.ts explains why a second signal
+       * exists at all). One row per (observation, distinct token), so scoring an incoming text costs
+       * an index seek per probe token instead of a scan over every candidate concept's content.
+       *
+       * Like observation_segments this is a DERIVED index with no lifecycle of its own: liveness is
+       * inherited by joining observations, and deleting every row costs recall quality and nothing
+       * else. It is maintained by the same replace-per-observation protocol, in the same transaction,
+       * so the two indexes can never disagree about which observations they cover.
+       *
+       * The token index is on (token) rather than (observation_id) because every read is
+       * "which observations contain this token" — the reverse of how the rows are written.
+       */
+      CREATE TABLE IF NOT EXISTS observation_tokens (
+        observation_id TEXT NOT NULL,
+        token TEXT NOT NULL,
+        PRIMARY KEY (observation_id, token)
+      );
+      CREATE INDEX IF NOT EXISTS idx_observation_tokens_token ON observation_tokens(token);
     `);
     // Embedder pin columns (embedder-pin ADR, slice 1) — guarded here in init(), NOT in migrate()
     // (Codex review, PR #51 round 6, FIX T): a v8-era store whose sync_meta TABLE already exists
@@ -3965,6 +4047,24 @@ export class MonetCore {
    * write differently, so its budget belongs in the chunker that produces it, not in a refusal
    * handed to a connector with no author to relay it to.
    */
+  /**
+   * Refuse text an English-only embedder cannot read (#155). Sits beside the window guard because it
+   * is the same class of failure — a write that succeeds and is then invisible to search — and the
+   * same layering applies: the MCP boundary refuses before any store read, and this refuses for
+   * non-MCP callers.
+   *
+   * A provider that does not declare `readsOnlyLatinScript` is not gated at all. Never guess a
+   * restriction a provider did not state.
+   */
+  assertEmbedderReadsScript(content: string, subject: EmbedderWindowSubject = "content"): void {
+    if (this.embedder.readsOnlyLatinScript !== true) return;
+    const letters = content.match(/\p{L}/gu);
+    if (letters === null || letters.length === 0) return; // digits and punctuation are script-neutral
+    const nonLatin = letters.filter((ch) => !/\p{Script=Latin}/u.test(ch)).length;
+    const share = nonLatin / letters.length;
+    if (share > NON_LATIN_LETTER_TOLERANCE) throw new ContentScriptUnsupportedError(share, subject);
+  }
+
   async assertWithinEmbedderWindow(content: string, subject: EmbedderWindowSubject = "content"): Promise<void> {
     const window = this.embedder.inputWindow?.bind(this.embedder);
     const count = this.embedder.countTokens?.bind(this.embedder);
@@ -4071,12 +4171,26 @@ export class MonetCore {
     // branch, which returns before this line, so a chunk materialized from a file is never refused
     // (its budget belongs in the chunker). Below it: the embed this guard exists to keep from
     // producing a vector that silently omits half its input.
+    this.assertEmbedderReadsScript(content);
     await this.assertWithinEmbedderWindow(content);
 
     // Two phase write: async embedding first, then durable space validation and mutation under one
     // BEGIN IMMEDIATE transaction. Never hold SQLite's write reservation across await.
     const emb = await this.checkedEmbed(content, "native");
     this.assertNoEmbedderMigrationReentry("store semantic data");
+
+    /*
+     * SEGMENTS ARE PREPARED HERE, IN THE ASYNC PHASE, AND WRITTEN INSIDE THE TRANSACTION BELOW
+     * (#155). Every accepted write creates its segments in the same transaction as the observation:
+     * if only the backfill produced them, a write landing after the backfill would be acknowledged
+     * and fetchable while search could not see it — this layer's own failure mode, reintroduced by
+     * its own fix. An observation is never durably present without its segments.
+     *
+     * Source-kind rows are excluded: they keep `source_chunks` and scoreSourceConcepts, which is
+     * what keeps authorizedSourceProjections out of this path. The check is on the effective kind
+     * rather than on which branch reached here, so it holds however the caller arrived.
+     */
+    const segments = (opts.kind ?? "statement") === "source" ? null : await this.prepareObservationSegments(content, emb);
 
     const obsId = this.newId();
     // OUTSIDE the transaction: session row is an audit trail; must survive a rolled-back store.
@@ -4142,7 +4256,7 @@ export class MonetCore {
       // 2,500 observations, running it unconditionally made attachTo writes ~2.4x slower.
       const nomination = opts.attachTo || opts.resolution === "forceNew"
         ? null
-        : this.nominateByObservation(candidates, emb);
+        : this.nominateByObservation(candidates, emb, content);
       // Keep the documented epoch-ms `since` contract even when this instance reuses a session
       // after a long idle. In logical maintenance mode this is still only a persisted +1.
       this.nextSyncTimestamp();
@@ -4170,6 +4284,7 @@ export class MonetCore {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(obsId, content, embToJson(emb), opts.kind ?? "statement", circle, sessionId, this.agentId, refsJson);
+      if (segments !== null) this.writeObservationSegments(obsId, content, segments);
 
       let action: IngestAction;
       let row: ConceptRow;
@@ -4632,6 +4747,7 @@ export class MonetCore {
     // long is usually several questions, and asking them separately is the better search anyway.
     await this.assertWithinEmbedderWindow(query, "query");
     const limit = opts.limit ?? 5;
+    this.assertEmbedderReadsScript(query, "query");
     const emb = await this.checkedEmbed(query, "native");
     return this.db.transaction((): SearchCard[] => {
     this.assertReadSpaceSatisfied(emb.length);
@@ -4673,17 +4789,23 @@ export class MonetCore {
     //
     // Source rows are NOT floored: #54's file/chunk semantics are untouched by this slice, so a
     // junk query can still return a low-cosine source card while every native row stays silent.
-    const nativeMatches = this.scoreNativeConcepts(nativeRows.map((r) => r.id), emb);
+    const nativeMatches = this.scoreNativeConcepts(nativeRows.map((r) => r.id), emb, query);
     return rows
       .map((r) => {
-        if (r.kind === "source") return { row: r, score: sourceScores.get(r.id)!, matchedObservationId: undefined };
+        // The floor and the card both read the RAW cosine; only the ordering reads `rank`, which is
+        // that cosine re-ordered by the lexical arm. A source row has no lexical arm, so it ranks on
+        // its own score and #54's semantics are untouched.
+        if (r.kind === "source") {
+          const s = sourceScores.get(r.id)!;
+          return { row: r, score: s, rank: s, matchedObservationId: undefined };
+        }
         const match = nativeMatches.get(r.id);
         if (match === undefined || match.score < NATIVE_SCORE_FLOOR) return null;
-        return { row: r, score: match.score, matchedObservationId: match.observationId };
+        return { row: r, score: match.score, rank: match.rank, matchedObservationId: match.observationId };
       })
-      .filter((c): c is { row: ConceptRow; score: number; matchedObservationId: string | undefined } => c !== null)
+      .filter((c): c is { row: ConceptRow; score: number; rank: number; matchedObservationId: string | undefined } => c !== null)
       .sort((a, b) => {
-        const diff = b.score - a.score;
+        const diff = b.rank - a.rank;
         if (Math.abs(diff) > 1e-9) return diff;
         // Tie-break in store-wide mode: same-circle-as-defaultCircle first, then id ascending.
         if (resolvedCircle === undefined) {
@@ -8398,8 +8520,8 @@ export class MonetCore {
    * vector, or every observation below NATIVE_SCORE_FLOOR) do not rank densely at all; there is
    * deliberately NO centroid fallback.
    */
-  private scoreNativeConcepts(conceptIds: readonly string[], emb: Float32Array): Map<string, NativeObservationMatch> {
-    return scoreNativeConceptsByObservation(this.db, conceptIds, emb);
+  private scoreNativeConcepts(conceptIds: readonly string[], emb: Float32Array, text: string): Map<string, NativeObservationMatch> {
+    return scoreNativeConceptsByObservation(this.db, conceptIds, emb, text, this.embedder.needsLexicalArm === true);
   }
 
   createSource(input: CreateSourceInput): KnowledgeSource {
@@ -8913,6 +9035,126 @@ export class MonetCore {
       const output: unknown = await this.embedder.embed(text);
       return validateEmbeddingProviderOutput(this.embedder, output, population);
     });
+  }
+
+  /**
+   * THE SEGMENT WRITE PROTOCOL, half one: segment and embed, OUTSIDE any transaction (#155).
+   *
+   * Split in two because the observation INSERT runs inside a SYNCHRONOUS better-sqlite3
+   * transaction and embedding is async — the vectors must exist before the transaction opens, which
+   * is the same shape the observation's own vector already uses. Half two (writeObservationSegments)
+   * is pure SQL and runs inside it.
+   *
+   * Embedding goes through checkedEmbed like every other served embed, so segments cannot become a
+   * side door around the pin guard and the migration-reentry check. Population is "native": this
+   * layer covers `kind != 'source'` rows only.
+   *
+   * An unbounded provider (the lexical embedder declares no window) yields exactly one segment whose
+   * text is the whole observation, so such a store's vectors are unchanged by this layer.
+   */
+  private async prepareObservationSegments(
+    content: string,
+    contentEmbedding: Float32Array,
+  ): Promise<Array<{ content: string; embedding: string }>> {
+    const budget = await segmentTokenBudget(this.embedder);
+    const segments = await segmentObservation(content, budget, this.embedder);
+    /*
+     * THE WHOLE-OBSERVATION CASE COSTS NOTHING. When segmentation returns the observation verbatim —
+     * an unbounded provider (the lexical embedder declares no window), or any observation already
+     * inside the budget — its single segment vector is BY DEFINITION the vector just computed for
+     * the observation itself. Re-embedding it would double every write's embedding cost and make the
+     * provider observably busier, which is a contract several callers rely on. Equality is checked
+     * against the raw content, not a trimmed copy, so a whitespace difference can never make these
+     * two vectors silently disagree.
+     */
+    if (segments.length === 1 && segments[0] === content) {
+      return [{ content, embedding: embToJson(contentEmbedding) }];
+    }
+    const prepared: Array<{ content: string; embedding: string }> = [];
+    for (const segment of segments) {
+      prepared.push({ content: segment, embedding: embToJson(await this.checkedEmbed(segment, "native")) });
+    }
+    return prepared;
+  }
+
+  /**
+   * THE SEGMENT WRITE PROTOCOL, half two: replace this observation's segments, inside the caller's
+   * transaction (#155).
+   *
+   * IDEMPOTENT BY PROTOCOL, NOT BY DETERMINISM. Stable input does make segmentation deterministic,
+   * but that alone would not stop a rerun from appending a second copy of every row. The unit of
+   * replacement is the OBSERVATION: delete its segments, insert the new set, one transaction. A
+   * rerun therefore grows nothing, and an interrupted backfill leaves each observation either fully
+   * re-segmented or untouched rather than half-indexed.
+   *
+   * One protocol, two callers — the write path and the backfill both come through here, so neither
+   * can invent a different notion of "current".
+   */
+  private writeObservationSegments(
+    observationId: string,
+    content: string,
+    prepared: ReadonlyArray<{ content: string; embedding: string }>,
+  ): void {
+    this.db.prepare(`DELETE FROM observation_segments WHERE observation_id = ?`).run(observationId);
+    const insert = this.db.prepare(
+      `INSERT INTO observation_segments (observation_id, segment_index, content, embedding) VALUES (?, ?, ?, ?)`,
+    );
+    for (const [i, segment] of prepared.entries()) insert.run(observationId, i + 1, segment.content, segment.embedding);
+
+    /*
+     * The lexical posting list is replaced in the SAME transaction as the segments, from the SAME
+     * observation text. Splitting them into two protocols would let one index cover an observation
+     * the other does not, and the scorer reads both — a candidate present in one and absent from the
+     * other would be scored on half a signal without anything saying so.
+     *
+     * Tokens come from the whole observation rather than per segment: a segment boundary is an
+     * artifact of the embedder's window, and a term should not stop matching because it happened to
+     * fall either side of one.
+     */
+    this.db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(observationId);
+    const insertToken = this.db.prepare(`INSERT INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
+    for (const token of lexicalTokens(content)) insertToken.run(observationId, token);
+  }
+
+  /**
+   * BACKFILL — the third caller of the segment write protocol (#155), after the write path and the
+   * embedder migration's drop.
+   *
+   * Walks live native observations and re-segments each one. Retroactive by design: two months of
+   * stored memory becomes findable at the granularity the model can actually read, not just what is
+   * written from now on.
+   *
+   * ONE TRANSACTION PER OBSERVATION, never one across the walk. Segmentation embeds, embedding is
+   * async, and SQLite's write reservation must never be held across an await — the same two-phase
+   * shape storeInternal uses. It also gives the protocol's idempotency its teeth: an interrupted run
+   * leaves each observation either fully re-segmented or untouched, and a rerun replaces rather than
+   * appends, so this is safe to run repeatedly and safe to run again after an embedder migration.
+   *
+   * Source observations are excluded, matching the layer's native-only scope.
+   */
+  async resegmentObservations(
+    opts: { circle?: string; onProgress?: (done: number, total: number) => void } = {},
+  ): Promise<{ observations: number; segments: number }> {
+    this.assertPinSatisfied();
+    const rows = this.db
+      .prepare(
+        `SELECT o.id AS id, o.content AS content
+           FROM observations o JOIN concepts c ON c.id = o.concept_id
+          WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
+            AND o.kind != 'source' AND c.kind != 'source'
+            ${opts.circle ? "AND c.circle = ?" : ""}
+          ORDER BY o.id`,
+      )
+      .all(...(opts.circle ? [opts.circle] : [])) as Array<{ id: string; content: string }>;
+
+    let segments = 0;
+    for (const [i, row] of rows.entries()) {
+      const prepared = await this.prepareObservationSegments(row.content, await this.checkedEmbed(row.content, "native"));
+      this.db.transaction((): void => this.writeObservationSegments(row.id, row.content, prepared))();
+      segments += prepared.length;
+      opts.onProgress?.(i + 1, rows.length);
+    }
+    return { observations: rows.length, segments };
   }
 
   // ---- embedder pin (embedder-pin ADR, slice 1) ----------------------------
@@ -9677,6 +9919,21 @@ export class MonetCore {
       }
       for (const row of prepared) {
         this.db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(embToJson(row.embedding), row.id);
+        /*
+         * DROP THIS OBSERVATION'S SEGMENTS (#155). Segments are vectors that scoring reads, so they
+         * fall under the ratified invariant "migration coverage = ALL vectors that scoring reads" —
+         * leaving them would put two embedding spaces in one comparison, which is precisely what the
+         * invariant exists to prevent.
+         *
+         * Dropped rather than re-embedded here because re-embedding is async and this runs inside a
+         * synchronous transaction. Dropping is safe by construction: scoreNativeConceptsByObservation
+         * falls back to the observation's own vector when it has no segments, and that vector was
+         * just rewritten into the NEW space one line above. So retrieval stays correct and in one
+         * space, and only its granularity reverts to pre-#155 until the segment backfill is re-run —
+         * which is idempotent by protocol and safe to run at any time after a migration.
+         */
+        this.db.prepare(`DELETE FROM observation_segments WHERE observation_id = ?`).run(row.id);
+        this.db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(row.id);
       }
       if (prepared.length > 0) this.markEmbedderMigrationVectorsRewritten();
     })();
@@ -14216,6 +14473,19 @@ export class MonetCore {
             row.superseded_at ?? null, row.session_id ?? null, row.author_agent_id, row.source_refs ?? null,
             row.created_at, relayAt, revision, writer,
           );
+        /*
+         * THE LEXICAL POSTING LIST FOLLOWS A GRAFTED OBSERVATION (Codex P2, PR #156). Dense scoring
+         * has a fallback for a row with no segments — it reads the observation's own vector — but the
+         * lexical arm reads `observation_tokens` and nothing else, so a synced memory would silently
+         * arrive without the boost and stay that way until someone reran a backfill on every
+         * receiver. Tokens need no embedding, so unlike segments they can be written right here in
+         * the sync transaction. Segments cannot, and remain the backfill's job.
+         */
+        if (r.changes > 0 && row.kind !== "source") {
+          this.db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(row.id);
+          const insertToken = this.db.prepare(`INSERT INTO observation_tokens (observation_id, token) VALUES (?, ?)`);
+          for (const token of lexicalTokens(row.content)) insertToken.run(row.id, token);
+        }
         const winning = this.db.prepare(
           `SELECT concept_id, circle FROM observations WHERE id = ?`,
         ).get(row.id) as { concept_id: string | null; circle: string } | undefined;
@@ -16298,14 +16568,20 @@ export class MonetCore {
    * Ties break on the lexicographically smaller concept id (the codebase's determinism convention —
    * rankByCentroid above, and the observation-level tie-break inside the scorer itself).
    */
-  private nominateByObservation(candidates: readonly ConceptRow[], emb: Float32Array): ResolutionNomination | null {
+  private nominateByObservation(candidates: readonly ConceptRow[], emb: Float32Array, text: string): ResolutionNomination | null {
     if (candidates.length === 0) return null;
-    const scored = scoreNativeConceptsByObservation(this.db, candidates.map((c) => c.id), emb);
+    const scored = scoreNativeConceptsByObservation(this.db, candidates.map((c) => c.id), emb, text, this.embedder.needsLexicalArm === true);
     let best: ResolutionNomination | null = null;
+    let bestRank = -Infinity;
     for (const candidate of candidates) {
       const match = scored.get(candidate.id);
       if (match === undefined) continue;
-      if (best !== null && (match.score < best.obsScore || (match.score === best.obsScore && candidate.id > best.conceptId))) continue;
+      // WHICH concept wins is decided on `rank` — cosine re-ordered by the lexical arm, the thing
+      // that measurement showed picks the right concept 46.3% -> 59.1% of the time. WHAT the
+      // decision then reads is `score`, the raw cosine, because tauAttach/tauAmbiguous are
+      // calibrated against cosine and nothing measured says where they belong under a blend.
+      if (best !== null && (match.rank < bestRank || (match.rank === bestRank && candidate.id > best.conceptId))) continue;
+      bestRank = match.rank;
       best = {
         conceptId: candidate.id,
         obsScore: match.score,
@@ -17220,6 +17496,7 @@ export class MonetCore {
     const resolvedCircle = opts.circle !== undefined ? this.resolveCircle(opts.circle) : undefined;
 
     await this.assertWithinEmbedderWindow(intent, "query"); // #137 — see search() for why refusing beats truncating
+    this.assertEmbedderReadsScript(intent, "query");
     const emb = await this.checkedEmbed(intent, "native");
     return this.db.transaction((): GatherResult => {
     this.assertReadSpaceSatisfied(emb.length);
@@ -17287,7 +17564,7 @@ export class MonetCore {
     //      Keeping it in `sim` at its true low cosine is what actually ranks it low.
     //   2. gather's junk-query silence is STRUCTURAL, not floor-derived: an intent that seeds
     //      nothing returns early on `seedStrength.size === 0` below.
-    const dense = this.scoreAllConcepts(emb, resolvedCircle, opts.includeArchived); // [{id, cos, observationId}] desc
+    const dense = this.scoreAllConcepts(emb, intent, resolvedCircle, opts.includeArchived); // [{id, cos, observationId}] desc
     const sim = new Map<string, number>();
     // matchedObservationById: which observation earned each dense score — carried onto RANKED
     // cards only (the id only, never its content). A concept that entered via the lexical,
@@ -17429,8 +17706,8 @@ export class MonetCore {
    * Ranked desc; ties break by id ascending (determinism is a hard contract).
    */
   private scoreAllConcepts(
-    emb: Float32Array, circle?: string, includeArchived?: boolean,
-  ): Array<{ id: string; cos: number; observationId: string }> {
+    emb: Float32Array, text: string, circle?: string, includeArchived?: boolean,
+  ): Array<{ id: string; cos: number; rank: number; observationId: string }> {
     const rows: Array<{ id: string }> = circle !== undefined
       ? this.db
           .prepare(`SELECT id FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
@@ -17446,13 +17723,17 @@ export class MonetCore {
                WHERE c.kind NOT IN ('workstream', 'source') AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND c.status != 'retired' AND ca.from_name IS NULL`,
             )
             .all() as Array<{ id: string }>;
-    const matches = this.scoreNativeConcepts(rows.map((r) => r.id), emb);
-    const scored: Array<{ id: string; cos: number; observationId: string }> = [];
+    const matches = this.scoreNativeConcepts(rows.map((r) => r.id), emb, text);
+    // ORDER on rank (cosine re-ordered by the lexical arm), REPORT cos as the raw cosine: `cos`
+    // becomes gather's `sim`, which fuse() weighs against graph activation on a cosine scale.
+    const scored: Array<{ id: string; cos: number; rank: number; observationId: string }> = [];
     for (const r of rows) {
       const match = matches.get(r.id);
-      if (match !== undefined) scored.push({ id: r.id, cos: match.score, observationId: match.observationId });
+      if (match !== undefined) scored.push({ id: r.id, cos: match.score, rank: match.rank, observationId: match.observationId });
     }
-    return scored.sort((a, b) => b.cos - a.cos || (a.id < b.id ? -1 : 1));
+    // Ordered on rank; identical to ordering on cos whenever the lexical arm is off, since rank is
+    // then a copy of it. That is what keeps a lexical-embedder store byte-identical to pre-#155.
+    return scored.sort((a, b) => b.rank - a.rank || (a.id < b.id ? -1 : 1));
   }
 
   /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). When `circle` is omitted, seeds from all circles. Archived circles excluded by default. */
@@ -17726,6 +18007,10 @@ export class MonetCore {
     // actually rewrites this content (a real edit, or a classification-affecting version bump).
     let rawChunkEmbedding: unknown;
     try {
+      // Codex P2 (PR #156): the source branch returns before storeInternal's script guard, so without
+      // this a Latin-only provider would embed a non-Latin chunk into an arbitrary direction and write
+      // it — the same silent hole the gate exists to close, on the one path that skipped it.
+      this.assertEmbedderReadsScript(content);
       rawChunkEmbedding = await this.embedder.embed(contextualizeSourceChunk(content, opts.headingPath, opts.fileTitle));
     } catch (error) {
       console.error(

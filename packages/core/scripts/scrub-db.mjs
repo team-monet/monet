@@ -894,6 +894,30 @@ function scrubConceptsAndObservations(db) {
   });
   scrubConceptsTx(conceptRows);
 
+  /*
+      * observation_tokens is dropped for the same reason and by the same argument: its token column is
+   * a decomposition of the very text being scrubbed, and it is a derived index that costs nothing but
+   * recall quality to rebuild.
+   *
+   * observation_segments is DROPPED WHOLESALE, not scrubbed (#155). Its `content` column is a
+   * verbatim copy of slices of observations.content, so leaving it would republish every string the
+   * scrub below removes — the exact raw-byte violation the closure test exists to catch.
+   *
+   * Deleting rather than scrubbing is correct because a segment is a derived retrieval index with no
+   * provenance and no identity anything outside ranking refers to: delete every row and the store is
+   * intact, only the index is gone. Scrubbing the text instead would preserve an index over strings
+   * that no longer exist anywhere else in the file, which is worse than having no index at all — and
+   * a published corpus can be re-segmented from its scrubbed observations whenever one is wanted,
+   * because the write protocol is idempotent by replacement.
+   */
+  // GUARDED (Codex P2, PR #156): scrubSizeDb copies a file and opens it directly, without running
+  // MonetCore.init(), so a snapshot taken before #155 has neither table and an unconditional DELETE
+  // aborts the whole scrub. Older corpora must stay scrubbable.
+  const hasTable = (name) =>
+    db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !== undefined;
+  if (hasTable("observation_segments")) db.exec(`DELETE FROM observation_segments`);
+  if (hasTable("observation_tokens")) db.exec(`DELETE FROM observation_tokens`);
+
   const obsRows = db.prepare(`SELECT id, content, kind, source_refs, author_agent_id, circle FROM observations ORDER BY id`).all();
   assertScopeAlreadyApplied(obsRows, db.name, "observations");
   const updateObs = db.prepare(`UPDATE observations SET content = ?, kind = ?, source_refs = ?, author_agent_id = ? WHERE id = ?`);

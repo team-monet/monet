@@ -28,6 +28,7 @@
  * and reads `concepts.embedding` exactly as before.
  */
 import { cosine, isZeroVector, jsonToEmb } from "./embedding";
+import { blendLexical, lexicalOverlap, lexicalTokens, tokenIdf } from "./lexical-overlap";
 import type { StoragePort } from "./storage";
 
 /**
@@ -88,6 +89,26 @@ export interface ScorableConceptRow {
 
 /** How a native concept earned its query score: the value, and the observation that produced it. */
 export interface NativeObservationMatch {
+  /**
+   * THE RANKING KEY, and the only thing the lexical arm moves (#155).
+   *
+   * `score` above is the raw cosine and stays the raw cosine, because it is what tauAttach/
+   * tauAmbiguous and NATIVE_SCORE_FLOOR are compared against. The lexical measurement justified
+   * re-ORDERING candidates — argmax accuracy 46.3% -> 67.1% — and said nothing whatever about where
+   * a band boundary belongs. Letting the blend inflate `score` would have silently loosened every
+   * threshold that reads it by up to the boost factor, which is a threshold change with no evidence
+   * behind it and exactly the carry-a-constant-across-a-scale-change mistake this issue documents.
+   *
+   * So: argmax on `rank`; compare `score`. Equal to `score` when no lexical evidence applies.
+   *
+   * BOTH ARMS READ `rank`, and whether the lexical component contributes at all is a property of the
+   * EMBEDDER (EmbeddingProvider.needsLexicalArm). With it off, `rank` is a copy of `score`, so a
+   * lexical-embedder store ranks exactly as it did before #155 — which is why the eval gates that
+   * run on HashingEmbeddingProvider stay byte-identical while the shipping semantic model gets the
+   * arm. Measured on the live corpus: read-side R rises 33.6% -> 56.0% on short queries and
+   * 28.8% -> 56.4% on long ones, and nomination 46.3% -> 67.1%.
+   */
+  rank: number;
   /** MAX cosine over this concept's live, non-zero observation vectors. Strictly positive; NOT
    *  floored — NATIVE_SCORE_FLOOR is search()'s emission rule, applied by the caller. */
   score: number;
@@ -143,23 +164,55 @@ export interface NativeObservationMatch {
  *
  * Ties break on the lexicographically smaller observation id: two observations of one concept can
  * legitimately score identically (duplicate text), and determinism is a hard contract here.
+ *
+ * SEGMENT GRANULARITY (#155, docs/design/bounded-retrieval-unit.md). The vectors scored here are an
+ * observation's SEGMENTS, not the observation as a whole: the same unit split applied one level down,
+ * because an observation is too big to be a retrieval unit. Measured on the live store, whole-
+ * observation scoring let pairs from DIFFERENT concepts clear tauAttach 41.5% of the time and held
+ * clean-label separability to AUC 0.7782; at segment granularity that becomes 0.2% and 0.9119. The
+ * per-concept MAX still does the delivery-side dedupe by construction — one entry per concept id
+ * however many segments or observations match — so this function's contract is unchanged and only
+ * the granularity of its evidence moved.
+ *
+ * LIVENESS IS INHERITED, NOT MIRRORED: segments carry no lifecycle of their own, so the join applies
+ * the observation's own `superseded_by IS NULL AND superseded_at IS NULL` predicate in this one
+ * place. A segment that could be live while its observation is not would be a second truth about
+ * what exists.
+ *
+ * THE UNION ALL ARM IS A TRANSITIONAL FALLBACK, not a permanent one. Every accepted write now creates
+ * its segments in the same transaction, so only rows written BEFORE the backfill lack them — and for
+ * those, scoring the observation's own vector is exactly the pre-#155 behavior, i.e. never worse than
+ * status quo. Omitting the arm instead would make un-backfilled observations silently unfindable, the
+ * loudest possible version of the defect this change exists to remove. The `NOT EXISTS` probe is
+ * keyed on `observation_segments`' own PRIMARY KEY (observation_id, segment_index), so it is an index
+ * seek per row rather than the unindexed correlated scan that wedged the store in #145.
  */
 export function scoreNativeConceptsByObservation(
   db: StoragePort,
   conceptIds: readonly string[],
   emb: Float32Array,
+  queryText: string,
+  applyLexical: boolean,
 ): Map<string, NativeObservationMatch> {
   const best = new Map<string, NativeObservationMatch>();
   if (conceptIds.length === 0) return best;
   const rows = db
     .prepare(
-      `SELECT o.concept_id AS concept_id, o.id AS observation_id, o.embedding AS embedding
+      `SELECT o.concept_id AS concept_id, o.id AS observation_id, s.embedding AS embedding
+         FROM observation_segments s
+         JOIN observations o ON o.id = s.observation_id
+        WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
+          AND o.kind != 'source'
+          AND o.concept_id IN (SELECT value FROM json_each(?))
+       UNION ALL
+       SELECT o.concept_id AS concept_id, o.id AS observation_id, o.embedding AS embedding
          FROM observations o
         WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
           AND o.kind != 'source'
-          AND o.concept_id IN (SELECT value FROM json_each(?))`,
+          AND o.concept_id IN (SELECT value FROM json_each(?))
+          AND NOT EXISTS (SELECT 1 FROM observation_segments s2 WHERE s2.observation_id = o.id)`,
     )
-    .all(JSON.stringify([...conceptIds])) as Array<{ concept_id: string; observation_id: string; embedding: string }>;
+    .all(JSON.stringify([...conceptIds]), JSON.stringify([...conceptIds])) as Array<{ concept_id: string; observation_id: string; embedding: string }>;
   for (const row of rows) {
     const vec = jsonToEmb(row.embedding);
     if (isZeroVector(vec)) continue; // placeholder, not a measurement
@@ -167,10 +220,89 @@ export function scoreNativeConceptsByObservation(
     if (score <= 0) continue; // mirrors the pre-split `cos > 0` sim/seed condition exactly
     const prior = best.get(row.concept_id);
     if (prior === undefined || score > prior.score || (score === prior.score && row.observation_id < prior.observationId)) {
-      best.set(row.concept_id, { score, observationId: row.observation_id });
+      best.set(row.concept_id, { score, rank: score, observationId: row.observation_id });
     }
   }
+  if (applyLexical) applyLexicalArm(db, conceptIds, queryText, best);
   return best;
+}
+
+/**
+ * THE LEXICAL ARM (#155). Re-orders the candidates the dense arm already scored, by how much of the
+ * incoming text's discriminative vocabulary each concept already contains. See src/lexical-overlap.ts
+ * for why this exists, why it is lexical rather than entity-based, and why the blend is multiplicative
+ * and modest.
+ *
+ * IT NEVER ADDS A CANDIDATE. Only concepts with a strictly positive best-observation cosine are in
+ * `best` by the time this runs, and this function only rescales them — so the candidate set is
+ * exactly what the dense arm admitted, and a concept the embedding rejected cannot be talked into
+ * the results by vocabulary alone. That also keeps NATIVE_SCORE_FLOOR meaningful: the floor still
+ * gates on a value derived from a real cosine.
+ *
+ * WHICH OBSERVATION IS NAMED is deliberately left alone. `observationId` still points at the segment's
+ * observation that won the DENSE comparison — the lexical arm is a property of the whole concept, not
+ * of any one observation, so letting it change the attribution would name a row that did not earn it.
+ *
+ * DOCUMENT FREQUENCY IS COUNTED OVER THE CANDIDATE CONCEPTS, which is the population the ranking is
+ * actually deciding among. Counting over the whole store would let concepts outside this circle — or
+ * outside this call's scope — shift weights inside it.
+ */
+function applyLexicalArm(
+  db: StoragePort,
+  conceptIds: readonly string[],
+  queryText: string,
+  best: Map<string, NativeObservationMatch>,
+): void {
+  if (best.size === 0) return;
+  const probeTokens = lexicalTokens(queryText);
+  if (probeTokens.size === 0) return; // nothing discriminative arrived; leave the dense ranking alone
+  const rows = db
+    .prepare(
+      `SELECT o.concept_id AS concept_id, t.observation_id AS observation_id, t.token AS token
+         FROM observation_tokens t
+         JOIN observations o ON o.id = t.observation_id
+        WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
+          AND o.kind != 'source'
+          AND t.token IN (SELECT value FROM json_each(?))
+          AND o.concept_id IN (SELECT value FROM json_each(?))`,
+    )
+    .all(JSON.stringify([...probeTokens]), JSON.stringify([...conceptIds])) as
+    Array<{ concept_id: string; observation_id: string; token: string }>;
+
+  /*
+   * OVERLAP IS MAX OVER THE CONCEPT'S OBSERVATIONS, never over their union — the same unit rule the
+   * dense arm follows, and for the same reason. A concept's UNION of tokens grows with its size, so a
+   * 135-observation concept contains nearly every term in the corpus and scores an overlap near 1.0
+   * against anything at all. Measured, that is not theoretical: with union overlap, concepts of 2-4
+   * observations lost 71.9% of their own evidence to a 20+ concept and returned home 21.6% of the
+   * time; scored per observation instead, those become 32.3% and 40.7%, and overall argmax accuracy
+   * goes 59.1% -> 67.1%. Union overlap reintroduced, inside the fix, exactly the size bias this issue
+   * exists to remove.
+   */
+  const tokensByObservation = new Map<string, { conceptId: string; tokens: Set<string> }>();
+  const conceptsPerToken = new Map<string, Set<string>>();
+  for (const row of rows) {
+    const entry = tokensByObservation.get(row.observation_id) ?? { conceptId: row.concept_id, tokens: new Set<string>() };
+    entry.tokens.add(row.token);
+    tokensByObservation.set(row.observation_id, entry);
+    const concepts = conceptsPerToken.get(row.token) ?? new Set<string>();
+    concepts.add(row.concept_id);
+    conceptsPerToken.set(row.token, concepts);
+  }
+  // Document frequency counts CONCEPTS, not observations: a term repeated across one concept's many
+  // observations must not look rare, which is what an observation-level count would make it.
+  const idfOf = (token: string): number => tokenIdf(conceptIds.length, conceptsPerToken.get(token)?.size ?? 0);
+
+  const bestOverlap = new Map<string, number>();
+  for (const { conceptId, tokens } of tokensByObservation.values()) {
+    const overlap = lexicalOverlap(probeTokens, tokens, idfOf);
+    if (overlap > (bestOverlap.get(conceptId) ?? 0)) bestOverlap.set(conceptId, overlap);
+  }
+
+  for (const [conceptId, match] of best) {
+    const overlap = bestOverlap.get(conceptId) ?? 0;
+    best.set(conceptId, { score: match.score, rank: blendLexical(match.score, overlap), observationId: match.observationId });
+  }
 }
 
 /**

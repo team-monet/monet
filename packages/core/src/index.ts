@@ -5,6 +5,8 @@ export {
   ContentExceedsEmbedderWindowError,
   type EmbedderWindowSubject,
   RELIABLE_EMBED_TOKENS,
+  NON_LATIN_LETTER_TOLERANCE,
+  ContentScriptUnsupportedError,
   EmbedderPinUnsatisfiedError,
   EmbedderWidthConflictError,
   MalformedEmbeddingStoreError,

@@ -49,11 +49,12 @@ export function resolveModelCacheDir(): string {
  * no external service, no Ollama. The model loads lazily on first `embed()` and is
  * cached on disk after the first download.
  *
- * Default: paraphrase-multilingual-MiniLM-L12-v2 (384-dim; multilingual swap, item 9 — same
- * dimensionality as the prior all-MiniLM-L6-v2 default, so existing stores' vector space size is
- * unaffected, but the actual vectors are NOT compatible across the swap — see the threshold
- * recalibration note below). For a smaller install, point `model` at a quantized build. This is
- * async by nature — which is exactly why the engine's write path (`store`/`search`) is async.
+ * Default: DEFAULT_MODEL — see its own note for what it is and why. Every default this class has
+ * carried has been 384-dim, so a store's vector WIDTH survives a change of default; the vectors
+ * themselves never do, which is what embedder_migration exists for. Per-checkpoint properties
+ * (bands, script restriction) live in MODEL_PROFILES rather than on this class, because they are
+ * facts about a space and not about a provider. This is async by nature — which is exactly why the
+ * engine's write path (`store`/`search`) is async.
  *
  * `@huggingface/transformers` is an OPTIONAL dependency, imported dynamically through a
  * non-literal specifier so (a) the default lexical provider never pulls it in and
@@ -82,27 +83,109 @@ interface TransformersModule {
  */
 const UNKNOWN_WINDOW = null;
 
+/**
+ * What is known about a specific checkpoint, as opposed to about this provider CLASS.
+ *
+ * The class accepts any hub id, so nothing here can be a class constant. A threshold is a property of
+ * the SPACE, and carrying one model's bands into another is the precise mistake #155 exists to
+ * document — it is how the shipping tauAttach came to sit under its own corpus's noise floor.
+ *
+ * Every band below was derived the same way: replay the live corpus through the REAL nomination
+ * decision in that model's own space (scripts/measure-attach-thresholds.ts), sweep candidate
+ * thresholds, and stop where the exchange rate between a recoverable fork and an unrecoverable wrong
+ * attach stops paying. Not from a cosine distribution, and not by scaling another model's number.
+ */
+interface ModelProfile {
+  thresholds: EmbeddingThresholds;
+  /** Declared only where the model genuinely cannot read other scripts; see EmbeddingProvider. */
+  readsOnlyLatinScript?: boolean;
+}
+
+/**
+ * KNOWN GUESS, and labelled as one. Any checkpoint without a profile gets these — the values the
+ * codebase carried before #155, themselves derived for a different model and a different quantity.
+ * They are kept so an unmeasured model still runs; they are not evidence about it.
+ */
+const LEGACY_UNMEASURED_THRESHOLDS: EmbeddingThresholds = { tauAttach: 0.72, tauAmbiguous: 0.5 };
+
+/**
+ * The checkpoint a NEW store pins to (#155).
+ *
+ * bge-small-en-v1.5 over the multilingual MiniLM it replaces, measured on the live corpus at every
+ * layer that matters: concept-level search R@1 56.0% -> 65.8% on short queries and 56.4% -> 75.5%
+ * on long ones, nomination argmax 67.1% -> 72.8%, exact-observation recall 90.4% -> 97.4%. It is a
+ * QUARTER the parameters and keeps the same 384 width, so it costs less to run and a migration is a
+ * re-embed rather than a width change.
+ *
+ * The two 768-dim candidates measured alongside it (bge-base-en, multilingual-e5-base) land within
+ * 1.6 points on both query shapes — inside the standard error at n=739. The choice is therefore a
+ * cost decision, not a quality one, and that is only visible because the comparison was run at the
+ * layer the decision affects rather than on the near-saturated one.
+ *
+ * ENGLISH-ONLY, and that is a real constraint rather than a footnote: this checkpoint declares
+ * readsOnlyLatinScript, so a store pinned to it REFUSES non-Latin content at write and query time.
+ * The store's content is English by ratified preference and the multilingual reason (an Obsidian
+ * vault reached through the source pipeline) no longer applies, but any EXISTING store holding
+ * non-Latin content must deal with that content before migrating — a pinned store's vectors cannot
+ * be rescued after the fact.
+ *
+ * CHANGING THIS DOES NOT MOVE AN EXISTING STORE. A store that has minted a pin keeps it until an
+ * explicit embedder migration; this only decides what a fresh store adopts.
+ */
+export const DEFAULT_MODEL = "Xenova/bge-small-en-v1.5";
+
+const MODEL_PROFILES: Record<string, ModelProfile> = {
+  /*
+   * Measured on example-circle, 739 replays, at LEXICAL_BOOST = 1.0:
+   *   0.65 -> 70.5% correct / 27.2% wrong / 2.3% fork
+   *   0.70 -> 67.7% / 24.4% /  8.0%   <- chosen
+   *   0.72 -> 63.9% / 22.6% / 13.5%
+   * From 0.65 to 0.70 the trade is one-for-one (2.8 correct for 2.8 wrong), which the recoverable/
+   * unrecoverable asymmetry settles in favour of the higher bar. Past 0.70 it costs two correct
+   * attaches per wrong one removed, and the asymmetry no longer carries it. The 0.72 this replaces
+   * was never derived on this model at all.
+   */
+  "Xenova/paraphrase-multilingual-MiniLM-L12-v2": { thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5 } },
+  /*
+   * Measured the same way, same corpus, same blend weight:
+   *   0.72 -> 73.3% correct / 25.2% wrong /  1.5% fork   (threshold nearly inert here)
+   *   0.75 -> 70.6% / 22.1% /  7.3%
+   *   0.78 -> 63.3% / 16.2% / 20.4%   <- chosen
+   *   0.80 -> 51.3% / 11.5% / 37.2%
+   * This space runs HIGHER than the multilingual one, so the old 0.72 would have been almost inert —
+   * carrying it across is exactly the failure this file's profile table exists to prevent. 0.72->0.75
+   * removes more wrong than correct outright; 0.75->0.78 costs 7.3 correct for 5.9 wrong and is
+   * justified by the asymmetry; 0.78->0.80 costs 2.6 correct per wrong and is not.
+   *
+   * tauAmbiguous stays 0.5 deliberately: nothing on this corpus nominates below 0.65, so every fork
+   * lands in the ambiguous band and earns a possible-duplicate edge. Raising it would start creating
+   * concepts with no link back, and no measurement here says where that line belongs.
+   */
+  "Xenova/bge-small-en-v1.5": {
+    thresholds: { tauAttach: 0.78, tauAmbiguous: 0.5 },
+    readsOnlyLatinScript: true,
+  },
+};
+
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
-  // STALE PENDING RECALIBRATION (item 9): calibrated on the PRIOR default, all-MiniLM-L6-v2, via
-  // `embed:check` (real cosine distribution): near-dup ≈ 0.95, paraphrase ≈ 0.78, related ≈ 0.38,
-  // unrelated ≈ 0.18. tauAttach sits just under paraphrase (so true restatements attach);
-  // tauAmbiguous sits well above "related" (so merely-related evidence forks rather than wrongly
-  // merging — the ADR's conservative-dedup rule: prefer a duplicate over a bad merge). The
-  // multilingual-MiniLM-L12-v2 swap has its own, likely different, cosine distribution — these
-  // values are deliberately NOT auto-adjusted here; see the Phase 1 dry-run's threshold
-  // recalibration report (distributions computed over the live store under both models) for a
-  // recommended replacement, decided at the John gate.
-  readonly recommendedThresholds: EmbeddingThresholds = { tauAttach: 0.72, tauAmbiguous: 0.5 };
+  /** From MODEL_PROFILES for a known checkpoint; the labelled legacy guess otherwise. */
+  readonly recommendedThresholds: EmbeddingThresholds;
+  /** Semantic space: neighbours are close and the lexical arm is what separates them (#155). */
+  readonly needsLexicalArm = true;
+  readonly readsOnlyLatinScript?: boolean;
   readonly modelId: string;
   private readonly model: string;
   private extractor: Promise<FeatureExtractor> | null = null;
   private tokenizer: Promise<Tokenizer> | null = null;
 
   constructor(opts: { model?: string; dim?: number } = {}) {
-    this.model = opts.model ?? "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
+    this.model = opts.model ?? DEFAULT_MODEL;
     this.dim = opts.dim ?? 384;
     this.modelId = this.model;
+    const profile = MODEL_PROFILES[this.model];
+    this.recommendedThresholds = profile?.thresholds ?? LEGACY_UNMEASURED_THRESHOLDS;
+    this.readsOnlyLatinScript = profile?.readsOnlyLatinScript;
   }
 
   private load(): Promise<FeatureExtractor> {

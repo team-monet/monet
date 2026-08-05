@@ -129,17 +129,37 @@ describe("per-call resolution control (Change 1)", () => {
     core.close();
   });
 
-  it("threshold pinning: HashingEmbeddingProvider is 0.55 / 0.4, OnnxEmbeddingProvider is 0.72 / 0.5", () => {
+  it("threshold pinning: hashing is 0.55 / 0.4, and the ONNX bands come from the MODEL, not the class", () => {
     // Lexical (hashing) provider — looser thresholds, lexical overlap saturates lower.
     const hashing = new HashingEmbeddingProvider();
     expect(hashing.recommendedThresholds.tauAttach).toBe(0.55);
     expect(hashing.recommendedThresholds.tauAmbiguous).toBe(0.4);
 
-    // Semantic (ONNX/MiniLM) provider — recommendedThresholds is a plain readonly property;
-    // reading it does NOT trigger model load (load() is only called from embed()).
+    // Semantic (ONNX) provider — recommendedThresholds is a plain readonly property; reading it does
+    // NOT trigger a model load (load() is only called from embed()).
+    //
+    // PER MODEL (#155). Each band below was derived by replaying the live corpus through the real
+    // nomination decision in that model's own space. The default is 0.70, not the 0.72 this test
+    // used to pin: 0.72 was never measured on this checkpoint at all — it was inherited from
+    // all-MiniLM-L6-v2 and left in place across the multilingual swap.
+    // The DEFAULT checkpoint carries its own measured band and its script restriction.
     const onnx = new OnnxEmbeddingProvider();
-    expect(onnx.recommendedThresholds.tauAttach).toBe(0.72);
+    expect(onnx.recommendedThresholds.tauAttach).toBe(0.78);
     expect(onnx.recommendedThresholds.tauAmbiguous).toBe(0.5);
+    expect(onnx.readsOnlyLatinScript).toBe(true);
+
+    // The multilingual checkpoint it replaced has a DIFFERENT measured band (its space runs lower)
+    // and no script restriction. Carrying either model's number to the other is the mistake #155
+    // documents; the 0.72 that used to sit here was never derived on either of them.
+    const multilingual = new OnnxEmbeddingProvider({ model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2" });
+    expect(multilingual.recommendedThresholds.tauAttach).toBe(0.70);
+    expect(multilingual.readsOnlyLatinScript).toBeUndefined();
+
+    // An unmeasured checkpoint falls back to the labelled legacy guess rather than to another
+    // model's measured band, and is not script-gated on an assumption.
+    const unknown = new OnnxEmbeddingProvider({ model: "Xenova/some-unmeasured-model" });
+    expect(unknown.recommendedThresholds.tauAttach).toBe(0.72);
+    expect(unknown.readsOnlyLatinScript).toBeUndefined();
   });
 });
 

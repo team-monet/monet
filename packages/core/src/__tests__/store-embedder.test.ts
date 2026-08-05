@@ -9,6 +9,7 @@ import {
   readStoredEmbedderPin,
 } from "../index";
 import { HashingEmbeddingProvider } from "../embedding";
+import { DEFAULT_MODEL } from "../embedding-onnx";
 
 vi.mock("@huggingface/transformers", () => ({
   pipeline: vi.fn(async () => {
@@ -45,7 +46,9 @@ describe("chooseStoreEmbedder — first-boot hard requirement", () => {
   it("fresh + ONNX available proceeds with the semantic provider", async () => {
     const provider = await chooseStoreEmbedder(dbPath);
     expect(provider.constructor.name).toBe("OnnxEmbeddingProvider");
-    expect(provider.modelId).toBe("Xenova/paraphrase-multilingual-MiniLM-L12-v2");
+    // Whatever DEFAULT_MODEL is, not a literal: this test is about the CHOICE being the semantic
+    // provider on a fresh store, not about which checkpoint that provider currently defaults to.
+    expect(provider.modelId).toBe(DEFAULT_MODEL);
     expect(existsSync(dbPath)).toBe(false);
   });
 

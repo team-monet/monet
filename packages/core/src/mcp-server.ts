@@ -884,6 +884,7 @@ export function registerMonetCoreTools(
       // the caller how to succeed on the retry (see ContentExceedsEmbedderWindowError). core.store()
       // enforces the same rule for non-MCP callers; this placement only makes the failure cheaper.
       try {
+        core.assertEmbedderReadsScript(content);
         await core.assertWithinEmbedderWindow(content);
       } catch (e) {
         return err(msg(e));
@@ -1239,6 +1240,7 @@ export function registerMonetCoreTools(
       // uses, and for the same reason: counting tokens needs no database and no model load, so a
       // query the embedder cannot fully read costs nothing to reject (#137).
       try {
+        core.assertEmbedderReadsScript(query, "query");
         await core.assertWithinEmbedderWindow(query, "query");
       } catch (e) {
         return err(msg(e));
@@ -1350,6 +1352,7 @@ export function registerMonetCoreTools(
       // uses, and for the same reason: counting tokens needs no database and no model load, so a
       // query the embedder cannot fully read costs nothing to reject (#137).
       try {
+        core.assertEmbedderReadsScript(intent, "query");
         await core.assertWithinEmbedderWindow(intent, "query");
       } catch (e) {
         return err(msg(e));

@@ -25,6 +25,21 @@ const CIRCLE = "unit-split";
  *  to set up states no public API produces (legacy placeholder vectors) or to read raw rows. */
 const dbOf = (core: MonetCore): StoragePort => (core as unknown as { db: StoragePort }).db;
 
+/**
+ * Set an observation's vector by hand, at the granularity retrieval actually ranks (#155).
+ *
+ * These tests craft vectors directly to reach states normal writes cannot produce — a zero
+ * placeholder, or a vector at an exact cosine from a query. Ranking now reads `observation_segments`
+ * rather than `observations.embedding`, so writing only the latter leaves the crafted state
+ * invisible to the very scorer under test. Every observation in this suite is short enough to be a
+ * single whole-content segment, so the observation vector and its one segment vector are the same
+ * value by construction and this writes both.
+ */
+const setObservationVector = (db: StoragePort, observationId: string, embeddingJson: string): void => {
+  db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(embeddingJson, observationId);
+  db.prepare(`UPDATE observation_segments SET embedding = ? WHERE observation_id = ?`).run(embeddingJson, observationId);
+};
+
 /** Dedup OFF (thresholds above max cosine) so every store() creates a DISTINCT concept and
  *  `attachTo` is the only way observations pile onto one — the eval harness's own convention
  *  (seedScenario, src/eval/harness.ts). Deterministic ids so ranking ties are reproducible. */
@@ -168,8 +183,7 @@ describe("recall unit split — which observations count", () => {
 
       // A placeholder vector, as storeSourceChunk used to write for every chunk — the state
       // isZeroVector exists for. A placeholder is not a measurement.
-      db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`)
-        .run(JSON.stringify(new Array<number>(width).fill(0)), claim.observationId);
+      setObservationVector(db, claim.observationId, JSON.stringify(new Array<number>(width).fill(0)));
 
       const query = "pgbouncer transaction mode connection pooling for postgres";
       const card = (await core.search(query, { circle: CIRCLE, limit: 5 })).find((c) => c.id === concept.conceptId);
@@ -180,8 +194,7 @@ describe("recall unit split — which observations count", () => {
       const solo = newCore();
       try {
         const only = await solo.store("Postgres connection pooling uses pgbouncer in transaction mode.", { circle: CIRCLE });
-        dbOf(solo).prepare(`UPDATE observations SET embedding = ? WHERE id = ?`)
-          .run(JSON.stringify(new Array<number>(width).fill(0)), only.observationId);
+        setObservationVector(dbOf(solo), only.observationId, JSON.stringify(new Array<number>(width).fill(0)));
         expect(await solo.search(query, { circle: CIRCLE, limit: 5 })).toEqual([]);
       } finally {
         solo.close();
@@ -216,7 +229,7 @@ describe("recall unit split — which observations count", () => {
       // (much weaker) native evidence instead — the row is skipped, not merely outranked.
       const sourceRowCosine = cosine(emb, embedder.embed(claim));
       expect(sourceRowCosine).toBeGreaterThan(0.9);
-      const match = scoreNativeConceptsByObservation(db, [concept.conceptId], emb).get(concept.conceptId)!;
+      const match = scoreNativeConceptsByObservation(db, [concept.conceptId], emb, query, false).get(concept.conceptId)!;
       expect(match.observationId).toBe(concept.observationId); // the native one
       expect(match.observationId).not.toBe("obs-grafted-source");
       expect(match.score).toBeLessThan(sourceRowCosine / 2);
@@ -243,8 +256,7 @@ describe("recall unit split — which observations count", () => {
       const width = (JSON.parse(
         (db.prepare(`SELECT embedding FROM observations WHERE id = ?`).get(stranded.observationId) as { embedding: string }).embedding,
       ) as number[]).length;
-      db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`)
-        .run(JSON.stringify(new Array<number>(width).fill(0)), stranded.observationId);
+      setObservationVector(db, stranded.observationId, JSON.stringify(new Array<number>(width).fill(0)));
 
       // The concept row (and its centroid) still exists — the hard-retire decision is that this
       // is NOT enough to rank. A centroid fallback here would reintroduce exactly the blurred
@@ -315,7 +327,7 @@ describe("recall unit split — concepts are the unit of delivery", () => {
       // The MAX is the representative: the card's score is the BEST matching observation's.
       const db = dbOf(core);
       const emb = new HashingEmbeddingProvider().embed(query);
-      const best = scoreNativeConceptsByObservation(db, [concept.conceptId], emb).get(concept.conceptId)!;
+      const best = scoreNativeConceptsByObservation(db, [concept.conceptId], emb, query, false).get(concept.conceptId)!;
       expect(cards[0].score).toBeCloseTo(best.score, 10);
       expect(cards[0].matchedObservationId).toBe(best.observationId);
 
@@ -434,16 +446,13 @@ describe("recall unit split — the score floor", () => {
         for (let i = 0; i < emb.length; i++) d += basis[i] * emb[i];
         const perp = Array.from({ length: emb.length }, (_, i) => basis[i] - d * emb[i]);
         const pn = Math.sqrt(perp.reduce((a, b) => a + b * b, 0));
-        db.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(
-          JSON.stringify(perp.map((x, i) => (x / pn) * Math.sqrt(1 - target * target) + target * emb[i])),
-          row.id,
-        );
+        setObservationVector(db, row.id, JSON.stringify(perp.map((x, i) => (x / pn) * Math.sqrt(1 - target * target) + target * emb[i])));
       };
       forceCos(dense.conceptId, 0.25); // above the floor — a genuine match
       forceCos(lexical.conceptId, 0.10); // POSITIVE but below the floor — the noise
 
       // The scorer is pure measurement: it reports the sub-floor cosine rather than hiding it.
-      const scored = scoreNativeConceptsByObservation(db, [dense.conceptId, lexical.conceptId], emb);
+      const scored = scoreNativeConceptsByObservation(db, [dense.conceptId, lexical.conceptId], emb, query, false);
       expect(scored.get(lexical.conceptId)!.score).toBeCloseTo(0.10, 6);
       expect(scored.get(dense.conceptId)!.score).toBeCloseTo(0.25, 6);
 
@@ -498,7 +507,7 @@ describe("recall unit split — one scorer, two arms", () => {
       const query = "pgbouncer transaction mode connection pooling for postgres";
       const db = dbOf(core);
       const allIds = (db.prepare(`SELECT id FROM concepts WHERE circle = ?`).all(CIRCLE) as Array<{ id: string }>).map((r) => r.id);
-      const expected = scoreNativeConceptsByObservation(db, allIds, embedder.embed(query));
+      const expected = scoreNativeConceptsByObservation(db, allIds, embedder.embed(query), query, false);
 
       // search(): score AND matched observation come straight from the shared scorer, and its
       // card set is exactly the scorer's above-floor subset — the floor lives HERE, at emission,

@@ -57,6 +57,37 @@ export interface EmbeddingProvider {
    * name. Omitted whenever `inputWindow` is.
    */
   countTokens?(text: string): number | Promise<number>;
+  /**
+   * Whether this provider's space needs the LEXICAL ARM (#155, src/lexical-overlap.ts).
+   *
+   * A SEMANTIC embedder maps a technical corpus into a narrow region — on the live store, max-cosine
+   * alone returns an observation to its own concept 46.3% of the time and short-query search recall
+   * is R 14.9% — and IDF-weighted token overlap is what tells those neighbours apart. A LEXICAL
+   * embedder already scores trigram overlap, so the arm double-counts there: wired in globally it
+   * regressed three eval gates that run on HashingEmbeddingProvider, while on the shipping semantic
+   * model it lifts read-side R by 22-28 points.
+   *
+   * So this is a property of the SPACE, not a global switch, which is the same shape
+   * recommendedThresholds already has. Omitted means false: a provider that says nothing gets the
+   * pre-#155 behaviour, and `rank` then equals `score` everywhere.
+   */
+  readonly needsLexicalArm?: boolean;
+  /**
+   * Whether this provider reads ONLY Latin-script text (#155).
+   *
+   * An English-only model maps text in a script it never saw to essentially arbitrary directions.
+   * Nothing errors: the write is accepted, the row is fetchable, and it is unreachable by search
+   * forever — the same silent hole the window guard exists to close, in a different dimension. And it
+   * is worse than the window case, because the store is PINNED to one embedder: content written in
+   * Korean under a multilingual model cannot be rescued by re-embedding once the pin moves to an
+   * English one. The commitment has to be enforced BEFORE the content accumulates, not discovered at
+   * migration.
+   *
+   * OMITTED MEANS UNKNOWN, AND UNKNOWN MEANS PERMISSIVE. A provider that says nothing gets no gate —
+   * refusing writes on a guess would be the same invented-limit failure the window guard refuses to
+   * make. Only a provider that positively declares its restriction gets it enforced.
+   */
+  readonly readsOnlyLatinScript?: boolean;
   /** May be sync (lexical) or async (a real model). The engine always awaits it. */
   embed(text: string): Float32Array | Promise<Float32Array>;
 }

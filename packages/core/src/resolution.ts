@@ -61,10 +61,24 @@
  *
  * THRESHOLDS ARE REUSED, NOT REINVENTED. tauAttach/tauAmbiguous are already embedder-derived
  * (EmbeddingProvider.recommendedThresholds; applyEmbedderDerivedThresholds in engine.ts) and this
- * slice adds no new knob. Obs-vs-obs cosines do run higher than obs-vs-centroid — the whole point,
- * since a centroid dilutes — so the same numbers are STRICTER in obs space, which is the
- * conservative direction for a resolution rule (a wrong fork is recoverable by merge; a wrong merge
- * loses provenance). Measured on the STARTER_SUITE corpus, see scripts/measure-resolution-bands.ts.
+ * slice adds no new knob.
+ *
+ * THE ORIGINAL JUSTIFICATION FOR THAT REUSE WAS BACKWARDS, and #155 is the correction. It read:
+ * obs-vs-obs cosines run higher than obs-vs-centroid, so the same numbers are STRICTER in obs space,
+ * the conservative direction. A threshold held FIXED while the quantity it gates shifts UPWARD gets
+ * EASIER to clear, not harder — it is looser, not stricter. The supporting measurement
+ * (scripts/measure-resolution-bands.ts) ran on the STARTER_SUITE corpus, whose own harness note
+ * records that it "barely consolidates (1.0-1.1 observations/concept)": on a store of
+ * single-observation concepts a centroid IS its one observation vector, so the shift being argued
+ * about cannot appear there at all. The fixture could not exhibit the effect it was certifying.
+ *
+ * On the live store the cost was 41.5% of observation pairs drawn from DIFFERENT concepts clearing
+ * tauAttach. The bands are now derived from a replay of the DECISION on the corpus that governs it —
+ * leave-one-out nomination, argmax over every concept in the circle, swept over candidate thresholds
+ * (scripts/measure-attach-thresholds.ts). tauAttach = 0.72 survives that re-derivation on its merits:
+ * across the segmented, lexically-armed corpus it yields 60.9% correct attaches, 27.6% wrong, and an
+ * 11.5% fork rate, and the exchange rate turns unfavourable above it. Anyone changing the embedder,
+ * the segment budget, or the ranking arms must re-run that script rather than reason about scales.
  *
  * SINGLE-OBSERVATION CONCEPTS ARE UNAFFECTED IN PRACTICE: their centroid IS their one observation
  * vector, so evidence and identity coincide and every band collapses to the old behavior.
