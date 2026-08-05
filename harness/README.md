@@ -1,6 +1,6 @@
 # with-monet
 
-**An agent-agnostic harness that pairs a product owner with strong technical understanding (`Stig`) and a focused engineering team with [Monet](https://www.npmjs.com/package/@team-monet/monet)'s memory substrate.**
+**An agent-agnostic harness that gives the coding agent you already use durable state through [Monet](https://www.npmjs.com/package/@team-monet/monet), plus disposable contexts (`Stig` and three workers) for the work that would otherwise eat the conversation.**
 
 The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet`](https://www.npmjs.com/package/@team-monet/monet) on npm) — maintains a persistent memory model so the agent doesn't have to. `with-monet` is the *lightweight* harness that points the coding agent you already use (Claude Code) at that substrate and gives it a team that knows how to use it.
 
@@ -11,12 +11,28 @@ The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet
 | `team-monet/monet` | **Monet** — the local-first client: the `monet` MCP server + CLI (npm `@team-monet/monet`). |
 | **`with-monet` (this repo)** | The **lightweight, agent-agnostic harness**: portable agent prompts + bootstrap that wire a host to `monet`. |
 
-**`Stig` is the product owner** — it learns how the product should work, makes routine priority/scope/disposition decisions, and turns technical evidence into the smallest adequate product response. Monet, context assembly, delegation, and verification support that judgment; they are not Stig's identity.
-
 ## The team
 
-- **`stig`** — product owner and lead. Owns routine product judgment inside the ratified model, returns new direction or meaningful contract/priority/scope changes to the user, delegates with focused context, and is the only agent that touches Monet.
-- Workers Stig delegates to: `explorer`, `researcher`, `analyst`, `mechanic`, `developer`, `tester`, `reviewer`, `auditor`, `security`.
+```text
+User
+  ↕
+Stig — the lead: intent, decisions, meaning, continuity
+  ↕
+Monet — what survives the session
+  ├─ investigator — evidence
+  ├─ developer    — change
+  └─ verifier     — proof
+```
+
+**`stig`** is the only persistent agent, the only one the user talks to, the only one that uses Monet, and the only one that delegates. There is no required workflow: Stig answers directly when that suffices and delegates when a fresh isolated context earns its cost.
+
+The three workers are disposable. They hold no memory and own no decisions — each returns a compact artifact of exact evidence, and its context is thrown away. Stig keeps the semantics.
+
+- **`investigator`** — reads the repo, history, logs, docs, or the web, and returns verbatim evidence with its inferences and unknowns kept separate.
+- **`developer`** — implements one ratified, bounded change and returns the real diff and the real validation output.
+- **`verifier`** — proves or disproves a claim through the lens the brief names: acceptance, runtime, review, security, or a **cold** audit that is deliberately given the change location and nothing else.
+
+Workers can be trimmed, and on a host without a real subagent primitive Stig installs **lead-only** and does the work itself — the Monet loop is unchanged either way.
 
 ## Install — agent-first (paste one line into your agent)
 

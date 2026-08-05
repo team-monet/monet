@@ -6,11 +6,17 @@ Within-store reorganization: synthesize what's dirty, mediate duplicates, and re
 
 **The librarian rule:** reorganizing is safe because recall is store-wide — moving a memory changes its address, never its findability. But reshelve deliberately, at session boundaries, with the user steering — never mid-task, never silently. Circles are write-home/project locality; **topic organization belongs to the entity/edge graph, not to circles** — don't propose topic-taxonomy circles.
 
+**Curation covers the normative layer too, not just concepts.** A store holds principles, rules and
+the stages they bind to alongside its facts, and those have their own decay: a stage whose rules have
+all died is inert, a rule that fires but never changes behaviour is a retirement candidate, and a
+trigger pattern that has never matched anything may be aimed at a moment that does not exist. Surface
+those in the same pass — they are cheaper to notice here than to discover when a rule fails to fire.
+
 ## When to run
 
-- At the end of a long session, after `memory_checkpoint`
+- At the end of a long session
 - On demand, when the user asks to tidy memory
-- When `memory_overview` shows signals: open `possibleDuplicates`, several stale concepts, or fragmentation in `otherCircles` (many small circles)
+- When `memory_overview` shows signals: open `possibleDuplicates`, several stale concepts, fragmentation in `otherCircles` (many small circles), or gate exceptions and retirement candidates in the normative layer
 
 ## Phase 0 — Read the state
 
