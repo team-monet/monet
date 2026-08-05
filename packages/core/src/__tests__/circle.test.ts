@@ -45,7 +45,7 @@ describe("checkpoint / listDirty honor defaultCircle", () => {
 describe("workstream getters honor defaultCircle", () => {
   it("a workstream saved without a circle is restored by getActiveWorkstreams() (round-trip)", async () => {
     const core = new MonetCore(":memory:", { defaultCircle: "proj-a" });
-    await core.saveWorkstream({ status: "active", nextSteps: ["ship the circle work"] }); // no circle → proj-a
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "ship the circle work" }] }); // no circle → proj-a
     expect(core.getActiveWorkstreams()).toHaveLength(1); // no circle → proj-a, matches the save (not "default")
     expect(core.getActiveWorkstreams("default")).toHaveLength(0);
     core.close();

@@ -1328,7 +1328,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
       // Build a store, then manually craft the stranded state: NULL last_confirmed_at, user_version=0.
       const core0 = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
       const r0 = await core0.store("Concept written before the simulated crash.");
-      const ws0 = await core0.saveWorkstream({ status: "active", nextSteps: ["catch up"] });
+      const ws0 = await core0.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "catch up" }] });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const db0 = (core0 as any).db as import("../storage").StoragePort;
       // Force stranded state: NULL temporal fields, user_version=0.
@@ -1337,7 +1337,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
 
       // Verify the workstream row is NULL (it was NULL by design or just set to NULL above).
       const wsRowBefore = db0.prepare(`SELECT last_confirmed_at, kind FROM concepts WHERE id = ?`)
-        .get(ws0.id) as { last_confirmed_at: number | null; kind: string };
+        .get(ws0!.id) as { last_confirmed_at: number | null; kind: string };
       expect(wsRowBefore.kind).toBe("workstream");
       expect(wsRowBefore.last_confirmed_at).toBeNull();
 
@@ -1356,7 +1356,7 @@ describe("Fix B — temporal backfill migration matrix", () => {
 
       // Workstream row must still be NULL — excluded by kind != 'workstream' guard.
       const wsRowAfter = db1.prepare(`SELECT last_confirmed_at FROM concepts WHERE id = ?`)
-        .get(ws0.id) as { last_confirmed_at: number | null };
+        .get(ws0!.id) as { last_confirmed_at: number | null };
       expect(wsRowAfter.last_confirmed_at).toBeNull();
 
       core1.close();
@@ -1402,11 +1402,11 @@ describe("Fix B — temporal backfill migration matrix", () => {
     // Workstream rows are kind='workstream'. They are NULL by design and excluded from all
     // backfill paths (kind != 'workstream' guard in both the column-guard and WHERE-NULL branches).
     const core = new MonetCore(":memory:");
-    const ws = await core.saveWorkstream({ status: "active", nextSteps: ["do a thing"] });
+    const ws = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "do a thing" }] });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const db = (core as any).db as import("../storage").StoragePort;
     const wsRow = db.prepare(`SELECT last_confirmed_at, kind FROM concepts WHERE id = ?`)
-      .get(ws.id) as { last_confirmed_at: number | null; kind: string };
+      .get(ws!.id) as { last_confirmed_at: number | null; kind: string };
     expect(wsRow.kind).toBe("workstream");
     // Workstream temporal field must remain NULL — excluded by design from staleness consumers.
     expect(wsRow.last_confirmed_at).toBeNull();

@@ -387,7 +387,7 @@ describe("addLifecycleEdge validation", () => {
     const native = await c.store("An ordinary native rule.");
     const other = await c.store("Another ordinary native rule.");
     const source = await c.storeSource("A chunk of connector-owned source truth.", { sourceRefs: ["source://docs/rules.md#a~1"] });
-    const workstream = await c.saveWorkstream({ status: "active", openQuestions: [], nextSteps: ["ship edges"] });
+    const workstream = await c.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "ship edges" }] });
 
     // Without this guard the write succeeds, reads see it, and the export silently drops it forever
     // — no counter, no diagnostic, and the dangling sweep stays quiet because the endpoint resolves.
@@ -401,14 +401,14 @@ describe("addLifecycleEdge validation", () => {
       c.addLifecycleEdge({ family: "provenance", srcConceptId: source.conceptId, dstSpan: SPAN, bornOf: "correction" }),
     ).toThrow(/source concept '.*' is connector-owned/);
     expect(() =>
-      c.addLifecycleEdge({ family: "supersession", srcConceptId: native.conceptId, dstConceptId: workstream.id, bornOf: "correction" }),
+      c.addLifecycleEdge({ family: "supersession", srcConceptId: native.conceptId, dstConceptId: workstream!.id, bornOf: "correction" }),
     ).toThrow(/destination concept '.*' is a workstream .* derived cache/);
     expect(() =>
-      c.addLifecycleEdge({ family: "derivation", srcConceptId: workstream.id, dstConceptId: native.conceptId, bornOf: "extraction" }),
+      c.addLifecycleEdge({ family: "derivation", srcConceptId: workstream!.id, dstConceptId: native.conceptId, bornOf: "extraction" }),
     ).toThrow(/source concept '.*' is a workstream/);
     expect(() => c.recordRatification({ subjectConceptId: source.conceptId, verdict: "approve" }))
       .toThrow(/subject concept '.*' is connector-owned/);
-    expect(() => c.recordRatification({ subjectConceptId: workstream.id, verdict: "approve" }))
+    expect(() => c.recordRatification({ subjectConceptId: workstream!.id, verdict: "approve" }))
       .toThrow(/subject concept '.*' is a workstream/);
 
     // Control: the same shapes between two native concepts are accepted, and nothing landed above.
@@ -1160,13 +1160,13 @@ describe("lifecycle edge sync", () => {
     const base = src.exportDelta(0);
     const good = base.lifecycleEdges![0]!;
 
-    const workstream = await dst.saveWorkstream({ status: "active", openQuestions: [], nextSteps: ["ship"] });
-    expect(() => dst.graftRows({ ...base, lifecycleEdges: [{ ...good, dst_concept_id: workstream.id }] }))
+    const workstream = await dst.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "ship" }] });
+    expect(() => dst.graftRows({ ...base, lifecycleEdges: [{ ...good, dst_concept_id: workstream!.id }] }))
       .toThrow(/destination concept '.*' is a workstream .* derived cache/);
-    expect(() => dst.graftRows({ ...base, lifecycleEdges: [{ ...good, src_concept_id: workstream.id }] }))
+    expect(() => dst.graftRows({ ...base, lifecycleEdges: [{ ...good, src_concept_id: workstream!.id }] }))
       .toThrow(/source concept '.*' is a workstream/);
     expect(() => dst.graftRows({ ...base, ratifications: [{
-      id: "r1", subject_concept_id: workstream.id, verdict: "approve", packet: null,
+      id: "r1", subject_concept_id: workstream!.id, verdict: "approve", packet: null,
       ratified_by: null, circle: "default", created_at: 1, sync_updated_at: 1,
     }] })).toThrow(/subject concept '.*' is a workstream/);
     expect((raw(dst).prepare(`SELECT COUNT(*) AS n FROM lifecycle_edges`).get() as { n: number }).n).toBe(0);

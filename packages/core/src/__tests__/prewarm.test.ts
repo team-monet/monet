@@ -17,7 +17,7 @@ describe("prewarm — session-start orientation", () => {
   it("carries none of the task or curation fields retired from resident state", async () => {
     const core = new MonetCore(":memory:");
     const stored = await core.store("We use SQLite for local storage.");
-    await core.saveWorkstream({ status: "active", nextSteps: ["continue implementation"] });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "continue implementation" }] });
     core.flagContradiction(stored.conceptId, { detail: "new evidence disagrees" });
 
     const state = core.prewarm() as Record<string, unknown>;

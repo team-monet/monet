@@ -74,7 +74,7 @@ describe("A.1 — stats() no-arg back-compat (store-wide shape unchanged)", () =
     // This mirrors overview()'s precedent. The asymmetry is a deliberate design choice.
     const core = freshCore();
     // Session 1: ONLY saveWorkstream — writes a session row but no observation rows.
-    await core.saveWorkstream({ status: "active", nextSteps: ["plan step"] }, { circle: "mycirc" });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "plan step" }] }, { circle: "mycirc" });
     core.endSessionForEval();
     // Session 2: normal store — writes both a session row and an observation row.
     await core.store("Observed fact.", { circle: "mycirc" });
@@ -94,7 +94,7 @@ describe("A.2 — stats(circle) circle-filtered correctness across ≥2 circles"
     // alpha gets 2 facts + 1 workstream.
     await core.store("Alpha fact one.", { circle: "alpha" });
     await core.store("Alpha fact two.", { circle: "alpha" });
-    await core.saveWorkstream({ status: "active", nextSteps: ["alpha step"] }, { circle: "alpha" });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "alpha step" }] }, { circle: "alpha" });
     // beta gets 1 fact.
     await core.store("Beta fact.", { circle: "beta" });
 
@@ -167,7 +167,7 @@ describe("A.5 — workstream split correct per circle", () => {
     // So c1 has 1 workstream and 1 fact; c2 has 0 workstreams and 1 fact.
     const core = freshCore();
     await core.store("Fact in c1.", { circle: "c1" });
-    await core.saveWorkstream({ status: "active", nextSteps: ["do X"] }, { circle: "c1" });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "do X" }] }, { circle: "c1" });
     await core.store("Fact in c2.", { circle: "c2" });
 
     const s1 = core.stats("c1");

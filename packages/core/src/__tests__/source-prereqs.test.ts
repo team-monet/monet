@@ -594,10 +594,10 @@ describe("source-pipeline core prerequisites", () => {
   it("keeps workstreams on their dedicated active/archive lifecycle", async () => {
     const core = new MonetCore(":memory:");
     try {
-      const workstream = await core.saveWorkstream({ status: "active", decisions: ["Keep the workstream lifecycle separate."] });
-      expect(() => core.retireConcept(workstream.id)).toThrow("workstream concept");
-      expect(() => core.restoreConcept(workstream.id)).toThrow("workstream concept");
-      expect(core.getActiveWorkstreams().map((item) => item.id)).toContain(workstream.id);
+      const workstream = await core.saveWorkstream({ status: "active" });
+      expect(() => core.retireConcept(workstream!.id)).toThrow("workstream concept");
+      expect(() => core.restoreConcept(workstream!.id)).toThrow("workstream concept");
+      expect(core.getActiveWorkstreams().map((item) => item.id)).toContain(workstream!.id);
     } finally {
       core.close();
     }

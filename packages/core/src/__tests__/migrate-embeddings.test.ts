@@ -179,11 +179,7 @@ async function seedFixture(dbPath: string, oldEmbedder: SpaceEmbedder): Promise<
 
     const workstreamPayload = {
       status: "active" as const,
-      openQuestions: ["question"],
-      nextSteps: ["step"],
-      decisions: ["decision"],
-      confirmedContext: ["context"],
-      discardedAlternatives: ["must not be embedded"],
+      open: [{ slot: "question" as const, text: "question" }, { slot: "step" as const, text: "step" }],
     };
     const workstream = await core.saveWorkstream(workstreamPayload);
 
@@ -197,8 +193,10 @@ async function seedFixture(dbPath: string, oldEmbedder: SpaceEmbedder): Promise<
       retiredObservation: retired.observationId,
       source: source.conceptId,
       sourceObservation: source.observationId,
-      workstream: workstream.id,
-      workstreamText: "question step decision context",
+      workstream: workstream!.id,
+      // The embedded text is the OPEN items, in payload order (#131): the four record slots
+      // that used to be joined in here no longer exist.
+      workstreamText: "question step",
     };
   } finally {
     core.close();
@@ -819,7 +817,8 @@ describe("MonetCore.migrateEmbeddings", () => {
     { phase: "native-observations", needle: "native-observation-wrong" },
     { phase: "source-concepts", needle: "Persisted source body" },
     { phase: "source-chunk-observations", needle: "source-chunk-wrong" },
-    { phase: "workstreams", needle: "question step decision context" },
+    // The needle is the workstream's embedded text — open items only since the slot cut (#131).
+    { phase: "workstreams", needle: "question step" },
   ] as const) {
     it(`validates every ${scenario.phase} provider result before its rewrite and resumes safely after correction`, async () => {
       await withTempDb(async (dbPath) => {

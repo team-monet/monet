@@ -41,7 +41,7 @@ describe("listMemories", () => {
   it("returns structural cards (never a body) and excludes workstreams", async () => {
     const core = new MonetCore(":memory:");
     await core.store("We cache auth tokens in Redis with a 5-minute TTL.", { circle: "c1" });
-    await core.saveWorkstream({ status: "active", nextSteps: ["resume the cache work"] }, { circle: "c1" });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "resume the cache work" }] }, { circle: "c1" });
 
     const list = core.listMemories("c1");
     expect(list).toHaveLength(1); // the workstream concept is filtered out
@@ -210,8 +210,8 @@ describe("reassignCircle — move", () => {
   it("returns null for a missing id and refuses to reassign a workstream", async () => {
     const core = new MonetCore(":memory:");
     expect(core.reassignCircle("does-not-exist", "x")).toBeNull();
-    const ws = await core.saveWorkstream({ status: "active", nextSteps: ["x"] }, { circle: "c1" });
-    expect(() => core.reassignCircle(ws.id, "c2")).toThrow(/workstream/);
+    const ws = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "x" }] }, { circle: "c1" });
+    expect(() => core.reassignCircle(ws!.id, "c2")).toThrow(/workstream/);
     core.close();
   });
 });

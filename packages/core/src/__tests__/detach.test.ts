@@ -783,9 +783,9 @@ describe("detach — F3: mirror contradiction hygiene (prior moves, correction s
 describe("detach — F4: workstream concept rejection", () => {
   it("store({ attachTo: workstreamId }) throws 'cannot attach to a workstream concept'", async () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const ws = await c.saveWorkstream({ status: "active", openQuestions: ["q1"] });
+    const ws = await c.saveWorkstream({ status: "active", open: [{ slot: "question" as const, text: "q1" }] });
     await expect(
-      c.store("Some new observation.", { attachTo: ws.id }),
+      c.store("Some new observation.", { attachTo: ws!.id }),
     ).rejects.toThrow(/cannot attach to a workstream concept/);
     c.close();
   });
@@ -798,7 +798,7 @@ describe("detach — F4: workstream concept rejection", () => {
     const fetched = (await c.getConcept(a.conceptId, { synthesize: false }))!;
     const obs2Id = fetched.observations[1]!.id;
     await expect(
-      c.detach(a.conceptId, [obs2Id], { destConceptId: ws.id }),
+      c.detach(a.conceptId, [obs2Id], { destConceptId: ws!.id }),
     ).rejects.toThrow(/cannot attach to a workstream concept/);
     c.close();
   });
@@ -807,7 +807,7 @@ describe("detach — F4: workstream concept rejection", () => {
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const ws = await c.saveWorkstream({ status: "active" });
     await expect(
-      c.detach(ws.id, ["any-obs-id"]),
+      c.detach(ws!.id, ["any-obs-id"]),
     ).rejects.toThrow(/cannot detach from a workstream concept/);
     c.close();
   });

@@ -72,9 +72,10 @@ async function main(): Promise<void> {
         summary: "smoke session",
         workstream: {
           status: "active",
-          openQuestions: ["does continuation restore this next session?"],
-          nextSteps: ["call memory_workstreams on continuation intent"],
-          decisions: [a.conceptId],
+          open: [
+            { slot: "question", text: "does continuation restore this next session?" },
+            { slot: "step", text: "call memory_workstreams on continuation intent" },
+          ],
         },
       },
     }),
@@ -89,7 +90,7 @@ async function main(): Promise<void> {
   const detail = parse(await client.callTool({ name: "memory_workstreams", arguments: { id: wss[0]?.id } }));
   console.log(
     `agent_context → circle=${ctx.circle}; memory_workstreams → ${wss.length} thread(s); ` +
-      `nextSteps=${JSON.stringify(detail.nextSteps)}`,
+      `items=${JSON.stringify(detail.items)}`,
   );
   if (wss.length !== 1 || ckWs?.id !== wss[0]?.id) throw new Error("workstream did not round-trip through checkpoint → memory_workstreams");
 

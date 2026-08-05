@@ -46,7 +46,7 @@ describe("overview composition + invariants", () => {
     for (let index = 0; index < 6; index++) {
       await c.store(`Distinct overview concept ${index}.`, { kind: "fact", resolution: "forceNew" });
     }
-    await c.saveWorkstream({ status: "active", nextSteps: ["wire rotation"] });
+    await c.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "wire rotation" }] });
     const full = c.overview("default");
     const limited = c.overview("default", { conceptLimit: 3 });
     expect(full.livingModel).toHaveLength(5);
@@ -97,7 +97,7 @@ describe("overview composition + invariants", () => {
   it("removes diagnostics, thread state, inventory, and timestamps by key absence", async () => {
     const c = core();
     await c.store("A workbench concept.", { resolution: "forceNew" });
-    await c.saveWorkstream({ status: "active", nextSteps: ["continue elsewhere"] });
+    await c.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "continue elsewhere" }] });
     await c.store("Another circle concept.", { circle: "other", resolution: "forceNew" });
     const overview = c.overview("default");
     for (const key of ["activeThreads", "graph", "resolutionStats", "health", "otherCircles", "agentId", "generatedAt"]) {

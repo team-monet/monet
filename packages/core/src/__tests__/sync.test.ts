@@ -1124,7 +1124,7 @@ describe("v8 sync closure", () => {
 
       a.renameCircle("old", "middle");
       a.renameCircle("middle", "final");
-      await a.saveWorkstream({ status: "paused", nextSteps: ["resume"] }, { circle: "final", summary: "ended" });
+      await a.saveWorkstream({ status: "paused", open: [{ slot: "step" as const, text: "resume" }] }, { circle: "final", summary: "ended" });
       b.graftRows(a.exportDelta(initial.exportedAt));
 
       expect(b.resolveCircleName("old")).toBe("final");

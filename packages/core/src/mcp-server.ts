@@ -13,7 +13,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore } from "./engine";
-import type { MemoryOverview, MergeConceptResult, RuleSuccession, SearchCard, StageView } from "./engine";
+import type { MemoryOverview, MergeConceptResult, RuleSuccession, SearchCard, StageView, WorkstreamItem } from "./engine";
 import {
   BREADTH_CIRCLE,
   MODEL_TAG_MAX_CHARS,
@@ -1743,20 +1743,34 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_checkpoint",
-    "At session end, preserve a compressed `workstream` snapshot: open questions, confirmed context, decisions, discarded alternatives, important entities/files, next steps, and status. Later continuation retrieves it through memory_workstreams. This does not synthesize memories.",
+    "At session end, record what is still OPEN as items — questions that need answering and steps that need doing. This MERGES: `open` adds items, `close` resolves named ones, and anything you do not name stays open untouched. Omitting an item no longer removes it, so carrying items forward by re-typing them is neither needed nor wanted — it mints duplicates. Close what you finished (`done`) or abandoned (`dropped`); leave the rest. Rationale, decisions, and context belong in the artifact they are about, not here.",
     {
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
       summary: z.string().optional(),
       workstream: z
         .object({
-          status: z.enum(["active", "paused", "done"]).default("active"),
-          openQuestions: z.array(z.string()).optional(),
-          confirmedContext: z.array(z.string()).optional(),
-          decisions: z.array(z.string()).optional(),
-          discardedAlternatives: z.array(z.string()).optional(),
-          importantEntities: z.array(z.string()).optional(),
-          nextSteps: z.array(z.string()).optional(),
+          status: z.enum(["active", "paused", "done"]).optional(),
+          open: z
+            .array(z.object({
+              slot: z.enum(["question", "step"]).describe("`question` gets answered; `step` gets done."),
+              text: z.string().min(1),
+            }))
+            .optional()
+            .describe("New items. Do not re-send items that are already open."),
+          close: z
+            .array(z.object({
+              id: z.string().describe("Item id from memory_workstreams."),
+              as: z.enum(["done", "dropped"]).describe("`done` finished it; `dropped` abandoned it."),
+            }))
+            .optional()
+            .describe("Resolve items by id. Closing an unknown or already-closed id is a no-op, never an error."),
         })
+        // STRICT, so the pre-#131 fields are REFUSED rather than stripped (Codex P2 on PR #149).
+        // Zod drops unknown keys by default, so a caller still sending openQuestions/nextSteps
+        // reached saveWorkstream with only `status` and got a success back carrying openItems: 0 —
+        // its entire checkpoint silently discarded. That is the same data-loss class this change
+        // exists to remove, so the entrance names what it does not accept instead of eating it.
+        .strict()
         .optional(),
     },
     async ({ circle, summary, workstream }) => {
@@ -1766,7 +1780,24 @@ export function registerMonetCoreTools(
         const saved = workstream ? await core.saveWorkstream(workstream, { circle: resolvedCircle, summary }) : null;
         return mutOk({
           circle: resolvedCircle,
-          workstream: saved ? { id: saved.id, status: saved.payload.status, version: saved.version } : null,
+          workstream: saved
+            ? {
+                id: saved.id,
+                status: saved.payload.status,
+                version: saved.version,
+                openItems: saved.payload.items.filter((item) => item.state === "open").length,
+                // NAME WHAT WAS ACTUALLY CLOSED (Codex round 2 on PR #149). A close against an id
+                // this circle's row does not hold — a stale id, or one read from a non-canonical
+                // row in a malformed store, which saveWorkstream can never write to — is a no-op
+                // by design. A bare success would report that as done. The receipt lists the ids
+                // that actually moved, so "I asked for three and two came back" is visible.
+                closed: (workstream?.close ?? [])
+                  .map((c) => c.id)
+                  .filter((id) => saved.payload.items.some(
+                    (item) => item.id === id && item.state !== "open" && item.closedIn === saved.payload.lastSessionId,
+                  )),
+              }
+            : null,
         }, "memory_checkpoint", capturedBlock);
       } catch (e) {
         return err(`checkpoint failed: ${msg(e)}`);
@@ -1776,13 +1807,14 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_workstreams",
-    "Call only on continuation intent, never for a fresh directive. Omit id to list compact active/paused workstreams, then confirm which to resume unless the user named one unambiguously. Pass its id for detail. Detail pages preserve slot order: openQuestions, decisions, discardedAlternatives, confirmedContext, importantEntities, nextSteps. Advance detailOffset by entries actually returned; detailOmitted is the true remainder.",
+    "Call only on continuation intent, never for a fresh directive. Omit id to list compact active/paused workstreams, then confirm which to resume unless the user named one unambiguously. Pass its id for detail: OPEN items only, questions before steps, each with the id memory_checkpoint's `close` takes. `closedItems` says how many resolved ones exist without delivering them; pass includeClosed to see them with their state and closing session. Advance detailOffset by entries actually returned; detailOmitted is the true remainder.",
     {
       id: z.string().optional().describe("Workstream id for detail; omit to list active/paused workstreams."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
-      detailOffset: z.number().int().min(0).optional().describe("With id, skip this many cross-slot entries; advance by entries returned."),
+      detailOffset: z.number().int().min(0).optional().describe("With id, skip this many entries; advance by entries returned."),
+      includeClosed: z.boolean().optional().describe("With id, also return done/dropped items. Off by default — the working set is the open ones."),
     },
-    async ({ id, circle, detailOffset }) => {
+    async ({ id, circle, detailOffset, includeClosed }) => {
       const resolvedCircle = scope(circle);
       // A continuation pull must not re-inject session-start orientation. Passing an explicit empty
       // snapshot consumes auto-prewarm deterministically instead of falling through to wrapSuccess's
@@ -1812,21 +1844,23 @@ export function registerMonetCoreTools(
           return readOk(envelope(fit.fitted, fit.omitted), "memory_workstreams", suppressPrewarm);
         }
 
-        const workstream = workstreams.find((candidate) => candidate.id === id);
+        // An id lookup with includeClosed must reach a FINISHED workstream (Codex round 2 on
+        // #152): the one a caller most wants the resolved items of is the one just closed, and
+        // getActiveWorkstreams filters `done` out, so the option could not deliver what it names.
+        // Continuation (the list path above) still sees only active/paused.
+        const workstream = workstreams.find((candidate) => candidate.id === id)
+          ?? (includeClosed ? core.getWorkstreamById(id, resolvedCircle) : undefined);
         if (!workstream) return err(`workstream not found: ${id}`);
-        const arraySlots = [
-          "openQuestions",
-          "decisions",
-          "discardedAlternatives",
-          "confirmedContext",
-          "importantEntities",
-          "nextSteps",
-        ] as const;
-        type ArraySlot = typeof arraySlots[number];
-        type DetailEntry = { slot: ArraySlot; value: string };
-        const allEntries: DetailEntry[] = arraySlots.flatMap((slot) =>
-          (workstream.payload[slot] ?? []).map((value) => ({ slot, value })),
-        );
+        // OPEN BY DEFAULT, closed on request. A closed item is not deleted, it is not delivered —
+        // which is what makes "was this finished, or dropped three checkpoints ago?" answerable at
+        // all, while costing nothing on the turns nobody asks.
+        type DetailEntry = { item: WorkstreamItem; value: string };
+        const questionsFirst = (a: WorkstreamItem, b: WorkstreamItem): number =>
+          a.slot === b.slot ? a.openedAt - b.openedAt : a.slot === "question" ? -1 : 1;
+        const allEntries: DetailEntry[] = workstream.payload.items
+          .filter((item) => (includeClosed ?? false) || item.state === "open")
+          .sort(questionsFirst)
+          .map((item) => ({ item, value: item.text }));
         const offsetRequested = detailOffset !== undefined;
         const offset = Math.min(detailOffset ?? 0, allEntries.length);
         const remaining = allEntries.slice(offset);
@@ -1835,24 +1869,33 @@ export function registerMonetCoreTools(
           entries: DetailEntry[],
           valueClipped: boolean,
         ): Record<string, unknown> => {
-          const grouped = new Map<ArraySlot, string[]>();
-          for (const entry of entries) {
-            const values = grouped.get(entry.slot) ?? [];
-            values.push(entry.value);
-            grouped.set(entry.slot, values);
-          }
           const omitted = allEntries.length - offset - entries.length;
+          const openCount = workstream.payload.items.filter((item) => item.state === "open").length;
           return {
             id: workstream.id,
             title: workstream.title,
             status: workstream.payload.status,
-            ...Object.fromEntries(arraySlots.flatMap((slot) => {
-              const values = grouped.get(slot);
-              return values === undefined ? [] : [[slot, values]];
+            openItems: openCount,
+            // The id is the addressable part: memory_checkpoint's `close` takes exactly these.
+            items: entries.map(({ item, value }) => ({
+              id: item.id,
+              slot: item.slot,
+              text: value,
+              ...(item.state === "open" ? {} : {
+                state: item.state,
+                ...(item.closedAt !== undefined ? { closedAt: item.closedAt } : {}),
+                ...(item.closedIn !== undefined ? { closedIn: item.closedIn } : {}),
+              }),
             })),
-            ...(workstream.payload.lastSessionId !== undefined
-              ? { lastSessionId: workstream.payload.lastSessionId }
-              : {}),
+            // Say that closed items exist without delivering them; silence about them would read
+            // as "nothing was ever closed here", which is the ambiguity this design removes.
+            ...(includeClosed ? {} : (() => {
+              const closed = workstream.payload.items.length - openCount;
+              return closed > 0 ? { closedItems: closed } : {};
+            })()),
+            // lastSessionId is stored, not delivered: nothing in this contract acts on it, and
+            // where session provenance actually matters — "who closed this item" — it rides the
+            // closed item as `closedIn`. Stored-not-delivered is the same rule closed items get.
             ...(offsetRequested || omitted > 0 || valueClipped ? { detailOffset: offset } : {}),
             ...(omitted > 0 || valueClipped ? {
               detailTruncated: true,

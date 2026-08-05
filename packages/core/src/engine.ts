@@ -1711,15 +1711,127 @@ export interface DetachResult {
  * policy made concrete. The agent compresses a session into this at `checkpoint`; it
  * survives for explicit continuation through memory_workstreams. These slots SURVIVE; raw turns are EPHEMERAL.
  */
+/** The two slots that can CLOSE. See the slot cut, `docs/design/workstream-continuity-2026-08-05.md` §2. */
+export type WorkstreamItemSlot = "question" | "step";
+
+/**
+ * `dropped` is explicit and is the entire point of #131: omission stops being a way to remove
+ * anything. An item leaves the open set only by being named.
+ */
+export type WorkstreamItemState = "open" | "done" | "dropped";
+
+export interface WorkstreamItem {
+  id: string;
+  slot: WorkstreamItemSlot;
+  text: string;
+  state: WorkstreamItemState;
+  openedAt: number;
+  closedAt?: number;
+  /** The session that closed it — what makes "finished, or dropped three checkpoints ago?" answerable. */
+  closedIn?: string;
+}
+
+/**
+ * A workstream carries OPEN ITEMS ONLY (ruled by John, 2026-08-05).
+ *
+ * The four slots this replaced — decisions, discardedAlternatives, confirmedContext,
+ * importantEntities — were cut because a field with no state can never be filtered: there is no
+ * version of it that is not delivered in full, every time. Measured before the cut, they held 125
+ * of the 158 entries across 11 live workstreams, and `example-circle`'s own copy had decayed into
+ * misinformation — it named three merged PRs as open, a `main` SHA that had moved, and a backup
+ * file that no longer existed. A stateless slot does not merely accumulate; it goes stale with no
+ * way to say so, which is worse than being absent.
+ */
 export interface WorkstreamPayload {
   status: "active" | "paused" | "done";
+  items: WorkstreamItem[];
+  lastSessionId?: string;
+}
+
+/**
+ * What a checkpoint says. Three intents and nothing else — and the third is the change: whatever
+ * the caller does not name is left exactly as it was.
+ */
+export interface WorkstreamCheckpoint {
+  status?: "active" | "paused" | "done";
+  open?: Array<{ slot: WorkstreamItemSlot; text: string }>;
+  close?: Array<{ id: string; as: "done" | "dropped" }>;
+  /**
+   * Never set. Present so a `WorkstreamPayload` cannot structurally satisfy this type (Codex round
+   * 2 on PR #149): every field above is optional, so a direct package user still holding a payload
+   * variable could pass `{ status, items }` and get a success back having written nothing — the
+   * excess-property check only fires on object literals, not on variables. A refusal at runtime
+   * covers JavaScript callers, which types cannot reach.
+   */
+  items?: never;
+}
+
+/** The pre-#131 payload, still on disk in every row written before the cut. */
+interface LegacyWorkstreamPayload {
+  status?: "active" | "paused" | "done";
   openQuestions?: string[];
-  confirmedContext?: string[];
-  decisions?: string[];
-  discardedAlternatives?: string[];
-  importantEntities?: string[];
   nextSteps?: string[];
   lastSessionId?: string;
+  [legacySlot: string]: unknown;
+}
+
+/**
+ * Read-time migration. Old rows keep their bytes; nothing rewrites them until the next checkpoint.
+ *
+ * The two item slots become open items; the four cut slots are not carried, because carrying them
+ * as items would assert they can close, and they cannot. Everything arrives `open` — the history
+ * cannot distinguish a finished item from a dropped one, which is the exact defect #131 is about,
+ * so inventing a `done` here would be the same lie one layer down.
+ */
+export function normalizeWorkstreamPayload(raw: unknown, openedAt: number): WorkstreamPayload {
+  const payload = (raw ?? {}) as LegacyWorkstreamPayload & Partial<WorkstreamPayload>;
+  const status = payload.status ?? "active";
+  if (Array.isArray(payload.items)) {
+    return { status, items: payload.items as WorkstreamItem[], ...(payload.lastSessionId !== undefined ? { lastSessionId: payload.lastSessionId } : {}) };
+  }
+  const items: WorkstreamItem[] = [];
+  const carry = (values: unknown, slot: WorkstreamItemSlot): void => {
+    if (!Array.isArray(values)) return;
+    values.forEach((text, index) => {
+      if (typeof text !== "string" || text.length === 0) return;
+      items.push({ id: legacyWorkstreamItemId(slot, text, index), slot, text, state: "open", openedAt });
+    });
+  };
+  carry(payload.openQuestions, "question");
+  carry(payload.nextSteps, "step");
+  // A LEGACY `done` THAT CARRIES ITEMS IS NOT HONEST (Codex on PR #152). The old shape let status
+  // and slots move independently, and 5 of the 11 live rows are exactly this: `done` with 7 items
+  // between them. Migrating that verbatim marks them open and then hides the whole workstream
+  // behind getActiveWorkstreams' `status === "done"` filter — #131's defect surviving the change
+  // that fixes #131, on half the store. `done` asserts nothing is open, so a row carrying items
+  // was never done; the same rule the merge applies when opening revives a finished workstream.
+  const carriedOpen = items.some((item) => item.state === "open");
+  return {
+    status: status === "done" && carriedOpen ? "active" : status,
+    items,
+    ...(payload.lastSessionId !== undefined ? { lastSessionId: payload.lastSessionId } : {}),
+  };
+}
+
+/** Parse a stored workstream body; a corrupt one reads as empty rather than throwing. */
+export function safeParseWorkstreamBody(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * A migrated item's id is derived from its slot and text, not minted fresh. Two reads of the same
+ * unmigrated row must agree on ids, or a close issued against one read would miss on the next —
+ * and rows migrate lazily, on whichever session checkpoints first.
+ */
+function legacyWorkstreamItemId(slot: WorkstreamItemSlot, text: string, index: number): string {
+  // The occurrence index is in the hash input (Codex P2 on PR #149): a legacy slot may hold the
+  // same string twice, and without it both migrate to one id — two open items sharing one close
+  // address, where resolving either resolves both. The index is stable because the body is.
+  return `wi:${createHash("sha256").update(`${slot}\0${index}\0${text}`).digest("hex").slice(0, 24)}`;
 }
 
 export interface Workstream {
@@ -4728,7 +4840,94 @@ export class MonetCore {
    * versioned, with a revision) and ends the current session. Agent-authored, so it is
    * never marked dirty. Restored on continuation intent via getActiveWorkstreams (#242).
    */
-  async saveWorkstream(payload: WorkstreamPayload, opts: { circle?: string; summary?: string } = {}): Promise<Workstream> {
+  /** Read the current payload for a slug, migrating a pre-#131 body on the way out. */
+  private readWorkstreamPayload(
+    circle: string,
+    slug: string,
+  ): { payload: WorkstreamPayload; archived: boolean } | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+        AND source_identity IS NULL AND active_observation_id IS NULL
+        ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC
+        LIMIT 1`)
+      .get(circle, slug) as ConceptRow | undefined;
+    if (!row) return undefined;
+    return {
+      payload: normalizeWorkstreamPayload(safeParseWorkstreamBody(row.body), row.updated_at),
+      archived: row.status === "archived",
+    };
+  }
+
+  /**
+   * A checkpoint that opens nothing and states no status has nothing to write unless a LIVE row
+   * exists to close against (Codex round 3 on #152). "Live" excludes archived: an archived-only
+   * slug is gone as far as the read path is concerned, so reviving it through an operation the
+   * tool documents as a no-op would resurrect a hidden workstream out of a stale id.
+   */
+  private isCloseOnlyNoOp(input: WorkstreamCheckpoint, existing: { archived: boolean } | undefined): boolean {
+    if ((input.open ?? []).length > 0 || input.status !== undefined) return false;
+    return existing === undefined || existing.archived;
+  }
+
+  /**
+   * Apply a checkpoint's intents to the existing item set.
+   *
+   * Closing is idempotent and closing an unknown id is NOT an error: a checkpoint written against a
+   * read that a concurrent write has since changed must not fail the whole save over one stale id.
+   * Re-opening is likewise not special-cased — an item that says the same thing as a closed one
+   * arrives as a NEW item with its own id, because the author asked for it again.
+   */
+  private mergeWorkstreamPayload(
+    existing: WorkstreamPayload | undefined,
+    input: WorkstreamCheckpoint,
+    sessionId: string,
+  ): WorkstreamPayload {
+    const now = Date.now();
+    const items = [...(existing?.items ?? [])];
+    // The MCP boundary enforces this enum; a direct JS caller does not have one (Codex round 2 on
+    // #152). A typo like `as: "closed"` persisted verbatim, which hides the item from the default
+    // view AND makes every later legitimate close skip it, because it is no longer `open`.
+    for (const closed of input.close ?? []) {
+      if (closed.as !== "done" && closed.as !== "dropped") {
+        throw new Error(`close disposition must be 'done' or 'dropped', not '${String(closed.as)}' (item ${closed.id}).`);
+      }
+    }
+    // The sibling of the check above, missed when that one was added (Codex round 3 on #152). A
+    // typo like `slot: "todo"` writes an item outside the documented contract, and every reader
+    // that branches on question|step then meets a third value.
+    for (const opened of input.open ?? []) {
+      if (opened.slot !== "question" && opened.slot !== "step") {
+        throw new Error(`open slot must be 'question' or 'step', not '${String(opened.slot)}'.`);
+      }
+    }
+    const closing = new Map((input.close ?? []).map((c) => [c.id, c.as] as const));
+    for (let i = 0; i < items.length; i += 1) {
+      const as = closing.get(items[i].id);
+      if (as === undefined || items[i].state !== "open") continue;
+      items[i] = { ...items[i], state: as, closedAt: now, closedIn: sessionId };
+    }
+    for (const opened of input.open ?? []) {
+      if (opened.text.length === 0) continue;
+      items.push({ id: this.newId(), slot: opened.slot, text: opened.text, state: "open", openedAt: now });
+    }
+    // OPENING REVIVES (Codex round 2 on PR #149). Inheriting a previous `done` would make the
+    // first checkpoint of follow-up work in that circle fail the open-items guard — and `done`
+    // workstreams are filtered out of memory_workstreams, so the caller could not see the status
+    // it was inheriting or learn to override it. A dead end I created with the guard itself.
+    //
+    // `done` asserts nothing is open; opening something contradicts it, so the honest resolution is
+    // that the workstream is active again. An EXPLICIT `status: "done"` alongside `open` is still
+    // refused by the guard — this only fills in a status the caller did not state.
+    const opened = (input.open ?? []).length > 0;
+    const inherited = existing?.status ?? "active";
+    return {
+      status: input.status ?? (opened && inherited === "done" ? "active" : inherited),
+      items,
+      lastSessionId: sessionId,
+    };
+  }
+
+  async saveWorkstream(input: WorkstreamCheckpoint, opts: { circle?: string; summary?: string } = {}): Promise<Workstream | null> {
     this.assertNoEmbedderMigrationReentry("save a workstream");
     this.assertPinSatisfied(); // embedder-pin ADR
     this.requireStableEmbedderIdentity();
@@ -4751,19 +4950,55 @@ export class MonetCore {
           `Save it at an ordinary circle.`,
       );
     }
+    // The MCP boundary is `.strict()`, but a direct package caller reaches this method with no Zod
+    // in between (Codex on PR #152). Every one of these fields is silently ignored by the merge, so
+    // without this the caller gets a successful save that wrote nothing — the same silent loss the
+    // strict schema exists to prevent, one layer down.
+    const stale = ["items", "openQuestions", "nextSteps", "decisions", "discardedAlternatives", "confirmedContext", "importantEntities"]
+      .filter((field) => (input as Record<string, unknown>)[field] !== undefined);
+    if (stale.length > 0) {
+      throw new Error(
+        `saveWorkstream takes a checkpoint (status/open/close), not a workstream payload — ` +
+          `${stale.join(", ")} ${stale.length === 1 ? "is" : "are"} ignored and would report success ` +
+          `having written nothing. Open new items with \`open\`, resolve existing ones with \`close\`, ` +
+          `and everything unnamed stays as it is.`,
+      );
+    }
     const sessionId = this.ensureSession();
-    const full: WorkstreamPayload = { ...payload, lastSessionId: sessionId };
     const slug = `workstream:${circle}`;
-    const body = JSON.stringify(full, null, 2);
-    const title = workstreamTitle(full);
-    const emb = await this.checkedEmbed(workstreamText(full), "native"); // column is NOT NULL; not used for dedup
+
+    // MERGE, NOT REPLACE (#131). A checkpoint states three intents — open new items, close named
+    // ones, and leave everything it did not name alone. Forgetting an item can no longer destroy
+    // it; it just fails to close it, and the next session finds it still open.
+    //
+    // The read below is a PREVIEW, taken outside the write reservation only so the embedding has
+    // something to embed: `checkedEmbed` is async and the transaction is synchronous, so the two
+    // cannot be interleaved. The authoritative merge happens again inside the transaction against
+    // the row it is actually writing. A concurrent checkpoint between the two can therefore leave
+    // the embedding one revision stale — harmless and deliberate, because this column is explicitly
+    // not used for dedup or ranking (it exists because the column is NOT NULL).
+    const previewRow = this.readWorkstreamPayload(circle, slug);
+    // BEFORE THE EMBEDDER (Codex round 3 on #152, completing round 2's fix). Returning null from
+    // inside the transaction was too late: this path still embedded first, so an unavailable or
+    // mismatched embedder turned a documented no-op close into `checkpoint failed` and took the
+    // caller's session-ending summary with it.
+    //
+    // Deciding from the preview read is safe here precisely because the ids are stale: they came
+    // from a read taken before this call, so if no live row existed then, they cannot belong to one
+    // that appeared since. The authoritative check inside the transaction reaches the same answer.
+    if (this.isCloseOnlyNoOp(input, previewRow)) {
+      this.endSession(opts.summary);
+      return null;
+    }
+    const preview = this.mergeWorkstreamPayload(previewRow?.payload, input, sessionId);
+    const emb = await this.checkedEmbed(workstreamText(preview), "native");
 
     // TRANSACTION: workstream concept write + revision must be all-or-nothing.
     // Acquire the write reservation before deciding whether to create or update: concurrent
     // checkpoint writers for the same circle must not act on a stale workstream row snapshot.
     // endSession() lives OUTSIDE the envelope — it is session lifecycle and should proceed
     // regardless of the workstream write outcome (same reasoning as ensureSession in store()).
-    const result = this.db.immediateTransaction((): { row: ConceptRow; proofToken?: EmbeddingWidthProofToken } => {
+    const result = this.db.immediateTransaction((): { row: ConceptRow; proofToken?: EmbeddingWidthProofToken } | null => {
       this.assertNoEmbedderMigrationReentry("save a workstream");
       this.assertPinSatisfied();
       this.assertEmbedderOutput(emb, "native");
@@ -4789,6 +5024,48 @@ export class MonetCore {
           LIMIT 1`)
         .get(circle, slug) as ConceptRow | undefined;
 
+      // THE AUTHORITATIVE MERGE, against the row actually being written. The preview above only
+      // fed the embedding; a concurrent checkpoint that landed in between is picked up here, so no
+      // item opened by that writer is lost and no close it applied is undone.
+      let existingPayload: WorkstreamPayload | undefined;
+      if (existing) {
+        existingPayload = normalizeWorkstreamPayload(safeParseWorkstreamBody(existing.body), existing.updated_at);
+      }
+      const existingIsArchived = existing?.status === "archived";
+      // A NO-OP CLOSE MUST NOT MINT A THREAD (Codex on PR #152). Closing an id this circle has no
+      // row for is a deliberate no-op — stale ids, wrong circle, a race — but with no row to merge
+      // into it produced `{status: "active", items: []}` and inserted a visible
+      // "workstream: session state" row. Creating an empty continuation thread out of a no-op is
+      // the mirror of the silent loss this change removes: something appears that nobody asked for.
+      if (this.isCloseOnlyNoOp(input, existing === undefined ? undefined : { archived: existingIsArchived })) {
+        // NOTHING TO WRITE, AND THAT IS NOT AN ERROR (Codex round 2 on #152, correcting round 1's
+        // fix here). Round 1 stopped this path from minting an empty "workstream: session state"
+        // row by throwing — which broke the contract the tool documents, that an unknown close is a
+        // no-op. A stale or wrong-circle close is idempotent by design; failing the whole
+        // checkpoint over one also skipped the caller's session-ending summary.
+        //
+        // The honest result is that no workstream exists, which is what null says. The MCP handler
+        // already renders that as `workstream: null`.
+        return null;
+      }
+      const full = this.mergeWorkstreamPayload(existingPayload, input, sessionId);
+      // `done` MUST NOT HIDE OPEN ITEMS (Codex P1 on PR #149, ruled by John 2026-08-05).
+      // getActiveWorkstreams filters `status === "done"`, so a checkpoint that closed the
+      // workstream while items were still open made them unreachable — recreating, inside the
+      // change that removes it, exactly the silent loss #131 is about. A workstream with open
+      // items is not done, so the entrance refuses the claim instead of quietly acting on it,
+      // and names the ids so the fix is mechanical. Checking here rather than in the preview
+      // means a concurrent close between the two reads is respected.
+      const stillOpen = full.items.filter((item) => item.state === "open");
+      if (full.status === "done" && stillOpen.length > 0) {
+        throw new Error(
+          `cannot mark this workstream 'done' while ${stillOpen.length} item(s) are still open: ` +
+            `${stillOpen.map((item) => item.id).join(", ")}. Close them in the same checkpoint ` +
+            `(done or dropped), or leave the status as it was — omitting an item never removes it.`,
+        );
+      }
+      const body = JSON.stringify(full, null, 2);
+      const title = workstreamTitle(full);
 
       let conceptId: string;
       let version: number;
@@ -4820,9 +5097,30 @@ export class MonetCore {
       if (!savedRow) throw new Error("workstream row missing after save");
       return { row: savedRow, proofToken: this.captureEmbeddingWidthProof(emb.length) };
     })();
+    // endSession still runs for a no-op close: the session ended either way, and the caller's
+    // summary belongs to it.
     this.endSession(opts.summary);
+    if (result === null) return null;
     this.installEmbeddingWidthProof(result.proofToken);
     return toWorkstream(result.row);
+  }
+
+  /**
+   * One workstream by id, regardless of payload status (Codex round 2 on #152). `includeClosed`
+   * advertises the resolved items of a workstream, and the most likely one to ask about is the one
+   * just finished — which getActiveWorkstreams filters out, so the option could not deliver what it
+   * promised. Continuation still goes through getActiveWorkstreams; this is the id path only.
+   */
+  getWorkstreamById(id: string, circle?: string): Workstream | undefined {
+    circle ??= this.defaultCircle;
+    // ARCHIVED STAYS GONE (Codex round 3 on #152). The list path treats an archived loser from a
+    // rename/merge/graft collision as gone on purpose; `includeClosed` is about resolved ITEMS, not
+    // about bypassing the row lifecycle, so the id path excludes them the same way.
+    const row = this.db
+      .prepare(`SELECT * FROM concepts WHERE id=? AND circle=? AND kind='workstream'
+        AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'archived'`)
+      .get(id, this.resolveCircle(circle)) as ConceptRow | undefined;
+    return row ? toWorkstream(row) : undefined;
   }
 
   /** Restore a circle's active/paused workstreams for an explicit continuation request. */
@@ -9501,7 +9799,11 @@ export class MonetCore {
     const run = this.assertRepairOwnership("reembedWorkstream");
     const row = this.getRow(conceptId);
     if (!row || row.kind !== "workstream") return false;
-    const payload = JSON.parse(row.body) as WorkstreamPayload;
+    // MIGRATE HERE TOO (Codex P1 on PR #149). Read-time migration covered toWorkstream and
+    // saveWorkstream and missed this one, so a pre-#131 body reached workstreamText with no
+    // `items` and the workstreams phase recorded a TypeError — every existing store would have
+    // been unable to complete an embedder migration after upgrading.
+    const payload = normalizeWorkstreamPayload(safeParseWorkstreamBody(row.body), row.updated_at);
     const embedding = await this.checkedEmbed(workstreamText(payload), "native");
     this.db.transaction((): void => {
       this.assertRepairOwnershipUnchanged(run, "reembedWorkstream");
@@ -17888,11 +18190,12 @@ function conceptCarriesNormativeRecord(db: StoragePort, conceptId: string): stri
 }
 
 function toWorkstream(r: ConceptRow): Workstream {
+  // Migrates a pre-#131 body on the way out; rows keep their bytes until the next checkpoint.
   let payload: WorkstreamPayload;
   try {
-    payload = JSON.parse(r.body) as WorkstreamPayload;
+    payload = normalizeWorkstreamPayload(JSON.parse(r.body), r.updated_at);
   } catch {
-    payload = { status: "active" };
+    payload = { status: "active", items: [] };
   }
   return { id: r.id, slug: r.slug, title: r.title, circle: r.circle, version: r.version, payload, updatedAt: r.updated_at };
 }
@@ -17915,14 +18218,15 @@ function livingModelScore(r: ConceptRow, now: number): number {
 }
 
 function workstreamTitle(p: WorkstreamPayload): string {
-  const lead = p.nextSteps?.[0] ?? p.openQuestions?.[0] ?? "session state";
+  const open = p.items.filter((i) => i.state === "open");
+  const lead = (open.find((i) => i.slot === "step") ?? open[0])?.text ?? "session state";
   const t = `workstream: ${lead}`;
   return t.length > 80 ? t.slice(0, 77) + "…" : t;
 }
 
 /** A representative string for the workstream's (dedup-irrelevant) embedding column. */
 function workstreamText(p: WorkstreamPayload): string {
-  const parts = [...(p.openQuestions ?? []), ...(p.nextSteps ?? []), ...(p.decisions ?? []), ...(p.confirmedContext ?? [])];
+  const parts = p.items.filter((i) => i.state === "open").map((i) => i.text);
   return parts.join(" ") || "workstream";
 }
 

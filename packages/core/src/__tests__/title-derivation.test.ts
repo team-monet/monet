@@ -165,17 +165,16 @@ describe("title re-derivation on synthesis", () => {
     // Create a workstream — its title is derived from workstreamTitle(), stored as a JSON body.
     const w = await core.saveWorkstream({
       status: "active",
-      openQuestions: ["how to tune thresholds?"],
-      nextSteps: ["wire prewarm"],
+      open: [{ slot: "question" as const, text: "how to tune thresholds?" }, { slot: "step" as const, text: "wire prewarm" }],
     });
-    const originalWorkstreamTitle = w.title;
+    const originalWorkstreamTitle = w!.title;
     expect(originalWorkstreamTitle).toBeTruthy();
 
     // Drive applySynthesis directly on the workstream concept id (the MCP path).
     // The body we pass is a plain string — firstLine of it would be "{" if the guard were absent
     // (i.e. if we had passed a JSON body). We pass something whose firstLine is clearly different
     // from the workstream title to prove the guard suppresses the re-derivation.
-    const updated = await core.applySynthesis(w.id, '{"status":"active","nextSteps":["wire prewarm"]}');
+    const updated = await core.applySynthesis(w!.id, '{"status":"active","nextSteps":["wire prewarm"]}');
     // applySynthesis returns null only when the id is not found; workstreams always exist.
     expect(updated).not.toBeNull();
     // Title must remain the workstream's proper title, not "{" (firstLine of the JSON body).

@@ -60,7 +60,7 @@ describe("renameCircle", () => {
 
   it("updates workstream slug after rename so next checkpoint doesn't fork a duplicate", async () => {
     const core = new MonetCore(":memory:");
-    await core.saveWorkstream({ status: "active", nextSteps: ["step one"] }, { circle: "proj-old" });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "step one" }] }, { circle: "proj-old" });
 
     // Slug before rename should be "workstream:proj-old".
     const wsBefore = core.getActiveWorkstreams("proj-old");
@@ -201,13 +201,13 @@ describe("mergeCircle", () => {
 
   it("workstream concept in from-circle is deleted, not moved to into-circle", async () => {
     const core = new MonetCore(":memory:");
-    const ws = await core.saveWorkstream({ status: "active", nextSteps: ["continue work"] }, { circle: "src" });
+    const ws = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "continue work" }] }, { circle: "src" });
     await core.store("Real fact in src.", { circle: "src", resolution: "forceNew" });
     await core.store("Real fact in dst.", { circle: "dst", resolution: "forceNew" });
 
     const result = await core.mergeCircle("src", "dst");
     // Workstream should be deleted (not in dst).
-    expect(core.circleOf(ws.id)).toBeNull();
+    expect(core.circleOf(ws!.id)).toBeNull();
     // Real fact should be moved.
     expect(result.counts.moved + result.counts.merged).toBe(1);
     // src circle is empty.

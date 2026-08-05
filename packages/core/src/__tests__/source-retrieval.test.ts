@@ -428,18 +428,18 @@ describe("authorized source-backed generic retrieval", () => {
 
   it("keeps a connector-marked workstream invisible and refuses to overwrite it", async () => {
     const core = makeCore();
-    const workstream = await core.saveWorkstream({ status: "active", nextSteps: ["secret connector task"] }, { circle });
+    const workstream = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "secret connector task" }] }, { circle });
     const db = rawDb(core);
-    db.prepare(`UPDATE concepts SET source_identity='source://ghost' WHERE id=?`).run(workstream.id);
-    const before = db.prepare(`SELECT body,version FROM concepts WHERE id=?`).get(workstream.id);
+    db.prepare(`UPDATE concepts SET source_identity='source://ghost' WHERE id=?`).run(workstream!.id);
+    const before = db.prepare(`SELECT body,version FROM concepts WHERE id=?`).get(workstream!.id);
 
     expect(core.getActiveWorkstreams(circle)).toEqual([]);
     expect(core.stats(circle).workstreams).toBe(0);
     expect(core.stats().workstreams).toBe(0);
     expect(core.overview(circle).counts.workstreams).toBe(0);
-    await expect(core.saveWorkstream({ status: "active", nextSteps: ["overwrite attempt"] }, { circle }))
+    await expect(core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "overwrite attempt" }] }, { circle }))
       .rejects.toThrow(/connector-owned workstream/);
-    expect(db.prepare(`SELECT body,version FROM concepts WHERE id=?`).get(workstream.id)).toEqual(before);
+    expect(db.prepare(`SELECT body,version FROM concepts WHERE id=?`).get(workstream!.id)).toEqual(before);
 
     const server = new McpServer({ name: "workstream-marker-test", version: "1" });
     registerMonetCoreTools(server, core, { autoPrewarm: false, checkpointNudge: false });

@@ -12,6 +12,11 @@ import { BetterSqlitePort } from "../storage";
 import type { EmbeddingProvider } from "../embedding";
 import type { PragmaOptions, Statement, StoragePort } from "../storage";
 
+/** Open item texts for a slot — the post-#131 shape of what these assertions used to read directly. */
+const openTexts = (payload: { items: Array<{ slot: string; text: string; state: string }> }, slot: "question" | "step"): string[] =>
+  payload.items.filter((i) => i.state === "open" && i.slot === slot).map((i) => i.text);
+
+
 function rawDb(core: MonetCore): StoragePort {
   return (core as unknown as { db: StoragePort }).db;
 }
@@ -276,60 +281,56 @@ describe("memory_workstreams MCP tool", () => {
     const core = new MonetCore(":memory:");
     const saved = await core.saveWorkstream({
       status: "paused",
-      openQuestions: ["Which threshold should move?"],
-      confirmedContext: ["The serial runner is authoritative."],
-      decisions: ["Keep resident context minimal."],
-      discardedAlternatives: ["Push every workstream at session start."],
-      importantEntities: ["src/mcp-server.ts"],
-      nextSteps: ["Run the serial suite."],
+      open: [{ slot: "question" as const, text: "Which threshold should move?" }, { slot: "step" as const, text: "Run the serial suite." }],
     });
 
     const { list, detail } = await withWorkstreamServer(core, async (client) => ({
       list: toolJson(await client.callTool({ name: "memory_workstreams", arguments: {} })),
-      detail: toolJson(await client.callTool({ name: "memory_workstreams", arguments: { id: saved.id } })),
+      detail: toolJson(await client.callTool({ name: "memory_workstreams", arguments: { id: saved!.id } })),
     }));
 
-    expect(list).toEqual({ workstreams: [{ id: saved.id, title: saved.title, status: "paused" }] });
-    expect(detail).toEqual({ id: saved.id, title: saved.title, ...saved.payload });
+    expect(list).toEqual({ workstreams: [{ id: saved!.id, title: saved!.title, status: "paused" }] });
+    // Detail is the OPEN working set, questions before steps, each carrying the id that
+    // memory_checkpoint's `close` takes. `lastSessionId` is not delivered — nothing acts on it.
+    expect(detail).toEqual({
+      id: saved!.id,
+      title: saved!.title,
+      status: "paused",
+      openItems: 2,
+      items: saved!.payload.items.map((item) => ({ id: item.id, slot: item.slot, text: item.text })),
+    });
     expect(JSON.stringify(list)).not.toContain("Which threshold should move?");
     core.close();
   });
 
-  it("walks fat detail pages without gaps or duplicates in the documented slot order", async () => {
+  it("walks fat detail pages without gaps or duplicates, questions before steps", async () => {
     const core = new MonetCore(":memory:");
-    const expected = [
-      ...Array.from({ length: 10 }, (_, index) => ({ slot: "openQuestions", value: `question-${index}-${"q".repeat(1_500)}` })),
-      ...Array.from({ length: 10 }, (_, index) => ({ slot: "decisions", value: `decision-${index}-${"d".repeat(1_500)}` })),
-      ...Array.from({ length: 10 }, (_, index) => ({ slot: "discardedAlternatives", value: `discarded-${index}-${"a".repeat(1_500)}` })),
-      ...Array.from({ length: 10 }, (_, index) => ({ slot: "confirmedContext", value: `context-${index}-${"c".repeat(1_500)}` })),
-      ...Array.from({ length: 10 }, (_, index) => ({ slot: "importantEntities", value: `entity-${index}-${"e".repeat(1_500)}` })),
-      ...Array.from({ length: 10 }, (_, index) => ({ slot: "nextSteps", value: `step-${index}-${"s".repeat(1_500)}` })),
-    ] as const;
-    const payload = Object.fromEntries(
-      ["openQuestions", "decisions", "discardedAlternatives", "confirmedContext", "importantEntities", "nextSteps"]
-        .map((slot) => [slot, expected.filter((entry) => entry.slot === slot).map((entry) => entry.value)]),
-    );
-    const saved = await core.saveWorkstream({ status: "active", ...payload } as Parameters<MonetCore["saveWorkstream"]>[0]);
+    const open = [
+      ...Array.from({ length: 10 }, (_, i) => ({ slot: "question" as const, text: `question-${i}-${"q".repeat(1_500)}` })),
+      ...Array.from({ length: 10 }, (_, i) => ({ slot: "step" as const, text: `step-${i}-${"s".repeat(1_500)}` })),
+    ];
+    const saved = await core.saveWorkstream({ status: "active", open });
 
-    const recovered: Array<{ slot: string; value: string }> = [];
+    const recovered: Array<{ slot: string; text: string }> = [];
     await withWorkstreamServer(core, async (client) => {
       let detailOffset = 0;
       do {
         const detail = toolJson(await client.callTool({
           name: "memory_workstreams",
-          arguments: { id: saved.id, detailOffset },
+          arguments: { id: saved!.id, detailOffset },
         }));
-        const pageEntries = ["openQuestions", "decisions", "discardedAlternatives", "confirmedContext", "importantEntities", "nextSteps"]
-          .flatMap((slot) => ((detail[slot] as string[] | undefined) ?? []).map((value) => ({ slot, value })));
-        expect(pageEntries.length).toBeGreaterThan(0);
-        recovered.push(...pageEntries);
-        detailOffset += pageEntries.length;
+        const page = (detail.items as Array<{ slot: string; text: string }>) ?? [];
+        expect(page.length).toBeGreaterThan(0);
+        recovered.push(...page.map(({ slot, text }) => ({ slot, text })));
+        detailOffset += page.length;
         if (detail.detailOmitted === undefined) break;
-        expect(detail.detailOmitted).toBe(expected.length - detailOffset);
+        expect(detail.detailOmitted).toBe(open.length - detailOffset);
       } while (true);
     });
 
-    expect(recovered).toEqual(expected);
+    // Every item exactly once, in the documented order: questions first, then steps, each in the
+    // order it was opened. Paging must not lose or repeat one across the boundary.
+    expect(recovered).toEqual(open.map(({ slot, text }) => ({ slot, text })));
     core.close();
   });
 
@@ -338,17 +339,19 @@ describe("memory_workstreams MCP tool", () => {
     const oversized = `oversized-${"z".repeat(80_000)}`;
     const saved = await core.saveWorkstream({
       status: "active",
-      openQuestions: [oversized],
-      nextSteps: ["recover me next"],
+      open: [
+        { slot: "question" as const, text: oversized },
+        { slot: "step" as const, text: "recover me next" },
+      ],
     });
 
     const first = await withWorkstreamServer(core, (client) =>
-      client.callTool({ name: "memory_workstreams", arguments: { id: saved.id, detailOffset: 0 } }),
+      client.callTool({ name: "memory_workstreams", arguments: { id: saved!.id, detailOffset: 0 } }),
     ) as { content: Array<{ text: string }> };
     const firstDetail = toolJson(first);
     expect(first.content[0]!.text.length).toBeLessThanOrEqual(40_000);
-    expect((firstDetail.openQuestions as string[])).toHaveLength(1);
-    expect((firstDetail.openQuestions as string[])[0]).toContain("…[truncated");
+    expect((firstDetail.items as unknown[])).toHaveLength(1);
+    expect(((firstDetail.items as Array<{ text: string }>)[0]!).text).toContain("…[truncated");
     expect(firstDetail).toMatchObject({
       detailOffset: 0,
       detailTruncated: true,
@@ -357,9 +360,12 @@ describe("memory_workstreams MCP tool", () => {
     });
 
     const second = await withWorkstreamServer(core, (client) =>
-      client.callTool({ name: "memory_workstreams", arguments: { id: saved.id, detailOffset: 1 } }),
+      client.callTool({ name: "memory_workstreams", arguments: { id: saved!.id, detailOffset: 1 } }),
     );
-    expect(toolJson(second)).toMatchObject({ detailOffset: 1, nextSteps: ["recover me next"] });
+    expect(toolJson(second)).toMatchObject({
+      detailOffset: 1,
+      items: [{ slot: "step", text: "recover me next" }],
+    });
     core.close();
   });
 
@@ -367,14 +373,216 @@ describe("memory_workstreams MCP tool", () => {
     const core = new MonetCore(":memory:");
     const saved = await core.saveWorkstream({
       status: "active",
-      openQuestions: ["small question"],
-      decisions: ["small decision"],
-      nextSteps: ["small step"],
+      open: [{ slot: "question" as const, text: "small question" }, { slot: "step" as const, text: "small step" }],
     });
     const detail = await withWorkstreamServer(core, (client) =>
-      client.callTool({ name: "memory_workstreams", arguments: { id: saved.id } }),
+      client.callTool({ name: "memory_workstreams", arguments: { id: saved!.id } }),
     );
-    expect(toolJson(detail)).toEqual({ id: saved.id, title: saved.title, ...saved.payload });
+    expect(toolJson(detail)).toEqual({
+      id: saved!.id,
+      title: saved!.title,
+      status: "active",
+      openItems: 2,
+      items: saved!.payload.items.map((item) => ({ id: item.id, slot: item.slot, text: item.text })),
+    });
+    core.close();
+  });
+
+  it("refuses a pre-#131 checkpoint instead of silently discarding it", async () => {
+    // Codex P2 on PR #149: Zod strips unknown keys by default, so a caller still sending
+    // openQuestions/nextSteps got a SUCCESS back with openItems: 0 and its whole checkpoint gone.
+    const core = new MonetCore(":memory:");
+    const result = await withWorkstreamServer(core, (client) =>
+      client.callTool({
+        name: "memory_checkpoint",
+        arguments: { workstream: { status: "active", nextSteps: ["legacy shape"] } },
+      }),
+    ) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(JSON.stringify(result)).toMatch(/nextSteps/);
+    expect(core.getActiveWorkstreams()).toHaveLength(0); // nothing was written
+    core.close();
+  });
+
+  it("opening items revives a done workstream instead of dead-ending", async () => {
+    // Codex round 2 on PR #149, and a dead end the round-1 guard created: a finished workstream
+    // kept status 'done', a later checkpoint that opened follow-up work inherited it, the guard
+    // then refused — and done workstreams are filtered out of memory_workstreams, so the caller
+    // could not even see the status it was inheriting.
+    const core = new MonetCore(":memory:");
+    const first = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "ship it" }] });
+    await core.saveWorkstream({ status: "done", close: [{ id: first!.payload.items[0]!.id, as: "done" }] });
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+
+    const revived = await core.saveWorkstream({ open: [{ slot: "step" as const, text: "follow-up work" }] });
+    expect(revived!.payload.status).toBe("active");
+    expect(core.getActiveWorkstreams()).toHaveLength(1);
+    expect(openTexts(revived!.payload, "step")).toEqual(["follow-up work"]);
+
+    // An EXPLICIT done alongside open is still refused — reviving fills in a status the caller
+    // did not state, it does not overrule one they did.
+    await expect(
+      core.saveWorkstream({ status: "done", open: [{ slot: "step" as const, text: "contradiction" }] }),
+    ).rejects.toThrow(/still open/);
+    core.close();
+  });
+
+  it("refuses a WorkstreamPayload where a checkpoint belongs", async () => {
+    // Codex round 2: every checkpoint field is optional, so a payload variable satisfies the type
+    // structurally and would write nothing while reporting success. `items?: never` stops TypeScript
+    // callers; this refusal covers JavaScript ones.
+    const core = new MonetCore(":memory:");
+    await expect(
+      core.saveWorkstream({ status: "active", items: [] } as unknown as Parameters<MonetCore["saveWorkstream"]>[0]),
+    ).rejects.toThrow(/takes a checkpoint/);
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+    core.close();
+  });
+
+  it("the checkpoint receipt names the ids it actually closed", async () => {
+    // Codex round 2: a close against an id this circle's row does not hold is a no-op by design
+    // (stale ids, concurrency). A bare success reports that as done.
+    const core = new MonetCore(":memory:");
+    const opened = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "real item" }] });
+    const realId = opened!.payload.items[0]!.id;
+
+    const ack = await withWorkstreamServer(core, (client) =>
+      client.callTool({
+        name: "memory_checkpoint",
+        arguments: { workstream: { close: [{ id: realId, as: "done" }, { id: "not-in-this-row", as: "done" }] } },
+      }),
+    );
+    expect(toolJson(ack).workstream).toMatchObject({ openItems: 0, closed: [realId] });
+    core.close();
+  });
+
+  it("a legacy 'done' row that carried items stays reachable", async () => {
+    // Codex on PR #152, and live: 5 of the 11 workstreams in the real store are `done` with items
+    // still in their legacy slots — 7 items that migrating verbatim would hide behind
+    // getActiveWorkstreams' done filter. #131's defect surviving the change that fixes #131.
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    db.prepare(
+      `INSERT INTO concepts (id, slug, title, body, kind, status, embedding, support_count, version, dirty, circle, updated_at)
+       VALUES (?, ?, ?, ?, 'workstream', 'active', ?, 1, 0, 0, ?, ?)`,
+    ).run(
+      "legacy-done", "workstream:legacy", "workstream: legacy",
+      JSON.stringify({ status: "done", nextSteps: ["never finished"], openQuestions: ["still unanswered"] }),
+      "[1,0]", "legacy", 1,
+    );
+
+    const restored = core.getActiveWorkstreams("legacy");
+    expect(restored).toHaveLength(1); // not filtered away
+    expect(restored[0]!.payload.status).toBe("active"); // the status was never honest
+    expect(openTexts(restored[0]!.payload, "step")).toEqual(["never finished"]);
+    expect(openTexts(restored[0]!.payload, "question")).toEqual(["still unanswered"]);
+    core.close();
+  });
+
+  it("refuses legacy checkpoint fields from a direct caller, not only at the MCP boundary", async () => {
+    // Codex on PR #152: the strict Zod schema guards the tool, but a package caller reaches
+    // saveWorkstream with nothing in between and every legacy field is silently ignored by merge.
+    const core = new MonetCore(":memory:");
+    await expect(
+      core.saveWorkstream({ status: "active", nextSteps: ["lost"] } as unknown as Parameters<MonetCore["saveWorkstream"]>[0]),
+    ).rejects.toThrow(/nextSteps is ignored/);
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+    core.close();
+  });
+
+  it("a close against nothing is a no-op — it neither mints a workstream nor fails", async () => {
+    // Two rounds on the same line. Round 1: a stale-only close with no existing row produced an
+    // empty active "workstream: session state" thread. Round 2: refusing it instead broke the
+    // documented contract that an unknown close is a no-op, and skipped the caller's
+    // session-ending summary with it. Nothing to write is not an error — it is `null`.
+    const core = new MonetCore(":memory:");
+    const result = await core.saveWorkstream(
+      { close: [{ id: "stale-from-another-circle", as: "done" }] },
+      { summary: "session that closed nothing" },
+    );
+    expect(result).toBeNull();
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+    core.close();
+  });
+
+  it("refuses a close disposition outside done | dropped", async () => {
+    // Codex round 2 on #152: only the MCP boundary enforced the enum, so a direct caller's typo
+    // persisted verbatim — hiding the item from the default view AND making every later
+    // legitimate close skip it, because it was no longer `open`.
+    const core = new MonetCore(":memory:");
+    const opened = (await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "real" }] }))!;
+    await expect(
+      core.saveWorkstream({ close: [{ id: opened.payload.items[0]!.id, as: "closed" as "done" }] }),
+    ).rejects.toThrow(/must be 'done' or 'dropped'/);
+    expect(openTexts(core.getActiveWorkstreams()[0]!.payload, "step")).toEqual(["real"]);
+    core.close();
+  });
+
+  it("includeClosed reaches a workstream that is already done", async () => {
+    // Codex round 2 on #152: the id lookup searched only getActiveWorkstreams, which filters done
+    // — so the workstream a caller most wants the resolved items of, the one just finished, came
+    // back "not found" from the option that advertises exactly that.
+    const core = new MonetCore(":memory:");
+    const opened = (await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "finish me" }] }))!;
+    const itemId = opened.payload.items[0]!.id;
+    await core.saveWorkstream({ status: "done", close: [{ id: itemId, as: "done" }] });
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+
+    const detail = await withWorkstreamServer(core, (client) =>
+      client.callTool({ name: "memory_workstreams", arguments: { id: opened.id, includeClosed: true } }),
+    );
+    expect(toolJson(detail)).toMatchObject({
+      id: opened.id,
+      items: [{ id: itemId, text: "finish me", state: "done" }],
+    });
+    core.close();
+  });
+
+  it("a close-only no-op never reaches the embedder", async () => {
+    // Codex round 3 on #152, completing round 2's fix: returning null from inside the transaction
+    // was too late, because the preview still embedded first — so an unavailable embedder turned a
+    // documented no-op into `checkpoint failed` and took the session summary with it.
+    let embedCalls = 0;
+    const counting = new StaticEmbeddingProvider();
+    const embed = counting.embed.bind(counting);
+    counting.embed = () => { embedCalls += 1; return embed(); };
+    const core = new MonetCore(":memory:", { embedder: counting });
+
+    const result = await core.saveWorkstream({ close: [{ id: "stale", as: "done" }] }, { summary: "ended anyway" });
+    expect(result).toBeNull();
+    expect(embedCalls).toBe(0);
+    core.close();
+  });
+
+  it("a close-only no-op does not resurrect an archived workstream", async () => {
+    // Codex round 3 on #152: with only an archived row for the slug, existingPayload was defined,
+    // so the no-op branch was skipped and the update set the row back to active — a hidden
+    // archived workstream resurrected by an operation documented as a no-op.
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, { id: "arch", circle: "z", status: "archived", version: 3, updatedAt: 9, nextStep: "long gone" });
+
+    const result = await core.saveWorkstream({ close: [{ id: "stale", as: "done" }] }, { circle: "z" });
+    expect(result).toBeNull();
+    expect((db.prepare(`SELECT status FROM concepts WHERE id='arch'`).get() as { status: string }).status).toBe("archived");
+    expect(core.getActiveWorkstreams("z")).toHaveLength(0);
+    core.close();
+  });
+
+  it("refuses an open slot outside question | step", async () => {
+    const core = new MonetCore(":memory:");
+    await expect(
+      core.saveWorkstream({ open: [{ slot: "todo" as "step", text: "x" }] }),
+    ).rejects.toThrow(/must be 'question' or 'step'/);
+    core.close();
+  });
+
+  it("includeClosed does not surface an archived row by id", async () => {
+    // Codex round 3 on #152: the list path treats an archived loser as gone on purpose, and
+    // includeClosed is about resolved ITEMS, not about bypassing the row lifecycle.
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, { id: "arch2", circle: "z", status: "archived", version: 1, updatedAt: 5, nextStep: "hidden" });
+    expect(core.getWorkstreamById("arch2", "z")).toBeUndefined();
     core.close();
   });
 
@@ -429,22 +637,25 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
 
     const w1 = await core.saveWorkstream({
       status: "active",
-      openQuestions: ["how to tune dedup thresholds?"],
-      nextSteps: ["wire prewarm"],
+      open: [{ slot: "question" as const, text: "how to tune dedup thresholds?" }, { slot: "step" as const, text: "wire prewarm" }],
     });
-    expect(w1.payload.openQuestions).toEqual(["how to tune dedup thresholds?"]);
-    expect(w1.version).toBe(0);
-    expect(core.isDirty(w1.id)).toBe(false); // agent-authored → no synthesis needed
+    expect(openTexts(w1!.payload, "question")).toEqual(["how to tune dedup thresholds?"]);
+    expect(w1!.version).toBe(0);
+    expect(core.isDirty(w1!.id)).toBe(false); // agent-authored → no synthesis needed
 
     const w2 = await core.saveWorkstream({
       status: "active",
-      openQuestions: [],
-      nextSteps: ["wire prewarm", "add contradiction tier"],
-      decisions: ["use MiniLM-384 locally"],
+      open: [{ slot: "step" as const, text: "wire prewarm" }, { slot: "step" as const, text: "add contradiction tier" }],
     });
-    expect(w2.id).toBe(w1.id); // same workstream, updated in place
-    expect(w2.version).toBe(1);
-    expect(w2.payload.decisions).toEqual(["use MiniLM-384 locally"]);
+    expect(w2!.id).toBe(w1!.id); // same workstream, updated in place
+    expect(w2!.version).toBe(1);
+    // MERGE, NOT REPLACE (#131). The second checkpoint never mentioned the question, and the
+    // question is still open — that is the whole behavioural change. Before the cut this same
+    // write would have destroyed it.
+    expect(openTexts(w2!.payload, "question")).toEqual(["how to tune dedup thresholds?"]);
+    // "wire prewarm" was re-sent, so it is a NEW item: re-typing an open item mints a duplicate
+    // rather than matching it, which is why callers are told not to carry items forward.
+    expect(openTexts(w2!.payload, "step")).toEqual(["wire prewarm", "wire prewarm", "add contradiction tier"]);
     expect(core.getActiveWorkstreams()).toHaveLength(1);
 
     core.close();
@@ -461,7 +672,7 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     const core = new MonetCore(":memory:");
     await expect(
       core.saveWorkstream(
-        { status: "active", openQuestions: [], nextSteps: [] },
+        { status: "active", open: [] },
         { circle: BREADTH_CIRCLE },
       ),
     ).rejects.toThrow(/reserved global-breadth marker/);
@@ -483,17 +694,20 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     });
 
     const saved = await core.saveWorkstream(
-      { status: "active", nextSteps: ["caller write"] },
+      { status: "active", open: [{ slot: "step" as const, text: "caller write" }] },
       { circle: "race" },
     );
 
-    expect(saved.id).toBe("interleaved");
-    expect(saved.version).toBe(1);
-    expect(saved.payload.nextSteps).toEqual(["caller write"]);
+    expect(saved!.id).toBe("interleaved");
+    expect(saved!.version).toBe(1);
+    // The re-read inside the transaction is what makes this true (#131): before merge semantics
+    // this write replaced the interleaved row's payload wholesale and the competitor's item was
+    // gone. Now the merge picks it up, so BOTH survive — the race is visible instead of silent.
+    expect(openTexts(saved!.payload, "step")).toEqual(["interleaved write", "caller write"]);
     expect(workstreamRows(port, "race")).toEqual([
-      { id: "interleaved", version: 1, body: JSON.stringify(saved.payload, null, 2) },
+      { id: "interleaved", version: 1, body: JSON.stringify(saved!.payload, null, 2) },
     ]);
-    expect(revisionVersions(port, saved.id)).toEqual([0, 1]);
+    expect(revisionVersions(port, saved!.id)).toEqual([0, 1]);
     core.close();
   });
 
@@ -511,20 +725,22 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     });
 
     const saved = await core.saveWorkstream(
-      { status: "active", nextSteps: ["caller write"] },
+      { status: "active", open: [{ slot: "step" as const, text: "caller write" }] },
       { circle: "snapshot" },
     );
 
-    expect(saved.version).toBe(0);
-    expect(saved.payload.nextSteps).toEqual(["caller write"]);
+    expect(saved!.version).toBe(0);
+    expect(openTexts(saved!.payload, "step")).toEqual(["caller write"]);
     expect(workstreamRows(port, "snapshot")).toEqual([
       {
-        id: saved.id,
+        id: saved!.id,
         version: 1,
+        // The competitor wrote a legacy body through the fixture helper; the assertion is that
+        // OUR return value is the snapshot we committed, not whatever landed after it.
         body: JSON.stringify({ status: "active", nextSteps: ["competing write"] }, null, 2),
       },
     ]);
-    expect(revisionVersions(port, saved.id)).toEqual([0, 1]);
+    expect(revisionVersions(port, saved!.id)).toEqual([0, 1]);
     core.close();
   });
 
@@ -537,16 +753,16 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
       const second = new MonetCore(dbPath, { embedder });
 
       const [a, b] = await Promise.all([
-        first.saveWorkstream({ status: "active", nextSteps: ["from first"] }, { circle: "shared" }),
-        second.saveWorkstream({ status: "active", nextSteps: ["from second"] }, { circle: "shared" }),
+        first.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "from first" }] }, { circle: "shared" }),
+        second.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "from second" }] }, { circle: "shared" }),
       ]);
 
       const db = rawDb(first);
       const rows = workstreamRows(db, "shared");
       expect(rows).toHaveLength(1);
       expect(rows[0].version).toBe(1);
-      expect(new Set([a.id, b.id])).toEqual(new Set([rows[0].id]));
-      expect(new Set([a.version, b.version])).toEqual(new Set([0, 1]));
+      expect(new Set([a!.id, b!.id])).toEqual(new Set([rows[0].id]));
+      expect(new Set([a!.version, b!.version])).toEqual(new Set([0, 1]));
       expect(revisionVersions(db, rows[0].id)).toEqual([0, 1]);
 
       first.close();
@@ -559,15 +775,17 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
   it("different-circle workstream saves do not cross-mutate", async () => {
     const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
 
-    const alpha = await core.saveWorkstream({ status: "active", nextSteps: ["alpha step"] }, { circle: "alpha" });
-    const beta = await core.saveWorkstream({ status: "active", nextSteps: ["beta step"] }, { circle: "beta" });
-    const alpha2 = await core.saveWorkstream({ status: "active", nextSteps: ["alpha step 2"] }, { circle: "alpha" });
+    const alpha = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "alpha step" }] }, { circle: "alpha" });
+    const beta = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "beta step" }] }, { circle: "beta" });
+    const alpha2 = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "alpha step 2" }] }, { circle: "alpha" });
 
-    expect(alpha2.id).toBe(alpha.id);
-    expect(alpha2.version).toBe(1);
-    expect(beta.version).toBe(0);
-    expect(core.getActiveWorkstreams("alpha").map((w) => w.payload.nextSteps)).toEqual([["alpha step 2"]]);
-    expect(core.getActiveWorkstreams("beta").map((w) => w.payload.nextSteps)).toEqual([["beta step"]]);
+    expect(alpha2!.id).toBe(alpha!.id);
+    expect(alpha2!.version).toBe(1);
+    expect(beta!.version).toBe(0);
+    // alpha accumulates (merge), beta is untouched — the isolation claim, now stated against the
+    // merge contract rather than against replacement.
+    expect(core.getActiveWorkstreams("alpha").map((w) => openTexts(w.payload, "step"))).toEqual([["alpha step", "alpha step 2"]]);
+    expect(core.getActiveWorkstreams("beta").map((w) => openTexts(w.payload, "step"))).toEqual([["beta step"]]);
     core.close();
   });
 
@@ -577,7 +795,7 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     try {
       const s1 = new MonetCore(dbPath);
       await s1.saveWorkstream(
-        { status: "active", openQuestions: ["resume #242?"], nextSteps: ["build prewarm ranking"] },
+        { status: "active", open: [{ slot: "question" as const, text: "resume #242?" }, { slot: "step" as const, text: "build prewarm ranking" }] },
         { summary: "end of session 1" },
       );
       s1.close();
@@ -585,8 +803,8 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
       const s2 = new MonetCore(dbPath); // "next session" — fresh instance, same store
       const restored = s2.getActiveWorkstreams();
       expect(restored).toHaveLength(1);
-      expect(restored[0].payload.openQuestions).toEqual(["resume #242?"]);
-      expect(restored[0].payload.nextSteps).toEqual(["build prewarm ranking"]);
+      expect(openTexts(restored[0].payload, "question")).toEqual(["resume #242?"]);
+      expect(openTexts(restored[0].payload, "step")).toEqual(["build prewarm ranking"]);
       s2.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -602,35 +820,55 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
 
     const w = await core.saveWorkstream({
       status: "active",
-      decisions: ["use approach B"],
-      discardedAlternatives: ["approach A — failed on X"],
-      nextSteps: ["write tests"],
+      open: [{ slot: "step" as const, text: "write tests" }],
     });
     expect(core.getActiveWorkstreams()).toHaveLength(1); // five turns → one durable workstream
-    expect(w.payload.discardedAlternatives?.[0]).toContain("approach A");
+    expect(openTexts(w!.payload, "step")).toEqual(["write tests"]);
     core.close();
   });
 
   it("a normal store() never folds into a workstream, and search excludes workstreams", async () => {
     const core = new MonetCore(":memory:");
     // payload text deliberately overlaps a real concept we then store
-    const w = await core.saveWorkstream({ status: "active", nextSteps: ["use SQLite for storage backend"] });
+    const w = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "use SQLite for storage backend" }] });
 
     const s = await core.store("We decided to use SQLite as the storage backend for Monet Local.");
-    expect(s.conceptId).not.toBe(w.id); // did NOT attach to the workstream
+    expect(s.conceptId).not.toBe(w!.id); // did NOT attach to the workstream
     expect(s.action).toBe("created");
 
     const hits = await core.search("sqlite storage backend");
-    expect(hits.some((h) => h.id === w.id)).toBe(false); // workstream never appears as a search card
+    expect(hits.some((h) => h.id === w!.id)).toBe(false); // workstream never appears as a search card
     expect(core.conceptCount()).toBe(1); // conceptCount excludes the workstream
     core.close();
   });
 
-  it("'done' workstreams drop out of the active restore set", async () => {
+  it("'done' workstreams drop out of the active restore set — once nothing is open", async () => {
     const core = new MonetCore(":memory:");
-    await core.saveWorkstream({ status: "active", nextSteps: ["ship it"] });
+    const opened = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "ship it" }] });
     expect(core.getActiveWorkstreams()).toHaveLength(1);
-    await core.saveWorkstream({ status: "done", nextSteps: [] });
+    const item = opened!.payload.items[0]!;
+    await core.saveWorkstream({ status: "done", close: [{ id: item.id, as: "done" }] });
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+    core.close();
+  });
+
+  it("refuses 'done' while items are still open, and names them", async () => {
+    // This test previously WAS the bug (Codex P1 on PR #149): it opened an item, checkpointed
+    // `done` without closing it, and asserted the workstream disappeared — which is the silent
+    // loss #131 exists to remove, reappearing inside the change that removes it.
+    const core = new MonetCore(":memory:");
+    const opened = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "ship it" }] });
+    const item = opened!.payload.items[0]!;
+
+    await expect(core.saveWorkstream({ status: "done" })).rejects.toThrow(
+      new RegExp(`1 item\\(s\\) are still open: ${item.id}`),
+    );
+    // Refused, not partially applied: the workstream is still active and the item still open.
+    expect(core.getActiveWorkstreams()).toHaveLength(1);
+    expect(openTexts(core.getActiveWorkstreams()[0]!.payload, "step")).toEqual(["ship it"]);
+
+    // Closing it in the same checkpoint as the status is the supported move.
+    await core.saveWorkstream({ status: "done", close: [{ id: item.id, as: "dropped" }] });
     expect(core.getActiveWorkstreams()).toHaveLength(0);
     core.close();
   });
@@ -669,9 +907,9 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
 
     expect(core.getActiveWorkstreams("peer").map((w) => w.id)).toEqual(["survivor"]);
 
-    const saved = await core.saveWorkstream({ status: "active", nextSteps: ["next"] }, { circle: "peer" });
-    expect(saved.id).toBe("survivor");
-    expect(saved.version).toBe(1);
+    const saved = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "next" }] }, { circle: "peer" });
+    expect(saved!.id).toBe("survivor");
+    expect(saved!.version).toBe(1);
     expect(workstreamStatuses(db, "peer").find((s) => s.id === "loser")?.status).toBe("archived"); // never resurrected
     core.close();
   });
@@ -683,7 +921,7 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     insertWorkstreamRow(db, { id: "connector", circle: "guard", version: 1, updatedAt: 200, nextStep: "connector" });
     db.prepare(`UPDATE concepts SET source_identity = ? WHERE id = ?`).run("source://guard", "connector");
 
-    await expect(core.saveWorkstream({ status: "active", nextSteps: ["caller"] }, { circle: "guard" }))
+    await expect(core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "caller" }] }, { circle: "guard" }))
       .rejects.toThrow(/connector-owned workstream/);
 
     expect(workstreamRows(db, "guard").map((row) => row.id)).toEqual(["ordinary"]);
@@ -742,7 +980,7 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
     expect(active).toHaveLength(1);
     expect(active[0].id).toBe("a-ws");
     expect(active[0].slug).toBe("workstream:B");
-    expect(active[0].payload.nextSteps).toEqual(["moved in from A"]);
+    expect(openTexts(active[0].payload, "step")).toEqual(["moved in from A"]);
     core.close();
   });
 
@@ -794,7 +1032,7 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
     const active = core.getActiveWorkstreams("B");
     expect(active).toHaveLength(1);
     expect(active[0].id).toBe("b-active");
-    expect(active[0].payload.nextSteps).toEqual(["active, genuinely canonical"]);
+    expect(openTexts(active[0].payload, "step")).toEqual(["active, genuinely canonical"]);
     core.close();
   });
 
@@ -819,7 +1057,7 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
 
   it("no-collision rename: a single workstream moves over with its slug updated and content intact", async () => {
     const core = new MonetCore(":memory:");
-    await core.saveWorkstream({ status: "active", nextSteps: ["only workstream"] }, { circle: "solo-a" });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "only workstream" }] }, { circle: "solo-a" });
 
     core.renameCircle("solo-a", "solo-b");
 
@@ -828,7 +1066,7 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
     const active = core.getActiveWorkstreams("solo-b");
     expect(active).toHaveLength(1);
     expect(active[0].slug).toBe("workstream:solo-b");
-    expect(active[0].payload.nextSteps).toEqual(["only workstream"]);
+    expect(openTexts(active[0].payload, "step")).toEqual(["only workstream"]);
     core.close();
   });
 
@@ -844,10 +1082,10 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
 
     core.renameCircle("A", "B"); // canonicalizes: b-active survives (bumped), b-archived-newer stays archived
 
-    const saved = await core.saveWorkstream({ status: "active", nextSteps: ["checkpoint after merge"] }, { circle: "B" });
+    const saved = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "checkpoint after merge" }] }, { circle: "B" });
 
-    expect(saved.id).toBe("b-active"); // updates the survivor, NOT the higher-updated_at archived loser
-    expect(saved.version).toBe(2); // b-active was version 1 before this checkpoint
+    expect(saved!.id).toBe("b-active"); // updates the survivor, NOT the higher-updated_at archived loser
+    expect(saved!.version).toBe(2); // b-active was version 1 before this checkpoint
 
     const loser = (db.prepare(`SELECT status FROM concepts WHERE id = ?`).get("b-archived-newer") as { status: string });
     expect(loser.status).toBe("archived"); // never resurrected back to active
@@ -855,7 +1093,9 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
     const active = core.getActiveWorkstreams("B");
     expect(active).toHaveLength(1);
     expect(active[0].id).toBe("b-active");
-    expect(active[0].payload.nextSteps).toEqual(["checkpoint after merge"]);
+    // The survivor's own item is still there: the checkpoint added to it rather than replacing it,
+    // which is also a sharper proof that the archived loser was not the row that got written.
+    expect(openTexts(active[0].payload, "step")).toEqual(["active, genuinely canonical", "checkpoint after merge"]);
     core.close();
   });
 });

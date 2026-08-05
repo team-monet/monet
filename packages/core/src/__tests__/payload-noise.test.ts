@@ -58,7 +58,7 @@ describe("payload noise — memory_checkpoint", () => {
     const res = await withServer(core, (c) =>
       c.callTool({
         name: "memory_checkpoint",
-        arguments: { circle, workstream: { status: "active", nextSteps: ["continue the payload trim"] } },
+        arguments: { circle, workstream: { status: "active", open: [{ slot: "step" as const, text: "continue the payload trim" }] } },
       }),
     );
 
@@ -84,9 +84,7 @@ describe("payload noise — memory_checkpoint", () => {
     `);
     const workstream = {
       status: "active" as const,
-      openQuestions: ["Does the checkpoint preserve this workstream?"],
-      decisions: ["Synthesis debt is ordered by evidence volume."],
-      nextSteps: ["Continue after this checkpoint."],
+      open: [{ slot: "question" as const, text: "Does the checkpoint preserve this workstream?" }, { slot: "step" as const, text: "Continue after this checkpoint." }],
     };
     // Seed the workstream before fixture SQL adds the bulk concepts; a real checkpoint updates this
     // row and therefore proves the primary contract survives under the large dirty population.
@@ -105,7 +103,7 @@ describe("payload noise — memory_checkpoint", () => {
 
     const { first, second } = await withServer(core, async (c) => ({
       first: await c.callTool({ name: "memory_checkpoint", arguments: { circle, workstream } }),
-      second: await c.callTool({ name: "memory_checkpoint", arguments: { circle, workstream: { ...workstream, decisions: ["A stable replay updates the same workstream."] } } }),
+      second: await c.callTool({ name: "memory_checkpoint", arguments: { circle, workstream: { ...workstream } } }),
     }));
 
     const firstText = (first as ToolResult).content[0]!.text;
@@ -135,12 +133,12 @@ describe("payload noise — memory_checkpoint", () => {
     expect(secondPayload.workstream.version).toBeGreaterThan(firstPayload.workstream.version);
 
     const restored = core.getActiveWorkstreams(circle).find((w) => w.id === firstPayload.workstream.id);
-    expect(restored?.payload).toMatchObject({
-      status: workstream.status,
-      openQuestions: workstream.openQuestions,
-      decisions: ["A stable replay updates the same workstream."],
-      nextSteps: workstream.nextSteps,
-    });
+    expect(restored?.payload.status).toBe(workstream.status);
+    // The stored form is items, not the checkpoint's input shape. Both checkpoints sent the same
+    // two, and merge does not deduplicate by text, so the survivor carries both rounds — the
+    // contract this test guards is that the row survives the dirty population, not the count.
+    expect(restored?.payload.items.filter((i) => i.state === "open").map((i) => i.text))
+      .toEqual(expect.arrayContaining(workstream.open.map((o) => o.text)));
     core.close();
   });
 });

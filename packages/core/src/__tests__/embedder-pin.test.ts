@@ -611,7 +611,7 @@ describe("embedder pin — constructor-time guard (review hardening, FIX 1)", ()
 describe("embedder pin — checkpoint-only and mixed-dimension backfill (review hardening, FIX 2 + FIX 3)", () => {
   it("(c) a checkpoint-only pre-pin store (one workstream vector in concepts, ZERO observations) backfills to hashing tok=1 from the concepts fallback, not the live embedder's id", async () => {
     const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // default tok=2
-    await core.saveWorkstream({ status: "active", nextSteps: ["resume later"] }, { circle: "checkpoint-only" });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "resume later" }] }, { circle: "checkpoint-only" });
     // Confirm the shape before asserting on it: saveWorkstream() really does write zero observations.
     expect((core as any).db.prepare(`SELECT COUNT(*) AS n FROM observations`).get().n).toBe(0);
     expect((core as any).db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind='workstream'`).get().n).toBe(1);
@@ -2133,7 +2133,7 @@ describe("embedder pin — MAJOR 6 fix: width-guard coverage for the two remaini
 
     let caught: unknown;
     try {
-      await core.saveWorkstream({ status: "active", nextSteps: ["should never be written"] });
+      await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "should never be written" }] });
     } catch (e) {
       caught = e;
     }

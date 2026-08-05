@@ -37,7 +37,13 @@ async function main(): Promise<void> {
   await S("The AuthService lives in src/auth/service.ts and validates every request.", "fact");
   await S("Open: rotate the jose signing keys without dropping users already in the AuthService.", "issue");
   await a.saveWorkstream(
-    { status: "active", nextSteps: ["wire jose key rotation"], openQuestions: ["how to roll keys without dropping sessions?"] },
+    {
+      status: "active",
+      open: [
+        { slot: "step", text: "wire jose key rotation" },
+        { slot: "question", text: "how to roll keys without dropping sessions?" },
+      ],
+    },
     { circle: CIRCLE },
   );
   // Session B: payments work (a different sitting → its own co-occurrence thread).

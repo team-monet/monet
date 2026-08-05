@@ -90,7 +90,7 @@ describe("exportMdTreeFromStore — content-only export, no scenario/gold requir
   it("excludes kind='workstream' concepts, matching allConceptsForExport's own convention", async () => {
     const core = new MonetCore(":memory:", { embedder: embedder(), defaultCircle: "proj" });
     await core.store("A real fact that should be exported.", { kind: "fact" });
-    await core.saveWorkstream({ status: "active", openQuestions: ["an in-progress workstream note that should NOT be exported"] });
+    await core.saveWorkstream({ status: "active", open: [{ slot: "question" as const, text: "an in-progress workstream note that should NOT be exported" }] });
     await core.checkpoint();
 
     const result = exportMdTreeFromStore(core, { circle: "proj" });
