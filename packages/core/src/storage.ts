@@ -20,6 +20,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, link, lstat, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { createStatementTracer, statementTraceEnabled } from "./statement-trace";
+import type { StatementMethod, StatementTracer } from "./statement-trace";
 
 /** The result of a write (INSERT/UPDATE/DELETE) — mirrors better-sqlite3's RunResult. */
 export interface RunResult {
@@ -125,33 +127,134 @@ export class BetterSqlitePort implements StoragePort {
   private readonly dbPath: string;
   private ownsExclusiveLock = false;
   private uncertainExclusiveLockError?: StorageExclusiveLockError;
+  private readonly tracer?: StatementTracer;
 
-  constructor(path = ":memory:") {
+  constructor(path = ":memory:", options?: { tracer?: StatementTracer }) {
     this.memoryOnly = path === ":memory:";
     this.dbPath = this.memoryOnly ? path : resolve(path);
     this.db = new Database(this.dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
+    // TRACER FIRST, THEN THE SETUP PRAGMAS (Codex round 3). `journal_mode = WAL` takes real locks
+    // and can stall against a busy store — which is startup, the exact path #148 is about. Built
+    // after them, the marker would not even be open when the thing worth naming blocked.
+    //
+    // A `:memory:` connection has no cross-process identity and cannot wedge a shared store, so it
+    // is never traced even when the switch is on — the records exist to be read from OUTSIDE a
+    // stuck process, and there is no outside for an in-process database.
+    this.tracer = options?.tracer
+      ?? (!this.memoryOnly && statementTraceEnabled()
+        ? createStatementTracer({ dir: dirname(this.dbPath) })
+        : undefined);
+    this.pragma("journal_mode = WAL");
+    this.pragma("busy_timeout = 5000");
   }
 
   prepare(sql: string): Statement {
-    return this.db.prepare(sql);
+    // PREPARING IS SQLite WORK TOO (Codex round 4). `sqlite3_prepare_v2` reads schema and can
+    // block on a schema lock before run/get/all is ever reached, so building the statement
+    // outside a frame left the marker empty for that window.
+    const stmt = this.traced("prepare", sql, () => this.db.prepare(sql));
+    const tracer = this.tracer;
+    if (tracer === undefined) return stmt; // untraced: the raw statement, no wrapper allocated
+    // The wrapper records around the call rather than inside it, because better-sqlite3
+    // offers no hook inside a running statement. `end` is in a `finally` so a statement that
+    // THROWS still clears the in-flight marker — otherwise one failed query would leave a
+    // stale marker that reads as a hang forever after.
+    return {
+      run: (...params: unknown[]) => {
+        const startedAt = tracer.begin("run", sql);
+        try {
+          return stmt.run(...params);
+        } finally {
+          tracer.end(startedAt, "run", sql);
+        }
+      },
+      get: (...params: unknown[]) => {
+        const startedAt = tracer.begin("get", sql);
+        try {
+          return stmt.get(...params);
+        } finally {
+          tracer.end(startedAt, "get", sql);
+        }
+      },
+      all: (...params: unknown[]) => {
+        const startedAt = tracer.begin("all", sql);
+        let rows: unknown[] | undefined;
+        try {
+          rows = stmt.all(...params);
+          return rows;
+        } finally {
+          tracer.end(startedAt, "all", sql, rows?.length);
+        }
+      },
+    };
+  }
+
+  /**
+   * THE ONLY PLACE SQL IS ISSUED IN THIS CLASS (Codex round 2, P2 on the exclusive-ownership
+   * path). Round 1 traced `prepare`/`exec`/`pragma` one method at a time, and round 2 found two
+   * more mouths that bypassed them — the transaction entry points, and nine `this.db.*` calls
+   * inside acquire/release that never went through the public methods at all. Patching those two
+   * would have invited a round 3.
+   *
+   * So the bypass is closed structurally instead: every SYNCHRONOUS SQL call in this class routes
+   * through `traced`, and `this.db.prepare/exec/pragma` appears nowhere else below.
+   *
+   * The claim was originally written as "no `this.db.<sql-method>` anywhere else" and that was
+   * FALSE (Codex round 4): it was scoped to three method names, while SQLite work also happens
+   * through `db.backup()` — asynchronous, so it cannot use this helper at all — and inside
+   * `db.prepare()` before any statement runs. Both are traced now, explicitly, at their own call
+   * sites. The invariant that actually matters is "no SQLite work outside a frame", which is a
+   * claim about the work, not about a list of method names; four rounds of review each found one
+   * more mouth because the earlier phrasings were about the names.
+   */
+  private traced<R>(method: StatementMethod, sql: string, run: () => R): R {
+    const tracer = this.tracer;
+    if (tracer === undefined) return run();
+    const startedAt = tracer.begin(method, sql);
+    try {
+      return run();
+    } finally {
+      tracer.end(startedAt, method, sql);
+    }
+  }
+
+  /**
+   * The real-page touch that acquire/release both depend on (see their FIX comments). It is a
+   * statement like any other and can block like any other, so it goes through `traced` rather
+   * than reaching for `this.db` — that is the whole point of the helper above.
+   */
+  private warmSchemaRead(): void {
+    const sql = "SELECT name FROM sqlite_schema LIMIT 1";
+    this.traced("get", sql, () => this.db.prepare(sql).get());
   }
 
   exec(sql: string): void {
-    this.db.exec(sql);
+    this.traced("exec", sql, () => this.db.exec(sql));
   }
 
   pragma(source: string, options?: PragmaOptions): unknown {
-    return this.db.pragma(source, options);
+    // `wal_checkpoint`, `quick_check`, and the locking_mode switches below are unbounded on a
+    // large store and hold real locks while they run. `PRAGMA ` is prefixed so the record reads
+    // as SQL rather than as a bare keyword.
+    return this.traced("pragma", `PRAGMA ${source}`, () => this.db.pragma(source, options));
   }
 
+  /**
+   * The trace brackets the RETURNED function, not this call: better-sqlite3 runs `BEGIN` when the
+   * transaction function is invoked, not when it is built. That is the case worth catching — if
+   * BEGIN blocks on the write lock the callback never starts, so no statement inside can mark
+   * anything, and without this the marker would be empty precisely when the store is wedged.
+   */
   transaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
-    return this.db.transaction(fn);
+    const wrapped = this.db.transaction(fn);
+    if (this.tracer === undefined) return wrapped;
+    return (...args: A): R => this.traced("transaction", "BEGIN", () => wrapped(...args));
   }
 
   immediateTransaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
-    return this.db.transaction(fn).immediate;
+    const wrapped = this.db.transaction(fn).immediate;
+    if (this.tracer === undefined) return wrapped;
+    return (...args: A): R => this.traced("immediateTransaction", "BEGIN IMMEDIATE", () => wrapped(...args));
   }
 
   inTransaction(): boolean {
@@ -190,12 +293,25 @@ export class BetterSqlitePort implements StoragePort {
 
       // better-sqlite3's online backup reads through this same connection and includes committed WAL
       // frames while the connection's retained EXCLUSIVE ownership prevents external mutation.
-      await this.db.backup(partialPath);
+      //
+      // TRACED EXPLICITLY, NOT THROUGH `traced` (Codex round 4): this is the one SQLite path that
+      // is asynchronous, and the synchronous helper would end its frame when the promise is
+      // created rather than when it settles. It is also the worst possible place to be blind — the
+      // backup runs while this connection HOLDS exclusive ownership, so a stall here blocks every
+      // other client with an empty marker, which is #145 exactly.
+      const backupStartedAt = this.tracer?.begin("backup", `BACKUP TO ${partialPath}`);
+      try {
+        await this.db.backup(partialPath);
+      } finally {
+        if (backupStartedAt !== undefined) this.tracer?.end(backupStartedAt, "backup", `BACKUP TO ${partialPath}`);
+      }
       const verification = new Database(partialPath, { readonly: true, fileMustExist: true });
       let check: string[];
+      const verifyStartedAt = this.tracer?.begin("backupVerify", "PRAGMA quick_check");
       try {
         check = (verification.pragma("quick_check") as Array<{ quick_check: string }>).map((row) => row.quick_check);
       } finally {
+        if (verifyStartedAt !== undefined) this.tracer?.end(verifyStartedAt, "backupVerify", "PRAGMA quick_check");
         verification.close();
       }
       // A readonly open of a WAL-mode backup can materialize empty sidecars beside the unique
@@ -263,24 +379,24 @@ export class BetterSqlitePort implements StoragePort {
       // (empirical: 9/9 unwarmed failures vs warmed success; see also releaseExclusiveOwnership's
       // real-page-touch requirement). This read makes acquire self-sufficient regardless of the
       // connection's history.
-      this.db.prepare("SELECT name FROM sqlite_schema LIMIT 1").get();
+      this.warmSchemaRead();
       // FIX: locking_mode is connection state, but SQLite does not actually retain the exclusive
       // file lock until a transaction performs a real write. Reversibly toggling user_version in one
       // transaction is schema-independent, leaves the committed logical value unchanged, and makes
       // the lock effective against non-cooperating readers/writers after COMMIT.
-      this.db.pragma("locking_mode = EXCLUSIVE");
-      const currentUserVersion = this.db.pragma("user_version", { simple: true }) as number;
+      this.pragma("locking_mode = EXCLUSIVE");
+      const currentUserVersion = this.pragma("user_version", { simple: true }) as number;
       const probeUserVersion = currentUserVersion === 2_147_483_647 ? currentUserVersion - 1 : currentUserVersion + 1;
-      this.db.exec(
+      this.exec(
         `BEGIN IMMEDIATE; PRAGMA user_version = ${probeUserVersion}; PRAGMA user_version = ${currentUserVersion}; COMMIT;`,
       );
       this.ownsExclusiveLock = true;
     } catch (cause) {
       let cleanupError: unknown;
       try {
-        if (this.db.inTransaction) this.db.exec("ROLLBACK");
-        this.db.pragma("locking_mode = NORMAL");
-        this.db.prepare("SELECT name FROM sqlite_schema LIMIT 1").get();
+        if (this.db.inTransaction) this.exec("ROLLBACK");
+        this.pragma("locking_mode = NORMAL");
+        this.warmSchemaRead();
       } catch (error) {
         cleanupError = error;
       }
@@ -303,8 +419,8 @@ export class BetterSqlitePort implements StoragePort {
     try {
       // FIX: switching back to NORMAL only changes the requested mode; one subsequent access is
       // required before SQLite drops the connection-level exclusive lock and restores shared access.
-      this.db.pragma("locking_mode = NORMAL");
-      this.db.prepare("SELECT name FROM sqlite_schema LIMIT 1").get();
+      this.pragma("locking_mode = NORMAL");
+      this.warmSchemaRead();
       this.ownsExclusiveLock = false;
       this.uncertainExclusiveLockError = undefined;
     } catch (cause) {
@@ -318,28 +434,36 @@ export class BetterSqlitePort implements StoragePort {
   }
 
   close(): void {
-    let releaseError: unknown;
+    // TRACER CLOSES LAST (Codex round 3, and a regression this PR introduced itself): round 2
+    // routed releaseExclusiveOwnership through the traced helpers, so closing the tracer first
+    // blinded exactly the shutdown SQL most able to block — the locking_mode switch and its warm
+    // read. It still clears on the way out, in a `finally`, so a clean exit leaves no stale marker.
     try {
-      this.releaseExclusiveOwnership();
-    } catch (error) {
-      releaseError = error;
-    }
-
-    try {
-      this.db.close();
-      this.ownsExclusiveLock = false;
-      this.uncertainExclusiveLockError = undefined;
-    } catch (closeError) {
-      if (releaseError !== undefined) {
-        throw new AggregateError(
-          [releaseError, closeError],
-          "SQLite exclusive-lock release and connection close both failed.",
-          { cause: releaseError },
-        );
+      let releaseError: unknown;
+      try {
+        this.releaseExclusiveOwnership();
+      } catch (error) {
+        releaseError = error;
       }
-      throw closeError;
+
+      try {
+        this.db.close();
+        this.ownsExclusiveLock = false;
+        this.uncertainExclusiveLockError = undefined;
+      } catch (closeError) {
+        if (releaseError !== undefined) {
+          throw new AggregateError(
+            [releaseError, closeError],
+            "SQLite exclusive-lock release and connection close both failed.",
+            { cause: releaseError },
+          );
+        }
+        throw closeError;
+      }
+      if (releaseError !== undefined) throw releaseError;
+    } finally {
+      this.tracer?.close();
     }
-    if (releaseError !== undefined) throw releaseError;
   }
 }
 
