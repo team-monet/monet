@@ -17594,7 +17594,25 @@ export class MonetCore {
     // how strongly that observation matched", which it is not.
     const matchedObservationById = new Map<string, string>();
     for (const d of dense) {
-      sim.set(d.id, d.cos);
+      // RANK, not raw cosine (#155 follow-up). sim carries the similarity term fuse() adds the graph
+      // term to, and the lexical arm is part of how similar something actually is — dropping it here
+      // meant gather threw away, at the fusion step, the signal search ranks by. Measured on the live
+      // store: gather R 30.2% -> 46.2%, MRR 0.077 -> 0.137 over identical intents.
+      //
+      // It does NOT close the gap: search finds the home concept first 100% of the time on these
+      // intents and gather 2.0%, because fuse's graph branch still dominates with beta, priorExp and
+      // includeFloor calibrated for a different scale and a different embedder. That recalibration is
+      // its own measured change, tracked separately; this line is the part that needs no constant.
+      // BOOST ONLY ABOVE THE FLOOR (Codex P2, PR #160 round 3). gather deliberately applies
+      // NATIVE_SCORE_FLOOR nowhere — see the constant's own note for why floor-filtering `sim` inverts
+      // its ranking — and what keeps sub-floor noise down there instead is that it carries its TRUE,
+      // low cosine. `rank` can be ~2x that, so a 0.10 candidate with strong token overlap arrives as
+      // 0.20 and outranks a genuine above-floor match: the exact low-cosine path the surrounding
+      // comments say is held down, reopened by the fix meant to improve this arm.
+      //
+      // So the lexical arm re-orders the candidates that already cleared the floor on their own
+      // evidence, and everything below it stays on the cosine that put it there.
+      sim.set(d.id, d.cos >= NATIVE_SCORE_FLOOR ? d.rank : d.cos);
       matchedObservationById.set(d.id, d.observationId);
     }
 

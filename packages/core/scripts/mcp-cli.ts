@@ -15,7 +15,9 @@ import { createMonetCoreMcpServer } from "../src/mcp-server";
 import { GATE_JOURNAL_FILENAME } from "../src/gate-journal";
 import { deriveCircle } from "../src/circle";
 
-function resolveDbPath(): string {
+/** Exported so a script can REFUSE the live store by asking the resolver that owns the path,
+ *  rather than reimplementing its precedence and getting a subset of it right (#160). */
+export function resolveDbPath(): string {
   const projectDir = path.join(process.cwd(), ".monet");
   const dir =
     process.env.MONET_STORAGE_DIR ??
