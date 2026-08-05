@@ -161,6 +161,13 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
    * lands in the ambiguous band and earns a possible-duplicate edge. Raising it would start creating
    * concepts with no link back, and no measurement here says where that line belongs.
    */
+  /*
+   * The pre-multilingual default, still instantiated for legacy 384-dim pins. English-only, so it is
+   * script-restricted — without an entry here a legacy-pinned store bypassed every guard added in
+   * #155 (Codex P2, post-merge on PR #156). It carries no measured band because it has never been
+   * replayed on this corpus; it takes the labelled legacy pair rather than borrowing another model's.
+   */
+  "Xenova/all-MiniLM-L6-v2": { thresholds: LEGACY_UNMEASURED_THRESHOLDS, readsOnlyLatinScript: true },
   "Xenova/bge-small-en-v1.5": {
     thresholds: { tauAttach: 0.78, tauAmbiguous: 0.5 },
     readsOnlyLatinScript: true,

@@ -9933,7 +9933,14 @@ export class MonetCore {
          * which is idempotent by protocol and safe to run at any time after a migration.
          */
         this.db.prepare(`DELETE FROM observation_segments WHERE observation_id = ?`).run(row.id);
-        this.db.prepare(`DELETE FROM observation_tokens WHERE observation_id = ?`).run(row.id);
+        /*
+         * TOKENS SURVIVE THE MIGRATION (Codex P2, post-merge on PR #156). observation_tokens is
+         * derived from the observation's CONTENT, which a migration does not touch — only the
+         * embedding space moves. Dropping them alongside the segments left a migrated store with
+         * needsLexicalArm true and no postings, so ranking fell back to dense-only, silently, until
+         * someone thought to rerun the backfill. Segments must go because they hold vectors in the
+         * old space; tokens hold no vector at all.
+         */
       }
       if (prepared.length > 0) this.markEmbedderMigrationVectorsRewritten();
     })();
@@ -17361,6 +17368,19 @@ export class MonetCore {
     this.db.prepare(`DELETE FROM concept_activity_components WHERE concept_id = ?`).run(conceptId);
     this.db.prepare(`DELETE FROM contradictions WHERE concept_id = ?`).run(conceptId);
     this.db.prepare(`DELETE FROM concept_revisions WHERE concept_id = ?`).run(conceptId);
+    /*
+     * THE DERIVED INDEXES GO WITH THE EVIDENCE (Codex P2, post-merge on PR #156). Neither table
+     * declares a foreign key, so a hard delete left orphaned rows behind — and
+     * observation_segments.content holds verbatim slices of the very text being deleted. A hard
+     * delete has to mean the content is gone from the database, not merely unreachable through the
+     * observations table. Ordered before the observations delete so the ids are still resolvable.
+     */
+    this.db.prepare(
+      `DELETE FROM observation_segments WHERE observation_id IN (SELECT id FROM observations WHERE concept_id = ?)`,
+    ).run(conceptId);
+    this.db.prepare(
+      `DELETE FROM observation_tokens WHERE observation_id IN (SELECT id FROM observations WHERE concept_id = ?)`,
+    ).run(conceptId);
     this.db.prepare(`DELETE FROM observations WHERE concept_id = ?`).run(conceptId);
     // Before the row goes: a hard delete removes a rule from the mirror exactly as a retire does,
     // and the binding it is read from is about to be unjoinable. NOT sourced from
