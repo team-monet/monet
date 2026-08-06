@@ -318,16 +318,16 @@ export async function createLocalEmbedderWithProvenance(
 
   const onnx = new OnnxEmbeddingProvider(opts);
   try {
-    console.error("[monet-core] loading local embedding model (paraphrase-multilingual-MiniLM-L12-v2; first run downloads once)…");
+    console.error(`[monet-core] loading local embedding model (${onnx.modelId}; first run downloads once)…`);
     const warmup: unknown = await onnx.embed("warmup"); // forces model load + native init now, not on the first store
     validateEmbeddingProviderOutput(onnx, warmup);
-    console.error("[monet-core] semantic embeddings ready (multilingual MiniLM, 384-dim).");
+    console.error(`[monet-core] semantic embeddings ready (${onnx.modelId}, ${onnx.dim}-dim).`);
     return { provider: onnx, selection: "onnx" };
   } catch (e) {
     const why = e instanceof Error ? e.message : String(e);
-    if (pref === "onnx") throw new Error(`MONET_EMBEDDER=onnx but MiniLM failed to load: ${why}`);
-    console.error(`[monet-core] MiniLM unavailable (${why}); falling back to lexical embedder.`);
-    console.error("[monet-core] recall will be lexical, not semantic. Set MONET_EMBEDDER=onnx to require MiniLM.");
+    if (pref === "onnx") throw new Error(`MONET_EMBEDDER=onnx but ${onnx.modelId} failed to load: ${why}`);
+    console.error(`[monet-core] ${onnx.modelId} unavailable (${why}); falling back to lexical embedder.`);
+    console.error("[monet-core] recall will be lexical, not semantic. Set MONET_EMBEDDER=onnx to require the semantic model.");
     return { provider: new HashingEmbeddingProvider(), selection: "implicit-hashing-fallback" };
   }
 }

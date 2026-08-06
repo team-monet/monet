@@ -1,7 +1,7 @@
-name: Eval (MiniLM, nightly)
+name: Eval (semantic embedder, nightly)
 
 # The real-recall gate. Runs the eval suite on the actual shipping
-# embedder (all-MiniLM-L6-v2 via @huggingface/transformers) — too slow/networked for every PR,
+# embedder (DEFAULT_MODEL via @huggingface/transformers; bge-small-en-v1.5 today) — too slow/networked for every PR,
 # so it runs nightly and on demand. src/__tests__/eval.onnx.test.ts FAILS the job on a
 # semantic-recall regression; `pnpm eval` is also captured as a human-readable artifact.
 #
@@ -21,8 +21,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  minilm-eval:
-    name: MiniLM recall gate + report
+  semantic-eval:
+    name: semantic recall gate + report
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +37,7 @@ jobs:
           cache: pnpm
 
       # onnxruntime-node ships a prebuilt linux/x64 binary inside the package (no build script),
-      # so a plain install yields a working MiniLM on ubuntu-latest — no approve-builds needed.
+      # so a plain install yields a working ONNX runtime on ubuntu-latest — no approve-builds needed.
       - name: Install dependencies (incl. optional @huggingface/transformers)
         run: pnpm install --frozen-lockfile
 
@@ -47,7 +47,9 @@ jobs:
       # ~450MB every night. Unlike the node_modules path this one survives install, so it no longer
       # depends on step ordering. Best-effort: a miss just re-downloads. Any pnpm-lock.yaml change
       # busts the exact key, but the restore-keys prefix still reuses the previous cache.
-      - name: Cache the MiniLM model
+      # The cache KEY still says minilm- for historical reasons: renaming it busts the cache and
+      # forces one ~450MB re-download for a cosmetic change. It names the cache, not the model.
+      - name: Cache the embedding model
         uses: actions/cache@v4
         with:
           path: ~/.monet/models
@@ -60,7 +62,7 @@ jobs:
       # Phase 0 md-baseline gate needs its own filter listed here rather than assuming the
       # existing pattern already covers it — verified by running both filters together locally
       # before wiring this in.
-      - name: MiniLM recall gate (fails the job on a semantic-recall regression)
+      - name: Recall gate (fails the job on a semantic-recall regression)
         env:
           MONET_EVAL_ONNX: "1"
         run: pnpm exec vitest run --dir src eval.onnx eval-baseline.onnx
@@ -77,7 +79,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: minilm-eval-report
+          name: semantic-eval-report
           path: eval-report.txt
           if-no-files-found: warn
 
@@ -85,6 +87,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: minilm-eval-baseline-report
+          name: semantic-eval-baseline-report
           path: eval-baseline-report.txt
           if-no-files-found: warn

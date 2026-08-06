@@ -75,10 +75,14 @@
  * On the live store the cost was 41.5% of observation pairs drawn from DIFFERENT concepts clearing
  * tauAttach. The bands are now derived from a replay of the DECISION on the corpus that governs it —
  * leave-one-out nomination, argmax over every concept in the circle, swept over candidate thresholds
- * (scripts/measure-attach-thresholds.ts). tauAttach = 0.72 survives that re-derivation on its merits:
- * across the segmented, lexically-armed corpus it yields 60.9% correct attaches, 27.6% wrong, and an
- * 11.5% fork rate, and the exchange rate turns unfavourable above it. Anyone changing the embedder,
- * the segment budget, or the ranking arms must re-run that script rather than reason about scales.
+ * (scripts/measure-attach-thresholds.ts). The band is NOT a constant in this file — it travels with
+ * the embedder via EmbeddingProvider.recommendedThresholds (MODEL_PROFILES, embedding-onnx.ts), and
+ * under today's default bge-small-en-v1.5 it is 0.78, yielding 63.2% correct attaches, 16.0% wrong
+ * and a 20.8% fork rate on a fresh replay of the live corpus. The 0.72 this paragraph used to quote
+ * was derived on a different model and no longer reproduces: re-run at 0.72 today and the same script
+ * reports 73.9 / 24.5 / 1.6. Anyone changing the embedder, the segment budget, or the ranking arms
+ * must re-run that script rather than reason about scales — and must re-derive per model, since a
+ * value identical across every profile was derived for none of them.
  *
  * SINGLE-OBSERVATION CONCEPTS ARE UNAFFECTED IN PRACTICE: their centroid IS their one observation
  * vector, so evidence and identity coincide and every band collapses to the old behavior.
