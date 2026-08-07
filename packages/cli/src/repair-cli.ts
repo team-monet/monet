@@ -56,6 +56,8 @@ interface RepairOptions {
   json?: boolean;
   apply?: boolean;
   yes?: boolean;
+  /** Explicit acknowledgement that a Latin-only target will strand non-Latin rows. Not implied by --yes. */
+  acceptNonLatinLoss?: boolean;
 }
 
 type RepairMode = "target" | "resume" | "abandon";
@@ -280,6 +282,29 @@ function migrationLabel(inspection: StoredEmbedderStateInspection): string {
   return `active -> ${migration.targetModelId}; rewrite ${migration.rewriteProgress}; abandon ${migration.abandon.classification}`;
 }
 
+/**
+ * What a move to an ENGLISH-only model would strand, printed on every doctor run. The check itself
+ * is a SCRIPT floor — it finds non-Latin script, so it under-counts by exactly the Latin-alphabet
+ * languages the model also cannot read.
+ *
+ * Not gated on the CURRENT pin: the answer only helps before the move, and the rewrite is one-way
+ * for content. Measured against the same tolerance the write gate enforces, so this cannot clear a
+ * row the write path would refuse.
+ */
+function nonLatinLabel(inspection: StoredEmbedderStateInspection): string {
+  const n = inspection.nonLatin;
+  if (n.status === "unknown") return `unknown (${n.reason})`;
+  if (n.observationCount === 0 && n.conceptCount === 0) {
+    return "0 detected (note: only non-Latin SCRIPT is detectable — French or Vietnamese would not be counted)";
+  }
+  const samples = n.sampleIds.length > 0 ? `; e.g. ${n.sampleIds.join(", ")}` : "";
+  // Listed, not summed: a concept body is derived from its observations, so one piece of non-English
+  // content appears in both. A total would over-report what a rewrite actually has to touch.
+  return `${n.observationCount} observation(s) and ${n.conceptCount} concept body/bodies ` +
+    `not written in English${samples} ` +
+    `(detected by script; text in another language using Latin letters is NOT counted)`;
+}
+
 function printInspection(
   inspection: StoredEmbedderStateInspection,
   assessment = inspection.assessment,
@@ -292,6 +317,7 @@ function printInspection(
   console.log(`Integrity:  ${integrityLabel(inspection)}`);
   console.log(`Pin:        ${pinLabel(inspection)}`);
   console.log(`Migration:  ${migrationLabel(inspection)}`);
+  console.log(`Non-English: ${nonLatinLabel(inspection)}`);
   console.log("Embedding populations:");
   for (const [name, population] of Object.entries(inspection.populations)) {
     if (population.status === "unknown") {
@@ -344,6 +370,9 @@ function jsonDoctor(
     pin: inspection.pin,
     populations: inspection.populations,
     migration: inspection.migration,
+    // What a move to an ENGLISH-only model would strand. Present whatever the current pin is, because
+    // the answer is only useful BEFORE the move — the rewrite is one-way for content.
+    nonLatin: inspection.nonLatin,
     assessment,
     rawAssessment: inspection.assessment,
     provider,
@@ -454,6 +483,7 @@ async function applyRepair(
   provider: EmbeddingProvider | undefined,
   providerResult: ProviderResult,
   dependencies: RecoveryCliDependencies,
+  recheckNonEnglish?: (fresh: StoredEmbedderStateInspection) => void,
 ): Promise<{ backup: VerifiedBackupResult; report: EmbeddingMigrationReport | { action: "abandon"; status: "completed" } }> {
   const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
   mkdirSync(path.dirname(destination), { recursive: true });
@@ -466,6 +496,9 @@ async function applyRepair(
     port = dependencies.createPort(dbPath);
     backup = await port.createVerifiedBackup(destination);
     console.error(`backup: ${backup.path}`);
+    // The backup is the point exclusive ownership exists. Anything that must be true of the store
+    // AT REWRITE TIME, rather than at preflight, is checked here.
+    if (recheckNonEnglish) recheckNonEnglish(dependencies.inspect(dbPath));
     core = dependencies.createCore(port, provider);
     if (mode === "abandon") {
       core.abandonEmbedderMigration();
@@ -758,6 +791,108 @@ async function runRepair(options: RepairOptions, dependencies: RecoveryCliDepend
       return;
     }
 
+    /*
+     * REFUSE A ONE-WAY MOVE THAT STRANDS CONTENT.
+     *
+     * `--yes` confirms "apply without prompting"; it cannot stand in for a decision the operator was
+     * never shown. Moving onto a Latin-only checkpoint rewrites every vector and cannot be undone,
+     * and rows above the write gate's tolerance do not merely go quiet: measured on
+     * bge-small-en-v1.5, unrelated Korean rows score 0.42-0.52 against English queries and take a
+     * quarter of the top-5 slots — above the emission floor — while never being retrievable by their
+     * own content. So the refusal names the count and requires an explicit second flag.
+     *
+     * Only fires when the TARGET declares the restriction and the store has something to lose. A
+     * move onto a multilingual model is unaffected. The condition reads `readsOnlyLatinScript`
+     * because that is what the provider declares today — the flag is misnamed for what these models
+     * actually are, and that gap is why the message says the check is a floor.
+     */
+    /*
+     * REFUSE A ONE-WAY MOVE THAT STRANDS CONTENT.
+     *
+     * `--yes` confirms "apply without prompting"; it cannot stand in for a decision the operator was
+     * never shown. Moving onto an English checkpoint rewrites every vector and cannot be undone, and
+     * the rows do not merely go quiet: measured on bge-small-en-v1.5, unrelated Korean rows score
+     * 0.42-0.52 against English queries and take a quarter of the top-5 slots — above the emission
+     * floor — while never being retrievable by their own content.
+     *
+     * The condition reads `readsOnlyLatinScript` because that is all a provider declares today. The
+     * flag is misnamed for what these models are, which is why the message says the check is a floor.
+     */
+    const targetIsEnglishOnly = provider?.readsOnlyLatinScript === true;
+    /*
+     * RESUME COUNTS TOO (Codex P2). A sentinel created by an older client, or by an attempt that
+     * failed before rewriting anything, carries rewriteProgress "not-started" — the operator never
+     * saw this refusal, and resuming performs the same one-way rewrite. A migration already in
+     * progress keeps its existing acknowledgement: refusing there would strand a half-rewritten
+     * store, which is worse than the loss being re-confirmed.
+     */
+    const guardedMode =
+      mode === "target" ||
+      (mode === "resume" && inspection.migration.status === "active" && inspection.migration.rewriteProgress === "not-started");
+
+    if (guardedMode && targetIsEnglishOnly && options.acceptNonLatinLoss !== true) {
+      const n = inspection.nonLatin;
+      /*
+       * UNKNOWN IS NOT ZERO (Codex P1). The previous condition tested `status === "known" &&
+       * observationCount > 0`, so a failed or unsupported content scan evaluated false and the
+       * irreversible rewrite proceeded unacknowledged — fail-open at precisely the moment the client
+       * cannot prove nothing will be stranded. A record must distinguish "not known" from a verdict.
+       */
+      if (n.status !== "known") {
+        throw new RepairOperationError(
+          `Refusing: the non-English content scan could not run (${n.reason}), and '${targetModelId}' is an ENGLISH ` +
+            `model. This rewrite is ONE-WAY, so proceeding without knowing what it would strand is not something ` +
+            `--yes can confirm. Fix the store so \`monet doctor\` can scan it, or pass --accept-non-latin-loss to ` +
+            `proceed unverified.`,
+          { dbPath, inspection, provider: providerResult, nextCommands },
+        );
+      }
+      if (n.observationCount > 0 || n.conceptCount > 0) {
+        throw new RepairOperationError(
+          `Refusing: '${targetModelId}' is an ENGLISH model, and ${n.observationCount} observation(s) plus ` +
+            `${n.conceptCount} concept body/bodies are not written in English. This rewrite is ONE-WAY — ` +
+            `those rows keep their text, become ` +
+            `unreachable by their own content, and still surface in unrelated results. Re-express them in ` +
+            `English first (they stay addressable by id), or pass --accept-non-latin-loss to proceed ` +
+            `knowing the cost. NOTE the check is a FLOOR: it detects non-Latin script only, so content ` +
+            `written in French, Vietnamese or another Latin-alphabet language is not counted here and ` +
+            `degrades the same way.` +
+            (n.sampleIds.length > 0 ? ` Samples: ${n.sampleIds.join(", ")}.` : ""),
+          { dbPath, inspection, provider: providerResult, nextCommands },
+        );
+      }
+    }
+
+    /*
+     * RECHECK AFTER EXCLUSIVE OWNERSHIP (Codex P1).
+     *
+     * The count above was read before provider loading and probing — seconds during which another
+     * Monet process can write a non-English observation into a live store. Exclusive SQLite
+     * ownership is not taken until applyRepair creates its verified backup, so a stale zero could
+     * wave through the one rewrite that cannot be undone. applyRepair re-reads the count under that
+     * ownership and refuses there if it moved; this closure is how the decision reaches it without
+     * duplicating the message.
+     */
+    const recheckNonEnglish = guardedMode && targetIsEnglishOnly && options.acceptNonLatinLoss !== true
+      ? (fresh: StoredEmbedderStateInspection): void => {
+          const n = fresh.nonLatin;
+          if (n.status !== "known") {
+            throw new Error(
+              `the non-English content scan stopped working between preflight and the rewrite (${n.reason}). ` +
+              `Refusing rather than proceeding blind on a one-way migration.`,
+            );
+          }
+          if (n.observationCount > 0 || n.conceptCount > 0) {
+            throw new Error(
+              `${n.observationCount} observation(s) and ${n.conceptCount} concept body/bodies not written in English ` +
+              `appeared after preflight and before the ` +
+              `rewrite; another process is writing to this store. Re-run, or pass --accept-non-latin-loss.` +
+              (n.sampleIds.length > 0 ? ` Samples: ${n.sampleIds.join(", ")}.` : ""),
+            );
+          }
+        }
+      : undefined;
+
     const result = await applyRepair(
       mode,
       dbPath,
@@ -766,6 +901,7 @@ async function runRepair(options: RepairOptions, dependencies: RecoveryCliDepend
       provider,
       providerResult,
       dependencies,
+      recheckNonEnglish,
     );
     latestBackup = result.backup;
     let after: StoredEmbedderStateInspection;
@@ -914,6 +1050,7 @@ export function registerRecoveryCommands(
     .option("--json", "Print one stable JSON result object")
     .option("--apply", "Apply the repair after provider preflight and verified backup")
     .option("--yes", "Confirm --apply noninteractively")
+    .option("--accept-non-latin-loss", "Proceed onto an ENGLISH model knowing it strands non-Latin-script rows")
     .action((options: RepairOptions) => runRepair(options, dependencies));
 
   /*

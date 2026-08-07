@@ -45,6 +45,7 @@ function inspection(overrides: Partial<StoredEmbedderStateInspection> = {}): Sto
       sourceConcepts: knownPopulation(),
     },
     migration: { status: "none" },
+    nonLatin: { status: "known", tolerance: 0.2, observationCount: 0, conceptCount: 0, sampleIds: [] },
     assessment: "safe",
     ...overrides,
   };
