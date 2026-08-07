@@ -33,12 +33,14 @@
  * produce the same segments, which is what lets the migration be idempotent by protocol (a rerun
  * replaces an observation's segments with an identical set).
  */
-import { RELIABLE_EMBED_TOKENS } from "./embed-budget";
+import { RELIABLE_EMBED_TOKENS, reliableSegmentTokensOf } from "./embed-budget";
 
 /** What a provider must expose for its text to be segmented at all. Structurally satisfied by EmbeddingProvider. */
 export interface SegmentBudgetProvider {
   inputWindow?(): number | null | Promise<number | null>;
   countTokens?(text: string): number | Promise<number>;
+  /** Per-model reliable budget. Finite and >= 1 token, or it falls back — see reliableSegmentTokensOf. */
+  readonly reliableSegmentTokens?: number;
 }
 
 /**
@@ -49,14 +51,20 @@ export interface SegmentBudgetProvider {
  * treat null as "do not segment": a guessed budget there would shred text that indexes perfectly, and
  * inventing a number is the same silent-wrongness the window guard exists to remove.
  *
- * A provider that reports a window SMALLER than RELIABLE_EMBED_TOKENS gets its own window, because
+ * A provider that reports a window SMALLER than the reliable budget gets its own window, because
  * past it the failure is irreversible data loss rather than degraded ranking.
+ *
+ * THE BUDGET TRAVELS WITH THE MODEL. Where the collapse begins is a fact about a space, so a provider
+ * may declare `reliableSegmentTokens` and RELIABLE_EMBED_TOKENS is only the fallback for one that
+ * does not. The shipped 280 was derived on multilingual-MiniLM; re-derived on bge-small-en-v1.5 by
+ * LOO argmax over the live corpus it is 380 (see MODEL_PROFILES). A constant left in place across a
+ * model swap is unjustified until re-derived in the space it now governs.
  */
 export async function segmentTokenBudget(provider: SegmentBudgetProvider): Promise<number | null> {
   if (provider.inputWindow === undefined || provider.countTokens === undefined) return null;
   const window = await provider.inputWindow();
   if (window === null) return null; // provider could not determine one — never guess
-  return Math.min(RELIABLE_EMBED_TOKENS, window);
+  return Math.min(reliableSegmentTokensOf(provider.reliableSegmentTokens), window);
 }
 
 /**

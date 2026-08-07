@@ -73,6 +73,20 @@ export interface EmbeddingProvider {
    */
   readonly needsLexicalArm?: boolean;
   /**
+   * The segment token budget this provider's space stays RELIABLE at (#155, src/embed-budget.ts).
+   *
+   * Same shape and same reason as recommendedThresholds: it is a property of the SPACE, measured in
+   * that space, not a global. RELIABLE_EMBED_TOKENS is the documented fallback for a provider that
+   * says nothing — it is a real measurement, but of a model this may not be. Omitting it is honest
+   * for an unprofiled provider; carrying another model's number silently is not.
+   *
+   * MUST be a positive finite number when present. A 0, a negative, or a NaN is treated as absent
+   * rather than honoured — see segmentTokenBudget for why an unguarded 0 degenerates to one segment
+   * per character.
+   */
+  readonly reliableSegmentTokens?: number;
+
+  /**
    * Whether this provider reads ONLY Latin-script text (#155).
    *
    * An English-only model maps text in a script it never saw to essentially arbitrary directions.

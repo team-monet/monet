@@ -99,6 +99,8 @@ interface ModelProfile {
   thresholds: EmbeddingThresholds;
   /** Declared only where the model genuinely cannot read other scripts; see EmbeddingProvider. */
   readsOnlyLatinScript?: boolean;
+  /** Segment budget measured IN THIS SPACE; omitted means fall back to RELIABLE_EMBED_TOKENS. */
+  reliableSegmentTokens?: number;
 }
 
 /**
@@ -168,9 +170,37 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
    * replayed on this corpus; it takes the labelled legacy pair rather than borrowing another model's.
    */
   "Xenova/all-MiniLM-L6-v2": { thresholds: LEGACY_UNMEASURED_THRESHOLDS, readsOnlyLatinScript: true },
+  /*
+   * SEGMENT BUDGET, re-derived for this model. Swept by re-segmenting and re-embedding a copy of the
+   * live store at each budget, then replaying the DECISION the budget governs — leave-one-out
+   * nomination, argmax over every concept in the circle, scored at tauAttach 0.78:
+   *
+   *   budget   segs/obs   correct   WRONG    fork   attach precision
+   *      140       4.17     58.1%   15.5%   26.5%           79.0%
+   *      210       2.82     62.5%   16.9%   20.6%           78.7%
+   *      280       2.16     63.2%   16.0%   20.8%           79.8%   <- the multilingual-MiniLM value
+   *      380       1.69     66.1%   15.6%   18.3%           80.9%   <- chosen
+   *      512       1.35     65.5%   18.5%   16.0%           77.9%
+   *
+   * 380 dominates the inherited 280 on every column — more correct attaches, marginally fewer wrong
+   * ones, higher precision, and fewer segments to embed. It reverses the premise the 280 was chosen
+   * under: that doc measured longer text collapsing into the zone where unrelated pairs clear
+   * tauAttach 64.5% of the time, and in THIS space that collapse is milder and starts later. Past 380
+   * it does bite — 512 costs 2.9 points of precision.
+   *
+   * Two honest limits. This is one user's corpus, so the number is as corpus-bound as any other here;
+   * and the harness is deterministic (fixed stride, no RNG), so re-running reproduces rather than
+   * estimating variance — the 2.9-point gap over 280 is ~21 of 739 replays and carries no error bar.
+   * Raw argmax barely moves across the sweep (67.0-68.7% excluding blobs); what the budget moves is
+   * behaviour near the threshold.
+   *
+   * Existing stores stay segmented at whatever budget wrote them. Re-run
+   * scripts/backfill-observation-segments.ts to make a store uniform at the current value.
+   */
   "Xenova/bge-small-en-v1.5": {
     thresholds: { tauAttach: 0.78, tauAmbiguous: 0.5 },
     readsOnlyLatinScript: true,
+    reliableSegmentTokens: 380,
   },
 };
 
@@ -181,6 +211,8 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   /** Semantic space: neighbours are close and the lexical arm is what separates them (#155). */
   readonly needsLexicalArm = true;
   readonly readsOnlyLatinScript?: boolean;
+  /** From MODEL_PROFILES for a known checkpoint; undefined otherwise, so the fallback applies. */
+  readonly reliableSegmentTokens?: number;
   readonly modelId: string;
   private readonly model: string;
   private extractor: Promise<FeatureExtractor> | null = null;
@@ -193,6 +225,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
     const profile = MODEL_PROFILES[this.model];
     this.recommendedThresholds = profile?.thresholds ?? LEGACY_UNMEASURED_THRESHOLDS;
     this.readsOnlyLatinScript = profile?.readsOnlyLatinScript;
+    this.reliableSegmentTokens = profile?.reliableSegmentTokens;
   }
 
   private load(): Promise<FeatureExtractor> {

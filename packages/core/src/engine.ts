@@ -88,7 +88,7 @@ import {
   type ResolutionNomination,
 } from "./resolution";
 export type { ResolutionMode } from "./resolution";
-import { RELIABLE_EMBED_TOKENS } from "./embed-budget";
+import { RELIABLE_EMBED_TOKENS, reliableSegmentTokensOf } from "./embed-budget";
 import { segmentObservation, segmentTokenBudget } from "./observation-segmenter";
 import { lexicalTokens } from "./lexical-overlap";
 import {
@@ -4020,7 +4020,11 @@ export class MonetCore {
     const limit = await window();
     if (limit === null) return; // provider reports no window, or could not determine one — never guess
     const tokens = await count(content);
-    if (tokens > limit) throw new ContentExceedsEmbedderWindowError(tokens, limit, RELIABLE_EMBED_TOKENS, subject);
+    // The advisory must quote the budget THIS embedder actually segments at, not the global fallback.
+    // Telling a bge caller to target 280 while the engine cuts at 380 is the same stranded-constant
+    // failure this field exists to fix, one layer out where the user can see it.
+    const reliable = reliableSegmentTokensOf(this.embedder.reliableSegmentTokens);
+    if (tokens > limit) throw new ContentExceedsEmbedderWindowError(tokens, limit, reliable, subject);
   }
 
   /**

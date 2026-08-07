@@ -24,3 +24,25 @@
  * doc named — measured in #155 at 41.5% of unrelated observation pairs clearing tauAttach.
  */
 export const RELIABLE_EMBED_TOKENS = 280;
+
+/**
+ * The reliable budget to actually use, given what a provider declared.
+ *
+ * ONE READ, ONE VALIDATION. This exists because there are two consumers — the segmenter, which cuts
+ * text at the budget, and the window guard, which tells a refused caller what to aim for — and when
+ * they each read `provider.reliableSegmentTokens ?? RELIABLE_EMBED_TOKENS` on their own, their
+ * validation drifts apart. It did: the segmenter was hardened against a bogus declaration while the
+ * guard kept forwarding it, so an `Infinity` declaration produced advice to stay under Infinity
+ * tokens (Codex P2, PR #171, second round).
+ *
+ * A declaration is honoured only when it is a finite number of AT LEAST ONE token. Token counts are
+ * non-negative integers, so anything under 1 — `0`, a negative, or a fractional `0.5` — leaves
+ * hardCut's binary search unable to fit any non-empty prefix: `fit` stays at its initial 1 and the
+ * text is emitted one CHARACTER at a time, one embedding call each. Anything else falls back, which
+ * is a real measured number rather than a guess.
+ */
+export function reliableSegmentTokensOf(declared: number | undefined): number {
+  return typeof declared === "number" && Number.isFinite(declared) && declared >= 1
+    ? declared
+    : RELIABLE_EMBED_TOKENS;
+}
