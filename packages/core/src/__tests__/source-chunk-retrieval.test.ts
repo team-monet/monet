@@ -1,5 +1,5 @@
 /**
- * Chunk-granular source retrieval (ratified): search()/gather() rank a kind='source' concept by
+ * Chunk-granular source retrieval (ratified): search() ranks a kind='source' concept by
  * the MAX cosine over its own ACTIVE chunk vectors (observations.embedding, now a real per-chunk
  * embedding written at ingestion by storeSourceChunk) instead of one mean-pooled whole-file
  * concepts.embedding — root cause: a multi-section file's on-topic chunk gets diluted below the
@@ -328,22 +328,7 @@ describe("chunk-granular source retrieval — best-chunk ranking", () => {
     expect(multiCard.score).toBeGreaterThan(wholeFileCos);
   });
 
-  it("gather() surfaces the same multi-section file for the same query, consistent with search()", async () => {
-    const core = makeCore();
-    const { multi, distractor } = await buildFixture(core);
 
-    const gathered = await core.gather(query, { circle, sourceAuthorizationContext: auth });
-    const gatheredIds = [...gathered.seed.map((c) => c.id), ...gathered.ranked.map((c) => c.id)];
-    expect(gatheredIds).toContain(multi.conceptId);
-
-    const results = await core.search(query, { circle, limit: 5, sourceAuthorizationContext: auth });
-    const searchIds = results.map((r) => r.id);
-    // search() and gather() agree on the hit itself (both read best-chunk scores off the same
-    // scoreSourceConcepts helper) — not necessarily on final fused scores, since gather() also
-    // folds seed strength / RRF fusion through fuse(), which search() never applies.
-    expect(searchIds).toContain(multi.conceptId);
-    void distractor;
-  });
 });
 
 describe("chunk-granular source retrieval — zero-vector compatibility", () => {
@@ -368,9 +353,6 @@ describe("chunk-granular source retrieval — zero-vector compatibility", () => 
     // produce without the fallback, ranking strictly worse than pre-fix behavior).
     expect(card!.score).toBe(expectedFallbackScore);
 
-    const gathered = await core.gather(query, { circle, sourceAuthorizationContext: auth });
-    const gatheredIds = [...gathered.seed.map((c) => c.id), ...gathered.ranked.map((c) => c.id)];
-    expect(gatheredIds).toContain(stored.conceptId);
   });
 });
 
@@ -432,9 +414,6 @@ describe("chunk-granular source retrieval — partial-refresh mixed state (revie
     expect(card!.score).toBe(Math.max(wholeFileCos, weatherChunkCos));
     expect(card!.score).toBe(wholeFileCos);
 
-    const gathered = await core.gather(query, { circle, sourceAuthorizationContext: auth });
-    const gatheredIds = [...gathered.seed.map((c) => c.id), ...gathered.ranked.map((c) => c.id)];
-    expect(gatheredIds).toContain(conceptId);
   });
 });
 
@@ -465,10 +444,5 @@ describe("chunk-granular source retrieval — candidate scoring at scale (review
     expect(results.map((r) => r.id)).toContain(target.conceptId);
     expect(results[0].id).toBe(target.conceptId);
 
-    const gathered = await core.gather("What database did we choose for the billing service?", {
-      circle, sourceAuthorizationContext: auth,
-    });
-    const gatheredIds = [...gathered.seed.map((c) => c.id), ...gathered.ranked.map((c) => c.id)];
-    expect(gatheredIds).toContain(target.conceptId);
   }, 10_000);
 });

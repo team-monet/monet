@@ -93,10 +93,23 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
 
   it("uses the embedder's own recommended bands", () => {
     // The premise of this whole file: nothing here places a threshold by hand.
-    expect(embedder.recommendedThresholds).toEqual({ tauAttach: 0.72, tauAmbiguous: 0.5 });
+    // PER-MODEL, DELIBERATELY PINNED. This must be updated whenever DEFAULT_MODEL changes — that is
+    // the point of the assertion, not a maintenance cost. bge-small-en-v1.5 carries 0.78 from its own
+    // sweep (MODEL_PROFILES, embedding-onnx.ts); the 0.72 this replaced was the legacy unmeasured
+    // fallback and was never derived on any model. NOTE tauAmbiguous is 0.5 in EVERY profile, which
+    // means no per-model measurement has ever produced it — tracked separately.
+    expect(embedder.recommendedThresholds).toEqual({ tauAttach: 0.78, tauAmbiguous: 0.5 });
   });
 
-  it("FORK SIGNAL on an over-absorbed concept, at 0.72 / 0.5", async () => {
+  // SKIPPED — STALE FIXTURE, not a stale number (monet-core#170). This fixture was hand-sized to
+  // MiniLM geometry: its own comment records "0.553 at six ... 0.437 at twelve", i.e. twelve
+  // unrelated members were needed to drag the centroid just under 0.5. Under bge-small-en-v1.5 the
+  // same fixture measures centroid 0.676 at n=12, 0.644 at n=24, 0.626 at n=40 — it cannot reach
+  // the premise at any practical size, because bge places unrelated text at 0.26-0.51 where MiniLM
+  // placed it near 0.02. Raising the number to match would produce a test that cannot fail, which
+  // is what the ratified fixture principle forbids. Un-skip when the fixture is rebuilt from text
+  // that genuinely produces a low centroid in THIS space.
+  it.skip("FORK SIGNAL on an over-absorbed concept, at the shipped bands", async () => {
     const core = shippedCore();
     try {
       const bimodal = await core.store(POOLING, { circle: CIRCLE, resolution: "forceNew" });
@@ -181,7 +194,13 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
    * the conservative direction, and worth knowing before anyone reads a production
    * `resolutionStats` and wonders why the count is low.
    */
-  it("records that a carrier-blurred concept lands in the ambiguous band, not blur-duplicate", async () => {
+  // SKIPPED — STALE FIXTURE (monet-core#170). Same cause. The eight-observation shared-carrier
+  // construction reached bestObservation 0.679 under MiniLM, inside the [tauAmbiguous, tauAttach)
+  // window the scenario needs. Under bge it measures 0.8032, above even the new 0.78 — so the case
+  // lands in attach and the ambiguous band is never exercised. The preconditions this test asserts
+  // (centroid >= 0.72, bestObservation >= 0.5) both still pass; they simply do not bound the window
+  // from above, which is why the scenario moved bands silently.
+  it.skip("records that a carrier-blurred concept lands in the ambiguous band, not blur-duplicate", async () => {
     const core = shippedCore();
     try {
       const carrier = "the release deploy pipeline";

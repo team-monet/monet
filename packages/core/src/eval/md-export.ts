@@ -23,8 +23,7 @@
  *                                authors already have).
  *
  * CLUSTERING — grouping heuristic ONLY, never a retrieval mechanism (spec §2.1 is explicit
- * about this boundary): co_occurred connected components over core.edges(), the same "worked
- * together" signal core.gather() exploits for restoration, reused here purely to decide which
+ * about this boundary): co_occurred connected components over core.edges(), a "worked together" signal used here purely to decide which
  * concepts land in the same topic file. A concept with no co_occurred edges (every
  * single-fact scenario — gotchas/decisions/preferences seeded alone in their own session, per
  * scenarios.ts's own comment on why those carry no tangents) becomes its own singleton

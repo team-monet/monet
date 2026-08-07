@@ -1816,7 +1816,7 @@ describe("source ledger schema migration", () => {
       const assertFence = async () => {
         expect((await core.search("source sentinel knowledge", { circle: "source-a", limit: 20 })).map((card) => card.id)).not.toContain(source.stored.conceptId);
         expect(await core.getConcept(source.stored.conceptId)).toBeNull();
-        expect((await core.gather("source sentinel knowledge", { circle: "source-a", limit: 20 })).ranked.map((card) => card.id)).not.toContain(source.stored.conceptId);
+        expect((await core.search("source sentinel knowledge", { circle: "source-a", limit: 20 })).map((card) => card.id)).not.toContain(source.stored.conceptId);
         expect(core.listMemories("source-a").map((card) => card.id)).toEqual([native.conceptId]);
         expect(core.overview("source-a").livingModel.map((card) => card.id)).toEqual([native.conceptId]);
         expect(core.conceptCount("source-a")).toBe(1);

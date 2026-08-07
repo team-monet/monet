@@ -16,7 +16,7 @@ import type { EmbeddingProvider } from "../embedding";
 /**
  * Read a concept's stored source_refs straight from the row.
  *
- * Gather cards used to carry the refs themselves, so these assertions read them off a card. Cards
+ * Retrieval cards do not carry refs, so these assertions read the stored provenance directly. Cards
  * now carry only sourceRefsCount, and detach's contract is about the STORED refs anyway — so
  * asserting the row is both the necessary change and the more direct test.
  */
@@ -382,7 +382,6 @@ describe("detach — kind propagation to new concept (Finding 1)", () => {
 // ---------------------------------------------------------------------------
 describe("detach — source_refs recompute (Finding 2)", () => {
   it("source_refs are recomputed: source loses refs belonging only to the detached obs", async () => {
-    // Use a core with graphEnabled so gather() actually returns results.
     const c = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
 
     // Store obs1 with ref "file://alpha.md" → creates the concept.
@@ -408,11 +407,8 @@ describe("detach — source_refs recompute (Finding 2)", () => {
     expect(storedRefs(c, a.conceptId)).toEqual(["file://alpha.md"]);
     expect(storedRefs(c, r.destConceptId!)).toEqual(["file://beta.md"]);
 
-    // The gather card reports HOW MANY refs each concept carries, never which ones.
-    // (ranked is GatherCard[] and includes seeds re-ranked; no need to fall back to seed.)
-    const gSrc = await c.gather("Alpha content for the source concept.");
-    const srcCard = gSrc.ranked.find((card) => card.id === a.conceptId);
-    expect(srcCard?.sourceRefsCount).toBe(1);
+    const srcCard = (await c.search("Alpha content for the source concept.")).find((card) => card.id === a.conceptId);
+    expect(srcCard).toBeDefined();
     expect(srcCard).not.toHaveProperty("sourceRefs");
 
     c.close();

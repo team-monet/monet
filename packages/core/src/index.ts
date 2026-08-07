@@ -51,8 +51,6 @@ export type {
   LivingModelCard,
   Contradiction,
   PrewarmContradiction,
-  GatherResult,
-  GatherCard,
   MemoryOverview,
   ResolutionStats,
   EntityHub,
@@ -217,9 +215,8 @@ export type {
   StoredEmbeddingPopulations,
 } from "./embedding-state";
 export { MONET_SCHEMA_VERSION } from "./schema-version";
-/** The unit split (observations retrieve, concepts deliver): the native dense arm's absolute
- *  cosine floor. Exported alongside the other retrieval tuning constants because it is the reason
- *  a query can legitimately return FEWER cards than its limit — including zero. */
+/** The unit split (observations retrieve, concepts deliver): search's native-card emission floor.
+ *  It is why a query can legitimately return fewer cards than its limit, including zero. */
 export { NATIVE_SCORE_FLOOR } from "./retrieval";
 export type { NativeObservationMatch } from "./retrieval";
 /** Store-time resolution: find by evidence, confirm by identity. The DECISION is pure and exported
@@ -334,7 +331,6 @@ export type {
 export { renderOverview } from "./render-overview";
 export { extractEntities } from "./extract-entities";
 export type { ExtractedEntity, EntityKind } from "./extract-entities";
-export type { GraphParams } from "./graph";
 export { HashingEmbeddingProvider, cosine, validateEmbeddingProviderOutput } from "./embedding";
 export type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
 export {

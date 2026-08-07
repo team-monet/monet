@@ -15,8 +15,7 @@ import { MonetCore } from "../engine";
 
 /**
  * Read a concept's stored source_refs straight from the row. These tests assert PROVENANCE
- * (recorded with the graph off; carried through a reassign-merge); gather cards were the window
- * onto it and now carry sourceRefsCount rather than the refs themselves.
+ * (recorded with the graph off; carried through a reassign-merge).
  */
 const storedRefs = (core: MonetCore, conceptId: string): string[] => {
   const row = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
@@ -227,10 +226,9 @@ describe("sourceRefs provenance — recorded regardless of graph mode", () => {
       sourceRefs: ["/work/acme-api/AGENTS.md"],
     });
     expect(storedRefs(core, r.conceptId)).toContain("/work/acme-api/AGENTS.md");
-    // gather() reports how many refs the concept carries, not which ones.
-    const g = await core.gather("Build conventions: never run a root-level build.", { circle: "acme-api" });
-    const card = g.ranked.find((c) => c.id === r.conceptId);
-    expect(card?.sourceRefsCount).toBe(1);
+    const card = (await core.search("Build conventions: never run a root-level build.", { circle: "acme-api" }))
+      .find((c) => c.id === r.conceptId);
+    expect(card).toBeDefined();
     core.close();
   });
 });

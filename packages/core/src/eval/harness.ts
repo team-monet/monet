@@ -97,15 +97,13 @@ export async function seedScenario(
   const core = new MonetCore(":memory:", { embedder, tauAttach: 1.1, tauAmbiguous: 1.1, idGen });
   const map = new Map<string, string>();
 
-  // SESSION MODEL — how co-occurrence (the signal gather exploits for restoration) is formed.
-  // This is a realistic model, NOT an adversarial best case for gather:
+  // SESSION MODEL — how co-occurrence is formed for the retained restoration acceptance fixture.
   //  - BACKGROUND = long-term memory learned across MANY prior sessions — each fact its OWN
   //    session (not worked on together) ⇒ no background co-occurrence clique. (If instead ALL
-  //    memory were one undifferentiated session, co_occurred is universal and gather drops BELOW
-  //    search — the win depends on sessions being checkpointed, which real agents do.)
+  //    memory were one undifferentiated session, co_occurred would be universal and meaningless.)
   //  - a thread's seed group = ONE focused work session, but that session ALSO holds the
   //    scenario's `tangents` (unrelated things touched in the same sitting). So co_occurred is
-  //    NOT a pristine gold-only clique: gather must rank the thread above its own session noise.
+  //    NOT a pristine gold-only clique: a future successor must rank the thread above session noise.
   //  - distractors = independent facts, each its OWN session ⇒ they never co-occur with the gold.
   // Entity `about` edges (durable across sessions) span sessions; for divergent-vocabulary
   // threads they connect at most 1–2 members (see restorationReachability), which is why

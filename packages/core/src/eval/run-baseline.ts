@@ -2,8 +2,8 @@
  * md-baseline eval CLI — pnpm eval:baseline [--json] [--verbose] [--embedder=auto|onnx|hashing]
  *
  * Reports the SAME STARTER_SUITE (spec §2.5: no scenarios.ts changes, no real-store export in
- * Phase 0) against six arms: the three existing engine arms (no-memory, monet-search,
- * monet-gather) + bm25 (ported, concept-granularity) + chunk-cosine-rag + md-tree (both
+ * Phase 0) against five arms: the two existing engine arms (no-memory, monet-search) + bm25
+ * (ported, concept-granularity) + chunk-cosine-rag + md-tree (both
  * chunk-granularity, scored via harness-baseline.ts's separate chunk-id scoring pass).
  *
  * Deliberately a SEPARATE script/entry from run.ts (spec §2.4/§2.6) — `pnpm eval` and

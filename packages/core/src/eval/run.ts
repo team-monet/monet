@@ -65,12 +65,7 @@ async function main(): Promise<void> {
         .join(" · ");
       lines.push(`  ${r.scenarioId.padEnd(16)} ${cells}`);
     }
-    lines.push(
-      "",
-      "→ co_occurred carries the divergent-vocabulary threads; about carries the entity-cohesive one",
-      "  (checkout-thread) and only partially connects the rest — which signal earns the recall, per thread.",
-      "",
-    );
+    lines.push("");
     process.stdout.write(lines.join("\n") + "\n");
   }
 }

@@ -41,7 +41,7 @@ function insertExternalObservation(db: Database.Database, id: string, width: num
 }
 
 describe("embedder safety contract — checked reads and stable identity", () => {
-  it("rejects malformed search and gather query outputs before native or source-backed scoring", async () => {
+  it("rejects malformed search query outputs before native or source-backed scoring", async () => {
     const provider = new SwitchableProvider();
     const core = new MonetCore(":memory:", { embedder: provider });
     try {
@@ -51,7 +51,7 @@ describe("embedder safety contract — checked reads and stable identity", () =>
       provider.malformed = "wrong-width";
       await expect(core.search("query")).rejects.toBeInstanceOf(EmbedderOutputDimensionError);
       provider.malformed = "wrong-type";
-      await expect(core.gather("query")).rejects.toBeInstanceOf(EmbedderOutputDimensionError);
+      await expect(core.search("query")).rejects.toBeInstanceOf(EmbedderOutputDimensionError);
     } finally {
       core.close();
     }

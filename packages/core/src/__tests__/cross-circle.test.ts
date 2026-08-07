@@ -8,7 +8,6 @@
  *   (a) search without circle → results from multiple circles, each card carries correct circle
  *   (b) search with explicit circle → only that circle (unchanged)
  *   (c) store-wide tie-break — same-circle-as-defaultCircle ranks first on an exact tie
- *   (d) gather without circle → A-topic intent returns A1+A2 (spread worked) + circle labels
  *   (e) fetch without circle → resolves a foreign-circle id and reports its home circle
  *   (f) fetch with WRONG explicit circle → still errors
  *   (g) listCircles — counts + exclusion
@@ -114,96 +113,6 @@ describe("search — store-wide tie-break", () => {
     const inHome2: Scored = { row: { circle: "home", id: "id-z" }, score: 0.9 };
     expect(comparator(inHome, inHome2)).toBeLessThan(0); // "id-a" < "id-z"
     expect(comparator(inHome2, inHome)).toBeGreaterThan(0);
-  });
-});
-
-// ---- (d) gather without circle -----------------------------------------------
-
-describe("gather — store-wide", () => {
-  it("(d) gather on A-topic returns A1+A2 (spreading worked within circle A) and includes circle labels", async () => {
-    // Circle A: two concepts that co-occurred in the same session → connected by a co_occurred edge.
-    // Circle B: one isolated concept.
-    // Intent matches circle A. Gather should recover both A concepts via spreading.
-    const core = new MonetCore(":memory:", { idGen: seq("d"), defaultCircle: "circle-a" });
-
-    const a1 = await core.store("routing decisions for the authentication system", { circle: "circle-a" });
-    const a2 = await core.store("authentication session token expiry configuration", { circle: "circle-a" });
-    // Store in same session → co_occurred edge between a1 and a2
-    core.endSessionForEval();
-
-    await core.store("completely unrelated postgres tuning note", { circle: "circle-b" });
-    core.endSessionForEval();
-
-    // Gather without circle
-    const result = await core.gather("authentication routing", { limit: 20 });
-    const rankedIds = result.ranked.map((r) => r.id);
-
-    // Both A concepts should be present
-    expect(rankedIds).toContain(a1.conceptId);
-    expect(rankedIds).toContain(a2.conceptId);
-
-    // Cards should carry circle labels
-    const cardA1 = result.ranked.find((r) => r.id === a1.conceptId);
-    const cardA2 = result.ranked.find((r) => r.id === a2.conceptId);
-    expect(cardA1?.circle).toBe("circle-a");
-    expect(cardA2?.circle).toBe("circle-a");
-
-    core.close();
-  });
-});
-
-// ---- (d2) gather without circle — pure-graph cross-circle spreading ---------
-
-describe("gather — store-wide (pure-graph spreading)", () => {
-  it("(d2) pure-graph cross-circle spreading: a graph-only concept in circle-A is reached from a seed in circle-A even though defaultCircle is circle-B", async () => {
-    // Intent: exercise the per-seed circleOf() lookup in the spread phase (engine.ts ~2334).
-    // The mechanism: when gather is called store-wide (no circle) and the session's defaultCircle
-    // is circle-B, each seed must spread through ITS OWN circle's edges.  If the spread
-    // mistakenly used defaultCircle (circle-B) for every seed, the co_occurred edge between a1
-    // and a2 (which lives in circle-A's scope) would be invisible and a2 would never be reached.
-    //
-    // Embedding guarantee: "fjord mnemonic crypt" has cosine == 0 with "authentication routing"
-    // under the HashingEmbeddingProvider (verified: no word/trigram hash collisions). This
-    // ensures a2 cannot enter the result via dense/lexical seeding — only through graph spreading.
-
-    const core = new MonetCore(":memory:", { idGen: seq("d2"), defaultCircle: "circle-b" });
-
-    // Circle-A: a1 is seed-able (vocabulary matches intent); a2 is graph-only (zero cosine).
-    // Same session → co_occurred edge in circle-A scope.
-    const a1 = await core.store("routing decisions for the authentication system", { circle: "circle-a" });
-    const a2 = await core.store("fjord mnemonic crypt", { circle: "circle-a" });
-    core.endSessionForEval();
-
-    // Circle-B (=defaultCircle): unrelated concept, isolated.
-    await core.store("completely unrelated postgres tuning note", { circle: "circle-b" });
-    core.endSessionForEval();
-
-    // Confirm the co_occurred edge exists in circle-A scope (guard against silent edge failure).
-    const coEdges = core.edges({ type: "co_occurred", circle: "circle-a" });
-    const edgeFormed =
-      coEdges.some((e) => e.srcId === a1.conceptId && e.dstId === a2.conceptId) ||
-      coEdges.some((e) => e.srcId === a2.conceptId && e.dstId === a1.conceptId);
-    expect(edgeFormed).toBe(true);
-
-    // Gather store-wide (no circle); defaultCircle is circle-B — the per-seed circleOf() must
-    // be used so that a1's spread travels circle-A edges and activates a2.
-    const result = await core.gather("authentication routing", { limit: 20 });
-    const rankedIds = result.ranked.map((r) => r.id);
-
-    // a1 should be present (seeded).
-    expect(rankedIds).toContain(a1.conceptId);
-
-    // a2 must be present — reachable ONLY via per-seed circle-A spreading.
-    expect(rankedIds).toContain(a2.conceptId);
-
-    // a2 must carry viaSeed: false — confirms it was not a dense/lexical seed, only graph-reached.
-    const cardA2 = result.ranked.find((r) => r.id === a2.conceptId);
-    expect(cardA2?.viaSeed).toBe(false);
-
-    // a2's home circle must be circle-A.
-    expect(cardA2?.circle).toBe("circle-a");
-
-    core.close();
   });
 });
 

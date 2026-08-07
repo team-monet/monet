@@ -9,7 +9,7 @@
  *   - mergeCircle: moves all concepts + alias + forceNew near-match → dup edge not merge
  *   - mergeCircle: auto resolution merges a matching pair
  *   - mergeCircle: workstream in from-circle is deleted (not moved)
- *   - archiveCircle/unarchiveCircle: store-wide search/gather exclude archived (includeArchived restores)
+ *   - archiveCircle/unarchiveCircle: store-wide search excludes archived (includeArchived restores)
  *   - archiveCircle/unarchiveCircle: listCircles flags, explicit access still works, store-to-archived allowed
  */
 import { describe, it, expect } from "vitest";
@@ -286,27 +286,27 @@ describe("archiveCircle / unarchiveCircle", () => {
     core.close();
   });
 
-  it("archived circle is excluded from store-wide gather by default", async () => {
+  it("archived circle remains excluded from store-wide search by default", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const r = await core.store("JWT token expiry configuration.", { circle: "archived-proj" });
     await core.store("JWT token expiry configuration.", { circle: "active-proj", resolution: "forceNew" });
 
     core.archiveCircle("archived-proj");
 
-    const result = await core.gather("JWT token expiry");
-    const ids = result.ranked.map((x) => x.id);
+    const result = await core.search("JWT token expiry");
+    const ids = result.map((x) => x.id);
     expect(ids).not.toContain(r.conceptId);
 
     core.close();
   });
 
-  it("includeArchived restores archived circle in store-wide gather", async () => {
+  it("includeArchived continues to restore archived circle in store-wide search", async () => {
     const core = new MonetCore(":memory:");
     const r = await core.store("JWT token expiry configuration.", { circle: "archived-proj" });
     core.archiveCircle("archived-proj");
 
-    const result = await core.gather("JWT token expiry", { includeArchived: true });
-    expect(result.ranked.map((x) => x.id)).toContain(r.conceptId);
+    const result = await core.search("JWT token expiry", { includeArchived: true });
+    expect(result.map((x) => x.id)).toContain(r.conceptId);
 
     core.close();
   });

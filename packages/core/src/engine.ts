@@ -201,17 +201,6 @@ import type { GateJournalClaimType, GateJournalDisposition, GateJournalMouth } f
 import { RATIFICATION_ENTRANCES, classifyRatificationPair } from "./lifecycle-edges";
 import { inspectLifecycleEdgeIntegrity } from "./diagnostics";
 import type { LifecycleEdgeIntegrityReport } from "./diagnostics";
-import {
-  spread,
-  fuse,
-  evidenceGapStop,
-  rrfFuse,
-  DEFAULT_GRAPH_PARAMS,
-  type GraphParams,
-  type Adj,
-  type Ranked,
-} from "./graph";
-
 // ---- graph derivation tunables (#245, ADR §3.7) -------------------------
 const EDGE_NEIGHBORS = 6; // top-M cosine neighbours per store (dedup argmax + `related` edges)
 const MAX_NEIGHBORS = 25; // cap co-member / co-occurrence fan-out per store
@@ -222,18 +211,6 @@ const EDGE_MIN_STRENGTH = 2.0; // else summed rarity·kindBoost over shared enti
 const CO_OCCURRED_WEIGHT = 0.85;
 const FOLLOWS_WEIGHT = 0.5;
 const ASSERTED_WEIGHT = 0.95;
-const SEED_K = 10; // gather seed-set size
-const RRF_K = 60; // RRF constant for seed fusion
-// Cards carry a source-ref COUNT, never the refs themselves.
-//
-// Supersedes the round-4 / Codex-thread-13 fix, which capped source_refs at the first 20 entries
-// per card for exactly the right reason (one large source concept holds one ref per active chunk
-// and could push a serialized memory_gather payload past ok()'s size ceiling) but stopped one step
-// short: the capped 20 were not consumed either. They are file paths and agent ids — provenance a
-// caller reads via memory_fetch on the one concept it cares about, not something it needs on every
-// card of every gather. Measured: a single card in one field gather carried 20 refs against a true
-// total of 255, and none of them were used. The count keeps "how much provenance exists" — the
-// only part the ranking view ever needed — at a fixed cost per card.
 const OVERVIEW_DUP_PAIRS_MAX = 10; // top-N possible-duplicate pairs shown in overview (by score); counts.possibleDuplicates has the full total
 /** Pair/contradiction/gate-exception queues stay top-10; counts or omission fields carry true totals. */
 export const OVERVIEW_EXCEPTION_LIMIT = 10;
@@ -290,7 +267,6 @@ const RESOLUTION_STATS_WINDOW_DAYS = 30;
 /** Same window for gate stats, for the same reason — curation reads one consistent notion of lately. */
 const GATE_STATS_WINDOW_DAYS = 30;
 const KIND_BOOST: Record<string, number> = { path: 3, id: 3, err: 3, lib: 2, noun: 1 };
-const DIRECTED_TYPES = ["follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"];
 // Edges that may BOOST a similarity hit's rank: the "worked-on-together / causal" signals.
 // about/related are excluded — they re-encode similarity and would reorder single-fact hits.
 const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradicts", "resolves", "derived_from", "supports", "part_of"]);
@@ -305,10 +281,8 @@ const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradic
  * chances for the set to drift apart. The two are deliberately treated ALIKE everywhere the
  * substrate handles a pair flag as a pair flag.
  *
- * DELIBERATELY NOT IN `DIRECTED_TYPES` OR `THREAD_TYPES` above, exactly as `possible_duplicate_of`
- * has never been: those two decide gather's spread activation and rank boosting, and a pair flag is
- * a CURATION question, not a "these were worked on together" signal — boosting a hit because
- * something near it is an unresolved question would let unmediated noise reorder recall. Same
+ * DELIBERATELY NOT IN `THREAD_TYPES` above, exactly as `possible_duplicate_of` has never been: a
+ * pair flag is a CURATION question, not a "these were worked on together" signal. Same
  * reason neither appears in `memory_edge.type`'s own column comment, which enumerates the
  * derived/asserted graph vocabulary rather than every value the column can hold.
  *
@@ -484,7 +458,7 @@ export class EmbedderMismatchError extends Error {
 
 /**
  * Thrown by a served embed choke point OR a cross-store exchange method (store/storeSource/
- * search/saveWorkstream/gather/recomputeSourceConceptBody/exportDelta/graftRows/batchDedup — see
+ * search/saveWorkstream/recomputeSourceConceptBody/exportDelta/graftRows/batchDedup — see
  * assertPinSatisfied's doc comment for the exact list and why each is included) when the
  * engine was constructed with an embedder that does NOT match this store's recorded pin, and
  * ensureEmbedderPin() has not yet been awaited to reconcile the two (MonetCore.pinUnsatisfied).
@@ -805,7 +779,6 @@ const USEFULNESS_DECAY_TAU_DAYS = 60; // usefulness decays slower than recency (
 const AROUSAL_DECAY_TAU_DAYS = 120; // arousal decays at half the rate of usefulness (more persistent)
 const AROUSAL_FLOOR_FRAC = 0.1; // decay-resistant floor — a concept retains ≥10% of its cumulative arousal signal regardless of idle time (arousal_score never decrements)
 const AROUSAL_WEIGHT_LIVING = 0.5; // boost factor in livingModelScore
-const AROUSAL_WEIGHT_GATHER = 0.3; // boost factor in nodePrior (gather path)
 
 export type IngestAction = "created" | "attached" | "ambiguous";
 
@@ -849,10 +822,7 @@ export interface SearchCard {
   /**
    * The unit split (observations retrieve, concepts deliver): WHICH of this concept's observations
    * earned its dense score. Present on native concepts ranked through the dense arm — search()
-   * results and gather()'s RANKED cards. Absent on source concepts (they rank by file/chunk, #54),
-   * on concepts pulled in by a non-embedding arm (gather's lexical seed, entity seeding, graph
-   * spread), and on gather()'s SEED cards (those are scored by confidence, not by retrieval — see
-   * cardOf — so naming a matched observation beside that number would misread).
+   * results. Absent on source concepts, which rank by file/chunk (#54).
    *
    * The id ONLY — never the observation's content or an excerpt of it. A card shows shape and
    * depth, never the claim (ADR §4.5, #232); naming the matching observation tells an agent WHERE
@@ -1942,24 +1912,6 @@ export interface PrewarmState {
   instruction?: string;
 }
 
-/** A gather result row: a search card plus why it was pulled in (#245, ADR §4.7). */
-export interface GatherCard extends SearchCard {
-  /** True if this concept matched the intent directly (a seed); false if reached via the graph. */
-  viaSeed: boolean;
-  /** How many source refs this concept carries. The refs themselves are NOT on the card —
-   *  memory_fetch the concept when you actually need its provenance. Absent when there are none. */
-  sourceRefsCount?: number;
-}
-
-/** What gather(intent) returns: the seed set, the ranked gathered set, and why it stopped. */
-export interface GatherResult {
-  seed: SearchCard[];
-  ranked: GatherCard[];
-  stopReason: string;
-  /** Per-edge-type count of distinct concepts reachable from the seeds (explainability + anti-gaming). */
-  reachableByType: Record<string, number>;
-}
-
 /** An entity hub (#245): a rare, shared anchor — "everything the agent knows touches X". */
 export interface EntityHub {
   key: string;
@@ -2230,10 +2182,8 @@ export interface MonetCoreOptions {
   staleAfterMs?: number;
   /** Id generator (default randomUUID). Inject a deterministic sequence for reproducible eval/tests. */
   idGen?: () => string;
-  /** Build the connection graph at store time + enable gather() (#245). Default true. */
+  /** Build the connection graph at store time for diagnostics and curation. Default true. */
   graphEnabled?: boolean;
-  /** Override spreading/fusion/stop tunables (ADR §3.7/§4.7). Merged over defaults. */
-  graph?: Partial<GraphParams>;
   /** Min cosine for a `related` edge. Default: embedder-bound (0.45 MiniLM / 0.40 lexical). */
   edgeSimMin?: number;
   /** Monet-owned base directory for managed source repositories and sealed snapshots. */
@@ -2455,7 +2405,6 @@ export class MonetCore {
   private staleAfterMs: number;
   private sessionId: string | null = null; // lazily opened on first write/checkpoint
   private graphEnabled: boolean;
-  private graphParams: GraphParams;
   private edgeSimMin!: number; // see the tauAttach/tauAmbiguous comment above — same reason
   private newId: () => string;
   private sourceRegistry: SourceRegistry;
@@ -2536,7 +2485,6 @@ export class MonetCore {
     this.defaultCircle = opts.defaultCircle ?? "default";
     this.staleAfterMs = opts.staleAfterMs ?? 30 * 24 * 60 * 60 * 1000; // 30 days
     this.graphEnabled = opts.graphEnabled ?? true;
-    this.graphParams = { ...DEFAULT_GRAPH_PARAMS, ...opts.graph, wType: { ...DEFAULT_GRAPH_PARAMS.wType, ...opts.graph?.wType } };
     // Sets tauAttach/tauAmbiguous/edgeSimMin from this.embedder + explicitThresholdOpts (both
     // already assigned above) — see the method's doc comment for why this must also run again
     // after any embedder-pin swap, not just here at construction.
@@ -4622,7 +4570,7 @@ export class MonetCore {
 
       // MERGE refs into the concept (don't replace): later evidence attaching from a different file/URL
       // must not erase earlier return-to-source pointers. Recorded UNCONDITIONALLY — NOT gated on the
-      // graph: gather()/toGatherCard and any source-keyed lookup read the concept-level `source_refs`, so
+      // Any source-keyed lookup reads the concept-level `source_refs`, so
       // a graph-disabled store must still record provenance. Otherwise a re-ingest/idempotency check that
       // keys on the source pointer (e.g. the consolidation playbook's "did I already capture this file?")
       // would wrongly report "never captured" on a graph-off runtime.
@@ -4781,11 +4729,9 @@ export class MonetCore {
     // is structural: the MAX yields at most one entry per concept however many observations
     // matched, so one concept still delivers exactly one card.
     //
-    // THIS is where NATIVE_SCORE_FLOOR applies, and the ONLY place it does: card emission. A
-    // native row with no usable live observation vector, or whose best one falls below the floor,
-    // yields NO card — returning fewer than `limit`, possibly zero, is correct: silence over
-    // noise. gather() deliberately does NOT floor (its silence is structural; flooring its
-    // fusion inputs inverts its ranking — see the constant's note in src/retrieval.ts).
+    // THIS is where NATIVE_SCORE_FLOOR applies: card emission. A native row with no usable live
+    // observation vector, or whose best one falls below the floor, yields NO card — returning fewer
+    // than `limit`, possibly zero, is correct: silence over noise.
     //
     // Source rows are NOT floored: #54's file/chunk semantics are untouched by this slice, so a
     // junk query can still return a low-cosine source card while every native row stays silent.
@@ -6053,7 +5999,7 @@ export class MonetCore {
     const initial = this.getRow(conceptId);
     if (!initial) throw new Error(`concept not found: ${conceptId}`);
     if (initial.kind !== "source") throw new Error("recomputeSourceConceptBody requires a source concept");
-    // Cheap early-out BEFORE the expensive gather+embed below: a caller may batch-recompute every
+    // Cheap early-out BEFORE the expensive collect+embed below: a caller may batch-recompute every
     // concept a run touched without first filtering out ones a full-file retirement (drainCleanup)
     // already retired this same run — that is the common case, not an edge case, so it must be cheap.
     if (initial.status !== "active") {
@@ -6065,10 +6011,10 @@ export class MonetCore {
     // REVIEW FIX (IMPORTANT): recomputeSourceConceptBody has no CAS against the state it gathered,
     // unlike supersedeSourceChunkObservation's own observation-pair CAS. embed() is async and runs
     // OUTSIDE any transaction (SQLite transactions must be synchronous), so the active chunk set
-    // can legitimately change between the gather below and the write transaction — a concurrent
-    // recompute of the same concept, or a new chunk write landing mid-flight. Bounded retry: gather
+    // can legitimately change between the collection below and the write transaction — a concurrent
+    // recompute of the same concept, or a new chunk write landing mid-flight. Bounded retry: collect
     // + embed + write, re-checking a cheap chunk-set fingerprint inside the write transaction; a
-    // mismatch means the read was stale, so the write is skipped and the whole gather repeats
+    // mismatch means the read was stale, so the write is skipped and the whole collection repeats
     // against the now-current state rather than persisting content that raced its own inputs. In
     // practice this races only under losing the materializer's single-writer file lock — the retry
     // makes the method correct on its own, not just correct because of an external invariant.
@@ -6135,7 +6081,7 @@ export class MonetCore {
         const row = this.getRow(conceptId);
         if (!row) throw new Error(`concept not found: ${conceptId}`);
         if (row.kind !== "source") throw new Error("recomputeSourceConceptBody requires a source concept");
-        // A racing full-file retirement (every chunk gone) between the gather above and this
+        // A racing full-file retirement (every chunk gone) between the collection above and this
         // transaction leaves nothing to project — leave the (already-retired) concept alone rather
         // than reviving it, and clear its pending marker (see the early-out above).
         if (row.status !== "active") {
@@ -6205,7 +6151,7 @@ export class MonetCore {
    * strict SUPERSET of search()'s own native-row filter, not an exact match — it omits search()'s
    * `active_observation_id IS NULL` conjunct. Over-covering here is safe (re-embedding a row that
    * search() would never have surfaced anyway is wasted work, never wrong work); under-covering
-   * would not be (silently skipping a concept a future search()/gather() call COULD surface would
+   * would not be (silently skipping a concept a future search() call COULD surface would
    * leave it stranded under the old model, exactly the bug this migration step exists to close).
    * Workstreams are identity-upserted state, never embedding-compared (see search()'s own comment);
    * source concepts have their own embedder — recomputeSourceConceptBody, not this.
@@ -6274,7 +6220,7 @@ export class MonetCore {
    *
    * Scoped to native concepts only (mirrors listNativeConceptIds' own exclusions): a source
    * chunk's observation embedding is a REAL per-chunk retrieval vector now (chunk-granular source
-   * retrieval — storeSourceChunk embeds each chunk's own content; search()/gather()'s
+   * retrieval — storeSourceChunk embeds each chunk's own content; search()'s
    * scoreSourceConcepts reads it back for best-chunk ranking), but it is refreshed by ordinary
    * re-sync of changed content (storeSourceChunk), never by this migration pass. A source
    * concept's OWN embedding still derives straight from its body text via
@@ -7207,7 +7153,7 @@ export class MonetCore {
 
       // 3.5. Recompute source_refs from per-observation refs.
       // Observations carry their own source_refs; concepts.source_refs is the aggregate used by
-      // gather()/toGatherCard.  Detach invalidates both endpoints.
+      // source-keyed lookups. Detach invalidates both endpoints.
       {
         // Source: aggregate over the observations that REMAIN.
         const srcRefs = new Set<string>();
@@ -7740,18 +7686,18 @@ export class MonetCore {
   }
 
   /**
-   * Concepts ranked by connection degree over THREAD edges ONLY (the same set fuse() spreads on:
-   * worked-together / causal). Excludes `related`/`about` — otherwise similarity edges float
+   * Concepts ranked by connection degree over worked-together/causal THREAD edges only. Excludes
+   * `related`/`about` — otherwise similarity edges float
    * near-duplicate filler to the top and bury the real cluster.
    */
   topConnectedConcepts(circle?: string, limit = 6): ConnectedConcept[] {
     circle ??= this.defaultCircle;
     const placeholders = [...THREAD_TYPES].map(() => "?").join(",");
-    // Count distinct thread/causal neighbours in BOTH directions (matching adjacency()'s traversal):
+    // Count distinct thread/causal neighbours in both directions:
     // directed causal edges (supports/resolves/derived_from/…) are stored one-way, so a hub that
     // everything POINTS AT — a plan many memories support/resolve — has only incoming edges. Ranking
     // outgoing degree alone (the old `e.src_id = c.id`) omitted exactly those sinks, the most
-    // informative hubs, and misreported the graph vs. what gather() can actually reach. DISTINCT on the
+    // informative hubs and misreported the graph diagnostics. DISTINCT on the
     // neighbour collapses the symmetric co_occurred mirror so it is never double-counted.
     return this.db
       .prepare(
@@ -8382,8 +8328,8 @@ export class MonetCore {
           -- body (a re-publish). source_recompute_pending is exactly the durable marker for "this
           -- row is not yet trustworthy" that recomputeSourceConceptBody clears on success — reusing
           -- it here closes the read-time window instead of only healing it eventually: a concept
-          -- with an outstanding pending row is excluded from every authorized read (memory_fetch,
-          -- search, gather) until its own recompute clears the row, rather than briefly serving
+          -- with an outstanding pending row is excluded from every authorized read (memory_fetch
+          -- and search) until its own recompute clears the row, rather than briefly serving
           -- stale/empty content. No false negatives: a genuinely fresh concept's pending row was
           -- already cleared by the recompute that made it fresh, in the same transaction.
           AND NOT EXISTS (SELECT 1 FROM source_recompute_pending pending WHERE pending.concept_id=concept.id)
@@ -8514,9 +8460,8 @@ export class MonetCore {
    * (the unit split: observations retrieve, concepts deliver; see that module's header for the
    * measured r = -0.58 length/relevance defect this closes).
    *
-   * search() and gather()'s dense arm BOTH go through this one method, by construction — that is
-   * #54's lesson restated: the moment two ranking arms are allowed to score the same store
-   * differently, they drift. Concepts absent from the returned map (no live non-zero observation
+   * search() goes through this one method by construction. Concepts absent from the returned map
+   * (no live non-zero observation
    * vector, or every observation below NATIVE_SCORE_FLOOR) do not rank densely at all; there is
    * deliberately NO centroid fallback.
    */
@@ -9170,7 +9115,7 @@ export class MonetCore {
    * to four — see the fourth, below, for what it added):
    *  - Embed choke points (every place this.embedder.embed() is reachable from a normal client
    *    request): store/storeSource (via storeInternal — its non-source-connector branch is the
-   *    real embed call; see category 4 below for its OTHER branch), search, saveWorkstream, gather,
+   *    real embed call; see category 4 below for its OTHER branch), search, saveWorkstream,
    *    recomputeSourceConceptBody (routine source-sync maintenance, NOT a one-off migration).
    *  - Cross-store exchange (reads/compares embedderModelId or stored vector data against another
    *    engine's data — Codex review, PR #51, FIX A): exportDelta (would otherwise stamp the WRONG
@@ -16405,7 +16350,7 @@ export class MonetCore {
 
   /**
    * Archive a circle: upserts a circle_aliases row with status='archived'. Archived circles
-   * are hidden from store-wide search/gather scans and from listCircles by default.
+   * are hidden from store-wide search scans and from listCircles by default.
    * Explicit access (reads and writes) still works — archived = hidden by default, not sealed.
    *
    * Throws if `name` is an active rename/merge alias (to_name !== name): archiving an alias row
@@ -16769,7 +16714,7 @@ export class MonetCore {
   /**
    * ONE-TIME graph backfill for DBs created before the connection graph existed (P2, Codex review):
    * the graph tables are created empty by init() but edges are only ever derived at store time, so a
-   * pre-graph .monet DB has no hubs/threads and gather() degrades to plain search for its concepts.
+   * pre-graph .monet DB has no hubs/threads for diagnostics and curation.
    * Re-derive entity/`about`/`related`/asserted edges from stored bodies+observations, and reconstruct
    * `co_occurred`/`follows` best-effort from observation session+circle ordering. Idempotent (uq_edge /
    * INSERT OR IGNORE), version-gated to run exactly once, and wrapped in a single transaction.
@@ -16792,8 +16737,8 @@ export class MonetCore {
         const refs = new Set<string>();
         for (const o of obs) if (o.source_refs) for (const r of JSON.parse(o.source_refs) as string[]) refs.add(r);
         // Merge the observations' refs back onto the concept row too: a DB ingested with graphEnabled:false
-        // never ran store()'s concept-level source_refs update, so gather()/toGatherCard (which read
-        // concepts.source_refs) would otherwise lose every return-to-source pointer after the upgrade.
+        // never ran store()'s concept-level source_refs update, so source-keyed lookups would otherwise
+        // lose every return-to-source pointer after the upgrade.
         if (refs.size) {
           const cur = c.source_refs ? (JSON.parse(c.source_refs) as string[]) : [];
           const merged = [...new Set([...cur, ...refs])];
@@ -17111,16 +17056,6 @@ export class MonetCore {
     return Math.log((n + 1) / (df + 1));
   }
 
-  private isHub(key: string, circle: string): boolean {
-    const row = this.db.prepare(`SELECT df FROM entities WHERE key = ? AND scope = ?`).get(key, circle) as { df: number } | undefined;
-    return row ? this.isHubDf(row.df, this.entityScopeSize(circle)) : true;
-  }
-
-  private rarity(key: string, circle: string): number {
-    const row = this.db.prepare(`SELECT df FROM entities WHERE key = ? AND scope = ?`).get(key, circle) as { df: number } | undefined;
-    return this.rarityFromDf(row?.df ?? 0, this.entityScopeSize(circle));
-  }
-
   private resolveRef(ref: string, circle: string, excludeId: string): string | null {
     const slug = slugify(ref);
     const bySlug = this.db
@@ -17224,6 +17159,11 @@ export class MonetCore {
    * the src row + its revisions, then re-derive the target's graph over the now-larger evidence. The
    * target is marked dirty so the agent re-synthesizes the combined body on next touch.
    */
+  /** Open contradictions on a concept. Read by mergeConceptInto to keep a merged concept disputed. */
+  private openContraCount(id: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`).get(id) as { n: number }).n;
+  }
+
   private mergeConceptInto(src: ConceptRow, target: ConceptRow, toCircle: string): ReassignResult {
     this.assertActiveMutableConcept(src, "merge");
     this.assertActiveMutableConcept(target, "merge into");
@@ -17241,7 +17181,7 @@ export class MonetCore {
     for (const l of splitLines(src.body)) if (!lines.includes(l)) lines.push(l);
     const supportCount = target.support_count + src.support_count;
     const blended = blendWeighted(jsonToEmb(target.embedding), target.support_count, jsonToEmb(src.embedding), src.support_count);
-    // Union return-to-source pointers — gather cards and source-keyed idempotency read concept-level
+    // Union return-to-source pointers — source-keyed idempotency reads concept-level
     // source_refs, so a dedup-merge must not drop the moved concept's refs.
     const refs = [
       ...new Set([
@@ -17490,208 +17430,6 @@ export class MonetCore {
     for (const m of mates) this.upsertEdgeBoth(conceptId, m.id, "co_occurred", CO_OCCURRED_WEIGHT, "cheap", circle);
   }
 
-  // ---- #245 graph: gather (read path) ------------------------------------
-
-  /**
-   * gather(intent) — ADR §4.7's active context-builder: hybrid seed → 2-hop weighted spreading
-   * activation across the MAGMA graph → similarity-floored fusion → seed-relative evidence-gap
-   * stop. Read-only (never opens a session). Where plain top-k returns the most-similar few,
-   * gather recovers the whole neighbourhood — the divergent-vocabulary thread members similarity
-   * alone misses. Cold graph ⇒ degrades exactly to search().
-   *
-   * When `opts.circle` is omitted, seeds from ALL circles; each seed spreads within ITS OWN
-   * circle (edges are circle-scoped, so cross-circle spreading is structurally impossible —
-   * this supplies the right scope per seed). Entity seeding and reachableByType remain
-   * defaultCircle-scoped when circle is undefined (conservative; dense+lexical cover all circles).
-   * When `opts.circle` is provided, strictly scope-isolated (unchanged behavior).
-   */
-  async gather(
-    intent: string,
-    opts: { circle?: string; limit?: number; depth?: number; includeArchived?: boolean } & SourceAwareReadOptions = {},
-  ): Promise<GatherResult> {
-    this.assertPinSatisfied(); // embedder-pin ADR
-    const limit = opts.limit ?? 12;
-    const params = opts.depth ? { ...this.graphParams, hopLimit: Math.max(1, Math.min(opts.depth, 3)) } : this.graphParams;
-    const empty: GatherResult = { seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} };
-    const resolvedCircle = opts.circle !== undefined ? this.resolveCircle(opts.circle) : undefined;
-
-    await this.assertWithinEmbedderWindow(intent, "query"); // #137 — see search() for why refusing beats truncating
-    this.assertEmbedderReadsScript(intent, "query");
-    const emb = await this.checkedEmbed(intent, "native");
-    return this.db.transaction((): GatherResult => {
-    this.assertReadSpaceSatisfied(emb.length);
-    // Source rows are direct evidence seeds only. Build and rank them separately so their
-    // presence cannot change native RRF normalization, graph activation, priors, stopping, or
-    // reachability counts.
-    const sourceProjections = this.authorizedSourceProjections(
-      opts.sourceAuthorizationContext, resolvedCircle, opts.includeArchived,
-    );
-    const sourceScores = this.scoreSourceConcepts(sourceProjections.map((projection) => projection.row), emb);
-    const sourceDense = sourceProjections
-      .map((projection) => ({ projection, cos: sourceScores.get(projection.row.id)! }))
-      .filter(({ cos }) => cos > 0)
-      .sort((a, b) => b.cos - a.cos || (a.projection.row.id < b.projection.row.id ? -1 : 1));
-    const intentTokens = new Set(tokenize(intent));
-    const sourceLex = sourceProjections
-      .map((projection) => {
-        let overlap = 0;
-        for (const token of new Set(tokenize(`${projection.row.title} ${projection.row.body}`))) {
-          if (intentTokens.has(token)) overlap++;
-        }
-        return { projection, overlap };
-      })
-      .filter(({ overlap }) => overlap > 0)
-      .sort((a, b) => b.overlap - a.overlap || (a.projection.row.id < b.projection.row.id ? -1 : 1));
-    const sourceFused = rrfFuse([
-      sourceDense.map(({ projection }) => projection.row.id),
-      sourceLex.map(({ projection }) => projection.row.id),
-    ], RRF_K).slice(0, SEED_K);
-    const sourceById = new Map(sourceProjections.map((projection) => [projection.row.id, projection]));
-    const sourceCos = new Map(sourceDense.map(({ projection, cos }) => [projection.row.id, cos]));
-    const maxSourceRrf = sourceFused[0]?.rrf ?? 1;
-    const sourceSeedStrength = new Map<string, number>();
-    for (const { id, rrf } of sourceFused) sourceSeedStrength.set(id, maxSourceRrf > 0 ? rrf / maxSourceRrf : 1);
-    // Calibrate direct-only source scores through the same activation/similarity fusion used by
-    // native gather. Source activation is exactly its seed strength: no adjacency or graph prior.
-    const sourceDirectRanked = fuse(sourceSeedStrength, sourceCos, sourceSeedStrength, new Map(), params);
-    const sourceScore = new Map(sourceDirectRanked.map(({ id, score }) => [id, score]));
-    const sourceSeedCards = sourceFused.map(({ id }) => {
-      const projection = sourceById.get(id)!;
-      return toCard(projection.row, sourceScore.get(id) ?? 0, 0);
-    });
-    const sourceRankedCards: GatherCard[] = sourceDirectRanked.map(({ id, score }) => {
-      const projection = sourceById.get(id)!;
-      return {
-        ...toCard(projection.row, score, 0),
-        viaSeed: true,
-        ...countSourceRefs(projection.row.source_refs),
-      };
-    });
-    // THE UNIT SPLIT: `dense` is ranked by each concept's best LIVE OBSERVATION (shared with
-    // search() via scoreNativeConcepts) rather than by the concept centroid. ONLY the scoring
-    // SOURCE changed — the candidate condition is still `cos > 0`, exactly as before the split,
-    // so `sim` and the dense seed list cover the same rows they always did.
-    //
-    // NATIVE_SCORE_FLOOR is deliberately NOT applied anywhere in gather. Two reasons, both
-    // load-bearing:
-    //   1. Withholding a sub-floor concept from `sim` does not demote it — it PROMOTES it.
-    //      fuse() (src/graph.ts:126-134) branches on `sim > 0`; a concept missing from `sim`
-    //      takes the pure-graph branch `beta * activation * prior^priorExp`, which carries NO
-    //      relevance term. Sub-floor concepts DO reach that branch: lexicalSeed and entity
-    //      seeding are embedding-independent, and spread() copies its seeds straight into its
-    //      output (src/graph.ts:78), so activation is already 1.0 with no thread edge required.
-    //      A healthy fresh concept then scores ~0.387 there — enough to outrank a genuine match.
-    //      Keeping it in `sim` at its true low cosine is what actually ranks it low.
-    //   2. gather's junk-query silence is STRUCTURAL, not floor-derived: an intent that seeds
-    //      nothing returns early on `seedStrength.size === 0` below.
-    const dense = this.scoreAllConcepts(emb, intent, resolvedCircle, opts.includeArchived); // [{id, cos, observationId}] desc
-    const sim = new Map<string, number>();
-    // matchedObservationById: which observation earned each dense score — carried onto RANKED
-    // cards only (the id only, never its content). A concept that entered via the lexical,
-    // entity, or graph arms has no entry: it did not match an observation, and its card must not
-    // claim it did. SEED cards deliberately do not carry it either — cardOf() scores them with
-    // row.confidence, and an observation id sitting next to a confidence value reads as "this is
-    // how strongly that observation matched", which it is not.
-    const matchedObservationById = new Map<string, string>();
-    for (const d of dense) {
-      // RANK, not raw cosine (#155 follow-up). sim carries the similarity term fuse() adds the graph
-      // term to, and the lexical arm is part of how similar something actually is — dropping it here
-      // meant gather threw away, at the fusion step, the signal search ranks by. Measured on the live
-      // store: gather R 30.2% -> 46.2%, MRR 0.077 -> 0.137 over identical intents.
-      //
-      // It does NOT close the gap: search finds the home concept first 100% of the time on these
-      // intents and gather 2.0%, because fuse's graph branch still dominates with beta, priorExp and
-      // includeFloor calibrated for a different scale and a different embedder. That recalibration is
-      // its own measured change, tracked separately; this line is the part that needs no constant.
-      // BOOST ONLY ABOVE THE FLOOR (Codex P2, PR #160 round 3). gather deliberately applies
-      // NATIVE_SCORE_FLOOR nowhere — see the constant's own note for why floor-filtering `sim` inverts
-      // its ranking — and what keeps sub-floor noise down there instead is that it carries its TRUE,
-      // low cosine. `rank` can be ~2x that, so a 0.10 candidate with strong token overlap arrives as
-      // 0.20 and outranks a genuine above-floor match: the exact low-cosine path the surrounding
-      // comments say is held down, reopened by the fix meant to improve this arm.
-      //
-      // So the lexical arm re-orders the candidates that already cleared the floor on their own
-      // evidence, and everything below it stays on the cosine that put it there.
-      sim.set(d.id, d.cos >= NATIVE_SCORE_FLOOR ? d.rank : d.cos);
-      matchedObservationById.set(d.id, d.observationId);
-    }
-
-    const denseIds = dense.map((d) => d.id);
-    const lexIds = this.lexicalSeed(intent, resolvedCircle, 30, opts.includeArchived);
-    const fused = rrfFuse([denseIds, lexIds], RRF_K).slice(0, SEED_K);
-    const seedIds = fused.map((f) => f.id);
-
-    const seedStrength = new Map<string, number>();
-    const maxRrf = fused[0]?.rrf ?? 1;
-    for (const f of fused) seedStrength.set(f.id, maxRrf > 0 ? f.rrf / maxRrf : 1);
-
-    // Entity-anchored seeding from the PROBE TEXT ONLY (never scenario metadata) — complementary.
-    // When circle is undefined (store-wide), scope entity seeding to defaultCircle (conservative —
-    // dense+lexical seeds already cover all circles).
-    const entityCircle = resolvedCircle ?? this.defaultCircle;
-    for (const e of extractEntities(intent)) {
-      if (this.isHub(e.key, entityCircle)) continue;
-      const boost = (params.wType.about ?? 1) * this.rarity(e.key, entityCircle) * (KIND_BOOST[e.kind] ?? 1) * 0.1;
-      for (const m of this.coMembers(e.key, entityCircle, "", MAX_NEIGHBORS)) {
-        seedStrength.set(m, Math.max(seedStrength.get(m) ?? 0, boost));
-      }
-    }
-    if (seedStrength.size === 0) {
-      return sourceSeedCards.length === 0 ? empty : {
-        seed: sourceSeedCards,
-        ranked: sourceRankedCards.slice(0, limit),
-        stopReason: "exhausted",
-        reachableByType: {},
-      };
-    }
-
-    // Spread ONLY over thread/causal edges (worked-together / caused-by). about/related are NOT
-    // spread — they re-encode similarity (the seed signal) and would inject single-fact noise;
-    // entity recall enters gather via the entity-anchored SEEDING above, not via spread.
-    // In store-wide mode each seed spreads within its OWN circle — edges are circle-scoped by
-    // schema so cross-circle spreading is structurally impossible; this just supplies the right
-    // scope per seed.
-    const activation = spread(
-      seedStrength,
-      (id) => this.adjacency(id, this.circleOf(id) ?? this.defaultCircle, THREAD_TYPES),
-      params,
-    );
-
-    const priors = new Map<string, number>();
-    for (const id of activation.keys()) if (!sim.has(id)) priors.set(id, this.nodePrior(id));
-    const ranked = fuse(activation, sim, seedStrength, priors, params);
-
-    const embCache = new Map<string, Float32Array | null>();
-    const embOf = (id: string): Float32Array | null => {
-      if (!embCache.has(id)) embCache.set(id, this.embOf(id));
-      return embCache.get(id) ?? null;
-    };
-    const { accepted, stopReason } = evidenceGapStop(ranked, seedIds.length, embOf, cosine, params);
-
-    // reachableByType: when circle undefined, pass defaultCircle (explainability metric approximation).
-    const reachCircle = resolvedCircle ?? this.defaultCircle;
-    const nativeRanked = accepted
-        .slice(0, limit)
-        .map((r) => this.toGatherCard(r, matchedObservationById.get(r.id)))
-        .filter((c): c is GatherCard => c !== null);
-    const mergedRanked = nativeRanked.concat(sourceRankedCards)
-      .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-      .slice(0, limit);
-    return {
-      seed: seedIds.map((id) => this.cardOf(id)).filter((c): c is SearchCard => c !== null).concat(sourceSeedCards),
-      ranked: mergedRanked,
-      stopReason,
-      reachableByType: this.reachableByType(seedIds, reachCircle, params.hopLimit),
-    };
-    })();
-  }
-
-  /** Thin id-only overload for retrieval callers (the eval arm). Ranked, stop-trimmed. */
-  async gatherIds(intent: string, opts: { circle?: string; limit?: number; depth?: number } = {}): Promise<string[]> {
-    const r = await this.gather(intent, opts);
-    return r.ranked.map((c) => c.id);
-  }
-
   /** Public, test-scoped wrapper over the private endSession so the eval can mark session boundaries. */
   endSessionForEval(summary?: string): void {
     this.assertNoEmbedderMigrationReentry("end an evaluation session");
@@ -17722,213 +17460,6 @@ export class MonetCore {
       .prepare(`SELECT id, title, body, kind FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
       .all(circle) as Array<{ id: string; title: string; body: string; kind: string }>;
     return rows.map((r) => ({ id: r.id, title: r.title, body: r.body, kind: r.kind }));
-  }
-
-  /**
-   * gather()'s NATIVE DENSE ARM. Enumerates the in-scope native concepts, then ranks them through
-   * the SAME shared scorer search() uses (scoreNativeConcepts → src/retrieval.ts): each concept's
-   * score is the MAX cosine over its live observation vectors — the unit split — never the
-   * concept centroid, which is retired from query ranking.
-   *
-   * Concepts with no usable live observation vector, and concepts whose every observation falls
-   * below NATIVE_SCORE_FLOOR, are ABSENT from the result: they contribute neither a dense seed
-   * nor a `sim` term. They remain reachable in gather through the lexical seed, entity seeding,
-   * and graph spread — none of which is an embedding path. (search(), which has only this arm,
-   * simply does not return them.)
-   *
-   * The candidate SELECT no longer reads `concepts.embedding` at all — that column is exactly the
-   * blurred centroid this split retired, and not fetching a 384-float JSON blob per concept
-   * offsets the per-observation vector load this arm adds.
-   *
-   * When `circle` is omitted, scores across all circles. Archived circles excluded by default.
-   * Ranked desc; ties break by id ascending (determinism is a hard contract).
-   */
-  private scoreAllConcepts(
-    emb: Float32Array, text: string, circle?: string, includeArchived?: boolean,
-  ): Array<{ id: string; cos: number; rank: number; observationId: string }> {
-    const rows: Array<{ id: string }> = circle !== undefined
-      ? this.db
-          .prepare(`SELECT id FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
-          .all(circle) as Array<{ id: string }>
-      : includeArchived
-        ? this.db
-            .prepare(`SELECT id FROM concepts WHERE kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
-            .all() as Array<{ id: string }>
-        : this.db
-            .prepare(
-              `SELECT c.id FROM concepts c
-                LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
-               WHERE c.kind NOT IN ('workstream', 'source') AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND c.status != 'retired' AND ca.from_name IS NULL`,
-            )
-            .all() as Array<{ id: string }>;
-    const matches = this.scoreNativeConcepts(rows.map((r) => r.id), emb, text);
-    // ORDER on rank (cosine re-ordered by the lexical arm), REPORT cos as the raw cosine: `cos`
-    // becomes gather's `sim`, which fuse() weighs against graph activation on a cosine scale.
-    const scored: Array<{ id: string; cos: number; rank: number; observationId: string }> = [];
-    for (const r of rows) {
-      const match = matches.get(r.id);
-      if (match !== undefined) scored.push({ id: r.id, cos: match.score, rank: match.rank, observationId: match.observationId });
-    }
-    // Ordered on rank; identical to ordering on cos whenever the lexical arm is off, since rank is
-    // then a copy of it. That is what keeps a lexical-embedder store byte-identical to pre-#155.
-    return scored.sort((a, b) => b.rank - a.rank || (a.id < b.id ? -1 : 1));
-  }
-
-  /** Lexical seed: token overlap over title+body (deterministic, no FTS dependency). When `circle` is omitted, seeds from all circles. Archived circles excluded by default. */
-  private lexicalSeed(intent: string, circle: string | undefined, n: number, includeArchived?: boolean): string[] {
-    const q = new Set(tokenize(intent));
-    if (q.size === 0) return [];
-    const rows: Array<{ id: string; title: string; body: string }> = circle !== undefined
-      ? this.db
-          .prepare(`SELECT id, title, body FROM concepts WHERE circle = ? AND kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
-          .all(circle) as Array<{ id: string; title: string; body: string }>
-      : includeArchived
-        ? this.db
-            .prepare(`SELECT id, title, body FROM concepts WHERE kind NOT IN ('workstream', 'source') AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`)
-            .all() as Array<{ id: string; title: string; body: string }>
-        : this.db
-            .prepare(
-              `SELECT c.id, c.title, c.body FROM concepts c
-                LEFT JOIN circle_aliases ca ON ca.from_name = c.circle AND ca.status = 'archived'
-               WHERE c.kind NOT IN ('workstream', 'source') AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND c.status != 'retired' AND ca.from_name IS NULL`,
-            )
-            .all() as Array<{ id: string; title: string; body: string }>;
-    return rows
-      .map((r) => {
-        let overlap = 0;
-        for (const t of new Set(tokenize(`${r.title} ${r.body}`))) if (q.has(t)) overlap++;
-        return { id: r.id, overlap };
-      })
-      .filter((x) => x.overlap > 0)
-      .sort((a, b) => b.overlap - a.overlap || (a.id < b.id ? -1 : 1))
-      .slice(0, n)
-      .map((x) => x.id);
-  }
-
-  /**
-   * All edges traversable from a node (symmetric stored both ways; directed reachable either end).
-   * `only` restricts to a subset of edge types (used to spread thread/causal signal separately).
-   */
-  private adjacency(id: string, circle: string, only?: Set<string>): Adj[] {
-    if (!this.isActiveGraphConcept(id, circle)) return [];
-    const out = this.db
-      .prepare(
-        `SELECT e.dst_id AS dst, e.type AS type, e.weight AS weight FROM memory_edge e
-          JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired' AND dst.kind NOT IN ('workstream', 'source') AND dst.source_identity IS NULL AND dst.active_observation_id IS NULL
-         WHERE e.src_id = ? AND e.scope = ?`,
-      )
-      .all(id, circle) as Adj[];
-    const placeholders = DIRECTED_TYPES.map(() => "?").join(",");
-    const inc = this.db
-      .prepare(
-        `SELECT e.src_id AS dst, e.type AS type, e.weight AS weight FROM memory_edge e
-          JOIN concepts src ON src.id = e.src_id AND src.status != 'retired' AND src.kind NOT IN ('workstream', 'source') AND src.source_identity IS NULL AND src.active_observation_id IS NULL
-         WHERE e.dst_id = ? AND e.scope = ? AND e.type IN (${placeholders})`,
-      )
-      .all(id, circle, ...DIRECTED_TYPES) as Adj[];
-    const all = out.concat(inc);
-    return only ? all.filter((e) => only.has(e.type)) : all;
-  }
-
-  private nodePrior(id: string): number {
-    const m = this.nodeMeta(id);
-    if (!m) return 1;
-    const now = Date.now();
-    // Precise usefulness decay: use actual fetch timestamp (usefulness_last_fetched_at) instead
-    // of the confirmation proxy. Falls back to COALESCE(last_confirmed_at, updated_at) for
-    // never-fetched or workstream rows where usefulness_last_fetched_at is NULL.
-    const fetchTs = m.usefulnessLastFetchedAt ?? m.lastConfirmedAt ?? m.updatedAt;
-    const usefulnessDays = Math.max(0, (now - fetchTs) / 86_400_000);
-    const usefulnessDecayed = m.usefulness * Math.exp(-usefulnessDays / USEFULNESS_DECAY_TAU_DAYS);
-    // Recency for the overall prior uses confirmed age (unchanged from slice 1).
-    const ageDays = Math.max(0, (now - (m.lastConfirmedAt ?? m.updatedAt)) / 86_400_000);
-    // Arousal boost (decay-resistant; floored at AROUSAL_FLOOR_FRAC of cumulative arousal score).
-    const arousalDays = m.arousalLastUpdatedAt != null ? Math.max(0, (now - m.arousalLastUpdatedAt) / 86_400_000) : 0;
-    const effectiveArousal = Math.max(m.arousalScore * AROUSAL_FLOOR_FRAC, m.arousalScore * Math.exp(-arousalDays / AROUSAL_DECAY_TAU_DAYS));
-    return Math.max(1e-3, m.confidence * Math.log1p(usefulnessDecayed + m.support) * Math.exp(-ageDays / 30) * (1 + AROUSAL_WEIGHT_GATHER * effectiveArousal));
-  }
-
-  private nodeMeta(id: string): {
-    confidence: number; usefulness: number; support: number; updatedAt: number;
-    lastConfirmedAt: number | null; usefulnessLastFetchedAt: number | null;
-    arousalScore: number; arousalLastUpdatedAt: number | null;
-  } | null {
-    const r = this.db
-      .prepare(
-        `SELECT confidence, usefulness_score, support_count, updated_at, last_confirmed_at,
-                usefulness_last_fetched_at, arousal_score, arousal_last_updated_at
-           FROM concepts WHERE id = ?`,
-      )
-      .get(id) as {
-        confidence: number; usefulness_score: number; support_count: number; updated_at: number;
-        last_confirmed_at: number | null; usefulness_last_fetched_at: number | null;
-        arousal_score: number; arousal_last_updated_at: number | null;
-      } | undefined;
-    if (!r) return null;
-    return {
-      confidence: r.confidence,
-      usefulness: r.usefulness_score,
-      support: r.support_count,
-      updatedAt: r.updated_at,
-      lastConfirmedAt: r.last_confirmed_at,
-      usefulnessLastFetchedAt: r.usefulness_last_fetched_at,
-      arousalScore: r.arousal_score,
-      arousalLastUpdatedAt: r.arousal_last_updated_at,
-    };
-  }
-
-  private embOf(id: string): Float32Array | null {
-    const r = this.db.prepare(`SELECT embedding FROM concepts WHERE id = ?`).get(id) as { embedding: string } | undefined;
-    return r ? jsonToEmb(r.embedding) : null;
-  }
-
-  private openContraCount(id: string): number {
-    return (this.db.prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ? AND status = 'open'`).get(id) as { n: number }).n;
-  }
-
-  /** NOTE: scores the card with `row.confidence`, not a retrieval score (pre-existing). That is
-   *  precisely why a seed card never carries `matchedObservationId` — the two side by side would
-   *  read as "confidence = how strongly that observation matched". Ranked cards carry it. */
-  private cardOf(id: string): SearchCard | null {
-    const row = this.getRow(id);
-    if (!row || row.status === "retired" || isConnectorOwnedRow(row)) return null;
-    return toCard(row, row.confidence, this.openContraCount(id));
-  }
-
-  private toGatherCard(r: Ranked, matchedObservationId?: string): GatherCard | null {
-    const row = this.getRow(r.id);
-    if (!row || row.status === "retired" || isConnectorOwnedRow(row)) return null;
-    return { ...toCard(row, r.score, this.openContraCount(r.id), matchedObservationId), viaSeed: r.viaSeed, ...countSourceRefs(row.source_refs) };
-  }
-
-  /** Per-edge-type: distinct non-seed concepts reachable from the seeds within `hop` (explainability). */
-  private reachableByType(seedIds: string[], circle: string, hop: number): Record<string, number> {
-    const result: Record<string, number> = {};
-    for (const type of Object.keys(this.graphParams.wType)) {
-      const seen = new Set(seedIds);
-      let frontier = [...seedIds];
-      for (let h = 0; h < hop; h++) {
-        const next: string[] = [];
-        for (const id of frontier) {
-          const nbrs = this.db
-            .prepare(
-              `SELECT e.dst_id AS nbr FROM memory_edge e
-                 JOIN concepts dst ON dst.id = e.dst_id AND dst.status != 'retired' AND dst.kind NOT IN ('workstream', 'source') AND dst.source_identity IS NULL AND dst.active_observation_id IS NULL
-                WHERE e.src_id = ? AND e.scope = ? AND e.type = ?
-               UNION
-               SELECT e.src_id AS nbr FROM memory_edge e
-                 JOIN concepts src ON src.id = e.src_id AND src.status != 'retired' AND src.kind NOT IN ('workstream', 'source') AND src.source_identity IS NULL AND src.active_observation_id IS NULL
-                WHERE e.dst_id = ? AND e.scope = ? AND e.type = ?`,
-            )
-            .all(id, circle, type, id, circle, type) as Array<{ nbr: string }>;
-          for (const { nbr } of nbrs) if (!seen.has(nbr)) { seen.add(nbr); next.push(nbr); }
-        }
-        frontier = next;
-      }
-      const reached = seen.size - seedIds.length;
-      if (reached > 0) result[type] = reached;
-    }
-    return result;
   }
 
   private create(
@@ -18018,7 +17549,7 @@ export class MonetCore {
     // Chunk-granular source retrieval (ratified): a real embedding of this chunk's OWN content,
     // computed OUTSIDE the write transaction — db.transaction() callbacks must run synchronously
     // and embed() may be async, the same reason recomputeSourceConceptBody's own embed() call sits
-    // outside its write transaction. search()/gather() (scoreSourceConcepts) read this back to
+    // outside its write transaction. search() (scoreSourceConcepts) reads this back to
     // rank a source concept by its single BEST-matching chunk instead of one mean-pooled
     // whole-file vector. Deliberately NOT batched across this file's sibling chunks: the caller
     // (materializeStagedBindings, source-sync.ts) resolves each new file's concept id from the
@@ -18585,14 +18116,6 @@ function toCard(r: ConceptRow, score: number, contradictions: number, matchedObs
   };
 }
 
-/** Shared by both gather() source-card sites (the direct-seed sourceRankedCards map and
- *  toGatherCard): report HOW MANY source refs a concept carries, never which ones. */
-function countSourceRefs(sourceRefsJson: string | null): { sourceRefsCount?: number } {
-  if (!sourceRefsJson) return {};
-  const all = JSON.parse(sourceRefsJson) as string[];
-  return all.length ? { sourceRefsCount: all.length } : {};
-}
-
 function fetchHint(kind: string): string {
   const what =
     kind === "decision"
@@ -18702,15 +18225,6 @@ function canonicalSourceIdentityFromJson(refs: string | null | undefined): strin
   } catch {
     return null;
   }
-}
-
-/** Lexical tokens for the gather seed's lexical arm — lowercase alphanumerics, length ≥ 2. */
-function tokenize(s: string): string[] {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((t) => t.length >= 2);
 }
 
 // Exported (round 3, F2 fix — scrub-db.mjs's slug-scrubbing gap) SOLELY so

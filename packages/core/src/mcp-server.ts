@@ -50,12 +50,12 @@ import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-sch
  * because it costs nothing to correct and misleads every session until it is.
  */
 export const MONET_SERVER_INSTRUCTIONS =
-  "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. Start each project session with agent_context. Recall with memory_search/memory_gather pointer cards, then memory_fetch content. Write with memory_store when a norm changes — a correction, a rule, a principle candidate — never a narrative summary of work whose artifact already exists. Nothing is owed at session end: every record Monet keeps is written by the mechanism that made it, as it happens.";
+  "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. Start each project session with agent_context. Recall with memory_search pointer cards, then memory_fetch content. Write with memory_store when a norm changes — a correction, a rule, a principle candidate — never a narrative summary of work whose artifact already exists. Nothing is owed at session end: every record Monet keeps is written by the mechanism that made it, as it happens.";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
 // concept — long body + many observations — otherwise serializes to tens of thousands of chars and
 // the host rejects it: "N chars … exceeds maximum allowed tokens"). memory_fetch is bounded at the
-// source (below); ok() is the last-resort safety net for every tool (overview/gather/agent_context).
+// source (below); ok() is the last-resort safety net for every tool (overview/agent_context).
 const RESULT_MAX_CHARS = 40_000; // hard ceiling on any serialized tool result
 const FETCH_MAX_OBS = 20; // most-recent observations returned by memory_fetch
 const FETCH_OBS_MAX_CHARS = 1_200; // per-observation cap
@@ -229,7 +229,7 @@ function fitRenderedPatternsForAck(patterns: readonly string[]): { items: string
 }
 
 /**
- * Search and gather cards are pointers, so their wire contract is deliberately smaller than the
+ * Search cards are pointers, so their wire contract is deliberately smaller than the
  * engine's ranking record. Keep ranking inputs inside the engine; the array order is the only rank
  * signal a caller needs. This projection is shared by both tools so their key contracts cannot drift.
  * Circle stays exact because it is a routing key; an oversized card is omitted whole by the envelope
@@ -1334,50 +1334,6 @@ export function registerMonetCoreTools(
         }, "memory_list", capturedBlock);
       } catch (e) {
         return err(`list failed: ${msg(e)}`);
-      }
-    },
-  );
-
-  server.tool(
-    "memory_gather",
-    "Gather context for an intent through graph spread. Returns ranked pointer cards, not content; call memory_fetch with a card's id and non-default circle to read it. Omit circle to gather store-wide. Empty results mean no match.",
-    {
-      intent: z.string(),
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Restrict to one circle; omit for all. Cards include home circles; spread stays within each seed's circle."),
-      limit: z.number().int().positive().optional(),
-      depth: z.enum(["1", "2"]).optional().describe("Graph hops from seeds; default 2."),
-    },
-    async ({ intent, circle, limit, depth }) => {
-      // Refused before the snapshot below, which reads the store — the same placement memory_store
-      // uses, and for the same reason: counting tokens needs no database and no model load, so a
-      // query the embedder cannot fully read costs nothing to reject (#137).
-      try {
-        core.assertEmbedderReadsScript(intent, "query");
-        await core.assertWithinEmbedderWindow(intent, "query");
-      } catch (e) {
-        return err(msg(e));
-      }
-      // Fix A: snapshot uses the call's resolved circle; fall back to session default for all-circle gathers.
-      const capturedBlock = capturePrewarmSnapshot(circle !== undefined ? scope(circle) : scope());
-      try {
-        // When circle is omitted, gather store-wide (circle: undefined); when provided, scope exactly.
-        const r = await core.gather(intent, {
-          circle: circle !== undefined ? scope(circle) : undefined,
-          limit,
-          depth: depth ? Number(depth) : undefined,
-          sourceAuthorizationContext,
-        });
-        const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
-        const cards = r.ranked.map((card) => recallWireCard(card, core.countObservationsForConcept(card.id)));
-        const envelope = (fitted: RecallWireCard[], omitted: number): Record<string, unknown> => ({
-          circle: circleLabel,
-          ranked: fitted,
-          ...(omitted > 0 ? { rankedTruncated: true, rankedOmitted: omitted } : {}),
-          ...(cards.length === 0 ? { note: RECALL_EMPTY_LINE } : {}),
-        });
-        return readOk(fitRecallEnvelope(envelope, cards), "memory_gather", capturedBlock);
-      } catch (e) {
-        return err(`gather failed: ${msg(e)}`);
       }
     },
   );

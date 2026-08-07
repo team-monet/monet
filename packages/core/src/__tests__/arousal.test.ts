@@ -20,9 +20,8 @@
  * A.4 — Merge-carry: merge two concepts → usefulness additive, arousal MAX, nothing lost.
  *        Mutation-check: omitting carry loses the accumulated values.
  *
- * G.1 — gather.test.ts byte-identical gate: fixtures at age~0 + zero arousal → identity
- *        (arousal term = 0 boost, so existing gather/prewarm results are unaffected when
- *        arousal is zero). Verified by running gather twice and asserting byte-identical.
+ * G.1 — search determinism gate: repeated reads over unchanged zero-arousal concepts are
+ *        byte-identical.
  */
 import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -393,81 +392,6 @@ describe("A.2 — Arousal decay-resistance: floor at score * AROUSAL_FLOOR_FRAC"
 // ---- A.3 Precise usefulness decay ------------------------------------------
 
 describe("A.3 — Precise usefulness decay from fetch timestamp (not confirmation)", () => {
-  /**
-   * Mutation-check: usefulness_last_fetched_at (actual fetch time) must be used instead of
-   * last_confirmed_at (confirmation time) for the usefulness decay computation.
-   *
-   * Scenario:
-   *   - Concept confirmed 1 day ago (last_confirmed_at = now - 1d).
-   *   - Concept last fetched 30 days ago (usefulness_last_fetched_at = now - 30d).
-   *   - usefulness_score = 20.
-   *
-   * With precise decay (usefulness_last_fetched_at):
-   *   usefulnessDays = 30d → usefulnessDecayed = 20 * exp(-30/60) ≈ 12.13
-   *
-   * With confirmation proxy (last_confirmed_at):
-   *   usefulnessDays = 1d → usefulnessDecayed = 20 * exp(-1/60) ≈ 19.67
-   *
-   * The two differ by ~62%, well outside any reasonable tolerance.
-   * This test pins the nodePrior value to the FETCH-timestamp formula and fails if
-   * the confirmation proxy is used instead.
-   */
-  it("nodePrior uses usefulness_last_fetched_at, not last_confirmed_at — mutation-check", async () => {
-    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
-    const db = rawDb(core);
-
-    const r = await core.store("Concept for precise decay test.");
-
-    const now = Date.now();
-    const FETCH_AGE_DAYS = 30;
-    const CONFIRM_AGE_DAYS = 1;
-    const USEFULNESS = 20;
-    const RECENCY_TAU = 30;
-    const USEFULNESS_TAU = 60;
-
-    // Pin: fetched 30 days ago, confirmed 1 day ago.
-    db.prepare(
-      `UPDATE concepts SET
-         usefulness_score = ?,
-         usefulness_last_fetched_at = ?,
-         last_confirmed_at = ?,
-         updated_at = ?,
-         support_count = 0
-       WHERE id = ?`,
-    ).run(
-      USEFULNESS,
-      now - FETCH_AGE_DAYS * 86_400_000,
-      now - CONFIRM_AGE_DAYS * 86_400_000,
-      now - CONFIRM_AGE_DAYS * 86_400_000,
-      r.conceptId,
-    );
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const prior = (core as any).nodePrior(r.conceptId) as number;
-
-    // Expected: decay from FETCH timestamp (30d), recency from CONFIRM timestamp (1d).
-    const usefulnessDecayedFetch = USEFULNESS * Math.exp(-FETCH_AGE_DAYS / USEFULNESS_TAU);
-    const recency = Math.exp(-CONFIRM_AGE_DAYS / RECENCY_TAU);
-    const CONFIDENCE = 0.6;
-    // nodePrior = confidence * log1p(usefulnessDecayed + support) * recency * (1 + arousalBoost)
-    // With arousal = 0 and support = 0: arousalBoost = 0.
-    const expected = CONFIDENCE * Math.log1p(usefulnessDecayedFetch) * recency;
-
-    // Tolerance ±2% — tight enough to reject the confirmation-proxy formula (~62% off).
-    const tolerance = expected * 0.02;
-    expect(prior).toBeGreaterThan(expected - tolerance);
-    expect(prior).toBeLessThan(expected + tolerance);
-
-    // Also verify it does NOT match the confirmation-proxy formula (reject the mutation).
-    const usefulnessDecayedConfirm = USEFULNESS * Math.exp(-CONFIRM_AGE_DAYS / USEFULNESS_TAU);
-    const expectedByConfirm = CONFIDENCE * Math.log1p(usefulnessDecayedConfirm) * recency;
-    // The two formulas must differ by more than 5% — if they don't, the pin above is weak.
-    const diff = Math.abs(expected - expectedByConfirm) / expected;
-    expect(diff).toBeGreaterThan(0.05); // sanity-check that the scenario is actually discriminating
-
-    core.close();
-  });
-
   it("getConcept sets usefulness_last_fetched_at to the fetch time, not the confirmation time", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     const db = rawDb(core);
@@ -602,18 +526,17 @@ describe("A.4 — Merge-carry: usefulness additive, arousal MAX, nothing lost", 
   });
 });
 
-// ---- G.1 Gather determinism gate ------------------------------------------
+// ---- G.1 Search determinism gate ------------------------------------------
 
-describe("G.1 — gather byte-identical gate: age~0 + zero arousal → identity (zero boost)", () => {
+describe("G.1 — search byte-identical gate: age~0 + zero arousal", () => {
   it("returns byte-identical results across repeated calls when arousal=0 (no boost, no reordering)", async () => {
     const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
     await core.store("The AuthService validates sessions.");
     await core.store("We standardized on jose for token verification.");
     const q = "how does auth session validation work";
     // When arousal_score = 0 (default for new concepts), effectiveArousal = MAX(0*0.1, 0*exp(...)) = 0,
-    // so the (1 + 0.3 * 0) = 1.0 multiplier is identity. gather must be byte-identical across calls.
-    const first = await core.gatherIds(q, { limit: 5 });
-    const second = await core.gatherIds(q, { limit: 5 });
+    const first = await core.search(q, { limit: 5 });
+    const second = await core.search(q, { limit: 5 });
     expect(first).toEqual(second);
     core.close();
   });

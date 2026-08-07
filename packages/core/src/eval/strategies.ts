@@ -3,9 +3,8 @@
  *
  * Every arm answers the same question ("given this query, which concept ids would the
  * agent get back, in rank order?") so a metric is just: did the gold concept land in the
- * top-k? Arms are how we keep the eval honest AND make it a gate for #245: each new
- * recall mechanism (graph-backed `gather`, a reranker, hybrid exact+semantic) is added
- * here and must BEAT `monet-search` on the same scenarios to earn its place.
+ * top-k? Arms are how we keep the eval honest: each new recall mechanism is added here and
+ * must BEAT `monet-search` on the same scenarios to earn its place.
  *
  * An unavailable arm (`available: false`) is reported, never silently skipped — a blank
  * column would read as "covered" when it isn't.
@@ -40,19 +39,5 @@ export const monetSearchArm: RetrievalArm = {
   },
 };
 
-/**
- * #245 flagship (ADR §3.7 / §4.7): hybrid seed → spread across the MAGMA graph (k≤2) →
- * evidence-gap stop. The active context-builder — recovers the whole neighbourhood (the
- * divergent-vocabulary thread members) that plain top-k similarity misses.
- */
-export const monetGatherArm: RetrievalArm = {
-  name: "monet-gather",
-  available: true,
-  async retrieve(core, query, { circle, k }) {
-    // Ranked + stop-trimmed; do NOT re-sort by cosine (that would discard the graph signal).
-    return core.gatherIds(query, { circle, limit: k, depth: 2 });
-  },
-};
-
-/** The arms run by default. `monet-gather` rides along as a reported-pending column. */
-export const DEFAULT_ARMS: RetrievalArm[] = [noMemoryArm, monetSearchArm, monetGatherArm];
+/** The arms run by default. */
+export const DEFAULT_ARMS: RetrievalArm[] = [noMemoryArm, monetSearchArm];

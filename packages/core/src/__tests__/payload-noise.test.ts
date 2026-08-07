@@ -6,8 +6,7 @@
  *   • memory_checkpoint returned every dirty concept's full observation text and blew the host's
  *     tool-result limit twice in one session — a WRITE path emitting the largest payload in the
  *     system, none of which the caller asked for.
- *   • gather cards carried up to 20 source refs each (one card's true total was 255) — file paths
- *     and agent ids, never consumed.
+ *   • recall cards must never carry source refs — file paths and agent ids are not retrieval data.
  *   • agent_context returned 20 staleConcepts on session restore; zero were used.
  *   • memory_fetch truncated a 191K-char body and then still appended a page of newest-first
  *     observations — cutting the durable synthesized claim to pay for tactical churn.
@@ -162,27 +161,6 @@ describe("payload noise — canonical success serializer", () => {
       originalChars: 50_019,
       note: "Result exceeded the host tool-result limit; the original payload was omitted.",
     });
-  });
-});
-
-describe("payload noise — gather cards", () => {
-  it("never returns source provenance metadata", async () => {
-    const core = newCore();
-    const ref = "/work/secret-project/DESIGN.md";
-    await core.store("Cache invalidation uses a per-tenant version stamp.", { circle, sourceRefs: [ref] });
-
-    const res = await withServer(core, (c) =>
-      c.callTool({ name: "memory_gather", arguments: { intent: "cache invalidation", circle } }),
-    );
-
-    expect(wire(res)).not.toContain(ref);
-    const payload = parse(res);
-    expect(payload).not.toHaveProperty("seed");
-    expect(payload.ranked).toHaveLength(1);
-    expect(payload.ranked[0]).not.toHaveProperty("sourceRefsCount");
-    expect(payload.ranked[0]).not.toHaveProperty("sourceRefs");
-    expect(payload.ranked[0]).not.toHaveProperty("sourceRefsTotal");
-    core.close();
   });
 });
 

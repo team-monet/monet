@@ -9,8 +9,6 @@ const circle = "recall-card-contract";
 const RESULT_MAX_CHARS = 40_000;
 const SEARCH_DESCRIPTION =
   "Find memories by similarity. Returns ranked pointer cards, not content; call memory_fetch with a card's id and non-default circle to read it. Omit circle for store-wide search. Empty results mean no match.";
-const GATHER_DESCRIPTION =
-  "Gather context for an intent through graph spread. Returns ranked pointer cards, not content; call memory_fetch with a card's id and non-default circle to read it. Omit circle to gather store-wide. Empty results mean no match.";
 
 const removedCardKeys = [
   "supportCount",
@@ -19,20 +17,13 @@ const removedCardKeys = [
   "confidence",
   "matchedObservationId",
 ] as const;
-const gatherOnlyKeys = [
-  "seed",
-  "viaSeed",
-  "sourceRefsCount",
-  "stopReason",
-  "reachableByType",
-] as const;
 
 type ToolResult = { content: Array<{ type: string; text: string }> };
 type Payload = Record<string, unknown>;
 type Harness = {
   core: MonetCore;
   client: Client;
-  call: (name: "memory_search" | "memory_gather", args: Record<string, unknown>) => Promise<{ payload: Payload; text: string }>;
+  call: (name: "memory_search", args: Record<string, unknown>) => Promise<{ payload: Payload; text: string }>;
   close: () => Promise<void>;
 };
 
@@ -98,7 +89,7 @@ function expectLeanCard(card: unknown, expected: {
 }
 
 describe("recall pointer-card payload contract", () => {
-  it("uses the same lean card shape in search and gather, with a correct observation count and no fixed guidance", async () => {
+  it("uses the lean search card shape with a correct observation count and no fixed guidance", async () => {
     const h = await harness();
     const stored = await h.core.store("Postgres pooling uses pgbouncer in transaction mode.", {
       circle,
@@ -109,7 +100,6 @@ describe("recall pointer-card payload contract", () => {
     await h.core.store("Pgbouncer fronts every application connection.", { circle, attachTo: stored.conceptId });
 
     const search = (await h.call("memory_search", { query: "pgbouncer transaction pooling", circle })).payload;
-    const gather = (await h.call("memory_gather", { intent: "pgbouncer transaction pooling", circle })).payload;
     const expected = {
       id: stored.conceptId,
       slug: "postgres-pooling-uses-pgbouncer-in-transaction-mode",
@@ -118,10 +108,7 @@ describe("recall pointer-card payload contract", () => {
     };
 
     expectLeanCard((search.results as unknown[])[0], expected);
-    expectLeanCard((gather.ranked as unknown[])[0], expected);
     expect(search).not.toHaveProperty("guidance");
-    expect(gather).not.toHaveProperty("guidance");
-    for (const key of gatherOnlyKeys) expect(collectKeys(gather).has(key), `${key} must be absent from the gather envelope`).toBe(false);
   });
 
   it("matches memory_fetch's full ledger count after one of two observations is terminally superseded", async () => {
@@ -134,7 +121,6 @@ describe("recall pointer-card payload contract", () => {
     h.core.supersedeObservation(second.observationId, null);
 
     const search = (await h.call("memory_search", { query: "postgres pgbouncer pooling", circle })).payload;
-    const gather = (await h.call("memory_gather", { intent: "postgres pgbouncer pooling", circle })).payload;
     const fetchResponse = await h.client.callTool({
       name: "memory_fetch",
       arguments: { id: stored.conceptId, circle },
@@ -142,47 +128,36 @@ describe("recall pointer-card payload contract", () => {
     const fetched = JSON.parse(fetchResponse.content[0]!.text) as Payload;
 
     expect((search.results as Payload[])[0].observationCount).toBe(2);
-    expect((gather.ranked as Payload[])[0].observationCount).toBe(2);
     expect(fetched.observationCount).toBe(2);
   });
 
-  it("omits zero contradictions and includes the nonzero count in both tools", async () => {
+  it("omits zero contradictions and includes the nonzero count", async () => {
     const h = await harness();
     const stored = await h.core.store("Deployment rollback uses the prior artifact generation.", { circle });
 
     const beforeSearch = (await h.call("memory_search", { query: "deployment rollback artifact", circle })).payload;
-    const beforeGather = (await h.call("memory_gather", { intent: "deployment rollback artifact", circle })).payload;
     expect((beforeSearch.results as Payload[])[0]).not.toHaveProperty("contradictions");
-    expect((beforeGather.ranked as Payload[])[0]).not.toHaveProperty("contradictions");
 
     h.core.flagContradiction(stored.conceptId, { detail: "The registry no longer retains that generation." });
     h.core.flagContradiction(stored.conceptId, { detail: "The rollback controller now uses snapshots." });
 
     const afterSearch = (await h.call("memory_search", { query: "deployment rollback artifact", circle })).payload;
-    const afterGather = (await h.call("memory_gather", { intent: "deployment rollback artifact", circle })).payload;
     expect((afterSearch.results as Payload[])[0].contradictions).toBe(2);
-    expect((afterGather.ranked as Payload[])[0].contradictions).toBe(2);
   });
 
   it("adds the nothing-matched line only to empty result sets", async () => {
     const h = await harness();
     const emptySearch = (await h.call("memory_search", { query: "anything", circle })).payload;
-    const emptyGather = (await h.call("memory_gather", { intent: "anything", circle })).payload;
     expect(emptySearch).toEqual({ circle, results: [], note: "Nothing matched." });
-    expect(emptyGather).toEqual({ circle, ranked: [], note: "Nothing matched." });
 
     await h.core.store("Feature flags are evaluated once per request.", { circle });
     const nonemptySearch = (await h.call("memory_search", { query: "feature flags request", circle })).payload;
-    const nonemptyGather = (await h.call("memory_gather", { intent: "feature flags request", circle })).payload;
     expect((nonemptySearch.results as unknown[]).length).toBeGreaterThan(0);
-    expect((nonemptyGather.ranked as unknown[]).length).toBeGreaterThan(0);
     expect(nonemptySearch).not.toHaveProperty("note");
-    expect(nonemptyGather).not.toHaveProperty("note");
   });
 
   it.each([
     ["memory_search", "query", "results", "resultsTruncated", "resultsOmitted"],
-    ["memory_gather", "intent", "ranked", "rankedTruncated", "rankedOmitted"],
   ] as const)("size-fits the complete %s envelope and reports an indivisible adversarial card's omission", async (
     tool,
     inputKey,
@@ -207,7 +182,6 @@ describe("recall pointer-card payload contract", () => {
 
   it.each([
     ["memory_search", "query", "results", "resultsTruncated", "resultsOmitted"],
-    ["memory_gather", "intent", "ranked", "rankedTruncated", "rankedOmitted"],
   ] as const)("omits a %s card with an oversized routing circle whole and reports it honestly", async (
     tool,
     inputKey,
@@ -235,6 +209,5 @@ describe("recall tool descriptions", () => {
     const h = await harness();
     const tools = (await h.client.listTools()).tools;
     expect(tools.find((tool) => tool.name === "memory_search")?.description).toBe(SEARCH_DESCRIPTION);
-    expect(tools.find((tool) => tool.name === "memory_gather")?.description).toBe(GATHER_DESCRIPTION);
   });
 });

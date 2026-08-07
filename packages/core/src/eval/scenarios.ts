@@ -48,8 +48,7 @@ export interface Scenario {
   /**
    * Unrelated facts touched in the SAME session as the thread (realistic tangents). They are
    * never gold but DO co-occur with the gold members — so co_occurred is not a pristine
-   * gold-only clique, and gather must rank the thread above its own session noise. This is the
-   * realistic (not best-case) co-occurrence model the restoration win is measured under.
+   * gold-only clique. This preserves a realistic acceptance fixture for any future restoration successor.
    */
   tangents?: Seed[];
   probes: Probe[];
@@ -61,8 +60,8 @@ export interface Scenario {
  *   - paraphrase-only probes (e.g. deploy-gate, error-convention, branching) — pass on
  *     MiniLM, expose the lexical embedder's semantic gap,
  *   - multi-gold restoration threads (auth/search/incident/checkout/cache/rollout) — the
- *     case plain top-k search under-serves and the #245 graph-backed `gather` is meant to
- *     close (seed→spread→stop); the cache thread (5 members) is currently the widest such case.
+ *     case plain top-k search under-serves and a future successor must improve; the cache thread
+ *     (5 members) is currently the widest such case.
  * Probe-category counts are asserted in eval.test.ts, so adding a scenario forces that
  * assertion to be updated in lockstep — a deliberate tripwire against silent suite drift.
  */
@@ -225,7 +224,7 @@ export const STARTER_SUITE: Scenario[] = [
     id: "auth-refactor",
     title: "Restore the sign-in thread",
     rationale:
-      "Context restoration: one intent must pull back the WHOLE thread — three concepts worked on together in one session but worded so none restates the intent and they share NO common entity. Plain top-k similarity recovers the closest one or two; the rest return via SAME-SESSION CO-OCCURRENCE (the signal that records 'these were worked on together'), not entity edges (which here connect at most 1 of 3 — see the reachability report). The realistic test: the work session also held unrelated tangents, so gather must rank the thread above its own session noise.",
+      "Context restoration: one intent must pull back the WHOLE thread — three concepts worked on together in one session but worded so none restates the intent and they share NO common entity. Plain top-k similarity recovers the closest one or two; the rest return via SAME-SESSION CO-OCCURRENCE (the signal that records 'these were worked on together'), not entity edges (which here connect at most 1 of 3 — see the reachability report). The realistic test keeps unrelated same-session tangents so a future successor must rank the thread above session noise.",
     seed: [
       {
         key: "auth-task",
@@ -416,7 +415,7 @@ export const STARTER_SUITE: Scenario[] = [
   {
     id: "incident-thread",
     title: "Restore the prod-incident thread",
-    rationale: "A larger (4-concept) restoration thread — recall over more members is where plain top-k drops most and gather's completion gain shows clearly; recovered via session co-occurrence (no shared entity links symptom→cause→fix), with an in-session tangent for realism.",
+    rationale: "A larger (4-concept) restoration thread — recall over more members is where plain top-k drops most; retained as the acceptance bar for a future successor, with an in-session tangent for realism.",
     seed: [
       { key: "inc-symptom", kind: "issue", content: "Production returned intermittent 500s under load last Tuesday." },
       { key: "inc-cause", kind: "fact", content: "Traced to the database client running out of available connections during sustained traffic." },
@@ -456,9 +455,8 @@ export const STARTER_SUITE: Scenario[] = [
   // ── Broadened coverage ──────────────────────────────────────
   // More single-fact gotchas/decisions and larger restoration threads so the recall
   // numbers aren't overfit to a thin suite. Single-fact scenarios deliberately carry NO
-  // tangents (their seed sits alone in its work session ⇒ no co_occurred/follows edges),
-  // which keeps the precision guarantee testable: with no thread to spread over, gather's
-  // ranking must stay identical to plain search (no single-fact regression).
+  // tangents (their seed sits alone in its work session ⇒ no co_occurred/follows edges), preserving
+  // a precision baseline for any future restoration successor.
   {
     id: "secret-logging",
     title: "Don't log full request bodies",
@@ -551,7 +549,7 @@ export const STARTER_SUITE: Scenario[] = [
     id: "cache-thread",
     title: "Restore the lookup-cache thread (five members)",
     rationale:
-      "Currently the widest restoration thread (5 concepts) — recall over more divergent members is exactly where plain top-k drops most and graph-backed gather has the most to add. Recovered via same-session co-occurrence, with an in-session tangent so co-occurrence isn't a pristine gold-only clique.",
+      "Currently the widest restoration thread (5 concepts) — recall over more divergent members is exactly where plain top-k drops most. Retained as the acceptance bar for a future successor, with an in-session tangent so co-occurrence is not a pristine gold-only clique.",
     seed: [
       { key: "cache-task", kind: "fact", content: "Adding an in-memory LRU in front of the concept lookup path to cut repeated work within a single session." },
       { key: "cache-decision", kind: "decision", content: "Chose a bounded LRU with a five-minute time-to-live over a Redis round-trip — the local tier should avoid a network hop." },

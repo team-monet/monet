@@ -8,8 +8,7 @@
  *      left off from a session that no longer exists.
  *   2. STOPS REPEATING MISTAKES — a contradiction is surfaced (confidence visibly decays),
  *      then mediated — never silent last-write-wins.
- *   3. REBUILDS CLEAN CONTEXT AFTER A RESET — gather() pulls the whole thread (via the #245
- *      graph), including members a plain search would miss.
+ *   3. FINDS RELEVANT MEMORY AFTER A RESET — search restores matching context on demand.
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -94,11 +93,9 @@ async function main(): Promise<void> {
   rule("BEAT 3 · REBUILDS CLEAN CONTEXT AFTER A RESET  (context window wiped)");
   const intent = "pick up the auth key-rotation work";
   const search = await b.search(intent, { circle: CIRCLE, limit: 10 });
-  const g = await b.gather(intent, { circle: CIRCLE });
   console.log(`intent: "${intent}"  (the store holds ${b.overview(CIRCLE).counts.concepts} memories across many prior sessions)`);
   console.log(`  plain search → ${search.length} top-similar cards.`);
-  console.log(`  gather → ${g.ranked.length} memories, spreading BEYOND the seeds through the graph: ${JSON.stringify(g.reachableByType)}`);
-  console.log("   gather follows co-occurrence/causal links to rebuild the focused working set — not just keyword matches.");
+  console.log(`  search → ${search.length} matching memories.`);
   console.log("\nthe morning-after view:\n");
   console.log(renderOverview(b.overview(CIRCLE)));
   foot();

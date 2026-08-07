@@ -1,8 +1,8 @@
 /**
  * Human-readable rendering of a SuiteReport. One sub-table per metric, arms as rows, the
  * recall@k ladder as columns. recall@1 is the demanding "is the right memory the TOP card?"
- * view where headroom lives; recall@5 is the lenient "is it in budget?" view. The headroom
- * line names exactly what #245 must close. Verbose mode adds a per-scenario recall@1 grid so
+ * view where headroom lives; recall@5 is the lenient "is it in budget?" view. Verbose mode adds
+ * a per-scenario recall@1 grid so
  * a single weak case (a paraphrase miss, a half-recovered thread) is visible, not averaged away.
  */
 import type { SuiteReport, ArmReport, MetricsAtK } from "./harness";
@@ -24,15 +24,6 @@ export function formatReport(report: SuiteReport, opts: { verbose?: boolean } = 
   lines.push(...metricTable(report, "reExplainRate", "re-explain rate", "lower is better"));
   lines.push(...metricTable(report, "restorationRecall", "context-restoration recall", "higher is better"));
   lines.push(...mrrTable(report));
-
-  const search = report.arms.find((a) => a.arm === "monet-search");
-  if (search?.metrics) {
-    const k1 = search.metrics.byK[1];
-    lines.push(
-      `headroom @1 (what #245 must close): repeated-mistake ${pct(k1.repeatedMistakeRate)} · ` +
-        `re-explain ${pct(k1.reExplainRate)} · restoration ${pct(1 - k1.restorationRecall)} short of full.`,
-    );
-  }
 
   if (opts.verbose) lines.push(...perScenarioAt1(report));
 

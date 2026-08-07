@@ -2,7 +2,7 @@
  * #245 connection-graph derivation tests: the entity extractor and the edges store() lays
  * down (about / related / co_occurred / asserted). The load-bearing guarantee is that
  * co_occurred is SESSION-scoped — it connects facts worked on together and never bridges a
- * session boundary. That selectivity is what makes gather's restoration lift legitimate.
+ * session boundary. That selectivity preserves the meaning of session-cohesion diagnostics.
  */
 import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -14,8 +14,7 @@ import type { EmbeddingProvider } from "../embedding";
 
 /**
  * Read a concept's stored source_refs straight from the row. These tests are about what lands in
- * concepts.source_refs (merge-on-attach, post-upgrade backfill); gather cards were only ever the
- * window onto it, and they now carry sourceRefsCount rather than the refs themselves.
+ * concepts.source_refs (merge-on-attach, post-upgrade backfill).
  */
 const storedRefs = (core: MonetCore, conceptId: string): string[] => {
   const row = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
@@ -212,10 +211,9 @@ describe("codex-review fixes", () => {
     const core = new MonetCore(":memory:"); // dedup ON ⇒ identical evidence attaches to one concept
     const first = await core.store("Auth uses JSON web tokens for sessions.", { sourceRefs: ["docs/auth.md"] });
     await core.store("Auth uses JSON web tokens for sessions.", { sourceRefs: ["src/auth.ts"] }); // attaches; new ref
-    const card = (await core.gather("Auth uses JSON web tokens for sessions.")).ranked.find((c) => c.id === first.conceptId);
-    expect(card, "the merged concept should be gathered").toBeTruthy();
+    const card = (await core.search("Auth uses JSON web tokens for sessions.")).find((c) => c.id === first.conceptId);
+    expect(card, "the merged concept should be searchable").toBeTruthy();
     expect([...storedRefs(core, first.conceptId)].sort()).toEqual(["docs/auth.md", "src/auth.ts"]);
-    expect(card!.sourceRefsCount).toBe(2);
     core.close();
   });
 
@@ -249,13 +247,13 @@ describe("codex-review fixes", () => {
     const dbPath = join(dir, "monet.db");
     try {
       // graphEnabled:false skips store()'s concept-level source_refs update, so the refs live only on
-      // the observation row — gather() (which reads concepts.source_refs) would lose them post-upgrade.
+      // the observation row — a post-upgrade provenance read would otherwise lose them.
       const old = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1, graphEnabled: false });
       const a = await old.store("Auth uses JSON web tokens for sessions.", { sourceRefs: ["docs/auth.md", "src/auth.ts"] });
       old.close();
       const upgraded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
-      const card = (await upgraded.gather("Auth uses JSON web tokens for sessions.")).ranked.find((c) => c.id === a.conceptId);
-      expect(card, "the backfilled concept should be gathered").toBeTruthy();
+      const card = (await upgraded.search("Auth uses JSON web tokens for sessions.")).find((c) => c.id === a.conceptId);
+      expect(card, "the backfilled concept should be searchable").toBeTruthy();
       expect([...storedRefs(upgraded, a.conceptId)].sort()).toEqual(["docs/auth.md", "src/auth.ts"]);
       upgraded.close();
     } finally {

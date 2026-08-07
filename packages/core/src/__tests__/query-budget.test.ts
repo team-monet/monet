@@ -61,10 +61,6 @@ describe("query budget — an over-window query is refused, not truncated", () =
     await expect(core.search(words(25))).rejects.toBeInstanceOf(ContentExceedsEmbedderWindowError);
   });
 
-  it("refuses an over-window gather", async () => {
-    await expect(core.gather(words(25))).rejects.toBeInstanceOf(ContentExceedsEmbedderWindowError);
-  });
-
   // Same reason the write path checks before touching the store: counting tokens needs no database
   // and no model load. If the guard ever moves below the embed, this fails.
   it("refuses without invoking the embedder", async () => {
@@ -88,7 +84,7 @@ describe("query budget — an over-window query is refused, not truncated", () =
 
   it("leaves an in-window query working", async () => {
     await expect(core.search(words(5))).resolves.toBeInstanceOf(Array);
-    await expect(core.gather(words(5))).resolves.toHaveProperty("ranked");
+    await expect(core.search(words(5))).resolves.toBeInstanceOf(Array);
   });
 });
 

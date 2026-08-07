@@ -57,15 +57,17 @@ jobs:
           restore-keys: |
             minilm-model-${{ runner.os }}-
 
-      # Two explicit vitest positional filters, not one: "eval.onnx" matches ONLY
-      # eval.onnx.test.ts (eval-baseline.onnx.test.ts does not contain that substring), so the
-      # Phase 0 md-baseline gate needs its own filter listed here rather than assuming the
-      # existing pattern already covers it — verified by running both filters together locally
-      # before wiring this in.
+      # ONE POSITIONAL FILTER PER FILE. These are substring matches, not globs: "eval.onnx" matches
+      # ONLY eval.onnx.test.ts. Every *.onnx.test.ts file gates itself on MONET_EVAL_ONNX and this is
+      # the only job that sets it, so a file missing from this list does not run ANYWHERE — it is not
+      # merely unscheduled, it is dead. recall-floor.onnx and resolution-hybrid.onnx were exactly that
+      # for their whole existence: they self-gated, were never named here, and were found failing 5 of
+      # 9 assertions the first time anyone ran them. Adding a *.onnx.test.ts file means adding it here,
+      # and src/__tests__/onnx-gate-coverage.test.ts fails if you forget.
       - name: Recall gate (fails the job on a semantic-recall regression)
         env:
           MONET_EVAL_ONNX: "1"
-        run: pnpm exec vitest run --dir src eval.onnx eval-baseline.onnx
+        run: pnpm exec vitest run --dir src eval.onnx eval-baseline.onnx recall-floor.onnx resolution-hybrid.onnx
 
       - name: Capture the eval report
         if: always()

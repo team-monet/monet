@@ -13,12 +13,6 @@
  *    6. Concept A: confirmed long ago but structurally touched recently (updated_at fresh,
  *       last_confirmed_at old). Concept B: confirmed recently. Under new source B outranks A
  *       in overview.livingModel; under old source A would have ranked higher.
- *
- * C. nodePrior path (last_confirmed_at fallback).
- *    7. Direct divergence test via (core as any).nodePrior(): two concepts with equal structural
- *       scores but opposite last_confirmed_at vs updated_at profiles. Under the new source
- *       (last_confirmed_at ?? updated_at) the recently-confirmed concept wins; under the old
- *       source (updated_at) the recently-structurally-touched concept would win.
  */
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
@@ -247,50 +241,3 @@ describe("B.6 — livingModelScore ranking divergence: confirmed-recently beats 
   });
 });
 
-// ---- C. nodePrior direct divergence test ------------------------------------
-
-describe("C.7 — nodePrior uses last_confirmed_at ?? updated_at (direct divergence)", () => {
-  it("concept B (confirmed recently, updated long ago) beats concept A (updated recently, confirmed long ago)", async () => {
-    // Two concepts: equal confidence, usefulness, and support (one observation each, no attaches,
-    // no contradictions). Timestamps pinned via direct SQLite so the only variable is the
-    // last_confirmed_at / updated_at profile.
-    //
-    // nodePrior calls Date.now() internally — not injectable — but 30-day-scale separation
-    // dwarfs any millisecond drift between the pin and the call.
-    //
-    // Concept A: updated_at = now (structurally fresh), last_confirmed_at = 30 days ago (stale).
-    //   Under NEW source: ageDays ≈ 30 → exp(-30/30) ≈ 0.368
-    //   Under OLD source: ageDays ≈ 0  → exp(0)       ≈ 1.0
-    //
-    // Concept B: updated_at = 30 days ago (structurally stale), last_confirmed_at = now (fresh).
-    //   Under NEW source: ageDays ≈ 0  → exp(0)       ≈ 1.0
-    //   Under OLD source: ageDays ≈ 30 → exp(-30/30)  ≈ 0.368
-    //
-    // New source → B > A.  Old source → A > B.  Any revert of the nodePrior line fails this test.
-    const core = freshCore();
-    const db = rawDb(core);
-
-    const rA = await core.store("Concept A: structurally touched recently, confirmed long ago.");
-    const rB = await core.store("Concept B: confirmed recently, structurally untouched for a month.");
-
-    const now = Date.now();
-    const thirtyDaysAgo = now - 30 * 86_400_000;
-
-    // A: updated_at = now, last_confirmed_at = 30 days ago.
-    db.prepare(`UPDATE concepts SET updated_at = ?, last_confirmed_at = ? WHERE id = ?`).run(
-      now, thirtyDaysAgo, rA.conceptId,
-    );
-    // B: updated_at = 30 days ago, last_confirmed_at = now.
-    db.prepare(`UPDATE concepts SET updated_at = ?, last_confirmed_at = ? WHERE id = ?`).run(
-      thirtyDaysAgo, now, rB.conceptId,
-    );
-
-    const priorA = (core as any).nodePrior(rA.conceptId) as number;
-    const priorB = (core as any).nodePrior(rB.conceptId) as number;
-
-    // Under the new source (last_confirmed_at ?? updated_at): B is confirmed now → B wins.
-    expect(priorB).toBeGreaterThan(priorA);
-
-    core.close();
-  });
-});

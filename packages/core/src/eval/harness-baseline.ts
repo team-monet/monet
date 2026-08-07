@@ -13,7 +13,7 @@
  * OWN recallAt/meanReciprocalRank primitives (imported, not forked) so the arithmetic is
  * identical to the concept-granularity arms — only the id space differs.
  *
- * Concept-granularity arms (no-memory, monet-search, monet-gather, bm25) still run through the
+ * Concept-granularity arms (no-memory, monet-search, bm25) still run through the
  * UNMODIFIED runSuite() from harness.ts — this file adds a second pass alongside it, combined
  * into one report by runBaselineSuite() below, rather than replacing or forking the tested path.
  *
@@ -46,7 +46,7 @@ import { seedScenario, recallAt, meanReciprocalRank, runSuite, K_LADDER, type Su
 const CIRCLE = "default";
 const RANK_DEPTH = 10;
 
-/** The md-baseline arm set: the three existing engine arms + bm25 (concept-granularity, ported per §2.4). Kept separate from DEFAULT_ARMS (spec §2.4/§2.6) so `pnpm eval` is untouched. */
+/** The md-baseline arm set: the two existing engine arms + bm25 (concept-granularity, ported per §2.4). Kept separate from DEFAULT_ARMS (spec §2.4/§2.6) so `pnpm eval` is untouched. */
 export const MD_BASELINE_CONCEPT_ARMS: RetrievalArm[] = [...DEFAULT_ARMS, bm25Arm];
 
 export interface ChunkArmReport extends ArmReport {

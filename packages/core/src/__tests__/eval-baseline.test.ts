@@ -1,7 +1,7 @@
 /**
  * md-baseline eval regression gate — Phase 0 (spec §2.6). Fast tier: deterministic hashing
  * embedder, no network, no model download — mirrors eval.test.ts's shape-not-numbers
- * philosophy for the four new arms (bm25, chunk-cosine-rag, md-tree) plus their combination
+ * philosophy for the three additional arms (bm25, chunk-cosine-rag, md-tree) plus their combination
  * into runBaselineSuite(). The real (MiniLM) numbers come from `pnpm eval:baseline`; this test
  * guards invariants, not exact percentages — same division of labor as eval.test.ts/pnpm eval.
  *
@@ -21,15 +21,15 @@ import { exportMdTree } from "../eval/md-export";
 const embedder = (): HashingEmbeddingProvider => new HashingEmbeddingProvider();
 
 describe("md-baseline eval — shape/crash guarantees (deterministic lexical embedder)", () => {
-  it("does not mutate DEFAULT_ARMS or pnpm eval's 3-arm shape", async () => {
+  it("does not mutate DEFAULT_ARMS or pnpm eval's 2-arm shape", async () => {
     // Defense-in-depth: MD_BASELINE_CONCEPT_ARMS must be DEFAULT_ARMS plus exactly bm25 appended
-    // — never a different arm SET for the three existing engine arms (spec §2.4's "existing
-    // three arms untouched" requirement, asserted structurally, not just by inspection).
-    expect(DEFAULT_ARMS).toHaveLength(3);
+    // — never a different arm set for the two existing engine arms (asserted structurally, not just
+    // by inspection).
+    expect(DEFAULT_ARMS).toHaveLength(2);
     expect(MD_BASELINE_CONCEPT_ARMS.map((a) => a.name)).toEqual([...DEFAULT_ARMS.map((a) => a.name), "bm25"]);
 
     const plainReport = await runSuite(STARTER_SUITE, DEFAULT_ARMS, embedder());
-    expect(plainReport.arms.map((a) => a.arm)).toEqual(["no-memory", "monet-search", "monet-gather"]);
+    expect(plainReport.arms.map((a) => a.arm)).toEqual(["no-memory", "monet-search"]);
   });
 
   // Explicit ceilings preserve CI headroom for deterministic full-suite baseline work.

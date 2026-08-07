@@ -43,8 +43,7 @@
  *      array syntax contains no character scrubString's patterns key off), but relies on that
  *      accidentally being true rather than parsing the structure, and provides no closure guarantee
  *      as the JSON shape evolves. Fixed to JSON.parse → scrubString each array element →
- *      JSON.stringify. Reaches a caller via toGatherCard (engine.ts:3653-3658,
- *      `sourceRefs: refs` on every GatherCard the A4 arm's gather() calls return).
+ *      JSON.stringify before any source-keyed read parses it.
  *   3. entities.surface (+ the matching entities.key / concept_entities.entity_key) — SCRUBBED.
  *      Investigated separately from surface (see ENTITY_KEY INVESTIGATION below): `entity_key` is
  *      NOT a hash/opaque id — for `kind: 'path'` entities it is literally `ref:<raw source ref>`
@@ -331,7 +330,7 @@
  * observations.content reach agent context" claim — corrected per audit finding #5 above). Every
  * column an A4-arm MonetCore instance can return to an MCP caller today, with its exact read site:
  *
- *   - concepts.title, concepts.body       → search()/gather() cards (toCard) and the rendered
+ *   - concepts.title, concepts.body       → search() cards (toCard) and the rendered
  *                                            prewarm block's "Top concepts"/workstream lines
  *                                            (mcp-server.ts:167-181).
  *   - concepts.slug                       → toCard (engine.ts:3864-3875, returns `.slug` directly
@@ -387,12 +386,8 @@
  *                                            agent_context/prewarm AND direct-response surface,
  *                                            not an internal-only column.
  *   - concepts.source_refs,
- *     observations.source_refs            → toGatherCard (engine.ts:3653-3658) attaches
- *                                            concepts.source_refs to every GatherCard returned by
- *                                            gather()/memory_gather; store()/backfillGraph read
- *                                            observations.source_refs to recompute the concept-level
- *                                            aggregate (engine.ts:913-929, 3069-3080) which then
- *                                            flows through the same toGatherCard path. Also becomes
+ *     observations.source_refs            → store()/backfillGraph read observations.source_refs to
+ *                                            recompute the concept-level aggregate. Also becomes
  *                                            a synthetic entities.surface/entity_key value verbatim
  *                                            (deriveEntityEdges, engine.ts:3012).
  *   - entities.surface, entities.key,
@@ -852,7 +847,7 @@ function scrubSourceRefsJson(raw) {
  * the `INSERT INTO concepts (..., kind, ...) VALUES (..., ?, ...)` bind param, with nothing in
  * between validating or normalizing the value. A hostile-shaped kind (e.g. `kind:
  * "jane.doe@example.com"`, `kind: "/Users/dev/secret"`) lands verbatim in `concepts.kind`, and
- * is then returned verbatim by every card/list/search/gather read surface (toCard, listMemories,
+ * is then returned verbatim by every card/list/search read surface (toCard, listMemories,
  * overview, etc. — engine.ts's toCard-family functions all pass `kind: row.kind` straight through
  * with no scrub of their own) — the identical "reaches an agent context unscrubbed" class as every
  * other column this stage already closes. Fixed by folding `kind` into the exact same

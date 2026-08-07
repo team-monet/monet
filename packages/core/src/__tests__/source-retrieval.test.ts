@@ -89,7 +89,7 @@ const makeCore = (): MonetCore => {
 afterEach(() => { while (cores.length) cores.pop()!.close(); });
 
 describe("authorized source-backed generic retrieval", () => {
-  it("projects an exact publication across search/list/fetch/gather/prewarm/overview and hides it without exact identity", async () => {
+  it("projects an exact publication across search/list/fetch/prewarm/overview and hides it without exact identity", async () => {
     const core = makeCore();
     core.createSource(sourceInput());
     const { stored, chunk } = await publish(core);
@@ -103,11 +103,6 @@ describe("authorized source-backed generic retrieval", () => {
       id: stored.conceptId, body: content, outline: [{ observationId: stored.observationId }],
       totalObservations: 1, supportCount: 1, dirty: false, needsSynthesis: false, synthesizedNow: false,
     });
-    const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
-    expect(gathered.seed).toContainEqual(expect.objectContaining({ id: stored.conceptId, kind: "source" }));
-    expect(gathered.ranked).toContainEqual(expect.objectContaining({
-      id: stored.conceptId, viaSeed: true, sourceRefsCount: 1,
-    }));
     expect(core.overview(circle, { sourceAuthorizationContext: auth }).livingModel).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
     expect(core.overview(circle, { sourceAuthorizationContext: auth })).toMatchObject({
       counts: { concepts: 1, observations: 1 }, livingModel: [expect.objectContaining({ id: stored.conceptId })],
@@ -119,7 +114,6 @@ describe("authorized source-backed generic retrieval", () => {
       expect(core.conceptCount(circle, sourceAuthorizationContext)).toBe(0);
       expect(core.circleOf(stored.conceptId, sourceAuthorizationContext)).toBeNull();
       expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext })).toBeNull();
-      expect(await core.gather("cobalt walruses", { circle, sourceAuthorizationContext })).toEqual({ seed: [], ranked: [], stopReason: "exhausted", reachableByType: {} });
       expect(core.overview(circle, { sourceAuthorizationContext }).livingModel).toEqual([]);
       expect(core.overview(circle, { sourceAuthorizationContext }).counts).toMatchObject({ concepts: 0, observations: 0 });
     }
@@ -199,9 +193,6 @@ describe("authorized source-backed generic retrieval", () => {
     expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).toBeNull();
     expect(await core.search("cobalt walruses", { circle, sourceAuthorizationContext: auth })).toEqual([]);
     expect(core.listMemories(circle, { sourceAuthorizationContext: auth })).toEqual([]);
-    const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
-    expect(gathered.seed.map((c) => c.id)).not.toContain(stored.conceptId);
-    expect(gathered.ranked.map((c) => c.id)).not.toContain(stored.conceptId);
 
     // No false negatives: once recompute clears the pending row (the normal, non-crashed case —
     // and exactly what the sweep does for a stranded one), the concept is visible again.
@@ -212,16 +203,11 @@ describe("authorized source-backed generic retrieval", () => {
 
   it("fetches only the active observation without synthesis/usefulness writes and sources cannot influence native graph results", async () => {
     const core = makeCore();
-    const nativeA = await core.store("Native cobalt walrus anchor.", { circle, resolution: "forceNew" });
-    const nativeB = await core.store("supports: #native-cobalt-walrus-anchor distant native detail.", { circle, resolution: "forceNew" });
+    await core.store("Native cobalt walrus anchor.", { circle, resolution: "forceNew" });
+    await core.store("supports: #native-cobalt-walrus-anchor distant native detail.", { circle, resolution: "forceNew" });
     core.createSource(sourceInput());
     const { stored } = await publish(core, "source-a", "Cobalt walruses supports: #native-cobalt-walrus-anchor");
     const before = rawDb(core).prepare(`SELECT usefulness_score,dirty FROM concepts WHERE id=?`).get(stored.conceptId);
-    const withoutContext = await core.gather("cobalt walrus", { circle });
-    const withContext = await core.gather("cobalt walrus", { circle, sourceAuthorizationContext: auth });
-    expect(withContext.ranked.filter((row) => row.kind !== "source")).toEqual(withoutContext.ranked);
-    expect(withContext.reachableByType).toEqual(withoutContext.reachableByType);
-    expect(withContext.ranked.map((row) => row.id)).toEqual(expect.arrayContaining([nativeA.conceptId, nativeB.conceptId, stored.conceptId]));
 
     // File=concept (Phase 1), Ruling 9: structure (outline), not observations, by default.
     const fetched = await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth });
@@ -257,7 +243,6 @@ describe("authorized source-backed generic retrieval", () => {
         try {
           Date.now = () => fixedNow;
           return {
-            gather: await core.gather("Native shared module", { circle, limit: 20 }),
             edges: core.edges({ circle }),
             entitiesA: core.conceptEntities(nativeA.conceptId),
             entitiesB: core.conceptEntities(nativeB.conceptId),
@@ -376,8 +361,6 @@ describe("authorized source-backed generic retrieval", () => {
           outline: [{ observationId: initial.stored.observationId }],
         });
         expect(JSON.stringify(await candidate.search("STAGED successor", { circle, sourceAuthorizationContext: auth }))).not.toContain("STAGED");
-        expect((await candidate.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth })).ranked)
-          .toContainEqual(expect.objectContaining({ id: initial.stored.conceptId, sourceRefsCount: 1 }));
       };
       await assertPublishedPredecessor(core);
       expect(core.abortSourceRun(replacement.run.id, "failed", "test crash before rollback").state).toBe("aborted");
@@ -410,7 +393,6 @@ describe("authorized source-backed generic retrieval", () => {
       const surfacedIds = [
         ...(await core.search("corrupt", { circle, sourceAuthorizationContext })).map((row) => row.id),
         ...core.listMemories(circle, { sourceAuthorizationContext }).map((row) => row.id),
-        ...(await core.gather("corrupt", { circle, sourceAuthorizationContext })).ranked.map((row) => row.id),
         ...core.overview(circle, { sourceAuthorizationContext }).livingModel.map((row) => row.id),
       ];
       for (const id of hidden) expect(surfacedIds).not.toContain(id);
@@ -500,11 +482,6 @@ describe("authorized source-backed generic retrieval", () => {
       }
       expect(await core.getConcept(stored.conceptId, { sourceAuthorizationContext: auth })).toBeNull();
       expect(core.listMemories(circle, { sourceAuthorizationContext: auth }).map((row) => row.id)).not.toContain(stored.conceptId);
-      if (isZeroPlaceholder) {
-        expect((await core.gather("cobalt", { circle, sourceAuthorizationContext: auth })).ranked.map((row) => row.id)).not.toContain(stored.conceptId);
-      } else {
-        await expect(core.gather("cobalt", { circle, sourceAuthorizationContext: auth })).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
-      }
       expect(core.overview(circle, { sourceAuthorizationContext: auth }).livingModel.map((row) => row.id)).not.toContain(stored.conceptId);
       expect(core.conceptCount(circle, auth)).toBe(1);
       expect(core.listCircles(undefined, { sourceAuthorizationContext: auth })).toContainEqual(expect.objectContaining({ circle, concepts: 1 }));
@@ -514,42 +491,7 @@ describe("authorized source-backed generic retrieval", () => {
     expect((await core.search("native retrieval", { circle, sourceAuthorizationContext: auth })).map((row) => row.id)).toContain(native.conceptId);
   });
 
-  it("keeps native gather scores/order stable while a stronger source displaces the weak tail", async () => {
-    const calibratedEmbedder: EmbeddingProvider = {
-      dim: 2,
-      modelId: "gather-merge:2",
-      embed: (text) => {
-        if (text === "priority needle" || text.includes("published exact source")) return new Float32Array([1, 0]);
-        if (text.includes("native head")) return new Float32Array([0.9, 0.1]);
-        return new Float32Array([0.2, 1]);
-      },
-    };
-    const core = new MonetCore(":memory:", { defaultCircle: circle, embedder: calibratedEmbedder });
-    cores.push(core);
-    await core.store("priority needle native head", { circle, resolution: "forceNew" });
-    core.endSessionForEval();
-    for (let index = 0; index < 4; index++) {
-      await core.store(`priority needle weak native tail ${index}`, { circle, resolution: "forceNew" });
-      core.endSessionForEval();
-    }
-    core.createSource(sourceInput());
-    const { stored } = await publish(core, "source-a", "priority needle published exact source");
-    const realNow = Date.now;
-    const fixedNow = realNow();
-    let nativeLimited; let authorizedLimited; let nativeWide; let authorizedWide;
-    try {
-      Date.now = () => fixedNow;
-      nativeLimited = await core.gather("priority needle", { circle, limit: 3 });
-      authorizedLimited = await core.gather("priority needle", { circle, limit: 3, sourceAuthorizationContext: auth });
-      nativeWide = await core.gather("priority needle", { circle, limit: 20 });
-      authorizedWide = await core.gather("priority needle", { circle, limit: 20, sourceAuthorizationContext: auth });
-    } finally { Date.now = realNow; }
-    expect(authorizedWide.ranked.filter((row) => row.kind !== "source")).toEqual(nativeWide.ranked);
-    expect(authorizedLimited.ranked.map((row) => row.id)).toContain(stored.conceptId);
-    expect(authorizedLimited.ranked.filter((row) => row.kind !== "source")).toEqual(nativeLimited.ranked.slice(0, 2));
-    const sourceCard = authorizedWide.ranked.find((row) => row.id === stored.conceptId);
-    expect(sourceCard).toMatchObject({ viaSeed: true, score: 1 });
-  });
+
 
   it("returns exact top-20 mixed circle aggregates when source activity promotes a native tail circle", async () => {
     const core = makeCore();
@@ -725,8 +667,6 @@ describe("authorized source-backed generic retrieval", () => {
         bodyOmitted: true,
       });
       expect(JSON.parse(fetched.content[0].text)).not.toHaveProperty("needsSynthesis");
-      const gathered = await client.callTool({ name: "memory_gather", arguments: { intent: "cobalt", circle } }) as { content: Array<{ type: string; text: string }> };
-      expect(JSON.parse(gathered.content[0].text).ranked).toContainEqual(expect.objectContaining({ id: stored.conceptId }));
       const instrumented = core as unknown as { authorizedSourceProjections: (...args: unknown[]) => unknown[] };
       const originalProjection = instrumented.authorizedSourceProjections.bind(core);
       let projectionScans = 0;
@@ -952,59 +892,5 @@ describe("authorized source-backed generic retrieval", () => {
     }
   });
 
-  it("reports a source gather card's ref COUNT and never the refs themselves (supersedes the round-4 cap)", async () => {
-    // recomputeSourceConceptBody stores one source_refs entry per active chunk — hundreds for a
-    // large file — and gather()'s cards used to include that array verbatim. A gather response
-    // with even a couple of such cards can exceed RESULT_MAX_CHARS and get truncated mid-JSON by
-    // ok(), same failure shape as the outline bug above. Round 4 (Codex thread 13) capped the array
-    // at the first 20; the payload-noise pass found the capped 20 were not consumed either, so the
-    // card now carries only the count.
-    const core = makeCore();
-    core.createSource(sourceInput());
-    const begun = core.beginSourceRun({ sourceId: "source-a", snapshotId: "snap-refs-cap" });
-    if (begun.kind !== "started") throw new Error("expected started run");
-    const metadata = { tags: [] as string[], scope: null, frontmatter: {} };
-    const sectionCount = 40; // comfortably more than the old 20-entry card cap
-    const chunks = Array.from({ length: sectionCount }, (_, i) => {
-      const heading = `Section ${i}`;
-      const text = `evidence about cobalt walruses, section ${i}`;
-      const contentHash = computeSourceContentHash(Buffer.from(text, "utf8"));
-      const ingestFingerprint = computeSourceIngestFingerprint({
-        contentHash, headingPath: [heading], metadata, ingestConfigHash: begun.run.ingestConfigHash,
-      });
-      return {
-        bindingId: `binding-${i}`, bindingGeneration: 1,
-        operationId: computeSourceOperationId(begun.run.sourceId, `binding-${i}`, ingestFingerprint, begun.run.snapshotId, 1),
-        relativePath: "MANY.md", headingPath: [heading], occurrence: 1, segmentIndex: 1, documentSequence: i + 1,
-        contentHash, ingestFingerprint, metadata,
-        sourceRef: `source://source-a/MANY.md#section-${i}~1`, content: text,
-      };
-    });
-    const files = [{ relativePath: "MANY.md", type: "file" as const, contentHash: "many-file-hash", byteLength: 10_000, title: "MANY" }];
-    core.stageSourceManifest({
-      runId: begun.run.id, scanStatus: "complete", manifestHash: computeSourceManifestHash(files), files, chunks,
-    });
-    let conceptId: string | undefined;
-    for (const chunk of chunks) {
-      const stored = await core.storeSource(chunk.content, {
-        circle, sourceRefs: [chunk.sourceRef], operationId: chunk.operationId,
-        ...(conceptId ? { attachTo: conceptId } : { resolution: "forceNew" as const }),
-      });
-      conceptId = stored.conceptId;
-      core.recordSourceBindingReceipt({
-        runId: begun.run.id, bindingId: chunk.bindingId, conceptId: stored.conceptId, observationId: stored.observationId,
-        predecessorObservationId: null, writeState: "committed",
-      });
-    }
-    core.publishSourceRun({ runId: begun.run.id, activationToken: core.beginSourceActivation(begun.run.id) });
-    await core.recomputeSourceConceptBody(conceptId!);
 
-    const gathered = await core.gather("cobalt walruses", { circle, sourceAuthorizationContext: auth });
-    const card = gathered.ranked.find((c) => c.id === conceptId);
-    expect(card).toBeDefined();
-    expect(card!.sourceRefsCount).toBe(sectionCount);
-    // The refs themselves must not ride along on the card at any size.
-    expect(card).not.toHaveProperty("sourceRefs");
-    expect(JSON.stringify(card)).not.toContain("source://source-a/MANY.md");
-  });
 });

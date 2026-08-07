@@ -3,7 +3,7 @@
  *
  *   MONET_DB=/path/to/backfilled.db npx tsx scripts/measure-search-recall.ts
  *
- * The segment layer changed BOTH arms — search and gather rank through the same
+ * The segment layer changed search ranking through the shared
  * scoreNativeConceptsByObservation that nomination uses — but only the write side was ever measured.
  * The read-side claim so far rests on a pair-level statistic (observation pairs from different
  * concepts clearing tauAttach, 41.5% -> 3.6%), and this issue has already been misled three times by

@@ -11,7 +11,7 @@
  * (chunk = retrieval unit, file = unit of truth), applied natively.
  *
  * These tests pin the behavior that split buys, and the sharp edges it deliberately keeps:
- * no centroid fallback, an absolute score floor, and ONE scorer shared by search() and gather().
+ * no centroid fallback, an absolute score floor, and observation-granular scoring in search().
  */
 import { describe, it, expect } from "vitest";
 import { MonetCore } from "../engine";
@@ -242,66 +242,9 @@ describe("recall unit split — which observations count", () => {
     }
   });
 
-  it("keeps a concept with NO usable observation vector out of the dense arm — search invisible, gather still reachable", async () => {
-    const core = newCore();
-    try {
-      // Evidence INTACT (support/confidence untouched), but its only vector is a placeholder —
-      // isolating "no usable vector" from "no evidence".
-      const stranded = await core.store(
-        "Postgres connection pooling uses pgbouncer in transaction mode.",
-        { circle: CIRCLE },
-      );
-      await core.store("Feature flags are evaluated at request time.", { circle: CIRCLE });
-      const db = dbOf(core);
-      const width = (JSON.parse(
-        (db.prepare(`SELECT embedding FROM observations WHERE id = ?`).get(stranded.observationId) as { embedding: string }).embedding,
-      ) as number[]).length;
-      setObservationVector(db, stranded.observationId, JSON.stringify(new Array<number>(width).fill(0)));
 
-      // The concept row (and its centroid) still exists — the hard-retire decision is that this
-      // is NOT enough to rank. A centroid fallback here would reintroduce exactly the blurred
-      // ranking the split removed, on the rows least able to afford it.
-      const cards = await core.search("pgbouncer transaction mode connection pooling for postgres", { circle: CIRCLE, limit: 5 });
-      expect(cards.map((c) => c.id)).not.toContain(stranded.conceptId);
 
-      // It is not erased from the store, though: gather's LEXICAL seed reads concepts.title/body,
-      // not any embedding, so wording still recovers it. Search invisible, gather reachable.
-      const gathered = await core.gather("pgbouncer pooling transaction", { circle: CIRCLE, limit: 5 });
-      expect(gathered.ranked.map((c) => c.id)).toContain(stranded.conceptId);
-      // ...and it is reached WITHOUT claiming an observation match, because there is none.
-      expect(gathered.ranked.find((c) => c.id === stranded.conceptId)!.matchedObservationId).toBeUndefined();
-    } finally {
-      core.close();
-    }
-  });
 
-  it("a concept whose only evidence was terminally superseded is seeded lexically but ranked out by its own collapsed prior", async () => {
-    const core = newCore();
-    try {
-      const emptied = await core.store(
-        "Postgres connection pooling uses pgbouncer in transaction mode.",
-        { circle: CIRCLE },
-      );
-      await core.store("Feature flags are evaluated at request time.", { circle: CIRCLE });
-      core.supersedeObservation(emptied.observationId, null); // its only evidence, terminally gone
-
-      expect((await core.search("pgbouncer transaction mode connection pooling", { circle: CIRCLE, limit: 5 })).map((c) => c.id))
-        .not.toContain(emptied.conceptId);
-
-      // Pinning the boundary of the claim above: gather's lexical arm DOES still reach it (it is
-      // in `seed`), but this concept no longer clears fuse()'s pure-graph includeFloor — terminal
-      // supersession zeroes support_count AND confidence, so nodePrior() bottoms out at its 1e-3
-      // clamp. That is gather's own ACT-R prior machinery deciding an evidence-less concept is not
-      // worth ranking, NOT the unit split: it is equally true before this change, and it is why
-      // "search invisible, gather reachable" is a statement about the SEED arms, not a guarantee
-      // that every dense-invisible concept survives fusion.
-      const gathered = await core.gather("pgbouncer pooling transaction", { circle: CIRCLE, limit: 5 });
-      expect(gathered.seed.map((c) => c.id)).toContain(emptied.conceptId);
-      expect(gathered.ranked.map((c) => c.id)).not.toContain(emptied.conceptId);
-    } finally {
-      core.close();
-    }
-  });
 });
 
 describe("recall unit split — concepts are the unit of delivery", () => {
@@ -331,9 +274,6 @@ describe("recall unit split — concepts are the unit of delivery", () => {
       expect(cards[0].score).toBeCloseTo(best.score, 10);
       expect(cards[0].matchedObservationId).toBe(best.observationId);
 
-      // gather delivers one card per concept too — dedupe is not a search-only property.
-      const gathered = await core.gather(query, { circle: CIRCLE, limit: 10 });
-      expect(gathered.ranked.filter((c) => c.id === concept.conceptId)).toHaveLength(1);
     } finally {
       core.close();
     }
@@ -413,85 +353,13 @@ describe("recall unit split — the score floor", () => {
     }
   });
 
-  it("does NOT apply the floor in gather: a sub-floor concept keeps its true similarity instead of being promoted by the prior branch", async () => {
-    // THE REGRESSION THIS PINS (found in review): filtering gather's `sim` by the floor does not
-    // demote a sub-floor concept, it PROMOTES it. fuse() branches on `sim > 0`; a concept missing
-    // from `sim` takes the pure-graph branch `beta * activation * prior^priorExp`, which carries
-    // NO relevance term. Sub-floor concepts DO reach it — lexicalSeed is embedding-independent and
-    // spread() copies seeds into its own output — so a healthy fresh concept scored ~0.387 there
-    // and outranked a genuine 0.25 match. Gold observation-max p50 is 0.4023, so roughly half of
-    // all genuine matches were beatable by noise. The floor is a search EMISSION rule only.
-    const embedder = new HashingEmbeddingProvider();
-    const core = newCore(embedder);
-    try {
-      const query = "pgbouncer transaction pooling postgres";
-      // DENSE-only match: no wording overlap with the query, so it seeds through similarity alone.
-      const dense = await core.store("Connection multiplexing avoids exhausting backend slots.", { circle: CIRCLE });
-      core.endSessionForEval();
-      // LEXICAL-only match: heavy wording overlap, so it seeds through lexicalSeed regardless of
-      // its vector — the exact shape that reaches fuse()'s prior branch when `sim` is filtered.
-      const lexical = await core.store("pgbouncer transaction pooling postgres tuning notes", { circle: CIRCLE });
-      core.endSessionForEval();
 
-      // Pin both cosines exactly, so the band under test (0 < cos < floor) is not left to chance.
-      const emb = embedder.embed(query);
-      const db = dbOf(core);
-      const forceCos = (conceptId: string, target: number): void => {
-        const row = db.prepare(`SELECT id FROM observations WHERE concept_id = ?`).get(conceptId) as { id: string };
-        let k = 0;
-        for (let i = 1; i < emb.length; i++) if (Math.abs(emb[i]) < Math.abs(emb[k])) k = i;
-        const basis = new Float64Array(emb.length);
-        basis[k] = 1;
-        let d = 0;
-        for (let i = 0; i < emb.length; i++) d += basis[i] * emb[i];
-        const perp = Array.from({ length: emb.length }, (_, i) => basis[i] - d * emb[i]);
-        const pn = Math.sqrt(perp.reduce((a, b) => a + b * b, 0));
-        setObservationVector(db, row.id, JSON.stringify(perp.map((x, i) => (x / pn) * Math.sqrt(1 - target * target) + target * emb[i])));
-      };
-      forceCos(dense.conceptId, 0.25); // above the floor — a genuine match
-      forceCos(lexical.conceptId, 0.10); // POSITIVE but below the floor — the noise
 
-      // The scorer is pure measurement: it reports the sub-floor cosine rather than hiding it.
-      const scored = scoreNativeConceptsByObservation(db, [dense.conceptId, lexical.conceptId], emb, query, false);
-      expect(scored.get(lexical.conceptId)!.score).toBeCloseTo(0.10, 6);
-      expect(scored.get(dense.conceptId)!.score).toBeCloseTo(0.25, 6);
 
-      const ranked = (await core.gather(query, { circle: CIRCLE, limit: 10 })).ranked;
-      const denseRank = ranked.findIndex((c) => c.id === dense.conceptId);
-      const lexicalRank = ranked.findIndex((c) => c.id === lexical.conceptId);
-      expect(denseRank).toBeGreaterThanOrEqual(0);
-      expect(lexicalRank).toBeGreaterThan(denseRank); // the genuine match wins — no inversion
-
-      // And the sub-floor concept is scored by the SIMILARITY branch (its own cosine, viaSeed),
-      // not the relevance-free prior branch that produced the inversion.
-      const lexicalCard = ranked[lexicalRank];
-      expect(lexicalCard.score).toBeCloseTo(0.10, 6);
-      expect(lexicalCard.viaSeed).toBe(true);
-      // search(), which DOES apply the floor, withholds it entirely.
-      expect((await core.search(query, { circle: CIRCLE, limit: 10 })).map((c) => c.id)).not.toContain(lexical.conceptId);
-    } finally {
-      core.close();
-    }
-  });
-
-  it("gather's silence is structural — nothing seeds, so it returns early rather than being floored", async () => {
-    const core = newCore();
-    try {
-      await core.store("The billing exporter emits CSV on the first of the month.", { circle: CIRCLE });
-      // Nothing in this circle to seed from at all: no dense candidate, no lexical overlap, no
-      // entity. This — not the score floor — is what makes gather quiet.
-      const gathered = await core.gather("pgbouncer transaction pooling", { circle: "unit-split-empty", limit: 5 });
-      expect(gathered.ranked).toEqual([]);
-      expect(gathered.seed).toEqual([]);
-      expect(gathered.stopReason).toBe("exhausted");
-    } finally {
-      core.close();
-    }
-  });
 });
 
-describe("recall unit split — one scorer, two arms", () => {
-  it("search() and gather()'s dense arm consume the SAME native scorer", async () => {
+describe("recall unit split — scorer integration", () => {
+  it("search() consumes the native observation scorer", async () => {
     const embedder = new HashingEmbeddingProvider();
     const core = newCore(embedder);
     try {
@@ -511,7 +379,7 @@ describe("recall unit split — one scorer, two arms", () => {
 
       // search(): score AND matched observation come straight from the shared scorer, and its
       // card set is exactly the scorer's above-floor subset — the floor lives HERE, at emission,
-      // not inside the scorer (which stays pure measurement for gather's sake).
+      // not inside the scorer, which stays pure measurement.
       const searchCards = await core.search(query, { circle: CIRCLE, limit: 10 });
       const aboveFloor = [...expected.entries()].filter(([, m]) => m.score >= NATIVE_SCORE_FLOOR);
       expect(searchCards.map((c) => c.id).sort()).toEqual(aboveFloor.map(([id]) => id).sort());
@@ -521,20 +389,6 @@ describe("recall unit split — one scorer, two arms", () => {
         expect(card.matchedObservationId).toBe(match.observationId);
       }
 
-      // gather(): its fused SCORES are its own (activation + priors + stop), but every concept it
-      // reached densely must name the SAME observation search did — that is the invariant a second
-      // scoring implementation would break, and the reason there is only one.
-      const gathered = await core.gather(query, { circle: CIRCLE, limit: 10 });
-      for (const card of gathered.ranked) {
-        if (card.matchedObservationId === undefined) continue;
-        expect(card.matchedObservationId).toBe(expected.get(card.id)?.observationId);
-      }
-      // The concept the dense arm ranks first is the same one in both arms.
-      expect(gathered.ranked[0].id).toBe(searchCards[0].id);
-      expect(gathered.ranked[0].matchedObservationId).toBe(searchCards[0].matchedObservationId);
-      // SEED cards never carry it: cardOf scores them with confidence, and an observation id
-      // beside a confidence number reads as "how strongly that observation matched".
-      for (const card of gathered.seed) expect(card.matchedObservationId).toBeUndefined();
     } finally {
       core.close();
     }

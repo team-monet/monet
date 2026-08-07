@@ -26,14 +26,14 @@
  *
  *  2. `memory_edge` already has `derived_from` and `supersedes` types (its own `type` column's
  *     vocabulary), and they are HEURISTIC — "agent-asserted typed edges parsed from content" (that
- *     column's own doc comment), matched out of free text by `ASSERTED_RE` and fed into gather's
- *     spread activation. The edges here are born from ACTS (a correction, a declaration, a
+ *     column's own doc comment), matched out of free text by `ASSERTED_RE` and used by graph
+ *     diagnostics. The edges here are born from ACTS (a correction, a declaration, a
  *     ratification), never parsed from prose. Sharing rows or type names would conflate heuristic
  *     association with normative authority — precisely the collapse the design directive forbids.
  *
  * Consequences of that separation, all deliberate:
- *   - These rows NEVER participate in gather spread, adjacency, hub filtering, or the similarity
- *     graph's edge-type histograms. They are substrate truth, not a recall surface.
+ *   - These rows NEVER participate in similarity-graph adjacency, hub filtering, or edge-type
+ *     histograms. They are substrate truth, not a recall surface.
  *   - They are APPEND-ONLY. There is no update path for family/src/dst, and graph maintenance never
  *     deletes them.
  *   - They DO sync: unlike `resolution_events` (deliberately local-only, engine.ts:1691), a

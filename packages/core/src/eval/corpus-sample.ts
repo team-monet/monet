@@ -38,7 +38,7 @@
  * scripts/sample-corpus.ts's own console output for the analogous FULL-shortfall notice). Every
  * sampled concept is still RE-CIRCLED to a single fixed output circle (`SAMPLED_CIRCLE` below) in
  * the derived .db, so the derived store behaves exactly like a single-project store to every
- * circle-scoped engine call (allConceptsForExport, edges(), gather(), search()) — unchanged from
+ * circle-scoped engine call (allConceptsForExport, edges(), search()) — unchanged from
  * before, this part of the design wasn't scope-dependent.
  *
  * STRATIFICATION — kind × recency, proportional allocation (documented per the mission's request

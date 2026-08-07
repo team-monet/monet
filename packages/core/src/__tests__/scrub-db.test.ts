@@ -29,7 +29,7 @@
  *      byte-identical before/after running scrub-db.mjs against a fixture copy of it.
  *   3. determinism: running scrubSizeDb twice against the same source produces byte-identical
  *      output files.
- *   4. a MonetCore opened directly on the scrubbed copy answers search()/gather() sanely (finds a
+ *   4. a MonetCore opened directly on the scrubbed copy answers search() sanely (finds a
  *      concept by its non-sensitive content, sourceRefs parse back to a clean array, and nothing
  *      redacted resurfaces).
  *   5. everything not explicitly scrubbed/emptied (embeddings, edges, row counts on
@@ -1418,7 +1418,7 @@ describe("clearConceptAliases — round 4, G1 fix: concepts.aliases carries pre-
     // ALSO verify resolveRef()/search on the CURRENT (surviving) concept's title still works
     // correctly on the scrubbed db post-clear — a MonetCore opened on the scrubbed copy should still
     // find the survivor by its own current (scrubbed) content, same pattern as this file's existing
-    // "a MonetCore opened on the scrubbed copy answers search()/gather() sanely" test.
+    // "a MonetCore opened on the scrubbed copy answers search() sanely" test.
     const liveCore = new MonetCore(dstPath);
     try {
       const results = await liveCore.search("merge-history detail", { circle: SAMPLED_CIRCLE });
@@ -2520,7 +2520,7 @@ describe("scrubSizeDb — copy-then-scrub, the full per-size operation", () => {
     }
   });
 
-  it("a MonetCore opened on the scrubbed copy answers search()/gather() sanely, with sourceRefs parsing back to a clean array", async () => {
+  it("a MonetCore opened on the scrubbed copy answers search() sanely, with sourceRefs parsing back to a clean array", async () => {
     const dir = mkTmp("scrub-db-search-");
     const srcPath = join(dir, "src-monet.db");
     const { conceptIds } = await buildFixtureDb(srcPath);
@@ -2540,17 +2540,7 @@ describe("scrubSizeDb — copy-then-scrub, the full per-size operation", () => {
       expect(serialized).not.toContain("key_GZTqlLr41FS2p7AY");
       expect(serialized).not.toContain("192.168.1.10");
 
-      // gather() reads concepts.source_refs via countSourceRefs (engine.ts). A numeric count on the
-      // card proves the engine-side JSON.parse still works against this JSON-aware-scrubbed column
-      // (a raw unparsed string would throw there). The refs themselves are no longer carried on the
-      // card, so assert their scrubbed CONTENT against the stored row.
-      const gathered = await core.gather(conceptIds[0], { circle: SAMPLED_CIRCLE });
-      const seedCard = gathered.seed.find((s) => s.id === conceptIds[0]);
-      expect(seedCard).toBeDefined();
-      const rankedOrSeed = gathered.ranked.find((r) => r.id === conceptIds[0]);
-      if (rankedOrSeed) {
-        expect(typeof rankedOrSeed.sourceRefsCount).toBe("number");
-      }
+      // Parse the JSON-aware-scrubbed source_refs column directly and assert its scrubbed content.
       const scrubbedRow = (core as unknown as { db: { prepare(sql: string): { get(id: string): unknown } } }).db
         .prepare(`SELECT source_refs FROM concepts WHERE id = ?`)
         .get(conceptIds[0]) as { source_refs: string | null } | undefined;

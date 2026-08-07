@@ -24,10 +24,9 @@
  * measures nothing; the store size reported is the one they were measured against.
  *
  * REFERENCE NUMBERS — SEARCH (this machine, main c24e62e vs the unit split, mean over 40 searches):
- *   250 concepts / 2,500 observations   search 3.72ms -> 15.57ms (4.19x)   gather 384ms -> 425ms
- *   500 concepts / 5,000 observations   search 7.47ms -> 33.65ms (4.51x)   gather 1049ms -> 1075ms
- * Both arms are linear in store size and the ratio is stable across the doubling. Gather's own
- * cost is dominated by spreading activation and the evidence-gap stop, NOT by this scorer.
+ *   250 concepts / 2,500 observations   search 3.72ms -> 15.57ms (4.19x)
+ *   500 concepts / 5,000 observations   search 7.47ms -> 33.65ms (4.51x)
+ * Search is linear in store size and the ratio is stable across the doubling.
  *
  * REFERENCE NUMBERS — STORE (this machine, main ad3ee70 vs the resolution hybrid, mean over 40):
  *    50 concepts /   500 observations   store()  5.29ms -> 9.06ms  (+3.8ms)
@@ -52,7 +51,6 @@ const CIRCLE = "perf";
 const CONCEPTS = Number(process.env.CONCEPTS ?? 250);
 const OBS_PER_CONCEPT = 9; // + the creating observation => 10 per concept
 const SEARCH_ROUNDS = 5;
-const GATHER_ROUNDS = 3;
 const STORE_WRITES = 40; // matches the search sample size (8 queries x 5 rounds)
 
 const NOUNS = ["scheduler", "exporter", "cluster", "cache", "queue", "router", "ledger", "indexer", "planner", "collector"];
@@ -116,14 +114,6 @@ async function main(): Promise<void> {
         searchTimes.push(nowMs() - t);
       }
     }
-    const gatherTimes: number[] = [];
-    for (let round = 0; round < GATHER_ROUNDS; round++) {
-      for (const query of QUERIES) {
-        const t = nowMs();
-        await core.gather(query, { circle: CIRCLE, limit: 12 });
-        gatherTimes.push(nowMs() - t);
-      }
-    }
 
     // AUTO-RESOLUTION WRITES against a store of this size. Each one runs BOTH store-time scans (the
     // centroid scan for `related` edges, the observation scan for nomination) plus the write itself.
@@ -138,7 +128,6 @@ async function main(): Promise<void> {
 
     console.log(`store:  ${sizeAtStoreTiming}  (seeded in ${seedSeconds.toFixed(1)}s)`);
     console.log(`search  ${summarize(searchTimes)}`);
-    console.log(`gather  ${summarize(gatherTimes)}`);
     console.log(`store() ${summarize(storeTimes)}   <- auto resolution: centroid scan + nomination scan + write`);
     const cards = await core.search(QUERIES[0], { circle: CIRCLE, limit: 10 });
     console.log(`sanity: "${QUERIES[0]}" -> ${cards.length} cards, top score ${cards[0]?.score.toFixed(4) ?? "n/a"}`);
