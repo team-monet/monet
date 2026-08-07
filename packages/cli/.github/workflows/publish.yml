@@ -60,12 +60,45 @@ jobs:
       # 2. Check out the PRIVATE core repo alongside the client.
       #    The file: dep in package.json resolves to ../monet-core relative
       #    to the client root, so both repos must be siblings at the workspace root.
+      # PIN THE CORE REVISION (Codex P1, PR #65). Without a ref this checks out core's default
+      # branch AT PUBLISH TIME, so a tag pushed after core advances bundles code that was never
+      # reviewed for this version and the tarball cannot be reproduced from this commit. The sha
+      # lives in .monet-core-ref beside package.json and is bumped with the version.
+      - name: Resolve the pinned core revision
+        id: core-ref
+        run: |
+          ref="$(tr -d '[:space:]' < monet-client/.monet-core-ref)"
+          if [ -z "$ref" ]; then
+            echo "::error::.monet-core-ref is empty — refusing to publish against an unpinned core"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Pinned core revision: $ref"
+
       - name: Checkout monet-core (private)
         uses: actions/checkout@v4
         with:
           repository: team-monet/monet-core
+          ref: ${{ steps.core-ref.outputs.ref }}
           token: ${{ secrets.MONET_CORE_TOKEN }}
           path: monet-core
+
+      - name: Verify the core checkout matches the pin
+        working-directory: monet-core
+        run: |
+          got="$(git rev-parse HEAD)"
+          want="${{ steps.core-ref.outputs.ref }}"
+          if [ "$got" != "$want" ]; then
+            echo "::error::core checkout is $got, expected $want"
+            exit 1
+          fi
+          echo "core at $got"
+
+      # Same trap as client#64, one layer out: the file: dep is COPIED by pnpm, so a cached copy
+      # from a previous run would silently win over the freshly pinned checkout.
+      - name: Drop any cached copy of the core dependency
+        working-directory: monet-client
+        run: rm -rf node_modules/.pnpm/@team-monet+core* node_modules/@team-monet/core
 
       # Directory layout after the two checkouts:
       #   $GITHUB_WORKSPACE/

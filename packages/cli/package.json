@@ -1,8 +1,8 @@
 {
   "name": "@team-monet/monet",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "mcpName": "io.github.team-monet/monet",
-  "description": "Monet — local-first, state-centric memory for coding agents. MCP server + CLI.",
+  "description": "Monet \u2014 local-first, state-centric memory for coding agents. MCP server + CLI.",
   "license": "LicenseRef-Monet-Proprietary",
   "type": "module",
   "homepage": "https://monet.team-monet.com",
