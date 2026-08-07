@@ -230,7 +230,7 @@ export type {
   ResolutionNomination,
   ResolutionThresholds,
 } from "./resolution";
-export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError } from "./store-embedder";
+export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError, PinnedStoreEmbedderUnavailableError } from "./store-embedder";
 export {
   DEFAULT_SOURCE_SCANNER_LIMITS,
   SOURCE_SCANNER_VERSION,

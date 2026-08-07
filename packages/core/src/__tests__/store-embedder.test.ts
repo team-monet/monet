@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,6 +7,7 @@ import {
   MonetCore,
   chooseStoreEmbedder,
   readStoredEmbedderPin,
+  readStoredVectorPresence,
 } from "../index";
 import { HashingEmbeddingProvider } from "../embedding";
 import { DEFAULT_MODEL } from "../embedding-onnx";
@@ -71,19 +72,41 @@ describe("chooseStoreEmbedder — first-boot hard requirement", () => {
     expect(readStoredEmbedderPin(dbPath)).toBe("hashing:dim=256:tok=2");
   });
 
-  it("legacy unpinned vectors preserve automatic lexical fallback", async () => {
+  it("legacy unpinned vectors keep the auto-fallback — the engine infers their model from vector DIMENSION, and only reaching it can", async () => {
     const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
-    await seed.store("legacy vector evidence", { resolution: "forceNew" });
-    (seed as any).db
-      .prepare(
-        `UPDATE sync_meta SET embedder_model_id = NULL, embedder_pin_source = NULL, embedder_pinned_at = NULL WHERE singleton = 1`,
-      )
-      .run();
+    await seed.store("legacy content written before pinning existed");
+    (seed as any).db.prepare(`UPDATE sync_meta SET embedder_model_id = NULL WHERE singleton = 1`).run();
     seed.close();
+    expect(readStoredEmbedderPin(dbPath)).toBeNull(); // the premise: unpinned, but NOT empty
 
+    // NOT the fresh-store case, and the difference is load-bearing. backfillEmbedderPin maps 384 ->
+    // LEGACY_ONNX_DEFAULT_MODEL_ID and 256 -> hashing tok=1 from the vectors themselves, inside
+    // ensureEmbedderPin — after construction. Refusing here would mean a legacy store whose own
+    // model is cached becomes unopenable because an unrelated current default cannot download.
     process.env.MONET_TEST_ONNX_FAILURE = "1";
     const provider = await chooseStoreEmbedder(dbPath);
     expect(provider.constructor.name).toBe("HashingEmbeddingProvider");
+    expect(readStoredEmbedderPin(dbPath)).toBeNull(); // still unpinned — the engine decides, not this
+  });
+
+  it("an UNREADABLE unpinned store does not take the legacy path — unknown is not evidence of vectors", async () => {
+    /*
+     * The three states of readStoredVectorPresence are true / false / null, and null means the store
+     * could not be read at all. Folding null into the legacy branch let an unreadable unpinned store
+     * reach createLocalEmbedder(), silently take the lexical fallback, and get PERMANENTLY pinned to
+     * it by ensureEmbedderPin — the exact silent degradation this module exists to prevent, entered
+     * through the one state that proves nothing.
+     */
+    writeFileSync(dbPath, "this is not a SQLite database");
+    expect(readStoredEmbedderPin(dbPath)).toBeNull();
+    expect(readStoredVectorPresence(dbPath)).toBeNull(); // the premise: unknown, not false
+
+    process.env.MONET_TEST_ONNX_FAILURE = "1";
+    await expect(chooseStoreEmbedder(dbPath)).rejects.toBeInstanceOf(FreshStoreEmbedderUnavailableError);
+
+    // And it is not a blanket refusal: an EXPLICIT lexical opt-in still proceeds.
+    process.env.MONET_EMBEDDER = "hashing";
+    await expect(chooseStoreEmbedder(dbPath)).resolves.toBeDefined();
   });
 
   it("a pinned store honors its pin without consulting a failing default ONNX path", async () => {

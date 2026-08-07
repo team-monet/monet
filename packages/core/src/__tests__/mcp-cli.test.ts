@@ -115,7 +115,7 @@ describe("chooseStartupEmbedder (Codex review, PR #51 round 7, FIX U)", () => {
     expect(embedder.constructor.name).toBe("HashingEmbeddingProvider"); // the fallback, not a thrown error
   });
 
-  it("(round 8, FIX Z) pin present but unloadable, NON-empty store: chooseStartupEmbedder STILL falls back (it can't see store contents — it runs before construction) — but the full construct-then-ensure lifecycle still ends in the same loud failure, just at ensure instead of pre-construction", async () => {
+  it("pin present but unloadable, NON-EMPTY store: refuses BEFORE construction — its vectors live in a space nothing available can read", async () => {
     const seed = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
     await seed.store("real content making this store genuinely non-empty", { circle: "fix-z" });
     (seed as any).db
@@ -123,18 +123,19 @@ describe("chooseStartupEmbedder (Codex review, PR #51 round 7, FIX U)", () => {
       .run();
     seed.close();
 
+    // SUPERSEDES FIX Z's non-empty half. That round asserted chooseStartupEmbedder "can't see store
+    // contents", fell back to lexical, and left the loud failure to ensureEmbedderPin. It does read
+    // them now, and refuses here — because between those two points the server would have been
+    // constructed on a provider whose space does not match the stored vectors. FIX Z's own comment
+    // called the two "the same loud failure, just at ensure instead of pre-construction"; this is
+    // that failure at the earlier of the two points, before anything can serve from it.
+    //
+    // MONET_EMBEDDER=hashing does NOT rescue it: an explicit lexical opt-in chooses a provider, it
+    // does not re-space vectors that are already written.
     process.env.MONET_EMBEDDER = "hashing";
-    const fallback = await chooseStartupEmbedder(dbPath);
-    expect(fallback.constructor.name).toBe("HashingEmbeddingProvider"); // chooseStartupEmbedder itself can't tell empty from non-empty — same fallback either way
-
-    // The REST of the lifecycle (construct with the fallback, then ensure) is what actually
-    // distinguishes empty from non-empty — that decision lives entirely in ensureEmbedderPin
-    // (engine.ts), already covered exhaustively at the engine level by
-    // embedder-pin.test.ts's "(test 2) a NON-empty store with an unsatisfiable pin still fails
-    // closed" (FIX O's own non-empty-store test) — guard-poisoning, pin-unchanged, and
-    // guard-actually-gates assertions live there; not duplicated here, just connected end to end.
-    const core = new MonetCore(dbPath, { embedder: fallback });
-    await expect(core.ensureEmbedderPin()).rejects.toBeInstanceOf(UnsatisfiableEmbedderError);
-    core.close();
+    await expect(chooseStartupEmbedder(dbPath)).rejects.toMatchObject({
+      name: "PinnedStoreEmbedderUnavailableError",
+      pin: "Xenova/mock-cli-broken-model",
+    });
   });
 });

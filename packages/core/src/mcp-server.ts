@@ -50,7 +50,8 @@ import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-sch
  * because it costs nothing to correct and misleads every session until it is.
  */
 export const MONET_SERVER_INSTRUCTIONS =
-  "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. Start each project session with agent_context. Recall with memory_search pointer cards, then memory_fetch content. Write with memory_store when a norm changes — a correction, a rule, a principle candidate — never a narrative summary of work whose artifact already exists. Nothing is owed at session end: every record Monet keeps is written by the mechanism that made it, as it happens.";
+  "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. Start each project session with agent_context. Recall with memory_search pointer cards, then memory_fetch content. Write with memory_store when a norm changes — a correction, a rule, a principle candidate — never a narrative summary of work whose artifact already exists. Write memories in English: the embedding model reads it best, and a store is pinned to its model, so content the model could not read is stored and then never found. "
+  + "Nothing is owed at session end: every record Monet keeps is written by the mechanism that made it, as it happens.";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
 // concept — long body + many observations — otherwise serializes to tens of thousands of chars and

@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { nonLatinLetterShare, NON_LATIN_LETTER_TOLERANCE } from "./script-gate";
 import { createHash } from "node:crypto";
 import { closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -73,8 +74,36 @@ export interface StoredEmbedderStateInspection {
   pin: StoredEmbedderPin;
   populations: StoredEmbeddingPopulations;
   migration: StoredEmbedderMigration;
+  /** Live observations a Latin-only pin would strand. Reported whatever the CURRENT pin is. */
+  nonLatin: StoredNonLatinContent;
   assessment: StoredEmbedderSafetyAssessment;
 }
+
+/**
+ * WHY THIS IS REPORTED EVEN ON A MULTILINGUAL PIN.
+ *
+ * The count exists to be read BEFORE a move to a Latin-only checkpoint, which is exactly when the
+ * current pin is still multilingual. Gating the count on the current pin would answer only after the
+ * answer stopped mattering — the migration is one-way for content.
+ *
+ * Measured with engine's nonLatinLetterShare against NON_LATIN_LETTER_TOLERANCE, the same threshold
+ * the write gate enforces, so this cannot clear a row the write path would refuse.
+ */
+export type StoredNonLatinContent =
+  | {
+      status: "known";
+      tolerance: number;
+      /** Observations the migration re-embeds — native (including superseded) and live source. */
+      observationCount: number;
+      /**
+       * Concept BODIES it re-embeds. Counted separately because a body is derived from its
+       * observations, so one piece of non-English content appears in both populations — summing
+       * them would double-report it, and an operator reads these to size a rewrite, not to total it.
+       */
+      conceptCount: number;
+      sampleIds: string[];
+    }
+  | { status: "unknown"; reason: string };
 
 type SchemaMap = Map<string, Set<string>>;
 
@@ -335,6 +364,91 @@ function classifyFailure(dbPath: string, error: unknown): StoredEmbedderStateDia
  * connection/schema pragma. Missing files are ordinary results; unreadable/non-SQLite/locked files
  * throw a typed failure so a CLI cannot accidentally report them as empty or healthy.
  */
+/**
+ * Count everything a migration would re-embed into a model that cannot read it.
+ *
+ * SCANS EXACTLY WHAT THE MIGRATION REWRITES, which is four populations, not one:
+ *
+ *   enforcedNativeObservationRows   every `kind != 'source'` row, NO supersession filter
+ *   enforcedSourceObservationRows   source rows whose chunks are live (or which have none)
+ *   enforcedNativeConceptRows       every `kind != 'source'` concept — its BODY is re-embedded,
+ *                                   which is `SELECT * FROM concepts WHERE kind != 'source'` and so
+ *                                   takes workstream concepts along with ordinary ones
+ *
+ * A narrower scan reports zero while the rewrite strands content. Two of these were missed in
+ * earlier rounds and each hid a distinct failure: source chunks feed scoreSourceConcepts against
+ * live queries, and concept BODIES are written by applySynthesis, which accepts arbitrary text
+ * WITHOUT the write path's script gate — so a store of English observations can hold a non-Latin
+ * body, and migrateEmbeddings' reembedConcept phase then persists an unusable concept vector and
+ * rebuilds `related` edges from it (Codex P1, PR #173).
+ *
+ * STREAMED, not materialized. The diagnostic needs a count and five sample ids; `.all()` on a large
+ * source-backed store would hold every row's content in memory at once and could exhaust it while
+ * producing the warning that was supposed to prevent a loss (Codex P2).
+ *
+ * The predicates are duplicated here rather than imported because diagnostics reads a raw
+ * better-sqlite3 handle on a possibly-unopenable store, before any MonetCore exists.
+ */
+function inspectNonLatin(db: Database.Database, schema: SchemaMap): StoredNonLatinContent {
+  const observationColumns = schema.get("observations");
+  if (!observationColumns || !observationColumns.has("content") || !observationColumns.has("id") || !observationColumns.has("kind")) {
+    return { status: "unknown", reason: "observations table lacks id/kind/content" };
+  }
+  const conceptColumns = schema.get("concepts");
+  if (!conceptColumns || !conceptColumns.has("body") || !conceptColumns.has("id") || !conceptColumns.has("kind")) {
+    return { status: "unknown", reason: "concepts table lacks id/kind/body" };
+  }
+  try {
+    const observationQueries = [
+      `SELECT id, content AS text FROM observations WHERE kind != 'source'`,
+      schema.has("source_chunks")
+        ? `SELECT o.id AS id, o.content AS text
+             FROM observations o
+            WHERE o.kind = 'source'
+              AND (
+                NOT EXISTS (SELECT 1 FROM source_chunks any_sc WHERE any_sc.observation_id = o.id)
+                OR EXISTS (
+                  SELECT 1 FROM source_chunks live_sc
+                  LEFT JOIN concepts live_c ON live_c.id = live_sc.concept_id
+                   WHERE live_sc.observation_id = o.id AND live_sc.lifecycle = 'active'
+                     AND (live_c.id IS NULL OR live_c.status = 'active')
+                )
+              )`
+        : `SELECT id, content AS text FROM observations WHERE kind = 'source'`,
+    ];
+    // Concept bodies. applySynthesis writes these WITHOUT the script gate, so this is the one
+    // population that can be non-English in a store whose every observation is English.
+    const conceptQuery = `SELECT id, body AS text FROM concepts WHERE kind != 'source' AND body IS NOT NULL`;
+
+    /*
+     * SAMPLES ARE PER-POPULATION, not first-come. A shared five-slot buffer filled in query order
+     * means a store with five non-English OBSERVATIONS reports `conceptCount: 3` and hands the
+     * operator no id for any body — which is precisely the invisibility this scan was widened to
+     * fix, reproduced one level up. Bodies are the hard population to find by browsing, so each
+     * gets its own quota and they are concatenated.
+     */
+    const scan = (sql: string, into: string[], quota: number): number => {
+      let n = 0;
+      for (const row of db.prepare(sql).iterate() as Iterable<{ id: string; text: string | null }>) {
+        if (typeof row.text !== "string") continue;
+        if (nonLatinLetterShare(row.text) > NON_LATIN_LETTER_TOLERANCE) {
+          n++;
+          if (into.length < quota) into.push(row.id);
+        }
+      }
+      return n;
+    };
+    const observationSamples: string[] = [];
+    const conceptSamples: string[] = [];
+    const observationCount = observationQueries.reduce((total, sql) => total + scan(sql, observationSamples, 3), 0);
+    const conceptCount = scan(conceptQuery, conceptSamples, 2);
+    const offenders = [...observationSamples, ...conceptSamples];
+    return { status: "known", tolerance: NON_LATIN_LETTER_TOLERANCE, observationCount, conceptCount, sampleIds: offenders };
+  } catch (error) {
+    return { status: "unknown", reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export function inspectStoredEmbedderState(dbPath: string): StoredEmbedderStateInspection {
   const absolutePath = resolve(dbPath);
   if (!existsSync(absolutePath)) {
@@ -348,6 +462,7 @@ export function inspectStoredEmbedderState(dbPath: string): StoredEmbedderStateI
       pin: { status: "unknown", reason },
       populations: unknownPopulations(reason),
       migration: { status: "unknown", reason },
+      nonLatin: { status: "unknown", reason },
       assessment: "missing",
     };
   }
@@ -423,6 +538,7 @@ export function inspectStoredEmbedderState(dbPath: string): StoredEmbedderStateI
       pin,
       populations,
       migration,
+      nonLatin: inspectNonLatin(db, schema),
       assessment: assess(schemaVersion, integrity, pin, populations, migration),
     };
   } catch (error) {

@@ -200,6 +200,7 @@ import type { ConformanceAnnotation, JournalDispositionLine } from "./conformanc
 import { clipActionContext, closeGateJournalEvent, gateJournalDisposition, openGateJournalEvent } from "./gate-journal";
 import type { GateJournalClaimType, GateJournalDisposition, GateJournalMouth } from "./gate-journal";
 import { RATIFICATION_ENTRANCES, classifyRatificationPair } from "./lifecycle-edges";
+import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "./script-gate";
 import { inspectLifecycleEdgeIntegrity } from "./diagnostics";
 import type { LifecycleEdgeIntegrityReport } from "./diagnostics";
 // ---- graph derivation tunables (#245, ADR §3.7) -------------------------
@@ -382,7 +383,9 @@ export type EmbedderWindowSubject = "content" | "query";
  * Letters only. Punctuation, digits and the em-dashes and arrows this codebase writes in quantity are
  * script-neutral and would otherwise dilute the ratio into uselessness on short text.
  */
-export const NON_LATIN_LETTER_TOLERANCE = 0.2;
+// The script measurement lives in its own leaf module so diagnostics can share it without closing
+// an import cycle back into engine. Re-exported here because both are part of engine's public API.
+export { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "./script-gate";
 
 /** Thrown when an English-only embedder is handed text it cannot read. */
 export class ContentScriptUnsupportedError extends Error {
@@ -4007,10 +4010,7 @@ export class MonetCore {
    */
   assertEmbedderReadsScript(content: string, subject: EmbedderWindowSubject = "content"): void {
     if (this.embedder.readsOnlyLatinScript !== true) return;
-    const letters = content.match(/\p{L}/gu);
-    if (letters === null || letters.length === 0) return; // digits and punctuation are script-neutral
-    const nonLatin = letters.filter((ch) => !/\p{Script=Latin}/u.test(ch)).length;
-    const share = nonLatin / letters.length;
+    const share = nonLatinLetterShare(content);
     if (share > NON_LATIN_LETTER_TOLERANCE) throw new ContentScriptUnsupportedError(share, subject);
   }
 
