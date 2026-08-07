@@ -752,3 +752,67 @@ describe("doctor and repair CLI", () => {
     expect(after.pin).toMatchObject({ modelId: "hashing:dim=256:tok=1" });
   });
 });
+
+/**
+ * EVERY GUARD MUST BE ABLE TO FAIL.
+ *
+ * `resegment` is a recovery command that DELETEs and re-INSERTs segment rows in the operator's live
+ * store. Each refusal below was a real Codex finding on PR #66, and each test asserts the thing the
+ * unguarded code actually did — opened the port, or advertised a command that cannot run — so a
+ * regression that removes the guard turns this file red rather than leaving it green.
+ */
+describe("resegment refuses before it writes", () => {
+  const seg = (state: StoredEmbedderStateInspection) => {
+    const deps = fakeDependencies(state);
+    return { deps, go: () => run(["resegment", "--dir", "/tmp/monet test/store's dir"], deps) };
+  };
+
+  it("refuses a nonexistent store WITHOUT opening SQLite — opening it would create the file", async () => {
+    const { deps, go } = seg(inspection({ exists: false }));
+    await expect(go()).rejects.toThrow(/no Monet store at/);
+    expect(deps.createPort).not.toHaveBeenCalled();
+  });
+
+  it("refuses a store whose integrity check FAILED, rather than mutating a corrupt database", async () => {
+    const { deps, go } = seg(inspection({ integrity: { status: "failed", check: ["malformed page"] } }));
+    await expect(go()).rejects.toThrow(/integrity result is failed.*refusing to rewrite segments/s);
+    expect(deps.createPort).not.toHaveBeenCalled();
+  });
+
+  it("carries --dir into BOTH recovery commands — without it the operator repairs a different store", async () => {
+    const { go } = seg(migrationInspection("safe"));
+    await expect(go()).rejects.toThrow(
+      /--resume --apply --yes`, or clear it with `monet repair --dir '\/tmp\/monet test\/store'"'"'s dir' --abandon/,
+    );
+  });
+
+  it("offers --abandon only when inspection classified it safe — repair rejects every other class", async () => {
+    const { go } = seg(migrationInspection("refused"));
+    const error = (await go().catch((e: unknown) => e)) as Error;
+    expect(error.message).toMatch(/--resume --apply --yes`, then resegment/);
+    expect(error.message).not.toMatch(/--abandon/);
+  });
+
+  it("does NOT offer --resume for an unreadable sentinel — ensureInspectableForRepair rejects it first", async () => {
+    const { go } = seg(inspection({ migration: { status: "unknown", reason: "sentinel row unreadable" } }));
+    const error = (await go().catch((e: unknown) => e)) as Error;
+    expect(error.message).toMatch(/could not be read \(sentinel row unreadable\)/);
+    expect(error.message).toMatch(/diagnose with `monet doctor --dir/);
+    expect(error.message).not.toMatch(/--resume/);
+  });
+
+  it("refuses when the pinned provider's width does not match the store's live vectors", async () => {
+    // Pin name matches, so an identity-only check passes; the STORED width is 384 and the provider
+    // that loads under that name declares 256. Writing segments would put two widths in one space.
+    const { deps, go } = seg(customInspection("hashing:dim=256:tok=2"));
+    await expect(go()).rejects.toThrow(/not proven compatible.*width 384.*declares width 256/s);
+    expect(deps.createPort).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the pinned provider cannot be loaded at all", async () => {
+    const { deps, go } = seg(inspection());
+    deps.instantiate = vi.fn(async () => { throw new Error("model cache empty"); });
+    await expect(go()).rejects.toThrow(/could not be loaded \(model cache empty\).*refusing to rebuild/s);
+    expect(deps.createPort).not.toHaveBeenCalled();
+  });
+});

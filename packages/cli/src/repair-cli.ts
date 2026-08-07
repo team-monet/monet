@@ -477,6 +477,42 @@ async function applyRepair(
           console.error(progressLine(event));
         },
       });
+      /*
+       * RE-SEGMENT AFTER THE REWRITE, IN THE SAME COMMAND.
+       *
+       * migrateEmbeddings DROPS observation_segments rather than re-embedding them, and says so at
+       * the drop: re-embedding is async and that code runs inside a synchronous transaction. Its
+       * stated remedy is "re-run the segment backfill", which is correct — and was unreachable for
+       * anyone using the published package, because the backfill lives in a script in the PRIVATE
+       * core repo. So the shipped path left a migrated store permanently at pre-#155 granularity:
+       * retrieval stayed correct (the scorer falls back to the observation's own vector) but coarser,
+       * and only observations written AFTER the migration got segments — two units in one store.
+       *
+       * Runs here rather than inside migrateEmbeddings because this is outside the transaction, which
+       * is the whole reason the drop exists. Idempotent by protocol, so a re-run costs nothing.
+       *
+       * Failure is reported, not thrown: the migration itself has already committed and is correct.
+       * Losing the resegment pass degrades granularity; losing the exit code would suggest the
+       * embedder move failed, which would send an operator to restore a backup they do not need.
+       */
+      try {
+        console.error("resegmenting observations in the new space…");
+        const resegment = await core.resegmentObservations({
+          onProgress(done, total) {
+            if (done === total || done % 250 === 0) console.error(`  resegment: ${done}/${total} observations`);
+          },
+        });
+        console.error(`resegment: ${resegment.observations} observations → ${resegment.segments} segments`);
+      } catch (error) {
+        console.error(
+          `resegment FAILED after a successful embedder migration: ${messageFrom(error)}\n` +
+          `The store is migrated and searchable, at pre-#155 granularity. Retry with ` +
+          `\`monet resegment --dir ${shellQuote(path.dirname(dbPath))}\` — NOT this repair, which now refuses: ` +
+          `--target is rejected because the store already matches it, and --resume is rejected because the ` +
+          `migration sentinel is cleared. Carrying --dir matters: without it the retry would target the default ` +
+          `project store, not this one (Codex P2, PR #66).`,
+        );
+      }
       result = { backup, report };
     }
   } catch (error) {
@@ -879,6 +915,139 @@ export function registerRecoveryCommands(
     .option("--apply", "Apply the repair after provider preflight and verified backup")
     .option("--yes", "Confirm --apply noninteractively")
     .action((options: RepairOptions) => runRepair(options, dependencies));
+
+  /*
+   * WHY THIS IS ITS OWN COMMAND AND NOT A REPAIR FLAG.
+   *
+   * migrateEmbeddings drops observation_segments rather than re-embedding them — re-embedding is
+   * async and that code runs inside a synchronous transaction — and its stated remedy is to re-run
+   * the segment backfill. `repair --apply` now does that automatically after a migration it
+   * performs. But `repair` REFUSES when the store is already on the target pin ("no embedding repair
+   * is required"), which is exactly the state a store migrated by an earlier release is in: right
+   * pin, zero segments, retrieval permanently at pre-#155 granularity with no shipped way back.
+   * Until now the only fix lived in a script in the private core repo, so a published-package user
+   * could not reach it at all.
+   *
+   * Idempotent by protocol: each observation's segments are deleted and reinserted in one
+   * transaction, so a re-run grows nothing and an interrupt leaves every observation either fully
+   * re-segmented or untouched.
+   */
+  program
+    .command("resegment")
+    .description("Rebuild observation segments in the store's current embedding space")
+    .option("-d, --dir <storage-directory>", "Storage directory (default: .monet or ~/.monet)")
+    .option("--circle <name>", "Limit to one circle")
+    .action(async (options: { dir?: string; circle?: string }) => {
+      const dbPath = dependencies.dbPath(options.dir);
+      console.error(`store: ${dbPath}`);
+      const inspection = dependencies.inspect(dbPath);
+      // BEFORE createPort. Opening SQLite CREATES the file, so a typo or stale --dir would leave an
+      // empty store behind and only then report the missing pin (Codex P2, PR #66).
+      if (!inspection.exists) {
+        throw new Error(`no Monet store at ${dbPath} — check --dir, or run \`monet doctor\` to see what is there.`);
+      }
+      /*
+       * AN ACTIVE MIGRATION MAKES THE PIN A PROMISE, NOT A FACT (Codex P2, PR #66).
+       *
+       * A migration stamps the TARGET pin before every vector is rewritten — the repair-cli recovery
+       * fixture sets exactly that state, target pin with vectors_rewritten = 0. Selecting the provider
+       * from that pin would rebuild target-space segments over prior-space observation vectors, which
+       * is the same-space invariant this command exists to restore, violated by the command itself.
+       */
+      /*
+       * INTEGRITY BEFORE ANY WRITE (Codex P2, PR #66). resegmentObservations DELETEs and re-INSERTs
+       * segment rows; doing that in a database SQLite has already reported as corrupt mutates
+       * damage. `ensureInspectableForRepair` refuses this state on the repair path — the recovery
+       * path had no reason to be more permissive than the thing it recovers from.
+       */
+      if (inspection.integrity.status !== "ok") {
+        throw new Error(
+          `the store integrity result is ${integrityLabel(inspection)}; refusing to rewrite segments in it. ` +
+          `Restore from a backup, or run \`${doctorCommand(dbPath)}\` for the full report.`,
+        );
+      }
+      if (inspection.migration.status !== "none") {
+        /*
+         * PROVEN INACTIVE, not merely not-active (Codex P2). `unknown` means the sentinel could not
+         * be read — the pin may still name an uncompleted target, and rebuilding from it would mix
+         * target-space segments with prior-space observation vectors: the same-space invariant this
+         * command exists to restore, broken by the command itself.
+         *
+         * EACH BRANCH ADVERTISES ONLY A COMMAND THAT CAN RUN (Codex P2, round 3). `--resume` is
+         * reachable only for an `active` sentinel: `ensureInspectableForRepair` rejects every
+         * `unknown` migration BEFORE resume handling, so offering it there is guaranteed to fail.
+         * Abandon is offered only when inspection classified it `safe`, since the repair path
+         * accepts no other classification. Both carry --dir, or the operator repairs a different
+         * store than the one just inspected.
+         */
+        if (inspection.migration.status === "active") {
+          const canAbandon = inspection.migration.abandon.classification === "safe";
+          throw new Error(
+            "a migration is in progress; the pin may already name its target while vectors are still in the " +
+            `previous space. Finish it with \`${resumeCommand(dbPath, true)}\`` +
+            (canAbandon ? `, or clear it with \`${abandonCommand(dbPath, true)}\`` : "") +
+            ", then resegment.",
+          );
+        }
+        throw new Error(
+          `the migration sentinel could not be read (${inspection.migration.reason}), so the pin cannot be trusted ` +
+          `to describe the vectors. Repair cannot resume an unreadable sentinel either — diagnose with ` +
+          `\`${doctorCommand(dbPath)}\` or restore from a backup first.`,
+        );
+      }
+      const modelId = inspection.pin.status === "known" ? inspection.pin.modelId : undefined;
+      if (!modelId) throw new Error(`this store has no embedder pin; run \`${doctorCommand(dbPath)}\` first`);
+      /*
+       * A MATCHING PIN NAME IS NOT A MATCHING SPACE (Codex P2, PR #66).
+       *
+       * Segments must be embedded by the same provider the store's vectors are in. The pin says
+       * which model that is, but says nothing about whether the provider that loads under that name
+       * actually produces vectors of the stored width — a store whose live vectors are 384-wide and
+       * a provider that now declares 768 both answer to one pin string. Writing segments then puts
+       * two widths in one comparison, which is the invariant this command exists to restore.
+       *
+       * `checkProvider` proves identity and probe output; `reconcileProviderWithStore` proves the
+       * declared width against the store's uniform live width. Repair runs exactly this pair before
+       * it rewrites anything, and so does this.
+       */
+      const { result: providerResult, provider } = await checkProvider(modelId, dependencies);
+      if (providerResult.loadStatus !== "available" || provider === undefined) {
+        throw new Error(
+          `the pinned embedder '${modelId}' could not be loaded (${providerResult.reason ?? "unknown reason"}); ` +
+          `refusing to rebuild segments in a space that cannot be produced.`,
+        );
+      }
+      const reconciled = reconcileProviderWithStore(inspection, providerResult).provider;
+      if (reconciled.storeCompatibility !== "compatible") {
+        throw new Error(
+          `the pinned embedder '${modelId}' is not proven compatible with this store's vectors ` +
+          `(${reconciled.storeCompatibility}: ${reconciled.reason ?? "no reason given"}); refusing to write segments ` +
+          `in a space the existing vectors may not share. Run \`${doctorCommand(dbPath, true)}\` for the full report.`,
+        );
+      }
+
+      const port = dependencies.createPort(dbPath);
+      let core: MonetCore | undefined;
+      try {
+        console.error(`embedder: ${modelId}`);
+        core = dependencies.createCore(port, provider);
+        const started = Date.now();
+        const result = await core.resegmentObservations({
+          ...(options.circle ? { circle: options.circle } : {}),
+          onProgress(done, total) {
+            if (done === total || done % 250 === 0) console.error(`  ${done}/${total} observations`);
+          },
+        });
+        console.error(
+          `resegmented ${result.observations} observations into ${result.segments} segments ` +
+          `(${(result.segments / Math.max(result.observations, 1)).toFixed(2)} per observation) ` +
+          `in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+        );
+      } finally {
+        if (core) core.close();
+        else port.close();
+      }
+    });
 
   return program;
 }
