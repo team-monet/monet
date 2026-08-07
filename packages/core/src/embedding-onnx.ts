@@ -200,7 +200,37 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
    * scripts/backfill-observation-segments.ts to make a store uniform at the current value.
    */
   "Xenova/bge-small-en-v1.5": {
-    thresholds: { tauAttach: 0.78, tauAmbiguous: 0.5 },
+    /*
+     * RELATED-EDGE FLOOR, measured in this space with scripts/measure-fork-and-edge-bands.ts on the
+     * live store (284 active concepts, 40,186 pairs). The inherited 0.45 comes from engine.ts's
+     * `semantic ? 0.45 : 0.4` — one number for the whole class of semantic models, which is the
+     * carried-over-constant failure this table exists to prevent. In THIS space it sits well below
+     * the concept-pair median of 0.6000, so it admits most of the corpus:
+     *
+     *   edgeSimMin   related edges   density   max degree   concepts with no edge
+     *         0.45          39,168     97.5%      283/283                       0   <- inherited
+     *         0.50          36,912     91.9%          281                       0
+     *         0.55          30,873     76.8%          276                       0
+     *         0.60          19,949     49.6%          243                       1   <- the pair median
+     *         0.65           8,357     20.8%          174                       9
+     *         0.70           2,092      5.2%           86                      32   <- chosen
+     *
+     * At 0.45 the graph is COMPLETE: one concept is linked to all 283 others, so "most connected"
+     * is not a fact about the corpus. 0.70 is the first point where the population is a minority of
+     * pairs and degree spreads.
+     *
+     * WHAT THIS NUMBER IS NOT. It is not decision-derived like tauAttach or the segment budget,
+     * because after gather's removal (#168) no ranking reads these edges — topConnectedConcepts
+     * excludes `related`/`about` by design, topThread uses `co_occurred`, and both curation queues
+     * use their own edge types. What remains is the overview's per-type count and the dashboard's
+     * force graph, and neither yields an accuracy metric to optimize. So this is a stated display
+     * judgement backed by a density sweep, deliberately not dressed up as a derivation. If these
+     * edges regain a ranking consumer, re-derive it against THAT decision.
+     *
+     * Existing stores keep the edges written under the old floor until rederiveAllConceptGraphs
+     * rebuilds them.
+     */
+    thresholds: { tauAttach: 0.78, tauAmbiguous: 0.5, edgeSimMin: 0.70 },
     readsOnlyLatinScript: true,
     reliableSegmentTokens: 380,
     /*

@@ -172,3 +172,59 @@ describe("card-emission floor reaches search()", () => {
     });
   });
 });
+
+/**
+ * THE THIRD AND LAST CONSTANT IN THE CLASS.
+ *
+ * `edgeSimMin` was the one that never travelled at all: engine.ts picked `semantic ? 0.45 : 0.4`,
+ * a single number for the whole class of semantic models, and the header above names exactly why
+ * that is not evidence about any of them. Measured in bge's space, 0.45 produced a 97.5%-dense
+ * `related` graph in which one concept linked to all 283 others.
+ *
+ * These assert the value ARRIVES from the profile, and that a model with no profile entry still
+ * falls back to the class guess instead of inheriting bge's number — an unmeasured model must not
+ * be silently governed by a measurement taken somewhere else.
+ */
+describe("edgeSimMin travels with the model", () => {
+  const dirs: string[] = [];
+  const core = (embedder: EmbeddingProvider, opts: Record<string, unknown> = {}): MonetCore => {
+    const d = mkdtempSync(join(tmpdir(), "monet-edgemin-"));
+    dirs.push(d);
+    return new MonetCore(join(d, "monet.db"), { embedder, ...opts });
+  };
+  const readEdgeSimMin = (c: MonetCore): number => (c as unknown as { edgeSimMin: number }).edgeSimMin;
+  const stub = (thresholds: EmbeddingProvider["recommendedThresholds"]): EmbeddingProvider => ({
+    dim: 8,
+    modelId: "stub/unprofiled",
+    embed: () => new Float32Array(8),
+    ...(thresholds ? { recommendedThresholds: thresholds } : {}),
+  });
+
+  it("delivers the shipping default's PROFILE value, not the semantic-class guess", () => {
+    const onnx = new OnnxEmbeddingProvider({});
+    expect(onnx.modelId).toBe(DEFAULT_MODEL);
+    expect(onnx.recommendedThresholds?.edgeSimMin).toBe(0.70);
+
+    const c = core(onnx);
+    try {
+      expect(readEdgeSimMin(c)).toBe(0.70);
+      expect(readEdgeSimMin(c)).not.toBe(0.45); // the class guess this replaced
+    } finally { c.close(); }
+  });
+
+  it("falls back to the CLASS guess for a model with no measured value, rather than borrowing one", () => {
+    const semantic = core(stub({ tauAttach: 0.75, tauAmbiguous: 0.5 }));
+    const lexical = core(stub({ tauAttach: 0.55, tauAmbiguous: 0.4 }));
+    try {
+      expect(readEdgeSimMin(semantic)).toBe(0.45);
+      expect(readEdgeSimMin(lexical)).toBe(0.4);
+    } finally { semantic.close(); lexical.close(); }
+  });
+
+  it("still lets an explicit constructor option win over both", () => {
+    const c = core(new OnnxEmbeddingProvider({}), { edgeSimMin: 0.51 });
+    try { expect(readEdgeSimMin(c)).toBe(0.51); } finally { c.close(); }
+  });
+
+  it("cleans up", () => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+});

@@ -9416,9 +9416,15 @@ export class MonetCore {
   private applyEmbedderDerivedThresholds(embedder: EmbeddingProvider): void {
     this.tauAttach = this.explicitThresholdOpts.tauAttach ?? embedder.recommendedThresholds?.tauAttach ?? 0.55;
     this.tauAmbiguous = this.explicitThresholdOpts.tauAmbiguous ?? embedder.recommendedThresholds?.tauAmbiguous ?? 0.4;
-    // A `related` edge needs more overlap than a semantic model implies; bind to the embedder scale.
+    /*
+     * A `related` edge needs more overlap than a semantic model implies. The MEASURED per-model
+     * value wins; the class split below is the fallback for a model nobody has swept, and it is a
+     * guess about the class rather than a fact about the model — on bge it produced a 97.5%-dense
+     * graph, which is why edgeSimMin joined the profile table (see embedding-onnx.ts).
+     */
     const semantic = (embedder.recommendedThresholds?.tauAttach ?? 0) >= 0.7;
-    this.edgeSimMin = this.explicitThresholdOpts.edgeSimMin ?? (semantic ? 0.45 : 0.4);
+    this.edgeSimMin =
+      this.explicitThresholdOpts.edgeSimMin ?? embedder.recommendedThresholds?.edgeSimMin ?? (semantic ? 0.45 : 0.4);
   }
 
   /**

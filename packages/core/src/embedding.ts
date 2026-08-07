@@ -20,7 +20,23 @@
  */
 export interface EmbeddingThresholds {
   tauAttach: number;
+  /**
+   * NEAR-INERT BY CONSTRUCTION, and identical in every profile for that reason — not because it
+   * travels badly, but because nothing lands under it. It is compared against a nomination ARGMAX
+   * over every concept in the circle, and a max of hundreds of draws concentrates just below
+   * whatever tauAttach is calibrated to. Measured on the live bge store (931 replays, 118 forks):
+   * the LOWEST fork scored 0.6953, so every candidate up to 0.65 left 100% of forks in the
+   * ambiguous band and 0.70 separated exactly one. Raising it toward tauAttach is the only way to
+   * give it work, and that trades a possible-duplicate edge for an orphan concept — a worse trade
+   * than the fork it is deciding about. Treat a change here as a design change, not a tuning knob.
+   */
   tauAmbiguous: number;
+  /**
+   * Lower bound of the `related` edge band, `edgeSimMin <= cos < tauAttach`. Per-model because it
+   * is a raw cosine and cosine scales differ by space; omitted means the engine's embedder-class
+   * fallback, which is a guess about the class rather than a measurement of the model.
+   */
+  edgeSimMin?: number;
 }
 
 export interface EmbeddingProvider {
