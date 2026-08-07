@@ -75,10 +75,9 @@ For a **prior Monet store** (`"default"` circle), use `memory_list(circle:"defau
 **Migrating from a _separate_ prior Monet install (its own MCP server, not just a `"default"` circle in this store)?** Register the old server under a distinct name (e.g. `monet-old`) so both are visible in one session. Field caveat: even with distinct names, older models and some MCP clients can still confuse the two servers' identically-named tools (`memory_store`, `memory_search`, …) and read or write the wrong store. If that happens: use a current model for the migration, or do it **one server at a time** — read everything out of the old store in a session where only `monet-old` is connected, then `memory_store` it into the new store in a fresh session where only the new server is connected. Verify each batch by reading it back from the new store before you retire the old one.
 
 ## Phase 3 — Check what's already captured (idempotency)
-Re-runs must not duplicate, and — more importantly — you must not retire a source you only *think* is captured. Verify capture by **reading content back**, not by trusting a single probe:
+Re-runs must not duplicate, and — more importantly — you must not retire a source you only *think* is captured. Verify capture by **reading content back**:
 
-- `memory_search` for the source's distinctive content, then `memory_fetch` the top candidate and confirm the source's actual facts are present. This is the reliable oracle.
-- As a hint, `memory_gather(intent: "<source path/topic>", circle: <target>)` and look at the `sourceRefs` its ranked cards echo — a matching canonical ref means "already captured." Treat this as a *hint only*: gather attaches refs to ranked (not seed) cards and trims by its stop/limit, and some runtimes don't surface refs at all, so a missing ref is **not** proof of "never captured." Always fall back to the content read-back above.
+- `memory_search` for the source's distinctive content, then `memory_fetch` the top candidate and confirm the source's actual facts are present. A card alone is not proof — the facts have to be in the body you read.
 
 Derive a **canonical source reference** per source for the `sourceRefs` you'll store: the absolute file path (or `path#section` for a chunked doc; the full URL for web). Skip or merge anything already captured.
 
@@ -146,7 +145,6 @@ Close the loop plainly: Monet is now the single place to read from; where a runt
 - **Your own file tools** (`Read`/`Glob`/`Bash`) — discover and read sources, follow `@path` imports, and write pointers / move files when retiring. Monet has no file/ingest tool by design (it stays agent-agnostic); you bring the filesystem.
 - `memory_store(content, circle, kind, sourceRefs)` — the **capture** primitive. Pass `circle` = the target and `sourceRefs` = the source's canonical path/URL (provenance + idempotency key). Dedups automatically. Returns `action`: `created` | `attached` | `ambiguous`.
 - `memory_search(query, circle)` / `memory_fetch(id, circle)` — find and **read back** a memory's content (the reliable capture-verification path).
-- `memory_gather(intent, circle)` — context rebuild whose ranked cards echo `sourceRefs` (a *hint* for prior-capture detection; verify with a content read-back).
 - `memory_synthesize(id, body, circle)` — write a coherent body for a freshly-captured (unsynthesized) concept.
 - `memory_overview(circle)` — quick counts + shape of a circle, if your runtime exposes it.
 - `memory_list(circle, withProvenance)` — enumerate every concept in a circle with its card and (for legacy memory) the project path(s) its observations came from. Group legacy memory by provenance + content.
