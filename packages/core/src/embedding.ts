@@ -85,6 +85,13 @@ export interface EmbeddingProvider {
    * per character.
    */
   readonly reliableSegmentTokens?: number;
+  /**
+   * The card-emission floor for search() in this provider's space (src/retrieval.ts).
+   *
+   * An absolute cosine, so it is a property of the SPACE like the bands and the segment budget.
+   * NATIVE_SCORE_FLOOR is the documented fallback; must be finite and in [0, 1) when present.
+   */
+  readonly nativeScoreFloor?: number;
 
   /**
    * Whether this provider reads ONLY Latin-script text (#155).

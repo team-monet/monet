@@ -101,6 +101,8 @@ interface ModelProfile {
   readsOnlyLatinScript?: boolean;
   /** Segment budget measured IN THIS SPACE; omitted means fall back to RELIABLE_EMBED_TOKENS. */
   reliableSegmentTokens?: number;
+  /** search() card-emission floor measured IN THIS SPACE; omitted means fall back to NATIVE_SCORE_FLOOR. */
+  nativeScoreFloor?: number;
 }
 
 /**
@@ -201,6 +203,29 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
     thresholds: { tauAttach: 0.78, tauAmbiguous: 0.5 },
     readsOnlyLatinScript: true,
     reliableSegmentTokens: 380,
+    /*
+     * CARD-EMISSION FLOOR, re-derived for this model with scripts/measure-recall-floor.ts on the same
+     * STARTER_SUITE corpus the 0.12 came from — 20 probe queries, 9 junk queries, observation
+     * granularity. Read the way that script says to: take the highest floor still keeping 100% of
+     * GOLD, then see what it suppresses.
+     *
+     *   floor   gold kept   junk cards suppressed   junk queries fully silent
+     *    0.12       100.0%                   0.0%                       0.0%   <- MiniLM's value
+     *    0.35       100.0%                  18.3%                       0.0%   <- chosen
+     *    0.40        97.1%                  52.5%                       0.0%
+     *    0.50        91.4%                  97.4%                      22.2%
+     *    0.60        54.3%                 100.0%                     100.0%
+     *
+     * GOLD min is 0.3642 and that is the binding constraint, exactly as it was for 0.12.
+     *
+     * WHAT THIS DOES NOT RESTORE. On MiniLM 0.12 bought 100% gold AND 82.2% junk suppression. No bge
+     * floor buys both: GOLD min (0.3642) sits BELOW JUNK p50 (0.3971), so the distributions overlap
+     * and silence on an unanswerable query costs real answers — 0.50 is the first floor that silences
+     * any junk query at all, and it drops 8.6% of gold. Representing "the store knows nothing about
+     * this" is therefore not a constant problem in this space; it needs a relative or margin-based
+     * rule. Tracked in #170.
+     */
+    nativeScoreFloor: 0.35,
   },
 };
 
@@ -213,6 +238,8 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly readsOnlyLatinScript?: boolean;
   /** From MODEL_PROFILES for a known checkpoint; undefined otherwise, so the fallback applies. */
   readonly reliableSegmentTokens?: number;
+  /** From MODEL_PROFILES for a known checkpoint; undefined otherwise, so the fallback applies. */
+  readonly nativeScoreFloor?: number;
   readonly modelId: string;
   private readonly model: string;
   private extractor: Promise<FeatureExtractor> | null = null;
@@ -226,6 +253,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
     this.recommendedThresholds = profile?.thresholds ?? LEGACY_UNMEASURED_THRESHOLDS;
     this.readsOnlyLatinScript = profile?.readsOnlyLatinScript;
     this.reliableSegmentTokens = profile?.reliableSegmentTokens;
+    this.nativeScoreFloor = profile?.nativeScoreFloor;
   }
 
   private load(): Promise<FeatureExtractor> {

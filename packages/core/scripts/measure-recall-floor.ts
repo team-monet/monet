@@ -32,12 +32,17 @@
  */
 import { MonetCore } from "../src/engine";
 import { HashingEmbeddingProvider, cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../src/embedding";
-import { NATIVE_SCORE_FLOOR } from "../src/retrieval";
+import { NATIVE_SCORE_FLOOR, nativeScoreFloorOf } from "../src/retrieval";
 import { STARTER_SUITE, BACKGROUND } from "../src/eval/scenarios";
 import type { StoragePort } from "../src/storage";
 
 const CIRCLE = "default";
-const CANDIDATE_FLOORS = [0.05, 0.1, 0.12, 0.15, 0.2, 0.25];
+// The candidate list must span the space the SHIPPING model's decision actually lives in. The
+// original stopped at 0.25 because that bracketed MiniLM, whose junk p50 was 0.023; bge places
+// junk at p50 0.397, so every candidate here was below its noise floor and the sweep could not
+// show the trade at all. Overridable for a one-off sweep.
+const CANDIDATE_FLOORS = (process.env.FLOORS ?? "0.05,0.1,0.12,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6")
+  .split(",").map(Number);
 
 /** Off-topic in a way no engineering store answers: other domains, and pure noise. */
 const JUNK_QUERIES = [
@@ -106,6 +111,10 @@ const pct = (sorted: number[], p: number): number =>
   sorted.length === 0 ? NaN : sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((p / 100) * (sorted.length - 1))))];
 
 async function measure(label: string, embedder: EmbeddingProvider): Promise<void> {
+  // The floor TRAVELS (#172), so the marker and the warning must resolve the provider's own value.
+  // Marking the module fallback would label the wrong threshold active and stay silent while
+  // search() drops gold sitting between the fallback and the real floor.
+  const effectiveFloor = nativeScoreFloorOf((embedder as { nativeScoreFloor?: number }).nativeScoreFloor);
   const { core, goldByQuery, queries } = await seed(embedder);
   try {
     const db = dbOf(core);
@@ -140,15 +149,15 @@ async function measure(label: string, embedder: EmbeddingProvider): Promise<void
       const keptGold = g.filter((s) => s >= floor).length / g.length;
       const suppressedJunk = j.filter((s) => s < floor).length / j.length;
       const silentQueries = t.filter((s) => s < floor).length / t.length;
-      const mark = floor === NATIVE_SCORE_FLOOR ? "  <== NATIVE_SCORE_FLOOR" : "";
+      const mark = floor === effectiveFloor ? `  <== ACTIVE FLOOR for ${label}` : "";
       console.log(
         `  floor=${floor.toFixed(2)}  gold kept=${(keptGold * 100).toFixed(1)}%` +
         `  junk cards suppressed=${(suppressedJunk * 100).toFixed(1)}%` +
         `  junk queries fully silent=${(silentQueries * 100).toFixed(1)}%${mark}`,
       );
     }
-    if (g[0] < NATIVE_SCORE_FLOOR) {
-      console.log(`\n  WARNING: the weakest genuine match (${f(g[0])}) is BELOW NATIVE_SCORE_FLOOR (${NATIVE_SCORE_FLOOR}) — search would drop it.`);
+    if (g[0] < effectiveFloor) {
+      console.log(`\n  WARNING: the weakest genuine match (${f(g[0])}) is BELOW this provider's ACTIVE floor (${effectiveFloor}) — search would drop it.`);
     }
   } finally {
     core.close();

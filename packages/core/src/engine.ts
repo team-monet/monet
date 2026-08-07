@@ -79,6 +79,7 @@ import {
   scoreNativeConceptsByObservation,
   scoreSourceConcepts,
   type NativeObservationMatch,
+  nativeScoreFloorOf,
 } from "./retrieval";
 import {
   isDecidedResolutionMode,
@@ -4740,6 +4741,9 @@ export class MonetCore {
     // Source rows are NOT floored: #54's file/chunk semantics are untouched by this slice, so a
     // junk query can still return a low-cosine source card while every native row stays silent.
     const nativeMatches = this.scoreNativeConcepts(nativeRows.map((r) => r.id), emb, query);
+    // The floor travels with the embedder: it is an absolute cosine, and where it belongs is a fact
+    // about the space. Read once here rather than at the comparison, so there is one validated read.
+    const floor = nativeScoreFloorOf(this.embedder.nativeScoreFloor);
     return rows
       .map((r) => {
         // The floor and the card both read the RAW cosine; only the ordering reads `rank`, which is
@@ -4750,7 +4754,7 @@ export class MonetCore {
           return { row: r, score: s, rank: s, matchedObservationId: undefined };
         }
         const match = nativeMatches.get(r.id);
-        if (match === undefined || match.score < NATIVE_SCORE_FLOOR) return null;
+        if (match === undefined || match.score < floor) return null;
         return { row: r, score: match.score, rank: match.rank, matchedObservationId: match.observationId };
       })
       .filter((c): c is { row: ConceptRow; score: number; rank: number; matchedObservationId: string | undefined } => c !== null)

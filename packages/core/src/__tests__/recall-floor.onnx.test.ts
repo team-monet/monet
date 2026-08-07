@@ -19,7 +19,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createLocalEmbedder } from "../embedding-onnx";
 import { cosine, isZeroVector, jsonToEmb, type EmbeddingProvider } from "../embedding";
 import { MonetCore } from "../engine";
-import { NATIVE_SCORE_FLOOR } from "../retrieval";
+import { NATIVE_SCORE_FLOOR, nativeScoreFloorOf, scoreNativeConceptsByObservation } from "../retrieval";
 import { STARTER_SUITE, BACKGROUND } from "../eval/scenarios";
 import type { StoragePort } from "../storage";
 
@@ -78,50 +78,70 @@ describe.skipIf(!ENABLED)("NATIVE_SCORE_FLOOR — real MiniLM gate (semantic emb
     else process.env.MONET_EMBEDDER = priorEmbedderEnv;
   });
 
-  /** Observation-granular score per concept — the unit the native arm ranks by. */
-  const observationMax = (emb: Float32Array): Map<string, number> => {
+  /**
+   * SCORE THROUGH THE PRODUCTION SCORER, not a hand-rolled query.
+   *
+   * search() floors `match.score` from scoreNativeConceptsByObservation, whose union reads
+   * observation_segments and EXCLUDES the whole-observation vector wherever segments exist
+   * (retrieval.ts). A hand-rolled `SELECT embedding FROM observations` therefore measures a
+   * different quantity than the one being floored: a long observation's whole vector can clear the
+   * floor while its best SEGMENT — the value search actually compares — does not, so the gate passes
+   * while the genuine result is dropped (Codex P2, PR #172). Reusing the real scorer removes the
+   * possibility of that drift instead of re-deriving it correctly and hoping it stays that way.
+   */
+  const observationMax = (emb: Float32Array, text: string): Map<string, number> => {
     const db = (core as unknown as { db: StoragePort }).db;
-    const rows = db
-      .prepare(
-        `SELECT concept_id, embedding FROM observations
-          WHERE concept_id IS NOT NULL AND kind != 'source'
-            AND superseded_by IS NULL AND superseded_at IS NULL`,
-      )
-      .all() as Array<{ concept_id: string; embedding: string }>;
+    const ids = (db
+      .prepare(`SELECT id FROM concepts WHERE kind != 'source' AND status != 'retired'`)
+      .all() as Array<{ id: string }>).map((r) => r.id);
+    const matches = scoreNativeConceptsByObservation(db, ids, emb, text, embedder.needsLexicalArm === true);
     const best = new Map<string, number>();
-    for (const row of rows) {
-      const vec = jsonToEmb(row.embedding);
-      if (isZeroVector(vec)) continue;
-      const score = cosine(emb, vec);
-      const prior = best.get(row.concept_id);
-      if (prior === undefined || score > prior) best.set(row.concept_id, score);
-    }
+    for (const [id, m] of matches) best.set(id, m.score);
     return best;
   };
 
   it("keeps every genuine match: the weakest gold observation still clears the floor", async () => {
     const goldScores: number[] = [];
+    // PRESENCE BEFORE MINIMUM. scoreNativeConceptsByObservation OMITS a concept whose vectors are all
+    // placeholders or whose best cosine is <= 0 (retrieval.ts). Reading only what the map returned
+    // therefore skips a gold match that became UNREACHABLE — a strictly worse failure than one
+    // sitting below the floor — while `goldScores.length > 0` still passes on the survivors. Assert
+    // every expected pair is present first, so "the weakest retained score" cannot quietly become
+    // "the weakest score among whatever survived" (Codex P2, PR #172).
+    const missing: string[] = [];
     for (const query of queries) {
-      const scores = observationMax(await embedder.embed(query));
+      const scores = observationMax(await embedder.embed(query), query);
       const gold = goldByQuery.get(query)!;
-      for (const [id, score] of scores) if (gold.has(id)) goldScores.push(score);
+      for (const id of gold) {
+        const score = scores.get(id);
+        if (score === undefined) missing.push(`${id} for "${query.slice(0, 48)}"`);
+        else goldScores.push(score);
+      }
     }
+    expect(missing, `gold concepts search can never emit: ${missing.join("; ")}`).toEqual([]);
     expect(goldScores.length).toBeGreaterThan(0);
     const weakest = Math.min(...goldScores);
-    // THE binding constraint on the constant: raise it past the weakest real answer and search
-    // starts silently dropping correct results. Measured at 0.1303 when 0.12 was chosen.
-    expect(weakest).toBeGreaterThanOrEqual(NATIVE_SCORE_FLOOR);
+    // THE binding constraint, checked against the floor THIS PROVIDER ACTUALLY USES. Asserting
+    // against the module fallback would let a profile floor above the weakest gold ship silently:
+    // search would start dropping correct results while this gate — the one that exists to catch
+    // exactly that — stayed green (Codex P2, PR #172). Verified by raising the bge profile to 0.45:
+    // this form fails with "expected 0.3642 to be >= 0.45", the fallback form passes. Measured
+    // 0.1303 when 0.12 was chosen on MiniLM; 0.3642 on bge, which is why its profile floor is 0.35.
+    const effectiveFloor = nativeScoreFloorOf((embedder as { nativeScoreFloor?: number }).nativeScoreFloor);
+    expect(weakest).toBeGreaterThanOrEqual(effectiveFloor);
   }, 120_000);
 
-  // SKIPPED — REAL DEFECT, tracked in monet-core#170. NATIVE_SCORE_FLOOR = 0.12 was derived on
-  // multilingual-MiniLM, whose junk obs-max p50 was 0.023. bge-small-en-v1.5 places unrelated text
-  // at a measured MINIMUM of 0.2630, so nothing in the store can ever fall below 0.12 and the floor
-  // suppresses 0% instead of the documented 82.2%. This is not a threshold to re-tune in place: the
-  // floor is a module constant while every other band travels with the embedder, and the fix is to
-  // extend that travel mechanism. Un-skip when the floor is per-provider and re-derived for bge.
+  // SKIPPED — the floor now travels (PR #172, bge = 0.35), but this assertion's TARGET is
+  // unreachable in this space, which is a different and larger problem. Measured on this corpus:
+  // GOLD min 0.3642 sits BELOW JUNK p50 0.3971, so the distributions overlap. 0.35 keeps 100% of
+  // gold and suppresses 18.3% of junk cards; reaching the 60% this asserts needs ~0.45, which drops
+  // 5.7% of genuine answers, and silencing a junk query outright needs 0.50 and drops 8.6%.
+  // No constant buys what 0.12 bought on MiniLM (100% gold AND 82.2% suppression). Representing
+  // "the store knows nothing about this" needs a relative or margin-based rule, not a number here —
+  // tracked in monet-core#170. Un-skip when that rule exists, with a target derived under it.
   it.skip("suppresses the large majority of null-query noise", async () => {
     const junk: number[] = [];
-    for (const query of JUNK_QUERIES) junk.push(...observationMax(await embedder.embed(query)).values());
+    for (const query of JUNK_QUERIES) junk.push(...observationMax(await embedder.embed(query), query).values());
     expect(junk.length).toBeGreaterThan(0);
     const suppressed = junk.filter((s) => s < NATIVE_SCORE_FLOOR).length / junk.length;
     // Measured at 82.2% when 0.12 was chosen. Asserted loosely (>= 60%) because this is a noise
@@ -138,7 +158,7 @@ describe.skipIf(!ENABLED)("NATIVE_SCORE_FLOOR — real MiniLM gate (semantic emb
   // together — a per-provider floor, and an expectation computed on the ranking key search uses.
   it.skip("search() emits exactly the above-floor native cards, and stays silent when nothing clears", async () => {
     for (const query of queries.slice(0, 5)) {
-      const expected = [...observationMax(await embedder.embed(query)).entries()]
+      const expected = [...observationMax(await embedder.embed(query), query).entries()]
         .filter(([, score]) => score >= NATIVE_SCORE_FLOOR)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 10)

@@ -69,6 +69,24 @@ import type { StoragePort } from "./storage";
  */
 export const NATIVE_SCORE_FLOOR = 0.12;
 
+/**
+ * The card-emission floor to actually use, given what a provider declared.
+ *
+ * The floor is an ABSOLUTE cosine, so where it belongs is a fact about a space — the same reason
+ * recommendedThresholds and reliableSegmentTokens travel. 0.12 was chosen on multilingual-MiniLM,
+ * whose junk obs-max p50 was 0.023. bge-small-en-v1.5 puts junk at p50 0.397, so 0.12 sits below its
+ * entire noise distribution and suppresses 0.0% of junk cards — the constant is not merely mistuned
+ * there, it is unreachable.
+ *
+ * Honoured only when finite and within [0, 1): a cosine floor outside that cannot gate anything, and
+ * a NaN would compare false against every score and silently disable emission filtering entirely.
+ */
+export function nativeScoreFloorOf(declared: number | undefined): number {
+  return typeof declared === "number" && Number.isFinite(declared) && declared >= 0 && declared < 1
+    ? declared
+    : NATIVE_SCORE_FLOOR;
+}
+
 /** The minimum concept shape retrieval scoring reads. engine.ts's ConceptRow satisfies it structurally. */
 export interface ScorableConceptRow {
   id: string;
