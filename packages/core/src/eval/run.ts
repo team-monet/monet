@@ -37,11 +37,15 @@ function parseFlags(argv: string[]): Flags {
 
 async function pickEmbedder(pref: Flags["embedder"]): Promise<{ embedder: EmbeddingProvider; name: string }> {
   if (pref === "hashing") return { embedder: new HashingEmbeddingProvider(), name: "HashingEmbeddingProvider (lexical)" };
-  if (pref === "onnx") process.env.MONET_EMBEDDER = "onnx"; // make createLocalEmbedder throw if MiniLM can't load
+  if (pref === "onnx") process.env.MONET_EMBEDDER = "onnx"; // make createLocalEmbedder throw if the semantic model can't load
   // Eval auto mode intentionally preserves createLocalEmbedder's lexical fallback for reportability.
   const embedder = await createLocalEmbedder();
   const semantic = embedder.constructor.name === "OnnxEmbeddingProvider";
-  return { embedder, name: `${embedder.constructor.name}${semantic ? " (MiniLM, semantic)" : " (lexical fallback)"}` };
+  // The uploaded report is an experimental record, so the label comes from the provider rather
+  // than a literal (Codex review, PR #178): "MiniLM" outlived two default changes here and would
+  // have attributed bge-m3 CLS/q8 numbers to a space that never produced them.
+  const space = embedder.modelId ?? "unnamed space";
+  return { embedder, name: `${embedder.constructor.name}${semantic ? ` (${space}, semantic)` : " (lexical fallback)"}` };
 }
 
 async function main(): Promise<void> {

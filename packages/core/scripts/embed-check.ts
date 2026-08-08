@@ -26,7 +26,10 @@ const cases: Array<[string, string]> = [
 
 async function main(): Promise<void> {
   const e = new OnnxEmbeddingProvider();
-  console.log(`model: all-MiniLM-L6-v2 (${e.dim}-dim)\nbase:  "${BASE}"\n`);
+  // From the provider, never a literal. This line said all-MiniLM-L6-v2 through two default changes,
+  // so every cosine it printed was attributed to a space that had not produced it — on the one script
+  // whose entire output exists to be turned into thresholds.
+  console.log(`model: ${e.modelId ?? "(anonymous provider)"} (${e.dim}-dim)\nbase:  "${BASE}"\n`);
   const base = await e.embed(BASE);
   for (const [label, text] of cases) {
     const v = await e.embed(text);

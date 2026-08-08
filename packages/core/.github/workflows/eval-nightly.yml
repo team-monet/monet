@@ -47,15 +47,21 @@ jobs:
       # ~450MB every night. Unlike the node_modules path this one survives install, so it no longer
       # depends on step ordering. Best-effort: a miss just re-downloads. Any pnpm-lock.yaml change
       # busts the exact key, but the restore-keys prefix still reuses the previous cache.
-      # The cache KEY still says minilm- for historical reasons: renaming it busts the cache and
-      # forces one ~450MB re-download for a cosmetic change. It names the cache, not the model.
+      # THE KEY NAMES THE MODEL, and that is load-bearing rather than cosmetic. It used to say
+      # minilm- for historical reasons, on the argument that it names the cache and not the model —
+      # which held only while the model never changed. A cache entry is immutable, so once the
+      # checkpoint moves, the old key still HITS, restores the previous model's files, and never
+      # takes the newly downloaded one: every run then re-downloads (~570MB for bge-m3) and saves
+      # nothing. Keep the space id here in step with DEFAULT_MODEL; the lockfile hash stays in the
+      # key so a dependency change still rotates, and the restore-keys prefix keeps THIS model's
+      # cache reusable across such rotations.
       - name: Cache the embedding model
         uses: actions/cache@v4
         with:
           path: ~/.monet/models
-          key: minilm-model-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          key: embed-model-Xenova-bge-m3-cls-q8-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
-            minilm-model-${{ runner.os }}-
+            embed-model-Xenova-bge-m3-cls-q8-${{ runner.os }}-
 
       # ONE POSITIONAL FILTER PER FILE. These are substring matches, not globs: "eval.onnx" matches
       # ONLY eval.onnx.test.ts. Every *.onnx.test.ts file gates itself on MONET_EVAL_ONNX and this is

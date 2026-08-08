@@ -17,7 +17,13 @@ vi.mock("@huggingface/transformers", () => ({
     if (process.env.MONET_TEST_ONNX_FAILURE === "1") {
       throw new Error("injected ONNX startup failure");
     }
-    return async () => ({ data: new Float32Array(384) });
+    // The width follows whatever the DEFAULT space declares, read from the provider rather than
+    // written as a literal: a fresh store validates its warmup against that declaration, so a mock
+    // pinned to one checkpoint's width fails every future default of another width — for a reason
+    // that has nothing to do with what these tests are about.
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    const width = new OnnxEmbeddingProvider().dim;
+    return async () => ({ data: new Float32Array(width) });
   }),
 }));
 

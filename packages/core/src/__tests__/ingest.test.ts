@@ -142,11 +142,19 @@ describe("per-call resolution control (Change 1)", () => {
     // nomination decision in that model's own space. The default is 0.70, not the 0.72 this test
     // used to pin: 0.72 was never measured on this checkpoint at all — it was inherited from
     // all-MiniLM-L6-v2 and left in place across the multilingual swap.
-    // The DEFAULT checkpoint carries its own measured band and its script restriction.
+    // The DEFAULT space carries its own measured band. It is MULTILINGUAL and therefore declares no
+    // script restriction — pinned here as an assertion about the default, since a store that adopts
+    // it accepts non-Latin content permanently and that is the property most worth catching a silent
+    // change to. The English-only checkpoint it replaced is asserted below, band and restriction
+    // together, so both directions stay covered.
     const onnx = new OnnxEmbeddingProvider();
-    expect(onnx.recommendedThresholds.tauAttach).toBe(0.78);
+    expect(onnx.recommendedThresholds.tauAttach).toBe(0.70);
     expect(onnx.recommendedThresholds.tauAmbiguous).toBe(0.5);
-    expect(onnx.readsOnlyLatinScript).toBe(true);
+    expect(onnx.readsOnlyLatinScript).toBeUndefined();
+
+    const english = new OnnxEmbeddingProvider({ model: "Xenova/bge-small-en-v1.5" });
+    expect(english.recommendedThresholds.tauAttach).toBe(0.78);
+    expect(english.readsOnlyLatinScript).toBe(true);
 
     // The multilingual checkpoint it replaced has a DIFFERENT measured band (its space runs lower)
     // and no script restriction. Carrying either model's number to the other is the mistake #155

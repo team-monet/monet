@@ -49,12 +49,12 @@ export function resolveModelCacheDir(): string {
  * no external service, no Ollama. The model loads lazily on first `embed()` and is
  * cached on disk after the first download.
  *
- * Default: DEFAULT_MODEL — see its own note for what it is and why. Every default this class has
- * carried has been 384-dim, so a store's vector WIDTH survives a change of default; the vectors
- * themselves never do, which is what embedder_migration exists for. Per-checkpoint properties
- * (bands, script restriction) live in MODEL_PROFILES rather than on this class, because they are
- * facts about a space and not about a provider. This is async by nature — which is exactly why the
- * engine's write path (`store`/`search`) is async.
+ * Default: DEFAULT_MODEL — see its own note for what it is and why. Every default before this one was
+ * 384-dim, so a store's vector WIDTH used to survive a change of default; at 1024 it no longer does,
+ * and the vectors never did either — which is what embedder_migration exists for. Per-space
+ * properties (width, pooling, dtype, bands, script restriction) live in MODEL_PROFILES rather than on
+ * this class, because they are facts about a space and not about a provider. This is async by nature
+ * — which is exactly why the engine's write path (`store`/`search`) is async.
  *
  * `@huggingface/transformers` is an OPTIONAL dependency, imported dynamically through a
  * non-literal specifier so (a) the default lexical provider never pulls it in and
@@ -62,8 +62,17 @@ export function resolveModelCacheDir(): string {
  * installed throws from `embed()` with an install hint.
  */
 interface FeatureExtractor {
-  (text: string, opts: { pooling: "mean"; normalize: boolean }): Promise<{ data: Float32Array }>;
+  (text: string, opts: { pooling: Pooling; normalize: boolean }): Promise<{ data: Float32Array }>;
 }
+
+/**
+ * How a checkpoint turns token states into ONE vector. Not a preference: each model was TRAINED
+ * with one of these, and its published cosine behaviour is a fact about that choice. bge-small and
+ * the MiniLMs are mean-pooled; the bge-m3 family reads its dense vector off the CLS token. Pooling a
+ * model the other way still returns 1024 finite floats, so nothing downstream can catch it — it just
+ * silently measures a space the model was never trained to produce.
+ */
+export type Pooling = "mean" | "cls";
 
 interface Tokenizer {
   encode: (text: string) => unknown[];
@@ -72,7 +81,7 @@ interface Tokenizer {
 }
 
 interface TransformersModule {
-  pipeline: (task: string, model: string, opts: { cache_dir: string }) => Promise<unknown>;
+  pipeline: (task: string, model: string, opts: { cache_dir: string; dtype?: string }) => Promise<unknown>;
   AutoTokenizer: { from_pretrained: (model: string, opts: { cache_dir: string }) => Promise<Tokenizer> };
 }
 
@@ -82,6 +91,15 @@ interface TransformersModule {
  * whole guard exists to prevent, one layer up.
  */
 const UNKNOWN_WINDOW = null;
+
+/**
+ * What transformers.js loads when no dtype is asked for, on the only runtime this package supports.
+ * Its own mapping assigns q8 to wasm and falls through to fp32 everywhere else; monet-core is
+ * Node-only by construction (better-sqlite3), so "everywhere else" is the only branch reachable here.
+ * Named so an omitted profile dtype and an explicitly-stated fp32 compare as the same space rather
+ * than as a departure from it.
+ */
+const EFFECTIVE_DEFAULT_DTYPE = "fp32";
 
 /**
  * What is known about a specific checkpoint, as opposed to about this provider CLASS.
@@ -97,6 +115,58 @@ const UNKNOWN_WINDOW = null;
  */
 interface ModelProfile {
   thresholds: EmbeddingThresholds;
+  /**
+   * Output width of THIS checkpoint. Omitted means the class default (384), which every model this
+   * file has ever named happens to share — so no entry declares it yet and nothing changes by its
+   * absence. A checkpoint of another width MUST declare it: the declared width is what
+   * validateEmbeddingProviderOutput checks embed() against, so a fresh store on an undeclared
+   * non-384 model fails its own warmup and never opens. (A PINNED store survives that gap by
+   * measuring the real width off the warmup — see instantiateEmbedderForPin's FIX J — which is why
+   * a hand-pinned wide model works today while a fresh one would not.)
+   */
+  dim?: number;
+  /**
+   * How this checkpoint was TRAINED to reduce token states to one vector; omitted means "mean", the
+   * pooling every model named here until now was trained with. Never a preference — see Pooling.
+   */
+  pooling?: Pooling;
+  /**
+   * Weight precision to load at; omitted leaves transformers.js's own default (fp32 off the browser).
+   * Declared here rather than passed by a caller because it is a property of the SPACE, exactly like
+   * pooling: two dtypes of one checkpoint produce different vectors.
+   *
+   * A PROFILE THAT DECLARES A NON-DEFAULT POOLING OR DTYPE MUST BE KEYED BY A SPACE ID, not by the
+   * bare hub id — see `checkpoint`. Otherwise the store's pin would name the checkpoint while the
+   * build silently decided the rest of the space, and changing this field would move every pinned
+   * store's vectors without changing anything the migration machinery can see.
+   */
+  dtype?: string;
+  /**
+   * The hub id (or path) to actually LOAD, when this profile's key is a space id rather than a
+   * checkpoint id. Omitted means the key is itself what gets loaded, which is the case for every
+   * profile whose space is fully described by its checkpoint alone.
+   *
+   * WHY SPACE IDS EXIST. A store's pin is its entire record of which space its vectors occupy, and
+   * equality on that string is what the migration machinery, the graft check, and repair all reason
+   * with. A checkpoint id under-describes the space as soon as pooling or dtype is a choice: one id,
+   * several incompatible vector sets. The hashing provider solved this long ago by naming the
+   * tokenizer version in the pin itself (`hashing:dim=256:tok=1`); this is the same move for ONNX.
+   * So `Xenova/bge-m3:cls:q8` is a KEY here, not a string anyone parses — the profile it selects
+   * carries the pooling, the dtype and the checkpoint to load, which is why no id-parsing exists (and
+   * why a Windows path full of colons cannot be mistaken for a decorated id).
+   *
+   * WHAT IT BUYS AT AN UPGRADE, which is the point. A store pinned to the bare `Xenova/bge-m3` was
+   * written in the hand-pinned mean space; a build that now ships `Xenova/bge-m3:cls:q8` does NOT
+   * match that pin, so it keeps serving the old space through the old profile and the operator has a
+   * real `monet repair --target Xenova/bge-m3:cls:q8` to run. Without the decoration the pin would
+   * match, and the new build would start writing CLS vectors into a mean store with nothing anywhere
+   * able to notice. Fail-closed on the way down, too: an OLDER build handed a decorated pin cannot
+   * load it and refuses to serve, rather than guessing at a checkpoint.
+   *
+   * DECORATE ONLY WHERE THE SPACE NEEDS IT. Every profile whose pooling is the default and whose
+   * dtype is unset stays keyed by its bare hub id, so no store pinned before this existed moves.
+   */
+  checkpoint?: string;
   /** Declared only where the model genuinely cannot read other scripts; see EmbeddingProvider. */
   readsOnlyLatinScript?: boolean;
   /** Segment budget measured IN THIS SPACE; omitted means fall back to RELIABLE_EMBED_TOKENS. */
@@ -113,30 +183,31 @@ interface ModelProfile {
 const LEGACY_UNMEASURED_THRESHOLDS: EmbeddingThresholds = { tauAttach: 0.72, tauAmbiguous: 0.5 };
 
 /**
- * The checkpoint a NEW store pins to (#155).
+ * The space a NEW store pins to.
  *
- * bge-small-en-v1.5 over the multilingual MiniLM it replaces, measured on the live corpus at every
- * layer that matters: concept-level search R@1 56.0% -> 65.8% on short queries and 56.4% -> 75.5%
- * on long ones, nomination argmax 67.1% -> 72.8%, exact-observation recall 90.4% -> 97.4%. It is a
- * QUARTER the parameters and keeps the same 384 width, so it costs less to run and a migration is a
- * re-embed rather than a width change.
+ * bge-m3 at CLS/q8 over the bge-small-en-v1.5 it replaces — and the case for it is NOT that it
+ * retrieves better, because on English it does not. Measured as the nomination decision, it is a tie
+ * there (74.2% vs 74.4% on example-circle, 1 replay of 745) while costing 3x the embed latency and 2.4x the
+ * resident memory. On a Korean-heavy corpus it wins by 4.1 points, and that gap is the entire
+ * quality argument. See its profile entry for every table behind those numbers.
  *
- * The two 768-dim candidates measured alongside it (bge-base-en, multilingual-e5-base) land within
- * 1.6 points on both query shapes — inside the standard error at n=739. The choice is therefore a
- * cost decision, not a quality one, and that is only visible because the comparison was run at the
- * layer the decision affects rather than on the near-saturated one.
+ * WHAT DECIDES IT IS THE ASYMMETRY, not the average. A pin is permanent until an explicit migration,
+ * and bge-small declares readsOnlyLatinScript — so a fresh store that adopts it REFUSES non-Latin
+ * content at write and query time, forever, and a store that later needs Korean has to be migrated
+ * with content already stranded. The reverse error costs latency and memory on a store that turns
+ * out to be all English. One of those is recoverable by paying more; the other is recoverable only by
+ * rewriting every vector, and only if the content was never refused in the first place. A default is
+ * exactly the decision that should be made under that asymmetry, because it is the decision made
+ * BEFORE anyone knows what the store will hold.
  *
- * ENGLISH-ONLY, and that is a real constraint rather than a footnote: this checkpoint declares
- * readsOnlyLatinScript, so a store pinned to it REFUSES non-Latin content at write and query time.
- * The store's content is English by ratified preference and the multilingual reason (an Obsidian
- * vault reached through the source pipeline) no longer applies, but any EXISTING store holding
- * non-Latin content must deal with that content before migrating — a pinned store's vectors cannot
- * be rescued after the fact.
+ * The runtime price is real and is not hidden: ~570MB on disk, ~840MB resident, ~30ms per embed
+ * against bge-small's ~130MB / ~490MB / ~10ms. An operator who knows their store is English-only and
+ * wants the cheaper space can still pin it explicitly.
  *
  * CHANGING THIS DOES NOT MOVE AN EXISTING STORE. A store that has minted a pin keeps it until an
  * explicit embedder migration; this only decides what a fresh store adopts.
  */
-export const DEFAULT_MODEL = "Xenova/bge-small-en-v1.5";
+export const DEFAULT_MODEL = "Xenova/bge-m3:cls:q8";
 
 const MODEL_PROFILES: Record<string, ModelProfile> = {
   /*
@@ -257,6 +328,209 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
      */
     nativeScoreFloor: 0.35,
   },
+  /*
+   * MULTILINGUAL, 1024-dim, CLS-pooled, loaded at q8. Adopted because a store whose content is
+   * substantially Korean had already been hand-pinned to it and was being served with every band
+   * borrowed from a model it is not — see each field below for what was measured and where.
+   *
+   * WHAT THIS CHECKPOINT ACTUALLY BUYS, measured as the nomination DECISION (leave-one-out argmax,
+   * scripts/measure-attach-thresholds.ts) on two corpora rather than one, because a profile governs
+   * every store and the two disagree:
+   *
+   *   corpus                          bge-small-en-v1.5   bge-m3 (cls, q8)
+   *   coda      (56% Korean, n=293)              63.5%              67.6%
+   *     └ excluding blob concepts                51.1%              56.1%
+   *   example-circle  (English,    n=745)              74.4%              74.2%
+   *     └ excluding blob concepts                68.8%              68.3%
+   *
+   * So it is not a better model, it is a model that reads the content. On English it is a TIE — 1
+   * replay of 745, well inside the noise this corpus can resolve — and it costs 3x the embed latency
+   * (10ms -> 30ms) and 2.4x the resident memory (491MB -> 839MB) to hold that tie. The English number
+   * is the honest reason NOT to reach for this on an English store, and the Korean number is the
+   * whole reason it is here. bge-small was never a legal option on that store anyway: it declares
+   * readsOnlyLatinScript, so its 63.5% is what a Latin-only model scores when made to read Korean
+   * regardless, not an alternative anyone could ship there.
+   *
+   * NO readsOnlyLatinScript, DELIBERATELY. XLM-RoBERTa vocabulary, 100+ languages. Its ABSENCE is
+   * what has been letting Korean writes through on the hand-pinned store, which was luck rather than
+   * policy; declared here, the same permission is a decision. Storage language is a ratified
+   * preference enforced elsewhere, and this field was never the mechanism for it — it says what the
+   * model can READ, and refusing content it reads fine would be a lie about the space.
+   */
+  /*
+   * THE HAND-PINNED SPACE, named so it stops being an accident. Before this table knew the checkpoint
+   * at all, a store was pinned to the bare id by hand and served with every band borrowed: mean
+   * pooling (the class default, and NOT what this model was trained for), the labelled legacy
+   * thresholds, MiniLM's card floor, multilingual-MiniLM's segment budget. Its vectors are real and
+   * self-consistent, so this entry describes that space rather than condemning it — the width and the
+   * pooling are what those vectors actually are, and the thresholds stay the legacy pair because
+   * nothing was ever measured here.
+   *
+   * IT IS NOT AN OPTION ANYONE SHOULD CHOOSE. `Xenova/bge-m3:cls:q8` below is the measured space; this
+   * exists so a store already holding these vectors keeps serving, and keeps serving under a profile
+   * that says out loud what it is, until `monet repair --target Xenova/bge-m3:cls:q8` moves it.
+   *
+   * ONE MEASURED FACT ABOUT IT, from the same replay that chose the pooling: tauAttach is inert in
+   * this space. Every candidate from 0.40 to 0.72 scored identically with 0.0% forks, so a store here
+   * attaches 100% of arriving observations and 35.2% of them land on the wrong concept.
+   */
+  "Xenova/bge-m3": {
+    dim: 1024,
+    pooling: "mean",
+    thresholds: LEGACY_UNMEASURED_THRESHOLDS,
+  },
+  "Xenova/bge-m3:cls:q8": {
+    checkpoint: "Xenova/bge-m3",
+    dim: 1024,
+    /*
+     * CLS, from the checkpoint's own model card, and confirmed to matter here rather than taken on
+     * faith. Same corpus, same segments, same lexical arm — only the pooling differs (n=293, coda):
+     *
+     *            argmax   excluding blobs   size 2-4   size 5-9   size 20+
+     *   mean      64.8%             52.3%      53.6%       9.5%      81.8%
+     *   cls       67.9%             56.1%      57.1%      14.3%      84.5%
+     *
+     * +3.1 points overall and +3.8 excluding blobs is 9 and 5 replays — small, and it is the SIGN
+     * holding across every size bin that carries this, not the margin in any one of them.
+     *
+     * The larger finding is not in the accuracy column at all: under mean pooling tauAttach is INERT
+     * on this corpus. Every candidate from 0.40 to 0.72 produced an identical row and 0.0% forks —
+     * every nomination scored above the bar — so a mean-pooled store attaches 100% of incoming
+     * observations and 35.2% of them land on the wrong concept, which resolution.ts's own asymmetry
+     * calls the unrecoverable direction. Pooling the model the way it was trained is what gives the
+     * threshold a live range back (0.65 -> 3.4% fork, 0.70 -> 8.2%, 0.75 -> 15.0%).
+     */
+    pooling: "cls",
+    /*
+     * q8, not fp32. Same replay, same corpus, both pooled CLS (n=293, coda):
+     *
+     *           argmax   excluding blobs   ms/embed   process RSS   on disk
+     *   fp32     67.9%             56.1%       49ms        1757MB     2.1GB
+     *   q8       67.6%             56.1%       30ms         839MB     570MB
+     *
+     * One replay apart overall and identical once blobs are excluded, while costing 40% less time and
+     * 918MB less memory — on a local always-on server that is not a close call. The int8 kernels are
+     * FASTER than fp32 on CPU, so this is not the usual accuracy-for-speed trade; there is no
+     * measurable accuracy to trade.
+     */
+    dtype: "q8",
+    /*
+     * SEGMENT BUDGET 768, and it REVERSES the finding it inherits. bge-small chose 380 and measured
+     * 512 as worse; this model's window is 8192 rather than 512, and the sweep runs the other way.
+     * Same method as that one: re-segment a copy of the corpus at each budget through the engine's
+     * own resegmentObservations, then replay leave-one-out nomination over it.
+     *
+     *   example-circle, 745 replays          segs/obs   argmax   correct@0.70   WRONG   fork
+     *      280 (the current fallback)      2.38    68.6%          64.2%   18.0%  17.9%
+     *      380 (bge-small's value)         1.82    71.1%          67.5%   16.9%  15.6%
+     *      512                             1.45    70.5%          68.2%   15.8%  16.0%
+     *      768                             1.11    72.3%          71.1%   16.9%  11.9%   <- chosen
+     *     1024                             1.04    71.9%          70.3%   18.1%  11.5%
+     *
+     * (argmax = threshold-independent, excluding blob concepts.) It rises to 768 and flattens; 1024
+     * buys nothing because by then there is almost nothing left to split.
+     *
+     * READ WHAT 768 ACTUALLY MEANS HERE: 1.11 segments per observation. The best budget for this
+     * model is the one where the bounded retrieval unit mostly stops dividing — #155 built that
+     * apparatus for a 512-token window, and a model with sixteen times the window does better when it
+     * is allowed to see the observation whole. That is a statement about this corpus's observation
+     * lengths as much as about the model, and it should be re-run if either changes.
+     *
+     * coda CANNOT DECIDE THIS, and the honest record says so rather than averaging it in: its
+     * observations are short enough that every budget lands within 1.5 points (56.1% at 280 down to
+     * 55.0% at 768 — one or two replays), and 768 and 1024 produce byte-identical output because
+     * nothing splits at either. A corpus that cannot exhibit the effect is not evidence about it.
+     */
+    reliableSegmentTokens: 768,
+    /*
+     * tauAttach 0.70, re-derived AT the budget above rather than left where the earlier pass put it —
+     * the budget moves behaviour near the threshold, so a tau measured at another budget is a tau
+     * measured somewhere else. It did not move, which is worth stating plainly: the same 0.70 chosen
+     * at the inherited 280/380 segmentation survives the sweep that replaced it.
+     *
+     * Swept at LEXICAL_BOOST 1.0, reading DOWN the wrong-attach column and stopping where a
+     * recoverable fork stops paying for an unrecoverable wrong attach (resolution.ts's asymmetry):
+     *
+     *   example-circle @768 (n=745)                    coda @768 (n=293)
+     *   tau    correct  WRONG   fork             tau    correct  WRONG   fork
+     *   0.64     77.2%  22.3%   0.5%             0.64     66.2%  30.7%   3.1%
+     *   0.66     76.2%  21.2%   2.6%             0.66     66.2%  29.0%   4.8%
+     *   0.68     74.1%  19.9%   6.0%             0.68     65.5%  28.3%   6.1%
+     *   0.70     71.1%  16.9%  11.9%   <-        0.70     63.5%  27.3%   9.2%   <- chosen
+     *   0.72     64.2%  13.6%  22.3%             0.72     62.5%  26.3%  11.3%
+     *
+     * example-circle is the corpus that discriminates, and its exchange rate (correct lost per wrong
+     * removed) reads 0.91 at 0.64->0.66, 1.62 at 0.66->0.68, 1.00 at 0.68->0.70, then 2.09 at
+     * 0.70->0.72. The precedent this file already set on bge-small took 1.24 and refused 2.6, which
+     * puts the stop exactly at 0.70. coda's curve is flat enough that 0.68 through 0.72 are all
+     * defensible on it (its own rate is 2.0 at 0.68->0.70), so it neither picks nor contradicts.
+     *
+     * tauAmbiguous stays 0.5 and is INERT here, on both corpora and for the same reason it is inert
+     * on bge-small (#174): the lowest score any fork reached was 0.6298 on example-circle and 0.5296 on
+     * coda, so every fork already clears 0.5 and earns its possible-duplicate edge. Nothing measured
+     * says where a different line belongs, so nothing here invents one.
+     *
+     * edgeSimMin 0.60, measured with scripts/measure-fork-and-edge-bands.ts on stores whose CONCEPT
+     * vectors are in this space — which is the whole trick, and a first pass got it wrong. Concept
+     * vectors are rewritten by migrateEmbeddings' reembedConcept phase and NOT by the re-embed fixture
+     * script, so a corpus prepared that way answers this question with its OLD concept vectors while
+     * looking entirely healthy. Measured that way this space appeared compressed high (pair median
+     * 0.7082, complete graph at every candidate floor) and the honest-looking conclusion was that no
+     * selective floor exists here. Both were artefacts of mean-pooled concept vectors.
+     *
+     *   coda (271 concepts, 36,585 pairs)      example-circle (286 concepts, 40,755 pairs)
+     *   pair median 0.4217                     pair median 0.5246
+     *   floor  density  maxdeg  isolated       floor  density  maxdeg  isolated
+     *    0.45    35.2%     217      0.0%        0.45    87.3%     282      0.0%   <- the class guess
+     *    0.50    17.5%     132      0.7%        0.50    64.6%     269      0.0%
+     *    0.55     8.7%      67      1.5%        0.55    34.9%     219      0.3%
+     *    0.60     4.7%      45      8.1%        0.60    13.6%     134      2.4%   <- chosen
+     *    0.65     2.4%      39     24.0%        0.65     4.6%      71     11.5%
+     *    0.70     0.8%      29     49.8%        0.70     1.3%      32     44.4%
+     *
+     * bge-small's rule was "the first point where the population is a minority of pairs and degree
+     * spreads", and it accepted 11% of concepts left with no edge at all. 0.60 satisfies that on BOTH
+     * corpora; 0.65 would satisfy it on example-circle while isolating a quarter of coda's concepts. The
+     * inherited 0.45 is what the class guess would give, and on example-circle it links 87.3% of all pairs
+     * with one concept touching 282 of 285 — "most connected" would not be a fact about the corpus.
+     *
+     * SAME STANDING AS bge-small's, deliberately: this is a display judgement backed by a density
+     * sweep, not a decision-derived band, because after gather's removal (#168) no ranking reads these
+     * edges. If they regain a ranking consumer, re-derive against THAT decision — and #175 is asking
+     * the prior question of whether they should be written at all.
+     */
+    thresholds: { tauAttach: 0.70, tauAmbiguous: 0.5, edgeSimMin: 0.60 },
+    /*
+     * CARD-EMISSION FLOOR 0.40, from scripts/measure-recall-floor.ts on the same STARTER_SUITE corpus
+     * every other floor here came from — 20 probe queries, 9 junk queries, observation granularity.
+     * Read as that script says: take the highest floor still keeping 100% of GOLD, then see what it
+     * suppresses.
+     *
+     *   floor   gold kept   junk cards suppressed   junk queries fully silent
+     *    0.12       100.0%                   0.0%                       0.0%   <- the fallback
+     *    0.35       100.0%                  82.7%                       0.0%
+     *    0.40       100.0%                  98.2%                      33.3%   <- chosen
+     *    0.45        94.3%                  99.8%                      77.8%
+     *    0.50        80.0%                 100.0%                     100.0%
+     *
+     * GOLD min is 0.4285 and is the binding constraint, leaving 0.028 of margin — wider than the
+     * 0.014 bge-small's own floor was chosen with.
+     *
+     * THIS SPACE CAN SAY "I KNOW NOTHING ABOUT THAT", AND bge-small's COULD NOT. That is the finding,
+     * not the number. On bge-small the GOLD minimum (0.3642) sits BELOW the JUNK median (0.3971), so
+     * the two populations overlap and no constant separates them — its note says silence costs real
+     * answers, and #170 tracks the consequence. Here GOLD min (0.4285) clears JUNK p95 (0.3847) and
+     * even JUNK max is only 0.4697, so one constant keeps every real answer while silencing a third of
+     * the unanswerable queries outright. #170 asked for a relative or margin-based rule because a
+     * constant could not work in THAT space; in this one a constant does.
+     *
+     * WHAT THIS FIXTURE CANNOT SHOW, and it is the same limit its own predecessors carried:
+     * STARTER_SUITE is 20 English probes. For a checkpoint whose entire reason for being here is that
+     * it reads Korean, an English-only fixture cannot exhibit the behaviour that matters most, so
+     * this floor is derived where it is derivable and is not evidence about cross-lingual queries.
+     */
+    nativeScoreFloor: 0.40,
+  },
 };
 
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
@@ -270,20 +544,70 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly reliableSegmentTokens?: number;
   /** From MODEL_PROFILES for a known checkpoint; undefined otherwise, so the fallback applies. */
   readonly nativeScoreFloor?: number;
-  readonly modelId: string;
+  /**
+   * The SPACE this instance produces — the store's pin. A space id where one is needed; see
+   * ModelProfile.checkpoint.
+   *
+   * UNDEFINED WHEN AN OVERRIDE MOVED THE SPACE OFF ITS PROFILE, which is the honest answer rather
+   * than a missing feature. `pooling` and `dtype` can be passed per instance so a candidate space can
+   * be measured before any profile adopts it — but such an instance produces vectors that NO id
+   * names, and reporting the undecorated model id would be a lie a store could persist: a fresh store
+   * would pin to it, and the next process would reconstruct that pin from the profile, load the
+   * declared pooling, and write a second space into the same table with nothing able to notice
+   * (Codex review, PR #178, P1). An absent modelId is already a state this codebase handles
+   * deliberately — the engine calls it an anonymous embedder and refuses to persist it as a pin (see
+   * backfillEmbedderPin's "EMPTY STORE + ANONYMOUS EMBEDDER"), so a measurement provider simply
+   * cannot back a store. Overriding `dim` alone does NOT anonymize: it is declarative only, and
+   * instantiateEmbedderForPin's measure-and-adopt path re-declares it while satisfying a real pin.
+   */
+  readonly modelId: string | undefined;
   private readonly model: string;
+  /** What transformers.js is asked to load — and therefore what is CACHED, which recovery advice must name. */
+  readonly checkpoint: string;
+  /** From MODEL_PROFILES for a known checkpoint; "mean" otherwise — see Pooling for why it matters. */
+  private readonly pooling: Pooling;
+  /**
+   * Weight precision, from MODEL_PROFILES for a known checkpoint and overridable per instance so a
+   * candidate dtype can be measured before any profile adopts it. See ModelProfile.dtype for why the
+   * profile — not the caller — is where a SHIPPING dtype belongs, and what that leaves unclosed.
+   */
+  private readonly dtype?: string;
   private extractor: Promise<FeatureExtractor> | null = null;
   private tokenizer: Promise<Tokenizer> | null = null;
 
-  constructor(opts: { model?: string; dim?: number } = {}) {
+  constructor(opts: { model?: string; dim?: number; pooling?: Pooling; dtype?: string } = {}) {
     this.model = opts.model ?? DEFAULT_MODEL;
-    this.dim = opts.dim ?? 384;
-    this.modelId = this.model;
     const profile = MODEL_PROFILES[this.model];
-    this.recommendedThresholds = profile?.thresholds ?? LEGACY_UNMEASURED_THRESHOLDS;
+    this.checkpoint = profile?.checkpoint ?? this.model;
+    this.dim = opts.dim ?? profile?.dim ?? 384;
+    this.pooling = opts.pooling ?? profile?.pooling ?? "mean";
+    this.dtype = opts.dtype ?? profile?.dtype;
+    // Identity survives an override that AGREES with the profile — passing the value already in
+    // force names the same space and is how a measurement script pins one arm explicitly — and is
+    // surrendered by one that disagrees. See modelId's own note for why silence beats a wrong name.
+    // Both comparisons run against the EFFECTIVE value, not the declared one, so naming a default
+    // explicitly is never mistaken for departing from it (Codex review, PR #178 round 3). An omitted
+    // profile pooling is "mean" and an omitted dtype is what transformers.js loads off the browser,
+    // which is fp32 — true here because monet-core is Node-only by construction (better-sqlite3), so
+    // the wasm default this would otherwise have to reason about cannot arise.
+    const movedOffProfile =
+      (opts.pooling !== undefined && opts.pooling !== (profile?.pooling ?? "mean"))
+      || (opts.dtype !== undefined && opts.dtype !== (profile?.dtype ?? EFFECTIVE_DEFAULT_DTYPE));
+    this.modelId = movedOffProfile ? undefined : this.model;
+    // AND THE CALIBRATED NUMBERS GO WITH IT (Codex review, PR #178 round 2). tauAttach, edgeSimMin,
+    // the segment budget and the card floor were each measured by replaying a corpus in the space
+    // this instance has just been moved out of, so keeping them would drive resolution and retrieval
+    // with another space's bands — and would corrupt the candidate measurement these overrides exist
+    // to make in the first place. An unmeasured space gets what every unmeasured space gets: the
+    // labelled legacy guess, and fallbacks for the rest. `dim` and `readsOnlyLatinScript` stay:
+    // neither is a calibration, they are facts about the checkpoint's output width and its
+    // vocabulary, and pooling and precision move neither.
+    this.recommendedThresholds = movedOffProfile
+      ? LEGACY_UNMEASURED_THRESHOLDS
+      : profile?.thresholds ?? LEGACY_UNMEASURED_THRESHOLDS;
     this.readsOnlyLatinScript = profile?.readsOnlyLatinScript;
-    this.reliableSegmentTokens = profile?.reliableSegmentTokens;
-    this.nativeScoreFloor = profile?.nativeScoreFloor;
+    this.reliableSegmentTokens = movedOffProfile ? undefined : profile?.reliableSegmentTokens;
+    this.nativeScoreFloor = movedOffProfile ? undefined : profile?.nativeScoreFloor;
   }
 
   private load(): Promise<FeatureExtractor> {
@@ -315,8 +639,9 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
         // `cache_dir` set succeeded, so no sub-fetch silently fell back to the global. Being an
         // argument rather than a global also removes the ordering hazard entirely — there is no
         // "set it too late" state to get wrong.
-        return (await mod.pipeline("feature-extraction", this.model, {
+        return (await mod.pipeline("feature-extraction", this.checkpoint, {
           cache_dir: resolveModelCacheDir(),
+          ...(this.dtype ? { dtype: this.dtype } : {}),
         })) as FeatureExtractor;
       })();
     }
@@ -325,7 +650,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
 
   async embed(text: string): Promise<Float32Array> {
     const extractor = await this.load();
-    const output = await extractor(text, { pooling: "mean", normalize: true });
+    const output = await extractor(text, { pooling: this.pooling, normalize: true });
     return Float32Array.from(output.data);
   }
 
@@ -345,7 +670,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
         // goes out of its way to support.
         const specifier = "@huggingface/transformers";
         const mod = (await import(specifier)) as TransformersModule;
-        return mod.AutoTokenizer.from_pretrained(this.model, { cache_dir: resolveModelCacheDir() });
+        return mod.AutoTokenizer.from_pretrained(this.checkpoint, { cache_dir: resolveModelCacheDir() });
       })();
     }
     return this.tokenizer;
@@ -554,12 +879,19 @@ export async function instantiateEmbedderForPin(modelId: string): Promise<Embedd
           // cleanup line would name a directory that does not exist and cannot recover anything. The
           // recognizer is the same forward-or-back-slash test the loader itself uses, inverted: a bare
           // "owner/repo" is a hub id, anything path-shaped is not.
-          (isLocalModelPath(modelId)
-            ? `'${modelId}' is a local path, so nothing was cached for it — check that the path exists ` +
-              `and holds a complete model.`
-            : `This model is cached in ${resolveModelCacheDir()}/${modelId} — if its download was ` +
-              `interrupted, delete that model's directory (not the cache root, which may be shared) to ` +
-              `force a clean re-fetch.`),
+          // THE ADVICE NAMES THE CHECKPOINT, THE ERROR NAMES THE PIN, and they are not always the
+          // same string (Codex review, PR #178). A space id resolves through its profile to the
+          // checkpoint transformers.js actually fetches, so that is what sits on disk — advice built
+          // from the pin would send an operator to delete `…/Xenova/bge-m3:cls:q8`, a directory that
+          // never existed, leaving the truncated download in place and the store still unserveable.
+          // The classification follows the same value for the same reason: whether anything was
+          // cached at all is a fact about what was loaded, not about what the store recorded.
+          (isLocalModelPath(onnx.checkpoint)
+            ? `'${onnx.checkpoint}' is a local path, so nothing was cached for it — check that the path ` +
+              `exists and holds a complete model.`
+            : `This model is cached in ${resolveModelCacheDir()}/${onnx.checkpoint} — if its download ` +
+              `was interrupted, delete that model's directory (not the cache root, which may be ` +
+              `shared) to force a clean re-fetch.`),
         { cause: e },
       );
     }

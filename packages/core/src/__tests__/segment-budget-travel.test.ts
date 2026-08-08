@@ -203,11 +203,11 @@ describe("edgeSimMin travels with the model", () => {
   it("delivers the shipping default's PROFILE value, not the semantic-class guess", () => {
     const onnx = new OnnxEmbeddingProvider({});
     expect(onnx.modelId).toBe(DEFAULT_MODEL);
-    expect(onnx.recommendedThresholds?.edgeSimMin).toBe(0.70);
+    expect(onnx.recommendedThresholds?.edgeSimMin).toBe(0.60);
 
     const c = core(onnx);
     try {
-      expect(readEdgeSimMin(c)).toBe(0.70);
+      expect(readEdgeSimMin(c)).toBe(0.60);
       expect(readEdgeSimMin(c)).not.toBe(0.45); // the class guess this replaced
     } finally { c.close(); }
   });

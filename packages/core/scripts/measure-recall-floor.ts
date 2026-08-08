@@ -169,7 +169,10 @@ async function main(): Promise<void> {
   await measure("HashingEmbeddingProvider (lexical — what CI runs)", new HashingEmbeddingProvider());
   if (process.env.MONET_EVAL_ONNX === "1") {
     const { OnnxEmbeddingProvider } = await import("../src/embedding-onnx");
-    const onnx = new OnnxEmbeddingProvider();
+    // MONET_EVAL_MODEL names the space to measure; without it this measures whatever DEFAULT_MODEL
+    // happens to be, which is the wrong instrument for deriving a CANDIDATE model's own floor — the
+    // one job that brings anyone here while a default is being changed.
+    const onnx = new OnnxEmbeddingProvider({ model: process.env.MONET_EVAL_MODEL });
     await onnx.embed("warmup"); // force model load before timing anything
     await measure(`${onnx.modelId} (semantic — what ships)`, onnx);
   } else {

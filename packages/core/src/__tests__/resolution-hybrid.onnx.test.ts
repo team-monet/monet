@@ -94,11 +94,13 @@ describe.skipIf(!ENABLED)("store-time resolution — real MiniLM, shipped thresh
   it("uses the embedder's own recommended bands", () => {
     // The premise of this whole file: nothing here places a threshold by hand.
     // PER-MODEL, DELIBERATELY PINNED. This must be updated whenever DEFAULT_MODEL changes — that is
-    // the point of the assertion, not a maintenance cost. bge-small-en-v1.5 carries 0.78 from its own
-    // sweep (MODEL_PROFILES, embedding-onnx.ts); the 0.72 this replaced was the legacy unmeasured
-    // fallback and was never derived on any model. NOTE tauAmbiguous is 0.5 in EVERY profile, which
-    // means no per-model measurement has ever produced it — tracked separately.
-    expect(embedder.recommendedThresholds).toEqual({ tauAttach: 0.78, tauAmbiguous: 0.5 });
+    // the point of the assertion, not a maintenance cost, and it did its job: the bge-m3 swap tripped
+    // it here rather than in a nightly nobody was reading. bge-m3 at CLS/q8 carries 0.70 and 0.60
+    // from its own two-corpus sweeps (MODEL_PROFILES, embedding-onnx.ts); the 0.78 this replaces was
+    // bge-small-en-v1.5's, measured on a corpus this default no longer serves. NOTE tauAmbiguous is
+    // 0.5 in EVERY profile, and the bge-m3 sweep found out WHY on both of its corpora: no fork scores
+    // below it, so it is inert rather than tuned (#174).
+    expect(embedder.recommendedThresholds).toEqual({ tauAttach: 0.70, tauAmbiguous: 0.5, edgeSimMin: 0.60 });
   });
 
   // SKIPPED — STALE FIXTURE, not a stale number (monet-core#170). This fixture was hand-sized to

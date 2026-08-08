@@ -28,11 +28,33 @@ import { HashingEmbeddingProvider } from "../embedding";
 // than set on the module's `env` global (see the model-cache describe block at the bottom).
 // Hoisted so the mock factory (itself hoisted above the imports) can close over it: it records the
 // `cache_dir` production actually passed to pipeline(), which is what #90's fix consists of.
-const transformers = vi.hoisted(() => ({ cacheDirPassedToPipeline: undefined as string | undefined }));
+// It also records the model id, the dtype and the pooling production asked for, which is what the
+// space-id block at the bottom asserts on: a space id names the SPACE and must resolve to the
+// checkpoint, the weights and the pooling its profile declares, none of which is visible anywhere
+// else — nothing but the arguments reaching transformers.js can distinguish it from a hub id.
+const transformers = vi.hoisted(() => ({
+  cacheDirPassedToPipeline: undefined as string | undefined,
+  modelPassedToPipeline: undefined as string | undefined,
+  dtypePassedToPipeline: undefined as string | undefined,
+  poolingPassedToExtractor: undefined as string | undefined,
+}));
 
 vi.mock("@huggingface/transformers", () => ({
-  pipeline: vi.fn(async (_task: string, model: string, opts?: { cache_dir?: string }) => {
+  pipeline: vi.fn(async (_task: string, model: string, opts?: { cache_dir?: string; dtype?: string }) => {
     transformers.cacheDirPassedToPipeline = opts?.cache_dir;
+    transformers.modelPassedToPipeline = model;
+    transformers.dtypePassedToPipeline = opts?.dtype;
+    // The one real checkpoint named here, standing in for a model whose profile is keyed by a space
+    // id rather than by this id. 1024-wide, matching what that profile declares.
+    if (model === "Xenova/bge-m3") {
+      // The load-failure branch for a DECORATED pin: the checkpoint is what fails, and the recovery
+      // advice has to name it rather than the pin the store recorded.
+      if (process.env.MONET_TEST_CHECKPOINT_FAILURE === "1") throw new Error("injected checkpoint load failure");
+      return async (_text: string, opts2: { pooling?: string }) => {
+        transformers.poolingPassedToExtractor = opts2?.pooling;
+        return { data: new Float32Array(1024) };
+      };
+    }
     if (model === "Xenova/mock-ok-model") {
       // 384-long (matching OnnxEmbeddingProvider's declared default dim — the ordinary, no-mismatch
       // case): a distinctive first three values, zero-padded, so tests can still assert on real
@@ -356,5 +378,124 @@ describe("unsatisfiable-pin recovery advice (mocked, no network)", () => {
     const local = (await instantiateEmbedderForPin("/opt/models/mock-missing").catch((e: Error) => e)) as Error;
     expect(local.message).toContain("is a local path, so nothing was cached");
     expect(local.message).not.toContain("delete that model's directory");
+  });
+});
+
+/*
+ * A SPACE ID IS NOT A HUB ID, and nothing except the arguments handed to transformers.js can tell
+ * the difference — which is exactly why this block exists. Drop the profile's `checkpoint`
+ * indirection and every one of these calls asks the hub for a repository named
+ * "Xenova/bge-m3:cls:q8", which does not exist; the failure surfaces only at a real model load, so
+ * no other test in this suite can see it. That was not hypothetical: `monet repair --target
+ * Xenova/bge-m3:cls:q8` failed exactly that way against a real store while this suite stayed green.
+ */
+describe("space-id pins resolve to the checkpoint, weights and pooling their profile declares", () => {
+  it("loads the base checkpoint at the declared dtype and pooling, while REPORTING the space id", async () => {
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    const provider = new OnnxEmbeddingProvider({ model: "Xenova/bge-m3:cls:q8" });
+
+    // The pin — what a store records and what every equality check reasons with — is the space,
+    // never the checkpoint. Two spaces of one checkpoint must not share this string.
+    expect(provider.modelId).toBe("Xenova/bge-m3:cls:q8");
+    expect(provider.dim).toBe(1024);
+
+    const vector = await provider.embed("warmup");
+    expect(vector.length).toBe(1024);
+    expect(transformers.modelPassedToPipeline).toBe("Xenova/bge-m3");
+    expect(transformers.dtypePassedToPipeline).toBe("q8");
+    expect(transformers.poolingPassedToExtractor).toBe("cls");
+  });
+
+  it("leaves an undecorated id alone — bare pins load themselves, at the default pooling", async () => {
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    const provider = new OnnxEmbeddingProvider({ model: "Xenova/bge-m3" });
+    await provider.embed("warmup");
+
+    expect(provider.modelId).toBe("Xenova/bge-m3");
+    expect(transformers.modelPassedToPipeline).toBe("Xenova/bge-m3");
+    expect(transformers.dtypePassedToPipeline).toBeUndefined();
+    // Mean, not CLS: the hand-pinned space this id describes was written that way, and a store
+    // holding those vectors must keep being served in the space they occupy.
+    expect(transformers.poolingPassedToExtractor).toBe("mean");
+  });
+
+  it("satisfies a space-id PIN, which is the path an upgrade actually takes", async () => {
+    const provider = await instantiateEmbedderForPin("Xenova/bge-m3:cls:q8");
+    expect(provider.modelId).toBe("Xenova/bge-m3:cls:q8");
+    expect(provider.dim).toBe(1024);
+    expect(transformers.modelPassedToPipeline).toBe("Xenova/bge-m3");
+  });
+});
+
+/*
+ * Codex review, PR #178 (P1 + P2). Both findings are about a string that names the wrong thing: an
+ * override that changes the space while the reported id does not, and recovery advice built from the
+ * pin when what sits on disk is the checkpoint.
+ */
+describe("an override moves the space, so it surrenders the identity", () => {
+  it("reports no modelId when pooling or dtype disagrees with the profile", async () => {
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    // The exact construction from the finding: bge-m3's own profile is mean/undefined, so asking for
+    // CLS at q8 through it produces vectors that no id names.
+    expect(new OnnxEmbeddingProvider({ model: "Xenova/bge-m3", pooling: "cls", dtype: "q8" }).modelId).toBeUndefined();
+    expect(new OnnxEmbeddingProvider({ model: "Xenova/bge-m3", pooling: "cls" }).modelId).toBeUndefined();
+    // And in the other direction: the decorated profile IS cls/q8, so overriding it back to mean
+    // moves off it just as far.
+    expect(new OnnxEmbeddingProvider({ model: "Xenova/bge-m3:cls:q8", pooling: "mean" }).modelId).toBeUndefined();
+  });
+
+  it("keeps the identity for an override that names the space already in force", async () => {
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    // Naming what the profile already declares is how a measurement arm pins itself explicitly; the
+    // space is unchanged, so the id still describes it.
+    const explicit = new OnnxEmbeddingProvider({ model: "Xenova/bge-m3:cls:q8", pooling: "cls", dtype: "q8" });
+    expect(explicit.modelId).toBe("Xenova/bge-m3:cls:q8");
+    // A dim override is declarative only — instantiateEmbedderForPin's measure-and-adopt path uses it
+    // WHILE satisfying a real pin, so it must never cost the identity.
+    expect(new OnnxEmbeddingProvider({ model: "Xenova/bge-m3", dim: 1024 }).modelId).toBe("Xenova/bge-m3");
+    // Naming the EFFECTIVE default is naming the same space, not departing from it: a profile that
+    // omits dtype gets what transformers.js loads off the browser, and that is fp32 here (Node-only
+    // package). Comparing an explicit "fp32" against the omitted `undefined` would anonymize a
+    // provider that produces byte-identical vectors — and cost it a store it could legitimately back.
+    const explicitDefault = new OnnxEmbeddingProvider({ model: "Xenova/bge-small-en-v1.5", dtype: "fp32" });
+    expect(explicitDefault.modelId).toBe("Xenova/bge-small-en-v1.5");
+    expect(explicitDefault.recommendedThresholds.tauAttach).toBe(0.78);
+    expect(explicitDefault.reliableSegmentTokens).toBe(380);
+  });
+});
+
+describe("cache recovery advice names the checkpoint, the error names the pin", () => {
+  afterEach(() => { delete process.env.MONET_TEST_CHECKPOINT_FAILURE; });
+
+  it("sends an operator to the directory that actually holds the download", async () => {
+    process.env.MONET_TEST_CHECKPOINT_FAILURE = "1";
+    const error = (await instantiateEmbedderForPin("Xenova/bge-m3:cls:q8").catch((e: Error) => e)) as Error;
+    expect(error).toBeInstanceOf(UnsatisfiableEmbedderError);
+    // Identity: the store recorded the space id, so that is what the operator is told is unsatisfied.
+    expect(error.message).toContain("pinned to 'Xenova/bge-m3:cls:q8'");
+    // Advice: transformers.js cached the checkpoint under its own name, and deleting a directory
+    // named after the pin would recover nothing.
+    expect(error.message).toContain(`${resolveModelCacheDir()}/Xenova/bge-m3 —`);
+    expect(error.message).not.toContain("cached in " + resolveModelCacheDir() + "/Xenova/bge-m3:cls:q8");
+  });
+});
+
+describe("an off-profile override loses the calibrated numbers with the identity", () => {
+  it("falls back to the labelled guess rather than driving a new space with the old one's bands", async () => {
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    const onProfile = new OnnxEmbeddingProvider({ model: "Xenova/bge-small-en-v1.5" });
+    expect(onProfile.recommendedThresholds).toEqual({ tauAttach: 0.78, tauAmbiguous: 0.5, edgeSimMin: 0.70 });
+    expect(onProfile.reliableSegmentTokens).toBe(380);
+    expect(onProfile.nativeScoreFloor).toBe(0.35);
+
+    // Same checkpoint, CLS instead of the mean it was measured under: a different cosine
+    // distribution, so every number above was derived somewhere this instance no longer is.
+    const moved = new OnnxEmbeddingProvider({ model: "Xenova/bge-small-en-v1.5", pooling: "cls" });
+    expect(moved.recommendedThresholds).toEqual({ tauAttach: 0.72, tauAmbiguous: 0.5 });
+    expect(moved.reliableSegmentTokens).toBeUndefined();
+    expect(moved.nativeScoreFloor).toBeUndefined();
+    // Width and vocabulary are facts about the checkpoint, not calibrations — they stay.
+    expect(moved.dim).toBe(384);
+    expect(moved.readsOnlyLatinScript).toBe(true);
   });
 });
