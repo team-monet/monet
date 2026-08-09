@@ -1,16 +1,16 @@
 # monet
 
-**Local-first, state-centric memory for coding agents.**
+**Memory should change what your agent does.**
 
-[![npm](https://img.shields.io/npm/v/@team-monet/monet)](https://www.npmjs.com/package/@team-monet/monet) [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.team--monet%2Fmonet-1f6feb)](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.team-monet/monet) [![Website](https://img.shields.io/badge/website-monet.team--monet.com-6E56CF)](https://monet.team-monet.com/)
+[![npm](https://img.shields.io/npm/v/@team-monet/monet)](https://www.npmjs.com/package/@team-monet/monet) [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.team--monet%2Fmonet-1f6feb)](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.team-monet/monet) [![Website](https://img.shields.io/badge/website-team--monet.com-6E56CF)](https://team-monet.com/)
 
-🌐 **[monet.team-monet.com](https://monet.team-monet.com/)** · listed on the **[MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.team-monet/monet)**
+🌐 **[team-monet.com](https://team-monet.com/)** · listed on the **[MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.team-monet/monet)**
 
-Monet gives your coding agent a memory that persists across sessions — not by hoarding transcripts, but by maintaining structured **state**: decisions, conventions, errors, and the relationships between them. It runs **100% locally** (SQLite + on-device embeddings) and speaks **MCP**.
+Monet is local-first memory for coding agents, built for the outcome you meant. It keeps what you and your team actually want — principles, rules, corrections — and delivers it while the agent works: principles always on, rules read at the moment they bind, corrections recorded so they never need making twice. It runs **100% locally** (SQLite + on-device embeddings) and speaks **MCP**.
 
 ## Get started — let your agent set it up
 
-The easiest way to use Monet is to let the coding agent you already use install and wire it for you. Paste one line into your agent:
+The easiest way to use Monet is to let your agent install and wire it for you. Paste one line into Claude Code (more agents coming soon):
 
 > **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md and follow it, checking with me at each step.**
 
