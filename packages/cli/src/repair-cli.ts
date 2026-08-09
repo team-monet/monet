@@ -255,7 +255,21 @@ async function checkProvider(
 function resolveTargetAlias(target: string): string {
   const normalized = target.trim();
   if (normalized.length === 0) throw new Error("--target must be a nonblank exact model ID, 'onnx', or 'hashing'.");
-  if (normalized === "onnx") return new OnnxEmbeddingProvider().modelId;
+  if (normalized === "onnx") {
+    // `modelId` became optional in core#178: a provider whose pooling or dtype was overridden off its
+    // profile produces vectors no id names, and reports no id rather than a wrong one. A DEFAULT
+    // provider has no overrides, so this is not reachable today — but the alias resolves to a
+    // MIGRATION TARGET, i.e. the string a store is about to be pinned to permanently, and the one
+    // thing that must never happen here is "undefined" reaching that pin. Fail loudly instead.
+    const target = new OnnxEmbeddingProvider().modelId;
+    if (target === undefined) {
+      throw new Error(
+        "This build's default ONNX provider reports no model ID, so 'onnx' names no space to migrate " +
+          "to. Pass an exact model ID as --target.",
+      );
+    }
+    return target;
+  }
   if (normalized === "hashing") return new HashingEmbeddingProvider().modelId;
   if (/^dim:/i.test(normalized)) {
     throw new Error("Dimension-only targets are ambiguous; use 'onnx', 'hashing', or an exact model ID.");
