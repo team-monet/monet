@@ -898,7 +898,7 @@ describe("embedder pin — source placeholder observations excluded from dimensi
       embedderLoader: async (modelId) => fakePinnedProvider(modelId), // exact-identity stand-in — no real ONNX load
     });
     insertFakeObservation(core, 256, "source-placeholder-only", "source", undefined, 0); // the ONLY observation row — a provable placeholder
-    insertFakeConcept(core, 384); // kind='fact' (the default) — a genuine NATIVE concept vector, unaffected by FIX K's kind='source' exclusion; see the FIX K test below for the all-source-kind shape
+    insertFakeConcept(core, 384); // kind='fact' (the default) AND a non-zero fill — genuine evidence on both counts. What excludes the observation above is its ALL-ZERO placeholder vector, not its kind: since #56 the sample unions real source vectors in, so kind alone no longer keeps anything out. See the FIX K test below for the both-tables-placeholder shape
     clearPin(core);
 
     await core.ensureEmbedderPin();
@@ -918,7 +918,7 @@ describe("embedder pin — source placeholder observations excluded from dimensi
     await core.ensureEmbedderPin(); // no embedderLoader override needed — samples empty, so this is Shape 4's "pin to the live embedder" path, no swap
 
     const pin = readPin(core);
-    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2"); // BOTH tables sampled empty (both rows are kind='source') — pinned to the live embedder, exactly like Shape 4
+    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2"); // BOTH tables sampled empty because both rows are ALL-ZERO placeholders, which the width inventory excludes — NOT because they are kind='source' (#56 unioned real source vectors INTO the sample; only zero placeholders and dead residue stay out). Pinned to the live embedder, exactly like Shape 4
     expect(pin.embedder_pin_source).toBe("backfilled");
     expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // already satisfied — no swap
     core.close();

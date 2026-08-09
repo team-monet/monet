@@ -10346,8 +10346,15 @@ export class MonetCore {
    * internally, consistently at the old width. A per-population check sees two clean populations
    * (nativeDims.size === 1, sourceDims.size === 1) and lets the abandon proceed — silently stranding
    * source data at the old width with NOTHING left to say so: no sentinel (just deleted), no pin
-   * mismatch (backfillEmbedderPin's inference reads only native evidence — see sampleStoredVectorDim's
-   * own kind != 'source' scope — so it confidently pins the NEW width from the native side alone), and
+   * mismatch (pin inference is unreachable across the entire interrupted window — the lock phase
+   * calls writeMigratedEmbedderPin() BEFORE the first vector is rewritten, so the pin is the non-NULL
+   * target for every interruption described here, and ensureEmbedderPin reaches backfillEmbedderPin
+   * ONLY on a NULL pin. A successful abandon then restores prior_model_id, which CAN legitimately be
+   * null — a genuinely unpinned store entering migration, see the lock-phase comment that captures it
+   * — and THAT sub-case alone reaches inference, where since #56 the unioned sample would refuse. An
+   * earlier version of this paragraph instead blamed the inference for being native-only, which #56
+   * made false: what changed is WHY this hazard survives, not THAT it does, and it still survives
+   * unguarded for the ordinary already-pinned store), and
    * cosine() truncates rather than throwing on the resulting width mismatch. Unioning ALL FOUR arrays
    * into one comparison catches this the same way it already caught the narrower same-population
    * cross-TABLE split (native concepts vs. native observations) below.
