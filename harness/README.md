@@ -1,6 +1,6 @@
 # with-monet
 
-**An agent-agnostic harness that gives the coding agent you already use durable state through [Monet](https://www.npmjs.com/package/@team-monet/monet), plus disposable contexts (`Stig` and three workers) for the work that would otherwise eat the conversation.**
+**The harness that runs the method behind [Monet](https://www.npmjs.com/package/@team-monet/monet) — memory that should change what your agent does — plus disposable contexts (`Stig` and three workers) for the work that would otherwise eat the conversation.**
 
 The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet`](https://www.npmjs.com/package/@team-monet/monet) on npm) — maintains a persistent memory model so the agent doesn't have to. `with-monet` is the *lightweight* harness that points the coding agent you already use (Claude Code) at that substrate and gives it a team that knows how to use it.
 
@@ -8,6 +8,7 @@ The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet
 
 | Repo | What it is |
 |---|---|
+| [team-monet.com](https://team-monet.com) | **The front door** — what Monet is and why. |
 | `team-monet/monet` | **Monet** — the local-first client: the `monet` MCP server + CLI (npm `@team-monet/monet`). |
 | **`with-monet` (this repo)** | The **lightweight, agent-agnostic harness**: portable agent prompts + bootstrap that wire a host to `monet`. |
 
@@ -40,7 +41,7 @@ You don't clone this repo or run a script. You open the coding agent you already
 
 Paste into your agent:
 
-> **Set up Monet globally (for all my projects): read https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md and follow it, checking with me at each decision point.**
+> **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md and follow it, checking with me at each step.**
 
 _(Local dev: point at `with-monet/bootstrap/install.md` instead of the URL. The substrate it installs — `monet` — ships on npm as `@team-monet/monet`.)_
 
