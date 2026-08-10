@@ -9,7 +9,13 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": true
+    "noEmit": true,
+    // Lets a test disambiguate the ONE .ts/.mjs basename collision in this repo,
+    // src/extract-entities.{ts,mjs}: vitest resolves the extensionless specifier to the .mjs
+    // mirror while esbuild resolves it to the .ts that actually ships, so a test must be able to
+    // name the .ts explicitly or it silently asserts against the mirror. Safe here because TS
+    // permits this flag only under noEmit (set above) and nothing type-emits — tsup/esbuild builds.
+    "allowImportingTsExtensions": true
   },
   "include": ["src/**/*", "scripts/**/*", "tsup.config.ts"],
   "exclude": ["node_modules", "dist"]

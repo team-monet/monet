@@ -42,9 +42,13 @@
  */
 
 export function slugify(s) {
-  return s
+  const cleaned = s
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60);
+    .normalize("NFC")
+    // `\p{L}\p{N}\p{M}` rather than `a-z0-9` (#187; marks added per Codex review on PR #189) —
+    // see engine.ts's slugify for why a combining mark is part of the letter, and why the cap
+    // below counts code points rather than UTF-16 units.
+    .replace(/[^\p{L}\p{N}\p{M}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+  return [...cleaned].slice(0, 60).join("");
 }

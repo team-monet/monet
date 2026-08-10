@@ -60,6 +60,21 @@ const STOPWORDS = new Set([
   "same", "both", "many", "much", "own", "into", "onto", "within", "around", "here", "there",
   "again", "once", "while", "before", "after", "during", "per", "off", "out", "above", "below",
   "every", "without", "upon",
+  // TWO-LETTER ENGLISH, previously hidden by the three-character floor (Codex review, PR #189).
+  // Removing that floor removed the implicit filtering it was doing, and this list is where the
+  // explicit filtering belongs — the floor was never the right home for English vocabulary. Found
+  // by measuring AFTER the floor came down: an earlier check ran while it was still 3, so it could
+  // not tell "already in STOPWORDS" from "dropped by the floor" and reported a clean result.
+  "he", "me", "us", "am", "go", "id", "ok", "vs", "re", "ye", "oh", "ah", "eh", "hi", "ha",
+  "na", "um", "er", "uh", "hm", "ya", "yo", "pm", "ie", "eg",
+  // Non-Latin function words. Single-character ones (的, 를, の) never reach here — `tooShort`
+  // drops them — so this covers only the two-character forms that would otherwise pass the dense-
+  // script floor and become entities. A STARTING set from the scripts #187 was reported against,
+  // not a complete one for any of them; extend per script as real text arrives.
+  "した", "する", "ある", "いる", "この", "その", "など", "ため", "よう", "もの", "こと",
+  "から", "まで", "より", "および", "ます", "です",
+  "하는", "있는", "없는", "이런", "그런", "대해", "통해", "위해", "때문", "그리고", "하지만",
+  "这个", "那个", "可以", "因为", "所以", "但是", "如果", "已经", "还有", "以及",
 ]);
 
 const PATH_FILE = /\b[\w./-]*\w[\w-]*\.(?:ts|tsx|js|jsx|mjs|cjs|json|sql|md|sh|ya?ml|py|go|rs|toml|css)\b/g;
@@ -68,7 +83,51 @@ const CAMEL = /\b[A-Za-z][a-z0-9]*[A-Z]\w*\b/g; // camelCase AND PascalCase (int
 const SNAKE = /\b[a-z0-9]+_[a-z0-9_]+\b/g;
 const DOTTED = /\b[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w+)+\b/g;
 const ERRCODE = /\b(?:E[A-Z]{3,}|[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+|E\d{2,})\b/g;
+/** Latin-only, and deliberately so: it scans for LEXICON hits, and every lexicon entry is an ASCII
+ *  package name. The noun pass uses `words()` below instead. */
 const WORD = /[a-z][a-z0-9]*/g;
+
+/**
+ * Word segmentation for every script, via ICU. `WORD` recognized `[a-z]` only, so all non-Latin
+ * text produced ZERO entities and therefore zero derived edges (#187) — Korean, Cyrillic, Greek,
+ * Arabic and Hebrew because of the character class, and Chinese/Japanese/Thai additionally because
+ * they are not whitespace-delimited at all, which no character class can solve.
+ *
+ * Still dependency-free: Intl.Segmenter is part of the runtime (Node 22 ships full ICU). It is NOT
+ * as version-stable as a regex, though — a future ICU revision can segment a given string
+ * differently, so extraction is deterministic for a given runtime rather than across all of them.
+ * That is a real weakening of this module's original promise, accepted because the alternative it
+ * replaces was not "less deterministic", it was "silently empty for most of the world's text".
+ * Edges are re-derived rather than frozen, so the effect of a shift is drift, not corruption.
+ */
+const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "word" });
+
+function words(text: string): string[] {
+  const out: string[] = [];
+  for (const s of SEGMENTER.segment(text)) if (s.isWordLike) out.push(s.segment);
+  return out;
+}
+
+/**
+ * TWO CHARACTERS, IN EVERY SCRIPT. There is no script test here, and that is the fix.
+ *
+ * The old floor was three, which exists to drop English function words. Two attempts to keep it
+ * conditional both failed the same way (Codex review, PR #189): first a list of four scripts, which
+ * read as "every script" while still discarding Hebrew שם, Hindi की and Greek γη; then
+ * `\p{Script=Latin}`, which is not English either and discarded French os, German Ei, Vietnamese cá.
+ *
+ * The thing that is actually English-specific is the WORD LIST, not a property of the script — and
+ * STOPWORDS already is that list. Verified before making the change: every two-letter English
+ * function word ("of", "to", "is", "it", "as", "so", "up", "an", "no", "do", …) is already in it, so
+ * lowering the floor leaks none of them. A predicate that does not exist cannot have a third
+ * counterexample.
+ */
+function tooShort(token: string): boolean {
+  return token.length < 2;
+}
+
+/** Any script's letters. Numbers alone are not entities — see the noun pass for why. */
+const HAS_LETTER = /\p{L}/u;
 
 export function extractEntities(text: string): ExtractedEntity[] {
   const out = new Map<string, ExtractedEntity>();
@@ -99,13 +158,74 @@ export function extractEntities(text: string): ExtractedEntity[] {
     if (LEXICON[token]) add("lib", LEXICON[token], 2);
   }
 
-  // Pass 2 — plain nouns from what's left.
-  for (const token of residual.toLowerCase().match(WORD) ?? []) {
-    if (token.length < 3 || STOPWORDS.has(token) || LEXICON[token]) continue;
-    add("noun", singularize(token), 1);
+  // Pass 2 — plain nouns from what's left. NFC before anything else (Codex review, PR #189): an
+  // entity key IS the join column for `about` edges, so a composed and a decomposed spelling of the
+  // same word — routine across input methods and operating systems — would otherwise be two keys
+  // and two concepts mentioning it would never link.
+  for (const segment of words(residual.toLowerCase().normalize("NFC"))) {
+    // SPLIT ON EVERYTHING THAT IS NOT A LETTER, DIGIT OR MARK — which is what the old
+    // `[a-z][a-z0-9]*` did by construction, since it could only ever match runs of those.
+    //
+    // ICU keeps punctuation-bearing strings together as one word, so both of these leaked into noun
+    // morphology (Codex review, PR #189): "it's" was not in STOPWORDS and singularize took its
+    // trailing s, emitting `noun:it'`; and a filename with a non-Latin basename never matched the
+    // ASCII-only structural patterns, so "café.ts" became `noun:café.t` — an entity that also failed
+    // to share a key with a plain mention of café. One split fixes both, where an apostrophe-only
+    // split fixed the first and left the second.
+    for (const token of segment.split(/[^\p{L}\p{N}\p{M}]+/u)) {
+      // A SEGMENT MUST CONTAIN A LETTER (Codex review, PR #189). `isWordLike` is true for numbers,
+      // so "2026" and "3.14" became entities; the old `[a-z][a-z0-9]*` required a leading letter,
+      // and this module's contract has always been to drop numeric tokens. Dates, counts and
+      // version numbers are exactly the tokens that would otherwise link unrelated concepts.
+      if (!HAS_LETTER.test(token)) continue;
+      if (tooShort(token) || STOPWORDS.has(token) || KOREAN_PARTICLE_SET.has(token) || LEXICON[token]) continue;
+      add("noun", normalizeToken(token), 1);
+    }
   }
 
   return [...out.values()];
+}
+
+/**
+ * Per-script morphology. This module always did language-specific normalization — `singularize` is
+ * English plural stripping and STOPWORDS is an English function-word list. The defect was never
+ * that it is language-specific; it is that only ONE language was ever added. This dispatch makes
+ * that structural, so the next script is an entry rather than a rewrite.
+ */
+function normalizeToken(w: string): string {
+  return HANGUL_ONLY.test(w) ? stripKoreanParticle(w) : singularize(w);
+}
+
+const HANGUL_ONLY = /^\p{Script=Hangul}+$/u;
+
+/**
+ * Korean 조사 (particles) are a CLOSED class, which is what makes stripping them the same move
+ * `singularize` makes for English plurals rather than a guess. Without it 주식/주식을/주식이/주식은
+ * are four different entities and no two concepts mentioning the stock tracker ever link — which
+ * is the entire point of extracting entities.
+ *
+ * Longest match wins, and a strip never leaves fewer than two syllables: 마을 and 가을 end in 을
+ * without containing a particle, and the length guard is what saves them. It is not perfect — 물리학과
+ * loses its 과 — and that is the same class of error `singularize` accepts for English, bounded the
+ * same way, by a guard rather than by a dictionary.
+ */
+const KOREAN_PARTICLES = [
+  "으로서", "으로써", "에게서", "에서는", "이라고", "라고", "으로", "에서", "에게", "한테",
+  "부터", "까지", "보다", "처럼", "마다", "조차", "이나", "라는", "이란", "에는",
+  "은", "는", "이", "가", "을", "를", "에", "의", "와", "과", "도", "만", "랑",
+];
+
+/** A token that is ENTIRELY a particle is always a particle — Korean spacing puts one on its own
+ *  often enough that this leaks otherwise ("에서" surviving as a noun). The strip below cannot
+ *  catch it: its two-syllable floor refuses to reduce a token to nothing, which is correct there
+ *  and wrong here, so this is a separate check rather than a loosened guard. */
+const KOREAN_PARTICLE_SET = new Set(KOREAN_PARTICLES);
+
+function stripKoreanParticle(w: string): string {
+  for (const p of KOREAN_PARTICLES) {
+    if (w.endsWith(p) && w.length - p.length >= 2) return w.slice(0, -p.length);
+  }
+  return w;
 }
 
 /** Conservative deterministic singularizer (never touches structural entities). */

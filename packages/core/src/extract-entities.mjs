@@ -68,6 +68,15 @@ const STOPWORDS = new Set([
   "same", "both", "many", "much", "own", "into", "onto", "within", "around", "here", "there",
   "again", "once", "while", "before", "after", "during", "per", "off", "out", "above", "below",
   "every", "without", "upon",
+  // Two-letter English, previously hidden by the three-character floor — see
+  // src/extract-entities.ts for why this list is the right home for it.
+  "he", "me", "us", "am", "go", "id", "ok", "vs", "re", "ye", "oh", "ah", "eh", "hi", "ha",
+  "na", "um", "er", "uh", "hm", "ya", "yo", "pm", "ie", "eg",
+  // Non-Latin function words — see src/extract-entities.ts for why only two-character forms.
+  "した", "する", "ある", "いる", "この", "その", "など", "ため", "よう", "もの", "こと",
+  "から", "まで", "より", "および", "ます", "です",
+  "하는", "있는", "없는", "이런", "그런", "대해", "통해", "위해", "때문", "그리고", "하지만",
+  "这个", "那个", "可以", "因为", "所以", "但是", "如果", "已经", "还有", "以及",
 ]);
 
 const PATH_FILE = /\b[\w./-]*\w[\w-]*\.(?:ts|tsx|js|jsx|mjs|cjs|json|sql|md|sh|ya?ml|py|go|rs|toml|css)\b/g;
@@ -77,6 +86,44 @@ const SNAKE = /\b[a-z0-9]+_[a-z0-9_]+\b/g;
 const DOTTED = /\b[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w+)+\b/g;
 const ERRCODE = /\b(?:E[A-Z]{3,}|[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+|E\d{2,})\b/g;
 const WORD = /[a-z][a-z0-9]*/g;
+
+// ICU word segmentation — see src/extract-entities.ts for the full rationale (#187).
+const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "word" });
+
+function words(text) {
+  const out = [];
+  for (const s of SEGMENTER.segment(text)) if (s.isWordLike) out.push(s.segment);
+  return out;
+}
+
+// Two characters, every script — no script test. English-specific knowledge lives in STOPWORDS,
+// which already holds every two-letter English function word. See src/extract-entities.ts.
+function tooShort(token) {
+  return token.length < 2;
+}
+
+const HAS_LETTER = /\p{L}/u;
+
+const HANGUL_ONLY = /^\p{Script=Hangul}+$/u;
+
+const KOREAN_PARTICLES = [
+  "으로서", "으로써", "에게서", "에서는", "이라고", "라고", "으로", "에서", "에게", "한테",
+  "부터", "까지", "보다", "처럼", "마다", "조차", "이나", "라는", "이란", "에는",
+  "은", "는", "이", "가", "을", "를", "에", "의", "와", "과", "도", "만", "랑",
+];
+
+const KOREAN_PARTICLE_SET = new Set(KOREAN_PARTICLES);
+
+function stripKoreanParticle(w) {
+  for (const p of KOREAN_PARTICLES) {
+    if (w.endsWith(p) && w.length - p.length >= 2) return w.slice(0, -p.length);
+  }
+  return w;
+}
+
+function normalizeToken(w) {
+  return HANGUL_ONLY.test(w) ? stripKoreanParticle(w) : singularize(w);
+}
 
 export function extractEntities(text) {
   const out = new Map();
@@ -105,9 +152,14 @@ export function extractEntities(text) {
     if (LEXICON[token]) add("lib", LEXICON[token], 2);
   }
 
-  for (const token of residual.toLowerCase().match(WORD) ?? []) {
-    if (token.length < 3 || STOPWORDS.has(token) || LEXICON[token]) continue;
-    add("noun", singularize(token), 1);
+  // NFC before filtering — see src/extract-entities.ts (Codex review, PR #189).
+  for (const segment of words(residual.toLowerCase().normalize("NFC"))) {
+    // Apostrophe split + letter requirement — see src/extract-entities.ts (Codex review, PR #189).
+    for (const token of segment.split(/[^\p{L}\p{N}\p{M}]+/u)) {
+      if (!HAS_LETTER.test(token)) continue;
+      if (tooShort(token) || STOPWORDS.has(token) || KOREAN_PARTICLE_SET.has(token) || LEXICON[token]) continue;
+      add("noun", normalizeToken(token), 1);
+    }
   }
 
   return [...out.values()];

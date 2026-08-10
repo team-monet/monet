@@ -86,7 +86,11 @@
  * "#". Capture group 3: the ref token itself (slug, id, or alias — this rewrite only acts when it
  * exactly equals a renameMap key).
  */
-export const ASSERTED_REF_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)(\s*:\s*)(#?)([\w:-]+)/gi;
+// Unicode ref repertoire, matching engine.ts's ASSERTED_RE and slugify (#187, Codex review on PR
+// #189). This module rewrites references when scrubbing renames a slug; with an ASCII-only class a
+// scrubbed non-Latin concept keeps references pointing at its PRE-scrub slug, which is a dangling
+// reference produced by the privacy pipeline itself.
+export const ASSERTED_REF_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)(\s*:\s*)(#?)([\p{L}\p{N}\p{M}_:-]+)/giu;
 
 /**
  * Rewrite every asserted-ref token in `text` that exactly matches an OLD slug in `renameMap` to its

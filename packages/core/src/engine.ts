@@ -296,7 +296,11 @@ const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradic
 const PAIR_FLAG_EDGE_TYPES = ["possible_duplicate_of", "extraction_candidate"] as const;
 /** The same set as a literal SQL IN-list. Fixed literals, never interpolated caller data. */
 const PAIR_FLAG_EDGE_TYPES_SQL = PAIR_FLAG_EDGE_TYPES.map((t) => `'${t}'`).join(", ");
-const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s*:\s*#?([\w:-]+)/gi;
+// The reference class must match slugify's repertoire (Codex review, PR #189). `\w` is ASCII here,
+// so `supports: #주식-트래커` never reached resolveRef at all — giving non-Latin concepts distinct
+// slugs is worth nothing while the parser that consumes those slugs cannot read one. `_` and `:`
+// are kept because `\w` included them and workstream slugs are `workstream:<circle>`.
+const ASSERTED_RE = /\b(resolves|supersedes|derived-from|supports|contradicts)\s*:\s*#?([\p{L}\p{N}\p{M}_:-]+)/giu;
 const GRAPH_SCHEMA_VERSION = 1; // PRAGMA user_version gate for the one-time graph backfill (P2)
 const TEMPORAL_SCHEMA_VERSION = 2; // PRAGMA user_version gate for the temporal layer (0.6.0)
 const AROUSAL_SCHEMA_VERSION = 3; // PRAGMA user_version gate for the V-A arousal layer (slice 2)
@@ -335,7 +339,13 @@ const SOURCE_LEDGER_SCHEMA_VERSION = 9; // durable source scan/materialization/a
 // SOURCE_REGISTRY_SCHEMA_VERSION (a prior, unrelated migration) — reusing it would corrupt that
 // gate, so this is the next free sequential slot after SOURCE_LEDGER_SCHEMA_VERSION instead.
 const SOURCE_FILE_CONCEPT_SCHEMA_VERSION = 11;
-const FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION = MONET_SCHEMA_VERSION;
+// PINNED, no longer tracking MONET_SCHEMA_VERSION. Written as `= MONET_SCHEMA_VERSION` this was
+// harmless only while 12 was the top of the ladder: the moment the ladder grows, this gate moves
+// with it and a store already at 12 RE-RUNS the first-block retirement it had finished. Every other
+// rung in this file is an explicit number for exactly that reason. Found while adding rung 13 for a
+// migration that has since been withdrawn (#187) — the trap it leaves for the next rung is real
+// regardless, so the pin stays.
+const FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION = 12;
 const FIRST_BLOCK_OBSERVATION_AUTHOR = "schema-12-first-block-migration";
 const FIRST_BLOCK_OBSERVATION_PREFIX = "First Block pin (surface retired 2026-08-02): ";
 
@@ -2519,6 +2529,7 @@ export class MonetCore {
     // first time, now that the table they watch actually exists.
     migrateGateColumns(this.db);
     this.sourceLedger.ensureSchema();
+    this.repairEmptyConceptSlugs();
     this.repairConnectorGraphContamination();
     const versionAfterLedger = this.db.pragma("user_version", { simple: true }) as number;
     if (versionAfterLedger >= SYNC_CLOSURE_SCHEMA_VERSION && versionAfterLedger < SOURCE_LEDGER_SCHEMA_VERSION) {
@@ -14285,7 +14296,13 @@ export class MonetCore {
                 OR (excluded.sync_revision = concepts.sync_revision AND excluded.sync_writer > COALESCE(concepts.sync_writer, ''))`,
           )
           .run(
-            row.id, row.slug, row.title, row.body, row.kind, row.status, row.confidence,
+            // NORMALIZE AN EMPTY INCOMING SLUG (Codex review, PR #189). repairEmptyConceptSlugs
+            // runs at construction, so a long-running process that grafts a non-Latin concept from
+            // a peer still on an older build would store its empty slug verbatim and keep the
+            // ambiguous lookup key until restart. Deriving it here closes that window; a peer that
+            // sends a real slug is untouched, and a title that yields nothing stays empty exactly
+            // as the constructor repair leaves it.
+            row.id, row.slug === "" ? slugify(row.title) : row.slug, row.title, row.body, row.kind, row.status, row.confidence,
             row.version, row.circle, row.embedding, row.support_count, row.dirty,
             relayAt, row.created_at ?? now, row.usefulness_score,
             row.usefulness_last_fetched_at ?? null, row.arousal_score,
@@ -16805,6 +16822,44 @@ export class MonetCore {
   }
 
   /**
+   * Give a slug back to concepts an older build left with an EMPTY one (#187): before slugify
+   * accepted non-Latin letters, a wholly non-Latin title produced "".
+   *
+   * DELIBERATELY ONLY THE EMPTY ONES, not a recompute of every slug from its title. Measured on the
+   * dogfood store before writing this: 131 of 680 concepts already carry a slug that does not match
+   * slugify(title) for reasons that predate and have nothing to do with this change, while the new
+   * rule alters only 4. A blanket recompute would quietly rewrite all 131 — and `concepts.slug` is a
+   * REFERENCE KEY (`supports: #slug`, resolveRef, merge aliases), so rewriting a live one breaks
+   * assertions that resolve today. Filling an empty slug cannot break anything by the same argument
+   * run backwards: "" resolves to an arbitrary same-circle concept already, and nothing can
+   * meaningfully reference it.
+   *
+   * Runs on every open, like the repair below it, and is a no-op once done. Costs one indexed-free
+   * scan of a small table; on a store that never held non-Latin titles it matches nothing.
+   */
+  private repairEmptyConceptSlugs(): void {
+    const broken = this.db.prepare(
+      `SELECT id, title FROM concepts WHERE slug='' AND kind!='workstream'`,
+    ).all() as Array<{ id: string; title: string }>;
+    if (broken.length === 0) return;
+    this.db.transaction(() => {
+      // CONDITIONAL ON THE ROW STILL BEING THE ONE WE READ (Codex review, PR #189). `broken` is
+      // selected before this transaction opens, so another process can change a concept's title and
+      // slug in between; an unconditional write by id would then overwrite its new slug with one
+      // derived from the title we read, leaving slug and title inconsistent and breaking any
+      // reference to the new slug. Re-asserting the empty slug and the exact title makes the write a
+      // no-op in that race instead.
+      const update = this.db.prepare(`UPDATE concepts SET slug=? WHERE id=? AND slug='' AND title=?`);
+      for (const row of broken) {
+        const slug = slugify(row.title);
+        // A title with no letters or digits in ANY script still slugifies to "" — there is no
+        // better value available, so leave the row alone rather than churn it on every open.
+        if (slug !== "") update.run(slug, row.id, row.title);
+      }
+    })();
+  }
+
+  /**
    * Source-owned concepts are direct retrieval projections, never generic graph participants.
    * Run on every open so databases written by older builds are repaired idempotently without
    * disturbing native-native relationships.
@@ -18256,9 +18311,29 @@ function canonicalSourceIdentityFromJson(refs: string | null | undefined): strin
 // Logic/body is UNCHANGED by this export — only visibility changed; every in-engine call site below
 // continues to use the unqualified local reference, unaffected by this becoming exported.
 export function slugify(s: string): string {
-  return s
+  const cleaned = s
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60);
+    // NFC first, so a composed character and its decomposed spelling produce ONE key rather than
+    // two (Codex review, PR #189): the same title typed on two systems must not resolve differently.
+    .normalize("NFC")
+    // `\p{L}\p{N}` rather than `a-z0-9` (#187): the ASCII class deleted every non-Latin character,
+    // so a wholly Korean/Japanese/Chinese/Greek/Cyrillic title slugified to the EMPTY STRING, and a
+    // mixed one kept only its Latin fragment. That is not cosmetic — `resolveRef` looks a concept up
+    // `WHERE slug=?` with `LIMIT 1`, so every empty-slug concept in a circle is a match for every
+    // other one, and a `supports: #ref` assertion lands on an arbitrary wrong concept rather than
+    // failing. NOT applied to src/eval/md-export.ts's separate `slugify`, which names files and is
+    // legitimately constrained to ASCII.
+    // `\p{M}` IS PART OF THE LETTER, not punctuation between letters (Codex review, PR #189). In an
+    // abugida a vowel is a combining mark, so dropping marks recreates the exact collision this
+    // function was changed to remove — measured before the fix: Hindi दिन, दान and दीन all became
+    // "द-न", three distinct titles sharing one lookup key.
+    .replace(/[^\p{L}\p{N}\p{M}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+  // TRUNCATE BY CODE POINT, not UTF-16 unit (Codex review, PR #189). A supplementary-plane letter
+  // occupies two units, so `.slice(0, 60)` could cut a surrogate pair in half and leave a lone high
+  // surrogate as the final character — an unpaired surrogate is not valid UTF-8, so the key would be
+  // mangled on its way to or from storage and could not round-trip through resolveRef. Code points
+  // rather than graphemes: this only has to keep the string well-formed, and a base character
+  // separated from a trailing mark at exactly the cap is still legible and still encodes cleanly.
+  return [...cleaned].slice(0, 60).join("");
 }
