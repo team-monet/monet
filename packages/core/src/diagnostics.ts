@@ -518,7 +518,30 @@ export function inspectStoredEmbedderState(dbPath: string): StoredEmbedderStateI
 
   let db: Database.Database | undefined;
   try {
-    db = new Database(inspectionPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
+    // READONLY ONLY FOR THE REAL FILE (#188). The comment above states that a readonly handle on a
+    // closed WAL database makes SQLite create fresh -wal/-shm — true on macOS, verified directly,
+    // and NOT true everywhere: on Linux/WSL2 the same open fails with a raw `database is locked`.
+    //
+    // WHY IT IS SQLITE_BUSY AND NOT A CANNOT-CREATE ERROR: SQLite runs WAL *recovery* whenever the
+    // number of connected clients goes from ZERO TO ONE, and recovery takes an exclusive WRITER
+    // lock before it starts (SQLite's own wal-lock.md). A readonly connection cannot hold that
+    // lock, so the very first reader of an unheld WAL store loses a race against SQLite's own
+    // startup step — no other process is involved, which is why a process listing shows nothing.
+    //
+    // The consequence is inverted from how it reads: `monet doctor` and `monet repair` fail
+    // precisely when NOTHING else is running, because that is what makes the open a zero-to-one
+    // transition. #188 was first filed against the filesystem for exactly that reason.
+    //
+    // The snapshot branch already exists to keep the source bytes untouched, and `inspectionPath`
+    // there is a throwaway copy in a temp directory that is removed below. Nothing is protected by
+    // opening THAT readonly, so it opens read-write and SQLite is free to build the sidecars it
+    // needs beside the copy. The real file keeps the readonly handle it always had, and keeps it for
+    // a reason: the walExists branch inspects the live store in place.
+    db = new Database(inspectionPath, {
+      readonly: snapshotDir === undefined,
+      fileMustExist: true,
+      timeout: 5_000,
+    });
     const schemaVersion = db.pragma("user_version", { simple: true }) as number;
     const checkRows = db.pragma("quick_check") as Array<{ quick_check: string }>;
     const check = checkRows.map((row) => row.quick_check);
