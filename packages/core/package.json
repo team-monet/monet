@@ -52,8 +52,14 @@
   "pnpm": {
     "overrides": {
       "esbuild": "^0.28.1",
-      "hono": "^4.12.25",
-      "protobufjs": "^7.6.3"
+      "hono": "^4.12.34",
+      "protobufjs": "^7.6.5",
+      "tar": "^7.5.21",
+      "ip-address": "^10.3.1",
+      "body-parser": "^2.3.0",
+      "fast-uri": "^3.1.5",
+      "postcss": "^8.5.23",
+      "nanoid": "^3.3.17"
     },
     "onlyBuiltDependencies": [
       "better-sqlite3",
