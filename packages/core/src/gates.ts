@@ -1275,11 +1275,42 @@ export function hasLiveBinding(db: StoragePort, conceptId: string): boolean {
  *   while another table says it is live" has no constraint form — so a hand-written DELETE or
  *   UPDATE against the database file bypasses this. The store's file is the trust boundary.
  *
- *   A CIRCLE MOVE. reassignCircle relocates a rule, and a rule denies only in its own circle, so a
- *   move IS a removal from the origin circle. That is correct by design rather than a gap: the deny
- *   moves WITH the rule and keeps firing in the destination, which is the same relationship every
- *   other memory has with locality. It is named here only because it is the one place a deny
- *   legitimately stops firing somewhere without a declaration.
+ *   A CIRCLE MOVE TO A LIVE CIRCLE. reassignCircle relocates a rule, and a rule denies only in its
+ *   own circle, so a move IS a removal from the origin circle. That stays uncovered by design
+ *   rather than as a gap: the deny moves WITH the rule and keeps firing in the destination, which
+ *   is the same relationship every other memory has with locality. It is named here only because it
+ *   is the one place a deny legitimately stops firing somewhere without a declaration.
+ *
+ *   A MOVE INTO AN ARCHIVED CIRCLE IS COVERED, and is not an exception to that paragraph but its
+ *   premise failing. "Keeps firing in the destination" means keeps firing where someone is, and an
+ *   archived circle is the store's own flag that nobody works there — so the move is a removal
+ *   wearing a relocation's clothes, and goes through declaration like every other removal.
+ *
+ *   ...EXCEPT FOR A BREADTH-BOUND DENY, which stays uncovered wherever it moves, archived
+ *   destination included — not as a carve-out from the paragraph above but by the same reasoning
+ *   turned on the binding. Delivery is decided by `rule_bindings.circle` (RULE_LIVENESS_WHERE), and
+ *   `moveConcept` deliberately does not let a `*` binding follow its concept (see its own comment),
+ *   so moving a global deny takes delivery away from nowhere: it still fires in the circle it left
+ *   and in every other one. Refusing it would be worse than a guard on a path that removes nothing,
+ *   because the refusal's own remediation is "declare it advisory" — following it would trade a real
+ *   deny away to get past a refusal that was protecting nothing. Hence the move door asks
+ *   `isCircleLocalLiveBlockingRule` while every other door asks the plain question: retire, delete,
+ *   detach, dispute and supersede end the rule's liveness outright, and breadth is no protection
+ *   against that.
+ *
+ *   ...AND EXCEPT WHERE THE ORIGIN'S NAME IS REPOINTED AT THE DESTINATION, which is that same
+ *   reasoning turned on the other end of the move — written down here so the next inventory does not
+ *   re-file it as a door. What decides this is ALIAS PUBLICATION, never which method ran: an
+ *   operation that upserts an ACTIVE circle alias origin→destination alongside the move keeps every
+ *   entrance resolving the old name through that alias before it queries, so a session still working
+ *   under it is transparently redirected and delivered the same deny. `renameCircle` does this
+ *   (measured: after `renameCircle("work", "attic")` with `attic` already archived, the deny fires
+ *   under BOTH names) and so does `mergeCircle` — it publishes from→into in the same transaction as
+ *   its moves, so a committed merge always carries the alias (measured the same way). Any future
+ *   caller that publishes the alias with the move is covered by this sentence, and any that does not
+ *   is a door: `batchReassignCircle` and a bare `reassignCircle` publish nothing, which is exactly
+ *   why they stay guarded. What a repoint into an archived name DOES change is discovery, not
+ *   delivery: the surviving circle is hidden from `listCircles`' default output.
  */
 export type BlockingRuleOperation =
   | "retire"
@@ -1292,7 +1323,8 @@ export type BlockingRuleOperation =
   | "relayed delete"
   | "relayed contradiction"
   | "relayed supersession"
-  | "supersession";
+  | "supersession"
+  | "circle move into an archived circle";
 
 export interface BlockingRuleGuardVerdict {
   /** True when the concept is a live deny and the operation must not proceed. */
@@ -1305,17 +1337,20 @@ export interface BlockingRuleGuardVerdict {
 }
 
 /**
- * Ask whether `operation` may remove `conceptId` from the gate. Local paths throw `message`;
- * graft paths skip and count, because an incoming row must never abort an otherwise-good graft.
+ * THE ONE DEFINITION OF "LIVE BLOCKING RULE" in this codebase: a blocking binding whose concept is
+ * active, is kind='rule', and carries no supersession edge — gateQuery's own delivery conditions,
+ * minus locality. Returns the rule's title, so the guard can name it in an error a human can act on,
+ * and the BINDING's own circle, which is what decides whether a given operation takes delivery away
+ * from anywhere at all (RULE_LIVENESS_WHERE reads `b.circle`, never the concept's).
+ *
+ * Extracted so the chokepoint and every caller that merely needs to KNOW a deny is at stake (the
+ * MCP layer's relocation disclosure) ask the identical question. Two copies of this predicate is
+ * how a guard and the disclosure about that guard's subject drift into disagreeing.
  */
-export function blockingRuleMutationGuard(
-  db: StoragePort,
-  conceptId: string,
-  operation: BlockingRuleOperation,
-): BlockingRuleGuardVerdict {
-  const row = db
+function liveBlockingRuleRow(db: StoragePort, conceptId: string): { title: string; circle: string } | undefined {
+  return db
     .prepare(
-      `SELECT c.title AS title
+      `SELECT c.title AS title, b.circle AS circle
          FROM rule_bindings b
          JOIN concepts c ON c.id = b.concept_id
         WHERE b.concept_id = ? AND b.severity = 'blocking'
@@ -1325,7 +1360,35 @@ export function blockingRuleMutationGuard(
              WHERE e.family = 'supersession' AND e.src_concept_id = b.concept_id
           )`,
     )
-    .get(conceptId) as { title: string } | undefined;
+    .get(conceptId) as { title: string; circle: string } | undefined;
+}
+
+/**
+ * Is this concept a live deny whose delivery is tied to ONE circle — the narrower question, and the
+ * only one a CIRCLE MOVE may be judged on. "A live deny" and "a live deny that a move actually takes
+ * away from somewhere" are two different questions, and reading them as one is precisely how the
+ * archived-destination guard came to refuse moves that removed nothing: a `*` binding does not
+ * follow its concept (moveConcept), so a breadth deny keeps firing in every circle regardless of
+ * where its concept is filed.
+ *
+ * ONLY the circle-move door and the MCP layer's relocation disclosure ask this. Every other door
+ * asks `blockingRuleMutationGuard`, which is right for them — see the chokepoint's own comment.
+ */
+export function isCircleLocalLiveBlockingRule(db: StoragePort, conceptId: string): boolean {
+  const row = liveBlockingRuleRow(db, conceptId);
+  return row !== undefined && row.circle !== BREADTH_CIRCLE;
+}
+
+/**
+ * Ask whether `operation` may remove `conceptId` from the gate. Local paths throw `message`;
+ * graft paths skip and count, because an incoming row must never abort an otherwise-good graft.
+ */
+export function blockingRuleMutationGuard(
+  db: StoragePort,
+  conceptId: string,
+  operation: BlockingRuleOperation,
+): BlockingRuleGuardVerdict {
+  const row = liveBlockingRuleRow(db, conceptId);
   if (!row) return { blocked: false, conceptId, title: null, message: "" };
   return {
     blocked: true,

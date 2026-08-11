@@ -2075,6 +2075,37 @@ export function registerMonetCoreTools(
             return null;
           });
           const r = core.batchReassignCircle(passIds, toCircle, opts);
+          // OFF EACH RESULT, for the reason the single path states at length: this used to be a
+          // pre-scan of `passIds` before the batch call, which is the identical stale-read window
+          // one item at a time. `wasCircleLocalLiveDeny` is frozen inside each move's own
+          // `BEGIN IMMEDIATE`. CIRCLE-LOCAL denies only — a breadth-bound deny keeps firing
+          // everywhere after the move, so announcing that it "now denies only in X" would be a
+          // false statement, not an over-disclosure; the engine's predicate is already the narrow
+          // one, so that stays true here for free.
+          //
+          // NO `fromCircle` ON THESE ENTRIES (round 3), matching an instruction that has always said
+          // "the circle it left" without naming one. The reservation freezes `wasCircleLocalLiveDeny`;
+          // it does NOT freeze the origin, which `reassignCircle` reads off a `src` row fetched before
+          // the transaction opens. Reproduced: a second connection moved the rule default→staging
+          // during `bestMatches`, and the origin reported was `default` — a circle that had already
+          // stopped firing and that this mutation did not empty, sitting beside a sentence that reads
+          // as naming exactly the circle emptied. That stale-snapshot family is #197's; the disclosure
+          // stops DEPENDING on the fact rather than pretending a frozen copy would have fixed it.
+          const relocatedDenies = r.results
+            .filter((res): res is Extract<typeof res, { conceptId: string }> =>
+              res.action === "moved" && res.wasCircleLocalLiveDeny === true)
+            .map((res) => ({ conceptId: res.conceptId }));
+          // Present only when a deny actually moved — presence alone is the signal.
+          const denyDisclosure = relocatedDenies.length > 0
+            ? {
+                deniesRelocated: {
+                  rules: relocatedDenies,
+                  instruction: relocatedDenies.length === 1
+                    ? `DENY RELOCATED: this blocking rule no longer fires in the circle it left — it now denies only in ${r.toCircle}. Tell the user plainly.`
+                    : `DENY RELOCATED: these ${relocatedDenies.length} blocking rules no longer fire in the circles they left — each now denies only in ${r.toCircle}. Tell the user plainly.`,
+                },
+              }
+            : {};
           // Weave scope-error items back in, preserving input id ordering.
           let passIdx = 0;
           const mergedResults: BatchItem[] = ids.map((_id, i) => {
@@ -2092,16 +2123,21 @@ export function registerMonetCoreTools(
           const BATCH_INLINE_LIMIT = 25;
           if (mergedResults.length > BATCH_INLINE_LIMIT) {
             const errorItems = mergedResults.filter((res) => res.action === "error");
+            // `denyDisclosure` RIDES THE ELISION PATH TOO, deliberately. Eliding per-item successes
+            // keeps a large response parseable; eliding the one field that says a deny stopped
+            // firing somewhere would make a big batch the silent door a small batch is not.
             return mutOk({
               toCircle: r.toCircle,
               counts: totalCounts,
               errors: errorItems,
+              ...denyDisclosure,
               note: `per-item results elided for ${mergedResults.length - errorItems.length} items — all non-error items succeeded with the actions in counts`,
             }, "memory_reassign_circle", capturedBlock);
           }
           return mutOk({
             toCircle: r.toCircle,
             counts: totalCounts,
+            ...denyDisclosure,
             results: mergedResults,
           }, "memory_reassign_circle", capturedBlock);
         }
@@ -2111,6 +2147,33 @@ export function registerMonetCoreTools(
         if (core.circleOf(id!) !== scope(circle)) return err(`concept not found: ${id}`);
         const r = core.reassignCircle(id!, toCircle, opts);
         if (!r) return err(`concept not found: ${id}`);
+        // A DENY THAT STOPS FIRING SOMEWHERE IS NEVER SOMETHING THE USER FINDS OUT LATER — the same
+        // discipline memory_declare's DENY REMOVED / BREADTH NARROWED disclosures carry, one axis
+        // over. The move is legal (the deny keeps firing in the destination), which is exactly why
+        // nothing else in this response would have mentioned it. A BREADTH-BOUND deny is silent
+        // here on purpose: its binding does not travel with the concept, so it stops firing nowhere
+        // and there is no severity news to carry.
+        //
+        // READ OFF THE RESULT, never asked here. The predicate used to be called just before
+        // `reassignCircle`, which put the whole `bestMatches` scan between the answer and the move
+        // it describes — and a second connection re-declaring the rule's severity inside that
+        // window (a supported topology, storage.ts) made this line lie in both directions:
+        // silent about a deny that had just become blocking, and — worse — announcing a deny in the
+        // destination for a rule that had just become advisory, which is a mandatory disclosure
+        // saying the opposite of the truth. `wasCircleLocalLiveDeny` is captured inside
+        // reassignCircle's own `BEGIN IMMEDIATE`, so the sentence and the mutation share one fact.
+        //
+        // AND IT NAMES NO ORIGIN CIRCLE (round 3) — the same words the batch instruction has always
+        // used, so both paths carry one wording. The origin is the one input the reservation does NOT
+        // freeze: `reassignCircle` reads it off a `src` row fetched before the transaction opens, and
+        // a second connection moving the rule default→staging during `bestMatches` made this line say
+        // "no longer fires in default" about a circle that had already stopped firing, while the
+        // circle this move actually emptied went unnamed. #197 owns that snapshot and its worse
+        // consumers; the fix here is to stop depending on the fact, and "the circle it left" is
+        // exactly as actionable and cannot go stale.
+        const denyRelocated = r.wasCircleLocalLiveDeny && r.action === "moved"
+          ? `DENY RELOCATED: this blocking rule no longer fires in the circle it left — it now denies only in ${r.toCircle}. Tell the user plainly. `
+          : "";
         return mutOk({
           action: r.action,
           conceptId: r.conceptId,
@@ -2122,7 +2185,7 @@ export function registerMonetCoreTools(
             r.action === "merged"
               ? `Deduped into an existing memory in ${r.toCircle} (no duplicate). Read it with memory_fetch(id, "${r.toCircle}").`
               : r.action === "moved"
-                ? `Moved to ${r.toCircle}. It now lives in that circle — fetch/search it there.`
+                ? `${denyRelocated}Moved to ${r.toCircle}. It now lives in that circle — fetch/search it there.`
                 : `Already in ${r.toCircle}; nothing to do.`,
         }, "memory_reassign_circle", capturedBlock);
       } catch (e) {

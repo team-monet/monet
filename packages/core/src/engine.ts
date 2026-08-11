@@ -159,6 +159,7 @@ import {
   hasLineBreak,
   hasNoReason,
   inspectSidecar,
+  isCircleLocalLiveBlockingRule,
   LEGACY_STAR_CIRCLE,
   listMatchableStages,
   listStages,
@@ -2114,6 +2115,25 @@ export interface ReassignResult {
   mergedIntoId?: string;
   /** Observations relocated into the target circle. */
   observationsMoved: number;
+  /**
+   * Was this concept a live deny bound to ONE circle at the instant of the mutation — the fact the
+   * MCP layer's relocation disclosure is about, FROZEN by the same `BEGIN IMMEDIATE` that performed
+   * the move, so the disclosure and the mutation can never be answering two different questions.
+   *
+   * Returned rather than asked separately because there is no way to ask it correctly from outside:
+   * reassignCircle runs a full `bestMatches` vector scan before it opens its write reservation, and
+   * one `.monet` file shared by the MCP server and a `monet` CLI call is a supported topology
+   * (storage.ts). A caller reading the predicate before the call gets an answer with a shelf life,
+   * and a second connection re-declaring the rule's severity inside that window makes the
+   * disclosure state the opposite of the truth in BOTH directions — silent about a deny that did
+   * relocate, or announcing protection in the destination that no longer exists. Both were
+   * reproduced against a real second process.
+   *
+   * ABSENT on the `noop` early-return, which returns before any transaction opens: there is no
+   * mutation there and therefore no frozen instant to report, and `false` would be a verdict where
+   * the honest record is "not asked".
+   */
+  wasCircleLocalLiveDeny?: boolean;
 }
 
 /** Result of renameCircle(). */
@@ -3958,6 +3978,58 @@ export class MonetCore {
   /** Public wrapper for MCP scope-enforcement (resolveCircle is private). */
   resolveCircleName(name: string): string {
     return this.resolveCircle(name);
+  }
+
+  /**
+   * Has the store itself flagged this circle as one nobody works in? archiveCircle writes a
+   * circle_aliases row pointing the name at itself with status='archived', so this reads the same
+   * row `listCircles` joins against, for a single name instead of a candidate set.
+   *
+   * Archiving is DELIVERY-INERT — nothing in RULE_LIVENESS_WHERE consults it — which is exactly why
+   * the one place that must read it is a guard about whether a deny still governs real work.
+   */
+  private isArchivedCircle(name: string): boolean {
+    return this.db
+      .prepare(`SELECT 1 FROM circle_aliases WHERE from_name = ? AND status = 'archived'`)
+      .get(name) !== undefined;
+  }
+
+  /**
+   * THE CHOKEPOINT'S CIRCLE-MOVE DOOR, as one method because reassignCircle asserts it TWICE — once
+   * as a fast-fail before any work, and again under the write reservation (see both call sites).
+   *
+   * A move is a removal from the origin circle — a rule denies only where it lives — and that is
+   * legal precisely because the deny keeps firing in the destination, i.e. keeps firing WHERE
+   * SOMEONE IS. An archived destination is the store's own statement that nobody works there, so the
+   * premise fails and the move is a removal wearing a relocation's clothes: it goes through
+   * declaration like every other removal.
+   *
+   * CONDITIONED ON THE BINDING'S OWN LOCALITY, not on the destination alone (review round 2). A
+   * breadth (`*`) binding does not follow its concept — moveConcept excludes it deliberately — so
+   * moving a GLOBAL deny into an attic takes delivery away from nowhere: it still fires in the
+   * circle it left and in every other one. Refusing that would be worse than a guard on a path that
+   * removes nothing, because the refusal's own remediation is "declare it advisory": a caller
+   * following the error message would trade a real deny away to get past a refusal that was
+   * protecting nothing.
+   *
+   * ...AND ON WHETHER THE ORIGIN'S NAME STILL REACHES THE RULE (review round 3), which is the same
+   * reasoning turned on the other end of the move. A caller that publishes an ACTIVE circle alias
+   * origin→destination in the same transaction as the move keeps every entrance resolving the old
+   * name through that alias before it queries, so a session still working under it is delivered the
+   * identical deny — measured after `mergeCircle`, the deny fires under BOTH names. Coverage is then
+   * the same before and after, and refusing would once again hand the caller "declare it advisory"
+   * as the remediation for a move that removed nothing. Only a caller that can PROVE the alias lands
+   * with the move may pass this; see `reassignCircleInternal` for why it is not reachable publicly.
+   */
+  private assertArchivedCircleMoveAllowed(
+    conceptId: string,
+    resolvedTo: string,
+    sourceNameResolvesToDestination: boolean,
+  ): void {
+    if (sourceNameResolvesToDestination) return;
+    if (this.isArchivedCircle(resolvedTo) && isCircleLocalLiveBlockingRule(this.db, conceptId)) {
+      assertBlockingRuleMutationAllowed(this.db, conceptId, "circle move into an archived circle");
+    }
   }
 
   /**
@@ -6893,6 +6965,29 @@ export class MonetCore {
    * scoped session state, not knowledge) cannot be reassigned.
    */
   reassignCircle(id: string, toCircle: string, opts: { resolution?: "auto" | "forceNew" } = {}): ReassignResult | null {
+    return this.reassignCircleInternal(id, toCircle, opts, false);
+  }
+
+  /**
+   * The move itself, plus the one thing no public caller may assert about it:
+   * `sourceNameResolvesToDestination` — that after this move a query made under the ORIGIN circle's
+   * name still reaches this concept, because the caller publishes an active origin→destination
+   * alias in the same transaction. That is what exempts it from the archived-destination door (see
+   * `assertArchivedCircleMoveAllowed`'s last paragraph for the whole reason).
+   *
+   * Named for the PROPERTY, not for the caller that happens to have it: a flag called "from merge"
+   * would invite the next caller to set it for being a merge, when what earns the exemption is the
+   * alias. Private for the reason `storeSource`/`storeInternal` is — the exemption must be
+   * unreachable from the public surface, so `reassignCircle`, `batchReassignCircle` (which publishes
+   * no alias and IS a removal) and the MCP layer all reach the move through the wrapper above with
+   * the flag off, and `mergeCircle` is the single call site that sets it.
+   */
+  private reassignCircleInternal(
+    id: string,
+    toCircle: string,
+    opts: { resolution?: "auto" | "forceNew" },
+    sourceNameResolvesToDestination: boolean,
+  ): ReassignResult | null {
     this.assertNoEmbedderMigrationReentry("reassign a concept");
     this.assertPinSatisfied(); // embedder-pin ADR — bestMatches below decides merge-vs-move under this.tauAttach/this.tauAmbiguous
     const src = this.getRow(id);
@@ -6913,6 +7008,11 @@ export class MonetCore {
     if (fromCircle === resolvedTo) {
       return { action: "noop", conceptId: id, fromCircle, toCircle: resolvedTo, observationsMoved: 0 };
     }
+    // THE CHOKEPOINT'S CIRCLE-MOVE DOOR (see the method's own comment for what it refuses and why),
+    // as the FAST-FAIL copy: checked before the embedding scan below does any work, and re-asserted
+    // under the write reservation further down, which is the copy that actually holds. Placed after
+    // the noop early-return above, so a move that changes nothing never throws.
+    this.assertArchivedCircleMoveAllowed(id, resolvedTo, sourceNameResolvesToDestination);
     // Dedup target: the best match already in resolvedTo (bestMatches excludes workstreams; the source
     // lives in fromCircle, so it can never match itself). score ≥ tauAttach ⇒ "same concept" ⇒ merge.
     // Under forceNew: never merge; if score >= tauAmbiguous, record a possible_duplicate_of edge.
@@ -6953,7 +7053,31 @@ export class MonetCore {
       // land between the gate and the semantic mutation.
       this.assertPinSatisfied();
       this.assertWriteWidthSatisfied(this.embedder.dim);
-      const result = mergeInto ? this.mergeConceptInto(src, mergeInto, resolvedTo) : this.moveConcept(src, resolvedTo);
+      // AND THE DENY DOOR AGAIN, under that same reservation and for that same reason — the deny
+      // guard's own two-copy rule (see detach()'s F4 comment) applied to the one door whose outer
+      // copy is separated from its mutation by real work: the fast-fail above runs before the
+      // bestMatches scan, and the MCP server sharing a `.monet` file with a `monet` CLI call is a
+      // supported topology (storage.ts's WAL + busy_timeout setup exists for exactly it). A second
+      // connection committing archiveCircle(resolvedTo) inside that window is not hypothetical — it
+      // was reproduced with a real second connection, landing a live deny in an archived circle
+      // where it stopped firing for the circle it left. BEGIN IMMEDIATE freezes both halves of the
+      // question — the destination's archived flag and the rule's own liveness — through the move.
+      this.assertArchivedCircleMoveAllowed(id, resolvedTo, sourceNameResolvesToDestination);
+      // THE DISCLOSURE'S SUBJECT, FROZEN BY THE SAME RESERVATION AS THE MUTATION (see the field's
+      // own comment on ReassignResult). Asked HERE, and returned, rather than left to the MCP layer
+      // to ask before the call: the pre-call read sits on the far side of the bestMatches scan, and
+      // a second connection re-declaring this rule's severity in that window made the disclosure
+      // announce a deny in the destination that no longer existed — a mandatory disclosure stating
+      // the opposite of the truth, which is worse than the silence the same window produced in the
+      // other direction. One fact, read once, under the reservation that owns the move.
+      //
+      // BEFORE the mutation, necessarily: the merge branch consumes the source row, so afterwards
+      // the question has no answer at all rather than a stale one. (For a plain move it would still
+      // answer — moveConcept carries a circle-local binding along with its concept — but reading it
+      // in one place is the point, not reading it in the place each branch happens to allow.)
+      const wasCircleLocalLiveDeny = isCircleLocalLiveBlockingRule(this.db, id);
+      const moveResult = mergeInto ? this.mergeConceptInto(src, mergeInto, resolvedTo) : this.moveConcept(src, resolvedTo);
+      const result: ReassignResult = { ...moveResult, wasCircleLocalLiveDeny };
       return { result, proofToken: this.captureEmbeddingWidthProof(this.embedder.dim) };
     })();
     const result = committed.result;
@@ -16334,7 +16458,14 @@ export class MonetCore {
 
           let result: ReassignResult | null;
           try {
-            result = this.reassignCircle(row.id, into, { resolution });
+            // THE ARCHIVED-DESTINATION DOOR IS EXEMPT HERE, AND ONLY HERE (issue #184, round 3).
+            // The alias upsert below publishes an ACTIVE from→into row inside THIS reservation, and
+            // any per-item failure escapes this callback and rolls the whole merge back — so a
+            // committed merge always carries its alias, and a deny moved by it keeps firing under
+            // the source name (measured: it fires under both). Refusing therefore removed nothing:
+            // it aborted an entire merge and offered "declare it advisory" as the way past, which
+            // is the exact harm the door exists to prevent, produced by the door.
+            result = this.reassignCircleInternal(row.id, into, { resolution }, true);
           } catch (error) {
             throw new Error(`mergeCircle failed for concept '${row.id}': ${error instanceof Error ? error.message : String(error)}`);
           }

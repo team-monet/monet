@@ -6217,6 +6217,13 @@ describe("the chokepoint: every door is a call site", () => {
         return null;
       }],
     ];
+    attempts.push(["circle move into an archived circle", () => {
+      // ISSUE #184. A move to a LIVE circle is the one legitimate deny relocation (asserted at the
+      // end of this test); a move into a circle the store has flagged archived is a removal wearing
+      // a relocation's clothes, so it belongs in the battery like every other door.
+      c.archiveCircle("the-attic");
+      return c.reassignCircle(deny.conceptId, "the-attic");
+    }]);
     attempts.push(["supersession (public API)", () => {
       // DOOR 11. The exported slice-3 API predates the guard, and the inventory that found the
       // other doors grepped status writes and concept deletes — which structurally could not see
@@ -6238,6 +6245,170 @@ describe("the chokepoint: every door is a call site", () => {
     expect(fires(c, "elsewhere")).toBe(1);
     expect(c.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
     c.close();
+  });
+
+  /**
+   * ISSUE #184 — THE DOOR ARCHIVING OPENED, on its own, with the origin circle's gate asserted after
+   * the refusal. `RULE_LIVENESS_WHERE` matches on the querying session's circle and never reads
+   * `circle_aliases.status`, so archiving is delivery-inert and a move into an archived circle is
+   * the whole of the removal: the deny leaves the circle people work in and lands where, by the
+   * store's own flag, nobody queries. The legitimate route is unchanged — withdraw by declaration,
+   * then move — so this refusal costs a caller who genuinely means it exactly one honest step.
+   */
+  it("refuses a circle move into an ARCHIVED circle, and the deny still fires where it already was", async () => {
+    const c = resolvingCore();
+    const deny = await liveDeny(c);
+    c.archiveCircle("the-attic");
+    expect(fires(c)).toBe(1);
+
+    expect(() => c.reassignCircle(deny.conceptId, "the-attic")).toThrow(/blocking rule/);
+    // The deny did not move and did not stop governing the circle it was declared in.
+    expect(c.circleOf(deny.conceptId)).toBe("default");
+    expect(fires(c)).toBe(1);
+    expect(c.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
+
+    // AND THE DECLARED WITHDRAWAL STILL OPENS IT — the guard refuses the silent route, not the act.
+    await withdrawDeny(c, deny.conceptId, "rm -rf");
+    expect(fires(c)).toBe(0);
+    expect(c.reassignCircle(deny.conceptId, "the-attic")!.action).toBe("moved");
+    expect(c.circleOf(deny.conceptId)).toBe("the-attic");
+    c.close();
+  });
+
+  /**
+   * THE DOOR IS INHERITED, NOT RE-IMPLEMENTED. batchReassignCircle loops reassignCircle per concept,
+   * so it is closed by construction rather than by a second call site — which is the shape the
+   * chokepoint's doc comment asks for. That is only true while it keeps delegating: a refactor that
+   * inlines the loop reopens it while every assertion above still passes, because those exercise the
+   * single-concept path only. Hence this test. A batch is per-item, so the deny's item errors and
+   * its batch-mates still move.
+   *
+   * MERGECIRCLE IS THE EXEMPTION, and this is where it is pinned (issue #184, review round 3). It
+   * delegates too, but through the internal method with `sourceNameResolvesToDestination` set,
+   * because it publishes an ACTIVE from→into alias in the SAME transaction as its moves. Refusing it
+   * removed nothing and cost everything: one refused item rolled an entire merge back, and the
+   * refusal's own remediation is "declare it advisory" — a caller following it would trade a real
+   * deny away to get past a guard that was protecting nothing. The property the exemption is named
+   * for is asserted below: after the merge the deny still fires under the SOURCE circle's name.
+   */
+  it("the archived-circle door stays shut through batchReassignCircle, and mergeCircle passes because its alias keeps the source name firing", async () => {
+    const c = resolvingCore();
+    const deny = await liveDeny(c);
+    const fact = await c.store("An ordinary concept riding the same batch.", { kind: "fact" });
+    c.archiveCircle("the-attic");
+    expect(fires(c)).toBe(1);
+
+    const batch = c.batchReassignCircle([deny.conceptId, fact.conceptId], "the-attic");
+    expect(batch.counts).toMatchObject({ moved: 1, error: 1 });
+    const denyItem = batch.results.find((r) => r.action === "error" && r.id === deny.conceptId);
+    expect(denyItem, "the deny's own item must carry the refusal").toBeDefined();
+    expect((denyItem as { error: string }).error).toMatch(/blocking rule/);
+    // The refusal is scoped to the deny: its batch-mate still moved, and the deny still governs.
+    expect(c.circleOf(fact.conceptId)).toBe("the-attic");
+    expect(c.circleOf(deny.conceptId)).toBe("default");
+    expect(fires(c)).toBe(1);
+
+    // A move to a LIVE circle is the legal relocation, so the deny can be staged for the merge.
+    c.reassignCircle(deny.conceptId, "staging");
+    expect(fires(c, "staging")).toBe(1);
+
+    // ...AND THE MERGE OF THAT SAME CIRCLE INTO THAT SAME ARCHIVED ONE SUCCEEDS, because it repoints
+    // the source name at the destination instead of stranding it.
+    const merged = await c.mergeCircle("staging", "the-attic");
+    expect(merged.counts).toMatchObject({ moved: 1, error: 0 });
+    expect(c.circleOf(deny.conceptId)).toBe("the-attic");
+    expect(c.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
+    // THE WHOLE PREMISE OF THE EXEMPTION, measured: the alias mergeCircle published redirects the
+    // source name, so the deny fires under it exactly as before — and in the destination. Coverage
+    // is identical before and after, which is why there was nothing for the door to protect.
+    expect(fires(c, "staging")).toBe(1);
+    expect(fires(c, "the-attic")).toBe(1);
+    c.close();
+  });
+
+  /**
+   * THE OTHER HALF OF THAT PREMISE (review round 2). The refusal above is right because the move
+   * takes the deny away from where people work — and that is a claim about the BINDING, not about
+   * the concept's destination. A breadth ('*') binding never follows its concept (moveConcept
+   * excludes it deliberately, see its own comment), so this move removes nothing at all: the deny
+   * keeps firing in the circle it left and in every other one.
+   *
+   * Refusing it would therefore be worse than a guard on a no-op. The chokepoint's remediation is
+   * "withdraw the deny by declaring it advisory", so a caller who followed the error message would
+   * trade a REAL deny away to get past a refusal that was protecting nothing — the exact harm the
+   * guard exists to prevent, produced by the guard.
+   */
+  it("MOVES a BREADTH-bound live deny into an archived circle — that move takes delivery from nowhere", async () => {
+    const c = resolvingCore();
+    const declared = await c.declare({
+      circle: BREADTH_CIRCLE, species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a directory tree unattended.", severity: "blocking",
+      reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
+    });
+    if (declared.species !== "rule") throw new Error("unreachable");
+    // The concept lives at the ordinary default circle; only the BINDING is global.
+    expect(c.ruleBinding(declared.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    expect(c.circleOf(declared.conceptId)).toBe("default");
+    c.archiveCircle("the-attic");
+    expect(fires(c)).toBe(1);
+
+    expect(c.reassignCircle(declared.conceptId, "the-attic")!.action).toBe("moved");
+    expect(c.circleOf(declared.conceptId)).toBe("the-attic");
+    // THE BINDING DID NOT MOVE, which is the whole reason the move was allowed.
+    expect(c.ruleBinding(declared.conceptId)).toMatchObject({ circle: BREADTH_CIRCLE, severity: "blocking" });
+    // And delivery is exactly what it was: the origin circle, the archived destination, and a
+    // circle nothing in this fixture has ever touched.
+    expect(fires(c)).toBe(1);
+    expect(fires(c, "the-attic")).toBe(1);
+    expect(fires(c, "a-circle-nothing-else-touches")).toBe(1);
+    c.close();
+  });
+
+  /**
+   * THE GUARD IS RE-ASSERTED UNDER THE WRITE RESERVATION, proved against a REAL second connection
+   * rather than by inspecting the code shape. reassignCircle's fast-fail copy runs some forty lines
+   * and a full `bestMatches` vector scan before `BEGIN IMMEDIATE`, and one `.monet` file shared by
+   * the MCP server and a `monet` CLI call is a supported topology (storage.ts's WAL + busy_timeout
+   * setup exists for precisely that) — so "the destination was live when we checked" is a fact with
+   * a shelf life.
+   *
+   * The window is opened deliberately rather than approximated, the same discipline `raceOnEmbed`
+   * uses earlier in this file: the second connection commits its `archiveCircle` from inside
+   * `bestMatches`, which is the work that actually sits in the gap. Without the inner copy the move
+   * commits and the deny lands in an archived circle, silently stopping for the circle it left.
+   */
+  it("re-checks the archived destination INSIDE the write reservation, against a second connection archiving mid-move", async () => {
+    const dbPath = join(mkTmp(), "race.db");
+    const a = new MonetCore(dbPath);
+    const b = new MonetCore(dbPath); // the competing writer: its own connection to the same file
+    const deny = await liveDeny(a);
+    expect(fires(a)).toBe(1);
+    // Not archived yet, so the fast-fail copy passes — which is the premise of the whole test.
+    expect(a.reassignCircle(deny.conceptId, "still-live")!.action).toBe("moved");
+    expect(fires(a, "still-live")).toBe(1);
+
+    type Matcher = { bestMatches(emb: Float32Array, circle: string, m: number): unknown[] };
+    const original = (Object.getPrototypeOf(a) as Matcher).bestMatches;
+    let raced = false;
+    const spy = vi.spyOn(a as unknown as Matcher, "bestMatches").mockImplementation((emb, circle, m) => {
+      if (!raced) {
+        raced = true;
+        b.archiveCircle("the-attic"); // a real commit, on a real second connection, mid-window
+      }
+      return original.call(a as unknown as Matcher, emb, circle, m);
+    });
+
+    expect(() => a.reassignCircle(deny.conceptId, "the-attic")).toThrow(/blocking rule/);
+    // The refusal came from the INNER copy, necessarily: the outer one ran before the archive
+    // existed, and had it thrown, `bestMatches` — and therefore the archive — would never have run.
+    expect(raced).toBe(true);
+    expect(a.circleOf(deny.conceptId)).toBe("still-live");
+    expect(fires(a, "still-live")).toBe(1);
+    expect(a.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
+
+    spy.mockRestore();
+    a.close();
+    b.close();
   });
 
   it("SKIPS every relayed operation that would remove a live deny, counting rather than aborting", async () => {
@@ -11785,6 +11956,281 @@ describe("MCP surface", () => {
     await client.close();
     c.close();
   });
+
+  /** A live deny, declared the only way a deny can be born: by declaration. `circle: "*"` = global. */
+  async function mcpDeny(c: MonetCore, content: string, stage: string, circle?: string) {
+    const r = await c.declare({
+      species: "rule", stage, patterns: [`Bash:${stage}`], content,
+      severity: "blocking", reason: "there is no undo", declaredBy: "john", ...AGENT_RULE,
+      ...(circle ? { circle } : {}),
+    });
+    if (r.species !== "rule") throw new Error("unreachable");
+    return r;
+  }
+
+  /**
+   * ISSUE #184's SECOND HALF. The move that stays legal — live circle to live circle — is still a
+   * deny that stops firing where it was, and the response said only "Moved to X." Nothing else in
+   * the payload names severity, so the caller had no way to know and the user was never told. This
+   * is the mandatory-disclosure discipline memory_declare already carries for DENY REMOVED /
+   * BREADTH NARROWED, extended one axis over at the same layer.
+   */
+  it("memory_reassign_circle discloses a relocated deny in single mode, and says nothing for an ordinary move", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const deny = await mcpDeny(c, "Never delete a directory tree unattended.", "rm -rf");
+
+    const moved = await call("memory_reassign_circle", { id: deny.conceptId, toCircle: "elsewhere" });
+    expect(moved.isError).toBe(false);
+    expect(moved.json.action).toBe("moved");
+    const message = moved.json.message as string;
+    expect(message).toContain("DENY RELOCATED");
+    expect(message).toContain("no longer fires in the circle it left");
+    expect(message).toContain("it now denies only in elsewhere");
+    expect(message).toContain("Tell the user plainly");
+    // The ordinary guidance still rides along — the disclosure precedes it, never replaces it.
+    expect(message).toContain("Moved to elsewhere.");
+
+    // A NON-DENY MOVE SAYS NOTHING: presence of the line is the signal, so it must not be noise.
+    const fact = await c.store("An ordinary fact.", { kind: "fact" });
+    const plain = await call("memory_reassign_circle", { id: fact.conceptId, toCircle: "elsewhere" });
+    expect(plain.isError).toBe(false);
+    expect(plain.json.action).toBe("moved");
+    expect(plain.json.message as string).not.toContain("DENY RELOCATED");
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * WHAT THE DISCLOSURE MAY NOT DEPEND ON (review round 3). `wasCircleLocalLiveDeny` is frozen by the
+   * reservation that performed the move; the ORIGIN is not — `reassignCircle` reads it off a `src`
+   * row fetched before the transaction opens. Reproduced with a second connection moving the rule
+   * default→staging during `bestMatches`: this line said "no longer fires in default" about a circle
+   * that had already stopped firing, while `staging`, the circle this mutation actually emptied,
+   * appeared nowhere in the response. Freezing a snapshot is NOT the fix — the same stale value has a
+   * far worse consumer in `unwindConceptGraph`, and that whole family is #197 — so the disclosure
+   * stops depending on the fact instead, in the batch instruction's own words. This pins that no
+   * circle name stands where the origin used to.
+   */
+  it("memory_reassign_circle's single-mode disclosure names no origin circle — that fact is not frozen by the move", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const deny = await mcpDeny(c, "Never delete a directory tree unattended.", "rm -rf");
+    expect(c.circleOf(deny.conceptId)).toBe("default");
+
+    const moved = await call("memory_reassign_circle", { id: deny.conceptId, toCircle: "elsewhere" });
+    expect(moved.isError).toBe(false);
+    const disclosure = (moved.json.message as string).split("Tell the user plainly")[0]!;
+    expect(disclosure).toContain("DENY RELOCATED");
+    expect(disclosure).toContain("no longer fires in the circle it left");
+    // The DESTINATION is still named — `toCircle` is the caller's own argument, not a pre-transaction
+    // read — and the origin is not named at all, by any spelling.
+    expect(disclosure).toContain("it now denies only in elsewhere");
+    expect(disclosure).not.toContain("default");
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_reassign_circle discloses relocated denies in batch mode, and the >25-item elision never drops that field", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const deny = await mcpDeny(c, "Never delete a directory tree unattended.", "rm -rf");
+    const fact = await c.store("An ordinary fact.", { kind: "fact" });
+
+    const small = await call("memory_reassign_circle", { ids: [deny.conceptId, fact.conceptId], toCircle: "elsewhere" });
+    expect(small.isError).toBe(false);
+    expect(small.json.results).toHaveLength(2);
+    expect(small.json.deniesRelocated).toEqual({
+      rules: [{ conceptId: deny.conceptId }],
+      instruction:
+        "DENY RELOCATED: this blocking rule no longer fires in the circle it left — it now denies only in elsewhere. Tell the user plainly.",
+    });
+
+    // THE ELISION PATH IS THE ONE THAT MATTERS: a batch big enough to elide per-item results is
+    // exactly where a silently relocated deny would disappear. 30 ordinary concepts + one deny.
+    const bulkDeny = await mcpDeny(c, "Never rewrite published history.", "git push --force");
+    const ids = [bulkDeny.conceptId];
+    for (let i = 0; i < 30; i++) {
+      ids.push((await c.store(`Bulk fact ${i}.`, { kind: "fact", resolution: "forceNew" })).conceptId);
+    }
+    const big = await call("memory_reassign_circle", { ids, toCircle: "attic" });
+    expect(big.isError).toBe(false);
+    expect(big.json.results).toBeUndefined();
+    expect(big.json.note as string).toContain("per-item results elided");
+    expect(big.json.deniesRelocated).toEqual({
+      rules: [{ conceptId: bulkDeny.conceptId }],
+      instruction:
+        "DENY RELOCATED: this blocking rule no longer fires in the circle it left — it now denies only in attic. Tell the user plainly.",
+    });
+
+    await client.close();
+    c.close();
+  }, 30_000);
+
+  /**
+   * THE DISCLOSURE'S SUBJECT, NARROWED (review round 2). A breadth ('*') binding does not travel
+   * with its concept, so for a global deny the line this handler was emitting — "no longer fires in
+   * default, now denies only in elsewhere" — was simply untrue: the rule still denies in default,
+   * in elsewhere, and everywhere else. A mandatory disclosure that can be false is worse than an
+   * absent one, because the entire protocol here is that the line's PRESENCE is the signal.
+   */
+  it("memory_reassign_circle says NOTHING for a BREADTH-bound deny — single and batch — because the move costs it no delivery", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const deny = await mcpDeny(c, "Never delete a directory tree unattended.", "rm -rf", BREADTH_CIRCLE);
+    expect(c.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    const moved = await call("memory_reassign_circle", { id: deny.conceptId, toCircle: "elsewhere" });
+    expect(moved.isError).toBe(false);
+    expect(moved.json.action).toBe("moved");
+    expect(moved.json.message as string).not.toContain("DENY RELOCATED");
+    // Because nothing about its delivery changed: the binding stayed global, and the deny still
+    // fires in the circle its concept just left.
+    expect(c.ruleBinding(deny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+    expect(c.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules
+      .filter((r) => r.severity === "blocking")).toHaveLength(1);
+
+    // BATCH MODE, same question — the field is absent entirely rather than present and empty.
+    const batchDeny = await mcpDeny(c, "Never rewrite published history.", "git push --force", BREADTH_CIRCLE);
+    const batch = await call("memory_reassign_circle", { ids: [batchDeny.conceptId], toCircle: "elsewhere" });
+    expect(batch.isError).toBe(false);
+    expect(batch.json.counts).toMatchObject({ moved: 1, error: 0 });
+    expect(batch.json.deniesRelocated).toBeUndefined();
+    expect(c.ruleBinding(batchDeny.conceptId)!.circle).toBe(BREADTH_CIRCLE);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * The competing writer's own GateDeps, so its severity write goes through `bindRule` — the
+   * production function every declaration's severity ruling lands in — rather than raw SQL. Called
+   * directly, the same technique the bindRule TOCTOU tests above use, because only a SYNCHRONOUS
+   * commit can land inside the synchronous window the race below opens.
+   */
+  const raceDeps = (c: MonetCore) => ({
+    db: raw(c) as never, newId: () => "unused", nextSyncTimestamp: () => Date.now(), syncDeviceId: "connection-b",
+  });
+
+  /** Run `mid` from inside `c`'s next bestMatches scan — i.e. inside reassignCircle's pre-write gap. */
+  function raceInsideReassign(c: MonetCore, mid: () => void) {
+    type Matcher = { bestMatches(emb: Float32Array, circle: string, m: number): unknown[] };
+    const original = (Object.getPrototypeOf(c) as Matcher).bestMatches;
+    const state = { raced: false };
+    const spy = vi.spyOn(c as unknown as Matcher, "bestMatches").mockImplementation((emb, circle, m) => {
+      if (!state.raced) {
+        state.raced = true;
+        mid();
+      }
+      return original.call(c as unknown as Matcher, emb, circle, m);
+    });
+    return { state, spy };
+  }
+
+  /**
+   * THE DISCLOSURE AND THE MOVE MUST READ ONE FROZEN FACT. The handler used to ask
+   * `isCircleLocalLiveBlockingRule` just before calling `reassignCircle` — and reassignCircle runs a
+   * full `bestMatches` vector scan before it opens `BEGIN IMMEDIATE`, so that answer was separated
+   * from the move it describes by real work. One `.monet` file shared by the MCP server and a
+   * `monet` CLI call is a supported topology (storage.ts), and a re-declaration of the rule's
+   * severity landing in that window broke the disclosure in BOTH directions — this test and its
+   * sibling below. The fix returns the fact from inside the reservation instead
+   * (`ReassignResult.wasCircleLocalLiveDeny`), so there is one definition and no window at all.
+   *
+   * THE WORSE DIRECTION FIRST, and the one the reviewer did not name: a WITHDRAWN deny still
+   * announced as relocated. A disclosure whose entire purpose is telling the user the truth about
+   * deny coverage was stating the opposite — the same failure the breadth-bound narrowing above
+   * fixed, arriving on a different axis.
+   *
+   * The window is opened deliberately rather than approximated, the same discipline the
+   * archived-destination race test earlier in this file uses: the second connection commits from
+   * inside `bestMatches`, which is the work that actually sits in the gap.
+   */
+  it("memory_reassign_circle says NOTHING when a second connection withdrew the deny mid-move — the disclosure never asserts protection that no longer exists", async () => {
+    const dbPath = join(mkTmp(), "relocate-downgrade.db");
+    const a = new MonetCore(dbPath);
+    const b = new MonetCore(dbPath); // the competing writer: its own connection to the same file
+    const { call, client } = await harness(a);
+    const deny = await mcpDeny(a, "Never delete a directory tree unattended.", "rm -rf");
+    const stageId = a.ruleBinding(deny.conceptId)!.stage_id;
+    // Blocking when the caller asked — which is the premise: the old pre-call read saw exactly this.
+    expect(a.ruleBinding(deny.conceptId)!.severity).toBe("blocking");
+
+    const { state, spy } = raceInsideReassign(a, () => {
+      bindRule(raceDeps(b), {
+        conceptId: deny.conceptId, stageId, severity: "advisory", scope: "agent",
+        modelTag: "test-model-1", origin: "declaration", declaredBy: "john", circle: "default",
+      }, "replace");
+    });
+
+    const moved = await call("memory_reassign_circle", { id: deny.conceptId, toCircle: "live-dest" });
+    // The withdrawal necessarily landed BEFORE the reservation opened: bestMatches runs first.
+    expect(state.raced).toBe(true);
+    expect(moved.isError).toBe(false);
+    expect(moved.json.action).toBe("moved");
+    // THE LIE THAT MUST NOT BE TOLD: "it now denies only in live-dest" about a rule that denies
+    // nowhere. A mandatory disclosure stating the opposite of the truth is worse than an absent one.
+    expect(moved.json.message as string).not.toContain("DENY RELOCATED");
+    // ...and the silence is accurate: advisory now, and no deny fires in either circle.
+    expect(a.ruleBinding(deny.conceptId)!.severity).toBe("advisory");
+    for (const circle of ["default", "live-dest"]) {
+      expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle }).rules
+        .filter((r) => r.severity === "blocking")).toHaveLength(0);
+    }
+    // The ordinary guidance is untouched — silence is about the disclosure, not the response.
+    expect(moved.json.message as string).toContain("Moved to live-dest.");
+
+    spy.mockRestore();
+    await client.close();
+    a.close();
+    b.close();
+  }, 30_000);
+
+  it("memory_reassign_circle DISCLOSES a deny a second connection minted mid-move — the omission direction of the same window", async () => {
+    const dbPath = join(mkTmp(), "relocate-escalate.db");
+    const a = new MonetCore(dbPath);
+    const b = new MonetCore(dbPath);
+    const { call, client } = await harness(a);
+    // Advisory at the moment the caller asked, so the old pre-call read said "nothing to disclose".
+    const rule = await a.declare({
+      species: "rule", stage: "rm -rf", patterns: ["Bash:rm -rf"],
+      content: "Never delete a directory tree unattended.", reason: "there is no undo",
+      declaredBy: "john", ...AGENT_RULE,
+    });
+    if (rule.species !== "rule") throw new Error("unreachable");
+    const stageId = a.ruleBinding(rule.conceptId)!.stage_id;
+    expect(a.ruleBinding(rule.conceptId)!.severity).toBe("advisory");
+
+    const { state, spy } = raceInsideReassign(a, () => {
+      bindRule(raceDeps(b), {
+        conceptId: rule.conceptId, stageId, severity: "blocking", scope: "agent",
+        modelTag: "test-model-1", origin: "declaration", declaredBy: "john",
+        reason: "there is no undo", circle: "default",
+      }, "replace");
+    });
+
+    const moved = await call("memory_reassign_circle", { id: rule.conceptId, toCircle: "live-dest" });
+    expect(state.raced).toBe(true);
+    expect(moved.isError).toBe(false);
+    expect(moved.json.action).toBe("moved");
+    const message = moved.json.message as string;
+    expect(message).toContain("DENY RELOCATED");
+    expect(message).toContain("no longer fires in the circle it left");
+    expect(message).toContain("it now denies only in live-dest");
+    // ...and the disclosure is accurate: a real deny stopped covering `default` and covers live-dest.
+    expect(a.ruleBinding(rule.conceptId)).toMatchObject({ severity: "blocking", circle: "live-dest" });
+    expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "default" }).rules
+      .filter((r) => r.severity === "blocking")).toHaveLength(0);
+    expect(a.gate({ actionContext: "Bash:rm -rf /tmp/x", circle: "live-dest" }).rules
+      .filter((r) => r.severity === "blocking")).toHaveLength(1);
+
+    spy.mockRestore();
+    await client.close();
+    a.close();
+    b.close();
+  }, 30_000);
 
   it("measures declare and ratify as complete acknowledgement envelopes", async () => {
     const c = core();
