@@ -13,7 +13,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MonetCore } from "./engine";
-import type { MemoryOverview, MergeConceptResult, RuleSuccession, SearchCard, StageView, WorkstreamItem } from "./engine";
+import type { MemoryOverview, MergeConceptResult, RetirementBlocker, RuleSuccession, SearchCard, StageView, WorkstreamItem } from "./engine";
 import {
   BREADTH_CIRCLE,
   MODEL_TAG_MAX_CHARS,
@@ -417,6 +417,22 @@ function err(message: string): CallToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Render `retirementBlockers()`'s findings as the refusal an agent reads — EVERY blocker, each one
+ * naming its own withdrawal path, because a caller that fixes one and retries into the next has
+ * been told the truth twice and helped once. One formatter, shared by the single and batch paths of
+ * memory_retire, so the two can never disagree about what a refusal says.
+ */
+function retirementRefusal(id: string, blockers: readonly RetirementBlocker[]): string {
+  return `cannot retire ${id}: ${blockers
+    // THE REMEDY CLAUSE IS OMITTED, NOT FILLED IN, when no withdrawal surface exists — a blocker
+    // whose `withdrawVia` is absent says so in its own `detail`. Rendering "withdraw it through
+    // <nothing available>" is how a refusal starts reading as an instruction that cannot be
+    // followed, which is the round-1 finding this formatter now cannot reproduce.
+    .map((blocker) => (blocker.withdrawVia ? `${blocker.detail} — withdraw it through ${blocker.withdrawVia}` : blocker.detail))
+    .join("; ")}`;
+}
 
 // ---------------------------------------------------------------------------
 // Session lifecycle helpers (0.7.0)
@@ -2205,6 +2221,212 @@ export function registerMonetCoreTools(
         }, "memory_reassign_circle", capturedBlock);
       } catch (e) {
         return err(`reassign failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // memory_retire / memory_restore — the reversible end of a memory's lifecycle
+  // -------------------------------------------------------------------------
+  /** Same value and same reason as memory_reassign_circle's own copy: keep a big batch parseable. */
+  const RETIRE_BATCH_INLINE_LIMIT = 25;
+  /**
+   * How much of a caller-supplied id an error echoes back (review fix — round 3).
+   *
+   * An id is a routing identifier, not prose — CIRCLE_NAME_MAX_CHARS' own sentence, applied to the
+   * other caller-controlled value these two tools echo. `ids` was size-fitted in round 1, but the
+   * SINGLE-id path returns through `err()`, which has no ceiling of its own the way `ok()` does: one
+   * id longer than RESULT_MAX_CHARS produced a `CallToolResult` past the host's limit, so the caller
+   * got a rejected or unusable response instead of "concept not found". Clipped at the SOURCE, in
+   * `applyLifecycle`, so the batch's per-item errors are bounded by the same line rather than
+   * relying on `fitObjectArray` to drop the whole item — an error that survives clipped says more
+   * than one dropped whole.
+   *
+   * 128 rather than a tighter number: a concept id is a 36-char uuid, so this shows every real id in
+   * full, and enough of an unreal one to recognize what was sent. Only the CALLER's own value is
+   * clipped; an engine message reaching `msg(e)` is this codebase's own text, bounded by whoever
+   * wrote it.
+   */
+  const LIFECYCLE_ERROR_ID_MAX_CHARS = 128;
+  type LifecycleItem = { id: string; action: "retired" | "restored" | "error"; error?: string };
+
+  /**
+   * ONE ITEM OF EITHER ACT, so a batch is exactly its items and a single call is a batch of one.
+   * Never throws: a blocked or failing item is a RESULT, which is what lets a batch report it
+   * without aborting the items after it (memory_reassign_circle's own per-item contract).
+   *
+   * `action` REPORTS THE POST-STATE, and there is deliberately no "noop" member. retireConcept and
+   * restoreConcept are idempotent and return the same concept whether or not they changed anything,
+   * so "already retired" is not a distinction the engine offers this layer — and inventing one from
+   * a second read would be a claim this surface cannot actually stand behind. That contract is what
+   * makes an ALREADY-RETIRED concept a `retired` result rather than a refusal (review fix — round 2:
+   * the blockers used to run first, so a batch retry or a replicated tombstone reported a declared
+   * or ratified concept as an error for a retirement that had already happened).
+   */
+  const applyLifecycle = (id: string, callerCircle: string, act: "retire" | "restore"): LifecycleItem => {
+    // SCOPE ENFORCEMENT, identical to memory_reassign_circle's: a caller may only touch an id that
+    // lives in the circle they named, and one that does not reads as absent rather than forbidden.
+    // Connector-owned rows are invisible to circleOf (it excludes kind='source', source_identity
+    // and active_observation_id alike) without a source authorization context, so they are answered
+    // here; retirementBlockers' connector clause is the same refusal for any caller that can see
+    // the row at all, and restoreConcept throws its own.
+    //
+    // THE FAST-FAIL COPY, NOT THE ONE THAT HOLDS (review fix — round 2). The binding copy is inside
+    // the engine's write reservation (`retireIfUnblocked` / `restoreIfInCircle`, whose comments
+    // carry the window and the writers that fit through it); this one runs first so a batch's
+    // missing and out-of-circle ids cost no transaction at all, and because it is the only check
+    // that can answer before either act is chosen. Both copies produce the SAME sentence, so which
+    // one fired is not something a caller can observe — the shape reassignCircle's own paired
+    // archived-destination guards already use.
+    // EVERY ECHO OF THE CALLER'S OWN ID BELOW IS THE CLIPPED ONE — see
+    // LIFECYCLE_ERROR_ID_MAX_CHARS. The `id` FIELD of the item keeps the value verbatim, because
+    // that is what a batch caller correlates its own list against; it is the size-fitted array's
+    // problem, and it already has one.
+    const shownId = clip(id, LIFECYCLE_ERROR_ID_MAX_CHARS).text;
+    if (core.circleOf(id) !== callerCircle) return { id, action: "error", error: `concept not found: ${shownId}` };
+    try {
+      if (act === "restore") {
+        // NO BLOCKER PASS ON THIS SIDE. Restoring returns a memory to the authority it already
+        // entered on — nothing is being withdrawn — so the only refusal is connector ownership,
+        // which restoreConcept itself raises (engine.ts) and which surfaces here as that error.
+        return core.restoreIfInCircle(id, callerCircle).outcome === "restored"
+          ? { id, action: "restored" }
+          : { id, action: "error", error: `concept not found: ${shownId}` };
+      }
+      // ONE CALL, NOT THREE. `retireIfUnblocked` rechecks the caller's circle, evaluates the
+      // blockers and retires under a single write reservation — see its own comment for the two
+      // windows that asking them separately left open.
+      const outcome = core.retireIfUnblocked(id, callerCircle);
+      if (outcome.outcome === "blocked") return { id, action: "error", error: retirementRefusal(shownId, outcome.blockers) };
+      // `not-in-circle` is every way the id is not this caller's — including one that became true
+      // between the fast-fail above and the reservation — and it reads exactly as that fast-fail
+      // does, deliberately.
+      return outcome.outcome === "retired"
+        ? { id, action: "retired" }
+        : { id, action: "error", error: `concept not found: ${shownId}` };
+    } catch (e) {
+      return { id, action: "error", error: msg(e) };
+    }
+  };
+
+  /**
+   * The batch payload for either act — counts always, per-item results until they stop fitting.
+   *
+   * COUNTS SURVIVE EVERYTHING (review fix — round 1). `ids` is unbounded and every error echoes its
+   * caller-supplied id verbatim, so a large batch of blocked or missing ids could serialize past
+   * RESULT_MAX_CHARS — at which point `ok()` replaces the WHOLE payload with its generic truncation
+   * object, losing `counts` and every per-item error AFTER the successful mutations had already
+   * committed. The caller could not tell what had changed. Both variable-size arrays are now
+   * size-fitted with `fitObjectArray` against the same ceiling and the same serialization `ok()`
+   * measures, and `circle`/`counts`/`note` sit outside the fitted array, so the worst case is an
+   * empty list beside an honest count of what was left out — never a payload that says nothing.
+   */
+  const lifecycleBatchPayload = (
+    circle: string,
+    results: LifecycleItem[],
+    done: "retired" | "restored",
+  ): Record<string, unknown> => {
+    const errorItems = results.filter((item) => item.action === "error");
+    const counts = { [done]: results.length - errorItems.length, error: errorItems.length };
+    // When results are large, elide per-item successes to avoid a blind mid-JSON clip — every
+    // ERROR still ships until the ceiling itself binds, because an elided refusal is a refusal the
+    // caller never acts on, and `errorsOmitted` says exactly how many went unsaid.
+    if (results.length > RETIRE_BATCH_INLINE_LIMIT) {
+      const envelope = (fitted: LifecycleItem[], omitted: number): Record<string, unknown> => ({
+        circle,
+        counts,
+        errors: fitted,
+        ...(omitted > 0 ? { errorsTruncated: true, errorsOmitted: omitted } : {}),
+        note: `per-item results elided for ${results.length - errorItems.length} items — every non-error item is ${done}`,
+      });
+      const fit = fitObjectArray(envelope, errorItems, RESULT_MAX_CHARS);
+      return envelope(fit.fitted, fit.omitted);
+    }
+    // The small path is size-fitted too: RETIRE_BATCH_INLINE_LIMIT caps the item COUNT, and an id
+    // carries no length bound, so 25 long ones reach the ceiling just as readily.
+    const envelope = (fitted: LifecycleItem[], omitted: number): Record<string, unknown> => ({
+      circle,
+      counts,
+      results: fitted,
+      ...(omitted > 0 ? { resultsTruncated: true, resultsOmitted: omitted } : {}),
+    });
+    const fit = fitObjectArray(envelope, results, RESULT_MAX_CHARS);
+    return envelope(fit.fitted, fit.omitted);
+  };
+
+  server.tool(
+    "memory_retire",
+    "Hide a memory: it leaves memory_search, memory_fetch, memory_list and the overview counts, its evidence untouched, and memory_restore brings it back — its graph re-derived from that evidence rather than replayed, so ordering and reinforcement history do not survive the round trip. Pass exactly one of id or ids; batches are per-item and report errors without aborting. `circle` is the concept's home. A memory leaves with the authority it entered on, so this refuses one that entered by declaration or by ratification, and one carrying an open contradiction or an undismissed duplicate/extraction pair flag — retiring those would end the question by making its subject vanish instead of answering it. Each refusal names the tool that withdraws that authority first, or says plainly when no surface does. Ordinary memories, and rules an agent stored itself, retire freely.",
+    {
+      id: z.string().optional().describe("Single concept id; mutually exclusive with ids."),
+      ids: z.array(z.string()).optional().describe("Batch concept ids; mutually exclusive with id."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Concept's circle; defaults to the session circle."),
+    },
+    async ({ id, ids, circle }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      try {
+        if (id !== undefined && ids !== undefined) return err("provide exactly one of `id` or `ids`, not both");
+        if (id === undefined && ids === undefined) return err("provide exactly one of `id` or `ids`");
+        const callerCircle = scope(circle);
+        if (ids !== undefined) {
+          const results = ids.map((each) => applyLifecycle(each, callerCircle, "retire"));
+          return mutOk(lifecycleBatchPayload(callerCircle, results, "retired"), "memory_retire", capturedBlock);
+        }
+        const single = applyLifecycle(id!, callerCircle, "retire");
+        if (single.action === "error") return err(single.error!);
+        return mutOk({
+          circle: callerCircle,
+          action: single.action,
+          conceptId: id,
+          // THE CIRCLE IS PART OF THE CALL (review fix — round 1). `memory_restore` scopes by
+          // circle, so the bare `memory_restore("<id>")` this used to suggest answers
+          // "concept not found" for every concept outside the session default — an instruction that
+          // fails for exactly the caller who needed it. Same shape memory_reassign_circle's own
+          // acknowledgement already uses for memory_fetch.
+          //
+          // AND BOTH ARGUMENTS ARE SERIALIZED, NEVER INTERPOLATED (review fix — round 2). A circle
+          // name is only length-bounded (CIRCLE_NAME_MAX_CHARS) — no charset rule anywhere accepts
+          // or rejects one — so a name carrying a quote, a backslash or a newline rendered a
+          // malformed suggestion (`memory_restore("id", "project"x")`) that the caller cannot
+          // replay, for exactly the caller who cannot guess the escaping either. JSON.stringify
+          // emits a well-formed string literal for every name this tool accepts, and for a plain
+          // name it is byte-identical to what the interpolation produced.
+          message: `Retired. It is out of memory_search, memory_fetch, memory_list and the overview counts; memory_restore(${JSON.stringify(id)}, ${JSON.stringify(callerCircle)}) brings it back with its evidence intact.`,
+        }, "memory_retire", capturedBlock);
+      } catch (e) {
+        return err(`retire failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "memory_restore",
+    "Undo memory_retire: a retired memory is searchable, fetchable, listed and counted again, and its graph is re-derived. Pass exactly one of id or ids; batches are per-item and report errors without aborting. `circle` is the concept's home.",
+    {
+      id: z.string().optional().describe("Single retired concept id; mutually exclusive with ids."),
+      ids: z.array(z.string()).optional().describe("Batch retired concept ids; mutually exclusive with id."),
+      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Concept's circle; defaults to the session circle."),
+    },
+    async ({ id, ids, circle }) => {
+      const capturedBlock = capturePrewarmSnapshot(scope(circle));
+      try {
+        if (id !== undefined && ids !== undefined) return err("provide exactly one of `id` or `ids`, not both");
+        if (id === undefined && ids === undefined) return err("provide exactly one of `id` or `ids`");
+        const callerCircle = scope(circle);
+        if (ids !== undefined) {
+          const results = ids.map((each) => applyLifecycle(each, callerCircle, "restore"));
+          return mutOk(lifecycleBatchPayload(callerCircle, results, "restored"), "memory_restore", capturedBlock);
+        }
+        const single = applyLifecycle(id!, callerCircle, "restore");
+        if (single.action === "error") return err(single.error!);
+        return mutOk({
+          circle: callerCircle,
+          action: single.action,
+          conceptId: id,
+          message: `Restored to ${callerCircle}. It is searchable, fetchable and listed again.`,
+        }, "memory_restore", capturedBlock);
+      } catch (e) {
+        return err(`restore failed: ${msg(e)}`);
       }
     },
   );

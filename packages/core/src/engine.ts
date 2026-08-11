@@ -297,6 +297,13 @@ const THREAD_TYPES = new Set(["co_occurred", "follows", "supersedes", "contradic
 const PAIR_FLAG_EDGE_TYPES = ["possible_duplicate_of", "extraction_candidate"] as const;
 /** The same set as a literal SQL IN-list. Fixed literals, never interpolated caller data. */
 const PAIR_FLAG_EDGE_TYPES_SQL = PAIR_FLAG_EDGE_TYPES.map((t) => `'${t}'`).join(", ");
+/**
+ * How many pair partners a retirement refusal names before it says "and N more". The refusal has to
+ * carry AT LEAST one id — `memory_resolve` needs both endpoints and no read on this server
+ * enumerates an undismissed edge — but an error string is not a listing, and the count beside it
+ * already reports the true total.
+ */
+const RETIREMENT_PAIR_FLAG_NAMED_MAX = 3;
 // The reference class must match slugify's repertoire (Codex review, PR #189). `\w` is ASCII here,
 // so `supports: #주식-트래커` never reached resolveRef at all — giving non-Latin concepts distinct
 // slugs is worth nothing while the parser that consumes those slugs cannot read one. `_` and `:`
@@ -2171,6 +2178,51 @@ export interface BatchReassignResult {
   toCircle: string;
   results: Array<ReassignResult | { id: string; action: "error"; error: string }>;
   counts: { moved: number; merged: number; noop: number; error: number };
+}
+
+/**
+ * One reason a concept may not be retired, and the surface that can withdraw it — see
+ * `retirementBlockers()` for the principle all of them are instances of.
+ */
+export interface RetirementBlocker {
+  /**
+   * Stable machine label for the finding: what kind of authority the concept entered on — or, for
+   * the last two, which unanswered question retiring it would destroy instead of answering.
+   */
+  code: "declaration" | "ratification" | "connector-owned" | "open-contradiction" | "open-pair-flag";
+  /** The finding, as a sentence fragment a caller renders into its own error. */
+  detail: string;
+  /**
+   * The tool that ends that authority. Never a way to force the retirement.
+   *
+   * ABSENT WHEN NO SUCH SURFACE EXISTS, which is the honest record rather than a verdict — a
+   * declared rule has no withdrawal act today (#200), and naming one anyway is what the round-1
+   * review caught: a caller was sent between two tools that both refuse. A renderer must omit the
+   * remedy clause entirely when this is absent, not print a sentence that reads as one.
+   */
+  withdrawVia?: string;
+}
+
+/**
+ * What one reserved retirement did — the three answers a tool surface must be able to tell apart.
+ *
+ * `blocked` carries the findings to render. `retired` is the POST-STATE, not a claim that this call
+ * performed it: a concept that was already retired answers `retired` too, because that is the state
+ * the caller asked for. `not-in-circle` means no concept with this id lives in the circle the caller
+ * named — gone, never minted, moved away under a competing writer, or connector-owned (`circleOf`
+ * answers null for all of them) — and the surface renders it as the same "concept not found" its own
+ * pre-reservation fast-fail produces, so a caller can never tell which copy fired.
+ *
+ * `blockers` is empty except under `blocked`.
+ */
+export interface RetirementOutcome {
+  outcome: "retired" | "blocked" | "not-in-circle";
+  blockers: RetirementBlocker[];
+}
+
+/** What one reserved restoration did — `not-in-circle` exactly as above, and no blocker pass. */
+export interface RestorationOutcome {
+  outcome: "restored" | "not-in-circle";
 }
 
 /** Maximum pending-synthesis entries returned by one checkpoint worklist. */
@@ -6630,8 +6682,314 @@ export class MonetCore {
   }
 
 
-  /** Retire a concept without deleting immutable evidence. Restoring re-derives its graph. */
-  retireConcept(id: string): Concept | null {
+  /**
+   * WHAT MUST BE WITHDRAWN BEFORE THIS CONCEPT MAY BE RETIRED — every applicable reason in one
+   * pass, never the first one found: a caller has to know everything it must do before it starts.
+   * An empty array means the concept retires freely.
+   *
+   * ONE PRINCIPLE, FIVE INSTANCES: A MEMORY LEAVES WITH THE AUTHORITY IT ENTERED ON. That is the
+   * blocking-rule chokepoint's own sentence (`retireConcept` below — "declaration-only in both
+   * directions — as hard to remove as it is to mint") with `severity` swapped for the thing that
+   * actually varies here: who authorized the entry. So each blocker names the surface that ENDS
+   * that authority, and none of them is a way to force the retirement through.
+   *
+   * THE LAST TWO VARY IT, and say so in their own comments: what retirement would take is not an
+   * authority but an UNANSWERED QUESTION it would destroy rather than answer, so the surface each
+   * names is the one that answers the question rather than one that withdraws a right. They are
+   * structurally identical to the first three in every other respect — same verdict object, same
+   * "no way to force it through", same reserved evaluation.
+   *
+   * A VERDICT OBJECT RATHER THAN A THROW, modelled on `blockingRuleMutationGuard` (gates.ts) for
+   * the reason that guard states: every caller renders the finding into its own sentence, and the
+   * tool surface must be able to report one blocked item without aborting the batch around it.
+   *
+   * A QUESTION, NOT A GATE. `retireConcept` is unchanged and still carries the one refusal that is
+   * its own (the live-deny chokepoint); these five live at the TOOL surface, which is why nothing
+   * that retires today stops retiring.
+   *
+   * WHAT IS DELIBERATELY NOT HERE: `origin='correction'` and `origin='projection'` bindings — the
+   * rules an agent stored itself, which retire freely. The naming trap, recorded so the next reader
+   * does not re-file it as a marker of user authority: `origin='correction'` does NOT mean "born
+   * from a correction". It is simply the default when `declaration !== true` (captureRuleBinding),
+   * and a `kind="correction"` OBSERVATION is a different thing entirely that carries no origin of
+   * its own.
+   */
+  retirementBlockers(conceptId: string): RetirementBlocker[] {
+    const row = this.getRow(conceptId);
+    // NOT A VERDICT. A concept that does not exist has no authority to withdraw; reporting the id
+    // as missing belongs to the caller's own existence check (the MCP layer's circleOf scope gate),
+    // and answering "nothing blocks it" here would be a finding about a row that isn't there.
+    if (!row) return [];
+    const marks = this.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM rule_bindings b WHERE b.concept_id = ? AND b.origin = 'declaration') AS declaredBinding,
+           (SELECT COUNT(*) FROM contradictions k WHERE k.concept_id = ? AND k.status = 'open') AS openContradictions,
+           -- PAIRS, NOT ROWS. upsertEdgeBoth records a pair flag in both directions, so counting
+           -- memory_edge rows would report one open question as two. DISTINCT over (type, the OTHER
+           -- endpoint) is the count a human recognizes: how many questions are still unanswered.
+           -- Scoped to this concept's own circle because that is exactly what unwindConceptGraph
+           -- deletes (scope = ?), so the count is the loss rather than an approximation of it.
+           (SELECT COUNT(*) FROM (
+              SELECT DISTINCT e.type, CASE WHEN e.src_id = ? THEN e.dst_id ELSE e.src_id END AS partner
+                FROM memory_edge e
+               WHERE e.scope = ? AND e.type IN (${PAIR_FLAG_EDGE_TYPES_SQL})
+                 AND e.dismissed_at IS NULL AND (e.src_id = ? OR e.dst_id = ?)
+            )) AS openPairFlags`,
+      )
+      .get(conceptId, conceptId, conceptId, row.circle, conceptId, conceptId) as
+        { declaredBinding: number; openContradictions: number; openPairFlags: number };
+    const blockers: RetirementBlocker[] = [];
+    // THE BINDING'S OWN ORIGIN, AND DELIBERATELY NOT THE STAGE'S. The principle is the authority
+    // THIS MEMORY entered on, not the authority that minted its address, and the two come apart in
+    // exactly the case #182 exists to serve: `memory_declare(species:"stage")` followed by
+    // `memory_store(kind:"rule")` at that stage leaves 'correction' on the binding and
+    // 'declaration' on the stage. That rule entered on the agent's own authority and retires
+    // freely; blocking it would re-file the agent's own memory as the user's, which is the failure
+    // this pair is most likely to have (see the free-tier test).
+    //
+    // A relayed declared rule is the case that would want the stage marker — it arrives with
+    // `origin='import'` on its binding while the stage keeps the declaration. It is not read here
+    // because that would cost the live free tier to protect an inert one: sync is not in use, and
+    // when it is, "whose authority does a grafted row carry" is the sync slice's own question
+    // (#195), not a marker to approximate from the stage.
+    if (marks.declaredBinding > 0) {
+      // NO WITHDRAWAL SURFACE EXISTS FOR THIS ONE, and the refusal now says so (review fix — round
+      // 1). It used to name `memory_declare`, which is fiction: that tool has no retire or withdraw
+      // operation, and re-declaring the same rule preserves `origin='declaration'` on its binding —
+      // so the advertised remedy left a caller circling between two tools that both refuse. What a
+      // declared rule actually needs is a withdrawal act that does not exist yet; until it does, the
+      // honest answer is that this memory cannot be retired here, and both dead ends are named so
+      // nobody spends a turn discovering them.
+      blockers.push({
+        code: "declaration",
+        detail:
+          "it entered by declaration, and no surface withdraws one — memory_declare has no retire, " +
+          "and re-declaring keeps the declaration (monet-core#200)",
+      });
+    }
+    // THE CURRENT VERDICT, NEVER THE HISTORY (review fix — round 1). This used to COUNT
+    // `ratifications` rows, and `memory_ratify` is append-only with latest-wins membership
+    // (`skeleton()`'s own LATEST-WINS clause), so the count was wrong in both directions: a caller
+    // who followed the refusal and recorded verdict "retire" ADDED a row, pushing the count up and
+    // repeating the same refusal forever — the advertised withdrawal path could never unblock — and
+    // a candidate whose only verdict was `reject` never entered the skeleton at all yet was blocked
+    // as though it had. Read through `isCurrentSkeletonMember` rather than restated here, so the
+    // blocker and the skeleton cannot drift about what membership means.
+    //
+    // THE VERDICT HALF ONLY, deliberately. `skeleton()` additionally requires `status = 'active'`,
+    // which SUSPENDS a disputed member's delivery without withdrawing the ruling that admitted it —
+    // and retiring it would end that membership just as surely, so the blocker holds where delivery
+    // has merely paused. Nothing is reachable through the gap regardless: a disputed concept carries
+    // the open contradiction that the last blocker below refuses on anyway.
+    if (this.isCurrentSkeletonMember(conceptId)) {
+      blockers.push({
+        code: "ratification",
+        detail: "it is a current skeleton member by ratification",
+        withdrawVia: 'memory_ratify with verdict "retire"',
+      });
+    }
+    if (isConnectorOwnedRow(row)) {
+      blockers.push({
+        code: "connector-owned",
+        detail: "it is connector-owned, and no user path retires a source projection",
+        withdrawVia: "source_sync",
+      });
+    }
+    // ITS OWN REASON, AND NOT ABOUT AUTHORITY. `retireConcept` dismisses every open contradiction
+    // on the concept it retires (`resolved_by = 'retireConcept'`, below) — so retiring a disputed
+    // concept ENDS THE DISPUTE BY MAKING ITS SUBJECT VANISH rather than by answering it. This
+    // blocker is what makes that statement dead for tool-initiated retires, which is the intent:
+    // resolve first, and then the retirement is ordinary.
+    if (marks.openContradictions > 0) {
+      blockers.push({
+        code: "open-contradiction",
+        detail: `it carries ${marks.openContradictions} open contradiction(s), which retiring would silently dismiss rather than answer`,
+        withdrawVia: "memory_resolve",
+      });
+    }
+    // THE SAME REASON, ONE SUBSTRATE OVER (review fix — round 3). `retireConcept` calls
+    // `unwindConceptGraph`, which deletes EVERY `memory_edge` touching the concept in its circle —
+    // pair-flag rows and their dismissal provenance included — while `restoreConcept` only
+    // re-derives the graph, and `rederiveConceptGraph` never recreates a pair flag: those are
+    // recorded at STORE TIME from a scoring decision that no longer exists to be recomputed, which
+    // is the same fact the consolidating-detach path already carries a snapshot/restore carve-out
+    // for (see PAIR_FLAG_EDGE_TYPES and detach's own "Preserve PAIR-FLAG edges" step). So a
+    // retire/restore round trip PERMANENTLY ERASES an unanswered duplicate or extraction question,
+    // and this pair of tools is what first made that round trip reachable.
+    //
+    // FIXED IN THE BLOCKER FRAME, NOT IN THE GRAPH, because the finding is the open-contradiction
+    // one exactly: an unanswered question that retiring would destroy rather than answer, whose
+    // answer is the same `memory_resolve` — its pair-flag dismissal shape rather than its
+    // contradiction verdict, which is why the remedy names the shape. Snapshotting the edges around
+    // the unwind (detach's answer) would preserve the ROWS while leaving the question just as
+    // unanswered, and it would be a second, subtly different copy of that carve-out; refusing keeps
+    // one rule — a question is answered before its subject may leave — and needs no new mechanism.
+    //
+    // UNDISMISSED, NOT PRESENT. A dismissed flag is an ANSWERED question: its rows die in the same
+    // unwind, but nothing anybody still owes is lost with them, and blocking on them would make
+    // every pair a human has ever adjudicated permanently unretirable — a refusal whose advertised
+    // remedy had already been followed, which is the round-1 defect class this slice exists to keep
+    // out.
+    if (marks.openPairFlags > 0) {
+      // AND THE PARTNERS ARE NAMED, not just counted (review fix — round 4). `memory_resolve`'s
+      // pair-flag shape needs BOTH ids, and there is no read on this server that enumerates an
+      // undismissed edge: `memory_overview`'s duplicate and extraction queues are top-N and carry
+      // their own filters, so a pair outside them is invisible. A refusal that demands an id the
+      // caller has no way to obtain is a remedy that cannot be followed — the same defect as round
+      // 1's declaration path, round 2's unparseable suggestion and round 3's over-ceiling error,
+      // and the fourth time this slice has shipped one. Bounded because an error string is not a
+      // listing, and the count above already says how many there are.
+      const partners = this.db
+        .prepare(
+          `SELECT DISTINCT e.type AS type,
+                  CASE WHEN e.src_id = ? THEN e.dst_id ELSE e.src_id END AS partner
+             FROM memory_edge e
+            WHERE e.scope = ? AND e.type IN (${PAIR_FLAG_EDGE_TYPES_SQL})
+              AND e.dismissed_at IS NULL AND (e.src_id = ? OR e.dst_id = ?)
+            ORDER BY e.type, partner
+            LIMIT ${RETIREMENT_PAIR_FLAG_NAMED_MAX}`,
+        )
+        .all(conceptId, row.circle, conceptId, conceptId) as Array<{ type: string; partner: string }>;
+      const named = partners.map((pair) => `${pair.partner} (${pair.type})`).join(", ");
+      const unnamed = marks.openPairFlags - partners.length;
+      blockers.push({
+        code: "open-pair-flag",
+        detail:
+          `it carries ${marks.openPairFlags} undismissed pair flag(s) (a duplicate or extraction ` +
+          `question about it and another memory), which retiring would erase rather than answer` +
+          (named ? ` — paired with ${named}${unnamed > 0 ? `, and ${unnamed} more` : ""}` : ""),
+        withdrawVia: `memory_resolve with conceptAId="${conceptId}" and conceptBId set to a partner above`,
+      });
+    }
+    return blockers;
+  }
+
+  /**
+   * THE CALLER'S CIRCLE, THE BLOCKERS AND THE RETIREMENT AS ONE ACT — all three under a single write
+   * reservation, which is the only form in which either refusal is actually an invariant (review fix
+   * — round 1 for the blockers, round 2 for the circle; the same defect class as monet-core#196/#197
+   * and the same fix shape).
+   *
+   * The tool surface used to ask `retirementBlockers()` and then call `retireConcept()`, two
+   * statements with an unreserved gap between them. One `.monet` file shared by the MCP server and a
+   * `monet` CLI call is a supported topology (storage.ts's WAL + busy_timeout setup exists for
+   * precisely that), so a second connection could commit a ratification — or open a contradiction —
+   * inside that gap, and the retirement would proceed on a finding that was already false, silently
+   * dismissing the contradiction it was added to refuse on. `BEGIN IMMEDIATE` takes the write lock
+   * before the blockers are read, so the fact and the mutation it authorizes cannot come apart.
+   *
+   * `expectedCircle` IS THE SAME FACT ONE LAYER UP, AND IT HAD THE IDENTICAL GAP (review fix — round
+   * 2). The tool surface reads `circleOf(id)` to enforce its scope boundary and then calls this
+   * method: a second connection moving the concept between those two statements (`reassignCircle`
+   * on an active concept; `graftRows`' own `circle = excluded.circle` under sync) made the
+   * retirement land in the circle the concept had just moved TO while the caller had named the one
+   * it left — the tool's stated scope boundary, bypassed through the same window, in the same
+   * topology. THIS copy is the one that holds. Unlike the blockers, the outer copy is kept as a
+   * fast-fail (see `applyLifecycle`'s own comment for what it buys), which is `reassignCircle`'s
+   * paired archived-destination guards, not a second definition: both answer with the same sentence.
+   *
+   * ALREADY RETIRED IS SUCCESS, AND IS ANSWERED BEFORE THE BLOCKERS (review fix — round 2). The tool
+   * surface reports the POST-STATE, and for a concept that has already left, the post-state the
+   * caller asked for is the durable one — there is no authority still to withdraw. Evaluating the
+   * blockers first made a batch retry, or a replicated tombstone that arrived first, report a
+   * declared or ratified concept as an ERROR for a retirement that had already happened, which
+   * contradicts the idempotence that surface documents. Read under the reservation like everything
+   * else here, so it cannot be a stale reading of a concept another connection is restoring.
+   *
+   * ONE DEFINITION OF THE BLOCKER LOGIC: this calls the same public `retirementBlockers()`, which
+   * stays a question anyone may ask, and the same public `retireConcept()`, whose own
+   * `db.transaction` nests as a savepoint here (better-sqlite3 flattens nested transactions — the
+   * property `ratify()` already depends on) and remains correct standalone for source-sync's
+   * callers. There is deliberately no fast-fail copy of the BLOCKER pass at the tool surface:
+   * nothing expensive sits between those two halves, so a second copy would buy no work and add a
+   * way for the two to disagree.
+   */
+  retireIfUnblocked(id: string, expectedCircle: string): RetirementOutcome {
+    const outcome = this.db.immediateTransaction((): RetirementOutcome => {
+      // SCOPE FIRST: everything below is a finding about a concept the caller must own to ask about.
+      if (this.circleOf(id) !== expectedCircle) return { outcome: "not-in-circle", blockers: [] };
+      const row = this.getRow(id);
+      // `circleOf` just matched a row for this id under this reservation, so `row` is present — the
+      // guard narrows the type rather than describing a state this can reach.
+      if (!row) return { outcome: "not-in-circle", blockers: [] };
+      if (row.status === "retired") return { outcome: "retired", blockers: [] };
+      const blockers = this.retirementBlockers(id);
+      if (blockers.length > 0) return { outcome: "blocked", blockers };
+      // THE ROWS ONLY — THE MIRROR IS PUBLISHED AFTER THIS COMMITS (review fix — round 3), which is
+      // what `deferSidecarRefresh` suppresses. `retireConcept`'s own closing `refreshGateSidecar()`
+      // used to run HERE, inside the reservation, accepted in round 1 on the reasoning that nothing
+      // after it could roll back and the write is idempotent against the gate generation. The
+      // hazard is not rollback: a file published from inside an UNCOMMITTED transaction is visible
+      // to every other process while the store they can read still sits at the OLD generation. A
+      // second WAL reader materializing the mirror in that interval sees a file ahead of the
+      // generation its own fresh read reports, cannot distinguish it from debris of a lineage the
+      // store no longer has (materializeGateMirror's own AHEAD OF OUR SNAPSHOT compare — its
+      // tiebreaking re-read of `gateGeneration` cannot see our uncommitted bump either), and
+      // overwrites it with the pre-retirement rule set. After the commit the database and the
+      // offline mirror then disagree with nothing left to correct them, since the write that would
+      // have re-derived the file is the one that just happened. A process exit or a failed commit
+      // inside the same interval leaves the identical mismatch.
+      return { outcome: this.retireConcept(id, true) !== null ? "retired" : "not-in-circle", blockers: [] };
+    })();
+    // PUBLISHED HERE, FROM COMMITTED STATE, and unconditionally — the same posture every other
+    // generation-moving path keeps. It reproduces exactly what the suppressed in-transaction call
+    // would have written (`refreshGateSidecar` derives the whole file from the database, and
+    // nothing runs between the commit and this line), and it is the same cheap no-op on every
+    // outcome that changed nothing: its own staleness compare returns before writing, and it
+    // returns before even that when no `gateSidecarPath` is configured, which is the default.
+    this.refreshGateSidecar();
+    return outcome;
+  }
+
+  /**
+   * THE CALLER'S CIRCLE AND THE RESTORATION AS ONE ACT — `retireIfUnblocked`'s scope paragraph
+   * applied to the other half of the pair (review fix — round 2), because the window was identical:
+   * the tool surface read `circleOf(id)` and then called `restoreConcept(id)`, so a concept moved in
+   * between came back in a circle the caller never named while the acknowledgement announced the one
+   * they did. Narrower than the retire side but not closed: the two public movers refuse a retired
+   * concept outright (`reassignCircle` through `assertActiveMutableConcept`, and `renameCircle`/
+   * `mergeCircle` through their own "cannot rename/merge circles containing retired concepts"), so
+   * the reachable mover of a RETIRED row is `graftRows`' `circle = excluded.circle` under sync —
+   * while for an already-active concept, where restoring is an idempotent no-op, an ordinary
+   * `reassignCircle` was enough to make the acknowledgement name the wrong circle.
+   *
+   * NO BLOCKER PASS ON THIS SIDE: restoring returns a memory to the authority it already entered on,
+   * so nothing is being withdrawn. `restoreConcept`'s own refusals (workstream, connector-owned)
+   * still throw, out through this reservation, which rolls back.
+   *
+   * ITS PIN ASSERTION AND ITS ROW READ NOW RUN INSIDE THE RESERVATION TOO, which is strictly the
+   * stronger reading: they used to sit ahead of its deferred `db.transaction`, whose write lock is
+   * not taken until the first write. That transaction nests as a savepoint here, and its closing
+   * `refreshGateSidecar()` is suppressed and re-issued after the commit for exactly the reason
+   * `retireIfUnblocked` states above — MORE sharply on this side, because restoring a rule ADDS to
+   * the mirror: the interval publishes a newly live deny that a second WAL reader then reverts, and
+   * the store is left enforcing a deny the offline mirror omits. That is the under-block direction,
+   * the one `restoreConcept`'s own comment names as the one that must not be forgotten.
+   */
+  restoreIfInCircle(id: string, expectedCircle: string): RestorationOutcome {
+    const outcome = this.db.immediateTransaction((): RestorationOutcome => {
+      if (this.circleOf(id) !== expectedCircle) return { outcome: "not-in-circle" };
+      return { outcome: this.restoreConcept(id, true) !== null ? "restored" : "not-in-circle" };
+    })();
+    this.refreshGateSidecar();
+    return outcome;
+  }
+
+  /**
+   * Retire a concept without deleting immutable evidence. Restoring re-derives its graph.
+   *
+   * `deferSidecarRefresh` IS INTERNAL, AND HAS EXACTLY ONE CALLER (review fix — round 3):
+   * `retireIfUnblocked`, which wraps this in a write reservation and therefore has to publish the
+   * mirror AFTER that reservation commits rather than from inside it — see its own comment for the
+   * second-reader interval this closes. It is a suppression flag, never a skip: the reserved wrapper
+   * owes the identical `refreshGateSidecar()` call, one commit later. Every ORDINARY caller
+   * (source-sync's two apply loops, tests, any direct engine use) leaves it defaulted and keeps
+   * today's behavior exactly — this method still publishes the mirror itself, and the flag's shape
+   * is `hardDeleteNativeConcept`'s own `replicate`: an internal-only positional whose non-default
+   * value appears at one call site, directly under the comment that justifies it.
+   */
+  retireConcept(id: string, deferSidecarRefresh = false): Concept | null {
     this.assertNoEmbedderMigrationReentry("retire a concept");
     const row = this.getRow(id);
     if (!row) return null;
@@ -6680,12 +7038,17 @@ export class MonetCore {
       return toConcept(this.getRow(id)!);
     })();
     for (const [circle, conceptId] of this.lastConceptByCircle) if (conceptId === id) this.lastConceptByCircle.delete(circle);
-    this.refreshGateSidecar(); // no-op unless retiring this concept moved the generation
+    if (!deferSidecarRefresh) this.refreshGateSidecar(); // no-op unless retiring this concept moved the generation
     return result;
   }
 
-  /** Restore a retired concept's active read status and graph footprint. */
-  restoreConcept(id: string): Concept | null {
+  /**
+   * Restore a retired concept's active read status and graph footprint.
+   *
+   * `deferSidecarRefresh`: see `retireConcept`'s own note — same flag, same one internal caller
+   * (`restoreIfInCircle`), same obligation to publish one commit later.
+   */
+  restoreConcept(id: string, deferSidecarRefresh = false): Concept | null {
     this.assertNoEmbedderMigrationReentry("restore a concept");
     this.assertPinSatisfied(); // embedder-pin ADR — rederiveConceptGraph below scores this concept's stored vector against every OTHER concept's under this.tauAttach/this.edgeSimMin
     const row = this.getRow(id);
@@ -6713,7 +7076,7 @@ export class MonetCore {
       this.rederiveConceptGraph(id, row.circle);
       return toConcept(this.getRow(id)!);
     })();
-    this.refreshGateSidecar();
+    if (!deferSidecarRefresh) this.refreshGateSidecar();
     return restored;
   }
 

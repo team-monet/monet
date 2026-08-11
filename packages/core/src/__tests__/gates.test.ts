@@ -13317,6 +13317,803 @@ describe("MCP surface", () => {
     await client.close();
     c.close();
   });
+
+  // -------------------------------------------------------------------------
+  // memory_retire / memory_restore (#182)
+  //
+  // THE ONE PRINCIPLE THESE PIN: a memory leaves with the authority it entered on. Every refusal
+  // below is an instance of it, and the free cases are the other half of the same sentence — an
+  // over-broad guard here silently re-files the agent's own memory as the user's, which is the
+  // failure this pair is most likely to have.
+  // -------------------------------------------------------------------------
+  it("memory_retire takes a fact out of every read path, and memory_overview's counts drop with it", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const stored = await call("memory_store", { content: "The staging cron ran at 04:00 and found nothing." });
+    const id = stored.json.conceptId as string;
+    expect((await call("memory_overview", {})).json.counts).toMatchObject({ concepts: 1, observations: 1 });
+
+    const retired = await call("memory_retire", { id });
+    expect(retired.isError).toBe(false);
+    expect(retired.json).toMatchObject({ circle: "default", action: "retired", conceptId: id });
+
+    // EVERY READ PATH, not a representative one: crowding is the harm retirement removes, so a
+    // single surface that still returns the row would leave the act half-done.
+    expect((await call("memory_search", { query: "staging cron" })).json.results).toEqual([]);
+    const fetched = await call("memory_fetch", { id });
+    expect(fetched.isError).toBe(true);
+    expect(fetched.text).toBe(`concept not found: ${id}`);
+    expect((await call("memory_list", {})).json).toMatchObject({ total: 0, memories: [] });
+    expect((await call("memory_overview", {})).json.counts).toMatchObject({ concepts: 0, observations: 0 });
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_restore brings a retired fact back and it is findable again", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const stored = await call("memory_store", { content: "The staging cron ran at 04:00 and found nothing." });
+    const id = stored.json.conceptId as string;
+    expect((await call("memory_retire", { id })).isError).toBe(false);
+
+    const restored = await call("memory_restore", { id });
+    expect(restored.isError).toBe(false);
+    expect(restored.json).toMatchObject({ circle: "default", action: "restored", conceptId: id });
+
+    const found = (await call("memory_search", { query: "staging cron" })).json.results as Array<{ id: string }>;
+    expect(found.map((card) => card.id)).toEqual([id]);
+    expect((await call("memory_fetch", { id })).isError).toBe(false);
+    expect((await call("memory_overview", {})).json.counts).toMatchObject({ concepts: 1 });
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_retire refuses a DECLARED rule and names memory_declare", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    // ADVISORY on purpose: a blocking declaration is already refused by retireConcept's own
+    // chokepoint, so an advisory one is what proves THIS guard fired rather than that one.
+    const declared = await call("memory_declare", {
+      species: "rule", stage: "opening a pr", content: "Say what changed and why.",
+      severity: "advisory", scope: "domain", declaredBy: "john",
+    });
+    expect(declared.isError).toBe(false);
+    const id = declared.json.conceptId as string;
+    expect(c.ruleBinding(id)!.origin).toBe("declaration");
+
+    const refused = await call("memory_retire", { id });
+    expect(refused.isError).toBe(true);
+    // AND NAMES NO PATH, because none exists (review fix — round 1). The refusal used to send the
+    // caller to `memory_declare`, which has no retire and whose re-declaration preserves
+    // `origin='declaration'` — a loop between two tools that both refuse. Both dead ends are stated
+    // here so the message cannot quietly grow a remedy back without this assertion noticing.
+    // The remedy clause is OMITTED, not filled with a placeholder — "withdraw it through <nothing>"
+    // is itself an instruction that cannot be followed, which is the shape being refused here.
+    expect(refused.text).toBe(
+      `cannot retire ${id}: it entered by declaration, and no surface withdraws one — ` +
+      `memory_declare has no retire, and re-declaring keeps the declaration (monet-core#200)`,
+    );
+    expect(refused.text).not.toContain("withdraw it through");
+    // …and the second dead end is a fact about this build, not a claim: re-declaring really does
+    // leave the binding declaration-born, so the refusal repeats verbatim.
+    const redeclared = await call("memory_declare", {
+      species: "rule", stage: "opening a pr", content: "Say what changed and why.",
+      severity: "advisory", scope: "domain", declaredBy: "john",
+    });
+    expect(redeclared.isError).toBe(false);
+    expect(c.ruleBinding(redeclared.json.conceptId as string)!.origin).toBe("declaration");
+    // REFUSED MEANS UNTOUCHED — the rule is still delivered at its stage.
+    expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE POST-STATE THE CALLER ASKED FOR IS ALREADY DURABLE, SO IT IS SUCCESS (review fix — round 2).
+   * `applyLifecycle` documents `action` as the post-state, and a concept can already be retired
+   * without this tool ever having authorized it: the pre-existing public `retireConcept()` carries
+   * no blocker pass (they live at the tool surface, deliberately), and a replicated tombstone lands
+   * the same state from another device. The blockers used to be evaluated first, so a batch retry or
+   * a maintenance sweep counted an already-retired declared or ratified concept as an ERROR for a
+   * retirement that had already happened. Nothing is being withdrawn from a memory that has left.
+   */
+  it("an ALREADY-RETIRED declared rule reports retired rather than the declaration refusal", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const declared = await call("memory_declare", {
+      species: "rule", stage: "opening a pr", content: "Say what changed and why.",
+      severity: "advisory", scope: "domain", declaredBy: "john",
+    });
+    const id = declared.json.conceptId as string;
+    // WHILE IT IS LIVE THE REFUSAL STANDS — this test weakens nothing about the blocker itself.
+    expect((await call("memory_retire", { id })).isError).toBe(true);
+
+    // The engine path retires it anyway, which is not a loophole but the documented split: the
+    // blockers are the TOOL's question, and retireConcept is the same call source-sync's tombstone
+    // replay makes.
+    expect(c.retireConcept(id)).not.toBeNull();
+    // The authority is still on record — this is why evaluating the blockers first refused here.
+    expect(c.retirementBlockers(id).map((blocker) => blocker.code)).toEqual(["declaration"]);
+
+    const retired = await call("memory_retire", { id });
+    expect(retired.isError).toBe(false);
+    expect(retired.json).toMatchObject({ action: "retired", conceptId: id });
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_retire refuses a RATIFIED principle and names memory_ratify's retire verdict", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const principle = await call("memory_declare", { species: "principle", content: "Prefer the smallest reversible step." });
+    const id = principle.json.conceptId as string;
+    expect((await call("memory_ratify", { candidateId: id, verdict: "re-ratify", ratifiedBy: "john" })).isError).toBe(false);
+
+    const refused = await call("memory_retire", { id });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toBe(
+      `cannot retire ${id}: it is a current skeleton member by ratification — withdraw it through ` +
+      `memory_ratify with verdict "retire"`,
+    );
+    expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(true);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE WITHDRAWAL PATH THE REFUSAL ADVERTISES, DRIVEN END TO END (review fix — round 1). The
+   * blocker used to COUNT `ratifications` rows, and `memory_ratify` is append-only with latest-wins
+   * membership — so a caller who did exactly what the refusal said ADDED a row, the count went up,
+   * and the refusal repeated forever. The advertised path could never unblock, which made the
+   * "a memory leaves with the authority it entered on" sentence a dead end rather than a door.
+   * Deleting this test is how the count comes back.
+   */
+  it("memory_ratify verdict \"retire\" really unblocks the retirement — the withdrawal round trip", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const principle = await call("memory_declare", { species: "principle", content: "Prefer the smallest reversible step." });
+    const id = principle.json.conceptId as string;
+    expect((await call("memory_ratify", { candidateId: id, verdict: "approve", ratifiedBy: "john" })).isError).toBe(false);
+    expect((await call("memory_retire", { id })).isError).toBe(true);
+
+    // THE WITHDRAWAL, through the one surface the refusal names.
+    expect((await call("memory_ratify", { candidateId: id, verdict: "retire", ratifiedBy: "john" })).isError).toBe(false);
+    // Membership really ended: the skeleton no longer carries it, and neither does the blocker.
+    expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
+
+    const retired = await call("memory_retire", { id });
+    expect(retired.isError).toBe(false);
+    expect(retired.json).toMatchObject({ action: "retired", conceptId: id });
+    expect((await call("memory_fetch", { id })).isError).toBe(true);
+
+    await client.close();
+    c.close();
+  });
+
+  it("a principle whose only verdict was `reject` never entered, and retires freely", async () => {
+    // THE OTHER DIRECTION OF THE SAME BUG: a rejected candidate has a ratification ON RECORD and no
+    // membership whatsoever, so the old count blocked a concept that never entered the skeleton.
+    const c = core();
+    const { call, client } = await harness(c);
+    const principle = await call("memory_declare", { species: "principle", content: "Ship on Fridays, always." });
+    const id = principle.json.conceptId as string;
+    expect((await call("memory_ratify", { candidateId: id, verdict: "reject", ratifiedBy: "john" })).isError).toBe(false);
+    expect(c.skeleton("default").some((entry) => entry.conceptId === id)).toBe(false);
+    expect(c.retirementBlockers(id)).toEqual([]);
+
+    expect((await call("memory_retire", { id })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  it("memory_retire refuses a concept carrying an open contradiction and names memory_resolve", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const fact = await call("memory_store", { content: "The metrics service listens on 8080." });
+    const id = fact.json.conceptId as string;
+    // VERIFIED, NOT ASSUMED: this is the reachable route to an open contradiction, and the guard
+    // below is only meaningful if the correction really opened one.
+    const correction = await call("memory_store", { content: "It listens on 9090 now.", kind: "correction", attachTo: id });
+    expect(correction.isError).toBe(false);
+    expect(correction.json.contradiction).toMatchObject({ status: "open" });
+    expect((await call("memory_fetch", { id })).json.status).toBe("disputed");
+
+    const refused = await call("memory_retire", { id });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toBe(
+      `cannot retire ${id}: it carries 1 open contradiction(s), which retiring would silently ` +
+      `dismiss rather than answer — withdraw it through memory_resolve`,
+    );
+    // THE POINT OF THIS ONE: retireConcept dismisses open contradictions itself, so without the
+    // guard the dispute would have been closed by making its subject vanish. It is still open.
+    expect(c.countOpenContradictionsForConcept(id)).toBe(1);
+
+    await client.close();
+    c.close();
+  });
+
+  it("a rule the agent stored itself retires freely — the tier #182 is about", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const stored = await call("memory_store", {
+      content: "Run the typecheck before handing a diff back.",
+      kind: "rule", rule: { stage: "handing back a diff", scope: "domain" },
+    });
+    const id = stored.json.conceptId as string;
+    // `origin='correction'` is the DEFAULT for a non-declaration capture, not a claim that a
+    // correction bore it — this is the marker that must never be read as user authority.
+    expect(c.ruleBinding(id)!.origin).toBe("correction");
+    expect(c.retirementBlockers(id)).toEqual([]);
+
+    const retired = await call("memory_retire", { id });
+    expect(retired.isError).toBe(false);
+    expect(retired.json).toMatchObject({ action: "retired", conceptId: id });
+    expect(c.stageLookup({ stage: "handing back a diff" }).rules.map((rule) => rule.conceptId)).not.toContain(id);
+
+    await client.close();
+    c.close();
+  });
+
+  it("...and still retires freely when the STAGE it addresses was declared — the address is not the authority", async () => {
+    // THE NARROWING THIS PINS (#182 review): the blocker reads the BINDING's origin and deliberately
+    // not the stage's. A user declaring a stage and an agent then storing a rule at it is the
+    // ordinary case — most stages in a real store are declared — so reading the stage's origin
+    // would re-file the agent's own rule as the user's and close the whole tier this issue exists
+    // to open. Deleting this test is how that clause comes back.
+    const c = core();
+    const { call, client } = await harness(c);
+    const declaredStage = await call("memory_declare", {
+      species: "stage", stage: "opening a pr", patterns: ["Bash:gh pr create"], declaredBy: "john",
+    });
+    expect(declaredStage.isError).toBe(false);
+    expect(c.stages().find((stage) => stage.name === "opening a pr")!.origin).toBe("declaration");
+
+    const stored = await call("memory_store", {
+      content: "Name the risk section before asking for review.",
+      kind: "rule", rule: { stage: "opening a pr", scope: "domain" },
+    });
+    const id = stored.json.conceptId as string;
+    // Agent authority on the rule, user authority on its address — and only the first governs.
+    expect(c.ruleBinding(id)!.origin).toBe("correction");
+    expect(c.retirementBlockers(id)).toEqual([]);
+
+    expect((await call("memory_retire", { id })).isError).toBe(false);
+    expect(c.stageLookup({ stage: "opening a pr" }).rules.map((rule) => rule.conceptId)).not.toContain(id);
+
+    // The stage itself is untouched by retiring a rule that addressed it.
+    expect(c.stages().some((stage) => stage.name === "opening a pr")).toBe(true);
+
+    await client.close();
+    c.close();
+  });
+
+  it("a mixed batch retires the free item and reports the blocked one without aborting", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const free = await call("memory_store", { content: "An unremarkable scan log entry." });
+    const freeId = free.json.conceptId as string;
+    const disputed = await call("memory_store", { content: "The metrics service listens on 8080." });
+    const disputedId = disputed.json.conceptId as string;
+    expect((await call("memory_store", { content: "It listens on 9090 now.", kind: "correction", attachTo: disputedId })).isError).toBe(false);
+
+    // BLOCKED ITEM FIRST, so a batch that aborted on it would leave the free one unretired.
+    const batch = await call("memory_retire", { ids: [disputedId, freeId] });
+    expect(batch.isError).toBe(false);
+    expect(batch.json.counts).toEqual({ retired: 1, error: 1 });
+    expect(batch.json.results).toEqual([
+      {
+        id: disputedId,
+        action: "error",
+        error: `cannot retire ${disputedId}: it carries 1 open contradiction(s), which retiring would ` +
+          `silently dismiss rather than answer — withdraw it through memory_resolve`,
+      },
+      { id: freeId, action: "retired" },
+    ]);
+    // The free one really left; the blocked one really stayed.
+    expect((await call("memory_fetch", { id: freeId })).isError).toBe(true);
+    expect((await call("memory_fetch", { id: disputedId })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  it("a connector-owned row is refused by both tools, and the engine names source_sync", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const stored = await call("memory_store", { content: "A row that becomes connector-owned." });
+    const id = stored.json.conceptId as string;
+    raw(c).prepare(`UPDATE concepts SET source_identity = ? WHERE id = ?`).run("source://fixture/x", id);
+
+    // AT THE ENGINE, where the withdrawal path is named: `source_sync`, and no user path.
+    expect(c.retirementBlockers(id)).toEqual([
+      {
+        code: "connector-owned",
+        detail: "it is connector-owned, and no user path retires a source projection",
+        withdrawVia: "source_sync",
+      },
+    ]);
+    expect(() => c.restoreConcept(id)).toThrow(/connector-owned source concept; source sync\/rebuild owns restoration/);
+
+    // AT THE WIRE, both tools refuse — as "not found", because circleOf excludes every
+    // connector-ownership marker (kind='source', source_identity, active_observation_id) unless a
+    // source authorization context is supplied, and these handlers pass none (the scope-enforcement
+    // shape memory_reassign_circle carries).
+    expect((await call("memory_retire", { id })).text).toBe(`concept not found: ${id}`);
+    expect((await call("memory_restore", { id })).text).toBe(`concept not found: ${id}`);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE BLOCKERS ARE EVALUATED UNDER THE RESERVATION THAT PERFORMS THE RETIREMENT, proved against a
+   * REAL second connection rather than by inspecting the code shape — the technique, and the
+   * reasoning, of "re-checks the archived destination INSIDE the write reservation" earlier in this
+   * file, applied to the same defect class (monet-core#196/#197).
+   *
+   * The tool surface used to ask `retirementBlockers()` and then call `retireConcept()` as two
+   * statements, and one `.monet` file shared by the MCP server and a `monet` CLI call is a supported
+   * topology (storage.ts's WAL + busy_timeout setup exists for precisely that). The racing write is
+   * therefore placed exactly where the gap was: AFTER the blockers are read, BEFORE the retirement.
+   * Without the reservation it commits, and `retireConcept` then dismisses the contradiction it just
+   * opened (`resolved_by = 'retireConcept'`) — the invariant this slice added, bypassed silently.
+   *
+   * The row COUNT is what discriminates, not the open count: a bypassed race leaves a DISMISSED row
+   * behind, so "no open contradictions" is true in both worlds and proves nothing.
+   */
+  it("evaluates the retirement blockers INSIDE the write reservation, against a second connection disputing mid-retire", async () => {
+    const dbPath = join(mkTmp(), "retire-race.db");
+    const a = new MonetCore(dbPath);
+    const b = new MonetCore(dbPath); // the competing writer: its own connection to the same file
+    // A short busy timeout ON THE RACER ONLY. The reservation refusing its write is the assertion;
+    // the default 5 s wait would spend five seconds proving the identical thing.
+    (raw(b) as unknown as { pragma(source: string): unknown }).pragma("busy_timeout = 50");
+    const { call, client } = await harness(a);
+    const fact = await a.store("The metrics service listens on 8080.");
+    const id = fact.conceptId;
+    expect(a.retirementBlockers(id)).toEqual([]); // nothing blocks it — the premise of the test
+
+    type Blockable = { retirementBlockers(conceptId: string): unknown[] };
+    const original = (Object.getPrototypeOf(a) as Blockable).retirementBlockers;
+    let raced = "not attempted";
+    const spy = vi.spyOn(a as unknown as Blockable, "retirementBlockers").mockImplementation((conceptId) => {
+      const blockers = original.call(a as unknown as Blockable, conceptId);
+      if (raced === "not attempted") {
+        try {
+          b.flagContradiction(conceptId, { detail: "a second connection disputes it" });
+          raced = "landed";
+        } catch (e) {
+          raced = e instanceof Error ? e.message : String(e);
+        }
+      }
+      return blockers;
+    });
+
+    const retired = await call("memory_retire", { id });
+    expect(spy).toHaveBeenCalled();
+    // THE RESERVATION HELD: the racing write could not commit inside the window.
+    expect(raced).toMatch(/SQLITE_BUSY|database is locked/);
+    expect(retired.isError).toBe(false);
+    // ...so no contradiction row exists at all — neither open, nor dismissed by the retirement.
+    expect(raw(a).prepare(`SELECT COUNT(*) AS n FROM contradictions WHERE concept_id = ?`).get(id)).toEqual({ n: 0 });
+
+    spy.mockRestore();
+    await client.close();
+    a.close();
+    b.close();
+  });
+
+  /**
+   * THE CALLER'S CIRCLE IS RECHECKED UNDER THE SAME RESERVATION, proved against a REAL second
+   * connection — the same technique as the blocker race above, applied to the second instance of the
+   * same defect class in the same pair of handlers (review fix — round 2; monet-core#196/#197 and
+   * round 1's blocker fix are the earlier three).
+   *
+   * The tool surface reads `circleOf(id)` to enforce its scope boundary and then calls the engine.
+   * The racing move is therefore placed exactly in that gap: AFTER the fast-fail has answered "yes,
+   * default", BEFORE the reservation opens. It COMMITS here — unlike the blocker race, nothing is
+   * holding the write lock yet, which is precisely the window. Without the reserved recheck the
+   * retirement then lands in `attic`, a circle this caller never named, and the acknowledgement
+   * says `default`.
+   */
+  it("rechecks the caller's circle INSIDE the write reservation, against a second connection moving the concept mid-retire", async () => {
+    const dbPath = join(mkTmp(), "retire-scope-race.db");
+    const a = new MonetCore(dbPath);
+    const b = new MonetCore(dbPath); // the competing writer: its own connection to the same file
+    const { call, client } = await harness(a);
+    const fact = await a.store("The metrics service listens on 8080.");
+    const id = fact.conceptId;
+    expect(a.circleOf(id)).toBe("default"); // the premise of the caller's scope claim
+    expect(a.retirementBlockers(id)).toEqual([]); // nothing else would refuse this retirement
+
+    type Reserved = { retireIfUnblocked(conceptId: string, expectedCircle: string): unknown };
+    const original = (Object.getPrototypeOf(a) as Reserved).retireIfUnblocked;
+    let raced = "not attempted";
+    const spy = vi.spyOn(a as unknown as Reserved, "retireIfUnblocked").mockImplementation((conceptId, expectedCircle) => {
+      if (raced === "not attempted") {
+        b.reassignCircle(conceptId, "attic"); // an ordinary supported move, from another connection
+        raced = "landed";
+      }
+      return original.call(a as unknown as Reserved, conceptId, expectedCircle);
+    });
+
+    const retired = await call("memory_retire", { id });
+    expect(spy).toHaveBeenCalled();
+    expect(raced).toBe("landed"); // the move really committed — otherwise this proves nothing
+    // THE RESERVED COPY REFUSED, in the fast-fail's own words: a caller cannot tell which fired.
+    expect(retired.isError).toBe(true);
+    expect(retired.text).toBe(`concept not found: ${id}`);
+    // ...and the concept is untouched in the circle it moved to.
+    expect(raw(a).prepare(`SELECT status, circle FROM concepts WHERE id = ?`).get(id)).toEqual({ status: "active", circle: "attic" });
+    expect(raw(a).prepare(`SELECT COUNT(*) AS n FROM concept_tombstones WHERE concept_id = ?`).get(id)).toEqual({ n: 0 });
+
+    spy.mockRestore();
+    await client.close();
+    a.close();
+    b.close();
+  });
+
+  /** The same recheck on the restore side, whose window was identical (review fix — round 2). */
+  it("rechecks the caller's circle INSIDE the write reservation on the RESTORE side too", async () => {
+    const dbPath = join(mkTmp(), "restore-scope-race.db");
+    const a = new MonetCore(dbPath);
+    const b = new MonetCore(dbPath);
+    const { call, client } = await harness(a);
+    const fact = await a.store("The staging cron ran at 04:00 and found nothing.");
+    const id = fact.conceptId;
+    expect(a.retireConcept(id)).not.toBeNull();
+
+    type Reserved = { restoreIfInCircle(conceptId: string, expectedCircle: string): unknown };
+    const original = (Object.getPrototypeOf(a) as Reserved).restoreIfInCircle;
+    let raced = "not attempted";
+    const spy = vi.spyOn(a as unknown as Reserved, "restoreIfInCircle").mockImplementation((conceptId, expectedCircle) => {
+      // RAW SQL DELIBERATELY, and this is the honest model rather than a shortcut: every PUBLIC
+      // mover refuses a RETIRED concept (reassignCircle through assertActiveMutableConcept;
+      // renameCircle and mergeCircle through their own "cannot rename/merge circles containing
+      // retired concepts"), so the reachable mover of this row is `graftRows`' own
+      // `circle = excluded.circle` under sync — one UPDATE from another connection, which is this.
+      if (raced === "not attempted") {
+        raw(b).prepare(`UPDATE concepts SET circle = 'attic' WHERE id = ?`).run(conceptId);
+        raced = "landed";
+      }
+      return original.call(a as unknown as Reserved, conceptId, expectedCircle);
+    });
+
+    const restored = await call("memory_restore", { id });
+    expect(spy).toHaveBeenCalled();
+    expect(raced).toBe("landed");
+    expect(restored.isError).toBe(true);
+    expect(restored.text).toBe(`concept not found: ${id}`);
+    // Still hidden, in the circle it moved to: nothing was un-hidden outside the caller's scope.
+    expect(raw(a).prepare(`SELECT status, circle FROM concepts WHERE id = ?`).get(id)).toEqual({ status: "retired", circle: "attic" });
+    expect(raw(a).prepare(`SELECT COUNT(*) AS n FROM concept_restorations WHERE concept_id = ?`).get(id)).toEqual({ n: 0 });
+
+    spy.mockRestore();
+    await client.close();
+    a.close();
+    b.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // THE MIRROR IS PUBLISHED AFTER THE RESERVATION COMMITS (review fix — round 3)
+  //
+  // The two races above prove the ROWS are decided under the reservation. These two prove the one
+  // write in this pair that is not a row is decided OUTSIDE it — for the opposite reason, and with
+  // the same technique: a REAL second connection, run at the exact instant this store publishes.
+  //
+  // WHAT ROUND 1 ACCEPTED, AND WHY IT WAS WRONG: `retireConcept`/`restoreConcept` end with their own
+  // `refreshGateSidecar()`, which under the reserved wrappers ran INSIDE the transaction, on the
+  // reasoning that nothing after it could roll back and the write is idempotent against the gate
+  // generation. The hazard is not rollback. A file published from inside an uncommitted transaction
+  // is visible to every other process while the store they can read still sits at the OLD
+  // generation, so a second reader materializing the mirror in that interval sees a file ahead of
+  // the generation its own fresh read reports, cannot tell it from debris of a lineage the store no
+  // longer has, and overwrites it. The commit then lands with no further write to re-derive the
+  // file — the very write that would have is the one that just happened.
+  //
+  // THE INTERLEAVING IS FORCED, NOT WAITED FOR: better-sqlite3 is synchronous, so the second reader
+  // is placed by spying on THIS store's own publish point and calling through first. That is the
+  // one hook that sits at the same code location in both worlds — only its position relative to the
+  // commit differs, which is exactly the property under test.
+  // -------------------------------------------------------------------------
+  const readMirror = (path: string): GateMirror => JSON.parse(readFileSync(path, "utf8")) as GateMirror;
+
+  /** Interpose `after` immediately after this store's own sidecar publish, once. */
+  function onPublish(c: MonetCore, after: () => string): { spy: { mockRestore(): void }; raced: () => string } {
+    type Sidecarred = { refreshGateSidecar(): void };
+    const original = (Object.getPrototypeOf(c) as Sidecarred).refreshGateSidecar;
+    let raced = "not attempted";
+    const spy = vi.spyOn(c as unknown as Sidecarred, "refreshGateSidecar").mockImplementation(() => {
+      original.call(c as unknown as Sidecarred);
+      if (raced === "not attempted") raced = after();
+    });
+    return { spy, raced: () => raced };
+  }
+
+  it("publishes the gate sidecar only AFTER the retirement's reservation commits, against a second reader materializing it in the interval", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const dbPath = join(mkTmp(), "retire-sidecar-order.db");
+    const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    // The second reader: its own connection to the same file, and NO sidecar of its own — it writes
+    // this one only when asked, which is what an offline hook's `monet` CLI invocation does.
+    const b = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    // AN ADVISORY RULE, and that is the whole reachable range here: retiring a LIVE DENY is refused
+    // outright by the blocking-rule chokepoint, so a locally-retirable rule is one whose deny has
+    // already been withdrawn. The mirror carries both severities (format 4), so the generation moves
+    // and the file changes exactly as it would for a deny — the restore test below is the direction
+    // where that difference would matter, and it is stated there.
+    const rule = await a.store("Pull before you push.", {
+      kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE },
+    });
+    expect(readMirror(path).entries.map((e) => e.conceptId)).toEqual([rule.conceptId]); // the premise
+
+    const { spy, raced } = onPublish(a, () => b.materializeGateMirror(path).outcome);
+    expect(a.retireIfUnblocked(rule.conceptId, "default").outcome).toBe("retired");
+
+    // THE SECOND READER FOUND THE FILE ALREADY CURRENT — it could only have, because the commit had
+    // landed before the publish, so its own snapshot carried the same generation and the same
+    // (empty) rule set. In the in-transaction world it reads the OLD generation, calls the fresh
+    // file debris, and answers "written" for a mirror it has just reverted.
+    expect(raced()).toBe("skipped-current");
+    expect(readMirror(path).entries).toEqual([]);
+    expect(a.isSidecarStale().stale).toBe(false); // the store and the file agree
+
+    spy.mockRestore();
+    a.close();
+    b.close();
+  });
+
+  /**
+   * The same ordering on the RESTORE side, where the mismatch runs the dangerous way: restoring a
+   * rule ADDS it to the mirror, so a reverted publish leaves the store DELIVERING a rule the offline
+   * file omits — the under-block direction `restoreConcept`'s own comment names as the one that must
+   * not be forgotten. Advisory here for the reason the retire test states (a live deny cannot be
+   * retired locally, so no locally-retired concept carries one), and the mechanism is severity-blind:
+   * both live in `entries`, and one generation bump governs both.
+   */
+  it("publishes the gate sidecar only AFTER the restoration's reservation commits", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "gate-sidecar.json");
+    const dbPath = join(mkTmp(), "restore-sidecar-order.db");
+    const a = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1, gateSidecarPath: path });
+    const b = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const rule = await a.store("Pull before you push.", {
+      kind: "rule", rule: { stage: "git push", instance: "Bash:git push", ...AGENT_RULE },
+    });
+    expect(a.retireConcept(rule.conceptId)!.status).toBe("retired");
+    expect(readMirror(path).entries).toEqual([]); // the premise: the file is caught up on the retire
+
+    const { spy, raced } = onPublish(a, () => b.materializeGateMirror(path).outcome);
+    expect(a.restoreIfInCircle(rule.conceptId, "default").outcome).toBe("restored");
+
+    expect(raced()).toBe("skipped-current");
+    // THE RULE THE STORE NOW DELIVERS IS IN THE FILE. Without the deferral this array is empty while
+    // `stageLookup` below answers with the rule — the store enforcing what the mirror denies knowing.
+    expect(readMirror(path).entries.map((e) => e.conceptId)).toEqual([rule.conceptId]);
+    expect(a.stageLookup({ stage: "git push" }).rules.map((r) => r.conceptId)).toEqual([rule.conceptId]);
+    expect(a.isSidecarStale().stale).toBe(false);
+
+    spy.mockRestore();
+    a.close();
+    b.close();
+  });
+
+  /**
+   * COUNTS SURVIVE A BATCH WHOSE ERRORS DO NOT FIT (review fix — round 1). `ids` is unbounded and
+   * every error echoes its caller-supplied id verbatim, so enough long blocked ids pushed the
+   * `errors` array past RESULT_MAX_CHARS — and `ok()` then replaced the ENTIRE payload with its
+   * generic truncation object, losing `counts` and every per-item error, after the batch's
+   * successful mutations had already committed. The caller could not tell what had changed.
+   */
+  it("a batch whose errors overflow the ceiling keeps its counts and says how many were omitted", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    // Ids that exist nowhere, long enough that echoing them back is ~90 000 chars — comfortably
+    // past the 40 000-char result ceiling. Over RETIRE_BATCH_INLINE_LIMIT (25), so this is the
+    // errors-only elision path.
+    const longIds = Array.from({ length: 60 }, (_, i) => `${String(i).padStart(3, "0")}-${"x".repeat(1_200)}`);
+    const batch = await call("memory_retire", { ids: longIds });
+    expect(batch.isError).toBe(false);
+    // NOT the generic truncation object — that is the failure, and it is what `truncated` marks.
+    expect(batch.json).not.toHaveProperty("truncated");
+    expect(batch.json.counts).toEqual({ retired: 0, error: 60 });
+    expect(batch.json.errorsTruncated).toBe(true);
+    expect((batch.json.errors as unknown[]).length + (batch.json.errorsOmitted as number)).toBe(60);
+    expect((batch.json.errors as unknown[]).length).toBeGreaterThan(0);
+    expect(batch.text.length).toBeLessThanOrEqual(40_000);
+
+    // THE SMALL PATH IS FITTED TOO: RETIRE_BATCH_INLINE_LIMIT caps the item COUNT, and an id carries
+    // no length bound, so 20 very long ones reach the same ceiling without ever being elided.
+    const hugeIds = Array.from({ length: 20 }, (_, i) => `${i}-${"y".repeat(3_000)}`);
+    const small = await call("memory_retire", { ids: hugeIds });
+    expect(small.isError).toBe(false);
+    expect(small.json).not.toHaveProperty("truncated");
+    expect(small.json.counts).toEqual({ retired: 0, error: 20 });
+    expect(small.json.resultsTruncated).toBe(true);
+    expect((small.json.results as unknown[]).length + (small.json.resultsOmitted as number)).toBe(20);
+    expect(small.text.length).toBeLessThanOrEqual(40_000);
+
+    await client.close();
+    c.close();
+  });
+
+  it("the retire acknowledgement names the circle in its memory_restore suggestion, and that exact call works", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const stored = await call("memory_store", {
+      content: "The staging cron ran at 04:00 and found nothing.", circle: "project-x",
+    });
+    const id = stored.json.conceptId as string;
+    const retired = await call("memory_retire", { id, circle: "project-x" });
+    expect(retired.isError).toBe(false);
+
+    // THE BARE CALL THIS USED TO SUGGEST CANNOT WORK: memory_restore scopes by circle, and an id
+    // outside the session default reads as absent — the instruction failed for exactly the caller
+    // who needed it, in the only circle arrangement a real store has.
+    expect((await call("memory_restore", { id })).text).toBe(`concept not found: ${id}`);
+
+    // ...so the suggestion is REPLAYED rather than merely matched: whatever the message says, that
+    // is the call that must succeed.
+    const suggested = /memory_restore\("([^"]+)", "([^"]+)"\)/.exec(retired.json.message as string);
+    expect(suggested).not.toBeNull();
+    expect(suggested![1]).toBe(id);
+    const restored = await call("memory_restore", { id: suggested![1], circle: suggested![2] });
+    expect(restored.isError).toBe(false);
+    expect((await call("memory_fetch", { id, circle: "project-x" })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * THE SUGGESTION IS A CALL, SO IT MUST PARSE AS ONE FOR EVERY NAME THE TOOL ACCEPTS (review fix —
+   * round 2). `circle` is `z.string().max(CIRCLE_NAME_MAX_CHARS)` and nothing anywhere restricts its
+   * characters, so interpolating it between quotes produced `memory_restore("id", "pro"ject\x")` —
+   * a literal that ends where the name's own quote falls. The round-1 fix made the suggestion
+   * complete; this one makes it well-formed, which is the same promise for the rest of the names.
+   */
+  it("the suggested memory_restore call stays well-formed for a circle name carrying a quote and a backslash", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const circle = `pro"ject\\x`;
+    const stored = await call("memory_store", { content: "The staging cron ran at 04:00 and found nothing.", circle });
+    expect(stored.isError).toBe(false); // the name is ACCEPTED — measured, not assumed
+    const id = stored.json.conceptId as string;
+
+    const retired = await call("memory_retire", { id, circle });
+    expect(retired.isError).toBe(false);
+    const args = /memory_restore\((.*)\) brings it back/.exec(retired.json.message as string);
+    expect(args).not.toBeNull();
+    // WELL-FORMEDNESS ASSERTED BY PARSING, not by matching the string this handler happens to build:
+    // an argument list that is two string literals is exactly one that parses inside brackets, and
+    // the interpolated version throws here.
+    expect(JSON.parse(`[${args![1]!}]`)).toEqual([id, circle]);
+
+    // ...and REPLAYED, because a suggestion that parses but does not work is the same dead end.
+    const [suggestedId, suggestedCircle] = JSON.parse(`[${args![1]!}]`) as [string, string];
+    expect((await call("memory_restore", { id: suggestedId, circle: suggestedCircle })).isError).toBe(false);
+    expect((await call("memory_fetch", { id, circle })).isError).toBe(false);
+
+    await client.close();
+    c.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // THE FIFTH BLOCKER: AN UNANSWERED PAIR FLAG (review fix — round 3)
+  //
+  // tauAttach 0.9 / tauAmbiguous 0.1 with these two texts is detach.test.ts's own deterministic
+  // fixture for an ambiguous fork: the second store does not merge and records the pair flag.
+  // -------------------------------------------------------------------------
+  const PAIR_A = "We decided to use SQLite as the storage backend for Monet Local.";
+  const PAIR_B = "Monet Local uses SQLite for its local storage backend.";
+  const flaggingCore = (): MonetCore => new MonetCore(":memory:", { tauAttach: 0.9, tauAmbiguous: 0.1 });
+
+  it("a retire/restore round trip ERASES an undismissed pair flag — the loss the blocker exists to refuse", async () => {
+    const c = flaggingCore();
+    const a = await c.store(PAIR_A);
+    const b = await c.store(PAIR_B);
+    expect(b.action).toBe("ambiguous"); // the premise: a real, undismissed question about the pair
+    const pair = (): unknown[] => c.edges({ circle: "default", type: "possible_duplicate_of" })
+      .filter((e) => [e.srcId, e.dstId].includes(a.conceptId) && [e.srcId, e.dstId].includes(b.conceptId));
+    expect(pair().length).toBeGreaterThan(0);
+
+    // THE ENGINE'S OWN PAIR, which carries no blocker pass and is what source-sync calls: this is
+    // the round trip, not a way around the refusal.
+    expect(c.retireConcept(a.conceptId)!.status).toBe("retired");
+    expect(c.restoreConcept(a.conceptId)!.status).toBe("active");
+
+    // GONE, AND UNRECOVERABLE. `unwindConceptGraph` deletes every edge touching the concept;
+    // `rederiveConceptGraph` never records a pair flag, because one is minted at STORE TIME from a
+    // scoring decision that no longer exists to recompute. Nobody ever answered the question, and
+    // nothing now asks it.
+    expect(pair()).toEqual([]);
+    expect(c.overview("default").counts.possibleDuplicates).toBe(0);
+    c.close();
+  });
+
+  it("memory_retire refuses a concept carrying an undismissed pair flag, and the dismissal it names unblocks it", async () => {
+    const c = flaggingCore();
+    const { call, client } = await harness(c);
+    const aId = (await call("memory_store", { content: PAIR_A })).json.conceptId as string;
+    const bId = (await call("memory_store", { content: PAIR_B })).json.conceptId as string;
+    expect(aId).not.toBe(bId); // forked, not merged — the fixture's premise
+    expect(c.retirementBlockers(aId).map((blocker) => blocker.code)).toEqual(["open-pair-flag"]);
+
+    const refused = await call("memory_retire", { id: aId });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toBe(
+      `cannot retire ${aId}: it carries 1 undismissed pair flag(s) (a duplicate or extraction ` +
+      `question about it and another memory), which retiring would erase rather than answer ` +
+      `— paired with ${bId} (possible_duplicate_of) — withdraw it through memory_resolve ` +
+      `with conceptAId="${aId}" and conceptBId set to a partner above`,
+    );
+    // THE PARTNER ID IS IN THE REFUSAL, and this is the assertion that matters (review fix — round
+    // 4). `memory_resolve`'s pair shape needs BOTH ids and no read on this server enumerates an
+    // undismissed edge — memory_overview's queues are top-N and filtered — so a refusal carrying
+    // only a count names a remedy the caller cannot follow. Both ids the next call needs are here.
+    expect(refused.text).toContain(aId);
+    expect(refused.text).toContain(bId);
+    // ONE PAIR, NOT TWO ROWS: the flag is recorded in both directions, and the count a caller reads
+    // is the number of open QUESTIONS. It also names two memories, so retiring EITHER end erases it
+    // — and both ends are refused.
+    expect((await call("memory_retire", { id: bId })).text).toContain("1 undismissed pair flag(s)");
+    expect((await call("memory_fetch", { id: aId })).isError).toBe(false); // untouched, still readable
+
+    // THE ADVERTISED REMEDY, FOLLOWED AND THEN RE-TRIED — the round trip round 1 established as the
+    // standard for any refusal that names a way out.
+    const dismissed = await call("memory_resolve", { conceptAId: aId, conceptBId: bId });
+    expect(dismissed.isError).toBe(false);
+    expect(dismissed.json).toMatchObject({ action: "pair-flags-dismissed" });
+    expect(c.retirementBlockers(aId)).toEqual([]);
+    const retired = await call("memory_retire", { id: aId });
+    expect(retired.isError).toBe(false);
+    expect(retired.json).toMatchObject({ action: "retired", conceptId: aId });
+
+    await client.close();
+    c.close();
+  });
+
+  /**
+   * A SINGLE-ITEM ERROR IS BOUNDED TOO (review fix — round 3). `ids` was size-fitted in round 1, but
+   * the single-id path returns through `err()`, which has no ceiling of its own the way `ok()` does:
+   * an id longer than RESULT_MAX_CHARS was echoed verbatim into a `CallToolResult` past the host's
+   * limit, so the caller got a rejected or unusable response in place of "concept not found".
+   */
+  it("a single-id error stays inside the result ceiling however long the caller's id is", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    const hugeId = "z".repeat(60_000);
+    for (const tool of ["memory_retire", "memory_restore"]) {
+      const answered = await call(tool, { id: hugeId });
+      expect(answered.isError).toBe(true);
+      expect(answered.text.length).toBeLessThanOrEqual(40_000);
+      // The head of the id survives, so the caller can still recognize what it sent.
+      expect(answered.text).toBe(`concept not found: ${"z".repeat(128)}\n…[truncated 59872 chars]`);
+    }
+    await client.close();
+    c.close();
+  });
+
+  it("memory_retire and memory_restore require exactly one of id or ids", async () => {
+    const c = core();
+    const { call, client } = await harness(c);
+    for (const tool of ["memory_retire", "memory_restore"]) {
+      expect((await call(tool, {})).text).toBe("provide exactly one of `id` or `ids`");
+      expect((await call(tool, { id: "a", ids: ["b"] })).text).toBe("provide exactly one of `id` or `ids`, not both");
+      // Scope enforcement: an id outside the named circle is absent, never forbidden.
+      expect((await call(tool, { id: "a", circle: "elsewhere" })).text).toBe("concept not found: a");
+    }
+    await client.close();
+    c.close();
+  });
 });
 
 // ---------------------------------------------------------------------------
