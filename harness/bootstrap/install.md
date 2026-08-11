@@ -251,7 +251,7 @@ The payoff is visible or it didn't happen. Once the sort is ratified, rewrite th
 
 **Read back every fact before removing its line.** A `memory_store` can fail, and it can return `ambiguous` — which the consolidation playbook already treats as too uncertain to retire a source on. Shrinking on the strength of the call having been *made* removes a live instruction whose replacement may not be fetchable, and the only way back is the backup. Fetch or search each stored fact, confirm it comes back, and leave any line that does not in the file — then say which ones stayed and why.
 
-**Materialize first, then shrink.** Run `monet materialize` (needs `@team-monet/monet` >= 1.4.0; upgrade first if the command comes back unknown) BEFORE rewriting, and confirm the `<!-- BEGIN monet:skeleton -->` block is actually in the file. On a fresh onboarding that block does not exist yet, so a file rewritten "down to a bootstrap line plus the principles" is left holding the bootstrap line and nothing else — the principles were removed from the file and never arrived in it. Check the block is present and carries the principles you just ratified; if it is empty or missing, stop and fix that before touching the rest of the file.
+**Materialize first, then shrink.** Run `monet materialize` (needs `@team-monet/monet` >= 1.4.0; upgrade first if the command comes back unknown — and run it with the same `MONET_STORAGE_DIR` Phase 3 configured, if any: the MCP config's env block does not reach your shell) BEFORE rewriting, and confirm the `<!-- BEGIN monet:skeleton -->` block is actually in the file. On a fresh onboarding that block does not exist yet, so a file rewritten "down to a bootstrap line plus the principles" is left holding the bootstrap line and nothing else — the principles were removed from the file and never arrived in it. Check the block is present and carries the principles you just ratified; if it is empty or missing, stop and fix that before touching the rest of the file.
 
 **Shrink only what you sorted.** Two kinds of content in that file are not yours to replace, and taking either is how "nothing lost" becomes false in the same breath you say it.
 
@@ -278,9 +278,43 @@ nothing by keeping it. The one thing to get right: `--include` is effectively ma
 reports healthy — and a broad glob like `**/*.md` sweeps in installed worker prompts and the
 `<!-- BEGIN with-monet:stig -->` block inside `CLAUDE.md`, since linking works on whole files.
 
-### If they have nothing
+### If they have nothing — offer the starter pack
 
-Say one line and move on: *"Nothing to sort — Monet will pick this up as we work, from the corrections you give me."* No ceremony. The loop fills it in.
+A user who arrives with no standing file gets no sort, and without one the product's value
+only appears after they author norms unaided — at exactly the moment they know the product
+least. Offer the starter pack: a small, host-neutral default set, reviewed exactly like
+sorted material — per-entry verdict, every entry carrying its reason, nothing entering
+silently. The dumping-ground law applies to defaults too.
+
+Present each entry, one at a time, and declare only what they approve — `memory_declare`,
+then `memory_ratify` with `entrance: "declaration"`, because their yes is what admitted it
+and the record should say so:
+
+- **Principle** — *Make the smallest change that meets the request; improvements outside it
+  are proposals, not edits.* Reason: unrequested changes cost more to review than they save.
+- **Principle** — *Batch questions: collect what needs asking and ask once.* Reason:
+  drip-fed questions interrupt more than they resolve.
+- **Rule at "declare work complete" (advisory)** — *A claim of done carries the evidence
+  that proves it: the command, the output, the diff.* Reason: prevents done-by-assertion.
+- **Rule at "fix a bug" (advisory)** — *Name the cause before shipping the fix.* Reason:
+  prevents symptom patches that return.
+- **Rule at "commit changes" (advisory)** — *If a secret, key, or token is about to enter a
+  file or commit, stop and say so.* Reason: prevents credential leakage into history —
+  advisory, not blocking, because conditional text cannot carry a hard deny.
+
+A fresh store has no stages; declaring the first rule at a moment brings its stage with it.
+Principles need a delivery surface. Where the host reads a standing file, register it first —
+`monet materialize add <path> --global`, creating the file if this user never had one — then
+run `monet materialize` and confirm the `<!-- BEGIN monet:skeleton -->` block landed (same
+check as the shrink step above). Run both with the store Phase 3 actually configured: a
+per-repo `MONET_STORAGE_DIR` lives in the MCP config's env block and a bare shell call will
+not inherit it — prefix the command with the same value, or you materialize the wrong store.
+Where the host's persona surface is a setting rather than a file, skip materialize: the
+server's auto-prewarm delivers the skeleton in-band each session, so declared principles
+still arrive.
+
+The zero path stays one sentence: decline the whole pack and start empty on purpose —
+*"Nothing seeded — Monet will pick this up as we work, from the corrections you give me."*
 
 ## Phase 6 — Offer to start
 
@@ -291,14 +325,17 @@ call `agent_context` (no query) and report what comes back — **narrating only 
 actually returned.**
 
 **The skeleton** is the claim, and it is the only one this install makes: the principles the sort
-ratified now govern you, arriving on every request without anyone fetching them. Name one, in their
+— or the starter pack — ratified now govern you, arriving on every request without anyone fetching
+them. Name one, in their
 own words.
 
-If it is missing — they skipped the ask, the sort was deferred, something didn't come back — narrate
-what *is* there and say so plainly if the store is still near-empty ("this grows as we work"). A real
-miss you can fix beats a faked memory, and this is the first moment the install pays off; don't let
-it read as a status line. Something like: *"Four lines govern me now — [one of them], from your own
-file."* Then continue as Stig.
+If it is missing — they skipped the ask, the sort was deferred, they took only staged rules from
+the pack, or something didn't come back — narrate what *is* there. An empty-on-purpose skeleton
+with armed stages is a success state, not a miss: name an approved rule and the moment it fires
+instead of forcing a principle. Say so plainly if the store is still near-empty ("this grows as
+we work"). A real miss you can fix beats a faked memory, and this is the first moment the install
+pays off; don't let it read as a status line. Something like: *"Four lines govern me now — [one of
+them], from your own file."* Then continue as Stig.
 
 (No restart available or practical in this host? Skip the reload framing and run the same `agent_context` call and narration in-band, right now — the demonstration is about what comes back, not about proving a fresh process. Source the narration strictly from what the tool call actually returns, not from what's already in this conversation; a real miss you can fix beats a convincing fake.)
 
