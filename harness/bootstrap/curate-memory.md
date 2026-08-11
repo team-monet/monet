@@ -16,11 +16,11 @@ those in the same pass — they are cheaper to notice here than to discover when
 
 - At the end of a long session
 - On demand, when the user asks to tidy memory
-- When `memory_overview` shows signals: open `possibleDuplicates`, several stale concepts, fragmentation in `otherCircles` (many small circles), or gate exceptions and retirement candidates in the normative layer
+- When `memory_overview` shows signals: open `possibleDuplicates`, several stale concepts, or gate exceptions and retirement candidates in the normative layer — or when `memory_circle_manage {action: "list"}` shows fragmentation (many small circles)
 
 ## Phase 0 — Read the state
 
-`memory_overview` (omit `circle` args where supported to see `otherCircles`) for: counts, `possibleDuplicates`, stale, dirty, and the circle list. For any circle that looks fragmented or misplaced, `memory_list` with `withProvenance: true` — the working-dir paths each memory's observations were recorded under are the strongest signal of where it belongs. This evidence base grounds every proposal; no proposal without it.
+`memory_overview` for: counts, `possibleDuplicates`, stale, and dirty. `memory_circle_manage {action: "list"}` for the circle list (per-circle concept counts and last activity). For any circle that looks fragmented or misplaced, `memory_list` with `withProvenance: true` — the working-dir paths each memory's observations were recorded under are the strongest signal of where it belongs. This evidence base grounds every proposal; no proposal without it.
 
 ## Phase 1 — Synthesize dirty concepts
 

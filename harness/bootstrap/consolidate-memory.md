@@ -111,7 +111,7 @@ A source isn't captured until its content is in Monet **and** coherent. This gat
 - Check the operation's `action`. For `memory_store`: `created`/`attached` are fine; **`ambiguous` is a yellow flag** — the evidence was attached to a possibly-different concept, so don't trust it blindly. For `memory_reassign_circle` (prior Monet store moves): `moved`/`merged` are fine.
 - Independently confirm with `memory_search` / `memory_overview` (it landed) and `memory_fetch` (read it back). Confirm the **source's specific content** is actually represented — not just that *some* coherent body exists. On an `ambiguous` store especially, if the source's facts aren't clearly present, do **not** retire it.
 - When a source contained context-profile material, confirm every applicable one of the exactly three families — project technical/system context, user context, and project product context — reads back with the correct applicability scope, evidence/`sourceRefs`, and stale/disputed status. A missing or mis-scoped applicable family means the source is not captured and is not eligible for retirement.
-- On **first** capture the concept is unsynthesized: `memory_fetch` returns raw observations plus a `synthesisInstruction`. Write a coherent body with `memory_synthesize`, then `memory_fetch` again to confirm it reads well.
+- On **first** capture the concept is unsynthesized: `memory_fetch` returns `needsSynthesis: true`. Pull the raw observations with `observations: true`, write a coherent body with `memory_synthesize`, then `memory_fetch` again to confirm it reads well.
 
 Only sources that pass this are eligible for Phase 7.
 
