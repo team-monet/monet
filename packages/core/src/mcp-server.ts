@@ -41,13 +41,28 @@ import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-sch
  * that already happens. An instruction demanding a closing ceremony taught every agent to believe a
  * mechanism that no longer exists, and to blame itself for state loss it never caused.
  *
+ * THAT NOTE'S PREMISE WAS REVERSED; ITS CONCLUSION WAS NOT (#143, amended 2026-08-09 and
+ * 2026-08-11). "Generic memory and workstreams are ruled out" is now true of nothing:
+ * memory_workstreams, memory_checkpoint and generic recall were ruled KEPT on 2026-08-09, and on
+ * 2026-08-11 baseline memory — store, recall, provenance, staleness, dedup, contradiction — was
+ * ruled FIRST-CLASS rather than a concession, striking "remove generic memory" from the North Star
+ * and retitling it. The paragraph below about pending REMOVALS went with them; there are none. What
+ * survives untouched is why the closing ceremony went: a record written by the mechanism that made
+ * it needs no ritual, and that holds however much Monet is ruled to hold.
+ *
  * This text is re-sent on every request, so it is the most expensive standing surface Monet has:
  * it says what Monet IS and the two moments a session actually touches it, and stops. The tools
  * carry their own descriptions; restating them here would bill every turn for it.
  *
- * The tool REMOVALS §8 also rules (memory_workstreams, memory_checkpoint, the generic store path)
- * belong to the MCP surface redesign, deliberately not done here. Text that lies is corrected now
- * because it costs nothing to correct and misleads every session until it is.
+ * WHAT THE SENTENCE BELOW STILL OWES THE 2026-08-11 RULING, named rather than guessed at: it calls
+ * Monet the normative system of record and gives memory_store a single trigger, "when a norm
+ * changes". Under a first-class memory substrate both are narrower than what is ruled. The
+ * replacement is deliberately not written here — #143 records the counterweight boundary that would
+ * govern it (Monet is the authoritative home of what it holds, never a second copy of anything whose
+ * home is code, a tracker, or a doc) as its own ruling, still being formulated. Guessing at that
+ * boundary in the most expensive standing surface Monet has would bill every request until it was
+ * corrected again. Correcting a comment costs nothing, which is why the stale premise above is
+ * struck today and the sentence waits.
  */
 export const MONET_SERVER_INSTRUCTIONS =
   "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. Start each project session with agent_context. Recall with memory_search pointer cards, then memory_fetch content. Write with memory_store when a norm changes — a correction, a rule, a principle candidate — never a narrative summary of work whose artifact already exists. Write memories in English: the embedding model reads it best, and a store is pinned to its model, so content the model could not read is stored and then never found. "
