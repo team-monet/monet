@@ -77,9 +77,9 @@ Merge into the host's **user-level** MCP config **without clobbering existing se
 
 **The liveness check is the first step that needs the model.** Before running it, confirm the warm-up finished — the Phase 2 background job **exited 0**, and its log CONTAINS the readiness lines: `semantic embeddings ready (…)`, which is the model itself reporting in, then `Monet started`, then `Storage:` and `Circle: <name>`. Match on presence and on the exit code, never on which line is last: `Monet started` is followed by two more, so a check for it at the end of the log never passes and holds Phase 4 forever. If it's still running, say so and keep going with Phase 4's READ-ONLY parts — reading `roster.json` and the agent files, drafting, deciding scope — but hold the writes. An always-on Stig persona reaching for tools that never appear is worse than no persona: the user gets a lead that cannot do the one thing it exists for, and nothing in the file says why. Write the persona and worker configs once `agent_context` has actually answered. If it exited non-zero, read the log and fix that before touching the host config — a Monet that cannot load its model will not serve at all, so no amount of MCP wiring will make the tools appear.
 
-With the model cached, verify the tools are live **in this session**: call `agent_context` (no query — on a fresh install expect a near-empty restore, which is fine). If the call isn't available, your host only connects MCP servers at launch: tell the user to reload/restart now, then resume this playbook at Phase 4 in the fresh session — Phases 5 and 6 need Monet callable. Before that reload, hand the user the resume line to paste into the fresh session — it has none of this conversation, so the paste-line is its whole handoff. Include the source: if this install is running from a local checkout, use the absolute path to `bootstrap/install.md` in that checkout; if from a raw URL, use the URL you received it from. The handoff reads: *"Read <absolute local install.md path or raw URL, the exact source for this session> and resume the Monet install at Phase 4. First, re-run the Phase 3 liveness check — call `agent_context` to confirm Monet is live and connected (a config path issue or env var misalignment is only observable after the restart); if the call fails, debug registration before proceeding; if it succeeds, continue with Phase 4. Host: <host>, scope: <global or this repo>."* The server carries its own tool descriptions, so don't restate them here or in anything you install — that text is re-sent on every request and is the most expensive place to put guidance. What matters is the loop: `agent_context` to orient, `memory_search` for pointer cards then `memory_fetch` to read, `memory_store` to write a correction or a principle candidate, `memory_declare` and `memory_ratify` for rules and principles, and `stage_lookup` at a named moment. Nothing is owed at session end — Monet's records are written by the mechanisms that make them, as they happen. The `source_*` tools serve Phase 5's linking flow. Recall is store-wide and every card names its home circle, so reorganizing circles never breaks findability.
+With the model cached, verify the tools are live **in this session**: call `agent_context` (no query — on a fresh install expect a near-empty restore, which is fine). If the call isn't available, your host only connects MCP servers at launch: tell the user to reload/restart now, then resume this playbook at Phase 4 in the fresh session — Phases 5 and 6 need Monet callable. Before that reload, hand the user the resume line to paste into the fresh session — it has none of this conversation, so the paste-line is its whole handoff. Include the source: if this install is running from a local checkout, use the absolute path to `bootstrap/install.md` in that checkout; if from a raw URL, use the URL you received it from. The handoff reads: *"Read <absolute local install.md path or raw URL, the exact source for this session> and resume the Monet install at Phase 4. First, re-run the Phase 3 liveness check — call `agent_context` to confirm Monet is live and connected (a config path issue or env var misalignment is only observable after the restart); if the call fails, debug registration before proceeding; if it succeeds, continue with Phase 4. Host: <host>, scope: <global or this repo>."* The server carries its own tool descriptions, so don't restate them here or in anything you install — that text is re-sent on every request and is the most expensive place to put guidance. What matters is the loop: `agent_context` to orient, `memory_search` for pointer cards then `memory_fetch` to read, `memory_store` to write a correction or a principle candidate, `memory_declare` and `memory_ratify` for rules and principles, and `stage_lookup` at a named moment. Nothing is owed at session end — Monet's records are written by the mechanisms that make them, as they happen; the one closing act is offering any ripe extraction candidates for ratification, and skipping it costs a batch, never a record. The `source_*` tools serve Phase 5's linking flow. Recall is store-wide and every card names its home circle, so reorganizing circles never breaks findability.
 
-The server also provides an in-band session lifecycle with zero host configuration: on the first successful tool response, it appends a delimited block (`=== MONET SESSION CONTEXT (auto-prewarm) ===`) as an additional content item carrying the skeleton, top concepts, and a curation advisory — suppressed when the first call is `agent_context` (no double-inject), and opt-out server-side via `MONET_NO_AUTOPREWARM`; and the server's `instructions` field says what Monet is and the two moments a session touches it, so an agent without the Stig persona still gets the loop on first use. Nothing is owed at session end: Monet's records are written by the mechanisms that make them, as they happen.
+The server also provides an in-band session lifecycle with zero host configuration: on the first successful tool response, it appends a delimited block (`=== MONET SESSION CONTEXT (auto-prewarm) ===`) as an additional content item carrying the skeleton, top concepts, and a curation advisory — suppressed when the first call is `agent_context` (no double-inject), and opt-out server-side via `MONET_NO_AUTOPREWARM`; and the server's `instructions` field says what Monet is and the two moments a session touches it, so an agent without the Stig persona still gets the loop on first use.
 
 ## Phase 4 — Install the agent team (user scope)
 
@@ -118,7 +118,7 @@ If the markers already exist, replace the block in place; never append a second 
 
 If the host has it: write one worker prompt per worker — `investigator, developer, verifier` — into the host's subagent location, mapping each worker's `roster.json` fields to the host's format:
 - `name` → the host's agent name.
-- `description` → the host's dispatch/trigger text — **use it verbatim, not a bare role label**; it's what routes a task to the right worker. (The descriptions contain colons, so quote them if the host's format needs it.)
+- `description` → the host's dispatch/trigger text — **use it verbatim, not a bare role label**; it's what routes a task to the right worker. Trigger-phrased is not proactive-by-default: nothing you write here should push the host to dispatch a worker on its own — the lead decides when to delegate. (The descriptions contain colons, so quote them if the host's format needs it.)
 - `model` → the roster's `haiku`/`sonnet`/`opus` are **capability guidance**, not portable model IDs; translate them to the host's equivalents or omit to inherit the session model. Match the model to what the work actually costs to get wrong: strongest reasoning for `developer`, where a bad change propagates, and for `verifier`, whose whole job is catching what the change missed; a balanced model for `investigator`, which mostly reads and reports. Review independence comes from fresh context, not from being stronger than the developer. Offer to retune for cost and task complexity.
 - `touchesMonet` (denylist enforcement) → for every worker whose roster entry is NOT `touchesMonet: true` (i.e. all workers — only `stig` carries `touchesMonet: true`): if the host provides a per-subagent tool denylist, deny the Monet MCP server's tools using it. Feature-detected; degrades gracefully:
   - **Claude Code**: add `disallowedTools: mcp__monet` to the generated frontmatter. The `mcp__monet` prefix is server-level and covers all of Monet's tools while leaving every other inherited tool intact. `stig` (the lead) must NOT get this — it needs full Monet access.
@@ -147,18 +147,20 @@ After the worker files are written, update the mode marker's `workers=` list (Ti
 
 **Don't clobber.** If the target file already exists, back it up (`<name>.md.bak`) and tell the user before overwriting — generic names (`developer`, `verifier`, …) can collide with the user's own sub-contexts.
 
-**Reconcile, don't clobber — when a prior install exists with local edits.** Don't blindly overwrite a Stig block or agent file the user has changed. Compare the installed version against the new canonical and merge: keep the user's customizations (extra rules, model choices, tone), apply the new changes. Ensure these invariants survive — and warn the user if one of their edits conflicts with them:
-- the Stig block's `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` markers and each worker's `<!-- with-monet:agent -->` marker (lose them and a later update can't find the block),
-- "sub-contexts can't spawn sub-contexts — the lead is the only orchestrator",
-- the Monet lifecycle (`agent_context` at start; the `memory_store` write discipline),
-- Stig's **voice rule**: a teammate rather than an assistant, in the user's register; observed fact kept separate from inference; lead with the outcome and end with the decision or next action,
-- Stig's **authorization boundary**: git and GitHub mutations (commit, push, opening or replying to a PR, merging) need the user's explicit go-ahead or a durable standing instruction; otherwise prepare the change and hand over the exact command,
-- the **tracker/Monet split**: multi-step scope belongs in whatever tracker the project already uses (issue, ticket, plan file), which holds the boundary and the done, while the artifact holds the rationale and Monet holds the normative record — how a rule was born, when it fired, what it changed,
-- the **skeleton offer**: when the user states a rule meant to govern every session, store it and offer to declare it — written as an instruction rather than a label — and never declare without asking,
-- **no required workflow**: answer directly when that suffices, delegate when a fresh isolated context earns its cost, and stop when the user's goal is met. Do not preserve an older mandatory-delegation or fixed-verification-ceremony rule over this invariant,
-- the **model-selection policy**: match the model to what the work costs to get wrong — strongest reasoning for `developer` and `verifier`, balanced for `investigator`; fresh-context independence never requires the verifier to outrank the developer,
-- the **worker contracts**: `investigator` returns verbatim evidence with observation kept separate from inference and names what it could not establish, and decides nothing about product priority, scope, or disposition; `developer` implements only the ratified scope and returns blocked rather than inventing a missing decision; `verifier` reads through the lens the brief names — including a `cold` audit that must never be handed the design intent — and does not edit,
-- each worker's `name` + `description` — the `description` drives your host's dispatch trigger; if it's broken, delegation silently stops.
+**Reconcile, don't clobber — when a prior install exists with local edits.** Don't blindly overwrite a Stig block or agent file the user has changed. Compare the installed version against the new canonical and merge: keep the user's customizations (extra rules, model choices, tone), apply the new changes. Ensure these invariants survive — and warn the user if one of their edits conflicts with them.
+
+Each invariant below is named plus its canonical home — read the wording there, not here, so a direction change never has to chase copies:
+- the **install markers** — `<!-- BEGIN with-monet:stig -->` / `<!-- END with-monet:stig -->` and each worker's `<!-- with-monet:agent -->`; lose them and a later update can't find the block,
+- **the lead is the only orchestrator** (sub-contexts can't spawn sub-contexts) — `agents/stig.md`, "# Work", plus Tier A above,
+- the **Monet lifecycle** — `agent_context` at session start and the `memory_store` write discipline; `agents/stig.md`, "# Memory",
+- Stig's **voice rule** — `agents/stig.md`, "# Voice",
+- Stig's **authorization boundary** — `agents/stig.md`, "# Boundaries",
+- the **tracker/Monet split** — `agents/stig.md`, "# Work",
+- the **skeleton offer** — `agents/stig.md`, "# Memory",
+- **no required workflow**, and delegation by displacement — `agents/stig.md`, "# Work"; don't preserve an older mandatory-delegation or fixed-verification-ceremony rule over it,
+- the **model-selection policy** — the `model` mapping in Tier B above,
+- the **worker contracts** — `agents/investigator.md`, `agents/developer.md`, `agents/verifier.md`, each of which stands alone,
+- each worker's `name` + `description` — `roster.json`; the `description` drives your host's dispatch trigger, and if it's broken, delegation silently stops.
 
 Show the merged result, write only on the user's approval, and keep the `.bak`. A coding agent can do this reconciliation by judgment — no version-pinning or 3-way merge tooling required; `.bak` plus approve-before-write keep it safe.
 
@@ -214,6 +216,13 @@ entrances, and they are not interchangeable:
   landed. Without it a rerun stores duplicates and then removes a line whose replacement cannot be
   tied back to it.
 
+A multi-step how — a deploy sequence, a review checklist — is not a fat rule. The constraint it
+protects is the rule; the steps are an artifact the host loads on demand (a skill, a playbook file).
+Sort the constraint to its stage with a pointer, and leave the steps where they execute — unless
+they execute from the standing file itself: then write them into a concrete on-demand artifact
+first and confirm it reads back, because the shrink below removes the file's copy, and a rule
+pointing at an artifact that was never created fires into nothing.
+
 **Ratify each principle AND each rule before the file shrinks.** `memory_declare` places it; `memory_ratify` records the verdict and how it was reached — `entrance: "declaration"` when the user's word settled it, `entrance: "extraction"` with the four gates answered when the battery did. That distinction is the point of the whole exercise: once the always-on file is gone, the record of WHY a line governs is the only thing left that can be argued with. Declared and unratified, a norm still fires and nobody can say what admitted it — and that is as true of a staged rule, whose original line the shrink is about to remove, as of a principle.
 
 **And the entrance the sort will need most, which is not the sort at all:** later, in real work,
@@ -242,7 +251,7 @@ The payoff is visible or it didn't happen. Once the sort is ratified, rewrite th
 
 **Read back every fact before removing its line.** A `memory_store` can fail, and it can return `ambiguous` — which the consolidation playbook already treats as too uncertain to retire a source on. Shrinking on the strength of the call having been *made* removes a live instruction whose replacement may not be fetchable, and the only way back is the backup. Fetch or search each stored fact, confirm it comes back, and leave any line that does not in the file — then say which ones stayed and why.
 
-**Materialize first, then shrink.** Run `monet materialize` **(needs `@team-monet/monet` >= 1.4.0 — earlier versions exit with an unknown command, and if that happens STOP: upgrade before shrinking anything, because the block this step creates is what the shrink leaves behind)** BEFORE rewriting, and confirm the `<!-- BEGIN monet:skeleton -->` block is actually in the file. On a fresh onboarding that block does not exist yet, so a file rewritten "down to a bootstrap line plus the principles" is left holding the bootstrap line and nothing else — the principles were removed from the file and never arrived in it. Check the block is present and carries the principles you just ratified; if it is empty or missing, stop and fix that before touching the rest of the file.
+**Materialize first, then shrink.** Run `monet materialize` (needs `@team-monet/monet` >= 1.4.0; upgrade first if the command comes back unknown) BEFORE rewriting, and confirm the `<!-- BEGIN monet:skeleton -->` block is actually in the file. On a fresh onboarding that block does not exist yet, so a file rewritten "down to a bootstrap line plus the principles" is left holding the bootstrap line and nothing else — the principles were removed from the file and never arrived in it. Check the block is present and carries the principles you just ratified; if it is empty or missing, stop and fix that before touching the rest of the file.
 
 **Shrink only what you sorted.** Two kinds of content in that file are not yours to replace, and taking either is how "nothing lost" becomes false in the same breath you say it.
 
@@ -259,25 +268,15 @@ Progress is the difference between their file and the store, so this phase is re
 ### Linking live files — exists, deliberately not offered
 
 Monet can register a file or a repo's Markdown tree as a source: the file stays where it is, fully
-editable, and Monet indexes it and keeps it in sync rather than taking a copy. The shape is right.
+editable, and Monet indexes it rather than taking a copy. **Don't offer it during onboarding** — the
+one thing it buys over you reading the file is surfacing a document nobody pointed you at, and that
+design question is open, not merely unimplemented (monet-core#135, paused for redesign).
 
-**Don't offer it during onboarding.** Registering trades nothing away — the file is still the
-truth — but what it buys over you simply reading the file is one thing: surfacing a document the
-user never thought to point you at. On the evidence so far that is not dependable (a document's own
-exact title has scored barely above this store's noise floor against its own chunks), and the design
-question underneath it is open, not merely unimplemented — monet-core#135 is paused for redesign
-rather than repair.
-
-Onboarding is the one moment a user decides whether this product works. Spending it on the part we
-know is weakest is a bad trade, especially when the alternative — you read the file — is exact,
-current, and already available.
-
-If the user asks for it directly, or already has sources registered, nothing here is broken and they
-lose nothing by keeping it. The one thing to get right if you do register: `--include` is effectively
-mandatory. Without it (and without `--auto-detect true`) the registration selects nothing, publishes
-zero files, and still reports healthy — and a broad glob like `**/*.md` sweeps in installed worker
-prompts and the `<!-- BEGIN with-monet:stig -->` block inside `CLAUDE.md`, since linking works on
-whole files.
+If the user asks for it directly, or already has sources registered, nothing is broken and they lose
+nothing by keeping it. The one thing to get right: `--include` is effectively mandatory. Without it
+(and without `--auto-detect true`) the registration selects nothing, publishes zero files, and still
+reports healthy — and a broad glob like `**/*.md` sweeps in installed worker prompts and the
+`<!-- BEGIN with-monet:stig -->` block inside `CLAUDE.md`, since linking works on whole files.
 
 ### If they have nothing
 
@@ -320,7 +319,7 @@ Confirm both halves before wrapping up:
 1. **Memory reaches the lead agent.** Stig (the main agent) should be able to call Monet tools — a quick `agent_context` or `memory_search` that returns confirms the wiring. If those calls fail or time out, the server may be unregistered *or* registered-but-not-starting (missing `monet` binary, PATH/env, a crash, or a startup timeout) — check the host's MCP status/logs and the server's startup, not just the config entry.
 2. **Workers launch and run on their own.** Confirm each worker sub-agent still starts and completes a task — a worker that silently fails to start usually means its config got mangled during install (see Host notes). Workers don't use Monet — on hosts that support a per-subagent tool denylist (Claude Code: `disallowedTools: mcp__monet`), this is enforced at config level for every worker whose roster entry lacks `touchesMonet: true`; on hosts without a denylist mechanism, it is a behavioral guarantee (role prompts never call memory tools). On Codex, workers inherit the parent's Monet server and can see its tools but don't use them — this is expected and cannot be prevented at config level (see Host notes). (Lead-only installs: skip the worker check — instead verify the Stig block with its `with-monet:mode` marker is present at the persona surface, and after the reload confirm the session actually opens as Stig: it should identify as Stig and reach for `agent_context`, not behave as the host's default persona. A passing Monet check alone doesn't prove the persona loaded.)
 3. **Git/GitHub operations require explicit authorization.** Verify that the installed Stig's persona still requires the user's explicit go-ahead — per action or as a durable standing instruction — before commit, push, opening or replying to a PR, or merging. Without that, Stig prepares the change and hands over the exact command rather than performing the state-changing action. This invariant must survive every upgrade.
-4. **The installed block still carries its invariants.** Read the installed Stig block back and confirm the pieces an update must never lose: the `agent_context`-at-session-start restore; the `memory_store` write discipline (norm changes only — a correction, a rule, a principle candidate; never narrative, never activity, never current-task state, never anything recoverable from code, git, a file, or a test result); the skeleton offer with its instruction-not-label rule and never-declare-without-asking; **the `stage_lookup`-before-acting clause** and **the ratify-after-declare step** — an update that drops either leaves norms firing with no record of what admitted them — an update that drops it leaves a Stig that never consults staged rules, and Phase 5 has by then moved standing instructions into exactly those, so they stop firing with nothing to show it; the `with-monet:mode` marker; the git/GitHub authorization boundary; and the voice rule. On a `lead-only` install, confirm the lead-only line is present and that Stig does the work itself rather than looking for workers.
+4. **The installed block still carries its invariants.** Read the installed Stig block back and confirm the pieces an update must never lose — named here, with their canonical wording in `agents/stig.md`: the `agent_context`-at-session-start restore and the `memory_store` write discipline ("# Memory"); the skeleton offer with its never-declare-without-asking and ratify-what-admitted-it steps ("# Memory"); **the `stage_lookup`-before-acting clause** ("# Memory") — an update that drops it leaves a Stig that never consults staged rules, and Phase 5 has by then moved standing instructions into exactly those, so they stop firing with nothing to show it; the `with-monet:mode` marker; the git/GitHub authorization boundary ("# Boundaries"); and the voice rule ("# Voice"). On a `lead-only` install, confirm the lead-only line is present and that Stig does the work itself rather than looking for workers.
 
 ### Host notes
 
@@ -333,18 +332,7 @@ Codex sub-agents inherit the parent session's `mcp_servers` (Monet included), so
 
 ## Phase 8 — One last thing (star with-monet)
 
-Once the install is working, ask the user once — lightly, no pressure:
-
-> *"If Monet's earning its keep: I can ⭐ star **team-monet/with-monet** for you (a quick `gh` command you approve), and point you to the one-time setting for new-release notifications. Want either?"*
-
-If they want to **star**, check `gh` is usable (`gh auth status`); if so, run it with their explicit approval:
-- **Star (support / bookmark):** `gh api --method PUT /user/starred/team-monet/with-monet`
-
-For **release notifications**, send them to the UI — GitHub's API can't set a release-only watch, so don't automate it: tell them to open the repo and choose **Watch → Custom → Releases**. (Only if they explicitly want notifications for *everything* — issues, PRs, the lot — is the all-activity `gh api --method PUT /repos/team-monet/with-monet/subscription -F subscribed=true` appropriate; never run it under the banner of "release notifications.")
-
-If `gh` is missing or unauthenticated, fall back to the link: open https://github.com/team-monet/with-monet and let them star/watch manually. Ask once; don't nag; never act without a yes.
-
-Key distinction: starring does **not** create notifications — that's what watching is for. Star = support/bookmark; watch = updates (and release-only is a UI choice, not an API one). Keep these separate in how you describe them.
+Once the install is working, say it once and drop it: *"If Monet's earning its keep, a star on [team-monet/with-monet](https://github.com/team-monet/with-monet) helps."*
 
 ---
 

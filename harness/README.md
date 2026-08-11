@@ -25,7 +25,7 @@ Monet — what survives the session
   └─ verifier     — proof
 ```
 
-**`stig`** is the only persistent agent, the only one the user talks to, the only one that uses Monet, and the only one that delegates. There is no required workflow: Stig answers directly when that suffices and delegates when a fresh isolated context earns its cost.
+**`stig`** is the only persistent agent, the only one the user talks to, the only one that uses Monet, and the only one that delegates. There is no required workflow: Stig answers directly when that suffices and delegates by displacement — when what a task must touch (file sweeps, logs, large diffs) exceeds what its conclusion needs, it goes to a worker instead of eating the conversation.
 
 The three workers are disposable. They hold no memory and own no decisions — each returns a compact artifact of exact evidence, and its context is thrown away. Stig keeps the semantics.
 

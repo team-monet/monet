@@ -52,6 +52,16 @@ Staleness derives from `lastConfirmedAt` (≥ 0.6.0) — a concept is stale when
 
 For each stale concept the overview surfaced: "Last confirmed [when]: [title] — still true?" Options: the user confirms (store a confirming observation — this refreshes `lastConfirmedAt`), corrects (store with `kind: "correction"` — opens a dispute to mediate), or retires it (consolidate into a successor concept, or leave archived-by-staleness).
 
-## Phase 5 — Report
+## Phase 5 — Normative layer review
+
+The normative layer decays on its own terms, and none of it shows in the concept counts — `memory_overview`'s gate exceptions and retirement candidates are the entry point. This phase needs a Monet whose `memory_overview` actually exposes that normative layer; if yours reports no such section (older releases don't), skip this phase or upgrade first. Three checks, each producing proposals the user confirms like everything else in this pass:
+
+- **Decay:** a rule that has never fired, or that fires without ever changing behaviour, is a retirement candidate — bring it with its firing record, not its title. A trigger pattern that has never matched is aimed at a moment that may not exist: propose re-aiming it at a stage that actually occurs, or retiring it. A stage whose rules have all died is inert.
+- **Shape:** a rule body carrying steps, a roster, a tool list, or a copy of another artifact is a procedure wearing a rule's clothes — the copy rots while the original moves on. Propose extraction: the how goes to an artifact the host loads on demand (a skill, a playbook file), and the rule shrinks to its constraint, the reason it exists, and a pointer to that artifact.
+- **Pointers:** for every rule that names an artifact, verify the artifact still exists. A dangling pointer is a rule that fires into nothing — repair the pointer or retire the rule.
+
+Batch the proposals with their evidence — the firing record, the offending rule body, the missing path — and apply only what the user confirms. Apply with the write surface that exists — and for a Shape extraction, order matters: write the procedure into its on-demand artifact and confirm it reads back BEFORE storing the successor, or the steps stop firing while the pointer leads nowhere. A successor rule is `memory_store kind:"rule"` at the same stage (the acknowledgement's `ruleSuccession` records what it replaced); a retirement is `kind:"correction"` against the rule, then `memory_resolve` on the contradiction it opens; a re-aim is the successor at the right stage plus that retirement of the misaimed one. Read back with `stage_lookup` on each affected stage — the surviving roster is the check — and for an extraction, open the pointed-at artifact too.
+
+## Phase 6 — Report
 
 Re-run `memory_overview` on affected circles. Report counts: synthesized, duplicate pairs mediated, concepts re-homed, circles renamed/merged/archived, stale concepts addressed, and any new `possibleDuplicates` queued for the next pass.

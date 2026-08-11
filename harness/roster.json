@@ -1,6 +1,6 @@
 {
   "lead": "stig",
-  "_note": "Subagent `description` is your host's dispatch signal — it must be trigger-phrased, not an identity label (Claude Code: YAML `description` frontmatter drives auto-dispatch; other hosts: see install.md). Trigger-phrased but not proactive-by-default: the lead decides when a fresh isolated context earns its cost, so nothing here should push the host to dispatch on its own. `model` is used where the host supports per-worker model selection (Claude Code: YAML `model` frontmatter). The lead `stig` runs as the main agent and uses the session's model.",
+  "_note": "Field semantics and host mapping: bootstrap/install.md Phase 4.",
   "agents": [
     {
       "name": "stig",
@@ -8,7 +8,7 @@
       "mode": "primary",
       "prompt": "agents/stig.md",
       "touchesMonet": true,
-      "description": "The lead. The only agent the user talks to, the only one that uses Monet, and the only one that delegates. Answers directly when that suffices and delegates when a fresh isolated context earns its cost."
+      "description": "The lead. The only agent the user talks to, the only one that uses Monet, and the only one that delegates. Answers directly when that suffices, and delegates by displacement — when what a task must touch exceeds what its conclusion needs."
     },
     {
       "name": "investigator",
