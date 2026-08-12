@@ -81,7 +81,15 @@ interface Tokenizer {
 }
 
 interface TransformersModule {
-  pipeline: (task: string, model: string, opts: { cache_dir: string; dtype?: string }) => Promise<unknown>;
+  pipeline: (
+    task: string,
+    model: string,
+    opts: {
+      cache_dir: string;
+      dtype?: string;
+      progress_callback?: (event: ModelLoadProgressEvent) => void;
+    },
+  ) => Promise<unknown>;
   AutoTokenizer: { from_pretrained: (model: string, opts: { cache_dir: string }) => Promise<Tokenizer> };
 }
 
@@ -533,6 +541,102 @@ const MODEL_PROFILES: Record<string, ModelProfile> = {
   },
 };
 
+/**
+ * One transformers.js `progress_callback` event. Verified against 3.8.1, not assumed
+ * (`src/utils/hub.js`): `initiate` fires per file before the cache is consulted (line 417),
+ * `download` after it (571), `progress` while the body is read (597/607/630), `done` at the end
+ * (650). `loaded`/`total` ride only on `progress`, and `total` can be absent when the response
+ * carries no length.
+ */
+export interface ModelLoadProgressEvent {
+  status: string;
+  name?: string;
+  file?: string;
+  loaded?: number;
+  total?: number;
+}
+
+export interface ModelLoadReporterOptions {
+  /** Stay silent until the load has run this long. Default 3000ms. */
+  quietMs?: number;
+  /** At most one line per interval once reporting has started. Default 5000ms. */
+  intervalMs?: number;
+  /** Deterministic test seams. */
+  now?: () => number;
+  write?: (line: string) => void;
+}
+
+/**
+ * Report a slow first-run model download to stderr, so a normal wait stops being indistinguishable
+ * from a hang.
+ *
+ * WHY THIS EXISTS AT ALL (#185). The download is the longest thing startup does and it emitted
+ * nothing: one line before `pipeline()` and then minutes of silence. A user watching that has no
+ * way to tell a working download from a wedged process, and Ctrl-C is the reasonable response —
+ * which is how a partial file ends up at the cache's final path, where transformers.js's
+ * existence-only `match()` treats it as a hit forever. Progress does not fix the cache (that is
+ * #185's options 1 and 2); it removes the reason to interrupt.
+ *
+ * SILENCE IS THE HEALTHY STATE, so the reporter is gated on TIME, not on event type. The obvious
+ * gate — report only on `status: "download"` — does not work: verified in 3.8.1, that event is
+ * dispatched at hub.js:571, OUTSIDE the `if (response === undefined)` block that closes at 568, so
+ * it fires for a cache hit exactly as it does for a real fetch. A warm load finishes well inside
+ * `quietMs` and therefore prints nothing at all, which is what today's users already experience.
+ *
+ * NO AGGREGATE PERCENTAGE, EVER — bytes read, and nothing else (Codex review, PR #208). A percentage
+ * needs a denominator, and the complete file set is not known until the load has finished: several
+ * files load per pipeline (tokenizer, config, weights) and `files` holds only those that have
+ * already emitted a `progress` event. A small config completing first therefore yields a confident
+ * "0.5 MB / 0.5 MB (100%)" minutes before the weights are even requested — an apparent completion
+ * followed by a long silence, which is precisely the hang signal this reporter exists to remove. A
+ * denominator that can only be known in retrospect is not reported at all.
+ *
+ * "LOADING", NOT "DOWNLOADING", for the same reason one layer up (Codex review, PR #208). This gate
+ * separates slow loads from fast ones; it cannot separate a network fetch from a cache read. A local
+ * model path, or a warm cache on a network-mounted home, streams through this same callback, so
+ * calling it a download would state as fact something the gate cannot establish.
+ */
+export function createModelLoadReporter(
+  opts: ModelLoadReporterOptions = {},
+): (event: ModelLoadProgressEvent) => void {
+  const quietMs = opts.quietMs ?? 3000;
+  const intervalMs = opts.intervalMs ?? 5000;
+  // MONOTONIC, not the wall clock (Codex review, PR #208). A load runs for minutes, and `Date.now()`
+  // can step BACKWARDS mid-load on an NTP correction or a VM clock adjustment. Both gates below are
+  // "has enough time passed", so a backward step holds them shut until wall time catches up —
+  // silence for the rest of the download, which is the hang signal this reporter exists to remove.
+  const now = opts.now ?? (() => performance.now());
+  const write = opts.write ?? ((line: string) => console.error(line));
+
+  const startedAt = now();
+  let lastReportAt = 0;
+  const bytesByFile = new Map<string, number>();
+
+  return (event: ModelLoadProgressEvent): void => {
+    if (event.status !== "progress") return;
+    // Keyed per file, and kept at its HIGH-WATER MARK. `loaded` is that file's running total, so
+    // summing every event would count each byte once per chunk — but a plain overwrite is wrong in
+    // the other direction (Codex review, PR #208): more than one pipeline component can request the
+    // same file (a tokenizer fallback and the model loader both reading `config.json`), and those
+    // requests share this key. A second request restarting from a smaller `loaded` would then make
+    // the reported total go DOWN, contradicting the monotonicity claimed below.
+    const key = `${event.name ?? ""}/${event.file ?? ""}`;
+    const loaded = Number.isFinite(event.loaded) ? (event.loaded as number) : 0;
+    bytesByFile.set(key, Math.max(bytesByFile.get(key) ?? 0, loaded));
+
+    const at = now();
+    if (at - startedAt < quietMs) return; // a warm cache never gets here
+    if (lastReportAt !== 0 && at - lastReportAt < intervalMs) return;
+    lastReportAt = at;
+
+    let loadedBytes = 0;
+    for (const bytes of bytesByFile.values()) loadedBytes += bytes;
+    // Monotonic and always true — a number that only ever climbs is the whole signal a waiting user
+    // needs, and it cannot mislead the way a retrospective denominator can.
+    write(`[monet-core] loading model files… ${(loadedBytes / 1_000_000).toFixed(1)} MB read`);
+  };
+}
+
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
   /** From MODEL_PROFILES for a known checkpoint; the labelled legacy guess otherwise. */
@@ -639,9 +743,14 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
         // `cache_dir` set succeeded, so no sub-fetch silently fell back to the global. Being an
         // argument rather than a global also removes the ordering hazard entirely — there is no
         // "set it too late" state to get wrong.
+        // #185: the download is the longest thing startup does, and it used to emit nothing after
+        // the single "first run downloads once" line — so a normal wait looked exactly like a hang,
+        // and Ctrl-C is what a reasonable person does to a hang. See createModelLoadReporter
+        // for why the gate is time-based and why a warm cache still prints nothing.
         return (await mod.pipeline("feature-extraction", this.checkpoint, {
           cache_dir: resolveModelCacheDir(),
           ...(this.dtype ? { dtype: this.dtype } : {}),
+          progress_callback: createModelLoadReporter(),
         })) as FeatureExtractor;
       })();
     }

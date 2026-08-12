@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import {
   createLocalEmbedderWithProvenance,
+  createModelLoadReporter,
   instantiateEmbedderForPin,
   resolveModelCacheDir,
   isLocalModelPath,
@@ -37,13 +38,22 @@ const transformers = vi.hoisted(() => ({
   modelPassedToPipeline: undefined as string | undefined,
   dtypePassedToPipeline: undefined as string | undefined,
   poolingPassedToExtractor: undefined as string | undefined,
+  // #185: whether production asks transformers.js to report download progress at all. Nothing but
+  // the arguments reaching pipeline() can show it — a silent download and a reporting one are
+  // identical from outside.
+  progressCallbackPassedToPipeline: undefined as unknown,
 }));
 
 vi.mock("@huggingface/transformers", () => ({
-  pipeline: vi.fn(async (_task: string, model: string, opts?: { cache_dir?: string; dtype?: string }) => {
+  pipeline: vi.fn(async (
+    _task: string,
+    model: string,
+    opts?: { cache_dir?: string; dtype?: string; progress_callback?: unknown },
+  ) => {
     transformers.cacheDirPassedToPipeline = opts?.cache_dir;
     transformers.modelPassedToPipeline = model;
     transformers.dtypePassedToPipeline = opts?.dtype;
+    transformers.progressCallbackPassedToPipeline = opts?.progress_callback;
     // The one real checkpoint named here, standing in for a model whose profile is keyed by a space
     // id rather than by this id. 1024-wide, matching what that profile declares.
     if (model === "Xenova/bge-m3") {
@@ -497,5 +507,169 @@ describe("an off-profile override loses the calibrated numbers with the identity
     // Width and vocabulary are facts about the checkpoint, not calibrations — they stay.
     expect(moved.dim).toBe(384);
     expect(moved.readsOnlyLatinScript).toBe(true);
+  });
+});
+
+/**
+ * #185. The download is the longest thing startup does and it reported nothing, so a normal wait
+ * was indistinguishable from a hang — and Ctrl-C on an apparent hang is what leaves a partial file
+ * at the cache's final path, where transformers.js's existence-only `match()` treats it as a hit
+ * forever. These tests drive the reporter with a fake clock and a fake writer: no network, no
+ * model, no real timers.
+ */
+describe("first-run model load reports progress (#185)", () => {
+  /** Builds a reporter with an advanceable clock and a captured stderr. */
+  function harness(opts: { quietMs?: number; intervalMs?: number } = {}) {
+    let clock = 1_000;
+    const lines: string[] = [];
+    const report = createModelLoadReporter({
+      quietMs: opts.quietMs ?? 3000,
+      intervalMs: opts.intervalMs ?? 5000,
+      now: () => clock,
+      write: (line) => lines.push(line),
+    });
+    return { lines, report, advance: (ms: number) => { clock += ms; } };
+  }
+
+  it("a warm cache prints NOTHING — silence is the healthy state, and the load never reaches the quiet threshold", () => {
+    const h = harness();
+    h.advance(40); // a cached load resolves in milliseconds
+    h.report({ status: "initiate", name: "Xenova/m", file: "model.onnx" });
+    h.report({ status: "download", name: "Xenova/m", file: "model.onnx" });
+    h.report({ status: "progress", name: "Xenova/m", file: "model.onnx", loaded: 90_000_000, total: 90_000_000 });
+    h.report({ status: "done", name: "Xenova/m", file: "model.onnx" });
+    expect(h.lines).toEqual([]);
+  });
+
+  it("a slow load reports once past the quiet threshold, then sums every file seen so far", () => {
+    const h = harness();
+    h.report({ status: "progress", name: "Xenova/m", file: "model.onnx", loaded: 1_000_000, total: 80_000_000 });
+    expect(h.lines).toEqual([]); // still inside the quiet window
+
+    h.advance(3_500);
+    h.report({ status: "progress", name: "Xenova/m", file: "model.onnx", loaded: 20_000_000, total: 80_000_000 });
+    // The first line past the quiet window goes out immediately — the point is to break the silence
+    // as soon as there is something to say. The tokenizer event lands inside the throttle interval.
+    h.report({ status: "progress", name: "Xenova/m", file: "tokenizer.json", loaded: 4_000_000, total: 20_000_000 });
+    expect(h.lines).toEqual(["[monet-core] loading model files… 20.0 MB read"]);
+
+    h.advance(5_000);
+    h.report({ status: "progress", name: "Xenova/m", file: "model.onnx", loaded: 40_000_000, total: 80_000_000 });
+    expect(h.lines[1]).toBe("[monet-core] loading model files… 44.0 MB read"); // 40 + the tokenizer's 4
+  });
+
+  /**
+   * Codex review, PR #208. `total` rides on the events and is deliberately IGNORED. The complete
+   * file set is not known until the load finishes, so any aggregate denominator is retrospective:
+   * a small config completing first would otherwise print a confident "100%" minutes before the
+   * weights are even requested — an apparent completion followed by a long silence, which is the
+   * exact hang signal this reporter exists to remove.
+   */
+  it("never reports a percentage or a total, so a small first file cannot fake completion", () => {
+    const h = harness();
+    h.advance(3_500);
+    // config.json is fully loaded and is, so far, the ONLY file the callback has mentioned.
+    h.report({ status: "progress", name: "n", file: "config.json", loaded: 500_000, total: 500_000 });
+    expect(h.lines).toEqual(["[monet-core] loading model files… 0.5 MB read"]);
+    expect(h.lines[0]).not.toMatch(/%|\//); // no percentage, no "x / y"
+
+    // The real payload only now appears, and the reported number keeps climbing rather than
+    // restarting from an apparent 100%.
+    h.advance(5_000);
+    h.report({ status: "progress", name: "n", file: "weights", loaded: 7_000_000 });
+    expect(h.lines[1]).toBe("[monet-core] loading model files… 7.5 MB read");
+  });
+
+  it("counts each file's running total once, not once per chunk event", () => {
+    const h = harness();
+    h.advance(3_500);
+    h.report({ status: "progress", name: "n", file: "f", loaded: 10_000_000 });
+    // transformers.js reports `loaded` as that file's cumulative byte count, so three events for
+    // one file must read 30 MB, not 10+20+30.
+    h.advance(5_000);
+    h.report({ status: "progress", name: "n", file: "f", loaded: 20_000_000 });
+    h.advance(5_000);
+    h.report({ status: "progress", name: "n", file: "f", loaded: 30_000_000 });
+    expect(h.lines).toEqual([
+      "[monet-core] loading model files… 10.0 MB read",
+      "[monet-core] loading model files… 20.0 MB read",
+      "[monet-core] loading model files… 30.0 MB read",
+    ]);
+  });
+
+  /**
+   * Codex review, PR #208. Two pipeline components can request the SAME file (a tokenizer fallback
+   * and the model loader both reading `config.json`), and their events share one key. A plain
+   * overwrite would let the second request's smaller starting `loaded` pull the reported total
+   * DOWN — a number that goes backwards is worse than no number, since the whole signal is "this is
+   * still moving".
+   */
+  it("never lets the reported total go backwards when one file is requested twice", () => {
+    const h = harness();
+    h.advance(3_500);
+    h.report({ status: "progress", name: "n", file: "config.json", loaded: 500_000 });
+    h.advance(5_000);
+    h.report({ status: "progress", name: "n", file: "weights", loaded: 30_000_000 });
+    // A SECOND request for config.json starts over from a few bytes.
+    h.advance(5_000);
+    h.report({ status: "progress", name: "n", file: "config.json", loaded: 1_000 });
+    expect(h.lines).toEqual([
+      "[monet-core] loading model files… 0.5 MB read",
+      "[monet-core] loading model files… 30.5 MB read",
+      "[monet-core] loading model files… 30.5 MB read", // held, never 30.0
+    ]);
+  });
+
+  /**
+   * Codex review, PR #208. Both gates ask "has enough time passed", so a wall clock that steps
+   * BACKWARDS mid-load (NTP correction, VM clock adjustment) would hold them shut until wall time
+   * caught up — silence for the rest of a multi-minute download. The arithmetic cannot defend
+   * against that; the DEFAULT CLOCK is what does, so that is what this asserts. `performance.now()`
+   * is monotonic by specification, `Date.now()` is not.
+   */
+  it("reads its default clock from performance.now(), not the wall clock", () => {
+    const perfSpy = vi.spyOn(performance, "now");
+    const dateSpy = vi.spyOn(Date, "now");
+    try {
+      const report = createModelLoadReporter({ quietMs: 0, intervalMs: 0, write: () => {} });
+      report({ status: "progress", name: "n", file: "f", loaded: 1_000_000 });
+      expect(perfSpy).toHaveBeenCalled();
+      expect(dateSpy).not.toHaveBeenCalled();
+    } finally {
+      perfSpy.mockRestore();
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("throttles to one line per interval, then reports again once the interval passes", () => {
+    const h = harness();
+    h.advance(3_500);
+    h.report({ status: "progress", name: "n", file: "f", loaded: 10_000_000 });
+    h.advance(1_000);
+    h.report({ status: "progress", name: "n", file: "f", loaded: 30_000_000 });
+    expect(h.lines).toHaveLength(1);
+
+    h.advance(5_000);
+    h.report({ status: "progress", name: "n", file: "f", loaded: 60_000_000 });
+    expect(h.lines).toEqual([
+      "[monet-core] loading model files… 10.0 MB read",
+      "[monet-core] loading model files… 60.0 MB read",
+    ]);
+  });
+
+  it("ignores every non-progress event, so lifecycle chatter alone never prints", () => {
+    const h = harness();
+    h.advance(60_000);
+    h.report({ status: "initiate", name: "n", file: "f" });
+    h.report({ status: "download", name: "n", file: "f" });
+    h.report({ status: "done", name: "n", file: "f" });
+    expect(h.lines).toEqual([]);
+  });
+
+  it("production actually asks for progress: pipeline() receives a progress_callback", async () => {
+    transformers.progressCallbackPassedToPipeline = undefined;
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    await new OnnxEmbeddingProvider({ model: "Xenova/mock-ok-model" }).embed("x");
+    expect(typeof transformers.progressCallbackPassedToPipeline).toBe("function");
   });
 });
