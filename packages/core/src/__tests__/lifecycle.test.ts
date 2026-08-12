@@ -364,15 +364,36 @@ describe("9. server factory instructions", () => {
       const { MONET_SERVER_INSTRUCTIONS } = await import("../mcp-server");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("Start each project session with agent_context");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("normative system of record");
-      // CORRECTED 2026-08-03 (normative-hierarchy §8). These used to assert the OPPOSITE — that the
-      // text demanded a memory_checkpoint at session end, "without it, session state is lost". That
-      // promise stopped being true, and this test was pinning the lie in place: the surface it
-      // guards is re-sent on every request, so a stale assertion here bills every turn for it.
-      // Asserted as ABSENCE now, because a closing ritual is the specific shape §6 rejects — every
-      // record Monet keeps rides an event that already happens.
-      expect(MONET_SERVER_INSTRUCTIONS).not.toContain("memory_checkpoint");
-      expect(MONET_SERVER_INSTRUCTIONS).not.toContain("memory_workstreams");
+      // CORRECTED 2026-08-03 (normative-hierarchy §8). The original assertions demanded a
+      // memory_checkpoint at session end, "without it, session state is lost" — a promise that had
+      // stopped being true, pinned in place on a surface re-sent every request. They were flipped
+      // to absence, which over-corrected: it banned the TOOL rather than the RITUAL.
+      //
+      // AMENDED 2026-08-12 (#181 shipped, then dogfooded). What §6 rejects is a closing ritual, not
+      // naming the tool. And the ban had a cost the absence assertion could not see: on a host that
+      // defers tool loading behind a search, these instructions are the ONLY Monet text that always
+      // arrives — a tool nobody knows about is a tool nobody searches for, so the entire capture
+      // contract sat in a description that never loaded. Assert the EVENT-SHAPED naming is present
+      // and the ritual framing stays gone.
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("memory_checkpoint as it happens");
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("when a directive lands");
       expect(MONET_SERVER_INSTRUCTIONS).not.toContain("session state is lost");
+      expect(MONET_SERVER_INSTRUCTIONS).not.toContain("At session end, record");
+
+      // Every tool a deferred-loading host would otherwise never search for. stage_lookup is the
+      // load-bearing one: unnamed, a blocking rule never fires at all.
+      for (const named of ["stage_lookup", "memory_declare", "memory_ratify"]) {
+        expect(MONET_SERVER_INSTRUCTIONS).toContain(named);
+      }
+      // Declaration stays the user's word, on the surface that reaches an agent with no persona.
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("never on your own initiative");
+      // The store guidance must not contradict with-monet's: durable context with no artifact home
+      // is in scope, not norms only (#143 made baseline memory first-class).
+      expect(MONET_SERVER_INSTRUCTIONS).toContain("context with no artifact home");
+      // The English-only claim was retired 2026-08-12: the default embedding space is multilingual
+      // (#178) and non-Latin extraction was fixed (#187), so the technical reason is gone — and
+      // language choice is a user's norm to declare, never a shipped instruction's to impose.
+      expect(MONET_SERVER_INSTRUCTIONS).not.toContain("in English");
       expect(MONET_SERVER_INSTRUCTIONS).toContain("Nothing is owed at session end");
     } finally {
       await client.close();

@@ -65,7 +65,11 @@ import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-sch
  * struck today and the sentence waits.
  */
 export const MONET_SERVER_INSTRUCTIONS =
-  "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. Start each project session with agent_context. Recall with memory_search pointer cards, then memory_fetch content. Write with memory_store when a norm changes — a correction, a rule, a principle candidate — never a narrative summary of work whose artifact already exists. Write memories in English: the embedding model reads it best, and a store is pinned to its model, so content the model could not read is stored and then never found. "
+  "Monet is the normative system of record: principles, rules, and the records that back them — how a norm was born, how it entered, when it fired, and what it changed. "
+  + "Start each project session with agent_context; when it names a stage you are about to act at, call stage_lookup first — the rules never travel with the index, so a stage you do not look up is a stage whose rules do not exist for you. "
+  + "Recall with memory_search pointer cards, then memory_fetch content — a search that stops at the cards has recalled nothing. "
+  + "Write with memory_store when something durable crosses the boundary: a norm change, or context with no artifact home; never a narrative summary of work whose artifact already exists. When the user states something meant to govern every session, memory_declare places it and memory_ratify records what admitted it — never on your own initiative. "
+  + "Track the session's own work with memory_checkpoint as it happens: open the plan when a directive lands, inbox anything you notice that is not this work, and settle both with the user before you report completion. "
   + "Nothing is owed at session end: every record Monet keeps is written by the mechanism that made it, as it happens.";
 
 // Bounds so a tool result never blows past the host's MCP tool-result token budget (a single big
