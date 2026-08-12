@@ -49,14 +49,8 @@ let _entitiesMode = null;
 // response arrives, the result is discarded so a slow in-flight response from a
 // prior Refresh cannot overwrite a freshly-invalidated cache.
 let _entitiesGen = 0;
-let FIRST_BLOCK = null;  // /api/firstblock payload (lazy, invalidated on Refresh)
-let _firstBlockMode = null;
 let SOURCES = null;      // /api/sources payload (lazy, invalidated on Refresh)
-// Generation counter — incremented when Refresh clears the FIRST_BLOCK cache.
-// Mirrors _entitiesGen: a stale in-flight response is discarded rather than
-// repopulating a cache that was intentionally cleared by Refresh.
-let _firstBlockGen = 0;
-// Mirrors _firstBlockGen for the SOURCES cache.
+// Mirrors _entitiesGen for the SOURCES cache.
 let _sourcesGen = 0;
 
 // All graph writers (initial load, visibility toggle, manual Refresh) share one
@@ -67,11 +61,18 @@ let _graphRequestGen = 0;
 let _spinnerOwnerGen = 0;
 const STALE_REQUEST = Symbol('stale-request');
 
+// Landing tab, and the fallback whenever a tab id no longer exists.
+// INTERIM: First Block was the landing tab until it was retired (#72); 'graph'
+// is a placeholder so the dashboard opens on a view that exists. #73 decides
+// the real landing view (the normative layer) and moves this constant — this is
+// not a considered choice of landing screen.
+const DEFAULT_TAB = 'graph';
+
 const state = {
   circle: 'all',
   search: '',
   selectedId: null,
-  activeTab: 'firstblock',
+  activeTab: DEFAULT_TAB,
   kindsOff: new Set(),
   flags: new Set(),
   minConfidence: 0,
@@ -206,7 +207,10 @@ function restoreUiState() {
   if (!stored.__v) return;
 
   if (stored.circle) state.circle = stored.circle;
-  if (stored.activeTab) state.activeTab = stored.activeTab;
+  // Ignore a persisted tab whose view no longer ships (e.g. 'firstblock', saved
+  // before #72 retired it) so state.activeTab never holds a dead id —
+  // rerenderActiveView() reads it directly, without switchTab's fallback.
+  if (stored.activeTab && tabViewExists(stored.activeTab)) state.activeTab = stored.activeTab;
   if (Array.isArray(stored.kindsOff)) state.kindsOff = new Set(stored.kindsOff);
   if (stored.edgeTypes) {
     for (const k of Object.keys(EDGE_DEFAULTS)) {
@@ -475,31 +479,9 @@ async function fetchEntities(includeRetired = state.showRetired) {
   return ENTITIES;
 }
 
-async function fetchFirstBlock(includeRetired = state.showRetired) {
-  if (FIRST_BLOCK && _firstBlockMode === includeRetired) return FIRST_BLOCK;
-  // Capture generation at call time so a delayed response from a prior Refresh
-  // (which set FIRST_BLOCK=null and incremented _firstBlockGen) cannot repopulate
-  // the cache after it was intentionally cleared, mirroring the _entitiesGen guard.
-  const gen = _firstBlockGen;
-  const qs = includeRetired ? '?includeRetired=1' : '';
-  let data;
-  try {
-    const r = await fetch('/api/firstblock' + qs);
-    if (!r.ok) throw new Error(`/api/firstblock returned ${r.status}`);
-    data = await r.json();
-  } catch (err) {
-    if (_firstBlockGen !== gen || state.showRetired !== includeRetired) return STALE_REQUEST;
-    throw err;
-  }
-  if (_firstBlockGen !== gen || state.showRetired !== includeRetired) return STALE_REQUEST;
-  FIRST_BLOCK = data;
-  _firstBlockMode = includeRetired;
-  return FIRST_BLOCK;
-}
-
 async function fetchSources() {
   if (SOURCES) return SOURCES;
-  // Generation guard — mirrors fetchFirstBlock: a delayed response from before a
+  // Generation guard — mirrors fetchEntities: a delayed response from before a
   // Refresh must not repopulate the cache Refresh just cleared.
   const gen = _sourcesGen;
   const r = await fetch('/api/sources');
@@ -514,9 +496,6 @@ function invalidateDependentCaches(includeSources) {
   ENTITIES = null;
   _entitiesMode = null;
   _entitiesGen++;
-  FIRST_BLOCK = null;
-  _firstBlockMode = null;
-  _firstBlockGen++;
   if (includeSources) {
     SOURCES = null;
     _sourcesGen++;
@@ -3335,74 +3314,6 @@ function renderHealth() {
   }
 }
 
-// ── First Block view ─────────────────────────────────────────────────────────
-
-async function renderFirstBlock() {
-  const list = document.getElementById('firstblock-list');
-  if (!list) return;
-
-  const gen = _firstBlockGen;
-  const includeRetired = state.showRetired;
-  let data;
-  try {
-    data = await fetchFirstBlock(includeRetired);
-  } catch (err) {
-    if (gen !== _firstBlockGen || state.showRetired !== includeRetired) return;
-    list.innerHTML = `<div style="padding:24px 16px;color:var(--danger);font-size:13px">Failed to load First Block: ${escHtml(err.message)}</div>`;
-    return;
-  }
-  if (data === STALE_REQUEST || gen !== _firstBlockGen || state.showRetired !== includeRetired) return;
-
-  let rows = data.rows || [];
-
-  // Filter by current circle selection when not "all"
-  if (state.circle !== 'all') {
-    rows = rows.filter(r => {
-      const canon = canonicalCircle(r.circle);
-      return canon === state.circle || r.circle === state.circle;
-    });
-  }
-
-  if (!rows.length) {
-    list.innerHTML = '<div style="padding:24px 16px;color:var(--text-muted);font-size:13px">No First Block entries for this circle.</div>';
-    return;
-  }
-
-  list.innerHTML = '';
-  for (const row of rows) {
-    const isDisputed = row.conceptStatus === 'disputed';
-    const isDirty    = !!row.summaryDirty;
-
-    const item = document.createElement('div');
-    item.className = 'fb-item' + (isDisputed ? ' fb-disputed' : '');
-    item.dataset.id = row.conceptId;
-
-    const flags = [];
-    if (isDisputed) flags.push(`<span class="badge-disputed">disputed</span>`);
-    if (isDirty)    flags.push(`<span class="badge-dirty">stale summary</span>`);
-
-    item.innerHTML = `
-      <div class="fb-pos">${row.position + 1}</div>
-      <div class="fb-body">
-        <div class="fb-title-row">
-          <span class="fb-title" title="${escHtml(row.title || row.conceptId)}">${escHtml(row.title || row.conceptId)}</span>
-          <span class="fb-title-link" title="Jump to concept in graph">&#x2197; graph</span>
-        </div>
-        <div class="fb-summary">${escHtml(row.summary || '')}</div>
-        ${flags.length ? `<div class="fb-flags">${flags.join('')}</div>` : ''}
-      </div>
-    `;
-
-    // Click anywhere on the row — open the concept in the graph view
-    item.addEventListener('click', () => {
-      selectConcept(row.conceptId);
-      switchTab('graph');
-    });
-
-    list.appendChild(item);
-  }
-}
-
 // ── Sources view ─────────────────────────────────────────────────────────────
 
 const SOURCE_STATUS_META = {
@@ -3555,26 +3466,34 @@ async function renderSources() {
 
 // ── Tab switching ────────────────────────────────────────────────────────────
 
-function switchTab(tab) {
-  state.activeTab = tab;
-  scheduleSave();
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === `${tab}-view`));
+/** Does this tab id still have a view container in the markup? */
+function tabViewExists(tab) {
+  return !!document.getElementById(`${tab}-view`);
+}
 
-  if (tab === 'graph') {
+// A tab id with no matching view container leaves every .view inactive — a
+// silently blank content pane, and nothing throws. Resolving against the shipped
+// markup here validates every caller at once (persisted state, keyboard
+// shortcuts, programmatic switches) instead of patching one instance.
+function switchTab(tab) {
+  const resolved = tabViewExists(tab) ? tab : DEFAULT_TAB;
+  state.activeTab = resolved;
+  scheduleSave();
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === resolved));
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === `${resolved}-view`));
+
+  if (resolved === 'graph') {
     resizeCanvas();
-  } else if (tab === 'concepts') {
+  } else if (resolved === 'concepts') {
     renderConceptsTable();
-  } else if (tab === 'entities') {
+  } else if (resolved === 'entities') {
     renderEntitiesTable();
-  } else if (tab === 'timeline') {
+  } else if (resolved === 'timeline') {
     setTimeout(renderTimeline, 50); // let layout settle
-  } else if (tab === 'sources') {
+  } else if (resolved === 'sources') {
     renderSources();
-  } else if (tab === 'health') {
+  } else if (resolved === 'health') {
     renderHealth();
-  } else if (tab === 'firstblock') {
-    renderFirstBlock();
   }
 }
 
@@ -3590,7 +3509,6 @@ function rerenderActiveView() {
   else if (state.activeTab === 'timeline') renderTimeline();
   else if (state.activeTab === 'sources') renderSources();
   else if (state.activeTab === 'health') renderHealth();
-  else if (state.activeTab === 'firstblock') renderFirstBlock();
   // 'graph' tab: canvas is kept current by redrawGraph(); nothing more to do here.
 }
 
@@ -3639,12 +3557,26 @@ async function init() {
 
   initCanvas();
 
-  buildGraph();
+  // Apply the restored tab (after the canvas element is wired, before the layout
+  // is built). Unconditional on purpose: switchTab() is the only code that sets
+  // .active on a view, so exempting any tab — this used to exempt 'graph' —
+  // leaves every pane hidden.
+  //
+  // It must also run BEFORE buildGraph(). Every .view ships display:none and
+  // .view.active is the only rule that gives one a box, so until a view is
+  // activated #graph-view measures 0x0. Building the layout against that
+  // pre-settles the graph on initSim's fallback dimensions (CVS.width / 2 || 625)
+  // and skips fitToView() entirely (it returns early at W === 0) — and then the
+  // activation drives resizeCanvas() through its zero-to-positive branch, which
+  // re-scatters every node and calls reheat(1) with SIM.settledOnce already true,
+  // so tick()'s settle branch never refits or saves the reheated layout and
+  // positions restored from localStorage are lost. Activating first means
+  // switchTab()'s own resizeCanvas() measures the real viewport while SIM.nodes
+  // is still empty (the reseed branch is guarded on a non-empty node set), so
+  // buildGraph() sees true dimensions and that branch never fires.
+  switchTab(state.activeTab);
 
-  // Switch to restored tab (after canvas is initialized)
-  if (state.activeTab && state.activeTab !== 'graph') {
-    switchTab(state.activeTab);
-  }
+  buildGraph();
 
   // Concepts table sort headers
   document.querySelectorAll('#concepts-table thead th[data-col]').forEach(th => {
@@ -3785,11 +3717,14 @@ async function init() {
     if (e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
     if (e.key === 'Escape') deselectConcept();
     if (e.key === 'f' || e.key === 'F') { fitToView([...SIM.nodes, ...SIM.entityNodes]); scheduleSave(); }
-    if (e.key === '1') switchTab('firstblock');
-    if (e.key === '2') switchTab('graph');
-    if (e.key === '3') switchTab('concepts');
-    if (e.key === '4') switchTab('entities');
-    if (e.key === '5') switchTab('timeline');
+    // 1-6 now follow the tab bar left to right. Removing First Block freed key
+    // 1, and shifting the rest closes the gap that left Sources — the one tab
+    // with no shortcut — unreachable from the keyboard.
+    if (e.key === '1') switchTab('graph');
+    if (e.key === '2') switchTab('concepts');
+    if (e.key === '3') switchTab('entities');
+    if (e.key === '4') switchTab('timeline');
+    if (e.key === '5') switchTab('sources');
     if (e.key === '6') switchTab('health');
   });
 

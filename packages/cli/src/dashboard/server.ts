@@ -572,75 +572,6 @@ export const SQL = {
     WHERE e.rn <= 128
     ORDER BY e.source_id, e.sequence DESC
   `,
-
-  // first_block rows joined to their concept for title + status. Retired joined
-  // concepts are hidden by default, while orphan rows remain visible so a
-  // missing concept record does not silently erase the stored First Block slot.
-  // The table may not exist in stores not yet migrated by the new engine;
-  // the caller guards with an existence check before running this query.
-  firstBlock: `
-    SELECT
-      fb.concept_id   AS conceptId,
-      fb.circle,
-      fb.summary,
-      fb.summary_dirty AS summaryDirty,
-      fb.position,
-      c.title         AS title,
-      c.status        AS conceptStatus
-    FROM first_block fb
-    LEFT JOIN concepts c ON c.id = fb.concept_id
-    WHERE fb.deleted_at IS NULL
-      AND (c.status IS NULL OR c.status != 'retired')
-    ORDER BY fb.position ASC
-  `,
-
-  // includeRetired=1 variant — preserves the previous unfiltered semantics.
-  firstBlockIncludeRetired: `
-    SELECT
-      fb.concept_id   AS conceptId,
-      fb.circle,
-      fb.summary,
-      fb.summary_dirty AS summaryDirty,
-      fb.position,
-      c.title         AS title,
-      c.status        AS conceptStatus
-    FROM first_block fb
-    LEFT JOIN concepts c ON c.id = fb.concept_id
-    WHERE fb.deleted_at IS NULL
-    ORDER BY fb.position ASC
-  `,
-
-  // Legacy-schema variants for stores whose first_block table predates the
-  // deleted_at column. The standalone dashboard opens stores read-only and does
-  // not run engine migrations, so these must not reference the missing column.
-  firstBlockLegacy: `
-    SELECT
-      fb.concept_id   AS conceptId,
-      fb.circle,
-      fb.summary,
-      fb.summary_dirty AS summaryDirty,
-      fb.position,
-      c.title         AS title,
-      c.status        AS conceptStatus
-    FROM first_block fb
-    LEFT JOIN concepts c ON c.id = fb.concept_id
-    WHERE c.status IS NULL OR c.status != 'retired'
-    ORDER BY fb.position ASC
-  `,
-
-  firstBlockLegacyIncludeRetired: `
-    SELECT
-      fb.concept_id   AS conceptId,
-      fb.circle,
-      fb.summary,
-      fb.summary_dirty AS summaryDirty,
-      fb.position,
-      c.title         AS title,
-      c.status        AS conceptStatus
-    FROM first_block fb
-    LEFT JOIN concepts c ON c.id = fb.concept_id
-    ORDER BY fb.position ASC
-  `,
 } as const;
 
 /**
@@ -650,8 +581,8 @@ export const SQL = {
  * against such a store throws "no such column", which was breaking
  * /api/graph entirely for legacy stores. handleGraph() calls this to pick
  * SQL.counts (full marker) vs SQL.countsLegacy (kind-only) -- mirrors the
- * sqlite_master table-existence guards in handleFirstBlock/handleSources,
- * which exist for the identical reason (older stores predate newer schema).
+ * sqlite_master table-existence guard in handleSources, which exists for the
+ * identical reason (older stores predate newer schema).
  * Exported so it can be unit-tested directly against both schema shapes
  * rather than only indirectly through handleGraph().
  */
@@ -659,17 +590,6 @@ export function conceptsHasSourceColumns(db: InstanceType<typeof Database>): boo
   const cols = db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
   const names = new Set(cols.map((c) => c.name));
   return names.has("source_identity") && names.has("active_observation_id");
-}
-
-/** Select a current- or legacy-schema First Block query without migrating the read-only store. */
-export function selectFirstBlockSql(
-  db: InstanceType<typeof Database>,
-  includeRetired: boolean,
-): string {
-  const cols = db.prepare(`PRAGMA table_info(first_block)`).all() as Array<{ name: string }>;
-  const hasDeletedAt = cols.some((c) => c.name === "deleted_at");
-  if (hasDeletedAt) return includeRetired ? SQL.firstBlockIncludeRetired : SQL.firstBlock;
-  return includeRetired ? SQL.firstBlockLegacyIncludeRetired : SQL.firstBlockLegacy;
 }
 
 // ── API handlers ─────────────────────────────────────────────────────────────
@@ -820,59 +740,6 @@ async function handleEntities(includeRetired: boolean): Promise<unknown> {
   }
 }
 
-async function handleFirstBlock(circle: string | null, includeRetired: boolean): Promise<unknown> {
-  if (!fs.existsSync(getDbPath(resolveProjectDir()))) return { rows: [] };
-  const snap = await makeSnapshot();
-  try {
-    // The first_block table only exists in stores migrated by the new engine.
-    // Check for its existence before querying so the endpoint returns an empty
-    // payload (rather than a 500) when pointed at an older store.
-    const db = new Database(snap, { readonly: true });
-    let tableExists = false;
-    let firstBlockSql: string | null = null;
-    try {
-      const row = db.prepare(
-        `SELECT 1 FROM sqlite_master WHERE type='table' AND name='first_block'`
-      ).get();
-      tableExists = !!row;
-      if (tableExists) firstBlockSql = selectFirstBlockSql(db, includeRetired);
-    } finally {
-      db.close();
-    }
-    if (!tableExists) return { rows: [] };
-
-    let rows = querySnap(snap, firstBlockSql!);
-    // Filter by circle when requested.  Resolve aliases so that a caller passing
-    // a canonical name (e.g. "example-circle") matches rows stored under the raw alias
-    // (e.g. "code-6849de25"), mirroring the alias aggregation in handleGraph().
-    if (circle) {
-      const aliases = querySnap(snap, SQL.aliases) as Array<{ from_name: string; to_name: string }>;
-      const aliasMap: Record<string, string> = {};
-      for (const a of aliases) aliasMap[a.from_name] = a.to_name;
-      const canonical = (name: string): string => {
-        const seen = new Set<string>();
-        let current = name;
-        while (aliasMap[current] && !seen.has(current)) {
-          seen.add(current);
-          current = aliasMap[current];
-        }
-        return current;
-      };
-      // Normalize both sides so a requested raw alias and its canonical target
-      // select the same rows, including rows stored under another equivalent raw
-      // alias. Comparing only the row side made raw-alias requests asymmetric.
-      const requestedCircle = canonical(circle);
-      rows = rows.filter(r => {
-        const rawCircle = r["circle"] as string;
-        return canonical(rawCircle) === requestedCircle;
-      });
-    }
-    return { rows };
-  } finally {
-    try { fs.unlinkSync(snap); } catch { /* ignore */ }
-  }
-}
-
 // ── Sources ──────────────────────────────────────────────────────────────────
 
 /**
@@ -994,7 +861,8 @@ async function handleSources(): Promise<unknown> {
   const snap = await makeSnapshot();
   try {
     // Stores written by engines without the source pipeline lack these tables;
-    // return an empty payload rather than a 500 (mirrors the first_block guard).
+    // return an empty payload rather than a 500 (the same sqlite_master
+    // table-existence guard conceptsHasSourceColumns applies for legacy stores).
     // The ledger tables can also be missing INDEPENDENTLY of the registry
     // (registry-only stores from older engines): still list registered sources
     // and treat run/attempt data as empty rather than hiding the registry.
@@ -1226,16 +1094,6 @@ export function startDashboard(port: number): void {
 
       if (pathname === "/api/sources") {
         const data = await handleSources();
-        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify(data));
-        return;
-      }
-
-      if (pathname === "/api/firstblock") {
-        const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
-        const circle = url.searchParams.get("circle");
-        const includeRetired = url.searchParams.get("includeRetired") === "1";
-        const data = await handleFirstBlock(circle, includeRetired);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(data));
         return;

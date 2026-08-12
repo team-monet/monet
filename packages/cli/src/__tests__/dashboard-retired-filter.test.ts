@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
-import { SQL, selectFirstBlockSql } from "../dashboard/server.js";
+import { SQL } from "../dashboard/server.js";
 
 // Runs the REAL query strings from server.ts against a seeded in-memory DB —
 // mirrors the approach in dashboard-source-marker.test.ts (real queries, not a
@@ -44,10 +44,6 @@ beforeEach(() => {
     CREATE TABLE entities (key TEXT);
     CREATE TABLE sessions (id TEXT);
     CREATE TABLE contradictions (id TEXT, status TEXT);
-    CREATE TABLE first_block (
-      concept_id TEXT PRIMARY KEY, circle TEXT, summary TEXT,
-      summary_dirty INTEGER, position INTEGER, deleted_at INTEGER
-    );
   `);
 });
 
@@ -91,13 +87,6 @@ function conceptIds(sql: string): string[] {
 }
 function edgeIds(sql: string): string[] {
   return (db.prepare(sql).all() as Array<{ id: string }>).map(r => r.id);
-}
-
-function insertFirstBlock(row: { conceptId: string; position: number; circle?: string; deletedAt?: number | null }) {
-  db.prepare(`
-    INSERT INTO first_block (concept_id, circle, summary, summary_dirty, position, deleted_at)
-    VALUES (@conceptId, @circle, @conceptId, 0, @position, @deletedAt)
-  `).run({ ...row, circle: row.circle ?? "default", deletedAt: row.deletedAt ?? null });
 }
 
 describe("SQL.concepts — retired excluded by default", () => {
@@ -288,108 +277,5 @@ describe("SQL.entityLinks — links to a retired concept excluded by default", (
     insertEntityLink({ concept_id: "b", entity_key: "k1" });
     expect(links(SQL.entityLinks).map(l => l.concept_id)).toEqual(["a"]);
     expect(links(SQL.entityLinksIncludeRetired).map(l => l.concept_id).sort()).toEqual(["a", "b"]);
-  });
-});
-
-describe("SQL.firstBlock — retired joined concepts excluded by default", () => {
-  function rows(sql: string, target = db) {
-    return target.prepare(sql).all() as Array<{ conceptId: string; conceptStatus: string | null }>;
-  }
-
-  function createLegacyDb() {
-    const legacy = new Database(":memory:");
-    legacy.exec(`
-      CREATE TABLE concepts (
-        id TEXT PRIMARY KEY,
-        slug TEXT, title TEXT, kind TEXT, status TEXT, confidence REAL, circle TEXT,
-        support_count INTEGER, version INTEGER, dirty INTEGER, usefulness_score INTEGER,
-        created_at INTEGER, updated_at INTEGER
-      );
-      CREATE TABLE first_block (
-        concept_id TEXT PRIMARY KEY, circle TEXT, summary TEXT,
-        summary_dirty INTEGER, position INTEGER
-      );
-    `);
-    return legacy;
-  }
-
-  function insertLegacyFirstBlock(
-    target: InstanceType<typeof Database>,
-    row: { conceptId: string; position: number; circle?: string },
-  ) {
-    target.prepare(`
-      INSERT INTO first_block (concept_id, circle, summary, summary_dirty, position)
-      VALUES (@conceptId, @circle, @conceptId, 0, @position)
-    `).run({ ...row, circle: row.circle ?? "default" });
-  }
-
-  it("keeps active, disputed, and orphan rows while excluding retired and soft-deleted pins", () => {
-    insertConcept({ id: "active" });
-    insertConcept({ id: "disputed", status: "disputed" });
-    insertConcept({ id: "retired", status: "retired" });
-    insertConcept({ id: "removed-active" });
-    insertFirstBlock({ conceptId: "active", position: 0 });
-    insertFirstBlock({ conceptId: "disputed", position: 1 });
-    insertFirstBlock({ conceptId: "retired", position: 2 });
-    insertFirstBlock({ conceptId: "orphan", position: 3 });
-    insertFirstBlock({ conceptId: "removed-active", position: 4, deletedAt: 123 });
-
-    const sql = selectFirstBlockSql(db, false);
-    expect(sql).toBe(SQL.firstBlock);
-    expect(rows(sql).map(r => [r.conceptId, r.conceptStatus])).toEqual([
-      ["active", "active"],
-      ["disputed", "disputed"],
-      ["orphan", null],
-    ]);
-  });
-
-  it("firstBlockIncludeRetired restores retired rows but still excludes soft-deleted pins", () => {
-    insertConcept({ id: "active" });
-    insertConcept({ id: "retired", status: "retired" });
-    insertConcept({ id: "removed-retired", status: "retired" });
-    insertFirstBlock({ conceptId: "active", position: 0 });
-    insertFirstBlock({ conceptId: "retired", position: 1 });
-    insertFirstBlock({ conceptId: "orphan", position: 2 });
-    insertFirstBlock({ conceptId: "removed-retired", position: 3, deletedAt: 456 });
-
-    const sql = selectFirstBlockSql(db, true);
-    expect(sql).toBe(SQL.firstBlockIncludeRetired);
-    expect(rows(sql).map(r => r.conceptId)).toEqual([
-      "active",
-      "retired",
-      "orphan",
-    ]);
-  });
-
-  it("selects legacy-safe default/include queries when deleted_at is absent", () => {
-    const legacy = createLegacyDb();
-    try {
-      insertConcept({ id: "active" }, legacy);
-      insertConcept({ id: "disputed", status: "disputed" }, legacy);
-      insertConcept({ id: "retired", status: "retired" }, legacy);
-      insertLegacyFirstBlock(legacy, { conceptId: "active", position: 0 });
-      insertLegacyFirstBlock(legacy, { conceptId: "disputed", position: 1 });
-      insertLegacyFirstBlock(legacy, { conceptId: "retired", position: 2 });
-      insertLegacyFirstBlock(legacy, { conceptId: "orphan", position: 3 });
-
-      const defaultSql = selectFirstBlockSql(legacy, false);
-      expect(defaultSql).toBe(SQL.firstBlockLegacy);
-      expect(rows(defaultSql, legacy).map(r => [r.conceptId, r.conceptStatus])).toEqual([
-        ["active", "active"],
-        ["disputed", "disputed"],
-        ["orphan", null],
-      ]);
-
-      const includeSql = selectFirstBlockSql(legacy, true);
-      expect(includeSql).toBe(SQL.firstBlockLegacyIncludeRetired);
-      expect(rows(includeSql, legacy).map(r => r.conceptId)).toEqual([
-        "active",
-        "disputed",
-        "retired",
-        "orphan",
-      ]);
-    } finally {
-      legacy.close();
-    }
   });
 });

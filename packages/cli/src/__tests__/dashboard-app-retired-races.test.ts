@@ -12,7 +12,6 @@ type DashboardHarness = {
   requests: PendingRequest[];
   respond: (index: number, payload: unknown) => void;
   refreshClasses: Set<string>;
-  firstBlockList: { innerHTML: string };
   entitiesBody: { innerHTML: string };
 };
 
@@ -34,23 +33,18 @@ globalThis.__dashboardTest = {
   state,
   STALE_REQUEST,
   fetchEntities,
-  fetchFirstBlock,
   fetchSources,
   invalidateDependentCaches,
   reloadGraph,
   reconcileCurrentCircle,
   reconcileSelectedDetail,
   renderEntitiesTable,
-  renderFirstBlock,
   cache: () => ({
     data: DATA,
     entities: ENTITIES,
     entitiesMode: _entitiesMode,
-    firstBlock: FIRST_BLOCK,
-    firstBlockMode: _firstBlockMode,
     sources: SOURCES,
     entitiesGen: _entitiesGen,
-    firstBlockGen: _firstBlockGen,
     sourcesGen: _sourcesGen,
     graphGen: _graphRequestGen,
   }),
@@ -73,11 +67,9 @@ globalThis.__dashboardTest = {
       contains: (name: string) => refreshClasses.has(name),
     },
   };
-  const firstBlockList = { innerHTML: "first-block-unchanged" };
   const entitiesBody = { innerHTML: "entities-unchanged" };
   const elements: Record<string, unknown> = {
     "refresh-btn": refreshButton,
-    "firstblock-list": firstBlockList,
     "entities-tbody": entitiesBody,
   };
   const document = {
@@ -98,7 +90,6 @@ globalThis.__dashboardTest = {
     api: (context as any).__dashboardTest,
     requests,
     refreshClasses,
-    firstBlockList,
     entitiesBody,
     respond(index, payload) {
       requests[index].resolve({ ok: true, status: 200, json: async () => payload });
@@ -246,30 +237,6 @@ describe("dashboard graph reconciliation", () => {
 });
 
 describe("dashboard visibility-dependent caches", () => {
-  it("tags First Block by mode and discards stale work without rendering", async () => {
-    const h = loadDashboard();
-    const oldRender = h.api.renderFirstBlock();
-    expect(h.requests[0].url).toBe("/api/firstblock");
-
-    h.api.state.showRetired = true;
-    h.api.invalidateDependentCaches(false);
-    const currentRender = h.api.renderFirstBlock();
-    expect(h.requests[1].url).toBe("/api/firstblock?includeRetired=1");
-
-    h.respond(0, { rows: [{ conceptId: "old" }] });
-    await oldRender;
-    expect(h.firstBlockList.innerHTML).toBe("first-block-unchanged");
-    expect(h.api.cache().firstBlock).toBe(null);
-
-    h.respond(1, { rows: [] });
-    await currentRender;
-    expect(h.firstBlockList.innerHTML).toContain("No First Block entries");
-    expect(h.api.cache().firstBlockMode).toBe(true);
-
-    await h.api.renderFirstBlock();
-    expect(h.requests).toHaveLength(2);
-  });
-
   it("returns an entity sentinel so stale table continuations neither cache nor crash", async () => {
     const h = loadDashboard();
     h.api.state.showRetired = true;
