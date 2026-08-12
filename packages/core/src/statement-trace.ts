@@ -40,7 +40,7 @@
  * instrument that can fail the thing it observes is worse than no instrument.
  */
 
-import { closeSync, fchmodSync, ftruncateSync, openSync, writeSync } from "node:fs";
+import { closeSync, fchmodSync, ftruncateSync, openSync, readFileSync, readdirSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 /** Longer than this and a completed statement is recorded in the slow log. */
@@ -99,6 +99,12 @@ export interface StatementTraceOptions {
   now?: () => number;
   /** Injectable for tests. Defaults to `process.pid`. */
   pid?: number;
+  /**
+   * Absolute path of the store these statements run against. Recorded in each marker so a reader
+   * can tell one store's markers from another's when several share a directory (Codex review,
+   * PR #216) — without it, an unrelated database's in-flight statement reads as this one's holder.
+   */
+  dbPath?: string;
 }
 
 export interface StatementTracer {
@@ -130,6 +136,7 @@ function clipSql(sql: string): string {
 export function createStatementTracer(options: StatementTraceOptions): StatementTracer {
   const now = options.now ?? Date.now;
   const pid = options.pid ?? process.pid;
+  const markerDbPath = options.dbPath;
   const slowThresholdMs = options.slowThresholdMs ?? STATEMENT_SLOW_THRESHOLD_MS;
   const connectionSeq = options.connectionSeq ?? nextConnectionSeq++;
   const inflightPath = join(options.dir, `${INFLIGHT_FILENAME_PREFIX}${pid}-${connectionSeq}.json`);
@@ -176,7 +183,15 @@ export function createStatementTracer(options: StatementTraceOptions): Statement
     writeMarker(
       top === undefined
         ? null
-        : JSON.stringify({ v: 1, pid, method: top.method, startedAt: top.startedAt, depth: frames.length, sql: clipSql(top.sql) }),
+        : JSON.stringify({
+            v: 1,
+            pid,
+            ...(markerDbPath === undefined ? {} : { dbPath: markerDbPath }),
+            method: top.method,
+            startedAt: top.startedAt,
+            depth: frames.length,
+            sql: clipSql(top.sql),
+          }),
     );
   };
 
@@ -234,4 +249,85 @@ export function createStatementTracer(options: StatementTraceOptions): Statement
       }
     },
   };
+}
+
+/** One in-flight statement, as recovered from another process's marker file. */
+export interface InflightStatement {
+  /** The process holding it. */
+  pid: number;
+  /** Epoch ms when that statement started. */
+  startedAt: number;
+  method: StatementMethod;
+  /** Nesting depth at the time — 1 is a bare statement, higher is inside a transaction. */
+  depth: number;
+  /** Clipped to STATEMENT_TRACE_SQL_MAX_CHARS by the writer. */
+  sql: string;
+  /**
+   * The store this statement runs against. Absent on markers written before this field existed —
+   * which is why a reader filtering on it must treat "absent" as "cannot tell", never as "not this
+   * store".
+   */
+  dbPath?: string;
+}
+
+/**
+ * Read every live in-flight marker beside a store — the reader this module's own JSDoc has been
+ * pointing at ("a reader globs `inflight-*.json` rather than naming one", and `inflightPath` exists
+ * "for tests and for the reader tool"). Nothing consumed these records until #148: they were
+ * written and never read.
+ *
+ * WHAT IT IS FOR. When a startup cannot take the store's write lock, the one thing that turns
+ * "database is locked" into an actionable sentence is WHO holds it and since when. SQLite will not
+ * say — it reports contention, never the holder — so the only source is what the holder itself
+ * wrote down. This returns exactly that, newest statement first.
+ *
+ * TOTAL, NEVER THROWING. This runs on a failure path that is already reporting something else. A
+ * missing directory, a marker half-written at the instant it is read, a foreign file matching the
+ * glob — each is skipped, because a diagnostic that fails while diagnosing tells the operator less
+ * than the error it was decorating.
+ *
+ * An empty result does NOT mean nothing holds the lock. It usually means tracing was off
+ * (`MONET_TRACE_SQL=1`), which callers must say rather than reporting "no holder".
+ */
+export function readInflightStatements(dir: string): InflightStatement[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: InflightStatement[] = [];
+  for (const name of names) {
+    if (!name.startsWith(INFLIGHT_FILENAME_PREFIX) || !name.endsWith(".json")) continue;
+    let raw: string;
+    try {
+      raw = readFileSync(join(dir, name), "utf8");
+    } catch {
+      continue;
+    }
+    if (raw.trim() === "") continue; // an idle connection truncates its own marker
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue; // caught mid-write; the next reader gets it whole
+    }
+    // `JSON.parse("null")` is valid JSON and would reach the field reads below as null, throwing a
+    // TypeError from a reader whose whole contract is that it never throws (Codex review, PR #216).
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const record = parsed as Partial<InflightStatement> & { v?: number };
+    if (
+      typeof record.pid !== "number" || typeof record.startedAt !== "number" ||
+      typeof record.method !== "string" || typeof record.sql !== "string"
+    ) continue;
+    out.push({
+      pid: record.pid,
+      startedAt: record.startedAt,
+      method: record.method as StatementMethod,
+      depth: typeof record.depth === "number" ? record.depth : 1,
+      sql: record.sql,
+      ...(typeof record.dbPath === "string" ? { dbPath: record.dbPath } : {}),
+    });
+  }
+  return out.sort((a, b) => b.startedAt - a.startedAt);
 }

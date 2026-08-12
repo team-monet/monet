@@ -20,8 +20,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, link, lstat, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { createStatementTracer, statementTraceEnabled } from "./statement-trace";
-import type { StatementMethod, StatementTracer } from "./statement-trace";
+import { createStatementTracer, readInflightStatements, statementTraceEnabled } from "./statement-trace";
+import type { InflightStatement, StatementMethod, StatementTracer } from "./statement-trace";
 
 /** The result of a write (INSERT/UPDATE/DELETE) — mirrors better-sqlite3's RunResult. */
 export interface RunResult {
@@ -54,6 +54,87 @@ export class StorageExclusiveLockError extends Error {
 
   /** Present when cleanup could not verify restored shared access after the acquisition failure. */
   readonly cleanupError?: unknown;
+}
+
+/**
+ * The store could not be opened because another process holds its write lock (#148).
+ *
+ * Distinct from StorageExclusiveLockError, which is about a lock this process asked for and could
+ * not keep. This one is ordinary contention on the SHARED topology the WAL + busy_timeout setup
+ * exists for — an MCP server and a `monet` CLI call on one `.monet` DB — and it is transient by
+ * nature: the remedy is usually to retry once the other process finishes.
+ */
+export class StoreBusyError extends Error {
+  constructor(
+    readonly dbPath: string,
+    readonly waitedMs: number,
+    /** Empty when tracing was off, which is NOT the same as "nothing holds it" — see the message. */
+    readonly holders: InflightStatement[],
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "StoreBusyError";
+  }
+}
+
+/** SQLite reports contention two ways, and the second is not a code (see diagnostics.ts on WSL2). */
+function isStoreContention(error: unknown): boolean {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : "";
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
+  return error instanceof Error && /database is locked/i.test(error.message);
+}
+
+/**
+ * Turn a contention failure into a sentence an operator can act on, or return undefined so the
+ * original error propagates untouched.
+ *
+ * WHAT THE MESSAGE HAS TO CARRY, because these are the three questions the afternoon in #148 was
+ * spent answering by hand: that this is contention rather than a broken binary or a bad path; how
+ * long was actually waited; and WHO holds it. SQLite answers only the first, and only in a code.
+ *
+ * The holder comes from the markers the lock-holder itself wrote (readInflightStatements). When
+ * tracing is off there are none, and the message leads with THAT rather than with "no holder" — an absent
+ * record and an absent holder are different facts, and reporting the first as the second is how a
+ * diagnostic starts lying.
+ */
+function storeContentionError(dbPath: string, error: unknown, waitedMs: number): StoreBusyError | undefined {
+  if (!isStoreContention(error)) return undefined;
+  // ONLY MARKERS THAT NAME THIS STORE (Codex review, PR #216). A marker carries no proof that its
+  // process owns the lock, and a directory can hold several databases — so an unfiltered list can
+  // point at an unrelated process, and sending an operator after the wrong pid is worse than saying
+  // nothing. Markers written before the field existed have no dbPath; those are dropped rather than
+  // assumed to match, because "cannot tell" must not read as "this one".
+  const holders = readInflightStatements(dirname(dbPath)).filter((h) => h.dbPath === dbPath);
+  const now = Date.now();
+  const held = holders.length === 0
+    // NOT "tracing is off" (Codex review, PR #216). An empty list has more than one cause: tracing
+    // may be off, OR a process may hold the lock while idle BETWEEN statements, which truncates its
+    // own marker by design. Inferring the cause here would repeat, one level up, exactly the
+    // mistake this message exists to avoid — reporting an absence as the thing that explains it.
+    ? `Nothing beside the store records who holds it. That happens when statement tracing is off ` +
+      `(set MONET_TRACE_SQL=1 on every monet process sharing this store and reproduce), and also ` +
+      `when the holder is idle between statements while keeping the lock — an absent RECORD either ` +
+      `way, never an absent holder.`
+    // "In flight against", not "held by": what was observed is a statement running against this
+    // store, which is evidence about the holder rather than proof of ownership. A crashed process
+    // can also leave a stale marker behind.
+    : `Statements in flight against this store: ${holders.map((h) =>
+        `pid ${h.pid} (${h.method}, ${Math.round((now - h.startedAt) / 1000)}s so far: ${h.sql})`,
+      ).join("; ")}. One of those is the likely holder; a marker is what a process recorded, not ` +
+      `proof it still runs.`;
+  return new StoreBusyError(
+    dbPath,
+    waitedMs,
+    holders,
+    `The store at ${dbPath} is busy: could not take its write lock after ${waitedMs}ms. ${held} ` +
+      `One MCP server and one \`monet\` CLI call sharing a store is the supported topology, so this ` +
+      `is usually transient — retry once the other process finishes. If nothing ever finishes, the ` +
+      `holder is wedged rather than busy.`,
+    { cause: error },
+  );
 }
 
 export interface VerifiedBackupResult {
@@ -132,7 +213,30 @@ export class BetterSqlitePort implements StoragePort {
   constructor(path = ":memory:", options?: { tracer?: StatementTracer }) {
     this.memoryOnly = path === ":memory:";
     this.dbPath = this.memoryOnly ? path : resolve(path);
-    this.db = new Database(this.dbPath);
+    // WHEN THIS BLOCKS, SAY SO IN WORDS (#148). Until now a contended store failed with SQLite's own
+    // `database is locked`, on a stderr an MCP host does not display, which is why one occurrence
+    // cost an afternoon of `lsof`, `ps` and hand-run probes.
+    //
+    // WHERE IT ACTUALLY BLOCKS, measured rather than assumed: `new Database(path)` executes no SQL
+    // and returns in ~0ms even against an exclusively-locked file; `journal_mode = WAL` below is the
+    // first statement and is what waits, observed at 5246ms. The guard around the open is therefore
+    // DEFENSIVE — kept because a different build or option could move where the first lock is taken,
+    // not because it is expected to fire.
+    //
+    // And the budget that wait runs under is NOT the pragma two lines below it: better-sqlite3 arms
+    // `sqlite3_busy_timeout` from its own `timeout` option at open, which defaults to 5000
+    // (lib/database.js). Our explicit `busy_timeout = 5000` runs AFTER the wait it looks like it
+    // governs. Separating a real boot budget therefore has to go through `new Database(path, {
+    // timeout })`, which is #215, not through editing that constant.
+    //
+    // The wait is timed from here so the message can say how long was actually spent, rather than
+    // quoting a configured number and hoping the two match.
+    const startedAt = Date.now();
+    try {
+      this.db = new Database(this.dbPath);
+    } catch (error) {
+      throw storeContentionError(this.dbPath, error, Date.now() - startedAt) ?? error;
+    }
     // TRACER FIRST, THEN THE SETUP PRAGMAS (Codex round 3). `journal_mode = WAL` takes real locks
     // and can stall against a busy store — which is startup, the exact path #148 is about. Built
     // after them, the marker would not even be open when the thing worth naming blocked.
@@ -142,10 +246,25 @@ export class BetterSqlitePort implements StoragePort {
     // stuck process, and there is no outside for an in-process database.
     this.tracer = options?.tracer
       ?? (!this.memoryOnly && statementTraceEnabled()
-        ? createStatementTracer({ dir: dirname(this.dbPath) })
+        ? createStatementTracer({ dir: dirname(this.dbPath), dbPath: this.dbPath })
         : undefined);
-    this.pragma("journal_mode = WAL");
-    this.pragma("busy_timeout = 5000");
+    try {
+      this.pragma("journal_mode = WAL");
+      this.pragma("busy_timeout = 5000");
+    } catch (error) {
+      // RELEASE WHAT THIS CONSTRUCTOR ALREADY TOOK (Codex review, PR #216). Reaching here means the
+      // instance will never exist, so nothing else can ever close these: the SQLite handle would be
+      // left to nondeterministic GC, and an auto-created tracer owns a raw descriptor with no
+      // finalizer at all — so a process that retries startup against a contended store leaks one
+      // descriptor per attempt, which is exactly the situation this path exists for.
+      try {
+        this.tracer?.close();
+      } catch { /* the throw below is the news; cleanup failing is not */ }
+      try {
+        this.db.close();
+      } catch { /* same */ }
+      throw storeContentionError(this.dbPath, error, Date.now() - startedAt) ?? error;
+    }
   }
 
   prepare(sql: string): Statement {
