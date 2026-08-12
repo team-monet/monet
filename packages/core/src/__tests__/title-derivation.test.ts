@@ -168,7 +168,7 @@ describe("title re-derivation on synthesis", () => {
       open: [{ slot: "question" as const, text: "how to tune thresholds?" }, { slot: "step" as const, text: "wire prewarm" }],
     });
     const originalWorkstreamTitle = w!.title;
-    expect(originalWorkstreamTitle).toBeTruthy();
+    expect(originalWorkstreamTitle).toBe("wire prewarm");
 
     // Drive applySynthesis directly on the workstream concept id (the MCP path).
     // The body we pass is a plain string — firstLine of it would be "{" if the guard were absent

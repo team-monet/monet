@@ -420,7 +420,7 @@ describe("authorized source-backed generic retrieval", () => {
     expect(core.stats().workstreams).toBe(0);
     expect(core.overview(circle).counts.workstreams).toBe(0);
     await expect(core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "overwrite attempt" }] }, { circle }))
-      .rejects.toThrow(/connector-owned workstream/);
+      .rejects.toMatchObject({ name: "WorkstreamAddressRequiredError", candidates: [] });
     expect(db.prepare(`SELECT body,version FROM concepts WHERE id=?`).get(workstream!.id)).toEqual(before);
 
     const server = new McpServer({ name: "workstream-marker-test", version: "1" });

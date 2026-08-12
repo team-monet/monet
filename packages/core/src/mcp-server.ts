@@ -12,7 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { MonetCore } from "./engine";
+import { MonetCore, WorkstreamAddressRequiredError } from "./engine";
 import type { MemoryOverview, MergeConceptResult, RetirementBlocker, RuleSuccession, SearchCard, StageView, WorkstreamItem } from "./engine";
 import {
   BREADTH_CIRCLE,
@@ -497,6 +497,14 @@ function buildPrewarmBlock(
   // === LOWER-PRIORITY SECTIONS (subject to truncation) ===
   const lowerLines: string[] = [];
 
+  // Auto-prewarm serves agents that never call agent_context, so it needs parity with that surface's
+  // open-work cue just as stageIndex does below. Counts only; detail remains intent-gated.
+  const workstreams = core.getActiveWorkstreams(circle).length;
+  const inboxItems = core.getWorkstreamInbox(circle)?.payload.items.filter((item) => item.state === "open").length ?? 0;
+  if (workstreams > 0 || inboxItems > 0) {
+    lowerLines.push(`open: ${workstreams} workstreams · ${inboxItems} inbox items`);
+  }
+
   // Stage index (review fix, item 5b): the recognition cue MUST actually reach a worker that never
   // calls agent_context explicitly — auto-prewarm is the only in-flight delivery into that
   // junctureless interior, and a stageIndex the structured agent_context payload carried but this
@@ -648,6 +656,19 @@ export function registerMonetCoreTools(
   // --- lifecycle closure state ---
   // Auto-prewarm: one-shot per server process.
   let prewarmed = false;
+  // MCP-process affinity for the last ordinary thread this process wrote or detail-read, per circle.
+  // The inbox is deliberately never recorded here.
+  const touchedWorkstreamByCircle = new Map<string, string>();
+  const moveTouchedWorkstreamAffinity = (from: string, to: string): void => {
+    // A no-op lifecycle call (self-merge, self-rename) must not destroy affinity: with from === to
+    // the "destination already has a key" skip and the source delete are the SAME key (Codex round
+    // 4 on #212).
+    if (from === to) return;
+    const touchedId = touchedWorkstreamByCircle.get(from);
+    if (touchedId === undefined) return;
+    if (!touchedWorkstreamByCircle.has(to)) touchedWorkstreamByCircle.set(to, touchedId);
+    touchedWorkstreamByCircle.delete(from);
+  };
 
   // When a tool call omits `circle`, fall back to the runtime's configured default (e.g. a per-project
   // circle the local client derived from the working tree) — so one shared store isolates per project.
@@ -1732,73 +1753,137 @@ export function registerMonetCoreTools(
     },
   );
 
-  server.tool(
+  const checkpointDescription = "Track work and capture finds as they happen — nothing is owed at session end. When a work directive lands, open the plan: work-level items that may outlive the session (fine-grained decomposition stays in the host's own todo). When something surfaces that is not this work, `inbox` it — one line, keep moving. Before reporting completion, settle: close what resolved, and dispose the inbox with the user — do it now, `filed` with a `ref`, `dropped`, or leave open to keep. This MERGES: `open` adds, `close` resolves by id, anything unnamed stays untouched. Address a workstream by `title` (mints if new) or `id` (exact); with neither, the one this session already touched, or the only active one — several active means refusal with the list. The receipt is only what this call did: `opened`/`closed` item ids, `status` only when this call changed it.";
+  const checkpointSchema = z.object({
+    circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
+    inbox: z.string().min(1).optional(),
+    workstream: z.object({
+      id: z.string().optional(),
+      // A title IS an address: displayed titles must replay through this field unchanged, so the
+      // cap matches the stored-title budget — an over-long title would slug from the full text but
+      // display clipped, and the clipped replay would mint a second thread (Codex round 4 on #212).
+      // COUNTED IN CODE POINTS, like the engine cap and the renderer: `.max()` counts UTF-16 units,
+      // which would refuse an astral title the engine stores and displays (Codex round 6).
+      title: z.string().refine(
+        (value) => [...value].length <= 80,
+        { message: "a workstream title is an address — 80 characters or fewer" },
+      ).optional(),
+      status: z.enum(["active", "paused", "done"]).optional(),
+      // Batch caps refuse BEFORE any mutation: the receipt promises every minted/closed item id,
+      // and an unbounded batch would commit and then lose those ids to the generic size-fit
+      // truncation — an unreturnable receipt is worse than a bounded input (Codex round 3 on #212).
+      open: z.array(z.object({
+        kind: z.enum(["question", "step"]),
+        text: z.string().min(1),
+      }).strict()).max(100, "open at most 100 items per checkpoint — split larger batches").optional(),
+      close: z.array(z.object({
+        id: z.string(),
+        as: z.enum(["done", "dropped", "filed"]),
+        // A ref is a pointer (URL, issue number), not a document: unbounded refs render verbatim
+        // in includeClosed detail pages and can make an entry that no clipping fits.
+        ref: z.string().max(2048, "a ref is a pointer — 2048 characters or fewer").optional(),
+      }).strict().refine(
+        (entry) => entry.as !== "filed" || (entry.ref !== undefined && entry.ref.trim().length > 0),
+        { message: "filed requires a non-empty ref", path: ["ref"] },
+      )).max(100, "close at most 100 items per checkpoint — split larger batches")
+        .refine(
+          (entries) => new Set(entries.map((entry) => entry.id)).size === entries.length,
+          { message: "close lists each item id at most once — repeated ids would make the receipt overstate the effects" },
+        ).optional(),
+    }).strict().optional(),
+  }).strict();
+
+  // Deliberately the only tool using registerTool: the deprecated raw-shape overload cannot express
+  // a top-level strict object, and removed keys such as `summary` must refuse rather than be stripped.
+  // registerTool bypasses the server.tool in-flight patch above, so this one handler carries the
+  // tracking explicitly — otherwise a shutdown arriving while the checkpoint awaits an embedding
+  // observes zero tracked work and closes the core under it (Codex round 3 on #212).
+  const trackedCheckpointHandler = <A, R>(handler: (args: A) => Promise<R>) => (args: A): Promise<R> => {
+    inFlightTracker.increment();
+    return handler(args).finally(() => inFlightTracker.decrement());
+  };
+  server.registerTool(
     "memory_checkpoint",
-    "At session end, record what is still OPEN as items — questions that need answering and steps that need doing. This MERGES: `open` adds items, `close` resolves named ones, and anything you do not name stays open untouched. Omitting an item no longer removes it, so carrying items forward by re-typing them is neither needed nor wanted — it mints duplicates. Close what you finished (`done`) or abandoned (`dropped`); leave the rest. Rationale, decisions, and context belong in the artifact they are about, not here.",
-    {
-      circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
-      summary: z.string().optional(),
-      workstream: z
-        .object({
-          status: z.enum(["active", "paused", "done"]).optional(),
-          open: z
-            .array(z.object({
-              slot: z.enum(["question", "step"]).describe("`question` gets answered; `step` gets done."),
-              text: z.string().min(1),
-            }))
-            .optional()
-            .describe("New items. Do not re-send items that are already open."),
-          close: z
-            .array(z.object({
-              id: z.string().describe("Item id from memory_workstreams."),
-              as: z.enum(["done", "dropped"]).describe("`done` finished it; `dropped` abandoned it."),
-            }))
-            .optional()
-            .describe("Resolve items by id. Closing an unknown or already-closed id is a no-op, never an error."),
-        })
-        // STRICT, so the pre-#131 fields are REFUSED rather than stripped (Codex P2 on PR #149).
-        // Zod drops unknown keys by default, so a caller still sending openQuestions/nextSteps
-        // reached saveWorkstream with only `status` and got a success back carrying openItems: 0 —
-        // its entire checkpoint silently discarded. That is the same data-loss class this change
-        // exists to remove, so the entrance names what it does not accept instead of eating it.
-        .strict()
-        .optional(),
-    },
-    async ({ circle, summary, workstream }) => {
+    { description: checkpointDescription, inputSchema: checkpointSchema },
+    trackedCheckpointHandler(async ({ circle, inbox, workstream }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         const resolvedCircle = scope(circle);
-        const saved = workstream ? await core.saveWorkstream(workstream, { circle: resolvedCircle, summary }) : null;
+        let workstreamInput = workstream;
+        if (workstreamInput !== undefined && workstreamInput.id === undefined && workstreamInput.title === undefined) {
+          const touchedId = touchedWorkstreamByCircle.get(resolvedCircle);
+          if (touchedId !== undefined) {
+            const touched = core.getWorkstreamById(touchedId, resolvedCircle);
+            if (touched !== undefined && touched.payload.status !== "done") {
+              workstreamInput = { ...workstreamInput, id: touchedId };
+            } else {
+              touchedWorkstreamByCircle.delete(resolvedCircle);
+            }
+          }
+        }
+        const engineWorkstreamInput = workstreamInput === undefined
+          ? undefined
+          : {
+              ...workstreamInput,
+              // Wire `kind` names the reader-facing species; engine `slot` remains the stored shape.
+              open: workstreamInput.open?.map(({ kind, text }) => ({ slot: kind, text })),
+            };
+        // A combined call owes an all-or-refusal boundary for every DETERMINISTIC failure, not just
+        // address ambiguity: the dry-run runs the save's full preparation (address, inbox shape,
+        // merge validation, done-with-open-items) before captureFind mutates the inbox, so a
+        // refusal cannot strand an unreturned find. Only embed-time and concurrent-writer failures
+        // can still split the pair, and both are disclosed by the error the caller receives.
+        if (inbox !== undefined && engineWorkstreamInput !== undefined) {
+          core.previewWorkstreamCheckpoint(engineWorkstreamInput, { circle: resolvedCircle });
+        }
+        const inboxSaved = inbox !== undefined ? await core.captureFind(inbox, { circle: resolvedCircle }) : undefined;
+        const saved = engineWorkstreamInput !== undefined
+          ? await core.saveWorkstream(engineWorkstreamInput, { circle: resolvedCircle })
+          : null;
+        // A settle addressed at the reserved inbox reports under the INBOX receipt: the row's
+        // physical UUID is deliberately unusable as an address (the read surface takes the
+        // semantic "inbox" only), so returning it as a `workstream` would hand the caller an
+        // address that resolves nowhere (Codex round 4 on #212).
+        // Classify from the row the engine actually wrote, not from the pre-embed circle name: a
+        // rename landing mid-call moves the write, and comparing against the stale name would
+        // publish the inbox's unusable physical id as a thread address (Codex round 6 on #212).
+        const savedIsInbox = saved !== null && saved.slug === `workstream:${saved.circle}::inbox`;
+        if (saved !== null && !savedIsInbox) {
+          touchedWorkstreamByCircle.set(saved.circle, saved.id);
+        }
+        const inboxReceipt = inboxSaved !== undefined || savedIsInbox
+          ? {
+              inbox: {
+                ...(inboxSaved !== undefined ? { opened: [inboxSaved.itemId] } : {}),
+                ...(savedIsInbox ? { closed: saved.closedItemIds } : {}),
+              },
+            }
+          : {};
         return mutOk({
-          circle: resolvedCircle,
-          workstream: saved
-            ? {
-                id: saved.id,
-                status: saved.payload.status,
-                version: saved.version,
-                openItems: saved.payload.items.filter((item) => item.state === "open").length,
-                // NAME WHAT WAS ACTUALLY CLOSED (Codex round 2 on PR #149). A close against an id
-                // this circle's row does not hold — a stale id, or one read from a non-canonical
-                // row in a malformed store, which saveWorkstream can never write to — is a no-op
-                // by design. A bare success would report that as done. The receipt lists the ids
-                // that actually moved, so "I asked for three and two came back" is visible.
-                closed: (workstream?.close ?? [])
-                  .map((c) => c.id)
-                  .filter((id) => saved.payload.items.some(
-                    (item) => item.id === id && item.state !== "open" && item.closedIn === saved.payload.lastSessionId,
-                  )),
-              }
-            : null,
+          // The circle the writes actually landed in — a mid-call rename moves them, and the
+          // receipt names where the work IS, not where the request aimed.
+          circle: saved?.circle ?? inboxSaved?.row.circle ?? resolvedCircle,
+          ...(saved !== null && !savedIsInbox ? {
+            workstream: {
+              id: saved.id,
+              title: saved.title,
+              ...(saved.statusChanged ? { status: saved.payload.status } : {}),
+              opened: saved.openedItemIds,
+              closed: saved.closedItemIds,
+            },
+          } : {}),
+          ...inboxReceipt,
         }, "memory_checkpoint", capturedBlock);
       } catch (e) {
+        if (e instanceof WorkstreamAddressRequiredError) return err(e.message);
         return err(`checkpoint failed: ${msg(e)}`);
       }
-    },
+    }),
   );
 
   server.tool(
     "memory_workstreams",
-    "Call only on continuation intent, never for a fresh directive. Omit id to list compact active/paused workstreams, then confirm which to resume unless the user named one unambiguously. Pass its id for detail: OPEN items only, questions before steps, each with the id memory_checkpoint's `close` takes. `closedItems` says how many resolved ones exist without delivering them; pass includeClosed to see them with their state and closing session. Advance detailOffset by entries actually returned; detailOmitted is the true remainder.",
+    "Two reads, two moments. Resume — on continuation intent only, never a fresh directive: omit `id` to list active/paused workstreams and confirm which to resume; then pass its `id` for detail — OPEN items only, questions first, each carrying the id `close` takes. Settle — `id: \"inbox\"` before reporting completion: every find awaiting disposition, this session's and every kept one. `closedCount` says how many resolved items exist without delivering them; `includeClosed` returns them with `state`, `closedAt`, and `ref` for the filed. Advance `detailOffset` by items actually returned; `detailOmitted` is the true remainder.",
     {
       id: z.string().optional().describe("Workstream id for detail; omit to list active/paused workstreams."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
@@ -1835,13 +1920,15 @@ export function registerMonetCoreTools(
           return readOk(envelope(fit.fitted, fit.omitted), "memory_workstreams", suppressPrewarm);
         }
 
-        // An id lookup with includeClosed must reach a FINISHED workstream (Codex round 2 on
-        // #152): the one a caller most wants the resolved items of is the one just closed, and
-        // getActiveWorkstreams filters `done` out, so the option could not deliver what it names.
-        // Continuation (the list path above) still sees only active/paused.
-        const workstream = workstreams.find((candidate) => candidate.id === id)
-          ?? (includeClosed ? core.getWorkstreamById(id, resolvedCircle) : undefined);
+        // Resolve the reserved semantic address before any UUID path. Inbox detail is deliberately
+        // lifecycle-free and never enters session affinity.
+        const inboxDetail = id === "inbox";
+        const workstream = inboxDetail
+          ? core.getWorkstreamInbox(resolvedCircle)
+          : workstreams.find((candidate) => candidate.id === id)
+            ?? (includeClosed ? core.getWorkstreamById(id, resolvedCircle) : undefined);
         if (!workstream) return err(`workstream not found: ${id}`);
+        if (!inboxDetail) touchedWorkstreamByCircle.set(resolvedCircle, workstream.id);
         // OPEN BY DEFAULT, closed on request. A closed item is not deleted, it is not delivered —
         // which is what makes "was this finished, or dropped three checkpoints ago?" answerable at
         // all, while costing nothing on the turns nobody asks.
@@ -1862,31 +1949,21 @@ export function registerMonetCoreTools(
         ): Record<string, unknown> => {
           const omitted = allEntries.length - offset - entries.length;
           const openCount = workstream.payload.items.filter((item) => item.state === "open").length;
+          const closedCount = workstream.payload.items.length - openCount;
           return {
-            id: workstream.id,
-            title: workstream.title,
-            status: workstream.payload.status,
-            openItems: openCount,
-            // The id is the addressable part: memory_checkpoint's `close` takes exactly these.
+            id: inboxDetail ? "inbox" : workstream.id,
+            ...(!inboxDetail ? { title: workstream.title, status: workstream.payload.status } : {}),
+            ...(includeClosed ? { openCount, closedCount } : closedCount > 0 ? { closedCount } : {}),
             items: entries.map(({ item, value }) => ({
               id: item.id,
-              slot: item.slot,
+              ...(!inboxDetail && item.slot !== undefined ? { kind: item.slot } : {}),
               text: value,
               ...(item.state === "open" ? {} : {
                 state: item.state,
-                ...(item.closedAt !== undefined ? { closedAt: item.closedAt } : {}),
-                ...(item.closedIn !== undefined ? { closedIn: item.closedIn } : {}),
+                ...(includeClosed && item.closedAt !== undefined ? { closedAt: item.closedAt } : {}),
+                ...(includeClosed && item.ref !== undefined ? { ref: item.ref } : {}),
               }),
             })),
-            // Say that closed items exist without delivering them; silence about them would read
-            // as "nothing was ever closed here", which is the ambiguity this design removes.
-            ...(includeClosed ? {} : (() => {
-              const closed = workstream.payload.items.length - openCount;
-              return closed > 0 ? { closedItems: closed } : {};
-            })()),
-            // lastSessionId is stored, not delivered: nothing in this contract acts on it, and
-            // where session provenance actually matters — "who closed this item" — it rides the
-            // closed item as `closedIn`. Stored-not-delivered is the same rule closed items get.
             ...(offsetRequested || omitted > 0 || valueClipped ? { detailOffset: offset } : {}),
             ...(omitted > 0 || valueClipped ? {
               detailTruncated: true,
@@ -2453,6 +2530,7 @@ export function registerMonetCoreTools(
           if (!circle) return err("rename requires `circle`");
           if (!to) return err("rename requires `to`");
           const r = core.renameCircle(circle, to);
+          if (r.action === "renamed") moveTouchedWorkstreamAffinity(circle, r.to);
           const response: CircleRenameResponse = {
             from: r.from,
             to: r.to,
@@ -2468,6 +2546,7 @@ export function registerMonetCoreTools(
           if (!circle) return err("merge requires `circle`");
           if (!to) return err("merge requires `to`");
           const r = await core.mergeCircle(circle, to, { resolution: resolution ?? "forceNew" });
+          moveTouchedWorkstreamAffinity(circle, r.into);
           const response: CircleMergeResponse = {
             from: r.from,
             into: r.into,
@@ -2545,7 +2624,7 @@ export function registerMonetCoreTools(
 
   server.tool(
     "agent_context",
-    "Session-start orientation. Call first. Returns resolved `circle`; `resolvedFrom` marks an alias. `stageIndex` names moments whose rules require stage_lookup. Skeleton delivery has three states: no mirror fields means loaded standing files are current; `mirrorStale` + `instruction` requires user-confirmed reconciliation; `skeleton` contains members not covered by a standing file.",
+    "Session-start orientation. Call first. Returns resolved `circle`; `resolvedFrom` marks an alias. `stageIndex` names moments whose rules require stage_lookup. Skeleton delivery has three states: no mirror fields means loaded standing files are current; `mirrorStale` + `instruction` requires user-confirmed reconciliation; `skeleton` contains members not covered by a standing file. `open` counts workstreams and inbox items still open — mention them to the user; resume only when asked.",
     { circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional() },
     async ({ circle }) => {
       const resolvedCircle = scope(circle);
@@ -2559,9 +2638,15 @@ export function registerMonetCoreTools(
         instruction,
       } = state;
 
+      const openWorkstreams = core.getActiveWorkstreams(resolvedCircle).length;
+      const openInboxItems = core.getWorkstreamInbox(resolvedCircle)?.payload.items
+        .filter((item) => item.state === "open").length ?? 0;
       const baseContentWithoutMirrorOrSkeleton = {
         circle: resolvedCircle,
         ...(state.resolvedFrom !== undefined ? { resolvedFrom: state.resolvedFrom } : {}),
+        ...(openWorkstreams > 0 || openInboxItems > 0
+          ? { open: { workstreams: openWorkstreams, inboxItems: openInboxItems } }
+          : {}),
       };
       const sizeBudget = RESULT_MAX_CHARS - RESULT_TRUNCATE_NOTE.length;
       const stageIndexItems = stageIndexFull?.slice(0, STAGE_INDEX_CAP);

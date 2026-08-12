@@ -1740,17 +1740,19 @@ export type WorkstreamItemSlot = "question" | "step";
  * `dropped` is explicit and is the entire point of #131: omission stops being a way to remove
  * anything. An item leaves the open set only by being named.
  */
-export type WorkstreamItemState = "open" | "done" | "dropped";
+export type WorkstreamItemState = "open" | "done" | "dropped" | "filed";
 
 export interface WorkstreamItem {
   id: string;
-  slot: WorkstreamItemSlot;
+  /** Inbox finds are deliberately slotless; work-thread items always carry question | step. */
+  slot?: WorkstreamItemSlot;
   text: string;
   state: WorkstreamItemState;
   openedAt: number;
   closedAt?: number;
   /** The session that closed it — what makes "finished, or dropped three checkpoints ago?" answerable. */
   closedIn?: string;
+  ref?: string;
 }
 
 /**
@@ -1768,6 +1770,7 @@ export interface WorkstreamPayload {
   status: "active" | "paused" | "done";
   items: WorkstreamItem[];
   lastSessionId?: string;
+  title?: string;
 }
 
 /**
@@ -1775,9 +1778,13 @@ export interface WorkstreamPayload {
  * the caller does not name is left exactly as it was.
  */
 export interface WorkstreamCheckpoint {
+  /** Exact row id. The reserved literal "inbox" addresses this circle's inbox. */
+  id?: string;
+  /** Named-thread upsert address; stored verbatim when the slug is minted. */
+  title?: string;
   status?: "active" | "paused" | "done";
   open?: Array<{ slot: WorkstreamItemSlot; text: string }>;
-  close?: Array<{ id: string; as: "done" | "dropped" }>;
+  close?: Array<{ id: string; as: "done" | "dropped" | "filed"; ref?: string }>;
   /**
    * Never set. Present so a `WorkstreamPayload` cannot structurally satisfy this type (Codex round
    * 2 on PR #149): every field above is optional, so a direct package user still holding a payload
@@ -1807,9 +1814,20 @@ interface LegacyWorkstreamPayload {
  */
 export function normalizeWorkstreamPayload(raw: unknown, openedAt: number): WorkstreamPayload {
   const payload = (raw ?? {}) as LegacyWorkstreamPayload & Partial<WorkstreamPayload>;
+  const preserved = { ...payload };
+  for (const legacySlot of [
+    "openQuestions",
+    "nextSteps",
+    "decisions",
+    "discardedAlternatives",
+    "confirmedContext",
+    "importantEntities",
+  ]) {
+    delete preserved[legacySlot];
+  }
   const status = payload.status ?? "active";
   if (Array.isArray(payload.items)) {
-    return { status, items: payload.items as WorkstreamItem[], ...(payload.lastSessionId !== undefined ? { lastSessionId: payload.lastSessionId } : {}) };
+    return { ...preserved, status, items: payload.items as WorkstreamItem[] };
   }
   const items: WorkstreamItem[] = [];
   const carry = (values: unknown, slot: WorkstreamItemSlot): void => {
@@ -1829,9 +1847,9 @@ export function normalizeWorkstreamPayload(raw: unknown, openedAt: number): Work
   // was never done; the same rule the merge applies when opening revives a finished workstream.
   const carriedOpen = items.some((item) => item.state === "open");
   return {
+    ...preserved,
     status: status === "done" && carriedOpen ? "active" : status,
     items,
-    ...(payload.lastSessionId !== undefined ? { lastSessionId: payload.lastSessionId } : {}),
   };
 }
 
@@ -1864,6 +1882,58 @@ export interface Workstream {
   version: number;
   payload: WorkstreamPayload;
   updatedAt: number;
+}
+
+/** Authoritative effects of one checkpoint merge, captured inside its write transaction. */
+export interface WorkstreamSaveResult extends Workstream {
+  openedItemIds: string[];
+  closedItemIds: string[];
+  statusChanged: boolean;
+}
+
+export interface WorkstreamCandidate {
+  id: string;
+  title: string;
+}
+
+/** Engine refusal for an unaddressed checkpoint when no unique work thread is eligible. */
+export class WorkstreamAddressRequiredError extends Error {
+  constructor(
+    public readonly circle: string,
+    public readonly candidates: WorkstreamCandidate[],
+  ) {
+    // The MESSAGE renders a bounded sample — the MCP err() path enforces no size ceiling, and a
+    // circle with hundreds of threads must still deliver a usable refusal (Codex round 3 on #212).
+    // The full list stays on the structured `candidates` property for engine callers.
+    const RENDERED_CANDIDATE_CAP = 8;
+    const sample = candidates.slice(0, RENDERED_CANDIDATE_CAP)
+      .map(({ id, title }) => `${id} (${JSON.stringify(title)})`).join(", ");
+    const omitted = candidates.length - Math.min(candidates.length, RENDERED_CANDIDATE_CAP);
+    const rendered = candidates.length === 0 ? "none" : omitted > 0 ? `${sample} — and ${omitted} more` : sample;
+    super(
+      `workstream address required in circle '${circle}': choose a candidate by id or title; candidates: ${rendered}`,
+    );
+    this.name = "WorkstreamAddressRequiredError";
+  }
+}
+
+export interface CaptureFindResult {
+  itemId: string;
+  row: Workstream;
+}
+
+const WORKSTREAM_INBOX_ID = "inbox";
+const WORKSTREAM_EMBEDDING_TEXT_MAX_CHARS = 2_000;
+const CIRCLE_MOVE_ID_CHUNK_SIZE = 500;
+const workstreamInboxSlug = (circle: string): string => `workstream:${circle}::inbox`;
+const workstreamUnnamedSlug = (circle: string): string => `workstream:${circle}`;
+
+interface ResolvedWorkstreamTarget {
+  slug: string;
+  rowId?: string;
+  mintTitle?: string;
+  inbox: boolean;
+  unaddressed?: boolean;
 }
 
 /** A living-model entry in prewarm — identity + shape, never the body (no-leak, §4.5). */
@@ -5048,25 +5118,191 @@ export class MonetCore {
   /**
    * Session-state survival (ADR §4.3): the agent compresses a session into a workstream
    * payload; this elevates it into the circle's `workstream` concept (create or update —
-   * versioned, with a revision) and ends the current session. Agent-authored, so it is
-   * never marked dirty. Restored on continuation intent via getActiveWorkstreams (#242).
+   * versioned, with a revision). Agent-authored, so it is never marked dirty. Restored on
+   * continuation intent via getActiveWorkstreams (#242).
    */
-  /** Read the current payload for a slug, migrating a pre-#131 body on the way out. */
+  /** Read the current payload for a resolved target, migrating a pre-#131 body on the way out. */
   private readWorkstreamPayload(
     circle: string,
-    slug: string,
+    target: ResolvedWorkstreamTarget,
   ): { payload: WorkstreamPayload; archived: boolean } | undefined {
-    const row = this.db
-      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
-        AND source_identity IS NULL AND active_observation_id IS NULL
-        ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC
-        LIMIT 1`)
-      .get(circle, slug) as ConceptRow | undefined;
+    const row = target.rowId !== undefined
+      ? this.db
+          .prepare(`SELECT * FROM concepts WHERE id=? AND circle=? AND kind='workstream'
+            AND source_identity IS NULL AND active_observation_id IS NULL
+            LIMIT 1`)
+          .get(target.rowId, circle) as ConceptRow | undefined
+      : this.db
+          .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+            AND source_identity IS NULL AND active_observation_id IS NULL
+            ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC
+            LIMIT 1`)
+          .get(circle, target.slug) as ConceptRow | undefined;
     if (!row) return undefined;
     return {
       payload: normalizeWorkstreamPayload(safeParseWorkstreamBody(row.body), row.updated_at),
       archived: row.status === "archived",
     };
+  }
+
+  private activeWorkstreamRows(circle: string): ConceptRow[] {
+    const inboxSlug = workstreamInboxSlug(circle);
+    const rows = this.db
+      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug != ?
+        AND source_identity IS NULL AND active_observation_id IS NULL
+        ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC`)
+      .all(circle, inboxSlug) as ConceptRow[];
+    const canonicalBySlug = new Map<string, ConceptRow>();
+    for (const row of rows) {
+      if (!canonicalBySlug.has(row.slug)) canonicalBySlug.set(row.slug, row);
+    }
+    return [...canonicalBySlug.values()].filter((row) => {
+      if (row.status === "archived") return false;
+      return normalizeWorkstreamPayload(safeParseWorkstreamBody(row.body), row.updated_at).status !== "done";
+    });
+  }
+
+  private workstreamCandidates(circle: string): WorkstreamCandidate[] {
+    return this.activeWorkstreamRows(circle).map((row) => ({ id: row.id, title: row.title }));
+  }
+
+  private connectorOwnedWorkstreamAtSlug(circle: string, slug: string): ConceptRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+        AND (source_identity IS NOT NULL OR active_observation_id IS NOT NULL)
+        ORDER BY updated_at DESC, version DESC, id ASC LIMIT 1`)
+      .get(circle, slug) as ConceptRow | undefined;
+  }
+
+  private resolveWorkstreamTarget(input: WorkstreamCheckpoint, circle: string): ResolvedWorkstreamTarget | null {
+    // The reserved literal is semantic, not a row id. Resolve it before any physical-id lookup so
+    // direct engine callers and later MCP callers share the same inbox behavior.
+    if (input.id === WORKSTREAM_INBOX_ID) {
+      return { slug: workstreamInboxSlug(circle), inbox: true };
+    }
+    if (input.id !== undefined && input.title !== undefined) {
+      throw new Error("address a workstream by either id or title, not both");
+    }
+    if (input.id !== undefined) {
+      const row = this.db
+        .prepare(`SELECT * FROM concepts WHERE id=? AND circle=? AND kind='workstream' LIMIT 1`)
+        .get(input.id, circle) as ConceptRow | undefined;
+      if (!row || row.status === "archived") {
+        throw new Error(`workstream not found: ${input.id}`);
+      }
+      if (isConnectorOwnedRow(row)) throw new Error("cannot overwrite a connector-owned workstream row");
+      return { slug: row.slug, rowId: row.id, inbox: row.slug === workstreamInboxSlug(circle) };
+    }
+    if (input.title !== undefined) {
+      // A title is an ADDRESS: the stored/displayed title must replay through this same path and
+      // reach the same slug. Over-length titles would slug from the full text but display clipped,
+      // so the clipped replay would mint a second thread (Codex round 4 on #212). 80 code points
+      // matches the stored-title budget.
+      if ([...input.title].length > 80) {
+        throw new Error("a workstream title is an address — 80 characters or fewer");
+      }
+      const titleSlug = slugify(input.title);
+      if (titleSlug.length === 0) {
+        throw new Error("workstream title must contain at least one letter or number; it slugifies to empty");
+      }
+      const slug = `workstream:${circle}:${titleSlug}`;
+      if (this.connectorOwnedWorkstreamAtSlug(circle, slug)) {
+        throw new Error("cannot overwrite a connector-owned workstream row");
+      }
+      return { slug, mintTitle: input.title, inbox: false };
+    }
+
+    const active = this.activeWorkstreamRows(circle);
+    if (active.length === 1) {
+      const row = active[0]!;
+      if (this.connectorOwnedWorkstreamAtSlug(circle, row.slug)) {
+        throw new WorkstreamAddressRequiredError(circle, this.workstreamCandidates(circle));
+      }
+      return { slug: row.slug, rowId: row.id, inbox: false, unaddressed: true };
+    }
+    if (active.length === 0) {
+      if (this.isCloseOnlyNoOp(input, undefined)) return null;
+      const slug = workstreamUnnamedSlug(circle);
+      if (this.connectorOwnedWorkstreamAtSlug(circle, slug)) {
+        throw new WorkstreamAddressRequiredError(circle, []);
+      }
+      return { slug, inbox: false, unaddressed: true };
+    }
+    throw new WorkstreamAddressRequiredError(circle, active.map((row) => ({ id: row.id, title: row.title })));
+  }
+
+  /**
+   * Preflight a checkpoint: address resolution plus every deterministic validation the save
+   * applies, with no session, no embed, and no write. A pass here leaves only embed-time and
+   * concurrent-writer failures possible in the subsequent save — which is what lets the MCP
+   * handler run this before mutating anything else in a combined call.
+   */
+  previewWorkstreamCheckpoint(input: WorkstreamCheckpoint, opts: { circle?: string } = {}): void {
+    this.assertNoEmbedderMigrationReentry("preview a workstream checkpoint");
+    this.prepareWorkstreamCheckpoint(input, this.resolveCircle(opts.circle ?? this.defaultCircle));
+  }
+
+  /**
+   * The deterministic front half shared by saveWorkstream and previewWorkstreamCheckpoint, so the
+   * dry-run cannot drift from what the save actually refuses. Returns null for the documented
+   * no-op shapes (nothing to write), the resolved target and merged preview otherwise. The
+   * done-with-open-items check runs again inside the write transaction — there it respects a
+   * concurrent close; here it fails fast before any sibling mutation.
+   */
+  private prepareWorkstreamCheckpoint(
+    input: WorkstreamCheckpoint,
+    circle: string,
+  ): { target: ResolvedWorkstreamTarget; previewRow: ReturnType<MonetCore["readWorkstreamPayload"]>; preview: WorkstreamPayload } | null {
+    if (circle === BREADTH_CIRCLE) {
+      throw new Error(
+        `a workstream may not live in circle '${BREADTH_CIRCLE}': that is the reserved global-breadth ` +
+          `marker for member delivery, not a circle a concept — workstream or otherwise — lives in. ` +
+          `Save it at an ordinary circle.`,
+      );
+    }
+    // The MCP boundary is `.strict()`, but a direct package caller reaches this method with no Zod
+    // in between (Codex on PR #152). Every one of these fields is silently ignored by the merge, so
+    // without this the caller gets a successful save that wrote nothing — the same silent loss the
+    // strict schema exists to prevent, one layer down.
+    const stale = ["items", "openQuestions", "nextSteps", "decisions", "discardedAlternatives", "confirmedContext", "importantEntities"]
+      .filter((field) => (input as Record<string, unknown>)[field] !== undefined);
+    if (stale.length > 0) {
+      throw new Error(
+        `saveWorkstream takes a checkpoint (status/open/close), not a workstream payload — ` +
+          `${stale.join(", ")} ${stale.length === 1 ? "is" : "are"} ignored and would report success ` +
+          `having written nothing. Open new items with \`open\`, resolve existing ones with \`close\`, ` +
+          `and everything unnamed stays as it is.`,
+      );
+    }
+    const target = this.resolveWorkstreamTarget(input, circle);
+    if (target === null) return null;
+    if (target.inbox) this.assertInboxCheckpoint(input);
+    const previewRow = this.readWorkstreamPayload(circle, target);
+    if (this.isCloseOnlyNoOp(input, previewRow)) return null;
+    // The preview merge exists for validation and for the embedding text; its session stamp is
+    // never persisted (the transaction re-merges with the real session id).
+    const preview = this.mergeWorkstreamPayload(previewRow?.payload, input, "preflight");
+    if (target.mintTitle !== undefined && previewRow === undefined) preview.title = target.mintTitle;
+    const stillOpen = preview.items.filter((item) => item.state === "open");
+    if (preview.status === "done" && stillOpen.length > 0) {
+      throw new Error(
+        `cannot mark this workstream 'done' while ${stillOpen.length} item(s) are still open: ` +
+          `${stillOpen.map((item) => item.id).join(", ")}. Close them in the same checkpoint ` +
+          `(done or dropped), or leave the status as it was — omitting an item never removes it.`,
+      );
+    }
+    return { target, previewRow, preview };
+  }
+
+  private assertInboxCheckpoint(input: WorkstreamCheckpoint): void {
+    if (
+      input.title !== undefined ||
+      input.status !== undefined ||
+      (input.open ?? []).length > 0 ||
+      (input.close ?? []).length === 0
+    ) {
+      throw new Error("the inbox has no lifecycle; an inbox checkpoint accepts a non-empty close only");
+    }
   }
 
   /**
@@ -5076,7 +5312,7 @@ export class MonetCore {
    * tool documents as a no-op would resurrect a hidden workstream out of a stale id.
    */
   private isCloseOnlyNoOp(input: WorkstreamCheckpoint, existing: { archived: boolean } | undefined): boolean {
-    if ((input.open ?? []).length > 0 || input.status !== undefined) return false;
+    if ((input.open ?? []).length > 0 || input.status !== undefined || input.title !== undefined) return false;
     return existing === undefined || existing.archived;
   }
 
@@ -5099,8 +5335,23 @@ export class MonetCore {
     // #152). A typo like `as: "closed"` persisted verbatim, which hides the item from the default
     // view AND makes every later legitimate close skip it, because it is no longer `open`.
     for (const closed of input.close ?? []) {
-      if (closed.as !== "done" && closed.as !== "dropped") {
-        throw new Error(`close disposition must be 'done' or 'dropped', not '${String(closed.as)}' (item ${closed.id}).`);
+      if (closed.as !== "done" && closed.as !== "dropped" && closed.as !== "filed") {
+        throw new Error(`close disposition must be 'done', 'dropped', or 'filed', not '${String(closed.as)}' (item ${closed.id}).`);
+      }
+      if (closed.as === "filed" && (closed.ref === undefined || closed.ref.trim().length === 0)) {
+        throw new Error(`close disposition 'filed' requires a non-empty ref (item ${closed.id}).`);
+      }
+      if (closed.ref !== undefined && closed.ref.length > 2048) {
+        throw new Error(`a ref is a pointer, not a document — 2048 characters or fewer (item ${closed.id}).`);
+      }
+    }
+    // Repeated close ids would make the receipt overstate the committed effects (the merge Map
+    // keeps only the final entry) and silently resolve conflicting dispositions by array order —
+    // refuse instead (Codex round 4 on #212).
+    {
+      const closeIds = (input.close ?? []).map((entry) => entry.id);
+      if (new Set(closeIds).size !== closeIds.length) {
+        throw new Error("close lists each item id at most once — repeated ids would make the receipt overstate the effects.");
       }
     }
     // The sibling of the check above, missed when that one was added (Codex round 3 on #152). A
@@ -5111,11 +5362,17 @@ export class MonetCore {
         throw new Error(`open slot must be 'question' or 'step', not '${String(opened.slot)}'.`);
       }
     }
-    const closing = new Map((input.close ?? []).map((c) => [c.id, c.as] as const));
+    const closing = new Map((input.close ?? []).map((c) => [c.id, c] as const));
     for (let i = 0; i < items.length; i += 1) {
-      const as = closing.get(items[i].id);
-      if (as === undefined || items[i].state !== "open") continue;
-      items[i] = { ...items[i], state: as, closedAt: now, closedIn: sessionId };
+      const closed = closing.get(items[i].id);
+      if (closed === undefined || items[i].state !== "open") continue;
+      items[i] = {
+        ...items[i],
+        state: closed.as,
+        closedAt: now,
+        closedIn: sessionId,
+        ...(closed.ref !== undefined ? { ref: closed.ref } : {}),
+      };
     }
     for (const opened of input.open ?? []) {
       if (opened.text.length === 0) continue;
@@ -5132,86 +5389,54 @@ export class MonetCore {
     const opened = (input.open ?? []).length > 0;
     const inherited = existing?.status ?? "active";
     return {
+      ...existing,
       status: input.status ?? (opened && inherited === "done" ? "active" : inherited),
       items,
       lastSessionId: sessionId,
     };
   }
 
-  async saveWorkstream(input: WorkstreamCheckpoint, opts: { circle?: string; summary?: string } = {}): Promise<Workstream | null> {
+  async saveWorkstream(input: WorkstreamCheckpoint, opts: { circle?: string } = {}): Promise<WorkstreamSaveResult | null> {
     this.assertNoEmbedderMigrationReentry("save a workstream");
     this.assertPinSatisfied(); // embedder-pin ADR
     this.requireStableEmbedderIdentity();
     const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
-    // CIRCLE-MINTING GUARD (Codex round 7, item 4 — the 12th minting surface; BREADTH_CIRCLE's own
-    // comment, gates.ts): an explicit `opts.circle` is this method's own direct argument, checked
-    // AFTER resolution (matching storeInternal's own convention — CIRCLE-MINTING GUARD 2 of N,
-    // above) so a caller routing through a stale alias that somehow still resolved to '*' would be
-    // refused too, not just a literal '*' argument. `defaultCircle` itself can never be '*' (guard 1
-    // of N, this constructor, above) so the fallback side of `opts.circle ?? this.defaultCircle` is
-    // already safe on its own — this closes the explicit-argument side, the one path guard 1 does
-    // not reach. Left unguarded, a workstream CONCEPT would land with `circle = '*'`, exactly the
-    // accident every other concept-creating surface already refuses: a workstream is a concept like
-    // any other (kind='workstream'), so it has no more business living in the breadth marker's
-    // synthetic circle than a fact, rule, principle, or preference concept does.
-    if (circle === BREADTH_CIRCLE) {
-      throw new Error(
-        `a workstream may not live in circle '${BREADTH_CIRCLE}': that is the reserved global-breadth ` +
-          `marker for member delivery, not a circle a concept — workstream or otherwise — lives in. ` +
-          `Save it at an ordinary circle.`,
-      );
-    }
-    // The MCP boundary is `.strict()`, but a direct package caller reaches this method with no Zod
-    // in between (Codex on PR #152). Every one of these fields is silently ignored by the merge, so
-    // without this the caller gets a successful save that wrote nothing — the same silent loss the
-    // strict schema exists to prevent, one layer down.
-    const stale = ["items", "openQuestions", "nextSteps", "decisions", "discardedAlternatives", "confirmedContext", "importantEntities"]
-      .filter((field) => (input as Record<string, unknown>)[field] !== undefined);
-    if (stale.length > 0) {
-      throw new Error(
-        `saveWorkstream takes a checkpoint (status/open/close), not a workstream payload — ` +
-          `${stale.join(", ")} ${stale.length === 1 ? "is" : "are"} ignored and would report success ` +
-          `having written nothing. Open new items with \`open\`, resolve existing ones with \`close\`, ` +
-          `and everything unnamed stays as it is.`,
-      );
-    }
+    // ADDRESS AND VALIDATE BEFORE THE EMBEDDER. A refusal, no-op, or deterministic violation must
+    // stay independent of embedder availability — and prepareWorkstreamCheckpoint is the same code
+    // the MCP handler dry-runs (previewWorkstreamCheckpoint) before mutating anything else in a
+    // combined call, so the dry-run cannot drift from what this save refuses. The CIRCLE-MINTING
+    // GUARD (Codex round 7, item 4 — checked after alias resolution, matching storeInternal's
+    // convention) and the stale-payload-field backstop (Codex on PR #152) both live inside prepare
+    // now, so the dry-run refuses them too.
+    const prepared = this.prepareWorkstreamCheckpoint(input, circle);
+    if (prepared === null) return null;
+    const { target, previewRow, preview } = prepared;
     const sessionId = this.ensureSession();
-    const slug = `workstream:${circle}`;
-
-    // MERGE, NOT REPLACE (#131). A checkpoint states three intents — open new items, close named
-    // ones, and leave everything it did not name alone. Forgetting an item can no longer destroy
-    // it; it just fails to close it, and the next session finds it still open.
-    //
-    // The read below is a PREVIEW, taken outside the write reservation only so the embedding has
-    // something to embed: `checkedEmbed` is async and the transaction is synchronous, so the two
-    // cannot be interleaved. The authoritative merge happens again inside the transaction against
-    // the row it is actually writing. A concurrent checkpoint between the two can therefore leave
-    // the embedding one revision stale — harmless and deliberate, because this column is explicitly
-    // not used for dedup or ranking (it exists because the column is NOT NULL).
-    const previewRow = this.readWorkstreamPayload(circle, slug);
-    // BEFORE THE EMBEDDER (Codex round 3 on #152, completing round 2's fix). Returning null from
-    // inside the transaction was too late: this path still embedded first, so an unavailable or
-    // mismatched embedder turned a documented no-op close into `checkpoint failed` and took the
-    // caller's session-ending summary with it.
-    //
-    // Deciding from the preview read is safe here precisely because the ids are stale: they came
-    // from a read taken before this call, so if no live row existed then, they cannot belong to one
-    // that appeared since. The authoritative check inside the transaction reaches the same answer.
-    if (this.isCloseOnlyNoOp(input, previewRow)) {
-      this.endSession(opts.summary);
-      return null;
-    }
-    const preview = this.mergeWorkstreamPayload(previewRow?.payload, input, sessionId);
     const emb = await this.checkedEmbed(workstreamText(preview), "native");
 
     // TRANSACTION: workstream concept write + revision must be all-or-nothing.
     // Acquire the write reservation before deciding whether to create or update: concurrent
     // checkpoint writers for the same circle must not act on a stale workstream row snapshot.
-    // endSession() lives OUTSIDE the envelope — it is session lifecycle and should proceed
-    // regardless of the workstream write outcome (same reasoning as ensureSession in store()).
-    const result = this.db.immediateTransaction((): { row: ConceptRow; proofToken?: EmbeddingWidthProofToken } | null => {
+    const result = this.db.immediateTransaction((): {
+      row: ConceptRow;
+      proofToken?: EmbeddingWidthProofToken;
+      openedItemIds: string[];
+      closedItemIds: string[];
+      statusChanged: boolean;
+    } | null => {
       this.assertNoEmbedderMigrationReentry("save a workstream");
       this.assertPinSatisfied();
+      // The pre-embed resolution is not authoritative: another writer may have minted or completed
+      // a thread — or RENAMED/MERGED the circle itself — while checkedEmbed was in flight. Re-derive
+      // the canonical circle and re-resolve the full ladder under the write reservation, so the row
+      // lands where the circle now lives instead of in a vacated source circle behind an alias
+      // (Codex round 5 on #212).
+      const txCircle = this.resolveCircle(circle);
+      // Settling finds must see every replicated sibling's items, or a close by id would be a
+      // silent no-op against a row this store cannot reach.
+      if (target.inbox) this.reconcileInboxSiblings(txCircle);
+      const writeTarget = this.resolveWorkstreamTarget(input, txCircle);
+      if (writeTarget === null) return null;
       this.assertEmbedderOutput(emb, "native");
       this.assertWriteWidthSatisfied(emb.length);
       const occupied = this.db
@@ -5219,21 +5444,27 @@ export class MonetCore {
           AND (source_identity IS NOT NULL OR active_observation_id IS NOT NULL)
           ORDER BY updated_at DESC, version DESC, id ASC
           LIMIT 1`)
-        .get(circle, slug) as ConceptRow | undefined;
+        .get(txCircle, writeTarget.slug) as ConceptRow | undefined;
       if (occupied && isConnectorOwnedRow(occupied)) {
+        if (writeTarget.unaddressed) {
+          throw new WorkstreamAddressRequiredError(txCircle, this.workstreamCandidates(txCircle));
+        }
         throw new Error("cannot overwrite a connector-owned workstream row");
       }
-      // Archived rows sort last here for the same reason getActiveWorkstreams orders them last
-      // (Codex review, PR #100, P1): updated_at ties after a graft, and a higher-version ARCHIVED
-      // loser must not be the row a checkpoint resurrects while an active survivor sits beside it
-      // — that would mint a second active row for the slug. An all-archived group still picks its
-      // newest archived row and revives it in place: a deliberate revive-by-checkpoint, unchanged.
-      const existing = this.db
-        .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
-          AND source_identity IS NULL AND active_observation_id IS NULL
-          ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC
-          LIMIT 1`)
-        .get(circle, slug) as ConceptRow | undefined;
+      // An exact-id address keeps targeting that row. Slug addresses retain the canonical pick and
+      // revive behavior used by legacy unnamed workstreams and named-title upserts.
+      const existing = writeTarget.rowId !== undefined
+        ? this.db
+            .prepare(`SELECT * FROM concepts WHERE id=? AND circle=? AND kind='workstream'
+              AND source_identity IS NULL AND active_observation_id IS NULL
+              LIMIT 1`)
+            .get(writeTarget.rowId, txCircle) as ConceptRow | undefined
+        : this.db
+            .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+              AND source_identity IS NULL AND active_observation_id IS NULL
+              ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC
+              LIMIT 1`)
+            .get(txCircle, writeTarget.slug) as ConceptRow | undefined;
 
       // THE AUTHORITATIVE MERGE, against the row actually being written. The preview above only
       // fed the embedding; a concurrent checkpoint that landed in between is picked up here, so no
@@ -5246,20 +5477,30 @@ export class MonetCore {
       // A NO-OP CLOSE MUST NOT MINT A THREAD (Codex on PR #152). Closing an id this circle has no
       // row for is a deliberate no-op — stale ids, wrong circle, a race — but with no row to merge
       // into it produced `{status: "active", items: []}` and inserted a visible
-      // "workstream: session state" row. Creating an empty continuation thread out of a no-op is
+      // "session state" row. Creating an empty continuation thread out of a no-op is
       // the mirror of the silent loss this change removes: something appears that nobody asked for.
       if (this.isCloseOnlyNoOp(input, existing === undefined ? undefined : { archived: existingIsArchived })) {
         // NOTHING TO WRITE, AND THAT IS NOT AN ERROR (Codex round 2 on #152, correcting round 1's
-        // fix here). Round 1 stopped this path from minting an empty "workstream: session state"
+        // fix here). Round 1 stopped this path from minting an empty "session state"
         // row by throwing — which broke the contract the tool documents, that an unknown close is a
-        // no-op. A stale or wrong-circle close is idempotent by design; failing the whole
-        // checkpoint over one also skipped the caller's session-ending summary.
+        // no-op. A stale or wrong-circle close is idempotent by design.
         //
         // The honest result is that no workstream exists, which is what null says. The MCP handler
-        // already renders that as `workstream: null`.
+        // omits the `workstream` key when there is no saved row.
         return null;
       }
+      const beforeIds = new Set(existingPayload?.items.map((item) => item.id) ?? []);
+      const beforeOpenIds = new Set(
+        existingPayload?.items.filter((item) => item.state === "open").map((item) => item.id) ?? [],
+      );
+      const beforeStatus = existingPayload?.status;
       const full = this.mergeWorkstreamPayload(existingPayload, input, sessionId);
+      if (target.mintTitle !== undefined && existingPayload === undefined) full.title = target.mintTitle;
+      const openedItemIds = full.items.filter((item) => !beforeIds.has(item.id)).map((item) => item.id);
+      const closedItemIds = (input.close ?? [])
+        .map((item) => item.id)
+        .filter((id) => beforeOpenIds.has(id) && full.items.some((item) => item.id === id && item.state !== "open"));
+      const statusChanged = (beforeStatus ?? "active") !== full.status;
       // `done` MUST NOT HIDE OPEN ITEMS (Codex P1 on PR #149, ruled by John 2026-08-05).
       // getActiveWorkstreams filters `status === "done"`, so a checkpoint that closed the
       // workstream while items were still open made them unreachable — recreating, inside the
@@ -5301,65 +5542,212 @@ export class MonetCore {
             `INSERT INTO concepts (id, slug, title, body, kind, status, embedding, support_count, version, dirty, circle)
              VALUES (?, ?, ?, ?, 'workstream', 'active', ?, 1, 0, 0, ?)`,
           )
-          .run(conceptId, slug, title, body, embToJson(emb), circle);
+          .run(conceptId, writeTarget.slug, title, body, embToJson(emb), txCircle);
       }
       this.writeRevision(conceptId, version, body);
       const savedRow = this.getRow(conceptId);
       if (!savedRow) throw new Error("workstream row missing after save");
-      return { row: savedRow, proofToken: this.captureEmbeddingWidthProof(emb.length) };
+      return {
+        row: savedRow,
+        proofToken: this.captureEmbeddingWidthProof(emb.length),
+        openedItemIds,
+        closedItemIds,
+        statusChanged,
+      };
     })();
-    // endSession still runs for a no-op close: the session ended either way, and the caller's
-    // summary belongs to it.
-    this.endSession(opts.summary);
     if (result === null) return null;
     this.installEmbeddingWidthProof(result.proofToken);
-    return toWorkstream(result.row);
+    return {
+      ...toWorkstream(result.row),
+      openedItemIds: result.openedItemIds,
+      closedItemIds: result.closedItemIds,
+      statusChanged: result.statusChanged,
+    };
+  }
+
+  /** Capture one slotless find in the per-circle inbox, lazily minting its reserved row. */
+  async captureFind(text: string, opts: { circle?: string } = {}): Promise<CaptureFindResult> {
+    this.assertNoEmbedderMigrationReentry("capture a find");
+    this.assertPinSatisfied();
+    this.requireStableEmbedderIdentity();
+    const circle = this.resolveCircle(opts.circle ?? this.defaultCircle);
+    if (circle === BREADTH_CIRCLE) {
+      throw new Error(
+        `an inbox may not live in circle '${BREADTH_CIRCLE}': that is the reserved global-breadth marker, not a concept circle.`,
+      );
+    }
+    if (text.length === 0) throw new Error("captureFind text must not be empty");
+    const slug = workstreamInboxSlug(circle);
+    if (this.connectorOwnedWorkstreamAtSlug(circle, slug)) {
+      throw new Error("cannot overwrite a connector-owned workstream inbox row");
+    }
+    const sessionId = this.ensureSession();
+    const itemId = this.newId();
+    const openedAt = Date.now();
+    const previewRow = this.readWorkstreamPayload(circle, { slug, inbox: true });
+    const preview: WorkstreamPayload = {
+      ...(previewRow?.payload ?? { status: "active", items: [] }),
+      status: "active",
+      items: [
+        ...(previewRow?.payload.items ?? []),
+        { id: itemId, text, state: "open", openedAt },
+      ],
+      lastSessionId: sessionId,
+    };
+    delete preview.title;
+    const emb = await this.checkedEmbed(workstreamText(preview), "native");
+
+    const result = this.db.immediateTransaction((): { row: ConceptRow; proofToken?: EmbeddingWidthProofToken } => {
+      this.assertNoEmbedderMigrationReentry("capture a find");
+      this.assertPinSatisfied();
+      this.assertEmbedderOutput(emb, "native");
+      this.assertWriteWidthSatisfied(emb.length);
+      // Re-resolve the circle under the write reservation: a rename or merge that landed while
+      // checkedEmbed was in flight would otherwise leave this find in a vacated source circle the
+      // read surface resolves AWAY from (Codex round 5 on #212).
+      const txCircle = this.resolveCircle(circle);
+      const txSlug = workstreamInboxSlug(txCircle);
+      if (this.connectorOwnedWorkstreamAtSlug(txCircle, txSlug)) {
+        throw new Error("cannot overwrite a connector-owned workstream inbox row");
+      }
+      // A graft may have left replica-minted siblings at this slug; collapse them before choosing
+      // the row to append to, so this find joins one inbox rather than a third.
+      this.reconcileInboxSiblings(txCircle);
+      const existing = this.db
+        .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+          AND source_identity IS NULL AND active_observation_id IS NULL
+          ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC LIMIT 1`)
+        .get(txCircle, txSlug) as ConceptRow | undefined;
+      const existingPayload = existing
+        ? normalizeWorkstreamPayload(safeParseWorkstreamBody(existing.body), existing.updated_at)
+        : undefined;
+      const full: WorkstreamPayload = {
+        ...(existingPayload ?? { status: "active", items: [] }),
+        status: "active",
+        items: [
+          ...(existingPayload?.items ?? []),
+          { id: itemId, text, state: "open", openedAt },
+        ],
+        lastSessionId: sessionId,
+      };
+      delete full.title;
+      const body = JSON.stringify(full, null, 2);
+      const title = workstreamTitle(full);
+      let conceptId: string;
+      let version: number;
+      if (existing) {
+        conceptId = existing.id;
+        version = existing.version + 1;
+        const updated = this.db.prepare(
+          `UPDATE concepts SET body=?, title=?, embedding=?, version=?, status='active', dirty=0,
+             updated_at=unixepoch() * 1000
+           WHERE id=? AND kind='workstream' AND source_identity IS NULL AND active_observation_id IS NULL`,
+        ).run(body, title, embToJson(emb), version, conceptId);
+        if (updated.changes !== 1) throw new Error("cannot overwrite a connector-owned workstream inbox row");
+      } else {
+        conceptId = this.newId();
+        version = 0;
+        this.db.prepare(
+          `INSERT INTO concepts (id, slug, title, body, kind, status, embedding, support_count, version, dirty, circle)
+           VALUES (?, ?, ?, ?, 'workstream', 'active', ?, 1, 0, 0, ?)`,
+        ).run(conceptId, txSlug, title, body, embToJson(emb), txCircle);
+      }
+      this.writeRevision(conceptId, version, body);
+      const savedRow = this.getRow(conceptId);
+      if (!savedRow) throw new Error("workstream inbox row missing after capture");
+      return { row: savedRow, proofToken: this.captureEmbeddingWidthProof(emb.length) };
+    })();
+    this.installEmbeddingWidthProof(result.proofToken);
+    return { itemId, row: toWorkstream(result.row) };
   }
 
   /**
-   * One workstream by id, regardless of payload status (Codex round 2 on #152). `includeClosed`
-   * advertises the resolved items of a workstream, and the most likely one to ask about is the one
-   * just finished — which getActiveWorkstreams filters out, so the option could not deliver what it
-   * promised. Continuation still goes through getActiveWorkstreams; this is the id path only.
+   * One ordinary workstream by physical id, regardless of payload status. The reserved literal
+   * `inbox` is intentionally refused here: callers use getWorkstreamInbox(), making the lifecycle-
+   * free row explicit instead of accidentally treating it as a resumable thread.
    */
   getWorkstreamById(id: string, circle?: string): Workstream | undefined {
-    circle ??= this.defaultCircle;
-    // ARCHIVED STAYS GONE (Codex round 3 on #152). The list path treats an archived loser from a
-    // rename/merge/graft collision as gone on purpose; `includeClosed` is about resolved ITEMS, not
-    // about bypassing the row lifecycle, so the id path excludes them the same way.
+    if (id === WORKSTREAM_INBOX_ID) {
+      throw new Error("'inbox' is the lifecycle-free workstream inbox; read it with getWorkstreamInbox(circle)");
+    }
+    const resolvedCircle = this.resolveCircle(circle ?? this.defaultCircle);
     const row = this.db
       .prepare(`SELECT * FROM concepts WHERE id=? AND circle=? AND kind='workstream'
-        AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'archived'`)
-      .get(id, this.resolveCircle(circle)) as ConceptRow | undefined;
+        AND slug != ? AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'archived'`)
+      .get(id, resolvedCircle, workstreamInboxSlug(resolvedCircle)) as ConceptRow | undefined;
     return row ? toWorkstream(row) : undefined;
   }
 
-  /** Restore a circle's active/paused workstreams for an explicit continuation request. */
-  getActiveWorkstreams(circle?: string): Workstream[] {
-    circle ??= this.defaultCircle;
-    // ARCHIVED ROWS SORT LAST in the canonical pick (Codex review, PR #100, P1): the pick must not
-    // let an archived sibling outrank an active one on updated_at, because updated_at is NOT
-    // replicated state — graftRows rewrites every grafted concept's updated_at to one common
-    // relayAt, so after a graft the survivor and an archived loser tie on timestamp and the pick
-    // would fall to version DESC, where a higher-version archived loser wins the slug, gets
-    // filtered below, and the workstream silently vanishes from restore on the peer. status IS
-    // replicated (a semantic column), so archived-last keeps the pick deterministic across grafts
-    // — and matches canonicalizeWorkstreamSlug's own survivor rule ("an already-archived row never
-    // outranks an active one"). A slug whose EVERY row is archived still yields nothing: gone
-    // stays gone; only a live active sibling beats an archived row.
+  /** Read the per-circle inbox, including open and disposed items. */
+  getWorkstreamInbox(circle?: string): Workstream | undefined {
+    const resolvedCircle = this.resolveCircle(circle ?? this.defaultCircle);
+    // REPLICAS CAN MINT SIBLINGS. Two stores that both lacked an inbox mint different concept ids
+    // at the same reserved slug, and sync converges concepts BY ID — so a graft can leave several
+    // live rows here. Physical convergence happens on the next write (reconcileInboxSiblings);
+    // this read unions them meanwhile, because a find that exists must never be invisible, and the
+    // sibling rows are unreachable by any other accessor (physical inbox ids are refused).
     const rows = this.db
-      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream'
-        AND source_identity IS NULL AND active_observation_id IS NULL
-        ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC`)
-      .all(circle) as ConceptRow[];
-    const canonicalBySlug = new Map<string, ConceptRow>();
-    for (const row of rows) {
-      if (!canonicalBySlug.has(row.slug)) canonicalBySlug.set(row.slug, row);
+      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+        AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'archived'
+        ORDER BY updated_at DESC, version DESC, id ASC`)
+      .all(resolvedCircle, workstreamInboxSlug(resolvedCircle)) as ConceptRow[];
+    if (rows.length === 0) return undefined;
+    const canonical = toWorkstream(rows[0]!);
+    if (rows.length === 1) return canonical;
+    const items = [...canonical.payload.items];
+    const seen = new Set(items.map((item) => item.id));
+    for (const sibling of rows.slice(1)) {
+      for (const item of toWorkstream(sibling).payload.items) {
+        if (!seen.has(item.id)) {
+          items.push(item);
+          seen.add(item.id);
+        }
+      }
     }
-    return [...canonicalBySlug.values()]
-      .filter((row) => row.status !== "archived")
-      .map(toWorkstream)
-      .filter((w) => w.payload.status !== "done");
+    return { ...canonical, payload: { ...canonical.payload, items } };
+  }
+
+  /**
+   * Collapse live inbox siblings at one circle's reserved slug into a single row: items union by
+   * id into the canonical survivor, losers archive. Must run inside the caller's write reservation.
+   * Siblings are minted by independent replicas (see getWorkstreamInbox), never locally.
+   */
+  private reconcileInboxSiblings(circle: string): void {
+    const slug = workstreamInboxSlug(circle);
+    const rows = this.db
+      .prepare(`SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+        AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'archived'
+        ORDER BY updated_at DESC, version DESC, id ASC`)
+      .all(circle, slug) as ConceptRow[];
+    if (rows.length < 2) return;
+    const survivor = rows[0]!;
+    const payload = normalizeWorkstreamPayload(safeParseWorkstreamBody(survivor.body), survivor.updated_at);
+    const items = [...payload.items];
+    const seen = new Set(items.map((item) => item.id));
+    for (const sibling of rows.slice(1)) {
+      const siblingPayload = normalizeWorkstreamPayload(safeParseWorkstreamBody(sibling.body), sibling.updated_at);
+      for (const item of siblingPayload.items) {
+        if (!seen.has(item.id)) {
+          items.push(item);
+          seen.add(item.id);
+        }
+      }
+      this.db.prepare(`UPDATE concepts SET status='archived' WHERE id=?`).run(sibling.id);
+    }
+    const full: WorkstreamPayload = { ...payload, status: "active", items };
+    delete full.title;
+    const body = JSON.stringify(full, null, 2);
+    const version = survivor.version + 1;
+    this.db.prepare(
+      `UPDATE concepts SET body=?, title=?, version=?, status='active', dirty=0 WHERE id=?`,
+    ).run(body, workstreamTitle(full), version, survivor.id);
+    this.writeRevision(survivor.id, version, body);
+  }
+
+  /** Restore a circle's active/paused work threads; the lifecycle-free inbox never participates. */
+  getActiveWorkstreams(circle?: string): Workstream[] {
+    const resolvedCircle = this.resolveCircle(circle ?? this.defaultCircle);
+    return this.activeWorkstreamRows(resolvedCircle).map(toWorkstream);
   }
 
   /**
@@ -8095,7 +8483,9 @@ export class MonetCore {
         concepts: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind != 'workstream' AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`),
         observations: n(`SELECT COUNT(*) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE c.status != 'retired' AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL`),
         dirty: n(`SELECT COUNT(*) AS n FROM concepts WHERE dirty = 1 AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`),
-        workstreams: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind='workstream' AND source_identity IS NULL AND active_observation_id IS NULL`),
+        // Compare each row to the exact inbox slug derived from its own circle. Suffix matching would
+        // exclude the unnamed thread in a circle whose literal name ends in `::inbox` (#213).
+        workstreams: n(`SELECT COUNT(*) AS n FROM concepts WHERE kind='workstream' AND slug != 'workstream:' || circle || '::inbox' AND source_identity IS NULL AND active_observation_id IS NULL`),
         // Store-wide stats retain the established sessions-table semantics: a workstream-only
         // session is real session state even though it has no observation in a visible circle.
         sessions: n(`SELECT COUNT(*) AS n FROM sessions s
@@ -8115,7 +8505,7 @@ export class MonetCore {
       concepts: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND kind != 'workstream' AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`, resolved),
       observations: this.scopedCount(`SELECT COUNT(*) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE o.circle = ? AND c.status != 'retired' AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL`, resolved),
       dirty: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND dirty = 1 AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`, resolved),
-      workstreams: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle=? AND kind='workstream' AND source_identity IS NULL AND active_observation_id IS NULL`, resolved),
+      workstreams: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle=? AND kind='workstream' AND slug != 'workstream:' || circle || '::inbox' AND source_identity IS NULL AND active_observation_id IS NULL`, resolved),
       // Per-circle: counts only sessions that wrote at least one observation to this circle.
       // Sessions that only called saveWorkstream contribute no observations, so they are
       // invisible here — intentional and mirrors overview()'s precedent. The sessions table
@@ -8618,7 +9008,7 @@ export class MonetCore {
         concepts,
         observations: this.scopedCount(`SELECT COUNT(*) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE o.circle = ? AND c.status != 'retired' AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL`, circle) + sourceObservations,
         dirty: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle = ? AND dirty = 1 AND kind != 'source' AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`, circle),
-        workstreams: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle=? AND kind='workstream' AND source_identity IS NULL AND active_observation_id IS NULL`, circle),
+        workstreams: this.scopedCount(`SELECT COUNT(*) AS n FROM concepts WHERE circle=? AND kind='workstream' AND slug != 'workstream:' || circle || '::inbox' AND source_identity IS NULL AND active_observation_id IS NULL`, circle),
         sessions: this.scopedCount(`SELECT COUNT(DISTINCT o.session_id) AS n FROM observations o JOIN concepts c ON c.id = o.concept_id WHERE o.circle = ? AND o.session_id IS NOT NULL AND c.status != 'retired' AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL`, circle),
         edges,
         entities: this.scopedCount(`SELECT COUNT(DISTINCT ce.entity_key) AS n FROM concept_entities ce JOIN concepts c ON c.id = ce.concept_id WHERE ce.scope = ? AND c.kind != 'source' AND c.source_identity IS NULL AND c.active_observation_id IS NULL AND c.status != 'retired'`, circle),
@@ -8754,26 +9144,33 @@ export class MonetCore {
 
   close(): void {
     this.assertNoEmbedderMigrationReentry("close the core");
-    let releaseError: unknown;
+    let cleanupError: unknown;
+    try {
+      this.endSession();
+    } catch (error) {
+      cleanupError = error;
+    }
     try {
       if (this.ownsEmbedderMigrationLock) this.releaseEmbedderMigrationOwnership();
     } catch (error) {
-      releaseError = error;
+      cleanupError = cleanupError === undefined
+        ? error
+        : new AggregateError([cleanupError, error], "Session end and embedder migration lock release both failed.", { cause: cleanupError });
     }
 
     try {
       this.db.close();
     } catch (closeError) {
-      if (releaseError !== undefined) {
+      if (cleanupError !== undefined) {
         throw new AggregateError(
-          [releaseError, closeError],
-          "Embedder migration lock release and storage close both failed.",
-          { cause: releaseError },
+          [cleanupError, closeError],
+          "Core cleanup and storage close both failed.",
+          { cause: cleanupError },
         );
       }
       throw closeError;
     }
-    if (releaseError !== undefined) throw releaseError;
+    if (cleanupError !== undefined) throw cleanupError;
   }
 
   // ---- source registry ----------------------------------------------------
@@ -16043,10 +16440,9 @@ export class MonetCore {
 
   /**
    * Atomically rename a circle: bulk-updates all five scope-bearing tables (concepts, observations,
-   * memory_edge, entities, concept_entities) from→to; updates workstream slugs in the to-circle
-   * after the rename, then canonicalizes that slug (see canonicalizeWorkstreamSlug) so a to-circle
-   * that already had its own workstream ends up with one active row, not two; upserts an active
-   * alias from→to; flattens chains (any alias that pointed to `from` is updated to point to `to`);
+   * memory_edge, entities, concept_entities) from→to; preserves each moved workstream suffix, assigns
+   * reserved counter suffixes to colliding work threads, and item-merges colliding inboxes; upserts an
+   * active alias from→to; flattens chains (any alias that pointed to `from` is updated to point to `to`);
    * renames the in-memory lastConceptByCircle key.
    * from===to → action "noop". Nonexistent from (no concepts AND no alias rows naming it) → throws.
    */
@@ -16156,15 +16552,6 @@ export class MonetCore {
             WHERE concept_id IN (${placeholders}) AND circle != ?`,
         ).run(to, renameStamp, this.syncDeviceId, ...movedConceptIds, BREADTH_CIRCLE);
       }
-      // The workstream re-slug inside moveCircleScopedTables (above) can mint a second row sharing
-      // `workstream:${to}` when `to` already had its own workstream: the just-moved `from` row and
-      // to's pre-existing row now collide. Collapse the group to one non-archived row here, at the
-      // mint site — read-side canonicalization alone (getActiveWorkstreams) can only pick a
-      // deterministic row among duplicates that should never have existed. RENAME-SPECIFIC, like the
-      // alias write below: the shared helper's other caller (the legacy-star migration) keeps its
-      // historic behavior — its rare "'*' held a workstream" collision stays covered by the
-      // canonical read until that path earns its own dedup.
-      this.canonicalizeWorkstreamSlug(to, `workstream:${to}`);
       // OWED REGARDLESS — a rename that holds ANY live rule (either severity) rewrites the mirror's
       // content even though no binding was touched, and past that, this rename ALSO writes the
       // from→to row `GateMirror.circleAliases`/`circles` are derived from (below), which changes the
@@ -16222,17 +16609,16 @@ export class MonetCore {
    * that field a real value (still `""`, its class-field default) and must resolve a writer id some
    * other way — see that migration's own comment.
    *
-   * `to` is assumed FRESH relative to `from`'s content for the entity merge logic below to be
-   * PROVABLY correct in every case, not merely the common one — true for both callers:
-   * renameCircle's own destination may already hold unrelated content (the merge/reconcile logic
-   * below handles that regardless), and the migration's destination is guaranteed unused by
-   * construction (Codex round 2, item 3's own probe).
+   * Destination populations may already exist. Entities reconcile by key; work threads retain both
+   * rows under distinct slugs; inboxes item-merge. The migration normally chooses a fresh destination,
+   * but this helper stays lossless even for inherited duplicate workstream shapes.
    */
   private moveCircleScopedTables(
     from: string, to: string, stamp: number, writerId: string | null,
   ): {
     conceptsUpdated: number; observationsUpdated: number; edgesUpdated: number; entitiesUpdated: number;
     knowledgeSourcesUpdated: number; normativeUpdated: number; movedConceptIds: string[];
+    workstreamMerges: Array<{ sourceId: string; destinationId: string }>;
   } {
     const movedConceptIds = (this.db.prepare(
       `SELECT id FROM concepts WHERE circle = ? ORDER BY id`,
@@ -16324,17 +16710,42 @@ export class MonetCore {
         .run(ce.concept_id, ce.entity_key, to);
     }
     this.db.prepare(`DELETE FROM concept_entities WHERE scope = ?`).run(from);
-    // Update workstream slugs: workstream slug = 'workstream:${circle}' — after the circle field
-    // moves, the slug still names the old circle and would fork a duplicate workstream on next
-    // checkpoint. A 1.3.1-era circle named '*' is unlikely to hold a workstream, but not impossible
-    // (1.3.1 accepted any circle name at all) — cheap and correct to handle unconditionally rather
-    // than assume it never applies to the migration caller.
-    this.db
-      .prepare(`UPDATE concepts SET slug='workstream:' || ? WHERE kind='workstream' AND circle=?
-        AND source_identity IS NULL AND active_observation_id IS NULL`)
-      .run(to, to);
-    // Update in-memory lastConceptByCircle if the key matches `from`. Safe at construction time:
-    // it is a class-field initializer (an empty Map), assigned before ANY constructor statement runs.
+    // Re-slug ONLY rows captured in movedConceptIds. Updating every workstream now in `to` flattened
+    // destination rows that never moved, destroying named-thread and inbox identity. Prefix equality
+    // uses SQLite code-point lengths (`[...prefix].length`), not JS UTF-16 length, so astral circle
+    // names match correctly; no LIKE/GLOB because `%`, `_`, and `*` are legal circle characters.
+    const movedWorkstreamRows: Array<{ id: string; slug: string; rowid: number }> = [];
+    if (movedConceptIds.length > 0) {
+      const oldPrefix = `workstream:${from}`;
+      // Bound each IN clause below SQLite's bind-parameter limit. The final sort restores the one
+      // global rowid order the prior single query produced, independent of chunk boundaries.
+      for (const conceptIds of chunksOf(movedConceptIds, CIRCLE_MOVE_ID_CHUNK_SIZE)) {
+        const placeholders = conceptIds.map(() => "?").join(",");
+        movedWorkstreamRows.push(...this.db.prepare(
+          `SELECT id, slug, rowid FROM concepts WHERE id IN (${placeholders}) AND kind='workstream'
+            AND source_identity IS NULL AND active_observation_id IS NULL
+            AND substr(slug, 1, ?) = ? ORDER BY rowid ASC`,
+        ).all(...conceptIds, [...oldPrefix].length, oldPrefix) as Array<{ id: string; slug: string; rowid: number }>);
+      }
+      movedWorkstreamRows.sort((a, b) => a.rowid - b.rowid);
+      for (const row of movedWorkstreamRows) {
+        const suffix = [...row.slug].slice([...oldPrefix].length).join("");
+        this.db.prepare(`UPDATE concepts SET slug=? WHERE id=?`).run(`workstream:${to}${suffix}`, row.id);
+      }
+    }
+
+    const collisionResult = this.resolveMovedWorkstreamCollisions(to, movedWorkstreamRows.map((row) => row.id));
+    // The canonicalizer remains byte-identical and now runs for BOTH callers. Counter suffixes and
+    // inbox item-merges should leave no fresh duplicates; this is the safety net for legacy shapes.
+    const resultingSlugs = new Set<string>(collisionResult.resultingSlugs);
+    for (const slug of resultingSlugs) this.canonicalizeWorkstreamSlug(to, slug);
+
+    // Transfer the in-memory follows predecessor with the circle. Every concepts row has already
+    // left `from` by this point (the circle UPDATE at the top of this helper), so the old
+    // "only for a whole-circle move" residency check always passed and gated nothing. The
+    // mergeCircle stale-key hazard it described is prevented earlier: the per-concept reassign
+    // loop retargets or clears the source key before this helper runs, so a populated source key
+    // here can only belong to a whole-circle caller.
     const prev = this.lastConceptByCircle.get(from);
     if (prev !== undefined) {
       this.lastConceptByCircle.delete(from);
@@ -16343,7 +16754,124 @@ export class MonetCore {
     return {
       conceptsUpdated, observationsUpdated, edgesUpdated, entitiesUpdated,
       knowledgeSourcesUpdated, normativeUpdated, movedConceptIds,
+      workstreamMerges: collisionResult.mergedRows,
     };
+  }
+
+  /**
+   * Resolve collisions created by moving workstreams into a populated destination. Work threads keep
+   * both rows by moving the incoming row onto the first unreachable `::N` slug. Inboxes instead merge
+   * complete item history into the destination survivor and archive the drained incoming row.
+   */
+  private resolveMovedWorkstreamCollisions(
+    circle: string,
+    movedIds: string[],
+  ): {
+    resultingSlugs: string[];
+    movedIds: string[];
+    mergedRows: Array<{ sourceId: string; destinationId: string }>;
+  } {
+    const resultingSlugs: string[] = [];
+    const moved: string[] = [];
+    const mergedRows: Array<{ sourceId: string; destinationId: string }> = [];
+    const inboxSlug = workstreamInboxSlug(circle);
+    const movedIdSet = new Set(movedIds);
+
+    // THE INBOX GROUP RESOLVES ONCE, not per incoming row. Per-row resolution re-processed rows an
+    // earlier iteration had already used as a merge destination, minting reciprocal merges and an
+    // archived "survivor" (Codex round 3 on #212). One pass: pick the single live survivor by the
+    // canonical order, drain every other MOVED row's items into it (id-dedupe makes re-draining an
+    // already-drained history row a no-op), archive live losers, leave archived losers archived.
+    const inboxGroup = this.db.prepare(
+      `SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=?
+        AND source_identity IS NULL AND active_observation_id IS NULL
+        ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC`,
+    ).all(circle, inboxSlug) as ConceptRow[];
+    if (inboxGroup.some((row) => movedIdSet.has(row.id))) {
+      if (this.connectorOwnedWorkstreamAtSlug(circle, inboxSlug)) {
+        throw new Error("cannot merge a workstream inbox into a connector-owned destination row");
+      }
+      // The destination's own live row survives when it exists — a moved row drains into the
+      // vessel that was already home. Only when the destination had no live inbox does the first
+      // live MOVED row (canonical order) become the survivor.
+      const survivor = inboxGroup.find((row) => row.status !== "archived" && !movedIdSet.has(row.id))
+        ?? inboxGroup.find((row) => row.status !== "archived");
+      if (survivor) {
+        const destination = normalizeWorkstreamPayload(safeParseWorkstreamBody(survivor.body), survivor.updated_at);
+        const items = [...destination.items];
+        const seen = new Set(items.map((item) => item.id));
+        let gainedOpen = false;
+        for (const row of inboxGroup) {
+          if (row.id === survivor.id || !movedIdSet.has(row.id)) continue;
+          const source = normalizeWorkstreamPayload(safeParseWorkstreamBody(row.body), row.updated_at);
+          for (const item of source.items) {
+            if (!seen.has(item.id)) {
+              items.push(item);
+              seen.add(item.id);
+              if (item.state === "open") gainedOpen = true;
+            }
+          }
+          if (row.status !== "archived") {
+            this.db.prepare(`UPDATE concepts SET status='archived' WHERE id=?`).run(row.id);
+          }
+          mergedRows.push({ sourceId: row.id, destinationId: survivor.id });
+        }
+        if (mergedRows.length > 0) {
+          const full: WorkstreamPayload = {
+            ...destination,
+            status: gainedOpen ? "active" : destination.status,
+            items,
+          };
+          delete full.title;
+          const body = JSON.stringify(full, null, 2);
+          const version = survivor.version + 1;
+          this.db.prepare(
+            `UPDATE concepts SET body=?, title=?, version=?, status='active', dirty=0 WHERE id=?`,
+          ).run(body, workstreamTitle(full), version, survivor.id);
+          this.writeRevision(survivor.id, version, body);
+        }
+        if (movedIdSet.has(survivor.id)) moved.push(survivor.id);
+      } else {
+        // Every row in the group is archived history — relocated, nothing live to drain into.
+        for (const row of inboxGroup) {
+          if (movedIdSet.has(row.id)) moved.push(row.id);
+        }
+      }
+      resultingSlugs.push(inboxSlug);
+    }
+
+    for (const id of movedIds) {
+      const incoming = this.db.prepare(
+        `SELECT * FROM concepts WHERE id=? AND circle=? AND kind='workstream'
+          AND source_identity IS NULL AND active_observation_id IS NULL`,
+      ).get(id, circle) as ConceptRow | undefined;
+      if (!incoming) continue;
+      // Inbox rows were resolved by the single group pass above.
+      if (incoming.slug === inboxSlug) continue;
+
+      const collision = this.db.prepare(
+        `SELECT * FROM concepts WHERE circle=? AND kind='workstream' AND slug=? AND id != ?
+          ORDER BY (status = 'archived') ASC, updated_at DESC, version DESC, id ASC LIMIT 1`,
+      ).get(circle, incoming.slug, incoming.id) as ConceptRow | undefined;
+      if (!collision) {
+        resultingSlugs.push(incoming.slug);
+        moved.push(incoming.id);
+        continue;
+      }
+
+      let counter = 2;
+      let candidate = `${incoming.slug}::${counter}`;
+      while (this.db.prepare(
+        `SELECT 1 FROM concepts WHERE circle=? AND kind='workstream' AND slug=? LIMIT 1`,
+      ).get(circle, candidate) !== undefined) {
+        counter++;
+        candidate = `${incoming.slug}::${counter}`;
+      }
+      this.db.prepare(`UPDATE concepts SET slug=? WHERE id=?`).run(candidate, incoming.id);
+      resultingSlugs.push(candidate);
+      moved.push(incoming.id);
+    }
+    return { resultingSlugs, movedIds: moved, mergedRows };
   }
 
   /**
@@ -16602,7 +17130,7 @@ export class MonetCore {
       destination: string;
       moved: {
         conceptsUpdated: number; observationsUpdated: number; edgesUpdated: number; entitiesUpdated: number;
-        knowledgeSourcesUpdated: number; normativeUpdated: number;
+        knowledgeSourcesUpdated: number; normativeUpdated: number; movedConceptIds: string[];
       };
       deletedStarSource: number;
       repointedStarTargets: number;
@@ -16705,8 +17233,8 @@ export class MonetCore {
 
   /**
    * Collapse every ordinary (non-connector-owned) workstream row sharing (circle, slug) down to
-   * exactly one non-archived survivor. Called after renameCircle's slug UPDATE, the only place a
-   * duplicate for a slug can be minted. Survivor = the row getActiveWorkstreams' canonical pick
+   * exactly one non-archived survivor. Called by moveCircleScopedTables after its lossless collision
+   * handling, for both rename and legacy-star migration callers. Survivor = the row getActiveWorkstreams' canonical pick
    * would choose (updated_at DESC, version DESC, id ASC) among the NON-archived rows — an
    * already-archived row never outranks an active one. Losers are archived, never deleted
    * (history preserved). No-op below two rows, and a no-op if every row in the group is already
@@ -16750,11 +17278,10 @@ export class MonetCore {
   }
 
   /**
-   * Merge all concepts from `from` into `into`. Calls assertSameSharingScope. Loops reassignCircle
-   * per concept; each is individually atomic. Workstream concepts in `from` are DELETED (not moved)
-   * because a workstream slug is circle-scoped (`workstream:${circle}`); after the circle empties
-   * there is no valid home for it — the `into` circle already has its own workstream. Upserts an
-   * active alias from→into and flattens chains. Default resolution: forceNew.
+   * Merge all concepts from `from` into `into`. Calls assertSameSharingScope. Ordinary concepts use
+   * reassignCircle per concept; workstreams move as one circle-scoped population so named/unnamed
+   * threads survive and the single inbox item-merges. Upserts an active alias from→into and flattens
+   * chains. Default resolution: forceNew.
    */
   async mergeCircle(
     from: string,
@@ -16784,6 +17311,13 @@ export class MonetCore {
               `for member delivery, never a circle a concept lives in or a merge can target.`,
           );
         }
+        // SELF-MERGE IS A NO-OP, refused before the whole-circle helper (Codex round 3 on #212):
+        // once the helper runs unconditionally, merging a circle onto itself would double every
+        // entity's df and then delete the circle's entire entity index — the per-concept loop was
+        // accidentally tolerant, the bulk move is not. Mirrors renameCircle's from===to noop.
+        if (from === into) {
+          return { from, into, conceptResults: [], counts: { moved: 0, merged: 0, noop: 0, error: 0 } };
+        }
         this.assertSameSharingScope(from, into);
         this.assertNoRegisteredSourceCircleParticipants("merge", [from, into]);
         const resolution = opts.resolution ?? "forceNew";
@@ -16805,19 +17339,7 @@ export class MonetCore {
         let moved = 0, merged = 0, noop = 0;
 
         for (const row of conceptRows) {
-          if (row.kind === "workstream") {
-            try {
-              // This nested transaction is a savepoint under the outer immediate transaction.
-              this.db.transaction(() => {
-                this.hardDeleteNativeConcept(row.id);
-              })();
-            } catch (error) {
-              throw new Error(`mergeCircle failed for workstream '${row.id}': ${error instanceof Error ? error.message : String(error)}`);
-            }
-            conceptResults.push({ action: "noop", conceptId: row.id, fromCircle: from, toCircle: into, observationsMoved: 0 });
-            noop++;
-            continue;
-          }
+          if (row.kind === "workstream") continue;
 
           let result: ReassignResult | null;
           try {
@@ -16837,6 +17359,38 @@ export class MonetCore {
           if (result.action === "moved") moved++;
           else if (result.action === "merged") merged++;
           else noop++;
+        }
+
+        const workstreamIds = conceptRows.filter((row) => row.kind === "workstream").map((row) => row.id);
+        // A merge relocates the WHOLE circle, unconditionally: moveCircleScopedTables also moves the
+        // normative substrate (lifecycle_edges, ratifications) with sync stamping, and gating it on
+        // the source happening to hold a workstream made merge semantics depend on an unrelated
+        // fact. Ordinary concepts moved per-row above, so the helper's whole-circle concept UPDATEs
+        // no-op for them; workstreams and the substrate are what actually move here.
+        const stamp = this.nextSyncTimestamp();
+        // Receipts come from the collision helper's ACTUAL outcome, not a pre-move prediction:
+        // a destination with no inbox can still see item-merges when the source carried several
+        // inbox rows (an active survivor plus archived drained rows from a prior merge), and only
+        // the helper knows which incoming row drained into which survivor (Codex round 2 on #212).
+        const moveOutcome = this.moveCircleScopedTables(from, into, stamp, this.syncDeviceId);
+        {
+          for (const id of workstreamIds) {
+            const mergedInto = moveOutcome.workstreamMerges.find((m) => m.sourceId === id);
+            if (mergedInto !== undefined) {
+              conceptResults.push({
+                action: "merged",
+                conceptId: id,
+                fromCircle: from,
+                toCircle: into,
+                mergedIntoId: mergedInto.destinationId,
+                observationsMoved: 0,
+              });
+              merged++;
+            } else {
+              conceptResults.push({ action: "moved", conceptId: id, fromCircle: from, toCircle: into, observationsMoved: 0 });
+              moved++;
+            }
+          }
         }
 
         this.db
@@ -18550,7 +19104,7 @@ export class MonetCore {
     return id;
   }
 
-  /** End the current session (checkpoint/disconnect); the next write opens a fresh one. */
+  /** End the current session. Production calls this once, from graceful close(); evals via endSessionForEval. */
   private endSession(summary?: string): void {
     if (!this.sessionId) return;
     this.db
@@ -18644,14 +19198,28 @@ function livingModelScore(r: ConceptRow, now: number): number {
 function workstreamTitle(p: WorkstreamPayload): string {
   const open = p.items.filter((i) => i.state === "open");
   const lead = (open.find((i) => i.slot === "step") ?? open[0])?.text ?? "session state";
-  const t = `workstream: ${lead}`;
-  return t.length > 80 ? t.slice(0, 77) + "…" : t;
+  const title = p.title ?? lead;
+  // CODE POINTS, not UTF-16 units — the entrance caps titles at 80 code points, and a unit-based
+  // slice could split a surrogate pair, yielding a displayed title that no longer replays to the
+  // stored thread's slug (Codex round 5 on #212).
+  const codePoints = [...title];
+  return codePoints.length > 80 ? codePoints.slice(0, 77).join("") + "…" : title;
 }
 
 /** A representative string for the workstream's (dedup-irrelevant) embedding column. */
 function workstreamText(p: WorkstreamPayload): string {
   const parts = p.items.filter((i) => i.state === "open").map((i) => i.text);
-  return parts.join(" ") || "workstream";
+  const text = parts.join(" ") || "workstream";
+  // Deliberately arbitrary fixed budget: this vector never participates in dedup or ranking.
+  return text.slice(0, WORKSTREAM_EMBEDDING_TEXT_MAX_CHARS);
+}
+
+/** Split a list into non-empty, ordered batches for bounded SQL parameter lists. */
+function chunksOf<T>(items: readonly T[], size: number): T[][] {
+  if (!Number.isInteger(size) || size <= 0) throw new Error("chunk size must be a positive integer");
+  const chunks: T[][] = [];
+  for (let offset = 0; offset < items.length; offset += size) chunks.push(items.slice(offset, offset + size));
+  return chunks;
 }
 
 function uniqueRowsById<T extends { id: string }>(rows: T[]): T[] {

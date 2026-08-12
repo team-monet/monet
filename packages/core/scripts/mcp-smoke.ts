@@ -69,19 +69,18 @@ async function main(): Promise<void> {
     await client.callTool({
       name: "memory_checkpoint",
       arguments: {
-        summary: "smoke session",
         workstream: {
           status: "active",
           open: [
-            { slot: "question", text: "does continuation restore this next session?" },
-            { slot: "step", text: "call memory_workstreams on continuation intent" },
+            { kind: "question", text: "does continuation restore this next session?" },
+            { kind: "step", text: "call memory_workstreams on continuation intent" },
           ],
         },
       },
     }),
   );
-  const ckWs = ck.workstream as { id: string; status: string; version: number } | null;
-  console.log(`\ncheckpoint → workstream ${ckWs?.id.slice(0, 8)} (status ${ckWs?.status}), dirtyCount=${ck.dirtyCount}`);
+  const ckWs = ck.workstream as { id: string; status?: string; opened: string[] } | undefined;
+  console.log(`\ncheckpoint → workstream ${ckWs?.id.slice(0, 8)} opened=${ckWs?.opened.length ?? 0}`);
 
   const ctx = parse(await client.callTool({ name: "agent_context", arguments: {} }));
   if (typeof ctx.circle !== "string" || ctx.circle.length === 0) throw new Error("agent_context did not return session orientation");

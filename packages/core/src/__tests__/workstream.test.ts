@@ -13,7 +13,7 @@ import type { EmbeddingProvider } from "../embedding";
 import type { PragmaOptions, Statement, StoragePort } from "../storage";
 
 /** Open item texts for a slot — the post-#131 shape of what these assertions used to read directly. */
-const openTexts = (payload: { items: Array<{ slot: string; text: string; state: string }> }, slot: "question" | "step"): string[] =>
+const openTexts = (payload: { items: Array<{ slot?: string; text: string; state: string }> }, slot: "question" | "step"): string[] =>
   payload.items.filter((i) => i.state === "open" && i.slot === slot).map((i) => i.text);
 
 
@@ -225,6 +225,14 @@ function workstreamRows(db: StoragePort, circle: string): Array<{ id: string; ve
   ).all(circle) as Array<{ id: string; version: number; body: string }>;
 }
 
+function workstreamIdentities(db: StoragePort, circle: string): Array<{ id: string; slug: string; title: string; status: string }> {
+  return db.prepare(
+    `SELECT id, slug, title, status FROM concepts
+      WHERE circle = ? AND kind = 'workstream' AND source_identity IS NULL AND active_observation_id IS NULL
+      ORDER BY id`,
+  ).all(circle) as Array<{ id: string; slug: string; title: string; status: string }>;
+}
+
 function revisionVersions(db: StoragePort, conceptId: string): number[] {
   return (db.prepare(
     `SELECT version FROM concept_revisions WHERE concept_id = ? ORDER BY version ASC`,
@@ -241,6 +249,17 @@ function workstreamStatuses(db: StoragePort, circle: string): Array<{ id: string
 }
 
 describe("memory_workstreams MCP tool", () => {
+  it("rejects removed top-level checkpoint keys instead of stripping them", async () => {
+    const core = new MonetCore(":memory:");
+    const result = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { summary: "removed session ritual" },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("Unrecognized key(s) in object: 'summary'");
+    core.close();
+  });
+
   it("suppresses auto-prewarm for default and explicit-circle continuation pulls", async () => {
     for (const { args, stage } of [
       { args: {}, stage: "default continuation stage" },
@@ -291,13 +310,12 @@ describe("memory_workstreams MCP tool", () => {
 
     expect(list).toEqual({ workstreams: [{ id: saved!.id, title: saved!.title, status: "paused" }] });
     // Detail is the OPEN working set, questions before steps, each carrying the id that
-    // memory_checkpoint's `close` takes. `lastSessionId` is not delivered — nothing acts on it.
+    // memory_checkpoint's `close` takes. Stored slot maps to wire kind.
     expect(detail).toEqual({
       id: saved!.id,
       title: saved!.title,
       status: "paused",
-      openItems: 2,
-      items: saved!.payload.items.map((item) => ({ id: item.id, slot: item.slot, text: item.text })),
+      items: saved!.payload.items.map((item) => ({ id: item.id, kind: item.slot, text: item.text })),
     });
     expect(JSON.stringify(list)).not.toContain("Which threshold should move?");
     core.close();
@@ -311,7 +329,7 @@ describe("memory_workstreams MCP tool", () => {
     ];
     const saved = await core.saveWorkstream({ status: "active", open });
 
-    const recovered: Array<{ slot: string; text: string }> = [];
+    const recovered: Array<{ kind: string; text: string }> = [];
     await withWorkstreamServer(core, async (client) => {
       let detailOffset = 0;
       do {
@@ -319,9 +337,9 @@ describe("memory_workstreams MCP tool", () => {
           name: "memory_workstreams",
           arguments: { id: saved!.id, detailOffset },
         }));
-        const page = (detail.items as Array<{ slot: string; text: string }>) ?? [];
+        const page = (detail.items as Array<{ kind: string; text: string }>) ?? [];
         expect(page.length).toBeGreaterThan(0);
-        recovered.push(...page.map(({ slot, text }) => ({ slot, text })));
+        recovered.push(...page.map(({ kind, text }) => ({ kind, text })));
         detailOffset += page.length;
         if (detail.detailOmitted === undefined) break;
         expect(detail.detailOmitted).toBe(open.length - detailOffset);
@@ -330,7 +348,7 @@ describe("memory_workstreams MCP tool", () => {
 
     // Every item exactly once, in the documented order: questions first, then steps, each in the
     // order it was opened. Paging must not lose or repeat one across the boundary.
-    expect(recovered).toEqual(open.map(({ slot, text }) => ({ slot, text })));
+    expect(recovered).toEqual(open.map(({ slot: kind, text }) => ({ kind, text })));
     core.close();
   });
 
@@ -364,7 +382,7 @@ describe("memory_workstreams MCP tool", () => {
     );
     expect(toolJson(second)).toMatchObject({
       detailOffset: 1,
-      items: [{ slot: "step", text: "recover me next" }],
+      items: [{ id: saved!.payload.items[1]!.id, kind: "step", text: "recover me next" }],
     });
     core.close();
   });
@@ -382,8 +400,7 @@ describe("memory_workstreams MCP tool", () => {
       id: saved!.id,
       title: saved!.title,
       status: "active",
-      openItems: 2,
-      items: saved!.payload.items.map((item) => ({ id: item.id, slot: item.slot, text: item.text })),
+      items: saved!.payload.items.map((item) => ({ id: item.id, kind: item.slot, text: item.text })),
     });
     core.close();
   });
@@ -451,7 +468,60 @@ describe("memory_workstreams MCP tool", () => {
         arguments: { workstream: { close: [{ id: realId, as: "done" }, { id: "not-in-this-row", as: "done" }] } },
       }),
     );
-    expect(toolJson(ack).workstream).toMatchObject({ openItems: 0, closed: [realId] });
+    expect(toolJson(ack).workstream).toMatchObject({ opened: [], closed: [realId] });
+    core.close();
+  });
+
+  it("uses detail-read affinity for a later unaddressed checkpoint and relays ambiguity plainly", async () => {
+    const core = new MonetCore(":memory:");
+    const alpha = (await core.saveWorkstream({ title: "Alpha", status: "active" }))!;
+    const beta = (await core.saveWorkstream({ title: "Beta", status: "active" }))!;
+
+    await withWorkstreamServer(core, async (client) => {
+      await client.callTool({ name: "memory_workstreams", arguments: { id: alpha.id } });
+      const receipt = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { workstream: { open: [{ kind: "step", text: "continue alpha" }] } },
+      }));
+      expect(receipt.workstream).toMatchObject({ id: alpha.id, opened: [expect.any(String)] });
+    });
+    expect(openTexts(core.getWorkstreamById(alpha.id)!.payload, "step")).toEqual(["continue alpha"]);
+    expect(openTexts(core.getWorkstreamById(beta.id)!.payload, "step")).toEqual([]);
+
+    const freshServerRefusal = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { status: "paused" } },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(freshServerRefusal.isError).toBe(true);
+    expect(freshServerRefusal.content[0]!.text).toContain(alpha.id);
+    expect(freshServerRefusal.content[0]!.text).toContain("Alpha");
+    expect(freshServerRefusal.content[0]!.text).not.toContain("checkpoint failed");
+    core.close();
+  });
+
+  it("receipts report only this call's thread and inbox effects", async () => {
+    const core = new MonetCore(":memory:");
+    const receipt = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: {
+        inbox: "unrelated find",
+        workstream: {
+          title: "Release plan",
+          status: "paused",
+          open: [{ kind: "question", text: "who approves?" }, { kind: "step", text: "draft it" }],
+        },
+      },
+    }));
+    const payload = toolJson(receipt);
+    expect(payload.circle).toBe("default");
+    expect(payload.workstream).toEqual({
+      id: expect.any(String),
+      title: "Release plan",
+      status: "paused",
+      opened: [expect.any(String), expect.any(String)],
+      closed: [],
+    });
+    expect(payload.inbox).toEqual({ opened: [expect.any(String)] });
     core.close();
   });
 
@@ -475,6 +545,8 @@ describe("memory_workstreams MCP tool", () => {
     expect(restored[0]!.payload.status).toBe("active"); // the status was never honest
     expect(openTexts(restored[0]!.payload, "step")).toEqual(["never finished"]);
     expect(openTexts(restored[0]!.payload, "question")).toEqual(["still unanswered"]);
+    expect(restored[0]!.payload).not.toHaveProperty("nextSteps");
+    expect(restored[0]!.payload).not.toHaveProperty("openQuestions");
     core.close();
   });
 
@@ -491,29 +563,366 @@ describe("memory_workstreams MCP tool", () => {
 
   it("a close against nothing is a no-op — it neither mints a workstream nor fails", async () => {
     // Two rounds on the same line. Round 1: a stale-only close with no existing row produced an
-    // empty active "workstream: session state" thread. Round 2: refusing it instead broke the
-    // documented contract that an unknown close is a no-op, and skipped the caller's
-    // session-ending summary with it. Nothing to write is not an error — it is `null`.
+    // empty active "session state" thread. Round 2: refusing it instead broke the documented
+    // contract that an unknown close is a no-op. Nothing to write is not an error — it is `null`.
     const core = new MonetCore(":memory:");
     const result = await core.saveWorkstream(
       { close: [{ id: "stale-from-another-circle", as: "done" }] },
-      { summary: "session that closed nothing" },
     );
     expect(result).toBeNull();
     expect(core.getActiveWorkstreams()).toHaveLength(0);
     core.close();
   });
 
-  it("refuses a close disposition outside done | dropped", async () => {
+  it("closes an item as filed with its ref, and refuses an unknown disposition", async () => {
     // Codex round 2 on #152: only the MCP boundary enforced the enum, so a direct caller's typo
     // persisted verbatim — hiding the item from the default view AND making every later
     // legitimate close skip it, because it was no longer `open`.
     const core = new MonetCore(":memory:");
-    const opened = (await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "real" }] }))!;
+    const opened = (await core.saveWorkstream({ status: "active", open: [
+      { slot: "step" as const, text: "file the issue" },
+      { slot: "step" as const, text: "leave open" },
+    ] }))!;
+    const filedId = opened.payload.items[0]!.id;
+    const openId = opened.payload.items[1]!.id;
+
+    const saved = (await core.saveWorkstream({
+      close: [{ id: filedId, as: "filed", ref: "https://github.com/team-monet/monet-core/issues/181" }],
+    }))!;
+    expect(saved.payload.items.find((item) => item.id === filedId)).toMatchObject({
+      state: "filed",
+      ref: "https://github.com/team-monet/monet-core/issues/181",
+    });
+
     await expect(
-      core.saveWorkstream({ close: [{ id: opened.payload.items[0]!.id, as: "closed" as "done" }] }),
-    ).rejects.toThrow(/must be 'done' or 'dropped'/);
-    expect(openTexts(core.getActiveWorkstreams()[0]!.payload, "step")).toEqual(["real"]);
+      core.saveWorkstream({ close: [{ id: openId, as: "filed" }] }),
+    ).rejects.toThrow(/filed.*non-empty ref/);
+    await expect(
+      core.saveWorkstream({ close: [{ id: openId, as: "filed", ref: "  " }] }),
+    ).rejects.toThrow(/filed.*non-empty ref/);
+    await expect(
+      core.saveWorkstream({ close: [{ id: openId, as: "closed" as "done" }] }),
+    ).rejects.toThrow(/must be 'done', 'dropped', or 'filed'/);
+    expect(core.getActiveWorkstreams()[0]!.payload.items.find((item) => item.id === openId)?.state).toBe("open");
+    core.close();
+  });
+
+  it("counts work threads only — the inbox is not a workstream in stats or overview", async () => {
+    const core = new MonetCore(":memory:");
+    await core.saveWorkstream({ title: "Real work", open: [{ slot: "step", text: "do it" }] }, { circle: "counted" });
+    await core.captureFind("stray find", { circle: "counted" });
+    await core.saveWorkstream({ status: "active" }, { circle: "team::inbox" });
+    expect(core.stats("counted").workstreams).toBe(1);
+    expect(core.stats("team::inbox").workstreams).toBe(1);
+    expect(core.stats().workstreams).toBe(2);
+    expect(core.overview("counted").counts.workstreams).toBe(1);
+    expect(core.overview("team::inbox").counts.workstreams).toBe(1);
+    core.close();
+  });
+
+  it("a combined checkpoint refuses before the inbox mutates when addressing is ambiguous", async () => {
+    const core = new MonetCore(":memory:");
+    await core.saveWorkstream({ title: "Alpha", open: [{ slot: "step", text: "a" }] });
+    await core.saveWorkstream({ title: "Beta", open: [{ slot: "step", text: "b" }] });
+
+    const refusal = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { inbox: "must not be stranded", workstream: { open: [{ kind: "step", text: "c" }] } },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+
+    expect(refusal.isError).toBe(true);
+    expect(refusal.content[0]!.text).toMatch(/workstream address required/);
+    expect(core.getWorkstreamInbox()).toBeUndefined();
+    core.close();
+  });
+
+  it("a combined checkpoint refuses a deterministic violation before the inbox mutates", async () => {
+    const core = new MonetCore(":memory:");
+    await core.saveWorkstream({ title: "Solo", open: [{ slot: "step", text: "open item" }] });
+
+    const refusal = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { inbox: "must not be stranded", workstream: { status: "done" } },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+
+    expect(refusal.isError).toBe(true);
+    expect(refusal.content[0]!.text).toMatch(/still open/);
+    expect(core.getWorkstreamInbox()).toBeUndefined();
+    core.close();
+  });
+
+  it("merge receipts reflect actual inbox collisions, not pre-move prediction", async () => {
+    const core = new MonetCore(":memory:");
+    await core.captureFind("find A", { circle: "A" });
+    await core.captureFind("find TMP", { circle: "TMP" });
+    // First merge leaves circle A holding an active survivor plus an archived drained inbox row.
+    await core.mergeCircle("TMP", "A");
+
+    // Second merge into a destination with NO inbox: the moved source rows still collide with
+    // each other after the re-slug, so one is an item-merge — a fact only the collision helper
+    // knows; the old pre-move prediction (destination inbox presence) classified all as moved.
+    const result = await core.mergeCircle("A", "B");
+    const mergedReceipts = result.conceptResults.filter((r) => r.action === "merged");
+    // EXACTLY one merge (the archived drained history row into the live survivor) and no
+    // reciprocal churn: the group resolves once, so a row already used as a destination is
+    // never re-processed as an incoming (Codex round 3 on #212).
+    expect(mergedReceipts).toHaveLength(1);
+
+    const survivor = core.getWorkstreamInbox("B");
+    expect(survivor).toBeDefined();
+    expect(survivor!.payload.status).toBe("active");
+    const openTextsInB = survivor!.payload.items.filter((i) => i.state === "open").map((i) => i.text).sort();
+    expect(openTextsInB).toEqual(["find A", "find TMP"]);
+    // The merged receipt names the LIVE survivor, and only one live inbox row exists at B.
+    expect(mergedReceipts[0]!.mergedIntoId).toBe(survivor!.id);
+    expect(core.circleOf(survivor!.id)).toBe("B");
+    const liveInboxRows = rawDb(core)
+      .prepare(`SELECT COUNT(*) AS n FROM concepts WHERE circle='B' AND kind='workstream'
+        AND slug='workstream:B::inbox' AND status != 'archived'`)
+      .get() as { n: number };
+    expect(liveInboxRows.n).toBe(1);
+    core.close();
+  });
+
+  it("an ambiguity refusal renders a bounded candidate sample", async () => {
+    const core = new MonetCore(":memory:");
+    for (let i = 0; i < 10; i++) {
+      await core.saveWorkstream({ title: `Thread ${i}`, open: [{ slot: "step", text: `t${i}` }] });
+    }
+    await expect(core.saveWorkstream({ open: [{ slot: "step", text: "unaddressed" }] }))
+      .rejects.toThrow(/and 2 more/);
+    core.close();
+  });
+
+  it("an oversized open batch refuses at the schema before any mutation", async () => {
+    const core = new MonetCore(":memory:");
+    const refusal = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { title: "Bulk", open: Array.from({ length: 101 }, (_, i) => ({ kind: "step", text: `item ${i}` })) } },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(refusal.isError).toBe(true);
+    expect(refusal.content[0]!.text).toMatch(/at most 100/);
+    expect(core.getActiveWorkstreams()).toHaveLength(0);
+    core.close();
+  });
+
+  it("an inbox settle reports under the inbox receipt, never as a workstream", async () => {
+    const core = new MonetCore(":memory:");
+    const captured = await core.captureFind("settle me");
+
+    const receipt = await withWorkstreamServer(core, async (client) => toolJson(await client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { id: "inbox", close: [{ id: captured.itemId, as: "dropped" }] } },
+    }))) as { workstream?: unknown; inbox?: { closed?: string[] } };
+
+    expect(receipt.workstream).toBeUndefined();
+    expect(receipt.inbox?.closed).toEqual([captured.itemId]);
+    core.close();
+  });
+
+  it("a self-merge does not destroy touched-thread affinity", async () => {
+    const core = new MonetCore(":memory:");
+    await core.saveWorkstream({ title: "Other", open: [{ slot: "step", text: "o" }] }, { circle: "A" });
+
+    const landed = await withWorkstreamServer(core, async (client) => {
+      const touched = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { circle: "A", workstream: { title: "Mine", open: [{ kind: "step", text: "m" }] } },
+      })) as { workstream: { id: string } };
+      await client.callTool({ name: "memory_circle_manage", arguments: { action: "merge", circle: "A", to: "A" } });
+      const after = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { circle: "A", workstream: { open: [{ kind: "step", text: "post-noop" }] } },
+      })) as { workstream: { id: string } };
+      return { touched, after };
+    });
+    expect(landed.after.workstream.id).toBe(landed.touched.workstream.id);
+    core.close();
+  });
+
+  it("refuses duplicate close ids, over-length titles, and document-sized refs", async () => {
+    const core = new MonetCore(":memory:");
+    const opened = (await core.saveWorkstream({ open: [{ slot: "step", text: "x" }] }))!;
+    const itemId = opened.openedItemIds[0]!;
+
+    await expect(core.saveWorkstream({ close: [{ id: itemId, as: "done" }, { id: itemId, as: "dropped" }] }))
+      .rejects.toThrow(/at most once/);
+    await expect(core.saveWorkstream({ title: "T".repeat(81), open: [{ slot: "step", text: "y" }] }))
+      .rejects.toThrow(/80 characters or fewer/);
+    await expect(core.saveWorkstream({ close: [{ id: itemId, as: "filed", ref: "r".repeat(2049) }] }))
+      .rejects.toThrow(/2048 characters or fewer/);
+    // The refusals wrote nothing: the item is still open.
+    expect(core.getActiveWorkstreams()[0]!.payload.items.find((i) => i.id === itemId)?.state).toBe("open");
+    core.close();
+  });
+
+  it("clips over-length stored titles by code point, never splitting a surrogate", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, { id: "astral", circle: "astral", version: 0, updatedAt: 100 });
+    db.prepare(`UPDATE concepts SET body = ? WHERE id = ?`).run(JSON.stringify({
+      status: "active",
+      title: "𝐀".repeat(100),
+      items: [{ id: "astral-item", slot: "step", text: "x", state: "open", openedAt: 10 }],
+    }, null, 2), "astral");
+
+    const saved = (await core.saveWorkstream({ status: "paused" }, { circle: "astral" }))!;
+    expect(saved.title).toBe("𝐀".repeat(77) + "…");
+    core.close();
+  });
+
+  it("a capture in flight across a circle rename lands in the destination", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const embedder: EmbeddingProvider = {
+      dim: 2,
+      modelId: "test:rename-race",
+      async embed(text: string) {
+        if (String(text).includes("in-flight find")) await gate;
+        return new Float32Array([1, 0]);
+      },
+    };
+    const core = new MonetCore(":memory:", { embedder, tauAttach: 1.1, tauAmbiguous: 1.1 });
+    await core.store("Anchor so the source circle exists.", { circle: "old" });
+
+    const pending = core.captureFind("in-flight find", { circle: "old" });
+    await new Promise((resolve) => setTimeout(resolve, 25)); // let the capture reach its embed await
+    core.renameCircle("old", "new");
+    release();
+    const captured = await pending;
+
+    // The write re-resolved the circle under its reservation: the find lives where the circle
+    // now lives, and both names reach it through the alias.
+    expect(core.circleOf(captured.row.id)).toBe("new");
+    expect(core.getWorkstreamInbox("new")!.payload.items.map((i) => i.text)).toContain("in-flight find");
+    expect(core.getWorkstreamInbox("old")!.id).toBe(captured.row.id);
+    core.close();
+  });
+
+  it("unions replica-minted inbox siblings on read and collapses them on the next write", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    // Two replicas that both lacked an inbox mint different ids at the same reserved slug; sync
+    // converges concepts BY ID, so a graft leaves both live rows here.
+    for (const [id, itemId, text] of [["inbox-a", "item-a", "find from A"], ["inbox-b", "item-b", "find from B"]]) {
+      insertWorkstreamRow(db, { id, circle: "shared", version: 0, updatedAt: id === "inbox-a" ? 200 : 100 });
+      db.prepare(`UPDATE concepts SET slug=?, body=? WHERE id=?`).run(
+        "workstream:shared::inbox",
+        JSON.stringify({ status: "active", items: [{ id: itemId, text, state: "open", openedAt: 10 }] }, null, 2),
+        id,
+      );
+    }
+
+    // READ: neither find is invisible, even before any write reconciles them.
+    const unioned = core.getWorkstreamInbox("shared")!;
+    expect(unioned.payload.items.map((i) => i.text).sort()).toEqual(["find from A", "find from B"]);
+
+    // WRITE: the next capture collapses the siblings into one live row carrying every item.
+    await core.captureFind("third find", { circle: "shared" });
+    const liveRows = db.prepare(
+      `SELECT id FROM concepts WHERE circle='shared' AND kind='workstream'
+        AND slug='workstream:shared::inbox' AND status != 'archived'`,
+    ).all() as Array<{ id: string }>;
+    expect(liveRows).toHaveLength(1);
+    expect(core.getWorkstreamInbox("shared")!.payload.items.map((i) => i.text).sort())
+      .toEqual(["find from A", "find from B", "third find"]);
+
+    // SETTLE: an item that arrived on the archived sibling is closable by id.
+    const settled = await core.saveWorkstream({ id: "inbox", close: [{ id: "item-b", as: "dropped" }] }, { circle: "shared" });
+    expect(settled!.closedItemIds).toEqual(["item-b"]);
+    core.close();
+  });
+
+  it("filed without a usable ref refuses at the MCP schema", async () => {
+    const core = new MonetCore(":memory:");
+    const opened = (await core.saveWorkstream({ open: [{ slot: "step", text: "x" }] }))!;
+    const refusal = await withWorkstreamServer(core, (client) => client.callTool({
+      name: "memory_checkpoint",
+      arguments: { workstream: { close: [{ id: opened.openedItemIds[0], as: "filed" }] } },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(refusal.isError).toBe(true);
+    expect(refusal.content[0]!.text).toMatch(/ref/);
+    core.close();
+  });
+
+  it("graceful close stamps the live session's end", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-close-"));
+    const dbPath = join(dir, "monet.db");
+    const core = new MonetCore(dbPath);
+    await core.saveWorkstream({ open: [{ slot: "step", text: "before close" }] });
+    core.close();
+
+    const reopened = new MonetCore(dbPath);
+    const row = (reopened as unknown as { db: StoragePort }).db
+      .prepare(`SELECT ended_at, status FROM sessions ORDER BY started_at DESC LIMIT 1`)
+      .get() as { ended_at: number | null; status: string };
+    expect(row.status).toBe("ended");
+    expect(row.ended_at).not.toBeNull();
+    reopened.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("captureFind keeps working when the accumulated inbox text exceeds the embedding budget", async () => {
+    const core = new MonetCore(":memory:");
+    for (let i = 0; i < 3; i++) await core.captureFind(`find ${i} ${"x".repeat(1500)}`);
+    const result = await core.captureFind("one more small find");
+    expect(result.itemId).toBeTruthy();
+    expect(core.getWorkstreamInbox()!.payload.items.filter((i) => i.state === "open")).toHaveLength(4);
+    core.close();
+  });
+
+  it("touched-thread affinity follows a circle rename", async () => {
+    const core = new MonetCore(":memory:");
+    // A second active thread in the DESTINATION makes the sole-active rung fail, so only
+    // migrated affinity can route the post-rename unaddressed call.
+    await core.saveWorkstream({ title: "Resident", open: [{ slot: "step", text: "r" }] }, { circle: "B" });
+
+    const landed = await withWorkstreamServer(core, async (client) => {
+      const touched = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { circle: "A", workstream: { title: "Moving", open: [{ kind: "step", text: "m" }] } },
+      })) as { workstream: { id: string } };
+      await client.callTool({ name: "memory_circle_manage", arguments: { action: "rename", circle: "A", to: "B" } });
+      const after = toolJson(await client.callTool({
+        name: "memory_checkpoint",
+        arguments: { circle: "B", workstream: { open: [{ kind: "step", text: "post-rename" }] } },
+      })) as { workstream: { id: string } };
+      return { touched, after };
+    });
+    expect(landed.after.workstream.id).toBe(landed.touched.workstream.id);
+    core.close();
+  });
+
+  it("reads the inbox by reserved id without lifecycle fields and keeps it out of thread lists", async () => {
+    const core = new MonetCore(":memory:");
+    const open = await core.captureFind("open find");
+    const closed = await core.captureFind("filed find");
+    await core.saveWorkstream({ id: "inbox", close: [{ id: closed.itemId, as: "filed", ref: "issue-181" }] });
+
+    const { list, openDetail, allDetail } = await withWorkstreamServer(core, async (client) => ({
+      list: toolJson(await client.callTool({ name: "memory_workstreams", arguments: {} })),
+      openDetail: toolJson(await client.callTool({ name: "memory_workstreams", arguments: { id: "inbox" } })),
+      allDetail: toolJson(await client.callTool({ name: "memory_workstreams", arguments: { id: "inbox", includeClosed: true } })),
+    }));
+    expect(list).toEqual({ workstreams: [] });
+    expect(openDetail).toEqual({
+      id: "inbox",
+      closedCount: 1,
+      items: [{ id: open.itemId, text: "open find" }],
+    });
+    expect(openDetail).not.toHaveProperty("title");
+    expect(openDetail).not.toHaveProperty("status");
+    expect((openDetail.items as Array<Record<string, unknown>>)[0]).not.toHaveProperty("kind");
+    expect(allDetail).toEqual({
+      id: "inbox",
+      openCount: 1,
+      closedCount: 1,
+      items: [
+        { id: open.itemId, text: "open find" },
+        expect.objectContaining({ id: closed.itemId, text: "filed find", state: "filed", ref: "issue-181", closedAt: expect.any(Number) }),
+      ],
+    });
+    expect(JSON.stringify(allDetail)).not.toContain("closedIn");
     core.close();
   });
 
@@ -532,8 +941,11 @@ describe("memory_workstreams MCP tool", () => {
     );
     expect(toolJson(detail)).toMatchObject({
       id: opened.id,
-      items: [{ id: itemId, text: "finish me", state: "done" }],
+      openCount: 0,
+      closedCount: 1,
+      items: [{ id: itemId, kind: "step", text: "finish me", state: "done", closedAt: expect.any(Number) }],
     });
+    expect(JSON.stringify(toolJson(detail))).not.toContain("closedIn");
     core.close();
   });
 
@@ -547,7 +959,7 @@ describe("memory_workstreams MCP tool", () => {
     counting.embed = () => { embedCalls += 1; return embed(); };
     const core = new MonetCore(":memory:", { embedder: counting });
 
-    const result = await core.saveWorkstream({ close: [{ id: "stale", as: "done" }] }, { summary: "ended anyway" });
+    const result = await core.saveWorkstream({ close: [{ id: "stale", as: "done" }] });
     expect(result).toBeNull();
     expect(embedCalls).toBe(0);
     core.close();
@@ -772,6 +1184,196 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     }
   });
 
+  it("preserves unknown payload keys through normalization and checkpoint merge", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, { id: "future-payload", circle: "future", version: 0, updatedAt: 100 });
+    const seeded = {
+      status: "active",
+      items: [{
+        id: "future-item",
+        slot: "step",
+        text: "keep future metadata",
+        state: "open",
+        openedAt: 10,
+      }],
+      futureKey: { retained: true },
+    };
+    db.prepare(`UPDATE concepts SET body = ? WHERE id = ?`).run(JSON.stringify(seeded, null, 2), "future-payload");
+    expect(core.getActiveWorkstreams("future")[0]!.payload).toMatchObject({
+      futureKey: { retained: true },
+    });
+
+    const saved = (await core.saveWorkstream({ status: "paused" }, { circle: "future" }))!;
+    expect(saved.payload).toMatchObject({
+      status: "paused",
+      futureKey: { retained: true },
+    });
+    expect(JSON.parse(workstreamRows(db, "future")[0]!.body)).toMatchObject({
+      futureKey: { retained: true },
+    });
+    core.close();
+  });
+
+  it("uses a stored title verbatim within the column budget and clips longer stored titles", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, { id: "named", circle: "named", version: 0, updatedAt: 100 });
+    const namedPayload = {
+      status: "active",
+      title: "Capture redesign",
+      items: [{ id: "named-item", slot: "step", text: "derived title must not win", state: "open", openedAt: 10 }],
+    };
+    db.prepare(`UPDATE concepts SET body = ? WHERE id = ?`).run(JSON.stringify(namedPayload, null, 2), "named");
+
+    const named = (await core.saveWorkstream({ status: "paused" }, { circle: "named" }))!;
+    expect(named.title).toBe("Capture redesign");
+
+    const longTitle = "T".repeat(81);
+    db.prepare(`UPDATE concepts SET body = ? WHERE id = ?`).run(
+      JSON.stringify({ ...named.payload, title: longTitle }, null, 2),
+      named.id,
+    );
+    const clipped = (await core.saveWorkstream({ status: "active" }, { circle: "named" }))!;
+    expect(clipped.title).toBe(`${longTitle.slice(0, 77)}…`);
+    core.close();
+  });
+
+  it("upserts named threads by slug, preserving the first stored-title echo on a collision", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+
+    const first = (await core.saveWorkstream({
+      title: "Release Plan",
+      open: [{ slot: "step", text: "draft the plan" }],
+    }))!;
+    const collided = (await core.saveWorkstream({
+      title: "Release---Plan",
+      open: [{ slot: "question", text: "who approves it?" }],
+    }))!;
+
+    expect(first.slug).toBe("workstream:default:release-plan");
+    expect(collided.id).toBe(first.id);
+    expect(collided.payload.title).toBe("Release Plan");
+    expect(collided.title).toBe("Release Plan");
+    expect(openTexts(collided.payload, "step")).toEqual(["draft the plan"]);
+    expect(openTexts(collided.payload, "question")).toEqual(["who approves it?"]);
+    expect(core.getActiveWorkstreams()).toHaveLength(1);
+
+    const emptyNamed = (await core.saveWorkstream({ title: "Empty named thread" }))!;
+    expect(emptyNamed.slug).toBe("workstream:default:empty-named-thread");
+    expect(emptyNamed.payload.title).toBe("Empty named thread");
+
+    await expect(core.saveWorkstream({ title: "😀✨", status: "active" }))
+      .rejects.toThrow(/slugifies to empty/);
+    core.close();
+  });
+
+  it("targets an exact id and refuses unaddressed ambiguity before embedding", async () => {
+    let embedCalls = 0;
+    const counting = new StaticEmbeddingProvider();
+    const embed = counting.embed.bind(counting);
+    counting.embed = () => { embedCalls += 1; return embed(); };
+    const core = new MonetCore(":memory:", { embedder: counting });
+    const alpha = (await core.saveWorkstream({ title: "Alpha", status: "active" }))!;
+    const beta = (await core.saveWorkstream({ title: "Beta", status: "active" }))!;
+    const beforeRefusal = embedCalls;
+
+    let refusal: unknown;
+    try {
+      await core.saveWorkstream({ status: "paused" });
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toMatchObject({
+      name: "WorkstreamAddressRequiredError",
+      candidates: [
+        { id: beta.id, title: "Beta" },
+        { id: alpha.id, title: "Alpha" },
+      ],
+    });
+    expect(embedCalls).toBe(beforeRefusal);
+
+    const updated = (await core.saveWorkstream({ id: alpha.id, status: "paused" }))!;
+    expect(updated.id).toBe(alpha.id);
+    expect(updated.payload.status).toBe("paused");
+    expect(core.getWorkstreamById(beta.id)?.payload.status).toBe("active");
+    core.close();
+  });
+
+  it("an unaddressed call targets the only active named thread; done threads do not count", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const live = (await core.saveWorkstream({ title: "Live", status: "active" }))!;
+    const finished = (await core.saveWorkstream({ title: "Finished", status: "done" }))!;
+
+    const saved = (await core.saveWorkstream({ open: [{ slot: "step", text: "continue live" }] }))!;
+    expect(saved.id).toBe(live.id);
+    expect(saved.id).not.toBe(finished.id);
+    expect(openTexts(saved.payload, "step")).toEqual(["continue live"]);
+    core.close();
+  });
+
+  it("unaddressed unnamed occupancy by a connector-owned row refuses with candidates instead of overwriting", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, { id: "owned-unnamed", circle: "owned", nextStep: "source" });
+    db.prepare(`UPDATE concepts SET source_identity=? WHERE id=?`).run("source://owned", "owned-unnamed");
+
+    await expect(core.saveWorkstream({ status: "active" }, { circle: "owned" }))
+      .rejects.toMatchObject({ name: "WorkstreamAddressRequiredError", candidates: [] });
+    await expect(core.saveWorkstream({ id: "owned-unnamed", status: "active" }, { circle: "owned" }))
+      .rejects.toThrow(/connector-owned workstream/);
+    core.close();
+  });
+
+  it("captures slotless inbox finds, excludes the inbox from active threads, and disposes by literal id", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const captured = await core.captureFind("Follow up on the flaky test");
+
+    expect(captured.row.slug).toBe("workstream:default::inbox");
+    expect(captured.row.payload).not.toHaveProperty("title");
+    expect(captured.row.payload.items).toEqual([
+      expect.objectContaining({ id: captured.itemId, text: "Follow up on the flaky test", state: "open" }),
+    ]);
+    expect(captured.row.payload.items[0]).not.toHaveProperty("slot");
+    expect(core.getActiveWorkstreams()).toEqual([]);
+    expect(() => core.getWorkstreamById("inbox")).toThrow(/getWorkstreamInbox/);
+    expect(core.getWorkstreamById(captured.row.id)).toBeUndefined();
+    expect(core.getWorkstreamInbox()).toEqual(captured.row);
+
+    const disposed = (await core.saveWorkstream({
+      id: "inbox",
+      close: [{ id: captured.itemId, as: "filed", ref: "https://example.test/181" }],
+    }))!;
+    expect(disposed.payload.items[0]).toMatchObject({
+      state: "filed",
+      ref: "https://example.test/181",
+    });
+    expect(core.getWorkstreamInbox()?.payload.items).toEqual(disposed.payload.items);
+    await expect(core.saveWorkstream({ id: "inbox" }))
+      .rejects.toThrow(/inbox has no lifecycle/);
+    await expect(core.saveWorkstream({ id: "inbox", status: "active" }))
+      .rejects.toThrow(/inbox has no lifecycle/);
+    await expect(core.saveWorkstream({ id: "inbox", open: [{ slot: "step", text: "not allowed" }] }))
+      .rejects.toThrow(/inbox has no lifecycle/);
+    core.close();
+  });
+
+  it("inbox capture refuses a connector-owned reserved slug", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, {
+      id: "owned-inbox",
+      circle: "owned-inbox",
+      slug: "workstream:owned-inbox::inbox",
+      nextStep: "source",
+    });
+    db.prepare(`UPDATE concepts SET source_identity=? WHERE id=?`).run("source://owned-inbox", "owned-inbox");
+
+    await expect(core.captureFind("must not overwrite", { circle: "owned-inbox" }))
+      .rejects.toThrow(/connector-owned workstream inbox/);
+    core.close();
+  });
+
   it("different-circle workstream saves do not cross-mutate", async () => {
     const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
 
@@ -796,7 +1398,6 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
       const s1 = new MonetCore(dbPath);
       await s1.saveWorkstream(
         { status: "active", open: [{ slot: "question" as const, text: "resume #242?" }, { slot: "step" as const, text: "build prewarm ranking" }] },
-        { summary: "end of session 1" },
       );
       s1.close();
 
@@ -922,20 +1523,56 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     db.prepare(`UPDATE concepts SET source_identity = ? WHERE id = ?`).run("source://guard", "connector");
 
     await expect(core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "caller" }] }, { circle: "guard" }))
-      .rejects.toThrow(/connector-owned workstream/);
+      .rejects.toMatchObject({
+        name: "WorkstreamAddressRequiredError",
+        candidates: [{ id: "ordinary", title: "workstream: ordinary" }],
+      });
 
     expect(workstreamRows(db, "guard").map((row) => row.id)).toEqual(["ordinary"]);
     core.close();
   });
 
-  it("checkpoint ends the session; the next write opens a fresh one", async () => {
-    const core = new MonetCore(":memory:");
-    await core.store("a"); // session 1 opens
+  it("a checkpoint keeps a repeated claim in the same session", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 0, tauAmbiguous: 0 });
+    const first = await core.store("The capture layer preserves one host session.");
+
+    await core.saveWorkstream({ status: "active" });
+    const second = await core.store("The capture layer preserves one host session.");
+    const row = rawDb(core)
+      .prepare(`SELECT confidence, arousal_score FROM concepts WHERE id = ?`)
+      .get(first.conceptId) as { confidence: number; arousal_score: number };
+
+    expect(second.conceptId).toBe(first.conceptId);
+    expect(row.confidence).toBeCloseTo(0.6, 5);
+    expect(row.arousal_score).toBe(0);
     expect(core.stats().sessions).toBe(1);
-    await core.saveWorkstream({ status: "active" }, { summary: "done for now" }); // ends session 1
-    await core.store("b"); // session 2 opens
-    expect(core.stats().sessions).toBe(2);
-    expect(core.stats().workstreams).toBe(1);
+    core.close();
+  });
+
+  it("two checkpoints stamp the same lastSessionId", async () => {
+    const core = new MonetCore(":memory:");
+    const first = (await core.saveWorkstream({
+      status: "active",
+      open: [{ slot: "step" as const, text: "capture the first checkpoint" }],
+    }))!;
+    const second = (await core.saveWorkstream({
+      open: [{ slot: "step" as const, text: "capture the second checkpoint" }],
+    }))!;
+
+    expect(first.payload.lastSessionId).toBeTruthy();
+    expect(second.payload.lastSessionId).toBe(first.payload.lastSessionId);
+    core.close();
+  });
+
+  it("a checkpoint does not break the follows chain", async () => {
+    const core = new MonetCore(":memory:", { tauAttach: 1.1, tauAmbiguous: 1.1 });
+    const first = await core.store("Capture thought Alpha through the host session.", { circle: "capture" });
+    await core.saveWorkstream({ status: "active" }, { circle: "capture" });
+    const second = await core.store("Capture thought Beta after the checkpoint.", { circle: "capture" });
+
+    expect(core.edges({ type: "follows", circle: "capture" })).toContainEqual(
+      expect.objectContaining({ srcId: first.conceptId, dstId: second.conceptId }),
+    );
     core.close();
   });
 });
@@ -948,6 +1585,84 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
  * duplicates should never exist, not merely be picked around on read.
  */
 describe("renameCircle workstream collision canonicalization (mint-site dup guard)", () => {
+  it("preserves named, unnamed, and inbox suffixes for moved rows without rewriting destination rows", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    const unnamed = (await core.saveWorkstream({ status: "active" }, { circle: "from_%_*" }))!;
+    const named = (await core.saveWorkstream({ title: "Auth", status: "active" }, { circle: "from_%_*" }))!;
+    const inbox = await core.captureFind("source find", { circle: "from_%_*" });
+    const destination = (await core.saveWorkstream({ title: "Destination", status: "active" }, { circle: "to_%_*" }))!;
+    const destinationBefore = workstreamIdentities(db, "to_%_*");
+
+    core.renameCircle("from_%_*", "to_%_*");
+
+    expect(workstreamIdentities(db, "to_%_*").filter((row) => row.id === destination.id)).toEqual(destinationBefore);
+    expect(workstreamIdentities(db, "to_%_*").filter((row) => [unnamed.id, named.id, inbox.row.id].includes(row.id)))
+      .toEqual([
+        { id: inbox.row.id, slug: "workstream:to_%_*::inbox", title: "source find", status: "active" },
+        { id: named.id, slug: "workstream:to_%_*:auth", title: "Auth", status: "active" },
+        { id: unnamed.id, slug: "workstream:to_%_*", title: "session state", status: "active" },
+      ].sort((a, b) => a.id.localeCompare(b.id)));
+    expect(core.getWorkstreamInbox("to_%_*")?.payload.items.map((item) => item.text)).toEqual(["source find"]);
+    core.close();
+  });
+
+  it("uses SQLite code-point prefix length when an astral circle name moves", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const named = (await core.saveWorkstream({ title: "Rocket plan", status: "active" }, { circle: "team🚀" }))!;
+    const inbox = await core.captureFind("astral find", { circle: "team🚀" });
+
+    core.renameCircle("team🚀", "launch🚀");
+
+    expect(core.getWorkstreamById(named.id, "launch🚀")?.slug).toBe("workstream:launch🚀:rocket-plan");
+    expect(core.getWorkstreamInbox("launch🚀")?.id).toBe(inbox.row.id);
+    expect(core.getWorkstreamInbox("launch🚀")?.slug).toBe("workstream:launch🚀::inbox");
+    core.close();
+  });
+
+  it("uses successive reserved counters when two destination slugs are already occupied", () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    insertWorkstreamRow(db, { id: "source-auth", circle: "A", slug: "workstream:A:auth", nextStep: "source" });
+    insertWorkstreamRow(db, { id: "dest-auth", circle: "B", slug: "workstream:B:auth", nextStep: "dest" });
+    insertWorkstreamRow(db, { id: "dest-auth-2", circle: "B", slug: "workstream:B:auth::2", nextStep: "earlier collision" });
+
+    core.renameCircle("A", "B");
+
+    expect(workstreamIdentities(db, "B").find((row) => row.id === "source-auth")?.slug).toBe("workstream:B:auth::3");
+    expect(core.getActiveWorkstreams("B").map((row) => row.id).sort()).toEqual(["dest-auth", "dest-auth-2", "source-auth"]);
+    core.close();
+  });
+
+  it("item-merges colliding inboxes, carries closed history, revives a done destination, and archives the source", async () => {
+    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
+    const db = rawDb(core);
+    const destination = await core.captureFind("destination closed", { circle: "B" });
+    await core.saveWorkstream({ id: "inbox", close: [{ id: destination.itemId, as: "done" }] }, { circle: "B" });
+    db.prepare(`UPDATE concepts SET body=? WHERE id=?`).run(
+      JSON.stringify({ ...core.getWorkstreamInbox("B")!.payload, status: "done" }, null, 2),
+      destination.row.id,
+    );
+    const sourceClosed = await core.captureFind("source closed", { circle: "A" });
+    await core.saveWorkstream({ id: "inbox", close: [{ id: sourceClosed.itemId, as: "filed", ref: "issue-181" }] }, { circle: "A" });
+    const sourceOpen = await core.captureFind("source open", { circle: "A" });
+
+    core.renameCircle("A", "B");
+
+    const merged = core.getWorkstreamInbox("B")!;
+    expect(merged.id).toBe(destination.row.id);
+    expect(merged.payload.status).toBe("active");
+    expect(merged.payload.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: destination.itemId, state: "done" }),
+      expect.objectContaining({ id: sourceClosed.itemId, state: "filed", ref: "issue-181" }),
+      expect.objectContaining({ id: sourceOpen.itemId, state: "open" }),
+    ]));
+    expect(workstreamIdentities(db, "B").find((row) => row.id === sourceOpen.row.id)?.status).toBe("archived");
+    expect(workstreamIdentities(db, "B").filter((row) => row.slug === "workstream:B::inbox" && row.status !== "archived"))
+      .toHaveLength(1);
+    core.close();
+  });
+
   // NOTE on updated_at in these fixtures: the pre-existing sync trigger (engine.ts's `trigger()`
   // helper, fired by any UPDATE that changes a "semantic" column — circle and slug are both in
   // that list) stamps a fresh wall-clock updated_at on any row renameCircle's bulk `circle=?`
@@ -960,7 +1675,7 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
   // unrelated concept only, so the rename has something to do) specifically so their updated_at
   // values stay under the test's control instead of being overwritten by the move.
 
-  it("rename-merge collision: the moved-in workstream wins the slug (freshly touched by the move); the target's own workstream is archived, not deleted", () => {
+  it("rename collision keeps both work threads active and gives the moved row an unreachable counter suffix", () => {
     const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
     const db = rawDb(core);
     insertWorkstreamRow(db, { id: "a-ws", circle: "A", version: 0, updatedAt: 100, nextStep: "moved in from A" });
@@ -968,28 +1683,22 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
 
     core.renameCircle("A", "B");
 
-    // Both rows survive physically — archived, never deleted.
     expect(workstreamRows(db, "B").map((r) => r.id)).toEqual(["a-ws", "b-ws"]);
-    const statuses = workstreamStatuses(db, "B");
-    // a-ws's `circle` column just changed (A→B), so the sync trigger stamps it with a fresh
-    // updated_at — newer than b-ws's untouched 200 — making it the row getActiveWorkstreams picks.
-    expect(statuses.find((s) => s.id === "a-ws")?.status).toBe("active");
-    expect(statuses.find((s) => s.id === "b-ws")?.status).toBe("archived");
-
+    expect(workstreamStatuses(db, "B").map(({ id, status }) => ({ id, status }))).toEqual([
+      { id: "a-ws", status: "active" },
+      { id: "b-ws", status: "active" },
+    ]);
     const active = core.getActiveWorkstreams("B");
-    expect(active).toHaveLength(1);
-    expect(active[0].id).toBe("a-ws");
-    expect(active[0].slug).toBe("workstream:B");
-    expect(openTexts(active[0].payload, "step")).toEqual(["moved in from A"]);
+    expect(active.map(({ id, slug }) => ({ id, slug }))).toEqual([
+      { id: "a-ws", slug: "workstream:B::2" },
+      { id: "b-ws", slug: "workstream:B" },
+    ]);
+    expect(openTexts(active.find((row) => row.id === "a-ws")!.payload, "step")).toEqual(["moved in from A"]);
+    expect(openTexts(active.find((row) => row.id === "b-ws")!.payload, "step")).toEqual(["already in B"]);
     core.close();
   });
 
-  it("rename-collision canonicalization never archives a connector-owned row sharing the slug", () => {
-    // B holds a connector-owned row on the workstream slug plus its own ordinary workstream; the
-    // rename moves A's ordinary workstream in, colliding the two ORDINARY rows. The archive pass
-    // must collapse only the ordinary group (Codex review, PR #100, P2) — the connector row is
-    // source-controlled state the same ownership boundary saveWorkstream enforces, and a
-    // native-circle rename has no business flipping its status.
+  it("rename collision leaves connector-owned and ordinary destination rows untouched", () => {
     const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
     const db = rawDb(core);
     insertWorkstreamRow(db, { id: "b-connector", circle: "B", version: 9, updatedAt: 900, nextStep: "connector-owned" });
@@ -999,59 +1708,43 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
 
     core.renameCircle("A", "B");
 
-    const status = (id: string): string =>
-      (db.prepare(`SELECT status FROM concepts WHERE id = ?`).get(id) as { status: string }).status;
-    expect(status("b-connector")).toBe("active"); // ownership boundary held
-    expect(status("a-ws")).toBe("active"); // survivor of the ordinary group (freshly touched by the move)
-    expect(status("b-ws")).toBe("archived"); // ordinary loser archived, never deleted
+    const row = (id: string): { status: string; slug: string } =>
+      db.prepare(`SELECT status, slug FROM concepts WHERE id = ?`).get(id) as { status: string; slug: string };
+    expect(row("b-connector")).toEqual({ status: "active", slug: "workstream:B" });
+    expect(row("b-ws")).toEqual({ status: "active", slug: "workstream:B" });
+    expect(row("a-ws")).toEqual({ status: "active", slug: "workstream:B::2" });
     core.close();
   });
 
-  it("archived-newest edge: a stale archived sibling with a higher updated_at does not shadow the active survivor", async () => {
+  it("unrelated destination workstream rows remain byte-stable when another circle moves in", async () => {
     const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
     const db = rawDb(core);
-    // Pre-existing malformed state, entirely within B (e.g. from a historical bug, or clock skew
-    // across synced devices): the active row is genuinely canonical, but an archived sibling
-    // outranks it on updated_at. Both rows already live in B so the rename's bulk circle/slug
-    // UPDATEs never touch either one — their fixture timestamps are exactly what canonicalization sees.
-    insertWorkstreamRow(db, { id: "b-active", circle: "B", version: 1, updatedAt: 100, nextStep: "active, genuinely canonical" });
-    insertWorkstreamRow(db, { id: "b-archived-newer", circle: "B", status: "archived", version: 5, updatedAt: 999999, nextStep: "stale archived, outranks by updated_at" });
-    await core.store("unrelated fact, gives A something to rename", { circle: "A" }); // A must be non-empty; not a workstream, so it never touches B's pair
+    insertWorkstreamRow(db, { id: "b-active", circle: "B", slug: "workstream:B:other", version: 1, updatedAt: 100, nextStep: "active, genuinely canonical" });
+    insertWorkstreamRow(db, { id: "b-archived-newer", circle: "B", slug: "workstream:B:other", status: "archived", version: 5, updatedAt: 999999, nextStep: "stale archived" });
+    const before = workstreamRows(db, "B");
+    await core.saveWorkstream({ title: "Incoming", status: "active" }, { circle: "A" });
 
     core.renameCircle("A", "B");
 
-    const statuses = workstreamStatuses(db, "B");
-    const survivor = statuses.find((s) => s.id === "b-active");
-    const loser = statuses.find((s) => s.id === "b-archived-newer");
-    expect(survivor?.status).toBe("active");
-    expect(loser?.status).toBe("archived");
-    expect(loser!.updatedAt).toBe(999999); // untouched loser — canonicalization never rewrites losers' timestamps
-    expect(survivor!.updatedAt).toBeGreaterThan(loser!.updatedAt); // survivor bumped so it unambiguously dominates the ordering
-
-    // The active row must be restorable — it must NOT vanish behind the archived-but-newer sibling.
-    const active = core.getActiveWorkstreams("B");
-    expect(active).toHaveLength(1);
-    expect(active[0].id).toBe("b-active");
-    expect(openTexts(active[0].payload, "step")).toEqual(["active, genuinely canonical"]);
+    expect(workstreamRows(db, "B").filter((row) => row.id.startsWith("b-"))).toEqual(before);
+    const restored = core.getActiveWorkstreams("B").find((row) => row.id === "b-active");
+    expect(restored).toBeDefined();
+    expect(openTexts(restored!.payload, "step")).toEqual(["active, genuinely canonical"]);
     core.close();
   });
 
-  it("idempotence: re-running the rename after canonicalization does not further mutate either row", () => {
+  it("idempotence: re-running the rename does not further mutate either active thread", () => {
     const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
     const db = rawDb(core);
     insertWorkstreamRow(db, { id: "a-ws", circle: "A", version: 0, updatedAt: 100, nextStep: "moved in from A" });
     insertWorkstreamRow(db, { id: "b-ws", circle: "B", version: 0, updatedAt: 200, nextStep: "already in B" });
 
     core.renameCircle("A", "B");
-    const afterFirst = workstreamStatuses(db, "B");
+    const afterFirst = workstreamRows(db, "B");
 
-    core.renameCircle("A", "B"); // A is now empty but still exists as an alias; re-running must be inert
-    const afterSecond = workstreamStatuses(db, "B");
-
-    expect(afterSecond).toEqual(afterFirst);
-    const active = core.getActiveWorkstreams("B");
-    expect(active).toHaveLength(1);
-    expect(active[0].id).toBe("a-ws");
+    core.renameCircle("A", "B");
+    expect(workstreamRows(db, "B")).toEqual(afterFirst);
+    expect(core.getActiveWorkstreams("B").map((row) => row.id).sort()).toEqual(["a-ws", "b-ws"]);
     core.close();
   });
 

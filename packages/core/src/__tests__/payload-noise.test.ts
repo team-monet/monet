@@ -57,15 +57,23 @@ describe("payload noise — memory_checkpoint", () => {
     const res = await withServer(core, (c) =>
       c.callTool({
         name: "memory_checkpoint",
-        arguments: { circle, workstream: { status: "active", open: [{ slot: "step" as const, text: "continue the payload trim" }] } },
+        arguments: { circle, workstream: { status: "active", open: [{ kind: "step" as const, text: "continue the payload trim" }] } },
       }),
     );
 
     expect(wire(res)).not.toContain(evidence);
-    expect(parse(res)).toEqual({
+    const payload = parse(res);
+    expect(payload).toEqual({
       circle,
-      workstream: expect.objectContaining({ id: expect.any(String), status: "active", version: expect.any(Number) }),
+      workstream: {
+        id: expect.any(String),
+        title: "continue the payload trim",
+        opened: [expect.any(String)],
+        closed: [],
+      },
     });
+    expect(payload.workstream).not.toHaveProperty("version");
+    expect(payload.workstream).not.toHaveProperty("openItems");
     core.close();
   });
 
@@ -83,11 +91,14 @@ describe("payload noise — memory_checkpoint", () => {
     `);
     const workstream = {
       status: "active" as const,
-      open: [{ slot: "question" as const, text: "Does the checkpoint preserve this workstream?" }, { slot: "step" as const, text: "Continue after this checkpoint." }],
+      open: [{ kind: "question" as const, text: "Does the checkpoint preserve this workstream?" }, { kind: "step" as const, text: "Continue after this checkpoint." }],
     };
     // Seed the workstream before fixture SQL adds the bulk concepts; a real checkpoint updates this
     // row and therefore proves the primary contract survives under the large dirty population.
-    await core.saveWorkstream(workstream, { circle });
+    await core.saveWorkstream({
+      status: workstream.status,
+      open: workstream.open.map(({ kind: slot, text }) => ({ slot, text })),
+    }, { circle });
     const fixtureEmbedding = JSON.stringify(Array(256).fill(0));
     store.transaction(() => {
       for (let n = 0; n < totalDirty; n++) {
@@ -121,15 +132,18 @@ describe("payload noise — memory_checkpoint", () => {
       expect(payload).not.toHaveProperty("dirtyOmitted");
       expect(payload).toEqual({
         circle,
-        workstream: expect.objectContaining({
+        workstream: {
           id: expect.any(String),
-          status: workstream.status,
-          version: expect.any(Number),
-        }),
+          title: "Continue after this checkpoint.",
+          opened: [expect.any(String), expect.any(String)],
+          closed: [],
+        },
       });
+      expect(payload.workstream).not.toHaveProperty("version");
+      expect(payload.workstream).not.toHaveProperty("openItems");
     }
     expect(firstPayload.workstream.id).toBe(secondPayload.workstream.id);
-    expect(secondPayload.workstream.version).toBeGreaterThan(firstPayload.workstream.version);
+    expect(firstPayload.workstream.opened).not.toEqual(secondPayload.workstream.opened);
 
     const restored = core.getActiveWorkstreams(circle).find((w) => w.id === firstPayload.workstream.id);
     expect(restored?.payload.status).toBe(workstream.status);
@@ -165,6 +179,48 @@ describe("payload noise — canonical success serializer", () => {
 });
 
 describe("payload noise — agent_context", () => {
+  it("delivers open counts only when nonzero", async () => {
+    const empty = newCore();
+    const emptyPayload = await withServer(empty, async (client) => parse(
+      await client.callTool({ name: "agent_context", arguments: { circle } }),
+    ));
+    expect(emptyPayload).not.toHaveProperty("open");
+    empty.close();
+
+    const core = newCore();
+    await core.saveWorkstream({ title: "Open thread", status: "active" }, { circle });
+    await core.captureFind("open find", { circle });
+    const payload = await withServer(core, async (client) => parse(
+      await client.callTool({ name: "agent_context", arguments: { circle } }),
+    ));
+    expect(payload.open).toEqual({ workstreams: 1, inboxItems: 1 });
+    core.close();
+  });
+
+  it("auto-prewarm mirrors nonzero open counts", async () => {
+    const core = newCore();
+    await core.saveWorkstream({ title: "Open thread", status: "active" }, { circle });
+    await core.captureFind("open find", { circle });
+    const server = new McpServer({ name: "prewarm-open-test", version: "1" });
+    registerMonetCoreTools(server, core, { autoPrewarm: true, checkpointNudge: false });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "prewarm-open-client", version: "1" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      const result = await client.callTool({
+        name: "memory_search",
+        arguments: { query: "anything", circle },
+      }) as ToolResult;
+      expect(result.content.slice(1).map((part) => part.text).join("\n"))
+        .toContain("open: 1 workstreams · 1 inbox items");
+    } finally {
+      await client.close();
+      await server.close();
+      core.close();
+    }
+  });
+
   it("never delivers stale state", async () => {
     const core = newCore({ staleAfterMs: 5 });
     await core.store("Retries use exponential backoff capped at thirty seconds.", { circle });

@@ -1,10 +1,8 @@
 /**
  * Tool-roster drift gate — pins the EXACT set of tools the MCP server registers.
  *
- * The canonical user-facing tool contract lives in with-monet's bootstrap/install.md
- * (a separate repo); roster changes (add/remove/rename) have shipped with doc lag
- * before. This test makes any drift loud: when it fails, update the contract doc and
- * the enumeration below in the same change.
+ * Tool descriptions are the canonical user-facing contract; with-monet's install surface explicitly
+ * defers to them. This test makes roster or load-bearing description drift loud.
  */
 import { describe, it, expect } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -39,7 +37,7 @@ describe("tool roster — drift gate", () => {
       const registered = tools.map((t) => t.name).sort();
       expect(
         registered,
-        "tool roster changed — update with-monet bootstrap/install.md (the canonical tool contract) and this enumeration together.",
+        "tool roster changed — review the canonical tool descriptions and this enumeration together.",
       ).toEqual([
         "agent_context",
         "memory_checkpoint",
@@ -76,10 +74,13 @@ describe("tool roster — drift gate", () => {
     try {
       const byName = new Map((await client.listTools()).tools.map((tool) => [tool.name, tool]));
       expect(byName.get("agent_context")?.description).toBe(
-        "Session-start orientation. Call first. Returns resolved `circle`; `resolvedFrom` marks an alias. `stageIndex` names moments whose rules require stage_lookup. Skeleton delivery has three states: no mirror fields means loaded standing files are current; `mirrorStale` + `instruction` requires user-confirmed reconciliation; `skeleton` contains members not covered by a standing file.",
+        "Session-start orientation. Call first. Returns resolved `circle`; `resolvedFrom` marks an alias. `stageIndex` names moments whose rules require stage_lookup. Skeleton delivery has three states: no mirror fields means loaded standing files are current; `mirrorStale` + `instruction` requires user-confirmed reconciliation; `skeleton` contains members not covered by a standing file. `open` counts workstreams and inbox items still open — mention them to the user; resume only when asked.",
+      );
+      expect(byName.get("memory_checkpoint")?.description).toBe(
+        "Track work and capture finds as they happen — nothing is owed at session end. When a work directive lands, open the plan: work-level items that may outlive the session (fine-grained decomposition stays in the host's own todo). When something surfaces that is not this work, `inbox` it — one line, keep moving. Before reporting completion, settle: close what resolved, and dispose the inbox with the user — do it now, `filed` with a `ref`, `dropped`, or leave open to keep. This MERGES: `open` adds, `close` resolves by id, anything unnamed stays untouched. Address a workstream by `title` (mints if new) or `id` (exact); with neither, the one this session already touched, or the only active one — several active means refusal with the list. The receipt is only what this call did: `opened`/`closed` item ids, `status` only when this call changed it.",
       );
       expect(byName.get("memory_workstreams")?.description).toBe(
-        "Call only on continuation intent, never for a fresh directive. Omit id to list compact active/paused workstreams, then confirm which to resume unless the user named one unambiguously. Pass its id for detail: OPEN items only, questions before steps, each with the id memory_checkpoint's `close` takes. `closedItems` says how many resolved ones exist without delivering them; pass includeClosed to see them with their state and closing session. Advance detailOffset by entries actually returned; detailOmitted is the true remainder.",
+        "Two reads, two moments. Resume — on continuation intent only, never a fresh directive: omit `id` to list active/paused workstreams and confirm which to resume; then pass its `id` for detail — OPEN items only, questions first, each carrying the id `close` takes. Settle — `id: \"inbox\"` before reporting completion: every find awaiting disposition, this session's and every kept one. `closedCount` says how many resolved items exist without delivering them; `includeClosed` returns them with `state`, `closedAt`, and `ref` for the filed. Advance `detailOffset` by items actually returned; `detailOmitted` is the true remainder.",
       );
       expect(byName.get("memory_overview")?.description).toBe(
         "Read-only curation workbench for one circle: compact counts, livingModel cards, bounded queues for possibleDuplicates, extractionCandidates, openContradictions and gate exceptions, plus the ratified skeleton. Opt into dirty or stale worklists; truncation fields report omissions. It never returns bodies: memory_fetch an id, use memory_resolve for contradictions or pair flags, and memory_detach with destConceptId to consolidate a duplicate. Pass entity to list one hub's memories.",

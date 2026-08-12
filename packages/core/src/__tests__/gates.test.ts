@@ -9912,6 +9912,35 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
    * no DROP-and-rebuild-the-legacy-DDL fixture (nothing to preserve — this store never had gate
    * tables to begin with), just the four gate tables genuinely absent.
    */
+  it("legacy-star migration preserves colliding workstreams and leaves no same-slug duplicates (#101)", async () => {
+    const dir = mkTmp();
+    const path = join(dir, "legacy-star-workstreams.db");
+    const built = new MonetCore(path, { embedder: new ConstantEmbeddingProvider(), syncDeviceId: "machine-a" });
+    const first = await built.saveWorkstream({ title: "Legacy task", open: [{ slot: "step", text: "first" }] }, { circle: "legacy-a" });
+    const second = await built.saveWorkstream({ title: "Legacy task", open: [{ slot: "step", text: "second" }] }, { circle: "legacy-b" });
+    built.close();
+
+    const legacy = new Database(path);
+    legacy.prepare(`UPDATE concepts SET circle='*', slug='workstream:*:legacy-task' WHERE id IN (?, ?)`).run(first!.id, second!.id);
+    legacy.close();
+
+    const upgraded = new MonetCore(path, { embedder: new ConstantEmbeddingProvider(), syncDeviceId: "machine-a" });
+    const rows = raw(upgraded).prepare(
+      `SELECT id, slug, status FROM concepts WHERE circle=? AND kind='workstream' ORDER BY id`,
+    ).all(LEGACY_STAR_CIRCLE) as Array<{ id: string; slug: string; status: string }>;
+    expect(rows).toEqual([
+      { id: first!.id, slug: `workstream:${LEGACY_STAR_CIRCLE}:legacy-task::2`, status: "active" },
+      { id: second!.id, slug: `workstream:${LEGACY_STAR_CIRCLE}:legacy-task`, status: "active" },
+    ].sort((a, b) => a.id.localeCompare(b.id)));
+    expect(raw(upgraded).prepare(
+      `SELECT slug, COUNT(*) AS n FROM concepts WHERE circle=? AND kind='workstream'
+       GROUP BY slug HAVING COUNT(*) > 1`,
+    ).all(LEGACY_STAR_CIRCLE)).toEqual([]);
+    expect(upgraded.getActiveWorkstreams(LEGACY_STAR_CIRCLE).map((row) => row.id).sort())
+      .toEqual([first!.id, second!.id].sort());
+    upgraded.close();
+  });
+
   it("a pre-gate store — no gate tables at all — with a '*' circle opens successfully on the FIRST attempt (Codex round 3, item 1)", async () => {
     const dir = mkTmp();
     const path = join(dir, "pregate-star.db");

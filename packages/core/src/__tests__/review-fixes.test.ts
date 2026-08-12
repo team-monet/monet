@@ -376,29 +376,25 @@ describe("F5 — mergeCircle per-item error results carry action:'error'", () =>
     core.close();
   });
 
-  it("merge error path: conceptResults carry action 'error', not 'moved'", async () => {
-    // Force the null-return path: concept disappears between listing and reassigning.
-    // We simulate this by marking the concept as a workstream (reassignCircle throws for those).
-    // mergeCircle catches the throw and pushes an error result — which before the fix
-    // was coerced with `"error" as unknown as "moved"`, stuffing a wrong string in.
+  it("a workstream moved by mergeCircle reports the honest 'moved' variant", async () => {
     const core = freshCore();
     await core.store("Normal fact.", { circle: "src" });
     const conceptId = core.listMemories("src")[0]!.id;
 
-    // Directly mark the concept kind as "workstream" via the storage layer so reassignCircle
-    // throws inside the merge loop, exercising the catch branch.
+    // Simulate an old ordinary row whose kind was later corrected to workstream. mergeCircle now
+    // moves it through the workstream population path rather than hard-deleting it.
     (core as unknown as { db: { prepare: (s: string) => { run: (...a: unknown[]) => void } } }).db
-      .prepare("UPDATE concepts SET kind = 'workstream' WHERE id = ?")
-      .run(conceptId);
+      .prepare("UPDATE concepts SET kind = 'workstream', slug = ? WHERE id = ?")
+      .run("workstream:src", conceptId);
 
     const result = await core.mergeCircle("src", "dst");
-    // mergeCircle takes the explicit workstream branch (delete → noop), NOT the catch path.
-    // The important assertion: the action is one of the honest union values, NEVER the
-    // coerced `"moved"` string that was previously used for errors.
-    const action = result.conceptResults[0]?.action;
-    expect(["noop", "error"]).toContain(action);
-    // The surviving string must literally be "noop" or "error" — never "moved" via coercion.
-    expect(action).not.toBe("moved");
+    expect(result.conceptResults).toContainEqual(expect.objectContaining({
+      action: "moved",
+      conceptId,
+      fromCircle: "src",
+      toCircle: "dst",
+    }));
+    expect(core.circleOf(conceptId)).toBe("dst");
 
     core.close();
   });

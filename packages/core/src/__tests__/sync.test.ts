@@ -1124,7 +1124,8 @@ describe("v8 sync closure", () => {
 
       a.renameCircle("old", "middle");
       a.renameCircle("middle", "final");
-      await a.saveWorkstream({ status: "paused", open: [{ slot: "step" as const, text: "resume" }] }, { circle: "final", summary: "ended" });
+      await a.saveWorkstream({ status: "paused", open: [{ slot: "step" as const, text: "resume" }] }, { circle: "final" });
+      a.endSessionForEval("ended");
       b.graftRows(a.exportDelta(initial.exportedAt));
 
       expect(b.resolveCircleName("old")).toBe("final");
@@ -1801,9 +1802,18 @@ describe("final cold-audit sync fixes", () => {
     let seedClosed = false;
     try {
       const stored = await seed.store("Logical clock concept.");
-      const seedCursor = seed.exportDelta(0).exportedAt;
+      // Graceful close ends the live session, and sessions carry the sync trigger family — that
+      // final mutation belongs in the copies, so capture the cursor from the closed file.
       seed.close();
       seedClosed = true;
+      const seedReader = new MonetCore(seedPath, {
+        tauAttach: 1.1,
+        tauAmbiguous: 1.1,
+        syncDeviceId: "deterministic-clock",
+        graphEnabled: false,
+      });
+      const seedCursor = seedReader.exportDelta(0).exportedAt;
+      seedReader.close();
       for (const path of [logicalFirstPath, logicalSecondPath, wallFirstPath, wallSecondPath]) {
         copyFileSync(seedPath, path);
       }

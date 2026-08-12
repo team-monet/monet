@@ -70,10 +70,15 @@ describe("db-slugify.mjs's slugify mirror — byte-identical to engine.ts's real
     expect(mirrored.length).toBeLessThanOrEqual(60);
   });
 
-  it("both return an empty string for input with no alphanumeric content at all", () => {
-    const input = "!!!@@@###$$$";
+  it("both return an empty string for input with no letters or numbers", () => {
+    const input = "😀✨!!!@@@###$$$";
     expect(mirroredSlugify(input)).toBe(realSlugify(input));
     expect(mirroredSlugify(input)).toBe("");
+  });
+
+  it("never emits the colon reserved by the workstream inbox slug", () => {
+    for (const input of cases) expect(realSlugify(input)).not.toContain(":");
+    expect(realSlugify("a:title::with:colons")).toBe("a-title-with-colons");
   });
 
   it("is NOT the same function as src/eval/md-export.ts's DIFFERENT slugify (48-char slice + 'topic' fallback) — sanity check that these two are not accidentally conflated", async () => {

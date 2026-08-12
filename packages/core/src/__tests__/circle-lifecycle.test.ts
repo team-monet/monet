@@ -8,7 +8,7 @@
  *   - prewarm/overview resolvedFrom
  *   - mergeCircle: moves all concepts + alias + forceNew near-match → dup edge not merge
  *   - mergeCircle: auto resolution merges a matching pair
- *   - mergeCircle: workstream in from-circle is deleted (not moved)
+ *   - mergeCircle: work threads move losslessly; inbox histories item-merge
  *   - archiveCircle/unarchiveCircle: store-wide search excludes archived (includeArchived restores)
  *   - archiveCircle/unarchiveCircle: listCircles flags, explicit access still works, store-to-archived allowed
  */
@@ -199,22 +199,91 @@ describe("mergeCircle", () => {
     core.close();
   });
 
-  it("workstream concept in from-circle is deleted, not moved to into-circle", async () => {
+  it("moves source work threads losslessly and counts them as moved", async () => {
     const core = new MonetCore(":memory:");
     const ws = await core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "continue work" }] }, { circle: "src" });
     await core.store("Real fact in src.", { circle: "src", resolution: "forceNew" });
     await core.store("Real fact in dst.", { circle: "dst", resolution: "forceNew" });
 
     const result = await core.mergeCircle("src", "dst");
-    // Workstream should be deleted (not in dst).
-    expect(core.circleOf(ws!.id)).toBeNull();
-    // Real fact should be moved.
-    expect(result.counts.moved + result.counts.merged).toBe(1);
-    // src circle is empty.
+    expect(core.circleOf(ws!.id)).toBe("dst");
+    expect(result.counts.moved + result.counts.merged).toBe(2);
+    expect(result.conceptResults).toContainEqual(expect.objectContaining({
+      action: "moved",
+      conceptId: ws!.id,
+      fromCircle: "src",
+      toCircle: "dst",
+    }));
     expect(core.conceptCount("src")).toBe(0);
-    // dst still has its own workstream unaffected.
-    expect(core.getActiveWorkstreams("dst").length).toBeGreaterThanOrEqual(0);
+    expect(core.getActiveWorkstreams("dst").map((row) => row.id)).toContain(ws!.id);
 
+    core.close();
+  });
+
+  it("moves colliding named and unnamed threads and item-merges inboxes with pinned counts", async () => {
+    const core = new MonetCore(":memory:");
+    const srcUnnamed = (await core.saveWorkstream({ status: "active" }, { circle: "src" }))!;
+    const dstUnnamed = (await core.saveWorkstream({ status: "active" }, { circle: "dst" }))!;
+    const srcNamed = (await core.saveWorkstream({ title: "Auth", status: "active" }, { circle: "src" }))!;
+    const dstNamed = (await core.saveWorkstream({ title: "Auth", status: "active" }, { circle: "dst" }))!;
+    const srcInbox = await core.captureFind("source find", { circle: "src" });
+    const dstInbox = await core.captureFind("destination find", { circle: "dst" });
+
+    const result = await core.mergeCircle("src", "dst");
+
+    expect(result.counts).toEqual({ moved: 2, merged: 1, noop: 0, error: 0 });
+    expect(result.conceptResults.filter((row) => row.action === "moved").map((row) => row.conceptId).sort())
+      .toEqual([srcUnnamed.id, srcNamed.id].sort());
+    expect(result.conceptResults).toContainEqual(expect.objectContaining({
+      action: "merged",
+      conceptId: srcInbox.row.id,
+      mergedIntoId: dstInbox.row.id,
+    }));
+    expect(core.getActiveWorkstreams("dst").map((row) => row.id).sort())
+      .toEqual([srcUnnamed.id, dstUnnamed.id, srcNamed.id, dstNamed.id].sort());
+    expect(core.getWorkstreamInbox("dst")?.payload.items.map((item) => item.text).sort())
+      .toEqual(["destination find", "source find"]);
+    core.close();
+  });
+
+  it("a self-merge is a no-op and leaves the entity index intact", async () => {
+    const core = freshCore();
+    await core.store("We split AuthService into modules.", { circle: "solo", resolution: "forceNew" });
+    const entitiesBefore = core.overview("solo").counts.entities;
+    expect(entitiesBefore).toBeGreaterThan(0);
+
+    // Unconditional whole-circle relocation made a self-merge destructive (entity df doubling,
+    // then full index deletion for the scope) — refuse it before the helper runs.
+    const result = await core.mergeCircle("solo", "solo");
+    expect(result.counts).toEqual({ moved: 0, merged: 0, noop: 0, error: 0 });
+    expect(result.conceptResults).toEqual([]);
+    expect(core.overview("solo").counts.entities).toBe(entitiesBefore);
+    expect(core.conceptCount("solo")).toBe(1);
+    core.close();
+  });
+
+  it("relocates the normative substrate even when the source holds no workstream", async () => {
+    const core = freshCore();
+    const src = await core.store("Substrate source concept.", { circle: "src", resolution: "forceNew" });
+    const dst = await core.store("Destination concept.", { circle: "dst", resolution: "forceNew" });
+    const db = (core as unknown as { db: import("../storage").StoragePort }).db;
+    db.prepare(
+      `INSERT INTO lifecycle_edges (id, family, src_concept_id, dst_concept_id, born_of, event_ref, circle, created_at, sync_updated_at)
+       VALUES ('merge-substrate-edge','derivation',?,?,'ratification','r-merge','src',1,1)`,
+    ).run(src.conceptId, dst.conceptId);
+    db.prepare(
+      `INSERT INTO ratifications (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at, sync_updated_at)
+       VALUES ('merge-substrate-rat',?,'approve',NULL,'fixture','src',1,1)`,
+    ).run(src.conceptId);
+
+    await core.mergeCircle("src", "dst");
+
+    // A merge moves the whole circle: normative rows must not stay behind naming a dead
+    // circle, and the relocation must not depend on the source having held a workstream.
+    expect(db.prepare(`SELECT circle FROM lifecycle_edges WHERE id='merge-substrate-edge'`).get())
+      .toEqual({ circle: "dst" });
+    expect(db.prepare(`SELECT circle FROM ratifications WHERE id='merge-substrate-rat'`).get())
+      .toEqual({ circle: "dst" });
     core.close();
   });
 
