@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
-import { ensureMonetDir, getDbPath, getGateMirrorPath } from "./db/index.js";
+import { ensureMonetDir, getDbPath, getGateJournalPath, getGateMirrorPath } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { openServedCore } from "./bootstrap.js";
 
@@ -34,10 +34,21 @@ async function main() {
   // getDbPath() would open the served store at cwd while gateSidecarPath already materialized the
   // mirror at projectDir; a declaration made through this session would land in the wrong store's
   // mirror. Same fix, same reasoning, second launch path.
+  // JOURNAL (monet-client#75), extended here too for the SAME reason the mirror above is: this is
+  // the second launch path of the one long-running serving process, and wiring only cli.ts's
+  // `start` action would make gate journaling depend on WHICH launch path a host happens to use —
+  // exactly the divergence the mirror comment above already refuses.
+  //
+  // Deliberately NOT rooted at `projectDir` the way the store and the mirror on the lines below
+  // are (P1, Codex round 1 on PR #76): the journal is ONE stream shared with the hook wrapper and
+  // `monet gate`, neither of which runs in this process, and a per-project journal is a different
+  // file from the one those mouths append to — see cli.ts's `start` action for the full argument
+  // and db/index.ts's getGateJournalPath for the resolution it settles on.
   const core = await openServedCore(getDbPath(projectDir), {
     scopeContext: projectDir,
     defaultCircle: circle,
     gateSidecarPath: getGateMirrorPath(projectDir),
+    gateJournalPath: getGateJournalPath(),
   });
   await createMonetCoreMcpServer(core);
   console.error(`Monet MCP server running on stdio · ${getDbPath(projectDir)}`);

@@ -1,13 +1,11 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import {
   GATE_MIRROR_FORMAT,
   RULE_SCOPES,
   RULE_SEVERITIES,
-  GATE_JOURNAL_FILENAME,
   clipActionContext,
   closeGateJournalEvent,
   deriveCircle as coreDeriveCircle,
@@ -23,7 +21,7 @@ import {
   type RuleScope,
   type RuleSeverity,
 } from "@team-monet/core";
-import { getGateMirrorPath } from "./db/index.js";
+import { getGateJournalPath, getGateMirrorPath } from "./db/index.js";
 import { resolveProjectDir } from "./project-dir.js";
 import { defaultNameFromRemote, getOriginRemote } from "./remote-circle.js";
 
@@ -692,8 +690,14 @@ export function defaultGateCliDependencies(): GateCliDependencies {
     mirrorPath: (explicitMirror) => (explicitMirror ? path.resolve(explicitMirror) : getGateMirrorPath(resolveProjectDir())),
     readStdin: readStdinSync,
     isStdinTTY: () => process.stdin.isTTY === true,
-    journalPath: () =>
-      path.join(process.env.MONET_STORAGE_DIR || path.join(os.homedir(), ".monet"), GATE_JOURNAL_FILENAME),
+    // ONE RESOLVER for every journal writer (P1, Codex round 1 on PR #76). This used to spell the
+    // two rungs out inline (`MONET_STORAGE_DIR || join(os.homedir(), ".monet")`), which held only
+    // for as long as nobody wrote a third spelling of them — and #75 did, on getMonetDir's
+    // project-aware chain, splitting the stream in half for any project carrying its own `.monet`.
+    // db/index.ts's getGateJournalPath is now the single answer this mouth and the served core's
+    // MCP mouths both read; see its comment for why it resolves these two rungs rather than
+    // getMonetDir's three, and for the follow-up that would move all three writers together.
+    journalPath: () => getGateJournalPath(),
     setExitCode(code) {
       process.exitCode = code;
     },
