@@ -7,12 +7,24 @@
 // (no network, no real model load — "constructor/dispatch logic and injected fakes", per the
 // brief). MonetCore.ensureEmbedderPin's own ONNX-satisfying path is additionally covered at the
 // engine level via an injected fake loader (see embedder-pin.test.ts, Shape 2).
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+  chmodSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   createLocalEmbedderWithProvenance,
   createModelLoadReporter,
+  loadThroughStagingCache,
   instantiateEmbedderForPin,
   resolveModelCacheDir,
   isLocalModelPath,
@@ -33,6 +45,15 @@ import { HashingEmbeddingProvider } from "../embedding";
 // space-id block at the bottom asserts on: a space id names the SPACE and must resolve to the
 // checkpoint, the weights and the pooling its profile declares, none of which is visible anywhere
 // else — nothing but the arguments reaching transformers.js can distinguish it from a hub id.
+// TEST ISOLATION FROM THE USER'S REAL CACHE (Codex review, PR #210). Since the mock makes every
+// `local_files_only` probe throw, every provider test now takes the staged path — and with no
+// override that path is the developer's own ~/.monet/models, where it would create staging
+// directories and run the production stale-scratch sweep, able to delete a `.staging-*` tree
+// belonging to a concurrent real download. Pinned to a temp directory for the whole file, at module
+// scope so it is set before any test body or hoisted mock runs. Tests that need a different value
+// set and restore it themselves.
+process.env.MONET_MODEL_CACHE = mkdtempSync(join(tmpdir(), "monet-test-cache-"));
+
 const transformers = vi.hoisted(() => ({
   cacheDirPassedToPipeline: undefined as string | undefined,
   modelPassedToPipeline: undefined as string | undefined,
@@ -48,8 +69,12 @@ vi.mock("@huggingface/transformers", () => ({
   pipeline: vi.fn(async (
     _task: string,
     model: string,
-    opts?: { cache_dir?: string; dtype?: string; progress_callback?: unknown },
+    opts?: { cache_dir?: string; dtype?: string; local_files_only?: boolean; progress_callback?: unknown },
   ) => {
+    // #185's warm probe runs with `local_files_only`, which in transformers.js CANNOT fetch and
+    // throws when the file is not already on disk. This mock caches nothing, so that is always the
+    // case here — modelling it is what lets a test see the staged path at all.
+    if (opts?.local_files_only) throw new Error("local_files_only=true, but the model is not cached");
     transformers.cacheDirPassedToPipeline = opts?.cache_dir;
     transformers.modelPassedToPipeline = model;
     transformers.dtypePassedToPipeline = opts?.dtype;
@@ -344,18 +369,39 @@ describe("model cache location (#90)", () => {
   // THE load-bearing property: the resolved directory reaches the actual load. Delete the
   // `cache_dir` argument in load() and only these two fail — the helper still returns the right
   // string while every download goes back into node_modules, which is #90 reopened.
-  it("passes the resolved cache dir to pipeline() on the real load path", async () => {
-    delete process.env.MONET_MODEL_CACHE;
+  //
+  // The assertion is "at or under the resolved root" rather than equality because #185 added
+  // staging: a COLD load is pointed at `<root>/.staging-*` so that dying mid-download cannot leave
+  // a partial file where `match()` would accept it. That is still #90's invariant — the bytes land
+  // under the resolved cache dir and never in node_modules — and the cut property is unchanged,
+  // since dropping the argument passes `undefined` and fails this outright.
+  it("passes the resolved cache dir (or a staging dir under it) to pipeline() on the real load path", async () => {
+    // A temp override rather than the default: this asserts that whatever `resolveModelCacheDir()`
+    // resolves to REACHES the load, which is #90's invariant. That the default is ~/.monet/models
+    // is already pinned by the pure-helper tests above, and performing a real load against the
+    // developer's own cache is what Codex flagged on PR #210.
+    const root = mkdtempSync(join(tmpdir(), "monet-reach-"));
+    process.env.MONET_MODEL_CACHE = root;
     transformers.cacheDirPassedToPipeline = undefined;
     await instantiateEmbedderForPin("Xenova/mock-ok-model");
-    expect(transformers.cacheDirPassedToPipeline).toBe(resolve(homedir(), ".monet", "models"));
+    const passed = transformers.cacheDirPassedToPipeline ?? "";
+    expect(passed).not.toBe(""); // dropping the argument passes undefined and stops here
+    expect(passed === root || passed.startsWith(join(root, ".staging-"))).toBe(true);
+    expect(passed).not.toContain("node_modules");
   });
 
   it("honors MONET_MODEL_CACHE on the real load path, not just in the helper", async () => {
-    process.env.MONET_MODEL_CACHE = "/srv/shared/models";
+    // A temp override, not a fixed absolute path (Codex review, PR #210). `/srv/shared/models` is
+    // uncreatable for an ordinary user, which made the load take the direct fallback and record the
+    // root exactly — but as root, or anywhere /srv is writable, it is created, the staged path runs,
+    // and the assertion sees a `.staging-*` child while also littering /srv.
+    const override = mkdtempSync(join(tmpdir(), "monet-override-"));
+    process.env.MONET_MODEL_CACHE = override;
     transformers.cacheDirPassedToPipeline = undefined;
     await instantiateEmbedderForPin("Xenova/mock-ok-model");
-    expect(transformers.cacheDirPassedToPipeline).toBe("/srv/shared/models");
+    const passed = transformers.cacheDirPassedToPipeline ?? "";
+    expect(passed).not.toBe("");
+    expect(passed === override || passed.startsWith(join(override, ".staging-"))).toBe(true);
   });
 
   // "Never touches the shared global" is asserted by this file's MOCK, not by a case here: it
@@ -671,5 +717,322 @@ describe("first-run model load reports progress (#185)", () => {
     const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
     await new OnnxEmbeddingProvider({ model: "Xenova/mock-ok-model" }).embed("x");
     expect(typeof transformers.progressCallbackPassedToPipeline).toBe("function");
+  });
+});
+
+/**
+ * #185, the actual defect: `FileCache.put()` streams into the file's FINAL path and `match()`
+ * accepts by existence alone, so a process killed mid-download leaves a truncated file that every
+ * later start treats as a complete cache entry. These tests use a REAL temp directory and REAL
+ * renames — no fs mocking — with `run` standing in for transformers.js writing into whatever
+ * `cache_dir` it was handed.
+ */
+describe("staged model load — a death mid-download cannot poison the cache (#185)", () => {
+  const CHECKPOINT = "Xenova/mock-model";
+  let root: string;
+  const lines: string[] = [];
+  const write = (l: string) => lines.push(l);
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "monet-stage-"));
+    lines.length = 0;
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const modelDir = () => join(root, CHECKPOINT);
+  const weights = (dir: string) => join(dir, CHECKPOINT, "onnx", "model.onnx");
+  /** Stands in for transformers.js fetching the model into the cache_dir it was handed. */
+  function writeModelInto(cacheDir: string, marker: string): void {
+    mkdirSync(join(cacheDir, CHECKPOINT, "onnx"), { recursive: true });
+    writeFileSync(join(cacheDir, CHECKPOINT, "config.json"), marker);
+    writeFileSync(weights(cacheDir), marker.repeat(64));
+  }
+  /**
+   * A `run` with transformers.js's real shape: with `local_files_only` it CANNOT fetch, so it
+   * either finds a complete model already present or throws — it never writes.
+   */
+  function realisticRun(onFetch: (cacheDir: string) => void) {
+    const calls: Array<{ cacheDir: string; localOnly: boolean }> = [];
+    const run = async (cacheDir: string, localOnly: boolean) => {
+      calls.push({ cacheDir, localOnly });
+      if (localOnly) {
+        if (!existsSync(weights(cacheDir))) throw new Error("local_files_only=true, but the file is not cached");
+        return "extractor";
+      }
+      onFetch(cacheDir);
+      return "extractor";
+    };
+    return { run, calls };
+  }
+
+  it("a cold load writes NOTHING to the model's cache path until the load has completed", async () => {
+    let modelPathDuringFetch: boolean | undefined;
+    const { run, calls } = realisticRun((cacheDir) => {
+      writeModelInto(cacheDir, "fresh");
+      // The invariant, observed at the one instant that matters: mid-fetch, the path `match()`
+      // consults does not exist, so there is nothing for it to accept as complete.
+      modelPathDuringFetch = existsSync(modelDir());
+    });
+    const result = await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+
+    expect(result).toBe("extractor");
+    expect(modelPathDuringFetch).toBe(false);
+    expect(calls[0]).toEqual({ cacheDir: root, localOnly: true }); // probe first, and it cannot fetch
+    expect(calls[1].localOnly).toBe(false);
+    expect(calls[1].cacheDir.startsWith(join(root, ".staging-"))).toBe(true);
+    expect(readFileSync(join(modelDir(), "config.json"), "utf8")).toBe("fresh");
+    expect(readdirSync(root).filter((e) => e.startsWith(".staging-"))).toEqual([]);
+  });
+
+  /**
+   * A genuine KILL, modelled honestly: the process dies, so none of this module's own code runs.
+   * What the NEXT start finds is a leftover staging directory holding a truncated file — and the
+   * whole point is that such a file is not a cache hit for anyone, because it is not under
+   * `<cacheRoot>/<checkpoint>`. Pre-fix it WAS the cache entry.
+   */
+  it("a truncated file left by a killed process is never at the cache path, and never becomes one", async () => {
+    const orphan = join(root, ".staging-killed");
+    mkdirSync(join(orphan, CHECKPOINT, "onnx"), { recursive: true });
+    writeFileSync(weights(orphan), "TRUNCATED");
+
+    const { run } = realisticRun((cacheDir) => writeModelInto(cacheDir, "fresh"));
+    await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+
+    // The next load fetched cleanly into its OWN staging dir and promoted that.
+    expect(readFileSync(weights(root), "utf8")).toBe("fresh".repeat(64));
+    expect(readFileSync(weights(root), "utf8")).not.toContain("TRUNCATED");
+  });
+
+  /**
+   * Codex review, PR #210 — and this test asserts the REVERSAL of an earlier round of it.
+   *
+   * Round 2 asked for completed files to be promoted on failure; round 4 showed why they cannot be.
+   * transformers.js fetches concurrently (`Promise.all` in pipelines.js:3572), so a rejection means
+   * only that ONE fetch failed — a sibling may still be streaming into staging. Promoting then
+   * moves a partial file to its final path, and the sibling's own cleanup afterwards unlinks a
+   * staging path it no longer occupies, leaving the truncated file cached forever.
+   */
+  it("discards staging on failure rather than promoting files a concurrent fetch may still be writing", async () => {
+    await expect(loadThroughStagingCache({
+      checkpoint: CHECKPOINT,
+      cacheRoot: root,
+      write,
+      run: async (cacheDir, localOnly) => {
+        if (localOnly) throw new Error("nothing cached");
+        // One file looks finished; a sibling fetch is still mid-write when the aggregate rejects.
+        mkdirSync(join(cacheDir, CHECKPOINT, "onnx"), { recursive: true });
+        writeFileSync(join(cacheDir, CHECKPOINT, "config.json"), "looks complete");
+        writeFileSync(weights(cacheDir), "STILL BEING WRITTEN");
+        throw new Error("connection reset");
+      },
+    })).rejects.toThrow("connection reset");
+
+    // Nothing reached a final path, so nothing can be mistaken for a complete cache entry.
+    expect(existsSync(modelDir())).toBe(false);
+    expect(readdirSync(root).filter((e) => e.startsWith(".staging-"))).toEqual([]);
+  });
+
+  /**
+   * Codex review, PR #210. A fully cached model can fail to initialise for a reason that has
+   * nothing to do with its files — OOM, an unsupported ONNX operator. Labelling that "incomplete"
+   * and failing with a download error hides the actionable local cause.
+   */
+  it("does not let the staged failure erase the probe's diagnosis", async () => {
+    writeModelInto(root, "warm");
+    await expect(loadThroughStagingCache({
+      checkpoint: CHECKPOINT,
+      cacheRoot: root,
+      write,
+      run: async (_cacheDir, localOnly) => {
+        if (localOnly) throw new Error("unsupported ONNX operator");
+        throw new Error("network unreachable");
+      },
+    })).rejects.toThrow("network unreachable");
+
+    expect(lines.join("\n")).toMatch(/cached model also failed to load: unsupported ONNX operator/);
+  });
+
+  /**
+   * Codex review, PR #210. If the cache root exists but will not take a new child — a shared cache
+   * whose root ACL forbids it — transformers.js can still write beneath an existing checkpoint. A
+   * fallback to a direct load there is the one case where the fallback is actively harmful.
+   */
+  // Skipped where the mode cannot be enforced (Codex review, PR #210): root ignores 0500, which is
+  // the common case in CI containers, and Windows directory ACLs do not follow this model at all.
+  // The assertion would then see a successful mkdtemp and fail for the wrong reason.
+  const cannotEnforceMode = process.platform === "win32" || process.getuid?.() === 0;
+  it.skipIf(cannotEnforceMode)("refuses rather than downloading directly when staging cannot be created under a usable root", async () => {
+    const readOnlyRoot = mkdtempSync(join(tmpdir(), "monet-ro-"));
+    chmodSync(readOnlyRoot, 0o500); // readable and traversable, but no new entries
+    try {
+      await expect(loadThroughStagingCache({
+        checkpoint: CHECKPOINT,
+        cacheRoot: readOnlyRoot,
+        write,
+        run: async (_c, localOnly) => {
+          // The probe's failure is the ACTIONABLE one here: the cache is populated, and the model
+          // did not load for a reason that has nothing to do with staging (Codex review, PR #210).
+          if (localOnly) throw new Error("unsupported ONNX operator");
+          throw new Error("MUST NOT REACH A DIRECT DOWNLOAD");
+        },
+      })).rejects.toThrow(/Cannot stage the model download[\s\S]*unsupported ONNX operator/);
+    } finally {
+      chmodSync(readOnlyRoot, 0o700);
+      rmSync(readOnlyRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("a warm cache is served by the probe alone — one call, no staging, no second fetch", async () => {
+    writeModelInto(root, "warm");
+    const { run, calls } = realisticRun(() => { throw new Error("must not fetch on a warm cache"); });
+    await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+
+    expect(calls).toEqual([{ cacheDir: root, localOnly: true }]);
+    expect(readFileSync(join(modelDir(), "config.json"), "utf8")).toBe("warm");
+    expect(readdirSync(root).filter((e) => e.startsWith("."))).toEqual([]);
+  });
+
+  /**
+   * Codex review, PR #210. `existsSync(<cacheRoot>/<checkpoint>)` was the original warm test, and
+   * this is the case that breaks it: `loadTokenizer()` fetches into the SAME directory, so calling
+   * countTokens() first makes it exist WITHOUT the weights. A probe that cannot fetch has no gap.
+   */
+  it("a checkpoint dir holding only tokenizer files is NOT treated as warm", async () => {
+    mkdirSync(modelDir(), { recursive: true });
+    writeFileSync(join(modelDir(), "tokenizer.json"), "vocab"); // what loadTokenizer() leaves behind
+    const { run, calls } = realisticRun((cacheDir) => writeModelInto(cacheDir, "fresh"));
+    await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+
+    expect(calls[1].localOnly).toBe(false);
+    expect(calls[1].cacheDir.startsWith(join(root, ".staging-"))).toBe(true); // weights fetched in staging
+    expect(readFileSync(weights(root), "utf8")).toBe("fresh".repeat(64));
+    expect(readFileSync(join(modelDir(), "tokenizer.json"), "utf8")).toBe("vocab"); // untouched
+  });
+
+  it("an ALREADY poisoned cache heals: the probe fails on it, the staged fetch replaces it", async () => {
+    mkdirSync(join(modelDir(), "onnx"), { recursive: true });
+    writeFileSync(weights(root), "TRUNCATED");
+    // The probe finds the file present, so this run() must fail on it the way a real load would.
+    const run = async (cacheDir: string, localOnly: boolean) => {
+      if (localOnly) throw new Error("model failed to load");
+      writeModelInto(cacheDir, "healed");
+      return "extractor";
+    };
+    await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+
+    expect(readFileSync(weights(root), "utf8")).toBe("healed".repeat(64));
+    expect(lines.join("\n")).toMatch(/is incomplete; re-fetching/);
+    expect(readdirSync(root).filter((e) => e.startsWith("."))).toEqual([]);
+  });
+
+  /**
+   * Codex review, PR #210. One checkpoint directory holds several spaces' artifacts — the real
+   * cache has model.onnx, model.onnx_data and model_quantized.onnx side by side, because the bare
+   * fp32 profile and the :cls:q8 profile resolve to the same checkpoint. Promoting the DIRECTORY
+   * would delete the variant this load did not fetch.
+   */
+  it("promotes only the files it fetched, leaving another dtype's weights in place", async () => {
+    mkdirSync(join(modelDir(), "onnx"), { recursive: true });
+    writeFileSync(join(modelDir(), "onnx", "model_quantized.onnx"), "q8-weights"); // another space
+    const run = async (cacheDir: string, localOnly: boolean) => {
+      if (localOnly) throw new Error("fp32 weights not cached");
+      mkdirSync(join(cacheDir, CHECKPOINT, "onnx"), { recursive: true });
+      writeFileSync(weights(cacheDir), "fp32-weights");
+      return "extractor";
+    };
+    await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+
+    expect(readFileSync(weights(root), "utf8")).toBe("fp32-weights");
+    expect(readFileSync(join(modelDir(), "onnx", "model_quantized.onnx"), "utf8")).toBe("q8-weights");
+  });
+
+  it("a promote that cannot complete keeps serving and says so, rather than failing the load", async () => {
+    // A real, unmockable failure: the checkpoint's PARENT is a regular file, so neither the mkdir
+    // nor the rename into it can succeed. Stands in for Windows refusing a rename.
+    writeFileSync(join(root, "Xenova"), "not a directory");
+    const result = await loadThroughStagingCache({
+      checkpoint: CHECKPOINT,
+      cacheRoot: root,
+      write,
+      run: async (cacheDir, localOnly) => {
+        if (localOnly) throw new Error("nothing cached");
+        writeModelInto(cacheDir, "fresh");
+        return "extractor";
+      },
+    });
+    expect(result).toBe("extractor"); // promotion is only the NEXT start's optimisation
+    expect(lines.join("\n")).toMatch(/could not move/);
+    expect(readdirSync(root).filter((e) => e.startsWith(".staging-"))).toEqual([]);
+  });
+
+  it("staging directories are uniquely named, so a restarted container cannot inherit one", async () => {
+    const seen = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      const { run } = realisticRun((cacheDir) => { seen.add(cacheDir); writeModelInto(cacheDir, "fresh"); });
+      rmSync(modelDir(), { recursive: true, force: true }); // force a cold load each time
+      await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+    }
+    expect(seen.size).toBe(3);
+  });
+
+  /**
+   * Codex review, PR #210. transformers.js writes into NESTED directories, which never touches the
+   * staging root's own mtime — so judging liveness by that mtime would delete a slow or suspended
+   * download out from under a live process.
+   */
+  it("judges scratch age by its newest file, not by the staging root's own mtime", async () => {
+    const slow = join(root, ".staging-slow");
+    mkdirSync(join(slow, "Xenova", "mock-model"), { recursive: true });
+    writeFileSync(join(slow, "Xenova", "mock-model", "model.onnx"), "in flight");
+    const dead = join(root, ".staging-dead");
+    mkdirSync(join(dead, "Xenova"), { recursive: true });
+    writeFileSync(join(dead, "Xenova", "leftover"), "orphan");
+
+    const old = new Date(Date.now() - 26 * 60 * 60 * 1000);
+    // BOTH roots look ancient. Only the live one has recent activity inside it.
+    utimesSync(slow, old, old);
+    utimesSync(dead, old, old);
+    utimesSync(join(dead, "Xenova"), old, old);
+    utimesSync(join(dead, "Xenova", "leftover"), old, old);
+
+    const { run } = realisticRun((cacheDir) => writeModelInto(cacheDir, "fresh"));
+    await loadThroughStagingCache({ checkpoint: CHECKPOINT, cacheRoot: root, run, write });
+
+    expect(existsSync(slow)).toBe(true);  // a live download survives its own old root mtime
+    expect(existsSync(dead)).toBe(false); // nothing recent anywhere inside — swept
+  });
+});
+
+/**
+ * The WIRING, which the unit tests above cannot see: they call loadThroughStagingCache directly, so
+ * they stay green even if the provider stops routing through it. These two pin the routing itself.
+ */
+describe("OnnxEmbeddingProvider routes its load through staging (#185 wiring)", () => {
+  const priorCache = process.env.MONET_MODEL_CACHE;
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "monet-wire-"));
+    process.env.MONET_MODEL_CACHE = root;
+  });
+  afterEach(() => {
+    if (priorCache === undefined) delete process.env.MONET_MODEL_CACHE;
+    else process.env.MONET_MODEL_CACHE = priorCache;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("a cold hub-id load is pointed at a staging directory, not at the cache root", async () => {
+    transformers.cacheDirPassedToPipeline = undefined;
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    await new OnnxEmbeddingProvider({ model: "Xenova/mock-ok-model" }).embed("x");
+    expect(transformers.cacheDirPassedToPipeline ?? "").toMatch(/[/\\]\.staging-/);
+  });
+
+  it("a LOCAL model path bypasses staging entirely — nothing is cached for it to promote", async () => {
+    transformers.cacheDirPassedToPipeline = undefined;
+    const { OnnxEmbeddingProvider } = await import("../embedding-onnx");
+    await new OnnxEmbeddingProvider({ model: "./models/mock-local-ok" }).embed("x");
+    expect(transformers.cacheDirPassedToPipeline).toBe(root);
   });
 });

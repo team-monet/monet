@@ -1,5 +1,6 @@
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { EmbeddingProvider, EmbeddingThresholds } from "./embedding";
 import { HashingEmbeddingProvider, validateEmbeddingProviderOutput } from "./embedding";
@@ -87,10 +88,16 @@ interface TransformersModule {
     opts: {
       cache_dir: string;
       dtype?: string;
+      local_files_only?: boolean;
       progress_callback?: (event: ModelLoadProgressEvent) => void;
     },
   ) => Promise<unknown>;
-  AutoTokenizer: { from_pretrained: (model: string, opts: { cache_dir: string }) => Promise<Tokenizer> };
+  AutoTokenizer: {
+    from_pretrained: (
+      model: string,
+      opts: { cache_dir: string; local_files_only?: boolean },
+    ) => Promise<Tokenizer>;
+  };
 }
 
 /**
@@ -637,6 +644,277 @@ export function createModelLoadReporter(
   };
 }
 
+/** Prefix for a download in flight; never a cache hit, because it is not under the checkpoint's own path. */
+const STAGING_PREFIX = ".staging-";
+/** Scratch whose newest file is older than this belonged to a process that died. */
+const STALE_SCRATCH_MS = 24 * 60 * 60 * 1000;
+
+export interface StagedLoadOptions<T> {
+  /** Hub id, e.g. "Xenova/bge-m3". Also the cache-relative path transformers.js fetches into. */
+  checkpoint: string;
+  /** The cache root that `<checkpoint>` sits under, and that staging happens inside. */
+  cacheRoot: string;
+  /**
+   * Performs the real load. `localOnly` is passed straight to transformers.js as
+   * `local_files_only`, which makes a load PHYSICALLY unable to fetch — see the warm probe below.
+   */
+  run: (cacheDir: string, localOnly: boolean) => Promise<T>;
+  /** Deterministic test seams. */
+  now?: () => number;
+  staleMs?: number;
+  write?: (line: string) => void;
+}
+
+/**
+ * Load a model so that dying mid-download cannot poison the cache (#185).
+ *
+ * THE DEFECT. transformers.js's `FileCache.put()` streams straight into the file's FINAL path, with
+ * no temp file and no rename, and its `match()` accepts a file by EXISTENCE alone. So at every
+ * instant of a download, a partial file sits exactly where a later start will accept it as complete.
+ * `put()`'s own catch unlinks on a rejection, so a network error is fine; what is fatal is the
+ * process dying — no catch runs, and the truncated file is a cache hit forever after.
+ *
+ * WHY THAT IS NOT A RARE ACCIDENT. `monet start` is what an MCP host spawns (monet-client's
+ * config-cli.ts writes `{ command: "monet", args: ["start"] }`), and the first-run download takes
+ * minutes during which the server cannot answer `initialize` — it has not reached `server.connect()`
+ * yet. Whether a host kills a server that silent is host-specific and NOT in the MCP spec, so it has
+ * to be assumed: a first install can brick itself with no user action at all.
+ *
+ * THE INVARIANT THIS ESTABLISHES, and it is per FILE rather than per directory: no file exists at
+ * its final path unless it is complete. Everything below follows from that one sentence.
+ *
+ * THE WARM PROBE CANNOT FETCH (Codex review, PR #210). The first attempt runs with
+ * `local_files_only: true`, so transformers.js throws rather than reaching the network — it cannot
+ * write anything anywhere. An earlier version instead tested `existsSync(<cacheRoot>/<checkpoint>)`,
+ * which is not the same question: `loadTokenizer()` caches tokenizer/config under that very
+ * directory without the ONNX weights, so calling `countTokens()` first made the directory exist,
+ * the next `embed()` read it as warm, and the missing weights streamed to their final path — the
+ * defect, rebuilt. A probe that cannot fetch has no such gap: it either finds everything already
+ * there, or it fails and the staged path runs.
+ *
+ * STAGING LIVES INSIDE THE CACHE ROOT deliberately, not in the OS temp dir: rename is atomic only
+ * within one filesystem, and `os.tmpdir()` guarantees nothing (on Linux it is frequently tmpfs).
+ * A copy fallback would be non-atomic, would double the I/O for a ~500 MB model, and a copy
+ * interrupted at the destination would recreate this very bug. `mkdtemp` names it, so a restarted
+ * container reusing pid 1 cannot inherit another run's scratch.
+ *
+ * A POISONED CACHE HEALS HERE FOR FREE. The probe fails on an unusable cached file exactly as it
+ * fails on a missing one, so the staged path runs and its per-file renames replace what was there.
+ */
+export async function loadThroughStagingCache<T>(opts: StagedLoadOptions<T>): Promise<T> {
+  const { checkpoint, cacheRoot, run } = opts;
+  const now = opts.now ?? (() => Date.now());
+  const staleMs = opts.staleMs ?? STALE_SCRATCH_MS;
+  const write = opts.write ?? ((line: string) => console.error(line));
+
+  sweepStaleScratch(cacheRoot, now(), staleMs);
+
+  const modelDir = join(cacheRoot, checkpoint);
+  const hadCachedFiles = existsSync(modelDir);
+  let probeError: unknown;
+  try {
+    return await run(cacheRoot, true); // cannot reach the network, so cannot write a partial file
+  } catch (error) {
+    probeError = error;
+    // Not diagnosed, deliberately. `match()` is existence-only, so a failure here is evidence of A
+    // failure — missing files, or a truncated one — never of truncation specifically. Nothing is
+    // deleted on that guess: the staged attempt below either replaces the files it fetched, or
+    // fails and leaves everything exactly where it was.
+    if (hadCachedFiles) write(`[monet-core] cached model at ${modelDir} is incomplete; re-fetching.`);
+  }
+
+  let stagingDir: string;
+  try {
+    mkdirSync(cacheRoot, { recursive: true });
+  } catch {
+    // The cache root itself cannot exist. The real load cannot write anything either, so it will
+    // fail on its own terms — with the loader's diagnosis naming the model and the path, rather
+    // than an fs error here about a directory the operator never asked for.
+    return await run(cacheRoot, false);
+  }
+  try {
+    stagingDir = mkdtempSync(join(cacheRoot, STAGING_PREFIX));
+  } catch (error) {
+    // THE ROOT EXISTS BUT WILL NOT TAKE A NEW CHILD — a shared cache whose root ACL forbids
+    // creating entries while an existing checkpoint subtree stays writable (Codex review, PR #210).
+    // Falling through to a direct load here would be the one case where the fallback actually
+    // matters: transformers.js COULD still write, straight into the final paths, and a kill
+    // mid-fetch would recreate exactly the state this function exists to prevent. Refuse instead,
+    // and name the cause — a load that cannot be made safe is not quietly made unsafe.
+    // The probe's own diagnosis rides along (Codex review, PR #210). This is a second exit that
+    // discards it: a populated but read-only shared cache reaches here, and if the probe failed for
+    // a runtime reason — OOM, an unsupported operator — that is the ACTIONABLE cause, while the
+    // staging failure is only why we could not work around it.
+    const probeNote = probeError === undefined
+      ? ""
+      : ` The cached model also failed to load: ` +
+        `${probeError instanceof Error ? probeError.message : String(probeError)}.`;
+    throw new Error(
+      `Cannot stage the model download: ${cacheRoot} exists but a staging directory could not be ` +
+        `created in it (${error instanceof Error ? error.message : String(error)}). Downloading ` +
+        `directly would leave a partial file that every later start accepts as a complete cache ` +
+        `entry (#185). Make the cache root writable, or point MONET_MODEL_CACHE somewhere that is.` +
+        probeNote,
+      { cause: probeError ?? error },
+    );
+  }
+
+  let loaded: T;
+  try {
+    loaded = await run(stagingDir, false);
+  } catch (error) {
+    // DISCARD THE STAGING DIRECTORY, and this supersedes an earlier round of this same review.
+    //
+    // Round 2 asked for the completed files to be promoted here, because throwing them away is a
+    // regression against the pre-staging behaviour. That was implemented and is now reverted, for a
+    // reason round 3 surfaced: transformers.js fetches the checkpoint's files CONCURRENTLY —
+    // `loadItems` builds an array of promises and awaits `Promise.all` (pipelines.js:3523-3572,
+    // their own comment says "in parallel"). `Promise.all` rejects on the FIRST rejection while the
+    // other writes are still streaming, so "everything left in staging is whole" is false at this
+    // instant: a sibling fetch may be mid-file. Promoting then renames a partial file to its final
+    // path, and that fetch's own cleanup afterwards unlinks the staging path it no longer occupies,
+    // so the truncated file stays in the cache forever — #185, reintroduced by its own fix.
+    //
+    // The bandwidth this gives up is small and was measured, not assumed (#211): the shipped
+    // default `Xenova/bge-m3:cls:q8` is ~587MB of which `model_quantized.onnx` is 570MB, so ~97% of
+    // a retry sits in ONE file that transformers.js re-fetches from zero regardless (it issues no
+    // range requests). Keeping the other ~3% is not worth a path that can poison the cache.
+    removeQuietly(stagingDir);
+    if (probeError !== undefined) {
+      // The staged attempt does not get to erase the probe's diagnosis. A fully cached model that
+      // fails to initialise for an unrelated reason — OOM, an unsupported ONNX operator — would
+      // otherwise surface as a download failure, which is neither the cause nor actionable.
+      try {
+        if ((error as { cause?: unknown }).cause === undefined) (error as { cause?: unknown }).cause = probeError;
+      } catch { /* frozen error object; the line below still carries it */ }
+      write(
+        `[monet-core] the cached model also failed to load: ` +
+          `${probeError instanceof Error ? probeError.message : String(probeError)}`,
+      );
+    }
+    throw error; // the real reason (offline, unknown model, …) — the store must not serve
+  }
+  promoteStagedFiles({ stagingDir, cacheRoot, write });
+  return loaded;
+}
+
+/**
+ * Move each fetched file to its final path with its own rename, then drop the staging directory.
+ *
+ * PER FILE, NOT PER DIRECTORY (Codex review, PR #210). One checkpoint directory holds the artifacts
+ * of SEVERAL spaces — `~/.monet/models/Xenova/bge-m3/onnx/` really does hold `model.onnx`,
+ * `model.onnx_data` and `model_quantized.onnx` side by side, because the bare fp32 profile and the
+ * `:cls:q8` profile resolve to the same checkpoint. Replacing the directory wholesale would delete
+ * the variants this load did not fetch, and a store pinned to one of them would have to re-download
+ * and could not serve offline. Renaming file by file writes only what was actually fetched.
+ *
+ * It is also strictly safer: each rename is atomic, so the per-file invariant holds at every instant
+ * and a death part-way through leaves a mix of complete files rather than a half-moved tree. There
+ * is no directory to displace, so the interrupted-quarantine window a directory swap needs does not
+ * exist. And on Windows it is renaming a DIRECTORY whose files are open that fails, not a file.
+ *
+ * NEVER FAILS THE LOAD. The model is already loaded and serving by the time this runs; promotion is
+ * an optimisation for the NEXT start. Whatever could not be moved is simply re-fetched next time.
+ *
+ * KNOWN LIMITATION — REVISIONS CAN MIX ACROSS DTYPE VARIANTS (Codex review, PR #210). Staging starts
+ * empty, so a staged fetch re-downloads the checkpoint's SHARED files (config.json, tokenizer) even
+ * when a copy is already cached, and promotion overwrites them. If upstream changed those files
+ * between two variants' fetches, the variant that is not being loaded keeps its old weights beside
+ * the new shared files. Today that cannot happen, because `match()` is existence-only and never
+ * re-fetches a file it can see — which is the same property that makes a truncated file permanent.
+ *
+ * It is not fixable by promoting only absent files: overwriting is precisely how a poisoned file is
+ * healed, and healing is what this whole path exists for. Nor by the directory swap this replaced,
+ * which "solved" it by deleting the other variant outright. A real fix needs revision awareness the
+ * cache does not carry. The exposure is narrow — Monet ships one default profile, so two variants
+ * coexist only when an operator has explicitly pinned another — and the failure is bounded: the
+ * stale variant either still loads, or fails its probe and is re-fetched whole on next use.
+ */
+function promoteStagedFiles(args: { stagingDir: string; cacheRoot: string; write: (line: string) => void }): void {
+  const { stagingDir, cacheRoot, write } = args;
+  let moved = 0;
+  let failure: unknown;
+  for (const relative of listFilesRecursively(stagingDir)) {
+    const destination = join(cacheRoot, relative);
+    try {
+      mkdirSync(dirname(destination), { recursive: true });
+      renameSync(join(stagingDir, relative), destination);
+      moved++;
+    } catch (error) {
+      failure ??= error;
+    }
+  }
+  if (failure !== undefined) {
+    write(
+      `[monet-core] could not move ${moved === 0 ? "the" : "every"} fetched model file into ${cacheRoot} ` +
+        `(${failure instanceof Error ? failure.message : String(failure)}); serving this process and ` +
+        `re-fetching on the next start.`,
+    );
+  }
+  removeQuietly(stagingDir);
+}
+
+/** Every file under `root`, as paths relative to it. Depth-first; symlinks are not followed. */
+function listFilesRecursively(root: string, prefix = ""): string[] {
+  const out: string[] = [];
+  // Structural rather than `Dirent[]`: node's typings make Dirent generic over the name encoding,
+  // and only these three members are used here.
+  let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+  try {
+    entries = readdirSync(join(root, prefix), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    const relative = prefix === "" ? entry.name : join(prefix, entry.name);
+    if (entry.isDirectory()) out.push(...listFilesRecursively(root, relative));
+    else if (entry.isFile()) out.push(relative);
+  }
+  return out;
+}
+
+/**
+ * Delete staging directories left by processes that died. Age is the liveness test rather than the
+ * pid: a pid check is not portable and pids are reused.
+ *
+ * AGE IS READ FROM THE NEWEST FILE INSIDE, not from the directory itself (Codex review, PR #210).
+ * transformers.js writes into nested descendants, which does not touch the staging root's own
+ * mtime — so a root's mtime is its creation time, and a genuinely slow or suspended download would
+ * look stale and be deleted out from under a live process.
+ */
+function sweepStaleScratch(cacheRoot: string, nowMs: number, staleMs: number): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(cacheRoot);
+  } catch {
+    return; // no cache root yet, or unreadable — a sweep must never block a load
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(STAGING_PREFIX)) continue;
+    const path = join(cacheRoot, entry);
+    try {
+      if (nowMs - newestMtimeMs(path) > staleMs) rmSync(path, { recursive: true, force: true });
+    } catch { /* another process may have just removed it; nothing to do */ }
+  }
+}
+
+/** The most recent mtime anywhere in the tree, including the root itself. */
+function newestMtimeMs(root: string): number {
+  let newest = statSync(root).mtimeMs;
+  for (const relative of listFilesRecursively(root)) {
+    try {
+      newest = Math.max(newest, statSync(join(root, relative)).mtimeMs);
+    } catch { /* vanished mid-scan; the remaining entries still bound it */ }
+  }
+  return newest;
+}
+
+function removeQuietly(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true });
+  } catch { /* scratch only — the sweep will get it */ }
+}
+
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly dim: number;
   /** From MODEL_PROFILES for a known checkpoint; the labelled legacy guess otherwise. */
@@ -747,11 +1025,25 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
         // the single "first run downloads once" line — so a normal wait looked exactly like a hang,
         // and Ctrl-C is what a reasonable person does to a hang. See createModelLoadReporter
         // for why the gate is time-based and why a warm cache still prints nothing.
-        return (await mod.pipeline("feature-extraction", this.checkpoint, {
-          cache_dir: resolveModelCacheDir(),
-          ...(this.dtype ? { dtype: this.dtype } : {}),
-          progress_callback: createModelLoadReporter(),
-        })) as FeatureExtractor;
+        const run = (cacheDir: string, localOnly: boolean): Promise<FeatureExtractor> =>
+          mod.pipeline("feature-extraction", this.checkpoint, {
+            cache_dir: cacheDir,
+            ...(localOnly ? { local_files_only: true } : {}),
+            ...(this.dtype ? { dtype: this.dtype } : {}),
+            progress_callback: createModelLoadReporter(),
+          }) as Promise<FeatureExtractor>;
+
+        // A LOCAL PATH IS NOT A CACHE ENTRY, so it never goes through staging (#185). transformers.js
+        // reads "./models/foo", "/opt/models/foo" or "C:\models\foo" straight off disk and caches
+        // nothing under `cache_dir`, so there would be nothing staged to promote — and the model
+        // directory being pointed at is the operator's own, never ours to rename.
+        if (isLocalModelPath(this.checkpoint)) return await run(resolveModelCacheDir(), false);
+
+        return await loadThroughStagingCache({
+          checkpoint: this.checkpoint,
+          cacheRoot: resolveModelCacheDir(),
+          run,
+        });
       })();
     }
     return this.extractor;
@@ -779,7 +1071,22 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
         // goes out of its way to support.
         const specifier = "@huggingface/transformers";
         const mod = (await import(specifier)) as TransformersModule;
-        return mod.AutoTokenizer.from_pretrained(this.checkpoint, { cache_dir: resolveModelCacheDir() });
+        const run = (cacheDir: string, localOnly: boolean): Promise<Tokenizer> =>
+          mod.AutoTokenizer.from_pretrained(this.checkpoint, {
+            cache_dir: cacheDir,
+            ...(localOnly ? { local_files_only: true } : {}),
+          });
+        if (isLocalModelPath(this.checkpoint)) return await run(resolveModelCacheDir(), false);
+        // THE TOKENIZER STAGES TOO (Codex review, PR #210). It fetches into the SAME checkpoint
+        // directory the weights live in, so leaving it on the direct path meant a `countTokens()`
+        // call could populate that directory with tokenizer files alone — after which a load could
+        // stream the missing weights straight to their final path. Every writer into the cache has
+        // to go through here, or the invariant is only true of some of them.
+        return await loadThroughStagingCache({
+          checkpoint: this.checkpoint,
+          cacheRoot: resolveModelCacheDir(),
+          run,
+        });
       })();
     }
     return this.tokenizer;
