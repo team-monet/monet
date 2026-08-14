@@ -1,0 +1,8 @@
+Monet
+Copyright (C) 2026 John Lee
+
+This repository is licensed under the GNU Affero General Public License,
+version 3 only (AGPL-3.0-only) — see LICENSE.
+
+Exception: the harness/ subdirectory is licensed separately under the
+Apache License 2.0 — see harness/LICENSE.
