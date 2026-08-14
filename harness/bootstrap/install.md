@@ -5,10 +5,10 @@
 Work through the phases in order. After each, tell the user what happened in one line. If a step fails, show the error, explain the likely cause, propose a fix, and retry — never leave a half-configured state.
 
 **This playbook is self-contained — no clone or pre-install needed.** You install the substrate yourself (Phase 2), and you read any prompt file you need (`roster.json`, `agents/<name>.md`) from one of:
-- a local `with-monet` checkout if one exists (prefer it), else
+- a local checkout of this repo if one exists (prefer it) — the prompt files are under its `harness/`, else
 - this repo's raw URLs, base `https://raw.githubusercontent.com/team-monet/monet/main/harness/` (e.g. `…/agents/stig.md`).
 
-(Raw fetch needs the repo to be **public**; if it's private and you can't fetch, that's the one time to ask the user to clone `with-monet` and point you at the local path.)
+(Raw fetch needs the repo to be **public**; if it's private and you can't fetch, that's the one time to ask the user to clone `team-monet/monet` and point you at the `harness/` directory inside their local clone.)
 
 ---
 

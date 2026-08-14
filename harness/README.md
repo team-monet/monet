@@ -6,11 +6,11 @@ The substrate — the `monet` MCP server + CLI (available as [`@team-monet/monet
 
 ## Where this sits
 
-| Repo | What it is |
+| Where | What it is |
 |---|---|
 | [team-monet.com](https://team-monet.com) | **The front door** — what Monet is and why. |
-| `team-monet/monet` | **Monet** — the local-first client: the `monet` MCP server + CLI (npm `@team-monet/monet`). |
-| **`with-monet` (this repo)** | The **lightweight, agent-agnostic harness**: portable agent prompts + bootstrap that wire a host to `monet`. |
+| `team-monet/monet` → `packages/` | **Monet** — the local-first client: the `monet` MCP server + CLI (npm `@team-monet/monet`). |
+| **`team-monet/monet` → `harness/` (this directory)** | The **lightweight, agent-agnostic harness**: portable agent prompts + bootstrap that wire a host to `monet`. |
 
 ## The team
 
@@ -43,7 +43,7 @@ Paste into your agent:
 
 > **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/monet/main/harness/bootstrap/install.md and follow it, checking with me at each step.**
 
-_(Local dev: point at `with-monet/bootstrap/install.md` instead of the URL. The substrate it installs — `monet` — ships on npm as `@team-monet/monet`.)_
+_(Local dev: point at `harness/bootstrap/install.md` instead of the URL. The substrate it installs — `monet` — ships on npm as `@team-monet/monet`.)_
 
 **Already installed?** To update your existing Monet install, paste:
 
