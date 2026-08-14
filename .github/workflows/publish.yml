@@ -1,0 +1,107 @@
+name: Publish closed client
+
+# Runs on a version tag (v1.x.x) or a manual trigger.
+# Publishes the closed @team-monet/monet artifact (packages/cli) to public npm via OIDC
+# trusted publishing.
+#
+# OIDC trusted publishing (token-less):
+#   Configure at npmjs.com → @team-monet/monet → Settings → Publishing → Trusted Publishers.
+#   Add a GitHub Actions publisher:
+#     Repository:        team-monet/monet
+#     Workflow filename: publish.yml
+#     Environment:       (leave blank — this workflow uses no GitHub environment)
+#   Then enable "Allow publish" (npm's post-May-2026 required toggle).
+#   No NPM_TOKEN secret needed. The id-token: write permission below is what unlocks OIDC.
+#
+# NO --provenance: the private core repo must not be linked via provenance attestations.
+#   NPM_CONFIG_PROVENANCE=false makes this explicit and durable even if the repo goes public.
+#
+# NO SECRETS REQUIRED. This workflow used to check out packages/core from a separate private
+# repository with MONET_CORE_TOKEN, and to pin that checkout by sha from packages/cli/.monet-core-ref
+# so a tag could not publish against un-reviewed core code. Both are gone: core and cli are one
+# repository now, so the tag being built already names exactly one revision of both, and the
+# workspace link resolves core without a second checkout. The pin file is deleted, not disabled —
+# there is nothing left for it to pin.
+
+# Never cancel an in-flight publish — a partial publish is worse than a duplicate attempt.
+concurrency:
+  group: publish-${{ github.workflow }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (pack but do not publish)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+  id-token: write # Required for OIDC trusted publishing to npm.
+
+jobs:
+  publish:
+    name: Build closed artifact and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4 # version is read from the ROOT package.json "packageManager"
+        with:
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+
+      # Ensure npm >= 11.5.1 for OIDC trusted publishing support.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build core first: packages/cli's esbuild bundle inlines @team-monet/core's dist.
+      - name: Build core
+        run: pnpm --filter @team-monet/core build
+
+      # Build the closed esbuild bundle (minified, no sourcemaps, no comments).
+      - name: Build closed client artifact
+        run: pnpm --filter @team-monet/monet build
+
+      # Smoke-check the tarball contents before publishing.
+      #
+      # Both this and the publish below run packages/cli's `prepack` hook
+      # (scripts/strip-dev-deps.mjs), which deletes devDependencies from the packed manifest.
+      # That hook is now doing a second job on top of hiding build tooling: `@team-monet/core`
+      # is a devDependency carrying the `workspace:*` specifier, which npm cannot resolve. It
+      # must not reach the tarball, and stripping devDependencies is what keeps it out.
+      - name: Verify tarball (no source, no sourcemap)
+        working-directory: packages/cli
+        run: npm pack --dry-run
+
+      # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
+      # --access public is required for scoped packages on first publish; safe to repeat.
+      # NO --provenance flag: the private core repo must not be linked via attestations.
+      # NPM_CONFIG_PROVENANCE=false is set explicitly so provenance stays OFF even if
+      # this repo is ever made public (npm enables provenance by default on public repos).
+      - name: Publish to npm (OIDC trusted publishing)
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: packages/cli
+        env:
+          NPM_CONFIG_PROVENANCE: "false"
+        run: npm publish --access public

@@ -1,9 +1,9 @@
 name: Eval (semantic embedder, nightly)
 
-# The real-recall gate. Runs the eval suite on the actual shipping
+# The real-recall gate for packages/core. Runs the eval suite on the actual shipping
 # embedder (DEFAULT_MODEL via @huggingface/transformers; bge-small-en-v1.5 today) — too slow/networked for every PR,
-# so it runs nightly and on demand. src/__tests__/eval.onnx.test.ts FAILS the job on a
-# semantic-recall regression; `pnpm eval` is also captured as a human-readable artifact.
+# so it runs nightly and on demand. packages/core/src/__tests__/eval.onnx.test.ts FAILS the job on
+# a semantic-recall regression; `pnpm eval` is also captured as a human-readable artifact.
 #
 # Note: scheduled runs only fire from the default branch. Use the "Run workflow" button
 # (workflow_dispatch) to trigger it on a branch.
@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v4 # version is read from the ROOT package.json "packageManager"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -46,7 +46,9 @@ jobs:
       # the pin that path is never written and this step would silently cache nothing, re-downloading
       # ~450MB every night. Unlike the node_modules path this one survives install, so it no longer
       # depends on step ordering. Best-effort: a miss just re-downloads. Any pnpm-lock.yaml change
-      # busts the exact key, but the restore-keys prefix still reuses the previous cache.
+      # busts the exact key, but the restore-keys prefix still reuses the previous cache. (The
+      # lockfile named here is now the single workspace lockfile at the repo root — hashFiles
+      # resolves relative to the workspace root, so the expression is unchanged.)
       # THE KEY NAMES THE MODEL, and that is load-bearing rather than cosmetic. It used to say
       # minilm- for historical reasons, on the argument that it names the cache and not the model —
       # which held only while the model never changed. A cache entry is immutable, so once the
@@ -69,18 +71,21 @@ jobs:
       # merely unscheduled, it is dead. recall-floor.onnx and resolution-hybrid.onnx were exactly that
       # for their whole existence: they self-gated, were never named here, and were found failing 5 of
       # 9 assertions the first time anyone ran them. Adding a *.onnx.test.ts file means adding it here,
-      # and src/__tests__/onnx-gate-coverage.test.ts fails if you forget.
+      # and packages/core/src/__tests__/onnx-gate-coverage.test.ts fails if you forget.
       - name: Recall gate (fails the job on a semantic-recall regression)
+        working-directory: packages/core
         env:
           MONET_EVAL_ONNX: "1"
         run: pnpm exec vitest run --dir src eval.onnx eval-baseline.onnx recall-floor.onnx resolution-hybrid.onnx
 
       - name: Capture the eval report
         if: always()
+        working-directory: packages/core
         run: pnpm -s eval --embedder=onnx --verbose | tee eval-report.txt
 
       - name: Capture the md-baseline eval report (bm25, chunk-cosine-rag, md-tree)
         if: always()
+        working-directory: packages/core
         run: pnpm -s eval:baseline --embedder=onnx --verbose | tee eval-baseline-report.txt
 
       - name: Upload the eval report
@@ -88,7 +93,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: semantic-eval-report
-          path: eval-report.txt
+          path: packages/core/eval-report.txt
           if-no-files-found: warn
 
       - name: Upload the md-baseline eval report
@@ -96,5 +101,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: semantic-eval-baseline-report
-          path: eval-baseline-report.txt
+          path: packages/core/eval-baseline-report.txt
           if-no-files-found: warn

@@ -25,7 +25,10 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TESTS_DIR = HERE;
-const WORKFLOW = resolve(HERE, "../../.github/workflows/eval-nightly.yml");
+// The nightly lives at the REPOSITORY root, not inside this package. GitHub reads workflows only
+// from the root `.github/workflows/`, so in a monorepo that is the one place they can be — four
+// levels up from packages/core/src/__tests__.
+const WORKFLOW = resolve(HERE, "../../../../.github/workflows/eval-nightly.yml");
 
 describe("nightly ONNX gate coverage", () => {
   it("names every *.onnx.test.ts file in the nightly's vitest filter list", () => {

@@ -1,0 +1,160 @@
+name: CI
+
+# ONE gate for the whole workspace, replacing the two per-repo CI workflows the merge carried in
+# (packages/core/.github/workflows/ci.yml and packages/cli/.github/workflows/ci.yml). Neither of
+# those ever ran on this repo: GitHub reads workflows only from the ROOT .github/workflows/.
+#
+# The cli gate no longer checks out a sibling repo. @team-monet/core is a workspace link, so one
+# checkout and one root install give the cli build the core it bundles. MONET_CORE_TOKEN is gone
+# with it, which also ends the old limitation that fork PRs could never pass the client gate.
+#
+# The core gate stays deterministic and offline: its unit tests construct the lexical hashing
+# embedder DIRECTLY (no model download) and the MiniLM eval.onnx tests stay skipped unless
+# MONET_EVAL_ONNX=1, so the eval regression gate is reproducible run-to-run. The real semantic
+# eval (the shipping embedder) runs separately in eval-nightly.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: which packages changed
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      cli: ${{ steps.filter.outputs.cli }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the filter diffs against a base commit, which a shallow clone lacks
+
+      # Plain git rather than a filter action: one less third-party action in the supply chain,
+      # and the rule is short enough to read in full.
+      #
+      # IT FAILS OPEN, deliberately. Every case where the base commit cannot be established —
+      # manual run, first push to a branch, force-push, pruned object — runs BOTH gates. A filter
+      # that guesses wrong has to guess towards running the tests; the cost of a redundant run is
+      # a few CI minutes, and the cost of a skipped one is an unverified merge.
+      - name: Decide which gates to run
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ] || [ -z "${BASE_SHA:-}" ] \
+             || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "no usable base commit (event=$EVENT base='${BASE_SHA:-}') — running every gate"
+            echo "core=true" >> "$GITHUB_OUTPUT"
+            echo "cli=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          echo "changed files:"
+          echo "$changed"
+          core=false
+          cli=false
+          # Root wiring — the workspace file, the single lockfile, the root manifest, and these
+          # workflows — can move either package's resolved tree, so it runs both gates.
+          if echo "$changed" | grep -qE '^(pnpm-workspace\.yaml|pnpm-lock\.yaml|package\.json|\.github/workflows/)'; then
+            core=true
+            cli=true
+          fi
+          # A core-only change RUNS THE CLI GATE TOO, and that is not caution — packages/cli's
+          # build.mjs inlines @team-monet/core into the published bundle, so core code ships
+          # inside @team-monet/monet without a byte of packages/cli changing.
+          if echo "$changed" | grep -q '^packages/core/'; then
+            core=true
+            cli=true
+          fi
+          if echo "$changed" | grep -q '^packages/cli/'; then
+            cli=true
+          fi
+          # harness/ intentionally matches nothing: it has no build, no tests and no dependencies,
+          # and is not a workspace member. There is no gate for it to run.
+          echo "core=$core" >> "$GITHUB_OUTPUT"
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+
+  core:
+    name: core · typecheck · test · build
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    # Defense-in-depth only: the tests already hard-wire the hashing embedder, so this just
+    # forces the lexical fallback for any future code path that happens to read the env var.
+    env:
+      MONET_EMBEDDER: hashing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4 # version is read from the ROOT package.json "packageManager"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # One root install covers both packages off the single lockfile. core's "prepare" script
+      # runs tsup during install, so dist is built here too; the explicit Build step below is
+      # kept as the legible, named build gate.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --filter @team-monet/core typecheck
+
+      - name: Test (includes the deterministic eval regression gate)
+        run: pnpm --filter @team-monet/core test
+
+      - name: Build
+        run: pnpm --filter @team-monet/core build
+
+  cli:
+    name: cli · typecheck · test · build
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4 # version is read from the ROOT package.json "packageManager"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Kept as its own named step even though core's "prepare" already builds during install.
+      # The cli typecheck reads packages/core/dist/index.d.ts and the cli bundle inlines
+      # packages/core/dist/index.js — if that install-time build ever stops happening, this job
+      # should fail at a step that says "Build core", not at a baffling missing-types error.
+      - name: Build core (the cli typecheck and bundle both consume its dist)
+        run: pnpm --filter @team-monet/core build
+
+      - name: Typecheck
+        run: pnpm --filter @team-monet/monet typecheck
+
+      - name: Test
+        run: pnpm --filter @team-monet/monet test
+
+      - name: Build
+        run: pnpm --filter @team-monet/monet build
