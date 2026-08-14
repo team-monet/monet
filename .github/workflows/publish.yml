@@ -1,7 +1,7 @@
-name: Publish closed client
+name: Publish CLI
 
 # Runs on a version tag (v1.x.x) or a manual trigger.
-# Publishes the closed @team-monet/monet artifact (packages/cli) to public npm via OIDC
+# Publishes the @team-monet/monet artifact (packages/cli) to public npm via OIDC
 # trusted publishing.
 #
 # OIDC trusted publishing (token-less):
@@ -52,7 +52,7 @@ permissions:
 
 jobs:
   publish:
-    name: Build closed artifact and publish
+    name: Build artifact and publish
     runs-on: ubuntu-latest
 
     steps:
@@ -82,8 +82,11 @@ jobs:
       - name: Build core
         run: pnpm --filter @team-monet/core build
 
-      # Build the closed esbuild bundle (minified, no sourcemaps, no comments).
-      - name: Build closed client artifact
+      # Build the esbuild bundle (minified, no sourcemaps, no comments). The minification
+      # and sourcemap suppression were introduced in June to keep the engine source out of
+      # the published artifact; under AGPL that purpose is gone, so whether to ship
+      # sourcemaps again is an OPEN DECISION, tracked with the provenance one.
+      - name: Build client artifact
         run: pnpm --filter @team-monet/monet build
 
       # Smoke-check the tarball contents before publishing.
