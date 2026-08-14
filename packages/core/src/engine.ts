@@ -1,5 +1,5 @@
 /**
- * MonetCore — the state-centric substrate engine (ADR 0001).
+ * MonetCore — the state-centric substrate engine.
  *
  * Two layers:
  *   - observation: immutable, append-only evidence (the Forensic Ledger)

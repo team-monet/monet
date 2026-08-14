@@ -52,7 +52,7 @@ Goal: the `monet` MCP server (the state-centric memory substrate) available on t
   Zero-install alternative: `npx -y @team-monet/monet start`. Requires `node` ≥ 22 and network access.
 - Dev / unpublished fallback: clone `team-monet/monet`, then `pnpm install && pnpm build`, and use `node <abs>/dist/index.js`.
 
-**Then start the download before anything else, and say so.** Monet embeds locally, so the first run fetches a ~480MB model. It is a one-time, per-machine cost — it is cached outside the install, so reinstalling never pays it again — but until it lands, **Monet's tools do not exist**: the server finishes loading the model before it connects, so a host that starts it cold shows no Monet at all, with nothing to explain why. Don't let the user meet that silence.
+**Then start the download before anything else, and say so.** Monet embeds locally, so the first run fetches a ~590MB model. It is a one-time, per-machine cost — it is cached outside the install, so reinstalling never pays it again — but until it lands, **Monet's tools do not exist**: the server finishes loading the model before it connects, so a host that starts it cold shows no Monet at all, with nothing to explain why. Don't let the user meet that silence.
 
 Kick it off in the background now, by running `monet start` **with its standard input already closed**, in the background, with output captured to a log file you can read back later. On a POSIX shell that is:
 ```
@@ -64,7 +64,7 @@ Use your platform's equivalents for the redirect, the log path, and the backgrou
 
 (Zero-install: `npx -y @team-monet/monet start`. Dev fallback: `node <abs>/dist/index.js`. Same closed-stdin treatment either way.)
 
-Tell the user plainly, once: *"Monet is downloading its embedding model — about 480MB, once per machine. It'll be a few minutes and everything after this is instant. I'll set up the rest while it runs."*
+Tell the user plainly, once: *"Monet is downloading its embedding model — about 590MB, once per machine. It'll be a few minutes and everything after this is instant. I'll set up the rest while it runs."*
 
 **Then keep working — do not wait here.** Everything through Phase 4 is local file work that needs no Monet: writing the MCP config, installing the agent team, and reading the user's `CLAUDE.md` / `AGENTS.md` / docs to decide what's worth migrating in Phase 5. Do that now, and let the download finish underneath it. Only the steps that actually *call* Monet — Phase 3's liveness check and everything in Phase 5 — need the warm-up to be done.
 
@@ -182,7 +182,7 @@ The user did not arrive empty. They arrived with principles and rules already in
 ### Two bins, and only one of them dissolves
 
 - **Standing instruction files** — `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, Cursor/Cline/Copilot/Windsurf/Continue rules. These are re-sent to the model on every single request, which is the scarcest space there is. They get **sorted by species**, below.
-- **Project-information files** — `README`s, `docs/`, `ARCHITECTURE.md`, design notes, plan and TODO files. **Leave these alone. You read them.** They are never dissolved and never copied — the file on disk is the truth, and you already have glob, grep and read, which give you the current bytes with no index to go stale. Monet can also register a file as a source and index it, and that machinery exists, but registering buys exactly one thing over reading: finding a document nobody knew to look for. That one thing is not reliable enough today to be worth the trade (monet-core#135 — paused for redesign), so don't offer it. If the user asks, say it plainly: their docs stay exactly as they are, you read them when the work needs them, and the only thing missing is Monet surfacing one unprompted.
+- **Project-information files** — `README`s, `docs/`, `ARCHITECTURE.md`, design notes, plan and TODO files. **Leave these alone. You read them.** They are never dissolved and never copied — the file on disk is the truth, and you already have glob, grep and read, which give you the current bytes with no index to go stale. Monet can also register a file as a source and index it, and that machinery exists, but registering buys exactly one thing over reading: finding a document nobody knew to look for. That one thing is not reliable enough today to be worth the trade, so don't offer it. If the user asks, say it plainly: their docs stay exactly as they are, you read them when the work needs them, and the only thing missing is Monet surfacing one unprompted.
 
 - **A prior memory store** — a Cline `memory-bank/`, another tool's notes directory, or an existing Monet store in the `"default"` circle. Neither of the two bins above: it is not re-sent every request and it is not a document with its own reader. It is memory that already exists and has nowhere else to live, which makes it the one thing consolidation was always best at. **Detect it and offer the migration** (`consolidate-memory.md`) — a user arriving from another memory tool otherwise finishes onboarding with their actual prior memory left behind, and no reason to suspect it.
 
@@ -277,7 +277,7 @@ Progress is the difference between their file and the store, so this phase is re
 Monet can register a file or a repo's Markdown tree as a source: the file stays where it is, fully
 editable, and Monet indexes it rather than taking a copy. **Don't offer it during onboarding** — the
 one thing it buys over you reading the file is surfacing a document nobody pointed you at, and that
-design question is open, not merely unimplemented (monet-core#135, paused for redesign).
+design question is open, not merely unimplemented.
 
 If the user asks for it directly, or already has sources registered, nothing is broken and they lose
 nothing by keeping it. The one thing to get right: `--include` is effectively mandatory. Without it

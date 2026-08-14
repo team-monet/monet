@@ -9,7 +9,7 @@ name: CI
 # with it, which also ends the old limitation that fork PRs could never pass the client gate.
 #
 # The core gate stays deterministic and offline: its unit tests construct the lexical hashing
-# embedder DIRECTLY (no model download) and the MiniLM eval.onnx tests stay skipped unless
+# embedder DIRECTLY (no model download) and the bge-m3 eval.onnx tests stay skipped unless
 # MONET_EVAL_ONNX=1, so the eval regression gate is reproducible run-to-run. The real semantic
 # eval (the shipping embedder) runs separately in eval-nightly.yml.
 

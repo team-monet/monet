@@ -7,8 +7,8 @@ narrower than it used to be.
 **What it no longer does: sweep up project documentation.** `README`s, `docs/`, ADRs, `NOTES.md` —
 those stay exactly where they are and you read them. You have glob, grep and read, which give you the
 current bytes with no index to go stale; pulling them into Monet buys one thing over that (surfacing
-a document nobody knew to look for) and that one thing is not dependable today (monet-core#135,
-paused for redesign). Capturing them would trade exactness for findability and get neither.
+a document nobody knew to look for) and that one thing is not dependable today. Capturing them
+would trade exactness for findability and get neither.
 
 So this playbook has two real jobs:
 

@@ -10,7 +10,7 @@ import { HashingEmbeddingProvider, validateEmbeddingProviderOutput } from "./emb
  *
  * transformers.js defaults `env.cacheDir` to `<the library's own directory>/.cache`, which for a
  * global install resolves INSIDE node_modules. The model is then part of the install rather than
- * part of the user's data, so every reinstall deletes ~480MB that took minutes to acquire and the
+ * part of the user's data, so every reinstall deletes ~590MB that took minutes to acquire and the
  * next start has to fetch it again. It belongs next to the store, in ~/.monet, where a reinstall
  * cannot reach it.
  *

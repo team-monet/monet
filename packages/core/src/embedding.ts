@@ -1,5 +1,5 @@
 /**
- * Embedding provider — the model-adapter seam (ADR 0001 §6).
+ * Embedding provider — the model-adapter seam.
  *
  * The substrate never depends on *how* text becomes a vector. Swap this interface
  * for a real semantic model (e.g. MiniLM/BGE-small via transformers.js, or a local
