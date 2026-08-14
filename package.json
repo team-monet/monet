@@ -1,0 +1,6 @@
+{
+  "name": "monet",
+  "private": true,
+  "description": "Monet monorepo — packages/core (engine), packages/cli (shipped MCP server + CLI), harness/ (agent harness, outside the workspace).",
+  "packageManager": "pnpm@10.33.2"
+}

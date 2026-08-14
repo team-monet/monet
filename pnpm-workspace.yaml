@@ -1,0 +1,36 @@
+# The workspace is the two buildable packages, and only those.
+#
+# harness/ is deliberately NOT a member. It ships markdown plus a dependency-free CLI stub:
+# no dependencies, no lockfile, no build, no tests. Membership would add a project that every
+# `pnpm -r` gate has to skip and an installer has to walk, and buy nothing back.
+packages:
+  - packages/*
+
+# ── Settings hoisted from the package manifests ───────────────────────────────
+# NOT new policy: pnpm reads `overrides` and `onlyBuiltDependencies` from the workspace ROOT
+# only, so the identical blocks still sitting in packages/core/package.json and
+# packages/cli/package.json stopped taking effect the moment those packages became workspace
+# members. Everything below is the union of what those two manifests pinned before the merge,
+# so that a root install resolves the same tree they each resolved on their own.
+#
+# ONE ENTRY IS NOT A PURE UNION, and it is worth naming rather than leaving to be discovered:
+# `esbuild` was pinned to ^0.28.1 by core alone (a security pin on the copy tsup pulls in),
+# while packages/cli declares esbuild ^0.25.12 as a direct devDependency of its publish
+# bundler. A root override beats a direct specifier, so under one workspace the cli bundler
+# also builds on 0.28.x. The pin winning across the whole tree is the intended reading of a
+# security override; the alternative — dropping it so cli keeps 0.25.x — would silently undo
+# the thing the override exists to do.
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
+
+overrides:
+  esbuild: ^0.28.1
+  hono: ^4.12.34
+  protobufjs: ^7.6.5
+  tar: ^7.5.21
+  ip-address: ^10.3.1
+  body-parser: ^2.3.0
+  fast-uri: ^3.1.5
+  postcss: ^8.5.23
+  nanoid: ^3.3.17

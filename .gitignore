@@ -1,0 +1,5 @@
+# Workspace-root ignores. Each package keeps its own .gitignore for the artifacts
+# only it produces; this file covers what the root install now creates.
+node_modules/
+.DS_Store
+*.log
