@@ -252,7 +252,7 @@ async function buildUnscrubbedFixtureDb(path: string): Promise<void> {
   let absorbedId!: string;
   try {
     const r = await core.store(
-      "/Users/dev/code/monet-core/src/engine.ts is the file — contact jane.doe@example.com with questions, key_GZTqlLr41FS2p7AY is the API key.",
+      "/Users/dev/code/monet-core/src/engine.ts is the file — contact jane.doe@example.com with questions, key_Ex4mpleN0tAReal1 is the API key.",
       { circle: SAMPLED_CIRCLE, sourceRefs: ["/Users/dev/.monet/monet.db", "~/code/with-monet/notes.md"] },
     );
     conceptId = r.conceptId!;
@@ -911,7 +911,7 @@ async function buildRawByteLeakFixtureDb(path: string): Promise<{ conceptIds: st
     for (let i = 0; i < 40; i++) {
       const r = await core.store(
         `Concept number ${i}: contact jane.doe${i}@example.com about /Users/dev/secret-${i}.txt, ` +
-          `key_GZTqlLr41FS2p7AY${i} is the key, reachable at 192.168.0.${i % 250}:9301, tenant acme. ` +
+          `key_Ex4mpleN0tAReal1${i} is the key, reachable at 192.168.0.${i % 250}:9301, tenant acme. ` +
           "x".repeat(300),
         { circle: SAMPLED_CIRCLE },
       );

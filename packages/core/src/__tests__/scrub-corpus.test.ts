@@ -3,9 +3,10 @@
  * coverage for P1-a/P1-b/P1-c, the 3 P1 privacy leaks from this PR's Codex review).
  *
  * F3 (post-review, both reviews): SECRET_RE's fixed vendor-prefix list (sk-/ghp_/AKIA/xox/Bearer)
- * missed a real, differently-shaped key (`key_GZTqlLr41FS2p7AY`, a Constructor.io public key) that
+ * missed a real, differently-shaped key (a Constructor.io public key, shaped `key_<16 alnum>`) that
  * survived scrubbing into committed artifacts (eval-corpus/publish/full/chunks.json — verified
- * empirically). Two additive patterns close this gap: a query-param heuristic
+ * empirically). The fixtures below carry a SYNTHETIC key of that exact shape, not the real value.
+ * Two additive patterns close this gap: a query-param heuristic
  * (`?key=`/`&api_key=`/`&token=`/`&secret=`/`&auth=`) and a bare `key_<alnum>{10,}` shape.
  *
  * BOTH DIRECTIONS are tested per the mission's explicit instruction:
@@ -28,19 +29,19 @@ import { scrubString, scrubFilenameIfNeeded, assertDerivedDbExists } from "../..
 
 describe("scrubString — F3 fix: query-param and bare key_ secret patterns", () => {
   describe("direction 1 — real secret-shaped strings ARE redacted", () => {
-    it("redacts the exact real leak (Constructor.io key in a query string)", () => {
+    it("redacts the real leak's exact shape (Constructor.io key in a query string)", () => {
       const input =
-        "GET https://ac.cnstrc.com/browse/items?key=key_GZTqlLr41FS2p7AY&ids=<P_id>&fmt_options[groups_max_depth]=0";
+        "GET https://ac.cnstrc.com/browse/items?key=key_Ex4mpleN0tAReal1&ids=<P_id>&fmt_options[groups_max_depth]=0";
       const out = scrubString(input);
-      expect(out).not.toContain("key_GZTqlLr41FS2p7AY");
+      expect(out).not.toContain("key_Ex4mpleN0tAReal1");
       // Query-param prefix is preserved (context kept), only the value is redacted.
       expect(out).toContain("?key=[redacted-secret]");
     });
 
     it("redacts a bare key_ token even outside a query string", () => {
-      const input = "The Constructor.io key is key_GZTqlLr41FS2p7AY and is passed as a header.";
+      const input = "The Constructor.io key is key_Ex4mpleN0tAReal1 and is passed as a header.";
       const out = scrubString(input);
-      expect(out).not.toContain("key_GZTqlLr41FS2p7AY");
+      expect(out).not.toContain("key_Ex4mpleN0tAReal1");
       expect(out).toContain("[redacted-secret]");
     });
 

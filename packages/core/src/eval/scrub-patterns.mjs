@@ -49,10 +49,11 @@ export const SECRET_RE =
   /\b(sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|Bearer\s+[A-Za-z0-9._-]{20,})\b/g;
 
 // F3 fix (post-review): SECRET_RE above is a fixed known-vendor-prefix list — it missed a real,
-// differently-shaped key (`key_GZTqlLr41FS2p7AY`, a Constructor.io public read-only key) that
+// differently-shaped key (a Constructor.io public read-only key, shaped `key_<16 alnum>`) that
 // survived scrubbing into committed artifacts (eval-corpus/publish/full/chunks.json, verified
-// empirically). Two additional, narrower patterns close this specific gap without loosening the
-// existing false-positive guard (the sk-author/sk-fixture class must still survive — these two
+// empirically). The fixtures carry a SYNTHETIC key of that exact shape, not the real value.
+// Two additional, narrower patterns close this specific gap without loosening the existing
+// false-positive guard (the sk-author/sk-fixture class must still survive — these two
 // patterns are additive, SECRET_RE's own alternation and length floors are untouched):
 //
 //   QUERY_PARAM_SECRET_RE — a `?key=`/`&api_key=`/`&token=`/`&secret=`/`&auth=`-style query

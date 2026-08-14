@@ -42,7 +42,7 @@ describe("db-slugify.mjs's slugify mirror — byte-identical to engine.ts's real
     "multiple    consecutive     whitespace   runs",
     "a.b.c.d.e.f.g dotted identifier chain",
     "snake_case_identifier_with_many_underscores",
-    "key_GZTqlLr41FS2p7AY is a secret-shaped bare key",
+    "key_Ex4mpleN0tAReal1 is a secret-shaped bare key",
     "?key=abcdef0123456789 query-param-secret shape",
     "   leading and trailing whitespace   ",
     "-already-looks-like-a-slug-",

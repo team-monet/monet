@@ -166,7 +166,7 @@ async function buildFixtureDb(path: string): Promise<{ conceptIds: string[] }> {
     );
     conceptIds.push(a.conceptId!);
 
-    const b = await core.store("key_GZTqlLr41FS2p7AY is the Constructor.io key, passed as a header on every request.", {
+    const b = await core.store("key_Ex4mpleN0tAReal1 is the Constructor.io key, passed as a header on every request.", {
       circle: SAMPLED_CIRCLE,
     });
     conceptIds.push(b.conceptId!);
@@ -2295,7 +2295,7 @@ describe("scrubSizeDb — copy-then-scrub, the full per-size operation", () => {
 
       expect(everything).not.toContain("jane.doe@example.com");
       expect(everything).not.toContain("/Users/dev/Documents");
-      expect(everything).not.toContain("key_GZTqlLr41FS2p7AY");
+      expect(everything).not.toContain("key_Ex4mpleN0tAReal1");
       expect(everything).not.toContain("/Users/dev/.monet/monet.db");
       expect(everything).not.toContain("/Users/dev/.claude/CLAUDE.md");
       expect(everything).not.toContain("192.168.1.10");
@@ -2537,7 +2537,7 @@ describe("scrubSizeDb — copy-then-scrub, the full per-size operation", () => {
       // remove.
       const serialized = JSON.stringify(results);
       expect(serialized).not.toContain("jane.doe@example.com");
-      expect(serialized).not.toContain("key_GZTqlLr41FS2p7AY");
+      expect(serialized).not.toContain("key_Ex4mpleN0tAReal1");
       expect(serialized).not.toContain("192.168.1.10");
 
       // Parse the JSON-aware-scrubbed source_refs column directly and assert its scrubbed content.
