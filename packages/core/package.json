@@ -50,6 +50,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/team-monet/monet-core.git"
+    "url": "git+https://github.com/team-monet/monet.git",
+    "directory": "packages/core"
   }
 }

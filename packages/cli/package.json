@@ -8,10 +8,11 @@
   "homepage": "https://monet.team-monet.com",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/team-monet/with-monet.git"
+    "url": "git+https://github.com/team-monet/monet.git",
+    "directory": "packages/cli"
   },
   "bugs": {
-    "url": "https://github.com/team-monet/with-monet/issues"
+    "url": "https://github.com/team-monet/monet/issues"
   },
   "keywords": [
     "mcp",
