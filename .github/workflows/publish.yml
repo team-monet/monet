@@ -13,8 +13,11 @@ name: Publish closed client
 #   Then enable "Allow publish" (npm's post-May-2026 required toggle).
 #   No NPM_TOKEN secret needed. The id-token: write permission below is what unlocks OIDC.
 #
-# NO --provenance: the private core repo must not be linked via provenance attestations.
-#   NPM_CONFIG_PROVENANCE=false makes this explicit and durable even if the repo goes public.
+# NO --provenance: provenance stays OFF, and NPM_CONFIG_PROVENANCE=false keeps it off even
+#   though npm turns provenance on by default for public repos. The original reason — a
+#   separate private core repo that must not be linked via attestations — no longer holds:
+#   core and cli are one repository. Whether to re-enable provenance is an OPEN DECISION,
+#   not a settled policy; nothing here argues against it.
 #
 # NO SECRETS REQUIRED. This workflow used to check out packages/core from a separate private
 # repository with MONET_CORE_TOKEN, and to pin that checkout by sha from packages/cli/.monet-core-ref
@@ -96,9 +99,10 @@ jobs:
 
       # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
       # --access public is required for scoped packages on first publish; safe to repeat.
-      # NO --provenance flag: the private core repo must not be linked via attestations.
-      # NPM_CONFIG_PROVENANCE=false is set explicitly so provenance stays OFF even if
-      # this repo is ever made public (npm enables provenance by default on public repos).
+      # NO --provenance flag. NPM_CONFIG_PROVENANCE=false is set explicitly so provenance
+      # stays OFF even once this repo is public (npm enables it by default on public repos).
+      # See the header note: the private-core-repo reason is gone, and re-enabling
+      # provenance is an open decision rather than a settled one.
       - name: Publish to npm (OIDC trusted publishing)
         if: ${{ inputs.dry_run != 'true' }}
         working-directory: packages/cli
