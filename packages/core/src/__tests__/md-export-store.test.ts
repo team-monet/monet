@@ -104,15 +104,21 @@ describe("exportMdTreeFromStore — content-only export, no scenario/gold requir
     it("never embeds a raw /Users/ path in a topic-file's relative path when the lead concept's title contains one", async () => {
       const core = new MonetCore(":memory:", { embedder: embedder(), defaultCircle: "proj" });
       // Lead title contains an absolute path — the exact leak shape confirmed in the real,
-      // previously-published corpus (a title like "build plan doc (written ..., /Users/dev/...)"
+      // previously-published corpus (a title like "build plan doc (written ..., /Users/griswold/...)"
       // slugified straight into a filename that survived unredacted).
-      await core.store("build plan doc for /Users/dev/code/some-project/ rollout.", { kind: "decision" });
+      //
+      // THE USERNAME IS A LONG, MADE-UP SENTINEL ON PURPOSE. The assertion below is a substring
+      // check over the whole relative path, so a SHORT username makes this test assert more than
+      // it means: with a 3-letter name it would also fire on "development", "device" or "devops"
+      // occurring anywhere in a slug, failing for a filename that leaked nothing. Whatever this
+      // name is changed to, keep it long enough that no ordinary slug word can contain it.
+      await core.store("build plan doc for /Users/griswold/code/some-project/ rollout.", { kind: "decision" });
       await core.checkpoint();
 
       const result = exportMdTreeFromStore(core, { circle: "proj" });
       for (const relPath of result.topicFiles.keys()) {
         expect(relPath).not.toContain("/Users/");
-        expect(relPath.toLowerCase()).not.toContain("dev");
+        expect(relPath.toLowerCase()).not.toContain("griswold");
       }
     });
 
