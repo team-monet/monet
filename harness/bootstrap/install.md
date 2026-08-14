@@ -6,7 +6,7 @@ Work through the phases in order. After each, tell the user what happened in one
 
 **This playbook is self-contained — no clone or pre-install needed.** You install the substrate yourself (Phase 2), and you read any prompt file you need (`roster.json`, `agents/<name>.md`) from one of:
 - a local `with-monet` checkout if one exists (prefer it), else
-- this repo's raw URLs, base `https://raw.githubusercontent.com/team-monet/with-monet/main/` (e.g. `…/agents/stig.md`).
+- this repo's raw URLs, base `https://raw.githubusercontent.com/team-monet/monet/main/harness/` (e.g. `…/agents/stig.md`).
 
 (Raw fetch needs the repo to be **public**; if it's private and you can't fetch, that's the one time to ask the user to clone `with-monet` and point you at the local path.)
 
@@ -374,9 +374,9 @@ Codex sub-agents inherit the parent session's `mcp_servers` (Monet included), so
 
 </details>
 
-## Phase 8 — One last thing (star with-monet)
+## Phase 8 — One last thing (star the repo)
 
-Once the install is working, say it once and drop it: *"If Monet's earning its keep, a star on [team-monet/with-monet](https://github.com/team-monet/with-monet) helps."*
+Once the install is working, say it once and drop it: *"If Monet's earning its keep, a star on [team-monet/monet](https://github.com/team-monet/monet) helps."*
 
 ---
 

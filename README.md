@@ -8,9 +8,9 @@ Monet is local-first memory for coding agents, built for one thing: the outcome 
 
 Paste this one line into Claude Code (more agents coming soon):
 
-> **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md and follow it, checking with me at each step.**
+> **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/monet/main/harness/bootstrap/install.md and follow it, checking with me at each step.**
 
-Your agent installs Monet, wires up the MCP server, and brings the working method — restore state at session start, read the rules when moments arrive, record what you correct. That's the **[with-monet](https://github.com/team-monet/with-monet)** harness, and it's the recommended path.
+Your agent installs Monet, wires up the MCP server, and brings the working method — restore state at session start, read the rules when moments arrive, record what you correct. That's the **with-monet** harness in [`harness/`](./harness), and it's the recommended path.
 
 Prefer to wire it yourself? The package is on npm:
 
@@ -29,10 +29,10 @@ npx @team-monet/monet
 |  |  |
 |---|---|
 | 🏠 **Homepage** | **[team-monet.com](https://team-monet.com)** |
-| 🧰 **Harness, docs & install** | **[github.com/team-monet/with-monet](https://github.com/team-monet/with-monet)** |
+| 🧰 **Harness, docs & install** | **[`harness/`](./harness)** |
 | 📦 **Package** | **[npmjs.com/package/@team-monet/monet](https://www.npmjs.com/package/@team-monet/monet)** |
 
-> ⭐ If Monet helps, **[star with-monet](https://github.com/team-monet/with-monet)** — it's the best way to support the project.
+> ⭐ If Monet helps, **[star the repo](https://github.com/team-monet/monet)** — it's the best way to support the project.
 
 ## License
 

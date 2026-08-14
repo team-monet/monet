@@ -12,11 +12,11 @@ Monet is local-first memory for coding agents, built for the outcome you meant. 
 
 The easiest way to use Monet is to let your agent install and wire it for you. Paste one line into Claude Code (more agents coming soon):
 
-> **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md and follow it, checking with me at each step.**
+> **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/monet/main/harness/bootstrap/install.md and follow it, checking with me at each step.**
 
-Your agent installs Monet, wires up the MCP server, and pulls in a memory-aware agent team — **no manual config, no environment variables.** That's the **[with-monet](https://github.com/team-monet/with-monet)** harness, and it's the recommended path.
+Your agent installs Monet, wires up the MCP server, and pulls in a memory-aware agent team — **no manual config, no environment variables.** That's the **with-monet** harness, which lives in `harness/` in the [Monet repo](https://github.com/team-monet/monet), and it's the recommended path.
 
-> ⭐ **If Monet helps, [star with-monet on GitHub](https://github.com/team-monet/with-monet)** — it's the best way to support the project.
+> ⭐ **If Monet helps, [star Monet on GitHub](https://github.com/team-monet/monet)** — it's the best way to support the project.
 
 ## Zero config
 

@@ -41,14 +41,14 @@ You don't clone this repo or run a script. You open the coding agent you already
 
 Paste into your agent:
 
-> **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md and follow it, checking with me at each step.**
+> **Set up Monet for all my projects: read https://raw.githubusercontent.com/team-monet/monet/main/harness/bootstrap/install.md and follow it, checking with me at each step.**
 
 _(Local dev: point at `with-monet/bootstrap/install.md` instead of the URL. The substrate it installs — `monet` — ships on npm as `@team-monet/monet`.)_
 
 **Already installed?** To update your existing Monet install, paste:
 
-> **Can you update my Monet installation following https://raw.githubusercontent.com/team-monet/with-monet/main/bootstrap/install.md?**
+> **Can you update my Monet installation following https://raw.githubusercontent.com/team-monet/monet/main/harness/bootstrap/install.md?**
 
 The agent then follows the [bootstrap playbook](bootstrap/install.md): **orient → get Monet → configure the MCP server → install the team → offer memory ingest → offer to start.** Why agent-first: the agent already has tools in your environment, so it can install, verify, and recover from failures conversationally — and we can tailor the experience to each user.
 
-> ⭐ **Like Monet? [Star this repo](https://github.com/team-monet/with-monet)** to support it — and **Watch → Custom → Releases** to get notified of new versions.
+> ⭐ **Like Monet? [Star this repo](https://github.com/team-monet/monet)** to support it — and **Watch → Custom → Releases** to get notified of new versions.
