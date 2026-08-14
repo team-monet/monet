@@ -38,7 +38,7 @@ npx @team-monet/monet
 
 | Path | What it is |
 |---|---|
-| `packages/core` | The memory engine — store, retrieval, gates. Bundled into the CLI rather than published on its own. |
+| `packages/core` | The memory engine — store, retrieval, gates. Published to npm as `@team-monet/core` through `0.8.1`; that line is now deprecated, and the engine reaches users bundled inside the CLI. |
 | `packages/cli` | The `monet` MCP server + CLI. This is what ships to npm as `@team-monet/monet`. |
 | `harness/` | The `with-monet` agent harness — agent prompts and the install playbook. Markdown and one CLI stub; not a workspace member. |
 
