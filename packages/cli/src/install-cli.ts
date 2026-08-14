@@ -58,7 +58,7 @@ import { resolveProjectDir } from "./project-dir.js";
  * exit-code/stdout contract — see gate-cli.ts — that says nothing about Claude Code specifically).
  * The Claude-Code-specific adapter is a SEPARATE generated wrapper script (buildWrapperScript,
  * below), written to `~/.monet/gate-hook.mjs` and invoked by the settings.json hook entry this
- * command writes. This is deliberate separation, matching next-monet-tool-surface.md's own
+ * command writes. This is deliberate separation, matching the design's own
  * "monet gate injection format per host hook contract... decided at slice 4 with the host wiring,
  * one adapter per surface" — this module IS that one adapter, for the one host this slice wires.
  */
@@ -68,7 +68,7 @@ import { resolveProjectDir } from "./project-dir.js";
 const WRAPPER_FILENAME = "gate-hook.mjs";
 const DENY_LOG_FILENAME = "gate-denies.log";
 /**
- * The gate journal (normative-hierarchy-2026-08-03.md §1/§5). Shared with the gate CLI — see
+ * The gate journal. Shared with the gate CLI — see
  * gate-cli.ts's own GATE_JOURNAL_FILENAME, which must name the same file: the hook and the gate it
  * spawns write two events about one interception, and they are only correlatable in one stream.
  */
@@ -284,7 +284,7 @@ function appendDenyLine(circleForJournal, firstStdoutLine) {
 
 // ── The gate journal: completeness governs the record ─────────────────────────────────────────
 //
-// normative-hierarchy-2026-08-03.md §1: minimization still governs DELIVERY — nothing here changes
+// Minimization still governs DELIVERY — nothing here changes
 // what reaches a model's context, and silence stays the agent-facing signal. Completeness governs
 // the RECORD: this hook appends what it actually did, to a stream no agent reads in-band.
 //
@@ -505,7 +505,7 @@ function surfaceForHostTool(toolName) {
 // does not otherwise recognize. See this file's own top comment for the full hooks.md:148 citation
 // on why this — not permissionDecision:"defer" — is the correct "no opinion" idiom in every mode.
 //
-// RECORDING GAP, NAMED (normative-hierarchy-2026-08-03.md §1/§5): each of those early returns is an
+// RECORDING GAP, NAMED: each of those early returns is an
 // OUTCOME, not an exemption from recording — the §0 incident was undiagnosable precisely because a
 // declining guard left no trace. The gate journal that turns each into a recorded disposition
 // (\`declined: foreign-tool\`) is the next task, deliberately not this one; this patch fixes the
@@ -1019,15 +1019,14 @@ function validateSettingsShape(value: unknown): { ok: true; settings: SettingsFi
 // ── The coverage report ───────────────────────────────────────────────────────────────────────
 
 /**
- * The install-time coverage report (tool-surface.md's `monet install` row: "emits the coverage
+ * The install-time coverage report (the `monet install` row: "emits the coverage
  * report naming wired and unwired surfaces (the accepted hole, stated honestly at install
  * time)"). Every "not wired" line names something real from the boundary statement's own "What it
  * CANNOT promise" section rather than staying silent about it.
  */
 export function buildCoverageReport(): string {
   return `
-Coverage report — what this install actually enforces, and what it does not
-(gate-boundary-statement.md, "What it CANNOT promise"):
+Coverage report — what this install actually enforces, and what it does not:
 
 WIRED
   Bash, via PreToolUse — every blocking/advisory rule declared against a "Bash:..." action
@@ -1061,8 +1060,7 @@ NOT WIRED — the accepted hole, named rather than left silent
     tripping a pattern — by design (boundary statement, "CANNOT promise" #1: heuristic
     interception was rejected by name). Not a gap this matcher will ever close.
   - Any host other than Claude Code (Cursor, Codex CLI, ...): this command wires Claude Code
-    only — other hosts need their own adapter (next-monet-tool-surface.md's own "one adapter per
-    surface" — unbuilt).
+    only — other hosts need their own adapter ("one adapter per surface" — unbuilt).
 `;
 }
 

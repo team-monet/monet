@@ -1276,7 +1276,7 @@ export interface DeclareInput {
   content?: string;
   /**
    * THE EXITS TEST'S OWN FIELD (species "principle"/"preference" only). What evidence would prove
-   * this wrong — "the unfalsifiable is inadmissible" (skeleton-gates-recall.md, Part 1: the Exits
+   * this wrong — "the unfalsifiable is inadmissible" (the Exits
    * test). Optional because sovereignty replaces the battery on this entrance: omitting it never
    * blocks the write, it only earns a warning-light advisory (see `DeclareAdvisory`) prompting for
    * it, since an always-on entry with no stated way to impeach it is exactly the platitude risk the
@@ -8983,7 +8983,7 @@ export class MonetCore {
     // MINIMAL CURATION SURFACING (skeleton-entrances slice, item 7): membership list + count, the
     // SAME dual shape possibleDuplicates/counts.possibleDuplicates already uses just below — a
     // small fixed cap rather than stage_lookup's byte-fit loop, proportionate to principles being
-    // "few, always present" by design (skeleton-gates-recall.md, Part 1) and preferences expected
+    // "few, always present" by design, and preferences expected
     // to stay in the same range.
     const OVERVIEW_SKELETON_CAP = 25;
     // Curation's view — carries how each member entered (monet-core#142). The always-on
@@ -11889,8 +11889,8 @@ export class MonetCore {
             const message = e instanceof Error ? e.message : String(e);
             // NAME THE DATED DEFERRAL rather than let addLifecycleEdge's own cross-circle message
             // stand alone: cross-circle skeleton membership isn't a bug this call tripped over, it
-            // is a decision the design has explicitly not made yet (skeleton-gates-recall.md's
-            // materialization slice owns it), and a caller hitting this should be told that rather
+            // is a decision the design has explicitly not made yet (the materialization slice
+            // owns it), and a caller hitting this should be told that rather
             // than left to guess whether it is a temporary validation gap.
             if (message.includes("would cross circles")) {
               throw new Error(
@@ -12202,8 +12202,8 @@ export class MonetCore {
    * not reach the always-on delivery path.
    */
   /**
-   * Runs the conformance pass over this store's gate journal and appends what it found
-   * (`normative-hierarchy-2026-08-03.md` §4/§7.3). Returns the annotations written.
+   * Runs the conformance pass over this store's gate journal and appends what it found.
+   * Returns the annotations written.
    *
    * NOT WIRED TO ANY TRIGGER, deliberately. §7 leaves the pass's trigger open in its own words —
    * "'rides the next session start' names the event, not the payer: agent_context is
@@ -13539,7 +13539,7 @@ export class MonetCore {
   }
 
   /**
-   * THE DECLARE-TIME FIRING TEST — monet-client#59, `normative-hierarchy-2026-08-03.md` §2:
+   * THE DECLARE-TIME FIRING TEST — monet-client#59:
    * "a pattern is admitted with at least one example action context it matches, verified at declare
    * time by the same evaluator the gate runs."
    *

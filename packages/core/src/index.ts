@@ -392,7 +392,7 @@ export type {
   GateJournalMouth,
 } from "./gate-journal";
 
-/** The conformance pass, cheap half (`normative-hierarchy-2026-08-03.md` §4/§7.3) — what the gate
+/** The conformance pass, cheap half — what the gate
  *  journal can say about whether a rule changed anything, claiming only what it observes. */
 export {
   appendConformanceAnnotations,

@@ -663,8 +663,8 @@ export interface GateCliDependencies {
   isStdinTTY(): boolean;
   setExitCode(code: number): void;
   /**
-   * Where to append the gate journal, or null to write none (`normative-hierarchy-2026-08-03.md`
-   * §1/§5). Resolved the same way the hook wrapper resolves it — MONET_STORAGE_DIR, else ~/.monet —
+   * Where to append the gate journal, or null to write none. Resolved the same way the hook
+   * wrapper resolves it — MONET_STORAGE_DIR, else ~/.monet —
    * and deliberately NOT via the project dir: a gate's cwd is whatever directory the host happened
    * to spawn it from, and a record that lands in a random project's .monet is worse than one that
    * always lands in the home store. Same reasoning the wrapper's own DENY_LOG_PATH comment gives.

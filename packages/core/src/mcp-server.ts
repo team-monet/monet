@@ -33,7 +33,7 @@ import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-sch
 /**
  * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions` option.
  *
- * CORRECTED 2026-08-03 (normative-hierarchy-2026-08-03.md §8, which required this before any code):
+ * CORRECTED 2026-08-03 (the design required this before any code):
  * the old text closed with "End with memory_checkpoint... without it, session state is lost", and
  * that promise had stopped being true. Monet is the normative system of record; generic memory and
  * workstreams are ruled out, and a session-end ritual is exactly the shape §6 rejects — every record
@@ -202,7 +202,7 @@ function fitStageViewForAck(stage: StageView): Record<string, unknown> {
 
 /**
  * The declare-time firing test's finding, rendered for the one channel a caller cannot skim past
- * (monet-client#59, `normative-hierarchy-2026-08-03.md` §2).
+ * (monet-client#59).
  *
  * WHY THIS IS GUIDANCE AND NOT JUST AN ADVISORY ENTRY: the write went through — sovereignty, and
  * that is correct — so the only thing standing between the author and a gate that never fires is

@@ -117,8 +117,8 @@
  * RULED 2026-07-28 (slice 4b-B): this artifact began as the "blocking sidecar" (slice 4a) — blocking
  * rules only, deliberately kept small for the offline-deny case. That scope is superseded: extending
  * the SAME artifact to carry every live rule (not shipping a second file) keeps one staleness
- * contract instead of two, and is what makes `monet gate` answerable offline in full — see
- * gate-boundary-statement.md's own dated supersession clause. The on-disk path and the
+ * contract instead of two, and is what makes `monet gate` answerable offline in full — per the
+ * boundary statement's own dated supersession clause. The on-disk path and the
  * `gateSidecarPath` config key are unchanged; only the entries widened and the names stopped saying
  * "blocking" for an artifact that no longer only carries blocking rules.
  */
@@ -4707,7 +4707,7 @@ export function materializeGateMirror(
   const checksum = createHash("sha256").update(canonical, "utf8").digest("hex");
   const sidecar: GateMirror = { ...sidecarWithoutChecksum, checksum };
   const dir = dirname(path);
-  // SIDECAR AT 0600 (gate-boundary-statement.md, "Binding consequences for 4b", item 1) — reusing
+  // SIDECAR AT 0600 — reusing
   // the source-materializer's own precedent MECHANISM: mode supplied at CREATION time, never a
   // chmod-after-the-fact (see e.g. source-materializer.ts's `writeFileSync(target, bytes, { mode:
   // ... })` and `openSync(..., O_CREAT | O_EXCL | O_WRONLY, 0o600)` call sites — none of them write

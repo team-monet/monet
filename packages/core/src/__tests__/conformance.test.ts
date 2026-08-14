@@ -1,5 +1,5 @@
 /**
- * The conformance pass, cheap half — `normative-hierarchy-2026-08-03.md` §4 and §7.3.
+ * The conformance pass, cheap half.
  *
  * The property under test throughout is restraint: this half must claim exactly what the journal
  * observes and no more. §4 rejected the counterfactual reading of "changed the action" as

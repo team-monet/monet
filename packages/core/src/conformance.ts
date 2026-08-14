@@ -316,7 +316,7 @@ export function appendConformanceAnnotations(
 }
 
 /**
- * The process-ratchet watch, from `next-monet-skeleton-gates-recall.md`'s own retirement-candidate
+ * The process-ratchet watch, from the design's own retirement-candidate
  * question: "rules and gates that fire but never change behavior".
  *
  * §4 makes it the query `fires > 0 AND changed + conformed = 0`, and this computes it — with the

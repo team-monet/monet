@@ -22,7 +22,7 @@ import { closeSync, openSync, renameSync, statSync, unlinkSync, writeSync } from
  * and it answers aggregate questions. It cannot be this, for two reasons that are not preferences:
  *
  *   1. The busiest mouth cannot reach it. The Claude Code hook wrapper is sqlite-write-free by
- *      standing ruling (gate-boundary-statement item 6) — it runs on every single Bash command, and
+ *      standing ruling — it runs on every single Bash command, and
  *      the §0 arrival it must witness happens BEFORE any decision to open a store. A record the
  *      most important mouth cannot write is not the record.
  *   2. A verdict row cannot witness a non-verdict. `commitGateWrites` inserts once, after the full

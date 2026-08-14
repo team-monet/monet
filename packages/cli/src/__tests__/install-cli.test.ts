@@ -853,7 +853,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
   });
 
   /**
-   * THE GATE JOURNAL, END TO END — `normative-hierarchy-2026-08-03.md` §1/§5.
+   * THE GATE JOURNAL, END TO END.
    *
    * Two mouths write one stream: the hook records what the HOOK did, the gate records what the GATE
    * did. Neither is redundant, and that is the point — when they disagree, or when one exists

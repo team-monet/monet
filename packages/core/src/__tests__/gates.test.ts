@@ -5689,8 +5689,8 @@ describe("the robustness tail", () => {
   });
 
   /**
-   * FILE PERMISSIONS (Codex round 7, item 5, corrected by round 8, item 1; gate-boundary-statement.md,
-   * "Binding consequences for 4b", item 1) — reusing source-materializer's own precedent MECHANISM:
+   * FILE PERMISSIONS (Codex round 7, item 5, corrected by round 8, item 1) — reusing
+   * source-materializer's own precedent MECHANISM:
    * mode supplied at creation time, never chmod-after. 0600 on the FILE defends against other local
    * accounts and backup tooling reading the mirror's content — never against the agent itself (same
    * uid) — the boundary doc's own framing, unchanged here. Three orthogonal cases, matching

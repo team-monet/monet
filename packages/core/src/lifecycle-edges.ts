@@ -271,8 +271,8 @@ export function createLifecycleEdgeSchema(db: StoragePort): void {
 }
 
 /**
- * THE FIRST ALTER THIS TABLE HAS EVER TAKEN — monet-core#142, `normative-hierarchy-2026-08-03.md`
- * §5. `ratifications` was born carrying every column it had; the bare `CREATE TABLE IF NOT EXISTS`
+ * THE FIRST ALTER THIS TABLE HAS EVER TAKEN — monet-core#142.
+ * `ratifications` was born carrying every column it had; the bare `CREATE TABLE IF NOT EXISTS`
  * above was enough because nothing was ever added. These two are added, so the guard is needed for
  * every store that already exists.
  *
@@ -307,8 +307,8 @@ function migrateRatificationColumns(db: StoragePort): void {
 }
 
 /**
- * The four gates a principle must pass to enter the skeleton by extraction
- * (`next-monet-skeleton-gates-recall.md`, Part 1). Ordered as the doc states them; the order is
+ * The four gates a principle must pass to enter the skeleton by extraction.
+ * Ordered as the doc states them; the order is
  * the record's, not an evaluation sequence — all four are answered together.
  */
 export const BATTERY_GATES = ["generates", "covers", "transfers", "exits"] as const;

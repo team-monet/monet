@@ -1,5 +1,5 @@
 /**
- * THE DECLARE-TIME FIRING TEST — monet-client#59, `normative-hierarchy-2026-08-03.md` §2:
+ * THE DECLARE-TIME FIRING TEST — monet-client#59:
  * "a pattern is admitted with at least one example action context it matches, verified at declare
  * time by the same evaluator the gate runs."
  *
