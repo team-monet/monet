@@ -34,6 +34,16 @@ npx @team-monet/monet
 
 > ⭐ If Monet helps, **[star the repo](https://github.com/team-monet/monet)** — it's the best way to support the project.
 
+## What's in this repo
+
+| Path | What it is |
+|---|---|
+| `packages/core` | The memory engine — store, retrieval, gates. Bundled into the CLI rather than published on its own. |
+| `packages/cli` | The `monet` MCP server + CLI. This is what ships to npm as `@team-monet/monet`. |
+| `harness/` | The `with-monet` agent harness — agent prompts and the install playbook. Markdown and one CLI stub; not a workspace member. |
+
+Building and testing: [CONTRIBUTING.md](./CONTRIBUTING.md). Reporting a vulnerability: [SECURITY.md](./SECURITY.md).
+
 ## License
 
 `packages/core` and `packages/cli` are licensed under the **GNU Affero General Public License v3.0** (`AGPL-3.0-only`) — see [LICENSE](./LICENSE). `harness/` is licensed under the **Apache License 2.0** — see [harness/LICENSE](./harness/LICENSE).
