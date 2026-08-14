@@ -59,8 +59,8 @@ export const QUERY_WILDCARD_CIRCLE = "*";
  *
  * Reads the gate mirror straight off disk: no store open, no MonetCore construction, no network.
  * That is the entire point — the CLI must answer with the server down. See
- * ../monet-core/docs/design/next-monet-tool-surface.md's `monet gate` row and
- * ../monet-core/docs/design/gate-boundary-statement.md's failure policy — this module implements
+ * ../core/docs/design/next-monet-tool-surface.md's `monet gate` row and
+ * ../core/docs/design/gate-boundary-statement.md's failure policy — this module implements
  * both, adapted to a store-less reader (see readGateMirrorFile's own comment for one adaptation,
  * and the next paragraph for another).
  *
