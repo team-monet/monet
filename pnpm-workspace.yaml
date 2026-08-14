@@ -8,9 +8,10 @@ packages:
 
 # ── Settings hoisted from the package manifests ───────────────────────────────
 # NOT new policy: pnpm reads `overrides` and `onlyBuiltDependencies` from the workspace ROOT
-# only, so the identical blocks still sitting in packages/core/package.json and
+# only, so the identical blocks that used to sit in packages/core/package.json and
 # packages/cli/package.json stopped taking effect the moment those packages became workspace
-# members. Everything below is the union of what those two manifests pinned before the merge,
+# members — they have since been deleted, since pnpm warned on every install that they did
+# nothing. Everything below is the union of what those two manifests pinned before the merge,
 # so that a root install resolves the same tree they each resolved on their own.
 #
 # ONE ENTRY IS NOT A PURE UNION, and it is worth naming rather than leaving to be discovered:
