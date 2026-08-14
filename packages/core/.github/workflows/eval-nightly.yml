@@ -1,0 +1,100 @@
+name: Eval (semantic embedder, nightly)
+
+# The real-recall gate. Runs the eval suite on the actual shipping
+# embedder (DEFAULT_MODEL via @huggingface/transformers; bge-small-en-v1.5 today) — too slow/networked for every PR,
+# so it runs nightly and on demand. src/__tests__/eval.onnx.test.ts FAILS the job on a
+# semantic-recall regression; `pnpm eval` is also captured as a human-readable artifact.
+#
+# Note: scheduled runs only fire from the default branch. Use the "Run workflow" button
+# (workflow_dispatch) to trigger it on a branch.
+
+on:
+  schedule:
+    - cron: "17 7 * * *" # 07:17 UTC nightly (off the top of the hour, per GitHub guidance)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semantic-eval:
+    name: semantic recall gate + report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # onnxruntime-node ships a prebuilt linux/x64 binary inside the package (no build script),
+      # so a plain install yields a working ONNX runtime on ubuntu-latest — no approve-builds needed.
+      - name: Install dependencies (incl. optional @huggingface/transformers)
+        run: pnpm install --frozen-lockfile
+
+      # embedding-onnx.ts pins transformers.js's cache to ~/.monet/models (#90), so cache THAT path.
+      # It used to point inside node_modules, which is where transformers defaults on its own; after
+      # the pin that path is never written and this step would silently cache nothing, re-downloading
+      # ~450MB every night. Unlike the node_modules path this one survives install, so it no longer
+      # depends on step ordering. Best-effort: a miss just re-downloads. Any pnpm-lock.yaml change
+      # busts the exact key, but the restore-keys prefix still reuses the previous cache.
+      # THE KEY NAMES THE MODEL, and that is load-bearing rather than cosmetic. It used to say
+      # minilm- for historical reasons, on the argument that it names the cache and not the model —
+      # which held only while the model never changed. A cache entry is immutable, so once the
+      # checkpoint moves, the old key still HITS, restores the previous model's files, and never
+      # takes the newly downloaded one: every run then re-downloads (~570MB for bge-m3) and saves
+      # nothing. Keep the space id here in step with DEFAULT_MODEL; the lockfile hash stays in the
+      # key so a dependency change still rotates, and the restore-keys prefix keeps THIS model's
+      # cache reusable across such rotations.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.monet/models
+          key: embed-model-Xenova-bge-m3-cls-q8-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            embed-model-Xenova-bge-m3-cls-q8-${{ runner.os }}-
+
+      # ONE POSITIONAL FILTER PER FILE. These are substring matches, not globs: "eval.onnx" matches
+      # ONLY eval.onnx.test.ts. Every *.onnx.test.ts file gates itself on MONET_EVAL_ONNX and this is
+      # the only job that sets it, so a file missing from this list does not run ANYWHERE — it is not
+      # merely unscheduled, it is dead. recall-floor.onnx and resolution-hybrid.onnx were exactly that
+      # for their whole existence: they self-gated, were never named here, and were found failing 5 of
+      # 9 assertions the first time anyone ran them. Adding a *.onnx.test.ts file means adding it here,
+      # and src/__tests__/onnx-gate-coverage.test.ts fails if you forget.
+      - name: Recall gate (fails the job on a semantic-recall regression)
+        env:
+          MONET_EVAL_ONNX: "1"
+        run: pnpm exec vitest run --dir src eval.onnx eval-baseline.onnx recall-floor.onnx resolution-hybrid.onnx
+
+      - name: Capture the eval report
+        if: always()
+        run: pnpm -s eval --embedder=onnx --verbose | tee eval-report.txt
+
+      - name: Capture the md-baseline eval report (bm25, chunk-cosine-rag, md-tree)
+        if: always()
+        run: pnpm -s eval:baseline --embedder=onnx --verbose | tee eval-baseline-report.txt
+
+      - name: Upload the eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-eval-report
+          path: eval-report.txt
+          if-no-files-found: warn
+
+      - name: Upload the md-baseline eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-eval-baseline-report
+          path: eval-baseline-report.txt
+          if-no-files-found: warn

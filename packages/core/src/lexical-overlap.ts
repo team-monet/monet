@@ -1,0 +1,119 @@
+/**
+ * THE LEXICAL ARM of native retrieval (#155) — the pure half.
+ *
+ * WHY A SECOND SIGNAL AT ALL. Nomination and search both reduce to top-1/top-k over every concept in
+ * a circle, and on the live corpus one embedding space cannot make that choice: measured by
+ * leave-one-out replay over 275 concepts, max-cosine returns an observation to its own concept 46.3%
+ * of the time. Raising or lowering tauAttach does not move it (46-49% across 0.50-0.75), and neither
+ * does removing the over-absorbed concepts (46.7% with blobs excluded from both sides). The signal,
+ * not the threshold and not the corpus, is the binding constraint.
+ *
+ * WHY LEXICAL AND NOT ENTITIES. `concept_entities` was the expected answer — it already exists and is
+ * densely populated (53,793 entities over 630 concepts). Measured on the same replay it scores 21.1%,
+ * WORSE than cosine alone, and 47.5% in combination: those entities are spread too evenly to separate
+ * anything. Plain IDF-weighted token overlap scores 53.2% by itself — beating the embedding — and
+ * cosine × (1 + 0.5 × lexical) scores 59.1% when overlap is taken against a concept's token union, and 67.1% when it is taken per observation and maxed — the unit rule this file's lexicalOverlap note explains.
+ *
+ * THE BLEND WEIGHT IS DELIBERATELY MODEST AND DELIBERATELY NOT PRESENTED AS TUNED. 0.5 measured
+ * 59.1% and 1.0 measured 57.5% across 739 replays, a gap inside the ~1.8pt standard error, so the
+ * sweep resolves the SHAPE and not the number: a modest boost on top of cosine wins, while
+ * lexical-dominant (54.0%) and evenly-weighted (55.5%) blends both score lower. Anyone changing it
+ * should re-run scripts/measure-nomination-signals.ts on the corpus it will govern rather than
+ * treating this constant as optimal.
+ *
+ * DOCUMENT FREQUENCY IS COUNTED OVER CONCEPTS, NOT OBSERVATIONS. A term every concept mentions must
+ * not be able to decide anything, and on a single-project store that describes most of the domain
+ * vocabulary — "monet", "store", "concept". Counting over observations would let a term that appears
+ * many times inside ONE concept look rare, which is exactly backwards for a signal whose whole job is
+ * to tell concepts apart.
+ *
+ * PURE: no db handle, no clock. The SQL that feeds it lives in retrieval.ts.
+ */
+
+/**
+ * Words worth matching on. Three characters minimum after the first, which drops the articles and
+ * operators that carry no discriminative load, and keeps identifiers (`tauAttach`, `source_chunks`)
+ * whole — those are the highest-signal tokens in a technical corpus and splitting them on case or
+ * underscore would scatter exactly the evidence this arm exists to catch.
+ */
+const TOKEN = /[a-z0-9][a-z0-9_-]{2,}/gu;
+
+/** The token set of one text. A SET, not a bag: this measures whether a term is shared, not how
+ *  often it is repeated, so a long observation cannot outscore a short one by restating itself. */
+export function lexicalTokens(text: string): Set<string> {
+  return new Set(text.toLowerCase().match(TOKEN) ?? []);
+}
+
+/**
+ * Inverse document frequency of one token, given how many of `conceptCount` concepts contain it.
+ *
+ * `1 + df` in the denominator so a token present in every concept still yields a positive weight
+ * rather than a zero or a negative one — a token cannot be made to count AGAINST a concept, which is
+ * what a raw log(N/df) would do once df exceeds N.
+ */
+export function tokenIdf(conceptCount: number, df: number): number {
+  // CLAMPED AT ZERO (Codex P2, PR #156). The `1 + df` denominator was supposed to keep a ubiquitous
+  // token from counting AGAINST a concept, and it does not: at df === conceptCount the log goes
+  // negative, so a term every candidate shares would subtract weight, `lexicalOverlap` could fall
+  // below zero, and a boosted rank could then sort UNDER an unboosted one. A term shared by
+  // everything must be NEUTRAL, which is exactly zero and never less.
+  return Math.max(0, Math.log(conceptCount / (1 + df)));
+}
+
+/**
+ * How much of the incoming text's discriminative mass this concept accounts for: the IDF-weighted
+ * fraction of the probe's own tokens that the concept also contains.
+ *
+ * APPLIED PER OBSERVATION, NEVER OVER A CONCEPT'S UNION — see the caller in retrieval.ts. A union
+ * grows with concept size until a large concept contains nearly every term and overlaps everything at
+ * ~1.0; measured, that cost small concepts 71.9% of their own evidence. Scored per observation and
+ * maxed, the same corpus goes 59.1% -> 67.1% argmax accuracy.
+ *
+ * NORMALIZED BY THE PROBE, NOT BY THE UNION. A concept holding a hundred observations contains more
+ * tokens than one holding two, and a Jaccard-style union denominator would penalise it for its size
+ * regardless of relevance — reintroducing a size bias in the opposite direction to the one #155
+ * started from. The question this answers is "how much of what arrived does this concept already
+ * know", which is the question resolution is actually asking.
+ *
+ * Returns 0 when the probe carries no weighted tokens at all, so an empty or stopword-only text
+ * contributes nothing rather than dividing by zero.
+ */
+export function lexicalOverlap(
+  probeTokens: ReadonlySet<string>,
+  conceptTokens: ReadonlySet<string>,
+  idfOf: (token: string) => number,
+): number {
+  let matched = 0;
+  let total = 0;
+  for (const token of probeTokens) {
+    const weight = idfOf(token);
+    total += weight;
+    if (conceptTokens.has(token)) matched += weight;
+  }
+  return total <= 0 ? 0 : matched / total;
+}
+
+/**
+ * The blend: cosine, boosted by how much of the incoming text the concept already contains.
+ *
+ * MULTIPLICATIVE, NOT ADDITIVE, and that is measured rather than preferred. An additive blend
+ * (0.5·cos + 0.5·lex) scores 59.4% against this form, because addition lets a concept with strong
+ * vocabulary overlap and no semantic relationship win outright, while multiplication keeps cosine as
+ * the floor of the decision and lets the lexical arm only re-order candidates that already have
+ * semantic support. A concept the embedding rejects cannot be talked into winning by vocabulary.
+ *
+ * THE WEIGHT IS A PLATEAU, NOT A POINT. Measured at the shipped observation-unit overlap, argmax
+ * accuracy runs 0.5 -> 67.1%, 1.0 -> 72.1%, 2.0 -> 72.7%, 4.0 -> 73.2% on the current embedder, and
+ * 72.8 / 73.9 / 74.2 / 73.3 on bge-small-en. Everything from 1.0 upward is one plateau inside the
+ * ~1.8pt standard error at n=739; 0.5 is measurably BELOW it. 1.0 is the conservative point on that
+ * plateau — enough boost to capture the gain, little enough that cosine keeps most of the decision.
+ *
+ * An earlier draft of this file claimed 0.5 was optimal and that higher weights scored worse. That
+ * came from measuring overlap against a concept's token UNION, whose size bias inverted the ordering.
+ * At the unit this code actually uses, the ordering is the other way around.
+ */
+export const LEXICAL_BOOST = 1.0;
+
+export function blendLexical(cosineScore: number, overlap: number): number {
+  return cosineScore * (1 + LEXICAL_BOOST * overlap);
+}

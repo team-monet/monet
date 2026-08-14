@@ -1,0 +1,73 @@
+{
+  "name": "@team-monet/core",
+  "version": "0.9.0",
+  "description": "Monet — state-centric memory substrate engine.",
+  "private": true,
+  "packageManager": "pnpm@10.33.2",
+  "license": "LicenseRef-Monet-Proprietary",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup && node scripts/strip-dts-comments.mjs",
+    "prepare": "pnpm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --dir src",
+    "demo": "tsx scripts/demo.ts",
+    "knows": "tsx scripts/knows-demo.ts",
+    "eval": "tsx src/eval/run.ts",
+    "eval:baseline": "tsx src/eval/run-baseline.ts",
+    "embed:check": "tsx scripts/embed-check.ts",
+    "mcp": "tsx scripts/mcp-cli.ts",
+    "mcp:smoke": "tsx scripts/mcp-smoke.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "better-sqlite3": "^11.7.0",
+    "zod": "^3.25.76"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^25.3.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4",
+    "typescript": "^5.7",
+    "vitest": "^3"
+  },
+  "pnpm": {
+    "overrides": {
+      "esbuild": "^0.28.1",
+      "hono": "^4.12.34",
+      "protobufjs": "^7.6.5",
+      "tar": "^7.5.21",
+      "ip-address": "^10.3.1",
+      "body-parser": "^2.3.0",
+      "fast-uri": "^3.1.5",
+      "postcss": "^8.5.23",
+      "nanoid": "^3.3.17"
+    },
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/team-monet/monet-core.git"
+  }
+}

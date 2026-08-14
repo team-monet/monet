@@ -1,0 +1,26 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
+.monet/
+.DS_Store
+*.log
+
+# Phase 1 corpus derivation pipeline (F2/F8 fixes): eval-corpus/{source,db,md}/ hold UNSCRUBBED
+# intermediates (raw sampled .db files and their md-tree exports) — these must never be committed.
+# The generic `*.db`/`*.db-shm`/`*.db-wal` globs above already guard the .db files incidentally,
+# but eval-corpus/md/ (pre-scrub markdown, containing the same emails/paths/keys the scrub step
+# exists to remove) had no guard at all. Explicit paths here make the intent unambiguous rather
+# than relying on an unrelated generic glob to happen to cover it.
+eval-corpus/source/
+eval-corpus/db/
+eval-corpus/md/
+
+# F8 fix: eval-corpus/publish/ (scrubbed, publishable) and its scrub-integrity marker are DERIVED
+# artifacts, regenerated on demand via the 3-command pipeline (see eval-corpus/README.md) and
+# delivered to the runner repo as run artifacts — not committed to source control. Kept on disk
+# locally; just no longer tracked in git.
+eval-corpus/publish/
+eval-corpus/SCRUB_MANIFEST.json
