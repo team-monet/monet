@@ -2,5 +2,6 @@
   "name": "monet",
   "private": true,
   "description": "Monet monorepo — packages/core (engine), packages/cli (shipped MCP server + CLI), harness/ (agent harness, outside the workspace).",
+  "license": "AGPL-3.0-only",
   "packageManager": "pnpm@10.33.2"
 }

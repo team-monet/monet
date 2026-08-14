@@ -39,4 +39,4 @@ await createMonetCoreMcpServer(core);
 
 ## License
 
-Proprietary and Confidential — see [LICENSE](./LICENSE).
+GNU Affero General Public License v3.0 (`AGPL-3.0-only`) — see [LICENSE](./LICENSE).

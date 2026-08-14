@@ -181,4 +181,4 @@ For the complete, version-matched option list, run `monet source --help` and `mo
 
 ## License
 
-Monet is distributed under a **proprietary license** — free to use for any purpose; redistribution, decompilation, and derivative works are not permitted. Full terms are in the `LICENSE` file included in this package.
+Monet is licensed under the **GNU Affero General Public License v3.0** (`AGPL-3.0-only`). Full terms are in the `LICENSE` file included in this package. The `with-monet` harness is licensed separately under the Apache License 2.0.

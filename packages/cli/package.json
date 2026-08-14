@@ -3,7 +3,7 @@
   "version": "1.6.1",
   "mcpName": "io.github.team-monet/monet",
   "description": "Monet \u2014 local-first, state-centric memory for coding agents. MCP server + CLI.",
-  "license": "LicenseRef-Monet-Proprietary",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "homepage": "https://monet.team-monet.com",
   "repository": {
@@ -56,21 +56,6 @@
     "tsx": "^4",
     "typescript": "^5.7",
     "vitest": "^3"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3",
-      "esbuild"
-    ],
-    "overrides": {
-      "tar": "^7.5.21",
-      "hono": "^4.12.34",
-      "fast-uri": "^3.1.5",
-      "ip-address": "^10.3.1",
-      "nanoid": "^3.3.17",
-      "postcss": "^8.5.23",
-      "body-parser": "^2.3.0"
-    }
   },
   "publishConfig": {
     "provenance": false

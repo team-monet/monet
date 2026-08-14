@@ -1,9 +1,12 @@
-Monet — @team-monet/monet
+Monet
 Copyright (C) 2026 John Lee
 
 This program is licensed under the GNU Affero General Public License,
 version 3 only (AGPL-3.0-only). The full, unmodified text of that
 license follows.
+
+Note: the harness/ subdirectory is licensed separately under the
+Apache License 2.0 — see harness/LICENSE.
 
 ================================================================================
 

@@ -36,4 +36,4 @@ npx @team-monet/monet
 
 ## License
 
-Monet is **free to use** for any purpose, personal or commercial, under the Monet Software License. Redistribution as a standalone product, modification, and reverse-engineering are not permitted. Full terms ship with the npm package.
+`packages/core` and `packages/cli` are licensed under the **GNU Affero General Public License v3.0** (`AGPL-3.0-only`) — see [LICENSE](./LICENSE). `harness/` is licensed under the **Apache License 2.0** — see [harness/LICENSE](./harness/LICENSE).
