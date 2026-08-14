@@ -1,4 +1,4 @@
-// THE load-bearing experiment behind docs/design/bounded-retrieval-unit.md: does cosine
+// THE load-bearing experiment behind the bounded retrieval unit: does cosine
 // discrimination collapse as text gets longer?
 //
 // Committed because the design leans on its output twice — to keep the thresholds (they measure

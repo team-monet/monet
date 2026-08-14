@@ -2,10 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, openSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 
 /**
- * The gate journal — `docs/design/normative-hierarchy-2026-08-03.md` §1 and §5.
+ * The gate journal.
  *
- * WHAT THIS IS FOR, in one line: normal silence and broken silence were indistinguishable. §0 of
- * that document is the incident report — the delegation gate surface sat invoked-but-inert for
+ * WHAT THIS IS FOR, in one line: normal silence and broken silence were indistinguishable. The
+ * incident report behind it — the delegation gate surface sat invoked-but-inert for
  * months after the host renamed its tool, and every observable stayed byte-identical to health the
  * whole time, because the guard that declined to evaluate left no trace. With arrival witnessed,
  * normal silence is "an arrival event with nothing to say" and broken silence is "no arrival event

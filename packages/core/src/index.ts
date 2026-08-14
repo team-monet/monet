@@ -368,7 +368,7 @@ export type {
   SyncRuleBindingRow,
 } from "./sync-types";
 
-/** The gate journal (`docs/design/normative-hierarchy-2026-08-03.md` §1/§5) — the record every
+/** The gate journal — the record every
  *  governing mechanism appends what it actually did to, including its declines. Exported because
  *  the mouths live in two repos: core's own gate and stage-lookup write it here, and the host-side
  *  CLI writes it from monet-client. One stream, or the correlation between them is guesswork. */

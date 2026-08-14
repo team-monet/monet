@@ -1733,7 +1733,7 @@ export interface DetachResult {
  * policy made concrete. The agent compresses a session into this at `checkpoint`; it
  * survives for explicit continuation through memory_workstreams. These slots SURVIVE; raw turns are EPHEMERAL.
  */
-/** The two slots that can CLOSE. See the slot cut, `docs/design/workstream-continuity-2026-08-05.md` §2. */
+/** The two slots that can CLOSE. */
 export type WorkstreamItemSlot = "question" | "step";
 
 /**
@@ -2360,7 +2360,7 @@ export interface MonetCoreOptions {
    */
   gateSidecarPath?: string;
   /**
-   * Where to append the gate journal (`docs/design/normative-hierarchy-2026-08-03.md` §1/§5) — the
+   * Where to append the gate journal — the
    * record of what every governing mechanism actually did, including its declines. NO DEFAULT, for
    * exactly the reason `gateSidecarPath` has none: a default would make every MonetCore ever
    * constructed append into the user's real store. Unset means core's own two mouths write nothing;
@@ -3222,7 +3222,7 @@ export class MonetCore {
       CREATE INDEX IF NOT EXISTS idx_resolution_events_circle_ts ON resolution_events(circle, ts);
 
       /*
-       * THE BOUNDED RETRIEVAL UNIT (#155, docs/design/bounded-retrieval-unit.md). The recall split
+       * THE BOUNDED RETRIEVAL UNIT (#155). The recall split
        * moved ranking off concept centroids onto observations; this is the same defect one level
        * down — an observation is too big to be a retrieval unit. A segment is a bounded span
        * carrying a vector and nothing else: no provenance, no identity anything outside retrieval

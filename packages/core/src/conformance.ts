@@ -2,7 +2,7 @@ import { appendGateJournalLine, GATE_JOURNAL_FORMAT } from "./gate-journal";
 import type { GateJournalClaimType } from "./gate-journal";
 
 /**
- * The conformance pass, cheap half — `docs/design/normative-hierarchy-2026-08-03.md` §4 and §7.3.
+ * The conformance pass, cheap half.
  *
  * WHAT §4 DEFINES, and why the definition matters more than the verdicts: "changed the action" is
  * given an OBSERVABLE definition on purpose. The counterfactual reading — what would have happened

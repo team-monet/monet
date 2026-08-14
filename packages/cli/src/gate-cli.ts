@@ -58,11 +58,9 @@ export const QUERY_WILDCARD_CIRCLE = "*";
  * `monet gate <action-context>` — the offline hook binary (slice 4b-C).
  *
  * Reads the gate mirror straight off disk: no store open, no MonetCore construction, no network.
- * That is the entire point — the CLI must answer with the server down. See
- * ../core/docs/design/next-monet-tool-surface.md's `monet gate` row and
- * ../core/docs/design/gate-boundary-statement.md's failure policy — this module implements
- * both, adapted to a store-less reader (see readGateMirrorFile's own comment for one adaptation,
- * and the next paragraph for another).
+ * That is the entire point — the CLI must answer with the server down. This module implements the
+ * `monet gate` contract and its failure policy, adapted to a store-less reader (see
+ * readGateMirrorFile's own comment for one adaptation, and the next paragraph for another).
  *
  * STALENESS SUBSTITUTED BY AGE — the ONE other adaptation this module makes and must state
  * plainly: `GateMirror.generation` is only meaningful compared against the LIVE store's own

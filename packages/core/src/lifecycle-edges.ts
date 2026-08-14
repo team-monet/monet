@@ -1,7 +1,7 @@
 /**
  * Lifecycle edges + ratifications — the normative substrate.
  *
- * The design of record ("Next Monet", docs/design/next-monet-skeleton-gates-recall.md) states that
+ * The design of record ("Next Monet") states that
  * edges are first-class relations in three families — derivation (principle → rule), provenance
  * (rule → transcript span), supersession (rule → rule) — and that authority is *edges, not a flag*:
  * impeachment, audit, extraction-evidence exclusion and mirror regeneration all run on them.

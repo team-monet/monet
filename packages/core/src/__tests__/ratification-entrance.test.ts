@@ -1,6 +1,5 @@
 /**
- * The ratification entrance and the battery record — monet-core#142,
- * `docs/design/normative-hierarchy-2026-08-03.md` §5.
+ * The ratification entrance and the battery record — monet-core#142.
  *
  * #142's defect, in its own words: three states are one observable — the battery ran and passed, it
  * ran and rejected, it never ran. The store could not be asked which. The measured evidence was

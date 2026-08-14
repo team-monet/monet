@@ -1,6 +1,5 @@
 /**
- * Backfill the bounded retrieval unit over already-stored memory (#155,
- * docs/design/bounded-retrieval-unit.md).
+ * Backfill the bounded retrieval unit over already-stored memory (#155).
  *
  *   MONET_DB=/path/to/monet.db npx tsx scripts/backfill-observation-segments.ts [--circle NAME]
  *

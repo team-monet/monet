@@ -1,8 +1,8 @@
 /**
- * The gate journal (`docs/design/normative-hierarchy-2026-08-03.md` §1/§5).
+ * The gate journal.
  *
  * THE PROPERTY EVERY TEST HERE IS ABOUT: normal silence and broken silence must stop being
- * indistinguishable. §0 of that document is the incident — a gate surface invoked-but-inert for
+ * indistinguishable. The incident behind it — a gate surface invoked-but-inert for
  * months, byte-identical to health throughout, because the mechanism that declined left no trace.
  * So the assertions below care far more about the events written when NOTHING happened than about
  * the ones written when a rule fired.

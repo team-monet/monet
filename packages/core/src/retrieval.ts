@@ -167,7 +167,7 @@ export interface NativeObservationMatch {
  * Ties break on the lexicographically smaller observation id: two observations of one concept can
  * legitimately score identically (duplicate text), and determinism is a hard contract here.
  *
- * SEGMENT GRANULARITY (#155, docs/design/bounded-retrieval-unit.md). The vectors scored here are an
+ * SEGMENT GRANULARITY (#155). The vectors scored here are an
  * observation's SEGMENTS, not the observation as a whole: the same unit split applied one level down,
  * because an observation is too big to be a retrieval unit. Measured on the live store, whole-
  * observation scoring let pairs from DIFFERENT concepts clear tauAttach 41.5% of the time and held

@@ -1,5 +1,5 @@
 /**
- * Observation segmenter tests (#155, docs/design/bounded-retrieval-unit.md).
+ * Observation segmenter tests (#155).
  *
  * The segmenter is where RELIABLE_EMBED_TOKENS stops being advice and becomes a bound, so the
  * properties that matter are the ones a downstream consumer is entitled to assume:

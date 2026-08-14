@@ -1,7 +1,7 @@
 /**
  * Rules, stages, and the gate engine — the deterministic firing path.
  *
- * The design of record (docs/design/next-monet-skeleton-gates-recall.md) says a rule is "bound to a
+ * The design of record says a rule is "bound to a
  * specific action, delivered by lookup at the moment of that action", that "a gate fires
  * deterministically: the host intercepts the action and asks Monet — no model, no judgment, no
  * network in the path, and silence when nothing matches", and that stages "need no taxonomy and no
@@ -108,7 +108,7 @@
  * `materializeGateMirror` writes every LIVE RULE — advisory and blocking alike — plus the full
  * stage registry to a local JSON file, so a host CLI can answer the WHOLE gate without reaching the
  * server, not only the offline-deny case ("one artifact, one staleness contract... answerable with
- * the server down" — docs/design/next-monet-tool-surface.md's `monet gate` row). The design's own
+ * the server down" — the `monet gate` contract). The design's own
  * distinction applies verbatim: a source's copy competes with the file as truth, while a MIRROR is
  * a build artifact with an unambiguous master. The store is master. The file is regenerated at
  * every declaration — never edited, never read back as authority, and safe to delete (the next
@@ -131,8 +131,7 @@ import type { StoragePort } from "./storage";
 // ---- vocabulary -------------------------------------------------------------
 
 /**
- * Breadth is a property of the MEMBER, and `*` is a breadth, not a circle (ratified 2026-07-28,
- * docs/design/next-monet-skeleton-gates-recall.md's "Breadth is a property of the binding" section).
+ * Breadth is a property of the MEMBER, and `*` is a breadth, not a circle (ratified 2026-07-28).
  * A rule carries it on its binding; a principle/preference carries it on its concept membership
  * metadata. A global member delivers in EVERY circle, unioned with the local circle's own members —
  * no shadowing or precedence. Stages are already store-global and therefore carry no breadth.
@@ -610,9 +609,8 @@ export function migrateGateColumns(db: StoragePort): void {
   // silently stale until SOME process restarts on the new build and a routine mutation (or the next
   // open's own backfill) re-triggers a refresh. That is a real regression — bounded to the upgrade
   // window only, self-healing on restart, never permanent — not a silent one: whoever takes this
-  // retreat must add ONE LINE to docs/design/gate-boundary-statement.md's own "Binding consequences
-  // for 4b" numbered list (the same section `materializeGateMirror`'s own 0600 comment already cites)
-  // naming the tradeoff plainly, the same way every other binding consequence in that list is named.
+  // retreat must record it plainly, naming the tradeoff in the change that takes it, the same way
+  // every other binding consequence of slice 4b is named.
   // Nobody has taken this retreat; this paragraph exists so a future profiler finding one has the
   // decision already made, not one to re-litigate from scratch.
   // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -2726,8 +2724,8 @@ export interface GateQueryOptions {
  * invocation payload the recognized matcher — and only the recognized matcher — spends the tokens
  * on. A distinct type rather than a widened `GateRule` (design directive): "never the body" stays
  * true for gateQuery's own delivery, unconditionally; this is agent-initiated pull at the moment of
- * need, which is where paying for the extra field is right (docs/design/next-monet-skeleton-gates-
- * recall.md, "Capabilities are content too — and the payload is the invocation, not a description").
+ * need, which is where paying for the extra field is right ("capabilities are content too — and the
+ * payload is the invocation, not a description").
  */
 export interface StageLookupRule extends GateRule {
   /** The rule concept's body when non-blank, else null — the invocation itself, not a description

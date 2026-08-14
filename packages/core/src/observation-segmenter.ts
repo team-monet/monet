@@ -1,5 +1,5 @@
 /**
- * THE BOUNDED RETRIEVAL UNIT for native observations (docs/design/bounded-retrieval-unit.md).
+ * THE BOUNDED RETRIEVAL UNIT for native observations.
  *
  * The recall unit split moved ranking off concept centroids and onto observations. This is the same
  * defect one level down, and the design doc states it on a postcard: *an observation is too big to be

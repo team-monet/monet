@@ -1,6 +1,6 @@
 /**
  * Store-time resolution — FIND BY EVIDENCE, CONFIRM BY IDENTITY (design of record,
- * docs/design/next-monet-skeleton-gates-recall.md, "Store-time resolution"). The DECISION lives
+ * "Store-time resolution"). The DECISION lives
  * here as a pure function; the engine executes it. (Refactoring-build directive: each subsystem
  * gets restructured as it is touched — src/retrieval.ts did this for the query arms in the recall
  * unit split, and this is its store-side twin.)

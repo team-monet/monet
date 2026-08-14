@@ -10,7 +10,7 @@
 /**
  * The size below which retrieval measures reliable on this store: unrelated pairs shorter than this
  * score 0.0% at or above tauAttach, while pairs three times longer cross it 93.3% of the time
- * (scripts/repros — the length-band table in docs/design/bounded-retrieval-unit.md).
+ * (scripts/repros — the length-band table).
  *
  * ADVISORY AT THE WRITE BOUNDARY, ENFORCED IN THE SEGMENTER. Refusing a write at this number would
  * turn away a large share of legitimate single-claim writes to buy a quality gradient, and a refusal
