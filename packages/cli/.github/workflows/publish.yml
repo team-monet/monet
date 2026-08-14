@@ -1,0 +1,161 @@
+name: Publish closed client
+
+# Runs on a version tag (v1.x.x) or a manual trigger.
+# Publishes the closed @team-monet/monet artifact to public npm via OIDC trusted publishing.
+#
+# OIDC trusted publishing (token-less):
+#   Configure at npmjs.com → @team-monet/monet → Settings → Publishing → Trusted Publishers.
+#   Add a GitHub Actions publisher:
+#     Repository:        team-monet/monet
+#     Workflow filename: publish.yml
+#     Environment:       (leave blank — this workflow uses no GitHub environment)
+#   Then enable "Allow publish" (npm's post-May-2026 required toggle).
+#   No NPM_TOKEN secret needed. The id-token: write permission below is what unlocks OIDC.
+#
+# NO --provenance: the private core repo must not be linked via provenance attestations.
+#   NPM_CONFIG_PROVENANCE=false makes this explicit and durable even if the repo goes public.
+#
+# Secrets required (set in GitHub repo Settings → Secrets → Actions):
+#   MONET_CORE_TOKEN  — GitHub PAT (classic or fine-grained) with read-only
+#                       access to the private repo team-monet/monet-core.
+#                       Fine-grained: repository "monet-core", permission "Contents: Read".
+#                       Classic: scope "repo" (read is sufficient for checkout).
+
+# Never cancel an in-flight publish — a partial publish is worse than a duplicate attempt.
+concurrency:
+  group: publish-${{ github.workflow }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (pack but do not publish)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+  id-token: write  # Required for OIDC trusted publishing to npm.
+
+jobs:
+  publish:
+    name: Build closed artifact and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the public client repo.
+      - name: Checkout monet-client
+        uses: actions/checkout@v4
+        with:
+          path: monet-client
+
+      # 2. Check out the PRIVATE core repo alongside the client.
+      #    The file: dep in package.json resolves to ../monet-core relative
+      #    to the client root, so both repos must be siblings at the workspace root.
+      # PIN THE CORE REVISION (Codex P1, PR #65). Without a ref this checks out core's default
+      # branch AT PUBLISH TIME, so a tag pushed after core advances bundles code that was never
+      # reviewed for this version and the tarball cannot be reproduced from this commit. The sha
+      # lives in .monet-core-ref beside package.json and is bumped with the version.
+      - name: Resolve the pinned core revision
+        id: core-ref
+        run: |
+          ref="$(tr -d '[:space:]' < monet-client/.monet-core-ref)"
+          if [ -z "$ref" ]; then
+            echo "::error::.monet-core-ref is empty — refusing to publish against an unpinned core"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Pinned core revision: $ref"
+
+      - name: Checkout monet-core (private)
+        uses: actions/checkout@v4
+        with:
+          repository: team-monet/monet-core
+          ref: ${{ steps.core-ref.outputs.ref }}
+          token: ${{ secrets.MONET_CORE_TOKEN }}
+          path: monet-core
+
+      - name: Verify the core checkout matches the pin
+        working-directory: monet-core
+        run: |
+          got="$(git rev-parse HEAD)"
+          want="${{ steps.core-ref.outputs.ref }}"
+          if [ "$got" != "$want" ]; then
+            echo "::error::core checkout is $got, expected $want"
+            exit 1
+          fi
+          echo "core at $got"
+
+      # Same trap as client#64, one layer out: the file: dep is COPIED by pnpm, so a cached copy
+      # from a previous run would silently win over the freshly pinned checkout.
+      - name: Drop any cached copy of the core dependency
+        working-directory: monet-client
+        run: rm -rf node_modules/.pnpm/@team-monet+core* node_modules/@team-monet/core
+
+      # Directory layout after the two checkouts:
+      #   $GITHUB_WORKSPACE/
+      #     monet-client/   ← public repo (this workflow)
+      #     monet-core/     ← private repo (file:../monet-core)
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+          cache-dependency-path: monet-client/pnpm-lock.yaml
+
+      # Ensure npm >= 11.5.1 for OIDC trusted publishing support.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      # Build core first so its dist/ is available for the client bundle step.
+      - name: Install core dependencies
+        working-directory: monet-core
+        run: pnpm install --frozen-lockfile
+
+      - name: Build core
+        working-directory: monet-core
+        run: pnpm build
+
+      # Install client dependencies — the file:../monet-core specifier now
+      # resolves to the freshly built local checkout.
+      - name: Install client dependencies
+        working-directory: monet-client
+        run: pnpm install --frozen-lockfile
+
+      # Build the closed esbuild bundle (minified, no sourcemaps, no comments).
+      - name: Build closed client artifact
+        working-directory: monet-client
+        run: pnpm build
+
+      # Smoke-check the tarball contents before publishing.
+      - name: Verify tarball (no source, no sourcemap)
+        working-directory: monet-client
+        run: npm pack --dry-run
+
+      # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
+      # --access public is required for scoped packages on first publish; safe to repeat.
+      # NO --provenance flag: the private core repo must not be linked via attestations.
+      # NPM_CONFIG_PROVENANCE=false is set explicitly so provenance stays OFF even if
+      # this repo is ever made public (npm enables provenance by default on public repos).
+      - name: Publish to npm (OIDC trusted publishing)
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: monet-client
+        env:
+          NPM_CONFIG_PROVENANCE: "false"
+        run: npm publish --access public

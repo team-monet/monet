@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
+.monet/
+.turbo/
+.DS_Store
+*.log
+package.json.bak

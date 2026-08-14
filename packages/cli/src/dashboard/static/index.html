@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monet — Memory Dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Loading screen -->
+<div id="loading">
+  <div class="loading-wordmark">Monet</div>
+  <div class="loading-dots">
+    <div class="loading-dot"></div>
+    <div class="loading-dot"></div>
+    <div class="loading-dot"></div>
+  </div>
+  <div class="loading-msg">Loading memory store…</div>
+</div>
+
+<!-- Tooltip -->
+<div id="tooltip">
+  <div class="tt-title" id="tt-title"></div>
+  <div class="tt-kind" id="tt-kind"></div>
+  <div class="tt-meta" id="tt-meta"></div>
+  <div class="tt-conf-bar"><div class="tt-conf-fill" id="tt-conf-fill"></div></div>
+</div>
+
+<div id="app">
+  <!-- Top bar -->
+  <div id="topbar">
+    <div id="wordmark">Monet</div>
+    <div id="subtitle">memory dashboard</div>
+    <div id="circle-selector"></div>
+    <div id="search-wrap">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="5.5" cy="5.5" r="4"/><line x1="9" y1="9" x2="13" y2="13"/>
+      </svg>
+      <input id="search-input" type="text" placeholder="search concepts…" autocomplete="off" spellcheck="false">
+    </div>
+    <button id="refresh-btn" title="Refresh data">
+      <svg id="refresh-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M13.5 8A5.5 5.5 0 1 1 8 2.5c1.76 0 3.32.82 4.36 2.1"/>
+        <polyline points="14,1 14,5 10,5"/>
+      </svg>
+      Refresh
+    </button>
+  </div>
+
+  <!-- Stat bar -->
+  <div id="statbar"></div>
+
+  <!-- Body -->
+  <div id="body">
+    <!-- Left rail -->
+    <div id="rail">
+      <div id="rail-scroll">
+        <!-- Kind legend -->
+        <div>
+          <div class="rail-section-title">Concept kinds</div>
+          <div class="kind-chips" id="kind-chips"></div>
+        </div>
+
+        <!-- Flags -->
+        <div>
+          <div class="rail-section-title">Filters</div>
+          <div class="flag-chips">
+            <div class="flag-chip" data-flag="disputed">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="8" cy="8" r="7"/><line x1="8" y1="5" x2="8" y2="8"/><circle cx="8" cy="11" r="0.8" fill="currentColor"/></svg>
+              Disputed
+            </div>
+            <div class="flag-chip" data-flag="show-retired" title="Retired concepts are excluded by default — toggle to fetch and show them">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="8" cy="8" r="7"/><path d="M5 8h6"/></svg>
+              Show retired
+            </div>
+            <div class="flag-chip" data-flag="dirty">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 14L8 2l6 12H2z"/></svg>
+              Dirty / needs update
+            </div>
+            <div class="flag-chip" data-flag="has-contradiction">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 2v8M8 13v1"/></svg>
+              Has contradiction
+            </div>
+            <div class="flag-chip" data-flag="possible-duplicate">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="1" y="1" width="9" height="9" rx="2"/><rect x="6" y="6" width="9" height="9" rx="2"/></svg>
+              Possible duplicate
+            </div>
+          </div>
+        </div>
+
+        <!-- Confidence slider -->
+        <div>
+          <div class="rail-section-title">Min confidence</div>
+          <div class="slider-row">
+            <input type="range" id="conf-slider" min="0" max="1" step="0.05" value="0">
+            <span class="val-lbl" id="conf-val">0</span>
+          </div>
+        </div>
+
+        <!-- Edge types -->
+        <div>
+          <div class="rail-section-title">Edge types</div>
+          <div class="edge-type-rows" id="edge-type-rows"></div>
+        </div>
+
+        <!-- Edge weight slider -->
+        <div>
+          <div class="rail-section-title">Min edge weight</div>
+          <div class="slider-row">
+            <input type="range" id="weight-slider" min="0" max="10" step="0.5" value="0">
+            <span class="val-lbl" id="weight-val">0</span>
+          </div>
+        </div>
+
+        <!-- Entity overlay -->
+        <div>
+          <div class="rail-section-title">Overlays</div>
+          <div class="flag-chip" id="entity-overlay-toggle" data-flag="entity-overlay">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2"/></svg>
+            Entity overlay
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main content -->
+    <div id="main">
+      <!-- Tabs -->
+      <div id="tabs">
+        <button class="tab-btn" data-tab="graph">Graph</button>
+        <button class="tab-btn" data-tab="concepts">Concepts</button>
+        <button class="tab-btn" data-tab="entities">Entities</button>
+        <button class="tab-btn" data-tab="timeline">Timeline</button>
+        <button class="tab-btn" data-tab="sources">Sources</button>
+        <button class="tab-btn" data-tab="health">Health</button>
+      </div>
+
+      <div id="views">
+        <!-- Graph view -->
+        <div id="graph-view" class="view">
+          <canvas id="graph-canvas"></canvas>
+          <div id="graph-overlay"></div>
+          <button id="reset-layout-btn" title="Clear all pins and saved positions for this circle; re-run layout">Reset layout</button>
+          <!-- Shown instead of running the force layout when the filtered node count
+               exceeds GRAPH_NODE_LIMIT=800 (app.js, see its comment for the measured
+               n^2 math behind that number) -- the O(n^2) physics is only safe to
+               auto-run up to a few hundred nodes. Per John's no-hiding ruling source
+               rows are included in this count (not excluded), so the full store or a
+               large single circle (e.g. obsidian-vault) hits this cap by default. This
+               is a rendering interlock, not a content filter -- nothing is hidden, the
+               guard just declines to auto-draw at an unsafe scale; filtering to a
+               smaller circle renders normally. -->
+          <div id="graph-guard" class="graph-guard hidden">
+            <div class="graph-guard-msg">
+              <div class="graph-guard-title"><span id="graph-guard-count"></span> concepts match</div>
+              <div class="graph-guard-sub">Rendering caps at <span id="graph-guard-limit"></span> nodes — nothing is hidden, filter to a circle to draw the graph.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Concepts view -->
+        <!-- Renders every concept row, source rows included (no-hiding ruling) --
+             measured at ~60-100ms for the full ~3,460-row store, so no note/banner
+             and no pagination; see renderConceptsTable() in app.js. -->
+        <div id="concepts-view" class="view">
+          <div class="table-wrap">
+            <table id="concepts-table">
+              <thead>
+                <tr>
+                  <th data-col="title">Title <span class="sort-arrow">↕</span></th>
+                  <th data-col="kind">Kind <span class="sort-arrow">↕</span></th>
+                  <th data-col="circle">Circle <span class="sort-arrow">↕</span></th>
+                  <th data-col="confidence">Conf <span class="sort-arrow">↕</span></th>
+                  <th data-col="support_count">Support <span class="sort-arrow">↕</span></th>
+                  <th data-col="degree">Degree <span class="sort-arrow">↕</span></th>
+                  <th data-col="updated_at">Updated <span class="sort-arrow">↕</span></th>
+                </tr>
+              </thead>
+              <tbody id="concepts-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Entities view -->
+        <div id="entities-view" class="view">
+          <div class="table-wrap">
+            <table id="entities-table">
+              <thead>
+                <tr>
+                  <th data-col="surface">Surface <span class="sort-arrow">↕</span></th>
+                  <th data-col="kind">Kind <span class="sort-arrow">↕</span></th>
+                  <th data-col="scope">Circle <span class="sort-arrow">↕</span></th>
+                  <th data-col="df">Doc freq <span class="sort-arrow">↕</span></th>
+                  <th data-col="conceptCount"># Concepts <span class="sort-arrow">↕</span></th>
+                </tr>
+              </thead>
+              <tbody id="entities-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Timeline view -->
+        <div id="timeline-view" class="view">
+          <canvas id="timeline-canvas" height="180"></canvas>
+          <div id="timeline-list"></div>
+        </div>
+
+        <!-- Sources view -->
+        <div id="sources-view" class="view"></div>
+
+        <!-- Health view -->
+        <div id="health-view" class="view"></div>
+      </div>
+    </div>
+
+    <!-- Right detail panel -->
+    <div id="detail">
+      <div id="detail-hdr">
+        <div id="detail-title"></div>
+        <button id="detail-close" title="Close (Esc)">✕</button>
+      </div>
+      <div id="detail-scroll"></div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

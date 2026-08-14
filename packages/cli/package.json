@@ -1,0 +1,79 @@
+{
+  "name": "@team-monet/monet",
+  "version": "1.6.1",
+  "mcpName": "io.github.team-monet/monet",
+  "description": "Monet \u2014 local-first, state-centric memory for coding agents. MCP server + CLI.",
+  "license": "LicenseRef-Monet-Proprietary",
+  "type": "module",
+  "homepage": "https://monet.team-monet.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/team-monet/with-monet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/team-monet/with-monet/issues"
+  },
+  "keywords": [
+    "mcp",
+    "memory",
+    "agent",
+    "monet",
+    "local-first",
+    "state-centric",
+    "embeddings"
+  ],
+  "bin": {
+    "monet": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:cli": "tsx watch src/cli.ts",
+    "build": "node build.mjs",
+    "build:cli": "node build.mjs cli",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests --dir src",
+    "prepack": "node build.mjs && node scripts/strip-dev-deps.mjs",
+    "postpack": "node scripts/restore-dev-deps.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  },
+  "devDependencies": {
+    "@team-monet/core": "file:../monet-core",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "commander": "^12.1.0",
+    "zod": "^3.25.76",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^25.3.3",
+    "esbuild": "^0.25.12",
+    "tsx": "^4",
+    "typescript": "^5.7",
+    "vitest": "^3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ],
+    "overrides": {
+      "tar": "^7.5.21",
+      "hono": "^4.12.34",
+      "fast-uri": "^3.1.5",
+      "ip-address": "^10.3.1",
+      "nanoid": "^3.3.17",
+      "postcss": "^8.5.23",
+      "body-parser": "^2.3.0"
+    }
+  },
+  "publishConfig": {
+    "provenance": false
+  },
+  "packageManager": "pnpm@10.33.2"
+}
