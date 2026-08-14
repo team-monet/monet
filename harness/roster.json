@@ -1,0 +1,41 @@
+{
+  "lead": "stig",
+  "_note": "Field semantics and host mapping: bootstrap/install.md Phase 4.",
+  "agents": [
+    {
+      "name": "stig",
+      "role": "lead with strong technical understanding",
+      "mode": "primary",
+      "prompt": "agents/stig.md",
+      "touchesMonet": true,
+      "description": "The lead. The only agent the user talks to, the only one that uses Monet, and the only one that delegates. Answers directly when that suffices, and delegates by displacement — when what a task must touch exceeds what its conclusion needs."
+    },
+    {
+      "name": "investigator",
+      "role": "bounded evidence",
+      "mode": "subagent",
+      "prompt": "agents/investigator.md",
+      "touchesMonet": false,
+      "model": "sonnet",
+      "description": "Use when a decision needs evidence the lead doesn't have: code paths, behavior, history, logs, documentation, or external prior art. Read-only; returns verbatim evidence, keeps inference separate from observation, and names what it could not establish."
+    },
+    {
+      "name": "developer",
+      "role": "bounded change",
+      "mode": "subagent",
+      "prompt": "agents/developer.md",
+      "touchesMonet": false,
+      "model": "opus",
+      "description": "Use when a bounded change is ratified and ready to implement. Edits only the agreed scope, validates locally, and returns the real diff, the real command output, and the state it left behind."
+    },
+    {
+      "name": "verifier",
+      "role": "independent proof",
+      "mode": "subagent",
+      "prompt": "agents/verifier.md",
+      "touchesMonet": false,
+      "model": "opus",
+      "description": "Use when independent proof would materially reduce risk. The brief names the lens — acceptance, runtime, review, security, or a cold audit with no design context — and it returns an evidence-backed verdict without editing."
+    }
+  ]
+}
