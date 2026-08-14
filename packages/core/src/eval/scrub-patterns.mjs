@@ -120,6 +120,14 @@ export const USERS_PATH_RE = /\/Users\/[^\s`'")\]]+/g;
 // which `+` refused to match at all).
 export const TILDE_PATH_RE = /~\/[^\s`'")\]]*/g;
 
+// LITERALS IN THIS BLOCK ARE SYNTHETIC, same convention as the Constructor.io key above: the
+// endpoint `192.168.1.10:9301` and the tenant name `acme` used throughout the history below
+// reproduce the SHAPE of a real historical leak (an RFC1918 host:port with an immediately-adjacent
+// ", tenant <name>" clause), not the real address or the real tenant name. Every empirical finding
+// recorded below was measured against the real corpus and is reported faithfully; only the two
+// identifiers standing in for the leaked values are substituted. The stand-in address is
+// deliberately inside RFC1918 so it still exercises PRIVATE_ENDPOINT_RE.
+//
 // P1-c fix (round 2): RFC1918 private-address ranges — 10.0.0.0/8, 172.16.0.0/12 (172.16.x through
 // 172.31.x only, NOT the full 172.x range), 192.168.0.0/16 — each optionally followed by a `:port`
 // and/or a `/path` run, with an optional `http(s)://` scheme prefix folded into the same match so

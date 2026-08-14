@@ -182,6 +182,15 @@ describe("scrubString — P1-a fix (round 2): tilde-form home paths", () => {
 });
 
 describe("scrubString — P1-c fix (round 2): private RFC1918 endpoints and syntactically-adjacent tenant names", () => {
+  // FIXTURE VALUES ARE SYNTHETIC, same convention as the Constructor.io key fixtures above: the
+  // endpoint `192.168.1.10:9301` and the tenant name `acme` used throughout this suite reproduce
+  // the SHAPE of a real historical leak (an RFC1918 host:port with an immediately-adjacent
+  // ", tenant <name>" clause) — they are not the real address or the real tenant name. The shape is
+  // what these patterns key on and what the empirical findings recorded below are about; the
+  // specific octets, port and tenant name are stand-ins. The address is deliberately inside RFC1918
+  // because PRIVATE_ENDPOINT_RE matches only RFC1918 — a documentation-range address would make
+  // these assertions vacuous.
+  //
   // DESIGN HISTORY (see PRIVATE_ENDPOINT_RE's own doc comment in scrub-patterns.mjs for the full
   // account): two earlier designs for tenant-name redaction were tried, both found unsafe against
   // the REAL corpus, and both are now gone. Attempt 1 (a bare "tenant <word>" pattern, unconditional)
@@ -198,7 +207,7 @@ describe("scrubString — P1-c fix (round 2): private RFC1918 endpoints and synt
   // after the endpoint) rather than any cross-string/cross-file heuristic — a design that cannot
   // straddle two unrelated concepts no matter how large or how many concepts a file aggregates.
   describe("direction 1 — private endpoints (with or without an adjacent tenant clause) ARE redacted", () => {
-    it("redacts the exact real leak (192.168.x host:port from example-host's remote endpoint, with its immediately-adjacent tenant clause)", () => {
+    it("redacts the real leak's exact shape (RFC1918 host:port from example-host's remote endpoint, with its immediately-adjacent tenant clause)", () => {
       const input = "example-host (the remote/server Monet at http://192.168.1.10:9301, tenant acme) is PROD.";
       const out = scrubString(input);
       expect(out).not.toContain("192.168.1.10");
@@ -348,7 +357,8 @@ describe("scrubString — P1-c fix (round 2): private RFC1918 endpoints and synt
       // recover this second mention without reintroducing that same risk. This is flagged
       // explicitly as a known, accepted gap rather than silently left untested: the endpoint
       // itself and its immediately-adjacent tenant clause ARE always caught (see direction 1's
-      // "redacts the exact real leak" test); only a later, non-adjacent bare back-reference is not.
+      // "redacts the real leak's exact shape" test); only a later, non-adjacent bare back-reference
+      // is not.
       const input = "REVERSIBLE: re-register example-remote (user scope, http transport + bearer auth → the acme endpoint) to restore live access.";
       expect(scrubString(input)).toBe(input);
     });
@@ -406,9 +416,10 @@ describe("scrubFilenameIfNeeded — P1-b fix (round 2): sensitive topic-file slu
       expect(scrubFilenameIfNeeded("build-plan-doc-written-2026-06-30-users-dev-.md", used)).toBeNull();
     });
 
-    it("does NOT rename an already-slugified private RFC1918 endpoint (IP-octet dots destroyed by slugify — the real example-host leak's filename)", () => {
-      // Real leaked filename: "example-host-the-remote-server-monet-at-http-192" (truncated at
-      // slugify()'s 48-char limit). PRIVATE_ENDPOINT_RE requires a dotted-octet shape a slug
+    it("does NOT rename an already-slugified private RFC1918 endpoint (IP-octet dots destroyed by slugify — the example-host leak's filename shape)", () => {
+      // Leaked filename shape: "example-host-the-remote-server-monet-at-http-192" (truncated at
+      // slugify()'s 48-char limit) — a synthetic stand-in reproducing the real basename's shape,
+      // not the real basename. PRIVATE_ENDPOINT_RE requires a dotted-octet shape a slug
       // (hyphens instead of dots) no longer has.
       const used = new Set();
       expect(scrubFilenameIfNeeded("example-host-the-remote-server-monet-at-http-192.md", used)).toBeNull();
