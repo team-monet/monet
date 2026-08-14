@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
  *
  * NOTE on upgrades: switching a store that already holds memory under the literal "default" circle to a
  * derived circle leaves that legacy memory in "default" — organize it with the interactive migration
- * (with-monet `bootstrap/migrate-memory.md`) rather than stranding it.
+ * (`harness/bootstrap/consolidate-memory.md`) rather than stranding it.
  */
 export function deriveCircle(cwd: string = process.cwd()): string {
   let root = cwd;
