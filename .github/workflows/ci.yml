@@ -158,3 +158,30 @@ jobs:
 
       - name: Build
         run: pnpm --filter @team-monet/monet build
+
+  # The single check branch protection requires.
+  #
+  # It exists because `core` and `cli` are path-filtered: a pull request touching only harness/
+  # never runs them, so requiring those two by name would leave a protected branch waiting on
+  # checks that are never going to report. This job always runs, so it is always present to be
+  # required, and it fails only when a gate that DID run came back failed or cancelled.
+  #
+  # `if: always()` is load-bearing twice over — without it this job inherits the default
+  # "skip when a dependency was skipped", which is exactly the state that must still be reportable.
+  # Skipped dependencies are a pass here BY DESIGN: a gate that was correctly filtered out has
+  # nothing to say. Anything that ran and did not succeed is a failure.
+  all-green:
+    name: all gates green
+    if: always()
+    needs: [changes, core, cli]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report each gate's result
+        run: |
+          echo "changes = ${{ needs.changes.result }}"
+          echo "core    = ${{ needs.core.result }}"
+          echo "cli     = ${{ needs.cli.result }}"
+
+      - name: Fail if any gate failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
