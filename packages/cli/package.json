@@ -1,6 +1,6 @@
 {
   "name": "@team-monet/monet",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "mcpName": "io.github.team-monet/monet",
   "description": "Monet \u2014 local-first, state-centric memory for coding agents. MCP server + CLI.",
   "license": "AGPL-3.0-only",

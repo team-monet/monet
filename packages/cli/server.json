@@ -3,7 +3,7 @@
   "name": "io.github.team-monet/monet",
   "title": "Monet",
   "description": "Local-first, state-centric memory for coding agents. MCP server + CLI.",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "repository": {
     "url": "https://github.com/team-monet/monet",
     "source": "github",
@@ -14,7 +14,7 @@
     {
       "registryType": "npm",
       "identifier": "@team-monet/monet",
-      "version": "1.6.2",
+      "version": "1.6.3",
       "transport": {
         "type": "stdio"
       },
