@@ -32,7 +32,14 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
     expect(plainReport.arms.map((a) => a.arm)).toEqual(["no-memory", "monet-search"]);
   });
 
-  // Explicit ceilings preserve CI headroom for deterministic full-suite baseline work.
+  // The next three tests used to carry an explicit `}, 10_000)` ceiling, justified as preserving CI
+  // headroom. It did the opposite: a per-test ceiling BELOW the package's derived 30s global
+  // (vitest.config.ts) reintroduced exactly the machine-dependent verdict that global exists to
+  // eliminate — these tests replay the full baseline suite, whose measured durations under parallel
+  // load reach into the double-digit seconds, so a 10s ceiling made the verdict a function of runner
+  // load rather than of the code. It failed on GitHub's runner while passing locally. The ceilings
+  // are gone; the derived global governs. A test that genuinely needs MORE than the global should
+  // carry its own timeout and say why — none here needs less.
   it("bm25 runs without crashing and produces non-degenerate output", async () => {
     const report = await runBaselineSuite(STARTER_SUITE, embedder());
     const bm25 = report.arms.find((a) => a.arm === "bm25");
@@ -42,7 +49,7 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
     // overlap on a suite deliberately containing lexically-strong probes, per scenarios.ts).
     const noMemory = report.arms.find((a) => a.arm === "no-memory")!.metrics!;
     expect(bm25!.metrics!.byK[5].repeatedMistakeRate).toBeLessThan(noMemory.byK[5].repeatedMistakeRate);
-  }, 10_000);
+  });
 
   it("chunk-cosine-rag and md-tree run without crashing and produce non-degenerate output", async () => {
     const report = await runBaselineSuite(STARTER_SUITE, embedder());
@@ -61,7 +68,7 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
       expect(arm.metrics!.mrr.overall).toBeGreaterThan(0);
       for (const k of K_LADDER) expect(arm.goldContainingFileByK[k]).toBeGreaterThanOrEqual(0);
     }
-  }, 10_000);
+  });
 
   it("granularity-mismatch honesty: gold-containing-file@k is never below strict chunk-recall at the same k (spec §2.2)", async () => {
     // The file-level number is a STRICT LOOSENING of the chunk-level number (any top-k chunk
@@ -76,7 +83,7 @@ describe("md-baseline eval — shape/crash guarantees (deterministic lexical emb
         expect(arm.goldContainingFileByK[k]).toBeGreaterThanOrEqual(overallChunkRecallAtK(k) - 1e-9);
       }
     }
-  }, 10_000);
+  });
 
   it("the md-tree export's gold manifest carries every scenario's seed keys mechanically, across the WHOLE suite (spec §2.2)", async () => {
     // Direct check on the exporter contract itself, independent of the arm-scoring layer above:
