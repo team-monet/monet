@@ -42,15 +42,22 @@ import { defineConfig } from "vitest/config";
  * unlike console forwarding, which is fire-and-forget and therefore cannot time out. The failure
  * condition is a worker thread blocked synchronously long enough that it cannot service the reply.
  *
- * WHY FEWER THREADS. `gates.test.ts` is the only file in the suite whose own duration — 64.5s of a
+ * WHY FEWER WORKERS. `gates.test.ts` is the only file in the suite whose own duration — 64.5s of a
  * 125s run — exceeds that 60s ceiling on its own, and it makes 273 synchronous better-sqlite3 calls,
- * which block a thread exactly as a synchronous subprocess does. Standard runners give 4 vCPU and
- * vitest defaults to `numCpus - 1` threads, so three workers were contending for four cores. Fewer
+ * which block a worker exactly as a synchronous subprocess does. Standard runners give 4 vCPU and
+ * vitest sizes the pool at `numCpus - 1`, so three workers were contending for four cores. Fewer
  * workers means each one's own wall-clock shrinks, which is what has to drop below the ceiling.
+ *
+ * IT IS `forks`, NOT `threads` — CHECK BEFORE YOU CHANGE THIS. The bundle contains exactly one pool
+ * default, `resolved.pool ??= "threads"`, and reading it is how the first attempt at this cap
+ * configured `poolOptions.threads` and silently did nothing at all. The governing pool is `forks`,
+ * established by a probe test that printed `worker_threads.isMainThread === true` — tests execute in
+ * a child process's main thread, which the threads pool cannot produce. Source reading lost to a
+ * five-line runtime probe here; if you touch this, run the probe rather than re-reading the bundle.
  *
  * THIS IS A MITIGATION, NOT A PROOF. It reduces the wall-clock a blocked worker accumulates; it does
  * not remove the blocking. If the error returns, the next move is to make the synchronous work
- * async rather than to cut threads further — `source-git.test.ts` performs 84 `execFileSync` calls
+ * async rather than to cut workers further — `source-git.test.ts` performs 84 `execFileSync` calls
  * through one helper, which is the shape upstream reporters fixed. Do not reach for
  * `dangerouslyIgnoreUnhandledErrors`: it does not touch this cause and would silence every future
  * unhandled rejection in the suite along with it.
@@ -61,6 +68,6 @@ export default defineConfig({
   test: {
     testTimeout: 30_000,
     hookTimeout: 30_000,
-    ...(process.env.CI ? { poolOptions: { threads: { maxThreads: 2 } } } : {}),
+    ...(process.env.CI ? { poolOptions: { forks: { maxForks: 2 } } } : {}),
   },
 });
