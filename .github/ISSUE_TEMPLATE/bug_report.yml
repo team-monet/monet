@@ -9,6 +9,8 @@ body:
 
         Do not report a security vulnerability here. Use the **Security** tab → **Report a vulnerability**, as described in [SECURITY.md](https://github.com/team-monet/monet/blob/main/SECURITY.md).
 
+        **This tracker is public, and Monet's store is personal.** Never paste memory contents, credentials, or anything private into an issue — we do not need them to act on a report.
+
   - type: textarea
     id: what-happened
     attributes:
@@ -71,10 +73,8 @@ body:
     attributes:
       label: Anything about your store that might matter
       description: >
-        Optional, and only what you are comfortable sharing. Store size, the embedding model you
-        are pinned to, roughly how many memories you hold, whether more than one session was
-        running. Never paste memory contents, credentials, or anything private — we do not need
-        them, and this issue is public.
+        Optional. Store size, the embedding model you are pinned to, roughly how many memories
+        you hold, whether more than one session was running.
     validations:
       required: false
 
