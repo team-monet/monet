@@ -112,26 +112,17 @@ jobs:
         working-directory: packages/cli
         run: npm pack --dry-run
 
-      # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
-      # --access public is required for scoped packages on first publish; safe to repeat.
-      # NO --provenance flag. NPM_CONFIG_PROVENANCE=false is set explicitly so provenance
-      # stays OFF even once this repo is public (npm enables it by default on public repos).
-      # See the header note: the private-core-repo reason is gone, and re-enabling
-      # provenance is an open decision rather than a settled one.
-      - name: Publish to npm (OIDC trusted publishing)
-        if: ${{ inputs.dry_run != 'true' && inputs.registry_only != 'true' }}
-        working-directory: packages/cli
-        env:
-          NPM_CONFIG_PROVENANCE: "false"
-        run: npm publish --access public
-
       # packages/cli/server.json is the manifest the official MCP registry serves. It carries
       # the version in two places — top level and packages[0] — and nothing else in the build
       # reads either one, so it drifts in silence. It did: the registry entry sat at 1.2.4
       # naming the archived team-monet/with-monet repository while npm was on 1.6.3, because
-      # the manifest was committed and no workflow ever published it. Check first, so a drifted
-      # manifest fails the release instead of publishing a wrong version to the registry.
-      - name: Check server.json agrees with the published package
+      # the manifest was committed and no workflow ever published it.
+      #
+      # THIS RUNS BEFORE THE NPM PUBLISH, and the order is the point. An npm version is
+      # immutable once published; a drifted manifest caught afterwards would leave the release
+      # half-shipped, with npm advanced and the registry stranded, and no way to take it back.
+      # Everything here is local, so it costs nothing to fail first.
+      - name: Check server.json agrees with the package
         working-directory: packages/cli
         run: |
           node -e '
@@ -147,8 +138,28 @@ jobs:
               console.error(`server.json names no package with identifier ${pkg.name}`);
               process.exit(1);
             }
-            console.log(`server.json agrees: ${pkg.name}@${pkg.version}`);
+            // srv.name is the registry IDENTITY, and the namespace OIDC authorises. It is not
+            // implied by the version or the npm identifier, so drift here would publish under
+            // a different name — or fail authorisation — with npm already out the door.
+            if (srv.name !== pkg.mcpName) {
+              console.error(`server.json name ${srv.name} != package.json mcpName ${pkg.mcpName}`);
+              process.exit(1);
+            }
+            console.log(`server.json agrees: ${srv.name} / ${pkg.name}@${pkg.version}`);
           '
+
+      # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
+      # --access public is required for scoped packages on first publish; safe to repeat.
+      # NO --provenance flag. NPM_CONFIG_PROVENANCE=false is set explicitly so provenance
+      # stays OFF even once this repo is public (npm enables it by default on public repos).
+      # See the header note: the private-core-repo reason is gone, and re-enabling
+      # provenance is an open decision rather than a settled one.
+      - name: Publish to npm (OIDC trusted publishing)
+        if: ${{ inputs.dry_run != 'true' && inputs.registry_only != 'true' }}
+        working-directory: packages/cli
+        env:
+          NPM_CONFIG_PROVENANCE: "false"
+        run: npm publish --access public
 
       # Pinned deliberately, not tracked to latest: this binary runs in a job holding
       # id-token: write, so an unreviewed upgrade lands with registry-publishing rights.
