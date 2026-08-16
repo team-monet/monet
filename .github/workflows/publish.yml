@@ -145,21 +145,20 @@ jobs:
               console.error(`server.json name ${srv.name} != package.json mcpName ${pkg.mcpName}`);
               process.exit(1);
             }
-            console.log(`server.json agrees: ${srv.name} / ${pkg.name}@${pkg.version}`);
+            // The repository this manifest points readers at. A move that updates one side and
+            // not the other publishes a registry entry aimed at a repository that is gone —
+            // which is the exact failure this workflow exists to end, so it is checked here.
+            const repoUrl = (u) => String(u || "").replace(/^git\+/, "").replace(/\.git$/, "").replace(/\/$/, "");
+            if (repoUrl(srv.repository?.url) !== repoUrl(pkg.repository?.url)) {
+              console.error(`server.json repository ${repoUrl(srv.repository?.url)} != package.json ${repoUrl(pkg.repository?.url)}`);
+              process.exit(1);
+            }
+            if ((srv.repository?.subfolder || "") !== (pkg.repository?.directory || "")) {
+              console.error(`server.json subfolder ${srv.repository?.subfolder} != package.json directory ${pkg.repository?.directory}`);
+              process.exit(1);
+            }
+            console.log(`server.json agrees: ${srv.name} / ${pkg.name}@${pkg.version} @ ${repoUrl(srv.repository?.url)}/${srv.repository?.subfolder}`);
           '
-
-      # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
-      # --access public is required for scoped packages on first publish; safe to repeat.
-      # NO --provenance flag. NPM_CONFIG_PROVENANCE=false is set explicitly so provenance
-      # stays OFF even once this repo is public (npm enables it by default on public repos).
-      # See the header note: the private-core-repo reason is gone, and re-enabling
-      # provenance is an open decision rather than a settled one.
-      - name: Publish to npm (OIDC trusted publishing)
-        if: ${{ inputs.dry_run != 'true' && inputs.registry_only != 'true' }}
-        working-directory: packages/cli
-        env:
-          NPM_CONFIG_PROVENANCE: "false"
-        run: npm publish --access public
 
       # Pinned deliberately, not tracked to latest: this binary runs in a job holding
       # id-token: write, so an unreviewed upgrade lands with registry-publishing rights.
@@ -173,10 +172,33 @@ jobs:
           tar -xzf mcp-publisher.tar.gz mcp-publisher
           sudo install -m 0755 mcp-publisher /usr/local/bin/mcp-publisher
 
+      # ALSO BEFORE THE NPM PUBLISH, for the same reason as the agreement check above, and
+      # covering what that check cannot: the agreement check compares this manifest against
+      # package.json, while this one holds it against the registry's schema. A manifest can
+      # agree with the package perfectly and still be rejected by the registry, so both have
+      # to clear before the immutable half of the release goes out.
+      #
       # Runs on dry runs too — a manifest that cannot validate should surface before a tag.
       - name: Validate the server manifest
         working-directory: packages/cli
         run: mcp-publisher validate
+
+      # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
+      # --access public is required for scoped packages on first publish; safe to repeat.
+      # NO --provenance flag. NPM_CONFIG_PROVENANCE=false is set explicitly so provenance
+      # stays OFF even once this repo is public (npm enables it by default on public repos).
+      # See the header note: the private-core-repo reason is gone, and re-enabling
+      # provenance is an open decision rather than a settled one.
+      #
+      # By this line everything that can fail locally already has: the manifest agrees with
+      # the package and satisfies the registry schema. What remains after this is the network
+      # half — the registry publish — which can be retried, unlike an npm version.
+      - name: Publish to npm (OIDC trusted publishing)
+        if: ${{ inputs.dry_run != 'true' && inputs.registry_only != 'true' }}
+        working-directory: packages/cli
+        env:
+          NPM_CONFIG_PROVENANCE: "false"
+        run: npm publish --access public
 
       # github-oidc needs no secret: it exchanges this job's OIDC token, and the
       # io.github.team-monet/* namespace is authorised by this repository's owner.
