@@ -1,6 +1,5 @@
 name: Bug report
 description: Something in Monet behaves differently from what it says it does.
-labels: []
 body:
   - type: markdown
     attributes:
