@@ -1,0 +1,87 @@
+name: Bug report
+description: Something in Monet behaves differently from what it says it does.
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The most useful reports here name **what you observed** and **how you know** — an exact error string beats a description of it, and a case that fails every time is worth more than one that failed once.
+
+        Do not report a security vulnerability here. Use the **Security** tab → **Report a vulnerability**, as described in [SECURITY.md](https://github.com/team-monet/monet/blob/main/SECURITY.md).
+
+        **This tracker is public, and Monet's store is personal.** Never paste memory contents, credentials, or anything private into an issue — we do not need them to act on a report.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, and what Monet did instead of what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Exact output
+      description: >
+        Paste the error, log line, or tool response verbatim — not a paraphrase.
+        If a command produced it, include the command.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducible
+    attributes:
+      label: Does it reproduce?
+      options:
+        - Every time
+        - Sometimes
+        - Saw it once, could not reproduce
+        - Have not tried
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: If it reproduces, the shortest sequence that gets there.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Monet version
+      description: "`monet --version`, or the version of `@team-monet/monet` you installed."
+      placeholder: "1.6.3"
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Agent / host
+      description: What is talking to the MCP server — Claude Code, Codex, something else, or nothing (CLI only).
+      placeholder: "Claude Code 2.x, macOS 15"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Anything about your store that might matter
+      description: >
+        Optional. Store size, the embedding model you are pinned to, roughly how many memories
+        you hold, whether more than one session was running.
+    validations:
+      required: false
+
+  - type: textarea
+    id: ruled-out
+    attributes:
+      label: What you already ruled out
+      description: Optional. If you checked something and it was not the cause, saying so saves the same check being run again.
+    validations:
+      required: false

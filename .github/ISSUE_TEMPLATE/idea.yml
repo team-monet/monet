@@ -1,0 +1,34 @@
+name: Idea or change proposal
+description: Something Monet should do differently, or should do at all.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals are welcome, including ones that argue Monet's current design is wrong.
+
+        The most useful ones start from a situation rather than a feature: what were you doing, and what did Monet do that got in the way? A described problem can be solved several ways; a described solution can only be accepted or rejected.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The situation
+      description: What you were trying to do, and where Monet made it harder or impossible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would change
+      description: Optional. If you already have a shape in mind, describe it — but the situation above matters more.
+    validations:
+      required: false
+
+  - type: textarea
+    id: today
+    attributes:
+      label: How you handle it today
+      description: Optional. A workaround tells us how much the gap actually costs.
+    validations:
+      required: false

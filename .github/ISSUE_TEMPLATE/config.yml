@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/team-monet/monet/security/advisories/new
+    about: Private disclosure. Please do not open a public issue, discussion, or pull request for a vulnerability.
+  - name: Questions, and ideas still taking shape
+    url: https://github.com/team-monet/monet/discussions
+    about: Ask anything here. Open an issue once there is a specific defect or a concrete proposal.
+  - name: Install, setup, and the working method
+    url: https://github.com/team-monet/monet/tree/main/harness
+    about: The with-monet harness, the install playbook, and the agent prompts.
