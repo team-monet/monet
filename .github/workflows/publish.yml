@@ -2,7 +2,11 @@ name: Publish CLI
 
 # Runs on a version tag (v1.x.x) or a manual trigger.
 # Publishes the @team-monet/monet artifact (packages/cli) to public npm via OIDC
-# trusted publishing.
+# trusted publishing, then publishes packages/cli/server.json to the official MCP
+# registry (registry.modelcontextprotocol.io) so the two never diverge again.
+#
+# Both use OIDC and neither needs a secret. To re-sync only the registry entry —
+# without cutting an npm release — dispatch this workflow with registry_only=true.
 #
 # OIDC trusted publishing (token-less):
 #   Configure at npmjs.com → @team-monet/monet → Settings → Publishing → Trusted Publishers.
@@ -39,6 +43,14 @@ on:
     inputs:
       dry_run:
         description: "Dry run (pack but do not publish)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      registry_only:
+        description: "Skip npm, publish only the MCP registry manifest (use to re-sync a drifted registry entry)"
         required: false
         default: "false"
         type: choice
@@ -107,8 +119,59 @@ jobs:
       # See the header note: the private-core-repo reason is gone, and re-enabling
       # provenance is an open decision rather than a settled one.
       - name: Publish to npm (OIDC trusted publishing)
-        if: ${{ inputs.dry_run != 'true' }}
+        if: ${{ inputs.dry_run != 'true' && inputs.registry_only != 'true' }}
         working-directory: packages/cli
         env:
           NPM_CONFIG_PROVENANCE: "false"
         run: npm publish --access public
+
+      # packages/cli/server.json is the manifest the official MCP registry serves. It carries
+      # the version in two places — top level and packages[0] — and nothing else in the build
+      # reads either one, so it drifts in silence. It did: the registry entry sat at 1.2.4
+      # naming the archived team-monet/with-monet repository while npm was on 1.6.3, because
+      # the manifest was committed and no workflow ever published it. Check first, so a drifted
+      # manifest fails the release instead of publishing a wrong version to the registry.
+      - name: Check server.json agrees with the published package
+        working-directory: packages/cli
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const srv = require("./server.json");
+            const versions = [srv.version, ...srv.packages.map((p) => p.version)];
+            const drifted = versions.filter((v) => v !== pkg.version);
+            if (drifted.length > 0) {
+              console.error(`server.json version(s) ${drifted.join(", ")} != package.json ${pkg.version}`);
+              process.exit(1);
+            }
+            if (!srv.packages.some((p) => p.identifier === pkg.name)) {
+              console.error(`server.json names no package with identifier ${pkg.name}`);
+              process.exit(1);
+            }
+            console.log(`server.json agrees: ${pkg.name}@${pkg.version}`);
+          '
+
+      # Pinned deliberately, not tracked to latest: this binary runs in a job holding
+      # id-token: write, so an unreviewed upgrade lands with registry-publishing rights.
+      # Bump it on purpose.
+      - name: Install mcp-publisher
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+        run: |
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          tar -xzf mcp-publisher.tar.gz mcp-publisher
+          sudo install -m 0755 mcp-publisher /usr/local/bin/mcp-publisher
+
+      # Runs on dry runs too — a manifest that cannot validate should surface before a tag.
+      - name: Validate the server manifest
+        working-directory: packages/cli
+        run: mcp-publisher validate
+
+      # github-oidc needs no secret: it exchanges this job's OIDC token, and the
+      # io.github.team-monet/* namespace is authorised by this repository's owner.
+      - name: Publish to the MCP registry (GitHub Actions OIDC)
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: packages/cli
+        run: |
+          mcp-publisher login github-oidc
+          mcp-publisher publish
