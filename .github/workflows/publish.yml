@@ -2,7 +2,11 @@ name: Publish CLI
 
 # Runs on a version tag (v1.x.x) or a manual trigger.
 # Publishes the @team-monet/monet artifact (packages/cli) to public npm via OIDC
-# trusted publishing.
+# trusted publishing, then publishes packages/cli/server.json to the official MCP
+# registry (registry.modelcontextprotocol.io) so the two never diverge again.
+#
+# Both use OIDC and neither needs a secret. To re-sync only the registry entry —
+# without cutting an npm release — dispatch this workflow with registry_only=true.
 #
 # OIDC trusted publishing (token-less):
 #   Configure at npmjs.com → @team-monet/monet → Settings → Publishing → Trusted Publishers.
@@ -39,6 +43,14 @@ on:
     inputs:
       dry_run:
         description: "Dry run (pack but do not publish)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      registry_only:
+        description: "Skip npm, publish only the MCP registry manifest (use to re-sync a drifted registry entry)"
         required: false
         default: "false"
         type: choice
@@ -100,15 +112,99 @@ jobs:
         working-directory: packages/cli
         run: npm pack --dry-run
 
+      # packages/cli/server.json is the manifest the official MCP registry serves. It carries
+      # the version in two places — top level and packages[0] — and nothing else in the build
+      # reads either one, so it drifts in silence. It did: the registry entry sat at 1.2.4
+      # naming the archived team-monet/with-monet repository while npm was on 1.6.3, because
+      # the manifest was committed and no workflow ever published it.
+      #
+      # THIS RUNS BEFORE THE NPM PUBLISH, and the order is the point. An npm version is
+      # immutable once published; a drifted manifest caught afterwards would leave the release
+      # half-shipped, with npm advanced and the registry stranded, and no way to take it back.
+      # Everything here is local, so it costs nothing to fail first.
+      - name: Check server.json agrees with the package
+        working-directory: packages/cli
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const srv = require("./server.json");
+            const versions = [srv.version, ...srv.packages.map((p) => p.version)];
+            const drifted = versions.filter((v) => v !== pkg.version);
+            if (drifted.length > 0) {
+              console.error(`server.json version(s) ${drifted.join(", ")} != package.json ${pkg.version}`);
+              process.exit(1);
+            }
+            if (!srv.packages.some((p) => p.identifier === pkg.name)) {
+              console.error(`server.json names no package with identifier ${pkg.name}`);
+              process.exit(1);
+            }
+            // srv.name is the registry IDENTITY, and the namespace OIDC authorises. It is not
+            // implied by the version or the npm identifier, so drift here would publish under
+            // a different name — or fail authorisation — with npm already out the door.
+            if (srv.name !== pkg.mcpName) {
+              console.error(`server.json name ${srv.name} != package.json mcpName ${pkg.mcpName}`);
+              process.exit(1);
+            }
+            // The repository this manifest points readers at. A move that updates one side and
+            // not the other publishes a registry entry aimed at a repository that is gone —
+            // which is the exact failure this workflow exists to end, so it is checked here.
+            const repoUrl = (u) => String(u || "").replace(/^git\+/, "").replace(/\.git$/, "").replace(/\/$/, "");
+            if (repoUrl(srv.repository?.url) !== repoUrl(pkg.repository?.url)) {
+              console.error(`server.json repository ${repoUrl(srv.repository?.url)} != package.json ${repoUrl(pkg.repository?.url)}`);
+              process.exit(1);
+            }
+            if ((srv.repository?.subfolder || "") !== (pkg.repository?.directory || "")) {
+              console.error(`server.json subfolder ${srv.repository?.subfolder} != package.json directory ${pkg.repository?.directory}`);
+              process.exit(1);
+            }
+            console.log(`server.json agrees: ${srv.name} / ${pkg.name}@${pkg.version} @ ${repoUrl(srv.repository?.url)}/${srv.repository?.subfolder}`);
+          '
+
+      # Pinned deliberately, not tracked to latest: this binary runs in a job holding
+      # id-token: write, so an unreviewed upgrade lands with registry-publishing rights.
+      # Bump it on purpose.
+      - name: Install mcp-publisher
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+        run: |
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          tar -xzf mcp-publisher.tar.gz mcp-publisher
+          sudo install -m 0755 mcp-publisher /usr/local/bin/mcp-publisher
+
+      # ALSO BEFORE THE NPM PUBLISH, for the same reason as the agreement check above, and
+      # covering what that check cannot: the agreement check compares this manifest against
+      # package.json, while this one holds it against the registry's schema. A manifest can
+      # agree with the package perfectly and still be rejected by the registry, so both have
+      # to clear before the immutable half of the release goes out.
+      #
+      # Runs on dry runs too — a manifest that cannot validate should surface before a tag.
+      - name: Validate the server manifest
+        working-directory: packages/cli
+        run: mcp-publisher validate
+
       # Publish to npm via OIDC trusted publishing (no NPM_TOKEN needed).
       # --access public is required for scoped packages on first publish; safe to repeat.
       # NO --provenance flag. NPM_CONFIG_PROVENANCE=false is set explicitly so provenance
       # stays OFF even once this repo is public (npm enables it by default on public repos).
       # See the header note: the private-core-repo reason is gone, and re-enabling
       # provenance is an open decision rather than a settled one.
+      #
+      # By this line everything that can fail locally already has: the manifest agrees with
+      # the package and satisfies the registry schema. What remains after this is the network
+      # half — the registry publish — which can be retried, unlike an npm version.
       - name: Publish to npm (OIDC trusted publishing)
-        if: ${{ inputs.dry_run != 'true' }}
+        if: ${{ inputs.dry_run != 'true' && inputs.registry_only != 'true' }}
         working-directory: packages/cli
         env:
           NPM_CONFIG_PROVENANCE: "false"
         run: npm publish --access public
+
+      # github-oidc needs no secret: it exchanges this job's OIDC token, and the
+      # io.github.team-monet/* namespace is authorised by this repository's owner.
+      - name: Publish to the MCP registry (GitHub Actions OIDC)
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: packages/cli
+        run: |
+          mcp-publisher login github-oidc
+          mcp-publisher publish
