@@ -3884,18 +3884,37 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
   //
   // SHARED LIVENESS PREDICATE, never a hand-rolled copy — this function's own opening comment is an
   // incident report about what two inline copies of it cost.
+  //
+  // LIVENESS IS AN `EXISTS`, NOT A JOIN (Codex P2 on PR #51, and it was right). Joining
+  // `rule_bindings` put one row per BINDING under each stage before the events joined, so
+  // `COUNT(e.id)` multiplied every read by the stage's live-rule count — measured exactly:
+  // `pr delivery` reported 124 reads against a true 31, with 4 live rules, and every other row was
+  // the same product. The question here is "was this STAGE read", so the rules must be a test the
+  // stage passes, never rows the count can multiply against.
+  //
+  // AND A ZERO-RULE HIT IS NOT A DELIVERY (Codex P2 on the same review, and also right).
+  // `evaluateStageLookup` records `matched_stage_id` even when the named stage resolved no
+  // deliverable rules — a stage whose rules are all filtered out by model tag, say — and this field's
+  // contract is that a read proves DELIVERY. Counting those would also let a later declaration
+  // retroactively convert an old empty lookup into a read and quietly drop the stage off the unread
+  // list. No instance exists in the dogfood store today (the minimum recorded `rule_count` is 1), so
+  // this is written against the shape of the record rather than against an observed failure.
   const byStageRead = db
     .prepare(
       `SELECT s.id AS stageId, s.name AS stageName, COUNT(e.id) AS reads
          FROM stages s
-         JOIN rule_bindings b ON b.stage_id = s.id
-         JOIN concepts c ON c.id = b.concept_id
          LEFT JOIN gate_events e
            ON e.matched_stage_id = s.id
           AND e.matcher = 'recognized'
           AND e.circle = ?
           AND e.ts >= ?
-        WHERE ${RULE_LIVENESS_WHERE}
+          AND e.rule_count > 0
+        WHERE EXISTS (
+                SELECT 1
+                  FROM rule_bindings b
+                  JOIN concepts c ON c.id = b.concept_id
+                 WHERE b.stage_id = s.id AND ${RULE_LIVENESS_WHERE}
+              )
         GROUP BY s.id, s.name
         ORDER BY reads ASC, stageName ASC`,
     )

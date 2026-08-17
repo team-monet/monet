@@ -11664,6 +11664,59 @@ describe("gateStats byStageRead — the read dimension, per stage", () => {
   });
 
   /**
+   * ONE READ IS ONE READ, however many rules the stage carries (Codex P2 on PR #51).
+   *
+   * The first cut joined `rule_bindings` to test liveness, which put a row per BINDING under each
+   * stage before the events joined — so the count multiplied by the live-rule count. Measured on the
+   * dogfood store: `pr delivery` reported 124 reads against a true 31, with 4 live rules.
+   *
+   * EVERY FIXTURE IN THIS BLOCK BOUND EXACTLY ONE RULE PER STAGE, which is why the suite was green
+   * while the defect was in every multi-rule row: at one rule the multiplier is 1 and the bug is
+   * arithmetically invisible. The fixture could not exhibit the effect it was certifying.
+   */
+  it("counts a lookup once even when the stage carries several rules", async () => {
+    const c = core();
+    for (const text of ["Never force-push.", "Explain the rewrite.", "Tell John first."]) {
+      await c.store(text, {
+        kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+      });
+    }
+    c.stageLookup({ stage: "git force push" });
+    c.stageLookup({ stage: "git force push" });
+    const row = c.gateStats().byStageRead.find((r) => r.stageName === "git force push")!;
+    expect(row.reads).toBe(2); // two lookups — not 2 x 3 rules
+    c.close();
+  });
+
+  /**
+   * A READ PROVES DELIVERY, so a lookup that delivered nothing is not one (Codex P2, same review).
+   * `evaluateStageLookup` still records `matched_stage_id` when every rule was filtered out — here by
+   * a model tag that does not match — and counting that would let a later declaration retroactively
+   * turn an empty lookup into a read, dropping the stage off the unread list without anything having
+   * been delivered.
+   */
+  it("does not let a later declaration turn an earlier empty lookup into a read", async () => {
+    const c = core();
+    // Only model-a has anything bound here.
+    await c.store("Never force-push.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-a" },
+    });
+    // model-b looks the stage up and is delivered NOTHING — but the hit is still recorded, carrying
+    // the stage id and rule_count 0.
+    c.stageLookup({ stage: "git force push", runtimeModelTag: "model-b" });
+    // Now model-b gains a rule, so the stage becomes live for it and passes the liveness test.
+    await c.store("Explain the rewrite.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-b" },
+    });
+
+    const row = c.gateStats(undefined, 30, "model-b").byStageRead.find((r) => r.stageName === "git force push");
+    expect(row, "the stage is live for model-b now, so it must appear").toBeDefined();
+    // The earlier lookup delivered nothing, so it is not a read, and the stage is still unread.
+    expect(row!.reads).toBe(0);
+    c.close();
+  });
+
+  /**
    * SCOPED TO STAGES WITH SOMETHING LIVE TO DELIVER. A registry entry with no live rule in this
    * circle has nothing to be unread ABOUT, and reporting it would manufacture a finding — which is
    * the same failure mode `retirementCandidates` guards against one field up.
