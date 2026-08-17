@@ -3732,6 +3732,26 @@ export interface GateStats {
    * zero-filled row for a matcher that never fired, same convention `byStage` already uses.
    */
   byMatcher: Array<{ matcher: GateMatcher; count: number }>;
+  /**
+   * THE READ DIMENSION, per stage, in the window (#28): how many times each stage's rules were
+   * delivered because an agent NAMED it through `stage_lookup`. The second field on this type not
+   * scoped to the mechanical matcher.
+   *
+   * A DIFFERENT QUESTION FROM `byStage`, not a better one. `byStage` counts an intercepted action
+   * matching a trigger pattern; this counts the agent asking. A read proves DELIVERY and nothing
+   * more — never that the rule changed the action — which is a weaker claim than a fire, and it is
+   * listed separately rather than blended for exactly the reason the doc comment above gives.
+   *
+   * ZERO-READ STAGES ARE INCLUDED, and they are the point. Every other list on this type reports
+   * what happened; this one has to report what did NOT, because a stage nobody has ever asked for is
+   * indistinguishable from a healthy quiet one until something says so. Ordered reads-first-ascending
+   * so the zeroes lead.
+   *
+   * SCOPED TO STAGES WITH A LIVE RULE IN THIS CIRCLE, via the shared liveness predicate: a stage
+   * with nothing bound to it in this circle has nothing to deliver, so counting it as unread would
+   * manufacture a finding out of an empty registry entry.
+   */
+  byStageRead: Array<{ stageId: string; stageName: string; reads: number }>;
   /** Stages whose patterns have never fired anywhere. Store-global; the dead-pattern watchlist. */
   unverifiedPatterns: Array<{ stageId: string; stageName: string; origin: StageOrigin; patterns: string[] }>;
   /**
@@ -3842,6 +3862,50 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
         ORDER BY matcher ASC`,
     )
     .all(opts.circle, since) as Array<{ matcher: GateMatcher; count: number }>;
+  // THE READ DIMENSION (#28). Everything above counts the gate answering an intercepted ACTION;
+  // this counts it answering an agent that NAMED a stage. The data has been in this table since
+  // stageLookup started writing `matcher = 'recognized'` rows and no accessor has ever exposed it —
+  // measured on one dogfood store, 387 recognized rows against 16 mechanical, the entire read
+  // dimension unreachable through the public API while the exposed one has been static since July.
+  //
+  // THE FILTERS LIVE IN THE JOIN, NOT IN `WHERE`, and that is the whole query. A stage with zero
+  // reads is the finding; moving `e.circle`/`e.ts`/`e.matcher` into `WHERE` would turn this back
+  // into an inner join and drop exactly the rows worth reporting — the list would then say only
+  // what already happened, which every other list here already says.
+  //
+  // GROUPED ON `matched_stage_id`, NOT THROUGH `gate_event_stages`, because a recognized call never
+  // writes that table (see byStage's comment above): the link table is structurally blind to reads,
+  // and stage identity for a recognized row lives on `gate_events.matched_stage_id` alone.
+  //
+  // A RECOGNIZED MISS carries a NULL stage by construction (evaluateStageLookup's miss path), so it
+  // joins to nothing and is counted nowhere here. That is correct and worth stating: the miss
+  // population is real and countable, but it is not attributable to a stage, so a per-stage list is
+  // not where it can honestly appear.
+  //
+  // SHARED LIVENESS PREDICATE, never a hand-rolled copy — this function's own opening comment is an
+  // incident report about what two inline copies of it cost.
+  const byStageRead = db
+    .prepare(
+      `SELECT s.id AS stageId, s.name AS stageName, COUNT(e.id) AS reads
+         FROM stages s
+         JOIN rule_bindings b ON b.stage_id = s.id
+         JOIN concepts c ON c.id = b.concept_id
+         LEFT JOIN gate_events e
+           ON e.matched_stage_id = s.id
+          AND e.matcher = 'recognized'
+          AND e.circle = ?
+          AND e.ts >= ?
+        WHERE ${RULE_LIVENESS_WHERE}
+        GROUP BY s.id, s.name
+        ORDER BY reads ASC, stageName ASC`,
+    )
+    .all(
+      opts.circle,
+      since,
+      opts.circle,
+      opts.runtimeModelTag ?? null,
+      opts.runtimeModelTag ?? null,
+    ) as GateStats["byStageRead"];
   const unverified = db
     .prepare(`SELECT id, name, origin, trigger_patterns FROM stages WHERE verified = 0 ORDER BY created_at ASC, id ASC`)
     .all() as Array<{ id: string; name: string; origin: StageOrigin; trigger_patterns: string }>;
@@ -3931,6 +3995,7 @@ export function gateStats(db: StoragePort, opts: GateStatsOptions): GateStats {
     total,
     byStage,
     byMatcher,
+    byStageRead,
     unverifiedPatterns: unverified.map((stage) => ({
       stageId: stage.id,
       stageName: stage.name,

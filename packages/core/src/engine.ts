@@ -198,7 +198,7 @@ import type {
 import { readFileSync } from "node:fs";
 import { appendConformanceAnnotations, computeConformance } from "./conformance";
 import type { ConformanceAnnotation, JournalDispositionLine } from "./conformance";
-import { clipActionContext, closeGateJournalEvent, gateJournalDisposition, openGateJournalEvent } from "./gate-journal";
+import { blockingRuleIdsOf, clipActionContext, closeGateJournalEvent, gateJournalDisposition, openGateJournalEvent } from "./gate-journal";
 import type { GateJournalClaimType, GateJournalDisposition, GateJournalMouth } from "./gate-journal";
 import { RATIFICATION_ENTRANCES, classifyRatificationPair } from "./lifecycle-edges";
 import { NON_LATIN_LETTER_TOLERANCE, nonLatinLetterShare } from "./script-gate";
@@ -2102,6 +2102,18 @@ export interface MemoryOverview {
     retirementCandidatesOmitted?: number;
     unexplainedDenies?: GateStats["unexplainedDenies"];
     unexplainedDeniesOmitted?: number;
+    /**
+     * Live stages in this circle that `stage_lookup` has never been asked for in the window (#28).
+     *
+     * THE ZEROES ONLY, never the full per-stage table. `GateStats.byStageRead` carries every stage
+     * with its count for a diagnostic consumer; what belongs on a curation surface is the part a
+     * reader cannot get from silence — a stage nobody has asked for looks exactly like a healthy
+     * quiet one. Omitted when empty, like every other exception list here, so a clean circle stays
+     * silent.
+     */
+    unreadStages?: Array<{ stageId: string; stageName: string }>;
+    /** True number omitted after the surface cap; absent when the list is complete. */
+    unreadStagesOmitted?: number;
   };
   livingModel: LivingModelCard[];
   openContradictions: PrewarmContradiction[];
@@ -8992,6 +9004,14 @@ export class MonetCore {
     const fullGateStats = this.gateStats(circle, GATE_STATS_WINDOW_DAYS, undefined, OVERVIEW_EXCEPTION_LIMIT);
     const retirementCandidates = fullGateStats.retirementCandidates;
     const unexplainedDenies = fullGateStats.unexplainedDenies;
+    // THE ZEROES, capped like every other exception list here (#28). `byStageRead` is the full
+    // per-stage table and belongs to a diagnostic reader; a curation surface gets only the stages
+    // nothing has asked for, because that is the one state indistinguishable from health.
+    const unreadStagesAll = fullGateStats.byStageRead
+      .filter((row) => row.reads === 0)
+      .map(({ stageId, stageName }) => ({ stageId, stageName }));
+    const unreadStages = unreadStagesAll.slice(0, OVERVIEW_EXCEPTION_LIMIT);
+    const unreadStagesOmitted = unreadStagesAll.length - unreadStages.length;
     const dirtyTotal = opts.includeDirty ? this.dirtyCount(circle) : 0;
     const dirty = opts.includeDirty
       ? this.listDirty(circle, OVERVIEW_ENUMERATION_LIMIT).map(({ title: _title, ...card }) => ({
@@ -9037,6 +9057,10 @@ export class MonetCore {
           ...(fullGateStats.unexplainedDeniesOmitted !== undefined
             ? { unexplainedDeniesOmitted: fullGateStats.unexplainedDeniesOmitted }
             : {}),
+        } : {}),
+        ...(unreadStages.length > 0 ? {
+          unreadStages,
+          ...(unreadStagesOmitted > 0 ? { unreadStagesOmitted } : {}),
         } : {}),
       },
       livingModel,
@@ -13919,13 +13943,11 @@ export class MonetCore {
           // can match a blocking rule and an advisory one; the event is a `deny` as a whole, and a
           // conformance pass reading ids alone would credit the advisory rules with an interception
           // they had no part in. Recorded only when the distinction exists to be made.
-          ...(result.rules.some((rule) => rule.severity === "blocking")
-            ? {
-                blockingRuleIds: result.rules
-                  .filter((rule) => rule.severity === "blocking")
-                  .map((rule) => rule.conceptId),
-              }
-            : {}),
+          //
+          // SHARED with `gate-cli`'s write rather than inlined here (monet#37). This mouth was the
+          // only one that ever wrote the field, and the busiest one silently did not — exactly the
+          // divergence that keeping the derivation next to `gateJournalDisposition` prevents.
+          ...blockingRuleIdsOf(result.rules),
         },
       );
       return result;

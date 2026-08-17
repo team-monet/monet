@@ -373,6 +373,13 @@ export function fitOverviewEnvelope(overview: MemoryOverview & { resolvedFrom?: 
       (result.gateStats.unexplainedDeniesOmitted ?? 0) + result.gateStats.unexplainedDenies.length;
     delete result.gateStats.unexplainedDenies;
   }
+  // Dropped the same way, and the COUNT survives the list — an omitted-to-zero list would say the
+  // circle is clean, which is the one thing this field exists to stop being confused with.
+  if (result.gateStats.unreadStages?.length) {
+    result.gateStats.unreadStagesOmitted =
+      (result.gateStats.unreadStagesOmitted ?? 0) + result.gateStats.unreadStages.length;
+    delete result.gateStats.unreadStages;
+  }
   if (fits()) return { ...result };
 
   // FINAL RUNG: skeleton identity and membership always survive. Only its user-authored resident
