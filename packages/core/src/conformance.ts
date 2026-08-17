@@ -45,8 +45,18 @@ export interface ConformanceAnnotation {
   ruleIds: string[];
   /**
    * The subset of `ruleIds` the verdict actually applies to. Present when one fire mixed severities:
-   * only the blocking rules earned the verdict, and the rest are awaiting judgment. Absent means the
-   * verdict applies to all of `ruleIds`.
+   * only the blocking rules earned the verdict, and the rest are awaiting judgment.
+   *
+   * ABSENT MEANS THE FIRE NAMED ONE RULE, so there is nothing to apportion — not "the verdict
+   * applies to everything" (monet#37). Under the old reading, absence was the WIDEST possible claim,
+   * and the mouth on every real hook-path deny never wrote the field: measured across a 36,892-line
+   * journal it appeared on zero lines, and a force-push deny handed its `changed` to four advisory
+   * rules that had no part in it.
+   *
+   * EMPTY MEANS UNAVAILABLE — a multi-rule fire whose blocking ids were never recorded. The deny
+   * itself is still observed; which rules earned it is not, so no rule is credited and all of them
+   * stay in the backlog. That is this project's own principle: where a value is unavailable the
+   * record says so rather than defaulting to the verdict that looks like it.
    */
   verdictRuleIds?: string[];
   /** Absent when this half cannot decide without judgment; `claimType` then says `unavailable`. */
@@ -159,6 +169,77 @@ function buildChainIds(lines: readonly JournalDispositionLine[]): Map<string, st
 const FIRE_DISPOSITIONS = new Set(["deny", "advisory"]);
 
 /**
+ * ONE INTERCEPTION IS ONE VERDICT (monet#37).
+ *
+ * The hook path journals a single interception through two mouths, and both write the same
+ * disposition: the wrapper records that it refused the call, and the `monet gate` it spawns records
+ * the same refusal again with the rule ids attached. Selecting on disposition alone annotated both.
+ * Measured on a real journal: 960 interceptions produced 1,920 annotations, and 960 of those
+ * credited no rule at all, because the wrapper deliberately names none — the gate it spawns is "the
+ * only party that knows which stage matched and which rule ids were delivered".
+ *
+ * WHY THE CHAIN AND NOT A MOUTH RANKING. Neither mouth is authoritative on its own: the wrapper owns
+ * whether the call was actually refused, the gate owns which rules did it. `parentId` already ties
+ * them into one evaluation — the same correlation `buildChainIds` was built for — so the fold is
+ * over the chain, and a reader needs to know nothing about which mouth wrote which line.
+ *
+ * THE REPRESENTATIVE IS THE LINE THAT NAMES THE MOST RULES, which is the one that can say something.
+ * A chain whose gate never answered keeps its lone wrapper line and is annotated crediting nothing —
+ * dropping it would make an interception nobody looked at indistinguishable from one whose rule data
+ * is missing, which is the exact conflation this journal exists to end.
+ */
+function foldChainsToOneFire(
+  dispositions: readonly JournalDispositionLine[],
+  chainIds: ReadonlyMap<string, string>,
+): Set<string> {
+  const best = new Map<string, { id: string; named: number }>();
+  for (const line of dispositions) {
+    const id = line.id;
+    if (typeof id !== "string" || typeof line.disposition !== "string") continue;
+    if (!FIRE_DISPOSITIONS.has(line.disposition)) continue;
+    const chain = chainIds.get(id) ?? id;
+    const named = Array.isArray(line.ruleIds) ? line.ruleIds.length : 0;
+    const incumbent = best.get(chain);
+    // Strictly greater, so a tie keeps the earlier line and the choice stays deterministic.
+    if (incumbent === undefined || named > incumbent.named) best.set(chain, { id, named });
+  }
+  return new Set([...best.values()].map((entry) => entry.id));
+}
+
+/**
+ * Whether this evaluation actually stopped the act, read across the WHOLE chain rather than off one
+ * line (monet#37). The mouth that refuses the call and the mouth that names the rules are different
+ * lines, so asking only the representative would miss an `enforced` written by its sibling.
+ *
+ * Absence is left to the caller's default and is deliberately NOT flipped here: reading an absent
+ * `enforced` as false would demote every legacy hook-path deny out of `changed` on a default the
+ * record still does not state — one silent verdict traded for another, which is what #37 warns
+ * against. The fix for absence is that the mouths now write the field, not that the reader guesses
+ * harder.
+ *
+ * ONE PASS, not a scan per fire. The first cut of this asked the question per annotation and walked
+ * every disposition to answer it, which is quadratic — and the suite's own linearity guards caught
+ * it on a 20k-deny journal. Same defect the retry index was already rewritten for, and this journal
+ * is capped at 64 MiB, so "it is only a few thousand lines" is never the operating case.
+ */
+function buildChainEnforced(
+  dispositions: readonly JournalDispositionLine[],
+  chainIds: ReadonlyMap<string, string>,
+): Map<string, boolean> {
+  const enforced = new Map<string, boolean>();
+  for (const line of dispositions) {
+    const id = line.id;
+    if (typeof id !== "string" || typeof line.enforced !== "boolean") continue;
+    const chain = chainIds.get(id) ?? id;
+    // A recorded `false` anywhere in the chain wins and is never overwritten: some mouth observed
+    // that nothing was stopped, which is the whole point of the field.
+    if (enforced.get(chain) === false) continue;
+    enforced.set(chain, line.enforced);
+  }
+  return enforced;
+}
+
+/**
  * Computes annotations for every fire event not already annotated.
  *
  * PURE, and deliberately so: it takes parsed lines and returns annotations, touching no file. The
@@ -216,6 +297,9 @@ export function computeConformance(lines: readonly JournalDispositionLine[]): Co
   }
 
   const out: ConformanceAnnotation[] = [];
+  // Computed once over the whole journal, not per line: the fold is a property of the chain set.
+  const fireEvents = foldChainsToOneFire(dispositions, chainIds);
+  const enforcedByChain = buildChainEnforced(dispositions, chainIds);
 
   for (let i = 0; i < dispositions.length; i++) {
     const line = dispositions[i]!;
@@ -223,6 +307,10 @@ export function computeConformance(lines: readonly JournalDispositionLine[]): Co
     const disposition = line.disposition;
     if (typeof id !== "string" || typeof disposition !== "string") continue;
     if (!FIRE_DISPOSITIONS.has(disposition)) continue; // no rule fired; nothing to be conformant to
+    // The sibling mouths of one interception are skipped here, never earlier: they still take part
+    // in retry detection above, where a second occurrence of the act is exactly what is being looked
+    // for. Only the VERDICT is one per interception.
+    if (!fireEvents.has(id)) continue;
     const ruleIds = Array.isArray(line.ruleIds) ? (line.ruleIds as string[]) : [];
 
     // A "deny" THAT WAS NEVER ENFORCED IS NOT ONE (Codex P1 on PR #144, and it was right). The
@@ -231,7 +319,10 @@ export function computeConformance(lines: readonly JournalDispositionLine[]): Co
     // observed `changed` would count acts that ran freely as acts the rule prevented — inflating the
     // exact effectiveness measure this pass exists to make honest. It falls through to the advisory
     // treatment below, which is what it actually was.
-    const enforced = line.enforced !== false;
+    // Read across the chain, so the mouth that refused the call is heard even when the mouth that
+    // named the rules is the one representing it. Absence still defaults to enforced — see
+    // `buildChainEnforced` for why that default is deliberately left alone.
+    const enforced = enforcedByChain.get(chainIds.get(id) ?? id) !== false;
 
     if (disposition === "deny" && enforced) {
       // OBSERVED, not inferred: the host does not run a denied call. The act did not proceed as
@@ -251,9 +342,18 @@ export function computeConformance(lines: readonly JournalDispositionLine[]): Co
       // an interception they had no part in. The gate now journals which ids were the blocking ones,
       // and the verdict is scoped to those; the rest stay awaiting judgment, which is their real
       // state.
-      const blockingRuleIds = Array.isArray(line.blockingRuleIds)
+      //
+      // AND WHEN IT WAS NOT RECORDED, NO RULE IS CREDITED (monet#37). The mouth on every real
+      // hook-path deny never wrote the field, so absence was silently doing the crediting the
+      // comment above says it prevents. A fire naming ONE rule is still unambiguous — a deny IS a
+      // blocking rule having matched, so the sole name is necessarily it, and withholding that
+      // credit would trade over-crediting for under-crediting. Past one, attribution is a value the
+      // record does not hold, and an empty scope says so.
+      const recorded = Array.isArray(line.blockingRuleIds)
         ? (line.blockingRuleIds as string[])
         : undefined;
+      const blockingRuleIds = recorded !== undefined ? recorded : ruleIds.length > 1 ? [] : undefined;
+      const attributionUnavailable = recorded === undefined && ruleIds.length > 1;
       const previouslySaidRetried = annotatedRetry.get(id);
       // Emitted when never annotated, or when a retry has become observable since.
       if (previouslySaidRetried !== undefined && !(retried === true && previouslySaidRetried === false)) continue;
@@ -269,11 +369,16 @@ export function computeConformance(lines: readonly JournalDispositionLine[]): Co
         // still asserted the act "did not return unchanged", which is a claim nobody made. The
         // deny itself is still observed; only the retry question is unanswerable.
         reason:
-          retried === undefined
+          (retried === undefined
             ? "denied; the act did not run as intercepted, and whether it was retried is unavailable — no act identity on the record"
             : retried
               ? "denied, and the identical act was intercepted again afterwards — the rule held, and was fought"
-              : "denied; the act did not run as intercepted and did not return unchanged",
+              : "denied; the act did not run as intercepted and did not return unchanged") +
+          // Said on the annotation itself, because this is the half a reader would otherwise take on
+          // trust: the deny is observed, the apportionment is not.
+          (attributionUnavailable
+            ? "; which rules blocked is unavailable — the fire named several and the mouth recorded none, so no rule is credited"
+            : ""),
       });
       continue;
     }

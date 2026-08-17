@@ -6,6 +6,7 @@ import {
   GATE_MIRROR_FORMAT,
   RULE_SCOPES,
   RULE_SEVERITIES,
+  blockingRuleIdsOf,
   clipActionContext,
   closeGateJournalEvent,
   deriveCircle as coreDeriveCircle,
@@ -1025,6 +1026,14 @@ function runGateUnguarded(
     stageIds: result.stages.map((stage) => stage.id),
     stageNames: result.stages.map((stage) => stage.name),
     ruleIds: result.rules.map((rule) => rule.conceptId),
+    // WHICH OF THEM BLOCKED (monet#37). `core-gate` has written this since PR #144, and THIS mouth —
+    // the one on every real hook-path deny — never did, so the field appeared on zero of 36,892
+    // journal lines while the pass that reads it treated absence as "the verdict applies to all of
+    // them". A force-push deny credited its `changed` to four advisories that had no part in it.
+    //
+    // The severity was in hand the whole time: `gateJournalDisposition` immediately above picks
+    // `deny` over `advisory` by reading these very same `severity` fields.
+    ...blockingRuleIdsOf(result.rules),
     gateExitCode: outcome.code,
     mirrorGeneratedAt: read.mirror.generatedAt,
   });

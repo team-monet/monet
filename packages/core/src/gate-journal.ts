@@ -265,6 +265,28 @@ export function gateJournalDisposition(result: {
   return result.rules.some((rule) => rule.severity === "blocking") ? "deny" : "advisory";
 }
 
+/**
+ * WHICH of the matched rules actually blocked — the companion to the disposition above, and here for
+ * the identical reason: two writers deriving "blocking" separately is how they drift.
+ *
+ * WHY IT MUST BE WRITTEN AND CANNOT BE RECOVERED LATER (monet#37). A reader holding only `ruleIds`
+ * cannot tell which of them produced the deny, and the mirror is not a way back: measured on a
+ * 36,892-line journal, 507 of ~962 `gate-cli` fire lines name at least one rule that no longer
+ * exists in the mirror at all, and eight single-rule DENIES name a rule that reads `advisory` today.
+ * Severity is a moving target, so attribution is only true at the instant of evaluation. Recorded
+ * then, or never.
+ *
+ * Returns an EMPTY OBJECT rather than an empty array when nothing blocked, so the field's absence
+ * keeps meaning "no blocking rule was in this fire" on an advisory, and the shape stays identical to
+ * what `core-gate` has always written.
+ */
+export function blockingRuleIdsOf(
+  rules: ReadonlyArray<{ conceptId: string; severity: string }>,
+): { blockingRuleIds?: string[] } {
+  const blocking = rules.filter((rule) => rule.severity === "blocking").map((rule) => rule.conceptId);
+  return blocking.length === 0 ? {} : { blockingRuleIds: blocking };
+}
+
 /** Mints the id both lines carry and writes the arrival immediately — at the mouth, before any guard. */
 export function openGateJournalEvent(path: string | null, arrival: GateJournalArrival): GateJournalHandle {
   const handle: GateJournalHandle = { id: randomUUID(), at: new Date().toISOString() };

@@ -378,6 +378,7 @@ export {
   GATE_JOURNAL_FORMAT,
   GATE_JOURNAL_MAX_BYTES,
   appendGateJournalLine,
+  blockingRuleIdsOf,
   clipActionContext,
   closeGateJournalEvent,
   gateJournalDisposition,
