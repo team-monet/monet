@@ -96,7 +96,7 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   }
 
   const gates = overview.gateStats;
-  if (gates.windowTotal > 0 || gates.retirementCandidates || gates.unexplainedDenies) {
+  if (gates.windowTotal > 0 || gates.retirementCandidates || gates.unexplainedDenies || gates.unreadStages) {
     lines.push(bold("GATE EXCEPTIONS"));
     if (gates.windowTotal > 0) {
       lines.push(truncate(dim(`  ${gates.windowTotal} asked · ${gates.fires} fires · ${gates.silences} silences · ${gates.overflows} overflows · ${gates.delivered} delivered`), width));
@@ -109,6 +109,18 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
       lines.push(truncate(`  repair [${deny.conceptId.slice(0, 8)}] ${deny.stageName}  ·  ${deny.title}`, width));
     }
     if (gates.unexplainedDeniesOmitted) lines.push(dim(`  ${gates.unexplainedDeniesOmitted} more unexplained denies omitted`));
+    // A stage with a live rule that nothing has asked for. Not an error — it is the one gate state
+    // that reads exactly like health, which is why it is worth a line at all.
+    //
+    // THE WINDOW IS IN THE LABEL (Codex P2 on PR #51, and it was right). `byStageRead` counts within
+    // `windowDays`, so a bare "unread" cannot be told apart from "last read just outside the
+    // window" — and the reader would take the narrower claim for the permanent one. This whole
+    // change is about not writing a verdict where the value is unavailable; the renderer was quietly
+    // doing it one layer above the query.
+    for (const stage of gates.unreadStages ?? []) {
+      lines.push(truncate(`  unread/${gates.windowDays}d [${stage.stageId.slice(0, 8)}] ${stage.stageName}`, width));
+    }
+    if (gates.unreadStagesOmitted) lines.push(dim(`  ${gates.unreadStagesOmitted} more unread stages omitted`));
     lines.push("");
   }
 
@@ -121,7 +133,7 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   if (
     overview.counts.dirty === 0 && overview.counts.stale === 0 && overview.counts.disputed === 0 &&
     overview.counts.possibleDuplicates === 0 && overview.counts.extractionCandidates === 0 &&
-    !gates.retirementCandidates && !gates.unexplainedDenies && !overview.legacyStarConcepts
+    !gates.retirementCandidates && !gates.unexplainedDenies && !gates.unreadStages && !overview.legacyStarConcepts
   ) {
     lines.push(green("no curation work queued"));
     lines.push("");

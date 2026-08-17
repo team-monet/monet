@@ -163,6 +163,161 @@ describe("a mixed-severity fire credits only the rules that blocked", () => {
   });
 });
 
+/**
+ * #37. Everything in this block was green before the fix while the defect was on 100% of production
+ * denies, and the reason is the fixture: the block above HANDS the pass a `blockingRuleIds` it
+ * writes itself. Measured on a 36,892-line journal, the field appeared on ZERO lines — so that test
+ * certifies the pass CONSUMES the field and says nothing about whether anything PRODUCES it. The
+ * project's own principle, applied to its own suite: a fixture that cannot exhibit the effect proves
+ * nothing about it, however green it runs.
+ *
+ * These fixtures therefore carry `mouth`, because the defects are properties of the multi-mouth
+ * record and are invisible to any fixture that omits it.
+ */
+describe("#37 — the hook path's record, read as it is actually written", () => {
+  const hookDeny = (id: string, action: string): JournalDispositionLine =>
+    // The wrapper names no rules, by design: the gate it spawns is "the only party that knows which
+    // stage matched and which rule ids were delivered". Measured: 9 of 9 host-hook denies and 951 of
+    // 951 host-hook advisories carry no `ruleIds` key at all.
+    ({ phase: "disposition", id, mouth: "host-hook", disposition: "deny", actionContext: action });
+  const gateDeny = (
+    id: string, parentId: string, ruleIds: string[], action: string, blockingRuleIds?: string[],
+  ): JournalDispositionLine =>
+    ({ phase: "disposition", id, parentId, mouth: "gate-cli", disposition: "deny", ruleIds, actionContext: action,
+      ...(blockingRuleIds === undefined ? {} : { blockingRuleIds }) });
+
+  /**
+   * ONE INTERCEPTION IS ONE VERDICT. Both hook-path mouths journal the same interception and both
+   * write `disposition: "deny"`, so selecting on disposition alone annotated both. Measured on the
+   * real journal: 960 interceptions produced 1,920 annotations, and 960 of them credited no rule at
+   * all — 46% of the whole annotation stream was content-free duplicates.
+   */
+  it("annotates one interception once, not once per mouth", () => {
+    const annotations = computeConformance([
+      hookDeny("hook-1", "Bash:git push --force"),
+      gateDeny("gate-1", "hook-1", ["rule-a"], "Bash:git push --force", ["rule-a"]),
+    ]);
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]!.ruleIds).toEqual(["rule-a"]);
+  });
+
+  /**
+   * And the surviving annotation is the one that can say something. The wrapper's line names no
+   * rules, so an annotation over it is a `changed` verdict crediting nothing and explaining nothing
+   * — a permanent record entry with no content, which the pass's own idempotence would then freeze.
+   */
+  it("keeps the mouth that names the rules, not the one that names none", () => {
+    const [annotation] = computeConformance([
+      hookDeny("hook-1", "Bash:git push --force"),
+      gateDeny("gate-1", "hook-1", ["rule-a", "rule-b"], "Bash:git push --force", ["rule-a"]),
+    ]);
+    expect(annotation!.fireEventId).toBe("gate-1");
+    expect(annotation!.ruleIds).toEqual(["rule-a", "rule-b"]);
+    expect(annotation!.verdictRuleIds).toEqual(["rule-a"]);
+  });
+
+  /**
+   * The same defect on the advisory path, which #37 did not measure and which is where 951 of the
+   * 960 duplicates actually are.
+   */
+  it("folds an advisory interception too, not only a deny", () => {
+    expect(computeConformance([
+      { phase: "disposition", id: "hook-1", mouth: "host-hook", disposition: "advisory", actionContext: "Bash:ls" },
+      { phase: "disposition", id: "gate-1", parentId: "hook-1", mouth: "gate-cli", disposition: "advisory",
+        ruleIds: ["rule-a"], actionContext: "Bash:ls" },
+    ])).toHaveLength(1);
+  });
+
+  /**
+   * WHEN THE GATE NEVER ANSWERED, the wrapper's line is all there is, and it still gets its one
+   * annotation — crediting nothing, because nothing is what the record knows. Dropping it would
+   * recreate §0's conflation: an interception nobody looked at and an interception with no rule
+   * data would become indistinguishable.
+   */
+  it("still annotates a lone wrapper line when no gate line joined it", () => {
+    const annotations = computeConformance([hookDeny("hook-1", "Bash:git push --force")]);
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]!.fireEventId).toBe("hook-1");
+    expect(annotations[0]!.ruleIds).toEqual([]);
+  });
+
+  /**
+   * ABSENT IS NOT "ALL" — the load-bearing half. The old contract read a missing `blockingRuleIds`
+   * as "the verdict applies to every rule named", so a deny spanning a blocking rule and four
+   * advisories credited `changed` to all five. Measured live: an advisory logging rule and the
+   * gate-2 comprehension order are on record as having prevented a force-push they had no part in.
+   *
+   * Absent now means NOT RECORDED, which is what it is, and the rules go to the backlog instead of
+   * to a verdict they did not earn. This is the project's own principle — where a value is
+   * unavailable the record says unavailable, rather than defaulting to the verdict that looks like it.
+   */
+  it("credits no rule when a multi-rule deny does not record which ones blocked", () => {
+    const [annotation] = computeConformance([
+      hookDeny("hook-1", "Bash:git push --force"),
+      gateDeny("gate-1", "hook-1", ["blocking-a", "advisory-b", "advisory-c"], "Bash:git push --force"),
+    ]);
+    expect(annotation!.verdict).toBe("changed"); // the act was still stopped — that much is observed
+    expect(annotation!.verdictRuleIds).toEqual([]);
+    expect(annotation!.reason).toContain("which rules blocked is unavailable");
+
+    const byRule = Object.fromEntries(tallyByRule([annotation!]).map((t) => [t.ruleId, t]));
+    for (const id of ["blocking-a", "advisory-b", "advisory-c"]) {
+      expect(byRule[id]!, id).toMatchObject({ fires: 1, changed: 0, awaitingJudgment: 1 });
+    }
+  });
+
+  /**
+   * The one case where attribution needs no record: a deny naming exactly one rule. A deny IS a
+   * blocking rule having matched, so the single named rule is necessarily it. Withholding the credit
+   * here would trade over-crediting for under-crediting — the same dishonesty, opposite sign.
+   */
+  it("credits the sole named rule of a single-rule deny, which cannot be ambiguous", () => {
+    const [annotation] = computeConformance([
+      hookDeny("hook-1", "Bash:git push --force"),
+      gateDeny("gate-1", "hook-1", ["rule-a"], "Bash:git push --force"),
+    ]);
+    expect(annotation!.verdict).toBe("changed");
+    expect(tallyByRule([annotation!])[0]!).toMatchObject({ ruleId: "rule-a", changed: 1, awaitingJudgment: 0 });
+  });
+
+  /**
+   * AN ANNOTATION WRITTEN UNDER THE OLD CONTRACT IS NOT DONE (Codex P2 on PR #51).
+   *
+   * Idempotence is keyed to the fire event, so without this a store that had already run the pass
+   * would keep its legacy annotations — the ones where a missing `verdictRuleIds` meant "credit
+   * every rule named" — and would therefore retain the precise over-crediting this whole change
+   * exists to remove. Nothing downstream could tell those apart from correctly scoped ones.
+   */
+  it("replaces a legacy annotation that scoped nothing on a fire it would now scope", () => {
+    const journal: JournalDispositionLine[] = [
+      hookDeny("hook-1", "Bash:git push --force"),
+      gateDeny("gate-1", "hook-1", ["blocking-a", "advisory-b"], "Bash:git push --force"),
+      // Written by an older pass: no `verdictRuleIds`, which used to mean "applies to all".
+      { phase: "conformance", fireEventId: "gate-1", ruleIds: ["blocking-a", "advisory-b"], verdict: "changed" },
+    ];
+    const [replacement] = computeConformance(journal);
+    expect(replacement, "the stale annotation must be re-emitted, not skipped").toBeDefined();
+    expect(replacement!.verdictRuleIds).toEqual([]);
+
+    // And once replaced it settles: a further pass over the corrected record is a no-op.
+    expect(computeConformance([...journal, { phase: "conformance", ...replacement! }])).toHaveLength(0);
+  });
+
+  /**
+   * A REAL RETRY STILL READS AS ONE once the chain is folded. Folding must not cost the pass the
+   * signal it was built for: the same act, intercepted again through a genuinely separate evaluation.
+   */
+  it("still sees a genuine retry across two folded interceptions", () => {
+    const [first] = computeConformance([
+      hookDeny("hook-1", "Bash:git push --force"),
+      gateDeny("gate-1", "hook-1", ["rule-a"], "Bash:git push --force", ["rule-a"]),
+      hookDeny("hook-2", "Bash:git push --force"),
+      gateDeny("gate-2", "hook-2", ["rule-a"], "Bash:git push --force", ["rule-a"]),
+    ]);
+    expect(first!.retriedUnchanged).toBe(true);
+  });
+});
+
 describe("a chain is followed to its root, and a negative retry stays revisable", () => {
   /**
    * CODEX P1 ON PR #144. A three-deep interception — host-hook → gate-cli → core-gate — got the

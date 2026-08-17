@@ -898,6 +898,73 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
   });
 
   /**
+   * WHAT THE RECORD ACTUALLY CARRIES ON A MIXED-SEVERITY DENY (monet#37).
+   *
+   * THE REASON THIS TEST IS E2E AND NOT A UNIT FIXTURE, which is the whole lesson of the defect it
+   * closes. `conformance.test.ts` already had a green test for mixed-severity scoping — and it
+   * SUPPLIED `blockingRuleIds` in its own fixture, so it proved the pass consumes the field and said
+   * nothing about whether anything writes it. Measured across a 36,892-line production journal, the
+   * field appeared on ZERO lines: the only mouth that ever wrote it was core's in-process `gate()`,
+   * and the mouth on every real hook-path deny silently did not. A force-push deny then credited its
+   * `changed` verdict to four advisory rules that had no part in the block.
+   *
+   * So this spawns the real wrapper against the real `monet gate` and reads the real journal off
+   * disk. A fixture that hands itself the answer cannot fail the way production failed.
+   */
+  it("gate journal: a mixed-severity deny records WHICH rules blocked, and that it was enforced", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+
+    // Two rules, two stages, one command — the shape the real journal showed: every over-credited
+    // deny on record spanned two stages and mixed a blocking rule with advisories.
+    const core = new MonetCore(":memory:", { gateSidecarPath: mirrorPath, defaultCircle: "acme-widgets" });
+    await core.declare({
+      species: "rule", stage: "git force push", patterns: ["Bash:git push --force"],
+      content: "Never force-push to main.", severity: "blocking", scope: "domain",
+      reason: "a rewritten history cannot be recovered from a teammate's clone", circle: "*",
+    });
+    await core.declare({
+      species: "rule", stage: "pr delivery", patterns: ["Bash:git push"],
+      content: "Say what changed before pushing.", severity: "advisory", scope: "domain",
+      reason: "an unexplained push costs the reviewer the diff", circle: "*",
+    });
+    core.materializeGateMirror();
+    core.close();
+
+    const wrapperPath = writeRealWrapper(dir);
+    const result = spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
+      encoding: "utf8",
+      input: claudeCodeHookJson("git push --force"),
+      env: { ...process.env, MONET_STORAGE_DIR: dir },
+    });
+    expect(result.status).toBe(0);
+
+    const lines = readFileSync(join(dir, "gate-journal.jsonl"), "utf8")
+      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const hookDisposition = lines.filter((l) => l.mouth === "host-hook" && l.phase === "disposition")[0]!;
+    const gateDisposition = lines.filter((l) => l.mouth === "gate-cli" && l.phase === "disposition")[0]!;
+
+    // Both rules fired and the fire is a deny as a whole — the situation the field exists for.
+    expect(gateDisposition.disposition).toBe("deny");
+    expect((gateDisposition.ruleIds as string[]).length).toBe(2);
+
+    // ATTRIBUTION, WRITTEN AT EVALUATION TIME because it cannot be recovered afterwards: severity is
+    // a moving target, and on the real journal 507 of ~962 gate-cli fire lines already name a rule
+    // the current mirror no longer holds. Recorded then, or never.
+    const blocking = gateDisposition.blockingRuleIds as string[];
+    expect(Array.isArray(blocking)).toBe(true);
+    expect(blocking).toHaveLength(1);
+    expect(blocking[0]).not.toBe(undefined);
+    // The blocking id is one of the fired ids, and strictly fewer than all of them.
+    expect(gateDisposition.ruleIds as string[]).toContain(blocking[0]);
+
+    // ENFORCED, STATED RATHER THAN ASSUMED. The pass reads an absent `enforced` as true, so the
+    // guard against counting an unenforced deny as `changed` was structurally inert on the only
+    // path that matters. The wrapper is the mouth that refused the call, so it is the one that says so.
+    expect(hookDisposition.enforced).toBe(true);
+  });
+
+  /**
    * THE §0 EVENT, AND ITS ABSENCE OF A SIBLING.
    *
    * This is the exact incident the design is an answer to, now leaving a trace: a tool_name the

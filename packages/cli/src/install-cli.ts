@@ -700,7 +700,17 @@ function decide(event, stdin) {
         },
         systemMessage,
       });
-      return { disposition: "deny", extra: Object.assign({}, journalBase, { gateExitCode: 30 }) };
+      // ENFORCED, RECORDED RATHER THAN ASSUMED (monet#37). The conformance pass reads an absent
+      // \`enforced\` as true, so every hook-path deny was verdicted \`changed\` on a default the record
+      // never stated — and the guard meant to catch an unenforced deny could only ever fire on the
+      // one mouth that writes the field, which is not this one.
+      //
+      // WHAT THIS CLAIMS, exactly: that THIS mechanism refused the call — the \`permissionDecision:
+      // "deny"\` emitted immediately above. It is NOT a claim about the host's internals; \`emit\` is a
+      // one-way write to stdout and nothing here reads an acknowledgment back. That is the same
+      // scope \`enforced: false\` already carries on the stage-lookup mouth, where it means "a
+      // blocking rule was delivered and this mechanism stopped nothing".
+      return { disposition: "deny", extra: Object.assign({}, journalBase, { gateExitCode: 30, enforced: true }) };
     }
     case 40: {
       // "ask" (hooks.md:1539) — the protocol's own escalate-to-the-human value, distinct from

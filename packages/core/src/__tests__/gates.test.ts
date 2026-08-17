@@ -11595,6 +11595,178 @@ describe("gateStats byMatcher", () => {
   });
 });
 
+/**
+ * THE READ DIMENSION (#28). `byMatcher` above proves the recognized rows are COUNTED; none of it
+ * could say WHICH stage was read, so "which of my stages has never been asked for" was unanswerable
+ * through the public API while the data sat in the same table the whole time.
+ *
+ * Measured on one dogfood store before this shipped: `byStage` could speak about 1 stage (9 rows in
+ * `gate_event_stages`), while the recognized rows in the same database covered 24 — and three of
+ * those had never been read at all.
+ */
+describe("gateStats byStageRead — the read dimension, per stage", () => {
+  it("counts stage_lookup deliveries per stage, and lists a live stage nobody has ever asked for", async () => {
+    const c = core();
+    await c.store("Never force-push to a shared branch.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force origin main", ...AGENT_RULE },
+    });
+    await c.store("Say what changed before opening a PR.", {
+      kind: "rule", rule: { stage: "pr delivery", instance: "Bash:gh pr create", ...AGENT_RULE },
+    });
+    c.stageLookup({ stage: "git force push" });
+    c.stageLookup({ stage: "git force push" });
+    c.stageLookup({ stage: "no such stage" }); // a MISS: null stage, attributable to none
+
+    const byStage = Object.fromEntries(
+      c.gateStats().byStageRead.map((row) => [row.stageName, row.reads]),
+    );
+    expect(byStage["git force push"]).toBe(2);
+    // THE FINDING. `pr delivery` has a live rule bound and has never been asked for — the state that
+    // is otherwise indistinguishable from a healthy quiet stage. A list that only reported stages
+    // with reads could not contain this row at all.
+    expect(byStage["pr delivery"]).toBe(0);
+    // The miss is attributable to no stage, so it appears nowhere here rather than being charged to one.
+    expect(Object.values(byStage).reduce((a, b) => a + b, 0)).toBe(2);
+    c.close();
+  });
+
+  /**
+   * ZEROES LEAD. The ordering is the disclosure: a reader scanning the top of this list sees the
+   * stages nothing has asked for, which is the only signal here that cannot be inferred from silence.
+   */
+  it("orders unread stages first", async () => {
+    const c = core();
+    await c.store("Never force-push.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+    });
+    await c.store("Explain the change.", {
+      kind: "rule", rule: { stage: "pr delivery", instance: "Bash:gh pr create", ...AGENT_RULE },
+    });
+    c.stageLookup({ stage: "git force push" });
+    expect(c.gateStats().byStageRead[0]).toMatchObject({ stageName: "pr delivery", reads: 0 });
+    c.close();
+  });
+
+  /**
+   * A READ IS NOT A FIRE, and the two dimensions must not contaminate each other — the reason the
+   * rest of `GateStats` stays mechanical-only in the first place.
+   */
+  it("counts only recognized rows: a mechanical fire on the same stage does not appear here", async () => {
+    const c = core();
+    await c.store("Never force-push.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+    });
+    c.gate({ actionContext: "Bash:git push --force" }); // a FIRE on this stage, not a read
+    const stats = c.gateStats();
+    expect(stats.byStageRead.find((row) => row.stageName === "git force push")!.reads).toBe(0);
+    expect(stats.byStage.find((row) => row.stageName === "git force push")!.fires).toBe(1);
+    c.close();
+  });
+
+  /**
+   * ONE READ IS ONE READ, however many rules the stage carries (Codex P2 on PR #51).
+   *
+   * The first cut joined `rule_bindings` to test liveness, which put a row per BINDING under each
+   * stage before the events joined — so the count multiplied by the live-rule count. Measured on the
+   * dogfood store: `pr delivery` reported 124 reads against a true 31, with 4 live rules.
+   *
+   * EVERY FIXTURE IN THIS BLOCK BOUND EXACTLY ONE RULE PER STAGE, which is why the suite was green
+   * while the defect was in every multi-rule row: at one rule the multiplier is 1 and the bug is
+   * arithmetically invisible. The fixture could not exhibit the effect it was certifying.
+   */
+  it("counts a lookup once even when the stage carries several rules", async () => {
+    const c = core();
+    for (const text of ["Never force-push.", "Explain the rewrite.", "Tell John first."]) {
+      await c.store(text, {
+        kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+      });
+    }
+    c.stageLookup({ stage: "git force push" });
+    c.stageLookup({ stage: "git force push" });
+    const row = c.gateStats().byStageRead.find((r) => r.stageName === "git force push")!;
+    expect(row.reads).toBe(2); // two lookups — not 2 x 3 rules
+    c.close();
+  });
+
+  /**
+   * A READ PROVES DELIVERY, so a lookup that delivered nothing is not one (Codex P2, same review).
+   * `evaluateStageLookup` still records `matched_stage_id` when every rule was filtered out — here by
+   * a model tag that does not match — and counting that would let a later declaration retroactively
+   * turn an empty lookup into a read, dropping the stage off the unread list without anything having
+   * been delivered.
+   */
+  it("does not let a later declaration turn an earlier empty lookup into a read", async () => {
+    const c = core();
+    // Only model-a has anything bound here.
+    await c.store("Never force-push.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-a" },
+    });
+    // model-b looks the stage up and is delivered NOTHING — but the hit is still recorded, carrying
+    // the stage id and rule_count 0.
+    c.stageLookup({ stage: "git force push", runtimeModelTag: "model-b" });
+    // Now model-b gains a rule, so the stage becomes live for it and passes the liveness test.
+    await c.store("Explain the rewrite.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", scope: "agent", modelTag: "model-b" },
+    });
+
+    const row = c.gateStats(undefined, 30, "model-b").byStageRead.find((r) => r.stageName === "git force push");
+    expect(row, "the stage is live for model-b now, so it must appear").toBeDefined();
+    // The earlier lookup delivered nothing, so it is not a read, and the stage is still unread.
+    expect(row!.reads).toBe(0);
+    c.close();
+  });
+
+  /**
+   * THE JOIN MUST PROBE BY STAGE, NOT RESCAN THE WINDOW UNDER EACH ONE (Codex P2 on PR #51).
+   *
+   * Asserted as a QUERY PLAN rather than a stopwatch on purpose: a timing test at this size passes
+   * on any plan, and at a size where it would not, it becomes the flakiest test in the suite. The
+   * plan states the property directly — if a later edit reorders the predicates past what the index
+   * can serve, this fails while every behavioural test above stays green.
+   *
+   * The measurement that justified the index is recorded beside its DDL in `gates.ts`.
+   */
+  it("resolves recognized events through an index instead of rescanning per stage", async () => {
+    const c = core();
+    await c.store("Never force-push.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+    });
+    const db = (c as unknown as { db: { prepare(s: string): { all(...a: unknown[]): Array<{ detail: string }> } } }).db;
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT s.id, COUNT(e.id) FROM stages s
+           LEFT JOIN gate_events e
+             ON e.matched_stage_id = s.id AND e.matcher = 'recognized'
+            AND e.circle = ? AND e.ts >= ? AND e.rule_count > 0
+          WHERE EXISTS (SELECT 1 FROM rule_bindings b WHERE b.stage_id = s.id)
+          GROUP BY s.id`,
+      )
+      .all("any-circle", 0)
+      .map((row) => row.detail)
+      .join("\n");
+    expect(plan).toContain("idx_gate_events_stage_lookup");
+    expect(plan).toMatch(/SEARCH e USING INDEX/); // a SEARCH, never a SCAN of the event table
+    c.close();
+  });
+
+  /**
+   * SCOPED TO STAGES WITH SOMETHING LIVE TO DELIVER. A registry entry with no live rule in this
+   * circle has nothing to be unread ABOUT, and reporting it would manufacture a finding — which is
+   * the same failure mode `retirementCandidates` guards against one field up.
+   */
+  it("omits a stage with no live rule bound in this circle", async () => {
+    const c = core({ circle: "acme" });
+    await c.store("Never force-push.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+    });
+    c.stageLookup({ stage: "git force push" });
+    const names = c.gateStats("other-circle").byStageRead.map((row) => row.stageName);
+    expect(names).not.toContain("git force push");
+    c.close();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // the agent-facing surface
 // ---------------------------------------------------------------------------
