@@ -111,8 +111,14 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     if (gates.unexplainedDeniesOmitted) lines.push(dim(`  ${gates.unexplainedDeniesOmitted} more unexplained denies omitted`));
     // A stage with a live rule that nothing has asked for. Not an error — it is the one gate state
     // that reads exactly like health, which is why it is worth a line at all.
+    //
+    // THE WINDOW IS IN THE LABEL (Codex P2 on PR #51, and it was right). `byStageRead` counts within
+    // `windowDays`, so a bare "unread" cannot be told apart from "last read just outside the
+    // window" — and the reader would take the narrower claim for the permanent one. This whole
+    // change is about not writing a verdict where the value is unavailable; the renderer was quietly
+    // doing it one layer above the query.
     for (const stage of gates.unreadStages ?? []) {
-      lines.push(truncate(`  unread [${stage.stageId.slice(0, 8)}] ${stage.stageName}`, width));
+      lines.push(truncate(`  unread/${gates.windowDays}d [${stage.stageId.slice(0, 8)}] ${stage.stageName}`, width));
     }
     if (gates.unreadStagesOmitted) lines.push(dim(`  ${gates.unreadStagesOmitted} more unread stages omitted`));
     lines.push("");

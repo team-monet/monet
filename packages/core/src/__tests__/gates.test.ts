@@ -11717,6 +11717,40 @@ describe("gateStats byStageRead — the read dimension, per stage", () => {
   });
 
   /**
+   * THE JOIN MUST PROBE BY STAGE, NOT RESCAN THE WINDOW UNDER EACH ONE (Codex P2 on PR #51).
+   *
+   * Asserted as a QUERY PLAN rather than a stopwatch on purpose: a timing test at this size passes
+   * on any plan, and at a size where it would not, it becomes the flakiest test in the suite. The
+   * plan states the property directly — if a later edit reorders the predicates past what the index
+   * can serve, this fails while every behavioural test above stays green.
+   *
+   * The measurement that justified the index is recorded beside its DDL in `gates.ts`.
+   */
+  it("resolves recognized events through an index instead of rescanning per stage", async () => {
+    const c = core();
+    await c.store("Never force-push.", {
+      kind: "rule", rule: { stage: "git force push", instance: "Bash:git push --force", ...AGENT_RULE },
+    });
+    const db = (c as unknown as { db: { prepare(s: string): { all(...a: unknown[]): Array<{ detail: string }> } } }).db;
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT s.id, COUNT(e.id) FROM stages s
+           LEFT JOIN gate_events e
+             ON e.matched_stage_id = s.id AND e.matcher = 'recognized'
+            AND e.circle = ? AND e.ts >= ? AND e.rule_count > 0
+          WHERE EXISTS (SELECT 1 FROM rule_bindings b WHERE b.stage_id = s.id)
+          GROUP BY s.id`,
+      )
+      .all("any-circle", 0)
+      .map((row) => row.detail)
+      .join("\n");
+    expect(plan).toContain("idx_gate_events_stage_lookup");
+    expect(plan).toMatch(/SEARCH e USING INDEX/); // a SEARCH, never a SCAN of the event table
+    c.close();
+  });
+
+  /**
    * SCOPED TO STAGES WITH SOMETHING LIVE TO DELIVER. A registry entry with no live rule in this
    * circle has nothing to be unread ABOUT, and reporting it would manufacture a finding — which is
    * the same failure mode `retirementCandidates` guards against one field up.

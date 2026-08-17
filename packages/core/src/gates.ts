@@ -435,6 +435,24 @@ export const GATE_SCHEMA_SQL = `
     matcher TEXT NOT NULL DEFAULT 'mechanical' CHECK (matcher IN ('mechanical', 'recognized'))
   );
   CREATE INDEX IF NOT EXISTS idx_gate_events_circle_ts ON gate_events(circle, ts);
+  -- The read dimension's join probes events BY STAGE, which idx_gate_events_circle_ts cannot
+  -- serve: it narrows the circle/window range and then rescans it beneath every stage, so
+  -- byStageRead degrades as stages x window events. This table is deliberately unbounded, so that
+  -- is a real ceiling rather than a theoretical one (Codex P2 on PR #51, and it was right).
+  --
+  -- MEASURED before adding it, because an index added on intuition is exactly what this repo's own
+  -- threshold discipline warns about. gateStats over a synthetic store, mean of five runs:
+  --
+  --     25 stages /   5k events:    14.1ms ->   2.0ms
+  --    100 stages /  50k events:   670.0ms ->  22.1ms
+  --    200 stages / 200k events:  6945.1ms -> 109.3ms
+  --
+  -- Today's dogfood store is 24 stages and 387 recognized rows, where none of this is visible — but
+  -- the recognized population is the one still growing, at roughly 60 rows a day.
+  --
+  -- CREATED AFTER THE GUARDED ALTER BELOW, never here: it indexes matcher, and on a store predating
+  -- that column this block runs before the ALTER that adds it. The suite's own schema-upgrade test
+  -- caught that; the create lives immediately after the guard.
 
   /*
    * EVERY stage a query matched, not just the one that answered. byStage asks "how often does
@@ -534,6 +552,12 @@ export function migrateGateColumns(db: StoragePort): void {
       if (!message.includes("duplicate column name")) throw error;
     }
   }
+  // The read dimension's per-stage index, created HERE rather than beside the table because it
+  // indexes `matcher` — on a store predating that column, the schema block above runs before the
+  // guard that adds it. Rationale and the measurement that justified it sit with the DDL there.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_gate_events_stage_lookup ON gate_events(matched_stage_id, matcher, circle, ts)`,
+  );
   // SAME GUARD, for breadth (slice 4b-B follow-up): a store created before breadth shipped has a
   // rule_bindings table with no `circle` column at all. UNLIKE `matcher`, there is no single
   // constant default — the correct value is "whichever circle this binding's own concept already
