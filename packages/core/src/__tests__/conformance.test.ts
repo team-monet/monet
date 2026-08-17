@@ -281,6 +281,29 @@ describe("#37 — the hook path's record, read as it is actually written", () =>
   });
 
   /**
+   * AN ANNOTATION WRITTEN UNDER THE OLD CONTRACT IS NOT DONE (Codex P2 on PR #51).
+   *
+   * Idempotence is keyed to the fire event, so without this a store that had already run the pass
+   * would keep its legacy annotations — the ones where a missing `verdictRuleIds` meant "credit
+   * every rule named" — and would therefore retain the precise over-crediting this whole change
+   * exists to remove. Nothing downstream could tell those apart from correctly scoped ones.
+   */
+  it("replaces a legacy annotation that scoped nothing on a fire it would now scope", () => {
+    const journal: JournalDispositionLine[] = [
+      hookDeny("hook-1", "Bash:git push --force"),
+      gateDeny("gate-1", "hook-1", ["blocking-a", "advisory-b"], "Bash:git push --force"),
+      // Written by an older pass: no `verdictRuleIds`, which used to mean "applies to all".
+      { phase: "conformance", fireEventId: "gate-1", ruleIds: ["blocking-a", "advisory-b"], verdict: "changed" },
+    ];
+    const [replacement] = computeConformance(journal);
+    expect(replacement, "the stale annotation must be re-emitted, not skipped").toBeDefined();
+    expect(replacement!.verdictRuleIds).toEqual([]);
+
+    // And once replaced it settles: a further pass over the corrected record is a no-op.
+    expect(computeConformance([...journal, { phase: "conformance", ...replacement! }])).toHaveLength(0);
+  });
+
+  /**
    * A REAL RETRY STILL READS AS ONE once the chain is folded. Folding must not cost the pass the
    * signal it was built for: the same act, intercepted again through a genuinely separate evaluation.
    */

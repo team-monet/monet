@@ -260,10 +260,21 @@ export function computeConformance(lines: readonly JournalDispositionLine[]): Co
   // reverse, so an event is re-annotated at most once and a pass over an unchanged journal remains a
   // no-op. Absence of a retry is a window that is still open, not a finding.
   const annotatedRetry = new Map<string, boolean>();
+  // AND RE-ANNOTATED WHEN THE ATTRIBUTION CONTRACT ITSELF MOVED (Codex P2 on PR #51, and it was
+  // right). Idempotence is keyed to the fire event, so an annotation written under the OLD reading —
+  // where a missing `verdictRuleIds` meant "the verdict applies to every rule named" — would be
+  // skipped forever by the guard below, and the store would keep the exact over-crediting this
+  // change exists to repair. A prior annotation that scoped nothing is therefore treated as
+  // incomplete rather than done.
+  //
+  // Still monotone, and for the same reason the retry upgrade is: a scope may appear once and never
+  // disappear, so an event is re-annotated at most once more and a second pass is a no-op.
+  const annotatedScoped = new Set<string>();
   for (const line of lines) {
     if (line.phase === "conformance" && typeof line.fireEventId === "string") {
       const priorSaidRetried = line.retriedUnchanged === true;
       annotatedRetry.set(line.fireEventId, (annotatedRetry.get(line.fireEventId) ?? false) || priorSaidRetried);
+      if (Array.isArray(line.verdictRuleIds)) annotatedScoped.add(line.fireEventId);
     }
   }
 
@@ -355,8 +366,16 @@ export function computeConformance(lines: readonly JournalDispositionLine[]): Co
       const blockingRuleIds = recorded !== undefined ? recorded : ruleIds.length > 1 ? [] : undefined;
       const attributionUnavailable = recorded === undefined && ruleIds.length > 1;
       const previouslySaidRetried = annotatedRetry.get(id);
-      // Emitted when never annotated, or when a retry has become observable since.
-      if (previouslySaidRetried !== undefined && !(retried === true && previouslySaidRetried === false)) continue;
+      // A prior annotation that carries no scope, on a fire this pass WOULD now scope, was written
+      // under the superseded contract and has to be replaced — see `annotatedScoped` above.
+      const attributionStale = blockingRuleIds !== undefined && !annotatedScoped.has(id);
+      // Emitted when never annotated, when a retry has become observable since, or when the
+      // attribution contract moved under an annotation already on the record.
+      if (
+        previouslySaidRetried !== undefined &&
+        !(retried === true && previouslySaidRetried === false) &&
+        !attributionStale
+      ) continue;
       out.push({
         fireEventId: id,
         ruleIds,
