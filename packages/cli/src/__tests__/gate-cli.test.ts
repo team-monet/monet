@@ -234,24 +234,46 @@ describe("monet gate CLI", () => {
     expect(result.stdout).toBe("");
   });
 
-  it("outcome 20 — advisory-inject: text on stdout, one per line, no dash when there is no reason", async () => {
+  /**
+   * WHAT THE ADVISORY PAYLOAD IS NOW (#49): identity plus an instruction, emitted ONCE — never the
+   * rule's own text, and never one line per rule. This test previously pinned that older contract
+   * with an exact-equality assertion on the rule's text, so it is rewritten rather than patched:
+   * the promise it made is deliberately gone, not merely reworded.
+   */
+  it("outcome 20 — advisory-inject: ONE identity instruction on stdout, naming the matched stage, carrying no rule text", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
-    expect(result.stdout).toBe("Always run plan first\n");
+    expect(result.stdout).toBe(
+      "1 Monet rule governs this action, at `terraform apply`.\n" +
+        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
+    );
+    // The fixture's advisory reads "Always run plan first" — the payload must not carry it.
+    expect(result.stdout).not.toContain("Always run plan first");
   });
 
-  it("outcome 30 — blocking-deny: the reason verbatim on stdout, mirror age disclosed on stderr", async () => {
+  /**
+   * A DENY IS NOT A CONTENT EXCEPTION (#49). This test previously pinned "the reason verbatim on
+   * stdout" — the deny path was the one place rule content was quoted, on the theory that a refusal
+   * must explain itself. It no longer is: the call is refused either way, the blocking COUNT is
+   * disclosed so a reader knows what to look for, and whoever wants the reason opens the rule via
+   * `stage_lookup`. The mirror-age disclosure on stderr is untouched by #49 and still asserted here
+   * unchanged — an offline deny is a cached deny, and that promise did not move.
+   */
+  it("outcome 30 — blocking-deny: an identity instruction disclosing the blocking count on stdout, mirror age disclosed on stderr", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
     expect(result.stdout).toBe(
-      "Never force-push to main — a rewritten history cannot be recovered from a teammate's clone\n",
+      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.\n" +
+        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
     );
+    expect(result.stdout).not.toContain("Never force-push to main");
+    expect(result.stdout).not.toContain("a rewritten history cannot be recovered");
     expect(result.stderr).toMatch(/generated .*ago/);
     expect(result.stderr).toContain("an offline answer is a cached answer");
   });
@@ -262,6 +284,45 @@ describe("monet gate CLI", () => {
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["Bash:git push --force", "--circle", "a-totally-different-circle", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+  });
+
+  /**
+   * THE INVARIANT #49 INTRODUCES, asserted directly rather than left as a side effect of the two
+   * outcome tests above: NO rule body text and NO reason reaches the payload, on EITHER firing
+   * path. The fixture plants markers that could only come from rule content, so a leak of either
+   * field — a future formatter change, a debug line, a re-added "helpful" excerpt — fails here and
+   * names which field leaked.
+   */
+  it("#49 invariant: neither firing path puts rule body text or a reason on the payload", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildCustomFixtureMirror(mirrorPath, [
+      {
+        stage: "deploy prod", pattern: "Bash:deploy prod",
+        content: "BODY-MARKER-BLOCKING never ship on a Friday.", severity: "blocking",
+        reason: "REASON-MARKER-BLOCKING nobody is around to roll it back",
+      },
+      {
+        stage: "run migrations", pattern: "Bash:run migrations",
+        content: "BODY-MARKER-ADVISORY take a snapshot first.", severity: "advisory",
+        reason: "REASON-MARKER-ADVISORY a bad migration is not reversible",
+      },
+    ]);
+
+    const deny = spawnGate(["Bash:deploy prod", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(deny.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    expect(deny.stdout).not.toContain("BODY-MARKER-BLOCKING");
+    expect(deny.stdout).not.toContain("REASON-MARKER-BLOCKING");
+
+    const advisory = spawnGate(["Bash:run migrations", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(advisory.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    expect(advisory.stdout).not.toContain("BODY-MARKER-ADVISORY");
+    expect(advisory.stdout).not.toContain("REASON-MARKER-ADVISORY");
+
+    // NOT VACUOUS: a real instruction was emitted on each path and each names its own stage, so the
+    // markers are absent from a payload that exists rather than from an empty stream.
+    expect(deny.stdout).toContain("at `deploy prod`.");
+    expect(advisory.stdout).toContain("at `run migrations`.");
   });
 
   it("outcome 40 — overflow-ask is wired through classifyGateResult (see below for why not spawned)", () => {
@@ -308,7 +369,9 @@ describe("monet gate CLI", () => {
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["git push --force", "--tool", "Bash", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    expect(result.stdout).toContain("Never force-push to main");
+    // The exit code above is what this test protects. The payload no longer quotes the rule (#49),
+    // so what it corroborates now is WHICH stage the synthesized prefix reached.
+    expect(result.stdout).toContain("(1 blocking) at `git force push`");
   });
 
   it("an invalid --tool value cannot synthesize a prefix and is refused", async () => {
@@ -542,8 +605,11 @@ describe("monet gate CLI", () => {
 
     const result = spawnGateAt(projectB, ["Bash:deploy-a-only"], env, "home-fallback");
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    expect(result.stdout).toContain("reason-from-project-A-only");
-    expect(result.stdout).not.toContain("reason-from-project-B-only");
+    // WHICH mirror answered is still the whole point of this test; only the marker moved. The
+    // payload carries identity rather than the reason (#49), so the STAGE NAME — unique per
+    // project in this fixture — is what separates A's mirror from B's.
+    expect(result.stdout).toContain("`deploy a`");
+    expect(result.stdout).not.toContain("`deploy b`");
   });
 
   // ── Coordinator review round: SHOULD-FIX 2 (element-shape validation, unconditional) ─────────
@@ -614,9 +680,27 @@ describe("monet gate CLI", () => {
     expect(result.status).not.toBe(GATE_EXIT_CODE.SILENCE);
   });
 
-  // ── Coordinator review round: SHOULD-FIX 4 (mixed severities disclose the advisory) ──────────
+  // ── #49: a mixed fire is ONE instruction naming every matched stage (replaces SHOULD-FIX 4) ──
 
-  it("SHOULD-FIX 4: a mixed blocking+advisory fire keeps stdout blocking-only but discloses the advisory on stderr", async () => {
+  /**
+   * WHAT THIS REPLACES, AND WHY THE OLD SHAPE EXISTED. Before #49 the payload carried rule TEXT,
+   * one line per rule, with no severity marker anywhere in the line protocol. Putting a blocking
+   * rule and an advisory on the same stdout would therefore have left a reader guessing which line
+   * was the enforceable one — so the deny path emitted blocking lines on stdout and disclosed any
+   * co-firing advisory separately on stderr ("advisory also fired (not part of the deny)"). That
+   * split was the only way to keep the two severities distinguishable while quoting content.
+   *
+   * Identity payloads dissolve the ambiguity instead of routing around it: nothing on the wire
+   * reads as guidance, so nothing can be mistaken for the enforceable line. ONE instruction now
+   * names every matched stage — including a stage that contributed only advisories — and states
+   * how many of the matched rules block. A separate stderr disclosure would repeat what stdout
+   * already carries, so it is gone.
+   *
+   * The fixture deliberately spans TWO stages: "npm publish" (blocking + advisory) and "release
+   * hygiene" (advisory only). An advisory-only stage is precisely what the old split banished to
+   * stderr, so its appearing in the stdout instruction IS the behavior change under test.
+   */
+  it("#49: a mixed blocking+advisory fire is ONE instruction naming every matched stage, with the blocking count", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildCustomFixtureMirror(mirrorPath, [
@@ -628,17 +712,32 @@ describe("monet gate CLI", () => {
         stage: "npm publish", content: "Bump the changelog first.",
         severity: "advisory",
       },
+      {
+        stage: "release hygiene", pattern: "Bash:npm", content: "Tag the release commit.",
+        severity: "advisory", reason: "an untagged release cannot be bisected",
+      },
     ]);
     const result = spawnGate(["Bash:npm publish", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    // stdout: blocking-only, one line — the advisory text must NOT be in the injectable payload.
-    const stdoutLines = result.stdout.split("\n").filter((line) => line.length > 0);
-    expect(stdoutLines).toHaveLength(1);
-    expect(result.stdout).toContain("a stolen token can publish a malicious version");
-    expect(result.stdout).not.toContain("Bump the changelog");
-    // stderr: the advisory is disclosed, not dropped.
-    expect(result.stderr).toContain("advisory also fired");
-    expect(result.stderr).toContain("Bump the changelog");
+    // ONE instruction — two lines, both stages named, the blocking count disclosed.
+    expect(result.stdout).toBe(
+      "Blocked by a Monet rule — 3 rules (1 blocking) at `npm publish`, `release hygiene`.\n" +
+        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
+    );
+    // Neither severity gets its content quoted — that symmetry is what removes the ambiguity the
+    // old stdout/stderr split existed to manage.
+    for (const content of [
+      "Never publish without 2FA",
+      "a stolen token can publish a malicious version",
+      "Bump the changelog",
+      "Tag the release commit",
+      "an untagged release cannot be bisected",
+    ]) {
+      expect(result.stdout).not.toContain(content);
+    }
+    // The stderr side-channel is gone: the advisory is disclosed by being named in the stdout
+    // instruction's own stage list, not relegated to a channel the agent never reads.
+    expect(result.stderr).not.toContain("advisory also fired");
   });
 
   // ── Coordinator review round: deny path also names the repair command (SHOULD-FIX 5) ─────────
@@ -717,7 +816,9 @@ describe("monet gate CLI", () => {
     expect(envWithoutStorageDir.MONET_STORAGE_DIR).toBeUndefined();
     const result = spawnGateAt(repoDir, ["Bash:npm publish"], envWithoutStorageDir, "home-fallback");
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    expect(result.stdout).toContain("a stolen token can publish a malicious version");
+    // Circle resolution is the subject: that the deny FIRED proves the circle-scoped rule was
+    // found. The payload names the stage rather than quoting the rule (#49).
+    expect(result.stdout).toContain("(1 blocking) at `npm publish`");
     expect(result.stderr).toContain(`circle ${expectedCircle} (resolved from remote)`);
   });
 
@@ -752,7 +853,9 @@ describe("monet gate CLI", () => {
     });
     const result = spawnGateAt(repoDir, ["Bash:npm publish"], envWithoutStorageDir, "home-fallback");
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    expect(result.stdout).toContain("a stolen token can publish a malicious version");
+    // Circle resolution is the subject: that the deny FIRED proves the circle-scoped rule was
+    // found. The payload names the stage rather than quoting the rule (#49).
+    expect(result.stdout).toContain("(1 blocking) at `npm publish`");
     expect(result.stderr).toContain(`circle ${friendlyName} (mirror alias of ${folderSlug}, resolved from folder)`);
   });
 
@@ -778,7 +881,9 @@ describe("monet gate CLI", () => {
     });
     const result = spawnGateAt(repoDir, ["Bash:npm publish"], envWithoutStorageDir, "home-fallback");
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    expect(result.stdout).toContain("a stolen token can publish a malicious version");
+    // Circle resolution is the subject: that the deny FIRED proves the circle-scoped rule was
+    // found. The payload names the stage rather than quoting the rule (#49).
+    expect(result.stdout).toContain("(1 blocking) at `npm publish`");
     expect(result.stderr).toContain(`circle ${folderSlug} (resolved from folder)`);
   });
 
@@ -790,8 +895,12 @@ describe("monet gate CLI", () => {
     await buildFixtureMirror(mirrorPath);
     const result = spawnGateStdin("Bash:git push --force", ["--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    // Byte-identical to what the positional argument produces (the outcome-30 test above asserts
+    // the same literal) — transport parity is the subject, and #49 only changed what that payload
+    // says, not that the two transports must agree on it.
     expect(result.stdout).toBe(
-      "Never force-push to main — a rewritten history cannot be recovered from a teammate's clone\n",
+      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.\n" +
+        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
     );
   });
 

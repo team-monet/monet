@@ -77,12 +77,18 @@ export const QUERY_WILDCARD_CIRCLE = "*";
  * excess positional arguments) exits 1, distinct from all five outcomes. `--help`/`-h`/`--version`
  * exit 0 through commander's own paths, before any evaluation runs.
  *
- * STDOUT/STDERR DISCIPLINE, deliberate: stdout carries ONLY the outcome's own injectable payload
- * (rule text/reason for 20 and 30, blocking-only even when an advisory also fired — see
- * SHOULD-FIX 4 in this slice's report) so a hook can pipe it straight into the agent's context or
- * a denial message without scraping it out of diagnostics. Every diagnostic — resolved circle,
- * mirror age, missing/malformed warnings, usage errors, a suppressed advisory — goes to stderr,
- * matching doctor/repair's existing convention in this codebase (repair-cli.ts).
+ * STDOUT/STDERR DISCIPLINE, deliberate: stdout carries ONLY the outcome's own injectable payload,
+ * so a hook can pipe it straight into the agent's context or a denial message without scraping it
+ * out of diagnostics. Every diagnostic — resolved circle, mirror age, missing/malformed warnings,
+ * usage errors — goes to stderr, matching doctor/repair's existing convention in this codebase
+ * (repair-cli.ts).
+ *
+ * THAT PAYLOAD IS IDENTITY, NOT CONTENT, as of #49: the matched stage names, how many rules apply,
+ * how many of them block, and an instruction to read them with `stage_lookup`. It formerly carried
+ * "text — reason" per rule, with a deny restricted to blocking lines and a co-firing advisory
+ * disclosed separately on stderr — a split that existed because the line protocol had no severity
+ * marker, so mixing severities would leave a reader guessing which line was enforceable. Identity
+ * dissolves that: one instruction names every matched stage and states the blocking count.
  *
  * PROCESS WALL TIME IS NOT SUB-MS, and this module must not claim it is: the design's "sub-ms" is
  * the ENGINE's own evaluation cost inside `evaluateGateFromMirror` (proved in 4b-B), not this
@@ -613,14 +619,43 @@ export function classifyGateResult(result: GateResult): GateOutcome {
 }
 
 /**
- * One line per rule, "text — reason", injection-ready. `reasonMissing` (a legally reasonless
- * relayed deny — see GateRule.reasonMissing's own comment in @team-monet/core/gates.ts) is
- * disclosed rather than hidden, matching that field's own design intent.
+ * WHAT THE HOOK SENDS: which stages govern this act, and an instruction to go read them (#49).
+ * Never the rule's text, and never its reason.
+ *
+ * WHY IDENTITY RATHER THAN CONTENT, and it is observability rather than brevity. The old payload
+ * was `text — reason`, where `text` is the concept TITLE — a display name produced by clipping the
+ * body's first sentence at 80 characters. Measured across 61 live rules, that clipped 82% of them,
+ * and of the ten rules whose body names an artifact to go load, the pointer survived in ZERO cases.
+ * The failure is structural rather than authorial: a rule is written "WHEN <trigger>, load
+ * <artifact>", so the more precisely the trigger is written, the further past the clip the artifact
+ * name falls. Better-written rules lost their pointer more reliably.
+ *
+ * Sending identity dissolves that rather than tuning it — with no content on the wire, no cap
+ * governs it. And it buys the thing the clip never could: a READ is an event, so receipt becomes
+ * decidable. Today the record can say a rule was delivered and can never say it arrived.
+ *
+ * NO REASON EITHER, which is the sharper half of the choice (John, 2026-08-18). `reason` is the one
+ * field that already arrived whole, so keeping it would have been free — but it is rule content,
+ * and it would supply the motivation to read, which is precisely the variable #50 is measuring.
+ *
+ * BLOCKING IS NOT SPECIAL, by the same ruling: the call is refused either way, and whoever wants
+ * the reason opens the rule. The count of blocking rules is disclosed so a reader knows what to
+ * look for, but no blocking rule's text is quoted here.
  */
-function formatRuleLine(rule: GateRule): string {
-  if (rule.reason) return `${rule.text} — ${rule.reason}`;
-  if (rule.reasonMissing) return `${rule.text} — (no reason recorded: relayed from an older peer)`;
-  return rule.text;
+function formatGateInstruction(result: GateResult): string {
+  const stages = result.stages.map((stage) => `\`${stage.name}\``).join(", ");
+  const total = result.rules.length;
+  const blocking = result.rules.filter((rule) => rule.severity === "blocking").length;
+  const noun = total === 1 ? "rule" : "rules";
+  const verb = total === 1 ? "governs" : "govern";
+  // The FIRST line carries the whole verdict on its own: the wrapper's deny log records only
+  // `stdout.split("\n")[0]`, so a first line that deferred the essential fact would truncate the
+  // permanent record rather than the delivery.
+  const head =
+    blocking > 0
+      ? `Blocked by a Monet rule — ${total} ${noun} (${blocking} blocking) at ${stages}.`
+      : `${total} Monet ${noun} ${verb} this action, at ${stages}.`;
+  return `${head}\nCall stage_lookup on each before acting; this hook carries identity only, not rule text.`;
 }
 
 /** Human-readable age, coarse enough for a disclosure line, never sub-second precision. */
@@ -974,18 +1009,17 @@ function runGateUnguarded(
   const outcome = classifyGateResult(result);
   switch (outcome.label) {
     case "advisory-inject":
-      for (const rule of result.rules) console.log(formatRuleLine(rule));
+      console.log(formatGateInstruction(result));
       break;
     case "blocking-deny": {
-      for (const rule of result.rules.filter((r) => r.severity === "blocking")) console.log(formatRuleLine(rule));
-      // SHOULD-FIX 4 (coordinator review round): an advisory that ALSO fired alongside the deny
-      // (same or another matched stage) must not simply vanish — stdout stays blocking-only (no
-      // severity marker in the line protocol, so mixing severities there would make a reader
-      // guess which line is the enforceable one), but the advisory is still real guidance and
-      // belongs somewhere. Disclosed on stderr instead of dropped.
-      for (const rule of result.rules.filter((r) => r.severity === "advisory")) {
-        console.error(`monet gate: advisory also fired (not part of the deny): ${formatRuleLine(rule)}`);
-      }
+      // ONE INSTRUCTION, NAMING EVERY MATCHED STAGE — including the stages that contributed only
+      // advisories (#49). The old shape put blocking rules on stdout and disclosed a co-firing
+      // advisory separately on stderr, because the line protocol carried rule TEXT with no severity
+      // marker and mixing them would have left a reader guessing which line was enforceable. With
+      // identity on the wire that ambiguity cannot arise: the payload names stages and counts, says
+      // how many of them block, and sends the reader to `stage_lookup` for the rest. A separate
+      // stderr disclosure would now repeat what stdout already carries.
+      console.log(formatGateInstruction(result));
       // SHOULD-FIX 5 (coordinator review round): the boundary statement requires naming the
       // staleness AND the repair command in the SAME breath as the reason (gate-boundary-
       // statement.md, "Binding consequences for 4b", item 2) — the missing/malformed path already
@@ -1063,9 +1097,14 @@ export function registerGateCommands(
 Exit codes (the host maps these; this command never enforces any of them):
   0   silence              no stage matched — nothing governs this action
   10  stage-hit-no-rules   a stage matched with no live rules bound (the projection-hook signal)
-  20  advisory-inject      advisory rule(s) fired; stdout carries "text — reason", one per line
-  30  blocking-deny        a blocking rule fired; stdout carries its reason, stderr discloses the
-                           mirror's age and the repair command (an offline deny is a cached deny)
+  20  advisory-inject      advisory rule(s) fired; stdout names the matched stages and instructs
+                           the agent to read them with stage_lookup
+  30  blocking-deny        a blocking rule fired; stdout names the matched stages and how many
+                           block, stderr discloses the mirror's age and the repair command (an
+                           offline deny is a cached deny)
+
+Neither payload carries rule text or a rule's reason: the gate sends identity and an instruction
+to read, so that the read is an observable event. stage_lookup is where a rule's own words live.
   40  overflow-ask         action context past the refusal threshold; NEVER map this to allow
   1   usage error          --circle '*' (not a queryable circle), no 'Tool:' prefix and no --tool,
                            excess positional arguments (quote the action context), or the action

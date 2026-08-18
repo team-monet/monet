@@ -348,7 +348,13 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     return wrapperPath;
   }
 
-  it("deny reaches the wrapper's own stdout in the protocol's deny shape, with the reason", async () => {
+  /**
+   * The protocol SHAPE is what this test protects — deny on the agent's channel, the same payload
+   * echoed on the user's channel, one journal line on disk. #49 changed only WHAT rides in those
+   * three places: identity and an instruction, no longer the rule's reason. Renamed accordingly so
+   * the next reader is not promised a reason the wrapper never sees.
+   */
+  it("deny reaches the wrapper's own stdout in the protocol's deny shape, carrying the identity instruction", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildFixtureMirror(mirrorPath);
@@ -371,17 +377,24 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     expect(output.hookSpecificOutput.hookEventName).toBe("PreToolUse");
     expect(output.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
-      "a rewritten history cannot be recovered from a teammate's clone",
+      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.",
     );
+    expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
+      "Call stage_lookup on each before acting; this hook carries identity only, not rule text.",
+    );
+    // #49: the rule's own text and reason never reach the agent — that is the point, not a side
+    // effect, so it is asserted rather than left implied by the equality above.
+    expect(output.hookSpecificOutput.permissionDecisionReason).not.toContain("Never force-push to main");
+    expect(output.hookSpecificOutput.permissionDecisionReason).not.toContain("a rewritten history cannot be recovered");
     // Boundary statement item 4: surfaces on the USER's channel too, not only the agent's.
-    expect(output.systemMessage).toContain("a rewritten history cannot be recovered from a teammate's clone");
+    expect(output.systemMessage).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.");
     // The journal line landed in the ISOLATED dir — asserted here so the isolation is load-bearing,
     // not decorative. (The HOME-fallback rung is covered by the dedicated "deny journal" test.)
     const journal = readFileSync(join(dir, "gate-denies.log"), "utf8");
-    expect(journal).toContain("a rewritten history cannot be recovered from a teammate's clone");
+    expect(journal).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.");
   });
 
-  it("P2-8 (Codex round 3 on PR #42): the deny's systemMessage carries BOTH the reason AND monet gate's own stderr diagnostics (the mirror's age, the repair instruction) — not the reason alone", async () => {
+  it("P2-8 (Codex round 3 on PR #42): the deny's systemMessage carries BOTH the deny payload AND monet gate's own stderr diagnostics (the mirror's age, the repair instruction) — not the payload alone", async () => {
     // Before this fix: monet gate's own stderr (resolved circle, mirror age, repair command) was
     // captured in `result` all along but silently dropped — a user blocked by a STALE cached deny
     // never saw the staleness or the repair command unless they separately ran `monet gate` by
@@ -402,19 +415,20 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
       hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
       systemMessage: string;
     };
-    // The reason is still there (unchanged) ...
-    expect(output.systemMessage).toContain("a rewritten history cannot be recovered from a teammate's clone");
-    // ... AND now the staleness/repair diagnostic rides alongside it, on the SAME systemMessage a
-    // user actually sees — this is the fix. permissionDecisionReason (the AGENT's channel) stays
-    // reason-only, unchanged from before.
+    // The deny payload is still there — since #49 that payload is the identity instruction rather
+    // than the rule's reason, but the PAIRING this test exists to protect is unchanged ...
+    expect(output.systemMessage).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.");
+    // ... AND the staleness/repair diagnostic rides alongside it, on the SAME systemMessage a user
+    // actually sees — this is the fix. permissionDecisionReason (the AGENT's channel) stays
+    // payload-only, unchanged from before.
     expect(output.systemMessage).toContain("monet gate: answering from a mirror generated");
     expect(output.systemMessage).toContain("monet start");
     expect(output.hookSpecificOutput.permissionDecisionReason).not.toContain("monet gate: answering from a mirror generated");
-    // Reason comes FIRST, diagnostics after — matches "append... after the reason".
-    const reasonIndex = output.systemMessage.indexOf("a rewritten history cannot be recovered");
+    // The payload comes FIRST, diagnostics after — matches "append... after the reason".
+    const payloadIndex = output.systemMessage.indexOf("Blocked by a Monet rule —");
     const diagnosticIndex = output.systemMessage.indexOf("monet gate: answering from a mirror generated");
-    expect(reasonIndex).toBeGreaterThanOrEqual(0);
-    expect(diagnosticIndex).toBeGreaterThan(reasonIndex);
+    expect(payloadIndex).toBeGreaterThanOrEqual(0);
+    expect(diagnosticIndex).toBeGreaterThan(payloadIndex);
   });
 
   it("P1-3 (Codex round 3 on PR #42): the exact Codex bypass example ('x: || true; git push --force') still DENIES — the wrapper no longer relies on --tool synthesis a prefix-grammar command can defeat", async () => {
@@ -442,8 +456,11 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
       hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
     };
     expect(output.hookSpecificOutput?.permissionDecision).toBe("deny");
+    // The deny above is this test's whole subject (a bypass that reaches the force-push must still
+    // be refused). The payload names the stage rather than quoting the rule since #49, and that it
+    // names THIS stage is what proves the Bash-scoped rule matched rather than some other.
     expect(output.hookSpecificOutput?.permissionDecisionReason).toContain(
-      "a rewritten history cannot be recovered from a teammate's clone",
+      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.",
     );
   });
 
@@ -486,7 +503,12 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
       hookSpecificOutput: { hookEventName: string; additionalContext: string; permissionDecision?: string };
     };
     expect(output.hookSpecificOutput.hookEventName).toBe("PreToolUse");
-    expect(output.hookSpecificOutput.additionalContext).toContain("Always run plan first");
+    // What gets injected is the identity instruction, not the advisory's text (#49). The assertions
+    // below — an ABSENT permissionDecision key — are what this test protects.
+    expect(output.hookSpecificOutput.additionalContext).toContain(
+      "1 Monet rule governs this action, at `terraform apply`.",
+    );
+    expect(output.hookSpecificOutput.additionalContext).not.toContain("Always run plan first");
     // BLOCKER 2 (round-5 coordinator review, hooks.md:1542): additionalContext is "Ignored when
     // permissionDecision is 'defer'" — pairing the two made this outcome a silent no-op under the
     // old code. permissionDecision must be genuinely ABSENT here, not merely falsy.
@@ -789,7 +811,11 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     const lines = readFileSync(logPath, "utf8").trim().split("\n");
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\t/); // ISO timestamp first
-    expect(lines[0]).toContain("Never force-push to main");
+    // WHAT THE LOG NOW RECORDS: the wrapper logs `stdout.split("\n")[0]`, which since #49 is the
+    // instruction's first line — the half that carries the whole verdict (stages, rule count,
+    // blocking count) precisely so this permanent record is not the truncated half.
+    expect(lines[0]).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.");
+    expect(lines[0]).not.toContain("Never force-push to main");
 
     // A second deny appends a SECOND line — never overwrites.
     spawnWrapper(wrapperPath, ["--mirror", mirrorPath], dir, {
@@ -846,8 +872,11 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
         hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
       };
       expect(output.hookSpecificOutput.permissionDecision).toBe("deny");
+      // The deny is the subject and is asserted above. The payload names the stage rather than
+      // quoting the rule since #49 — and naming THIS stage is what proves the `Task:`-declared rule
+      // is the one that matched, which is the whole claim of monet-client#58.
       expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
-        "an unlensed verification returns agreement, not proof",
+        "Blocked by a Monet rule — 1 rule (1 blocking) at `worker delegation`.",
       );
     }
   });

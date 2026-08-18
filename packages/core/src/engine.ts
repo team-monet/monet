@@ -1300,11 +1300,18 @@ export interface DeclareInput {
   scope?: RuleScope;
   modelTag?: string;
   /**
-   * One line naming the failure this rule prevents — what the gate shows when it fires.
-   * REQUIRED when `severity` is "blocking": a deny the agent cannot explain is a deny people
-   * learn to route around, and the boundary statement promises every deny carries its reason.
-   * Optional for advisory rules, where its absence is weaker guidance rather than a broken
-   * contract.
+   * One line naming the failure this rule prevents.
+   *
+   * REQUIRED when `severity` is "blocking", and that has not moved: a deny the agent cannot
+   * explain is a deny people learn to route around, and the boundary statement promises every deny
+   * carries its reason. The write path still refuses a blocking declaration without one. Optional
+   * for advisory rules, where its absence is weaker guidance rather than a broken contract.
+   *
+   * WHERE IT IS SHOWN DID MOVE (#49). This used to read "what the gate shows when it fires", and
+   * the hook path no longer shows it: that payload carries stage identity and an instruction to
+   * read, never rule content. The reason reaches a reader through `stage_lookup`, which delivers
+   * the rule whole. So the promise is intact and its delivery is now a pull rather than a push —
+   * which is the point, because a pull leaves a record that the words were actually fetched.
    */
   reason?: string;
   declaredBy?: string;
