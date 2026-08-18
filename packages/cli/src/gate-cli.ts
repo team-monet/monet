@@ -741,8 +741,17 @@ function formatGateInstruction(
   // filtered by model tag, this command filters with ITS tag, and `stage_lookup` has no model
   // argument — it filters with the running server's own. When the two differ the lookup returns a
   // different set from the one that produced this verdict, and nothing disclosed that.
+  // THE ADVISORY DISCLOSES ITS GENERATION TOO (Codex, round 4, and it was right). A rule present in
+  // this mirror may have been withdrawn, moved or superseded in the live store, and `stage_lookup`
+  // reads live — so the reader can be told that rules govern here and then find none, with nothing
+  // explaining the gap. The deny path already said this; the advisory silently did not.
+  //
+  // NO IDS HERE, unlike the deny, and the asymmetry is deliberate rather than an omission: a deny
+  // has to answer "what stopped me", which needs the exact rule. An advisory asks "what governs
+  // this", which the live set answers correctly — what was missing was only the account of why that
+  // set may differ from the one that fired.
   const head = `${total} Monet ${noun} ${verb} actions at ${stages} ${scope}${modelScope}.`;
-  return `${head}\nRead them with stage_lookup before acting at these stages; this payload carries identity only, not rule text.`;
+  return `${head}\nRead them with stage_lookup before acting at these stages. Judged from a mirror generated ${mirrorAge} ago — if a rule changed since, the lookup may return a different set, or none. This payload carries identity only, not rule text.`;
 }
 
 /** Human-readable age, coarse enough for a disclosure line, never sub-second precision. */

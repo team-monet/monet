@@ -325,10 +325,14 @@ describe("monet gate CLI", () => {
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
-    expect(result.stdout).toBe(
+    // The mirror age is wall-clock, so it is asserted in `formatMirrorAge`'s own shape and then
+    // normalized — every other byte stays pinned, and a payload that DROPPED the disclosure fails
+    // the match rather than passing the substitution.
+    expect(withNormalizedMirrorAge(result.stdout)).toBe(
       '1 Monet rule governs actions at "terraform apply" [circle: "acme-widgets"].\n' +
-        "Read them with stage_lookup before acting at these stages; " +
-        "this payload carries identity only, not rule text.\n",
+        "Read them with stage_lookup before acting at these stages. " +
+        "Judged from a mirror generated <AGE> ago — if a rule changed since, the lookup may return " +
+        "a different set, or none. This payload carries identity only, not rule text.\n",
     );
     // The fixture's advisory reads "Always run plan first" — the payload must not carry it.
     expect(result.stdout).not.toContain("Always run plan first");
@@ -950,13 +954,19 @@ describe("monet gate CLI", () => {
     expect(stale.stdout).not.toContain("memory_fetch the id above");
     expect(stale.stdout).not.toContain("if a rule has since moved");
 
-    // AN ADVISORY MAKES NO SUCH DISCLOSURE: it blocks nothing, so there is no refused call whose
-    // provenance a reader must reconstruct, and minimization keeps the line off that path. (The
-    // user-facing staleness warning on stderr is separate and fires on both paths — see the
-    // outcome-30 test.)
+    // AN ADVISORY DISCLOSES THE GENERATION TOO (Codex, round 4, and it was right — this block
+    // previously asserted the opposite). A rule in the mirror may have been withdrawn or superseded
+    // live, and `stage_lookup` reads live, so an agent can be told rules govern here and then find
+    // none. Without the disclosure nothing explains that gap.
     const advisory = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(advisory.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
-    expect(advisory.stdout).not.toContain("Judged from a mirror");
+    expect(advisory.stdout).toContain("Judged from a mirror generated 11h 21m ago —");
+    expect(advisory.stdout).toContain("the lookup may return a different set, or none");
+    // BUT IT CARRIES NO IDS, and the asymmetry is the point rather than an oversight: a deny must
+    // answer "what stopped me", which needs the exact rule; an advisory asks "what governs this",
+    // which the live set answers correctly.
+    expect(advisory.stdout).not.toContain("Blocking rule ids:");
+    expect(advisory.stdout).not.toContain("is not recoverable");
   });
 
   /**
