@@ -381,27 +381,37 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // remote derives to — an environment fact, not a contract. gate-cli.test.ts pins the whole
     // literal (including a deliberately foreign `--circle`) where the circle is owned by the test.
     expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
-      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`",
+      'Blocked by a Monet rule — 1 rule (1 blocking) at "git force push"',
     );
     // The suffix's SHAPE is still pinned, only its value is not — so a payload that dropped or
-    // malformed the circle fails here rather than passing on the prefix alone.
+    // malformed the circle fails here rather than passing on the prefix alone. Both identifiers are
+    // SERIALIZED since round 3, so the shape now includes their quotes: an unquoted circle here
+    // would be the round-2 interpolation coming back.
     expect(output.hookSpecificOutput.permissionDecisionReason).toMatch(
-      /at `git force push` \[circle: [^\]\s]+\]\.\n/,
+      /at "git force push" \[circle: "[^"]+"\]\.\n/,
     );
     expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
-      "Read the stages with stage_lookup; if a rule has since moved, memory_fetch the id above. " +
-        "This payload carries identity only, not rule text.",
+      "Read the stages with stage_lookup; memory_fetch an id for the rule's current text.",
+    );
+    // AND THE GENERATION THE VERDICT WAS JUDGED FROM, with the limit on recovering the rule that
+    // actually fired (Codex P1, round 3). The age is a wall-clock value, so its SHAPE is pinned
+    // here and its digits are not; gate-cli.test.ts backdates a mirror to pin the value itself.
+    expect(output.hookSpecificOutput.permissionDecisionReason).toMatch(
+      /Judged from a mirror generated .+ ago — if a rule changed since, what you read is the current version, NOT the one that blocked, and the one that blocked is not recoverable\./,
+    );
+    expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
+      "This payload carries identity only, not rule text.",
     );
     // #49: the rule's own text and reason never reach the agent — that is the point, not a side
     // effect, so it is asserted rather than left implied by the equality above.
     expect(output.hookSpecificOutput.permissionDecisionReason).not.toContain("Never force-push to main");
     expect(output.hookSpecificOutput.permissionDecisionReason).not.toContain("a rewritten history cannot be recovered");
     // Boundary statement item 4: surfaces on the USER's channel too, not only the agent's.
-    expect(output.systemMessage).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`");
+    expect(output.systemMessage).toContain('Blocked by a Monet rule — 1 rule (1 blocking) at "git force push"');
     // The journal line landed in the ISOLATED dir — asserted here so the isolation is load-bearing,
     // not decorative. (The HOME-fallback rung is covered by the dedicated "deny journal" test.)
     const journal = readFileSync(join(dir, "gate-denies.log"), "utf8");
-    expect(journal).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`");
+    expect(journal).toContain('Blocked by a Monet rule — 1 rule (1 blocking) at "git force push"');
   });
 
   it("P2-8 (Codex round 3 on PR #42): the deny's systemMessage carries BOTH the deny payload AND monet gate's own stderr diagnostics (the mirror's age, the repair instruction) — not the payload alone", async () => {
@@ -427,7 +437,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     };
     // The deny payload is still there — since #49 that payload is the identity instruction rather
     // than the rule's reason, but the PAIRING this test exists to protect is unchanged ...
-    expect(output.systemMessage).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`");
+    expect(output.systemMessage).toContain('Blocked by a Monet rule — 1 rule (1 blocking) at "git force push"');
     // ... AND the staleness/repair diagnostic rides alongside it, on the SAME systemMessage a user
     // actually sees — this is the fix. permissionDecisionReason (the AGENT's channel) stays
     // payload-only, unchanged from before.
@@ -470,7 +480,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // be refused). The payload names the stage rather than quoting the rule since #49, and that it
     // names THIS stage is what proves the Bash-scoped rule matched rather than some other.
     expect(output.hookSpecificOutput?.permissionDecisionReason).toContain(
-      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`",
+      'Blocked by a Monet rule — 1 rule (1 blocking) at "git force push"',
     );
   });
 
@@ -516,27 +526,39 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // What gets injected is the identity instruction, not the advisory's text (#49). The assertions
     // below — an ABSENT permissionDecision key — are what this test protects.
     expect(output.hookSpecificOutput.additionalContext).toContain(
-      "1 Monet rule governs actions at `terraform apply` [circle: acme-widgets].",
+      '1 Monet rule governs actions at "terraform apply" [circle: "acme-widgets"].',
     );
     expect(output.hookSpecificOutput.additionalContext).not.toContain("Always run plan first");
     // THIS LAYER IS THE SOLE OWNER OF THE TIMING CLAIM (Codex P2, round 2 on PR #58).
     // `additionalContext` is delivered next to the tool RESULT (hooks.md:831-836, cited in
-    // install-cli.ts) and the emit above carries no permissionDecision, so the terraform apply has
-    // already run by the time an agent reads a word of this. Round 1 put that sentence in the gate
-    // payload, where it was true only through THIS wrapper and false through any preflight caller
-    // of the same host-agnostic CLI; round 2 moved it into the adapter that actually knows the
-    // host contract. So it is asserted here, on the real hook JSON — this is the channel whose
-    // timing makes the claim true — and gate-cli.test.ts asserts the CLI stays silent on it. The
-    // pair is the test: whichever layer states it, exactly one of them must.
+    // install-cli.ts), so by the time an agent reads a word of this, the moment to intervene has
+    // passed. Round 1 put that sentence in the gate payload, where it was true only through THIS
+    // wrapper and false through any preflight caller of the same host-agnostic CLI; round 2 moved
+    // it into the adapter that actually knows the host contract. So it is asserted here, on the
+    // real hook JSON — this is the channel whose timing makes the claim true — and
+    // gate-cli.test.ts asserts the CLI stays silent on it. The pair is the test: whichever layer
+    // states it, exactly one of them must.
+    //
+    // WHAT IT CLAIMS IS NOW ABOUT THIS HOOK, NOT ABOUT THE CALL (Codex, round 3, and it was
+    // right). "This action has already run" asserted an outcome this layer does not decide: the
+    // emit carries no permissionDecision, but ANOTHER PreToolUse hook, or the normal permission
+    // flow, can still refuse the call — and then the sentence was simply false. The timing of its
+    // OWN channel is what this adapter actually knows, so that is all it now claims, and it hands
+    // the question of whether the call ran back to the flow that owns it.
     expect(output.hookSpecificOutput.additionalContext).toContain(
-      "This action has already run: a PreToolUse advisory reaches you beside the tool result, " +
-        "not before it. Read the stages above before your NEXT action at them.",
+      "This advisory cannot intervene before the call: a PreToolUse advisory reaches you beside " +
+        "the tool result, not before it. Whether the call ran is decided by the normal permission " +
+        "flow, which this hook leaves alone. Read the stages above before your next action at them.",
     );
+    // The claim it must not make is asserted ABSENT, not merely replaced — a reworded payload that
+    // reintroduced the outcome claim in any spelling would otherwise pass on the line above.
+    expect(output.hookSpecificOutput.additionalContext).not.toContain("already run");
+    expect(output.hookSpecificOutput.additionalContext).not.toContain("already ran");
     // And it is APPENDED to the gate's own payload, never replacing it — the stage identity the
     // wrapper is wrapping has to survive the append, so the ordering is asserted rather than
     // inferred from both substrings being present somewhere.
     expect(output.hookSpecificOutput.additionalContext).toMatch(
-      /1 Monet rule governs actions at `terraform apply`[\s\S]*This action has already run:/,
+      /1 Monet rule governs actions at "terraform apply"[\s\S]*This advisory cannot intervene before the call:/,
     );
     // BLOCKER 2 (round-5 coordinator review, hooks.md:1542): additionalContext is "Ignored when
     // permissionDecision is 'defer'" — pairing the two made this outcome a silent no-op under the
@@ -845,7 +867,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
     // blocking count) precisely so this permanent record is not the truncated half. PR #58 moved
     // the blocking rule's IDS onto line 2, which this journal by construction does not keep; the
     // first line still carries the verdict, which is what this assertion is about.
-    expect(lines[0]).toContain("Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`");
+    expect(lines[0]).toContain('Blocked by a Monet rule — 1 rule (1 blocking) at "git force push"');
     expect(lines[0]).not.toContain("Never force-push to main");
 
     // A second deny appends a SECOND line — never overwrites.
@@ -907,7 +929,7 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
       // quoting the rule since #49 — and naming THIS stage is what proves the `Task:`-declared rule
       // is the one that matched, which is the whole claim of monet-client#58.
       expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
-        "Blocked by a Monet rule — 1 rule (1 blocking) at `worker delegation`",
+        'Blocked by a Monet rule — 1 rule (1 blocking) at "worker delegation"',
       );
     }
   });

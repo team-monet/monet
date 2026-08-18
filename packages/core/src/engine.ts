@@ -13302,8 +13302,8 @@ export class MonetCore {
     if (input.severity === "blocking" && (input.reason === undefined || input.reason.trim() === "")) {
       throw new Error(
         "a blocking rule requires `reason`: one line naming the failure this deny prevents. " +
-          "It is what the gate shows at the moment of refusal, and what makes the deny explainable " +
-          "to the person who has to live with it.",
+          "It is what makes the deny explainable to the person who has to live with it — reached " +
+          "through stage_lookup, since the gate payload carries identity rather than rule text.",
       );
     }
     // ONE LINE is the other half of the same question about a reason's shape — see bindRule, which
@@ -13311,8 +13311,8 @@ export class MonetCore {
     // agent that has just written a multi-line reason should learn it before the embed, not after.
     if (input.severity === "blocking" && hasLineBreak(input.reason)) {
       throw new Error(
-        "a blocking rule's `reason` must be ONE LINE: it is printed beside the deny at the moment it " +
-          "fires, so a line break makes the gate appear to say something nobody wrote. Received " +
+        "a blocking rule's `reason` must be ONE LINE: it is delivered as the rule's own explanation " +
+          "of a refusal, so a line break makes the rule appear to say something nobody wrote. Received " +
           `${JSON.stringify(input.reason)} — restate it as a single sentence.`,
       );
     }
@@ -14669,7 +14669,7 @@ export class MonetCore {
       if (row.severity === "blocking" && !hasNoReason(row.reason) && hasLineBreak(row.reason)) {
         throw new Error(
           `graftRows rule binding '${row.concept_id}' has a blocking reason that is not ONE LINE: ` +
-            `it is printed beside the deny at the moment it fires, so a line break makes the gate ` +
+            `it is delivered as the rule's own explanation of a refusal, so a line break makes the rule ` +
             `appear to say something nobody wrote. Received ${JSON.stringify(row.reason)} — restate ` +
             `it as a single sentence.`,
         );

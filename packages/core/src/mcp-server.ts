@@ -929,7 +929,7 @@ export function registerMonetCoreTools(
           reason: z
             .string()
             .optional()
-            .describe("One line naming the failure this prevents; shown when the gate fires."),
+            .describe("One line naming the failure this prevents; delivered by stage_lookup, not by the gate payload."),
           projectedFromPrincipleId: z
             .string()
             .optional()
@@ -1045,7 +1045,7 @@ export function registerMonetCoreTools(
         ),
       scope: z.enum(["domain", "agent"]).optional().describe('"domain" binds any agent; "agent" (default) compensates for this model.'),
       modelTag: z.string().max(MODEL_TAG_MAX_CHARS).optional().describe('Model compensated for. Required for agent scope unless MONET_MODEL_TAG supplies it.'),
-      reason: z.string().optional().describe('One-line failure prevented, shown at the gate. Required for blocking severity; ask the user rather than inventing it.'),
+      reason: z.string().optional().describe('One-line failure prevented, delivered by stage_lookup rather than by the gate payload. Required for blocking severity; ask the user rather than inventing it.'),
       // Bounded like memberRuleIds and ratifiedBy: this lands verbatim in fixed response fields and
       // overview skeleton entries, which are not size-fitted — an actor "name" is never a document.
       declaredBy: z.string().max(200).optional().describe("Ruling actor; defaults to caller id."),

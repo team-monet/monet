@@ -275,8 +275,9 @@ function emitAdvisory(context) {
       hookEventName: "PreToolUse",
       additionalContext:
         context +
-        "\\nThis action has already run: a PreToolUse advisory reaches you beside the tool result, " +
-        "not before it. Read the stages above before your NEXT action at them.",
+        "\\nThis advisory cannot intervene before the call: a PreToolUse advisory reaches you beside " +
+        "the tool result, not before it. Whether the call ran is decided by the normal permission " +
+        "flow, which this hook leaves alone. Read the stages above before your next action at them.",
     },
   });
 }

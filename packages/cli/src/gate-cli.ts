@@ -662,7 +662,12 @@ export function classifyGateResult(result: GateResult): GateOutcome {
  */
 const INSTRUCTION_STAGE_CAP = 8;
 
-function formatGateInstruction(result: GateResult, circle: string): string {
+function formatGateInstruction(
+  result: GateResult,
+  circle: string,
+  mirrorAge: string,
+  runtimeModelTag: string | null,
+): string {
   // BOUNDED (Codex P2, same review). `result.stages` is every matching registry stage, and the
   // mirror deliberately carries an unbounded registry — a store with enough broad patterns could
   // otherwise push this past the wrapper's fixed 16 MiB spawn buffer, which fails the gate OPEN
@@ -672,11 +677,17 @@ function formatGateInstruction(result: GateResult, circle: string): string {
   // by circle or model tag; capping that order could name eight stages that delivered nothing while
   // hiding the one that did behind an anonymous `(+N more)`. Ranking by contribution keeps the cap
   // from dropping exactly the identity the reader needs.
+  // ONLY THE STAGES THAT CONTRIBUTED A RULE ARE NAMED (Codex, round 3, and it was right). Ranking
+  // contributors ahead of the cap was not enough: a ninth contributor still fell into an anonymous
+  // `(+N more)`, and on the advisory path there is no id to recover it with. A stage that delivered
+  // nothing has nothing for the reader to look up, so it is dropped rather than competing for the
+  // budget — which also makes overflowing the cap far rarer than registry order made it.
   const contributing = new Set(result.rules.map((rule) => rule.stageId));
-  const ranked = [...result.stages].sort(
-    (a, b) => Number(contributing.has(b.id)) - Number(contributing.has(a.id)),
-  );
-  const names = ranked.map((stage) => `\`${stage.name}\``);
+  const named = result.stages.filter((stage) => contributing.has(stage.id));
+  // SERIALIZED, NOT INTERPOLATED (Codex, round 3). A stage name may contain a backtick and a circle
+  // is only length-bounded, so raw prose interpolation lets an identifier break the surrounding
+  // syntax — and then the agent cannot tell which exact string to pass to `stage_lookup`.
+  const names = named.map((stage) => JSON.stringify(stage.name));
   const shown = names.slice(0, INSTRUCTION_STAGE_CAP);
   const omitted = names.length - shown.length;
   const stages = omitted > 0 ? `${shown.join(", ")} (+${omitted} more)` : shown.join(", ");
@@ -689,22 +700,36 @@ function formatGateInstruction(result: GateResult, circle: string): string {
   // longer than the MCP schema's 256-char limit, and a breadth-scoped rule still fires under it —
   // so telling the agent to pass that value on would hand it an argument the tool refuses. Naming
   // the overflow is honest where quietly emitting an unusable scope is not.
+  const modelScope = runtimeModelTag === null ? "" : ` [model: ${JSON.stringify(runtimeModelTag)}]`;
   const scope =
     circle.length <= CIRCLE_NAME_MAX_CHARS
-      ? `[circle: ${circle}]`
+      ? `[circle: ${JSON.stringify(circle)}]`
       : `[circle: name exceeds ${CIRCLE_NAME_MAX_CHARS} chars — pass it to stage_lookup from your own config]`;
 
   if (blockingRules.length > 0) {
     // The FIRST line carries the whole verdict on its own: the wrapper's deny log records only
     // `stdout.split("\n")[0]`, so a first line that deferred the essential fact would truncate the
     // permanent record rather than the delivery.
-    const head = `Blocked by a Monet rule — ${total} ${noun} (${blockingRules.length} blocking) at ${stages} ${scope}.`;
-    const ids = blockingRules.map((rule) => rule.conceptId).join(", ");
-    // NAMED WITH THE TOOL THAT ACCEPTS THEM (Codex P1, round 2, and it was right). `stage_lookup`
-    // takes a stage name or id, never a concept id — so pointing at it alone left the ids
-    // unusable in the one case they exist for. A stale mirror is exactly when the stage no longer
-    // resolves to the rule that blocked, and `memory_fetch` is the surface keyed by concept id.
-    return `${head}\nBlocking rule ids: ${ids}\nRead the stages with stage_lookup; if a rule has since moved, memory_fetch the id above. This payload carries identity only, not rule text.`;
+    const head = `Blocked by a Monet rule — ${total} ${noun} (${blockingRules.length} blocking) at ${stages} ${scope}${modelScope}.`;
+    // BOUNDED LIKE THE STAGE LIST (Codex, round 3, and it was right). The ids were capped nowhere,
+    // and an oversized stdout does not weaken the deny — it makes the wrapper's `spawnSync` return
+    // no status at all, which fails the gate OPEN. An unbounded field on the enforcing path is the
+    // one place a payload can turn a block into a pass.
+    const allIds = blockingRules.map((rule) => rule.conceptId);
+    const shownIds = allIds.slice(0, INSTRUCTION_STAGE_CAP);
+    const idsOmitted = allIds.length - shownIds.length;
+    const ids = idsOmitted > 0 ? `${shownIds.join(", ")} (+${idsOmitted} more)` : shownIds.join(", ");
+    // NAMED WITH THE TOOL THAT ACCEPTS THEM (Codex P1, round 2). `stage_lookup` takes a stage name
+    // or id, never a concept id.
+    //
+    // AND THE RECOVERY IS DISCLOSED AS PARTIAL (Codex P1, round 3, and it was right). This verdict
+    // was computed from a mirror generation, and both recovery surfaces read LIVE state: if the
+    // rule was edited after that generation, `memory_fetch` returns the current text rather than
+    // the one that fired, and it does not carry the binding's reason at all. Snapshot recovery
+    // would need an immutable revision the mirror does not carry. So the payload states the
+    // generation it judged from and says plainly that a later edit is unrecoverable, rather than
+    // promising a recovery it cannot perform — where a value is unavailable, say unavailable.
+    return `${head}\nBlocking rule ids: ${ids}\nRead the stages with stage_lookup; memory_fetch an id for the rule's current text. Judged from a mirror generated ${mirrorAge} ago — if a rule changed since, what you read is the current version, NOT the one that blocked, and the one that blocked is not recoverable. This payload carries identity only, not rule text.`;
   }
   // TIMING IS NOT STATED HERE (Codex P2, round 2, and it was right). Whether an advisory reaches
   // the agent before or after the act is a property of the HOST's hook contract, and this command
@@ -712,7 +737,11 @@ function formatGateInstruction(result: GateResult, circle: string): string {
   // wrapper (install-cli.ts's own ARCHITECTURE note). A sentence claiming the act already ran is
   // true through that wrapper and false through a preflight caller, so the adapter says it, not
   // this. The instruction here names the stages and stops.
-  const head = `${total} Monet ${noun} ${verb} actions at ${stages} ${scope}.`;
+  // THE EVALUATED MODEL SCOPE IS NAMED (Codex, round 3, and it was right). Agent-scoped rules are
+  // filtered by model tag, this command filters with ITS tag, and `stage_lookup` has no model
+  // argument — it filters with the running server's own. When the two differ the lookup returns a
+  // different set from the one that produced this verdict, and nothing disclosed that.
+  const head = `${total} Monet ${noun} ${verb} actions at ${stages} ${scope}${modelScope}.`;
   return `${head}\nRead them with stage_lookup before acting at these stages; this payload carries identity only, not rule text.`;
 }
 
@@ -1064,10 +1093,13 @@ function runGateUnguarded(
   }
 
   console.error(`monet gate: circle ${describeResolvedCircle(resolved, read.mirror)}`);
+  // Computed once for the payload: a deny states the generation it judged from, because both
+  // recovery surfaces read live state and a later edit is not recoverable from either.
+  const gateMirrorAge = formatMirrorAge(read.mirror.generatedAt, deps.now());
   const outcome = classifyGateResult(result);
   switch (outcome.label) {
     case "advisory-inject":
-      console.log(formatGateInstruction(result, resolved.circle));
+      console.log(formatGateInstruction(result, resolved.circle, gateMirrorAge, runtimeModelTag ?? null));
       break;
     case "blocking-deny": {
       // ONE INSTRUCTION, NAMING EVERY MATCHED STAGE — including the stages that contributed only
@@ -1077,7 +1109,7 @@ function runGateUnguarded(
       // identity on the wire that ambiguity cannot arise: the payload names stages and counts, says
       // how many of them block, and sends the reader to `stage_lookup` for the rest. A separate
       // stderr disclosure would now repeat what stdout already carries.
-      console.log(formatGateInstruction(result, resolved.circle));
+      console.log(formatGateInstruction(result, resolved.circle, gateMirrorAge, runtimeModelTag ?? null));
       // SHOULD-FIX 5 (coordinator review round): the boundary statement requires naming the
       // staleness AND the repair command in the SAME breath as the reason (gate-boundary-
       // statement.md, "Binding consequences for 4b", item 2) — the missing/malformed path already
