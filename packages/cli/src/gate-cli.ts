@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import {
+  CIRCLE_NAME_MAX_CHARS,
   GATE_MIRROR_FORMAT,
   RULE_SCOPES,
   RULE_SEVERITIES,
@@ -666,7 +667,16 @@ function formatGateInstruction(result: GateResult, circle: string): string {
   // mirror deliberately carries an unbounded registry — a store with enough broad patterns could
   // otherwise push this past the wrapper's fixed 16 MiB spawn buffer, which fails the gate OPEN
   // with no deny at all. The omission is stated rather than silent.
-  const names = result.stages.map((stage) => `\`${stage.name}\``);
+  // STAGES THAT ACTUALLY CONTRIBUTED A RULE COME FIRST (Codex P2, round 2, and it was right).
+  // `result.stages` is registry-ordered and can lead with stages whose rules were all filtered out
+  // by circle or model tag; capping that order could name eight stages that delivered nothing while
+  // hiding the one that did behind an anonymous `(+N more)`. Ranking by contribution keeps the cap
+  // from dropping exactly the identity the reader needs.
+  const contributing = new Set(result.rules.map((rule) => rule.stageId));
+  const ranked = [...result.stages].sort(
+    (a, b) => Number(contributing.has(b.id)) - Number(contributing.has(a.id)),
+  );
+  const names = ranked.map((stage) => `\`${stage.name}\``);
   const shown = names.slice(0, INSTRUCTION_STAGE_CAP);
   const omitted = names.length - shown.length;
   const stages = omitted > 0 ? `${shown.join(", ")} (+${omitted} more)` : shown.join(", ");
@@ -675,7 +685,14 @@ function formatGateInstruction(result: GateResult, circle: string): string {
   const blockingRules = result.rules.filter((rule) => rule.severity === "blocking");
   const noun = total === 1 ? "rule" : "rules";
   const verb = total === 1 ? "governs" : "govern";
-  const scope = `[circle: ${circle}]`;
+  // WITHIN `stage_lookup`'S OWN INPUT BOUND (Codex P2, round 2). The CLI accepts a circle name
+  // longer than the MCP schema's 256-char limit, and a breadth-scoped rule still fires under it —
+  // so telling the agent to pass that value on would hand it an argument the tool refuses. Naming
+  // the overflow is honest where quietly emitting an unusable scope is not.
+  const scope =
+    circle.length <= CIRCLE_NAME_MAX_CHARS
+      ? `[circle: ${circle}]`
+      : `[circle: name exceeds ${CIRCLE_NAME_MAX_CHARS} chars — pass it to stage_lookup from your own config]`;
 
   if (blockingRules.length > 0) {
     // The FIRST line carries the whole verdict on its own: the wrapper's deny log records only
@@ -683,10 +700,20 @@ function formatGateInstruction(result: GateResult, circle: string): string {
     // permanent record rather than the delivery.
     const head = `Blocked by a Monet rule — ${total} ${noun} (${blockingRules.length} blocking) at ${stages} ${scope}.`;
     const ids = blockingRules.map((rule) => rule.conceptId).join(", ");
-    return `${head}\nBlocking rule ids: ${ids}\nRead them with stage_lookup before retrying; this hook carries identity only, not rule text.`;
+    // NAMED WITH THE TOOL THAT ACCEPTS THEM (Codex P1, round 2, and it was right). `stage_lookup`
+    // takes a stage name or id, never a concept id — so pointing at it alone left the ids
+    // unusable in the one case they exist for. A stale mirror is exactly when the stage no longer
+    // resolves to the rule that blocked, and `memory_fetch` is the surface keyed by concept id.
+    return `${head}\nBlocking rule ids: ${ids}\nRead the stages with stage_lookup; if a rule has since moved, memory_fetch the id above. This payload carries identity only, not rule text.`;
   }
+  // TIMING IS NOT STATED HERE (Codex P2, round 2, and it was right). Whether an advisory reaches
+  // the agent before or after the act is a property of the HOST's hook contract, and this command
+  // is host-agnostic by explicit architecture — the Claude Code adapter is the separate generated
+  // wrapper (install-cli.ts's own ARCHITECTURE note). A sentence claiming the act already ran is
+  // true through that wrapper and false through a preflight caller, so the adapter says it, not
+  // this. The instruction here names the stages and stops.
   const head = `${total} Monet ${noun} ${verb} actions at ${stages} ${scope}.`;
-  return `${head}\nThis action already ran — an advisory reaches you beside its result, not before it. Read with stage_lookup before the next action at these stages; this hook carries identity only, not rule text.`;
+  return `${head}\nRead them with stage_lookup before acting at these stages; this payload carries identity only, not rule text.`;
 }
 
 /** Human-readable age, coarse enough for a disclosure line, never sub-second precision. */

@@ -389,7 +389,8 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
       /at `git force push` \[circle: [^\]\s]+\]\.\n/,
     );
     expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
-      "Read them with stage_lookup before retrying; this hook carries identity only, not rule text.",
+      "Read the stages with stage_lookup; if a rule has since moved, memory_fetch the id above. " +
+        "This payload carries identity only, not rule text.",
     );
     // #49: the rule's own text and reason never reach the agent — that is the point, not a side
     // effect, so it is asserted rather than left implied by the equality above.
@@ -518,13 +519,25 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
       "1 Monet rule governs actions at `terraform apply` [circle: acme-widgets].",
     );
     expect(output.hookSpecificOutput.additionalContext).not.toContain("Always run plan first");
-    // THIS FIELD IS WHY THE ADVISORY WORDING CHANGED (Codex P1 on PR #58). `additionalContext` is
-    // delivered next to the tool RESULT (hooks.md:831-836, cited in install-cli.ts), so by the time
-    // an agent reads this the terraform apply has already run — and the pre-review payload said
-    // "before acting". Asserted on the real hook JSON, not only on the CLI's stdout, because this
-    // is the channel whose timing makes the claim true or false.
-    expect(output.hookSpecificOutput.additionalContext).toContain("This action already ran");
-    expect(output.hookSpecificOutput.additionalContext).not.toContain("before acting");
+    // THIS LAYER IS THE SOLE OWNER OF THE TIMING CLAIM (Codex P2, round 2 on PR #58).
+    // `additionalContext` is delivered next to the tool RESULT (hooks.md:831-836, cited in
+    // install-cli.ts) and the emit above carries no permissionDecision, so the terraform apply has
+    // already run by the time an agent reads a word of this. Round 1 put that sentence in the gate
+    // payload, where it was true only through THIS wrapper and false through any preflight caller
+    // of the same host-agnostic CLI; round 2 moved it into the adapter that actually knows the
+    // host contract. So it is asserted here, on the real hook JSON — this is the channel whose
+    // timing makes the claim true — and gate-cli.test.ts asserts the CLI stays silent on it. The
+    // pair is the test: whichever layer states it, exactly one of them must.
+    expect(output.hookSpecificOutput.additionalContext).toContain(
+      "This action has already run: a PreToolUse advisory reaches you beside the tool result, " +
+        "not before it. Read the stages above before your NEXT action at them.",
+    );
+    // And it is APPENDED to the gate's own payload, never replacing it — the stage identity the
+    // wrapper is wrapping has to survive the append, so the ordering is asserted rather than
+    // inferred from both substrings being present somewhere.
+    expect(output.hookSpecificOutput.additionalContext).toMatch(
+      /1 Monet rule governs actions at `terraform apply`[\s\S]*This action has already run:/,
+    );
     // BLOCKER 2 (round-5 coordinator review, hooks.md:1542): additionalContext is "Ignored when
     // permissionDecision is 'defer'" — pairing the two made this outcome a silent no-op under the
     // old code. permissionDecision must be genuinely ABSENT here, not merely falsy.

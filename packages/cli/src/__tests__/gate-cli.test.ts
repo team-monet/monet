@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { MonetCore, deriveCircle as coreDeriveCircle } from "@team-monet/core";
+import { CIRCLE_NAME_MAX_CHARS, MonetCore, deriveCircle as coreDeriveCircle } from "@team-monet/core";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   GATE_EXIT_CODE,
@@ -269,9 +269,8 @@ describe("monet gate CLI", () => {
     expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
     expect(result.stdout).toBe(
       "1 Monet rule governs actions at `terraform apply` [circle: acme-widgets].\n" +
-        "This action already ran — an advisory reaches you beside its result, not before it. " +
-        "Read with stage_lookup before the next action at these stages; " +
-        "this hook carries identity only, not rule text.\n",
+        "Read them with stage_lookup before acting at these stages; " +
+        "this payload carries identity only, not rule text.\n",
     );
     // The fixture's advisory reads "Always run plan first" — the payload must not carry it.
     expect(result.stdout).not.toContain("Always run plan first");
@@ -295,7 +294,8 @@ describe("monet gate CLI", () => {
     expect(result.stdout).toBe(
       "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push` [circle: acme-widgets].\n" +
         `Blocking rule ids: ${blockingId}\n` +
-        "Read them with stage_lookup before retrying; this hook carries identity only, not rule text.\n",
+        "Read the stages with stage_lookup; if a rule has since moved, memory_fetch the id above. " +
+        "This payload carries identity only, not rule text.\n",
     );
     expect(result.stdout).not.toContain("Never force-push to main");
     expect(result.stdout).not.toContain("a rewritten history cannot be recovered");
@@ -355,35 +355,51 @@ describe("monet gate CLI", () => {
   // ── PR #58 review round (Codex): what the two paths say, and what identity travels with it ────
 
   /**
-   * THE ADVISORY PATH TELLS THE TRUTH ABOUT ITS OWN TIMING (Codex P1 on PR #58). The wrapper emits
-   * an advisory as `additionalContext` with no permission decision, and the host contract this repo
-   * cites (install-cli.ts, hooks.md:831-836) delivers such context "next to the tool result" — the
-   * act has already run by the time the agent can read a word of it. The pre-review payload told
-   * both paths to read "before acting", which on this path was simply false: nothing was pending.
+   * THE GATE STATES NO HOST TIMING, ON EITHER PATH (Codex P2, round 2 on PR #58).
    *
-   * So the assertion has two halves and needs both. That the payload STATES the act already ran is
-   * the promise; that it does NOT say "before acting" is the regression this pins — a future
-   * formatter that reunified the two paths under one sentence would satisfy the first half by
-   * accident while re-breaking the second.
+   * This test used to assert the OPPOSITE half of the same question: that the advisory payload said
+   * "This action already ran". That claim was true, but it was being made in the wrong layer, and
+   * round 2 moved it rather than reworded it. Whether an advisory arrives before or after the act
+   * is a property of the HOST's hook contract — through the generated Claude Code wrapper it rides
+   * `additionalContext`, delivered next to the tool result, so the act really has run; through a
+   * preflight caller of this same host-agnostic CLI nothing has run yet and the sentence is a lie.
+   * `monet gate` is host-agnostic by explicit architecture (install-cli.ts's ARCHITECTURE note), so
+   * the adapter that knows the timing says it and the CLI stays silent on the question.
+   *
+   * So this half now pins the SILENCE, which is the property the architecture actually promises:
+   * no timing vocabulary of any spelling reaches gate stdout. The surviving positive half of the
+   * old claim lives where the channel makes it true — install-cli.test.ts's "an advisory-only fire
+   * carries additionalContext..." test, asserted on the real hook JSON. Both halves are needed and
+   * neither file can drop its own without the pair going quiet.
    */
-  it("PR #58 (Codex P1): the advisory payload says the action ALREADY RAN, and never 'before acting'", async () => {
+  it("PR #58 (Codex P2, round 2): gate stdout is HOST-AGNOSTIC — it states no hook timing on either path", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildFixtureMirror(mirrorPath);
-    const result = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
-    expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
-    expect(result.stdout).toContain("This action already ran");
-    expect(result.stdout).toContain("an advisory reaches you beside its result, not before it");
-    expect(result.stdout).toContain("before the next action at these stages");
-    // The false half of the old single-sentence payload, on the path where it was false.
-    expect(result.stdout).not.toContain("before acting");
+    const advisory = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(advisory.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    // What the advisory DOES say: the stages, and where to read them. Nothing about when it arrives.
+    expect(advisory.stdout).toContain("Read them with stage_lookup before acting at these stages");
 
-    // AND THE DENY PATH STILL PROMISES RECOVERY, because there a retry genuinely is still ahead —
-    // asserted in the same test so the two paths cannot silently converge on one wording again.
     const deny = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(deny.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    expect(deny.stdout).toContain("before retrying");
-    expect(deny.stdout).not.toContain("This action already ran");
+
+    // Every spelling of the timing claim the wrapper is now the sole owner of. Listed rather than
+    // regex-sniffed so a formatter that reintroduced ANY of them — including by reunifying the two
+    // paths under one sentence, the way the pre-review payload did — fails here by name.
+    for (const timingClaim of [
+      "This action already ran",
+      "This action has already run",
+      "already ran",
+      "already run",
+      "beside its result",
+      "beside the tool result",
+      "not before it",
+      "PreToolUse",
+    ]) {
+      expect(advisory.stdout).not.toContain(timingClaim);
+      expect(deny.stdout).not.toContain(timingClaim);
+    }
   });
 
   /**
@@ -408,6 +424,18 @@ describe("monet gate CLI", () => {
     const [blockingId] = blockingConceptIds(mirrorPath, "git force push");
     // The REAL id of the rule that actually blocked — not merely a UUID-shaped string.
     expect(deny.stdout).toContain(`Blocking rule ids: ${blockingId}`);
+    // AND THE IDS ARE POINTED AT A TOOL THAT ACCEPTS THEM (Codex P1, round 2 on PR #58). The ids
+    // did not move; the tool named beside them did. `stage_lookup` takes a stage name or id and
+    // rejects a concept id outright (core's mcp-server.ts), so the round-1 wording — "Read them
+    // with stage_lookup" directly after the id line — named the one tool that cannot use them, in
+    // exactly the stale-mirror case they exist for. `memory_fetch` is the surface keyed by concept
+    // id, so recovery is a real instruction rather than a dead end.
+    expect(deny.stdout).toContain("memory_fetch the id above");
+    // The regression this pins is the SEQUENCING, not the vocabulary: `stage_lookup` legitimately
+    // still appears (it reads the stages), so a substring check for it proves nothing. What must
+    // never come back is the id line flowing into `stage_lookup` as its input.
+    expect(deny.stdout).not.toMatch(/Blocking rule ids:.*\n?.*Read them with stage_lookup/);
+    expect(deny.stdout).toContain("Read the stages with stage_lookup");
 
     const advisory = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(advisory.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
@@ -456,6 +484,58 @@ describe("monet gate CLI", () => {
       expect(stdout).not.toContain("acme-widgets");
       expect(stdout).not.toContain("[circle: *]");
     }
+  });
+
+  /**
+   * A CIRCLE THE READER CANNOT PASS ON IS NAMED AS SUCH, NOT EMITTED ANYWAY (Codex P2, round 2 on
+   * PR #58). The test above establishes why the circle is in the payload at all: it is an ARGUMENT
+   * the reader is told to hand `stage_lookup`. That makes the tool's own input bound part of the
+   * contract, and the two ends disagree — this CLI accepts a circle of any length (nothing rejects
+   * it, and a breadth-scoped rule fires under it perfectly well, both asserted below), while
+   * `stage_lookup`'s schema caps a circle name at CIRCLE_NAME_MAX_CHARS and refuses anything
+   * longer. Printing the oversized name would hand the agent an argument the tool bounces, on the
+   * one field the payload exists to make actionable.
+   *
+   * WHY THE BOUND IS IMPORTED, NOT TYPED AS 256: the number is core's, the gate reads it through
+   * core's own re-export, and a test restating the literal would keep passing on the day core
+   * moved it — which is the only day this assertion matters.
+   *
+   * The verdict is deliberately unchanged: an oversized circle is a payload-legibility problem, not
+   * a reason to stop blocking. Exit code and blocking-id disclosure are asserted here precisely so
+   * a future fix for the wording cannot quietly downgrade the deny.
+   */
+  it("PR #58 (Codex P2, round 2): a circle past stage_lookup's own input bound is disclosed as overflow, never emitted as a usable value", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    // The fixture's force-push rule is declared at breadth (`circle: "*"`), so it fires for any
+    // queried circle — including one no store would ever hold.
+    await buildFixtureMirror(mirrorPath);
+    const oversized = "z".repeat(CIRCLE_NAME_MAX_CHARS + 1);
+
+    const result = spawnGate(["Bash:git push --force", "--circle", oversized, "--mirror", mirrorPath]);
+
+    // THE CLI REALLY DID ACCEPT IT AND THE RULE REALLY DID FIRE — without this the test would pass
+    // just as well against a gate that rejected the circle outright, which is a different contract.
+    expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    const [blockingId] = blockingConceptIds(mirrorPath, "git force push");
+    expect(result.stdout).toContain(`Blocking rule ids: ${blockingId}`);
+
+    expect(result.stdout).toContain(
+      `[circle: name exceeds ${CIRCLE_NAME_MAX_CHARS} chars — pass it to stage_lookup from your own config]`,
+    );
+    // The unusable value itself never reaches the payload — not truncated to look valid, not
+    // emitted alongside the notice.
+    expect(result.stdout).not.toContain(oversized);
+    expect(result.stdout).not.toContain("zzzzzzzz");
+
+    // AND THE BOUND IS EXCLUSIVE AT THE EDGE: a circle of exactly the maximum is a legal argument,
+    // so it must still be emitted normally. Without this half, an off-by-one that suppressed every
+    // long-but-legal circle would pass on the assertions above.
+    const atLimit = "y".repeat(CIRCLE_NAME_MAX_CHARS);
+    const edge = spawnGate(["Bash:git push --force", "--circle", atLimit, "--mirror", mirrorPath]);
+    expect(edge.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    expect(edge.stdout).toContain(`[circle: ${atLimit}]`);
+    expect(edge.stdout).not.toContain("name exceeds");
   });
 
   /**
@@ -519,6 +599,104 @@ describe("monet gate CLI", () => {
     for (const spec of specs) {
       if (!namedStages.includes(spec.stage)) expect(head).not.toContain(spec.stage);
     }
+  });
+
+  /**
+   * THE CAP MUST NOT HIDE THE STAGE THAT ACTUALLY DELIVERED THE RULE (Codex P2, round 2 on PR #58).
+   *
+   * The cap above and this test pull in opposite directions, which is the whole point. `stages` is
+   * every matching REGISTRY stage — matching is a pattern question — while `rules` is what survived
+   * the circle and model-tag filters. The two sets come apart routinely: a stage whose only rule
+   * belongs to another circle still matches, still occupies a slot, and delivers nothing. Because
+   * `result.stages` arrives in registry order, a store can put eight such stages ahead of the one
+   * stage that did deliver, and the pre-fix formatter would then name eight stages that contributed
+   * nothing while hiding the single actionable identity behind an anonymous `(+N more)` — a payload
+   * that is entirely true and completely useless, on the exact path the payload exists to serve.
+   *
+   * THE FIXTURE IS THE ARGUMENT, and it is built to fail without the ranking rather than to pass
+   * with it. Eleven stages match one command; the ten declared FIRST carry rules scoped to a
+   * foreign circle and are filtered out at evaluation; the ELEVENTH, declared last and therefore
+   * last in registry order, is the only contributor. Registry position is asserted from the mirror
+   * itself below, so "outside the first 8" is a measured property of the fixture and not an
+   * assumption about how core happens to order rows today.
+   */
+  it("PR #58 (Codex P2, round 2): a contributing stage is named even when 10 non-contributing stages precede it in registry order", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    // Genuinely distinct subjects: core dedups semantically-close rule bodies at declare time, and
+    // eleven near-paraphrases would collapse into fewer bindings than this fixture needs.
+    const decoys = [
+      { stage: "tarball signature", token: "alpha", content: "Verify the tarball signature before it leaves the machine." },
+      { stage: "changelog hygiene", token: "bravo", content: "Write the changelog entry in the same commit as the change." },
+      { stage: "database backup", token: "charlie", content: "Take a database snapshot and confirm it restores." },
+      { stage: "on-call handoff", token: "delta", content: "Page the secondary responder when the primary does not acknowledge." },
+      { stage: "secret rotation", token: "echo", content: "Rotate the deploy key whenever a contractor leaves." },
+      { stage: "load shedding", token: "foxtrot", content: "Shed low-priority traffic before the queue saturates." },
+      { stage: "schema migration", token: "golf", content: "Ship an additive migration ahead of the code that reads it." },
+      { stage: "feature flag cleanup", token: "hotel", content: "Delete a flag once both branches have been decided." },
+      { stage: "dependency pinning", token: "india", content: "Pin the lockfile to an exact version for a release build." },
+      { stage: "customer notice", token: "juliett", content: "Tell affected customers before the maintenance window opens." },
+    ];
+    const CONTRIBUTOR = "rollback rehearsal";
+    await buildCustomFixtureMirror(mirrorPath, [
+      ...decoys.map((spec) => ({
+        stage: spec.stage, pattern: `Bash:${spec.token}`, content: spec.content,
+        severity: "advisory" as const,
+        // The filter that empties these stages. They still MATCH — that is what makes them decoys.
+        circle: "someone-elses-project",
+      })),
+      {
+        stage: CONTRIBUTOR, pattern: "Bash:kilo", content: "Rehearse the rollback path on staging first.",
+        severity: "advisory" as const, circle: "acme-widgets",
+      },
+    ]);
+
+    const command = [...decoys.map((spec) => spec.token), "kilo"].join(" ");
+    const result = spawnGate([`Bash:${command}`, "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    // Exactly one rule survived the circle filter — so the ten decoy stages are genuinely empty
+    // here, not merely quiet.
+    expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    expect(result.stdout).toContain("1 Monet rule governs actions at");
+
+    // NOT VACUOUS, PART 1: all eleven stages exist, so the cap really is truncating.
+    const mirror = JSON.parse(readFileSync(mirrorPath, "utf8")) as GateMirror;
+    expect(mirror.stages).toHaveLength(11);
+    // NOT VACUOUS, PART 2: the contributor sits outside the first 8 of the mirror's OWN stage
+    // order, so registry order alone would have hidden it. Without the sort this test fails.
+    const registryOrder = mirror.stages.map((stage) => stage.name);
+    expect(registryOrder.slice(0, 8)).not.toContain(CONTRIBUTOR);
+
+    const head = result.stdout.split("\n")[0];
+    const namedStages = (head.match(/`([^`]+)`/g) ?? []).map((match) => match.slice(1, -1));
+    // The promise: the one stage a reader can act on is named at all...
+    expect(namedStages).toContain(CONTRIBUTOR);
+    // ...and first, because contribution is what the sort ranks on.
+    expect(namedStages[0]).toBe(CONTRIBUTOR);
+    // The cap still applies — ranking reorders, it does not widen the list.
+    expect(namedStages).toHaveLength(8);
+    expect(head).toContain("(+3 more)");
+  });
+
+  /**
+   * THE SORT IS STABLE WITHIN EACH GROUP, so ranking by contribution does not quietly reshuffle the
+   * stage order everyone else reads. When every matching stage contributes, the payload must be
+   * byte-identical to the unranked registry order — otherwise the fix for the case above would have
+   * changed the output of every ordinary fire as a side effect.
+   */
+  it("PR #58 (Codex P2, round 2): when every stage contributes, ranking leaves registry order untouched", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildCustomFixtureMirror(mirrorPath, [
+      { stage: "tarball signature", pattern: "Bash:alpha", content: "Verify the tarball signature before it leaves the machine.", severity: "advisory", circle: "acme-widgets" },
+      { stage: "changelog hygiene", pattern: "Bash:bravo", content: "Write the changelog entry in the same commit as the change.", severity: "advisory", circle: "acme-widgets" },
+      { stage: "database backup", pattern: "Bash:charlie", content: "Take a database snapshot and confirm it restores.", severity: "advisory", circle: "acme-widgets" },
+    ]);
+    const result = spawnGate(["Bash:alpha bravo charlie", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    const mirror = JSON.parse(readFileSync(mirrorPath, "utf8")) as GateMirror;
+    const head = result.stdout.split("\n")[0];
+    const namedStages = (head.match(/`([^`]+)`/g) ?? []).map((match) => match.slice(1, -1));
+    expect(namedStages).toEqual(mirror.stages.map((stage) => stage.name));
   });
 
   it("outcome 40 — overflow-ask is wired through classifyGateResult (see below for why not spawned)", () => {
@@ -921,7 +1099,8 @@ describe("monet gate CLI", () => {
     expect(result.stdout).toBe(
       "Blocked by a Monet rule — 3 rules (1 blocking) at `npm publish`, `release hygiene` [circle: acme-widgets].\n" +
         `Blocking rule ids: ${blockingId}\n` +
-        "Read them with stage_lookup before retrying; this hook carries identity only, not rule text.\n",
+        "Read the stages with stage_lookup; if a rule has since moved, memory_fetch the id above. " +
+        "This payload carries identity only, not rule text.\n",
     );
     // Neither severity gets its content quoted — that symmetry is what removes the ambiguity the
     // old stdout/stderr split existed to manage.
@@ -1101,7 +1280,8 @@ describe("monet gate CLI", () => {
     expect(result.stdout).toBe(
       "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push` [circle: acme-widgets].\n" +
         `Blocking rule ids: ${blockingId}\n` +
-        "Read them with stage_lookup before retrying; this hook carries identity only, not rule text.\n",
+        "Read the stages with stage_lookup; if a rule has since moved, memory_fetch the id above. " +
+        "This payload carries identity only, not rule text.\n",
     );
   });
 

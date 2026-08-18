@@ -262,8 +262,23 @@ function emitSpawnFailureWarning() {
 // PostToolUseFailure, and PostToolBatch: next to the tool result"). Omitting permissionDecision
 // means Monet has no enforcement opinion here either — the normal permission flow still decides
 // allow/ask/deny on its own; the advisory rides alongside it, never overriding it.
+// THE TIMING SENTENCE LIVES HERE, NOT IN \`monet gate\` (Codex P2 on PR #58, and it was right).
+// Whether an advisory reaches the agent before or after the act is a property of THIS host's hook
+// contract, and the gate is host-agnostic by the ARCHITECTURE note at the top of this file. The
+// claim is true through this wrapper — hooks.md:831-836 puts additionalContext "next to the tool
+// result", and the emit below carries no permissionDecision, so the call proceeds — and would be
+// false through a preflight caller of the same gate. So the adapter that knows the timing states
+// it, and the payload it wraps stays silent on the question.
 function emitAdvisory(context) {
-  emit({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: context } });
+  emit({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      additionalContext:
+        context +
+        "\\nThis action has already run: a PreToolUse advisory reaches you beside the tool result, " +
+        "not before it. Read the stages above before your NEXT action at them.",
+    },
+  });
 }
 
 // Deny journal (boundary statement item 6) — see this file's own generator comment

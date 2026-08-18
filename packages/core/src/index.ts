@@ -345,6 +345,9 @@ export type { LocalEmbedderSelection, LocalEmbedderWithProvenance } from "./embe
 export { DeterministicSynthesizer } from "./synthesis";
 export type { Synthesizer } from "./synthesis";
 export { createMonetCoreMcpServer } from "./mcp-server";
+// Re-exported for the CLI's gate payload, which must not emit a circle longer than the value
+// `stage_lookup` will accept — restating the number there would let the two drift apart.
+export { CIRCLE_NAME_MAX_CHARS } from "./mcp-server";
 export type { CreateMonetCoreMcpServerOptions } from "./mcp-server";
 export { deriveCircle } from "./circle";
 export type {
