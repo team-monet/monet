@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import {
+  CIRCLE_NAME_MAX_CHARS,
   GATE_MIRROR_FORMAT,
   RULE_SCOPES,
   RULE_SEVERITIES,
@@ -77,12 +78,18 @@ export const QUERY_WILDCARD_CIRCLE = "*";
  * excess positional arguments) exits 1, distinct from all five outcomes. `--help`/`-h`/`--version`
  * exit 0 through commander's own paths, before any evaluation runs.
  *
- * STDOUT/STDERR DISCIPLINE, deliberate: stdout carries ONLY the outcome's own injectable payload
- * (rule text/reason for 20 and 30, blocking-only even when an advisory also fired — see
- * SHOULD-FIX 4 in this slice's report) so a hook can pipe it straight into the agent's context or
- * a denial message without scraping it out of diagnostics. Every diagnostic — resolved circle,
- * mirror age, missing/malformed warnings, usage errors, a suppressed advisory — goes to stderr,
- * matching doctor/repair's existing convention in this codebase (repair-cli.ts).
+ * STDOUT/STDERR DISCIPLINE, deliberate: stdout carries ONLY the outcome's own injectable payload,
+ * so a hook can pipe it straight into the agent's context or a denial message without scraping it
+ * out of diagnostics. Every diagnostic — resolved circle, mirror age, missing/malformed warnings,
+ * usage errors — goes to stderr, matching doctor/repair's existing convention in this codebase
+ * (repair-cli.ts).
+ *
+ * THAT PAYLOAD IS IDENTITY, NOT CONTENT, as of #49: the matched stage names, how many rules apply,
+ * how many of them block, and an instruction to read them with `stage_lookup`. It formerly carried
+ * "text — reason" per rule, with a deny restricted to blocking lines and a co-firing advisory
+ * disclosed separately on stderr — a split that existed because the line protocol had no severity
+ * marker, so mixing severities would leave a reader guessing which line was enforceable. Identity
+ * dissolves that: one instruction names every matched stage and states the blocking count.
  *
  * PROCESS WALL TIME IS NOT SUB-MS, and this module must not claim it is: the design's "sub-ms" is
  * the ENGINE's own evaluation cost inside `evaluateGateFromMirror` (proved in 4b-B), not this
@@ -613,14 +620,138 @@ export function classifyGateResult(result: GateResult): GateOutcome {
 }
 
 /**
- * One line per rule, "text — reason", injection-ready. `reasonMissing` (a legally reasonless
- * relayed deny — see GateRule.reasonMissing's own comment in @team-monet/core/gates.ts) is
- * disclosed rather than hidden, matching that field's own design intent.
+ * WHAT THE HOOK SENDS: which stages govern this act, and an instruction to go read them (#49).
+ * Never the rule's text, and never its reason.
+ *
+ * WHY IDENTITY RATHER THAN CONTENT, and it is observability rather than brevity. The old payload
+ * was `text — reason`, where `text` is the concept TITLE — a display name produced by clipping the
+ * body's first sentence at 80 characters. Measured across 61 live rules, that clipped 82% of them,
+ * and of the ten rules whose body names an artifact to go load, the pointer survived in ZERO cases.
+ * The failure is structural rather than authorial: a rule is written "WHEN <trigger>, load
+ * <artifact>", so the more precisely the trigger is written, the further past the clip the artifact
+ * name falls. Better-written rules lost their pointer more reliably.
+ *
+ * Sending identity dissolves that rather than tuning it — with no content on the wire, no cap
+ * governs it. And it buys the thing the clip never could: a READ is an event, so receipt becomes
+ * decidable. Today the record can say a rule was delivered and can never say it arrived.
+ *
+ * NO REASON EITHER, which is the sharper half of the choice (John, 2026-08-18). `reason` is the one
+ * field that already arrived whole, so keeping it would have been free — but it is rule content,
+ * and it would supply the motivation to read, which is precisely the variable #50 is measuring.
+ *
+ * BLOCKING IS NOT SPECIAL, by the same ruling: the call is refused either way, and whoever wants
+ * the reason opens the rule. The count of blocking rules is disclosed so a reader knows what to
+ * look for, but no blocking rule's text is quoted here.
+ *
+ * THE TWO PATHS GET DIFFERENT INSTRUCTIONS, because their physics differ (Codex P1 on PR #58, and
+ * it was right). A deny stops the call, so "read before retrying" is achievable. An advisory does
+ * NOT: the wrapper emits it as `additionalContext` with no permission decision, and this repo's own
+ * citation of the host's contract (install-cli.ts, hooks.md:831-836) is that such context arrives
+ * "next to the tool result" — the act has already run by the time the agent can read anything. A
+ * single "before acting" line would therefore have been false on the busier of the two paths.
+ *
+ * A DENY ALSO CARRIES ITS BLOCKING CONCEPT IDS (Codex P1, same review). The mirror can be stale —
+ * the deny path discloses its age for exactly that reason — so the rule that produced a cached
+ * verdict may since have been withdrawn, superseded or edited. `stage_lookup` reads the live store
+ * and would then return something else, or nothing, with no way back to what actually blocked. The
+ * id is snapshot identity, not content: it survives the rule changing underneath it.
+ *
+ * AND THE EVALUATED CIRCLE (Codex P2, same review), because `stage_lookup` resolves against the
+ * session's own circle. A gate invoked with a different `--circle` would otherwise send the reader
+ * to a scope that never produced this verdict.
  */
-function formatRuleLine(rule: GateRule): string {
-  if (rule.reason) return `${rule.text} — ${rule.reason}`;
-  if (rule.reasonMissing) return `${rule.text} — (no reason recorded: relayed from an older peer)`;
-  return rule.text;
+const INSTRUCTION_STAGE_CAP = 8;
+
+function formatGateInstruction(
+  result: GateResult,
+  circle: string,
+  mirrorGeneratedAt: number,
+  runtimeModelTag: string | null,
+): string {
+  // BOUNDED (Codex P2, same review). `result.stages` is every matching registry stage, and the
+  // mirror deliberately carries an unbounded registry — a store with enough broad patterns could
+  // otherwise push this past the wrapper's fixed 16 MiB spawn buffer, which fails the gate OPEN
+  // with no deny at all. The omission is stated rather than silent.
+  // STAGES THAT ACTUALLY CONTRIBUTED A RULE COME FIRST (Codex P2, round 2, and it was right).
+  // `result.stages` is registry-ordered and can lead with stages whose rules were all filtered out
+  // by circle or model tag; capping that order could name eight stages that delivered nothing while
+  // hiding the one that did behind an anonymous `(+N more)`. Ranking by contribution keeps the cap
+  // from dropping exactly the identity the reader needs.
+  // ONLY THE STAGES THAT CONTRIBUTED A RULE ARE NAMED (Codex, round 3, and it was right). Ranking
+  // contributors ahead of the cap was not enough: a ninth contributor still fell into an anonymous
+  // `(+N more)`, and on the advisory path there is no id to recover it with. A stage that delivered
+  // nothing has nothing for the reader to look up, so it is dropped rather than competing for the
+  // budget — which also makes overflowing the cap far rarer than registry order made it.
+  const contributing = new Set(result.rules.map((rule) => rule.stageId));
+  const named = result.stages.filter((stage) => contributing.has(stage.id));
+  // SERIALIZED, NOT INTERPOLATED (Codex, round 3). A stage name may contain a backtick and a circle
+  // is only length-bounded, so raw prose interpolation lets an identifier break the surrounding
+  // syntax — and then the agent cannot tell which exact string to pass to `stage_lookup`.
+  const names = named.map((stage) => JSON.stringify(stage.name));
+  const shown = names.slice(0, INSTRUCTION_STAGE_CAP);
+  const omitted = names.length - shown.length;
+  const stages = omitted > 0 ? `${shown.join(", ")} (+${omitted} more)` : shown.join(", ");
+
+  const total = result.rules.length;
+  const blockingRules = result.rules.filter((rule) => rule.severity === "blocking");
+  const noun = total === 1 ? "rule" : "rules";
+  const verb = total === 1 ? "governs" : "govern";
+  // WITHIN `stage_lookup`'S OWN INPUT BOUND (Codex P2, round 2). The CLI accepts a circle name
+  // longer than the MCP schema's 256-char limit, and a breadth-scoped rule still fires under it —
+  // so telling the agent to pass that value on would hand it an argument the tool refuses. Naming
+  // the overflow is honest where quietly emitting an unusable scope is not.
+  const modelScope = runtimeModelTag === null ? "" : ` [model: ${JSON.stringify(runtimeModelTag)}]`;
+  const scope =
+    circle.length <= CIRCLE_NAME_MAX_CHARS
+      ? `[circle: ${JSON.stringify(circle)}]`
+      : `[circle: name exceeds ${CIRCLE_NAME_MAX_CHARS} chars — pass it to stage_lookup from your own config]`;
+
+  if (blockingRules.length > 0) {
+    // The FIRST line carries the whole verdict on its own: the wrapper's deny log records only
+    // `stdout.split("\n")[0]`, so a first line that deferred the essential fact would truncate the
+    // permanent record rather than the delivery.
+    const head = `Blocked by a Monet rule — ${total} ${noun} (${blockingRules.length} blocking) at ${stages} ${scope}${modelScope}.`;
+    // BOUNDED LIKE THE STAGE LIST (Codex, round 3, and it was right). The ids were capped nowhere,
+    // and an oversized stdout does not weaken the deny — it makes the wrapper's `spawnSync` return
+    // no status at all, which fails the gate OPEN. An unbounded field on the enforcing path is the
+    // one place a payload can turn a block into a pass.
+    const allIds = blockingRules.map((rule) => rule.conceptId);
+    const shownIds = allIds.slice(0, INSTRUCTION_STAGE_CAP);
+    const idsOmitted = allIds.length - shownIds.length;
+    const ids = idsOmitted > 0 ? `${shownIds.join(", ")} (+${idsOmitted} more)` : shownIds.join(", ");
+    // NAMED WITH THE TOOL THAT ACCEPTS THEM (Codex P1, round 2). `stage_lookup` takes a stage name
+    // or id, never a concept id.
+    //
+    // AND THE RECOVERY IS DISCLOSED AS PARTIAL (Codex P1, round 3, and it was right). This verdict
+    // was computed from a mirror generation, and both recovery surfaces read LIVE state: if the
+    // rule was edited after that generation, `memory_fetch` returns the current text rather than
+    // the one that fired, and it does not carry the binding's reason at all. Snapshot recovery
+    // would need an immutable revision the mirror does not carry. So the payload states the
+    // generation it judged from and says plainly that a later edit is unrecoverable, rather than
+    // promising a recovery it cannot perform — where a value is unavailable, say unavailable.
+    return `${head}\nBlocking rule ids: ${ids}\nRead the stages with stage_lookup; memory_fetch an id for the rule's current text. Judged from the mirror generated ${new Date(mirrorGeneratedAt).toISOString()} — if a rule changed since, what you read is the current version, NOT the one that blocked, and the one that blocked is not recoverable. This payload carries identity only, not rule text.`;
+  }
+  // TIMING IS NOT STATED HERE (Codex P2, round 2, and it was right). Whether an advisory reaches
+  // the agent before or after the act is a property of the HOST's hook contract, and this command
+  // is host-agnostic by explicit architecture — the Claude Code adapter is the separate generated
+  // wrapper (install-cli.ts's own ARCHITECTURE note). A sentence claiming the act already ran is
+  // true through that wrapper and false through a preflight caller, so the adapter says it, not
+  // this. The instruction here names the stages and stops.
+  // THE EVALUATED MODEL SCOPE IS NAMED (Codex, round 3, and it was right). Agent-scoped rules are
+  // filtered by model tag, this command filters with ITS tag, and `stage_lookup` has no model
+  // argument — it filters with the running server's own. When the two differ the lookup returns a
+  // different set from the one that produced this verdict, and nothing disclosed that.
+  // THE ADVISORY DISCLOSES ITS GENERATION TOO (Codex, round 4, and it was right). A rule present in
+  // this mirror may have been withdrawn, moved or superseded in the live store, and `stage_lookup`
+  // reads live — so the reader can be told that rules govern here and then find none, with nothing
+  // explaining the gap. The deny path already said this; the advisory silently did not.
+  //
+  // NO IDS HERE, unlike the deny, and the asymmetry is deliberate rather than an omission: a deny
+  // has to answer "what stopped me", which needs the exact rule. An advisory asks "what governs
+  // this", which the live set answers correctly — what was missing was only the account of why that
+  // set may differ from the one that fired.
+  const head = `${total} Monet ${noun} ${verb} actions at ${stages} ${scope}${modelScope}.`;
+  return `${head}\nRead them with stage_lookup before acting at these stages. Judged from the mirror generated ${new Date(mirrorGeneratedAt).toISOString()} — if a rule changed since, the lookup may return a different set, or none. This payload carries identity only, not rule text.`;
 }
 
 /** Human-readable age, coarse enough for a disclosure line, never sub-second precision. */
@@ -971,21 +1102,26 @@ function runGateUnguarded(
   }
 
   console.error(`monet gate: circle ${describeResolvedCircle(resolved, read.mirror)}`);
+  // THE GENERATION, NOT ITS AGE. An age is wall-clock, so the same fixture and the same mirror
+  // produce different bytes a second apart — and this payload's first line is what the deny log
+  // records permanently. A generation timestamp carries the same fact and is deterministic: two
+  // evaluations of one mirror are byte-identical, which is what makes them comparable at all.
+  // (The human-facing staleness warning on stderr still renders an age; a diagnostic may be
+  // wall-clock, a record should not be.)
   const outcome = classifyGateResult(result);
   switch (outcome.label) {
     case "advisory-inject":
-      for (const rule of result.rules) console.log(formatRuleLine(rule));
+      console.log(formatGateInstruction(result, resolved.circle, read.mirror.generatedAt, runtimeModelTag ?? null));
       break;
     case "blocking-deny": {
-      for (const rule of result.rules.filter((r) => r.severity === "blocking")) console.log(formatRuleLine(rule));
-      // SHOULD-FIX 4 (coordinator review round): an advisory that ALSO fired alongside the deny
-      // (same or another matched stage) must not simply vanish — stdout stays blocking-only (no
-      // severity marker in the line protocol, so mixing severities there would make a reader
-      // guess which line is the enforceable one), but the advisory is still real guidance and
-      // belongs somewhere. Disclosed on stderr instead of dropped.
-      for (const rule of result.rules.filter((r) => r.severity === "advisory")) {
-        console.error(`monet gate: advisory also fired (not part of the deny): ${formatRuleLine(rule)}`);
-      }
+      // ONE INSTRUCTION, NAMING EVERY MATCHED STAGE — including the stages that contributed only
+      // advisories (#49). The old shape put blocking rules on stdout and disclosed a co-firing
+      // advisory separately on stderr, because the line protocol carried rule TEXT with no severity
+      // marker and mixing them would have left a reader guessing which line was enforceable. With
+      // identity on the wire that ambiguity cannot arise: the payload names stages and counts, says
+      // how many of them block, and sends the reader to `stage_lookup` for the rest. A separate
+      // stderr disclosure would now repeat what stdout already carries.
+      console.log(formatGateInstruction(result, resolved.circle, read.mirror.generatedAt, runtimeModelTag ?? null));
       // SHOULD-FIX 5 (coordinator review round): the boundary statement requires naming the
       // staleness AND the repair command in the SAME breath as the reason (gate-boundary-
       // statement.md, "Binding consequences for 4b", item 2) — the missing/malformed path already
@@ -1063,9 +1199,14 @@ export function registerGateCommands(
 Exit codes (the host maps these; this command never enforces any of them):
   0   silence              no stage matched — nothing governs this action
   10  stage-hit-no-rules   a stage matched with no live rules bound (the projection-hook signal)
-  20  advisory-inject      advisory rule(s) fired; stdout carries "text — reason", one per line
-  30  blocking-deny        a blocking rule fired; stdout carries its reason, stderr discloses the
-                           mirror's age and the repair command (an offline deny is a cached deny)
+  20  advisory-inject      advisory rule(s) fired; stdout names the matched stages and instructs
+                           the agent to read them with stage_lookup
+  30  blocking-deny        a blocking rule fired; stdout names the matched stages and how many
+                           block, stderr discloses the mirror's age and the repair command (an
+                           offline deny is a cached deny)
+
+Neither payload carries rule text or a rule's reason: the gate sends identity and an instruction
+to read, so that the read is an observable event. stage_lookup is where a rule's own words live.
   40  overflow-ask         action context past the refusal threshold; NEVER map this to allow
   1   usage error          --circle '*' (not a queryable circle), no 'Tool:' prefix and no --tool,
                            excess positional arguments (quote the action context), or the action

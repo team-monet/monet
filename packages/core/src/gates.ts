@@ -2409,8 +2409,8 @@ export function bindRule(deps: GateDeps, input: BindRuleInput, mode: BindMode): 
   // somebody else's data into a lock on this store. Relay's answer is disclosure, never a veto.
   if (severity === "blocking" && hasLineBreak(input.reason)) {
     throw new Error(
-      "a blocking rule's `reason` must be ONE LINE: it is printed beside the deny at the moment it " +
-        "fires, so a line break makes the gate appear to say something nobody wrote. Received " +
+      "a blocking rule's `reason` must be ONE LINE: it is delivered as the rule's own explanation " +
+        "of a refusal, so a line break makes the rule appear to say something nobody wrote. Received " +
         `${JSON.stringify(input.reason)} — restate it as a single sentence.`,
     );
   }
