@@ -55,6 +55,27 @@ async function buildFixtureMirror(mirrorPath: string): Promise<void> {
   core.close();
 }
 
+/**
+ * The conceptIds a fixture minted for the BLOCKING rules bound to `stageName`, read back out of the
+ * mirror the fixture just wrote.
+ *
+ * The deny payload snapshots these ids (PR #58's own Codex-P1 fix), and every fixture build mints
+ * fresh UUIDs, so a test that pins the deny payload byte-for-byte has to read them rather than
+ * hard-code one. Reading them here also keeps the assertion honest in the direction that matters:
+ * it proves the payload carries the id of the rule that ACTUALLY blocked, not merely that some
+ * UUID-shaped string appears.
+ */
+function blockingConceptIds(mirrorPath: string, stageName: string): string[] {
+  const mirror = JSON.parse(readFileSync(mirrorPath, "utf8")) as GateMirror;
+  const stage = mirror.stages.find((entry) => entry.name === stageName);
+  if (!stage) throw new Error(`fixture has no stage named '${stageName}'`);
+  const ids = mirror.entries
+    .filter((entry) => entry.stageId === stage.id && entry.severity === "blocking")
+    .map((entry) => entry.conceptId);
+  if (ids.length === 0) throw new Error(`fixture stage '${stageName}' has no live blocking rule`);
+  return ids;
+}
+
 interface FixtureRuleSpec {
   stage: string;
   /** Omit when a PRIOR rule spec in the same call already established this stage's patterns —
@@ -247,8 +268,10 @@ describe("monet gate CLI", () => {
     const result = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
     expect(result.stdout).toBe(
-      "1 Monet rule governs this action, at `terraform apply`.\n" +
-        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
+      "1 Monet rule governs actions at `terraform apply` [circle: acme-widgets].\n" +
+        "This action already ran — an advisory reaches you beside its result, not before it. " +
+        "Read with stage_lookup before the next action at these stages; " +
+        "this hook carries identity only, not rule text.\n",
     );
     // The fixture's advisory reads "Always run plan first" — the payload must not carry it.
     expect(result.stdout).not.toContain("Always run plan first");
@@ -268,9 +291,11 @@ describe("monet gate CLI", () => {
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    const [blockingId] = blockingConceptIds(mirrorPath, "git force push");
     expect(result.stdout).toBe(
-      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.\n" +
-        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
+      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push` [circle: acme-widgets].\n" +
+        `Blocking rule ids: ${blockingId}\n` +
+        "Read them with stage_lookup before retrying; this hook carries identity only, not rule text.\n",
     );
     expect(result.stdout).not.toContain("Never force-push to main");
     expect(result.stdout).not.toContain("a rewritten history cannot be recovered");
@@ -320,9 +345,180 @@ describe("monet gate CLI", () => {
     expect(advisory.stdout).not.toContain("REASON-MARKER-ADVISORY");
 
     // NOT VACUOUS: a real instruction was emitted on each path and each names its own stage, so the
-    // markers are absent from a payload that exists rather than from an empty stream.
-    expect(deny.stdout).toContain("at `deploy prod`.");
-    expect(advisory.stdout).toContain("at `run migrations`.");
+    // markers are absent from a payload that exists rather than from an empty stream. (The stage
+    // name is now followed by the evaluated circle rather than by the sentence's period — see the
+    // circle test below for what that suffix protects.)
+    expect(deny.stdout).toContain("at `deploy prod` [circle: acme-widgets].");
+    expect(advisory.stdout).toContain("at `run migrations` [circle: acme-widgets].");
+  });
+
+  // ── PR #58 review round (Codex): what the two paths say, and what identity travels with it ────
+
+  /**
+   * THE ADVISORY PATH TELLS THE TRUTH ABOUT ITS OWN TIMING (Codex P1 on PR #58). The wrapper emits
+   * an advisory as `additionalContext` with no permission decision, and the host contract this repo
+   * cites (install-cli.ts, hooks.md:831-836) delivers such context "next to the tool result" — the
+   * act has already run by the time the agent can read a word of it. The pre-review payload told
+   * both paths to read "before acting", which on this path was simply false: nothing was pending.
+   *
+   * So the assertion has two halves and needs both. That the payload STATES the act already ran is
+   * the promise; that it does NOT say "before acting" is the regression this pins — a future
+   * formatter that reunified the two paths under one sentence would satisfy the first half by
+   * accident while re-breaking the second.
+   */
+  it("PR #58 (Codex P1): the advisory payload says the action ALREADY RAN, and never 'before acting'", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+    const result = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    expect(result.stdout).toContain("This action already ran");
+    expect(result.stdout).toContain("an advisory reaches you beside its result, not before it");
+    expect(result.stdout).toContain("before the next action at these stages");
+    // The false half of the old single-sentence payload, on the path where it was false.
+    expect(result.stdout).not.toContain("before acting");
+
+    // AND THE DENY PATH STILL PROMISES RECOVERY, because there a retry genuinely is still ahead —
+    // asserted in the same test so the two paths cannot silently converge on one wording again.
+    const deny = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(deny.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    expect(deny.stdout).toContain("before retrying");
+    expect(deny.stdout).not.toContain("This action already ran");
+  });
+
+  /**
+   * A DENY SNAPSHOTS THE BLOCKING RULE'S IDENTITY, AN ADVISORY CARRIES NO IDS AT ALL (Codex P1 on
+   * PR #58). The mirror can be stale — the deny path discloses its own age for exactly that reason
+   * — so the rule behind a cached verdict may since have been withdrawn, superseded or edited, and
+   * `stage_lookup` (which reads the LIVE store) would then answer with something else, or nothing.
+   * The conceptId is snapshot identity rather than content: it survives the rule changing under it,
+   * and it is what keeps a stale deny explicable rather than merely unexplained.
+   *
+   * The advisory half is not symmetry for its own sake: an advisory blocks nothing, so the recovery
+   * urgency that justifies the id is absent, and the minimization rule says a field with no
+   * consumer does not ship. This test is where "no ids on the advisory path" is actually enforced.
+   */
+  it("PR #58 (Codex P1): a deny carries its blocking rule's conceptId; an advisory carries no ids", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+
+    const deny = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(deny.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    const [blockingId] = blockingConceptIds(mirrorPath, "git force push");
+    // The REAL id of the rule that actually blocked — not merely a UUID-shaped string.
+    expect(deny.stdout).toContain(`Blocking rule ids: ${blockingId}`);
+
+    const advisory = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(advisory.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    expect(advisory.stdout).not.toContain("Blocking rule ids");
+    // No id of ANY shape — the label above could be renamed while the ids stayed.
+    expect(advisory.stdout).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  });
+
+  /**
+   * BOTH PAYLOADS NAME THE CIRCLE THAT WAS ACTUALLY EVALUATED (Codex P2 on PR #58), because
+   * `stage_lookup` resolves against the session's own circle: a gate invoked with a different
+   * `--circle` than the reader's session would otherwise send them to a scope that never produced
+   * this verdict, and they would find nothing and conclude the gate was lying.
+   *
+   * THE FIXTURE IS THE ARGUMENT. Both rules are declared at breadth (`circle: "*"`), so both fire
+   * for ANY queried circle — which lets the gate be invoked with a circle that appears NOWHERE in
+   * the fixture, the store, or the CLI's defaults. A payload printing a constant, the fixture's
+   * default circle, or the rule's own `*` would fail here; only the evaluated circle passes.
+   */
+  it("PR #58 (Codex P2): both payloads name the EVALUATED circle, not the fixture's or a constant", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildCustomFixtureMirror(mirrorPath, [
+      {
+        stage: "git force push", pattern: "Bash:git push --force",
+        content: "Never force-push to main.", severity: "blocking", circle: "*",
+        reason: "a rewritten history cannot be recovered from a teammate's clone",
+      },
+      {
+        stage: "terraform apply", pattern: "Bash:terraform apply",
+        content: "Always run plan first.", severity: "advisory", circle: "*",
+      },
+    ]);
+    const elsewhere = "some-other-teams-circle";
+
+    const deny = spawnGate(["Bash:git push --force", "--circle", elsewhere, "--mirror", mirrorPath]);
+    expect(deny.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    expect(deny.stdout).toContain(`[circle: ${elsewhere}]`);
+
+    const advisory = spawnGate(["Bash:terraform apply", "--circle", elsewhere, "--mirror", mirrorPath]);
+    expect(advisory.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    expect(advisory.stdout).toContain(`[circle: ${elsewhere}]`);
+
+    // Not the fixture's default circle, and not the breadth marker the rules were declared at.
+    for (const stdout of [deny.stdout, advisory.stdout]) {
+      expect(stdout).not.toContain("acme-widgets");
+      expect(stdout).not.toContain("[circle: *]");
+    }
+  });
+
+  /**
+   * THE STAGE LIST IS BOUNDED, AND SAYS SO WHEN IT TRUNCATES (Codex P2 on PR #58). `result.stages`
+   * is every matching registry stage and the mirror deliberately carries an unbounded registry, so
+   * a store with enough broad patterns could push this payload past the wrapper's fixed 16 MiB
+   * spawn buffer — which fails the gate OPEN, with no deny at all. That is the failure mode worth a
+   * test: the cap exists to stop a large store from silently disarming the gate.
+   *
+   * ELEVEN STAGES, ONE COMMAND. Each stage is declared with a distinct single-token pattern and the
+   * probe command contains all eleven tokens, so all eleven match one action context.
+   *
+   * WHY THE RULE COUNT IS NOT PINNED: core dedups semantically-close rule bodies, and eleven rules
+   * distinct enough to survive that reliably would make the fixture about dedup rather than the
+   * cap. Stage ROWS are keyed by name and never merge, so the stage count — the thing under test —
+   * is deterministic; the assertions below read the head structurally instead of pinning it whole.
+   */
+  it("PR #58 (Codex P2): the stage list stops at 8 and discloses the omission as `(+N more)`", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    // Deliberately unrelated subjects — see the "WHY THE RULE COUNT IS NOT PINNED" note above.
+    const specs = [
+      { stage: "tarball signature", token: "alpha", content: "Verify the tarball signature before it leaves the machine." },
+      { stage: "changelog hygiene", token: "bravo", content: "Write the changelog entry in the same commit as the change." },
+      { stage: "database backup", token: "charlie", content: "Take a database snapshot and confirm it restores." },
+      { stage: "on-call handoff", token: "delta", content: "Page the secondary responder when the primary does not acknowledge." },
+      { stage: "secret rotation", token: "echo", content: "Rotate the deploy key whenever a contractor leaves." },
+      { stage: "load shedding", token: "foxtrot", content: "Shed low-priority traffic before the queue saturates." },
+      { stage: "schema migration", token: "golf", content: "Ship an additive migration ahead of the code that reads it." },
+      { stage: "feature flag cleanup", token: "hotel", content: "Delete a flag once both branches have been decided." },
+      { stage: "dependency pinning", token: "india", content: "Pin the lockfile to an exact version for a release build." },
+      { stage: "customer notice", token: "juliett", content: "Tell affected customers before the maintenance window opens." },
+      { stage: "rollback rehearsal", token: "kilo", content: "Rehearse the rollback path on staging first." },
+    ];
+    await buildCustomFixtureMirror(
+      mirrorPath,
+      specs.map((spec) => ({
+        stage: spec.stage, pattern: `Bash:${spec.token}`, content: spec.content,
+        severity: "advisory" as const, circle: "acme-widgets",
+      })),
+    );
+
+    const command = specs.map((spec) => spec.token).join(" ");
+    const result = spawnGate([`Bash:${command}`, "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
+    const head = result.stdout.split("\n")[0];
+
+    // NOT VACUOUS: all eleven stages really did match, so eight-of-eleven is a truncation rather
+    // than a fixture that never produced more than eight in the first place.
+    const mirror = JSON.parse(readFileSync(mirrorPath, "utf8")) as GateMirror;
+    expect(mirror.stages).toHaveLength(specs.length);
+
+    expect(head.match(/`[^`]+`/g)).toHaveLength(8);
+    expect(head).toContain(`(+${specs.length - 8} more)`);
+    // The omission is stated INSIDE the stage list, before the circle closes the line — a suffix
+    // that landed after the circle would read as a count of circles.
+    expect(head).toMatch(/\(\+3 more\) \[circle: acme-widgets\]\.$/);
+    // The three omitted stages are genuinely absent — the cap truncates rather than reflowing.
+    const namedStages = (head.match(/`([^`]+)`/g) ?? []).map((match) => match.slice(1, -1));
+    expect(new Set(namedStages).size).toBe(8);
+    for (const spec of specs) {
+      if (!namedStages.includes(spec.stage)) expect(head).not.toContain(spec.stage);
+    }
   });
 
   it("outcome 40 — overflow-ask is wired through classifyGateResult (see below for why not spawned)", () => {
@@ -719,10 +915,13 @@ describe("monet gate CLI", () => {
     ]);
     const result = spawnGate(["Bash:npm publish", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    // ONE instruction — two lines, both stages named, the blocking count disclosed.
+    const [blockingId] = blockingConceptIds(mirrorPath, "npm publish");
+    // ONE instruction — both stages named, the blocking count disclosed, and only the BLOCKING
+    // rule's id listed (the two advisories are named by their stage, never by id).
     expect(result.stdout).toBe(
-      "Blocked by a Monet rule — 3 rules (1 blocking) at `npm publish`, `release hygiene`.\n" +
-        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
+      "Blocked by a Monet rule — 3 rules (1 blocking) at `npm publish`, `release hygiene` [circle: acme-widgets].\n" +
+        `Blocking rule ids: ${blockingId}\n` +
+        "Read them with stage_lookup before retrying; this hook carries identity only, not rule text.\n",
     );
     // Neither severity gets its content quoted — that symmetry is what removes the ambiguity the
     // old stdout/stderr split existed to manage.
@@ -895,12 +1094,14 @@ describe("monet gate CLI", () => {
     await buildFixtureMirror(mirrorPath);
     const result = spawnGateStdin("Bash:git push --force", ["--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
+    const [blockingId] = blockingConceptIds(mirrorPath, "git force push");
     // Byte-identical to what the positional argument produces (the outcome-30 test above asserts
-    // the same literal) — transport parity is the subject, and #49 only changed what that payload
-    // says, not that the two transports must agree on it.
+    // the same literal) — transport parity is the subject, and neither #49 nor PR #58 changed that
+    // the two transports must agree on the payload, only what the payload says.
     expect(result.stdout).toBe(
-      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push`.\n" +
-        "Call stage_lookup on each before acting; this hook carries identity only, not rule text.\n",
+      "Blocked by a Monet rule — 1 rule (1 blocking) at `git force push` [circle: acme-widgets].\n" +
+        `Blocking rule ids: ${blockingId}\n` +
+        "Read them with stage_lookup before retrying; this hook carries identity only, not rule text.\n",
     );
   });
 

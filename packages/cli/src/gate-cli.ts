@@ -641,21 +641,52 @@ export function classifyGateResult(result: GateResult): GateOutcome {
  * BLOCKING IS NOT SPECIAL, by the same ruling: the call is refused either way, and whoever wants
  * the reason opens the rule. The count of blocking rules is disclosed so a reader knows what to
  * look for, but no blocking rule's text is quoted here.
+ *
+ * THE TWO PATHS GET DIFFERENT INSTRUCTIONS, because their physics differ (Codex P1 on PR #58, and
+ * it was right). A deny stops the call, so "read before retrying" is achievable. An advisory does
+ * NOT: the wrapper emits it as `additionalContext` with no permission decision, and this repo's own
+ * citation of the host's contract (install-cli.ts, hooks.md:831-836) is that such context arrives
+ * "next to the tool result" — the act has already run by the time the agent can read anything. A
+ * single "before acting" line would therefore have been false on the busier of the two paths.
+ *
+ * A DENY ALSO CARRIES ITS BLOCKING CONCEPT IDS (Codex P1, same review). The mirror can be stale —
+ * the deny path discloses its age for exactly that reason — so the rule that produced a cached
+ * verdict may since have been withdrawn, superseded or edited. `stage_lookup` reads the live store
+ * and would then return something else, or nothing, with no way back to what actually blocked. The
+ * id is snapshot identity, not content: it survives the rule changing underneath it.
+ *
+ * AND THE EVALUATED CIRCLE (Codex P2, same review), because `stage_lookup` resolves against the
+ * session's own circle. A gate invoked with a different `--circle` would otherwise send the reader
+ * to a scope that never produced this verdict.
  */
-function formatGateInstruction(result: GateResult): string {
-  const stages = result.stages.map((stage) => `\`${stage.name}\``).join(", ");
+const INSTRUCTION_STAGE_CAP = 8;
+
+function formatGateInstruction(result: GateResult, circle: string): string {
+  // BOUNDED (Codex P2, same review). `result.stages` is every matching registry stage, and the
+  // mirror deliberately carries an unbounded registry — a store with enough broad patterns could
+  // otherwise push this past the wrapper's fixed 16 MiB spawn buffer, which fails the gate OPEN
+  // with no deny at all. The omission is stated rather than silent.
+  const names = result.stages.map((stage) => `\`${stage.name}\``);
+  const shown = names.slice(0, INSTRUCTION_STAGE_CAP);
+  const omitted = names.length - shown.length;
+  const stages = omitted > 0 ? `${shown.join(", ")} (+${omitted} more)` : shown.join(", ");
+
   const total = result.rules.length;
-  const blocking = result.rules.filter((rule) => rule.severity === "blocking").length;
+  const blockingRules = result.rules.filter((rule) => rule.severity === "blocking");
   const noun = total === 1 ? "rule" : "rules";
   const verb = total === 1 ? "governs" : "govern";
-  // The FIRST line carries the whole verdict on its own: the wrapper's deny log records only
-  // `stdout.split("\n")[0]`, so a first line that deferred the essential fact would truncate the
-  // permanent record rather than the delivery.
-  const head =
-    blocking > 0
-      ? `Blocked by a Monet rule — ${total} ${noun} (${blocking} blocking) at ${stages}.`
-      : `${total} Monet ${noun} ${verb} this action, at ${stages}.`;
-  return `${head}\nCall stage_lookup on each before acting; this hook carries identity only, not rule text.`;
+  const scope = `[circle: ${circle}]`;
+
+  if (blockingRules.length > 0) {
+    // The FIRST line carries the whole verdict on its own: the wrapper's deny log records only
+    // `stdout.split("\n")[0]`, so a first line that deferred the essential fact would truncate the
+    // permanent record rather than the delivery.
+    const head = `Blocked by a Monet rule — ${total} ${noun} (${blockingRules.length} blocking) at ${stages} ${scope}.`;
+    const ids = blockingRules.map((rule) => rule.conceptId).join(", ");
+    return `${head}\nBlocking rule ids: ${ids}\nRead them with stage_lookup before retrying; this hook carries identity only, not rule text.`;
+  }
+  const head = `${total} Monet ${noun} ${verb} actions at ${stages} ${scope}.`;
+  return `${head}\nThis action already ran — an advisory reaches you beside its result, not before it. Read with stage_lookup before the next action at these stages; this hook carries identity only, not rule text.`;
 }
 
 /** Human-readable age, coarse enough for a disclosure line, never sub-second precision. */
@@ -1009,7 +1040,7 @@ function runGateUnguarded(
   const outcome = classifyGateResult(result);
   switch (outcome.label) {
     case "advisory-inject":
-      console.log(formatGateInstruction(result));
+      console.log(formatGateInstruction(result, resolved.circle));
       break;
     case "blocking-deny": {
       // ONE INSTRUCTION, NAMING EVERY MATCHED STAGE — including the stages that contributed only
@@ -1019,7 +1050,7 @@ function runGateUnguarded(
       // identity on the wire that ambiguity cannot arise: the payload names stages and counts, says
       // how many of them block, and sends the reader to `stage_lookup` for the rest. A separate
       // stderr disclosure would now repeat what stdout already carries.
-      console.log(formatGateInstruction(result));
+      console.log(formatGateInstruction(result, resolved.circle));
       // SHOULD-FIX 5 (coordinator review round): the boundary statement requires naming the
       // staleness AND the repair command in the SAME breath as the reason (gate-boundary-
       // statement.md, "Binding consequences for 4b", item 2) — the missing/malformed path already
