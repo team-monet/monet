@@ -665,7 +665,7 @@ const INSTRUCTION_STAGE_CAP = 8;
 function formatGateInstruction(
   result: GateResult,
   circle: string,
-  mirrorAge: string,
+  mirrorGeneratedAt: number,
   runtimeModelTag: string | null,
 ): string {
   // BOUNDED (Codex P2, same review). `result.stages` is every matching registry stage, and the
@@ -729,7 +729,7 @@ function formatGateInstruction(
     // would need an immutable revision the mirror does not carry. So the payload states the
     // generation it judged from and says plainly that a later edit is unrecoverable, rather than
     // promising a recovery it cannot perform — where a value is unavailable, say unavailable.
-    return `${head}\nBlocking rule ids: ${ids}\nRead the stages with stage_lookup; memory_fetch an id for the rule's current text. Judged from a mirror generated ${mirrorAge} ago — if a rule changed since, what you read is the current version, NOT the one that blocked, and the one that blocked is not recoverable. This payload carries identity only, not rule text.`;
+    return `${head}\nBlocking rule ids: ${ids}\nRead the stages with stage_lookup; memory_fetch an id for the rule's current text. Judged from the mirror generated ${new Date(mirrorGeneratedAt).toISOString()} — if a rule changed since, what you read is the current version, NOT the one that blocked, and the one that blocked is not recoverable. This payload carries identity only, not rule text.`;
   }
   // TIMING IS NOT STATED HERE (Codex P2, round 2, and it was right). Whether an advisory reaches
   // the agent before or after the act is a property of the HOST's hook contract, and this command
@@ -751,7 +751,7 @@ function formatGateInstruction(
   // this", which the live set answers correctly — what was missing was only the account of why that
   // set may differ from the one that fired.
   const head = `${total} Monet ${noun} ${verb} actions at ${stages} ${scope}${modelScope}.`;
-  return `${head}\nRead them with stage_lookup before acting at these stages. Judged from a mirror generated ${mirrorAge} ago — if a rule changed since, the lookup may return a different set, or none. This payload carries identity only, not rule text.`;
+  return `${head}\nRead them with stage_lookup before acting at these stages. Judged from the mirror generated ${new Date(mirrorGeneratedAt).toISOString()} — if a rule changed since, the lookup may return a different set, or none. This payload carries identity only, not rule text.`;
 }
 
 /** Human-readable age, coarse enough for a disclosure line, never sub-second precision. */
@@ -1102,13 +1102,16 @@ function runGateUnguarded(
   }
 
   console.error(`monet gate: circle ${describeResolvedCircle(resolved, read.mirror)}`);
-  // Computed once for the payload: a deny states the generation it judged from, because both
-  // recovery surfaces read live state and a later edit is not recoverable from either.
-  const gateMirrorAge = formatMirrorAge(read.mirror.generatedAt, deps.now());
+  // THE GENERATION, NOT ITS AGE. An age is wall-clock, so the same fixture and the same mirror
+  // produce different bytes a second apart — and this payload's first line is what the deny log
+  // records permanently. A generation timestamp carries the same fact and is deterministic: two
+  // evaluations of one mirror are byte-identical, which is what makes them comparable at all.
+  // (The human-facing staleness warning on stderr still renders an age; a diagnostic may be
+  // wall-clock, a record should not be.)
   const outcome = classifyGateResult(result);
   switch (outcome.label) {
     case "advisory-inject":
-      console.log(formatGateInstruction(result, resolved.circle, gateMirrorAge, runtimeModelTag ?? null));
+      console.log(formatGateInstruction(result, resolved.circle, read.mirror.generatedAt, runtimeModelTag ?? null));
       break;
     case "blocking-deny": {
       // ONE INSTRUCTION, NAMING EVERY MATCHED STAGE — including the stages that contributed only
@@ -1118,7 +1121,7 @@ function runGateUnguarded(
       // identity on the wire that ambiguity cannot arise: the payload names stages and counts, says
       // how many of them block, and sends the reader to `stage_lookup` for the rest. A separate
       // stderr disclosure would now repeat what stdout already carries.
-      console.log(formatGateInstruction(result, resolved.circle, gateMirrorAge, runtimeModelTag ?? null));
+      console.log(formatGateInstruction(result, resolved.circle, read.mirror.generatedAt, runtimeModelTag ?? null));
       // SHOULD-FIX 5 (coordinator review round): the boundary statement requires naming the
       // staleness AND the repair command in the SAME breath as the reason (gate-boundary-
       // statement.md, "Binding consequences for 4b", item 2) — the missing/malformed path already

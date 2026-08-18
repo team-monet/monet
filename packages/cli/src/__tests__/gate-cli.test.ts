@@ -102,30 +102,28 @@ function namedStagesIn(head: string, circle: string): string[] {
   return identifiers.slice(0, -1);
 }
 
-/** formatMirrorAge's own shapes, longest first so the alternation cannot match `21s` out of
- *  `1m 21s`. */
-const MIRROR_AGE = /\d+d \d+h|\d+h \d+m|\d+m \d+s|\d+s/;
-
 /**
- * A deny payload with its mirror age replaced by a fixed token, so every other byte stays pinned.
+ * The exact generation timestamp a payload judged from this mirror must disclose, read out of the
+ * very file the gate reads.
  *
- * A deny states the generation it judged from (Codex P1, round 3) because both recovery surfaces
- * read LIVE state. A freshly built fixture's age is a wall-clock value — "0s" here, "1s" on a
- * loaded machine — so pinning the literal would trade an exact assertion for a flaky one. The age
- * is required to be PRESENT, in formatMirrorAge's own shape, before it is normalized: a payload
- * that dropped the disclosure fails here rather than passing the substitution silently.
+ * The payload names the mirror's GENERATION, not its age. An age is wall-clock — the same fixture
+ * evaluated a second apart rendered different bytes, and this payload's first line is what the deny
+ * journal records permanently — so the disclosure was normalized out of these literals with a
+ * placeholder token to keep them stable. A generation carries the same fact and is a property of
+ * the FILE, so every byte can be pinned instead: this helper is what makes the literals below
+ * genuinely byte-exact rather than byte-exact-except-one-token.
  */
-function withNormalizedMirrorAge(stdout: string): string {
-  expect(stdout).toMatch(new RegExp(`Judged from a mirror generated (${MIRROR_AGE.source}) ago —`));
-  return stdout.replace(new RegExp(`generated (${MIRROR_AGE.source}) ago`), "generated <AGE> ago");
+function mirrorGeneration(mirrorPath: string): string {
+  const mirror = JSON.parse(readFileSync(mirrorPath, "utf8")) as GateMirror;
+  return new Date(mirror.generatedAt).toISOString();
 }
 
 /**
  * Rewrite a fixture mirror's `generatedAt` to `ageMs` in the past, checksum RECOMPUTED so the file
  * stays one the gate accepts on every one of its own terms (readGateMirrorFile verifies a checksum
  * whenever one is present, so stripping it instead would prove the disclosure against a file shape
- * that never ships). The deny's age disclosure is computed from this field, so this is what makes
- * "the disclosed age tracks the mirror" a measured claim rather than an assumed one.
+ * that never ships). The payload's generation disclosure is read straight off this field, so this
+ * is what makes "the disclosure tracks the mirror" a measured claim rather than an assumed one.
  */
 function backdateMirror(mirrorPath: string, ageMs: number): void {
   const { checksum: _stale, ...rest } = JSON.parse(readFileSync(mirrorPath, "utf8")) as Record<string, unknown>;
@@ -325,13 +323,12 @@ describe("monet gate CLI", () => {
     await buildFixtureMirror(mirrorPath);
     const result = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
-    // The mirror age is wall-clock, so it is asserted in `formatMirrorAge`'s own shape and then
-    // normalized — every other byte stays pinned, and a payload that DROPPED the disclosure fails
-    // the match rather than passing the substitution.
-    expect(withNormalizedMirrorAge(result.stdout)).toBe(
+    // EVERY byte pinned, the generation disclosure included — it is the mirror's own `generatedAt`
+    // rather than a wall-clock reading, so nothing has to be normalized out to keep this stable.
+    expect(result.stdout).toBe(
       '1 Monet rule governs actions at "terraform apply" [circle: "acme-widgets"].\n' +
         "Read them with stage_lookup before acting at these stages. " +
-        "Judged from a mirror generated <AGE> ago — if a rule changed since, the lookup may return " +
+        `Judged from the mirror generated ${mirrorGeneration(mirrorPath)} — if a rule changed since, the lookup may return ` +
         "a different set, or none. This payload carries identity only, not rule text.\n",
     );
     // The fixture's advisory reads "Always run plan first" — the payload must not carry it.
@@ -346,11 +343,14 @@ describe("monet gate CLI", () => {
    * `stage_lookup`. The mirror-age disclosure on stderr is untouched by #49 and still asserted here
    * unchanged — an offline deny is a cached deny, and that promise did not move.
    *
-   * THE AGE IS NOW ON STDOUT TOO (Codex P1, round 3), for a different reason than the stderr line:
-   * stderr tells the USER their answer is cached, while the payload tells the AGENT which
+   * THE STALENESS IS NOW ON STDOUT TOO (Codex P1, round 3), for a different reason than the stderr
+   * line: stderr tells the USER their answer is cached, while the payload tells the AGENT which
    * generation this verdict was judged from, and that a rule edited since is not recoverable from
-   * either recovery surface. Same fact, two audiences. The wall-clock value is normalized here so
-   * the rest of the payload can still be pinned byte-for-byte (see withNormalizedMirrorAge).
+   * either recovery surface. Same fact, two audiences — but NOT the same rendering. stderr renders
+   * an AGE (a diagnostic may be wall-clock); stdout names the GENERATION, because the payload's
+   * first line is what the deny journal records permanently and a record must not shift with the
+   * clock. That is why the stdout literal below is pinned to the last byte while the stderr
+   * assertion stays a shape.
    */
   it("outcome 30 — blocking-deny: an identity instruction disclosing the blocking count on stdout, mirror age disclosed on stderr", async () => {
     const dir = mkTmp();
@@ -359,11 +359,11 @@ describe("monet gate CLI", () => {
     const result = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(result.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
     const [blockingId] = blockingConceptIds(mirrorPath, "git force push");
-    expect(withNormalizedMirrorAge(result.stdout)).toBe(
+    expect(result.stdout).toBe(
       'Blocked by a Monet rule — 1 rule (1 blocking) at "git force push" [circle: "acme-widgets"].\n' +
         `Blocking rule ids: ${blockingId}\n` +
         "Read the stages with stage_lookup; memory_fetch an id for the rule's current text. " +
-        "Judged from a mirror generated <AGE> ago — if a rule changed since, what you read is the " +
+        `Judged from the mirror generated ${mirrorGeneration(mirrorPath)} — if a rule changed since, what you read is the ` +
         "current version, NOT the one that blocked, and the one that blocked is not recoverable. " +
         "This payload carries identity only, not rule text.\n",
     );
@@ -921,27 +921,38 @@ describe("monet gate CLI", () => {
    * payload states the generation it judged from and names the limit, rather than promising past
    * it: where a value is unavailable, the record says unavailable.
    *
-   * THE AGE IS PROVEN TO TRACK THE MIRROR — not a constant, and not a formatting of "now": the SAME
-   * mirror is read twice with the file backdated in between, and the disclosed age moves with the
-   * file's own `generatedAt`.
+   * THE DISCLOSURE IS PROVEN TO TRACK THE MIRROR — not a constant, and not a rendering of "now":
+   * the SAME file is read twice with its `generatedAt` moved eleven hours and twenty-one minutes
+   * back in between, and the disclosed timestamp moves with the FILE (to a moment that is plainly
+   * not now), while two reads of one unchanged mirror agree byte for byte.
    */
   it("PR #58 (Codex P1, round 3): a deny names the mirror generation it judged from and states plainly that a later edit is NOT recoverable", async () => {
     const dir = mkTmp();
     const mirrorPath = join(dir, "gate-mirror.json");
     await buildFixtureMirror(mirrorPath);
 
+    const freshGeneration = mirrorGeneration(mirrorPath);
     const fresh = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(fresh.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    const freshAge = fresh.stdout.match(new RegExp(`Judged from a mirror generated (${MIRROR_AGE.source}) ago`))?.[1];
-    expect(freshAge).toBeDefined();
+    expect(fresh.stdout).toContain(`Judged from the mirror generated ${freshGeneration} —`);
+    // NOT A RENDERING OF "now": the same unchanged mirror, read again, discloses the same bytes
+    // even though the two reads happened at different wall-clock instants.
+    const freshAgain = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
+    expect(freshAgain.stdout).toBe(fresh.stdout);
 
     // The same file and the same rule, eleven hours and twenty-one minutes older.
-    backdateMirror(mirrorPath, 11 * 60 * 60 * 1000 + 21 * 60 * 1000);
+    const backdatedBy = 11 * 60 * 60 * 1000 + 21 * 60 * 1000;
+    backdateMirror(mirrorPath, backdatedBy);
+    const staleGeneration = mirrorGeneration(mirrorPath);
+    // The fixture's own arithmetic, asserted rather than assumed: the file really did move by the
+    // interval this test claims, so the disclosure below is compared against a moved target.
+    expect(Date.parse(freshGeneration) - Date.parse(staleGeneration)).toBe(backdatedBy);
     const stale = spawnGate(["Bash:git push --force", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(stale.status).toBe(GATE_EXIT_CODE.BLOCKING_DENY);
-    expect(stale.stdout).toContain("Judged from a mirror generated 11h 21m ago —");
-    // NOT A CONSTANT: the two reads of the same mirror disclosed different ages.
-    expect(freshAge).not.toBe("11h 21m");
+    expect(stale.stdout).toContain(`Judged from the mirror generated ${staleGeneration} —`);
+    // NOT A CONSTANT: the two reads of the same PATH disclosed different generations, because the
+    // file underneath them changed.
+    expect(stale.stdout).not.toContain(freshGeneration);
 
     // THE LIMIT IS STATED, not implied: the reader is told which version `memory_fetch` returns,
     // and that the version which actually blocked is gone.
@@ -960,13 +971,85 @@ describe("monet gate CLI", () => {
     // none. Without the disclosure nothing explains that gap.
     const advisory = spawnGate(["Bash:terraform apply", "--circle", "acme-widgets", "--mirror", mirrorPath]);
     expect(advisory.status).toBe(GATE_EXIT_CODE.ADVISORY_INJECT);
-    expect(advisory.stdout).toContain("Judged from a mirror generated 11h 21m ago —");
+    expect(advisory.stdout).toContain(`Judged from the mirror generated ${staleGeneration} —`);
     expect(advisory.stdout).toContain("the lookup may return a different set, or none");
     // BUT IT CARRIES NO IDS, and the asymmetry is the point rather than an oversight: a deny must
     // answer "what stopped me", which needs the exact rule; an advisory asks "what governs this",
     // which the live set answers correctly.
     expect(advisory.stdout).not.toContain("Blocking rule ids:");
     expect(advisory.stdout).not.toContain("is not recoverable");
+  });
+
+  /**
+   * THE PAYLOAD IS A PURE FUNCTION OF THE MIRROR — same mirror in, same bytes out, whatever the
+   * clock says. This is WHY the disclosure names a generation instead of an age, and nothing
+   * asserted it directly until this test.
+   *
+   * It was learned from a failure, not from theory. The payload used to render the mirror's AGE, so
+   * one fixture evaluated twice a second apart produced two different payloads — and `circle chain:
+   * ONE alias hop total` (above), which compares two gate invocations for byte equality, went red
+   * when the second read elapsed into a different age bucket. That test's subject is circle
+   * resolution; it caught this only as collateral, and would stop catching it the moment its two
+   * invocations landed in the same second. The stake is bigger than a flaky assertion: a deny
+   * payload's first line is what the deny journal records permanently, and a record that shifts
+   * with the clock is not a record.
+   *
+   * WHY THE CLOCK IS INJECTED RATHER THAN WAITED OUT. Two spawned reads are milliseconds apart, so
+   * a re-introduced age would render identically at second granularity and this test would pass
+   * with the bug back in the tree. Driving `now` a full year apart across two in-process runs
+   * instead leaves no granularity — seconds, minutes, hours, days — at which a wall-clock component
+   * could survive undetected. (`runGate`'s own dependency seam is the only place `now` is
+   * reachable; the spawned CLI has no hook for it.)
+   */
+  it("the payload is a pure function of the mirror: two evaluations under clocks a year apart are byte-identical, on the advisory and the deny path alike", async () => {
+    const dir = mkTmp();
+    const mirrorPath = join(dir, "gate-mirror.json");
+    await buildFixtureMirror(mirrorPath);
+
+    const evaluateAt = (actionContext: string, now: number): { stdout: string; exitCode: number | undefined } => {
+      const lines: string[] = [];
+      const originalLog = console.log;
+      const originalError = console.error;
+      let exitCode: number | undefined;
+      console.log = (message: string) => { lines.push(message); };
+      // stderr is deliberately NOT the subject: its staleness warning still renders an age, because
+      // a diagnostic read by a human may be wall-clock where a permanent record may not.
+      console.error = () => {};
+      try {
+        runGate(actionContext, { circle: "acme-widgets", mirror: mirrorPath }, {
+          now: () => now,
+          env: {},
+          projectDir: () => dir,
+          mirrorPath: () => mirrorPath,
+          journalPath: () => null, // stdout is the subject here, not the record; no file is written
+          readStdin: () => { throw new Error("must not be called — the context is positional"); },
+          isStdinTTY: () => false,
+          setExitCode: (code) => { exitCode = code; },
+        });
+      } finally {
+        console.log = originalLog;
+        console.error = originalError;
+      }
+      return { stdout: lines.join("\n"), exitCode };
+    };
+
+    const generatedAt = Date.parse(mirrorGeneration(mirrorPath));
+    const oneYearMs = 365 * 24 * 60 * 60 * 1000;
+
+    for (const [label, actionContext, expectedCode] of [
+      ["advisory", "Bash:terraform apply", GATE_EXIT_CODE.ADVISORY_INJECT],
+      ["deny", "Bash:git push --force", GATE_EXIT_CODE.BLOCKING_DENY],
+    ] as const) {
+      const justAfter = evaluateAt(actionContext, generatedAt + 1_000);
+      const aYearLater = evaluateAt(actionContext, generatedAt + oneYearMs);
+      expect(justAfter.exitCode, label).toBe(expectedCode);
+      expect(aYearLater.exitCode, label).toBe(expectedCode);
+      // NOT VACUOUS, twice over: a payload was actually emitted, and it carries the very disclosure
+      // whose rendering is what is at risk — an empty stdout compared against an empty stdout would
+      // otherwise pass this test forever.
+      expect(justAfter.stdout, label).toContain(`Judged from the mirror generated ${mirrorGeneration(mirrorPath)} —`);
+      expect(aYearLater.stdout, label).toBe(justAfter.stdout);
+    }
   });
 
   /**
@@ -1409,12 +1492,12 @@ describe("monet gate CLI", () => {
     const [blockingId] = blockingConceptIds(mirrorPath, "npm publish");
     // ONE instruction — both stages named, the blocking count disclosed, and only the BLOCKING
     // rule's id listed (the two advisories are named by their stage, never by id).
-    expect(withNormalizedMirrorAge(result.stdout)).toBe(
+    expect(result.stdout).toBe(
       'Blocked by a Monet rule — 3 rules (1 blocking) at "npm publish", "release hygiene" ' +
         '[circle: "acme-widgets"].\n' +
         `Blocking rule ids: ${blockingId}\n` +
         "Read the stages with stage_lookup; memory_fetch an id for the rule's current text. " +
-        "Judged from a mirror generated <AGE> ago — if a rule changed since, what you read is the " +
+        `Judged from the mirror generated ${mirrorGeneration(mirrorPath)} — if a rule changed since, what you read is the ` +
         "current version, NOT the one that blocked, and the one that blocked is not recoverable. " +
         "This payload carries identity only, not rule text.\n",
     );
@@ -1593,11 +1676,11 @@ describe("monet gate CLI", () => {
     // Byte-identical to what the positional argument produces (the outcome-30 test above asserts
     // the same literal) — transport parity is the subject, and neither #49 nor PR #58 changed that
     // the two transports must agree on the payload, only what the payload says.
-    expect(withNormalizedMirrorAge(result.stdout)).toBe(
+    expect(result.stdout).toBe(
       'Blocked by a Monet rule — 1 rule (1 blocking) at "git force push" [circle: "acme-widgets"].\n' +
         `Blocking rule ids: ${blockingId}\n` +
         "Read the stages with stage_lookup; memory_fetch an id for the rule's current text. " +
-        "Judged from a mirror generated <AGE> ago — if a rule changed since, what you read is the " +
+        `Judged from the mirror generated ${mirrorGeneration(mirrorPath)} — if a rule changed since, what you read is the ` +
         "current version, NOT the one that blocked, and the one that blocked is not recoverable. " +
         "This payload carries identity only, not rule text.\n",
     );

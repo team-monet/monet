@@ -394,10 +394,12 @@ describe("install-cli: end-to-end hook rehearsal (the wrapper script actually ru
       "Read the stages with stage_lookup; memory_fetch an id for the rule's current text.",
     );
     // AND THE GENERATION THE VERDICT WAS JUDGED FROM, with the limit on recovering the rule that
-    // actually fired (Codex P1, round 3). The age is a wall-clock value, so its SHAPE is pinned
-    // here and its digits are not; gate-cli.test.ts backdates a mirror to pin the value itself.
-    expect(output.hookSpecificOutput.permissionDecisionReason).toMatch(
-      /Judged from a mirror generated .+ ago — if a rule changed since, what you read is the current version, NOT the one that blocked, and the one that blocked is not recoverable\./,
+    // actually fired (Codex P1, round 3). The disclosure names the mirror's own `generatedAt`
+    // rather than its age — a property of the FILE, not of the clock — so the exact value is
+    // pinned here, read out of the very mirror this rehearsal handed the wrapper.
+    const { generatedAt } = JSON.parse(readFileSync(mirrorPath, "utf8")) as { generatedAt: number };
+    expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
+      `Judged from the mirror generated ${new Date(generatedAt).toISOString()} — if a rule changed since, what you read is the current version, NOT the one that blocked, and the one that blocked is not recoverable.`,
     );
     expect(output.hookSpecificOutput.permissionDecisionReason).toContain(
       "This payload carries identity only, not rule text.",
