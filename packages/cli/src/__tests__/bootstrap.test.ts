@@ -9,7 +9,7 @@ import {
   type EmbeddingProvider,
 } from "@team-monet/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { openServedCore, openSourceCore, openStatusCore } from "../bootstrap";
+import { openServedCore, openStatusCore } from "../bootstrap";
 import { ensureMonetDir, getDbPath, getGateJournalPath, getGateMirrorPath } from "../db/index";
 import { defaultGateCliDependencies } from "../gate-cli";
 
@@ -59,17 +59,6 @@ describe("client core bootstrap", () => {
     const core = openStatusCore(dbPath, embedder);
 
     expect(core.stats()).toMatchObject({ concepts: 0, observations: 0 });
-    expect(embedder.embed).not.toHaveBeenCalled();
-    core.close();
-
-    expect(readEmbedderPin(dbPath)).toBeNull();
-  });
-
-  it("source openCore-style inspection leaves a fresh store unpinned and does not embed", () => {
-    const embedder = throwingEmbedder();
-    const core = openSourceCore(dbPath, join(dir, "sources"), embedder);
-
-    expect(core.listSources()).toEqual([]);
     expect(embedder.embed).not.toHaveBeenCalled();
     core.close();
 

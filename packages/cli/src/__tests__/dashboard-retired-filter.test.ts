@@ -191,19 +191,6 @@ describe("SQL.counts — retired exclusion on concepts/dirty/possibleDuplicatePa
   });
 });
 
-describe("SQL.countsLegacy — same retired-exclusion default on the legacy-schema fallback", () => {
-  it("mirrors SQL.counts' concepts/dirty exclusion using kind-only sourceConcepts", () => {
-    insertConcept({ id: "a", dirty: 1 });
-    insertConcept({ id: "b", dirty: 1, status: "retired" });
-    const row = db.prepare(SQL.countsLegacy).get() as Record<string, number>;
-    expect(row.concepts).toBe(1);
-    expect(row.dirty).toBe(1);
-    const rowAll = db.prepare(SQL.countsLegacyIncludeRetired).get() as Record<string, number>;
-    expect(rowAll.concepts).toBe(2);
-    expect(rowAll.dirty).toBe(2);
-  });
-});
-
 describe("SQL.circleConcepts — a circle with every concept retired drops out entirely", () => {
   function circleRows(sql: string) {
     return db.prepare(sql).all() as Array<{ name: string; conceptCount: number }>;

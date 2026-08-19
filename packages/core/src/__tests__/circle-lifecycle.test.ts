@@ -311,17 +311,6 @@ describe("mergeCircle", () => {
     expect(core.conceptCount("dst")).toBe(1);
     expect(core.resolveCircleName("src")).toBe("src");
 
-    // No alias was published, so a post-failure source remains attached to the original circle.
-    const source = core.createSource({
-      id: "post-failure-source",
-      type: "repo-md",
-      name: "Post-failure source",
-      localPath: "/tmp/monet-post-failure-source",
-      circle: "src",
-      access: { allowedCallerIds: ["caller"], allowedProjectIds: ["project"] },
-    });
-    expect(source.circle).toBe("src");
-    expect(core.updateSource(source.id, { name: "Still attached" }).circle).toBe("src");
     core.close();
   });
 });

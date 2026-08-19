@@ -69,16 +69,3 @@ export async function openServedCore(
 export function openStatusCore(dbPath: string, embedder?: EmbeddingProvider): MonetCore {
   return new MonetCore(dbPath, { ...(embedder ? { embedder } : {}), deferCreatedPin: true });
 }
-
-/** Open the synchronous source-registry path without allowing construction to mint a pin. */
-export function openSourceCore(
-  dbPath: string,
-  sourceStorageDir: string,
-  embedder?: EmbeddingProvider,
-): MonetCore {
-  return new MonetCore(dbPath, {
-    ...(embedder ? { embedder } : {}),
-    sourceStorageDir,
-    deferCreatedPin: true,
-  });
-}

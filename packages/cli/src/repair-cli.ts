@@ -7,8 +7,10 @@ import {
   HashingEmbeddingProvider,
   MonetCore,
   OnnxEmbeddingProvider,
+  connectorPopulation,
   inspectStoredEmbedderState,
   instantiateEmbedderForPin,
+  purgeConnectorPopulation,
   validateEmbeddingProviderOutput,
   type EmbeddingMigrationProgress,
   type EmbeddingMigrationReport,
@@ -1066,6 +1068,85 @@ export function registerRecoveryCommands(
     .option("--yes", "Confirm --apply noninteractively")
     .option("--accept-non-latin-loss", "Proceed onto an ENGLISH model knowing it strands non-Latin-script rows")
     .action((options: RepairOptions) => runRepair(options, dependencies));
+
+
+  /*
+   * WHY THIS IS ITS OWN COMMAND AND NOT A REPAIR FLAG.
+   *
+   * `repair` is about the embedding space: it preflights a provider and refuses outright when no
+   * embedding repair is required — which is the state every store needing THIS operation is in.
+   * The two also fail differently. A store holding connector rows cannot be opened as a MonetCore
+   * at all (the engine's rung-13 migration refuses it), so this command works the port directly.
+   *
+   * BACKUP FIRST, ALWAYS. The purge is irreversible and there is nothing to re-sync from once the
+   * connector is gone, so the verified backup is not a flag — it is the first thing that happens
+   * after --apply, and a failure to take one aborts before a single row is touched.
+   */
+  program
+    .command("retire-source")
+    .description("Dispose of the retired source subsystem's rows after a verified backup (#16)")
+    .option("-d, --dir <storage-directory>", "Storage directory (default: .monet or ~/.monet)")
+    .option("--apply", "Delete the connector rows after taking a verified backup")
+    .option("--yes", "Confirm --apply noninteractively")
+    .action(async (options: { dir?: string; apply?: boolean; yes?: boolean }) => {
+      if (options.apply && !options.yes) {
+        throw new Error("--apply requires --yes; retire-source never prompts interactively.");
+      }
+      if (options.yes && !options.apply) throw new Error("--yes is valid only with --apply.");
+
+      const dbPath = dependencies.dbPath(options.dir);
+      console.error(`store: ${dbPath}`);
+      // BEFORE createPort — opening SQLite CREATES the file, so a typo or stale --dir would leave an
+      // empty store behind and report on it as if it were the operator's own.
+      const inspection = dependencies.inspect(dbPath);
+      if (!inspection.exists) {
+        throw new Error(`no Monet store at ${dbPath} — check --dir, or run \`monet doctor\` to see what is there.`);
+      }
+      if (inspection.integrity.status !== "ok") {
+        throw new Error(
+          `the store integrity result is ${integrityLabel(inspection)}; refusing to delete rows in it. ` +
+          `Restore from a backup, or run \`${doctorCommand(dbPath)}\` for the full report.`,
+        );
+      }
+
+      const port = dependencies.createPort(dbPath);
+      let population: { conceptIds: string[]; observationIds: string[] };
+      try {
+        population = connectorPopulation(port);
+      } finally {
+        if (!options.apply) port.close();
+      }
+      const counts = { concepts: population.conceptIds.length, observations: population.observationIds.length };
+
+      if (counts.concepts === 0 && counts.observations === 0) {
+        if (options.apply) port.close();
+        console.log("Nothing to retire: this store holds no connector-owned rows.");
+        console.log("Open it normally — the residual tables and columns are dropped on the next open.");
+        return;
+      }
+
+      if (!options.apply) {
+        console.log(`Connector-owned rows: ${counts.concepts} concept(s), ${counts.observations} observation(s).`);
+        console.log("These are a materialized copy of files outside the store. The source subsystem that");
+        console.log("could read, re-sync, or repair them was retired (#16), so deleting them is permanent.");
+        console.log(`Backup:     taken automatically by --apply --yes`);
+        console.log(`Apply with: ${commandBase(dbPath).replace(" repair", " retire-source")} --apply --yes`);
+        return;
+      }
+
+      try {
+        const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
+        mkdirSync(path.dirname(destination), { recursive: true });
+        const backup = await port.createVerifiedBackup(destination);
+        console.error(`backup: ${backup.path}`);
+        const purged = purgeConnectorPopulation(port);
+        console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
+        console.log(`Backup:  ${backup.path}`);
+        console.log("The subsystem's own tables and columns are dropped on the next open.");
+      } finally {
+        port.close();
+      }
+    });
 
   /*
    * WHY THIS IS ITS OWN COMMAND AND NOT A REPAIR FLAG.

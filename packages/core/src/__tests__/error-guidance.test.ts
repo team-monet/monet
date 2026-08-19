@@ -15,13 +15,9 @@ import { instantiateEmbedderForPin, UnsatisfiableEmbedderError } from "../embedd
 const emptyWidths: EmbeddingWidthInventory = {
   observationDims: [256],
   conceptDims: [256],
-  sourceObservationDims: [],
-  sourceConceptDims: [],
   malformed: {
     nativeObservations: { count: 0, sampleIds: [] },
     nativeConcepts: { count: 0, sampleIds: [] },
-    sourceObservations: { count: 0, sampleIds: [] },
-    sourceConcepts: { count: 0, sampleIds: [] },
   },
 };
 

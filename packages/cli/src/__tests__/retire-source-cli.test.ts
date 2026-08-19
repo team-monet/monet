@@ -1,0 +1,158 @@
+/**
+ * `monet retire-source` — the destructive half of the source subsystem's retirement (#16).
+ *
+ * Run against a REAL store rather than the fake ports the rest of repair-cli's tests use, because
+ * the property that matters here is an ordering fact about the filesystem: the verified backup
+ * exists before a single row is deleted. A fake port can be told it took a backup; only a real one
+ * proves the file is there and holds the rows the store no longer does.
+ */
+import { describe, expect, it } from "vitest";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Command } from "commander";
+import { BetterSqlitePort, MonetCore, RETIRED_SOURCE_TABLES, inspectStoredEmbedderState } from "@team-monet/core";
+import { defaultRecoveryDependencies, registerRecoveryCommands } from "../repair-cli";
+import type { RecoveryCliDependencies } from "../repair-cli";
+
+/** A store in the schema-12 shape: marker columns, the subsystem's tables, one connector concept. */
+function seedSchema12Store(dbPath: string): void {
+  const core = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+  const db = (core as unknown as { db: BetterSqlitePort }).db;
+  db.exec(`ALTER TABLE concepts ADD COLUMN source_identity TEXT`);
+  db.exec(`ALTER TABLE concepts ADD COLUMN active_observation_id TEXT`);
+  for (const table of RETIRED_SOURCE_TABLES) {
+    db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, circle TEXT)`);
+  }
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                           support_count, dirty, embedding, updated_at, created_at,
+                           source_identity, active_observation_id)
+     VALUES ('connector-concept', 'connector-doc', 'Connector doc', 'materialized file body', 'source',
+             'active', 0.5, 1, 'default', 1, 0, '[]', ?, ?, 'source://src-a', 'connector-observation')`,
+  ).run(now, now);
+  db.prepare(
+    `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                               created_at, updated_at, source_refs)
+     VALUES ('connector-observation', 'materialized chunk', '[]', 'source', 'default',
+             'connector-concept', 'connector', ?, ?, '[]')`,
+  ).run(now, now);
+  db.pragma("user_version = 12");
+  core.close();
+}
+
+async function run(args: string[], dependencies: RecoveryCliDependencies): Promise<{ stdout: string; stderr: string }> {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const log = console.log;
+  const error = console.error;
+  console.log = (...values: unknown[]): void => { stdout.push(values.map(String).join(" ")); };
+  console.error = (...values: unknown[]): void => { stderr.push(values.map(String).join(" ")); };
+  try {
+    const program = new Command().name("monet");
+    registerRecoveryCommands(program, dependencies);
+    await program.parseAsync(["node", "monet", ...args]);
+    return { stdout: stdout.join("\n"), stderr: stderr.join("\n") };
+  } finally {
+    console.log = log;
+    console.error = error;
+  }
+}
+
+function withStore(run: (dbPath: string, dependencies: RecoveryCliDependencies) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "monet-retire-source-cli-"));
+  const dbPath = join(dir, "monet.db");
+  const dependencies: RecoveryCliDependencies = { ...defaultRecoveryDependencies(), dbPath: () => dbPath };
+  return run(dbPath, dependencies).finally(() => rmSync(dir, { recursive: true, force: true }));
+}
+
+describe("monet retire-source", () => {
+  it("without --apply, reports the population and changes nothing", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const output = await run(["retire-source"], dependencies);
+
+      expect(output.stdout).toContain("1 concept(s), 1 observation(s)");
+      expect(output.stdout).toContain("--apply --yes");
+
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        expect(port.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 1 });
+        expect(port.pragma("user_version", { simple: true })).toBe(12);
+      } finally {
+        port.close();
+      }
+      expect(existsSync(join(dbPath, "..", "backups"))).toBe(false);
+    });
+  });
+
+  it("with --apply --yes, takes a verified backup that still holds the rows the store no longer does", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const output = await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      expect(output.stdout).toContain("Retired 1 concept(s) and 1 observation(s).");
+      const backupLine = /backup: (.+)/.exec(output.stderr);
+      expect(backupLine).not.toBeNull();
+      const backupPath = backupLine![1]!;
+      expect(existsSync(backupPath)).toBe(true);
+
+      // THE ORDERING FACT: the backup predates the delete, so it still has the rows.
+      const backup = new BetterSqlitePort(backupPath);
+      try {
+        expect(backup.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 1 });
+      } finally {
+        backup.close();
+      }
+
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        expect(port.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 0 });
+      } finally {
+        port.close();
+      }
+
+      // And the store the engine refused before now opens and finishes the rung.
+      const core = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      try {
+        const db = (core as unknown as { db: BetterSqlitePort }).db;
+        expect(db.pragma("user_version", { simple: true })).toBe(13);
+        const tables = new Set(
+          (db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>)
+            .map((row) => row.name),
+        );
+        for (const table of RETIRED_SOURCE_TABLES) expect(tables.has(table)).toBe(false);
+      } finally {
+        core.close();
+      }
+    });
+  });
+
+  it("refuses --apply without --yes, before opening the store", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      await expect(run(["retire-source", "--apply"], dependencies)).rejects.toThrow(/--apply requires --yes/);
+
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        expect(port.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 1 });
+      } finally {
+        port.close();
+      }
+    });
+  });
+
+  it("says so plainly when there is nothing to retire", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      const core = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      await core.store("An ordinary native memory.", { resolution: "forceNew" });
+      core.close();
+      expect(inspectStoredEmbedderState(dbPath).exists).toBe(true);
+
+      const output = await run(["retire-source"], dependencies);
+      expect(output.stdout).toContain("Nothing to retire");
+      expect(readdirSync(join(dbPath, ".."))).not.toContain("backups");
+    });
+  });
+});

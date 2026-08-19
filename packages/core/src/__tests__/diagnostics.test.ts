@@ -37,25 +37,25 @@ describe("inspectStoredEmbedderState", () => {
     });
   });
 
-  it("reports exact counts, dimensions, malformed rows, pin metadata, and all four live populations", async () => {
+  it("reports exact counts, dimensions, malformed rows, pin metadata, and both live populations", async () => {
     await withTempDir(async (dir) => {
       const dbPath = join(dir, "current.db");
       const core = new MonetCore(dbPath, { embedder: new HashingEmbeddingProvider() });
       await core.store("native diagnostic row", { resolution: "forceNew" });
-      await core.storeSource("source diagnostic row", { sourceRefs: ["source://diagnostic"] });
       core.close();
 
+      // The mixed-width shape is now produced ACROSS the two native populations (concepts vs
+      // observations) — the source populations that used to carry it were retired with the source
+      // subsystem (#16), and the cross-population split this asserts is table-shaped either way.
       const raw = new Database(dbPath);
-      const sourceObservation = raw.prepare(`SELECT id FROM observations WHERE kind = 'source'`).pluck().get() as string;
-      const sourceConcept = raw.prepare(`SELECT id FROM concepts WHERE kind = 'source'`).pluck().get() as string;
-      raw.prepare(`UPDATE observations SET embedding = ? WHERE id = ?`).run(vector(384), sourceObservation);
-      raw.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`).run(vector(384), sourceConcept);
+      const nativeConcept = raw.prepare(`SELECT id FROM concepts WHERE kind != 'source'`).pluck().get() as string;
+      raw.prepare(`UPDATE concepts SET embedding = ? WHERE id = ?`).run(vector(384), nativeConcept);
       raw.close();
 
       const state = inspectStoredEmbedderState(dbPath);
       expect(state).toMatchObject({
         exists: true,
-        schemaVersion: 12,
+        schemaVersion: 13,
         integrity: { status: "ok", check: "ok" },
         pin: {
           status: "known",
@@ -69,12 +69,6 @@ describe("inspectStoredEmbedderState", () => {
         status: "known", liveRowCount: 1, scoredVectorCount: 1, dimensions: [256],
       });
       expect(state.populations.nativeConcepts).toMatchObject({
-        status: "known", liveRowCount: 1, scoredVectorCount: 1, dimensions: [256],
-      });
-      expect(state.populations.sourceObservations).toMatchObject({
-        status: "known", liveRowCount: 1, scoredVectorCount: 1, dimensions: [384],
-      });
-      expect(state.populations.sourceConcepts).toMatchObject({
         status: "known", liveRowCount: 1, scoredVectorCount: 1, dimensions: [384],
       });
     });
@@ -159,7 +153,6 @@ describe("inspectStoredEmbedderState", () => {
       expect(legacyState.schemaVersion).toBe(5);
       expect(legacyState.assessment).toBe("unknown");
       expect(legacyState.populations.nativeObservations.status).toBe("known");
-      expect(legacyState.populations.sourceObservations).toMatchObject({ status: "unknown" });
       expect(legacyState.pin).toMatchObject({ status: "unknown" });
       expect(legacyState.migration).toMatchObject({ status: "unknown" });
 

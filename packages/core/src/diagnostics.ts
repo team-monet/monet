@@ -110,19 +110,11 @@ type SchemaMap = Map<string, Set<string>>;
 const POPULATION_SCHEMA: Record<EmbeddingPopulationName, Record<string, string[]>> = {
   nativeObservations: { observations: ["id", "kind", "embedding"] },
   nativeConcepts: { concepts: ["id", "kind", "embedding"] },
-  sourceObservations: {
-    observations: ["id", "kind", "embedding"],
-    source_chunks: ["observation_id", "concept_id", "lifecycle"],
-    concepts: ["id", "status"],
-  },
-  sourceConcepts: { concepts: ["id", "kind", "status", "embedding"] },
 };
 
 const POPULATION_NAMES: EmbeddingPopulationName[] = [
   "nativeObservations",
   "nativeConcepts",
-  "sourceObservations",
-  "sourceConcepts",
 ];
 
 const PIN_SOURCES = new Set(["created", "backfilled", "migrated"]);
@@ -131,8 +123,6 @@ function unknownPopulations(reason: string): StoredEmbeddingPopulations {
   return {
     nativeObservations: { status: "unknown", reason },
     nativeConcepts: { status: "unknown", reason },
-    sourceObservations: { status: "unknown", reason },
-    sourceConcepts: { status: "unknown", reason },
   };
 }
 
@@ -143,7 +133,7 @@ function readSchema(db: Database.Database): SchemaMap {
     .map((row) => (row as { name: string }).name));
   const schema: SchemaMap = new Map();
   // Fixed literals only: diagnosis never interpolates a possibly-hostile sqlite_schema identifier.
-  for (const name of ["observations", "concepts", "source_chunks", "sync_meta", "embedder_migration"]) {
+  for (const name of ["observations", "concepts", "sync_meta", "embedder_migration"]) {
     if (!presentTables.has(name)) continue;
     const columns = db.prepare(`PRAGMA table_info(${name})`).all() as Array<{ name: string }>;
     schema.set(name, new Set(columns.map((column) => column.name)));
@@ -369,10 +359,10 @@ function classifyFailure(dbPath: string, error: unknown): StoredEmbedderStateDia
  *
  * SCANS EXACTLY WHAT THE MIGRATION REWRITES, which is four populations, not one:
  *
- *   enforcedNativeObservationRows   every `kind != 'source'` row, NO supersession filter
+ *   enforcedNativeObservationRows   every observation row, NO supersession filter
  *   enforcedSourceObservationRows   source rows whose chunks are live (or which have none)
- *   enforcedNativeConceptRows       every `kind != 'source'` concept — its BODY is re-embedded,
- *                                   which is `SELECT * FROM concepts WHERE kind != 'source'` and so
+ *   enforcedNativeConceptRows       every concept — its BODY is re-embedded,
+ *                                   which is `SELECT * FROM concepts` and so
  *                                   takes workstream concepts along with ordinary ones
  *
  * A narrower scan reports zero while the rewrite strands content. Two of these were missed in
@@ -400,25 +390,11 @@ function inspectNonLatin(db: Database.Database, schema: SchemaMap): StoredNonLat
   }
   try {
     const observationQueries = [
-      `SELECT id, content AS text FROM observations WHERE kind != 'source'`,
-      schema.has("source_chunks")
-        ? `SELECT o.id AS id, o.content AS text
-             FROM observations o
-            WHERE o.kind = 'source'
-              AND (
-                NOT EXISTS (SELECT 1 FROM source_chunks any_sc WHERE any_sc.observation_id = o.id)
-                OR EXISTS (
-                  SELECT 1 FROM source_chunks live_sc
-                  LEFT JOIN concepts live_c ON live_c.id = live_sc.concept_id
-                   WHERE live_sc.observation_id = o.id AND live_sc.lifecycle = 'active'
-                     AND (live_c.id IS NULL OR live_c.status = 'active')
-                )
-              )`
-        : `SELECT id, content AS text FROM observations WHERE kind = 'source'`,
+      `SELECT id, content AS text FROM observations`,
     ];
     // Concept bodies. applySynthesis writes these WITHOUT the script gate, so this is the one
     // population that can be non-English in a store whose every observation is English.
-    const conceptQuery = `SELECT id, body AS text FROM concepts WHERE kind != 'source' AND body IS NOT NULL`;
+    const conceptQuery = `SELECT id, body AS text FROM concepts WHERE body IS NOT NULL`;
 
     /*
      * SAMPLES ARE PER-POPULATION, not first-come. A shared five-slot buffer filled in query order

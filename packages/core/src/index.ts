@@ -1,7 +1,6 @@
 export {
   MonetCore,
   EmbedderMismatchError,
-  contextualizeSourceChunk,
   ContentExceedsEmbedderWindowError,
   type EmbedderWindowSubject,
   RELIABLE_EMBED_TOKENS,
@@ -231,103 +230,7 @@ export type {
   ResolutionThresholds,
 } from "./resolution";
 export { chooseStoreEmbedder, FreshStoreEmbedderUnavailableError, PinnedStoreEmbedderUnavailableError } from "./store-embedder";
-export {
-  DEFAULT_SOURCE_SCANNER_LIMITS,
-  SOURCE_SCANNER_VERSION,
-  computeSourceIngestConfigHash,
-  computeSourceManifestHash,
-  effectiveSourceScanConfig,
-  isMarkdownSourcePath,
-  matchesSourceGlob,
-  scanSourceSnapshot,
-} from "./source-scanner";
-export {
-  DEFAULT_SOURCE_MAX_CHUNKS,
-  SOURCE_CHUNKER_VERSION,
-  chunkSourceText,
-  canonicalizeSourceChunkMetadata,
-  computeSourceContentHash,
-  computeSourceIngestFingerprint,
-  computeSourceOperationId,
-  computeSourceRefOccurrences,
-  hashSourceDomain,
-  sourceHeadingIdentityKey,
-  sourceHeadingAnchor,
-} from "./source-chunker";
-export type { GitMdSyncOptions, GitMdSyncResult, RepoMdSyncOptions, RepoMdSyncResult } from "./source-sync";
-export type { GitCredential, GitCredentialProvider, GitCredentialRequest, RemoteGitOptions } from "./source-git";
-export { runRemoteGit } from "./source-git";
 export type { StoragePort, Statement, RunResult, PragmaOptions } from "./storage";
-export type {
-  EffectiveSourceScanConfig,
-  EffectiveSourceScanConfigInput,
-  ScanSourceSnapshotInput,
-  SourceScanDiagnostic,
-  SourceScanDiagnosticCode,
-  SourceScanFile,
-  SourceScanResult,
-  SourceScannerLimits,
-} from "./source-scanner";
-export type {
-  ChunkSourceTextInput,
-  ChunkSourceTextResult,
-  SourceChunk,
-  SourceChunkDiagnostic,
-  SourceChunkMetadata,
-  SourceHeadingIdentity,
-} from "./source-chunker";
-export type {
-  SourceType,
-  SourceWriteBack,
-  SourceRefreshMode,
-  SourceLifecycle,
-  SourceStatus,
-  SourceTransportScheme,
-  SourceAccessPolicy,
-  SourceTransportPolicy,
-  SourceRefreshPolicy,
-  SourceRepoMapping,
-  CreateRepoMdSource,
-  CreateGitMdSource,
-  CreateSourceInput,
-  UpdateSourceInput,
-  KnowledgeSource,
-  SourceListOptions,
-  SourceGetOptions,
-  SourceAuthorizationContext,
-  ConnectorSourceSummary,
-  ConnectorSourceStatus,
-  ConnectorSourcePath,
-  SourceRunFence,
-  SourceSyncRunState,
-  SourceSyncRunResult,
-  SourceChunkWriteState,
-  SourceSyncRun,
-  BeginSourceRunInput,
-  BeginSourceRunResult,
-  SourceManifestFileInput,
-  SourceManifestChunkInput,
-  SourceManifestSkippedFileInput,
-  StageSourceManifestInput,
-  RecordSourceBindingReceiptInput,
-  PublishSourceRunInput,
-  SourceFileRecord,
-  SourceChunkRecord,
-  SourceSkippedFileRecord,
-  SourceCleanupItem,
-  SourceRemoval,
-  SourceRemovalItem,
-  SourceScheduleState,
-  SourceScheduleStatus,
-} from "./source-types";
-export { createSourceScheduler, planSourceDue } from "./source-scheduler";
-export type {
-  PlanSourceDueInput,
-  ScheduledSourceCore,
-  SourceDuePlan,
-  SourceSchedulerHandle,
-  SourceSchedulerOptions,
-} from "./source-scheduler";
 export { renderOverview } from "./render-overview";
 export { extractEntities } from "./extract-entities";
 export type { ExtractedEntity, EntityKind } from "./extract-entities";
@@ -410,3 +313,11 @@ export type {
   JournalDispositionLine,
   RuleConformanceTally,
 } from "./conformance";
+export {
+  connectorPopulation,
+  dropRetiredSourceResidue,
+  purgeConnectorPopulation,
+  RETIRED_SOURCE_TABLES,
+  SourceRetirementRequiredError,
+} from "./source-retirement";
+export type { ConnectorPopulation } from "./source-retirement";

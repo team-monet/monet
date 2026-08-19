@@ -46,7 +46,7 @@ describe("schema 11 → 12 First Block retirement migration", () => {
 
       const migrated = new MonetCore(path);
       const db = raw(migrated);
-      expect(db.pragma("user_version", { simple: true })).toBe(12);
+      expect(db.pragma("user_version", { simple: true })).toBe(13);
       expect(db.prepare(`SELECT COUNT(*) AS count FROM first_block`).get()).toEqual({ count: 0 });
       for (const pin of summaries) {
         const rows = db.prepare(
@@ -64,7 +64,7 @@ describe("schema 11 → 12 First Block retirement migration", () => {
 
       const reopened = new MonetCore(path);
       const reopenedDb = raw(reopened);
-      expect(reopenedDb.pragma("user_version", { simple: true })).toBe(12);
+      expect(reopenedDb.pragma("user_version", { simple: true })).toBe(13);
       expect((reopenedDb.prepare(
         `SELECT COUNT(*) AS count FROM observations
           WHERE author_agent_id = 'schema-12-first-block-migration'`,
@@ -144,7 +144,7 @@ describe("schema 11 → 12 First Block retirement migration", () => {
       for (let open = 0; open < 2; open += 1) {
         const core = new MonetCore(path);
         const db = raw(core);
-        expect(db.pragma("user_version", { simple: true })).toBe(12);
+        expect(db.pragma("user_version", { simple: true })).toBe(13);
         expect(db.prepare(`SELECT COUNT(*) AS count FROM first_block`).get()).toEqual({ count: 0 });
         expect(db.prepare(
           `SELECT COUNT(*) AS count FROM observations

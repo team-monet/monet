@@ -6,9 +6,8 @@ import { createRequire } from "node:module";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
 import { ensureMonetDir, getDbPath, getGateJournalPath, getGateMirrorPath, getMonetDir } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
-import { printStoreLine, registerSourceCommands, SourceCliError } from "./source-cli.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
-import { openServedCore, openSourceCore, openStatusCore } from "./bootstrap.js";
+import { openServedCore, openStatusCore } from "./bootstrap.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
 import { registerGateCommands } from "./gate-cli.js";
 import { registerInstallCommands } from "./install-cli.js";
@@ -142,7 +141,7 @@ program
     ensureMonetDir(projectDir);
     const core = openStatusCore(getDbPath(projectDir));
     const s = core.stats(options.circle);
-    printStoreLine(getDbPath(projectDir));
+    console.error(`store: ${path.resolve(getDbPath(projectDir))}`);
     console.log(`Monet Status`);
     console.log(`------------------`);
     console.log(`Storage:       ${getDbPath(projectDir)}`);
@@ -225,35 +224,6 @@ program
     startDashboard(port);
   });
 
-registerSourceCommands(program, {
-  // P1-B (Codex round 4 on PR #42): both callbacks now root their ELSE branch (no explicit --dir)
-  // at resolveProjectDir(), NOT bare cwd — this is the store createSource/updateSource/etc.
-  // actually OPEN and WRITE to. source-cli.ts's own deriveCircle calls already root their
-  // storeDir at this SAME resolved projectDir (P1-2, round 3) — but that only fixed what
-  // deriveCircle itself CONSULTED; the store openCore actually OPENED was still bare/cwd-rooted,
-  // so the two could diverge under a MONET_PROJECT_DIR/CLAUDE_PROJECT_DIR override: a circle
-  // resolved against project A, with the resulting row written into project B's store. Rooting
-  // both at the identical resolveProjectDir() call closes that — the store opened and the store
-  // consulted are now provably the same object (see circle.ts's own "THE FINAL MATRIX" comment
-  // for the full per-caller audit). storageDir (the `source` command's own -d/--dir flag) still
-  // wins outright when given: it sets MONET_STORAGE_DIR, which getMonetDir checks BEFORE ever
-  // consulting the baseDir passed alongside it, so no extra branching is needed for the flag to
-  // take priority — matching install's own existing precedent for "an explicit flag wins".
-  openCore(storageDir) {
-    if (storageDir) process.env.MONET_STORAGE_DIR = path.resolve(storageDir);
-    const projectDir = resolveProjectDir();
-    const monetDir = ensureMonetDir(projectDir);
-    return openSourceCore(getDbPath(projectDir), path.join(monetDir, "sources"));
-  },
-  dbPath(storageDir) {
-    return storageDir ? path.join(path.resolve(storageDir), "monet.db") : path.resolve(getDbPath(resolveProjectDir()));
-  },
-  deriveCircle,
-  deriveCallerId,
-  deriveProjectId,
-  projectDir: resolveProjectDir,
-});
-
 registerRecoveryCommands(program);
 registerGateCommands(program);
 registerInstallCommands(program);
@@ -262,8 +232,6 @@ registerMaterializeCommands(program);
 void program.parseAsync().catch((error: unknown) => {
   if (error instanceof FreshStoreEmbedderUnavailableError) {
     console.error(error.message);
-  } else if (error instanceof SourceCliError) {
-    console.error(`monet source: ${error.message}`);
   } else if (error instanceof MaterializeCliError) {
     console.error(`monet materialize: ${error.message}`);
   } else {

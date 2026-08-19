@@ -871,60 +871,6 @@ describe("embedder pin — legacy-upgrade stores must not get a 'created' pin (C
   // still green after this fix (see the PR's full-suite run), not duplicated here.
 });
 
-describe("embedder pin — source placeholder observations excluded from dimension inference (Codex review, PR #51, FIX G)", () => {
-  it("a 256-dim source-connector placeholder alongside a genuine 384-dim native observation pins 384 (the real evidence), not a mixed-dim throw", async () => {
-    // The backfilled pin will be ONNX-shaped (384-dim) — inject a fake embedderLoader (ADR test
-    // discipline: real instantiation only for hashing) instead of letting the swap reach the real
-    // loader, which would attempt a genuine network/model load.
-    const core = new MonetCore(":memory:", {
-      embedder: new HashingEmbeddingProvider(),
-      embedderLoader: async (modelId) => fakePinnedProvider(modelId), // exact-identity stand-in — no real ONNX load
-    });
-    insertFakeObservation(core, 256, "source-placeholder-1", "source", undefined, 0); // provable all-zero placeholder
-    insertFakeObservation(core, 384, "native-real-1", "statement"); // genuine semantic evidence, recomputed under ONNX
-    clearPin(core);
-
-    await core.ensureEmbedderPin();
-
-    const pin = readPin(core);
-    expect(pin.embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID); // the REAL native vector's dimension, not the 256-dim source placeholder
-    expect(pin.embedder_pin_source).toBe("backfilled");
-    core.close();
-  });
-
-  it("a store whose ONLY observations are source placeholders falls through to the concepts fallback and pins from a genuine NATIVE concept vector there", async () => {
-    const core = new MonetCore(":memory:", {
-      embedder: new HashingEmbeddingProvider(),
-      embedderLoader: async (modelId) => fakePinnedProvider(modelId), // exact-identity stand-in — no real ONNX load
-    });
-    insertFakeObservation(core, 256, "source-placeholder-only", "source", undefined, 0); // the ONLY observation row — a provable placeholder
-    insertFakeConcept(core, 384); // kind='fact' (the default) AND a non-zero fill — genuine evidence on both counts. What excludes the observation above is its ALL-ZERO placeholder vector, not its kind: since #56 the sample unions real source vectors in, so kind alone no longer keeps anything out. See the FIX K test below for the both-tables-placeholder shape
-    clearPin(core);
-
-    await core.ensureEmbedderPin();
-
-    const pin = readPin(core);
-    expect(pin.embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID); // fell through to concepts — observations held ONLY a source placeholder, which FIX G excludes
-    expect(pin.embedder_pin_source).toBe("backfilled");
-    core.close();
-  });
-
-  it("(FIX K) a store whose ONLY vectors are source placeholders in BOTH tables (staged observations AND not-yet-recomputed source concepts) samples empty and pins the live embedder — no throw, no guess", async () => {
-    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() }); // default tok=2
-    insertFakeObservation(core, 256, "source-obs-placeholder", "source", undefined, 0);
-    insertFakeConcept(core, 256, "source-concept-placeholder", "source", 0);
-    clearPin(core);
-
-    await core.ensureEmbedderPin(); // no embedderLoader override needed — samples empty, so this is Shape 4's "pin to the live embedder" path, no swap
-
-    const pin = readPin(core);
-    expect(pin.embedder_model_id).toBe("hashing:dim=256:tok=2"); // BOTH tables sampled empty because both rows are ALL-ZERO placeholders, which the width inventory excludes — NOT because they are kind='source' (#56 unioned real source vectors INTO the sample; only zero placeholders and dead residue stay out). Pinned to the live embedder, exactly like Shape 4
-    expect(pin.embedder_pin_source).toBe("backfilled");
-    expect((core as any).embedderModelId).toBe("hashing:dim=256:tok=2"); // already satisfied — no swap
-    core.close();
-  });
-});
-
 describe("embedder pin — vector-threshold comparison guard (Codex review, PR #51, FIX H)", () => {
   it("reassignCircle and mergeCircle throw EmbedderPinUnsatisfiedError on a mismatched reopen, and succeed once ensureEmbedderPin has run", async () => {
     const dir = mkdtempSync(join(tmpdir(), "monet-pin-guard-vector-"));
@@ -1828,13 +1774,9 @@ describe("embedder pin — inspectEmbeddingWidths, a non-throwing width inventor
     expect(core.inspectEmbeddingWidths()).toEqual({
       observationDims: [],
       conceptDims: [],
-      sourceObservationDims: [],
-      sourceConceptDims: [],
       malformed: {
         nativeObservations: { count: 0, sampleIds: [] },
         nativeConcepts: { count: 0, sampleIds: [] },
-        sourceObservations: { count: 0, sampleIds: [] },
-        sourceConcepts: { count: 0, sampleIds: [] },
       },
     });
     core.close();
@@ -1850,55 +1792,18 @@ describe("embedder pin — inspectEmbeddingWidths, a non-throwing width inventor
     core.close();
   });
 
-  it("reports native and source vector widths SEPARATELY, in both directions, and never throws on the exact mixed-width shape sampleStoredVectorDim refuses to look at", () => {
-    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider() });
-    // Native evidence at TWO different widths (the exact shape sampleStoredVectorDim throws on) —
-    // inspectEmbeddingWidths must report BOTH, not throw, and not touch the pin.
-    insertFakeObservation(core, 256, "native-256", "statement");
-    insertFakeObservation(core, 384, "native-384", "statement");
-    // Source evidence at a SINGLE, DIFFERENT width — proving native/source are reported separately,
-    // not unioned (a union would contaminate one population's array with the other's width).
-    insertFakeObservation(core, 512, "source-obs-512", "source");
-    insertFakeConcept(core, 512, "source-concept-512", "source");
-
-    const widths = core.inspectEmbeddingWidths();
-    // Asserted in the order the interface documents (ascending, via the query's own `ORDER BY dim`)
-    // — NOT re-sorted first, which would defeat the very guarantee this test is meant to confirm.
-    expect(widths.observationDims).toEqual([256, 384]);
-    expect(widths.conceptDims).toEqual([]);
-    expect(widths.sourceObservationDims).toEqual([512]);
-    expect(widths.sourceConceptDims).toEqual([512]);
-    expect(widths.malformed).toEqual({
-      nativeObservations: { count: 0, sampleIds: [] },
-      nativeConcepts: { count: 0, sampleIds: [] },
-      sourceObservations: { count: 0, sampleIds: [] },
-      sourceConcepts: { count: 0, sampleIds: [] },
-    });
-    // Never throws (unlike sampleStoredVectorDim on this exact native shape), and never writes a
-    // pin — a pure read.
-    expect(readPin(core).embedder_model_id).toBe("hashing:dim=256:tok=2"); // untouched — still the 'created' pin from construction
-    core.close();
-  });
-
   it("reports every malformed live role without throwing and makes read, write, and graft proofs fail closed", async () => {
     const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(), tauAttach: 1.1 });
     const native = await core.store("native malformed-vector fixture", { resolution: "forceNew" });
-    insertFakeConcept(core, 256, "malformed-live-source-concept", "source");
-    insertFakeObservation(core, 256, "malformed-live-source-observation", "source", "malformed-live-source-concept");
-    insertFakeSourceChunk(core, "malformed-live-source-observation", "active", "malformed-live-source-chunk", "malformed-live-source-concept");
     const db = (core as any).db;
     db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run(`{"not":"an array"}`, native.observationId);
     db.prepare(`UPDATE concepts SET embedding=? WHERE id=?`).run(`[1,null]`, native.conceptId);
-    db.prepare(`UPDATE observations SET embedding=? WHERE id=?`).run(`[1,"2"]`, "malformed-live-source-observation");
-    db.prepare(`UPDATE concepts SET embedding=? WHERE id=?`).run(`not-json`, "malformed-live-source-concept");
 
     try {
       const inventory = core.inspectEmbeddingWidths();
       expect(inventory.malformed).toEqual({
         nativeObservations: { count: 1, sampleIds: [native.observationId] },
         nativeConcepts: { count: 1, sampleIds: [native.conceptId] },
-        sourceObservations: { count: 1, sampleIds: ["malformed-live-source-observation"] },
-        sourceConcepts: { count: 1, sampleIds: ["malformed-live-source-concept"] },
       });
       await expect(core.search("must diagnose before reading")).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
       await expect(core.store("must diagnose before writing", { resolution: "forceNew" })).rejects.toBeInstanceOf(MalformedEmbeddingStoreError);
@@ -1915,55 +1820,9 @@ describe("embedder pin — inspectEmbeddingWidths, a non-throwing width inventor
     }
   });
 
-  it("excludes malformed dead source residue from diagnostics and live width proof", async () => {
-    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(), tauAttach: 1.1 });
-    insertFakeConcept(core, 256, "dead-source-concept", "source");
-    insertFakeObservation(core, 256, "dead-source-observation", "source", "dead-source-concept");
-    insertFakeSourceChunk(core, "dead-source-observation", "superseded", "dead-source-chunk", "dead-source-concept");
-    const db = (core as any).db;
-    db.prepare(`UPDATE concepts SET status='retired', embedding='not-json' WHERE id='dead-source-concept'`).run();
-    db.prepare(`UPDATE observations SET embedding='[null]' WHERE id='dead-source-observation'`).run();
-    try {
-      expect(core.inspectEmbeddingWidths().malformed).toEqual({
-        nativeObservations: { count: 0, sampleIds: [] },
-        nativeConcepts: { count: 0, sampleIds: [] },
-        sourceObservations: { count: 0, sampleIds: [] },
-        sourceConcepts: { count: 0, sampleIds: [] },
-      });
-      await expect(core.store("live write ignores proven-dead source residue", { resolution: "forceNew" })).resolves.toMatchObject({
-        action: "created",
-      });
-      await expect(core.search("live read ignores proven-dead source residue")).resolves.toBeDefined();
-    } finally {
-      core.close();
-    }
-  });
 });
 
 describe("embedder pin — ordinary writes arbitrate one live semantic vector space", () => {
-  it("an unpinned native 256 store rejects its first source 384 write, and pin backfill cannot bless the resulting mixed native/source shape", async () => {
-    const core = new MonetCore(":memory:", { embedder: new FakeOnnxLikeProvider() });
-    insertFakeObservation(core, 256, "native-256", "statement");
-    clearPin(core);
-
-    let caught: unknown;
-    try {
-      await core.storeSource("the first source chunk", { sourceRefs: ["source://embedder-width-guard-test"] });
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).toBeInstanceOf(EmbedderPinUnsatisfiedError);
-    expect((core as any).db.prepare(`SELECT COUNT(*) AS n FROM observations WHERE kind = 'source'`).get().n).toBe(0);
-    expect((core as any).db.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get().n).toBe(0);
-
-    // Fabricate the damage an old binary could already have left. Backfill must union native and
-    // live source evidence and fail closed rather than blessing either half.
-    insertFakeObservation(core, 384, "source-384", "source");
-    await expect(core.ensureEmbedderPin()).rejects.toBeInstanceOf(UnsatisfiableEmbedderError);
-    expect(readPin(core).embedder_model_id).toBeNull();
-    core.close();
-  });
-
   it("NIT coverage — a genuinely-unpinned store with NO existing evidence for the relevant population accepts the write and establishes the ambient width, rather than throwing on an empty comparison set", async () => {
     // Fresh store pins itself 'created' to the live embedder at construction — clear it to simulate
     // a genuinely pre-pin store, exactly as the shared-space test above does. Unlike that test,
@@ -2143,22 +2002,6 @@ describe("embedder pin — MAJOR 6 fix: width-guard coverage for the two remaini
     core.close();
   });
 
-  it("recomputeSourceConceptBody revalidates the shared width inside its write transaction", async () => {
-    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(384, 1) });
-    insertFakeConcept(core, 256, "source-concept", "source");
-    insertFakeObservation(core, 256, "source-obs", "source", "source-concept");
-    insertFakeSourceChunk(core, "source-obs", "active", "source-chunk", "source-concept");
-    clearPin(core);
-
-    let caught: unknown;
-    try {
-      await core.recomputeSourceConceptBody("source-concept");
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).toBeInstanceOf(EmbedderPinUnsatisfiedError);
-    core.close();
-  });
 });
 
 describe("embedder pin — complete ordinary semantic-mutation closure", () => {
@@ -2177,7 +2020,7 @@ describe("embedder pin — complete ordinary semantic-mutation closure", () => {
     core.close();
   });
 
-  for (const population of ["native", "source"] as const) {
+  for (const population of ["native"] as const) {
     it(`rejects ${population} provider output whose actual width disagrees with declared dim before semantic mutation`, async () => {
       const malformed: EmbeddingProvider = {
         modelId: `test:malformed:${population}`,
@@ -2185,9 +2028,7 @@ describe("embedder pin — complete ordinary semantic-mutation closure", () => {
         async embed() { return new Float32Array(384).fill(0.25); },
       };
       const core = new MonetCore(":memory:", { embedder: malformed });
-      const write = population === "native"
-        ? core.store("malformed native output")
-        : core.storeSource("malformed source output", { sourceRefs: ["source://malformed-output"] });
+      const write = core.store("malformed native output");
 
       let caught: unknown;
       try { await write; } catch (error) { caught = error; }
@@ -2467,53 +2308,6 @@ describe("embedder pin — abandonEmbedderMigration, the recovery path for an in
     core.close();
   });
 
-  it("BLOCKING 1 fix — refuses when NATIVE is fully rewritten to the target width and SOURCE is fully still at the old width, even though EACH POPULATION is internally consistent on its own — the cross-POPULATION split migrateEmbeddings' native-then-source phase order produces on an interruption between the two", () => {
-    // migrateEmbeddings rewrites ALL native concepts+observations (phases "native-concepts",
-    // "native-observations") BEFORE touching ANY source concept/observation (phases
-    // "source-concepts", "source-chunk-observations") — one sentinel, one target pin, covering BOTH
-    // populations (see migrateEmbeddings itself). An interruption between "native-observations" and
-    // "source-concepts" leaves the ENTIRE native population at the target width while the ENTIRE
-    // source population is untouched, still fully at the old width — each POPULATION, checked in
-    // isolation (nativeDims.size === 1, sourceDims.size === 1), looks clean. Only unioning ALL FOUR
-    // arrays together (native AND source) reveals the split.
-    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(256, 1) });
-    insertFakeObservation(core, 384, "native-obs-done", "statement"); // native-observations phase already completed — new-space
-    insertFakeConcept(core, 384, "native-concept-done", "fact"); // native-concepts phase already completed — new-space
-    insertFakeObservation(core, 256, "source-obs-not-yet", "source"); // source-chunk-observations phase never ran — still old-space
-    insertFakeConcept(core, 256, "source-concept-not-yet", "source"); // source-concepts phase never ran — still old-space
-    writeMigrationSentinel(core, LEGACY_ONNX_DEFAULT_MODEL_ID);
-    writePin(core, LEGACY_ONNX_DEFAULT_MODEL_ID, "migrated");
-
-    let caught: unknown;
-    try {
-      core.abandonEmbedderMigration();
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).toBeInstanceOf(EmbedderMigrationAbandonRefusedError);
-    expect((caught as EmbedderMigrationAbandonRefusedError).targetModelId).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID);
-    // Each POPULATION's own union has length 1 (native: {384}, source: {256}) — proving this case is
-    // invisible to a per-population-only check; only the ALL-FOUR union ({256, 384}) catches it.
-    expect((caught as EmbedderMigrationAbandonRefusedError).widths.observationDims).toEqual([384]);
-    expect((caught as EmbedderMigrationAbandonRefusedError).widths.conceptDims).toEqual([384]);
-    expect((caught as EmbedderMigrationAbandonRefusedError).widths.sourceObservationDims).toEqual([256]);
-    expect((caught as EmbedderMigrationAbandonRefusedError).widths.sourceConceptDims).toEqual([256]);
-
-    // No silent half-abandon: the sentinel AND the pin are both exactly as they were before the call.
-    expect((core as any).readEmbedderMigration()).toEqual({
-      target_model_id: LEGACY_ONNX_DEFAULT_MODEL_ID,
-      started_at: expect.any(Number),
-      prior_model_id: null,
-      prior_pin_source: null,
-      prior_pinned_at: null,
-      prior_pin_captured: 0,
-      vectors_rewritten: 0,
-    });
-    expect(readPin(core).embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID);
-    expect(readPin(core).embedder_pin_source).toBe("migrated");
-    core.close();
-  });
-
   it("refuses (EmbedderMigrationAbandonRefusedError) and touches NOTHING when vectors were already partially rewritten into the target space — abandoning would strand exactly the mixed-width store this whole slice exists to prevent", () => {
     const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(256, 1) }); // pins itself 'created' to tok=1
     insertFakeObservation(core, 256, "not-yet-rewritten"); // surviving OLD-space evidence
@@ -2591,72 +2385,6 @@ describe("embedder pin — abandonEmbedderMigration, the recovery path for an in
     });
     expect(readPin(core).embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID);
     expect(readPin(core).embedder_pin_source).toBe("migrated");
-    core.close();
-  });
-
-  it("(cross-table split, source) refuses when source CONCEPTS and source OBSERVATIONS disagree, even though EACH TABLE is internally consistent on its own — the same interruption shape is reachable via migrateEmbeddings' source-concepts-then-source-chunk-observations phase order", () => {
-    // Mirrors the native case above: reembedSourceConcept (phase "source-concepts") runs in a full
-    // pass over sourceIds BEFORE reembedSourceChunkObservations (phase "source-chunk-observations")
-    // runs in its own separate pass — verified by reading migrateEmbeddings itself, same two-loop
-    // shape as the native phases.
-    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(256, 1) });
-    insertFakeObservation(core, 256, "source-obs-not-yet-rewritten", "source"); // source-chunk-observations phase never ran
-    insertFakeConcept(core, 384, "source-concept-already-rewritten", "source"); // source-concepts phase already completed
-    writeMigrationSentinel(core, LEGACY_ONNX_DEFAULT_MODEL_ID);
-    writePin(core, LEGACY_ONNX_DEFAULT_MODEL_ID, "migrated");
-
-    let caught: unknown;
-    try {
-      core.abandonEmbedderMigration();
-    } catch (e) {
-      caught = e;
-    }
-    expect(caught).toBeInstanceOf(EmbedderMigrationAbandonRefusedError);
-    expect((caught as EmbedderMigrationAbandonRefusedError).widths.sourceObservationDims).toEqual([256]);
-    expect((caught as EmbedderMigrationAbandonRefusedError).widths.sourceConceptDims).toEqual([384]);
-
-    expect((core as any).readEmbedderMigration()).toEqual({
-      target_model_id: LEGACY_ONNX_DEFAULT_MODEL_ID,
-      started_at: expect.any(Number),
-      prior_model_id: null,
-      prior_pin_source: null,
-      prior_pinned_at: null,
-      prior_pin_captured: 0,
-      vectors_rewritten: 0,
-    });
-    expect(readPin(core).embedder_model_id).toBe(LEGACY_ONNX_DEFAULT_MODEL_ID);
-    core.close();
-  });
-
-  it("MEDIUM 7 fix — a PERMANENT superseded source-chunk residue (from a prior, already-completed migration) never blocks a later, otherwise-clean abandon: reembedSourceChunkObservations only ever rewrites lifecycle='active' chunks, so a superseded chunk's old-width observation is expected residue, not evidence of a partial rewrite", () => {
-    const core = new MonetCore(":memory:", { embedder: new HashingEmbeddingProvider(256, 1) });
-    // Everything CURRENTLY relevant (native evidence, and the active half of source evidence) is a
-    // single consistent width — the store this migration is running against is clean.
-    insertFakeObservation(core, 256, "native-obs", "statement");
-    insertFakeConcept(core, 256, "native-concept", "fact");
-    insertFakeConcept(core, 256, "source-concept-active", "source");
-    insertFakeObservation(core, 256, "source-obs-active", "source");
-    insertFakeSourceChunk(core, "source-obs-active", "active");
-    // PERMANENT residue: a source-chunk observation from a PREVIOUS migration this store already
-    // completed, superseded since (a real edit, or a classification-affecting version bump) —
-    // reembedSourceChunkObservations (engine.ts) only ever re-embeds lifecycle='active' chunks, so
-    // this row's width was NEVER rewritten and never will be by any future migration either. Left
-    // unfiltered, this alone would make sourceObservationDims = [128, 256] forever, permanently
-    // tripping the mixed-width refusal on every future migration attempt regardless of its own health.
-    insertFakeObservation(core, 128, "source-obs-superseded-residue", "source");
-    insertFakeSourceChunk(core, "source-obs-superseded-residue", "superseded");
-    const priorPin = readPin(core);
-    writeMigrationSentinel(core, LEGACY_ONNX_DEFAULT_MODEL_ID, Date.now(), {
-      modelId: priorPin.embedder_model_id,
-      source: priorPin.embedder_pin_source as "created" | "backfilled" | "migrated",
-      pinnedAt: priorPin.embedder_pinned_at,
-    });
-    writePin(core, LEGACY_ONNX_DEFAULT_MODEL_ID, "migrated");
-
-    // Must NOT throw: the residue is excluded from the comparison, so the store reads as a single
-    // consistent width (256) and the abandon proceeds normally.
-    expect(() => core.abandonEmbedderMigration()).not.toThrow();
-    expect((core as any).readEmbedderMigration()).toBeUndefined();
     core.close();
   });
 

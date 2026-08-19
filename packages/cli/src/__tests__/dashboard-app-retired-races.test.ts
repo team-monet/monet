@@ -33,7 +33,6 @@ globalThis.__dashboardTest = {
   state,
   STALE_REQUEST,
   fetchEntities,
-  fetchSources,
   invalidateDependentCaches,
   reloadGraph,
   reconcileCurrentCircle,
@@ -43,9 +42,7 @@ globalThis.__dashboardTest = {
     data: DATA,
     entities: ENTITIES,
     entitiesMode: _entitiesMode,
-    sources: SOURCES,
     entitiesGen: _entitiesGen,
-    sourcesGen: _sourcesGen,
     graphGen: _graphRequestGen,
   }),
 };`;
@@ -261,33 +258,4 @@ describe("dashboard visibility-dependent caches", () => {
     expect(h.requests).toHaveLength(2);
   });
 
-  it("keeps Sources on visibility toggle but invalidates it on manual Refresh", async () => {
-    const h = loadDashboard();
-    const sources = h.api.fetchSources();
-    h.respond(0, { sources: [{ id: "source" }] });
-    await sources;
-    const initialSourcesGen = h.api.cache().sourcesGen;
-
-    const toggle = h.api.reloadGraph({
-      invalidateCaches: true,
-      invalidateSources: false,
-      spinner: false,
-      render: null,
-    });
-    expect(h.api.cache().sources.sources[0].id).toBe("source");
-    expect(h.api.cache().sourcesGen).toBe(initialSourcesGen);
-    h.respond(1, graphPayload("toggle"));
-    await toggle;
-
-    const refresh = h.api.reloadGraph({
-      invalidateCaches: true,
-      invalidateSources: true,
-      spinner: false,
-      render: null,
-    });
-    expect(h.api.cache().sources).toBe(null);
-    expect(h.api.cache().sourcesGen).toBe(initialSourcesGen + 1);
-    h.respond(2, graphPayload("refresh"));
-    await refresh;
-  });
 });

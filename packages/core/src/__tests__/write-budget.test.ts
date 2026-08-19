@@ -105,13 +105,6 @@ describe("write budget — content past the embedder's window is refused", () =>
   // A source chunk is materialized from a file, which cannot be asked to write differently. Its
   // budget belongs to the chunker that produces it, not to a refusal handed to a connector with no
   // author to relay it to — so this path stays open deliberately.
-  it("does not refuse source ingest, which has no author to retry", async () => {
-    const r = await core.storeSource(words(25), {
-      sourceRefs: ["source://budget-test/NOTES.md#section~1"],
-      resolution: "forceNew",
-    });
-    expect(r.conceptId).toBeTruthy(); // committed rather than refused — the property under test
-  });
 });
 
 // Codex review, PR #134 (P1). The window belongs to the SELECTED MODEL, not the provider class: an

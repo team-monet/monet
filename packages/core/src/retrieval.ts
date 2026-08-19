@@ -19,9 +19,7 @@
  * centroid does not become pointed by scaling it). The fix is the split the source pipeline
  * already made and shipped (#54: files chunked into per-section retrieval units, file = unit of
  * truth), applied natively — rank by the MAX cosine over a concept's own live observation
- * vectors, then dedupe to one card per concept. Native and source memory now share ONE retrieval
- * architecture: scoreSourceConcepts (below) and scoreNativeConceptsByObservation are the same
- * shape, and the two live side by side here so they cannot drift apart.
+ * vectors, then dedupe to one card per concept.
  *
  * Concept centroids are RETIRED FROM QUERY RANKING. They are retained for store-time resolution
  * only (resolve-or-create / dedup / merge / graph `related`), which is out of this slice's scope
@@ -137,7 +135,7 @@ export interface NativeObservationMatch {
  * the engine uses for an observation's active-ness (see the source active-pointer backfill in
  * engine.ts init()). A superseded observation is history: it must not retrieve.
  *
- * `kind != 'source'` matches enforcedNativeObservationRows (engine.ts) — the selector that defines
+ * enforcedNativeObservationRows (engine.ts) is the selector that defines
  * migrateEmbeddings' native-observations coverage — because a native concept CAN legitimately hold
  * a source-kind observation: the graft path writes the incoming row's `kind` verbatim and then
  * normalizes only its `circle` against the owning native concept (engine.ts, upsertObservation in
@@ -146,22 +144,20 @@ export interface NativeObservationMatch {
  * "migration coverage = ALL vectors that scoring reads" invariant. Aligning the two predicates is
  * what keeps that invariant true by construction rather than by luck.
  *
- * ZERO VECTORS are excluded rather than scored as 0 (isZeroVector), matching scoreSourceConcepts:
- * an all-zero embedding is a placeholder, not a measurement, and cosine against it is 0 for every
+ * ZERO VECTORS are excluded rather than scored as 0 (isZeroVector): an all-zero embedding is a
+ * placeholder, not a measurement, and cosine against it is 0 for every
  * query — which would otherwise let a placeholder define a concept's score.
  *
  * NO CENTROID FALLBACK — deliberate, and the sharp edge of this design. A native concept with no
  * usable live observation vector is simply ABSENT from the returned map and invisible to search.
  * Falling back to `concepts.embedding` would reintroduce
  * the exact blurred-centroid ranking this split exists to remove, on the rows least able to
- * afford it. Source concepts keep THEIR whole-file fallback (scoreSourceConcepts, below) because
- * a source concept's centroid is a file, which is #54's ratified unit of truth — not the same
- * object at all.
+ * afford it.
  *
  * The candidate ids are bound through `json_each(?)` as ONE JSON-array parameter rather than an
  * `IN (?,?,...)` list whose host-parameter count scales with the candidate count: this build's
- * SQLite accepts at most 32766 bound parameters (measured directly — see scoreSourceConcepts's
- * note), a reachable number for a large store. One query, parameter count exactly 1, regardless
+ * SQLite accepts at most 32766 bound parameters (measured directly), a reachable number for a
+ * large store. One query, parameter count exactly 1, regardless
  * of how many concepts are in scope.
  *
  * Ties break on the lexicographically smaller observation id: two observations of one concept can
@@ -204,13 +200,11 @@ export function scoreNativeConceptsByObservation(
          FROM observation_segments s
          JOIN observations o ON o.id = s.observation_id
         WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
-          AND o.kind != 'source'
           AND o.concept_id IN (SELECT value FROM json_each(?))
        UNION ALL
        SELECT o.concept_id AS concept_id, o.id AS observation_id, o.embedding AS embedding
          FROM observations o
         WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
-          AND o.kind != 'source'
           AND o.concept_id IN (SELECT value FROM json_each(?))
           AND NOT EXISTS (SELECT 1 FROM observation_segments s2 WHERE s2.observation_id = o.id)`,
     )
@@ -264,7 +258,6 @@ function applyLexicalArm(
          FROM observation_tokens t
          JOIN observations o ON o.id = t.observation_id
         WHERE o.superseded_by IS NULL AND o.superseded_at IS NULL
-          AND o.kind != 'source'
           AND t.token IN (SELECT value FROM json_each(?))
           AND o.concept_id IN (SELECT value FROM json_each(?))`,
     )
@@ -307,78 +300,3 @@ function applyLexicalArm(
   }
 }
 
-/**
- * Chunk-granular source retrieval (ratified, #54): scores each kind='source' row in `rows` by
- * MAX(whole-file concepts.embedding cosine, every ACTIVE chunk vector's cosine)
- * (source_chunks.lifecycle='active' → observations.embedding — the same join listMemories' own
- * provenance count uses, at `SELECT concept_id, observation_id FROM source_chunks WHERE
- * lifecycle='active' ...`), instead of JUST the single mean-pooled whole-file concepts.embedding
- * every OTHER consumer (dedup, graph, pin sampling) still reads unchanged. A multi-section
- * file's one on-topic chunk no longer gets diluted below the noise floor by every unrelated
- * section sharing that one vector.
- *
- * REVIEW FIX (Codex P2 finding 5): the whole-file cosine is an UNCONDITIONAL candidate in the
- * max now, not an all-or-nothing fallback used only when every chunk vector is zero. The
- * all-zero case (a store synced by an older build, storeSourceChunk used to write an all-zero
- * placeholder always; see its own comment) is the OBVIOUS case that needs it, but a subtler one
- * matters just as much: a file PARTIALLY refreshed by a content-changing sync on an old-build
- * store — the edited section gets a real vector, every UNCHANGED section keeps its zero
- * placeholder (storeSourceChunk only ever writes on an actual content change; see
- * materializeStagedBindings' unchanged-content fast path, source-sync.ts). With the old
- * all-or-nothing fallback, ANY non-zero chunk suppressed it entirely, so a query about one of the
- * still-zero UNCHANGED sections scored against only the unrelated edited chunk — worse than
- * status-quo whole-file scoring, not just no-better. Folding the whole-file cosine into the max
- * unconditionally closes that gap (it's a superset of the old behavior: identical whenever no
- * chunk is non-zero, since the max of one candidate is itself; never worse when a chunk IS
- * non-zero, since max only ever adds a candidate, never removes one).
- *
- * REVIEW FIX (Codex P2 finding 6, revised per reviewer follow-up): the chunk-vector query joins
- * the candidate id list through `json_each(?)` on ONE bound JSON-array parameter — the same
- * param-count-independent shape this codebase already uses for ACL membership checks
- * (authorizedSourceProjections' allowed_caller_ids_json/allowed_project_ids_json EXISTS clauses)
- * — rather than an unbounded `IN (?,?,...)` whose host-parameter count scales with the
- * candidate count. The scanner allows up to 10,000 files per source (maxFiles,
- * source-scanner.ts), and this build's actual ceiling was measured directly: SQLite 3.49.2 here
- * accepts up to 32766 bound parameters and throws "too many SQL variables" at 32767 — a real,
- * reachable number for a large multi-source circle, not a theoretical one. json_each(?) makes
- * this query's parameter count exactly 1 regardless of how many source concepts are in scope.
- *
- * Non-source rows are ignored (absent from the returned map) — they are scored by
- * scoreNativeConceptsByObservation instead (the unit split, above), NOT by the plain centroid
- * cosine this function's callers used for them before that split. search() calls this with its
- * authorized source candidate set.
- *
- * NOTE (unit split, deliberate): source scores are NOT subject to NATIVE_SCORE_FLOOR. The floor
- * is a native-arm decision; #54's source semantics are untouched by this slice.
- */
-export function scoreSourceConcepts(
-  db: StoragePort,
-  rows: readonly ScorableConceptRow[],
-  emb: Float32Array,
-): Map<string, number> {
-  const scores = new Map<string, number>();
-  const sourceRows = rows.filter((r) => r.kind === "source");
-  if (sourceRows.length === 0) return scores;
-  const sourceIds = sourceRows.map((r) => r.id);
-  const chunkVectors = db
-    .prepare(
-      `SELECT sc.concept_id AS concept_id, o.embedding AS embedding
-         FROM source_chunks sc JOIN observations o ON o.id = sc.observation_id
-        WHERE sc.lifecycle = 'active' AND sc.concept_id IN (SELECT value FROM json_each(?))`,
-    )
-    .all(JSON.stringify(sourceIds)) as Array<{ concept_id: string; embedding: string }>;
-  const bestByConceptId = new Map<string, number>();
-  for (const chunk of chunkVectors) {
-    const vec = jsonToEmb(chunk.embedding);
-    if (isZeroVector(vec)) continue; // pre-chunk-embedding placeholder — excluded, not scored as 0
-    const cos = cosine(emb, vec);
-    const prior = bestByConceptId.get(chunk.concept_id);
-    if (prior === undefined || cos > prior) bestByConceptId.set(chunk.concept_id, cos);
-  }
-  for (const row of sourceRows) {
-    const wholeFileCos = cosine(emb, jsonToEmb(row.embedding));
-    const bestChunkCos = bestByConceptId.get(row.id);
-    scores.set(row.id, bestChunkCos === undefined ? wholeFileCos : Math.max(wholeFileCos, bestChunkCos));
-  }
-  return scores;
-}

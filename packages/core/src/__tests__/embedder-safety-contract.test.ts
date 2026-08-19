@@ -41,12 +41,11 @@ function insertExternalObservation(db: Database.Database, id: string, width: num
 }
 
 describe("embedder safety contract — checked reads and stable identity", () => {
-  it("rejects malformed search query outputs before native or source-backed scoring", async () => {
+  it("rejects malformed search query outputs before native scoring", async () => {
     const provider = new SwitchableProvider();
     const core = new MonetCore(":memory:", { embedder: provider });
     try {
       await core.store("native scoring row", { resolution: "forceNew" });
-      await core.storeSource("source scoring row", { sourceRefs: ["source://safety/docs.md#row~1"] });
 
       provider.malformed = "wrong-width";
       await expect(core.search("query")).rejects.toBeInstanceOf(EmbedderOutputDimensionError);
@@ -68,7 +67,6 @@ describe("embedder safety contract — checked reads and stable identity", () =>
       });
       provider.malformed = "nonfinite";
       await expect(core.store("nonfinite native")).rejects.toBeInstanceOf(EmbedderOutputNonFiniteError);
-      await expect(core.storeSource("nonfinite source", { sourceRefs: ["source://nonfinite/a"] })).rejects.toBeInstanceOf(EmbedderOutputNonFiniteError);
       await expect(core.search("nonfinite query")).rejects.toBeInstanceOf(EmbedderOutputNonFiniteError);
       expect(JSON.stringify({
         concepts: dbOf(core).prepare(`SELECT * FROM concepts ORDER BY id`).all(),

@@ -220,7 +220,7 @@ function updateWorkstreamRow(
 function workstreamRows(db: StoragePort, circle: string): Array<{ id: string; version: number; body: string }> {
   return db.prepare(
     `SELECT id, version, body FROM concepts
-      WHERE circle = ? AND kind = 'workstream' AND source_identity IS NULL AND active_observation_id IS NULL
+      WHERE circle = ? AND kind = 'workstream'
       ORDER BY id`,
   ).all(circle) as Array<{ id: string; version: number; body: string }>;
 }
@@ -228,7 +228,7 @@ function workstreamRows(db: StoragePort, circle: string): Array<{ id: string; ve
 function workstreamIdentities(db: StoragePort, circle: string): Array<{ id: string; slug: string; title: string; status: string }> {
   return db.prepare(
     `SELECT id, slug, title, status FROM concepts
-      WHERE circle = ? AND kind = 'workstream' AND source_identity IS NULL AND active_observation_id IS NULL
+      WHERE circle = ? AND kind = 'workstream'
       ORDER BY id`,
   ).all(circle) as Array<{ id: string; slug: string; title: string; status: string }>;
 }
@@ -242,7 +242,7 @@ function revisionVersions(db: StoragePort, conceptId: string): number[] {
 function workstreamStatuses(db: StoragePort, circle: string): Array<{ id: string; status: string; updatedAt: number }> {
   return (db.prepare(
     `SELECT id, status, updated_at FROM concepts
-      WHERE circle = ? AND kind = 'workstream' AND source_identity IS NULL AND active_observation_id IS NULL
+      WHERE circle = ? AND kind = 'workstream'
       ORDER BY id`,
   ).all(circle) as Array<{ id: string; status: string; updated_at: number }>)
     .map((row) => ({ id: row.id, status: row.status, updatedAt: row.updated_at }));
@@ -1312,19 +1312,6 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     core.close();
   });
 
-  it("unaddressed unnamed occupancy by a connector-owned row refuses with candidates instead of overwriting", async () => {
-    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
-    const db = rawDb(core);
-    insertWorkstreamRow(db, { id: "owned-unnamed", circle: "owned", nextStep: "source" });
-    db.prepare(`UPDATE concepts SET source_identity=? WHERE id=?`).run("source://owned", "owned-unnamed");
-
-    await expect(core.saveWorkstream({ status: "active" }, { circle: "owned" }))
-      .rejects.toMatchObject({ name: "WorkstreamAddressRequiredError", candidates: [] });
-    await expect(core.saveWorkstream({ id: "owned-unnamed", status: "active" }, { circle: "owned" }))
-      .rejects.toThrow(/connector-owned workstream/);
-    core.close();
-  });
-
   it("captures slotless inbox finds, excludes the inbox from active threads, and disposes by literal id", async () => {
     const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
     const captured = await core.captureFind("Follow up on the flaky test");
@@ -1355,22 +1342,6 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
       .rejects.toThrow(/inbox has no lifecycle/);
     await expect(core.saveWorkstream({ id: "inbox", open: [{ slot: "step", text: "not allowed" }] }))
       .rejects.toThrow(/inbox has no lifecycle/);
-    core.close();
-  });
-
-  it("inbox capture refuses a connector-owned reserved slug", async () => {
-    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
-    const db = rawDb(core);
-    insertWorkstreamRow(db, {
-      id: "owned-inbox",
-      circle: "owned-inbox",
-      slug: "workstream:owned-inbox::inbox",
-      nextStep: "source",
-    });
-    db.prepare(`UPDATE concepts SET source_identity=? WHERE id=?`).run("source://owned-inbox", "owned-inbox");
-
-    await expect(core.captureFind("must not overwrite", { circle: "owned-inbox" }))
-      .rejects.toThrow(/connector-owned workstream inbox/);
     core.close();
   });
 
@@ -1512,23 +1483,6 @@ describe("workstream + checkpoint (session-state survival, #241)", () => {
     expect(saved!.id).toBe("survivor");
     expect(saved!.version).toBe(1);
     expect(workstreamStatuses(db, "peer").find((s) => s.id === "loser")?.status).toBe("archived"); // never resurrected
-    core.close();
-  });
-
-  it("saveWorkstream rejects a connector-owned same-slug row even with an ordinary candidate present", async () => {
-    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
-    const db = rawDb(core);
-    insertWorkstreamRow(db, { id: "ordinary", circle: "guard", version: 0, updatedAt: 100, nextStep: "ordinary" });
-    insertWorkstreamRow(db, { id: "connector", circle: "guard", version: 1, updatedAt: 200, nextStep: "connector" });
-    db.prepare(`UPDATE concepts SET source_identity = ? WHERE id = ?`).run("source://guard", "connector");
-
-    await expect(core.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "caller" }] }, { circle: "guard" }))
-      .rejects.toMatchObject({
-        name: "WorkstreamAddressRequiredError",
-        candidates: [{ id: "ordinary", title: "workstream: ordinary" }],
-      });
-
-    expect(workstreamRows(db, "guard").map((row) => row.id)).toEqual(["ordinary"]);
     core.close();
   });
 
@@ -1695,24 +1649,6 @@ describe("renameCircle workstream collision canonicalization (mint-site dup guar
     ]);
     expect(openTexts(active.find((row) => row.id === "a-ws")!.payload, "step")).toEqual(["moved in from A"]);
     expect(openTexts(active.find((row) => row.id === "b-ws")!.payload, "step")).toEqual(["already in B"]);
-    core.close();
-  });
-
-  it("rename collision leaves connector-owned and ordinary destination rows untouched", () => {
-    const core = new MonetCore(":memory:", { embedder: new StaticEmbeddingProvider() });
-    const db = rawDb(core);
-    insertWorkstreamRow(db, { id: "b-connector", circle: "B", version: 9, updatedAt: 900, nextStep: "connector-owned" });
-    db.prepare(`UPDATE concepts SET source_identity = ? WHERE id = ?`).run("source://b", "b-connector");
-    insertWorkstreamRow(db, { id: "b-ws", circle: "B", version: 0, updatedAt: 200, nextStep: "already in B" });
-    insertWorkstreamRow(db, { id: "a-ws", circle: "A", version: 0, updatedAt: 100, nextStep: "moved in from A" });
-
-    core.renameCircle("A", "B");
-
-    const row = (id: string): { status: string; slug: string } =>
-      db.prepare(`SELECT status, slug FROM concepts WHERE id = ?`).get(id) as { status: string; slug: string };
-    expect(row("b-connector")).toEqual({ status: "active", slug: "workstream:B" });
-    expect(row("b-ws")).toEqual({ status: "active", slug: "workstream:B" });
-    expect(row("a-ws")).toEqual({ status: "active", slug: "workstream:B::2" });
     core.close();
   });
 

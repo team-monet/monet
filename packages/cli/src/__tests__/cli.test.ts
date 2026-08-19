@@ -134,41 +134,4 @@ describe("CLI store visibility", () => {
     expect(existsSync(join(cwdB, ".monet"))).toBe(false); // cwd's own store was never touched
   });
 
-  it("P1-B (Codex round 4 on PR #42): source add writes into MONET_PROJECT_DIR's store AND derives its circle against it, not cwd, when they diverge (the pairing invariant: the store opened and the store consulted are the same object)", () => {
-    const projectA = mkdtempSync(join(tmpdir(), "monet-source-a-"));
-    const cwdB = mkdtempSync(join(tmpdir(), "monet-source-b-"));
-    const isolatedHome = mkdtempSync(join(tmpdir(), "monet-source-home-"));
-    dirs.push(projectA, cwdB, isolatedHome);
-    mkdirSync(join(projectA, ".monet"), { recursive: true }); // see the status test above for why
-
-    const result = spawnSync(
-      process.execPath,
-      ["--import", TSX_LOADER, CLI_ENTRY, "source", "add", "https://github.com/acme/widgets", "--branch", "main"],
-      {
-        cwd: cwdB,
-        encoding: "utf8",
-        env: { ...process.env, MONET_PROJECT_DIR: projectA, HOME: isolatedHome, MONET_STORAGE_DIR: "" },
-      },
-    );
-
-    expect(result.status).toBe(0);
-    expect(existsSync(join(cwdB, ".monet"))).toBe(false); // openCore never opened cwd's store
-
-    const core = new MonetCore(join(projectA, ".monet", "monet.db"), {
-      sourceStorageDir: join(projectA, ".monet", "sources"),
-    });
-    try {
-      const sources = core.listSources();
-      expect(sources).toHaveLength(1);
-      expect(sources[0].name).toBe("widgets");
-      // PAIRING INVARIANT: the circle assigned is exactly what deriveCircle(A) itself produces —
-      // proving deriveCircle was ALSO consulted against A, not cwdB (neither dir is a git repo, so
-      // both fall through to the pure folder-hash, which differs between two distinct absolute
-      // paths — the two roots could not silently agree by coincidence).
-      expect(sources[0].circle).toBe(coreDeriveCircle(projectA));
-      expect(sources[0].circle).not.toBe(coreDeriveCircle(cwdB));
-    } finally {
-      core.close();
-    }
-  });
 });

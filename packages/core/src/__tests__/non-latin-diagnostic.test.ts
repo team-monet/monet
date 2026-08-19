@@ -126,30 +126,6 @@ describe("doctor's non-Latin count", () => {
     expect(inspection.nonLatin.sampleIds).toEqual([]);
   });
 
-  it("counts SOURCE observations too — the migration re-embeds them and search compares them", async () => {
-    // enforcedSourceObservationRows is a second selector migrateEmbeddings drives, and
-    // scoreSourceConcepts compares those vectors against live queries. A scan that filtered on
-    // kind != 'source' reported zero while the rewrite made source recall meaningless
-    // (Codex P1, PR #173).
-    const dir = freshDir();
-    const path = join(dir, "monet.db");
-    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
-    await core.ensureEmbedderPin();
-    await core.store(ENGLISH);
-    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
-    db.prepare(
-      `INSERT INTO observations (id, concept_id, content, kind, embedding, created_at, author_agent_id)
-       VALUES (?, NULL, ?, 'source', '[]', 1, 'test')`,
-    ).run("src-korean-1", KOREAN);
-    core.close();
-
-    const n = inspectStoredEmbedderState(path).nonLatin;
-    expect(n.status).toBe("known");
-    if (n.status !== "known") return;
-    expect(n.observationCount).toBe(1);
-    expect(n.sampleIds).toContain("src-korean-1");
-  });
-
   it("counts SUPERSEDED native rows — the migration rewrites those as well", async () => {
     // enforcedNativeObservationRows has NO supersession filter. A scan that added one under-counted
     // exactly the rows the rewrite still touches.
@@ -166,26 +142,6 @@ describe("doctor's non-Latin count", () => {
     expect(n.status).toBe("known");
     if (n.status !== "known") return;
     expect(n.observationCount).toBeGreaterThan(0);
-  });
-
-  it("counts source rows in a store that predates source_chunks — SourceLedger creates it on open, and the migration then takes them", async () => {
-    const dir = freshDir();
-    const path = join(dir, "monet.db");
-    const core = new MonetCore(path, { embedder: new HashingEmbeddingProvider() });
-    await core.ensureEmbedderPin();
-    await core.store(ENGLISH);
-    const db = (core as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => void } } }).db;
-    db.prepare(
-      `INSERT INTO observations (id, concept_id, content, kind, embedding, created_at, author_agent_id)
-       VALUES (?, NULL, ?, 'source', '[]', 1, 'test')`,
-    ).run("legacy-src-1", KOREAN);
-    db.prepare(`DROP TABLE IF EXISTS source_chunks`).run();
-    core.close();
-
-    const n = inspectStoredEmbedderState(path).nonLatin;
-    expect(n.status).toBe("known");
-    if (n.status !== "known") return;
-    expect(n.sampleIds).toContain("legacy-src-1");
   });
 
   it("counts a non-Latin CONCEPT BODY even when every observation is English — applySynthesis has no script gate", async () => {

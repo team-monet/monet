@@ -204,47 +204,6 @@ describe("recall unit split — which observations count", () => {
     }
   });
 
-  it("ignores a source-kind observation parked on a native concept (migration-coverage invariant)", async () => {
-    const embedder = new HashingEmbeddingProvider();
-    const core = newCore(embedder);
-    try {
-      const concept = await core.store("The scheduler retries failed jobs.", { circle: CIRCLE });
-      const db = dbOf(core);
-      // The graft path writes an incoming observation's `kind` VERBATIM and afterwards normalizes
-      // only its `circle` against the owning native concept — never its kind — so a native concept
-      // really can end up holding a kind='source' row. migrateEmbeddings' native-observations
-      // phase selects `WHERE kind != 'source'` (enforcedNativeObservationRows), so such a vector is
-      // never re-embedded; scoring it would compare across two embedding spaces. The scorer's
-      // predicate is aligned with the migration's so that cannot happen.
-      const claim = "Postgres connection pooling uses pgbouncer in transaction mode.";
-      db.prepare(
-        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id, created_at, updated_at)
-         VALUES (?, ?, ?, 'source', ?, ?, 'test', ?, ?)`,
-      ).run("obs-grafted-source", claim, JSON.stringify(Array.from(embedder.embed(claim))), CIRCLE, concept.conceptId, Date.now(), Date.now());
-
-      const query = "pgbouncer transaction mode connection pooling for postgres";
-      const emb = embedder.embed(query);
-      // The grafted row is a near-exact match for this query, so if it were scored it would
-      // dominate. It is not a native retrieval unit, so the concept falls back to its OWN
-      // (much weaker) native evidence instead — the row is skipped, not merely outranked.
-      const sourceRowCosine = cosine(emb, embedder.embed(claim));
-      expect(sourceRowCosine).toBeGreaterThan(0.9);
-      const match = scoreNativeConceptsByObservation(db, [concept.conceptId], emb, query, false).get(concept.conceptId)!;
-      expect(match.observationId).toBe(concept.observationId); // the native one
-      expect(match.observationId).not.toBe("obs-grafted-source");
-      expect(match.score).toBeLessThan(sourceRowCosine / 2);
-
-      // Same through the public read path, and it does not throw.
-      const card = (await core.search(query, { circle: CIRCLE, limit: 5 })).find((c) => c.id === concept.conceptId);
-      expect(card?.matchedObservationId).toBe(concept.observationId);
-    } finally {
-      core.close();
-    }
-  });
-
-
-
-
 });
 
 describe("recall unit split — concepts are the unit of delivery", () => {
