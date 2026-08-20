@@ -22,13 +22,36 @@
 import { dirname } from "node:path";
 import type { StoragePort } from "./storage";
 
-/** Every table the retired source subsystem owned. Dropped whole; none is read any more. */
+/**
+ * The subsystem's tables as the code that created them named them. Kept for tests and for the
+ * documentation value — but NOT what the runtime enumerates, because a hand-maintained list is
+ * exactly what goes stale: the ledger also produced `*_legacy` and `*_rebuild` tables by RENAME
+ * during its own interrupted migrations, and a list built by reading CREATE statements missed
+ * every one of them. `discoverRetiredTables` finds those too.
+ */
 export const RETIRED_SOURCE_TABLES = [
   "source_attempt_events", "source_chunks", "source_cleanup_items", "source_files",
   "source_pre_pin_attempts", "source_recompute_pending", "source_removal_items", "source_removals",
   "source_scheduler_lease", "source_skipped_files", "source_snapshots", "source_staged_chunks",
   "source_staged_files", "source_sync_runs", "source_verification_checks", "knowledge_sources",
 ] as const;
+
+/**
+ * Every retired table actually present, found by name rather than recited from a list.
+ *
+ * The `source_` prefix is unambiguous: no native table in this schema uses it (verified against
+ * every CREATE TABLE in the engine, gates and lifecycle-edges), and `knowledge_sources` is the one
+ * retired table that does not carry the prefix. Discovering rather than listing is what makes an
+ * interrupted-migration leftover — `source_attempt_events_legacy` and its siblings — reachable by
+ * the disposal path instead of stranded past schema 13 with no command able to remove it.
+ */
+export function discoverRetiredTables(db: StoragePort): string[] {
+  return (db.prepare(
+    `SELECT name FROM sqlite_master
+      WHERE type = 'table' AND (name = 'knowledge_sources' OR name LIKE 'source\\_%' ESCAPE '\\')
+      ORDER BY name`,
+  ).all() as Array<{ name: string }>).map((row) => row.name);
+}
 
 const RETIRED_SOURCE_COLUMNS = ["source_identity", "active_observation_id"] as const;
 
@@ -50,11 +73,16 @@ export class SourceRetirementRequiredError extends Error {
     readonly population: { concepts: number; observations: number },
     readonly nonemptyTables: string[] = [],
   ) {
-    // THE COMMAND CARRIES --dir WHEN THE STORE IS NOT THE DEFAULT ONE. An unqualified
-    // `monet retire-source` resolves the ambient default store, so an operator who ran
-    // `monet start -d /srv/project/.monet` and pasted the bare command back would irreversibly
-    // purge a DIFFERENT store than the one that refused.
-    const target = dbPath === null ? "" : ` --dir ${shellQuote(dirname(dbPath))}`;
+    // THE COMMAND IS QUOTED ONLY WHEN THIS ERROR KNOWS WHICH STORE REFUSED. An unqualified
+    // `monet retire-source` resolves the ambient default store — so for a caller-supplied
+    // StoragePort, where the path is genuinely unknown, printing one would name a store that is
+    // not the refused one and could irreversibly purge it instead. Unknown says unknown.
+    const remediation = dbPath === null
+      ? "Dispose of it with `monet retire-source --dir <the directory holding this store> --apply --yes` " +
+        "(it takes a verified backup first) — this store was opened through a caller-supplied port, " +
+        "so its path is not known here and must be named explicitly"
+      : `Run \`monet retire-source --dir ${shellQuote(dirname(dbPath))} --apply --yes\` ` +
+        "(it takes a verified backup first)";
     const held = [
       `${population.concepts} connector-owned concept(s)`,
       `${population.observations} observation(s)`,
@@ -64,9 +92,8 @@ export class SourceRetirementRequiredError extends Error {
       `this store still holds ${held} from the source subsystem, retired in #16. That content is a ` +
         `materialized copy of files outside the store plus the registry describing them, and no ` +
         `surface in this build can read, re-sync, or repair it — but removing it is irreversible, ` +
-        `so this build will not do it implicitly. Run ` +
-        `\`monet retire-source${target} --apply --yes\` (it takes a verified backup first), or ` +
-        `stay on a 1.6.x build if you still need that content.`,
+        `so this build will not do it implicitly. ${remediation}, or stay on a 1.6.x build if you ` +
+        `still need that content.`,
     );
     this.name = "SourceRetirementRequiredError";
   }
@@ -122,9 +149,8 @@ export function connectorPopulation(db: StoragePort): ConnectorPopulation {
  */
 export function retirementData(db: StoragePort): RetirementData {
   const population = connectorPopulation(db);
-  const nonemptyTables = RETIRED_SOURCE_TABLES.filter(
-    (table) => tableExists(db, table) &&
-      ((db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0),
+  const nonemptyTables = discoverRetiredTables(db).filter(
+    (table) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0,
   );
   return { ...population, nonemptyTables };
 }
@@ -148,8 +174,8 @@ export function dropRetiredSourceResidue(db: StoragePort): void {
   // an error. `IF EXISTS` alone would not cover the column half — SQLite has no such form for
   // ALTER TABLE ... DROP COLUMN.
   db.immediateTransaction((): void => {
-    for (const table of RETIRED_SOURCE_TABLES) {
-      if (tableExists(db, table)) db.exec(`DROP TABLE IF EXISTS ${table}`);
+    for (const table of discoverRetiredTables(db)) {
+      db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     const columns = conceptColumns(db);
     for (const column of RETIRED_SOURCE_COLUMNS) {

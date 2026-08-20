@@ -18,6 +18,7 @@ import { MonetCore } from "../engine";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
 import {
+  discoverRetiredTables,
   dropRetiredSourceResidue,
   purgeConnectorPopulation,
   RETIRED_SOURCE_TABLES,
@@ -324,6 +325,40 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
       const port = new BetterSqlitePort(dbPath);
       try {
         expect(port.prepare(`SELECT COUNT(*) AS n FROM knowledge_sources`).get()).toEqual({ n: 1 });
+      } finally {
+        port.close();
+      }
+    });
+  });
+
+  it("finds an interrupted migration's renamed leftovers, which no hand-written list contained", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const db = raw(seeded);
+      // The ledger produced these by RENAME during its own interrupted migrations, so a list built
+      // by reading CREATE statements never held them. Discovery by name is what reaches them.
+      for (const table of [
+        "source_attempt_events_legacy",
+        "source_cleanup_items_legacy",
+        "source_verification_checks_legacy",
+        "source_verification_checks_rebuild",
+      ]) {
+        db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY)`);
+      }
+      db.prepare(`INSERT INTO source_attempt_events_legacy (id) VALUES ('stranded')`).run();
+      db.pragma("user_version = 12");
+      seeded.close();
+
+      let caught: unknown;
+      try { new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 }); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(SourceRetirementRequiredError);
+      expect((caught as SourceRetirementRequiredError).nonemptyTables).toEqual(["source_attempt_events_legacy"]);
+
+      // And disposal reaches every one of them, not just the row-bearing one.
+      purgeOnPort(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        expect(discoverRetiredTables(port)).toEqual([]);
       } finally {
         port.close();
       }
