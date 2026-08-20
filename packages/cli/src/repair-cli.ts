@@ -1108,6 +1108,17 @@ export function registerRecoveryCommands(
           `Restore from a backup, or run \`${doctorCommand(dbPath)}\` for the full report.`,
         );
       }
+      // DOWNGRADE REFUSAL, BEFORE THE PORT IS EVEN OPENED — the same guard the repair path carries,
+      // and this command needs it more: it decides what to delete from THIS build's ownership
+      // predicate and dependency list. A newer schema may reference these rows from tables this
+      // build cannot see, or give `kind='source'` a different meaning entirely, so proceeding would
+      // delete valid data and strand what it could not name.
+      if (inspection.schemaVersion !== null && inspection.schemaVersion > inspection.supportedSchemaVersion) {
+        throw new Error(
+          `store schema ${inspection.schemaVersion} is newer than supported schema ` +
+          `${inspection.supportedSchemaVersion}; refusing to retire source rows from it. Upgrade Monet first.`,
+        );
+      }
 
       const port = dependencies.createPort(dbPath);
       let population: { conceptIds: string[]; observationIds: string[] };

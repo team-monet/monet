@@ -155,4 +155,25 @@ describe("monet retire-source", () => {
       expect(readdirSync(join(dbPath, ".."))).not.toContain("backups");
     });
   });
+
+  it("refuses a store whose schema is newer than this build supports, before opening a write port", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      port.pragma("user_version = 99");
+      port.close();
+
+      await expect(run(["retire-source", "--apply", "--yes"], dependencies))
+        .rejects.toThrow(/store schema 99 is newer than supported schema/);
+
+      // Nothing was deleted and no backup was taken for a purge that must not run.
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 1 });
+      } finally {
+        check.close();
+      }
+      expect(existsSync(join(dbPath, "..", "backups"))).toBe(false);
+    });
+  });
 });

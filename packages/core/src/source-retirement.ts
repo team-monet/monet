@@ -60,6 +60,10 @@ function conceptColumns(db: StoragePort): Set<string> {
   );
 }
 
+function tableExists(db: StoragePort, table: string): boolean {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as unknown[]).length > 0;
+}
+
 /**
  * The rows the retired subsystem owned. A store old enough to predate the marker columns can only
  * carry them as `kind='source'`, which is why the predicate is assembled rather than fixed.
@@ -84,15 +88,22 @@ export function connectorPopulation(db: StoragePort): ConnectorPopulation {
  * columns because the rows that could hold a value are exactly the ones that had to go first.
  */
 export function dropRetiredSourceResidue(db: StoragePort): void {
-  const columns = conceptColumns(db);
-  for (const table of RETIRED_SOURCE_TABLES) {
-    if ((db.prepare(`PRAGMA table_info(${table})`).all() as unknown[]).length > 0) {
-      db.exec(`DROP TABLE ${table}`);
+  // ONE WRITE TRANSACTION, AND EACH OBJECT RE-CHECKED INSIDE IT. Concurrent first opens are a
+  // supported topology (several `monet start` servers against one store), and a presence check
+  // taken outside the write lock is stale by the time the drop runs: both processes see the table,
+  // one drops it, the other fails with `no such table` and takes an ordinary open down with it.
+  // The transaction serializes the two, and the re-read inside makes the loser a no-op rather than
+  // an error. `IF EXISTS` alone would not cover the column half — SQLite has no such form for
+  // ALTER TABLE ... DROP COLUMN.
+  db.immediateTransaction((): void => {
+    for (const table of RETIRED_SOURCE_TABLES) {
+      if (tableExists(db, table)) db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
-  }
-  for (const column of RETIRED_SOURCE_COLUMNS) {
-    if (columns.has(column)) db.exec(`ALTER TABLE concepts DROP COLUMN ${column}`);
-  }
+    const columns = conceptColumns(db);
+    for (const column of RETIRED_SOURCE_COLUMNS) {
+      if (columns.has(column)) db.exec(`ALTER TABLE concepts DROP COLUMN ${column}`);
+    }
+  })();
 }
 
 /**
@@ -112,10 +123,17 @@ export function purgeConnectorPopulation(db: StoragePort): { concepts: number; o
     const inSet = `IN (SELECT value FROM json_each(?))`;
     // Entity rows are counted BEFORE their memberships go, so the df recount below sees the exact
     // set that lost a member; reversing the order loses the list of what to recount.
-    const affectedEntities = db.prepare(
-      `SELECT DISTINCT entity_key AS key, scope FROM concept_entities WHERE concept_id ${inSet}`,
-    ).all(c) as Array<{ key: string; scope: string }>;
+    const affectedEntities = tableExists(db, "concept_entities")
+      ? db.prepare(
+          `SELECT DISTINCT entity_key AS key, scope FROM concept_entities WHERE concept_id ${inSet}`,
+        ).all(c) as Array<{ key: string; scope: string }>
+      : [];
 
+    // TABLE-PRESENCE GUARDED, EVERY ONE. `monet retire-source` opens a raw port and never runs the
+    // engine's migrations, so a store old enough to predate an additive table (observation_tokens
+    // and observation_segments are the recent ones) reaches here without it. An unguarded DELETE
+    // would raise `no such table`, roll the purge back, and leave the operator holding a fresh
+    // backup and no way to finish the migration it was taken for.
     for (const [sql, params] of [
       [`DELETE FROM observation_tokens WHERE observation_id ${inSet}`, [o]],
       [`DELETE FROM observation_segments WHERE observation_id ${inSet}`, [o]],
@@ -137,9 +155,12 @@ export function purgeConnectorPopulation(db: StoragePort): { concepts: number; o
       [`DELETE FROM observations WHERE id ${inSet}`, [o]],
       [`DELETE FROM concepts WHERE id ${inSet}`, [c]],
     ] as Array<[string, string[]]>) {
+      const table = /(?:DELETE FROM|UPDATE) ([a-z_]+)/.exec(sql)?.[1];
+      if (table && !tableExists(db, table)) continue;
       db.prepare(sql).run(...params);
     }
 
+    if (!tableExists(db, "entities")) return { concepts: conceptIds.length, observations: observationIds.length };
     for (const entity of affectedEntities) {
       db.prepare(
         `UPDATE entities SET df = (

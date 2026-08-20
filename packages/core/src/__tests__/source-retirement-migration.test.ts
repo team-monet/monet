@@ -18,6 +18,7 @@ import { MonetCore } from "../engine";
 import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
 import {
+  dropRetiredSourceResidue,
   purgeConnectorPopulation,
   RETIRED_SOURCE_TABLES,
   SourceRetirementRequiredError,
@@ -193,6 +194,75 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
         expect(columns.has("active_observation_id")).toBe(false);
       } finally {
         core.close();
+      }
+    });
+  });
+
+  it("closes a constructor-owned port when it refuses, so the remediation can take exclusive ownership", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      await seeded.store("A native memory.", { resolution: "forceNew" });
+      seedSchema12(seeded);
+      seeded.close();
+
+      // Ten refused opens. Each leaks a connection if the throw abandons its port, and the verified
+      // backup the error tells the operator to run needs exclusive ownership of the file.
+      for (let attempt = 0; attempt < 10; attempt++) {
+        expect(() => new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 }))
+          .toThrow(SourceRetirementRequiredError);
+      }
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        await expect(port.createVerifiedBackup(join(dbPath, "..", "after-refusals.db"))).resolves.toBeTruthy();
+      } finally {
+        port.close();
+      }
+    });
+  });
+
+  it("purges a store that predates the additive observation tables instead of rolling back on the first absent one", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      seedSchema12(seeded);
+      // An older source-enabled store: the connector rows are there, the newer additive tables are not.
+      raw(seeded).exec(`DROP TABLE observation_tokens`);
+      raw(seeded).exec(`DROP TABLE observation_segments`);
+      seeded.close();
+
+      expect(purgeOnPort(dbPath)).toEqual({ concepts: 1, observations: 1 });
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        expect(port.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 0 });
+      } finally {
+        port.close();
+      }
+    });
+  });
+
+  /*
+   * WHAT THIS DOES AND DOES NOT PROVE. It pins that a second residue drop is inert — a real
+   * property, and the one a re-run depends on. It does NOT reproduce the cross-process race Codex
+   * named: that needs both migrators to take their presence check before either drop commits, and
+   * two sequential in-process calls cannot open that window (verified — this test passes against
+   * the unfixed code). The race is closed by construction instead: the drop runs in one write
+   * transaction and re-reads presence inside it, so the loser sees the object already gone.
+   */
+  it("is inert on a second residue drop", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      seedSchema12(seeded);
+      seeded.close();
+      purgeOnPort(dbPath);
+
+      // The loser of the race sees the table in its own check and finds it gone at the drop.
+      const first = new BetterSqlitePort(dbPath);
+      const second = new BetterSqlitePort(dbPath);
+      try {
+        dropRetiredSourceResidue(first);
+        expect(() => dropRetiredSourceResidue(second)).not.toThrow();
+      } finally {
+        first.close();
+        second.close();
       }
     });
   });

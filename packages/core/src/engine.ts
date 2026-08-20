@@ -2527,7 +2527,13 @@ export class MonetCore {
    */
   constructor(db: string | StoragePort = ":memory:", opts: MonetCoreOptions = {}) {
     this.storeHome = typeof db === "string" && db !== ":memory:" ? dirname(resolve(db)) : null;
-    this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
+    // Ownership, tracked because the constructor can now THROW after opening: rung 13 refuses a
+    // store whose connector rows have not been disposed of. A caller that catches that error and
+    // follows the remediation in the same process must not be racing an unreachable connection for
+    // exclusive ownership, so a port this constructor opened is closed on the way out. A
+    // caller-supplied port stays the caller's to close.
+    const ownsPort = typeof db === "string";
+    this.db = ownsPort ? new BetterSqlitePort(db) : (db as StoragePort);
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
     this.deferCreatedPin = opts.deferCreatedPin ?? false;
@@ -2602,7 +2608,12 @@ export class MonetCore {
       this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
     }
     this.migrateFirstBlockPins();
-    this.migrateSourceRetirement();
+    try {
+      this.migrateSourceRetirement();
+    } catch (error) {
+      if (ownsPort) this.db.close();
+      throw error;
+    }
     // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
     // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
     // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
