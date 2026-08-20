@@ -120,10 +120,13 @@ export function connectorPopulation(db: StoragePort): ConnectorPopulation {
   ].join(" OR ");
   const conceptIds = (db.prepare(`SELECT id FROM concepts WHERE ${marker}`).all() as Array<{ id: string }>)
     .map((row) => row.id);
-  const observationIds = (db.prepare(
-    `SELECT id FROM observations
-      WHERE kind = 'source' OR concept_id IN (SELECT value FROM json_each(?))`,
-  ).all(JSON.stringify(conceptIds)) as Array<{ id: string }>).map((row) => row.id);
+  // CONNECTOR EVIDENCE, NOT "EVERYTHING THAT CONCEPT OWNS". Retained rows are served as ordinary
+  // memories after the upgrade, so a user can legitimately attach new native observations to one —
+  // and taking the whole parent population would delete what they wrote themselves, months after
+  // the connector that made the rest of it stopped existing. `kind` is what marks connector
+  // evidence; ownership is not.
+  const observationIds = (db.prepare(`SELECT id FROM observations WHERE kind = 'source'`).all() as Array<{ id: string }>)
+    .map((row) => row.id);
   return { conceptIds, observationIds };
 }
 
@@ -261,7 +264,10 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       // concept can end up with no live evidence at all after the successor is purged.
       [`UPDATE observations SET superseded_by = NULL, superseded_at = NULL WHERE superseded_by ${inSet}`, [o]],
       [`DELETE FROM observations WHERE id ${inSet}`, [o]],
-      [`DELETE FROM concepts WHERE id ${inSet}`, [c]],
+      // A concept the user has since written on SURVIVES, as an ordinary one — only the concepts
+      // left with no evidence at all go.
+      [`DELETE FROM concepts WHERE id ${inSet}
+          AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.concept_id = concepts.id)`, [c]],
     ] as Array<[string, string[]]>) {
       const table = /(?:DELETE FROM|UPDATE) ([a-z_]+)/.exec(sql)?.[1];
       if (table && !tableExists(db, table)) continue;

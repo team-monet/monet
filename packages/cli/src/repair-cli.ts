@@ -1132,9 +1132,20 @@ export function registerRecoveryCommands(
       const counts = { concepts: data.conceptIds.length, observations: data.observationIds.length };
 
       if (isRetirementDisposed(data)) {
-        if (options.apply) port.close();
+        // THE EMPTY RESIDUE IS DROPPED HERE OR NOWHERE. Rung 13 is a bare version bump — it does
+        // not dispose of anything — so telling the operator "the next open will remove it" would
+        // promise a migration that does not exist. With every table empty and both marker columns
+        // null there is nothing to lose, which is why this needs no backup.
+        if (options.apply) {
+          dropRetiredSourceResidue(port);
+          port.close();
+          console.log("Nothing to retire: no connector-owned rows and no registry data.");
+          console.log("Dropped the empty tables and marker columns the subsystem left behind.");
+          return;
+        }
+        port.close();
         console.log("Nothing to retire: this store holds no connector-owned rows and no registry data.");
-        console.log("Open it normally — the empty tables and marker columns are dropped on the next open.");
+        console.log(`Its empty tables and marker columns are dropped by: ${commandBase(dbPath).replace(" repair", " retire-source")} --apply --yes`);
         return;
       }
 

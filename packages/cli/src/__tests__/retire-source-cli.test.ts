@@ -261,4 +261,64 @@ describe("monet retire-source", () => {
       expect(existsSync(join(dbPath, "..", "backups"))).toBe(false);
     });
   });
+
+  it("keeps observations the user attached after the upgrade, and the concept they belong to", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // Retained rows are served as ordinary memories, so a user can legitimately write on one.
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('user-note', 'my own note on this file', '[0.1,0.2]', 'statement', 'default',
+                 'connector-concept', 'local', ?, ?, '[]')`,
+      ).run(now, now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        // The connector's own chunk is gone; what the user wrote is not, and neither is its concept.
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE kind = 'source'`).get()).toEqual({ n: 0 });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'user-note'`).get()).toEqual({ n: 1 });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE id = 'connector-concept'`).get())
+          .toEqual({ n: 1 });
+      } finally {
+        check.close();
+      }
+    });
+  });
+
+  it("drops the empty residue itself rather than promising a migration that no longer exists", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      // Retired tables and marker columns present, all empty — nothing to lose, so no backup.
+      const core = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const db = (core as unknown as { db: BetterSqlitePort }).db;
+      db.exec(`ALTER TABLE concepts ADD COLUMN source_identity TEXT`);
+      for (const table of RETIRED_SOURCE_TABLES) {
+        db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, circle TEXT)`);
+      }
+      core.close();
+
+      const output = await run(["retire-source", "--apply", "--yes"], dependencies);
+      expect(output.stdout).toContain("Dropped the empty tables");
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        const tables = new Set(
+          (check.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>)
+            .map((row) => row.name),
+        );
+        for (const table of RETIRED_SOURCE_TABLES) expect(tables.has(table)).toBe(false);
+        const columns = new Set(
+          (check.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>).map((c) => c.name),
+        );
+        expect(columns.has("source_identity")).toBe(false);
+      } finally {
+        check.close();
+      }
+    });
+  });
 });
