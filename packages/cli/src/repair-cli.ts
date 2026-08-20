@@ -1180,43 +1180,6 @@ export function registerRecoveryCommands(
        * nothing to retire and the stale projection can never be repaired. Loading it first turns
        * that unrecoverable state into a refusal that touches nothing.
        */
-      /*
-       * REQUIRED WHENEVER A CONNECTOR CONCEPT EXISTS, not only when one already needs repairing.
-       *
-       * Whether a reprojection is owed is decided by the purge, under its own lock — and a Monet
-       * server sharing this store can attach native evidence to a connector concept between this
-       * reading and `createVerifiedBackup()` taking ownership. Basing the decision on the earlier
-       * reading meant the repair core could be built with no embedder for a survivor that appeared
-       * in between, failing pin validation only after the purge had committed.
-       *
-       * A store whose retirement data is only registry and ledger rows still skips this: with no
-       * connector concept there is nothing an attach could land on.
-       */
-      // `staleNativeOwners` covers the shape with NO connector concept at all: a native concept
-      // holding a grafted `kind='source'` observation. Its owner needs reprojection just the same,
-      // and gating only on connector concepts left that store's projections stale with no rows
-      // left for a re-run to find them by.
-      const mayNeedReprojection = data.conceptIds.length > 0 || data.staleNativeOwners.length > 0;
-      let embedder: EmbeddingProvider | undefined;
-      if (mayNeedReprojection && (inspection.pin.status !== "known" || inspection.pin.modelId === null)) {
-        throw new Error(
-          `this store's embedder pin is not usable (${inspection.pin.status}), so a purged observation's owner could ` +
-          `not be reprojected afterwards. Diagnose with \`${doctorCommand(dbPath)}\` first — this command ` +
-          `refuses rather than delete rows it cannot finish repairing.`,
-        );
-      }
-      try {
-        if (mayNeedReprojection && inspection.pin.status === "known" && inspection.pin.modelId !== null) {
-          embedder = await dependencies.instantiate(inspection.pin.modelId);
-        }
-      } catch (error) {
-        throw new Error(
-          `the store's pinned embedder could not be loaded ` +
-          `(${error instanceof Error ? error.message : String(error)}); refusing to purge, because a ` +
-          `purged observation's owner could not be reprojected afterwards. Nothing has been deleted.`,
-        );
-      }
-
       {
         const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
         mkdirSync(path.dirname(destination), { recursive: true });
@@ -1245,15 +1208,35 @@ export function registerRecoveryCommands(
         // the observation leaves its owner's support count, centroid and confidence describing
         // evidence that no longer exists. The engine owns that projection logic; the purge only
         // reports who needs it. Safe to open now — the population it would refuse is gone.
+        /*
+         * THE EMBEDDER IS LOADED HERE, and only if the purge actually produced work for it.
+         *
+         * Under this command's policy a connector concept is either deleted whole or left
+         * untouched, so neither needs reprojection — the only owner that does is a NATIVE concept
+         * that held a grafted source observation, and whether one exists is decided by the purge
+         * under its own lock, not by a reading taken before it. Requiring the pin up front
+         * therefore blocked disposal on stores that would never have used it: an unreadable model
+         * cache was enough to make a store permanently unretirable.
+         *
+         * Loading late costs the guarantee that a failure happens before any delete. What replaces
+         * it is that the failure is recoverable and says so: the backup is on disk and the ids that
+         * still need repairing are named, which is exactly what an earlier version of this code
+         * could not do when it lost them to a committed purge.
+         */
         if (purged.staleNativeOwners.length > 0) {
-          // Belt and braces: the preflight above covers every store that could produce a survivor,
-          // so an owner set with no embedder behind it means the two disagreed — say so rather
-          // than build a core that will fail its pin assert after the delete has committed.
-          if (!embedder) {
+          let embedder: EmbeddingProvider;
+          try {
+            if (inspection.pin.status !== "known" || inspection.pin.modelId === null) {
+              throw new Error(`the store's embedder pin is ${inspection.pin.status}`);
+            }
+            embedder = await dependencies.instantiate(inspection.pin.modelId);
+          } catch (error) {
             throw new Error(
-              `${purged.staleNativeOwners.length} concept(s) need reprojection but no embedder was ` +
-              `loaded for this run. The purge is committed and the backup is at ${backup.path}; ` +
-              `run \`${doctorCommand(dbPath)}\` and repair those concepts before relying on their ranking.`,
+              `${purged.staleNativeOwners.length} concept(s) still need reprojection, and the ` +
+              `store's pinned embedder could not be loaded ` +
+              `(${error instanceof Error ? error.message : String(error)}). The purge is committed ` +
+              `and the backup is at ${backup.path}. The concepts are: ` +
+              `${purged.staleNativeOwners.join(", ")} — repair them once the model is available.`,
             );
           }
           const core = dependencies.createCore(dependencies.createPort(dbPath), embedder);

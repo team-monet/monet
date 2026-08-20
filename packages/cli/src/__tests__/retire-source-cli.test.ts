@@ -223,11 +223,13 @@ describe("monet retire-source", () => {
     });
   });
 
-  it("refuses before deleting anything when the pinned embedder cannot be loaded", async () => {
+  it("names the concepts still needing repair when the embedder cannot be loaded after the purge", async () => {
     await withStore(async (dbPath, dependencies) => {
       seedSchema12Store(dbPath);
       const port = new BetterSqlitePort(dbPath);
       const now = Date.now();
+      // A NATIVE concept holding a grafted source observation — the only shape that needs the
+      // embedder at all, and one the purge discovers rather than the preflight.
       port.prepare(
         `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
                                support_count, dirty, embedding, updated_at, created_at)
@@ -236,29 +238,49 @@ describe("monet retire-source", () => {
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default',
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.1,0.2]', 'source', 'default',
                  'native-owner', 'peer', ?, ?, '[0.1,0.2]')`,
       ).run(now, now);
       port.close();
 
-      // The reprojection this purge would owe cannot run without the store's own embedder, and
-      // discovering that AFTER the delete leaves a stale projection nothing can repair.
       const deps: RecoveryCliDependencies = {
         ...dependencies,
         instantiate: async () => { throw new Error("model cache empty"); },
       };
+      // The purge has committed by then — so the failure has to be RECOVERABLE, and say how.
       await expect(run(["retire-source", "--apply", "--yes"], deps))
-        .rejects.toThrow(/could not be loaded \(model cache empty\).*Nothing has been deleted/s);
+        .rejects.toThrow(/still need reprojection.*model cache empty.*native-owner/s);
 
       const check = new BetterSqlitePort(dbPath);
       try {
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 1 });
+        // The backup exists, and the ids the operator must repair were named in the error.
+        expect(readdirSync(join(dbPath, "..", "backups")).length).toBeGreaterThan(0);
         expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'grafted-source-obs'`).get())
-          .toEqual({ n: 1 });
+          .toEqual({ n: 0 });
       } finally {
         check.close();
       }
-      expect(existsSync(join(dbPath, "..", "backups"))).toBe(false);
+    });
+  });
+
+  it("retires a store whose embedder is unloadable, when nothing needs reprojection", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const deps: RecoveryCliDependencies = {
+        ...dependencies,
+        instantiate: async () => { throw new Error("model cache empty"); },
+      };
+      // A pure connector concept is deleted whole, so no projection is ever rebuilt — an
+      // unreadable model cache must not make this store permanently unretirable.
+      const output = await run(["retire-source", "--apply", "--yes"], deps);
+      expect(output.stdout).toContain("Retired 1 concept(s)");
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 0 });
+      } finally {
+        check.close();
+      }
     });
   });
 
