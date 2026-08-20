@@ -587,7 +587,6 @@ export function readMomentSpool(path: string, fromByte: number): MomentSpoolRead
   let malformedLines = 0;
   let futureVersionLines = 0;
   // Offsets are tracked per line so the cursor can stop exactly before a line this build cannot read.
-  let consumed = 0;
   let cursorLimit = lastNewline + 1;
   let offset = 0;
   while (offset <= lastNewline) {
@@ -605,10 +604,8 @@ export function readMomentSpool(path: string, fromByte: number): MomentSpoolRead
       if (parsed === null) malformedLines += 1;
       else records.push(parsed);
     }
-    consumed = lineEnd;
     offset = lineEnd;
   }
-  void consumed;
 
   return {
     records,
