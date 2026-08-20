@@ -53,6 +53,7 @@ function readAndActed(path: string, momentId: string, at = "2026-08-19T00:00:00.
     momentId,
     at,
     toolUseId: null,
+    circle: "acme-widgets",
     sessionId: null,
     surface: "Bash",
     actionSha256: "a".repeat(64),
@@ -83,7 +84,7 @@ describe("the four states, kept apart", () => {
     readAndActed(path, "never-asked");
     line(path, { kind: "ask", momentId: "asked-waiting", askedAt: "2026-08-19T00:00:01.000Z" });
 
-    const counts = momentConformance(db, path);
+    const counts = momentConformance(db, path, "acme-widgets");
     // The whole point: these are two numbers, not one "pending".
     expect(counts.unanswered).toBe(1);
     expect(counts.notAsked).toBe(1);
@@ -102,7 +103,7 @@ describe("the four states, kept apart", () => {
     line(path, { kind: "answer", momentId: "m-followed", answer: "followed", answeredAt: "t" });
     line(path, { kind: "answer", momentId: "m-broke-it", answer: "not-followed", answeredAt: "t" });
 
-    const counts = momentConformance(db, path);
+    const counts = momentConformance(db, path, "acme-widgets");
     expect(counts).toMatchObject({ followed: 1, notFollowed: 1, unanswered: 0, notAsked: 0 });
   });
 
@@ -117,6 +118,7 @@ describe("the four states, kept apart", () => {
       momentId: "silent-one",
       at: "2026-08-19T00:00:00.000Z",
       toolUseId: null,
+      circle: "acme-widgets",
       sessionId: null,
       surface: "Bash",
       actionSha256: "a".repeat(64),
@@ -130,8 +132,8 @@ describe("the four states, kept apart", () => {
     });
     line(path, { kind: "outcome", momentId: "silent-one", toolUseId: null, outcomeStatus: null, outcomeAt: "t", outcomeSha256: "c".repeat(64) });
 
-    expect(momentConformance(db, path).notAsked).toBe(0);
-    expect(momentsOwingAQuestion(db, path, 10)).toEqual([]);
+    expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(0);
+    expect(momentsOwingAQuestion(db, path, "acme-widgets", 10)).toEqual([]);
   });
 
   it("owes nothing for a moment that was read but has not finished", () => {
@@ -145,6 +147,7 @@ describe("the four states, kept apart", () => {
       momentId: "in-flight",
       at: "2026-08-19T00:00:00.000Z",
       toolUseId: null,
+      circle: "acme-widgets",
       sessionId: null,
       surface: "Bash",
       actionSha256: "a".repeat(64),
@@ -158,7 +161,7 @@ describe("the four states, kept apart", () => {
     });
     line(path, { kind: "read", momentId: "in-flight", ruleId: "rule-a", namedStageId: null, readAt: "t" });
 
-    expect(momentsOwingAQuestion(db, path, 10)).toEqual(["done"]);
+    expect(momentsOwingAQuestion(db, path, "acme-widgets", 10)).toEqual(["done"]);
   });
 
   it("gives unjoinable reads a durable home that a re-fold does not inflate", () => {
@@ -168,12 +171,12 @@ describe("the four states, kept apart", () => {
     line(path, { kind: "read", momentId: null, ruleId: "rule-a", namedStageId: null, readAt: "t" });
     line(path, { kind: "read", momentId: null, ruleId: "rule-b", namedStageId: null, readAt: "t" });
 
-    expect(momentConformance(db, path).unjoinableReads).toBe(2);
+    expect(momentConformance(db, path, "acme-widgets").unjoinableReads).toBe(2);
     // THE REASON IT IS KEYED RATHER THAN COUNTED: the fold re-reads ranges routinely, and an
     // incremented total would double on every one of them — turning the signal that detects a
     // broken delivery into a number nobody can trust.
     db.prepare(`UPDATE moment_fold_cursor SET byte_offset = 0 WHERE singleton = 1`).run();
-    expect(momentConformance(db, path).unjoinableReads).toBe(2);
+    expect(momentConformance(db, path, "acme-widgets").unjoinableReads).toBe(2);
   });
 });
 
@@ -185,7 +188,7 @@ describe("the ask and the answer attach to a moment that exists", () => {
     readAndActed(path, "m1");
     const core = coreWithSpool(path);
 
-    expect(momentsOwingAQuestion(db, path, 10)).toEqual(["m1"]);
+    expect(momentsOwingAQuestion(db, path, "acme-widgets", 10)).toEqual(["m1"]);
     core.recordMomentAsk("m1");
     // Asked: it has left the owed set and joined the queue.
     expect(core.momentConformance()).toMatchObject({ unanswered: 1, notAsked: 0 });
@@ -296,7 +299,7 @@ describe("the signal that tells the agent it owes a question", () => {
     }
   });
 
-  it("announces a moment once, not on every response until obeyed", async () => {
+  it("keeps naming a moment until the debt is cleared, because delivery cannot be confirmed", async () => {
     const path = join(mkTmp(), "moments.jsonl");
     const core = coreWithSpool(path);
     seq = 0;
@@ -306,9 +309,12 @@ describe("the signal that tells the agent it owes a question", () => {
       const first = await client.callTool({ name: "memory_search", arguments: { query: "a" } });
       expect(texts(first).some((t) => t.includes("owed-one"))).toBe(true);
       const second = await client.callTool({ name: "memory_search", arguments: { query: "b" } });
-      // A banner that reappears every turn is standing text by another name. The durable detection
-      // is the notAsked count, not repetition.
-      expect(texts(second).some((t) => t.includes("owed-one"))).toBe(false);
+      // ANNOUNCE-ONCE WAS WRONG, and this assertion is its reversal. The signal rides as a secondary
+      // content item; a host that exposes only content[0] shows it to nobody, and marking it
+      // delivered anyway then counting the silence as `notAsked` is the conflation between "ignored
+      // it" and "was never told" that these counts exist to remove. Nothing here can confirm
+      // delivery, so the debt stays named until the agent clears it by asking.
+      expect(texts(second).some((t) => t.includes("owed-one"))).toBe(true);
     } finally {
       await cleanup();
     }
@@ -327,7 +333,7 @@ describe("the signal that tells the agent it owes a question", () => {
       await cleanup();
     }
     // Announcing once is safe precisely BECAUSE ignoring it is mechanically detectable.
-    expect(momentConformance(db, path).notAsked).toBe(1);
+    expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(1);
   });
 });
 
@@ -343,7 +349,7 @@ describe("what the gate did, counted", () => {
     seq = 0;
     const moment = (id: string, ruleIds: string[] | null, disposition: string, delivered: string[] | null): void => {
       line(path, {
-        kind: "interception", momentId: id, at: "2026-08-19T00:00:00.000Z", toolUseId: null,
+        kind: "interception", momentId: id, at: "2026-08-19T00:00:00.000Z", toolUseId: null, circle: "acme-widgets",
         sessionId: null, surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "x",
         actionChars: 1, actionClipped: false, stageId: null, ruleIds, disposition,
         deliveredRuleIds: delivered,
@@ -354,8 +360,10 @@ describe("what the gate did, counted", () => {
     moment("quiet", [], "silent", []);
     moment("store-call", null, "ungoverned", null); // no gate evaluates a call into the store
 
-    const counts = momentCounts(db, path);
-    expect(counts).toEqual({ fires: 2, silences: 1, ungoverned: 1, delivered: 1, total: 4, unopened: 0 });
+    const counts = momentCounts(db, path, "acme-widgets");
+    expect(counts).toEqual({
+      fires: 2, silences: 1, ungoverned: 1, delivered: 1, total: 4, unopened: 0, unattributed: 0,
+    });
     // The store call is NOT a silence: reporting it as one would say "nothing governs this action"
     // about an action no rule set was ever consulted about.
     expect(counts.silences).toBe(1);
@@ -366,12 +374,12 @@ describe("what the gate did, counted", () => {
     const db = mkDb();
     seq = 0;
     line(path, {
-      kind: "interception", momentId: "advised-one", at: "2026-08-19T00:00:00.000Z", toolUseId: null,
+      kind: "interception", momentId: "advised-one", at: "2026-08-19T00:00:00.000Z", toolUseId: null, circle: "acme-widgets",
       sessionId: null, surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "x",
       actionChars: 1, actionClipped: false, stageId: "s1", ruleIds: ["rule-a"],
       disposition: "advised", deliveredRuleIds: [],
     });
-    const counts = momentCounts(db, path);
+    const counts = momentCounts(db, path, "acme-widgets");
     expect(counts.fires).toBe(1);
     // Receipt cannot be claimed for an identity that was never sent.
     expect(counts.delivered).toBe(0);

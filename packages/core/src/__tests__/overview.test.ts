@@ -112,7 +112,8 @@ describe("overview composition + invariants", () => {
     // The counts, the four conformance states, and what the record knows it is missing — and
     // nothing else until there is something actionable to say.
     expect(Object.keys(clean).sort()).toEqual([
-      "conformance", "delivered", "fires", "losses", "silences", "total", "ungoverned", "unopened",
+      "conformance", "delivered", "fires", "losses", "silences", "total", "unattributed",
+      "ungoverned", "unopened",
     ].sort());
     // `unopened` is its own key BY DESIGN (F3): debris is excluded from every rate, and excluding
     // it must not make it invisible — a swallowed interception is a real loss.

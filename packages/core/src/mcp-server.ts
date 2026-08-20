@@ -848,26 +848,33 @@ export function registerMonetCoreTools(
    * the action in its own transcript — re-sending a rendering of it would be paying context to tell
    * the model what it just did.
    *
-   * ANNOUNCED ONCE PER MOMENT, not repeated until obeyed. A banner that reappears every turn is
-   * standing text by another name, and nagging is not what makes this measurable: if the agent
-   * ignores the signal, the moment surfaces as `notAsked`, which is exactly the mechanical detection
-   * the design is built on. The set is per process, so a restart re-announces what is still owed.
+   * REPEATED WHILE THE DEBT STANDS, and that is a correction. This used to announce each moment
+   * exactly once, reasoning that a banner reappearing every turn is standing text by another name
+   * and that an ignored signal still surfaces as `notAsked`. Both halves rested on an assumption
+   * nothing here can check: that the agent SAW it. The signal rides as a secondary `content` item,
+   * and a host that exposes only `content[0]` — a degradation this file's own lifecycle code
+   * anticipates — shows it to nobody. Marking it delivered anyway, and then counting the silence as
+   * an agent defect, is verbatim the conflation between "ignored the signal" and "was never told"
+   * that these counts exist to remove.
+   *
+   * So delivery is never assumed. The moment stays named until it stops owing a question, which the
+   * agent clears by asking. The debt is small and self-clearing by construction — only moments that
+   * were read and then acted on are ever in it — so this is a persistent notice rather than a
+   * standing banner, and it is bounded by the cap below either way.
    *
    * SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so this appends nothing
    * at all on the overwhelming majority of responses.
    */
-  const announcedOwedMoments = new Set<string>();
   function askSignalBlock(): string {
     let owed: string[];
     try {
-      owed = core.momentsOwingAQuestion(ASK_SIGNAL_MAX_MOMENTS + announcedOwedMoments.size);
+      owed = core.momentsOwingAQuestion(ASK_SIGNAL_MAX_MOMENTS);
     } catch {
       // A signal that cannot be computed must never fail the tool call that carried it.
       return "";
     }
-    const fresh = owed.filter((momentId) => !announcedOwedMoments.has(momentId)).slice(0, ASK_SIGNAL_MAX_MOMENTS);
+    const fresh = owed.slice(0, ASK_SIGNAL_MAX_MOMENTS);
     if (fresh.length === 0) return "";
-    for (const momentId of fresh) announcedOwedMoments.add(momentId);
     const ids = fresh.join(", ");
     const noun = fresh.length === 1 ? "action" : "actions";
     // ONE SENTENCE. It names what is owed and the tool that records it, and nothing else — the
@@ -1675,16 +1682,6 @@ export function registerMonetCoreTools(
         // ONE CHAIN: no runtimeModelTag passed here — core.setRuntimeModelTag() was called once at
         // registration (above), so this resolves identically to gate()/gateCoverage() by construction.
         const r = core.stageLookup({ stage, circle: scope(circle) });
-        // THE READ, RECORDED AGAINST THE MOMENT THAT PROMPTED IT (invariant 03). Written for the
-        // rules this response actually carries, not for the ones the stage holds: receipt is a
-        // claim about identity that REACHED the agent, and a rule dropped by the size budget below
-        // never did. Deliberately BEFORE the size-fitting loop's own clipping, and deliberately
-        // against `r.rules` — the engine's own delivered set — so a later change to presentation
-        // cannot quietly change what counts as read.
-        // THE STAGE THE AGENT NAMED, resolved to its id — never the stage the gate matched. On a
-        // miss there is no id to record, and null is the honest value: the agent named something,
-        // and this build could not resolve it to a stage.
-        core.recordRuleReads(momentId ?? null, r.rules.map((rule) => rule.conceptId), r.stage?.id ?? null);
         const fixedFields = {
           circle: scope(circle),
           matched: r.matched,
@@ -1762,6 +1759,30 @@ export function registerMonetCoreTools(
         // the whole truth, exactly as before this fix (see StageLookupResult's own comment).
         const rulesTotal = r.rulesTotal ?? r.rules.length;
         const rulesOmittedCount = rulesTotal - fitRules.length;
+
+        // THE READ, RECORDED AGAINST THE MOMENT THAT PROMPTED IT (invariant 03) — AND ONLY FOR THE
+        // RULES THIS RESPONSE ACTUALLY CARRIES.
+        //
+        // THIS USED TO RUN BEFORE THE FIT LOOP, against the engine's whole `r.rules`, on the
+        // reasoning that recording the engine's delivered set stops a presentation change from
+        // moving what counts as read. That reasoning was wrong, and it confused two different
+        // things: what the ENGINE selected, and what the RESPONSE carried. Received is a claim
+        // about the AGENT — "it read this rule" — so the response is the authority. A rule the size
+        // budget dropped never reached the agent, and recording it as read is a verdict where the
+        // value is not known. It then propagates: `notAsked` inherits it, and a user is asked to
+        // judge compliance with a rule the agent could not read.
+        //
+        // A rule listed only in the omitted-ids recovery field is NOT counted either: its identity
+        // reached the agent, its content did not, and `stage_lookup`'s whole job is the content.
+        // Delivery and receipt stay separate facts.
+        core.recordRuleReads(
+          momentId ?? null,
+          fitRules.map((rule) => rule.conceptId as string),
+          // THE STAGE THE AGENT NAMED, resolved to its id — never the stage the gate matched. On
+          // a miss there is no id, and null is honest: the agent named something this build could
+          // not resolve.
+          r.stage?.id ?? null,
+        );
 
         // RECOVERY FOR OMITTED RULES (review fix): `rulesOmitted: K` alone is disclosure without
         // repair — the caller cannot memory_fetch a rule it cannot name. Three-tier degradation,

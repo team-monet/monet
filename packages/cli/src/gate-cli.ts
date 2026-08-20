@@ -927,6 +927,10 @@ function spoolUngovernedGateMoment(deps: GateCliDependencies, actionContext: str
       momentId,
       at: new Date(deps.now()).toISOString(),
       toolUseId: typeof toolUseId === "string" && toolUseId.length > 0 ? toolUseId : null,
+      // NULL, and honestly so: this path is reached precisely when the evaluation did not get far
+      // enough to resolve a circle. Guessing the default here would file another project's failure
+      // under this one's counts.
+      circle: null,
       sessionId: typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null,
       surface: actionContext === null ? null : surfaceOfActionContext(actionContext),
       action: actionContext,
@@ -1142,7 +1146,7 @@ function runGateUnguarded(
       break;
   }
   deps.setExitCode(outcome.code);
-  spoolGovernedMoment(deps, actionContext, result, outcome.code);
+  spoolGovernedMoment(deps, actionContext, resolved.circle, result, outcome.code);
   recorded.done = true;
 }
 
@@ -1182,6 +1186,7 @@ function runGateUnguarded(
 function spoolGovernedMoment(
   deps: GateCliDependencies,
   actionContext: string,
+  circle: string,
   result: GateResult,
   gateExitCode: number,
 ): void {
@@ -1203,6 +1208,9 @@ function spoolGovernedMoment(
       momentId,
       at: new Date(deps.now()).toISOString(),
       toolUseId: typeof toolUseId === "string" && toolUseId.length > 0 ? toolUseId : null,
+      // THE CIRCLE THE VERDICT WAS COMPUTED UNDER — the same one the evaluation used, so a count
+      // scoped to a circle reports the moments that circle actually governed.
+      circle,
       sessionId: typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null,
       surface: surfaceOfActionContext(actionContext),
       action: actionContext,

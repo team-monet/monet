@@ -228,6 +228,19 @@ export interface MomentInterceptionFields {
    */
   toolUseId: string | null;
   /**
+   * The circle this moment was governed under, or `null` when nothing resolved one.
+   *
+   * ON THE RECORD, NOT ON THE QUERY, and that is forced rather than chosen. The spool is home-level
+   * and shared, so every project's store folds every project's moments — a query cannot filter on a
+   * field the record does not carry, and without this an overview for one circle reported another
+   * circle's fires, silences, deliveries and conformance debt, across project boundaries.
+   *
+   * `null` is a real and common value: the gate can fail before resolving a circle, and a hook with
+   * no pinned circle never had one. It is never guessed at, and a reader counts those separately
+   * rather than folding them into whichever circle happened to ask.
+   */
+  circle: string | null;
+  /**
    * `null` means NOT KNOWN — the writer had no session identity to record. It never means "no
    * session". A record that cannot tell those apart is the failure this rebuild exists to end, so
    * the field is required and explicitly nullable rather than optional.
@@ -270,6 +283,8 @@ export interface MomentInterception {
   at: string;
   /** The host's tool-call id, or null when no host tool call is in play. See the field above. */
   toolUseId: string | null;
+  /** The circle this moment was governed under, or null when nothing resolved one. */
+  circle: string | null;
   sessionId: string | null;
   surface: string | null;
   /** The raw action, or `null` when this interceptor never had a legible one. See `renderAction`. */
@@ -367,6 +382,7 @@ export function spoolInterception(run: MomentRun, moment: MomentInterception): v
     momentId: moment.momentId,
     at: moment.at,
     toolUseId: moment.toolUseId,
+    circle: moment.circle,
     sessionId: moment.sessionId,
     surface: moment.surface,
     ...renderAction(moment.action),
@@ -489,20 +505,45 @@ export interface MomentSpoolRead {
 }
 
 /**
- * Reads the spool from a byte offset to EOF.
+ * How much of the spool one read may buffer.
+ *
+ * A MEMORY BOUND, NOT A MEASURED THRESHOLD. Nothing about the domain sets it: it exists because the
+ * unbounded version allocated the entire remaining spool in one buffer, and `fromByte` is zero far
+ * more often than the incremental design suggests — a fresh database, a reset cursor, or the FIRST
+ * overview in another project on the same home-level spool. Nothing reclaims the spool, so on a
+ * long-lived install that made an ordinary MCP read allocate the whole of history at once.
+ *
+ * Bounding the read does NOT bound the work: `foldMomentSpool` loops until the spool is consumed, so
+ * a new store still replays everything — it just does so in chunks it can hold.
+ */
+export const MOMENT_SPOOL_READ_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Reads the spool from a byte offset, at most one chunk at a time.
  *
  * THE CURSOR NEVER ADVANCES PAST A PARTIAL LINE. An append is one `writeSync` of one line, but
  * nothing in POSIX promises that write is atomic against a concurrent reader, so a read can land
  * mid-line. Stopping at the last newline means the next read picks that line up whole instead of
  * discarding it as garbage.
  *
- * A MISSING FILE IS NOT AN ERROR — it is the ordinary state before the first append.
+ * NOR PAST A LINE THIS BUILD CANNOT READ. A future-format line stops the cursor dead rather than
+ * being stepped over: skipping it would leave the record permanently absent from the ledger once a
+ * build that understands it arrives, and nothing would ever say so. Stalling is loud and
+ * recoverable; silent forward-loss is neither. The line is still counted in `futureVersionLines` so
+ * a reader can see why the cursor stopped moving.
+ *
+ * A MISSING FILE IS NOT AN ERROR — it is the ordinary state before the first append. Any OTHER open
+ * failure IS an error and is raised: `EACCES`, `EIO` and descriptor exhaustion used to be reported
+ * as an empty spool, which made broken recording indistinguishable from healthy inactivity — the
+ * exact incident this subsystem was built after.
  */
 export function readMomentSpool(path: string, fromByte: number): MomentSpoolRead {
   let fd: number;
   try {
     fd = openSync(path, "r");
-  } catch {
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw error;
     return {
       records: [],
       malformedLines: 0,
@@ -521,18 +562,18 @@ export function readMomentSpool(path: string, fromByte: number): MomentSpoolRead
       start = 0;
       restartedFromZero = true;
     }
-    const length = size - start;
-    if (length <= 0) {
+    const remaining = size - start;
+    if (remaining <= 0) {
       return { records: [], malformedLines: 0, futureVersionLines: 0, nextCursor: start, restartedFromZero };
     }
-    buffer = Buffer.allocUnsafe(length);
-    let filled = 0;
-    while (filled < length) {
-      const read = readSync(fd, buffer, filled, length - filled, start + filled);
-      if (read <= 0) break;
-      filled += read;
+    // ONE CHUNK, unless a single line is longer than one — an oversized line still has to be read
+    // whole or the cursor could never get past it, so that one case grows to the line's own size.
+    let length = Math.min(remaining, MOMENT_SPOOL_READ_CHUNK_BYTES);
+    buffer = readRange(fd, start, length);
+    while (buffer.lastIndexOf(0x0a) < 0 && length < remaining) {
+      length = Math.min(remaining, length * 4);
+      buffer = readRange(fd, start, length);
     }
-    buffer = buffer.subarray(0, filled);
   } finally {
     closeSync(fd);
   }
@@ -541,24 +582,53 @@ export function readMomentSpool(path: string, fromByte: number): MomentSpoolRead
   if (lastNewline < 0) {
     return { records: [], malformedLines: 0, futureVersionLines: 0, nextCursor: start, restartedFromZero };
   }
-  const complete = buffer.subarray(0, lastNewline).toString("utf8");
+
   const records: MomentSpoolRecord[] = [];
   let malformedLines = 0;
   let futureVersionLines = 0;
-  for (const line of complete.split("\n")) {
-    if (line.trim().length === 0) continue;
-    const parsed = parseMomentSpoolLine(line);
-    if (parsed === "future-version") futureVersionLines += 1;
-    else if (parsed === null) malformedLines += 1;
-    else records.push(parsed);
+  // Offsets are tracked per line so the cursor can stop exactly before a line this build cannot read.
+  let consumed = 0;
+  let cursorLimit = lastNewline + 1;
+  let offset = 0;
+  while (offset <= lastNewline) {
+    const newline = buffer.indexOf(0x0a, offset);
+    if (newline < 0 || newline > lastNewline) break;
+    const line = buffer.subarray(offset, newline).toString("utf8");
+    const lineEnd = newline + 1;
+    if (line.trim().length > 0) {
+      const parsed = parseMomentSpoolLine(line);
+      if (parsed === "future-version") {
+        futureVersionLines += 1;
+        cursorLimit = offset; // stop BEFORE it; a later build must still fold it
+        break;
+      }
+      if (parsed === null) malformedLines += 1;
+      else records.push(parsed);
+    }
+    consumed = lineEnd;
+    offset = lineEnd;
   }
+  void consumed;
+
   return {
     records,
     malformedLines,
     futureVersionLines,
-    nextCursor: start + lastNewline + 1,
+    nextCursor: start + cursorLimit,
     restartedFromZero,
   };
+}
+
+/** One positioned read, filled to `length` or to what the file had. */
+function readRange(fd: number, start: number, length: number): Buffer {
+  const buffer = Buffer.allocUnsafe(length);
+  let filled = 0;
+  while (filled < length) {
+    const read = readSync(fd, buffer, filled, length - filled, start + filled);
+    if (read <= 0) break;
+    filled += read;
+  }
+  return buffer.subarray(0, filled);
 }
 
 /**
@@ -597,6 +667,7 @@ export function parseMomentSpoolLine(line: string): MomentSpoolRecord | null | "
       // call" when it actually means "this writer forgot to say", and those are the two states the
       // whole record exists to keep apart.
       if (!("toolUseId" in row) || (row.toolUseId !== null && typeof row.toolUseId !== "string")) return null;
+      if (!("circle" in row) || (row.circle !== null && typeof row.circle !== "string")) return null;
       // The four action fields stand or fall together — a half-null set is not an observation.
       const actionKnown =
         typeof row.actionSha256 === "string" &&
@@ -622,6 +693,7 @@ export function parseMomentSpoolLine(line: string): MomentSpoolRecord | null | "
         momentId: row.momentId,
         at: row.at,
         toolUseId: row.toolUseId,
+        circle: row.circle as string | null,
         sessionId: row.sessionId,
         surface: row.surface as string | null,
         actionSha256: row.actionSha256 as string | null,

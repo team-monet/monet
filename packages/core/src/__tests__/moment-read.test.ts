@@ -50,6 +50,7 @@ function seedInterception(path: string, momentId: string): void {
       momentId,
       at: "2026-08-19T00:00:00.000Z",
       toolUseId: "toolu_1",
+      circle: "acme-widgets",
       sessionId: null,
       surface: "Bash",
       actionSha256: "a".repeat(64),

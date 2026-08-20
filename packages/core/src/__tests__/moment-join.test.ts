@@ -54,6 +54,7 @@ function opened(toolUseId: string | null, momentId = "m1"): Record<string, unkno
     momentId,
     at: "2026-08-19T00:00:00.000Z",
     toolUseId,
+    circle: "acme-widgets",
     sessionId: null,
     surface: "Bash",
     actionSha256: "a".repeat(64),

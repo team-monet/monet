@@ -85,6 +85,11 @@ export const MOMENT_SCHEMA_SQL = `
     -- moment simply closes with its outcome never observed. It is a foreign key into the host's
     -- world, never this record's identity: see the spool's own field comment for why.
     tool_use_id TEXT,
+    -- THE CIRCLE THIS MOMENT WAS GOVERNED UNDER. NULL when nothing resolved one, which is a real
+    -- state rather than a default. Every count a person reads is scoped by this: the spool is shared
+    -- at the home level, so one project's store folds every project's moments, and without a circle
+    -- on the row an overview reported another project's activity as its own.
+    circle TEXT,
     surface TEXT,
     action_sha256 TEXT,
     -- A bounded rendering of the real action. The most privacy-sensitive column in these tables;
@@ -510,6 +515,8 @@ export interface GovernedMomentRow {
   sessionId: string | null;
   /** The host's tool-call id. NULL means no host tool call, or none supplied — never a verdict. */
   toolUseId: string | null;
+  /** The circle this moment was governed under. NULL means nothing resolved one. */
+  circle: string | null;
   surface: string | null;
   actionSha256: string | null;
   actionRendering: string | null;
@@ -538,6 +545,20 @@ export interface GovernedMomentRow {
  * answer path a back door for moments the interceptor never observed, and the ledger would stop
  * being a record of what happened.
  */
+export class ConflictingAnswerError extends Error {
+  constructor(
+    readonly momentId: string,
+    readonly recorded: MomentAnswer,
+    readonly attempted: MomentAnswer,
+  ) {
+    super(
+      `moment ${momentId} is already answered "${recorded}"; refusing to record "${attempted}". ` +
+        "The record keeps the first answer, so accepting this one would report a value it did not store.",
+    );
+    this.name = "ConflictingAnswerError";
+  }
+}
+
 export class UnknownMomentError extends Error {
   constructor(readonly momentId: string) {
     super(`no governed moment ${momentId} in the record: an answer attaches to a moment, it never creates one`);
@@ -558,6 +579,38 @@ interface CursorRow {
  * otherwise, that is when to hoist it into store construction — not before.
  */
 export function foldMomentSpool(db: StoragePort, spoolPath: string): MomentFoldResult {
+  // ONE CHUNK PER PASS, LOOPED TO COMPLETION. `readMomentSpool` bounds what it buffers; this bounds
+  // nothing, because a caller that folded only part of the spool would answer from a ledger it knows
+  // is behind. The loop ends when a pass stops making progress — at EOF, or at a future-format line
+  // the cursor deliberately will not step over.
+  let total = foldMomentSpoolOnce(db, spoolPath);
+  // PROGRESS IS THE CURSOR MOVING, not records being folded: a chunk can be all malformed lines and
+  // still advance. Stopping on "folded nothing" would leave those unconsumed forever.
+  while (true) {
+    const before = total.cursor;
+    const pass = foldMomentSpoolOnce(db, spoolPath);
+    total = mergeFoldResults(total, pass);
+    if (pass.cursor <= before) break;
+  }
+  return total;
+}
+
+function mergeFoldResults(a: MomentFoldResult, b: MomentFoldResult): MomentFoldResult {
+  return {
+    recordsFolded: a.recordsFolded + b.recordsFolded,
+    malformedLines: a.malformedLines + b.malformedLines,
+    futureVersionLines: a.futureVersionLines + b.futureVersionLines,
+    gapsOpened: a.gapsOpened + b.gapsOpened,
+    gapsClosed: a.gapsClosed + b.gapsClosed,
+    unobservedInterceptionsOpened: a.unobservedInterceptionsOpened + b.unobservedInterceptionsOpened,
+    unobservedInterceptionsClosed: a.unobservedInterceptionsClosed + b.unobservedInterceptionsClosed,
+    unjoinableReads: a.unjoinableReads + b.unjoinableReads,
+    cursor: b.cursor,
+    restartedFromZero: a.restartedFromZero || b.restartedFromZero,
+  };
+}
+
+function foldMomentSpoolOnce(db: StoragePort, spoolPath: string): MomentFoldResult {
   createMomentTables(db);
   const cursor = db.prepare(`SELECT byte_offset FROM moment_fold_cursor WHERE singleton = 1`).get() as
     | CursorRow
@@ -744,7 +797,7 @@ export function momentLossCount(db: StoragePort, spoolPath: string): number {
 }
 
 /** Counts the four states, folding first so a just-recorded answer is already in them. */
-export function momentConformance(db: StoragePort, spoolPath: string): MomentConformance {
+export function momentConformance(db: StoragePort, spoolPath: string, circle: string): MomentConformance {
   foldMomentSpool(db, spoolPath);
   // A moment "was read" when its rule_reads object holds at least one entry. Stored as JSON rather
   // than a table (one moment, one row — see the ledger's own comment), so the emptiness test is on
@@ -755,8 +808,8 @@ export function momentConformance(db: StoragePort, spoolPath: string): MomentCon
   // comment has always said it "must never be counted as one". Nothing read the column until an
   // audit found debris counted in `total`, reported to a human as an agent defect, and served at
   // the HEAD of the ask backlog (its `at` is NULL, and ORDER BY at puts NULLs first).
-  const OPENED = `opened = 1`;
-  const one = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
+  const OPENED = `opened = 1 AND circle = ?`;
+  const one = (sql: string): number => (db.prepare(sql).get(circle) as { n: number }).n;
   return {
     followed: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE ${OPENED} AND answer = 'followed'`),
     notFollowed: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE ${OPENED} AND answer = 'not-followed'`),
@@ -771,7 +824,8 @@ export function momentConformance(db: StoragePort, spoolPath: string): MomentCon
       `SELECT COUNT(*) AS n FROM governed_moments
         WHERE ${OPENED} AND asked_at IS NULL AND answer IS NULL AND outcome_at IS NOT NULL AND ${READ}`,
     ),
-    unjoinableReads: one(`SELECT COUNT(*) AS n FROM moment_reads WHERE moment_id IS NULL`),
+    // NOT circle-scoped: a read that named no moment has no circle to scope by.
+    unjoinableReads: (db.prepare(`SELECT COUNT(*) AS n FROM moment_reads WHERE moment_id IS NULL`).get() as { n: number }).n,
   };
 }
 
@@ -803,8 +857,16 @@ export interface MomentCounts {
   ungoverned: number;
   /** Moments where at least one rule id actually reached the agent. */
   delivered: number;
-  /** Every governed moment on record. Debris is excluded and counted separately below. */
+  /** Every governed moment on record in this circle. Debris is excluded and counted below. */
   total: number;
+  /**
+   * Observed moments whose circle was never resolved.
+   *
+   * ITS OWN NUMBER, for the same reason `unopened` is: scoping the counts to a circle must not make
+   * an unattributable moment invisible. It is a real observation with one field missing, and
+   * folding it into whichever circle happened to ask would be the guess this record forbids.
+   */
+  unattributed: number;
   /**
    * Rows that were attached to but never observed at interception — `opened = 0`.
    *
@@ -817,23 +879,27 @@ export interface MomentCounts {
 }
 
 /** Counts every moment by what the gate did. Folds first. */
-export function momentCounts(db: StoragePort, spoolPath: string): MomentCounts {
+export function momentCounts(db: StoragePort, spoolPath: string, circle: string): MomentCounts {
   foldMomentSpool(db, spoolPath);
-  const one = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
+  const one = (sql: string): number => (db.prepare(sql).get(circle) as { n: number }).n;
+  const oneNoArg = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
   // F3: scoped to observed moments. `ungoverned` in particular is documented as "an overflow, an
   // unreadable surface, or a call into the store" — debris is none of those, and counting it there
   // put a fourth, undocumented population inside a number a human reads.
-  const EVALUATED = `opened = 1 AND rule_ids IS NOT NULL`;
+  // SCOPED, because the spool is shared across projects and this store folded all of it.
+  const EVALUATED = `opened = 1 AND circle = ? AND rule_ids IS NOT NULL`;
   return {
     fires: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE ${EVALUATED} AND rule_ids != '[]'`),
     silences: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE ${EVALUATED} AND rule_ids = '[]'`),
-    ungoverned: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND rule_ids IS NULL`),
+    ungoverned: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND circle = ? AND rule_ids IS NULL`),
     delivered: one(
       `SELECT COUNT(*) AS n FROM governed_moments
-        WHERE opened = 1 AND delivered_rule_ids IS NOT NULL AND delivered_rule_ids != '[]'`,
+        WHERE opened = 1 AND circle = ? AND delivered_rule_ids IS NOT NULL AND delivered_rule_ids != '[]'`,
     ),
-    total: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1`),
-    unopened: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 0`),
+    total: one(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND circle = ?`),
+    // NOT circle-scoped, deliberately: debris has no interception, so it has no circle either.
+    unopened: oneNoArg(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 0`),
+    unattributed: oneNoArg(`SELECT COUNT(*) AS n FROM governed_moments WHERE opened = 1 AND circle IS NULL`),
   };
 }
 
@@ -879,12 +945,18 @@ export function momentStageReads(db: StoragePort, spoolPath: string): Map<string
  * would otherwise be fed to a model as a moment to ask a user about — and served FIRST, because its
  * `at` is NULL and this orders oldest-first.
  */
-export function momentsOwingAQuestion(db: StoragePort, spoolPath: string, limit: number): string[] {
+export function momentsOwingAQuestion(
+  db: StoragePort,
+  spoolPath: string,
+  circle: string,
+  limit: number,
+): string[] {
   foldMomentSpool(db, spoolPath);
   const rows = db
     .prepare(
       `SELECT moment_id FROM governed_moments
         WHERE opened = 1
+          AND circle = ?
           AND asked_at IS NULL
           AND answer IS NULL
           AND outcome_at IS NOT NULL
@@ -892,7 +964,7 @@ export function momentsOwingAQuestion(db: StoragePort, spoolPath: string, limit:
         ORDER BY at
         LIMIT ?`,
     )
-    .all(limit) as Array<{ moment_id: string }>;
+    .all(circle, limit) as Array<{ moment_id: string }>;
   return rows.map((row) => row.moment_id);
 }
 
@@ -950,6 +1022,15 @@ export function attachMomentAnswer(
   const spoolPath = requireSpool(run);
   foldMomentSpool(db, spoolPath);
   requireObservedMoment(db, fields.momentId);
+  // A SECOND, DIFFERENT ANSWER IS REFUSED — not dropped. The apply below is first-write-wins, so a
+  // correction was silently ignored while the tool echoed it back as recorded, leaving the durable
+  // tally disagreeing with what the user was told. Repeating the SAME answer is allowed: it asserts
+  // nothing new. Changing one is a correction this record does not yet model, and saying so is the
+  // only honest option available — the alternative was a lie.
+  const existing = selectMoment(db, fields.momentId);
+  if (existing !== null && existing.answer !== null && existing.answer !== fields.answer) {
+    throw new ConflictingAnswerError(fields.momentId, existing.answer, fields.answer);
+  }
   spoolAnswer(run, fields);
   foldMomentSpool(db, spoolPath);
 }
@@ -974,6 +1055,15 @@ export function attachMomentAnswer(
 function requireObservedMoment(db: StoragePort, momentId: string): void {
   const moment = selectMoment(db, momentId);
   if (moment === null || !moment.opened) throw new UnknownMomentError(momentId);
+  // AND THERE MUST BE SOMETHING TO JUDGE. `opened` alone let two populations through that no user
+  // can answer about: a silent or store-side moment where no rule was ever read, and a BLOCKED
+  // moment — whose id is handed to the agent in the deny instruction, and which by design never
+  // acts. Accepting either produced a `followed`/`notFollowed` tally entry for an action that
+  // either had no rule behind it or never happened. Same two conditions `momentsOwingAQuestion`
+  // uses, so what may be answered is exactly what was asked for.
+  if (Object.keys(moment.ruleReads).length === 0 || moment.outcomeAt === null) {
+    throw new UnknownMomentError(momentId);
+  }
 }
 
 /**
@@ -999,6 +1089,7 @@ function selectMoment(db: StoragePort, momentId: string): GovernedMomentRow | nu
     at: (row.at as string | null) ?? null,
     sessionId: (row.session_id as string | null) ?? null,
     toolUseId: (row.tool_use_id as string | null) ?? null,
+    circle: (row.circle as string | null) ?? null,
     surface: (row.surface as string | null) ?? null,
     actionSha256: (row.action_sha256 as string | null) ?? null,
     actionRendering: (row.action_rendering as string | null) ?? null,
@@ -1059,14 +1150,16 @@ function applyRecord(db: StoragePort, record: MomentSpoolRecord): void {
     case "interception":
       db.prepare(
         `INSERT INTO governed_moments (
-           moment_id, opened, at, session_id, tool_use_id, surface, action_sha256, action_rendering,
-           action_chars, action_clipped, stage_id, rule_ids, disposition, delivered_rule_ids
-         ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           moment_id, opened, at, session_id, tool_use_id, circle, surface, action_sha256,
+           action_rendering, action_chars, action_clipped, stage_id, rule_ids, disposition,
+           delivered_rule_ids
+         ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(moment_id) DO UPDATE SET
              opened = 1,
              at = COALESCE(governed_moments.at, excluded.at),
              session_id = COALESCE(governed_moments.session_id, excluded.session_id),
              tool_use_id = COALESCE(governed_moments.tool_use_id, excluded.tool_use_id),
+             circle = COALESCE(governed_moments.circle, excluded.circle),
              surface = COALESCE(governed_moments.surface, excluded.surface),
              action_sha256 = COALESCE(governed_moments.action_sha256, excluded.action_sha256),
              action_rendering = COALESCE(governed_moments.action_rendering, excluded.action_rendering),
@@ -1081,6 +1174,7 @@ function applyRecord(db: StoragePort, record: MomentSpoolRecord): void {
         record.at,
         record.sessionId,
         record.toolUseId,
+        record.circle,
         record.surface,
         record.actionSha256,
         record.actionRendering,

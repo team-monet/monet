@@ -8321,8 +8321,8 @@ export class MonetCore {
         skeleton: skeletonMembers.length,
       },
       gate: {
-        ...this.momentCounts(),
-        conformance: this.momentConformance(),
+        ...this.momentCounts(circle),
+        conformance: this.momentConformance(circle),
         losses: this.momentLossCount(),
         ...(retirementCandidates.length > 0 ? {
           retirementCandidates,
@@ -12097,6 +12097,10 @@ export class MonetCore {
         momentId,
         at: new Date().toISOString(),
         toolUseId: null,
+        // The circle this server is serving. A call naming a DIFFERENT circle explicitly is not
+        // distinguished here — the tool wrapper that opens these moments does not parse arguments —
+        // so this is the circle the store is scoped to, not a claim about the call's own argument.
+        circle: this.defaultCircle,
         sessionId: null,
         surface,
         action: null,
@@ -12148,6 +12152,28 @@ export class MonetCore {
    * the spool and nothing else, which is what keeps invariant 05 intact: the hook is store-less and
    * stays that way.
    */
+  /**
+   * The run a conformance write must have, or an error the caller sees.
+   *
+   * SILENCE WAS THE BUG. With the default `momentSpoolPath: null` these methods returned quietly
+   * while the MCP handlers answered `recorded: "ask"` / `recorded: "answer"` — telling a user their
+   * conformance answer was saved when no byte was written anywhere. That answer is the one datum in
+   * this system nothing can reproduce, so a refusal the agent can relay is the only safe outcome.
+   *
+   * READS still return zeroes rather than throwing: "no spool configured" is a truthful description
+   * of an empty record, and a store with instrumentation switched off should still open an overview.
+   */
+  private requireMomentRun(): MomentRun {
+    const run = this.momentRunForWrite();
+    if (run === null) {
+      throw new Error(
+        "no governed-moment spool is configured for this store, so a conformance answer cannot be " +
+          "recorded. Nothing was written.",
+      );
+    }
+    return run;
+  }
+
   private momentRunForWrite(): MomentRun | null {
     if (this.momentSpoolPath === null) return null;
     if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
@@ -12167,8 +12193,7 @@ export class MonetCore {
    * verdict. Machinery to catch it would cost more than the failure it prevents.
    */
   recordMomentAsk(momentId: string): void {
-    const run = this.momentRunForWrite();
-    if (run === null) return;
+    const run = this.requireMomentRun();
     attachMomentAsk(this.db, run, { momentId });
   }
 
@@ -12180,17 +12205,16 @@ export class MonetCore {
    * caused it, which is unobservable and is not what is being measured.
    */
   recordMomentAnswer(momentId: string, answer: MomentAnswer): void {
-    const run = this.momentRunForWrite();
-    if (run === null) return;
+    const run = this.requireMomentRun();
     attachMomentAnswer(this.db, run, { momentId, answer });
   }
 
   /** What the gate did, across every moment on record. Folds first. */
-  momentCounts(): MomentCounts {
+  momentCounts(circle?: string): MomentCounts {
     if (this.momentSpoolPath === null) {
-      return { fires: 0, silences: 0, ungoverned: 0, delivered: 0, total: 0, unopened: 0 };
+      return { fires: 0, silences: 0, ungoverned: 0, delivered: 0, total: 0, unopened: 0, unattributed: 0 };
     }
-    return momentCounts(this.db, this.momentSpoolPath);
+    return momentCounts(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
 
   /**
@@ -12205,11 +12229,11 @@ export class MonetCore {
   }
 
   /** The four conformance states. Folds first. Zeroes when no spool is configured. */
-  momentConformance(): MomentConformance {
+  momentConformance(circle?: string): MomentConformance {
     if (this.momentSpoolPath === null) {
       return { followed: 0, notFollowed: 0, unanswered: 0, notAsked: 0, unjoinableReads: 0 };
     }
-    return momentConformance(this.db, this.momentSpoolPath);
+    return momentConformance(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
 
   /** How many losses the record is currently carrying, of either kind. */
@@ -12219,9 +12243,14 @@ export class MonetCore {
   }
 
   /** Moments that were read, acted on, and never asked about. Oldest first, bounded by the caller. */
-  momentsOwingAQuestion(limit: number): string[] {
+  momentsOwingAQuestion(limit: number, circle?: string): string[] {
     if (this.momentSpoolPath === null) return [];
-    return momentsOwingAQuestion(this.db, this.momentSpoolPath, limit);
+    return momentsOwingAQuestion(
+      this.db,
+      this.momentSpoolPath,
+      this.resolveCircle(circle ?? this.defaultCircle),
+      limit,
+    );
   }
 
   recordRuleReads(momentId: string | null, ruleIds: readonly string[], namedStageId: string | null): void {

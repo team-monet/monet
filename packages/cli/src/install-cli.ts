@@ -352,10 +352,22 @@ const MOMENT_ACTION_RENDERING_MAX_CHARS = 2048;
 // this process's lifetime; its sequence starts at 0 with the run-start record itself, so a run
 // whose declaration is the append that failed reports a hole at 0 rather than an unknown role.
 let momentRun = null;
+let pendingRunStart = null;
 function ensureMomentRun() {
   if (momentRun !== null) return momentRun;
   momentRun = { runId: randomUUID(), seq: 0 };
-  appendMomentRecord({ kind: "run-start", writerRole: "host-hook", at: new Date().toISOString() });
+  // HELD, NOT WRITTEN YET. A hook invocation is one run of exactly two records — this declaration
+  // and the single interception or outcome that follows it — so the two are emitted in ONE write
+  // below. If the second append is the one that fails (a disk that fills between two writes), the
+  // old shape left a run-start with nothing after it: a run that is merely SHORT, which no sequence
+  // gap can expose because a hole is only visible when a record follows it. Writing both together
+  // means either the whole run lands or none of it does, which removes that orphan case entirely.
+  //
+  // It does NOT make the loss detectable — a run that never wrote a byte is invisible either way,
+  // and that limit is stated in the spool's own header. It removes the WORSE state: a record that
+  // says a run existed while the thing it was recording is gone.
+  pendingRunStart = { kind: "run-start", writerRole: "host-hook", at: new Date().toISOString() };
+  momentRun.seq = 1; // the declaration owns seq 0, whether or not it has reached the disk yet
   return momentRun;
 }
 
@@ -368,10 +380,15 @@ function appendMomentRecord(body) {
   const seq = run.seq;
   run.seq = seq + 1;
   try {
-    const line = JSON.stringify(Object.assign({ v: MOMENT_SPOOL_FORMAT, runId: run.runId, seq: seq }, body)) + "\\n";
+    let payload = "";
+    if (pendingRunStart !== null) {
+      payload += JSON.stringify(Object.assign({ v: MOMENT_SPOOL_FORMAT, runId: run.runId, seq: 0 }, pendingRunStart)) + "\\n";
+      pendingRunStart = null;
+    }
+    payload += JSON.stringify(Object.assign({ v: MOMENT_SPOOL_FORMAT, runId: run.runId, seq: seq }, body)) + "\\n";
     const fd = openSync(MOMENT_SPOOL_PATH, "a", 0o600);
     try {
-      writeSync(fd, line);
+      writeSync(fd, payload);
     } finally {
       closeSync(fd);
     }
@@ -398,6 +415,12 @@ function renderMomentAction(action) {
 
 // A moment nothing could evaluate. \`ruleIds\` and \`deliveredRuleIds\` are NULL rather than [] --
 // [] would say the gate looked and found nothing bound, and on these paths the gate never ran.
+function pinnedCircleArg() {
+  const args = process.argv.slice(2);
+  const at = args.indexOf("--circle");
+  return at >= 0 && typeof args[at + 1] === "string" ? args[at + 1] : null;
+}
+
 function toolUseIdOf(hookInput) {
   return typeof hookInput.tool_use_id === "string" && hookInput.tool_use_id.length > 0 ? hookInput.tool_use_id : null;
 }
@@ -413,6 +436,9 @@ function spoolUngovernedMoment(momentId, toolUseId, sessionId, surface, action) 
       momentId: momentId,
       at: new Date().toISOString(),
       toolUseId: toolUseId,
+      // Only what this install pinned on its own command line. With no --circle there is nothing to
+      // record, and null says that rather than guessing at the project a shared spool is serving.
+      circle: pinnedCircleArg(),
       sessionId: sessionId,
       surface: surface,
       stageId: null,
@@ -857,6 +883,12 @@ function recordPostToolUse() {
         tool_response: hookInput.tool_response === undefined ? null : hookInput.tool_response,
       }
     : (hookInput.tool_response === undefined ? null : hookInput.tool_response);
+  // KNOWN LIMIT, NOT A FIX (Codex P2). A PostToolUse envelope past this wrapper's retained-stdin cap
+  // is truncated, so the parse above already failed and returned — the moment stays open and never
+  // enters the question backlog. It cannot be repaired here: the outcome can only be keyed by the
+  // host's tool_use_id, and on a truncated envelope that field may be past the cut. Recovering it by
+  // pattern-matching a partial JSON body would be a guess about identity, which is the one thing
+  // this record refuses to do. Stated here so the next reader does not mistake it for an oversight.
   let outcomeText;
   try {
     outcomeText = JSON.stringify(outcomeValue);

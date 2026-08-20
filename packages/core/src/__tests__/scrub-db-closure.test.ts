@@ -480,6 +480,7 @@ async function buildUnscrubbedFixtureDb(path: string): Promise<void> {
       momentId: "fixture-moment-1",
       at: "2026-08-19T00:00:00.000Z",
       toolUseId: "toolu_fixture",
+      circle: SAMPLED_CIRCLE,
       sessionId: null,
       surface: "Bash",
       actionSha256: "a".repeat(64),

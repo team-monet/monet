@@ -53,6 +53,7 @@ function interception(path: string, momentId: string, overrides: Record<string, 
     momentId,
     at: "2026-08-20T00:00:00.000Z",
     toolUseId: null,
+    circle: "acme-widgets",
     sessionId: null,
     surface: "Bash",
     actionSha256: "a".repeat(64),
@@ -83,7 +84,7 @@ describe("F2 — an answered moment is not also an unasked one", () => {
     // Nothing told it to call conformance_ask, so `asked_at` stays null.
     line(path, { kind: "answer", momentId: "m1", answer: "followed", answeredAt: "t" });
 
-    const counts = momentConformance(db, path);
+    const counts = momentConformance(db, path, "acme-widgets");
     expect(counts.followed).toBe(1);
     // AN ANSWER IS PROOF AN ASK HAPPENED. Counting this moment as an agent defect reports a
     // failure that did not occur, to a human, with a named owner.
@@ -97,7 +98,7 @@ describe("F2 — an answered moment is not also an unasked one", () => {
     readAndActed(path, "m1");
     line(path, { kind: "answer", momentId: "m1", answer: "followed", answeredAt: "t" });
     // Otherwise the ask signal names it forever, and every restart re-announces a closed moment.
-    expect(momentsOwingAQuestion(db, path, 10)).toEqual([]);
+    expect(momentsOwingAQuestion(db, path, "acme-widgets", 10)).toEqual([]);
   });
 });
 
@@ -115,7 +116,7 @@ describe("F3 — debris is not a governed moment", () => {
     interception(path, "real");
     debris(path, "debris");
 
-    const counts = momentCounts(db, path);
+    const counts = momentCounts(db, path, "acme-widgets");
     // The schema's own comment says a debris row "is not a governed moment and must never be
     // counted as one". Nothing read `opened` until now.
     expect(counts.total).toBe(1);
@@ -129,7 +130,7 @@ describe("F3 — debris is not a governed moment", () => {
     const db = mkDb();
     seq = 0;
     debris(path, "debris");
-    expect(momentConformance(db, path).notAsked).toBe(0);
+    expect(momentConformance(db, path, "acme-widgets").notAsked).toBe(0);
   });
 
   it("does not feed debris into a model's context as a moment to ask about", () => {
@@ -140,7 +141,7 @@ describe("F3 — debris is not a governed moment", () => {
     debris(path, "debris");
     // ORDER BY at puts debris (at IS NULL) at the HEAD of an oldest-first backlog, so it is not
     // merely included — it is served first.
-    expect(momentsOwingAQuestion(db, path, 10)).toEqual(["real-one"]);
+    expect(momentsOwingAQuestion(db, path, "acme-widgets", 10)).toEqual(["real-one"]);
   });
 
   it("reports how much debris there is, as its own number", () => {
@@ -151,7 +152,7 @@ describe("F3 — debris is not a governed moment", () => {
     debris(path, "debris");
     // Excluding debris from the counts must not make it invisible: a swallowed interception is a
     // real loss and the record has to be able to say how many it is holding.
-    expect(momentCounts(db, path).unopened).toBe(1);
+    expect(momentCounts(db, path, "acme-widgets").unopened).toBe(1);
   });
 });
 
@@ -213,7 +214,7 @@ describe("R1 — an answer can never land somewhere nothing reads", () => {
     // AND NOTHING WAS WRITTEN. The failure this replaces accepted the call, put the answer on disk,
     // and then reported {followed:0, notFollowed:0, unanswered:0, notAsked:0} — a user saying "the
     // rule was not followed", durable and invisible to every reader.
-    const counts = momentConformance(db, path);
+    const counts = momentConformance(db, path, "acme-widgets");
     expect(counts).toMatchObject({ followed: 0, notFollowed: 0, unanswered: 0, notAsked: 0 });
     const stored = db.prepare(`SELECT answer FROM governed_moments WHERE moment_id = 'debris'`).get();
     expect(stored).toEqual({ answer: null });

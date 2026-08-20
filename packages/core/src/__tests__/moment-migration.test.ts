@@ -91,7 +91,7 @@ describe("a store created before a column existed still works", () => {
     const spoolPath = join(dir, "moments.jsonl");
     const db = mkDb();
     db.exec(`CREATE TABLE governed_moments (moment_id TEXT PRIMARY KEY, opened INTEGER NOT NULL DEFAULT 0)`);
-    expect(() => momentConformance(db, spoolPath)).not.toThrow();
+    expect(() => momentConformance(db, spoolPath, "acme-widgets")).not.toThrow();
   });
 });
 
