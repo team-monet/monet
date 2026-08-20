@@ -113,11 +113,10 @@ describe("monet retire-source", () => {
         port.close();
       }
 
-      // And the store the engine refused before now opens and finishes the rung.
+      // And the store opens normally afterwards, with the retired schema gone.
       const core = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
       try {
         const db = (core as unknown as { db: BetterSqlitePort }).db;
-        expect(db.pragma("user_version", { simple: true })).toBe(13);
         const tables = new Set(
           (db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>)
             .map((row) => row.name),

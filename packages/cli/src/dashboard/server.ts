@@ -29,12 +29,6 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 // better-sqlite3 is externalized by esbuild and provided by the runtime node_modules.
 import Database from "better-sqlite3";
-import {
-  isRetirementDisposed,
-  retirementData,
-  SOURCE_RETIREMENT_SCHEMA_VERSION,
-  SourceRetirementRequiredError,
-} from "@team-monet/core";
 
 import { getDbPath } from "../db/index.js";
 // P1-B/P2-D (Codex round 4 on PR #42): every getDbPath() call in this module was bare (cwd-
@@ -451,45 +445,10 @@ function emptyGraphPayload(): unknown {
   };
 }
 
-/**
- * THE DASHBOARD NEEDS ITS OWN RETIREMENT GUARD (#16). Every other surface goes through
- * `new MonetCore(...)`, whose rung-13 migration refuses a store that still holds connector rows —
- * but the dashboard never constructs a core. It snapshots the SQLite file and queries it directly,
- * and its queries stopped excluding connector rows when the subsystem was retired, so an unretired
- * store would render exactly the population `start` and `status` refuse to serve.
- *
- * Checked against the SNAPSHOT rather than the live file: it is the thing actually being read, and
- * opening the live store read-write here would fight the servers this dashboard exists to observe.
- */
-function assertRetirementDisposed(snapPath: string): void {
-  const db = new Database(snapPath, { readonly: true });
-  try {
-    // SAME BOUND AS THE ENGINE'S OWN GUARD. Past schema 13 the engine serves the store, so
-    // refusing here would make the dashboard unusable for a store everything else considers
-    // valid — a `kind='source'` row arriving by graft is an ordinary concept at that point, by
-    // the same ruling that removed the sync-boundary rejection.
-    const schemaVersion = db.pragma("user_version", { simple: true }) as number;
-    if (schemaVersion >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
-    // `retirementData` reads through `prepare` only, which a raw better-sqlite3 handle satisfies —
-    // no StoragePort is constructed here, and none should be: this is a readonly snapshot.
-    const data = retirementData(db as unknown as Parameters<typeof retirementData>[0]);
-    if (!isRetirementDisposed(data)) {
-      throw new SourceRetirementRequiredError(
-        getDbPath(resolveProjectDir()),
-        { concepts: data.conceptIds.length, observations: data.observationIds.length },
-        data.nonemptyTables,
-      );
-    }
-  } finally {
-    db.close();
-  }
-}
-
 async function handleGraph(includeRetired: boolean): Promise<unknown> {
   if (!fs.existsSync(getDbPath(resolveProjectDir()))) return emptyGraphPayload();
   const snap = await makeSnapshot();
   try {
-    assertRetirementDisposed(snap);
     const concepts           = querySnap(snap, includeRetired ? SQL.conceptsIncludeRetired : SQL.concepts);
     const observations       = querySnap(snap, SQL.observations);
     const edges              = querySnap(snap, includeRetired ? SQL.edgesIncludeRetired : SQL.edges);
@@ -597,7 +556,6 @@ async function handleEntities(includeRetired: boolean): Promise<unknown> {
   if (!fs.existsSync(getDbPath(resolveProjectDir()))) return { entities: [], links: [] };
   const snap = await makeSnapshot();
   try {
-    assertRetirementDisposed(snap);
     const entities = querySnap(snap, SQL.entities);
     const links    = querySnap(snap, includeRetired ? SQL.entityLinksIncludeRetired : SQL.entityLinks);
     return { entities, links };
@@ -706,14 +664,6 @@ export function startDashboard(port: number): void {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not found", pathname }));
     } catch (err) {
-      // A DELIBERATE REFUSAL IS NOT AN INTERNAL ERROR. The retirement guard exists to tell the
-      // operator what to run; collapsing it into a bare 500 would withhold exactly that.
-      if (err instanceof SourceRetirementRequiredError) {
-        console.error("Refusing to serve an unretired store:", err.message);
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message, code: "source-retirement-required" }));
-        return;
-      }
       console.error("Handler error:", err);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "internal error" }));

@@ -23,13 +23,6 @@ import { StoragePort, BetterSqlitePort, StorageExclusiveLockError } from "./stor
 import { hasCoveringSkeletonSurface, inspectSkeletonMirrors } from "./skeleton-mirror";
 import { MONET_SCHEMA_VERSION } from "./schema-version";
 import {
-  dropRetiredSourceResidue,
-  isRetirementDisposed,
-  retirementData,
-  SOURCE_RETIREMENT_SCHEMA_VERSION,
-  SourceRetirementRequiredError,
-} from "./source-retirement";
-import {
   EmbeddingProvider,
   HashingEmbeddingProvider,
   EmbedderOutputDimensionError,
@@ -2406,8 +2399,6 @@ export class MonetCore {
   private db: StoragePort;
   /** Parent directory of the file-backed SQLite path; null for :memory: and custom storage ports. */
   private readonly storeHome: string | null;
-  /** The SQLite file itself; null for :memory: and custom ports. Quoted into remediation commands. */
-  private readonly dbFilePath: string | null;
   private embedder: EmbeddingProvider;
   /** Strict pin-satisfaction loader for ensureEmbedderPin() — see MonetCoreOptions.embedderLoader. */
   private embedderLoader: (modelId: string) => Promise<EmbeddingProvider>;
@@ -2490,14 +2481,7 @@ export class MonetCore {
    */
   constructor(db: string | StoragePort = ":memory:", opts: MonetCoreOptions = {}) {
     this.storeHome = typeof db === "string" && db !== ":memory:" ? dirname(resolve(db)) : null;
-    this.dbFilePath = typeof db === "string" && db !== ":memory:" ? resolve(db) : null;
-    // Ownership, tracked because the constructor can now THROW after opening: rung 13 refuses a
-    // store whose connector rows have not been disposed of. A caller that catches that error and
-    // follows the remediation in the same process must not be racing an unreachable connection for
-    // exclusive ownership, so a port this constructor opened is closed on the way out. A
-    // caller-supplied port stays the caller's to close.
-    const ownsPort = typeof db === "string";
-    this.db = ownsPort ? new BetterSqlitePort(db) : (db as StoragePort);
+    this.db = typeof db === "string" ? new BetterSqlitePort(db) : db;
     this.embedder = opts.embedder ?? new HashingEmbeddingProvider();
     this.embedderLoader = opts.embedderLoader ?? instantiateEmbedderForPin;
     this.deferCreatedPin = opts.deferCreatedPin ?? false;
@@ -2536,12 +2520,6 @@ export class MonetCore {
     // after any embedder-pin swap, not just here at construction.
     this.applyEmbedderDerivedThresholds(this.embedder);
     this.init();
-    // BEFORE migrate(), AND THAT IS THE POINT. Every migration below assumes the population it
-    // walks is native — the graph backfill in particular now writes entity/related/temporal state
-    // for whatever it finds, since the connector exclusions came out with the subsystem. Running
-    // them first would modify a store this open is about to refuse, so an operator taking the
-    // error's advice to stay on 1.6.x would find it already changed. Refused means untouched.
-    this.assertRetirementDisposed(ownsPort);
     this.initSyncIdentity(opts.syncDeviceId);
     this.migrate();
     // A SECOND migrateGateColumns() PASS, HERE (Codex round 11, item 3 — found by this item's own
@@ -2578,7 +2556,6 @@ export class MonetCore {
       this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
     }
     this.migrateFirstBlockPins();
-    this.migrateSourceRetirement();
     // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
     // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
     // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
@@ -3710,45 +3687,6 @@ export class MonetCore {
       this.db.prepare(`DELETE FROM first_block`).run();
       this.db.pragma(`user_version = ${FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION}`);
     })();
-  }
-
-  /**
-   * Schema 12 → 13: retire the source subsystem (#16).
-   *
-   * The constructor does the NON-DESTRUCTIVE half only — dropping the subsystem's own tables and
-   * the two marker columns once nothing describes them any more. When rows are still there it
-   * REFUSES to open, because the two alternatives are both worse: deleting a user's rows behind an
-   * ordinary `new MonetCore(path)` (and a verified backup is async, so this path cannot even take
-   * one), or serving them as ordinary memories now that no native query excludes them.
-   *
-   * The destructive half and its mandatory backup live in `monet retire-source`, which
-   * calls purgeConnectorPopulation directly on the port — no MonetCore, so this refusal never
-   * stands in its way.
-   */
-  private assertRetirementDisposed(ownsPort: boolean): void {
-    if ((this.db.pragma("user_version", { simple: true }) as number) >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
-    // NO VERSION LOWER BOUND HERE, deliberately. A graph-disabled open holds user_version at 0 to
-    // keep the graph backfill slot free, while the previous engine still created the source
-    // registry and ingested into it — so gating this on the rung would let exactly that store
-    // serve and mutate its connector rows as ordinary memories.
-    const data = retirementData(this.db);
-    if (isRetirementDisposed(data)) return;
-    if (ownsPort) this.db.close();
-    throw new SourceRetirementRequiredError(
-      this.dbFilePath,
-      { concepts: data.conceptIds.length, observations: data.observationIds.length },
-      data.nonemptyTables,
-    );
-  }
-
-  private migrateSourceRetirement(): void {
-    // Only the WRITES are bounded below, exactly as on rung 12: a store held at an earlier rung
-    // must not be jumped to 13 and have every intermediate migration's slot skipped. The refusal
-    // that protects this drop already ran, before any migration touched the store.
-    const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version < FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION || version >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
-    dropRetiredSourceResidue(this.db);
-    this.db.pragma(`user_version = ${SOURCE_RETIREMENT_SCHEMA_VERSION}`);
   }
 
   /** v8: replay-safe row clocks and per-writer edge components. */

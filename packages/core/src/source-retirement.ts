@@ -19,15 +19,7 @@
  * has run. Refusing is the honest failure: the alternative is either destroying rows silently or
  * serving them as ordinary memories now that every native query has stopped excluding them.
  */
-import { dirname } from "node:path";
 import type { StoragePort } from "./storage";
-
-/**
- * The schema rung this retirement occupies. Exported because more than one surface has to agree on
- * it — the engine's own preflight and the dashboard's, which reads a snapshot the engine never
- * opens. A copied number is how those two drift apart.
- */
-export const SOURCE_RETIREMENT_SCHEMA_VERSION = 13;
 
 /**
  * The subsystem's tables as the code that created them named them. Kept for tests and for the
@@ -70,51 +62,42 @@ export interface ConnectorPopulation {
 export interface RetirementData extends ConnectorPopulation {
   /** Retired tables that still hold rows — registry entries, ledger runs, attempt history. */
   nonemptyTables: string[];
-}
-
-/** Thrown when a store cannot be served because its connector rows have not been disposed of yet. */
-export class SourceRetirementRequiredError extends Error {
-  constructor(
-    /** The store file itself, not its directory — the remediation below is quoted against it. */
-    readonly dbPath: string | null,
-    readonly population: { concepts: number; observations: number },
-    readonly nonemptyTables: string[] = [],
-  ) {
-    // THE COMMAND IS QUOTED ONLY WHEN THIS ERROR KNOWS WHICH STORE REFUSED. An unqualified
-    // `monet retire-source` resolves the ambient default store — so for a caller-supplied
-    // StoragePort, where the path is genuinely unknown, printing one would name a store that is
-    // not the refused one and could irreversibly purge it instead. Unknown says unknown.
-    const remediation = dbPath === null
-      ? "Dispose of it with `monet retire-source --dir <the directory holding this store> --apply --yes` " +
-        "(it takes a verified backup first) — this store was opened through a caller-supplied port, " +
-        "so its path is not known here and must be named explicitly"
-      : `Run \`monet retire-source --dir ${shellQuote(dirname(dbPath))} --apply --yes\` ` +
-        "(it takes a verified backup first)";
-    const held = [
-      `${population.concepts} connector-owned concept(s)`,
-      `${population.observations} observation(s)`,
-      ...(nonemptyTables.length > 0 ? [`data in ${nonemptyTables.join(", ")}`] : []),
-    ].join(", ");
-    super(
-      `this store still holds ${held} from the source subsystem, retired in #16. That content is a ` +
-        `materialized copy of files outside the store plus the registry describing them, and no ` +
-        `surface in this build can read, re-sync, or repair it — but removing it is irreversible, ` +
-        `so this build will not do it implicitly. ${remediation}, or stay on a 1.6.x build if you ` +
-        `still need that content.`,
-    );
-    this.name = "SourceRetirementRequiredError";
-  }
-}
-
-/** Single-quote for a POSIX shell so a path with spaces survives being pasted back. */
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
+  /**
+   * Native concepts that own one of the doomed observations. Reported from the READ-ONLY reading
+   * so a caller can tell, before deleting anything, whether disposal will owe a reprojection —
+   * and therefore whether it needs the store's pinned embedder at all.
+   */
+  staleNativeOwners: string[];
 }
 
 function conceptColumns(db: StoragePort): Set<string> {
   return new Set(
     (db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>).map((column) => column.name),
   );
+}
+
+/**
+ * The contradictions cleanup, assembled from the pointer columns this store actually has.
+ *
+ * `resolution_obs_id` and `contradicted_observation_id` are additive — a store old enough to
+ * predate them reaches the purge without them, and `monet retire-source` opens a raw port that
+ * runs no migrations. Naming a column unconditionally would fail with `no such column` and roll
+ * the whole purge back, which is the same class as the missing-table failure one rung up.
+ */
+function contradictionCleanup(db: StoragePort, conceptIds: string, observationIds: string): Array<[string, string[]]> {
+  if (!tableExists(db, "contradictions")) return [];
+  const columns = new Set(
+    (db.prepare(`PRAGMA table_info(contradictions)`).all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  const inSet = `IN (SELECT value FROM json_each(?))`;
+  const clauses: string[] = [`concept_id ${inSet}`];
+  const params: string[] = [conceptIds];
+  for (const column of ["observation_id", "resolution_obs_id", "contradicted_observation_id"]) {
+    if (!columns.has(column)) continue;
+    clauses.push(`${column} ${inSet}`);
+    params.push(observationIds);
+  }
+  return [[`DELETE FROM contradictions WHERE ${clauses.join(" OR ")}`, params]];
 }
 
 function tableExists(db: StoragePort, table: string): boolean {
@@ -154,12 +137,25 @@ export function connectorPopulation(db: StoragePort): ConnectorPopulation {
  * rows alone would report "nothing to retire", skip the backup, and let the next ordinary open
  * drop a registered source's configuration and attempt history for good.
  */
+/** Native concepts owning one of these observations — the link identifying them dies with the delete. */
+export function staleNativeOwnersOf(db: StoragePort, population: ConnectorPopulation): string[] {
+  if (population.observationIds.length === 0) return [];
+  const inSet = `IN (SELECT value FROM json_each(?))`;
+  return (db.prepare(
+    `SELECT DISTINCT o.concept_id AS id
+       FROM observations o
+       JOIN concepts c ON c.id = o.concept_id
+      WHERE o.id ${inSet} AND c.id NOT ${inSet} AND c.kind != 'workstream'`,
+  ).all(JSON.stringify(population.observationIds), JSON.stringify(population.conceptIds)) as Array<{ id: string }>)
+    .map((row) => row.id);
+}
+
 export function retirementData(db: StoragePort): RetirementData {
   const population = connectorPopulation(db);
   const nonemptyTables = discoverRetiredTables(db).filter(
     (table) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0,
   );
-  return { ...population, nonemptyTables };
+  return { ...population, nonemptyTables, staleNativeOwners: staleNativeOwnersOf(db, population) };
 }
 
 /** True when nothing is left to dispose of and the residue drop is safe to run unattended. */
@@ -223,13 +219,8 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
     const inSet = `IN (SELECT value FROM json_each(?))`;
     // Entity rows are counted BEFORE their memberships go, so the df recount below sees the exact
     // set that lost a member; reversing the order loses the list of what to recount.
-    // The owners are read BEFORE the delete — afterwards the link that identifies them is gone.
-    const staleNativeOwners = (db.prepare(
-      `SELECT DISTINCT o.concept_id AS id
-         FROM observations o
-         JOIN concepts c ON c.id = o.concept_id
-        WHERE o.id ${inSet} AND c.id NOT ${inSet} AND c.kind != 'workstream'`,
-    ).all(o, c) as Array<{ id: string }>).map((row) => row.id);
+    // Read BEFORE the delete — afterwards the link that identifies them is gone.
+    const staleNativeOwners = staleNativeOwnersOf(db, { conceptIds, observationIds });
 
     const affectedEntities = tableExists(db, "concept_entities")
       ? db.prepare(
@@ -250,9 +241,7 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       // `resolution_obs_id`; either can be a purged source observation while the row's own
       // `observation_id` is native, leaving an audit row that points at evidence no longer in the
       // store — and the reprojection below would keep counting it toward confidence.
-      [`DELETE FROM contradictions
-          WHERE concept_id ${inSet} OR observation_id ${inSet}
-             OR resolution_obs_id ${inSet} OR contradicted_observation_id ${inSet}`, [c, o, o, o]],
+      ...contradictionCleanup(db, c, o),
       [`DELETE FROM ingest_operations WHERE concept_id ${inSet} OR observation_id ${inSet}`, [c, o]],
       [`DELETE FROM concept_revisions WHERE concept_id ${inSet}`, [c]],
       [`DELETE FROM concept_tombstones WHERE concept_id ${inSet}`, [c]],
@@ -266,7 +255,11 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       [`DELETE FROM ratifications WHERE subject_concept_id ${inSet}`, [c]],
       [`DELETE FROM resolution_events WHERE observation_id ${inSet} OR nominated_concept_id ${inSet}
           OR matched_observation_id ${inSet}`, [o, c, o]],
-      [`UPDATE observations SET superseded_by = NULL WHERE superseded_by ${inSet}`, [o]],
+      // BOTH HALVES, as detach's own cleanup does (engine.ts). Liveness is `superseded_by IS NULL
+      // AND superseded_at IS NULL` everywhere that reads it, so clearing only the pointer leaves
+      // the native predecessor terminally hidden — superseded by nothing, yet never live — and its
+      // concept can end up with no live evidence at all after the successor is purged.
+      [`UPDATE observations SET superseded_by = NULL, superseded_at = NULL WHERE superseded_by ${inSet}`, [o]],
       [`DELETE FROM observations WHERE id ${inSet}`, [o]],
       [`DELETE FROM concepts WHERE id ${inSet}`, [c]],
     ] as Array<[string, string[]]>) {

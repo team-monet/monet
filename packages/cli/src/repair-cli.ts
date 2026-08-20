@@ -1162,8 +1162,12 @@ export function registerRecoveryCommands(
        * nothing to retire and the stale projection can never be repaired. Loading it first turns
        * that unrecoverable state into a refusal that touches nothing.
        */
+      // ONLY WHEN A REPROJECTION IS ACTUALLY OWED. A store whose retirement data is nothing but
+      // connector rows, registry entries and ledger history needs no embedding operation at all —
+      // demanding a loadable pin there would leave it permanently refused by the engine over a
+      // model cache it never has to touch.
       let embedder: EmbeddingProvider | undefined;
-      if (inspection.pin.status !== "known" || inspection.pin.modelId === null) {
+      if (data.staleNativeOwners.length > 0 && (inspection.pin.status !== "known" || inspection.pin.modelId === null)) {
         throw new Error(
           `this store's embedder pin is not usable (${inspection.pin.status}), so a purged observation's owner could ` +
           `not be reprojected afterwards. Diagnose with \`${doctorCommand(dbPath)}\` first — this command ` +
@@ -1171,10 +1175,12 @@ export function registerRecoveryCommands(
         );
       }
       try {
-        embedder = await dependencies.instantiate(inspection.pin.modelId);
+        if (data.staleNativeOwners.length > 0 && inspection.pin.status === "known" && inspection.pin.modelId !== null) {
+          embedder = await dependencies.instantiate(inspection.pin.modelId);
+        }
       } catch (error) {
         throw new Error(
-          `the store's pinned embedder '${inspection.pin.modelId}' could not be loaded ` +
+          `the store's pinned embedder could not be loaded ` +
           `(${error instanceof Error ? error.message : String(error)}); refusing to purge, because a ` +
           `purged observation's owner could not be reprojected afterwards. Nothing has been deleted.`,
         );
