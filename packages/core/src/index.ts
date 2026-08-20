@@ -316,6 +316,7 @@ export {
   dropRetiredSourceResidue,
   isRetirementDisposed,
   retirementData,
+  SOURCE_RETIREMENT_SCHEMA_VERSION,
   purgeConnectorPopulation,
   RETIRED_SOURCE_TABLES,
   SourceRetirementRequiredError,

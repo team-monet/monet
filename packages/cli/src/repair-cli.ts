@@ -1151,6 +1151,35 @@ export function registerRecoveryCommands(
         return;
       }
 
+      /*
+       * THE EMBEDDER IS RESOLVED BEFORE ANYTHING IS DELETED, and that ordering is the fix.
+       *
+       * Purging a source observation owned by a NATIVE concept leaves that owner's projection
+       * describing evidence that is gone, and repairing it runs the engine's real reprojection —
+       * which asserts the store's pin. Opening the repair core without the pinned embedder gets
+       * MonetCore's hashing default and fails that assert, by which point the purge and the
+       * residue drop have committed and the affected ids exist only in memory: a re-run reports
+       * nothing to retire and the stale projection can never be repaired. Loading it first turns
+       * that unrecoverable state into a refusal that touches nothing.
+       */
+      let embedder: EmbeddingProvider | undefined;
+      if (inspection.pin.status !== "known" || inspection.pin.modelId === null) {
+        throw new Error(
+          `this store's embedder pin is not usable (${inspection.pin.status}), so a purged observation's owner could ` +
+          `not be reprojected afterwards. Diagnose with \`${doctorCommand(dbPath)}\` first — this command ` +
+          `refuses rather than delete rows it cannot finish repairing.`,
+        );
+      }
+      try {
+        embedder = await dependencies.instantiate(inspection.pin.modelId);
+      } catch (error) {
+        throw new Error(
+          `the store's pinned embedder '${inspection.pin.modelId}' could not be loaded ` +
+          `(${error instanceof Error ? error.message : String(error)}); refusing to purge, because a ` +
+          `purged observation's owner could not be reprojected afterwards. Nothing has been deleted.`,
+        );
+      }
+
       let closed = false;
       try {
         const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
@@ -1176,7 +1205,7 @@ export function registerRecoveryCommands(
         // evidence that no longer exists. The engine owns that projection logic; the purge only
         // reports who needs it. Safe to open now — the population it would refuse is gone.
         if (purged.staleNativeOwners.length > 0) {
-          const core = dependencies.createCore(dependencies.createPort(dbPath));
+          const core = dependencies.createCore(dependencies.createPort(dbPath), embedder);
           try {
             const repaired = core.repairNativeProjections(purged.staleNativeOwners);
             console.log(`Reprojected ${repaired} native concept(s) that owned a purged observation.`);

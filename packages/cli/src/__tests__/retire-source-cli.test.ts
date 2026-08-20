@@ -223,4 +223,43 @@ describe("monet retire-source", () => {
       }
     });
   });
+
+  it("refuses before deleting anything when the pinned embedder cannot be loaded", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at)
+         VALUES ('native-owner', 'owner', 'Owner', 'body', 'fact', 'active', 0.6, 1, 'default', 2, 0, '[0.1,0.2]', ?, ?)`,
+      ).run(now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default',
+                 'native-owner', 'peer', ?, ?, '[]')`,
+      ).run(now, now);
+      port.close();
+
+      // The reprojection this purge would owe cannot run without the store's own embedder, and
+      // discovering that AFTER the delete leaves a stale projection nothing can repair.
+      const deps: RecoveryCliDependencies = {
+        ...dependencies,
+        instantiate: async () => { throw new Error("model cache empty"); },
+      };
+      await expect(run(["retire-source", "--apply", "--yes"], deps))
+        .rejects.toThrow(/could not be loaded \(model cache empty\).*Nothing has been deleted/s);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 1 });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'grafted-source-obs'`).get())
+          .toEqual({ n: 1 });
+      } finally {
+        check.close();
+      }
+      expect(existsSync(join(dbPath, "..", "backups"))).toBe(false);
+    });
+  });
 });

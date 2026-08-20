@@ -23,6 +23,13 @@ import { dirname } from "node:path";
 import type { StoragePort } from "./storage";
 
 /**
+ * The schema rung this retirement occupies. Exported because more than one surface has to agree on
+ * it — the engine's own preflight and the dashboard's, which reads a snapshot the engine never
+ * opens. A copied number is how those two drift apart.
+ */
+export const SOURCE_RETIREMENT_SCHEMA_VERSION = 13;
+
+/**
  * The subsystem's tables as the code that created them named them. Kept for tests and for the
  * documentation value — but NOT what the runtime enumerates, because a hand-maintained list is
  * exactly what goes stale: the ledger also produced `*_legacy` and `*_rebuild` tables by RENAME
@@ -238,7 +245,14 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
     for (const [sql, params] of [
       [`DELETE FROM observation_tokens WHERE observation_id ${inSet}`, [o]],
       [`DELETE FROM observation_segments WHERE observation_id ${inSet}`, [o]],
-      [`DELETE FROM contradictions WHERE concept_id ${inSet} OR observation_id ${inSet}`, [c, o]],
+      // ALL FOUR OBSERVATION POINTERS, not just `observation_id`. A resolved contradiction names
+      // its losing evidence in `contradicted_observation_id` and its winning evidence in
+      // `resolution_obs_id`; either can be a purged source observation while the row's own
+      // `observation_id` is native, leaving an audit row that points at evidence no longer in the
+      // store — and the reprojection below would keep counting it toward confidence.
+      [`DELETE FROM contradictions
+          WHERE concept_id ${inSet} OR observation_id ${inSet}
+             OR resolution_obs_id ${inSet} OR contradicted_observation_id ${inSet}`, [c, o, o, o]],
       [`DELETE FROM ingest_operations WHERE concept_id ${inSet} OR observation_id ${inSet}`, [c, o]],
       [`DELETE FROM concept_revisions WHERE concept_id ${inSet}`, [c]],
       [`DELETE FROM concept_tombstones WHERE concept_id ${inSet}`, [c]],

@@ -29,7 +29,12 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 // better-sqlite3 is externalized by esbuild and provided by the runtime node_modules.
 import Database from "better-sqlite3";
-import { isRetirementDisposed, retirementData, SourceRetirementRequiredError } from "@team-monet/core";
+import {
+  isRetirementDisposed,
+  retirementData,
+  SOURCE_RETIREMENT_SCHEMA_VERSION,
+  SourceRetirementRequiredError,
+} from "@team-monet/core";
 
 import { getDbPath } from "../db/index.js";
 // P1-B/P2-D (Codex round 4 on PR #42): every getDbPath() call in this module was bare (cwd-
@@ -459,6 +464,12 @@ function emptyGraphPayload(): unknown {
 function assertRetirementDisposed(snapPath: string): void {
   const db = new Database(snapPath, { readonly: true });
   try {
+    // SAME BOUND AS THE ENGINE'S OWN GUARD. Past schema 13 the engine serves the store, so
+    // refusing here would make the dashboard unusable for a store everything else considers
+    // valid — a `kind='source'` row arriving by graft is an ordinary concept at that point, by
+    // the same ruling that removed the sync-boundary rejection.
+    const schemaVersion = db.pragma("user_version", { simple: true }) as number;
+    if (schemaVersion >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
     // `retirementData` reads through `prepare` only, which a raw better-sqlite3 handle satisfies —
     // no StoragePort is constructed here, and none should be: this is a readonly snapshot.
     const data = retirementData(db as unknown as Parameters<typeof retirementData>[0]);

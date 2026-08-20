@@ -26,6 +26,7 @@ import {
   dropRetiredSourceResidue,
   isRetirementDisposed,
   retirementData,
+  SOURCE_RETIREMENT_SCHEMA_VERSION,
   SourceRetirementRequiredError,
 } from "./source-retirement";
 import {
@@ -323,7 +324,6 @@ const FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION = 12;
 // Rung 13: the source subsystem's retirement (#16). The ruling that dropped the subsystem is
 // what makes the purge safe — its content was always a materialized copy of files that live
 // outside the store, and nothing can re-read it once the connector is gone.
-const SOURCE_RETIREMENT_SCHEMA_VERSION = 13;
 const FIRST_BLOCK_OBSERVATION_AUTHOR = "schema-12-first-block-migration";
 const FIRST_BLOCK_OBSERVATION_PREFIX = "First Block pin (surface retired 2026-08-02): ";
 
