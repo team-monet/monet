@@ -882,8 +882,13 @@ export function momentConformance(db: StoragePort, spoolPath: string, circle: st
       `SELECT COUNT(*) AS n FROM governed_moments
         WHERE ${OPENED} AND asked_at IS NULL AND answer IS NULL AND outcome_at IS NOT NULL AND ${READ}`,
     ),
-    // NOT circle-scoped: a read that named no moment has no circle to scope by.
-    unjoinableReads: (db.prepare(`SELECT COUNT(*) AS n FROM moment_reads WHERE moment_id IS NULL`).get() as { n: number }).n,
+    // SCOPED, and this comment used to say the opposite. The old reasoning — "a read that named no
+    // moment has no circle to scope by" — was true only while the read record carried no circle of
+    // its own. It carries one now: the circle lands on the READ, from the lookup that resolved it,
+    // precisely because a `stage_lookup` reached from `agent_context` names no moment. So the fact
+    // was available and this query was still counting every project's unjoinable reads into every
+    // project's overview.
+    unjoinableReads: one(`SELECT COUNT(*) AS n FROM moment_reads WHERE moment_id IS NULL AND circle = ?`),
   };
 }
 

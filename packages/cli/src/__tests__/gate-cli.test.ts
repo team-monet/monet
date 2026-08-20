@@ -2112,3 +2112,55 @@ describe("remote-circle.ts (extracted P1 helpers)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+/**
+ * Codex round three, `gate-cli.ts:1220` — an overflow is NOT an evaluated empty rule set.
+ *
+ * `momentDispositionOf` already maps overflow to `ungoverned`, but the same record wrote
+ * `ruleIds: []` beside it, and `momentCounts` reads `rule_ids IS NOT NULL` as "the gate evaluated
+ * this". One row therefore said `ungoverned` in its disposition and `silent` in every count derived
+ * from it — the not-known-versus-verdict substitution this whole subsystem exists to remove.
+ */
+describe("R3 — an overflow moment records no rule set, not an empty one", () => {
+  it("writes ruleIds and deliveredRuleIds as null so counts read it as ungoverned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "monet-r3-overflow-"));
+    const spool = join(dir, "moments.jsonl");
+    const mirrorPath = join(dir, "gate-mirror.json");
+    // A REAL mirror. A hand-written one is rejected by readGateMirrorFile, which sends the run down
+    // the fail-open path — where the record is already all-null and the defect cannot appear.
+    await buildFixtureMirror(mirrorPath);
+    // Past MAX_CONTEXT_BYTES (4 MiB), which short-circuits before any matching is attempted.
+    const huge = `Bash:${"x".repeat(4 * 1024 * 1024 + 10)}`;
+    const originalLog = console.log;
+    const originalError = console.error;
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      runGate(huge, { circle: "acme-widgets", mirror: mirrorPath }, {
+        now: () => 1_760_000_000_000,
+        env: { MONET_MOMENT_ID: "66666666-6666-4666-8666-666666666666" },
+        projectDir: () => dir,
+        mirrorPath: () => mirrorPath,
+        momentSpoolPath: () => spool,
+        readStdin: () => { throw new Error("must not be called"); },
+        isStdinTTY: () => false,
+        setExitCode: () => {},
+      });
+    } finally {
+      console.log = originalLog;
+      console.error = originalError;
+    }
+    const interception = readFileSync(spool, "utf8")
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((r) => r.kind === "interception");
+    // The circle proves this went through spoolGovernedMoment, not the fail-open recorder.
+    expect(interception?.circle).toBe("acme-widgets");
+    expect(interception?.disposition).toBe("ungoverned");
+    // NULL, not []. An empty array claims the gate looked and found nothing bound.
+    expect(interception?.ruleIds).toBeNull();
+    expect(interception?.deliveredRuleIds).toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

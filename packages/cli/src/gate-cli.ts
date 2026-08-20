@@ -1215,9 +1215,16 @@ function spoolGovernedMoment(
       surface: surfaceOfActionContext(actionContext),
       action: actionContext,
       stageId: result.stage?.id ?? null,
-      ruleIds: result.rules.map((rule) => rule.conceptId),
+      // NULL ON OVERFLOW, NEVER []. `evaluateGateFromMirror` short-circuits before any matching is
+      // attempted, so its `rules: []` means "nothing was consulted" — but `[]` on the record says
+      // the gate LOOKED and found nothing bound, and `momentCounts` reads every non-null rule set
+      // as evaluated. The row then said `ungoverned` in its own disposition while every count
+      // derived from it said `silent`: one record asserting a verdict it never reached, which is
+      // the substitution this whole subsystem exists to remove. `deliveredRuleIds` follows for the
+      // same reason — nothing can have been delivered from a set nobody built.
+      ruleIds: result.overflow ? null : result.rules.map((rule) => rule.conceptId),
       disposition: momentDispositionOf(result),
-      deliveredRuleIds: deliveredRuleIdsOf(result),
+      deliveredRuleIds: result.overflow ? null : deliveredRuleIdsOf(result),
     });
   } catch {
     // Total, and for the same reason the spool's own append is: the record is owed to the record,

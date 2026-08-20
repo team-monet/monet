@@ -168,8 +168,8 @@ describe("the four states, kept apart", () => {
     const path = join(mkTmp(), "moments.jsonl");
     const db = mkDb();
     seq = 0;
-    line(path, { kind: "read", momentId: null, ruleId: "rule-a", namedStageId: null, readAt: "t" });
-    line(path, { kind: "read", momentId: null, ruleId: "rule-b", namedStageId: null, readAt: "t" });
+    line(path, { kind: "read", momentId: null, ruleId: "rule-a", namedStageId: null, circle: "acme-widgets", readAt: "t" });
+    line(path, { kind: "read", momentId: null, ruleId: "rule-b", namedStageId: null, circle: "acme-widgets", readAt: "t" });
 
     expect(momentConformance(db, path, "acme-widgets").unjoinableReads).toBe(2);
     // THE REASON IT IS KEYED RATHER THAN COUNTED: the fold re-reads ranges routinely, and an

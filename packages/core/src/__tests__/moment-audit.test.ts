@@ -251,7 +251,7 @@ describe("G2 — the all-clear stays reachable", () => {
     // it. moment_reads has no DELETE anywhere, so this count only ever grows — suppressing the
     // all-clear on it made "no curation work queued" unreachable for the life of the store after
     // one lookup, with zero moments, zero losses, and nothing a human could act on.
-    line(path, { kind: "read", momentId: null, ruleId: "rule-a", namedStageId: "stage-1", readAt: "t" });
+    line(path, { kind: "read", momentId: null, ruleId: "rule-a", namedStageId: "stage-1", circle: "acme-widgets", readAt: "t" });
     foldMomentSpool(db, path);
     const core = new MonetCore(":memory:", { momentSpoolPath: path, defaultCircle: "acme-widgets" });
     cores.push(core);
@@ -267,7 +267,7 @@ describe("G2 — the all-clear stays reachable", () => {
     const path = join(mkTmp(), "moments.jsonl");
     const db = mkDb();
     seq = 0;
-    line(path, { kind: "read", momentId: null, ruleId: "rule-a", namedStageId: "stage-1", readAt: "t" });
+    line(path, { kind: "read", momentId: null, ruleId: "rule-a", namedStageId: "stage-1", circle: "acme-widgets", readAt: "t" });
     // Debris opens the section; the unjoinable count rides along rather than being lost.
     line(path, { kind: "outcome", momentId: "d1", toolUseId: null, outcomeStatus: null, outcomeAt: "t", outcomeSha256: "c".repeat(64) });
     foldMomentSpool(db, path);

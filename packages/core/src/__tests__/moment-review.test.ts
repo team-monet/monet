@@ -477,3 +477,18 @@ describe("R2 P2 — the overview response is measured whole before it is returne
     }
   });
 });
+
+describe("R3 — unjoinable reads are scoped to the circle that asked", () => {
+  it("does not count another project's moment-less lookups", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "circle-a", momentSpoolPath: spool });
+    cores.push(core);
+    // A stage_lookup reached from agent_context in circle-a: a real read, naming no moment.
+    core.recordRuleReads(null, ["rule-a"], "stage-alpha", "circle-a");
+    expect(core.momentConformance("circle-a").unjoinableReads).toBe(1);
+    // circle-b did nothing, and its overview must not inherit circle-a's count. The read knows its
+    // own circle even though the moment does not — that is why this is scopable at all.
+    expect(core.momentConformance("circle-b").unjoinableReads).toBe(0);
+  });
+});
