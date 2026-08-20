@@ -661,17 +661,35 @@ export function registerMonetCoreTools(
     // something else entirely (the process died mid-call).
     const toolName = typeof toolArgs[0] === "string" ? toolArgs[0] : "unknown";
     const trackedHandler = (...handlerArgs: unknown[]): unknown => {
-      const momentId = core.openStoreMoment(toolName);
+      // THE CIRCLE THE CALL ITSELF NAMES, read straight off the handler's own argument object.
+      // Every circle-accepting tool takes it under this one key, and `openStoreMoment` resolves
+      // aliases and falls back to the server default, so an omitted or unusable value lands exactly
+      // where it did before. Without this, a call explicitly targeting another circle was counted
+      // against the default one and never appeared in the circle it actually touched.
+      //
+      // '*' IS NOT A CIRCLE. It is the reserved global-breadth marker for member delivery, and a
+      // moment attributed to it would name a population no project can read; the default stands.
+      const argCircle =
+        typeof handlerArgs[0] === "object" && handlerArgs[0] !== null
+          ? (handlerArgs[0] as { circle?: unknown }).circle
+          : undefined;
+      const callCircle =
+        typeof argCircle === "string" && argCircle.length > 0 && argCircle !== "*" ? argCircle : undefined;
+      const momentId = core.openStoreMoment(toolName, callCircle);
       // Identity, never content: a sha256 of the serialized result. A result that cannot be
       // serialized still closes the moment — with the string form — rather than leaving it open.
-      const closeWith = (value: unknown): void => {
+      // THE STATUS IS OBSERVED HERE, at the only place that can tell. Each caller below already
+      // knows which branch it is in — the handler returned, or it threw/rejected — so passing it
+      // through is reporting a fact this wrapper holds rather than inferring one. Hard-coding
+      // `null` made a failed store operation indistinguishable from a successful one.
+      const closeWith = (value: unknown, outcomeStatus: "ok" | "failed"): void => {
         let rendered: string;
         try {
           rendered = JSON.stringify(value) ?? String(value);
         } catch {
           rendered = String(value);
         }
-        core.closeStoreMoment(momentId, rendered);
+        core.closeStoreMoment(momentId, rendered, outcomeStatus);
       };
       inFlightTracker.increment();
       let result: unknown;
@@ -679,23 +697,23 @@ export function registerMonetCoreTools(
         result = handler(...handlerArgs);
       } catch (error) {
         inFlightTracker.decrement();
-        closeWith({ threw: String(error) });
+        closeWith({ threw: String(error) }, "failed");
         throw error;
       }
       if (result instanceof Promise) {
         return result.then(
           (value) => {
-            closeWith(value);
+            closeWith(value, "ok");
             return value;
           },
           (error: unknown) => {
-            closeWith({ threw: String(error) });
+            closeWith({ threw: String(error) }, "failed");
             throw error;
           },
         ).finally(() => inFlightTracker.decrement());
       }
       inFlightTracker.decrement();
-      closeWith(result);
+      closeWith(result, "ok");
       return result;
     };
     const trackedArgs = [...toolArgs.slice(0, -1), trackedHandler];
@@ -1457,11 +1475,12 @@ export function registerMonetCoreTools(
         // threshold says when a backlog is too large — nothing has measured that — so these are
         // counts and nothing more. `followed` means the action followed the rule; it does not say
         // the rule caused it, which is unobservable.
-        return readOk(
-          { ...fitOverviewEnvelope(ov), conformance: core.momentConformance() },
-          "memory_overview",
-          capturedBlock,
-        );
+        // EVERY RETURNED FIELD GOES THROUGH THE FITTER. `ov.gate.conformance` already carries the
+        // four states, and a SECOND top-level copy was being attached after `fitOverviewEnvelope`
+        // had already measured the response — so near the ceiling the extra object pushed the
+        // payload over and `ok()` replaced the entire overview with a generic truncation notice.
+        // A field added past the fitter is a field the fitter cannot account for.
+        return readOk(fitOverviewEnvelope(ov), "memory_overview", capturedBlock);
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
       }
@@ -1782,6 +1801,9 @@ export function registerMonetCoreTools(
           // a miss there is no id, and null is honest: the agent named something this build could
           // not resolve.
           r.stage?.id ?? null,
+          // The circle THIS lookup was scoped to — the same value the lookup itself ran under, so
+          // stage coverage is read per circle instead of over every project sharing the spool.
+          scope(circle),
         );
 
         // RECOVERY FOR OMITTED RULES (review fix): `rulesOmitted: K` alone is disclosure without

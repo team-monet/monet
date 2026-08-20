@@ -273,6 +273,12 @@ export const MOMENT_SCHEMA_SQL = `
     moment_id TEXT,
     /** The stage the AGENT NAMED. Never the stage the gate matched — that is on the moment. */
     named_stage_id TEXT,
+    -- The circle the lookup was scoped to. NULL when the writer did not record one.
+    --
+    -- HERE RATHER THAN JOINED FROM THE MOMENT, because a read does not always have a moment: a
+    -- stage_lookup reached from agent_context names none. Joining through governed_moments to find
+    -- a circle would silently drop those reads from every circle's coverage map.
+    circle TEXT,
     PRIMARY KEY (run_id, seq)
   );
   CREATE INDEX IF NOT EXISTS idx_moment_reads_named_stage
@@ -559,6 +565,28 @@ export class ConflictingAnswerError extends Error {
   }
 }
 
+/**
+ * The write went through every check and still is not on the record.
+ *
+ * WHY THIS CANNOT BE INFERRED FROM THE CALL SUCCEEDING: every spool append is deliberately
+ * best-effort — `spoolAnswer` swallows its own write error, because instrumentation is owed to the
+ * record and never to the caller's operation (see moment-spool.ts's header). That posture is right
+ * for an interception, whose loss the sequence ledger will name. It is wrong for a conformance
+ * answer, which is the ONE datum in this system no machine can reproduce: if the disk filled or the
+ * mode changed, the append vanished, the fold found nothing, and the tool told the user their
+ * answer was recorded. Reading the value back after the fold is the only way to tell a write that
+ * landed from one that was swallowed.
+ */
+export class MomentWriteNotObservedError extends Error {
+  constructor(readonly momentId: string, readonly what: "ask" | "answer") {
+    super(
+      `the ${what} for moment ${momentId} is not on the record after writing it — the spool append ` +
+        "did not land. Nothing was recorded, and the value must be supplied again.",
+    );
+    this.name = "MomentWriteNotObservedError";
+  }
+}
+
 export class UnknownMomentError extends Error {
   constructor(readonly momentId: string) {
     super(`no governed moment ${momentId} in the record: an answer attaches to a moment, it never creates one`);
@@ -593,6 +621,35 @@ export function foldMomentSpool(db: StoragePort, spoolPath: string): MomentFoldR
     if (pass.cursor <= before) break;
   }
   return total;
+}
+
+/**
+ * Follows an active circle alias, so a renamed circle's history stays reachable under one name.
+ *
+ * AT FOLD TIME, NOT ONLY AT QUERY TIME, and both are needed for different halves of the same
+ * failure. `renameCircle` moves the rows that are already folded; this handles everything that
+ * arrives afterwards — the spool is APPEND-ONLY and immutable, so every record written before the
+ * rename still says `old` forever, and a re-fold with no resolution here would write `old` back
+ * over the row the rename just moved. Resolving on the way in makes the fold converge on the
+ * canonical name no matter how many times it runs.
+ *
+ * THE FOLD MAY READ THE STORE; the INTERCEPTOR may not (invariant 05). This runs inside the fold,
+ * which is already database-side by construction, so it costs nothing on the critical path.
+ *
+ * TOLERATES A STORE WITH NO `circle_aliases` TABLE. The moment tables are created lazily and on
+ * their own, so a database holding nothing but them is a real and tested configuration; there, the
+ * name is simply already canonical.
+ */
+function resolveCircleAlias(db: StoragePort, circle: string | null): string | null {
+  if (circle === null) return null;
+  try {
+    const row = db
+      .prepare(`SELECT to_name FROM circle_aliases WHERE from_name = ? AND status = 'active'`)
+      .get(circle) as { to_name: string } | undefined;
+    return row ? row.to_name : circle;
+  } catch {
+    return circle;
+  }
 }
 
 function mergeFoldResults(a: MomentFoldResult, b: MomentFoldResult): MomentFoldResult {
@@ -662,9 +719,10 @@ function foldMomentSpoolOnce(db: StoragePort, spoolPath: string): MomentFoldResu
           // regression wants.
           const noted = db
             .prepare(
-              `INSERT OR IGNORE INTO moment_reads (run_id, seq, moment_id, named_stage_id) VALUES (?, ?, ?, ?)`,
+              `INSERT OR IGNORE INTO moment_reads (run_id, seq, moment_id, named_stage_id, circle)
+                 VALUES (?, ?, ?, ?, ?)`,
             )
-            .run(record.runId, record.seq, record.momentId, record.namedStageId);
+            .run(record.runId, record.seq, record.momentId, record.namedStageId, resolveCircleAlias(db, record.circle));
           if (noted.changes === 1 && record.momentId === null) result.unjoinableReads += 1;
         }
         applyRecord(db, record);
@@ -916,16 +974,20 @@ export function momentCounts(db: StoragePort, spoolPath: string, circle: string)
  * an action is a different fact and lives on the moment as `stage_id`; the two can disagree in one
  * call and are deliberately never merged.
  */
-export function momentStageReads(db: StoragePort, spoolPath: string): Map<string, number> {
+export function momentStageReads(db: StoragePort, spoolPath: string, circle: string): Map<string, number> {
   foldMomentSpool(db, spoolPath);
+  // SCOPED, for the same reason every other count here is: the spool is home-level and this store
+  // folds every project's reads. Unscoped, one lookup of a global stage in circle A made that stage
+  // stop reporting as never-looked-up in circle B — the map's entire purpose is to name a stage
+  // NOBODY has consulted, and another project's activity was answering that question for it.
   const rows = db
     .prepare(
       `SELECT named_stage_id AS stageId, COUNT(*) AS reads
          FROM moment_reads
-        WHERE named_stage_id IS NOT NULL
+        WHERE named_stage_id IS NOT NULL AND circle = ?
         GROUP BY named_stage_id`,
     )
-    .all() as Array<{ stageId: string; reads: number }>;
+    .all(circle) as Array<{ stageId: string; reads: number }>;
   return new Map(rows.map((row) => [row.stageId, row.reads]));
 }
 
@@ -1005,6 +1067,10 @@ export function attachMomentAsk(db: StoragePort, run: MomentRun, fields: { momen
   requireObservedMoment(db, fields.momentId);
   spoolAsk(run, fields);
   foldMomentSpool(db, spoolPath);
+  // READ IT BACK. See MomentWriteNotObservedError for why a successful return is not evidence.
+  if (selectMoment(db, fields.momentId)?.askedAt == null) {
+    throw new MomentWriteNotObservedError(fields.momentId, "ask");
+  }
 }
 
 /**
@@ -1033,6 +1099,12 @@ export function attachMomentAnswer(
   }
   spoolAnswer(run, fields);
   foldMomentSpool(db, spoolPath);
+  // READ IT BACK, and compare the VALUE rather than merely checking for one: first-write-wins means
+  // a stale answer already on the row would otherwise pass an existence check while the caller's
+  // own answer was never stored.
+  if (selectMoment(db, fields.momentId)?.answer !== fields.answer) {
+    throw new MomentWriteNotObservedError(fields.momentId, "answer");
+  }
 }
 
 /**
@@ -1174,7 +1246,7 @@ function applyRecord(db: StoragePort, record: MomentSpoolRecord): void {
         record.at,
         record.sessionId,
         record.toolUseId,
-        record.circle,
+        resolveCircleAlias(db, record.circle),
         record.surface,
         record.actionSha256,
         record.actionRendering,
@@ -1200,14 +1272,39 @@ function applyRecord(db: StoragePort, record: MomentSpoolRecord): void {
       // the act; a later re-read of the same rule in the same moment does not change whether the
       // rule was received before the agent acted.
       const existing = db
-        .prepare(`SELECT rule_reads FROM governed_moments WHERE moment_id = ?`)
-        .get(record.momentId) as { rule_reads: string } | undefined;
+        .prepare(`SELECT rule_reads, rule_ids, outcome_at FROM governed_moments WHERE moment_id = ?`)
+        .get(record.momentId) as
+        | { rule_reads: string; rule_ids: string | null; outcome_at: string | null }
+        | undefined;
       if (existing === undefined) {
+        // No interception folded yet. The moment id is minted BY the interceptor and only travels
+        // out with a delivered rule, so a read naming an id the record has never seen means the
+        // interception append was lost — the row stays `opened = 0` debris, which no count reads.
         db.prepare(`INSERT INTO governed_moments (moment_id, opened, rule_reads) VALUES (?, 0, ?)`).run(
           record.momentId,
           JSON.stringify({ [record.ruleId]: record.readAt }),
         );
         return;
+      }
+      // A READ AFTER THE ACTION IS NOT A READ BEFORE ACTING. An agent can name a stale moment id
+      // in a later `stage_lookup` — the id is durable and nothing stops it being reused — and
+      // crediting that would report the completed action as governed by a rule the agent met only
+      // afterwards, then ask the user to judge it. Fact 3 is an ORDERING claim, so it is checked
+      // as one. Both stamps are `toISOString()`, whose fixed-width UTC form compares correctly as
+      // text; a read at exactly the outcome instant is KEPT, because a tie cannot be ordered from
+      // the record and discarding a real read on a coincidence is the worse error.
+      if (existing.outcome_at !== null && record.readAt > existing.outcome_at) return;
+      // ONLY A RULE THIS MOMENT WAS GOVERNED BY. A stale gate mirror, or a stage edited between
+      // interception and lookup, can hand back a rule that was not bound when the action was
+      // intercepted. Crediting it would enter the moment into conformance as though a rule that
+      // did not apply had been read and followed. The lookup is still recorded as a stage-read
+      // event in `moment_reads` above — what happened is kept; only the receipt claim is refused.
+      if (existing.rule_ids !== null) {
+        const applicable = parseJsonArray(existing.rule_ids);
+        // A rule_ids column that will not parse leaves nothing to check against, so the read is
+        // credited rather than dropped: refusing on an unreadable column would turn a storage
+        // defect into a silent loss of real receipts.
+        if (applicable !== null && !applicable.includes(record.ruleId)) return;
       }
       const reads = parseJsonObject(existing.rule_reads);
       if (Object.prototype.hasOwnProperty.call(reads, record.ruleId)) return;

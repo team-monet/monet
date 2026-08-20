@@ -14,6 +14,11 @@ import { BetterSqlitePort } from "../storage";
 import type { StoragePort } from "../storage";
 import { UnknownMomentError, foldMomentSpool, momentConformance, readGovernedMoment } from "../moment-ledger";
 import { MOMENT_SPOOL_READ_CHUNK_BYTES, readMomentSpool } from "../moment-spool";
+import { renderOverview } from "../render-overview";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { registerMonetCoreTools } from "../mcp-server";
 
 const dirs: string[] = [];
 const ports: StoragePort[] = [];
@@ -260,5 +265,215 @@ describe("P1 — moment counts are scoped to the circle the overview asked for",
     const counts = core.momentCounts("acme-widgets");
     expect(counts.fires).toBe(1);
     expect(counts.unattributed).toBe(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CODEX ROUND TWO — reproductions written BEFORE any fix.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("R2 P1 — a read recorded after the action is not a read before acting", () => {
+  it("does not credit a stage_lookup that lands after the moment's outcome", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const db = mkDb();
+    const m = "11111111-1111-4111-8111-111111111111";
+    line(spool, {
+      kind: "interception", momentId: m, at: "2026-08-21T00:00:00.000Z", toolUseId: null,
+      circle: "acme-widgets", sessionId: null, surface: "Bash", actionSha256: "a".repeat(64),
+      actionRendering: "terraform apply", actionChars: 15, actionClipped: false,
+      stageId: "stage-1", ruleIds: ["rule-a"], disposition: "advised", deliveredRuleIds: ["rule-a"],
+    });
+    // The action completes FIRST.
+    line(spool, {
+      kind: "outcome", momentId: m, toolUseId: null, outcomeStatus: "ok",
+      outcomeAt: "2026-08-21T00:00:10.000Z", outcomeSha256: "b".repeat(64),
+    });
+    // THEN the agent looks the rule up, naming the stale moment id.
+    line(spool, {
+      kind: "read", momentId: m, ruleId: "rule-a", namedStageId: "stage-1",
+      readAt: "2026-08-21T00:00:20.000Z",
+    });
+    foldMomentSpool(db, spool);
+    const row = readGovernedMoment(db, spool, m);
+    // Fact 3 is "the agent read it BEFORE acting". A read stamped after outcome_at is not that.
+    expect(Object.keys(row?.ruleReads ?? {})).toEqual([]);
+  });
+});
+
+describe("R2 P1 — only rules applicable to the moment may be credited", () => {
+  it("does not credit a rule absent from the moment's own rule_ids", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const db = mkDb();
+    const m = "22222222-2222-4222-8222-222222222222";
+    line(spool, {
+      kind: "interception", momentId: m, at: "2026-08-21T00:00:00.000Z", toolUseId: null,
+      circle: "acme-widgets", sessionId: null, surface: "Bash", actionSha256: "a".repeat(64),
+      actionRendering: "terraform apply", actionChars: 15, actionClipped: false,
+      stageId: "stage-1", ruleIds: ["rule-a"], disposition: "advised", deliveredRuleIds: ["rule-a"],
+    });
+    // A stale mirror hands back a rule that was NOT bound when this moment was intercepted.
+    line(spool, {
+      kind: "read", momentId: m, ruleId: "rule-added-later", namedStageId: "stage-1",
+      readAt: "2026-08-21T00:00:05.000Z",
+    });
+    foldMomentSpool(db, spool);
+    const row = readGovernedMoment(db, spool, m);
+    expect(Object.keys(row?.ruleReads ?? {})).toEqual([]);
+  });
+});
+
+describe("R2 P1 — an unwritable spool must not acknowledge a conformance answer", () => {
+  it("refuses when the append is swallowed and the answer never lands", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const db = mkDb();
+    const m = "33333333-3333-4333-8333-333333333333";
+    readAndActed(spool, m);
+    const core = new MonetCore(":memory:", { defaultCircle: "acme-widgets", momentSpoolPath: spool });
+    cores.push(core);
+    core.momentCounts(); // folds
+    // The disk goes read-only between the fold and the answer.
+    chmodSync(spool, 0o444);
+    expect(() => core.recordMomentAnswer(m, "followed")).toThrow();
+  });
+});
+
+describe("R2 P1 — a store call is attributed to the circle it targets", () => {
+  it("does not count a call against another circle's totals", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "circle-a", momentSpoolPath: spool });
+    cores.push(core);
+    // An MCP request that explicitly targets circle-b.
+    const id = core.openStoreMoment("memory_recall", "circle-b");
+    core.closeStoreMoment(id, "{}", "ok");
+    expect(core.momentCounts("circle-b").total).toBe(1);
+    expect(core.momentCounts("circle-a").total).toBe(0);
+  });
+});
+
+describe("R2 P2 — a store call's observed failure is on the record", () => {
+  it("distinguishes a handler that threw from one that returned", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const db = mkDb();
+    const core = new MonetCore(":memory:", { defaultCircle: "circle-a", momentSpoolPath: spool });
+    cores.push(core);
+    const ok = core.openStoreMoment("memory_fetch");
+    core.closeStoreMoment(ok, "{}", "ok");
+    const bad = core.openStoreMoment("memory_store");
+    core.closeStoreMoment(bad, '{"threw":"boom"}', "failed");
+    foldMomentSpool(db, spool);
+    expect(readGovernedMoment(db, spool, ok as string)?.outcomeStatus).toBe("ok");
+    expect(readGovernedMoment(db, spool, bad as string)?.outcomeStatus).toBe("failed");
+  });
+});
+
+describe("R2 P2 — stage-read coverage is scoped to the circle that asked", () => {
+  it("does not let a lookup in one circle answer for another", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "circle-a", momentSpoolPath: spool });
+    cores.push(core);
+    // One lookup of a global stage, in circle-a only.
+    core.recordRuleReads(null, ["rule-a"], "stage-shared", "circle-a");
+    expect(core.momentStageReads("circle-a").get("stage-shared")).toBe(1);
+    // circle-b has never looked this stage up, and must still report it as unread.
+    expect(core.momentStageReads("circle-b").has("stage-shared")).toBe(false);
+  });
+});
+
+describe("R2 P2 — governed moments survive a circle rename", () => {
+  it("keeps pre-rename history reachable under the new name", async () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const core = new MonetCore(":memory:", { defaultCircle: "old-name", momentSpoolPath: spool });
+    cores.push(core);
+    // A circle is renameable because it HOLDS something — governed moments alone do not make one
+    // exist, so this mirrors the only shape a rename actually happens in.
+    await core.store("A fact that gives this circle something to hold.", { kind: "fact" });
+    const id = core.openStoreMoment("memory_recall");
+    core.closeStoreMoment(id, "{}", "ok");
+    expect(core.momentCounts("old-name").total).toBe(1);
+
+    core.renameCircle("old-name", "new-name");
+    // Reachable under the new name...
+    expect(core.momentCounts("new-name").total).toBe(1);
+    // ...and under the old one, which resolves through the alias.
+    expect(core.momentCounts("old-name").total).toBe(1);
+    // AND A RECORD WRITTEN AFTER THE RENAME UNDER THE OLD NAME STILL LANDS IN THE CIRCLE.
+    // This is the case the rename migration alone cannot reach and it is not hypothetical: the
+    // generated hook has `--circle old-name` baked into settings.json, and renaming a circle in
+    // the store does not rewrite that file — so every later invocation keeps writing the old name.
+    // Without alias resolution on the way in, each one is orphaned under a circle nobody queries.
+    line(spool, {
+      kind: "interception", momentId: "55555555-5555-4555-8555-555555555555",
+      at: "2026-08-21T00:00:00.000Z", toolUseId: null, circle: "old-name", sessionId: null,
+      surface: "Bash", actionSha256: "a".repeat(64), actionRendering: "ls", actionChars: 2,
+      actionClipped: false, stageId: null, ruleIds: null, disposition: "ungoverned",
+      deliveredRuleIds: null,
+    });
+    expect(core.momentCounts("new-name").total).toBe(2);
+    expect(core.momentCounts("new-name").unattributed).toBe(0);
+  });
+});
+
+describe("R2 P2 — the terminal overview never hides an unattributed population", () => {
+  it("does not print the all-clear while moments sit with no circle", () => {
+    const dir = mkTmp();
+    const spool = join(dir, "moments.jsonl");
+    const db = mkDb();
+    const core = new MonetCore(":memory:", { defaultCircle: "circle-a", momentSpoolPath: spool });
+    cores.push(core);
+    // A gate that failed before it resolved a circle: observed, attributed to nothing.
+    const m = "44444444-4444-4444-8444-444444444444";
+    line(spool, {
+      kind: "interception", momentId: m, at: "2026-08-21T00:00:00.000Z", toolUseId: null,
+      circle: null, sessionId: null, surface: "Bash", actionSha256: "a".repeat(64),
+      actionRendering: "ls", actionChars: 2, actionClipped: false, stageId: null,
+      ruleIds: null, disposition: "ungoverned", deliveredRuleIds: null,
+    });
+    foldMomentSpool(db, spool);
+    const ov = core.overview("circle-a");
+    expect(ov.gate.unattributed).toBe(1);
+    const rendered = renderOverview(ov, { color: false });
+    expect(rendered).not.toContain("no curation work queued");
+    expect(rendered).toContain("GATE");
+    expect(rendered).toContain("no circle resolved");
+  });
+});
+
+describe("R2 P2 — the overview response is measured whole before it is returned", () => {
+  it("attaches no field past the fitter that the fitter never counted", async () => {
+    const dir = mkTmp();
+    const core = new MonetCore(":memory:", {
+      defaultCircle: "circle-a",
+      momentSpoolPath: join(dir, "moments.jsonl"),
+    });
+    const server = new McpServer(
+      { name: "monet-core-test", version: "0.6.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerMonetCoreTools(server, core);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "test-client", version: "0.0.1" });
+    await client.connect(clientTransport);
+    try {
+      const res = await client.callTool({ name: "memory_overview", arguments: { circle: "circle-a" } });
+      const text = (res.content as Array<{ type: string; text: string }>)[0].text;
+      const payload = JSON.parse(text) as Record<string, unknown>;
+      // The four states belong to the gate block, which the fitter measures.
+      expect(payload.gate).toHaveProperty("conformance");
+      // A SECOND top-level copy was appended AFTER fitOverviewEnvelope had measured the response,
+      // so near the ceiling it pushed the payload over and the whole overview was replaced by a
+      // generic truncation notice. Anything returned must be inside what the fitter counted.
+      expect(payload).not.toHaveProperty("conformance");
+    } finally {
+      await client.close();
+      core.close();
+    }
   });
 });

@@ -188,13 +188,17 @@ describe("the fold is idempotent", () => {
   it("keeps the first observation when a later record claims a different value", () => {
     const path = join(mkTmp(), "moments.jsonl");
     const db = mkDb();
-    seed(path, "run-a", 0, interception("m1", { surface: "Bash", disposition: "silent" }));
-    seed(path, "run-a", 1, interception("m1", { surface: "Write", disposition: "blocked" }));
+    // `ruleIds: ["r1"]`, because the two reads below claim receipt of r1 and only a rule this
+    // moment was actually governed by may be credited. With the helper's default silent
+    // interception (`ruleIds: []`) the fold now refuses both reads — correctly — and this test
+    // would certify first-write-wins against a pair of records that never land.
+    seed(path, "run-a", 0, interception("m1", { surface: "Bash", disposition: "advised", ruleIds: ["r1"] }));
+    seed(path, "run-a", 1, interception("m1", { surface: "Write", disposition: "blocked", ruleIds: ["r1"] }));
     seed(path, "run-a", 2, { kind: "read", momentId: "m1", ruleId: "r1", namedStageId: null, readAt: "first" });
     seed(path, "run-a", 3, { kind: "read", momentId: "m1", ruleId: "r1", namedStageId: null, readAt: "second" });
     foldMomentSpool(db, path);
     const moment = readGovernedMoment(db, path, "m1");
-    expect(moment).toMatchObject({ surface: "Bash", disposition: "silent" });
+    expect(moment).toMatchObject({ surface: "Bash", disposition: "advised" });
     expect(moment?.ruleReads).toEqual({ r1: "first" });
   });
 
@@ -258,7 +262,7 @@ describe("an answer attaches; it never creates", () => {
       disposition: "advised",
       deliveredRuleIds: ["r1"],
     });
-    spoolRuleRead(run, { momentId: "m1", ruleId: "r1", namedStageId: "stage-1", readAt: "2026-08-19T00:00:01.000Z" });
+    spoolRuleRead(run, { momentId: "m1", ruleId: "r1", namedStageId: "stage-1", circle: "acme-widgets", readAt: "2026-08-19T00:00:01.000Z" });
     spoolOutcome(run, { momentId: "m1", toolUseId: null, outcome: "ok", outcomeStatus: "ok", outcomeAt: "2026-08-19T00:00:02.000Z" });
     createMomentTables(db);
     return run;

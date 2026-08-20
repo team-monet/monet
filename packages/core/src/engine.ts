@@ -8288,7 +8288,7 @@ export class MonetCore {
     // the stages nothing has ever asked for, because that is the one state indistinguishable from
     // health. Derived by joining the live registry against the stages agents actually NAMED —
     // never against the stage the gate matched, which is a different fact.
-    const namedStages = this.momentStageReads();
+    const namedStages = this.momentStageReads(circle);
     const unreadStagesAll = coverage.liveStages
       .filter((stage) => !namedStages.has(stage.stageId))
       .map(({ stageId, stageName }) => ({ stageId, stageName }));
@@ -12088,7 +12088,7 @@ export class MonetCore {
    * plus the moment's own id already identify the call. If a consumer is ever named, render it then
    * and re-derive the privacy posture at the same time.
    */
-  openStoreMoment(surface: string): string | null {
+  openStoreMoment(surface: string, circle?: string): string | null {
     if (this.momentSpoolPath === null) return null;
     try {
       if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
@@ -12097,10 +12097,13 @@ export class MonetCore {
         momentId,
         at: new Date().toISOString(),
         toolUseId: null,
-        // The circle this server is serving. A call naming a DIFFERENT circle explicitly is not
-        // distinguished here — the tool wrapper that opens these moments does not parse arguments —
-        // so this is the circle the store is scoped to, not a claim about the call's own argument.
-        circle: this.defaultCircle,
+        // THE CIRCLE THIS CALL TARGETS, not merely the one the server defaults to. A tool argument
+        // naming another circle used to be invisible here, so a `memory_recall` against circle B
+        // was counted in circle A's totals while B saw no moment at all — the store's own calls
+        // reporting under the wrong project is the same misattribution the record carries `circle`
+        // to prevent. Resolved through the alias table like every other circle-accepting entry
+        // point, so a renamed circle attributes to its canonical name.
+        circle: this.resolveCircle(circle ?? this.defaultCircle),
         sessionId: null,
         surface,
         action: null,
@@ -12126,12 +12129,17 @@ export class MonetCore {
    * CALLED ON FAILURE TOO. A call that threw still HAPPENED, and a moment that opened and never
    * closed is indistinguishable from a process that died mid-call — which is a different finding.
    */
-  closeStoreMoment(momentId: string | null, outcome: string): void {
+  closeStoreMoment(momentId: string | null, outcome: string, outcomeStatus: "ok" | "failed" | null = null): void {
     if (momentId === null || this.momentSpoolPath === null || this.momentRun === null) return;
     try {
-      // `null`, not "ok": no host closing event stands behind a store-side call, so the record
-      // says not-observed rather than claiming success it did not witness.
-      spoolOutcome(this.momentRun, { momentId, toolUseId: null, outcome, outcomeStatus: null });
+      // THE STATUS THE CALLER ACTUALLY OBSERVED. This used to be hard-coded `null` on the reasoning
+      // that no HOST closing event stands behind a store-side call — true, and beside the point: the
+      // wrapper that closes these moments has distinct resolve and reject branches, so it witnesses
+      // firsthand whether the handler returned or threw. Writing `null` there discarded a fact the
+      // writer held, making a failed store operation indistinguishable from a successful one.
+      // `null` remains the default and still means NOT OBSERVED, for any caller that genuinely
+      // cannot tell — which is the state this column exists to keep distinct from a verdict.
+      spoolOutcome(this.momentRun, { momentId, toolUseId: null, outcome, outcomeStatus });
     } catch {
       // Same posture as every other append here.
     }
@@ -12223,9 +12231,9 @@ export class MonetCore {
    * A caller joins this against the stage registry: a declared stage ABSENT from the map is one
    * nobody has ever looked up, which is otherwise indistinguishable from a healthy quiet stage.
    */
-  momentStageReads(): Map<string, number> {
+  momentStageReads(circle?: string): Map<string, number> {
     if (this.momentSpoolPath === null) return new Map();
-    return momentStageReads(this.db, this.momentSpoolPath);
+    return momentStageReads(this.db, this.momentSpoolPath, this.resolveCircle(circle ?? this.defaultCircle));
   }
 
   /** The four conformance states. Folds first. Zeroes when no spool is configured. */
@@ -12253,22 +12261,32 @@ export class MonetCore {
     );
   }
 
-  recordRuleReads(momentId: string | null, ruleIds: readonly string[], namedStageId: string | null): void {
+  recordRuleReads(
+    momentId: string | null,
+    ruleIds: readonly string[],
+    namedStageId: string | null,
+    circle?: string,
+  ): void {
     if (this.momentSpoolPath === null) return;
     try {
       if (this.momentRun === null) this.momentRun = startMomentRun(this.momentSpoolPath, "core");
       const at = new Date().toISOString();
+      // THE CIRCLE THE LOOKUP WAS SCOPED TO, recorded on every read so stage coverage can be read
+      // per circle. The spool is home-level and this store folds every project's reads, so without
+      // it one lookup of a global stage in one project answered "has anyone ever consulted this
+      // stage?" for every other project too.
+      const readCircle = this.resolveCircle(circle ?? this.defaultCircle);
       // F7: A LOOKUP THAT RETURNED NOTHING IS STILL A READ. This used to return early on an empty
       // rule set, which silently covered two real outcomes — a stage-name miss, and a stage matched
       // with no live rules bound (its own gate exit code) — and left no trace of either. The attempt
       // is the numerator a recognition rate needs; `ruleId: null` says a read happened and delivered
       // no identity, which is a different claim from "no read happened".
       if (ruleIds.length === 0) {
-        spoolRuleRead(this.momentRun, { momentId, ruleId: null, namedStageId, readAt: at });
+        spoolRuleRead(this.momentRun, { momentId, ruleId: null, namedStageId, circle: readCircle, readAt: at });
         return;
       }
       for (const ruleId of ruleIds) {
-        spoolRuleRead(this.momentRun, { momentId, ruleId, namedStageId, readAt: at });
+        spoolRuleRead(this.momentRun, { momentId, ruleId, namedStageId, circle: readCircle, readAt: at });
       }
     } catch {
       // Instrumentation is owed to the record, never to the caller's operation.
@@ -15037,11 +15055,43 @@ export class MonetCore {
         .run(from, to, to);
       // Flatten chains: any alias that pointed to `from` should now point to `to`.
       this.db.prepare(`UPDATE circle_aliases SET to_name = ? WHERE to_name = ?`).run(to, from);
+      // THE GOVERNED-MOMENT POPULATION MOVES TOO, and it is NOT in moveCircleScopedTables above.
+      //
+      // Kept here rather than added to that helper for the same reason `rule_bindings` is: the
+      // helper's OTHER caller is the legacy-star migration, which runs long before these tables can
+      // exist. They are created lazily by the first fold, so a store that has never folded has no
+      // such tables at all — hence the guard rather than a bare UPDATE.
+      //
+      // THIS HALF ALONE IS NOT ENOUGH, and the other half lives in the fold. The spool is immutable
+      // and append-only, so every record written before this rename still says `from` forever; the
+      // next re-fold would write the old name straight back over the rows moved here. moment-ledger's
+      // `resolveCircleAlias` closes that on the way in, using the alias row written just above. The
+      // two together are what make the rename hold: this one moves the history that is already
+      // folded, that one keeps every later fold converging on the same name.
+      this.moveMomentCircle(from, to);
       return { from, to, action: "renamed", conceptsUpdated, observationsUpdated, edgesUpdated, entitiesUpdated };
     })();
     // The mirror names each rule's circle, so a rename that moved a deny changed the file's content.
     this.refreshGateSidecar();
     return result;
+  }
+
+  /**
+   * Repoint the folded governed-moment population at a renamed circle.
+   *
+   * TABLE-EXISTENCE GUARDED, because the moment tables are created lazily by the first fold and are
+   * deliberately off the `PRAGMA user_version` ladder — a store that has never recorded a moment
+   * genuinely does not have them, and that is a supported state rather than a broken one.
+   */
+  private moveMomentCircle(from: string, to: string): void {
+    const has = (table: string): boolean =>
+      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table) !== undefined;
+    if (has("governed_moments")) {
+      this.db.prepare(`UPDATE governed_moments SET circle = ? WHERE circle = ?`).run(to, from);
+    }
+    if (has("moment_reads")) {
+      this.db.prepare(`UPDATE moment_reads SET circle = ? WHERE circle = ?`).run(to, from);
+    }
   }
 
   /**

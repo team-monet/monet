@@ -165,6 +165,16 @@ export type MomentSpoolRecord =
        * `null` when the caller named nothing this build could resolve to a stage.
        */
       namedStageId: string | null;
+      /**
+       * The circle the LOOKUP was scoped to, or `null` on a line written before this field existed.
+       *
+       * ON THE READ, not inferred from the moment, because a read does not always have a moment: a
+       * `stage_lookup` reached from `agent_context` names no moment at all, and joining through
+       * `governed_moments` to find a circle would drop exactly those reads from a circle's coverage
+       * map — turning "this stage was looked up in another project" into "nobody has ever looked
+       * this stage up", which is the misreport the map exists to prevent.
+       */
+      circle: string | null;
       readAt: string;
     } & MomentSpoolEnvelope)
   | ({
@@ -400,13 +410,20 @@ export function spoolInterception(run: MomentRun, moment: MomentInterception): v
  */
 export function spoolRuleRead(
   run: MomentRun,
-  fields: { momentId: string | null; ruleId: string | null; namedStageId: string | null; readAt?: string },
+  fields: {
+    momentId: string | null;
+    ruleId: string | null;
+    namedStageId: string | null;
+    circle: string | null;
+    readAt?: string;
+  },
 ): void {
   appendMomentRecord(run, {
     kind: "read",
     momentId: fields.momentId,
     ruleId: fields.ruleId,
     namedStageId: fields.namedStageId,
+    circle: fields.circle,
     readAt: fields.readAt ?? new Date().toISOString(),
   });
 }
@@ -713,11 +730,18 @@ export function parseMomentSpoolLine(line: string): MomentSpoolRecord | null | "
       if (!("namedStageId" in row) || (row.namedStageId !== null && typeof row.namedStageId !== "string")) {
         return null;
       }
+      // ABSENT-IS-NULL here, unlike the interception's own `circle`, which is required. The
+      // difference is deliberate: a read line with no `circle` is still a read that happened, and
+      // rejecting it would discard a real observation over one missing fact. An interception with
+      // no `circle` key is a line from a writer that did not know about the field at all, and every
+      // count a person reads is scoped by it.
+      if ("circle" in row && row.circle !== null && typeof row.circle !== "string") return null;
       return {
         kind: "read",
         momentId: row.momentId as string | null,
         ruleId: row.ruleId as string | null,
         namedStageId: row.namedStageId as string | null,
+        circle: ("circle" in row ? row.circle : null) as string | null,
         readAt: row.readAt,
         ...envelope,
       };

@@ -101,7 +101,8 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   const owedByAgent = conformance.notAsked;
   if (
     gates.total > 0 || gates.retirementCandidates || gates.unexplainedDenies || gates.unreadStages ||
-    owedByUser > 0 || owedByAgent > 0 || gates.losses > 0 || gates.unopened > 0
+    owedByUser > 0 || owedByAgent > 0 || gates.losses > 0 || gates.unopened > 0 ||
+    gates.unattributed > 0
   ) {
     lines.push(bold("GATE"));
     if (gates.total > 0) {
@@ -110,6 +111,15 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
       lines.push(truncate(dim(
         `  ${gates.total} moments · ${gates.fires} fired · ${gates.silences} silent · ` +
         `${gates.ungoverned} ungoverned · ${gates.delivered} delivered`,
+      ), width));
+    }
+    // ITS OWN LINE, because it is in no other number here: `total` counts THIS circle's moments and
+    // these have no circle at all, so without a line of their own an opened section could show
+    // nothing. A moment the gate observed but could not attribute is a gate that failed before it
+    // resolved a circle — a defect to look at, not a quiet state.
+    if (gates.unattributed > 0) {
+      lines.push(truncate(yellow(
+        `  ${gates.unattributed} observed with no circle resolved — not counted in any circle`,
       ), width));
     }
 
@@ -195,6 +205,13 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     // the same commit — and if it is a number that only grows and has a benign normal case, it
     // belongs in neither.
     gates.unopened === 0 &&
+    // ADDED TO BOTH LISTS IN ONE CHANGE, per the rule above. Weighed against that rule's own
+    // counter-example first: `unattributed` is NOT the `unjoinableReads` case. It has no benign
+    // normal path — the gate resolves a circle on every ordinary invocation, including a
+    // user-global install where it resolves one per invocation rather than from a pin — so a
+    // nonzero value marks a gate that failed before attribution, it can fall again as a later
+    // record supplies the missing circle, and it is actionable while it stands.
+    gates.unattributed === 0 &&
     !overview.legacyStarConcepts
   ) {
     lines.push(green("no curation work queued"));
