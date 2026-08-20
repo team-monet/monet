@@ -317,7 +317,7 @@ export {
   isRetirementDisposed,
   RetiredResidueNotEmptyError,
   retirementData,
-  survivingConnectorConcepts,
+  hybridConnectorConcepts,
   purgeConnectorPopulation,
   RETIRED_SOURCE_TABLES,
 } from "./source-retirement";

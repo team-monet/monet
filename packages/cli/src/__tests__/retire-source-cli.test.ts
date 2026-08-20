@@ -262,118 +262,71 @@ describe("monet retire-source", () => {
     });
   });
 
-  it("keeps observations the user attached after the upgrade, and the concept they belong to", async () => {
+  it("leaves a hybrid concept completely untouched and reports it", async () => {
     await withStore(async (dbPath, dependencies) => {
       seedSchema12Store(dbPath);
       const port = new BetterSqlitePort(dbPath);
       const now = Date.now();
-      // Retained rows are served as ordinary memories, so a user can legitimately write on one.
+      port.prepare(
+        `UPDATE concepts SET body = ?, title = 'Meeting notes', slug = 'meeting-notes' WHERE id = 'connector-concept'`,
+      ).run("SECRET FILE TEXT from the vault\n\nmy own note");
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('user-note', 'my own note on this file', '[0.1,0.2]', 'statement', 'default',
+         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
                  'connector-concept', 'local', ?, ?, '[0.1,0.2]')`,
       ).run(now, now);
       port.close();
-
-      await run(["retire-source", "--apply", "--yes"], dependencies);
-
-      const check = new BetterSqlitePort(dbPath);
-      try {
-        // The connector's own chunk is gone; what the user wrote is not, and neither is its concept.
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE kind = 'source'`).get()).toEqual({ n: 0 });
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'user-note'`).get()).toEqual({ n: 1 });
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE id = 'connector-concept'`).get())
-          .toEqual({ n: 1 });
-      } finally {
-        check.close();
-      }
-    });
-  });
-
-  it("drops the empty residue itself rather than promising a migration that no longer exists", async () => {
-    await withStore(async (dbPath, dependencies) => {
-      // Retired tables and marker columns present, all empty — nothing to lose, so no backup.
-      const core = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
-      const db = (core as unknown as { db: BetterSqlitePort }).db;
-      db.exec(`ALTER TABLE concepts ADD COLUMN source_identity TEXT`);
-      for (const table of RETIRED_SOURCE_TABLES) {
-        db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, circle TEXT)`);
-      }
-      core.close();
 
       const output = await run(["retire-source", "--apply", "--yes"], dependencies);
-      expect(output.stdout).toContain("Dropped the empty tables");
+      expect(output.stdout).toContain("Left untouched: 1 concept(s)");
+      // Reported as retiring nothing, because nothing about this concept was retired.
+      expect(output.stdout).toContain("Retired 0 concept(s) and 0 observation(s).");
 
       const check = new BetterSqlitePort(dbPath);
       try {
-        const tables = new Set(
-          (check.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as Array<{ name: string }>)
-            .map((row) => row.name),
-        );
-        for (const table of RETIRED_SOURCE_TABLES) expect(tables.has(table)).toBe(false);
-        const columns = new Set(
-          (check.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>).map((c) => c.name),
-        );
-        expect(columns.has("source_identity")).toBe(false);
+        // UNTOUCHED means untouched: kind, body, title, slug, and BOTH observations.
+        const row = check.prepare(
+          `SELECT kind, body, title, slug FROM concepts WHERE id = 'connector-concept'`,
+        ).get() as { kind: string; body: string; title: string; slug: string };
+        expect(row).toEqual({
+          kind: "source",
+          body: "SECRET FILE TEXT from the vault\n\nmy own note",
+          title: "Meeting notes",
+          slug: "meeting-notes",
+        });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = 'connector-concept'`).get())
+          .toEqual({ n: 2 });
       } finally {
         check.close();
       }
+
+      // And it keeps saying so, because something really is still there. That is the honest
+      // report, not the never-terminates bug: the command claims nothing it has not done.
+      const second = await run(["retire-source"], dependencies);
+      expect(second.stdout).toContain("Left untouched:");
     });
   });
 
-  it("normalizes a surviving concept so a second run reaches the disposed state", async () => {
+  it("disposes of a pure connector concept while a hybrid sits beside it", async () => {
     await withStore(async (dbPath, dependencies) => {
       seedSchema12Store(dbPath);
       const port = new BetterSqlitePort(dbPath);
       const now = Date.now();
+      // A second, purely connector concept — nothing of the user's on it.
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at)
+         VALUES ('pure-connector', 'other-note', 'Other note', 'file text', 'source', 'active',
+                 0.5, 1, 'default', 1, 0, '[0.1,0.2]', ?, ?)`,
+      ).run(now, now);
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
-                 'connector-concept', 'local', ?, ?, '[]')`,
+         VALUES ('pure-chunk', 'file chunk', '[0.1,0.2]', 'source', 'default',
+                 'pure-connector', 'connector', ?, ?, '[0.1,0.2]')`,
       ).run(now, now);
-      // History the user made on that concept AFTER the upgrade — concept-wide cleanup must not
-      // take it just because the row started life as connector-owned.
-      port.prepare(
-        `INSERT INTO concept_revisions (id, concept_id, version, body, created_at)
-         VALUES ('rev-user', 'connector-concept', 2, 'my own note', ?)`,
-      ).run(now);
-      port.close();
-
-      await run(["retire-source", "--apply", "--yes"], dependencies);
-
-      const check = new BetterSqlitePort(dbPath);
-      try {
-        // The survivor is native now: left as kind='source' it would be re-detected as retirement
-        // data forever, and the store could never reach a disposed state.
-        expect(check.prepare(`SELECT kind FROM concepts WHERE id = 'connector-concept'`).get())
-          .toEqual({ kind: "fact" });
-        expect(check.prepare(`SELECT COUNT(*) AS n FROM concept_revisions WHERE id = 'rev-user'`).get())
-          .toEqual({ n: 1 });
-      } finally {
-        check.close();
-      }
-
-      // The second run has nothing left to find — disposal terminates.
-      const second = await run(["retire-source"], dependencies);
-      expect(second.stdout).toContain("Nothing to retire");
-    });
-  });
-
-  it("rebuilds a survivor's body and provenance, so the file text it reports as deleted is gone", async () => {
-    await withStore(async (dbPath, dependencies) => {
-      seedSchema12Store(dbPath);
-      const port = new BetterSqlitePort(dbPath);
-      const now = Date.now();
-      // The connector wrote the FILE into the body, and the ordinary attach path appends to it —
-      // so after a user writes on the concept its body holds both.
-      port.prepare(
-        `UPDATE concepts SET body = ?, source_refs = ? WHERE id = 'connector-concept'`,
-      ).run(
-        "SECRET FILE TEXT from the vault\n\nmy own note",
-        JSON.stringify(["source://src-a/notes.md#a~1", "https://example.com/ticket"]),
-      );
+      // ...and the user's own writing on the first one, making it a hybrid.
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
@@ -386,15 +339,15 @@ describe("monet retire-source", () => {
 
       const check = new BetterSqlitePort(dbPath);
       try {
-        const row = check.prepare(`SELECT body, source_refs, dirty FROM concepts WHERE id = 'connector-concept'`)
-          .get() as { body: string; source_refs: string | null; dirty: number };
-        expect(row.body).not.toContain("SECRET FILE TEXT");
-        expect(row.body).toContain("my own note");
-        // `source://` provenance is reserved to a connector that no longer exists.
-        expect(row.source_refs ?? "").not.toContain("source://");
-        expect(row.source_refs ?? "").toContain("example.com");
-        // Marked for synthesis: the joined body is an interim, not a final one.
-        expect(row.dirty).toBe(1);
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE id = 'pure-connector'`).get())
+          .toEqual({ n: 0 });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE id = 'pure-chunk'`).get())
+          .toEqual({ n: 0 });
+        // The hybrid and everything on it survive intact.
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE id = 'connector-concept'`).get())
+          .toEqual({ n: 1 });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM observations WHERE concept_id = 'connector-concept'`).get())
+          .toEqual({ n: 2 });
       } finally {
         check.close();
       }

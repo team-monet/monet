@@ -1158,6 +1158,9 @@ export function registerRecoveryCommands(
         if (data.nonemptyTables.length > 0) {
           console.log(`Registry/ledger data:  ${data.nonemptyTables.join(", ")}`);
         }
+        if (data.hybrids.length > 0) {
+          console.log(`Left untouched:        ${data.hybrids.length} concept(s) holding both file content and your own writing.`);
+        }
         console.log("These are a materialized copy of files outside the store, plus the registry describing");
         console.log("them. The subsystem that could read, re-sync, or repair them was retired (#16), so");
         console.log("deleting them is permanent.");
@@ -1189,7 +1192,11 @@ export function registerRecoveryCommands(
        * A store whose retirement data is only registry and ledger rows still skips this: with no
        * connector concept there is nothing an attach could land on.
        */
-      const mayNeedReprojection = data.conceptIds.length > 0;
+      // `staleNativeOwners` covers the shape with NO connector concept at all: a native concept
+      // holding a grafted `kind='source'` observation. Its owner needs reprojection just the same,
+      // and gating only on connector concepts left that store's projections stale with no rows
+      // left for a re-run to find them by.
+      const mayNeedReprojection = data.conceptIds.length > 0 || data.staleNativeOwners.length > 0;
       let embedder: EmbeddingProvider | undefined;
       if (mayNeedReprojection && (inspection.pin.status !== "known" || inspection.pin.modelId === null)) {
         throw new Error(
@@ -1224,6 +1231,12 @@ export function registerRecoveryCommands(
         // this port holds for the backup would otherwise block it.
         closePort();
         console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
+        if (purged.hybrids.length > 0) {
+          console.log(`Left untouched: ${purged.hybrids.length} concept(s) hold both file content and evidence you`);
+          console.log("wrote yourself. Nothing about them was changed — detach your own observations and");
+          console.log("re-run to dispose of them, or leave them as they are. This command will keep");
+          console.log("reporting them, because something really is still there.");
+        }
         if (data.nonemptyTables.length > 0) {
           console.log(`Dropped:  ${data.nonemptyTables.join(", ")} (and the rest of the retired schema).`);
         }
