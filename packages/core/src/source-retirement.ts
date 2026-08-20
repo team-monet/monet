@@ -331,9 +331,7 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       db.prepare(sql).run(...params);
     }
 
-    if (!tableExists(db, "entities")) {
-      return { concepts: conceptIds.length, observations: observationIds.length, staleNativeOwners };
-    }
+
     // The marker columns go the same way, where they still exist: a survivor carrying
     // `source_identity` would be re-detected as connector data by the very same predicate.
     if (survivors.size > 0) {
@@ -343,9 +341,44 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
           db.prepare(`UPDATE concepts SET ${column} = NULL WHERE id ${inSet}`).run(s_);
         }
       }
+      /*
+       * THE BODY IS CONNECTOR CONTENT TOO, and leaving it is the leak that matters most: a file
+       * concept's body was the materialized FILE, and the ordinary attach path appends to it — so
+       * a survivor still carries the text this command reports as deleted, and `source://`
+       * provenance the write path refuses to mint. Rebuilding the projection fixes vectors and
+       * counts; it never touches these.
+       *
+       * Rebuilt from the evidence that actually survives, and marked dirty so the next synthesis
+       * writes a real body rather than this concatenation.
+       */
+      for (const conceptId of survivors) {
+        const remaining = (db.prepare(
+          `SELECT content FROM observations
+            WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL
+            ORDER BY created_at ASC, id ASC`,
+        ).all(conceptId) as Array<{ content: string }>).map((row) => row.content);
+        const refs = (db.prepare(`SELECT source_refs FROM concepts WHERE id = ?`).get(conceptId) as
+          { source_refs: string | null } | undefined)?.source_refs;
+        let keptRefs: string | null = null;
+        if (refs) {
+          try {
+            const parsed = (JSON.parse(refs) as unknown[]).filter(
+              (ref) => typeof ref !== "string" || !ref.startsWith("source://"),
+            );
+            keptRefs = parsed.length > 0 ? JSON.stringify(parsed) : null;
+          } catch {
+            keptRefs = null; // unparseable provenance is not worth preserving over a clean row
+          }
+        }
+        db.prepare(`UPDATE concepts SET body = ?, source_refs = ?, dirty = 1 WHERE id = ?`)
+          .run(remaining.join("\n\n"), keptRefs, conceptId);
+      }
     }
 
-    for (const entity of affectedEntities) {
+    // Only the entity RECOUNT is skipped on a store without the optional table — never the
+    // survivor normalization above it, which is what keeps a survivor from being re-detected as
+    // connector-owned on every later run.
+    for (const entity of tableExists(db, "entities") ? affectedEntities : []) {
       db.prepare(
         `UPDATE entities SET df = (
            SELECT COUNT(*) FROM concept_entities ce JOIN concepts cc ON cc.id = ce.concept_id

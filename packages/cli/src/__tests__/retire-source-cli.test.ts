@@ -360,4 +360,44 @@ describe("monet retire-source", () => {
       expect(second.stdout).toContain("Nothing to retire");
     });
   });
+
+  it("rebuilds a survivor's body and provenance, so the file text it reports as deleted is gone", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      // The connector wrote the FILE into the body, and the ordinary attach path appends to it —
+      // so after a user writes on the concept its body holds both.
+      port.prepare(
+        `UPDATE concepts SET body = ?, source_refs = ? WHERE id = 'connector-concept'`,
+      ).run(
+        "SECRET FILE TEXT from the vault\n\nmy own note",
+        JSON.stringify(["source://src-a/notes.md#a~1", "https://example.com/ticket"]),
+      );
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'connector-concept', 'local', ?, ?, '[0.1,0.2]')`,
+      ).run(now, now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        const row = check.prepare(`SELECT body, source_refs, dirty FROM concepts WHERE id = 'connector-concept'`)
+          .get() as { body: string; source_refs: string | null; dirty: number };
+        expect(row.body).not.toContain("SECRET FILE TEXT");
+        expect(row.body).toContain("my own note");
+        // `source://` provenance is reserved to a connector that no longer exists.
+        expect(row.source_refs ?? "").not.toContain("source://");
+        expect(row.source_refs ?? "").toContain("example.com");
+        // Marked for synthesis: the joined body is an interim, not a final one.
+        expect(row.dirty).toBe(1);
+      } finally {
+        check.close();
+      }
+    });
+  });
 });
