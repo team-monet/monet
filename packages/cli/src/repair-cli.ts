@@ -1122,13 +1122,17 @@ export function registerRecoveryCommands(
         );
       }
 
+      // ONE finally FOR EVERYTHING AFTER createPort(). The preflight below can refuse — an
+      // unusable pin, a model that will not load, residue that turned out not to be empty — and
+      // each of those throws is an EXPECTED outcome a programmatic caller may catch. Leaving the
+      // port outside the cleanup leaked one SQLite connection per refused attempt.
       const port = dependencies.createPort(dbPath);
-      let data: ReturnType<typeof retirementData>;
+      let portClosed = false;
+      const closePort = (): void => {
+        if (!portClosed) { port.close(); portClosed = true; }
+      };
       try {
-        data = retirementData(port);
-      } finally {
-        if (!options.apply) port.close();
-      }
+      const data = retirementData(port);
       const counts = { concepts: data.conceptIds.length, observations: data.observationIds.length };
 
       if (isRetirementDisposed(data)) {
@@ -1137,13 +1141,13 @@ export function registerRecoveryCommands(
         // promise a migration that does not exist. With every table empty and both marker columns
         // null there is nothing to lose, which is why this needs no backup.
         if (options.apply) {
-          dropRetiredSourceResidue(port);
-          port.close();
+          // requireEmpty: the drop re-reads under its own write lock and refuses if data appeared
+          // since the reading above, because THIS path deliberately takes no backup.
+          dropRetiredSourceResidue(port, { requireEmpty: true });
           console.log("Nothing to retire: no connector-owned rows and no registry data.");
           console.log("Dropped the empty tables and marker columns the subsystem left behind.");
           return;
         }
-        port.close();
         console.log("Nothing to retire: this store holds no connector-owned rows and no registry data.");
         console.log(`Its empty tables and marker columns are dropped by: ${commandBase(dbPath).replace(" repair", " retire-source")} --apply --yes`);
         return;
@@ -1197,8 +1201,7 @@ export function registerRecoveryCommands(
         );
       }
 
-      let closed = false;
-      try {
+      {
         const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
         mkdirSync(path.dirname(destination), { recursive: true });
         const backup = await port.createVerifiedBackup(destination);
@@ -1210,8 +1213,7 @@ export function registerRecoveryCommands(
         dropRetiredSourceResidue(port);
         // Closed HERE, before the reprojection opens its own connection: the exclusive ownership
         // this port holds for the backup would otherwise block it.
-        port.close();
-        closed = true;
+        closePort();
         console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
         if (data.nonemptyTables.length > 0) {
           console.log(`Dropped:  ${data.nonemptyTables.join(", ")} (and the rest of the retired schema).`);
@@ -1231,8 +1233,9 @@ export function registerRecoveryCommands(
           }
         }
         console.log(`Backup:   ${backup.path}`);
+      }
       } finally {
-        if (!closed) port.close();
+        closePort();
       }
     });
 

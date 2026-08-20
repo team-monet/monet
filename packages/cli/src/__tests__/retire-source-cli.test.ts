@@ -30,13 +30,13 @@ function seedSchema12Store(dbPath: string): void {
                            support_count, dirty, embedding, updated_at, created_at,
                            source_identity, active_observation_id)
      VALUES ('connector-concept', 'connector-doc', 'Connector doc', 'materialized file body', 'source',
-             'active', 0.5, 1, 'default', 1, 0, '[]', ?, ?, 'source://src-a', 'connector-observation')`,
+             'active', 0.5, 1, 'default', 1, 0, '[0.1,0.2]', ?, ?, 'source://src-a', 'connector-observation')`,
   ).run(now, now);
   db.prepare(
     `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                created_at, updated_at, source_refs)
-     VALUES ('connector-observation', 'materialized chunk', '[]', 'source', 'default',
-             'connector-concept', 'connector', ?, ?, '[]')`,
+     VALUES ('connector-observation', 'materialized chunk', '[0.1,0.2]', 'source', 'default',
+             'connector-concept', 'connector', ?, ?, '[0.1,0.2]')`,
   ).run(now, now);
   db.pragma("user_version = 12");
   core.close();
@@ -194,12 +194,12 @@ describe("monet retire-source", () => {
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default', ?, 'peer', ?, ?, '[]')`,
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default', ?, 'peer', ?, ?, '[0.1,0.2]')`,
       ).run(owner, now, now);
       port.prepare(
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
-         VALUES ('native-obs', 'native evidence', '[0.1,0.2]', 'statement', 'default', ?, 'local', ?, ?, '[]')`,
+         VALUES ('native-obs', 'native evidence', '[0.1,0.2]', 'statement', 'default', ?, 'local', ?, ?, '[0.1,0.2]')`,
       ).run(owner, now, now);
       port.close();
 
@@ -237,7 +237,7 @@ describe("monet retire-source", () => {
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
          VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default',
-                 'native-owner', 'peer', ?, ?, '[]')`,
+                 'native-owner', 'peer', ?, ?, '[0.1,0.2]')`,
       ).run(now, now);
       port.close();
 
@@ -272,7 +272,7 @@ describe("monet retire-source", () => {
         `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
                                    created_at, updated_at, source_refs)
          VALUES ('user-note', 'my own note on this file', '[0.1,0.2]', 'statement', 'default',
-                 'connector-concept', 'local', ?, ?, '[]')`,
+                 'connector-concept', 'local', ?, ?, '[0.1,0.2]')`,
       ).run(now, now);
       port.close();
 
@@ -319,6 +319,45 @@ describe("monet retire-source", () => {
       } finally {
         check.close();
       }
+    });
+  });
+
+  it("normalizes a surviving concept so a second run reaches the disposed state", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const now = Date.now();
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('user-note', 'my own note', '[0.1,0.2]', 'statement', 'default',
+                 'connector-concept', 'local', ?, ?, '[]')`,
+      ).run(now, now);
+      // History the user made on that concept AFTER the upgrade — concept-wide cleanup must not
+      // take it just because the row started life as connector-owned.
+      port.prepare(
+        `INSERT INTO concept_revisions (id, concept_id, version, body, created_at)
+         VALUES ('rev-user', 'connector-concept', 2, 'my own note', ?)`,
+      ).run(now);
+      port.close();
+
+      await run(["retire-source", "--apply", "--yes"], dependencies);
+
+      const check = new BetterSqlitePort(dbPath);
+      try {
+        // The survivor is native now: left as kind='source' it would be re-detected as retirement
+        // data forever, and the store could never reach a disposed state.
+        expect(check.prepare(`SELECT kind FROM concepts WHERE id = 'connector-concept'`).get())
+          .toEqual({ kind: "fact" });
+        expect(check.prepare(`SELECT COUNT(*) AS n FROM concept_revisions WHERE id = 'rev-user'`).get())
+          .toEqual({ n: 1 });
+      } finally {
+        check.close();
+      }
+
+      // The second run has nothing left to find — disposal terminates.
+      const second = await run(["retire-source"], dependencies);
+      expect(second.stdout).toContain("Nothing to retire");
     });
   });
 });

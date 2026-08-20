@@ -140,6 +140,19 @@ export function connectorPopulation(db: StoragePort): ConnectorPopulation {
  * rows alone would report "nothing to retire", skip the backup, and let the next ordinary open
  * drop a registered source's configuration and attempt history for good.
  */
+/**
+ * Connector concepts that will SURVIVE the purge, because the user has written native evidence on
+ * them since the upgrade. Retained rows are served as ordinary memories, so this is a shape the
+ * policy invites — and it makes "connector concept" and "doomed concept" two different sets.
+ */
+export function survivingConnectorConcepts(db: StoragePort, conceptIds: readonly string[]): string[] {
+  if (conceptIds.length === 0) return [];
+  return (db.prepare(
+    `SELECT DISTINCT concept_id AS id FROM observations
+      WHERE kind != 'source' AND concept_id IN (SELECT value FROM json_each(?))`,
+  ).all(JSON.stringify([...conceptIds])) as Array<{ id: string }>).map((row) => row.id);
+}
+
 /** Native concepts owning one of these observations — the link identifying them dies with the delete. */
 export function staleNativeOwnersOf(db: StoragePort, population: ConnectorPopulation): string[] {
   if (population.observationIds.length === 0) return [];
@@ -158,7 +171,11 @@ export function retirementData(db: StoragePort): RetirementData {
   const nonemptyTables = discoverRetiredTables(db).filter(
     (table) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0,
   );
-  return { ...population, nonemptyTables, staleNativeOwners: staleNativeOwnersOf(db, population) };
+  // Survivors need reprojection too: their evidence is about to change under them, and they are
+  // excluded from staleNativeOwnersOf by construction (it skips every id in the population).
+  const survivors = survivingConnectorConcepts(db, population.conceptIds);
+  const staleNativeOwners = [...new Set([...staleNativeOwnersOf(db, population), ...survivors])];
+  return { ...population, nonemptyTables, staleNativeOwners };
 }
 
 /** True when nothing is left to dispose of and the residue drop is safe to run unattended. */
@@ -171,7 +188,19 @@ export function isRetirementDisposed(data: RetirementData): boolean {
  * ever correct once `isRetirementDisposed` holds, so every table it drops is empty and every
  * surviving row has NULL in the columns it removes.
  */
-export function dropRetiredSourceResidue(db: StoragePort): void {
+/** Thrown when the residue turned out not to be residue: data appeared between the read and the drop. */
+export class RetiredResidueNotEmptyError extends Error {
+  constructor(readonly tables: string[]) {
+    super(
+      `refusing to drop ${tables.join(", ")}: they hold rows. The emptiness this drop relies on was ` +
+        `read before the write lock was held, so another writer can add data in between — and a drop ` +
+        `taken on a stale read would destroy it with no backup. Re-run the backup-first path.`,
+    );
+    this.name = "RetiredResidueNotEmptyError";
+  }
+}
+
+export function dropRetiredSourceResidue(db: StoragePort, opts: { requireEmpty?: boolean } = {}): void {
   // ONE WRITE TRANSACTION, AND EACH OBJECT RE-CHECKED INSIDE IT. Concurrent first opens are a
   // supported topology (several `monet start` servers against one store), and a presence check
   // taken outside the write lock is stale by the time the drop runs: both processes see the table,
@@ -180,7 +209,19 @@ export function dropRetiredSourceResidue(db: StoragePort): void {
   // an error. `IF EXISTS` alone would not cover the column half — SQLite has no such form for
   // ALTER TABLE ... DROP COLUMN.
   db.immediateTransaction((): void => {
-    for (const table of discoverRetiredTables(db)) {
+    const tables = discoverRetiredTables(db);
+    // RE-READ UNDER THE WRITE LOCK, for the caller that took no backup. Its emptiness check
+    // happened before this transaction existed, so an older writer could have inserted registry or
+    // ledger rows in between; the no-backup decision rests on "there is nothing to lose", and that
+    // has to still be true here. A caller that DID take a backup passes nothing and drops whatever
+    // it finds — its copy is already on disk.
+    if (opts.requireEmpty) {
+      const nonempty = tables.filter(
+        (table) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0,
+      );
+      if (nonempty.length > 0) throw new RetiredResidueNotEmptyError(nonempty);
+    }
+    for (const table of tables) {
       db.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     const columns = conceptColumns(db);
@@ -217,13 +258,22 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       return { concepts: 0, observations: 0, staleNativeOwners: [] };
     }
 
-    const c = JSON.stringify(conceptIds);
+    // TWO SETS, NOT ONE. A connector concept the user has written on survives as an ordinary
+    // memory — so concept-wide cleanup must follow the DOOMED set, not the connector set, or it
+    // erases the revisions, lifecycle events and graph membership of a row it then keeps.
+    const survivors = new Set(survivingConnectorConcepts(db, conceptIds));
+    const doomedIds = conceptIds.filter((id) => !survivors.has(id));
+    const c = JSON.stringify(doomedIds);
+    const s_ = JSON.stringify([...survivors]);
     const o = JSON.stringify(observationIds);
     const inSet = `IN (SELECT value FROM json_each(?))`;
     // Entity rows are counted BEFORE their memberships go, so the df recount below sees the exact
     // set that lost a member; reversing the order loses the list of what to recount.
     // Read BEFORE the delete — afterwards the link that identifies them is gone.
-    const staleNativeOwners = staleNativeOwnersOf(db, { conceptIds, observationIds });
+    const staleNativeOwners = [...new Set([
+      ...staleNativeOwnersOf(db, { conceptIds, observationIds }),
+      ...survivors,
+    ])];
 
     const affectedEntities = tableExists(db, "concept_entities")
       ? db.prepare(
@@ -264,10 +314,17 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
       // concept can end up with no live evidence at all after the successor is purged.
       [`UPDATE observations SET superseded_by = NULL, superseded_at = NULL WHERE superseded_by ${inSet}`, [o]],
       [`DELETE FROM observations WHERE id ${inSet}`, [o]],
-      // A concept the user has since written on SURVIVES, as an ordinary one — only the concepts
-      // left with no evidence at all go.
-      [`DELETE FROM concepts WHERE id ${inSet}
-          AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.concept_id = concepts.id)`, [c]],
+      [`DELETE FROM concepts WHERE id ${inSet}`, [c]],
+      /*
+       * A SURVIVOR STOPS BEING CONNECTOR-OWNED, or it can never be disposed of.
+       *
+       * Left as `kind='source'` with its marker columns set, the next reading classifies it as
+       * retirement data all over again — and since its remaining evidence is native, the purge
+       * finds nothing to delete and the store never reaches a disposed state. Normalizing it is
+       * what makes disposal terminate. Its projection still describes evidence that just went, so
+       * it is returned in `staleNativeOwners` for the caller to reproject with a real embedder.
+       */
+      [`UPDATE concepts SET kind = 'fact' WHERE id ${inSet} AND kind = 'source'`, [s_]],
     ] as Array<[string, string[]]>) {
       const table = /(?:DELETE FROM|UPDATE) ([a-z_]+)/.exec(sql)?.[1];
       if (table && !tableExists(db, table)) continue;
@@ -277,6 +334,17 @@ export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
     if (!tableExists(db, "entities")) {
       return { concepts: conceptIds.length, observations: observationIds.length, staleNativeOwners };
     }
+    // The marker columns go the same way, where they still exist: a survivor carrying
+    // `source_identity` would be re-detected as connector data by the very same predicate.
+    if (survivors.size > 0) {
+      const conceptCols = conceptColumns(db);
+      for (const column of RETIRED_SOURCE_COLUMNS) {
+        if (conceptCols.has(column)) {
+          db.prepare(`UPDATE concepts SET ${column} = NULL WHERE id ${inSet}`).run(s_);
+        }
+      }
+    }
+
     for (const entity of affectedEntities) {
       db.prepare(
         `UPDATE entities SET df = (
