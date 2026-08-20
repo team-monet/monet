@@ -144,7 +144,7 @@ export {
   evaluateStageLookup,
   gateGeneration,
   gateQuery,
-  gateStats,
+  gateCoverage,
   hasLiveBinding,
   hasLineBreak,
   hasNoReason,
@@ -176,8 +176,8 @@ export type {
   GateResult,
   GateRule,
   GateStageRef,
-  GateStats,
-  GateStatsOptions,
+  GateCoverage,
+  GateCoverageOptions,
   LiveStageIndexResult,
   PendingGateWrites,
   RuleBindingOrigin,
@@ -272,45 +272,54 @@ export type {
   SyncRuleBindingRow,
 } from "./sync-types";
 
-/** The gate journal — the record every
- *  governing mechanism appends what it actually did to, including its declines. Exported because
- *  the mouths live in two repos: core's own gate and stage-lookup write it here, and the host-side
- *  CLI writes it from monet-client. One stream, or the correlation between them is guesswork. */
+/** The governed-moment record — the unit is an instant where an agent is about to act and the gate
+ *  has jurisdiction. The spool is the append-only sink every writer can reach (including the
+ *  standalone host hook, which can open no store); the ledger is what the fold makes queryable.
+ *  Exported because the writers live in more than one process, and a second record shape would put
+ *  the two populations beyond joining. */
 export {
-  GATE_JOURNAL_CONTEXT_MAX_CHARS,
-  GATE_JOURNAL_FILENAME,
-  GATE_JOURNAL_FORMAT,
-  GATE_JOURNAL_MAX_BYTES,
-  appendGateJournalLine,
-  blockingRuleIdsOf,
-  clipActionContext,
-  closeGateJournalEvent,
-  gateJournalDisposition,
-  openGateJournalEvent,
-} from "./gate-journal";
+  MOMENT_ACTION_RENDERING_MAX_CHARS,
+  MOMENT_SPOOL_FILENAME,
+  MOMENT_SPOOL_FORMAT,
+  appendMomentRecord,
+  mintMomentId,
+  outcomeSha256,
+  parseMomentSpoolLine,
+  readMomentSpool,
+  renderAction,
+  spoolAnswer,
+  spoolAsk,
+  spoolInterception,
+  spoolOutcome,
+  spoolRuleRead,
+  startMomentRun,
+} from "./moment-spool";
 export type {
-  GateJournalArrival,
-  GateJournalClaimType,
-  GateJournalDisposition,
-  GateJournalDispositionFields,
-  GateJournalHandle,
-  GateJournalMouth,
-} from "./gate-journal";
+  MomentAnswer,
+  MomentDisposition,
+  MomentInterception,
+  MomentInterceptionFields,
+  MomentRun,
+  MomentSpoolEnvelope,
+  MomentSpoolRead,
+  MomentSpoolRecord,
+  MomentWriterRole,
+} from "./moment-spool";
+export {
+  MOMENT_SCHEMA_SQL,
+  UnknownMomentError,
+  attachMomentAnswer,
+  attachMomentAsk,
+  createMomentTables,
+  foldMomentSpool,
+  momentConformance,
+  momentsOwingAQuestion,
+  observedMomentLosses,
+  readGovernedMoment,
+} from "./moment-ledger";
+export type { GovernedMomentRow, MomentConformance, MomentFoldResult, MomentLoss } from "./moment-ledger";
 
-/** The conformance pass, cheap half — what the gate
- *  journal can say about whether a rule changed anything, claiming only what it observes. */
-export {
-  appendConformanceAnnotations,
-  computeConformance,
-  retirementCandidates,
-  tallyByRule,
-} from "./conformance";
-export type {
-  ConformanceAnnotation,
-  ConformanceVerdict,
-  JournalDispositionLine,
-  RuleConformanceTally,
-} from "./conformance";
+
 export {
   connectorPopulation,
   dropRetiredSourceResidue,

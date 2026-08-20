@@ -150,6 +150,25 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
  * text: its last resort is a small valid-JSON envelope, but changing these established budgets would
  * alter non-pathological fitted responses that already honor the ceiling.
  */
+/**
+ * A moment id is a v4 UUID and nothing else — 36 characters, exactly. The bound is DERIVED from the
+ * format the interceptor mints (`randomUUID()`, moment-spool.ts), not chosen: anything longer was
+ * not produced by this system, and accepting it would let an unbounded string through a schema that
+ * exists to bound one.
+ */
+const MOMENT_ID_MAX_CHARS = 36;
+
+/**
+ * How many owed moments one ask signal may name.
+ *
+ * A DELIVERY BOUND, NOT A THRESHOLD ON THE BACKLOG. Nothing has measured how often a real store
+ * accumulates unasked moments, so no number here could say when a backlog is "too large" — and this
+ * one does not try. It bounds what reaches a model's context (8 ids is roughly 300 characters);
+ * the TRUE total is reported by the conformance counts, which are not capped. If more are owed than
+ * this names, the rest are named by the next signal.
+ */
+const ASK_SIGNAL_MAX_MOMENTS = 8;
+
 const RESULT_TRUNCATE_NOTE = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
 const RECALL_EMPTY_LINE = "Nothing matched.";
 /** Circle names are routing identifiers, not prose; bound every caller-controlled echo before writes. */
@@ -359,22 +378,22 @@ export function fitOverviewEnvelope(overview: MemoryOverview & { resolvedFrom?: 
   }
   if (fits()) return { ...result };
 
-  if (result.gateStats.retirementCandidates?.length) {
-    result.gateStats.retirementCandidatesOmitted =
-      (result.gateStats.retirementCandidatesOmitted ?? 0) + result.gateStats.retirementCandidates.length;
-    delete result.gateStats.retirementCandidates;
+  if (result.gate.retirementCandidates?.length) {
+    result.gate.retirementCandidatesOmitted =
+      (result.gate.retirementCandidatesOmitted ?? 0) + result.gate.retirementCandidates.length;
+    delete result.gate.retirementCandidates;
   }
-  if (result.gateStats.unexplainedDenies?.length) {
-    result.gateStats.unexplainedDeniesOmitted =
-      (result.gateStats.unexplainedDeniesOmitted ?? 0) + result.gateStats.unexplainedDenies.length;
-    delete result.gateStats.unexplainedDenies;
+  if (result.gate.unexplainedDenies?.length) {
+    result.gate.unexplainedDeniesOmitted =
+      (result.gate.unexplainedDeniesOmitted ?? 0) + result.gate.unexplainedDenies.length;
+    delete result.gate.unexplainedDenies;
   }
   // Dropped the same way, and the COUNT survives the list — an omitted-to-zero list would say the
   // circle is clean, which is the one thing this field exists to stop being confused with.
-  if (result.gateStats.unreadStages?.length) {
-    result.gateStats.unreadStagesOmitted =
-      (result.gateStats.unreadStagesOmitted ?? 0) + result.gateStats.unreadStages.length;
-    delete result.gateStats.unreadStages;
+  if (result.gate.unreadStages?.length) {
+    result.gate.unreadStagesOmitted =
+      (result.gate.unreadStagesOmitted ?? 0) + result.gate.unreadStages.length;
+    delete result.gate.unreadStages;
   }
   if (fits()) return { ...result };
 
@@ -635,19 +654,48 @@ export function registerMonetCoreTools(
   const originalTool = server.tool.bind(server);
   server.tool = ((...toolArgs: unknown[]) => {
     const handler = toolArgs[toolArgs.length - 1] as (...handlerArgs: unknown[]) => unknown;
+    // THE STORE'S OWN INTERCEPTION POINT, wrapped ONCE here for the same reason the in-flight
+    // tracker is: every handler gets it uniformly, and a tool added later cannot forget to open a
+    // moment. Every call into the store opens one and closes one — including the ones that throw,
+    // because a call that failed still happened, and an opened-but-never-closed moment means
+    // something else entirely (the process died mid-call).
+    const toolName = typeof toolArgs[0] === "string" ? toolArgs[0] : "unknown";
     const trackedHandler = (...handlerArgs: unknown[]): unknown => {
+      const momentId = core.openStoreMoment(toolName);
+      // Identity, never content: a sha256 of the serialized result. A result that cannot be
+      // serialized still closes the moment — with the string form — rather than leaving it open.
+      const closeWith = (value: unknown): void => {
+        let rendered: string;
+        try {
+          rendered = JSON.stringify(value) ?? String(value);
+        } catch {
+          rendered = String(value);
+        }
+        core.closeStoreMoment(momentId, rendered);
+      };
       inFlightTracker.increment();
       let result: unknown;
       try {
         result = handler(...handlerArgs);
       } catch (error) {
         inFlightTracker.decrement();
+        closeWith({ threw: String(error) });
         throw error;
       }
       if (result instanceof Promise) {
-        return result.finally(() => inFlightTracker.decrement());
+        return result.then(
+          (value) => {
+            closeWith(value);
+            return value;
+          },
+          (error: unknown) => {
+            closeWith({ threw: String(error) });
+            throw error;
+          },
+        ).finally(() => inFlightTracker.decrement());
       }
       inFlightTracker.decrement();
+      closeWith(result);
       return result;
     };
     const trackedArgs = [...toolArgs.slice(0, -1), trackedHandler];
@@ -705,13 +753,13 @@ export function registerMonetCoreTools(
   const rawModelTag = opts?.modelTag ?? process.env.MONET_MODEL_TAG;
   const defaultModelTag = rawModelTag?.trim() ? rawModelTag.trim() : undefined;
 
-  // ONE CHAIN (review fix): gate()/stageLookup()/gateStats() all resolve `this.runtimeModelTag`
+  // ONE CHAIN (review fix): gate()/stageLookup()/gateCoverage() all resolve `this.runtimeModelTag`
   // when a call omits an explicit tag. Wiring it here, ONCE, is what makes every surface reachable
   // from this process resolve the SAME tag — stage_lookup's handler used to pass `defaultModelTag`
   // per-call while gate() fell back to `this.runtimeModelTag`, and in the default deployment
   // (scripts/mcp-cli.ts constructs MonetCore without a runtimeModelTag option) that meant
   // MonetCore's own field stayed null even with MONET_MODEL_TAG set, so stage_lookup correctly
-  // filtered a foreign-model rule while gate()/gateStats() (reading the still-null field) did not
+  // filtered a foreign-model rule while gate()/gateCoverage() (reading the still-null field) did not
   // — the two surfaces silently disagreeing about which rules exist. Only set when defined: an
   // explicit runtimeModelTag passed at MonetCore's OWN construction (a test harness, an embedding
   // host) is a real host signal too, and an absent MCP-layer default must not silently erase it.
@@ -782,6 +830,56 @@ export function registerMonetCoreTools(
    *   the caller is agent_context (which handles its own lifecycle) or autoPrewarm is off. When
    *   non-null, consumePrewarmSnapshot() is called here and the block (if non-empty) is attached.
    */
+  /**
+   * THE ASK SIGNAL — the one thing in this design that reaches a model's context, and therefore the
+   * one that faces the strictest form of the minimization test. Answering it, as the question
+   * demands:
+   *
+   *   WHO CONSUMES IT — the agent, and nobody else. It is an instruction, not data for a reader.
+   *   ON WHICH TURN — the first tool response after a moment was read and then acted on. Not at
+   *     session start (the debt does not exist yet) and not on a timer.
+   *   WHAT BREAKS WITHOUT IT — the agent cannot know it owes a question. The hook that opened the
+   *     moment is store-less and cannot see whether a read happened, so nothing else is in a
+   *     position to tell it. Without the signal, `not asked` stops meaning "the agent failed to ask"
+   *     and starts meaning "the agent was never told" — one number covering a defect and an
+   *     impossibility, which is the precise conflation this whole rebuild exists to remove.
+   *
+   * IT NAMES MOMENTS; IT NEVER CARRIES THEIR CONTENT. Ids and one instruction. The agent already has
+   * the action in its own transcript — re-sending a rendering of it would be paying context to tell
+   * the model what it just did.
+   *
+   * ANNOUNCED ONCE PER MOMENT, not repeated until obeyed. A banner that reappears every turn is
+   * standing text by another name, and nagging is not what makes this measurable: if the agent
+   * ignores the signal, the moment surfaces as `notAsked`, which is exactly the mechanical detection
+   * the design is built on. The set is per process, so a restart re-announces what is still owed.
+   *
+   * SILENCE IS THE HEALTHY STATE. Most moments are silent and owe nothing, so this appends nothing
+   * at all on the overwhelming majority of responses.
+   */
+  const announcedOwedMoments = new Set<string>();
+  function askSignalBlock(): string {
+    let owed: string[];
+    try {
+      owed = core.momentsOwingAQuestion(ASK_SIGNAL_MAX_MOMENTS + announcedOwedMoments.size);
+    } catch {
+      // A signal that cannot be computed must never fail the tool call that carried it.
+      return "";
+    }
+    const fresh = owed.filter((momentId) => !announcedOwedMoments.has(momentId)).slice(0, ASK_SIGNAL_MAX_MOMENTS);
+    if (fresh.length === 0) return "";
+    for (const momentId of fresh) announcedOwedMoments.add(momentId);
+    const ids = fresh.join(", ");
+    const noun = fresh.length === 1 ? "action" : "actions";
+    // ONE SENTENCE. It names what is owed and the tool that records it, and nothing else — the
+    // wording deliberately asks whether the action FOLLOWED the rule, never whether the rule caused
+    // it, which is unobservable and is not what this measures.
+    // NAMES BOTH TOOLS, and that is a correction rather than a wording preference. This used to name
+    // only `conformance_answer`, so an agent obeying it literally — ask out loud, record the reply —
+    // left `asked_at` null and the moment was counted as an agent defect it had not committed. The
+    // ask is its own event with its own owner; an instruction that omits it asks for the wrong shape.
+    return `Monet: you read a rule and then acted, for ${fresh.length} ${noun} (${ids}). For each: call conformance_ask when you put the question to the user, then conformance_answer with their reply — did the action follow the rule it read?`;
+  }
+
   function wrapSuccess(
     result: CallToolResult,
     {
@@ -816,11 +914,16 @@ export function registerMonetCoreTools(
       }
     }
 
-    if (prewarmBlock === "") return result;
+    const askBlock = askSignalBlock();
+    if (prewarmBlock === "" && askBlock === "") return result;
 
+    const appended = [
+      ...(prewarmBlock === "" ? [] : [{ type: "text" as const, text: prewarmBlock }]),
+      ...(askBlock === "" ? [] : [{ type: "text" as const, text: askBlock }]),
+    ];
     return {
       ...result,
-      content: [result.content[0], ...result.content.slice(1), { type: "text", text: prewarmBlock }],
+      content: [result.content[0], ...result.content.slice(1), ...appended],
     };
   }
 
@@ -1341,7 +1444,17 @@ export function registerMonetCoreTools(
           includeDirty,
           includeStale,
         });
-        return readOk(fitOverviewEnvelope(ov), "memory_overview", capturedBlock);
+        // THE FOUR CONFORMANCE STATES, on the surface curation already reads. `unanswered` and
+        // `notAsked` are reported SEPARATELY and never summed: one is a queue owed to the user, the
+        // other is an agent defect, and they have different owners and different remedies. No
+        // threshold says when a backlog is too large — nothing has measured that — so these are
+        // counts and nothing more. `followed` means the action followed the rule; it does not say
+        // the rule caused it, which is unobservable.
+        return readOk(
+          { ...fitOverviewEnvelope(ov), conformance: core.momentConformance() },
+          "memory_overview",
+          capturedBlock,
+        );
       } catch (e) {
         return err(`overview failed: ${msg(e)}`);
       }
@@ -1493,19 +1606,85 @@ export function registerMonetCoreTools(
     },
   );
 
+  /**
+   * THE FOURTH FACT — the only one a machine may not produce.
+   *
+   * Applicable, Delivered and Received are all mechanical. Conformance is not: whether the action
+   * followed the rule is a judgement about the act, and the user is the one who makes it. Nothing
+   * in this system infers it, and these two tools are the only way it enters the record.
+   *
+   * TWO TOOLS, NOT ONE, because they are two events with two owners. The ASK is the agent's act and
+   * the ANSWER is the user's; a single call carrying both would make the agent the author of a fact
+   * it does not own, and would destroy the distinction between `unanswered` (asked, waiting on the
+   * user) and `not asked` (never asked, the agent's defect) — the one distinction this surface
+   * exists to keep.
+   */
+  server.tool(
+    "conformance_ask",
+    "Record that you asked the user whether an action followed the rule it read. Call this when you put the question, before their reply. The momentId comes from the Monet signal on a prior tool response.",
+    {
+      momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment you asked about."),
+    },
+    async ({ momentId }) => {
+      try {
+        core.recordMomentAsk(momentId);
+        return ok({ recorded: "ask", momentId });
+      } catch (e) {
+        // UnknownMomentError reaches the caller as an error rather than being softened into a
+        // created row: an ask against a moment nobody intercepted is not an event.
+        return err(`conformance_ask failed: ${msg(e)}`);
+      }
+    },
+  );
+
+  server.tool(
+    "conformance_answer",
+    "Record the user's reply to that question: 'followed' or 'not-followed'. Their answer only — never your own assessment. This says the action followed the rule; it never says the rule caused it.",
+    {
+      momentId: z.string().max(MOMENT_ID_MAX_CHARS).describe("The moment the user answered about."),
+      answer: z.enum(["followed", "not-followed"]).describe("The user's answer, verbatim in meaning."),
+    },
+    async ({ momentId, answer }) => {
+      try {
+        core.recordMomentAnswer(momentId, answer);
+        return ok({ recorded: "answer", momentId, answer });
+      } catch (e) {
+        return err(`conformance_answer failed: ${msg(e)}`);
+      }
+    },
+  );
+
   server.tool(
     "stage_lookup",
     "At a stage named by agent_context, fetch its rules before acting. A hit returns bounded rules with reasons and omission recovery fields. `parentDisputed:true` means `disputedParentIds` should be memory_fetched; projectedFromPrincipleId is only the display parent. A miss returns the live stage index.",
     {
       stage: z.string().max(STAGE_NAME_MAX_CHARS).describe("Stage name or id from agent_context/prewarm."),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional(),
+      /**
+       * The moment the delivered instruction named, when one did. Optional BY NECESSITY rather than
+       * by preference: an agent can reach this tool from `agent_context`, where no interception
+       * prompted it and there is no moment to name. Omitting it is a recorded state (an unjoinable
+       * read), never an error — see MonetCore.recordRuleReads.
+       */
+      momentId: z.string().max(MOMENT_ID_MAX_CHARS).optional()
+        .describe("The momentId from a gate instruction, so this read joins the moment that prompted it."),
     },
-    async ({ stage, circle }) => {
+    async ({ stage, circle, momentId }) => {
       const capturedBlock = capturePrewarmSnapshot(scope(circle));
       try {
         // ONE CHAIN: no runtimeModelTag passed here — core.setRuntimeModelTag() was called once at
-        // registration (above), so this resolves identically to gate()/gateStats() by construction.
+        // registration (above), so this resolves identically to gate()/gateCoverage() by construction.
         const r = core.stageLookup({ stage, circle: scope(circle) });
+        // THE READ, RECORDED AGAINST THE MOMENT THAT PROMPTED IT (invariant 03). Written for the
+        // rules this response actually carries, not for the ones the stage holds: receipt is a
+        // claim about identity that REACHED the agent, and a rule dropped by the size budget below
+        // never did. Deliberately BEFORE the size-fitting loop's own clipping, and deliberately
+        // against `r.rules` — the engine's own delivered set — so a later change to presentation
+        // cannot quietly change what counts as read.
+        // THE STAGE THE AGENT NAMED, resolved to its id — never the stage the gate matched. On a
+        // miss there is no id to record, and null is the honest value: the agent named something,
+        // and this build could not resolve it to a stage.
+        core.recordRuleReads(momentId ?? null, r.rules.map((rule) => rule.conceptId), r.stage?.id ?? null);
         const fixedFields = {
           circle: scope(circle),
           matched: r.matched,

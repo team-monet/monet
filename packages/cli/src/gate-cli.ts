@@ -7,23 +7,21 @@ import {
   GATE_MIRROR_FORMAT,
   RULE_SCOPES,
   RULE_SEVERITIES,
-  blockingRuleIdsOf,
-  clipActionContext,
-  closeGateJournalEvent,
   deriveCircle as coreDeriveCircle,
   evaluateGateFromMirror,
-  gateJournalDisposition,
-  openGateJournalEvent,
+  mintMomentId,
   parseActionContext,
-  type GateJournalClaimType,
-  type GateJournalDisposition,
+  spoolInterception,
+  startMomentRun,
   type GateMirror,
   type GateResult,
   type GateRule,
+  type MomentDisposition,
+  type MomentRun,
   type RuleScope,
   type RuleSeverity,
 } from "@team-monet/core";
-import { getGateJournalPath, getGateMirrorPath } from "./db/index.js";
+import { getGateMirrorPath, getMomentSpoolPath } from "./db/index.js";
 import { resolveProjectDir } from "./project-dir.js";
 import { defaultNameFromRemote, getOriginRemote } from "./remote-circle.js";
 
@@ -795,13 +793,10 @@ export interface GateCliDependencies {
   isStdinTTY(): boolean;
   setExitCode(code: number): void;
   /**
-   * Where to append the gate journal, or null to write none. Resolved the same way the hook
-   * wrapper resolves it — MONET_STORAGE_DIR, else ~/.monet —
-   * and deliberately NOT via the project dir: a gate's cwd is whatever directory the host happened
-   * to spawn it from, and a record that lands in a random project's .monet is worse than one that
-   * always lands in the home store. Same reasoning the wrapper's own DENY_LOG_PATH comment gives.
+   * Where the governed-moment spool lives — the same two rungs as the journal above, resolved
+   * through the same single answer in db/index.ts, and for the same reason.
    */
-  journalPath(): string | null;
+  momentSpoolPath(): string | null;
 }
 
 export function defaultGateCliDependencies(): GateCliDependencies {
@@ -820,14 +815,7 @@ export function defaultGateCliDependencies(): GateCliDependencies {
     mirrorPath: (explicitMirror) => (explicitMirror ? path.resolve(explicitMirror) : getGateMirrorPath(resolveProjectDir())),
     readStdin: readStdinSync,
     isStdinTTY: () => process.stdin.isTTY === true,
-    // ONE RESOLVER for every journal writer (P1, Codex round 1 on PR #76). This used to spell the
-    // two rungs out inline (`MONET_STORAGE_DIR || join(os.homedir(), ".monet")`), which held only
-    // for as long as nobody wrote a third spelling of them — and #75 did, on getMonetDir's
-    // project-aware chain, splitting the stream in half for any project carrying its own `.monet`.
-    // db/index.ts's getGateJournalPath is now the single answer this mouth and the served core's
-    // MCP mouths both read; see its comment for why it resolves these two rungs rather than
-    // getMonetDir's three, and for the follow-up that would move all three writers together.
-    journalPath: () => getGateJournalPath(),
+    momentSpoolPath: () => getMomentSpoolPath(),
     setExitCode(code) {
       process.exitCode = code;
     },
@@ -880,62 +868,75 @@ export function resolveActionContextSource(
  * leans: fail OPEN, loudly, rather than crash or silently answer wrong (the boundary statement's
  * "never fail closed on an unknown", applied to this command's own defects too).
  */
-/**
- * Records what this invocation actually did. Handed down into runGateUnguarded so that every one of
- * its exits — the deliberate refusals as much as the verdicts — names its own outcome.
- *
- * §1: "every early return is an outcome, not an exemption from recording". A guard that declines to
- * evaluate writes `declined: <reason>`. Had that line existed one layer up, monet-client#58's
- * host rename would have surfaced as `declined: foreign-tool` on day one instead of by hand-probing
- * months of silence.
- */
-type GateJournalRecorder = (
-  disposition: GateJournalDisposition,
-  claimType: GateJournalClaimType,
-  extra?: Record<string, unknown>,
-) => void;
-
 export function runGate(
   positionalActionContext: string | undefined,
   options: GateCommandOptions,
   deps: GateCliDependencies = defaultGateCliDependencies(),
 ): void {
-  const journalPath = deps.journalPath();
-  // The parent interception, when a host hook spawned this process. Passed by ENV rather than a
-  // flag on purpose (see the wrapper's own comment): an older `monet` reached through the hook's
-  // PATH fallback would reject an unknown flag as a usage error and report a broken install, while
-  // an unknown env var has been ignored by every version there has ever been.
-  const parentId = deps.env.MONET_GATE_JOURNAL_PARENT ?? null;
-  // At the mouth — before the TTY guard, before stdin is read, before anything can refuse.
-  const handle = openGateJournalEvent(journalPath, {
-    mouth: "gate-cli",
-    parentId,
-    claimType: "source-observed",
-  });
-
-  // DEFAULTS TO A COMPLAINT, deliberately. If some path added later returns without recording, the
-  // journal says so in as many words rather than quietly attributing the wrong outcome to it — a
-  // record that guesses is worse than one that admits a gap, which is this whole design's thesis.
-  let disposition: GateJournalDisposition = "declined: unrecorded-exit";
-  let claimType: GateJournalClaimType = "unavailable";
-  let extra: Record<string, unknown> = {};
-  const record: GateJournalRecorder = (d, c, e) => {
-    disposition = d;
-    claimType = c;
-    extra = e ?? {};
-  };
-
+  // FAIL OPEN, ALWAYS. An unanticipated throw in the evaluation below must never block a user's
+  // command — the gate's whole failure policy is that a broken gate lets the action through and
+  // says so loudly, rather than denying by accident.
+  //
+  // AND EVERY EXIT RECORDS ITS MOMENT (F4). `runGateUnguarded` has seven early returns and only its
+  // last line reached the recorder, so a store with no mirror — the state EVERY new install is in
+  // until one exists — evaluated nothing and wrote nothing, while this file's own comments claimed
+  // the difference survived in the record as `unavailable`. It did not: the surfaces showed zero
+  // moments and zero losses, which reads as perfect health. The flag below makes the record
+  // unskippable by control flow rather than by remembering, the same way the disposition used to be.
+  //
+  // WHAT USED TO BE HERE: this function opened and closed a gate-journal event around the call, so
+  // that a guard which declined to evaluate still left a trace. That record has moved to the
+  // governed moment, which spoolGovernedMoment writes from inside the evaluation where the stage
+  // and the rule ids are actually known — see its own comment for the two-process contract.
+  const recorded = { done: false };
+  let actionContextForFallback: string | null = null;
   try {
-    runGateUnguarded(positionalActionContext, options, deps, record);
+    runGateUnguarded(positionalActionContext, options, deps, recorded, (context) => {
+      actionContextForFallback = context;
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`monet gate: internal error (${message}) — ${GATE_FAIL_OPEN_MARKER} (nothing blocked).`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
-    record("declined: internal-error", "unavailable", { error: message });
   } finally {
-    // In a finally so that a throw this function did not anticipate still closes its own event.
-    // An arrival with no disposition would then mean what it should: the process died mid-evaluation.
-    closeGateJournalEvent(journalPath, handle, { mouth: "gate-cli", disposition, claimType, parentId, ...extra });
+    // NOTHING EVALUATED THIS. That is precisely `ungoverned`, and `ruleIds: null` says no rule set
+    // was consulted rather than that none matched — the distinction this whole record exists to
+    // keep. In a `finally` so a throw mid-evaluation is recorded too.
+    if (!recorded.done) spoolUngovernedGateMoment(deps, actionContextForFallback);
+  }
+}
+
+/**
+ * The moment for an evaluation that never produced a verdict — no mirror, an unreadable one, a
+ * refused circle, a usage error, or a throw.
+ *
+ * SEPARATE FROM `spoolGovernedMoment` because it claims strictly less: there is no stage, no rule
+ * set, and no delivery, and every one of those fields is null rather than empty. An empty array
+ * would say the gate looked and found nothing, which is the substitution this record forbids.
+ */
+function spoolUngovernedGateMoment(deps: GateCliDependencies, actionContext: string | null): void {
+  try {
+    const momentId = deps.env.MONET_MOMENT_ID;
+    if (typeof momentId !== "string" || momentId.length === 0) return;
+    const spoolPath = deps.momentSpoolPath();
+    if (spoolPath === null) return;
+    const toolUseId = deps.env.MONET_TOOL_USE_ID;
+    const sessionId = deps.env.MONET_SESSION_ID;
+    const run: MomentRun = startMomentRun(spoolPath, "gate-cli");
+    spoolInterception(run, {
+      momentId,
+      at: new Date(deps.now()).toISOString(),
+      toolUseId: typeof toolUseId === "string" && toolUseId.length > 0 ? toolUseId : null,
+      sessionId: typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null,
+      surface: actionContext === null ? null : surfaceOfActionContext(actionContext),
+      action: actionContext,
+      stageId: null,
+      ruleIds: null,
+      disposition: "ungoverned",
+      deliveredRuleIds: null,
+    });
+  } catch {
+    // Instrumentation is owed to the record, never to the user's command.
   }
 }
 
@@ -943,7 +944,8 @@ function runGateUnguarded(
   positionalActionContext: string | undefined,
   options: GateCommandOptions,
   deps: GateCliDependencies,
-  record: GateJournalRecorder,
+  recorded: { done: boolean },
+  noteActionContext: (context: string) => void,
 ): void {
   // NIT (round-5 coordinator review): refuse BEFORE resolveActionContextSource ever calls
   // deps.readStdin() — on a real TTY (nothing piped), that call blocks forever waiting for input
@@ -956,7 +958,6 @@ function runGateUnguarded(
         `echo "Bash:git push --force" | monet gate --stdin.`,
     );
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
-    record("declined: stdin-is-tty", "unavailable");
     return;
   }
 
@@ -973,7 +974,6 @@ function runGateUnguarded(
   if (source.kind === "usage-error") {
     console.error(`monet gate: ${source.message}`);
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
-    record("declined: no-action-context", "unavailable", { detail: source.message });
     return;
   }
   const rawContext = source.raw;
@@ -987,9 +987,11 @@ function runGateUnguarded(
   } catch (error) {
     console.error(`monet gate: ${(error as Error).message}`);
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
-    record("declined: unprefixed-context", "unavailable", { detail: (error as Error).message });
     return;
   }
+  // Handed to the fallback recorder the moment it is known, so an exit AFTER this point still
+  // records what the agent was about to do, not merely that something happened.
+  noteActionContext(actionContext);
   if (options.tool && parseActionContext(rawContext).tool !== null) {
     console.error(`monet gate: --tool ignored — action context already carries a 'Tool:' prefix.`);
   }
@@ -1015,7 +1017,6 @@ function runGateUnguarded(
         `rule already delivers everywhere on its own, with no need to ask for it by this name.`,
     );
     deps.setExitCode(USAGE_ERROR_EXIT_CODE);
-    record("declined: wildcard-circle", "unavailable", clipActionContext(actionContext));
     return;
   }
 
@@ -1066,9 +1067,6 @@ function runGateUnguarded(
     // THE EXIT CODE IS 0 — INDISTINGUISHABLE FROM SILENCE TO THE HOST, by the failure policy, and
     // that stays true. The record is where the difference survives: no rule set was ever consulted,
     // so nothing is known about whether this act is governed. "unavailable", never "silent".
-    record("declined: mirror-unreadable", "unavailable", {
-      ...clipActionContext(actionContext), circle: resolved.circle, mirrorPath, reason: read.kind,
-    });
     return;
   }
 
@@ -1086,7 +1084,6 @@ function runGateUnguarded(
       // and its thrown message is surfaced verbatim if it ever fires first.
       console.error(`monet gate: ${message}`);
       deps.setExitCode(USAGE_ERROR_EXIT_CODE);
-      record("declined: wildcard-circle", "unavailable", { ...clipActionContext(actionContext), detail: message });
       return;
     }
     // Structurally, assertQueryableCircle's `circle === '*'` check is the only throw this function
@@ -1095,9 +1092,6 @@ function runGateUnguarded(
     console.error(`monet gate: evaluation failed unexpectedly (${message}) — ${GATE_FAIL_OPEN_MARKER} (nothing blocked).`);
     console.error(`monet gate: circle ${describeResolvedCircle(resolved, read.mirror)}`);
     deps.setExitCode(GATE_EXIT_CODE.SILENCE);
-    record("declined: evaluation-failed", "unavailable", {
-      ...clipActionContext(actionContext), circle: resolved.circle, error: message,
-    });
     return;
   }
 
@@ -1148,31 +1142,124 @@ function runGateUnguarded(
       break;
   }
   deps.setExitCode(outcome.code);
-  // The verdict, and the rule ids that produced it — the field #62's "declared but never fired"
-  // query needs and that `gate_events` has never carried (it records rule_COUNT, not identity).
-  //
-  // claimType is `parsed`, NOT `source-observed`, and the distinction is the honest one: this
-  // command answers from a materialized mirror by construction (it must work with the store down),
-  // so every verdict it reports is true as of a frozen generation rather than as of the store. A
-  // later pass reading this stream can tell a live answer from a cached one without guessing, which
-  // is exactly what claim typing is for (§9.1).
-  record(gateJournalDisposition(result), result.source === "live" ? "source-observed" : "parsed", {
-    ...clipActionContext(actionContext),
-    circle: resolved.circle,
-    stageIds: result.stages.map((stage) => stage.id),
-    stageNames: result.stages.map((stage) => stage.name),
-    ruleIds: result.rules.map((rule) => rule.conceptId),
-    // WHICH OF THEM BLOCKED (monet#37). `core-gate` has written this since PR #144, and THIS mouth —
-    // the one on every real hook-path deny — never did, so the field appeared on zero of 36,892
-    // journal lines while the pass that reads it treated absence as "the verdict applies to all of
-    // them". A force-push deny credited its `changed` to four advisories that had no part in it.
-    //
-    // The severity was in hand the whole time: `gateJournalDisposition` immediately above picks
-    // `deny` over `advisory` by reading these very same `severity` fields.
-    ...blockingRuleIdsOf(result.rules),
-    gateExitCode: outcome.code,
-    mirrorGeneratedAt: read.mirror.generatedAt,
-  });
+  spoolGovernedMoment(deps, actionContext, result, outcome.code);
+  recorded.done = true;
+}
+
+/**
+ * THE GOVERNED-MOMENT INTERCEPTION — this process's half of a TWO-PROCESS CONTRACT.
+ *
+ * THE OTHER HALF IS THE GENERATED HOOK WRAPPER (install-cli.ts, buildWrapperScript). THE PAIR MOVES
+ * TOGETHER; changing either side alone breaks the record. The contract, stated here and again there:
+ *
+ *   1. The wrapper mints the moment id and forwards it in `MONET_MOMENT_ID`. It also forwards the
+ *      host's `tool_use_id` in `MONET_TOOL_USE_ID`, because only the wrapper ever sees it and only
+ *      this process is in a position to write it down.
+ *   2. When that env var is set, THIS process writes the interception record, because only this
+ *      process knows the stage and the rule identity — the wrapper receives an exit code and a
+ *      reason string, and nothing else.
+ *   3. The wrapper writes an interception itself ONLY when it never spawns this process at all
+ *      (a foreign tool, an unparseable payload, a truncated one). Those carry `ungoverned`.
+ *   4. So exactly one writer produces the interception on any given path. Where both ever do write
+ *      about one moment, the fold merges them, and THAT MERGE DEPENDS ON NULL MEANING "NOT
+ *      OBSERVED": the ledger's upsert is `COALESCE(existing, excluded)` per column, so a real value
+ *      fills a field an earlier partial record left null and never overwrites one already observed.
+ *      A writer that emitted a placeholder instead of null would silently win that merge.
+ *
+ * DELIBERATELY NOT DEFENSIVE. If this process is spawned and dies before reaching here, the right
+ * record is NO interception, an orphan outcome, and an `unobserved-interception` loss — which the
+ * fold already produces. A skeleton written "just in case" would turn every crash into a moment
+ * that looks observed and is empty, which is a verdict standing where the value is not known.
+ *
+ * ENV, NOT A FLAG, and the reason is the same one `MONET_GATE_JOURNAL_PARENT` gives above: an older
+ * `monet` reached through the hook's PATH fallback rejects an unknown flag as a usage error and
+ * reports a broken install, while an unknown env var has been ignored by every version there has
+ * ever been.
+ *
+ * NEVER THROWS. Instrumentation may not fail a user's tool call; the spool append swallows its own
+ * failures, and the sequence number it consumed is what makes the loss visible later.
+ */
+function spoolGovernedMoment(
+  deps: GateCliDependencies,
+  actionContext: string,
+  result: GateResult,
+  gateExitCode: number,
+): void {
+  try {
+    const momentId = deps.env.MONET_MOMENT_ID;
+    // NO MOMENT ID MEANS NO HOST INTERCEPTION. A human running `monet gate` by hand is not a
+    // governed moment anybody opened, and inventing one here would put a second population in the
+    // record that no interceptor ever saw.
+    if (typeof momentId !== "string" || momentId.length === 0) return;
+    const spoolPath = deps.momentSpoolPath();
+    if (spoolPath === null) return;
+    const toolUseId = deps.env.MONET_TOOL_USE_ID;
+    // F6: forwarded by the wrapper, which is the only party that ever sees it. Dropping it here
+    // left NULL on exactly the moments a gate evaluated — honest for "not known", wrong for
+    // "known and discarded".
+    const sessionId = deps.env.MONET_SESSION_ID;
+    const run: MomentRun = startMomentRun(spoolPath, "gate-cli");
+    spoolInterception(run, {
+      momentId,
+      at: new Date(deps.now()).toISOString(),
+      toolUseId: typeof toolUseId === "string" && toolUseId.length > 0 ? toolUseId : null,
+      sessionId: typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null,
+      surface: surfaceOfActionContext(actionContext),
+      action: actionContext,
+      stageId: result.stage?.id ?? null,
+      ruleIds: result.rules.map((rule) => rule.conceptId),
+      disposition: momentDispositionOf(result),
+      deliveredRuleIds: deliveredRuleIdsOf(result),
+    });
+  } catch {
+    // Total, and for the same reason the spool's own append is: the record is owed to the record,
+    // never to the user's tool call.
+  }
+  void gateExitCode;
+}
+
+/**
+ * The tool surface, read off the action context's own `Tool:` prefix.
+ *
+ * Derived rather than passed because the prefix is the ONE thing every action context is guaranteed
+ * to carry — `parseActionContext` refuses a context without it — so this cannot disagree with what
+ * was actually matched. Returns the whole context when there is no prefix, which cannot happen on
+ * any path that reached a verdict, rather than inventing a surface name.
+ */
+function surfaceOfActionContext(actionContext: string): string {
+  const colon = actionContext.indexOf(":");
+  return colon <= 0 ? actionContext : actionContext.slice(0, colon);
+}
+
+/**
+ * The gate's verdict in the governed-moment vocabulary.
+ *
+ * `overflow` MAPS TO `ungoverned`, NOT `silent`, and that is the whole point of having four words.
+ * Overflow means the action was past the refusal threshold and nothing was matched against it —
+ * nobody looked. Silence means the gate looked and nothing governed. Collapsing them would write a
+ * verdict where the value is not known, which is the failure this record exists to remove.
+ *
+ * `stage-hit-no-rules` maps to `silent`: the gate looked, a stage matched, and no live rule was
+ * bound. Nothing fired, which is exactly what silence is.
+ */
+function momentDispositionOf(result: GateResult): MomentDisposition {
+  if (result.overflow) return "ungoverned";
+  if (result.silence) return "silent";
+  if (result.rules.length === 0) return "silent";
+  return result.rules.some((rule) => rule.severity === "blocking") ? "blocked" : "advised";
+}
+
+/**
+ * WHICH RULE IDENTITIES ACTUALLY REACHED THE AGENT — not which ones fired.
+ *
+ * The deny payload names the blocking rules' concept ids, capped at INSTRUCTION_STAGE_CAP. The
+ * advisory payload names STAGES and tells the agent to call `stage_lookup`; it carries no rule id
+ * at all. So an advisory delivers an empty set, and that is a fact about delivery rather than a
+ * gap in this function: receipt cannot be claimed for an identity that was never sent.
+ */
+function deliveredRuleIdsOf(result: GateResult): string[] {
+  const blocking = result.rules.filter((rule) => rule.severity === "blocking").map((rule) => rule.conceptId);
+  return blocking.slice(0, INSTRUCTION_STAGE_CAP);
 }
 
 export function registerGateCommands(

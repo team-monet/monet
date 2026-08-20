@@ -4,13 +4,12 @@ import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import {
   FreshStoreEmbedderUnavailableError,
-  GATE_JOURNAL_FILENAME,
   HashingEmbeddingProvider,
   type EmbeddingProvider,
 } from "@team-monet/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openServedCore, openStatusCore } from "../bootstrap";
-import { ensureMonetDir, getDbPath, getGateJournalPath, getGateMirrorPath } from "../db/index";
+import { ensureMonetDir, getDbPath, getGateMirrorPath } from "../db/index";
 import { defaultGateCliDependencies } from "../gate-cli";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -166,53 +165,6 @@ describe("client core bootstrap", () => {
 
   // ── #75: the gate journal — the served core is the one writer surface for the MCP mouths ───────
 
-  it("a served core constructed with gateJournalPath journals a stage_lookup, carrying the per-rule identity gate_events cannot", async () => {
-    const journalPath = join(dir, "gate-journal.jsonl");
-    const core = await openServedCore(
-      ":memory:",
-      { scopeContext: dir, defaultCircle: "test-circle", gateJournalPath: journalPath },
-      async () => new HashingEmbeddingProvider(),
-    );
-    const declared = await core.declare({
-      species: "rule",
-      stage: "git force push",
-      patterns: ["Bash:git push --force"],
-      content: "Never force-push to main.",
-      severity: "blocking",
-      scope: "domain",
-      reason: "a rewritten history cannot be recovered from a teammate's clone",
-    });
-    // DeclareResult is a union; only the "rule" branch carries conceptId, which is the id the
-    // journal's own ruleIds is asserted against below.
-    if (declared.species !== "rule") throw new Error("expected a rule declaration");
-
-    // THE CALL BEHIND THE `stage_lookup` MCP TOOL. core's own mcp-server.ts handler is
-    // `core.stageLookup({ stage, circle })` — it passes no `record`, so the journal is NOT gated
-    // off (engine.ts's beginGateJournal: `opts.record !== false`). Calling it the same way here
-    // exercises the identical mouth the shipped server reaches.
-    const result = core.stageLookup({ stage: "git force push" });
-    expect(result.matched).toBe(true);
-    expect(result.rules).toHaveLength(1);
-    core.close();
-
-    expect(existsSync(journalPath)).toBe(true);
-    const entries = readFileSync(journalPath, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((entry) => entry.mouth === "stage-lookup");
-    // Both halves of the event: the arrival written at the mouth, and the disposition.
-    expect(entries.map((entry) => entry.phase)).toEqual(["arrival", "disposition"]);
-    const disposition = entries[1];
-    expect(disposition.disposition).toBe("deny");
-    // THE FIELD #62 NEEDS, and the whole reason this wiring matters: `gate_events` records
-    // rule_count and stage ids but never rule IDENTITY, so "declared but never fired" is
-    // unanswerable from sqlite alone. Asserting the actual declared id, not merely non-emptiness.
-    expect(disposition.ruleIds).toEqual([declared.conceptId]);
-    // Advisory-only by design: a blocking severity is DELIVERED at this mouth, never enforced.
-    expect(disposition.enforced).toBe(false);
-  });
-
   it("a served core constructed WITHOUT gateJournalPath writes no journal (today's behavior, unchanged for any caller that omits it)", async () => {
     const journalPath = join(dir, "gate-journal.jsonl");
     const core = await openServedCore(
@@ -243,148 +195,6 @@ describe("client core bootstrap", () => {
 // ── #75: the shipped server never wired the gate journal, so every MCP-originated gate call went
 // unrecorded — and there are TWO launch paths of that one server, so wiring either alone leaves
 // journaling dependent on which one a host happens to spawn ─────────────────────────────────────
-describe("#75: both served entry points wire the gate journal", () => {
-  it("source regression guard: cli.ts's `start` action AND index.ts's stdio entry both pass gateJournalPath, unrooted, at their openServedCore call site", () => {
-    // A source-text check, matching this file's own established guard shape above: the FUNCTIONAL
-    // test proves a served core given the option journals, and this proves the two REAL entry
-    // points actually give it — the exact gap #75 was, where the option existed in core and was
-    // set only by monet-core's dev-only scripts/mcp-cli.ts, which the shipped binary never runs.
-    const cliSource = readFileSync(join(REPO_ROOT, "src/cli.ts"), "utf8");
-    const indexSource = readFileSync(join(REPO_ROOT, "src/index.ts"), "utf8");
-    expect(cliSource).toContain("gateJournalPath: getGateJournalPath(),");
-    expect(indexSource).toContain("gateJournalPath: getGateJournalPath(),");
-    // NOT project-rooted — the inversion of what this guard asserted when #75 landed (P1, Codex
-    // round 1 on PR #76). The store and the mirror pair on one projectDir because each serves this
-    // project alone; the journal is one stream shared with the hook wrapper and `monet gate`, so
-    // per-project rooting silently forked it. `getGateJournalPath` no longer accepts a baseDir at
-    // all, which makes the project-rooted call a type error rather than merely a wrong answer —
-    // this guard stays because the reverting shape is a plausible re-edit and the reason it is
-    // wrong lives nowhere near the call site's type.
-    expect(cliSource).not.toContain("gateJournalPath: getGateJournalPath(projectDir),");
-    expect(indexSource).not.toContain("gateJournalPath: getGateJournalPath(projectDir),");
-  });
-
-  it("every journal writer resolves ONE file: with a project-local .monet present and MONET_STORAGE_DIR unset, getGateJournalPath() and gate-cli's own journalPath() agree", () => {
-    // P1 (Codex on PR #76): the finding itself, pinned. The journal's load-bearing invariant is
-    // that all mouths append to ONE stream — core's own GATE_JOURNAL_FILENAME comment ("all three
-    // mouths write ONE stream"), and `parentId` correlating a hook event to the gate event it
-    // caused, only mean anything if those events land in the same file. The divergence this pins
-    // shut: getGateJournalPath resolved through getMonetDir's THREE rungs (MONET_STORAGE_DIR →
-    // project-local .monet → home) while the gate CLI and the generated hook resolve TWO
-    // (MONET_STORAGE_DIR → home), so a project with its own .monet and no MONET_STORAGE_DIR split
-    // the stream in half — MCP-originated events into the project, hook/CLI events into home.
-    //
-    // The scenario is constructed to make exactly that split appear: MONET_STORAGE_DIR unset (the
-    // rung that otherwise collapses all three writers onto one answer regardless), a cwd that DOES
-    // have a project-local .monet (getMonetDir's second rung, which only fires when the directory
-    // already exists), and an isolated HOME so the third rung is observable without touching the
-    // operator's real ~/.monet.
-    const savedStorageDir = process.env.MONET_STORAGE_DIR;
-    const savedHome = process.env.HOME;
-    const savedCwd = process.cwd();
-    const fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "monet-76-home-")));
-    const projectDir = realpathSync(mkdtempSync(join(tmpdir(), "monet-76-project-")));
-    try {
-      delete process.env.MONET_STORAGE_DIR;
-      process.env.HOME = fakeHome;
-      mkdirSync(join(projectDir, ".monet"), { recursive: true });
-      process.chdir(projectDir);
-
-      // The gate CLI's REAL default dependency, not a restatement of it — this test is worthless
-      // if it asserts against a copy of the resolution rather than the one the shipped `monet
-      // gate` actually calls.
-      const cliJournalPath = defaultGateCliDependencies().journalPath();
-
-      // THE ASSERTION THE FINDING ASKS FOR: one file, not two.
-      expect(getGateJournalPath()).toBe(cliJournalPath);
-      // And WHICH file — the two-rung home answer both the gate CLI and install-cli.ts's
-      // generated hook already resolve to, not the project-local one. Asserting only equality
-      // would be satisfiable by moving the OTHER writers onto the project-aware chain, which the
-      // generated hook (a standalone script that cannot import a resolver) cannot follow.
-      expect(getGateJournalPath()).toBe(join(fakeHome, ".monet", GATE_JOURNAL_FILENAME));
-    } finally {
-      process.chdir(savedCwd);
-      if (savedStorageDir !== undefined) process.env.MONET_STORAGE_DIR = savedStorageDir;
-      else delete process.env.MONET_STORAGE_DIR;
-      if (savedHome !== undefined) process.env.HOME = savedHome;
-      else delete process.env.HOME;
-      rmSync(fakeHome, { recursive: true, force: true });
-      rmSync(projectDir, { recursive: true, force: true });
-    }
-  });
-
-  it("getGateJournalPath resolves TWO rungs — MONET_STORAGE_DIR, else home — and never getMonetDir's project-local rung between them", () => {
-    const savedStorageDir = process.env.MONET_STORAGE_DIR;
-    const savedHome = process.env.HOME;
-    const dir = mkdtempSync(join(tmpdir(), "monet-75-path-"));
-    const fakeHome = mkdtempSync(join(tmpdir(), "monet-76-ladder-home-"));
-    try {
-      // RUNG 1 — MONET_STORAGE_DIR, the override every journal writer honors first, and the ONE
-      // rung under which the journal does sit beside the store, since getDbPath honors it too.
-      process.env.MONET_STORAGE_DIR = dir;
-      expect(getGateJournalPath()).toBe(join(dir, "gate-journal.jsonl"));
-      expect(getGateJournalPath()).toBe(join(dir, GATE_JOURNAL_FILENAME));
-      expect(getDbPath()).toBe(join(dir, "monet.db"));
-
-      // RUNG 2 — unset falls straight through to home. Beside-the-store is NOT a property this
-      // function holds in general (P1, Codex round 1 on PR #76): getDbPath keeps getMonetDir's
-      // project-local rung BETWEEN these two and the journal deliberately does not, because the
-      // journal is one stream shared with mouths — the generated hook wrapper, `monet gate` —
-      // that resolve only these two rungs. The test above pins what that difference costs when a
-      // project-local .monet actually exists; this pins the ladder itself, including that the
-      // middle rung is absent rather than merely untested.
-      delete process.env.MONET_STORAGE_DIR;
-      process.env.HOME = fakeHome;
-      expect(getGateJournalPath()).toBe(join(fakeHome, ".monet", GATE_JOURNAL_FILENAME));
-    } finally {
-      if (savedStorageDir !== undefined) process.env.MONET_STORAGE_DIR = savedStorageDir;
-      else delete process.env.MONET_STORAGE_DIR;
-      if (savedHome !== undefined) process.env.HOME = savedHome;
-      else delete process.env.HOME;
-      rmSync(dir, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
-    }
-  });
-
-  it("the home rung is os.homedir(), not cwd: with MONET_STORAGE_DIR, HOME and USERPROFILE all unset, getGateJournalPath() lands under the account's real home", () => {
-    // P2 (Codex round 2 on PR #76): the LAST rung, which the ladder test above never reaches
-    // because it always leaves HOME set. In a minimal service environment — a launchd/systemd
-    // unit, a bare container — none of the three variables exist, and an env-only home chain
-    // (`HOME || USERPROFILE || cwd`) falls to whatever directory the process happens to have
-    // started in. The generated hook has no such rung: install-cli.ts bakes in `os.homedir()`,
-    // which falls back to the passwd DB and therefore still resolves the account's real home. So
-    // the stream splits again in exactly the environment nobody is watching — the split this
-    // shared resolver exists to close, reopened one rung further down.
-    const savedStorageDir = process.env.MONET_STORAGE_DIR;
-    const savedHome = process.env.HOME;
-    const savedUserProfile = process.env.USERPROFILE;
-    try {
-      delete process.env.MONET_STORAGE_DIR;
-      delete process.env.HOME;
-      delete process.env.USERPROFILE;
-
-      // `os.homedir()` is read AFTER the deletes for the same reason the assertion exists: with
-      // HOME unset it is the passwd-DB answer, not an echo of the variable this test just removed.
-      expect(getGateJournalPath()).toBe(join(homedir(), ".monet", GATE_JOURNAL_FILENAME));
-      // And explicitly NOT the cwd answer — the pre-fix value, spelled out so a revert to the
-      // env-only chain fails here with the wrong path named rather than merely a mismatch.
-      expect(getGateJournalPath()).not.toBe(join(process.cwd(), ".monet", GATE_JOURNAL_FILENAME));
-    } finally {
-      // Restoring HOME matters more than usual here: leaking an unset HOME into sibling tests
-      // would silently move every home-rung assertion in this file onto the real ~/.monet.
-      if (savedStorageDir !== undefined) process.env.MONET_STORAGE_DIR = savedStorageDir;
-      else delete process.env.MONET_STORAGE_DIR;
-      if (savedHome !== undefined) process.env.HOME = savedHome;
-      else delete process.env.HOME;
-      if (savedUserProfile !== undefined) process.env.USERPROFILE = savedUserProfile;
-      else delete process.env.USERPROFILE;
-    }
-  });
-});
-
-// ── FIX 1 (Codex round 2 on PR #42): the served core's store and its mirror sidecar must agree
-// on which project they're serving, or a declaration lands in one project's store while
-// materializing into a DIFFERENT project's mirror ──────────────────────────────────────────────
 describe("FIX 1: served core store/mirror project pairing", () => {
   let dirA: string;
   let dirB: string;

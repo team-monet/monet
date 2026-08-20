@@ -1021,7 +1021,7 @@ describe("monet gate CLI", () => {
           env: {},
           projectDir: () => dir,
           mirrorPath: () => mirrorPath,
-          journalPath: () => null, // stdout is the subject here, not the record; no file is written
+    momentSpoolPath: () => null, // stdout is the subject here, not the record; no file is written
           readStdin: () => { throw new Error("must not be called — the context is positional"); },
           isStdinTTY: () => false,
           setExitCode: (code) => { exitCode = code; },
@@ -1814,7 +1814,7 @@ describe("gate-cli helpers", () => {
         env: {},
         projectDir: () => "/tmp",
         mirrorPath: () => "/tmp/monet-gate-cli-test-does-not-exist.json",
-        journalPath: () => null, // this test asserts a refusal, not a record; no file is written
+    momentSpoolPath: () => null, // this test asserts a refusal, not a record; no file is written
         readStdin,
         isStdinTTY: () => true,
         setExitCode: (code) => { exitCode = code; },

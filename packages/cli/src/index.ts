@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createMonetCoreMcpServer, FreshStoreEmbedderUnavailableError } from "@team-monet/core";
-import { ensureMonetDir, getDbPath, getGateJournalPath, getGateMirrorPath } from "./db/index.js";
+import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath } from "./db/index.js";
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { openServedCore } from "./bootstrap.js";
 
@@ -40,15 +40,15 @@ async function main() {
   // exactly the divergence the mirror comment above already refuses.
   //
   // Deliberately NOT rooted at `projectDir` the way the store and the mirror on the lines below
-  // are (P1, Codex round 1 on PR #76): the journal is ONE stream shared with the hook wrapper and
-  // `monet gate`, neither of which runs in this process, and a per-project journal is a different
-  // file from the one those mouths append to — see cli.ts's `start` action for the full argument
-  // and db/index.ts's getGateJournalPath for the resolution it settles on.
+  // are: the moment spool is ONE stream shared with the hook wrapper and `monet gate`, neither of
+  // which runs in this process, and a per-project spool would be a different file from the one
+  // those writers append to — see db/index.ts's getMomentSpoolPath for the two rungs it settles on
+  // and why they must match the generated wrapper's own.
   const core = await openServedCore(getDbPath(projectDir), {
     scopeContext: projectDir,
     defaultCircle: circle,
     gateSidecarPath: getGateMirrorPath(projectDir),
-    gateJournalPath: getGateJournalPath(),
+    momentSpoolPath: getMomentSpoolPath(),
   });
   await createMonetCoreMcpServer(core);
   console.error(`Monet MCP server running on stdio · ${getDbPath(projectDir)}`);

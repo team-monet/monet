@@ -95,12 +95,54 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
     lines.push("");
   }
 
-  const gates = overview.gateStats;
-  if (gates.windowTotal > 0 || gates.retirementCandidates || gates.unexplainedDenies || gates.unreadStages) {
-    lines.push(bold("GATE EXCEPTIONS"));
-    if (gates.windowTotal > 0) {
-      lines.push(truncate(dim(`  ${gates.windowTotal} asked · ${gates.fires} fires · ${gates.silences} silences · ${gates.overflows} overflows · ${gates.delivered} delivered`), width));
+  const gates = overview.gate;
+  const conformance = gates.conformance;
+  const owedByUser = conformance.unanswered;
+  const owedByAgent = conformance.notAsked;
+  if (
+    gates.total > 0 || gates.retirementCandidates || gates.unexplainedDenies || gates.unreadStages ||
+    owedByUser > 0 || owedByAgent > 0 || gates.losses > 0 || gates.unopened > 0
+  ) {
+    lines.push(bold("GATE"));
+    if (gates.total > 0) {
+      // `ungoverned` is its own number and never folded into silences: a silence is a claim that the
+      // gate LOOKED and nothing was bound, and these are the moments nothing evaluated at all.
+      lines.push(truncate(dim(
+        `  ${gates.total} moments · ${gates.fires} fired · ${gates.silences} silent · ` +
+        `${gates.ungoverned} ungoverned · ${gates.delivered} delivered`,
+      ), width));
     }
+
+    // THE TWO PENDING STATES, ON SEPARATE LINES AND NEVER SUMMED. They have different owners and
+    // different remedies: one is a queue the user owes an answer to, the other is the agent failing
+    // to ask. A single "pending" line would be the exact collapse this record exists to prevent.
+    if (conformance.followed > 0 || conformance.notFollowed > 0) {
+      lines.push(truncate(dim(
+        `  answered: ${conformance.followed} followed · ${conformance.notFollowed} not followed`,
+      ), width));
+    }
+    if (owedByUser > 0) {
+      lines.push(truncate(`  awaiting you: ${owedByUser} asked, not yet answered`, width));
+    }
+    if (owedByAgent > 0) {
+      lines.push(truncate(yellow(`  never asked: ${owedByAgent} read and acted on without asking`), width));
+    }
+
+    // WHAT THE RECORD KNOWS IT NEVER RECEIVED. Surfaced because a record that quietly holds less
+    // than it should is the failure the sequence exists to make impossible.
+    if (gates.losses > 0) {
+      lines.push(truncate(yellow(`  ${gates.losses} gaps in the record`), width));
+    }
+    // Debris: attached to, never observed at interception. Excluded from every rate above (it is
+    // not a governed moment) and therefore reported here, because excluding a loss from the counts
+    // must not be the same as hiding it.
+    if (gates.unopened > 0) {
+      lines.push(truncate(yellow(`  ${gates.unopened} moments attached to but never observed`), width));
+    }
+    if (conformance.unjoinableReads > 0) {
+      lines.push(truncate(dim(`  ${conformance.unjoinableReads} reads that named no moment`), width));
+    }
+
     for (const candidate of gates.retirementCandidates ?? []) {
       lines.push(truncate(`  retire [${candidate.conceptId.slice(0, 8)}] ${candidate.title} · ${candidate.modelTag}`, width));
     }
@@ -109,18 +151,18 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
       lines.push(truncate(`  repair [${deny.conceptId.slice(0, 8)}] ${deny.stageName}  ·  ${deny.title}`, width));
     }
     if (gates.unexplainedDeniesOmitted) lines.push(dim(`  ${gates.unexplainedDeniesOmitted} more unexplained denies omitted`));
-    // A stage with a live rule that nothing has asked for. Not an error — it is the one gate state
-    // that reads exactly like health, which is why it is worth a line at all.
+
+    // A stage with a live rule that nothing has ever asked for. Not an error — it is the one gate
+    // state that reads exactly like health, which is why it is worth a line at all.
     //
-    // THE WINDOW IS IN THE LABEL (Codex P2 on PR #51, and it was right). `byStageRead` counts within
-    // `windowDays`, so a bare "unread" cannot be told apart from "last read just outside the
-    // window" — and the reader would take the narrower claim for the permanent one. This whole
-    // change is about not writing a verdict where the value is unavailable; the renderer was quietly
-    // doing it one layer above the query.
+    // NO WINDOW IN THE LABEL ANY MORE, and that is a strengthening rather than a loss. This used to
+    // read "unread/30d" because the count came from events inside a window, so "unread" could not be
+    // told from "last read just outside it". The claim is now over every read the record holds, so
+    // "never" is the honest word and the qualifier would be the misleading one.
     for (const stage of gates.unreadStages ?? []) {
-      lines.push(truncate(`  unread/${gates.windowDays}d [${stage.stageId.slice(0, 8)}] ${stage.stageName}`, width));
+      lines.push(truncate(`  never looked up [${stage.stageId.slice(0, 8)}] ${stage.stageName}`, width));
     }
-    if (gates.unreadStagesOmitted) lines.push(dim(`  ${gates.unreadStagesOmitted} more unread stages omitted`));
+    if (gates.unreadStagesOmitted) lines.push(dim(`  ${gates.unreadStagesOmitted} more never-looked-up stages omitted`));
     lines.push("");
   }
 
@@ -133,7 +175,27 @@ export function renderOverview(overview: MemoryOverview, opts: RenderOpts = {}):
   if (
     overview.counts.dirty === 0 && overview.counts.stale === 0 && overview.counts.disputed === 0 &&
     overview.counts.possibleDuplicates === 0 && overview.counts.extractionCandidates === 0 &&
-    !gates.retirementCandidates && !gates.unexplainedDenies && !gates.unreadStages && !overview.legacyStarConcepts
+    !gates.retirementCandidates && !gates.unexplainedDenies && !gates.unreadStages &&
+    gates.conformance.notAsked === 0 && gates.conformance.unanswered === 0 && gates.losses === 0 &&
+    // THIS LIST AND THE GATE SECTION'S OWN VISIBILITY CHECK ARE THE SAME SET. Mechanical on
+    // purpose, and grep-checkable: anything that can OPEN that section must also suppress the
+    // all-clear, or the page tells a human both things at once.
+    //
+    // BE SUSPICIOUS OF THIS RULE — it has been wrong three times. `unopened` was wired into the
+    // section and not into here (R2). `unjoinableReads` was missed the same way (N3). Then the fix
+    // for that went the wrong direction (G2): adding it here made the all-clear UNREACHABLE, because
+    // `moment_reads` has no DELETE anywhere and an unjoinable read is the documented normal case —
+    // a `stage_lookup` from `agent_context`, with no interception behind it. One such lookup on a
+    // brand-new store retired "no curation work queued" permanently, with nothing to act on. A
+    // signal that never fires is the same failure as one that always fires.
+    //
+    // So `unjoinableReads` was removed from BOTH lists rather than added to this one. It is `dim`
+    // and informational; it rides inside the section when something else opens it, and the two
+    // lists stay identical. If you are adding a condition here, add it to the visibility check in
+    // the same commit — and if it is a number that only grows and has a benign normal case, it
+    // belongs in neither.
+    gates.unopened === 0 &&
+    !overview.legacyStarConcepts
   ) {
     lines.push(green("no curation work queued"));
     lines.push("");

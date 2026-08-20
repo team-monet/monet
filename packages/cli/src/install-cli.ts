@@ -5,7 +5,6 @@ import path, { basename, dirname, join } from "node:path";
 import { Command } from "commander";
 import { deriveCircle } from "./circle.js";
 import { ensureMonetDir } from "./db/index.js";
-import { GATE_JOURNAL_CONTEXT_MAX_CHARS } from "@team-monet/core";
 import { GATE_FAIL_OPEN_MARKER, QUERY_WILDCARD_CIRCLE } from "./gate-cli.js";
 import { resolveProjectDir } from "./project-dir.js";
 
@@ -66,15 +65,14 @@ import { resolveProjectDir } from "./project-dir.js";
 // ── The generated wrapper script ─────────────────────────────────────────────────────────────
 
 const WRAPPER_FILENAME = "gate-hook.mjs";
-const DENY_LOG_FILENAME = "gate-denies.log";
 /**
- * The gate journal. Shared with the gate CLI — see
- * gate-cli.ts's own GATE_JOURNAL_FILENAME, which must name the same file: the hook and the gate it
- * spawns write two events about one interception, and they are only correlatable in one stream.
+ * The argv marker that tells the one wrapper script it was invoked for PostToolUse rather than
+ * PreToolUse. Exported so `runInstall` writes exactly the string the generated script checks for —
+ * a literal spelled twice is a literal that drifts, and a drifted one here would silently turn
+ * every outcome record off while the install still looked correct.
  */
-export const JOURNAL_FILENAME = "gate-journal.jsonl";
-export const JOURNAL_MAX_BYTES = 64 * 1024 * 1024;
-
+export const POST_TOOL_USE_FLAG = "--post-tool-use";
+const DENY_LOG_FILENAME = "gate-denies.log";
 /**
  * Generates the wrapper script's FULL source. Written fresh on every `monet install` run — safe
  * to overwrite unconditionally because the ONE thing baked in here (the resolved `monet`
@@ -84,16 +82,24 @@ export const JOURNAL_MAX_BYTES = 64 * 1024 * 1024;
  * separation is what lets a project-scoped install and a user-global install coexist without
  * fighting over this one shared file.
  *
- * DENY JOURNAL (boundary statement item 6, this slice's ruling): the hook path stays
- * sqlite-write-free — no `gate_events` row is ever written from here. On a deny (exit 30) this
- * script appends ONE line (ISO timestamp, the circle it ran under if pinned, the first stdout
- * line) to `~/.monet/gate-denies.log`, created 0600 (mode supplied at the `openSync` call that
- * creates it, never chmod-after — the sidecar-materializer precedent) and append-only thereafter.
- * THE RECORDING GAP, STATED HONESTLY: this is the ONLY record of a hook-path deny anywhere in
- * this client — no `gate_events` row, no sync, no query surface. Accepted because blocking fires
- * are declaration-only and (by the same design that keeps them rare) few; a full instrumentation
- * table for a handful of denies a year would be a store-write on the hook's own critical path for
- * a signal a human can `tail` instead.
+ * DENY LOG (boundary statement item 6): on a deny (exit 30) this script appends ONE line — ISO
+ * timestamp, the circle it ran under if pinned, the first stdout line — to
+ * `~/.monet/gate-denies.log`, created 0600 (mode supplied at the `openSync` call that creates it,
+ * never chmod-after — the sidecar-materializer precedent) and append-only thereafter. It is a plain
+ * text file a human can `tail`, and that is the whole of what it is for.
+ *
+ * IT IS NO LONGER THE ONLY RECORD OF A DENY, and this comment used to say that it was. A deny is
+ * now also a governed moment carrying `disposition: "blocked"`, written by `monet gate` with the
+ * stage and the rule ids that produced it — strictly more than this line holds, and queryable. The
+ * sole-record claim was true when it was written and stopped being true when the governed-moment
+ * record landed.
+ *
+ * WHETHER THIS FILE IS STILL WORTH KEEPING IS OPEN, deliberately left that way rather than settled
+ * here. For: a tail-able text file needs no store, no fold and no query surface, and it survives a
+ * store that will not open. Against: it is now a second, weaker copy of a fact the moment record
+ * already holds, and two populations describing one event is the shape this subsystem's own rebuild
+ * exists to remove. Not decided in this pass — the file is user-facing and somebody may be tailing
+ * it, so removing it is a separate decision from the work that made the question live.
  */
 export function buildWrapperScript(opts: { execPath: string; scriptPath: string }): string {
   return `#!/usr/bin/env node
@@ -135,21 +141,15 @@ const MONET_SCRIPT = ${JSON.stringify(opts.scriptPath)};
 // for. See main()'s own "default:" case for the detection, and gate-cli.ts's own comment on the
 // constant for the full bug this closes.
 const GATE_FAIL_OPEN_MARKER = ${JSON.stringify(GATE_FAIL_OPEN_MARKER)};
-// Journal path resolves at RUN time: MONET_STORAGE_DIR first (the same override db/index.ts's own
+// The record's path resolves at RUN time: MONET_STORAGE_DIR first (the same override db/index.ts's own
 // storage resolution honors — and what lets tests isolate this wrapper without touching the real
 // ~/.monet), else ~/.monet. The cwd rung of that resolution is DELIBERATELY absent here: a hook's
 // cwd is whatever directory the host happened to spawn from — the exact wrong-project hazard the
-// gate CLI's own default-mirror-path fix closed (4b-C Blocker 1) — and a journal that silently
+// gate CLI's own default-mirror-path fix closed (4b-C Blocker 1) — and a record that silently
 // lands in a random project's .monet would be worse than one that always lands in the home store.
 const MONET_STORAGE_DIR = process.env.MONET_STORAGE_DIR || join(homedir(), ".monet");
 const DENY_LOG_PATH = join(MONET_STORAGE_DIR, ${JSON.stringify(DENY_LOG_FILENAME)});
-const JOURNAL_PATH = join(MONET_STORAGE_DIR, ${JSON.stringify(JOURNAL_FILENAME)});
-// One generation of rotation, checked on append. A hook runs on EVERY Bash command, so an
-// unbounded append-only file on this path is a disk-filling surprise waiting to happen; a cap plus
-// one .prev generation bounds it at 2x without ever losing the most recent window. Deliberately
-// NOT a size a user configures — see the journal writer's own comment.
-const JOURNAL_MAX_BYTES = ${JOURNAL_MAX_BYTES};
-
+const POST_TOOL_USE_FLAG = ${JSON.stringify(POST_TOOL_USE_FLAG)};
 // SHOULD-FIX 4 (round-5 coordinator review): mirrors gate-cli.ts's own readStdinSync EXACTLY —
 // see that function's comment (src/gate-cli.ts) for the full EAGAIN story: a plain
 // \`readFileSync(0, "utf8")\` fails on a non-blocking piped stdin under load (reproduced reliably
@@ -190,7 +190,7 @@ function readAllStdin() {
   const chunks = [];
   let retainedBytes = 0;
   // BYTES ARRIVED, counted across everything read including what is drained-without-retaining
-  // (Codex P2 on PR #63, and it was right). The journal's \`stdinBytes\` used the RETAINED text's
+  // (Codex P2 on PR #63, and it was right). The retained-vs-arrived distinction matters because
   // \`.length\`, which is UTF-16 code units of a prefix — so the one payload whose size actually
   // matters, the monster one past the cap, was recorded at exactly the cap and every multibyte
   // payload was recorded short. A diagnostic number that is wrong precisely when it is interesting
@@ -269,7 +269,23 @@ function emitSpawnFailureWarning() {
 // result", and the emit below carries no permissionDecision, so the call proceeds — and would be
 // false through a preflight caller of the same gate. So the adapter that knows the timing states
 // it, and the payload it wraps stays silent on the question.
-function emitAdvisory(context) {
+// DELIVERY NAMES ITS MOMENT (invariant 03). The moment id rides along so that when the agent
+// calls \`stage_lookup\`, the read joins to the exact interception that prompted it, rather than
+// being counted against an unrelated total. ONE SENTENCE AND AN ID, because this text is read by a
+// model on every governed tool call: minimization governs delivery, so it carries identity and an
+// instruction and never rule content.
+//
+// THE SENTENCE IS SELF-CONTAINED, AND THAT IS MEASUREMENT RATHER THAN POLISH. It used to read
+// "Pass momentId X to stage_lookup" — an imperative that, read on its own, never says what to look
+// up. Whether the agent actually makes that call decides whether Received gets measured at all, and
+// a half instruction lowers the call rate. The failure would not look like a defect either: it
+// surfaces as unjoinableReads rising, which has a benign normal case.
+//
+// IT REFERS TO THE STAGES NAMED ABOVE WITHOUT REPEATING THEM — they are already in this payload,
+// and re-sending them is context paid twice — and it says "on each call" rather than pairing them:
+// a moment has ONE id and can match SEVERAL stages, so any phrasing implying a one-to-one pairing
+// would be wrong. The deny path carries the identical sentence for the identical reason.
+function emitAdvisory(context, momentId) {
   emit({
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -277,13 +293,16 @@ function emitAdvisory(context) {
         context +
         "\\nThis advisory cannot intervene before the call: a PreToolUse advisory reaches you beside " +
         "the tool result, not before it. Whether the call ran is decided by the normal permission " +
-        "flow, which this hook leaves alone. Read the stages above before your next action at them.",
+        "flow, which this hook leaves alone. Read the stages above before your next action at them." +
+        "\\nWhen you look those stages up with stage_lookup, pass momentId " + momentId + " on each call.",
     },
   });
 }
 
-// Deny journal (boundary statement item 6) — see this file's own generator comment
-// (buildWrapperScript, install-cli.ts) for the full recording-gap disclosure.
+// Deny log (boundary statement item 6) — a plain line a human can tail. NOT the only record of a
+// deny any more: the same deny is a governed moment with disposition "blocked", carrying the stage
+// and the rule ids this line does not. Whether this file is still worth keeping is an open
+// question — see buildWrapperScript's own comment (install-cli.ts) for both sides of it.
 function appendDenyLine(circleForJournal, firstStdoutLine) {
   try {
     // NIT (round-5 coordinator review): mode supplied unconditionally on the ONE openSync call —
@@ -298,181 +317,126 @@ function appendDenyLine(circleForJournal, firstStdoutLine) {
   }
 }
 
-// ── The gate journal: completeness governs the record ─────────────────────────────────────────
+// -- The governed-moment spool ---------------------------------------------------------------
 //
-// Minimization still governs DELIVERY — nothing here changes
-// what reaches a model's context, and silence stays the agent-facing signal. Completeness governs
-// the RECORD: this hook appends what it actually did, to a stream no agent reads in-band.
+// A COPY, ON PURPOSE, AND HALF OF A TWO-PROCESS CONTRACT. This block duplicates
+// packages/core/src/moment-spool.ts, and the path below duplicates getMomentSpoolPath() in
+// packages/cli/src/db/index.ts (getMomentSpoolPath), for the reason a generated script always has: a
+// generated standalone script can import nothing. THE COPIES MOVE TOGETHER -- a change to the
+// record shape, the format version, or the two path rungs must land in all of them in the same
+// commit, or two writers put two shapes in one file and every count over it is wrong.
 //
-// WHY, IN ONE LINE: normal silence and broken silence were indistinguishable. §0's incident — this
-// surface invoked-but-inert for months — was undiagnosable precisely because a declining guard left
-// no trace. With arrival witnessed, normal silence = an arrival event with nothing to say, and
-// broken silence = no arrival event at all.
+// THE CONTRACT WITH \`monet gate\` (gate-cli.ts, spoolGovernedMoment -- stated there too, in full):
+//   1. THIS script mints the moment id and forwards it in MONET_MOMENT_ID, along with the host's
+//      tool_use_id in MONET_TOOL_USE_ID, which only this script ever sees.
+//   2. When \`monet gate\` IS spawned, IT writes the interception record -- it is the only party
+//      that knows the matched stage and the rule identity. This script writes none.
+//   3. This script writes an interception ONLY when it never spawns the gate at all: a foreign
+//      tool, an unparseable payload, a truncated one. Those are recorded \`ungoverned\`, which is
+//      invariant 02 landing on exactly the cases it was written for.
+//   4. Exactly one writer per moment on every normal path. Where both ever write about one moment,
+//      the fold merges them, and THAT MERGE DEPENDS ON NULL MEANING "NOT OBSERVED": the ledger
+//      upserts COALESCE(existing, excluded) per column, so a real value fills what an earlier
+//      partial record left null and never overwrites what was already observed. A writer that
+//      emitted a placeholder instead of null would silently win that merge and bury the real value.
 //
-// TWO LINES PER INTERCEPTION, NOT ONE, and this is the load-bearing choice: \`arrival\` is written
-// BEFORE the payload is even parsed, and \`disposition\` at exit. One line written at exit would be
-// lost by exactly the failures worth recording — a crash, an OOM on a monster payload, a kill. An
-// arrival with no matching disposition is itself a finding, and it can only exist if the two are
-// separate appends.
-//
-// EVERY EARLY RETURN IS AN OUTCOME, NOT AN EXEMPTION (§1). A guard that declines to evaluate writes
-// \`declined: <reason>\`. Had that line existed, the Task->Agent rename would have surfaced as
-// \`declined: foreign-tool\` on day one instead of by hand-probing months of silence.
-//
-// THE ACTION CONTEXT IS RECORDED IN FULL, deliberately, and it is the one privacy-relevant call
-// here: this file accumulates the text of every gated command. Accepted because (1) the gate
-// already receives that text and the deny log already persists it, so no new class of data reaches
-// this machine; (2) §9's hash-reference discipline governs TRANSCRIPT evidence for the conformance
-// pass, which is a different, host-owned input; and (3) an arrival witness that cannot say what
-// arrived cannot close #58 — knowing a delegation was declined is the entire point. Mode 0600,
-// never synced, never in search.
-// Rotate BEFORE appending, so the cap is a real ceiling rather than a threshold the current write is
-// allowed to blow past. One generation only: the goal is bounding disk, not retention policy.
-//
-// SERIALIZED, because hooks run concurrently (Codex P2 on PR #63, and it was right). Two processes
-// can both see a journal at the cap; the first rotates and appends its arrival, and the second then
-// renames that fresh one-line file over \`.prev\` — discarding the whole retained generation, and
-// capable of separating an arrival from its own disposition. An exclusive create is the coordination:
-// \`wx\` fails if the marker exists, so exactly one writer rotates and the rest simply append.
-//
-// A STALE MARKER IS THE WORSE FAILURE and is handled rather than assumed away: a process killed while
-// holding it would otherwise block rotation forever, turning a bounded file into an unbounded one.
-// One older than a minute is cleared, and the next append rotates.
-const JOURNAL_ROTATE_LOCK = JOURNAL_PATH + ".rotating";
-const JOURNAL_LOCK_STALE_MS = 60000;
-function rotateIfNeeded() {
+// NO DEFENSIVE SKELETON. When the gate IS spawned and dies before writing, the right record is no
+// interception, an orphan outcome, and an \`unobserved-interception\` loss -- which the fold
+// produces on its own. A skeleton written "just in case" would turn every gate crash into a moment
+// that looks observed and is empty, which is a verdict standing where the value is not known.
+const MOMENT_SPOOL_PATH = join(MONET_STORAGE_DIR, "moments.jsonl");
+const MOMENT_SPOOL_FORMAT = 1;
+const MOMENT_ACTION_RENDERING_MAX_CHARS = 2048;
+
+// LAZY, so a governed tool call that spools nothing here leaves no run-start behind. The run is
+// this process's lifetime; its sequence starts at 0 with the run-start record itself, so a run
+// whose declaration is the append that failed reports a hole at 0 rather than an unknown role.
+let momentRun = null;
+function ensureMomentRun() {
+  if (momentRun !== null) return momentRun;
+  momentRun = { runId: randomUUID(), seq: 0 };
+  appendMomentRecord({ kind: "run-start", writerRole: "host-hook", at: new Date().toISOString() });
+  return momentRun;
+}
+
+// THE SEQUENCE NUMBER IS CONSUMED BEFORE THE WRITE IS TRIED, never after. Every failure here is
+// swallowed -- instrumentation may not fail a user's tool call -- and the consumed-but-unwritten
+// number is precisely what makes that swallow visible to the fold later.
+function appendMomentRecord(body) {
+  const run = momentRun;
+  if (run === null) return;
+  const seq = run.seq;
+  run.seq = seq + 1;
   try {
-    if (statSync(JOURNAL_PATH).size < JOURNAL_MAX_BYTES) return;
-  } catch {
-    return; // no file yet — the common case
-  }
-  let lockFd;
-  try {
-    lockFd = openSync(JOURNAL_ROTATE_LOCK, "wx", 0o600);
-  } catch {
+    const line = JSON.stringify(Object.assign({ v: MOMENT_SPOOL_FORMAT, runId: run.runId, seq: seq }, body)) + "\\n";
+    const fd = openSync(MOMENT_SPOOL_PATH, "a", 0o600);
     try {
-      if (Date.now() - statSync(JOURNAL_ROTATE_LOCK).mtimeMs > JOURNAL_LOCK_STALE_MS) {
-        unlinkSync(JOURNAL_ROTATE_LOCK);
-      }
-    } catch {
-      // Someone else cleared it, or we cannot read it. Either way: append, do not fight.
+      writeSync(fd, line);
+    } finally {
+      closeSync(fd);
     }
-    return;
-  }
-  try {
-    // Re-checked UNDER the marker: a racing writer may have rotated between our stat and our lock,
-    // and rotating again here is precisely the destructive case this exists to prevent.
-    if (statSync(JOURNAL_PATH).size >= JOURNAL_MAX_BYTES) renameSync(JOURNAL_PATH, JOURNAL_PATH + ".prev");
   } catch {
-    // Nothing to rotate, or a rename we are not going to fight over.
-  } finally {
-    closeSync(lockFd);
-    try {
-      unlinkSync(JOURNAL_ROTATE_LOCK);
-    } catch {
-      // Already gone. Fine.
-    }
+    // Total. The hole this leaves is the record.
   }
 }
 
-// The lock serializes ROTATORS; this makes APPENDERS wait for them (Codex P2 on PR #63, and it was
-// right). Without it, a process that lost the rotation race opens the journal immediately — possibly
-// the old inode, moments before the winner renames it — so its arrival is carried into \`.prev\`
-// while its own disposition lands in the new active file. That splits a correlated pair at every
-// rotation boundary, which is the one thing the shared id exists to prevent.
-//
-// BOUNDED, because a hook must never hold up the user's command: roughly 200 ms, then append
-// regardless. A split pair is bad; a wedged Bash call is worse.
-const ROTATION_WAIT_SLICE_MS = 5;
-const ROTATION_WAIT_SLICES = 40;
-const rotationPause = new Int32Array(new SharedArrayBuffer(4));
-function awaitRotation() {
-  for (let i = 0; i < ROTATION_WAIT_SLICES; i++) {
-    try {
-      statSync(JOURNAL_ROTATE_LOCK);
-    } catch {
-      return; // marker gone: whoever was rotating has finished
-    }
-    Atomics.wait(rotationPause, 0, 0, ROTATION_WAIT_SLICE_MS);
+// Identity always, rendering bounded. Kept textually in sync with core's own renderAction.
+function renderMomentAction(action) {
+  // NO ACTION MEANS NO OBSERVATION OF ONE — all four fields go null together, never a hash of ""
+  // and a length of 0, which downstream would read as a real, empty action. Mirrors core.
+  if (action === null) {
+    return { actionSha256: null, actionRendering: null, actionChars: null, actionClipped: null };
   }
-}
-
-// ONE DESCRIPTOR FOR THE WHOLE INTERCEPTION (Codex P2 on PR #63, and it was right). Rotation between
-// an arrival and its own disposition used to carry the arrival into \`.prev\` while the disposition
-// landed in the new active file — and a second rotation then discarded that \`.prev\`, leaving a
-// disposition whose arrival no longer exists anywhere. That fabricates the exact "incomplete event"
-// signal this journal exists to make trustworthy.
-//
-// A pair is always written by ONE process, and an open descriptor follows the inode rather than the
-// name: opening once means both lines land in the same file no matter who renames what in between.
-// The pair becomes unsplittable by construction rather than by timing. The process is a hook that
-// lives ~20ms, so the descriptor costs nothing and process exit closes it.
-//
-// Rotation is therefore evaluated exactly once, before that first open — which is also the only
-// moment it could be honoured anyway.
-let journalFd = null;
-function journalHandle() {
-  if (journalFd !== null) return journalFd;
-  rotateIfNeeded();
-  awaitRotation();
-  // CREATE THE DIRECTORY FIRST (Codex P2 on PR #63, and it was right). A MONET_STORAGE_DIR pointing
-  // somewhere that does not exist yet made openSync throw and the catch swallow every event —
-  // silently, and precisely on a fresh user-scoped install or a direct \`monet gate\` before the
-  // store was ever initialised. The first invocations are the ones a record most needs to have.
-  mkdirSync(dirname(JOURNAL_PATH), { recursive: true });
-  journalFd = openSync(JOURNAL_PATH, "a", 0o600);
-  return journalFd;
-}
-
-function journal(fields) {
-  try {
-    writeSync(journalHandle(), JSON.stringify(fields) + "\\n");
-  } catch {
-    // A journal that cannot be written must never block, alter, or crash the hook's own decision.
-    // Recording is a duty this process owes the record, never one it owes the user's command.
-  }
-}
-
-// BOUNDS WHAT A LINE SAYS ABOUT AN ACTION CONTEXT — found by measurement, not foresight. The first
-// build recorded it in full and a real run produced a single 12 MB journal line: the overflow
-// outcome exists PRECISELY for enormous contexts, so the one disposition guaranteed to carry a
-// monster payload was the one writing it verbatim. Identity is preserved by hash rather than by
-// bulk, which is also the evidence discipline §9.3 already asks for. Kept textually in sync with
-// core's own clipActionContext (gate-journal.ts) — a generated script cannot import it.
-const JOURNAL_CONTEXT_MAX_CHARS = ${GATE_JOURNAL_CONTEXT_MAX_CHARS};
-function clipActionContext(text) {
-  if (text.length <= JOURNAL_CONTEXT_MAX_CHARS) return { actionContext: text };
+  const clipped = action.length > MOMENT_ACTION_RENDERING_MAX_CHARS;
   return {
-    actionContext: text.slice(0, JOURNAL_CONTEXT_MAX_CHARS),
-    actionContextClipped: true,
-    actionContextChars: text.length,
-    // Only on the clipped path: digesting a multi-MB context costs real milliseconds, and charging
-    // that to every ordinary \`Bash:git status\` would tax the common case to serve the exception.
-    actionContextSha256: createHash("sha256").update(text).digest("hex"),
+    actionSha256: createHash("sha256").update(action).digest("hex"),
+    actionRendering: clipped ? action.slice(0, MOMENT_ACTION_RENDERING_MAX_CHARS) : action,
+    actionChars: action.length,
+    actionClipped: clipped,
   };
 }
 
-/**
- * Mints the id both of this interception's lines carry, and writes the \`arrival\` line immediately.
- * Called at the mouth — before the payload is parsed and before any guard runs.
- */
-function openJournalEvent() {
-  const event = { id: randomUUID(), at: new Date().toISOString() };
-  journal({
-    v: 1, phase: "arrival", id: event.id, at: event.at, mouth: "host-hook",
-    // §9's claim typing — verdicts say WHAT, claim types say HOW WE KNOW. An arrival is the
-    // strongest kind there is: this process was handed the payload by the host itself.
-    claimType: "source-observed",
-  });
-  return event;
+// A moment nothing could evaluate. \`ruleIds\` and \`deliveredRuleIds\` are NULL rather than [] --
+// [] would say the gate looked and found nothing bound, and on these paths the gate never ran.
+function toolUseIdOf(hookInput) {
+  return typeof hookInput.tool_use_id === "string" && hookInput.tool_use_id.length > 0 ? hookInput.tool_use_id : null;
+}
+function sessionIdOf(hookInput) {
+  return typeof hookInput.session_id === "string" && hookInput.session_id.length > 0 ? hookInput.session_id : null;
 }
 
-/** The closing line. \`disposition\` is the outcome; every early return has one. */
-function closeJournalEvent(event, disposition, extra) {
-  journal(Object.assign(
-    { v: 1, phase: "disposition", id: event.id, at: new Date().toISOString(), mouth: "host-hook", disposition },
-    extra || {},
+function spoolUngovernedMoment(momentId, toolUseId, sessionId, surface, action) {
+  ensureMomentRun();
+  appendMomentRecord(Object.assign(
+    {
+      kind: "interception",
+      momentId: momentId,
+      at: new Date().toISOString(),
+      toolUseId: toolUseId,
+      sessionId: sessionId,
+      surface: surface,
+      stageId: null,
+      ruleIds: null,
+      disposition: "ungoverned",
+      deliveredRuleIds: null,
+    },
+    renderMomentAction(action),
   ));
+}
+
+// The outcome half, written by the PostToolUse invocation -- a DIFFERENT PROCESS from the one that
+// opened the moment, which is the whole reason this record is keyed by the host's tool_use_id
+// rather than by a moment id it has no way to know. The fold resolves it.
+function spoolMomentOutcome(toolUseId, outcomeText, outcomeStatus) {
+  ensureMomentRun();
+  appendMomentRecord({
+    kind: "outcome",
+    momentId: null,
+    toolUseId: toolUseId,
+    outcomeStatus: outcomeStatus,
+    outcomeAt: new Date().toISOString(),
+    outcomeSha256: createHash("sha256").update(outcomeText).digest("hex"),
+  });
 }
 
 // ── Host tool names are HOST VARIABLES, never constants (monet-client#58, 2026-08-03) ─────────
@@ -521,17 +485,19 @@ function surfaceForHostTool(toolName) {
 // does not otherwise recognize. See this file's own top comment for the full hooks.md:148 citation
 // on why this — not permissionDecision:"defer" — is the correct "no opinion" idiom in every mode.
 //
-// RECORDING GAP, NAMED: each of those early returns is an
-// OUTCOME, not an exemption from recording — the §0 incident was undiagnosable precisely because a
-// declining guard left no trace. The gate journal that turns each into a recorded disposition
-// (\`declined: foreign-tool\`) is the next task, deliberately not this one; this patch fixes the
-// wrong answer, the journal makes the next wrong answer visible on day one.
-//
-// SHAPE (journal slice): \`decide\` returns its outcome instead of falling off the end, so that
-// EVERY exit — including all the deliberate silences above — passes through one place that records
-// it. A \`return;\` that skipped the record is exactly the defect §0 is an incident report about, so
-// the disposition is made unskippable by the control flow rather than by remembering to log.
-function decide(event, stdin) {
+// EVERY ONE OF THOSE EARLY RETURNS IS AN OUTCOME, not an exemption from recording — the §0
+// incident was undiagnosable precisely because a declining guard left no trace. The three that
+// never reach \`monet gate\` at all record themselves as \`ungoverned\` governed moments before
+// returning (see spoolUngovernedMoment), and every path that DOES reach the gate is recorded by the
+// gate, which is the only party that knows the stage and the rule ids. So no exit here is silent,
+// and \`decide\` returns nothing: the record is written where the fact is known, not carried back
+// to a caller to be logged.
+function decide(stdin) {
+  // MINTED HERE, WITHOUT THE STORE (invariant 07), and before anything can decline: every path
+  // below either forwards this id to \`monet gate\` (which writes the interception) or records an
+  // \`ungoverned\` interception against it here. A path that returned without doing one of the two
+  // would be an interception point that opened no moment, which invariant 02 forbids.
+  const momentId = randomUUID();
   let hookInput;
   try {
     hookInput = JSON.parse(stdin.text);
@@ -562,12 +528,22 @@ function decide(event, stdin) {
       // Nothing was evaluated, and nothing COULD be: the payload naming the action is itself
       // unreadable. "unavailable" is the honest claim type — the strongest thing we can say is
       // that we could not know.
-      return { disposition: "overflow", extra: { claimType: "unavailable", reason: "payload-truncated" } };
+      //
+      // AND THE MOMENT IS STILL RECORDED. A surface this wrapper cannot read is exactly what
+      // invariant 02 means by ungoverned; leaving it out would make an uninterceptable tool call
+      // indistinguishable from one that never happened. Surface and action are null because they
+      // are genuinely unknown here — the envelope naming them is the thing that could not be read.
+      spoolUngovernedMoment(momentId, null, null, null, null);
+      return;
     }
-    return { disposition: "declined: unparseable-payload", extra: { claimType: "unavailable" } };
+    spoolUngovernedMoment(momentId, null, null, null, null);
+    return;
   }
   if (!hookInput || typeof hookInput !== "object") {
-    return { disposition: "declined: malformed-payload", extra: { claimType: "unavailable" } };
+    // Same class as the two above: parsed, but not into anything this wrapper can act on. The gate
+    // is never spawned, so this is the only writer that can record the moment at all.
+    spoolUngovernedMoment(momentId, null, null, null, null);
+    return;
   }
   const surface = surfaceForHostTool(hookInput.tool_name);
   if (surface === null) {
@@ -575,13 +551,18 @@ function decide(event, stdin) {
     // while every observable stayed byte-identical to health. \`hostToolName\` is recorded verbatim
     // and unmapped ON PURPOSE: the question this answers months later is "what did the host
     // actually call it", and any normalization here would destroy the only evidence of the rename.
-    return {
-      disposition: "declined: foreign-tool",
-      extra: {
-        claimType: "source-observed",
-        hostToolName: typeof hookInput.tool_name === "string" ? hookInput.tool_name : null,
-      },
-    };
+    // THE §0 EVENT, RECORDED AS A MOMENT TOO. The surface is the host's own name for the tool,
+    // verbatim and unmapped — normalizing it would destroy the only evidence of a rename. The action is null:
+    // this wrapper extracts a command only for surfaces it maps, so for an unmapped one it has not
+    // observed an action at all, and rendering the raw tool_input would be inventing one.
+    spoolUngovernedMoment(
+      momentId,
+      typeof hookInput.tool_use_id === "string" ? hookInput.tool_use_id : null,
+      typeof hookInput.session_id === "string" ? hookInput.session_id : null,
+      typeof hookInput.tool_name === "string" ? hookInput.tool_name : null,
+      null,
+    );
+    return;
   }
 
   // Task (monet-client#56): the ONE interception that is pre-cognition rather than post — every
@@ -597,12 +578,13 @@ function decide(event, stdin) {
     const kind = typeof input.subagent_type === "string" ? input.subagent_type.trim() : "";
     const what = typeof input.description === "string" ? input.description.trim() : "";
     // Both absent means there is nothing a pattern could match, and an empty context would parse
-    // as a bare prefix rather than as a delegation — silence is the honest outcome.
+    // as a bare prefix rather than as a delegation. Silence is the honest VERDICT — but the moment
+    // still happened, and an interception point that opens none is the omission invariant 2 forbids
+    // (F5). Recorded ungoverned with a null action: nothing was evaluated, and there was no action
+    // this wrapper could render.
     if (!kind && !what) {
-      return {
-        disposition: "declined: empty-delegation-context",
-        extra: { claimType: "source-observed", surface, hostToolName: hookInput.tool_name },
-      };
+      spoolUngovernedMoment(momentId, toolUseIdOf(hookInput), sessionIdOf(hookInput), surface, null);
+      return;
     }
     command = [kind, what].filter(Boolean).join(" ");
   } else {
@@ -611,10 +593,9 @@ function decide(event, stdin) {
       : null;
   }
   if (command === null) {
-    return {
-      disposition: "declined: no-command",
-      extra: { claimType: "source-observed", surface, hostToolName: hookInput.tool_name },
-    };
+    // A Bash call carrying no command (F5). Same reasoning as the delegation guard above.
+    spoolUngovernedMoment(momentId, toolUseIdOf(hookInput), sessionIdOf(hookInput), surface, null);
+    return;
   }
 
   // P1-3 (Codex round 3 on PR #42): build the FULLY-PREFIXED action context OURSELVES — never
@@ -656,16 +637,23 @@ function decide(event, stdin) {
   // the honest posture: better a visible warning than a silently lost deny.
   const MAX_BUFFER = 16 * 1024 * 1024;
 
-  // The gate writes its OWN journal event — it is the only party that knows which stage matched and
-  // which rule ids were delivered. Handing it this interception's id is what makes the two lines
-  // one story, and turns "the hook arrived but the gate never evaluated" from an inference into a
-  // query. Passed as an ENV VAR, never a CLI flag, deliberately: an older \`monet\` on PATH (the
-  // fallback spawn right below can find one) would reject an unknown flag as a usage error and the
-  // hook would report a broken install instead of gating. An unknown env var is ignored by every
-  // version there has ever been.
-  const gateEnv = Object.assign({}, process.env, { MONET_GATE_JOURNAL_PARENT: event.id });
+  // THE TWO-PROCESS CONTRACT, in one line. MONET_MOMENT_ID makes the gate the writer of this
+  // moment's interception (it is the only party that knows the stage and the rule ids);
+  // MONET_TOOL_USE_ID hands it the host's own key for the tool call, which only this process ever
+  // sees and which is what lets the PostToolUse invocation's outcome be joined back at fold time.
+  //
+  // ENV VARS, NEVER CLI FLAGS, deliberately: an older \`monet\` on PATH (the fallback spawn below
+  // can find one) would reject an unknown flag as a usage error and the hook would report a broken
+  // install instead of gating. An unknown env var has been ignored by every version there has
+  // ever been.
+  const gateEnv = Object.assign({}, process.env, {
+    MONET_MOMENT_ID: momentId,
+    MONET_TOOL_USE_ID: typeof hookInput.tool_use_id === "string" ? hookInput.tool_use_id : "",
+    // F6: only this process ever sees the session id, and it was being discarded for exactly the
+    // moments a gate evaluated — the ungoverned ones kept theirs, the governed ones did not.
+    MONET_SESSION_ID: typeof hookInput.session_id === "string" ? hookInput.session_id : "",
+  });
   const spawnOpts = { input: actionContext, encoding: "utf8", maxBuffer: MAX_BUFFER, env: gateEnv };
-  const journalBase = { claimType: "source-observed", surface, hostToolName: hookInput.tool_name, ...clipActionContext(actionContext) };
 
   let result = spawnSync(MONET_EXEC, [MONET_SCRIPT, ...gateArgs], spawnOpts);
   if (result.error || typeof result.status !== "number") {
@@ -677,9 +665,12 @@ function decide(event, stdin) {
   }
   if (result.error || typeof result.status !== "number") {
     emitSpawnFailureWarning();
-    // The loud user-facing warning already exists for this; the record gets it too, because a
-    // permanently-broken install is precisely a condition that otherwise persists unnoticed.
-    return { disposition: "declined: gate-unreachable", extra: Object.assign({}, journalBase, { claimType: "unavailable" }) };
+    // The record gets it too (F5). This comment already claimed as much — "a permanently-broken
+    // install is precisely a condition that otherwise persists unnoticed" — with nothing under it
+    // that wrote anything, so it persisted unnoticed. The gate never ran, so nobody looked:
+    // ungoverned, with the action recorded because here we DO know what it was.
+    spoolUngovernedMoment(momentId, toolUseIdOf(hookInput), sessionIdOf(hookInput), surface, actionContext);
+    return;
   }
 
   const stdout = (result.stdout || "").trim();
@@ -708,11 +699,16 @@ function decide(event, stdin) {
         .map((line) => line.trim())
         .filter((line) => line.startsWith("monet gate:"));
       const systemMessage = diagnosticLines.length > 0 ? [reason, ...diagnosticLines].join("\\n") : reason;
+      // DELIVERY NAMES ITS MOMENT ON THE DENY PATH TOO (invariant 3). This carried the blocking
+      // rule ids and an instruction to run stage_lookup, but no moment id — so the read it asked
+      // for landed with moment_id: null and Received was structurally unreachable for every
+      // blocking rule. permissionDecisionReason is the field the docs say is shown to Claude on a
+      // deny, so the id rides there rather than in systemMessage, which the user sees instead.
       emit({
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "deny",
-          permissionDecisionReason: reason,
+          permissionDecisionReason: reason + "\\nWhen you look those stages up with stage_lookup, pass momentId " + momentId + " on each call.",
         },
         systemMessage,
       });
@@ -726,7 +722,7 @@ function decide(event, stdin) {
       // one-way write to stdout and nothing here reads an acknowledgment back. That is the same
       // scope \`enforced: false\` already carries on the stage-lookup mouth, where it means "a
       // blocking rule was delivered and this mechanism stopped nothing".
-      return { disposition: "deny", extra: Object.assign({}, journalBase, { gateExitCode: 30, enforced: true }) };
+      return;
     }
     case 40: {
       // "ask" (hooks.md:1539) — the protocol's own escalate-to-the-human value, distinct from
@@ -739,11 +735,11 @@ function decide(event, stdin) {
       });
       // The gate read the context and refused to judge it. Nothing was evaluated, so nothing is
       // known about whether a rule governs this act.
-      return { disposition: "overflow", extra: Object.assign({}, journalBase, { gateExitCode: 40, claimType: "unavailable" }) };
+      return;
     }
     case 20:
-      emitAdvisory(stdout);
-      return { disposition: "advisory", extra: Object.assign({}, journalBase, { gateExitCode: 20 }) };
+      emitAdvisory(stdout, momentId);
+      return;
     case 1:
       // RECHECK FINDING (round-5 reviewer, new defect in the SF3 fix): exit 1 is gate-cli's USAGE
       // ERROR — nothing was evaluated — and this wrapper's own invocation is well-formed, so in
@@ -754,8 +750,19 @@ function decide(event, stdin) {
       // made the warning unreachable on any machine with an older global monet, the most common
       // machine there is. Same fail-open posture, same user-visible warning as a spawn failure.
       emitSpawnFailureWarning();
-      return { disposition: "declined: gate-usage-error", extra: Object.assign({}, journalBase, { gateExitCode: 1, claimType: "unavailable" }) };
+      // An older monet with no gate subcommand: spawned fine, refused it, evaluated
+      // nothing (F5). Same reasoning as the spawn-failure branch above.
+      spoolUngovernedMoment(momentId, toolUseIdOf(hookInput), sessionIdOf(hookInput), surface, actionContext);
+      return;
     default: {
+      // R4: WHATEVER LANDS HERE OPENS A MOMENT. The gate emits only 0/1/10/20/30/40 today, so an
+      // unrecognized code is unreachable — which is exactly the assumption that rots, and a branch
+      // that records nothing is the silently-absent case this design forbids. Recorded before the
+      // fail-open analysis below so no path out of this switch can skip it; a later spool call for
+      // the same moment merges by first-write-wins rather than duplicating.
+      if (result.status !== 0 && result.status !== 10) {
+        spoolUngovernedMoment(momentId, toolUseIdOf(hookInput), sessionIdOf(hookInput), surface, actionContext);
+      }
       // P1-A (Codex round 1 on PR #42): 0 (silence) and 10 (stage-hit-no-rules) both land here —
       // but monet gate ALSO answers exit 0 when it fails OPEN because the mirror is missing,
       // malformed, or unreadable (gate-cli.ts's own GATE_FAIL_OPEN_MARKER lines — the same exit
@@ -776,10 +783,7 @@ function decide(event, stdin) {
         // A fail-open is NOT silence, and the record is the one place that difference survives: the
         // host saw exit 0 either way. "unavailable" says it plainly — no rule set was consulted, so
         // nothing is known about whether this act is governed.
-        return {
-          disposition: "declined: gate-fail-open",
-          extra: Object.assign({}, journalBase, { gateExitCode: result.status, claimType: "unavailable" }),
-        };
+        return;
       }
       // Genuine silence (exit 0) or stage-hit-no-rules (exit 10) — the gate answered, and had
       // nothing to say. THIS is the line that makes normal silence distinguishable from broken
@@ -788,19 +792,13 @@ function decide(event, stdin) {
       // AND ONLY THOSE TWO (Codex P2 on PR #63, and it was right). This switch's \`default:\` catches
       // every status the cases above do not, so an exit 2 — or any code a future gate introduces —
       // was being written down as \`silent\`: a healthy evaluation that never happened. That is the
-      // broken-silence ambiguity this journal exists to remove, reintroduced inside the journal
+      // broken-silence ambiguity this record exists to remove, reintroduced inside the record
       // itself. The fail-open behaviour is unchanged either way; what changes is that the record
       // stops claiming to know.
       if (result.status !== 0 && result.status !== 10) {
-        return {
-          disposition: "declined: gate-unknown-status",
-          extra: Object.assign({}, journalBase, { gateExitCode: result.status, claimType: "unavailable" }),
-        };
+        return;
       }
-      return {
-        disposition: result.status === 10 ? "stage-hit-no-rules" : "silent",
-        extra: Object.assign({}, journalBase, { gateExitCode: result.status }),
-      };
+      return;
     }
   }
 }
@@ -809,27 +807,91 @@ function decide(event, stdin) {
 // disposition is written on the way out, whatever the outcome — including an outcome nobody
 // anticipated, which is what the catch is for. A throw that escaped here would leave an arrival
 // with no disposition, and that asymmetry is itself the finding.
-function main() {
-  // ARRIVAL BEFORE THE READ, not merely before the parse (Codex P2 on PR #63, and it was right).
-  // This said "at the mouth" and was one line short of meaning it: reading stdin is where a monster
-  // payload exhausts memory and where a stalled producer never sends EOF, so an arrival appended
-  // after it is missing from exactly the mid-input failures the two-phase journal exists to reveal.
-  // The byte count moves to the disposition, where it is known and where nothing depends on it.
-  const event = openJournalEvent();
+/**
+ * THE OUTCOME HALF. A separate process from the PreToolUse that opened the moment, holding none of
+ * its state — which is why the record it writes is keyed by the host's \`tool_use_id\` and resolved
+ * later by the fold rather than here.
+ *
+ * EMITS NOTHING. The tool has already run; this hook has no opinion to offer and stays silent so
+ * the result reaches the model untouched.
+ */
+function recordPostToolUse() {
   const stdin = readAllStdin();
-  let outcome;
+  let hookInput;
   try {
-    outcome = decide(event, stdin);
-  } catch (error) {
-    closeJournalEvent(event, "declined: internal-error", {
-      claimType: "unavailable",
-      error: error && error.message ? String(error.message) : String(error),
-    });
+    hookInput = JSON.parse(stdin.text);
+  } catch {
+    return;
+  }
+  if (!hookInput || typeof hookInput !== "object") return;
+  // TWO CLOSING EVENTS, ONE PATH. The host's lifecycle fires PostToolUse after a tool call succeeds
+  // and PostToolUseFailure after one fails. BOTH close a moment, because the action HAPPENED either
+  // way — a failed rm -rf is at least as worth asking about as a successful one, and #60's own
+  // done-when says every host tool call opens AND CLOSES a moment. Accepting only the success event
+  // left every failed governed call permanently unclosed, and therefore permanently out of the ask
+  // backlog, which gates on an outcome.
+  //
+  // The host is the authority on which event this is; the argv marker only chose the code path.
+  const closingEvent = hookInput.hook_event_name;
+  if (closingEvent !== "PostToolUse" && closingEvent !== "PostToolUseFailure") return;
+  const toolUseId = typeof hookInput.tool_use_id === "string" && hookInput.tool_use_id.length > 0
+    ? hookInput.tool_use_id
+    : null;
+  // NO KEY, NO RECORD. The host documents tool_use_id as nullable, and an outcome that names
+  // neither a moment nor a tool call could be attached to nothing — it would become a recorded loss
+  // naming nothing missing. The moment simply closes with its outcome never observed, which is a
+  // state the ledger already carries honestly.
+  if (toolUseId === null) return;
+  // N1: HASHED OVER BOTH FIELDS, so no field name has to be guessed right. The first version took
+  // the failure digest over hookInput.error alone -- an unverified name -- and every failure whose
+  // detail lived elsewhere collapsed into one constant digest. A constant digest reads exactly like
+  // a real observation, which is the failure this project's own principle names. Including both
+  // removes the guess rather than improving it: whichever field the host actually populates lands
+  // in the hash, and the other contributes null.
+  //
+  // The digest stays identity, never content -- nothing here stores what the tool returned.
+  const outcomeValue = closingEvent === "PostToolUseFailure"
+    ? {
+        failed: true,
+        error: hookInput.error === undefined ? null : hookInput.error,
+        tool_response: hookInput.tool_response === undefined ? null : hookInput.tool_response,
+      }
+    : (hookInput.tool_response === undefined ? null : hookInput.tool_response);
+  let outcomeText;
+  try {
+    outcomeText = JSON.stringify(outcomeValue);
+  } catch {
+    // An outcome that cannot be serialized still HAPPENED. Recording its identity as the string
+    // form keeps it observed rather than dropping the moment's closing record.
+    outcomeText = String(outcomeValue);
+  }
+  // N2: which of the host's two closing events fired is a fact this process HOLDS, and dropping
+  // it made a call that landed indistinguishable from one the remote rejected.
+  spoolMomentOutcome(toolUseId, outcomeText, closingEvent === "PostToolUseFailure" ? "failed" : "ok");
+}
+
+function main() {
+  // ONE SCRIPT, TWO EVENTS. The marker on argv chooses the path BEFORE stdin is read, so a
+  // PostToolUse invocation never pays for reading a payload the PreToolUse path would want. The
+  // payload's own \`hook_event_name\` is still checked inside, and it is the authority if the two
+  // ever disagree.
+  if (process.argv.indexOf(POST_TOOL_USE_FLAG) !== -1) {
+    try {
+      recordPostToolUse();
+    } catch {
+      // Never fail, delay or alter a tool call because instrumentation broke. The tool has already
+      // run; the worst case here is a moment that closes outcome-unknown.
+    }
+    return;
+  }
+  const stdin = readAllStdin();
+  try {
+    decide(stdin);
+  } catch {
     // Same fail-open posture the rest of this wrapper holds: never block a command because THIS
     // hook broke. Nothing is emitted, so the normal permission flow decides.
     return;
   }
-  closeJournalEvent(event, outcome.disposition, Object.assign({ stdinBytes: stdin.arrivedBytes }, outcome.extra));
 }
 
 main();
@@ -866,6 +928,10 @@ export interface MatcherGroup {
 export interface SettingsFile {
   hooks?: {
     PreToolUse?: MatcherGroup[];
+    /** Written alongside PreToolUse since the outcome half shipped; the set is installed together. */
+    PostToolUse?: MatcherGroup[];
+    /** The other closing event: a tool call that ran and failed still closes its moment. */
+    PostToolUseFailure?: MatcherGroup[];
     [event: string]: unknown;
   };
   [key: string]: unknown;
@@ -968,7 +1034,7 @@ export function isMonetGateHandler(value: unknown, wrapperPath: string): value i
  *  - ONE group for the pair, not two, because two matcher groups that BOTH match fire BOTH their
  *    handlers: with separate `Task` and `Agent` groups installed, one delegation delivered the
  *    payload to each — the gate would spawn twice, advisories would inject twice, and every deny
- *    would write two journal lines. The alternation fires exactly once.
+ *    would open two governed moments for one call. The alternation fires exactly once.
  *  - ANCHORED because an unanchored `Bash` is a substring match against every tool whose name
  *    contains it — `BashOutput` among them — and each such match costs a wasted node spawn that
  *    the wrapper only ever answers with silence.
@@ -979,10 +1045,59 @@ export function upsertMonetGateHook(settings: SettingsFile, handler: HookHandler
   const next = structuredClone(settings ?? {}) as SettingsFile;
   const hooks = (next.hooks ?? {}) as NonNullable<SettingsFile["hooks"]>;
   next.hooks = hooks;
-  const preToolUse = (hooks.PreToolUse as MatcherGroup[] | undefined) ?? [];
 
+  hooks.PreToolUse = upsertHandlerForEvent(hooks.PreToolUse as MatcherGroup[] | undefined, handler, wrapperPath);
+  // BOTH EVENTS, ONE SCRIPT. PostToolUse is what makes a moment's outcome OBSERVED rather than
+  // reconstructed, and it is wired over the SAME matcher set on purpose: an outcome only means
+  // something for a moment PreToolUse actually opened, so a wider set here would record outcomes
+  // for tool calls no interception ever saw and manufacture losses out of the difference.
+  hooks.PostToolUse = upsertHandlerForEvent(
+    hooks.PostToolUse as MatcherGroup[] | undefined,
+    postToolUseHandler(handler),
+    wrapperPath,
+  );
+  // AND THE FAILURE HALF. The host closes a tool call with one of two events depending on whether
+  // it succeeded, and a moment closed only on success is a moment that never closes when the
+  // command fails — silently, and on exactly the calls a rule is most likely to have been about.
+  // Same marker, same script, same matcher set, for the same reason PostToolUse uses it.
+  hooks.PostToolUseFailure = upsertHandlerForEvent(
+    hooks.PostToolUseFailure as MatcherGroup[] | undefined,
+    postToolUseHandler(handler),
+    wrapperPath,
+  );
+  return next;
+}
+
+/**
+ * The same wrapper, marked so it takes its outcome path.
+ *
+ * EXEC FORM ONLY, and that is not a limitation this ignores: `runInstall` writes exec-form handlers
+ * (`command: execPath, args: [wrapperPath, ...]`) for the tokenization reason its own comment
+ * gives, so `args` is always present on a handler this command produced. A shell-form handler is
+ * returned unchanged rather than string-spliced — appending to a quoted command line is exactly the
+ * class of guess that produces a subtly wrong install, and a PostToolUse entry that silently did
+ * not carry the marker would take the PreToolUse path and emit a decision on a tool that has
+ * already run.
+ */
+function postToolUseHandler(handler: HookHandler): HookHandler {
+  if (handler.args === undefined) return handler;
+  return { ...handler, args: [...handler.args, POST_TOOL_USE_FLAG] };
+}
+
+/**
+ * Replaces this command's own handlers under ONE event, leaving every other handler alone.
+ *
+ * Extracted so PreToolUse and PostToolUse cannot drift: the removal half in particular has to be
+ * identical, or an uninstall would strip one event and leave the other pointing at a wrapper that
+ * is no longer there.
+ */
+function upsertHandlerForEvent(
+  existing: MatcherGroup[] | undefined,
+  handler: HookHandler,
+  wrapperPath: string,
+): MatcherGroup[] {
   const cleaned: MatcherGroup[] = [];
-  for (const group of preToolUse) {
+  for (const group of existing ?? []) {
     const originalHooks = group.hooks ?? [];
     const survivors = originalHooks.filter((h) => !isMonetGateHandler(h, wrapperPath));
     if (survivors.length > 0 || originalHooks.length === 0) {
@@ -1002,9 +1117,7 @@ export function upsertMonetGateHook(settings: SettingsFile, handler: HookHandler
     if (group) group.hooks = [...group.hooks, handler];
     else cleaned.push({ matcher, hooks: [handler] });
   }
-
-  hooks.PreToolUse = cleaned;
-  return next;
+  return cleaned;
 }
 
 /**
@@ -1049,12 +1162,32 @@ function validateSettingsShape(value: unknown): { ok: true; settings: SettingsFi
  * report naming wired and unwired surfaces (the accepted hole, stated honestly at install
  * time)"). Every "not wired" line names something real from the boundary statement's own "What it
  * CANNOT promise" section rather than staying silent about it.
+ *
+ * THIS IS ALSO THE GATE'S DECLARED COVERAGE BOUNDARY, and that is a load-bearing role rather than
+ * documentation. The governed-moment record's invariant 02 says a surface that CANNOT be
+ * intercepted is recorded as ungoverned rather than silently omitted. Applied literally to every
+ * unwatched tool it would be wrong, because there are THREE categories where the design named two:
+ *
+ *   - governed — intercepted, and a moment opens for every call;
+ *   - ungoverned BY NATURE — cannot be intercepted at all, so a per-moment record is impossible;
+ *   - ungoverned BY CHOICE — could be intercepted, and this install deliberately does not.
+ *
+ * The third is a POLICY fact, not a per-moment fact. One record per unwatched tool call would add
+ * volume and no information, and it would install a hook on every tool — the exact thing the
+ * narrow matcher set exists to avoid. So it is declared ONCE, here, where anyone asking "what does
+ * the gate actually see?" can read it (`monet install --dry-run` prints this without writing
+ * anything). Declared absence is what invariant 02 was protecting; silent absence is what it
+ * forbids.
+ *
+ * The by-nature set CANNOT be enumerated closed and this report must not imply otherwise: MCP tool
+ * names come from whatever servers a user has configured, so the list below names the classes it
+ * can and says plainly that it is open-ended.
  */
 export function buildCoverageReport(): string {
   return `
 Coverage report — what this install actually enforces, and what it does not:
 
-WIRED
+WIRED — a governed moment opens for every one of these, including the silent ones
   Bash, via PreToolUse — every blocking/advisory rule declared against a "Bash:..." action
   context is enforced for every Bash command Claude Code runs under this hook.
 
@@ -1075,12 +1208,35 @@ WIRED
   "--force" are no longer adjacent once "origin main" sits between them). Declare the orderings
   you fear as separate patterns.
 
-NOT WIRED — the accepted hole, named rather than left silent
-  - Every OTHER Claude Code tool (Read, Write, Edit, WebFetch, MCP tools, ...): no hook is
-    installed for them; a rule bound to one of those Tool: prefixes never fires through this
-    install. Deliberate, not pending — they are post-cognition (the agent has already decided by
-    the time the call is formed) and high-frequency, and noise is the fastest way to kill gate
-    trust.
+  Bash and Task also run under PostToolUse AND PostToolUseFailure — the host closes a tool call
+  with one or the other depending on whether it succeeded, and both record what the call RETURNED
+  against the moment its PreToolUse opened. A failed call is closed for the same reason a
+  successful one is: it ran, so whether it followed the rule is a real question. The events are
+  joined by the host's own tool_use_id; a call the host gives no tool_use_id simply closes with
+  its outcome never observed, recorded as unknown rather than guessed at.
+
+  A call the gate DENIES is closed by neither, because it never ran. That moment keeps its
+  interception and never receives an outcome, which is correct rather than missing: enforcement
+  already settled it, and there is no action to ask about.
+
+UNGOVERNED BY CHOICE — could be watched, deliberately is not. Declared here, once.
+  - Every OTHER Claude Code tool (Read, Write, Edit, Glob, Grep, WebFetch, WebSearch,
+    AskUserQuestion, ExitPlanMode, ...): no hook is installed for them, so no moment opens and
+    none is recorded. Deliberate, not pending — they are post-cognition (the agent has already
+    decided by the time the call is formed) and high-frequency, and noise is the fastest way to
+    kill gate trust. A rule bound to one of those Tool: prefixes never fires through this install.
+
+UNGOVERNED BY NATURE — cannot be watched at all. NOT a closed list.
+  - MCP tool calls: their names come from whatever servers you have configured, so this set is
+    open-ended by construction and no enumeration here can be complete.
+  - Files referenced with @ in a prompt: Claude Code inserts their contents while building the
+    prompt, with no tool call, so no PreToolUse hook fires for them — including hooks matching
+    Read (https://code.claude.com/docs/en/hooks, "PreToolUse").
+  - EndConversation: PreToolUse does not fire for it (same source).
+
+  These three cannot produce a per-moment record even in principle. They are named so their
+  absence from the record is a stated boundary rather than an unexplained silence.
+NOT ENFORCEABLE — reachable effects a pattern will never catch
   - Within Bash itself: sh -c, an inline script, a shell alias or function, a short flag (-f vs
     --force), reordered arguments, or padded whitespace all reach the same effect without
     tripping a pattern — by design (boundary statement, "CANNOT promise" #1: heuristic
