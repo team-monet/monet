@@ -314,6 +314,13 @@ const SOURCE_FILE_CONCEPT_SCHEMA_VERSION = 11;
 // migration that has since been withdrawn (#187) — the trap it leaves for the next rung is real
 // regardless, so the pin stays.
 const FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION = 12;
+// Rung 13: the source subsystem's retirement (#16). A BUMP AND NOTHING ELSE, deliberately. What
+// changed at this rung is what the build creates — a new store grows none of the subsystem's
+// sixteen tables and neither marker column — and existing rows are left exactly where they are:
+// disposing of them is `monet retire-source`, behind a verified backup, whenever the operator
+// wants. The rung is unconditional because the ladder has to stay a ladder: a rung that only some
+// stores climb leaves rung 14 with no single predecessor to gate on.
+const SOURCE_RETIREMENT_SCHEMA_VERSION = 13;
 // Rung 13: the source subsystem's retirement (#16). The ruling that dropped the subsystem is
 // what makes the purge safe — its content was always a materialized copy of files that live
 // outside the store, and nothing can re-read it once the connector is gone.
@@ -2556,6 +2563,7 @@ export class MonetCore {
       this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
     }
     this.migrateFirstBlockPins();
+    this.migrateSourceRetirement();
     // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
     // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
     // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
@@ -3687,6 +3695,13 @@ export class MonetCore {
       this.db.prepare(`DELETE FROM first_block`).run();
       this.db.pragma(`user_version = ${FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION}`);
     })();
+  }
+
+  /** Schema 12 → 13: the source subsystem's retirement (#16). See the constant's own note. */
+  private migrateSourceRetirement(): void {
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version < FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION || version >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
+    this.db.pragma(`user_version = ${SOURCE_RETIREMENT_SCHEMA_VERSION}`);
   }
 
   /** v8: replay-safe row clocks and per-writer edge components. */

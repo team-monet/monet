@@ -55,7 +55,7 @@ describe("inspectStoredEmbedderState", () => {
       const state = inspectStoredEmbedderState(dbPath);
       expect(state).toMatchObject({
         exists: true,
-        schemaVersion: 12,
+        schemaVersion: 13,
         integrity: { status: "ok", check: "ok" },
         pin: {
           status: "known",
