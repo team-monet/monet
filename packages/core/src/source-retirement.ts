@@ -191,16 +191,39 @@ export function dropRetiredSourceResidue(db: StoragePort): void {
  * asynchronous, and this runs inside a synchronous transaction so the store cannot be mutated
  * between the count and the delete.
  */
-export function purgeConnectorPopulation(db: StoragePort): { concepts: number; observations: number } {
-  return db.immediateTransaction((): { concepts: number; observations: number } => {
+export interface PurgeResult {
+  concepts: number;
+  observations: number;
+  /**
+   * Native concepts that OWNED one of the deleted observations, so their projection —
+   * support_count, centroid, confidence, confirmation stamps — now describes evidence that is
+   * gone. Grafting can legitimately produce this shape (see retrieval.ts's own note), so the purge
+   * reports them rather than leaving a phantom or mis-ranked native memory behind. Reprojecting
+   * them needs the engine's own helper, not a copy of it: see `MonetCore.repairNativeProjections`.
+   */
+  staleNativeOwners: string[];
+}
+
+export function purgeConnectorPopulation(db: StoragePort): PurgeResult {
+  return db.immediateTransaction((): PurgeResult => {
     const { conceptIds, observationIds } = connectorPopulation(db);
-    if (conceptIds.length === 0 && observationIds.length === 0) return { concepts: 0, observations: 0 };
+    if (conceptIds.length === 0 && observationIds.length === 0) {
+      return { concepts: 0, observations: 0, staleNativeOwners: [] };
+    }
 
     const c = JSON.stringify(conceptIds);
     const o = JSON.stringify(observationIds);
     const inSet = `IN (SELECT value FROM json_each(?))`;
     // Entity rows are counted BEFORE their memberships go, so the df recount below sees the exact
     // set that lost a member; reversing the order loses the list of what to recount.
+    // The owners are read BEFORE the delete — afterwards the link that identifies them is gone.
+    const staleNativeOwners = (db.prepare(
+      `SELECT DISTINCT o.concept_id AS id
+         FROM observations o
+         JOIN concepts c ON c.id = o.concept_id
+        WHERE o.id ${inSet} AND c.id NOT ${inSet} AND c.kind != 'workstream'`,
+    ).all(o, c) as Array<{ id: string }>).map((row) => row.id);
+
     const affectedEntities = tableExists(db, "concept_entities")
       ? db.prepare(
           `SELECT DISTINCT entity_key AS key, scope FROM concept_entities WHERE concept_id ${inSet}`,
@@ -238,7 +261,9 @@ export function purgeConnectorPopulation(db: StoragePort): { concepts: number; o
       db.prepare(sql).run(...params);
     }
 
-    if (!tableExists(db, "entities")) return { concepts: conceptIds.length, observations: observationIds.length };
+    if (!tableExists(db, "entities")) {
+      return { concepts: conceptIds.length, observations: observationIds.length, staleNativeOwners };
+    }
     for (const entity of affectedEntities) {
       db.prepare(
         `UPDATE entities SET df = (
@@ -249,6 +274,6 @@ export function purgeConnectorPopulation(db: StoragePort): { concepts: number; o
       db.prepare(`DELETE FROM entities WHERE key = ? AND scope = ? AND df <= 0`)
         .run(entity.key, entity.scope);
     }
-    return { concepts: conceptIds.length, observations: observationIds.length };
+    return { concepts: conceptIds.length, observations: observationIds.length, staleNativeOwners };
   })();
 }

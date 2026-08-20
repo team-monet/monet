@@ -2536,6 +2536,12 @@ export class MonetCore {
     // after any embedder-pin swap, not just here at construction.
     this.applyEmbedderDerivedThresholds(this.embedder);
     this.init();
+    // BEFORE migrate(), AND THAT IS THE POINT. Every migration below assumes the population it
+    // walks is native — the graph backfill in particular now writes entity/related/temporal state
+    // for whatever it finds, since the connector exclusions came out with the subsystem. Running
+    // them first would modify a store this open is about to refuse, so an operator taking the
+    // error's advice to stay on 1.6.x would find it already changed. Refused means untouched.
+    this.assertRetirementDisposed(ownsPort);
     this.initSyncIdentity(opts.syncDeviceId);
     this.migrate();
     // A SECOND migrateGateColumns() PASS, HERE (Codex round 11, item 3 — found by this item's own
@@ -2572,12 +2578,7 @@ export class MonetCore {
       this.db.pragma(`user_version = ${SOURCE_FILE_CONCEPT_SCHEMA_VERSION}`);
     }
     this.migrateFirstBlockPins();
-    try {
-      this.migrateSourceRetirement();
-    } catch (error) {
-      if (ownsPort) this.db.close();
-      throw error;
-    }
+    this.migrateSourceRetirement();
     // Constructor-time pin guard (embedder-pin ADR, review hardening) — synchronous, added no
     // async to the constructor. MUST run after initSyncIdentity (above): that is where a genuinely
     // FRESH store writes its own 'created' pin, matching this.embedderModelId by construction, so
@@ -3724,28 +3725,28 @@ export class MonetCore {
    * calls purgeConnectorPopulation directly on the port — no MonetCore, so this refusal never
    * stands in its way.
    */
-  private migrateSourceRetirement(): void {
-    const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
-
-    // THE REFUSAL IS CHECKED BEFORE THE VERSION LOWER BOUND, and the order is the whole point. A
-    // graph-disabled open deliberately holds user_version at 0 to keep the graph backfill slot
-    // free, while the previous engine still created the source registry and ingested into it — so
-    // gating the refusal on the rung would let exactly that store serve and mutate its connector
-    // rows as ordinary memories, which is the harm this rung exists to prevent.
+  private assertRetirementDisposed(ownsPort: boolean): void {
+    if ((this.db.pragma("user_version", { simple: true }) as number) >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
+    // NO VERSION LOWER BOUND HERE, deliberately. A graph-disabled open holds user_version at 0 to
+    // keep the graph backfill slot free, while the previous engine still created the source
+    // registry and ingested into it — so gating this on the rung would let exactly that store
+    // serve and mutate its connector rows as ordinary memories.
     const data = retirementData(this.db);
-    if (!isRetirementDisposed(data)) {
-      throw new SourceRetirementRequiredError(
-        this.dbFilePath,
-        { concepts: data.conceptIds.length, observations: data.observationIds.length },
-        data.nonemptyTables,
-      );
-    }
+    if (isRetirementDisposed(data)) return;
+    if (ownsPort) this.db.close();
+    throw new SourceRetirementRequiredError(
+      this.dbFilePath,
+      { concepts: data.conceptIds.length, observations: data.observationIds.length },
+      data.nonemptyTables,
+    );
+  }
 
-    // The lower bound governs only the WRITES, exactly as it does on rung 12: a store held at an
-    // earlier rung must not be jumped to 13 and have every intermediate migration's slot skipped.
-    // It gets the residue drop and the bump on the open where it actually reaches 12.
-    if (version < FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION) return;
+  private migrateSourceRetirement(): void {
+    // Only the WRITES are bounded below, exactly as on rung 12: a store held at an earlier rung
+    // must not be jumped to 13 and have every intermediate migration's slot skipped. The refusal
+    // that protects this drop already ran, before any migration touched the store.
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version < FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION || version >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
     dropRetiredSourceResidue(this.db);
     this.db.pragma(`user_version = ${SOURCE_RETIREMENT_SCHEMA_VERSION}`);
   }
@@ -14748,6 +14749,30 @@ export class MonetCore {
    * live semantic store is already mixed; otherwise its truncating centroid loop would perpetuate
    * corruption. Migration-only re-embed primitives remain separate and exempt.
    */
+  /**
+   * Reproject native concepts whose evidence changed underneath them, by id.
+   *
+   * EXISTS FOR THE RETIREMENT PURGE (#16), which runs on a raw port with no engine — it can delete
+   * a `kind='source'` observation owned by a NATIVE concept (grafting produces that shape) but
+   * cannot recompute the owner's centroid, support count or confidence without the projection
+   * logic below. Rather than copy that logic into the disposal path, where it would drift, the
+   * purge reports the affected ids and `monet retire-source` calls this once the store opens.
+   *
+   * Ids that no longer exist, or that are retired, are skipped rather than treated as an error:
+   * the caller is replaying a list captured before a delete.
+   */
+  repairNativeProjections(conceptIds: readonly string[]): number {
+    let repaired = 0;
+    const relayAt = this.nextSyncTimestamp();
+    for (const conceptId of conceptIds) {
+      const row = this.getRow(conceptId);
+      if (!row || row.status === "retired") continue;
+      this.recomputeNativeConceptProjection(conceptId, relayAt);
+      repaired += 1;
+    }
+    return repaired;
+  }
+
   private recomputeNativeConceptProjection(conceptId: string, relayAt: number): void {
     this.assertPinSatisfied(); // embedder-pin ADR, FIX AC — the empty-observation branch below writes a this.embedder.dim-sized vector with no embed() call to gate it otherwise
     const concept = this.getRow(conceptId);

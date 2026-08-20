@@ -1151,6 +1151,7 @@ export function registerRecoveryCommands(
         return;
       }
 
+      let closed = false;
       try {
         const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
         mkdirSync(path.dirname(destination), { recursive: true });
@@ -1161,13 +1162,31 @@ export function registerRecoveryCommands(
         // configuration and its attempt history, which a zero row count does not rule out — so the
         // drop belongs on this side of the backup, never in an ordinary open.
         dropRetiredSourceResidue(port);
+        // Closed HERE, before the reprojection opens its own connection: the exclusive ownership
+        // this port holds for the backup would otherwise block it.
+        port.close();
+        closed = true;
         console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
         if (data.nonemptyTables.length > 0) {
           console.log(`Dropped:  ${data.nonemptyTables.join(", ")} (and the rest of the retired schema).`);
         }
+
+        // A NATIVE concept can own a source observation (grafting produces that shape), so deleting
+        // the observation leaves its owner's support count, centroid and confidence describing
+        // evidence that no longer exists. The engine owns that projection logic; the purge only
+        // reports who needs it. Safe to open now — the population it would refuse is gone.
+        if (purged.staleNativeOwners.length > 0) {
+          const core = dependencies.createCore(dependencies.createPort(dbPath));
+          try {
+            const repaired = core.repairNativeProjections(purged.staleNativeOwners);
+            console.log(`Reprojected ${repaired} native concept(s) that owned a purged observation.`);
+          } finally {
+            core.close();
+          }
+        }
         console.log(`Backup:   ${backup.path}`);
       } finally {
-        port.close();
+        if (!closed) port.close();
       }
     });
 

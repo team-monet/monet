@@ -11,7 +11,7 @@
  * way first-block-migration.test.ts re-creates schema 11.
  */
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MonetCore } from "../engine";
@@ -104,7 +104,7 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
         caught = error;
       }
       expect(caught).toBeInstanceOf(SourceRetirementRequiredError);
-      expect((caught as SourceRetirementRequiredError).population).toEqual({ concepts: 1, observations: 1 });
+      expect((caught as SourceRetirementRequiredError).population).toMatchObject({ concepts: 1, observations: 1 });
       expect((caught as Error).message).toMatch(/monet retire-source --dir '.*' --apply --yes/);
 
       // REFUSED MEANS UNTOUCHED, not half-migrated: the store is exactly as it was.
@@ -129,7 +129,7 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
       seedSchema12(seeded);
       seeded.close();
 
-      expect(purgeOnPort(dbPath)).toEqual({ concepts: 1, observations: 1 });
+      expect(purgeOnPort(dbPath)).toMatchObject({ concepts: 1, observations: 1 });
 
       const upgraded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
       try {
@@ -232,7 +232,7 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
       raw(seeded).exec(`DROP TABLE observation_segments`);
       seeded.close();
 
-      expect(purgeOnPort(dbPath)).toEqual({ concepts: 1, observations: 1 });
+      expect(purgeOnPort(dbPath)).toMatchObject({ concepts: 1, observations: 1 });
       const port = new BetterSqlitePort(dbPath);
       try {
         expect(port.prepare(`SELECT COUNT(*) AS n FROM concepts WHERE kind = 'source'`).get()).toEqual({ n: 0 });
@@ -362,6 +362,25 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
       } finally {
         port.close();
       }
+    });
+  });
+
+  it("leaves a graph-disabled store byte-identical when a graph-enabled open refuses it", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { graphEnabled: false, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      await seeded.store("A native memory in a graph-disabled store.", { resolution: "forceNew" });
+      seedSchema12(seeded);
+      raw(seeded).pragma("user_version = 0");
+      seeded.close();
+      const before = readFileSync(dbPath);
+
+      // Graph ENABLED this time: migrate() would run the graph backfill over the connector rows —
+      // writing entity/related/temporal state and advancing the schema — if the refusal came after
+      // it. The operator's documented alternative is to stay on 1.6.x, which only works if this
+      // open truly changed nothing.
+      expect(() => new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 }))
+        .toThrow(SourceRetirementRequiredError);
+      expect(readFileSync(dbPath).equals(before)).toBe(true);
     });
   });
 });

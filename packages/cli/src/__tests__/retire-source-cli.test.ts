@@ -176,4 +176,51 @@ describe("monet retire-source", () => {
       expect(existsSync(join(dbPath, "..", "backups"))).toBe(false);
     });
   });
+
+  it("reprojects a native concept that owned a purged source observation", async () => {
+    await withStore(async (dbPath, dependencies) => {
+      // Seeded through a raw port: the store holds connector rows, so MonetCore refuses to open it.
+      seedSchema12Store(dbPath);
+      const port = new BetterSqlitePort(dbPath);
+      const owner = "native-owner";
+      const now = Date.now();
+      port.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at)
+         VALUES (?, 'owner', 'Owner', 'body', 'fact', 'active', 0.6, 1, 'default', 2, 0, '[0.1,0.2]', ?, ?)`,
+      ).run(owner, now, now);
+      // Grafting legitimately produces this shape: a NATIVE concept owning a kind='source'
+      // observation. The purge deletes the observation; without a reprojection the owner keeps a
+      // support count and centroid describing evidence that no longer exists.
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('grafted-source-obs', 'grafted chunk', '[0.9,0.9]', 'source', 'default', ?, 'peer', ?, ?, '[]')`,
+      ).run(owner, now, now);
+      port.prepare(
+        `INSERT INTO observations (id, content, embedding, kind, circle, concept_id, author_agent_id,
+                                   created_at, updated_at, source_refs)
+         VALUES ('native-obs', 'native evidence', '[0.1,0.2]', 'statement', 'default', ?, 'local', ?, ?, '[]')`,
+      ).run(owner, now, now);
+      port.close();
+
+      const output = await run(["retire-source", "--apply", "--yes"], dependencies);
+      expect(output.stdout).toContain("Reprojected 1 native concept(s)");
+
+      const reopened = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      try {
+        const db = (reopened as unknown as { db: BetterSqlitePort }).db;
+        const after = db.prepare(`SELECT support_count AS n FROM concepts WHERE id = ?`).get(owner) as { n: number };
+        const live = db.prepare(
+          `SELECT COUNT(*) AS n FROM observations
+            WHERE concept_id = ? AND superseded_by IS NULL AND superseded_at IS NULL`,
+        ).get(owner) as { n: number };
+        // The stale count was 2 with only one surviving observation; the projection now matches.
+        expect(live.n).toBe(1);
+        expect(after.n).toBe(1);
+      } finally {
+        reopened.close();
+      }
+    });
+  });
 });
