@@ -34,6 +34,16 @@ function core(opts: { syncDeviceId?: string; embedder?: EmbeddingProvider } = {}
   });
 }
 
+/** A connector-owned row, minted directly: the source subsystem that used to write these was
+ *  retired (#16), but the write/export/graft guards still refuse them for legacy stores. */
+async function storeConnectorOwned(c: MonetCore, content: string): Promise<{ conceptId: string }> {
+  const stored = await c.store(content, { resolution: "forceNew" });
+  (c as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown } } }).db
+    .prepare(`UPDATE concepts SET kind = 'source' WHERE id = ?`)
+    .run(stored.conceptId);
+  return { conceptId: stored.conceptId };
+}
+
 /** A real rule endpoint for supersession-family tests; plain store() creates a fact. */
 const storeRule = (c: MonetCore, content: string, stage: string, circle?: string) =>
   c.store(content, { circle, kind: "rule", rule: { stage, scope: "domain" } });
@@ -386,7 +396,7 @@ describe("addLifecycleEdge validation", () => {
     const c = core();
     const native = await c.store("An ordinary native rule.");
     const other = await c.store("Another ordinary native rule.");
-    const source = await c.storeSource("A chunk of connector-owned source truth.", { sourceRefs: ["source://docs/rules.md#a~1"] });
+    const source = await storeConnectorOwned(c, "A chunk of connector-owned source truth.");
     const workstream = await c.saveWorkstream({ status: "active", open: [{ slot: "step" as const, text: "ship edges" }] });
 
     // Without this guard the write succeeds, reads see it, and the export silently drops it forever
@@ -1026,32 +1036,6 @@ describe("lifecycle edge sync", () => {
     expect(cc.lifecycleEdgeIntegrity().dangling).toEqual([]);
     expect(cc.lifecycleEdgeIntegrity().danglingRatifications).toEqual([]);
     expect(cc.walkDerivation(successor.conceptId, "out")).toEqual([rule.conceptId]);
-  });
-
-  it("still refuses to relay THROUGH a store where the endpoint is source-owned", async () => {
-    // The LEFT join relaxes liveness, not authority. Security stays three-deep: refused at write on
-    // the origin, dropped by the export guard wherever the row is visible, and rejected by every
-    // hop's graft backdoor guard against ITS OWN local source-owned set.
-    const relay = core({ syncDeviceId: "machine-relay" });
-    const peer = core({ syncDeviceId: "machine-peer" });
-    const shadowed = await relay.storeSource("Connector-owned on the relay.", { sourceRefs: ["source://docs/x.md#a~1"] });
-    const native = await peer.store("Native on the peer.");
-    const other = await peer.store("Another native on the peer.");
-    peer.addLifecycleEdge({ family: "derivation", srcConceptId: native.conceptId, dstConceptId: other.conceptId, bornOf: "extraction" });
-
-    // A payload whose edge names an id the RELAY holds as source-owned.
-    const payload = peer.exportDelta(0);
-    const forged = { ...payload.lifecycleEdges![0]!, id: "forged-1", dst_concept_id: shadowed.conceptId };
-    expect(() => relay.graftRows({ ...payload, lifecycleEdges: [forged] }))
-      .toThrow(/graftRows cannot mutate source-owned concepts/);
-    expect((raw(relay).prepare(`SELECT COUNT(*) AS n FROM lifecycle_edges`).get() as { n: number }).n).toBe(0);
-
-    // And a locally source-owned endpoint is never exported even if a row somehow exists.
-    raw(relay).prepare(
-      `INSERT INTO lifecycle_edges (id, family, src_concept_id, dst_concept_id, dst_span, born_of, event_ref, circle, created_at, sync_updated_at)
-       VALUES ('smuggled','provenance',?,NULL,?, 'correction','obs-1','default',1,1)`,
-    ).run(shadowed.conceptId, SPAN);
-    expect(relay.exportDelta(0).lifecycleEdges).toEqual([]);
   });
 
   it("converges a circle rename across replicas, and a stale rename cannot clobber a newer one", async () => {

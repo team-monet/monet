@@ -55,7 +55,6 @@ function fixture(): { root: string; db: string; core: MonetCore } {
   const core = new MonetCore(db, {
     tauAttach: 1.1,
     tauAmbiguous: 1.1,
-    sourceStorageDir: join(root, "sources"),
   });
   cores.push(core);
   return { root, db, core };
@@ -409,7 +408,6 @@ describe("prewarm skeleton mirror delivery", () => {
       embedder: new ConstantEmbeddingProvider(),
       tauAttach: 0.5,
       tauAmbiguous: 0.2,
-      sourceStorageDir: join(root, "sources"),
     });
     cores.push(core);
     const path = join(root, "default.md");
@@ -474,7 +472,7 @@ describe("prewarm skeleton mirror delivery", () => {
     const { root, db, core: fixtureCore } = fixture();
     fixtureCore.close();
     cores.pop();
-    const core = new MonetCore(db, { sourceStorageDir: join(root, "sources") });
+    const core = new MonetCore(db);
     cores.push(core);
     const globalPath = join(root, "global.md");
     const localPath = join(root, "local.md");

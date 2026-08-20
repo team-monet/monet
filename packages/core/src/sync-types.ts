@@ -32,8 +32,6 @@ export interface SyncConceptRow {
   arousal_last_updated_at: number | null;
   source_refs: string | null; // JSON string[]
   /** Connector ownership markers. Generic sync accepts only rows where both are null/absent. */
-  source_identity?: string | null;
-  active_observation_id?: string | null;
   aliases: string | null; // JSON string[]
   /** Where a skeleton member delivers. Absent on payloads from before global skeleton breadth. */
   skeleton_breadth?: "local" | "global";

@@ -24,11 +24,7 @@ import {
   STAGE_LOOKUP_RULES_CAP,
   STAGE_NAME_MAX_CHARS,
 } from "./gates";
-import type { SourceAuthorizationContext } from "./source-types";
-import { sanitizeSourceError } from "./source-errors";
 import { MIRROR_STALE_INSTRUCTION, SKELETON_CHANGED_INSTRUCTION } from "./skeleton-mirror";
-import { createSourceScheduler } from "./source-scheduler";
-import type { SourceSchedulerHandle, SourceSchedulerOptions } from "./source-scheduler";
 
 /**
  * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions` option.
@@ -610,8 +606,6 @@ export interface RegisterMonetCoreToolsOpts {
   autoPrewarm?: boolean;
   /** Deprecated compatibility option. Checkpoint response nags are no longer emitted. */
   checkpointNudge?: boolean;
-  /** Host-injected identity; never accepted from tool arguments. */
-  sourceAuthorizationContext?: Readonly<SourceAuthorizationContext>;
   /**
    * Which model this runtime is serving — stamped on agent-scoped rules so the next model can
    * retire this one's compensations. Host-supplied for the same reason the authorization context
@@ -631,10 +625,6 @@ export function registerMonetCoreTools(
   opts?: RegisterMonetCoreToolsOpts,
 ): McpServer {
   const autoPrewarm = opts?.autoPrewarm ?? true;
-  const sourceAuthorizationContext = opts?.sourceAuthorizationContext
-    ? Object.freeze({ ...opts.sourceAuthorizationContext })
-    : undefined;
-
   // In-flight tool-call tracking (Codex P2 #2): wrap server.tool() ONCE, here, before any of the
   // individual registrations below, so every handler (memory_*, source_*, ...) is tracked
   // uniformly without touching each call site. getGracefulShutdown's run() awaits
@@ -1316,7 +1306,6 @@ export function registerMonetCoreTools(
         const results = await core.search(query, {
           circle: circle !== undefined ? scope(circle) : undefined,
           limit,
-          sourceAuthorizationContext,
         });
         const circleLabel = circle !== undefined ? scope(circle) : "(all circles)";
         const cards = results.map((card) => recallWireCard(card, core.countObservationsForConcept(card.id)));
@@ -1348,7 +1337,6 @@ export function registerMonetCoreTools(
       try {
         if (entity) return readOk({ circle: scope(circle), entity, concepts: core.conceptsForEntity(entity, scope(circle)) }, "memory_overview", capturedBlock);
         const ov = core.overview(scope(circle), {
-          sourceAuthorizationContext,
           conceptLimit,
           includeDirty,
           includeStale,
@@ -1383,13 +1371,13 @@ export function registerMonetCoreTools(
           if (i > 0) parsed = { updatedAt: Number(cursor.slice(0, i)), id: cursor.slice(i + 1) };
         }
         const memories = core.listMemories(scope(circle), {
-          withProvenance, limit: lim, cursor: parsed, sourceAuthorizationContext,
+          withProvenance, limit: lim, cursor: parsed,
         });
         const last = memories[memories.length - 1];
         const nextCursor = memories.length === lim && last ? `${last.updatedAt}:${last.id}` : null;
         return readOk({
           circle: scope(circle),
-          total: core.conceptCount(scope(circle), sourceAuthorizationContext), // current size — shrinks as you reassign out
+          total: core.conceptCount(scope(circle)), // current size — shrinks as you reassign out
           count: memories.length,
           ...(nextCursor ? { nextCursor } : {}),
           memories,
@@ -1404,15 +1392,14 @@ export function registerMonetCoreTools(
 
   server.tool(
     "memory_fetch",
-    "Read a concept by id. Normal concepts return `body` and `observationCount`; evidence appears only with observations:true as newest-first pages. If `needsSynthesis:true`, pull every page, reconcile one body, then call memory_synthesize. `bodyTruncated` means recover from observations. A disputed concept adds `status` and `openContradictions`; mediate with memory_resolve({ contradictionId: openContradictions[i].id }). Source concepts instead return title, sourcePath/sourceId, and outline; includeBody:true adds the concatenated file body.",
+    "Read a concept by id. Normal concepts return `body` and `observationCount`; evidence appears only with observations:true as newest-first pages. If `needsSynthesis:true`, pull every page, reconcile one body, then call memory_synthesize. `bodyTruncated` means recover from observations. A disputed concept adds `status` and `openContradictions`; mediate with memory_resolve({ contradictionId: openContradictions[i].id }).",
     {
       id: z.string(),
       circle: z.string().max(CIRCLE_NAME_MAX_CHARS).optional().describe("Expected home circle. Omit for store-wide id lookup; the response includes the home circle."),
-      observations: z.boolean().optional().describe("Normal concepts: include one newest-first evidence page. Default false; ignored for sources."),
+      observations: z.boolean().optional().describe("Include one newest-first evidence page. Default false."),
       observationsOffset: z.number().int().min(0).optional().describe("With observations:true, skip this many newest entries. Start at 0. Advance by observations.length, especially when observationsOmitted appears."),
-      includeBody: z.boolean().optional().describe("Source concepts: include the concatenated file body. Default false; ignored for normal concepts."),
     },
-    async ({ id, circle, observations, observationsOffset, includeBody }) => {
+    async ({ id, circle, observations, observationsOffset }) => {
       // memory_fetch is READ-ONLY — the pre-mutation capture rule (Fix B) does not apply here.
       // We defer capturePrewarmSnapshot until after homeCircle is resolved so that an omit-circle
       // call (store-wide lookup) snapshots the concept's actual home circle rather than the
@@ -1423,7 +1410,7 @@ export function registerMonetCoreTools(
         // - homeCircle null → concept not found (id doesn't exist).
         // - caller provided circle explicitly → id must live in that circle (back-compat gate).
         // - caller omitted circle → look up store-wide; the response surfaces the home circle.
-        const homeCircle = core.circleOf(id, sourceAuthorizationContext);
+        const homeCircle = core.circleOf(id);
         if (homeCircle === null) return err(`concept not found: ${id}`);
         // Scope-gate: if the caller named a circle explicitly, the id must live there.
         // Check BEFORE taking the snapshot so a rejection never consumes the one-shot.
@@ -1438,63 +1425,8 @@ export function registerMonetCoreTools(
           observationsOffset: observations ? observationsOffset ?? 0 : 0,
           pageSize: observations ? FETCH_MAX_OBS : 0,
           includeObservations: observations === true,
-          includeBody,
-          sourceAuthorizationContext,
         });
         if (!c) return err(`concept not found: ${id}`);
-
-        // File=concept (ratified, Phase 1), Ruling 9: a source concept's outline is present iff
-        // the engine classified it as connector-owned — structure, not paginated observations.
-        if (c.outline !== undefined) {
-          const body = includeBody ? clip(c.body ?? "", FETCH_BODY_MAX_CHARS) : undefined;
-          const fixedFields = {
-            id: c.id, circle: c.circle, kind: c.kind, title: c.title, sourcePath: c.sourcePath, sourceId: c.sourceId,
-            totalObservations: c.totalObservations,
-            ...(body ? { body: body.text, ...(body.clipped ? { bodyTruncated: true } : {}) } : { bodyOmitted: true }),
-            supportCount: c.supportCount, confidence: c.confidence, version: c.version, lastConfirmedAt: c.lastConfirmedAt,
-          };
-          // REVIEW FIX (MINOR): headingPath is caller/document content with no length ceiling, so
-          // a count cap alone (FETCH_OUTLINE_MAX_ENTRIES) is not provably safe against a file with
-          // long or deeply-nested headings. Two caps cooperate here: the count cap bounds how many
-          // JSON.stringify calls this
-          // loop makes (cheap, O(n), n ≤ FETCH_OUTLINE_MAX_ENTRIES); the size fit against the ACTUAL
-          // serialized envelope (fixed fields + growing outline) is the real guarantee, stopping
-          // one entry before the payload would cross budget so ok() never has to truncate this
-          // response mid-JSON and leave it unparseable.
-          const okNote = `\n\n…[result truncated to fit the host's tool-result limit — narrow the query/intent, lower \`limit\`, or memory_fetch a specific id]`;
-          const sizeBudget = RESULT_MAX_CHARS - okNote.length;
-          const countCapped = c.outline.slice(0, FETCH_OUTLINE_MAX_ENTRIES);
-          const fitOutline: Array<{ headingPath: string[]; occurrence: number; segmentIndex: number; observationId: string }> = [];
-          // REVIEW FIX (round 4, Codex thread 10): check the budget BEFORE pushing, uniformly for
-          // EVERY entry including the first. The old loop pushed the first candidate unconditionally
-          // (its pre-push check was gated on `fitOutline.length > 0`, which is always false on
-          // entry 1) and only then checked the budget — so a single pathologically long heading path
-          // still landed in fitOutline even though it alone exceeded sizeBudget, and the response
-          // fell through to readOk/ok() truncating the serialized JSON mid-object: unparseable
-          // output instead of a valid, merely-shorter one. Checking first means a first entry that
-          // alone is over budget is dropped entirely, leaving fitOutline empty rather than invalid.
-          for (const entry of countCapped) {
-            // REVIEW FIX (round 5, Codex thread R5-5): segmentIndex was dropped when building the
-            // fitted candidate entries, even though SourceOutlineEntry (engine.ts) carries it — a
-            // section split across multiple chunker segments (an oversized heading, see thread 9/
-            // R5-3) surfaced as indistinguishable, same-looking outline entries here.
-            const candidate = [...fitOutline, { headingPath: entry.headingPath, occurrence: entry.occurrence, segmentIndex: entry.segmentIndex, observationId: entry.observationId }];
-            const serialized = JSON.stringify({ ...fixedFields, outline: candidate }, null, 2);
-            if (serialized.length > sizeBudget) break; // would cross budget, even as the very first entry — stop, let the note explain
-            fitOutline.push(candidate[candidate.length - 1]!);
-          }
-          return readOk({
-            ...fixedFields,
-            outline: fitOutline,
-            ...(c.outline.length > fitOutline.length
-              ? {
-                  outlineNote: fitOutline.length === 0
-                    ? `This file's outline could not be included: even the first of ${c.outline.length} section(s) exceeds the result-size limit. memory_fetch a specific observation id, or narrow the query.`
-                    : `Showing the first ${fitOutline.length} of ${c.outline.length} sections.`,
-                }
-              : {}),
-          }, "memory_fetch", capturedBlock);
-        }
 
         const body = clip(c.body ?? "", FETCH_BODY_MAX_CHARS);
         const observationPage = observations
@@ -2354,10 +2286,6 @@ export function registerMonetCoreTools(
   const applyLifecycle = (id: string, callerCircle: string, act: "retire" | "restore"): LifecycleItem => {
     // SCOPE ENFORCEMENT, identical to memory_reassign_circle's: a caller may only touch an id that
     // lives in the circle they named, and one that does not reads as absent rather than forbidden.
-    // Connector-owned rows are invisible to circleOf (it excludes kind='source', source_identity
-    // and active_observation_id alike) without a source authorization context, so they are answered
-    // here; retirementBlockers' connector clause is the same refusal for any caller that can see
-    // the row at all, and restoreConcept throws its own.
     //
     // THE FAST-FAIL COPY, NOT THE ONE THAT HOLDS (review fix — round 2). The binding copy is inside
     // the engine's write reservation (`retireIfUnblocked` / `restoreIfInCircle`, whose comments
@@ -2580,56 +2508,12 @@ export function registerMonetCoreTools(
         }
         // list — read-only (enumerate circles)
         const response: CircleListResponse = {
-          circles: core.listCircles(undefined, { includeArchived: true, sourceAuthorizationContext }),
+          circles: core.listCircles(undefined, { includeArchived: true }),
         };
         return readOk(response, "memory_circle_manage", capturedBlock);
       } catch (e) {
         return err(`circle_manage failed: ${msg(e)}`);
       }
-    },
-  );
-
-  server.tool(
-    "source_list",
-    "List sources authorized for this host. Access identity is server-bound, never a tool argument.",
-    {},
-    async () => {
-      const capturedBlock = capturePrewarmSnapshot(scope());
-      try { return readOk({ sources: core.listConnectorSources(sourceAuthorizationContext) }, "source_list", capturedBlock); }
-      catch (e) { return err(`source_list failed: ${sanitizeSourceError(e)}`); }
-    },
-  );
-
-  server.tool(
-    "source_status",
-    "Return one authorized source's active published status; counts exclude partial and unpublished runs.",
-    { sourceId: z.string().min(1) },
-    async ({ sourceId }) => {
-      const capturedBlock = capturePrewarmSnapshot(scope());
-      try { return readOk(core.sourceStatus(sourceId, sourceAuthorizationContext), "source_status", capturedBlock); }
-      catch (e) { return err(`source_status failed: ${sanitizeSourceError(e)}`); }
-    },
-  );
-
-  server.tool(
-    "source_path",
-    "Return the sealed read-only path to an authorized source's active indexed snapshot, never a working tree or bare repository.",
-    { sourceId: z.string().min(1) },
-    async ({ sourceId }) => {
-      const capturedBlock = capturePrewarmSnapshot(scope());
-      try { return readOk(core.sourcePath(sourceId, sourceAuthorizationContext), "source_path", capturedBlock); }
-      catch (e) { return err(`source_path failed: ${sanitizeSourceError(e)}`); }
-    },
-  );
-
-  server.tool(
-    "source_sync",
-    "Synchronize one authorized active source. Remote git sync is noninteractive and uses its configured branch.",
-    { sourceId: z.string().min(1) },
-    async ({ sourceId }) => {
-      const capturedBlock = capturePrewarmSnapshot(scope());
-      try { return mutOk(await core.syncSource(sourceId, sourceAuthorizationContext), "source_sync", capturedBlock); }
-      catch (e) { return err(`source_sync failed: ${sanitizeSourceError(e)}`); }
     },
   );
 
@@ -2717,19 +2601,12 @@ export function registerMonetCoreTools(
  * MONET_NO_AUTOPREWARM=1  → autoPrewarm:false
  */
 export function deriveOptsFromEnv(env: NodeJS.ProcessEnv = process.env): RegisterMonetCoreToolsOpts {
-  const callerId = env.MONET_CALLER_ID;
-  const projectId = env.MONET_PROJECT_ID;
   return {
     autoPrewarm: env.MONET_NO_AUTOPREWARM !== "1",
-    ...(callerId && projectId ? { sourceAuthorizationContext: { callerId, projectId } } : {}),
   };
 }
 
 export interface CreateMonetCoreMcpServerOptions {
-  /** Disable for embedded/test runtimes; production also honors MONET_NO_SOURCE_SCHEDULER=1. */
-  sourceScheduler?: false | SourceSchedulerOptions;
-  /** Deterministic lifecycle seam used by tests. */
-  sourceSchedulerFactory?: (core: MonetCore, options?: SourceSchedulerOptions) => SourceSchedulerHandle;
   /**
    * Disable the automatic SIGINT/SIGTERM graceful-shutdown handlers (default: installed).
    * MUST be set to `false` on every instance but one when embedding multiple MonetCore/MCP
@@ -3394,53 +3271,6 @@ export function installStdinEofShutdown(
   stdin.on("close", onClose);
 }
 
-/** Attach only after transport connection. Exported as a deterministic lifecycle test seam. */
-export function attachSourceSchedulerLifecycle(
-  server: McpServer,
-  core: MonetCore,
-  options: CreateMonetCoreMcpServerOptions = {},
-  env: NodeJS.ProcessEnv = process.env,
-  transport?: Transport,
-): SourceSchedulerHandle | null {
-  const schedulerDisabled = options.sourceScheduler === false || env.MONET_NO_SOURCE_SCHEDULER === "1";
-  if (schedulerDisabled) return null;
-  const scheduler = (options.sourceSchedulerFactory ?? createSourceScheduler)(
-    core,
-    options.sourceScheduler || undefined,
-  );
-  const close = server.close.bind(server);
-  let stopPromise: Promise<void> | null = null;
-  const stopOnce = (): Promise<void> => {
-    stopPromise ??= scheduler.stop();
-    return stopPromise;
-  };
-  if (transport) {
-    // DEFENSIVE SECONDARY PATH — NOT the primary graceful-disconnect hook. A live two-process
-    // restart probe proved the MCP SDK's StdioServerTransport never calls transport.close() (and
-    // so never invokes onclose) in reaction to a plain stdin EOF — it only listens for
-    // 'data'/'error' on stdin. This wiring only fires for transports that DO call onclose
-    // themselves (an explicit transport.close(), a non-stdio transport with its own EOF
-    // handling, or the SDK's own re-entrant close chain — see the "double barrier" test). For the
-    // real stdio graceful-disconnect case, see installStdinEofShutdown, wired directly on
-    // process.stdin inside createMonetCoreMcpServer.
-    const onclose = transport.onclose;
-    transport.onclose = () => {
-      try { onclose?.(); }
-      // stopOnce() is fire-and-forget from the SDK's perspective (onclose isn't awaited), so the
-      // barrier keeps the event loop alive until drain + lease release commit (or the deadline).
-      // options.onCloseBarrier is a deterministic test seam only (see its own JSDoc) — omitted in
-      // production, where withShutdownBarrier falls back to real timers.
-      finally { void withShutdownBarrier(stopOnce(), options.onCloseBarrier); }
-    };
-  }
-  server.close = async (): Promise<void> => {
-    await stopOnce();
-    await close();
-  };
-  scheduler.start();
-  return scheduler;
-}
-
 /**
  * Create and connect the monet-core MCP server, with graceful shutdown wired in by default.
  *
@@ -3478,23 +3308,16 @@ export async function createMonetCoreMcpServer(
   // slow connect() still triggers a real shutdown attempt instead of Node's abrupt default
   // disposition. Crash-safe at any point relative to connect(): both installers call
   // server.close() by dynamic property lookup at the moment they actually fire, not a reference
-  // captured now, so whichever close behavior attachSourceSchedulerLifecycle has (or hasn't yet)
-  // wired in below is what runs. One narrow, purely theoretical gap: a signal that runs fully
-  // synchronously to the point of calling getGracefulShutdown's run() inside the sub-millisecond
-  // window between this line and attachSourceSchedulerLifecycle's call below would memoize the
-  // pre-scheduler close — negligible in practice, since neither the scheduler nor any lease
-  // exists yet at that point to lose (comment only; not worth the complexity of closing it).
+  // captured now, so whatever close behavior is wired in below is what runs.
   if (options.processShutdownHandlers !== false) installProcessShutdownHandlers(server, core);
   if (options.stdinEofShutdown !== false) installStdinEofShutdown(server, core);
   try {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    // Connect completes first; start only queues the non-blocking zero-delay cycle.
-    attachSourceSchedulerLifecycle(server, core, options, process.env, transport);
     // Explicit server.close() (an embedded host managing its own lifecycle, or a test) must ALSO
     // settle the shared shutdown coordinator even if no signal/EOF trigger ever fires — see
-    // settleGracefulShutdownOnExplicitClose (Codex P2 #1). Installed LAST/outermost, after
-    // attachSourceSchedulerLifecycle's own close patch, so it wraps the fully-assembled close chain.
+    // settleGracefulShutdownOnExplicitClose (Codex P2 #1). Installed LAST/outermost so it wraps
+    // the fully-assembled close chain.
     settleGracefulShutdownOnExplicitClose(server);
   } catch (error) {
     // Startup failed (e.g. transport.connect() rejected) after the installers above already

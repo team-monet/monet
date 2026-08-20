@@ -479,13 +479,11 @@ export function assertBatteryShape(battery: readonly BatteryVerdict[]): void {
 interface EndpointRow {
   circle: string;
   kind: string;
-  source_identity: string | null;
-  active_observation_id: string | null;
 }
 
 function endpointRow(db: StoragePort, conceptId: string): EndpointRow | undefined {
   return db
-    .prepare(`SELECT circle, kind, source_identity, active_observation_id FROM concepts WHERE id = ?`)
+    .prepare(`SELECT circle, kind FROM concepts WHERE id = ?`)
     .get(conceptId) as EndpointRow | undefined;
 }
 
@@ -517,9 +515,9 @@ function assertGovernableEndpoint(row: EndpointRow, conceptId: string, role: "so
  * endpoints one at a time) need not re-query.
  */
 export function ungovernableReason(
-  row: { kind: string; source_identity?: string | null; active_observation_id?: string | null },
+  row: { kind: string },
 ): string | null {
-  if (row.kind === "source" || row.source_identity != null || row.active_observation_id != null) {
+  if (row.kind === "source") {
     return `is connector-owned (kind '${row.kind}') and cannot carry normative record`;
   }
   if (row.kind === "workstream") {

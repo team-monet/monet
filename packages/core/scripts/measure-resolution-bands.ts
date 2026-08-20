@@ -88,13 +88,12 @@ function corpus(): Seed[] {
 
 interface CandidateRow { id: string; embedding: string }
 
-/** The candidate set the engine's own store path enumerates (native, live, non-source). */
+/** The candidate set the engine's own store path enumerates (live, non-workstream). */
 function candidates(db: StoragePort): CandidateRow[] {
   return db
     .prepare(
       `SELECT id, embedding FROM concepts
-        WHERE circle = ? AND kind NOT IN ('workstream','source')
-          AND source_identity IS NULL AND active_observation_id IS NULL AND status != 'retired'`,
+        WHERE circle = ? AND kind != 'workstream' AND status != 'retired'`,
     )
     .all(CIRCLE) as CandidateRow[];
 }

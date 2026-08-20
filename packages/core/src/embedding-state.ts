@@ -3,9 +3,7 @@ export const MALFORMED_EMBEDDING_SAMPLE_LIMIT = 20;
 
 export type EmbeddingPopulationName =
   | "nativeObservations"
-  | "nativeConcepts"
-  | "sourceObservations"
-  | "sourceConcepts";
+  | "nativeConcepts";
 
 export interface MalformedEmbeddingPopulation {
   count: number;
@@ -16,15 +14,11 @@ export interface MalformedEmbeddingPopulation {
 export interface MalformedEmbeddingInventory {
   nativeObservations: MalformedEmbeddingPopulation;
   nativeConcepts: MalformedEmbeddingPopulation;
-  sourceObservations: MalformedEmbeddingPopulation;
-  sourceConcepts: MalformedEmbeddingPopulation;
 }
 
 export interface EmbeddingWidthInventory {
   observationDims: number[];
   conceptDims: number[];
-  sourceObservationDims: number[];
-  sourceConceptDims: number[];
   malformed: MalformedEmbeddingInventory;
 }
 
@@ -33,7 +27,7 @@ export interface LiveEmbeddingPopulationInspection {
   liveRowCount: number;
   /** Finite vectors that participate in the shared scored space. */
   scoredVectorCount: number;
-  /** Legacy all-zero source placeholders excluded from scoring and width enforcement. */
+  /** Legacy all-zero placeholders excluded from scoring and width enforcement. */
   ignoredZeroVectorCount: number;
   dimensions: number[];
   malformed: MalformedEmbeddingPopulation;
@@ -59,43 +53,16 @@ export interface StoredEmbeddingRow {
 }
 
 const LIVE_EMBEDDING_SQL: Record<EmbeddingPopulationName, string> = {
-  // Keep these predicates byte-for-byte aligned with the merged #56 native/source ownership
-  // boundary. The marker-only stale-kind connector P2 is intentionally deferred to its own slice.
   nativeObservations: `
     SELECT id, embedding
       FROM observations
-     WHERE kind != 'source'
      ORDER BY id`,
   nativeConcepts: `
     SELECT id, embedding
       FROM concepts
-     WHERE kind != 'source'
-       AND embedding IS NOT NULL
-     ORDER BY id`,
-  sourceObservations: `
-    SELECT o.id AS id, o.embedding AS embedding
-      FROM observations o
-     WHERE o.kind = 'source'
-       AND (
-         NOT EXISTS (SELECT 1 FROM source_chunks any_sc WHERE any_sc.observation_id = o.id)
-         OR EXISTS (
-           SELECT 1 FROM source_chunks live_sc
-           LEFT JOIN concepts live_c ON live_c.id = live_sc.concept_id
-            WHERE live_sc.observation_id = o.id AND live_sc.lifecycle = 'active'
-              AND (live_c.id IS NULL OR live_c.status = 'active')
-         )
-       )
-     ORDER BY o.id`,
-  sourceConcepts: `
-    SELECT id, embedding
-      FROM concepts
-     WHERE kind = 'source'
-       AND status = 'active'
-       AND embedding IS NOT NULL
+     WHERE embedding IS NOT NULL
      ORDER BY id`,
 };
-
-const SOURCE_POPULATIONS = new Set<EmbeddingPopulationName>(["sourceObservations", "sourceConcepts"]);
 
 /** Strict persisted-vector parser shared by diagnosis, enforcement, and hostile payload validation. */
 export function parseFiniteEmbeddingJson(value: unknown): Float32Array | null {
@@ -166,7 +133,7 @@ export function inspectLiveEmbeddingPopulation(
   db: EmbeddingStateReader,
   population: EmbeddingPopulationName,
 ): LiveEmbeddingPopulationInspection {
-  return inspectStoredEmbeddingRows(readLiveEmbeddingRows(db, population), SOURCE_POPULATIONS.has(population));
+  return inspectStoredEmbeddingRows(readLiveEmbeddingRows(db, population), false);
 }
 
 export function inspectLiveEmbeddingPopulations(
@@ -175,8 +142,6 @@ export function inspectLiveEmbeddingPopulations(
   return {
     nativeObservations: inspectLiveEmbeddingPopulation(db, "nativeObservations"),
     nativeConcepts: inspectLiveEmbeddingPopulation(db, "nativeConcepts"),
-    sourceObservations: inspectLiveEmbeddingPopulation(db, "sourceObservations"),
-    sourceConcepts: inspectLiveEmbeddingPopulation(db, "sourceConcepts"),
   };
 }
 
@@ -186,13 +151,9 @@ export function toEmbeddingWidthInventory(
   return {
     observationDims: populations.nativeObservations.dimensions,
     conceptDims: populations.nativeConcepts.dimensions,
-    sourceObservationDims: populations.sourceObservations.dimensions,
-    sourceConceptDims: populations.sourceConcepts.dimensions,
     malformed: {
       nativeObservations: populations.nativeObservations.malformed,
       nativeConcepts: populations.nativeConcepts.malformed,
-      sourceObservations: populations.sourceObservations.malformed,
-      sourceConcepts: populations.sourceConcepts.malformed,
     },
   };
 }

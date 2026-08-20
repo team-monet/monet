@@ -7,8 +7,12 @@ import {
   HashingEmbeddingProvider,
   MonetCore,
   OnnxEmbeddingProvider,
+  dropRetiredSourceResidue,
+  isRetirementDisposed,
   inspectStoredEmbedderState,
   instantiateEmbedderForPin,
+  purgeConnectorPopulation,
+  retirementData,
   validateEmbeddingProviderOutput,
   type EmbeddingMigrationProgress,
   type EmbeddingMigrationReport,
@@ -1066,6 +1070,171 @@ export function registerRecoveryCommands(
     .option("--yes", "Confirm --apply noninteractively")
     .option("--accept-non-latin-loss", "Proceed onto an ENGLISH model knowing it strands non-Latin-script rows")
     .action((options: RepairOptions) => runRepair(options, dependencies));
+
+
+  /*
+   * WHY THIS IS ITS OWN COMMAND AND NOT A REPAIR FLAG.
+   *
+   * `repair` is about the embedding space: it preflights a provider and refuses outright when no
+   * embedding repair is required — which is the state every store needing THIS operation is in.
+   * The two also fail differently. A store holding connector rows cannot be opened as a MonetCore
+   * at all (the engine's rung-13 migration refuses it), so this command works the port directly.
+   *
+   * BACKUP FIRST, ALWAYS. The purge is irreversible and there is nothing to re-sync from once the
+   * connector is gone, so the verified backup is not a flag — it is the first thing that happens
+   * after --apply, and a failure to take one aborts before a single row is touched.
+   */
+  program
+    .command("retire-source")
+    .description("Dispose of the retired source subsystem's rows after a verified backup (#16)")
+    .option("-d, --dir <storage-directory>", "Storage directory (default: .monet or ~/.monet)")
+    .option("--apply", "Delete the connector rows after taking a verified backup")
+    .option("--yes", "Confirm --apply noninteractively")
+    .action(async (options: { dir?: string; apply?: boolean; yes?: boolean }) => {
+      if (options.apply && !options.yes) {
+        throw new Error("--apply requires --yes; retire-source never prompts interactively.");
+      }
+      if (options.yes && !options.apply) throw new Error("--yes is valid only with --apply.");
+
+      const dbPath = dependencies.dbPath(options.dir);
+      console.error(`store: ${dbPath}`);
+      // BEFORE createPort — opening SQLite CREATES the file, so a typo or stale --dir would leave an
+      // empty store behind and report on it as if it were the operator's own.
+      const inspection = dependencies.inspect(dbPath);
+      if (!inspection.exists) {
+        throw new Error(`no Monet store at ${dbPath} — check --dir, or run \`monet doctor\` to see what is there.`);
+      }
+      if (inspection.integrity.status !== "ok") {
+        throw new Error(
+          `the store integrity result is ${integrityLabel(inspection)}; refusing to delete rows in it. ` +
+          `Restore from a backup, or run \`${doctorCommand(dbPath)}\` for the full report.`,
+        );
+      }
+      // DOWNGRADE REFUSAL, BEFORE THE PORT IS EVEN OPENED — the same guard the repair path carries,
+      // and this command needs it more: it decides what to delete from THIS build's ownership
+      // predicate and dependency list. A newer schema may reference these rows from tables this
+      // build cannot see, or give `kind='source'` a different meaning entirely, so proceeding would
+      // delete valid data and strand what it could not name.
+      if (inspection.schemaVersion !== null && inspection.schemaVersion > inspection.supportedSchemaVersion) {
+        throw new Error(
+          `store schema ${inspection.schemaVersion} is newer than supported schema ` +
+          `${inspection.supportedSchemaVersion}; refusing to retire source rows from it. Upgrade Monet first.`,
+        );
+      }
+
+      const port = dependencies.createPort(dbPath);
+      let data: ReturnType<typeof retirementData>;
+      try {
+        data = retirementData(port);
+      } finally {
+        if (!options.apply) port.close();
+      }
+      const counts = { concepts: data.conceptIds.length, observations: data.observationIds.length };
+
+      if (isRetirementDisposed(data)) {
+        // THE EMPTY RESIDUE IS DROPPED HERE OR NOWHERE. Rung 13 is a bare version bump — it does
+        // not dispose of anything — so telling the operator "the next open will remove it" would
+        // promise a migration that does not exist. With every table empty and both marker columns
+        // null there is nothing to lose, which is why this needs no backup.
+        if (options.apply) {
+          dropRetiredSourceResidue(port);
+          port.close();
+          console.log("Nothing to retire: no connector-owned rows and no registry data.");
+          console.log("Dropped the empty tables and marker columns the subsystem left behind.");
+          return;
+        }
+        port.close();
+        console.log("Nothing to retire: this store holds no connector-owned rows and no registry data.");
+        console.log(`Its empty tables and marker columns are dropped by: ${commandBase(dbPath).replace(" repair", " retire-source")} --apply --yes`);
+        return;
+      }
+
+      if (!options.apply) {
+        console.log(`Connector-owned rows: ${counts.concepts} concept(s), ${counts.observations} observation(s).`);
+        if (data.nonemptyTables.length > 0) {
+          console.log(`Registry/ledger data:  ${data.nonemptyTables.join(", ")}`);
+        }
+        console.log("These are a materialized copy of files outside the store, plus the registry describing");
+        console.log("them. The subsystem that could read, re-sync, or repair them was retired (#16), so");
+        console.log("deleting them is permanent.");
+        console.log(`Backup:     taken automatically by --apply --yes`);
+        console.log(`Apply with: ${commandBase(dbPath).replace(" repair", " retire-source")} --apply --yes`);
+        return;
+      }
+
+      /*
+       * THE EMBEDDER IS RESOLVED BEFORE ANYTHING IS DELETED, and that ordering is the fix.
+       *
+       * Purging a source observation owned by a NATIVE concept leaves that owner's projection
+       * describing evidence that is gone, and repairing it runs the engine's real reprojection —
+       * which asserts the store's pin. Opening the repair core without the pinned embedder gets
+       * MonetCore's hashing default and fails that assert, by which point the purge and the
+       * residue drop have committed and the affected ids exist only in memory: a re-run reports
+       * nothing to retire and the stale projection can never be repaired. Loading it first turns
+       * that unrecoverable state into a refusal that touches nothing.
+       */
+      // ONLY WHEN A REPROJECTION IS ACTUALLY OWED. A store whose retirement data is nothing but
+      // connector rows, registry entries and ledger history needs no embedding operation at all —
+      // demanding a loadable pin there would leave it permanently refused by the engine over a
+      // model cache it never has to touch.
+      let embedder: EmbeddingProvider | undefined;
+      if (data.staleNativeOwners.length > 0 && (inspection.pin.status !== "known" || inspection.pin.modelId === null)) {
+        throw new Error(
+          `this store's embedder pin is not usable (${inspection.pin.status}), so a purged observation's owner could ` +
+          `not be reprojected afterwards. Diagnose with \`${doctorCommand(dbPath)}\` first — this command ` +
+          `refuses rather than delete rows it cannot finish repairing.`,
+        );
+      }
+      try {
+        if (data.staleNativeOwners.length > 0 && inspection.pin.status === "known" && inspection.pin.modelId !== null) {
+          embedder = await dependencies.instantiate(inspection.pin.modelId);
+        }
+      } catch (error) {
+        throw new Error(
+          `the store's pinned embedder could not be loaded ` +
+          `(${error instanceof Error ? error.message : String(error)}); refusing to purge, because a ` +
+          `purged observation's owner could not be reprojected afterwards. Nothing has been deleted.`,
+        );
+      }
+
+      let closed = false;
+      try {
+        const destination = backupPath(dbPath, dependencies.now(), dependencies.uuid());
+        mkdirSync(path.dirname(destination), { recursive: true });
+        const backup = await port.createVerifiedBackup(destination);
+        console.error(`backup: ${backup.path}`);
+        const purged = purgeConnectorPopulation(port);
+        // BEHIND THE BACKUP, AND ONLY HERE. The tables may still hold a registered source's
+        // configuration and its attempt history, which a zero row count does not rule out — so the
+        // drop belongs on this side of the backup, never in an ordinary open.
+        dropRetiredSourceResidue(port);
+        // Closed HERE, before the reprojection opens its own connection: the exclusive ownership
+        // this port holds for the backup would otherwise block it.
+        port.close();
+        closed = true;
+        console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
+        if (data.nonemptyTables.length > 0) {
+          console.log(`Dropped:  ${data.nonemptyTables.join(", ")} (and the rest of the retired schema).`);
+        }
+
+        // A NATIVE concept can own a source observation (grafting produces that shape), so deleting
+        // the observation leaves its owner's support count, centroid and confidence describing
+        // evidence that no longer exists. The engine owns that projection logic; the purge only
+        // reports who needs it. Safe to open now — the population it would refuse is gone.
+        if (purged.staleNativeOwners.length > 0) {
+          const core = dependencies.createCore(dependencies.createPort(dbPath), embedder);
+          try {
+            const repaired = core.repairNativeProjections(purged.staleNativeOwners);
+            console.log(`Reprojected ${repaired} native concept(s) that owned a purged observation.`);
+          } finally {
+            core.close();
+          }
+        }
+        console.log(`Backup:   ${backup.path}`);
+      } finally {
+        if (!closed) port.close();
+      }
+    });
 
   /*
    * WHY THIS IS ITS OWN COMMAND AND NOT A REPAIR FLAG.

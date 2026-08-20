@@ -49,9 +49,6 @@ let _entitiesMode = null;
 // response arrives, the result is discarded so a slow in-flight response from a
 // prior Refresh cannot overwrite a freshly-invalidated cache.
 let _entitiesGen = 0;
-let SOURCES = null;      // /api/sources payload (lazy, invalidated on Refresh)
-// Mirrors _entitiesGen for the SOURCES cache.
-let _sourcesGen = 0;
 
 // All graph writers (initial load, visibility toggle, manual Refresh) share one
 // latest-started-request-wins generation. Visibility mode alone is not enough:
@@ -479,27 +476,10 @@ async function fetchEntities(includeRetired = state.showRetired) {
   return ENTITIES;
 }
 
-async function fetchSources() {
-  if (SOURCES) return SOURCES;
-  // Generation guard — mirrors fetchEntities: a delayed response from before a
-  // Refresh must not repopulate the cache Refresh just cleared.
-  const gen = _sourcesGen;
-  const r = await fetch('/api/sources');
-  if (!r.ok) throw new Error(`/api/sources returned ${r.status}`);
-  const data = await r.json();
-  if (_sourcesGen !== gen) return { sources: [] }; // stale — discard
-  SOURCES = data;
-  return SOURCES;
-}
-
-function invalidateDependentCaches(includeSources) {
+function invalidateDependentCaches() {
   ENTITIES = null;
   _entitiesMode = null;
   _entitiesGen++;
-  if (includeSources) {
-    SOURCES = null;
-    _sourcesGen++;
-  }
 }
 
 function entitiesForCurrentMode() {
@@ -546,7 +526,6 @@ function renderAcceptedGraph() {
 // cleanup are all guarded by the same generation + captured visibility mode.
 async function reloadGraph({
   invalidateCaches = false,
-  invalidateSources = false,
   spinner = true,
   render = renderAcceptedGraph,
   detailCallbacks,
@@ -556,7 +535,7 @@ async function reloadGraph({
   const btn = document.getElementById('refresh-btn');
 
   if (invalidateCaches && isCurrentGraphRequest(generation, includeRetired)) {
-    invalidateDependentCaches(invalidateSources);
+    invalidateDependentCaches();
   }
   if (spinner && btn) {
     _spinnerOwnerGen = generation;
@@ -621,16 +600,8 @@ function renderStatBar() {
   const bar = document.getElementById('statbar');
   const c = DATA.counts;
   const h = DATA.health;
-  // Total count includes ALL concepts (native + source/vault-chunk rows) — and
-  // so do the graph/table views themselves now (per John's no-hiding ruling,
-  // source rows are first-class visible, not excluded). This label keeps the
-  // split visible anyway: it's a useful breakdown of what's IN that total, a
-  // disclosure rather than a hint that something's hidden from view.
-  const conceptsLbl = c.sourceConcepts > 0
-    ? `concepts · ${c.sourceConcepts.toLocaleString()} from sources`
-    : 'concepts';
   const chips = [
-    { val: c.concepts, lbl: conceptsLbl, cls: '' },
+    { val: c.concepts, lbl: 'concepts', cls: '' },
     { val: c.observations, lbl: 'observations', cls: '' },
     { val: c.edgesLive, lbl: 'live edges', cls: '' },
     { val: c.entities, lbl: 'entities', cls: '' },
@@ -3314,156 +3285,6 @@ function renderHealth() {
   }
 }
 
-// ── Sources view ─────────────────────────────────────────────────────────────
-
-const SOURCE_STATUS_META = {
-  'active':               { cls: 'ok',   label: 'active' },
-  'pending-initial-sync': { cls: 'warn', label: 'pending initial sync' },
-  'pending-replacement':  { cls: 'warn', label: 'pending replacement' },
-  'tombstoned':           { cls: 'dim',  label: 'tombstoned' },
-};
-
-const SOURCE_ATTEMPT_KIND_LABEL = {
-  'run': 'sync',
-  'invocation': 'invoked sync',
-  'verification': 'verification',
-  'pre-pin-failure': 'sync attempt',
-};
-
-function sourceAttemptIcon(a) {
-  if (a.kind === 'verification') return '<span class="att-icon muted">⊙</span>';
-  if (a.result === 'success') return '<span class="att-icon ok">✓</span>';
-  if (a.result === 'failed') return '<span class="att-icon danger">✕</span>';
-  if (a.result === 'partial') return '<span class="att-icon warn">◐</span>';
-  return '<span class="att-icon muted">…</span>'; // run still in flight
-}
-
-function sourceLocation(src) {
-  if (src.remoteUrl) return src.branch ? `${src.remoteUrl} #${src.branch}` : src.remoteUrl;
-  return src.localPath || '';
-}
-
-function sourceScheduleText(src) {
-  const sch = src.schedule || {};
-  if (sch.state === 'syncing') {
-    return `<span class="src-sched-live">syncing — ${escHtml(src.liveRunState || '')}…</span>`;
-  }
-  if (sch.state === 'manual') return 'manual';
-  const every = src.refreshIntervalSeconds ? `every ${fmtInterval(src.refreshIntervalSeconds)}` : '';
-  if (sch.state === 'backoff') {
-    return `${every} · <span class="src-sched-warn">retry ~${escHtml(fmtUntil(sch.nextAttemptAt))}` +
-      ` (${sch.consecutiveFailures} failed)</span>`;
-  }
-  // 'scheduled' / 'due' — nextAttemptAt is approximate (engine adds jitter)
-  return `${every} · next ~${escHtml(fmtUntil(sch.nextAttemptAt))}`;
-}
-
-async function renderSources() {
-  const el = document.getElementById('sources-view');
-  if (!el) return;
-
-  const gen = _sourcesGen;
-  let data;
-  try {
-    data = await fetchSources();
-  } catch (err) {
-    if (gen !== _sourcesGen) return;
-    el.innerHTML = `<div style="padding:24px 16px;color:var(--danger);font-size:13px">Failed to load sources: ${escHtml(err.message)}</div>`;
-    return;
-  }
-  if (gen !== _sourcesGen) return; // stale — a newer Refresh superseded this; don't render
-
-  let sources = data.sources || [];
-
-  if (!sources.length) {
-    el.innerHTML = '<div style="padding:24px 16px;color:var(--text-muted);font-size:13px">No knowledge sources registered. Add one with <code>monet source add</code>.</div>';
-    return;
-  }
-
-  // Filter by current circle selection when not "all"
-  if (state.circle !== 'all') {
-    sources = sources.filter(s => {
-      const canon = canonicalCircle(s.circle);
-      return canon === state.circle || s.circle === state.circle;
-    });
-  }
-
-  // Filter by search text (name, circle, location)
-  const q = (state.search || '').trim().toLowerCase();
-  if (q) {
-    sources = sources.filter(s =>
-      String(s.name || '').toLowerCase().includes(q) ||
-      String(s.circle || '').toLowerCase().includes(q) ||
-      sourceLocation(s).toLowerCase().includes(q));
-  }
-
-  if (!sources.length) {
-    el.innerHTML = '<div style="padding:24px 16px;color:var(--text-muted);font-size:13px">No sources match the current circle/search.</div>';
-    return;
-  }
-
-  el.innerHTML = '';
-  for (const src of sources) {
-    const meta = SOURCE_STATUS_META[src.status] || { cls: 'dim', label: src.status };
-    const counts = src.publishedFileCount != null
-      ? `${src.publishedFileCount} files · ${src.publishedChunkCount} chunks`
-      : '';
-
-    const sec = document.createElement('div');
-    sec.className = 'health-section';
-    sec.innerHTML = `
-      <div class="health-section-hdr">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
-          ${src.type === 'git-md'
-            ? '<circle cx="4" cy="4" r="2"/><circle cx="4" cy="12" r="2"/><circle cx="12" cy="8" r="2"/><path d="M4 6v4M6 4h2a2 2 0 0 1 2 2v0"/>'
-            : '<path d="M1.5 4.5a1 1 0 0 1 1-1h3l1.5 2h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1z"/>'}
-        </svg>
-        ${escHtml(src.name)}
-        <span class="src-type">${escHtml(src.type)}</span>
-        <span class="src-status ${meta.cls}">${escHtml(meta.label)}</span>
-        <span class="src-hdr-right">${escHtml(src.circle)}${counts ? ' · ' + escHtml(counts) : ''}</span>
-      </div>
-      <div class="src-meta">
-        <div class="src-meta-cell">
-          <div class="src-meta-lbl">Location</div>
-          <div class="src-meta-val mono" title="${escHtml(sourceLocation(src))}">${escHtml(sourceLocation(src))}</div>
-        </div>
-        <div class="src-meta-cell">
-          <div class="src-meta-lbl">Last successful sync</div>
-          <div class="src-meta-val">${src.lastSuccessAt ? escHtml(fmtRelTime(src.lastSuccessAt)) : 'never'}</div>
-        </div>
-        <div class="src-meta-cell">
-          <div class="src-meta-lbl">Refresh</div>
-          <div class="src-meta-val">${sourceScheduleText(src)}</div>
-        </div>
-      </div>
-      <div class="health-items">
-        ${!src.attempts.length ? '<div style="padding:14px 16px;color:var(--text-muted);font-size:12px">No sync attempts yet</div>' :
-          src.attempts.map(a => {
-            const kindLbl = SOURCE_ATTEMPT_KIND_LABEL[a.kind] || a.kind;
-            const outcome = a.kind === 'verification' ? 'checked'
-              : a.result ? escHtml(a.result)
-              : a.runState ? escHtml(a.runState) + '…' : 'pending';
-            const detail = a.reason ? ` — ${escHtml(String(a.reason).slice(0, 140))}` : '';
-            const cnt = (a.kind === 'run' && a.result === 'success' && a.fileCount != null)
-              ? `<span class="att-cnt">${a.fileCount}f · ${a.chunkCount}c</span>` : '';
-            return `
-              <div class="health-item src-attempt">
-                <div class="h-icon">${sourceAttemptIcon(a)}</div>
-                <div style="min-width:0">
-                  <div class="h-title">${escHtml(kindLbl)} · ${outcome}<span class="src-attempt-detail">${detail}</span></div>
-                  <div class="h-meta">${escHtml(fmtRelTime(a.attemptedAt))}</div>
-                </div>
-                ${cnt}
-              </div>
-            `;
-          }).join('')}
-      </div>
-    `;
-    el.appendChild(sec);
-  }
-}
-
 // ── Tab switching ────────────────────────────────────────────────────────────
 
 /** Does this tab id still have a view container in the markup? */
@@ -3490,8 +3311,6 @@ function switchTab(tab) {
     renderEntitiesTable();
   } else if (resolved === 'timeline') {
     setTimeout(renderTimeline, 50); // let layout settle
-  } else if (resolved === 'sources') {
-    renderSources();
   } else if (resolved === 'health') {
     renderHealth();
   }
@@ -3507,7 +3326,6 @@ function rerenderActiveView() {
   if (state.activeTab === 'concepts') renderConceptsTable();
   else if (state.activeTab === 'entities') renderEntitiesTable();
   else if (state.activeTab === 'timeline') renderTimeline();
-  else if (state.activeTab === 'sources') renderSources();
   else if (state.activeTab === 'health') renderHealth();
   // 'graph' tab: canvas is kept current by redrawGraph(); nothing more to do here.
 }
@@ -3705,7 +3523,7 @@ async function init() {
 
   // Refresh button
   document.getElementById('refresh-btn').addEventListener('click', async () => {
-    await reloadGraph({ invalidateCaches: true, invalidateSources: true });
+    await reloadGraph({ invalidateCaches: true });
   });
 
   // Keyboard shortcuts
@@ -3717,15 +3535,12 @@ async function init() {
     if (e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
     if (e.key === 'Escape') deselectConcept();
     if (e.key === 'f' || e.key === 'F') { fitToView([...SIM.nodes, ...SIM.entityNodes]); scheduleSave(); }
-    // 1-6 now follow the tab bar left to right. Removing First Block freed key
-    // 1, and shifting the rest closes the gap that left Sources — the one tab
-    // with no shortcut — unreachable from the keyboard.
+    // 1-5 follow the tab bar left to right.
     if (e.key === '1') switchTab('graph');
     if (e.key === '2') switchTab('concepts');
     if (e.key === '3') switchTab('entities');
     if (e.key === '4') switchTab('timeline');
-    if (e.key === '5') switchTab('sources');
-    if (e.key === '6') switchTab('health');
+    if (e.key === '5') switchTab('health');
   });
 
   // Health item click handlers added per render

@@ -9857,50 +9857,6 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
     upgraded.close();
   });
 
-  it("probes for an unused destination when 'legacy-star' is already taken by a registered SOURCE with zero concepts of its own — advances to 'legacy-star-2' (Codex round 5, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "legacy-star-source-collision.db");
-    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    // A real source registered at exactly "legacy-star" on purpose — coincidence, unrelated to any
-    // migration — that has never ingested anything, so NO concept anywhere names this circle either.
-    const userOwnedSource = built.createSource({
-      id: "user-owned-source", type: "repo-md", name: "User's own docs",
-      repositoryIdentity: "github.com/Acme/UserOwned.git/", localPath: join(dir, "repo-a"),
-      circle: LEGACY_STAR_CIRCLE,
-      include: ["**/*.md"], exclude: [],
-      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
-      writeBack: "none", refresh: { mode: "manual" },
-    });
-    // A SECOND, unrelated source — about to be discovered living in circle '*' after the downgrade
-    // below, exactly like a genuine 1.3.1-era registration.
-    const legacySource = built.createSource({
-      id: "legacy-source", type: "repo-md", name: "Legacy docs",
-      repositoryIdentity: "github.com/Acme/Legacy.git/", localPath: join(dir, "repo-b"),
-      circle: "an-ordinary-circle",
-      include: ["**/*.md"], exclude: [],
-      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
-      writeBack: "none", refresh: { mode: "manual" },
-    });
-    built.close();
-
-    const legacy = new Database(path);
-    legacy.prepare(`UPDATE knowledge_sources SET circle = '*' WHERE id = ?`).run(legacySource.id);
-    // Confirm the premise directly: NOTHING in concepts or circle_aliases names either circle — the
-    // OLD probe's own two checks would both come back empty, exactly why it missed this.
-    expect(legacy.prepare(`SELECT 1 FROM concepts WHERE circle IN ('*', ?)`).get(LEGACY_STAR_CIRCLE)).toBeUndefined();
-    expect(legacy.prepare(`SELECT 1 FROM circle_aliases WHERE from_name IN ('*', ?) OR to_name IN ('*', ?)`).get(LEGACY_STAR_CIRCLE, LEGACY_STAR_CIRCLE)).toBeUndefined();
-    legacy.close();
-
-    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    // NOT 'legacy-star' — that name was already taken by the first source — but the NEXT unused
-    // numbered variant.
-    expect(upgraded.getSource(legacySource.id)?.circle).toBe(`${LEGACY_STAR_CIRCLE}-2`);
-    // The pre-existing user-owned source is completely undisturbed — the collision this test exists
-    // to prevent, avoided.
-    expect(upgraded.getSource(userOwnedSource.id)?.circle).toBe(LEGACY_STAR_CIRCLE);
-    upgraded.close();
-  });
-
   /**
    * ROUND 2's OWN SEAM REPRODUCED B1's CLASS ONE LAYER UP (Codex round 3, item 1). A genuine
    * pre-gate 1.3.1 store has NO gate tables at all — not just no `circle` column, no `stages`,
@@ -10039,79 +9995,6 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
    * ingestion into it threw forever at storeInternal's own concept guard — this test proves the whole
    * round-trip closes, registration through a REAL ingestion, not merely that a column value changed.
    */
-  it("the legacy-star migration also moves a registered source's own circle, alongside its already-ingested concepts, and ingestion into it works afterward (Codex round 4, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "legacy-star-source.db");
-    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    const source = built.createSource({
-      id: "legacy-source", type: "repo-md", name: "Legacy docs",
-      repositoryIdentity: "github.com/Acme/Legacy.git/", localPath: join(dir, "repo"),
-      circle: "an-ordinary-circle",
-      include: ["**/*.md"], exclude: [],
-      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
-      writeBack: "none", refresh: { mode: "manual" },
-    });
-    const ingested = await built.storeSource("Legacy content ingested before the upgrade.", {
-      circle: "an-ordinary-circle", sourceRefs: [`source://${source.id}/README.md`],
-    });
-    built.close();
-
-    // Simulate the legacy shape: BOTH the source's own registry row and a concept it did not (yet)
-    // touch already lived in '*'.
-    const legacy = new Database(path);
-    legacy.prepare(`UPDATE knowledge_sources SET circle = '*' WHERE id = ?`).run(source.id);
-    legacy.prepare(`UPDATE concepts SET circle = '*' WHERE circle = 'an-ordinary-circle'`).run();
-    legacy.close();
-
-    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-
-    // The registry row followed the concepts it owns, not left behind under the now-reserved name.
-    const migratedSource = upgraded.getSource(source.id);
-    expect(migratedSource?.circle).toBe(LEGACY_STAR_CIRCLE);
-    const migratedConcept = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(ingested.conceptId) as { circle: string };
-    expect(migratedConcept.circle).toBe(LEGACY_STAR_CIRCLE);
-
-    // THE ROUND-TRIP: a fresh ingestion into the migrated source succeeds — pre-fix, this would
-    // throw at storeInternal's own concept guard forever, because the source's OWN registered circle
-    // (still '*') fed straight into this call's `circle` option.
-    const secondIngest = await upgraded.storeSource("Content ingested after the upgrade.", {
-      circle: migratedSource!.circle, sourceRefs: [`source://${source.id}/CHANGELOG.md`],
-    });
-    // Raw SQL, not getConcept(): a source-connector-owned concept is authorization-fenced there
-    // (isConnectorOwnedRow + authorizedSourceProjection) — unrelated to this item, just the same
-    // direct-row-check convention migratedConcept above already uses.
-    const secondIngestRow = raw(upgraded).prepare(`SELECT circle FROM concepts WHERE id = ?`).get(secondIngest.conceptId) as { circle: string };
-    expect(secondIngestRow.circle).toBe(LEGACY_STAR_CIRCLE);
-    upgraded.close();
-  });
-
-  it("moves a registered source's circle even when NO concept currently shares circle '*' at all — a source cannot be the only thing stranded (Codex round 4, item 2)", async () => {
-    const dir = mkTmp();
-    const path = join(dir, "legacy-star-source-only.db");
-    const built = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    const source = built.createSource({
-      id: "orphaned-source", type: "repo-md", name: "Orphaned docs",
-      repositoryIdentity: "github.com/Acme/Orphaned.git/", localPath: join(dir, "repo"),
-      circle: "an-ordinary-circle",
-      include: ["**/*.md"], exclude: [],
-      access: { allowedCallerIds: ["caller-a"], allowedProjectIds: ["project-a"] },
-      writeBack: "none", refresh: { mode: "manual" },
-    });
-    built.close();
-
-    // ONLY the source's registry row is in '*' — it has never ingested anything, so there is no
-    // concept anywhere in this store's circle '*' at all. hasLegacyStar (concepts.circle = '*')
-    // would be false; gating the whole move on it alone would strand this source forever.
-    const legacy = new Database(path);
-    legacy.prepare(`UPDATE knowledge_sources SET circle = '*' WHERE id = ?`).run(source.id);
-    expect(legacy.prepare(`SELECT 1 FROM concepts WHERE circle = '*'`).get()).toBeUndefined();
-    legacy.close();
-
-    const upgraded = new MonetCore(path, { tauAttach: 1.1, tauAmbiguous: 1.1, syncDeviceId: "machine-a" });
-    expect(upgraded.getSource(source.id)?.circle).toBe(LEGACY_STAR_CIRCLE);
-    upgraded.close();
-  });
-
   /**
    * A CIRCLE POPULATED ONLY BY NORMATIVE ROWS CAN BE THE ONLY THING STRANDED TOO (Codex round 9,
    * item 3). Same shape as the source-only test just above, for lifecycle_edges/ratifications
@@ -10138,11 +10021,10 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
         `INSERT INTO ratifications (id, subject_concept_id, verdict, packet, ratified_by, circle, created_at, sync_updated_at)
          VALUES ('rat-1', 'some-concept-elsewhere', 'approve', NULL, 'a-human', '*', ?, ?)`,
       ).run(now, now);
-      // ONLY the ratification is in '*' — no concept, no source, no alias anywhere names it, so
-      // hasLegacyStar/hasLegacyStarSource/staleStarSource/staleStarTarget are all false; only
-      // hasLegacyStarNormative can be what triggers the migration here.
+      // ONLY the ratification is in '*' — no concept and no alias anywhere names it, so
+      // hasLegacyStar/staleStarSource/staleStarTarget are all false; only hasLegacyStarNormative
+      // can be what triggers the migration here.
       expect(legacy.prepare(`SELECT 1 FROM concepts WHERE circle = '*'`).get()).toBeUndefined();
-      expect(legacy.prepare(`SELECT 1 FROM knowledge_sources WHERE circle = '*'`).get()).toBeUndefined();
       expect(legacy.prepare(`SELECT 1 FROM circle_aliases WHERE from_name = '*' OR to_name = '*'`).get()).toBeUndefined();
       legacy.close();
 
@@ -11154,11 +11036,12 @@ describe("createGateSchema — the circle column migration (BLOCKER B1)", () => 
 
     class ThrowingMidMigrationProbe extends BetterSqlitePort {
       override prepare(sql: string): Statement {
-        // knowledge_sources.circle's own UPDATE (moveCircleScopedTables, engine.ts) — reached only
-        // after concepts/observations/moveEdgeScope/lifecycle_edges/ratifications have already run
-        // in this SAME call, and before entities/concept_entities/workstream slugs/first_block/the
-        // alias cleanup/the generation bump ever get a chance to.
-        if (/UPDATE knowledge_sources SET circle/.test(sql)) {
+        // The entities scope move (moveCircleScopedTables, engine.ts) — reached only after
+        // concepts/observations/moveEdgeScope/lifecycle_edges/ratifications have already run in
+        // this SAME call, and before concept_entities/workstream slugs/first_block/the alias
+        // cleanup/the generation bump ever get a chance to. (It replaced the knowledge_sources
+        // UPDATE that used to occupy this exact position, retired with the source subsystem, #16.)
+        if (/DELETE FROM entities WHERE scope/.test(sql)) {
           throw new Error("INJECTED CRASH — simulated failure partway through the legacy-star migration");
         }
         return super.prepare(sql);
@@ -12837,7 +12720,6 @@ describe("MCP surface", () => {
     expect(fetchDescription).toContain("Normal concepts return `body` and `observationCount`");
     expect(fetchDescription).toContain("evidence appears only with observations:true");
     expect(fetchDescription).toContain("`needsSynthesis:true`");
-    expect(fetchDescription).toContain("Source concepts instead return title, sourcePath/sourceId, and outline");
     const principle = await c.declare({ species: "principle", content: "Irreversible acts get a confirmation." });
     if (principle.species !== "principle") throw new Error("unreachable");
     const projected = await c.store("Confirm the target namespace before deleting a release.", {
@@ -13820,34 +13702,6 @@ describe("MCP surface", () => {
     // The free one really left; the blocked one really stayed.
     expect((await call("memory_fetch", { id: freeId })).isError).toBe(true);
     expect((await call("memory_fetch", { id: disputedId })).isError).toBe(false);
-
-    await client.close();
-    c.close();
-  });
-
-  it("a connector-owned row is refused by both tools, and the engine names source_sync", async () => {
-    const c = core();
-    const { call, client } = await harness(c);
-    const stored = await call("memory_store", { content: "A row that becomes connector-owned." });
-    const id = stored.json.conceptId as string;
-    raw(c).prepare(`UPDATE concepts SET source_identity = ? WHERE id = ?`).run("source://fixture/x", id);
-
-    // AT THE ENGINE, where the withdrawal path is named: `source_sync`, and no user path.
-    expect(c.retirementBlockers(id)).toEqual([
-      {
-        code: "connector-owned",
-        detail: "it is connector-owned, and no user path retires a source projection",
-        withdrawVia: "source_sync",
-      },
-    ]);
-    expect(() => c.restoreConcept(id)).toThrow(/connector-owned source concept; source sync\/rebuild owns restoration/);
-
-    // AT THE WIRE, both tools refuse — as "not found", because circleOf excludes every
-    // connector-ownership marker (kind='source', source_identity, active_observation_id) unless a
-    // source authorization context is supplied, and these handlers pass none (the scope-enforcement
-    // shape memory_reassign_circle carries).
-    expect((await call("memory_retire", { id })).text).toBe(`concept not found: ${id}`);
-    expect((await call("memory_restore", { id })).text).toBe(`concept not found: ${id}`);
 
     await client.close();
     c.close();

@@ -41,8 +41,6 @@ function inspection(overrides: Partial<StoredEmbedderStateInspection> = {}): Sto
     populations: {
       nativeObservations: knownPopulation(),
       nativeConcepts: knownPopulation(),
-      sourceObservations: knownPopulation(),
-      sourceConcepts: knownPopulation(),
     },
     migration: { status: "none" },
     nonLatin: { status: "known", tolerance: 0.2, observationCount: 0, conceptCount: 0, sampleIds: [] },
@@ -67,8 +65,6 @@ function customInspection(modelId = "acme/custom-embedding"): StoredEmbedderStat
     populations: {
       nativeObservations: populated,
       nativeConcepts: populated,
-      sourceObservations: knownPopulation(),
-      sourceConcepts: knownPopulation(),
     },
   });
 }
@@ -311,8 +307,6 @@ describe("doctor and repair CLI", () => {
       populations: {
         nativeObservations: { ...knownPopulation(), liveRowCount: 1, scoredVectorCount: 1, dimensions: [384] },
         nativeConcepts: knownPopulation(),
-        sourceObservations: knownPopulation(),
-        sourceConcepts: knownPopulation(),
       },
     });
     const dependencies = fakeDependencies(state);
@@ -548,8 +542,6 @@ describe("doctor and repair CLI", () => {
       populations: {
         nativeObservations: { ...knownPopulation(), liveRowCount: 1, scoredVectorCount: 1, dimensions: [256] },
         nativeConcepts: knownPopulation(),
-        sourceObservations: knownPopulation(),
-        sourceConcepts: knownPopulation(),
       },
     });
     const stamped = migrationInspection("refused");

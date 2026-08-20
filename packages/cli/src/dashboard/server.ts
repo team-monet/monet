@@ -151,48 +151,21 @@ function querySnap(snapPath: string, sql: string): Record<string, unknown>[] {
 
 // ── SQL Definitions ──────────────────────────────────────────────────────────
 
-// Marker union that classifies a concept row as raw ingested "source" content
-// (e.g. an Obsidian vault chunk) rather than a synthesized concept.
-// Established rule (engine cold audit): kind alone is NOT reliable as the sole
-// signal, so source_identity / active_observation_id must also be checked —
-// classify by the full union, never kind alone.
-//
-// Per John's no-hiding ruling, source rows are NOT excluded from any query
-// below — concepts/observations/edges/graph all include them as first-class
-// rows, same as any other concept (this constant previously drove a WHERE NOT
-// / NOT EXISTS filter on concepts/observations/edges; that filtering has been
-// removed). SOURCE_MARKER's only remaining consumer is SQL.counts.sourceConcepts,
-// which powers the honest header split ("N concepts · M from sources") so the
-// UI is explicit about how much of the total is raw source content — a
-// disclosure, not an exclusion.
-//
-// This is a deliberate interim, not the end state: an upcoming engine reshape
-// (file=concept) will shrink the store to ~640 concepts and collapse the
-// source/native distinction at the row level, making this marker (and the
-// split it powers) moot. Until then, GRAPH_NODE_LIMIT in app.js is the only
-// scale guard on the graph — a visible, neutral rendering cap, not a content
-// filter.
-const SOURCE_MARKER = `(c.kind = 'source' OR c.source_identity IS NOT NULL OR c.active_observation_id IS NOT NULL)`;
-
 // Retired-exclusion default, aligned with the engine's own read convention:
 // engine.ts filters `status != 'retired'` in 90+ read paths (e.g. listCircles
 // at engine.ts:4536), and the dashboard previously didn't mirror that at all —
 // every retired concept (82% of a mature store) rendered as a first-class
-// node/row right alongside live ones. Unlike SOURCE_MARKER/kind='source' (which
-// stays visible per John's no-hiding ruling), retired concepts are excluded by
+// node/row right alongside live ones. Retired concepts are excluded by
 // default here; `includeRetired=1` on the affected /api routes restores the
 // unfiltered query below. status='disputed' is a different value of the same
 // column and is never touched by this filter — disputed concepts stay visible
 // in both modes, matching John's ruling that disputed must always show.
 const RETIRED_FILTER = `status != 'retired'`;
 
-// Exported so dashboard-source-marker.test.ts can run the real query strings
-// against a seeded test DB, rather than testing a parallel reimplementation of
-// the marker-union logic that could silently drift from what actually runs.
+// Exported so tests can run the real query strings against a seeded test DB,
+// rather than a parallel reimplementation that could silently drift.
 export const SQL = {
-  // Full concepts table, minus retired rows by default (see RETIRED_FILTER) —
-  // including raw ingested "source" content (e.g. Obsidian vault chunks), which
-  // stays first-class per John's no-hiding ruling (unaffected by this filter).
+  // Full concepts table, minus retired rows by default (see RETIRED_FILTER).
   // This is also the array that becomes graph nodes AND the Concepts tab's
   // rows. Scale is bounded client-side (GRAPH_NODE_LIMIT on the Graph tab,
   // simple pagination on the Concepts tab if needed) rather than by excluding
@@ -216,10 +189,7 @@ export const SQL = {
     ORDER BY updated_at DESC
   `,
 
-  // Full observations table — every row, including observations belonging to
-  // source concepts (the chunk text itself). No longer filtered by kind='source'
-  // or by parent-concept marker per John's no-hiding ruling; see SOURCE_MARKER
-  // above.
+  // Full observations table — every row.
   observations: `
     SELECT id, content, kind, circle, concept_id, session_id,
            author_agent_id, created_at, source_refs
@@ -227,13 +197,8 @@ export const SQL = {
     ORDER BY created_at DESC
   `,
 
-  // Full edge table, still excluding dismissed edges (unrelated to source
-  // visibility — dismissal is a separate, deliberate user action). Previously
-  // also excluded edges touching a source concept on either end; per John's
-  // no-hiding ruling that filter is removed. In the audited store the engine
-  // never links source/chunk concepts into the graph anyway (0 of 39,196 live
-  // edges touch a source concept), so this is a no-op on today's data and a
-  // correctness fix for whenever that invariant stops holding.
+  // Full edge table, excluding dismissed edges (dismissal is a separate,
+  // deliberate user action).
   //
   // Retired-exclusion default: joined to concepts on BOTH endpoints so an edge
   // with either endpoint retired is dropped entirely — a graph node that
@@ -307,14 +272,9 @@ export const SQL = {
   // the concept, so openContras (Health view's contradictions.filter(status===
   // 'open') in app.js renderHealth) can never reference a retired/absent concept.
   // That engine invariant ensures the Health view's concept-map dereference is safe.
-  // NOTE: references c.source_identity / c.active_observation_id via
-  // SOURCE_MARKER, which don't exist on stores predating the source-ingestion
-  // schema. handleGraph() checks conceptsHasSourceColumns() before running
-  // this and falls back to countsLegacy below when they're absent.
   counts: `
     SELECT
       (SELECT COUNT(*) FROM concepts WHERE ${RETIRED_FILTER}) as concepts,
-      (SELECT COUNT(*) FROM concepts c WHERE ${SOURCE_MARKER} AND c.${RETIRED_FILTER}) as sourceConcepts,
       (SELECT COUNT(*) FROM observations) as observations,
       (SELECT COUNT(*) FROM memory_edge e
          JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
@@ -338,56 +298,6 @@ export const SQL = {
   countsIncludeRetired: `
     SELECT
       (SELECT COUNT(*) FROM concepts) as concepts,
-      (SELECT COUNT(*) FROM concepts c WHERE ${SOURCE_MARKER}) as sourceConcepts,
-      (SELECT COUNT(*) FROM observations) as observations,
-      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NULL) as edgesLive,
-      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NOT NULL) as edgesDismissed,
-      (SELECT COUNT(*) FROM entities) as entities,
-      (SELECT COUNT(*) FROM sessions) as sessions,
-      (SELECT COUNT(*) FROM contradictions WHERE status='open') as contradictionsOpen,
-      (SELECT COUNT(*) FROM contradictions WHERE status='resolved') as contradictionsResolved,
-      (SELECT COUNT(*) FROM concepts WHERE status='disputed') as disputed,
-      (SELECT COUNT(*) FROM concepts WHERE dirty=1) as dirty,
-      (SELECT COUNT(*) FROM memory_edge WHERE type='possible_duplicate_of' AND dismissed_at IS NULL) as possibleDuplicatePairs
-  `,
-
-  // Legacy-schema fallback for stores created before the source-ingestion
-  // columns (source_identity / active_observation_id) existed on concepts —
-  // the full SOURCE_MARKER union in `counts` above throws "no such column" on
-  // them, which was breaking /api/graph entirely for those stores (findings
-  // review). sourceConcepts here uses kind='source' alone: the only marker
-  // such a store CAN carry (kind always exists; the other two columns don't
-  // on this schema, and NOT their absence being silently miscounted as 0 —
-  // kind-only is what these rows' actual data supports, not an approximation).
-  // Otherwise identical to `counts` (including the same retired-exclusion
-  // default). Selected by conceptsHasSourceColumns().
-  countsLegacy: `
-    SELECT
-      (SELECT COUNT(*) FROM concepts WHERE ${RETIRED_FILTER}) as concepts,
-      (SELECT COUNT(*) FROM concepts WHERE kind = 'source' AND ${RETIRED_FILTER}) as sourceConcepts,
-      (SELECT COUNT(*) FROM observations) as observations,
-      (SELECT COUNT(*) FROM memory_edge e
-         JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
-         JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
-        WHERE e.dismissed_at IS NULL) as edgesLive,
-      (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NOT NULL) as edgesDismissed,
-      (SELECT COUNT(*) FROM entities) as entities,
-      (SELECT COUNT(*) FROM sessions) as sessions,
-      (SELECT COUNT(*) FROM contradictions WHERE status='open') as contradictionsOpen,
-      (SELECT COUNT(*) FROM contradictions WHERE status='resolved') as contradictionsResolved,
-      (SELECT COUNT(*) FROM concepts WHERE status='disputed') as disputed,
-      (SELECT COUNT(*) FROM concepts WHERE dirty=1 AND ${RETIRED_FILTER}) as dirty,
-      (SELECT COUNT(*) FROM memory_edge e
-         JOIN concepts esrc ON esrc.id = e.src_id AND esrc.${RETIRED_FILTER}
-         JOIN concepts edst ON edst.id = e.dst_id AND edst.${RETIRED_FILTER}
-        WHERE e.type='possible_duplicate_of' AND e.dismissed_at IS NULL) as possibleDuplicatePairs
-  `,
-
-  // includeRetired=1 variant of countsLegacy.
-  countsLegacyIncludeRetired: `
-    SELECT
-      (SELECT COUNT(*) FROM concepts) as concepts,
-      (SELECT COUNT(*) FROM concepts WHERE kind = 'source') as sourceConcepts,
       (SELECT COUNT(*) FROM observations) as observations,
       (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NULL) as edgesLive,
       (SELECT COUNT(*) FROM memory_edge WHERE dismissed_at IS NOT NULL) as edgesDismissed,
@@ -516,81 +426,7 @@ export const SQL = {
     FROM concept_entities
   `,
 
-  // Knowledge-source registry. The tables may not exist in stores not yet
-  // migrated by an engine with the source pipeline; the caller guards with an
-  // existence check before running these queries.
-  sources: `
-    SELECT id, type, name, remote_url, local_path, branch,
-           circle, auto_detect, refresh_mode, refresh_interval_seconds,
-           config_version, applied_config_version, active_run_id,
-           lease_fence, lifecycle, created_at, updated_at, tombstoned_at
-    FROM knowledge_sources
-    ORDER BY created_at ASC, id ASC
-  `,
-
-  // The run each source currently has published (registry pin → run row).
-  sourceActiveRuns: `
-    SELECT r.id, r.source_id, r.state, r.result, r.file_count, r.chunk_count,
-           r.published_at, r.finished_at, r.created_at
-    FROM source_sync_runs r
-    JOIN knowledge_sources s ON s.active_run_id = r.id
-  `,
-
-  // Durable success marker per source: latest published_at among successful runs.
-  sourceLastSuccess: `
-    SELECT source_id, MAX(published_at) AS last_success_at
-    FROM source_sync_runs
-    WHERE result = 'success' AND published_at IS NOT NULL
-    GROUP BY source_id
-  `,
-
-  // At most one live (non-terminal) run per source — enforced by
-  // uq_source_sync_runs_live in the engine schema.
-  sourceLiveRuns: `
-    SELECT id, source_id, state, created_at, updated_at
-    FROM source_sync_runs
-    WHERE state IN ('scanning','staging','activating','cleaning')
-  `,
-
-  // Immutable attempt receipts joined to their run rows — the same shape as the
-  // engine's scheduleBasisSnapshot query (source-ledger). The window matches the
-  // engine's per-source event retention (128) so streak math sees everything the
-  // engine sees; the display list is sliced to 20 afterwards in JS.
-  sourceAttemptEvents: `
-    SELECT e.source_id, e.sequence, e.kind, e.run_id, e.attempted_at,
-           e.failure_reason, e.invocation_result, e.config_version, e.lease_fence,
-           r.state AS run_state, r.result AS run_result, r.reason AS run_reason,
-           r.file_count AS run_file_count, r.chunk_count AS run_chunk_count,
-           r.published_at AS run_published_at, r.finished_at AS run_finished_at
-    FROM (
-      SELECT ev.*, ROW_NUMBER() OVER (
-        PARTITION BY source_id ORDER BY sequence DESC
-      ) AS rn
-      FROM source_attempt_events ev
-    ) e
-    LEFT JOIN source_sync_runs r ON r.id = e.run_id AND r.source_id = e.source_id
-    WHERE e.rn <= 128
-    ORDER BY e.source_id, e.sequence DESC
-  `,
 } as const;
-
-/**
- * Column-presence guard for SOURCE_MARKER. Stores created before the
- * source-ingestion schema lack source_identity / active_observation_id on
- * concepts; running SQL.counts (which references both via SOURCE_MARKER)
- * against such a store throws "no such column", which was breaking
- * /api/graph entirely for legacy stores. handleGraph() calls this to pick
- * SQL.counts (full marker) vs SQL.countsLegacy (kind-only) -- mirrors the
- * sqlite_master table-existence guard in handleSources, which exists for the
- * identical reason (older stores predate newer schema).
- * Exported so it can be unit-tested directly against both schema shapes
- * rather than only indirectly through handleGraph().
- */
-export function conceptsHasSourceColumns(db: InstanceType<typeof Database>): boolean {
-  const cols = db.prepare(`PRAGMA table_info(concepts)`).all() as Array<{ name: string }>;
-  const names = new Set(cols.map((c) => c.name));
-  return names.has("source_identity") && names.has("active_observation_id");
-}
 
 // ── API handlers ─────────────────────────────────────────────────────────────
 
@@ -599,7 +435,7 @@ function emptyGraphPayload(): unknown {
   return {
     generatedAt: Date.now(),
     counts: {
-      concepts: 0, sourceConcepts: 0, observations: 0, edgesLive: 0, edgesDismissed: 0,
+      concepts: 0, observations: 0, edgesLive: 0, edgesDismissed: 0,
       entities: 0, sessions: 0, contradictionsOpen: 0, contradictionsResolved: 0,
       disputed: 0, dirty: 0, possibleDuplicatePairs: 0,
     },
@@ -621,18 +457,7 @@ async function handleGraph(includeRetired: boolean): Promise<unknown> {
     const revisionsCount     = querySnap(snap, SQL.revisionsCount);
     const aliases            = querySnap(snap, SQL.aliases);
 
-    // Detect legacy schema (pre-source-ingestion) before running SQL.counts --
-    // see conceptsHasSourceColumns() and SQL.countsLegacy above for why.
-    const colsDb = new Database(snap, { readonly: true });
-    let hasSourceColumns: boolean;
-    try {
-      hasSourceColumns = conceptsHasSourceColumns(colsDb);
-    } finally {
-      colsDb.close();
-    }
-    const countsSql = hasSourceColumns
-      ? (includeRetired ? SQL.countsIncludeRetired : SQL.counts)
-      : (includeRetired ? SQL.countsLegacyIncludeRetired : SQL.countsLegacy);
+    const countsSql = includeRetired ? SQL.countsIncludeRetired : SQL.counts;
     const [counts]           = querySnap(snap, countsSql) as [Record<string, number>];
     const [health]           = querySnap(snap, includeRetired ? SQL.healthIncludeRetired : SQL.health) as [Record<string, number | null>];
     const circleConceptsRaw     = querySnap(snap, includeRetired ? SQL.circleConceptsIncludeRetired : SQL.circleConcepts) as Array<{ name: string; conceptCount: number }>;
@@ -698,7 +523,6 @@ async function handleGraph(includeRetired: boolean): Promise<unknown> {
       generatedAt: Date.now(),
       counts: {
         concepts: counts["concepts"],
-        sourceConcepts: counts["sourceConcepts"],
         observations: counts["observations"],
         edgesLive: counts["edgesLive"],
         edgesDismissed: counts["edgesDismissed"],
@@ -741,261 +565,6 @@ async function handleEntities(includeRetired: boolean): Promise<unknown> {
 }
 
 // ── Sources ──────────────────────────────────────────────────────────────────
-
-/**
- * Registry status derivation — mirrors deriveStatus() in monet-core's
- * source-registry (the status is not a stored column). One deliberate
- * divergence: a corrupt applied>config row displays as pending-replacement
- * instead of throwing — a read-only view must not 500 on a corrupt store.
- */
-export function deriveSourceStatus(row: {
-  lifecycle: string;
-  config_version: number;
-  applied_config_version: number | null;
-}): string {
-  if (row.lifecycle === "tombstoned") return "tombstoned";
-  if (row.applied_config_version == null) return "pending-initial-sync";
-  if (row.applied_config_version === row.config_version) return "active";
-  return "pending-replacement";
-}
-
-/** Failure backoff — mirrors cappedBackoff() in monet-core's source-scheduler. */
-export function sourceBackoffMs(intervalMs: number, streak: number): number {
-  let value = 30_000;
-  for (let i = 1; i < streak && value < intervalMs; i += 1) value = Math.min(intervalMs, value * 2);
-  return Math.min(intervalMs, value);
-}
-
-export interface SourceAttemptOutcome {
-  attemptedAt: number;
-  result: string | null;
-}
-
-/** The event-row shape terminalOutcomes consumes (attempt event + joined run). */
-export interface SourceAttemptEventRow {
-  kind: string;
-  runId: string | null;
-  attemptedAt: number;
-  invocationResult: string | null;
-  configVersion: number | null;
-  leaseFence: number | null;
-  runResult: string | null;
-  runPublishedAt: number | null;
-  runFinishedAt: number | null;
-}
-
-/**
- * Terminal-outcome projection — mirrors the engine's scheduleBasisSnapshot loop
- * (source-ledger) over fence-scoped events, newest first:
- *   - events outside the source's CURRENT config_version/lease_fence are
- *     ignored (a config update bumps both and resets the failure streak);
- *   - verification counts as success (it breaks a failure streak);
- *   - pre-pin-failure counts as failed;
- *   - invocation carries its own result and always marks its run seen;
- *   - a run event counts only if not already covered by its invocation receipt,
- *     anchored at max(attempted_at, published_at, finished_at).
- */
-export function terminalOutcomes(
-  events: SourceAttemptEventRow[], // newest first
-  configVersion: number,
-  leaseFence: number,
-): SourceAttemptOutcome[] {
-  const seenRuns = new Set<string>();
-  const terminals: SourceAttemptOutcome[] = [];
-  for (const row of events) {
-    if (row.configVersion !== configVersion || row.leaseFence !== leaseFence) continue;
-    let result: string | null = null;
-    let attemptedAt = row.attemptedAt;
-    if (row.kind === "verification") result = "success";
-    else if (row.kind === "pre-pin-failure") result = "failed";
-    else if (row.kind === "invocation") {
-      result = row.invocationResult;
-      if (row.runId) seenRuns.add(row.runId);
-    } else if (row.runId && !seenRuns.has(row.runId) && row.runResult !== null) {
-      result = row.runResult;
-      attemptedAt = Math.max(attemptedAt, row.runPublishedAt ?? -1, row.runFinishedAt ?? -1);
-      seenRuns.add(row.runId);
-    }
-    if (result) terminals.push({ attemptedAt, result });
-  }
-  return terminals;
-}
-
-/**
- * Approximate the engine scheduler's next-attempt plan from durable state only.
- * The engine adds a deterministic jitter (≤30s or 10% of the interval) and a
- * recovery branch driven by ledger internals; this read-only view anchors on the
- * latest terminal attempt and skips the jitter, so nextAttemptAt is approximate.
- */
-export function computeSourceSchedule(
-  src: { lifecycle: string; refresh_mode: string; refresh_interval_seconds: number | null },
-  outcomes: SourceAttemptOutcome[], // newest first, terminal outcomes only
-  hasLiveRun: boolean,
-  now: number,
-): { state: string; nextAttemptAt: number | null; consecutiveFailures: number } {
-  if (hasLiveRun) return { state: "syncing", nextAttemptAt: null, consecutiveFailures: 0 };
-  if (src.lifecycle !== "active" || src.refresh_mode !== "interval" || !src.refresh_interval_seconds) {
-    return { state: "manual", nextAttemptAt: null, consecutiveFailures: 0 };
-  }
-  const intervalMs = src.refresh_interval_seconds * 1000;
-  if (outcomes.length === 0) {
-    // Never attempted: the engine schedules the initial sync within a short
-    // startup spread, so "due" is the honest display state.
-    return { state: "due", nextAttemptAt: now, consecutiveFailures: 0 };
-  }
-  const latest = outcomes[0];
-  let failures = 0;
-  for (const o of outcomes) {
-    if (o.result !== "success") failures += 1;
-    else break;
-  }
-  const failed = latest.result !== "success";
-  const delay = failed ? sourceBackoffMs(intervalMs, Math.max(1, failures)) : intervalMs;
-  const nextAttemptAt = latest.attemptedAt + delay;
-  const state = nextAttemptAt <= now ? "due" : failed ? "backoff" : "scheduled";
-  return { state, nextAttemptAt, consecutiveFailures: failures };
-}
-
-async function handleSources(): Promise<unknown> {
-  if (!fs.existsSync(getDbPath(resolveProjectDir()))) return { sources: [], generatedAt: Date.now() };
-  const snap = await makeSnapshot();
-  try {
-    // Stores written by engines without the source pipeline lack these tables;
-    // return an empty payload rather than a 500 (the same sqlite_master
-    // table-existence guard conceptsHasSourceColumns applies for legacy stores).
-    // The ledger tables can also be missing INDEPENDENTLY of the registry
-    // (registry-only stores from older engines): still list registered sources
-    // and treat run/attempt data as empty rather than hiding the registry.
-    const db = new Database(snap, { readonly: true });
-    const present = new Set<string>();
-    try {
-      const rows = db.prepare(
-        `SELECT name FROM sqlite_master
-         WHERE type='table' AND name IN ('knowledge_sources','source_sync_runs','source_attempt_events')`
-      ).all() as Array<{ name: string }>;
-      for (const r of rows) present.add(r.name);
-    } finally {
-      db.close();
-    }
-    if (!present.has("knowledge_sources")) return { sources: [], generatedAt: Date.now() };
-    const hasRuns   = present.has("source_sync_runs");
-    const hasEvents = present.has("source_attempt_events");
-
-    const sources       = querySnap(snap, SQL.sources);
-    const activeRuns    = hasRuns ? querySnap(snap, SQL.sourceActiveRuns) : [];
-    const lastSuccess   = hasRuns ? querySnap(snap, SQL.sourceLastSuccess) : [];
-    const liveRuns      = hasRuns ? querySnap(snap, SQL.sourceLiveRuns) : [];
-    const attemptEvents = (hasEvents && hasRuns) ? querySnap(snap, SQL.sourceAttemptEvents) : [];
-
-    const activeBySource: Record<string, Record<string, unknown>> = {};
-    for (const r of activeRuns) activeBySource[r["source_id"] as string] = r;
-    const successBySource: Record<string, number> = {};
-    for (const r of lastSuccess) successBySource[r["source_id"] as string] = r["last_success_at"] as number;
-    const liveBySource: Record<string, Record<string, unknown>> = {};
-    for (const r of liveRuns) liveBySource[r["source_id"] as string] = r;
-    const eventsBySource: Record<string, Record<string, unknown>[]> = {};
-    for (const e of attemptEvents) {
-      const sid = e["source_id"] as string;
-      (eventsBySource[sid] ||= []).push(e);
-    }
-
-    const now = Date.now();
-    const out = sources.map((s) => {
-      const sid = s["id"] as string;
-      const active = activeBySource[sid] || null;
-      const live = liveBySource[sid] || null;
-      const events = eventsBySource[sid] || [];
-
-      const eventRows: SourceAttemptEventRow[] = events.map((e) => ({
-        kind: e["kind"] as string,
-        runId: (e["run_id"] as string | null) ?? null,
-        attemptedAt: e["attempted_at"] as number,
-        invocationResult: (e["invocation_result"] as string | null) ?? null,
-        configVersion: (e["config_version"] as number | null) ?? null,
-        leaseFence: (e["lease_fence"] as number | null) ?? null,
-        runResult: (e["run_result"] as string | null) ?? null,
-        runPublishedAt: (e["run_published_at"] as number | null) ?? null,
-        runFinishedAt: (e["run_finished_at"] as number | null) ?? null,
-      }));
-
-      const outcomes = terminalOutcomes(
-        eventRows,
-        s["config_version"] as number,
-        s["lease_fence"] as number,
-      );
-
-      // Display rows for the 20 newest events; run-backed rows resolve result,
-      // reason, and counts through the joined run columns.
-      const attempts = events.slice(0, 20).map((e) => {
-        const kind = e["kind"] as string;
-        let result: string | null = null;
-        let reason: string | null = (e["failure_reason"] as string | null) ?? null;
-        if (kind === "run") {
-          result = (e["run_result"] as string | null) ?? null;
-          reason = reason ?? ((e["run_reason"] as string | null) ?? null);
-        } else if (kind === "invocation") {
-          result = (e["invocation_result"] as string | null) ?? null;
-        } else if (kind === "pre-pin-failure") {
-          result = "failed";
-        }
-        return {
-          sequence: e["sequence"] as number,
-          kind,
-          attemptedAt: e["attempted_at"] as number,
-          result,
-          reason,
-          runState: (e["run_state"] as string | null) ?? null,
-          fileCount: (e["run_file_count"] as number | null) ?? null,
-          chunkCount: (e["run_chunk_count"] as number | null) ?? null,
-        };
-      });
-
-      const schedule = computeSourceSchedule(
-        {
-          lifecycle: s["lifecycle"] as string,
-          refresh_mode: s["refresh_mode"] as string,
-          refresh_interval_seconds: s["refresh_interval_seconds"] as number | null,
-        },
-        outcomes,
-        live != null,
-        now,
-      );
-
-      return {
-        id: sid,
-        type: s["type"],
-        name: s["name"],
-        circle: s["circle"],
-        status: deriveSourceStatus({
-          lifecycle: s["lifecycle"] as string,
-          config_version: s["config_version"] as number,
-          applied_config_version: s["applied_config_version"] as number | null,
-        }),
-        lifecycle: s["lifecycle"],
-        remoteUrl: s["remote_url"],
-        localPath: s["local_path"],
-        branch: s["branch"],
-        autoDetect: s["auto_detect"] === 1,
-        refreshMode: s["refresh_mode"],
-        refreshIntervalSeconds: s["refresh_interval_seconds"],
-        createdAt: s["created_at"],
-        updatedAt: s["updated_at"],
-        tombstonedAt: s["tombstoned_at"],
-        lastSuccessAt: successBySource[sid] ?? null,
-        publishedAt: (active?.["published_at"] as number | null) ?? null,
-        publishedFileCount: (active?.["file_count"] as number | null) ?? null,
-        publishedChunkCount: (active?.["chunk_count"] as number | null) ?? null,
-        liveRunState: (live?.["state"] as string | null) ?? null,
-        schedule,
-        attempts,
-      };
-    });
-
-    return { sources: out, generatedAt: now };
-  } finally {
-    try { fs.unlinkSync(snap); } catch { /* ignore */ }
-  }
-}
 
 // ── Static file serving ──────────────────────────────────────────────────────
 
@@ -1087,13 +656,6 @@ export function startDashboard(port: number): void {
         const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
         const includeRetired = url.searchParams.get("includeRetired") === "1";
         const data = await handleEntities(includeRetired);
-        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify(data));
-        return;
-      }
-
-      if (pathname === "/api/sources") {
-        const data = await handleSources();
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(data));
         return;

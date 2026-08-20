@@ -12,6 +12,22 @@ import { MonetCore, EmbedderMismatchError, EmbedderWidthConflictError, Malformed
 import { HashingEmbeddingProvider } from "../embedding";
 import type { GraftPayload } from "../sync-types";
 
+/** A connector-owned concept + observation, minted directly. The source subsystem that used to
+ *  write these was retired (#16); the sync export/graft guards that refuse them still ship, for
+ *  legacy stores that hold such rows. */
+async function storeConnectorOwned(
+  core: MonetCore,
+  content: string,
+  sourceRef: string,
+): Promise<{ conceptId: string; observationId: string }> {
+  const stored = await core.store(content, { resolution: "forceNew" });
+  const db = (core as any).db as import("../storage").StoragePort;
+  db.prepare(`UPDATE concepts SET kind = 'source' WHERE id = ?`).run(stored.conceptId);
+  db.prepare(`UPDATE observations SET kind = 'source', source_refs = ? WHERE id = ?`)
+    .run(JSON.stringify([sourceRef]), stored.observationId);
+  return stored;
+}
+
 /** A MonetCore with dedup disabled so every store() creates a fresh concept. */
 function freshCore(opts: { tauAttach?: number; tauAmbiguous?: number; syncDeviceId?: string; graphEnabled?: boolean } = {}): MonetCore {
   return new MonetCore(":memory:", {
@@ -330,130 +346,6 @@ describe("terminal supersession replication", () => {
 });
 
 describe("retirement tombstone replication", () => {
-  it("exports no retired native/source content and makes an existing replica hide both concepts", async () => {
-    const nativeSource = freshCore();
-    const nativeReplica = freshCore();
-    const sourceSource = freshCore();
-    const sourceReplica = freshCore();
-    try {
-      const native = await nativeSource.store("Native retirement secret body.");
-      nativeReplica.graftRows(nativeSource.exportDelta(0));
-      const nativeWatermark = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 2));
-      nativeSource.retireConcept(native.conceptId);
-      const nativeDelta = nativeSource.exportDelta(nativeWatermark);
-      expect(nativeDelta.concepts).toEqual([]);
-      expect(nativeDelta.observations).toEqual([]);
-      expect(nativeDelta.conceptRevisions).toEqual([]);
-      expect(JSON.stringify(nativeDelta)).not.toContain("Native retirement secret body.");
-      expect(nativeDelta.tombstones).toContainEqual(expect.objectContaining({ concept_id: native.conceptId }));
-      nativeReplica.graftRows(nativeDelta);
-      await expect(nativeReplica.getConcept(native.conceptId)).resolves.toBeNull();
-      expect((nativeReplica
-        // @ts-expect-error raw replica lifecycle assertion
-        .db.prepare(`SELECT status FROM concepts WHERE id = ?`).get(native.conceptId) as { status: string }).status).toBe("retired");
-
-      const restoreWatermark = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 2));
-      nativeSource.restoreConcept(native.conceptId);
-      const restoreDelta = nativeSource.exportDelta(restoreWatermark);
-      // The monotonic clock may inclusively replay the prior tombstone beside the restoration;
-      // graft retains both events and deterministically applies the later semantic lifecycle time.
-      expect(restoreDelta.restorations).toContainEqual(expect.objectContaining({ concept_id: native.conceptId }));
-      nativeReplica.graftRows(restoreDelta);
-      expect((await nativeReplica.getConcept(native.conceptId, { synthesize: false }))?.body).toBe("Native retirement secret body.");
-      const restoredLifecycle = nativeReplica
-        // @ts-expect-error raw ordered-lifecycle assertion
-        .db.prepare(
-          `SELECT t.retired_at, r.restored_at, c.status
-             FROM concepts c
-             JOIN concept_tombstones t ON t.concept_id = c.id
-             JOIN concept_restorations r ON r.concept_id = c.id
-            WHERE c.id = ?`,
-        )
-        .get(native.conceptId) as { retired_at: number; restored_at: number; status: string };
-      expect(restoredLifecycle).toMatchObject({ status: "active" });
-      expect(restoredLifecycle.restored_at).toBeGreaterThan(restoredLifecycle.retired_at);
-
-      // An out-of-order old retirement event cannot undo the newer restore.
-      nativeReplica.graftRows(nativeDelta);
-      expect((await nativeReplica.getConcept(native.conceptId, { synthesize: false }))?.body).toBe("Native retirement secret body.");
-
-      const reRetireWatermark = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 2));
-      nativeSource.retireConcept(native.conceptId);
-      const reRetireDelta = nativeSource.exportDelta(reRetireWatermark);
-      nativeReplica.graftRows(reRetireDelta);
-      await expect(nativeReplica.getConcept(native.conceptId)).resolves.toBeNull();
-      const reRetiredLifecycle = nativeReplica
-        // @ts-expect-error raw ordered-lifecycle assertion
-        .db.prepare(
-          `SELECT t.retired_at, r.restored_at, c.status
-             FROM concepts c
-             JOIN concept_tombstones t ON t.concept_id = c.id
-             JOIN concept_restorations r ON r.concept_id = c.id
-            WHERE c.id = ?`,
-        )
-        .get(native.conceptId) as { retired_at: number; restored_at: number; status: string };
-      expect(reRetiredLifecycle).toMatchObject({ status: "retired" });
-      expect(reRetiredLifecycle.retired_at).toBeGreaterThan(reRetiredLifecycle.restored_at);
-
-      const source = await sourceSource.storeSource("Source retirement secret body.", {
-        sourceRefs: ["source://source-a/docs/retired.md#intro~1"],
-        operationId: "source-a:retired-binding:fingerprint-v1:snapshot-v1",
-      });
-      // Source lifecycle is connector-owned too — generic sync is intentionally not a connector
-      // authority boundary (see assertGraftPayloadIsNativeOnly), so a source concept's retirement
-      // must never leave the machine, even toward a same-id local source replica. This also closes
-      // the backdoor a forged tombstone could otherwise use to retire a local source concept
-      // through generic sync (see source-prereqs.test.ts "rejects forged source grafts").
-      sourceReplica
-        // @ts-expect-error test-only same-id source replica fixture
-        .db.prepare(
-          `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, circle, embedding,
-                                 support_count, dirty, source_identity, active_observation_id, updated_at, created_at,
-                                 usefulness_score, arousal_score)
-           VALUES (?, 'source-retired', 'Source retired', 'local source body', 'source', 'active', .6, 'default', '[]', 1, 0,
-                   'source://source-a', NULL, ?, ?, 0, 0)`,
-        )
-        .run(source.conceptId, Date.now(), Date.now());
-      const sourceWatermark = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 2));
-      sourceSource.retireConcept(source.conceptId);
-      const sourceDelta = sourceSource.exportDelta(sourceWatermark);
-      expect(sourceDelta.concepts).toEqual([]);
-      expect(sourceDelta.observations).toEqual([]);
-      expect(JSON.stringify(sourceDelta)).not.toContain("Source retirement secret body.");
-      expect(sourceDelta.tombstones).not.toContainEqual(expect.objectContaining({ concept_id: source.conceptId }));
-      sourceReplica.graftRows(sourceDelta);
-      // No lifecycle event ever arrived: the same-id local source replica stays untouched.
-      expect((sourceReplica
-        // @ts-expect-error raw replica lifecycle assertion
-        .db.prepare(`SELECT status FROM concepts WHERE id = ?`).get(source.conceptId) as { status: string }).status).toBe("active");
-    } finally {
-      nativeSource.close();
-      nativeReplica.close();
-      sourceSource.close();
-      sourceReplica.close();
-    }
-  });
-
-  it("never exports a retired source concept's tombstone — source lifecycle stays connector-owned", async () => {
-    const core = freshCore();
-    try {
-      const source = await core.storeSource("Source concept retired locally.", {
-        sourceRefs: ["source://source-a/docs/never-exported.md#intro~1"],
-        operationId: "source-a:never-exported-binding:fingerprint-v1:snapshot-v1",
-      });
-      const watermark = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 2));
-      core.retireConcept(source.conceptId);
-      expect(core.exportDelta(watermark).tombstones).toEqual([]);
-    } finally {
-      core.close();
-    }
-  });
-
   it("migrates a legacy retired concept into a fresh incremental tombstone event", async () => {
     const legacy = freshCore();
     const replica = freshCore();
@@ -1263,14 +1155,8 @@ describe("v8 verification fix round", () => {
     try {
       const one = await a.store("Graph native one AuthService.");
       const two = await a.store("Graph native two BillingService.");
-      const source = await a.storeSource("Graph connector binding.", {
-        sourceRefs: ["source://graph-source/docs/a.md#x~1"],
-        operationId: "graph-source:binding:fingerprint:snapshot",
-      });
       (a as any).upsertEdge(one.conceptId, two.conceptId, "related", 0.8, "fixture", "default");
-      (a as any).upsertEdge(source.conceptId, one.conceptId, "related", 0.8, "fixture", "default");
       const initial = a.exportDelta(0);
-      expect(initial.edgeComponents).not.toContainEqual(expect.objectContaining({ src_id: source.conceptId }));
       b.graftRows(initial);
       a.reassignCircle(one.conceptId, "moved");
       const moved = a.exportDelta(initial.exportedAt);
@@ -1345,42 +1231,6 @@ describe("v8 verification fix round", () => {
       expect(f.usefulness_score).toBe(2);
     } finally {
       seed.close(); left.close(); right.close(); forward.close(); reverse.close();
-    }
-  });
-
-  it("rejects native-looking collisions with local source concepts and ledger observations before writing", async () => {
-    const core = freshCore({ syncDeviceId: "collision-local", graphEnabled: false });
-    try {
-      const source = await core.storeSource("Collision source body.", {
-        sourceRefs: ["source://collision/docs/a.md#x~1"],
-        operationId: "collision:binding:fingerprint:snapshot",
-      });
-      const native = await core.store("Collision native target.");
-      const db = (core as any).db as import("../storage").StoragePort;
-      const sourceConcept = db.prepare(`SELECT * FROM concepts WHERE id = ?`).get(source.conceptId) as GraftPayload["concepts"][number];
-      const sourceObservation = db.prepare(`SELECT * FROM observations WHERE concept_id = ?`).get(source.conceptId) as GraftPayload["observations"][number];
-      const stable = () => JSON.stringify({
-        concept: db.prepare(`SELECT * FROM concepts WHERE id = ?`).get(source.conceptId),
-        observation: db.prepare(`SELECT * FROM observations WHERE id = ?`).get(sourceObservation.id),
-      });
-      const before = stable();
-      expect(() => core.graftRows(basePayload({
-        schemaVersion: 8,
-        concepts: [{ ...sourceConcept, kind: "note", source_refs: null, sync_revision: 999, sync_writer: "attacker" }],
-      }))).toThrow(/source-owned/);
-      expect(stable()).toBe(before);
-      expect(() => core.graftRows(basePayload({
-        schemaVersion: 8,
-        observations: [{ ...sourceObservation, kind: "note", concept_id: native.conceptId, source_refs: null, sync_revision: 999, sync_writer: "attacker" }],
-      }))).toThrow(/source-owned/);
-      expect(stable()).toBe(before);
-      expect(() => core.graftRows(basePayload({
-        schemaVersion: 8,
-        conceptRevisions: [{ id: "forged-revision", concept_id: native.conceptId, version: 1, body: "forged", trigger_observation_id: sourceObservation.id, created_at: 1 }],
-      }))).toThrow(/source-owned/);
-      expect(stable()).toBe(before);
-    } finally {
-      core.close();
     }
   });
 
@@ -1539,25 +1389,6 @@ describe("v8 verification fix round", () => {
   });
 
 
-  it("rejects source-owned ids through v8 deletions, activity, and edge components", async () => {
-    const core = freshCore({ syncDeviceId: "source-guard", graphEnabled: false });
-    try {
-      const source = await core.storeSource("Guarded source binding.", {
-        sourceRefs: ["source://guarded/docs/a.md#x~1"],
-        operationId: "guarded:binding:fingerprint:snapshot",
-      });
-      const native = await core.store("Guarded native endpoint.");
-      const common = { schemaVersion: 8, deviceId: "attacker" };
-      expect(() => core.graftRows(basePayload({ ...common, deletions: [{ concept_id: source.conceptId, deleted_at: 1, updated_at: 1, writer_id: "attacker", concept_kind: "native" }] }))).toThrow(/source-owned/);
-      expect(() => core.graftRows(basePayload({ ...common, conceptActivity: [{ concept_id: source.conceptId, writer_id: "attacker", usefulness_count: 1, usefulness_last_at: 1, arousal_count: 0, arousal_last_at: null, revision: 1, updated_at: 1 }] }))).toThrow(/source-owned/);
-      expect(() => core.graftRows(basePayload({
-        ...common,
-        edgeComponents: [{ src_id: source.conceptId, dst_id: native.conceptId, type: "related", scope: "default", writer_id: "attacker", count: 1, weight: 1, origin: "forged", created_at: 1, last_reinforced_at: 1, revision: 1, updated_at: 1 }],
-      }))).toThrow(/source-owned/);
-    } finally {
-      core.close();
-    }
-  });
 });
 
 describe("final cold-audit sync fixes", () => {
@@ -1925,37 +1756,6 @@ describe("sync ownership convergence closure", () => {
 
 
 
-
-
-  it("versions source identity pointers as semantic content while excluding activity-only touches", async () => {
-    const core = freshCore({ syncDeviceId: "source-pointer-clock", graphEnabled: false });
-    try {
-      const source = await core.storeSource("Terminal source pointer.", {
-        sourceRefs: ["source://pointer/docs/source.md#chunk~1"],
-        operationId: "pointer:binding:fingerprint:snapshot",
-      });
-      const db = (core as any).db as import("../storage").StoragePort;
-      const before = db.prepare(
-        `SELECT sync_revision, updated_at, active_observation_id FROM concepts WHERE id = ?`,
-      ).get(source.conceptId) as { sync_revision: number; updated_at: number; active_observation_id: string | null };
-      expect(before.active_observation_id).toBe(source.observationId);
-      core.supersedeObservation(source.observationId, null);
-      const after = db.prepare(
-        `SELECT sync_revision, updated_at, active_observation_id FROM concepts WHERE id = ?`,
-      ).get(source.conceptId) as { sync_revision: number; updated_at: number; active_observation_id: string | null };
-      expect(after).toMatchObject({ sync_revision: before.sync_revision + 1, active_observation_id: null });
-      expect(after.updated_at).toBeGreaterThan(before.updated_at);
-
-      const native = await core.store("Activity-only clock exclusion.");
-      const nativeBefore = db.prepare(`SELECT sync_revision, updated_at FROM concepts WHERE id = ?`)
-        .get(native.conceptId);
-      await core.getConcept(native.conceptId, { synthesize: false });
-      expect(db.prepare(`SELECT sync_revision, updated_at FROM concepts WHERE id = ?`).get(native.conceptId))
-        .toEqual(nativeBefore);
-    } finally {
-      core.close();
-    }
-  });
 
 
   it("normalizes bound observation circles to the post-LWW concept in either clock order", async () => {

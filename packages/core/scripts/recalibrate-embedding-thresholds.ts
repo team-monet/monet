@@ -10,13 +10,7 @@
  *   1. Reproduces embed-check.ts's own curated near-dup/paraphrase/related/unrelated English
  *      sentence categories under BOTH models side by side — a controlled, directly comparable
  *      baseline against the existing (already-validated) thresholds' own derivation methodology.
- *   2. Samples REAL content from a store (concept titles/bodies) under the NEW model only, for
- *      grounding beyond curated English sentences — this repo's real corpus is heavily Korean/
- *      English-mixed, exactly the case the swap targets and the curated set can't exercise:
- *        - "distinct": random cross-concept pairs (different files entirely).
- *        - "same-file section": chunk pairs from the SAME file/concept, different headings —
- *          topically related, not near-duplicate; a realistic "should NOT merge" upper bound.
- *   3. Reports percentile summaries per category and a recommended tauAttach/tauAmbiguous,
+ *   2. Reports percentile summaries per category and a recommended tauAttach/tauAmbiguous,
  *      mirroring the existing thresholds' own placement logic (tauAttach just under the
  *      high-similarity category's low end; tauAmbiguous well above the distinct category's high
  *      end — ADR's conservative-dedup rule: prefer a duplicate over a bad merge).
@@ -24,11 +18,17 @@
  * REPORT ONLY. Nothing here writes to recommendedThresholds or any store — the recommendation is
  * a decision for the John gate, not an automatic change.
  *
+ * THE REAL-CORPUS PHASE RETIRED WITH THE SOURCE SUBSYSTEM (#16). It sampled `kind='source'`
+ * concepts and same-file chunk pairs out of `source_chunks`, so with the subsystem gone it has no
+ * population and its table is dropped — it would fail with `no such table` rather than produce
+ * numbers. It is removed rather than repointed at native concepts: "chunk pairs from the same
+ * file" has no native equivalent, and silently swapping the population would change what the
+ * percentiles mean with no measurement behind the change. Re-grounding these thresholds on a
+ * native corpus is a measurement to design, not a rename.
+ *
  * Usage:
- *   tsx scripts/recalibrate-embedding-thresholds.ts [db-path]
- *   (db-path optional — omit to run the curated-sentence baseline only, no real-data sampling)
+ *   tsx scripts/recalibrate-embedding-thresholds.ts
  */
-import Database from "better-sqlite3";
 import { cosine } from "../src/embedding";
 import { OnnxEmbeddingProvider } from "../src/embedding-onnx";
 
@@ -73,101 +73,18 @@ async function runCuratedBaseline(): Promise<void> {
   }
 }
 
-interface ConceptRow {
-  id: string;
-  title: string;
-  body: string;
-}
-
-function sampleRealConcepts(dbPath: string, limit: number): ConceptRow[] {
-  const db = new Database(dbPath, { readonly: true });
-  try {
-    return db
-      .prepare(
-        `SELECT id, title, body FROM concepts
-         WHERE kind='source' AND status='active' AND length(body) > 40
-         ORDER BY RANDOM() LIMIT ?`,
-      )
-      .all(limit) as ConceptRow[];
-  } finally {
-    db.close();
-  }
-}
-
-function sampleSameFileChunkPairs(dbPath: string, limit: number): Array<[string, string]> {
-  const db = new Database(dbPath, { readonly: true });
-  try {
-    const files = db
-      .prepare(
-        `SELECT concept_id FROM source_chunks WHERE lifecycle='active'
-         GROUP BY concept_id HAVING COUNT(*) >= 2 ORDER BY RANDOM() LIMIT ?`,
-      )
-      .all(limit) as Array<{ concept_id: string }>;
-    const pairs: Array<[string, string]> = [];
-    for (const { concept_id } of files) {
-      const chunks = db
-        .prepare(`SELECT content FROM source_chunks WHERE concept_id=? AND lifecycle='active' ORDER BY document_sequence LIMIT 2`)
-        .all(concept_id) as Array<{ content: string }>;
-      if (chunks.length === 2 && chunks[0].content.length > 40 && chunks[1].content.length > 40) {
-        pairs.push([chunks[0].content, chunks[1].content]);
-      }
-    }
-    return pairs;
-  } finally {
-    db.close();
-  }
-}
-
-async function runRealDataSample(dbPath: string): Promise<void> {
-  console.log("=== Part 2: real corpus sample, NEW model only (multilingual grounding) ===\n");
-  const embedder = new OnnxEmbeddingProvider({ model: NEW_MODEL });
-
-  const concepts = sampleRealConcepts(dbPath, 40);
-  console.log(`Sampled ${concepts.length} real concepts for the "distinct" category.`);
-  const conceptVectors = await Promise.all(concepts.map((c) => embedder.embed(c.body.slice(0, 2000))));
-  const distinctScores: number[] = [];
-  for (let i = 0; i < conceptVectors.length; i++) {
-    for (let j = i + 1; j < conceptVectors.length; j++) {
-      distinctScores.push(cosine(conceptVectors[i], conceptVectors[j]));
-    }
-  }
-
-  const sameFilePairs = sampleSameFileChunkPairs(dbPath, 30);
-  console.log(`Sampled ${sameFilePairs.length} same-file section pairs for the "related (same file)" category.\n`);
-  const sameFileScores: number[] = [];
-  for (const [a, b] of sameFilePairs) {
-    const [va, vb] = await Promise.all([embedder.embed(a.slice(0, 2000)), embedder.embed(b.slice(0, 2000))]);
-    sameFileScores.push(cosine(va, vb));
-  }
-
-  console.log("Distributions (NEW model):");
-  summarize("distinct", distinctScores);
-  summarize("related (same file)", sameFileScores);
-  console.log("");
-
-  const distinctP95 = percentile([...distinctScores].sort((a, b) => a - b), 0.95);
-  const relatedP75 = percentile([...sameFileScores].sort((a, b) => a - b), 0.75);
-  console.log(`  distinct p95 = ${distinctP95.toFixed(3)} (tauAmbiguous should sit above this)`);
-  console.log(`  same-file p75 = ${relatedP75.toFixed(3)} (a reference point — same-file sections are`);
-  console.log(`    topically related by construction and should mostly stay BELOW tauAmbiguous too,`);
-  console.log(`    since they are different headings, not restatements of the same content)`);
-}
-
 async function main(): Promise<void> {
-  const dbPath = process.argv[2];
-
   await runCuratedBaseline();
-  if (dbPath) {
-    await runRealDataSample(dbPath);
-  } else {
-    console.log("(no db-path given — skipping Part 2 real-corpus sample)");
-  }
 
   console.log("\n=== Recommendation (NOT auto-applied — decide at the John gate) ===");
-  console.log("Compare the NEW model's curated near-dup/paraphrase gap against its distinct/same-file");
-  console.log("gap above. Placement mirrors the existing (stale) thresholds' own derivation: tauAttach");
-  console.log("just under the paraphrase score, tauAmbiguous comfortably above the distinct p95 and the");
-  console.log("same-file p75 — never below either, so two different files' sections never silently merge.");
+  console.log("Compare the NEW model's curated near-dup/paraphrase gap against its unrelated gap");
+  console.log("above. Placement mirrors the existing (stale) thresholds' own derivation: tauAttach just");
+  console.log("under the paraphrase score, tauAmbiguous comfortably above the unrelated high end.");
+  console.log("");
+  console.log("CURATED ENGLISH SENTENCES ONLY. The real-corpus half retired with the source subsystem");
+  console.log("(#16) and is not replaced here, so these numbers are not grounded in this store's own");
+  console.log("Korean/English-mixed content — the exact case the model swap targets. Treat the");
+  console.log("recommendation as a baseline, not a calibration, until a native-corpus sample exists.");
 }
 
 main().catch((error) => {
