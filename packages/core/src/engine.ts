@@ -23,8 +23,9 @@ import { StoragePort, BetterSqlitePort, StorageExclusiveLockError } from "./stor
 import { hasCoveringSkeletonSurface, inspectSkeletonMirrors } from "./skeleton-mirror";
 import { MONET_SCHEMA_VERSION } from "./schema-version";
 import {
-  connectorPopulation,
   dropRetiredSourceResidue,
+  isRetirementDisposed,
+  retirementData,
   SourceRetirementRequiredError,
 } from "./source-retirement";
 import {
@@ -785,12 +786,6 @@ export interface Concept {
   lastConfirmedAt: number | null;
 }
 
-/** Connector-only result for reversing one activated source observation. */
-export interface SourceConceptRollbackResult {
-  concept: Concept;
-  replayed: boolean;
-}
-
 /**
  * What `search` returns: shape + depth, never the claim. An agent can judge relevance
  * and see there's substance, but cannot lift an answer — so it must fetch (#232).
@@ -1136,28 +1131,6 @@ export interface RuleCaptureOpts {
   /** Recorded on a declared binding: who ruled. Meaningless without `declaration`. */
   declaredBy?: string;
 }
-
-/** Connector-only source ingestion options. `storeSource` is deliberately not exposed over MCP. */
-export type SourceStoreOpts = Omit<StoreOpts, "kind" | "rule"> & {
-  /**
-   * The chunk's document and section titles, used ONLY to build the text that gets embedded — never
-   * stored, never hashed, never part of the ledger's content comparison.
-   *
-   * A chunk's body is a section stripped of the headings that say what it is about, and those
-   * headings were parsed, stored in `source_chunks.heading_path_json`, and then dropped before
-   * embed(). So a query naming a document had nothing to match: on the live store, a file's own
-   * exact title scored 0.414 against its best chunk, against an unrelated-pair median of 0.328.
-   * Prepending the path costs ~20-40 tokens where chunk medians are 165, and moved that fixture to
-   * 0.600 (measured, scripts/repros/heading-gain.mjs).
-   *
-   * Kept out of the stored content deliberately: `contentHash`, `ingestFingerprint` and
-   * source-ledger's durable receipt validation are all computed from the exact chunker output, so
-   * changing what is stored would churn every fingerprint in the store to fix a retrieval problem.
-   */
-  headingPath?: readonly string[];
-  /** The document's display title (frontmatter or filename). Embed-only, like `headingPath`. */
-  fileTitle?: string;
-};
 
 /**
  * The text actually handed to the embedder for a source chunk: what the section is about, then what
@@ -1633,18 +1606,6 @@ export interface RatifyResult {
 export interface ObservationEntry {
   id: string;
   content: string;
-}
-
-/**
- * File=concept (ratified, Phase 1), Ruling 9. One active chunk under a source concept, as
- * returned by getConcept's outline — structure and position, not content. observationId is
- * needed to call memory_detach on a specific chunk.
- */
-export interface SourceOutlineEntry {
-  headingPath: string[];
-  occurrence: number;
-  segmentIndex: number;
-  observationId: string;
 }
 
 /** A near-duplicate pair surfaced at store time (possible_duplicate_of edge). */
@@ -2445,6 +2406,8 @@ export class MonetCore {
   private db: StoragePort;
   /** Parent directory of the file-backed SQLite path; null for :memory: and custom storage ports. */
   private readonly storeHome: string | null;
+  /** The SQLite file itself; null for :memory: and custom ports. Quoted into remediation commands. */
+  private readonly dbFilePath: string | null;
   private embedder: EmbeddingProvider;
   /** Strict pin-satisfaction loader for ensureEmbedderPin() — see MonetCoreOptions.embedderLoader. */
   private embedderLoader: (modelId: string) => Promise<EmbeddingProvider>;
@@ -2527,6 +2490,7 @@ export class MonetCore {
    */
   constructor(db: string | StoragePort = ":memory:", opts: MonetCoreOptions = {}) {
     this.storeHome = typeof db === "string" && db !== ":memory:" ? dirname(resolve(db)) : null;
+    this.dbFilePath = typeof db === "string" && db !== ":memory:" ? resolve(db) : null;
     // Ownership, tracked because the constructor can now THROW after opening: rung 13 refuses a
     // store whose connector rows have not been disposed of. A caller that catches that error and
     // follows the remediation in the same process must not be racing an unreachable connection for
@@ -3761,20 +3725,27 @@ export class MonetCore {
    * stands in its way.
    */
   private migrateSourceRetirement(): void {
-    // The lower bound is load-bearing, exactly as it is on rung 12: a store deliberately held at an
-    // earlier rung (a graph-disabled open keeps user_version at 0 so the graph backfill slot stays
-    // free) must not be jumped to 13 and have every intermediate migration's slot skipped. It gets
-    // this rung on the open where it actually reaches 12.
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version < FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION || version >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
+    if (version >= SOURCE_RETIREMENT_SCHEMA_VERSION) return;
 
-    const population = connectorPopulation(this.db);
-    if (population.conceptIds.length > 0 || population.observationIds.length > 0) {
-      throw new SourceRetirementRequiredError(this.storeHome ?? "(in-memory store)", {
-        concepts: population.conceptIds.length,
-        observations: population.observationIds.length,
-      });
+    // THE REFUSAL IS CHECKED BEFORE THE VERSION LOWER BOUND, and the order is the whole point. A
+    // graph-disabled open deliberately holds user_version at 0 to keep the graph backfill slot
+    // free, while the previous engine still created the source registry and ingested into it — so
+    // gating the refusal on the rung would let exactly that store serve and mutate its connector
+    // rows as ordinary memories, which is the harm this rung exists to prevent.
+    const data = retirementData(this.db);
+    if (!isRetirementDisposed(data)) {
+      throw new SourceRetirementRequiredError(
+        this.dbFilePath,
+        { concepts: data.conceptIds.length, observations: data.observationIds.length },
+        data.nonemptyTables,
+      );
     }
+
+    // The lower bound governs only the WRITES, exactly as it does on rung 12: a store held at an
+    // earlier rung must not be jumped to 13 and have every intermediate migration's slot skipped.
+    // It gets the residue drop and the bump on the open where it actually reaches 12.
+    if (version < FIRST_BLOCK_RETIREMENT_SCHEMA_VERSION) return;
     dropRetiredSourceResidue(this.db);
     this.db.pragma(`user_version = ${SOURCE_RETIREMENT_SCHEMA_VERSION}`);
   }
@@ -6216,31 +6187,6 @@ export class MonetCore {
    * "the" concept's refresh any more — that is recomputeSourceConceptBody's job, holistic and
    * strictly post-publish (item 4; see its own docstring for why pre-publish would leak).
    */
-  /**
-   * FILE=CONCEPT (ratified, Phase 1), item 4. Recomputes a file concept's title/body/embedding
-   * from its CURRENTLY ACTIVE chunk observations, in document order (document_sequence — heading
-   * occurrence/segment order alone cannot recover cross-heading order across DIFFERENT headings;
-   * see SourceChunk's own docstring, source-chunker.ts). The concept embedding is a FRESH re-embed
-   * of the recomputed body — never a running blend — so there is no drift and every supersession
-   * is exactly correct, never an average of stale and current evidence.
-   *
-   * MUST be called only once the run that touched this concept has DURABLY PUBLISHED, never
-   * mid-staging: recomputing pre-publish would let a reader observe either a not-yet-durable body
-   * (never actually published, if the run later aborts) or a body reflecting some-but-not-all of
-   * the file's chunks (if this file's own staging isn't complete yet) — both are exactly the
-   * "cannot leak historical/partial state" guarantee authorizedSourceProjections exists to
-   * uphold. Post-publish, source_chunks already reflects ONLY the file's final, complete,
-   * currently-active chunk set for the newly-published run, so there is no such window.
-   */
-  /** File=concept (ratified, Phase 1) REVIEW FIX (BLOCKER): every concept a source has durably
-   *  touched but not yet recomputed for — a durable resume queue swept at the start of every sync
-   *  (source-sync.ts) so a concept stranded by any crash between publish and recompute self-heals
-   *  on the next sync, including a noop one. */
-  listPendingRecomputeConcepts(sourceId: string): string[] {
-    return (this.db.prepare(`SELECT concept_id FROM source_recompute_pending WHERE source_id = ?`).all(sourceId) as Array<{ concept_id: string }>)
-      .map((row) => row.concept_id);
-  }
-
   /**
    * REVIEW FIX (MAJOR): every native concept id an embedding-model swap needs to re-embed
    * (kind != 'workstream', not source-owned, not retired). COLD-AUDIT FIX: this is a deliberate

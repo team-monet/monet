@@ -19,6 +19,7 @@
  * has run. Refusing is the honest failure: the alternative is either destroying rows silently or
  * serving them as ordinary memories now that every native query has stopped excluding them.
  */
+import { dirname } from "node:path";
 import type { StoragePort } from "./storage";
 
 /** Every table the retired source subsystem owned. Dropped whole; none is read any more. */
@@ -36,22 +37,44 @@ export interface ConnectorPopulation {
   observationIds: string[];
 }
 
+export interface RetirementData extends ConnectorPopulation {
+  /** Retired tables that still hold rows — registry entries, ledger runs, attempt history. */
+  nonemptyTables: string[];
+}
+
 /** Thrown when a store cannot be served because its connector rows have not been disposed of yet. */
 export class SourceRetirementRequiredError extends Error {
   constructor(
-    readonly dbPath: string,
+    /** The store file itself, not its directory — the remediation below is quoted against it. */
+    readonly dbPath: string | null,
     readonly population: { concepts: number; observations: number },
+    readonly nonemptyTables: string[] = [],
   ) {
+    // THE COMMAND CARRIES --dir WHEN THE STORE IS NOT THE DEFAULT ONE. An unqualified
+    // `monet retire-source` resolves the ambient default store, so an operator who ran
+    // `monet start -d /srv/project/.monet` and pasted the bare command back would irreversibly
+    // purge a DIFFERENT store than the one that refused.
+    const target = dbPath === null ? "" : ` --dir ${shellQuote(dirname(dbPath))}`;
+    const held = [
+      `${population.concepts} connector-owned concept(s)`,
+      `${population.observations} observation(s)`,
+      ...(nonemptyTables.length > 0 ? [`data in ${nonemptyTables.join(", ")}`] : []),
+    ].join(", ");
     super(
-      `this store still holds ${population.concepts} connector-owned concept(s) and ` +
-        `${population.observations} observation(s) from the source subsystem, retired in #16. ` +
-        `They are a materialized copy of files outside the store, and no surface in this build can ` +
-        `read, re-sync, or repair them — but removing them is irreversible, so this build will not ` +
-        `do it implicitly. Run \`monet retire-source --apply --yes\` (it takes a verified backup ` +
-        `first), or stay on a 1.6.x build if you still need that content.`,
+      `this store still holds ${held} from the source subsystem, retired in #16. That content is a ` +
+        `materialized copy of files outside the store plus the registry describing them, and no ` +
+        `surface in this build can read, re-sync, or repair it — but removing it is irreversible, ` +
+        `so this build will not do it implicitly. Run ` +
+        `\`monet retire-source${target} --apply --yes\` (it takes a verified backup first), or ` +
+        `stay on a 1.6.x build if you still need that content.`,
     );
     this.name = "SourceRetirementRequiredError";
   }
+}
+
+/** Single-quote for a POSIX shell so a path with spaces survives being pasted back. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 function conceptColumns(db: StoragePort): Set<string> {
@@ -69,10 +92,15 @@ function tableExists(db: StoragePort, table: string): boolean {
  * carry them as `kind='source'`, which is why the predicate is assembled rather than fixed.
  */
 export function connectorPopulation(db: StoragePort): ConnectorPopulation {
+  // EVERY MARKER THAT IS ACTUALLY PRESENT, not all-or-nothing. The two columns were added by
+  // separate ALTER statements, so an interrupted upgrade can leave exactly one — and requiring
+  // both would fall back to `kind` alone, miss the rows the surviving column marks, and let the
+  // residue drop remove that column and turn them into ordinary memories.
   const columns = conceptColumns(db);
-  const marker = RETIRED_SOURCE_COLUMNS.every((column) => columns.has(column))
-    ? `kind = 'source' OR source_identity IS NOT NULL OR active_observation_id IS NOT NULL`
-    : `kind = 'source'`;
+  const marker = [
+    `kind = 'source'`,
+    ...RETIRED_SOURCE_COLUMNS.filter((column) => columns.has(column)).map((column) => `${column} IS NOT NULL`),
+  ].join(" OR ");
   const conceptIds = (db.prepare(`SELECT id FROM concepts WHERE ${marker}`).all() as Array<{ id: string }>)
     .map((row) => row.id);
   const observationIds = (db.prepare(
@@ -83,9 +111,33 @@ export function connectorPopulation(db: StoragePort): ConnectorPopulation {
 }
 
 /**
+ * Everything the retirement has to dispose of: the connector rows, and any retired table that
+ * still holds data.
+ *
+ * THE TABLES ARE NOT AUTOMATICALLY RESIDUE. `monet source add` wrote a `knowledge_sources` row
+ * before any sync succeeded, and a failed attempt could fill ledger tables without ever creating a
+ * concept — so a zero concept/observation count does not mean there is nothing to lose. Counting
+ * rows alone would report "nothing to retire", skip the backup, and let the next ordinary open
+ * drop a registered source's configuration and attempt history for good.
+ */
+export function retirementData(db: StoragePort): RetirementData {
+  const population = connectorPopulation(db);
+  const nonemptyTables = RETIRED_SOURCE_TABLES.filter(
+    (table) => tableExists(db, table) &&
+      ((db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n > 0),
+  );
+  return { ...population, nonemptyTables };
+}
+
+/** True when nothing is left to dispose of and the residue drop is safe to run unattended. */
+export function isRetirementDisposed(data: RetirementData): boolean {
+  return data.conceptIds.length === 0 && data.observationIds.length === 0 && data.nonemptyTables.length === 0;
+}
+
+/**
  * Drop the subsystem's own tables and marker columns. Non-destructive by construction: it is only
- * ever correct once `connectorPopulation` is empty, and every surviving row has NULL in both
- * columns because the rows that could hold a value are exactly the ones that had to go first.
+ * ever correct once `isRetirementDisposed` holds, so every table it drops is empty and every
+ * surviving row has NULL in the columns it removes.
  */
 export function dropRetiredSourceResidue(db: StoragePort): void {
   // ONE WRITE TRANSACTION, AND EACH OBJECT RE-CHECKED INSIDE IT. Concurrent first opens are a

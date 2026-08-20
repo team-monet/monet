@@ -24,7 +24,6 @@ export {
 } from "./engine";
 export type {
   Concept,
-  SourceConceptRollbackResult,
   SearchCard,
   IngestResult,
   IngestAction,
@@ -42,7 +41,6 @@ export type {
   SkeletonBody,
   SkeletonBreadth,
   StageView,
-  SourceStoreOpts,
   MonetCoreOptions,
   Workstream,
   WorkstreamPayload,
@@ -316,8 +314,10 @@ export type {
 export {
   connectorPopulation,
   dropRetiredSourceResidue,
+  isRetirementDisposed,
+  retirementData,
   purgeConnectorPopulation,
   RETIRED_SOURCE_TABLES,
   SourceRetirementRequiredError,
 } from "./source-retirement";
-export type { ConnectorPopulation } from "./source-retirement";
+export type { ConnectorPopulation, RetirementData } from "./source-retirement";

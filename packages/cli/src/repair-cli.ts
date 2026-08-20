@@ -7,10 +7,12 @@ import {
   HashingEmbeddingProvider,
   MonetCore,
   OnnxEmbeddingProvider,
-  connectorPopulation,
+  dropRetiredSourceResidue,
+  isRetirementDisposed,
   inspectStoredEmbedderState,
   instantiateEmbedderForPin,
   purgeConnectorPopulation,
+  retirementData,
   validateEmbeddingProviderOutput,
   type EmbeddingMigrationProgress,
   type EmbeddingMigrationReport,
@@ -1121,25 +1123,29 @@ export function registerRecoveryCommands(
       }
 
       const port = dependencies.createPort(dbPath);
-      let population: { conceptIds: string[]; observationIds: string[] };
+      let data: ReturnType<typeof retirementData>;
       try {
-        population = connectorPopulation(port);
+        data = retirementData(port);
       } finally {
         if (!options.apply) port.close();
       }
-      const counts = { concepts: population.conceptIds.length, observations: population.observationIds.length };
+      const counts = { concepts: data.conceptIds.length, observations: data.observationIds.length };
 
-      if (counts.concepts === 0 && counts.observations === 0) {
+      if (isRetirementDisposed(data)) {
         if (options.apply) port.close();
-        console.log("Nothing to retire: this store holds no connector-owned rows.");
-        console.log("Open it normally — the residual tables and columns are dropped on the next open.");
+        console.log("Nothing to retire: this store holds no connector-owned rows and no registry data.");
+        console.log("Open it normally — the empty tables and marker columns are dropped on the next open.");
         return;
       }
 
       if (!options.apply) {
         console.log(`Connector-owned rows: ${counts.concepts} concept(s), ${counts.observations} observation(s).`);
-        console.log("These are a materialized copy of files outside the store. The source subsystem that");
-        console.log("could read, re-sync, or repair them was retired (#16), so deleting them is permanent.");
+        if (data.nonemptyTables.length > 0) {
+          console.log(`Registry/ledger data:  ${data.nonemptyTables.join(", ")}`);
+        }
+        console.log("These are a materialized copy of files outside the store, plus the registry describing");
+        console.log("them. The subsystem that could read, re-sync, or repair them was retired (#16), so");
+        console.log("deleting them is permanent.");
         console.log(`Backup:     taken automatically by --apply --yes`);
         console.log(`Apply with: ${commandBase(dbPath).replace(" repair", " retire-source")} --apply --yes`);
         return;
@@ -1151,9 +1157,15 @@ export function registerRecoveryCommands(
         const backup = await port.createVerifiedBackup(destination);
         console.error(`backup: ${backup.path}`);
         const purged = purgeConnectorPopulation(port);
+        // BEHIND THE BACKUP, AND ONLY HERE. The tables may still hold a registered source's
+        // configuration and its attempt history, which a zero row count does not rule out — so the
+        // drop belongs on this side of the backup, never in an ordinary open.
+        dropRetiredSourceResidue(port);
         console.log(`Retired ${purged.concepts} concept(s) and ${purged.observations} observation(s).`);
-        console.log(`Backup:  ${backup.path}`);
-        console.log("The subsystem's own tables and columns are dropped on the next open.");
+        if (data.nonemptyTables.length > 0) {
+          console.log(`Dropped:  ${data.nonemptyTables.join(", ")} (and the rest of the retired schema).`);
+        }
+        console.log(`Backup:   ${backup.path}`);
       } finally {
         port.close();
       }

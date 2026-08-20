@@ -29,6 +29,7 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 // better-sqlite3 is externalized by esbuild and provided by the runtime node_modules.
 import Database from "better-sqlite3";
+import { isRetirementDisposed, retirementData, SourceRetirementRequiredError } from "@team-monet/core";
 
 import { getDbPath } from "../db/index.js";
 // P1-B/P2-D (Codex round 4 on PR #42): every getDbPath() call in this module was bare (cwd-
@@ -155,21 +156,17 @@ function querySnap(snapPath: string, sql: string): Record<string, unknown>[] {
 // engine.ts filters `status != 'retired'` in 90+ read paths (e.g. listCircles
 // at engine.ts:4536), and the dashboard previously didn't mirror that at all —
 // every retired concept (82% of a mature store) rendered as a first-class
-// node/row right alongside live ones. Unlike SOURCE_MARKER/kind='source' (which
-// stays visible per John's no-hiding ruling), retired concepts are excluded by
+// node/row right alongside live ones. Retired concepts are excluded by
 // default here; `includeRetired=1` on the affected /api routes restores the
 // unfiltered query below. status='disputed' is a different value of the same
 // column and is never touched by this filter — disputed concepts stay visible
 // in both modes, matching John's ruling that disputed must always show.
 const RETIRED_FILTER = `status != 'retired'`;
 
-// Exported so dashboard-source-marker.test.ts can run the real query strings
-// against a seeded test DB, rather than testing a parallel reimplementation of
-// the marker-union logic that could silently drift from what actually runs.
+// Exported so tests can run the real query strings against a seeded test DB,
+// rather than a parallel reimplementation that could silently drift.
 export const SQL = {
-  // Full concepts table, minus retired rows by default (see RETIRED_FILTER) —
-  // including raw ingested "source" content (e.g. Obsidian vault chunks), which
-  // stays first-class per John's no-hiding ruling (unaffected by this filter).
+  // Full concepts table, minus retired rows by default (see RETIRED_FILTER).
   // This is also the array that becomes graph nodes AND the Concepts tab's
   // rows. Scale is bounded client-side (GRAPH_NODE_LIMIT on the Graph tab,
   // simple pagination on the Concepts tab if needed) rather than by excluding
@@ -193,10 +190,7 @@ export const SQL = {
     ORDER BY updated_at DESC
   `,
 
-  // Full observations table — every row, including observations belonging to
-  // source concepts (the chunk text itself). No longer filtered by kind='source'
-  // or by parent-concept marker per John's no-hiding ruling; see SOURCE_MARKER
-  // above.
+  // Full observations table — every row.
   observations: `
     SELECT id, content, kind, circle, concept_id, session_id,
            author_agent_id, created_at, source_refs
@@ -204,13 +198,8 @@ export const SQL = {
     ORDER BY created_at DESC
   `,
 
-  // Full edge table, still excluding dismissed edges (unrelated to source
-  // visibility — dismissal is a separate, deliberate user action). Previously
-  // also excluded edges touching a source concept on either end; per John's
-  // no-hiding ruling that filter is removed. In the audited store the engine
-  // never links source/chunk concepts into the graph anyway (0 of 39,196 live
-  // edges touch a source concept), so this is a no-op on today's data and a
-  // correctness fix for whenever that invariant stops holding.
+  // Full edge table, excluding dismissed edges (dismissal is a separate,
+  // deliberate user action).
   //
   // Retired-exclusion default: joined to concepts on BOTH endpoints so an edge
   // with either endpoint retired is dropped entirely — a graph node that
@@ -457,10 +446,39 @@ function emptyGraphPayload(): unknown {
   };
 }
 
+/**
+ * THE DASHBOARD NEEDS ITS OWN RETIREMENT GUARD (#16). Every other surface goes through
+ * `new MonetCore(...)`, whose rung-13 migration refuses a store that still holds connector rows —
+ * but the dashboard never constructs a core. It snapshots the SQLite file and queries it directly,
+ * and its queries stopped excluding connector rows when the subsystem was retired, so an unretired
+ * store would render exactly the population `start` and `status` refuse to serve.
+ *
+ * Checked against the SNAPSHOT rather than the live file: it is the thing actually being read, and
+ * opening the live store read-write here would fight the servers this dashboard exists to observe.
+ */
+function assertRetirementDisposed(snapPath: string): void {
+  const db = new Database(snapPath, { readonly: true });
+  try {
+    // `retirementData` reads through `prepare` only, which a raw better-sqlite3 handle satisfies —
+    // no StoragePort is constructed here, and none should be: this is a readonly snapshot.
+    const data = retirementData(db as unknown as Parameters<typeof retirementData>[0]);
+    if (!isRetirementDisposed(data)) {
+      throw new SourceRetirementRequiredError(
+        getDbPath(resolveProjectDir()),
+        { concepts: data.conceptIds.length, observations: data.observationIds.length },
+        data.nonemptyTables,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
 async function handleGraph(includeRetired: boolean): Promise<unknown> {
   if (!fs.existsSync(getDbPath(resolveProjectDir()))) return emptyGraphPayload();
   const snap = await makeSnapshot();
   try {
+    assertRetirementDisposed(snap);
     const concepts           = querySnap(snap, includeRetired ? SQL.conceptsIncludeRetired : SQL.concepts);
     const observations       = querySnap(snap, SQL.observations);
     const edges              = querySnap(snap, includeRetired ? SQL.edgesIncludeRetired : SQL.edges);
@@ -568,6 +586,7 @@ async function handleEntities(includeRetired: boolean): Promise<unknown> {
   if (!fs.existsSync(getDbPath(resolveProjectDir()))) return { entities: [], links: [] };
   const snap = await makeSnapshot();
   try {
+    assertRetirementDisposed(snap);
     const entities = querySnap(snap, SQL.entities);
     const links    = querySnap(snap, includeRetired ? SQL.entityLinksIncludeRetired : SQL.entityLinks);
     return { entities, links };
@@ -577,120 +596,6 @@ async function handleEntities(includeRetired: boolean): Promise<unknown> {
 }
 
 // ── Sources ──────────────────────────────────────────────────────────────────
-
-/**
- * Registry status derivation — mirrors deriveStatus() in monet-core's
- * source-registry (the status is not a stored column). One deliberate
- * divergence: a corrupt applied>config row displays as pending-replacement
- * instead of throwing — a read-only view must not 500 on a corrupt store.
- */
-export function deriveSourceStatus(row: {
-  lifecycle: string;
-  config_version: number;
-  applied_config_version: number | null;
-}): string {
-  if (row.lifecycle === "tombstoned") return "tombstoned";
-  if (row.applied_config_version == null) return "pending-initial-sync";
-  if (row.applied_config_version === row.config_version) return "active";
-  return "pending-replacement";
-}
-
-/** Failure backoff — mirrors cappedBackoff() in monet-core's source-scheduler. */
-export function sourceBackoffMs(intervalMs: number, streak: number): number {
-  let value = 30_000;
-  for (let i = 1; i < streak && value < intervalMs; i += 1) value = Math.min(intervalMs, value * 2);
-  return Math.min(intervalMs, value);
-}
-
-export interface SourceAttemptOutcome {
-  attemptedAt: number;
-  result: string | null;
-}
-
-/** The event-row shape terminalOutcomes consumes (attempt event + joined run). */
-export interface SourceAttemptEventRow {
-  kind: string;
-  runId: string | null;
-  attemptedAt: number;
-  invocationResult: string | null;
-  configVersion: number | null;
-  leaseFence: number | null;
-  runResult: string | null;
-  runPublishedAt: number | null;
-  runFinishedAt: number | null;
-}
-
-/**
- * Terminal-outcome projection — mirrors the engine's scheduleBasisSnapshot loop
- * (source-ledger) over fence-scoped events, newest first:
- *   - events outside the source's CURRENT config_version/lease_fence are
- *     ignored (a config update bumps both and resets the failure streak);
- *   - verification counts as success (it breaks a failure streak);
- *   - pre-pin-failure counts as failed;
- *   - invocation carries its own result and always marks its run seen;
- *   - a run event counts only if not already covered by its invocation receipt,
- *     anchored at max(attempted_at, published_at, finished_at).
- */
-export function terminalOutcomes(
-  events: SourceAttemptEventRow[], // newest first
-  configVersion: number,
-  leaseFence: number,
-): SourceAttemptOutcome[] {
-  const seenRuns = new Set<string>();
-  const terminals: SourceAttemptOutcome[] = [];
-  for (const row of events) {
-    if (row.configVersion !== configVersion || row.leaseFence !== leaseFence) continue;
-    let result: string | null = null;
-    let attemptedAt = row.attemptedAt;
-    if (row.kind === "verification") result = "success";
-    else if (row.kind === "pre-pin-failure") result = "failed";
-    else if (row.kind === "invocation") {
-      result = row.invocationResult;
-      if (row.runId) seenRuns.add(row.runId);
-    } else if (row.runId && !seenRuns.has(row.runId) && row.runResult !== null) {
-      result = row.runResult;
-      attemptedAt = Math.max(attemptedAt, row.runPublishedAt ?? -1, row.runFinishedAt ?? -1);
-      seenRuns.add(row.runId);
-    }
-    if (result) terminals.push({ attemptedAt, result });
-  }
-  return terminals;
-}
-
-/**
- * Approximate the engine scheduler's next-attempt plan from durable state only.
- * The engine adds a deterministic jitter (≤30s or 10% of the interval) and a
- * recovery branch driven by ledger internals; this read-only view anchors on the
- * latest terminal attempt and skips the jitter, so nextAttemptAt is approximate.
- */
-export function computeSourceSchedule(
-  src: { lifecycle: string; refresh_mode: string; refresh_interval_seconds: number | null },
-  outcomes: SourceAttemptOutcome[], // newest first, terminal outcomes only
-  hasLiveRun: boolean,
-  now: number,
-): { state: string; nextAttemptAt: number | null; consecutiveFailures: number } {
-  if (hasLiveRun) return { state: "syncing", nextAttemptAt: null, consecutiveFailures: 0 };
-  if (src.lifecycle !== "active" || src.refresh_mode !== "interval" || !src.refresh_interval_seconds) {
-    return { state: "manual", nextAttemptAt: null, consecutiveFailures: 0 };
-  }
-  const intervalMs = src.refresh_interval_seconds * 1000;
-  if (outcomes.length === 0) {
-    // Never attempted: the engine schedules the initial sync within a short
-    // startup spread, so "due" is the honest display state.
-    return { state: "due", nextAttemptAt: now, consecutiveFailures: 0 };
-  }
-  const latest = outcomes[0];
-  let failures = 0;
-  for (const o of outcomes) {
-    if (o.result !== "success") failures += 1;
-    else break;
-  }
-  const failed = latest.result !== "success";
-  const delay = failed ? sourceBackoffMs(intervalMs, Math.max(1, failures)) : intervalMs;
-  const nextAttemptAt = latest.attemptedAt + delay;
-  const state = nextAttemptAt <= now ? "due" : failed ? "backoff" : "scheduled";
-  return { state, nextAttemptAt, consecutiveFailures: failures };
-}
 
 // ── Static file serving ──────────────────────────────────────────────────────
 
@@ -790,6 +695,14 @@ export function startDashboard(port: number): void {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not found", pathname }));
     } catch (err) {
+      // A DELIBERATE REFUSAL IS NOT AN INTERNAL ERROR. The retirement guard exists to tell the
+      // operator what to run; collapsing it into a bare 500 would withhold exactly that.
+      if (err instanceof SourceRetirementRequiredError) {
+        console.error("Refusing to serve an unretired store:", err.message);
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message, code: "source-retirement-required" }));
+        return;
+      }
       console.error("Handler error:", err);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "internal error" }));

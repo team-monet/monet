@@ -76,11 +76,13 @@ async function withStore(run: (dbPath: string) => Promise<void>): Promise<void> 
   }
 }
 
-/** The destructive half as `monet retire-source` runs it — on the port, without a core. */
+/** The destructive half as `monet retire-source --apply` runs it: purge, then drop, behind a backup. */
 function purgeOnPort(dbPath: string): { concepts: number; observations: number } {
   const port = new BetterSqlitePort(dbPath);
   try {
-    return purgeConnectorPopulation(port);
+    const purged = purgeConnectorPopulation(port);
+    dropRetiredSourceResidue(port);
+    return purged;
   } finally {
     port.close();
   }
@@ -102,7 +104,7 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
       }
       expect(caught).toBeInstanceOf(SourceRetirementRequiredError);
       expect((caught as SourceRetirementRequiredError).population).toEqual({ concepts: 1, observations: 1 });
-      expect((caught as Error).message).toContain("monet retire-source --apply --yes");
+      expect((caught as Error).message).toMatch(/monet retire-source --dir '.*' --apply --yes/);
 
       // REFUSED MEANS UNTOUCHED, not half-migrated: the store is exactly as it was.
       const port = new BetterSqlitePort(dbPath);
@@ -263,6 +265,67 @@ describe("schema 12 → 13 — source subsystem retirement", () => {
       } finally {
         first.close();
         second.close();
+      }
+    });
+  });
+
+  it("refuses a store whose connector rows are marked only by the one column an interrupted upgrade left", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const db = raw(seeded);
+      // The two ALTERs were separate statements; an interrupt between them leaves exactly one.
+      db.exec(`ALTER TABLE concepts ADD COLUMN source_identity TEXT`);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO concepts (id, slug, title, body, kind, status, confidence, version, circle,
+                               support_count, dirty, embedding, updated_at, created_at, source_identity)
+         VALUES ('half-marked', 'doc', 'Doc', 'body', 'fact', 'active', 0.5, 1, 'default', 1, 0, '[]', ?, ?, 'source://a')`,
+      ).run(now, now);
+      db.pragma("user_version = 12");
+      seeded.close();
+
+      // kind is 'fact' here: only the surviving marker column identifies it. Requiring BOTH columns
+      // would report nothing to purge and then drop the column, turning it into ordinary memory.
+      expect(() => new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 }))
+        .toThrow(SourceRetirementRequiredError);
+    });
+  });
+
+  it("refuses a graph-disabled store held at user_version 0, where the rung's own lower bound would skip it", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { graphEnabled: false, tauAttach: 1.1, tauAmbiguous: 1.1 });
+      expect(raw(seeded).pragma("user_version", { simple: true })).toBe(0);
+      seedSchema12(seeded);
+      raw(seeded).pragma("user_version = 0"); // as a graph-disabled store actually sits
+      seeded.close();
+
+      // The refusal is checked BEFORE the lower bound; gating it on the rung would serve these rows.
+      expect(() => new MonetCore(dbPath, { graphEnabled: false, tauAttach: 1.1, tauAmbiguous: 1.1 }))
+        .toThrow(SourceRetirementRequiredError);
+    });
+  });
+
+  it("refuses a store whose only retirement data is a registered source that never synced", async () => {
+    await withStore(async (dbPath) => {
+      const seeded = new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 });
+      const db = raw(seeded);
+      db.exec(`CREATE TABLE IF NOT EXISTS knowledge_sources (id TEXT PRIMARY KEY, circle TEXT)`);
+      db.prepare(`INSERT INTO knowledge_sources (id, circle) VALUES ('registered-never-synced', 'default')`).run();
+      db.pragma("user_version = 12");
+      seeded.close();
+
+      // Zero concepts and zero observations — counting rows alone would call this disposable
+      // residue, skip the backup, and drop the registration on an ordinary open.
+      let caught: unknown;
+      try { new MonetCore(dbPath, { tauAttach: 1.1, tauAmbiguous: 1.1 }); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(SourceRetirementRequiredError);
+      expect((caught as SourceRetirementRequiredError).nonemptyTables).toEqual(["knowledge_sources"]);
+
+      const port = new BetterSqlitePort(dbPath);
+      try {
+        expect(port.prepare(`SELECT COUNT(*) AS n FROM knowledge_sources`).get()).toEqual({ n: 1 });
+      } finally {
+        port.close();
       }
     });
   });
