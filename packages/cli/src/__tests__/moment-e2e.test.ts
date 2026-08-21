@@ -29,7 +29,13 @@ import { MonetCore, readGovernedMoment } from "@team-monet/core";
 import { buildWrapperScript, POST_TOOL_USE_FLAG } from "../install-cli";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
-const CLI_DIST = join(REPO_ROOT, "dist/cli.js");
+// SOURCE, NOT `dist/`. CI runs typecheck -> test -> build, so `dist/cli.js` does not exist when
+// these tests run: pointing at it passed locally on a stale build and failed in CI with the
+// wrapper unable to spawn the gate at all. Same invocation the install-cli rehearsal uses.
+const CLI_ENTRY = join(REPO_ROOT, "src/cli.ts");
+// An ABSOLUTE path to tsx's loader: `--import tsx` resolves against the CHILD's cwd, and these
+// wrappers are spawned from temp directories. See gate-cli.test.ts's own note.
+const TSX_LOADER = join(REPO_ROOT, "node_modules/tsx/dist/loader.mjs");
 const dirs: string[] = [];
 afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
 
@@ -66,8 +72,18 @@ async function buildRig(): Promise<Rig> {
   core.materializeGateMirror();
   core.close();
 
+  // The real wrapper, with the one adaptation this repo's tests make to run against source rather
+  // than a build: splice the TS loader into the PRIMARY gate spawn. It changes nothing about the
+  // JSON the wrapper reads or emits, and leaves the PATH-fallback spawn untouched, exactly as the
+  // install-cli rehearsal does.
+  const script = buildWrapperScript({ execPath: process.execPath, scriptPath: CLI_ENTRY })
+    .replace(
+      "const MONET_EXEC = ",
+      `const NODE_LOADER_ARGS = ["--import", ${JSON.stringify(TSX_LOADER)}];\nconst MONET_EXEC = `,
+    )
+    .replace("[MONET_SCRIPT, ...gateArgs]", "[...NODE_LOADER_ARGS, MONET_SCRIPT, ...gateArgs]");
   const wrapperPath = join(storageDir, "gate-hook.mjs");
-  writeFileSync(wrapperPath, buildWrapperScript({ execPath: process.execPath, scriptPath: CLI_DIST }));
+  writeFileSync(wrapperPath, script);
   chmodSync(wrapperPath, 0o755);
   return { storageDir, projectDir, spool, dbPath, mirrorPath, wrapperPath };
 }
