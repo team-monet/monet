@@ -1,6 +1,7 @@
 import {
   MonetCore,
   chooseStoreEmbedder,
+  inStartupPhase,
   type EmbeddingProvider,
 } from "@team-monet/core";
 
@@ -47,14 +48,24 @@ export interface ServedCoreOptions {
 
 type StoreEmbedderSelector = (dbPath: string) => Promise<EmbeddingProvider>;
 
-/** Open a core that will be served, selecting the embedder from the store's durable pin first. */
+/**
+ * Open a core that will be served, selecting the embedder from the store's durable pin first.
+ *
+ * BOTH STEPS ARE PHASE-TAGGED (#13). These are the two widest fallible regions of startup and they
+ * run before the server factory is even entered, so every throw here reaches the host as
+ * `Connection closed` — with, until now, nothing to say which of the two it was. The distinction is
+ * not academic: the model load/download and the SQLite open fail for unrelated reasons and have
+ * unrelated fixes, and the one real incident behind #12 (a `database is locked` at 2026-08-01
+ * 15:21, retried twice, third attempt fine) was misread as the model download precisely because
+ * the two are indistinguishable from outside. See @team-monet/core's startup-diagnosis module.
+ */
 export async function openServedCore(
   dbPath: string,
   options: ServedCoreOptions,
   selectEmbedder: StoreEmbedderSelector = chooseStoreEmbedder,
 ): Promise<MonetCore> {
-  const embedder = await selectEmbedder(dbPath);
-  return new MonetCore(dbPath, { ...options, embedder });
+  const embedder = await inStartupPhase("embedder-selection", () => selectEmbedder(dbPath));
+  return await inStartupPhase("store-open", () => new MonetCore(dbPath, { ...options, embedder }));
 }
 
 /** Open the non-embedding status path without allowing construction to mint a pin. */

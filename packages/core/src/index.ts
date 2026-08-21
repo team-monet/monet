@@ -260,6 +260,28 @@ export { createMonetCoreMcpServer } from "./mcp-server";
 export { CIRCLE_NAME_MAX_CHARS } from "./mcp-server";
 export type { CreateMonetCoreMcpServerOptions } from "./mcp-server";
 export { deriveCircle } from "./circle";
+
+/** The startup failure record (#13) — a server that dies before the transport connects has no
+ *  protocol channel to say why, so the cause is written beside the store instead. Exported because
+ *  the writers are the ENTRY POINTS, which live in the CLI package, and the reader is `monet
+ *  doctor`, which lives there too. */
+export {
+  STARTUP_FAILURE_FORMAT,
+  STARTUP_FAILURE_SUFFIX,
+  inStartupPhase,
+  markStartupPhase,
+  readStartupFailure,
+  recordStartupFailure,
+  startupFailurePath,
+  startupPhaseOf,
+} from "./startup-diagnosis";
+export type {
+  RecordStartupFailureOptions,
+  StartupFailureRead,
+  StartupFailureRecord,
+  StartupPhase,
+} from "./startup-diagnosis";
+
 export type {
   GraftPayload,
   GraftResult,

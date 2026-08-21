@@ -8,6 +8,7 @@ import { ensureMonetDir, getDbPath, getGateMirrorPath, getMomentSpoolPath, getMo
 import { deriveCircle, deriveCallerId, deriveProjectId } from "./circle.js";
 import { generateAgentConfig, toYaml } from "./config-cli.js";
 import { openServedCore, openStatusCore } from "./bootstrap.js";
+import { reportStartupFailure } from "./startup-report.js";
 import { registerRecoveryCommands } from "./repair-cli.js";
 import { registerGateCommands } from "./gate-cli.js";
 import { registerInstallCommands } from "./install-cli.js";
@@ -59,66 +60,94 @@ program
     // repo — Claude Code sets CLAUDE_PROJECT_DIR and documents that servers shouldn't rely on cwd
     // — so prefer an explicit project dir, then fall back to cwd.
     const projectDir = resolveProjectDir();
-    // P1-1 (Codex round 3 on PR #42): ensureMonetDir(projectDir) — NOT bare ensureMonetDir() —
-    // and computed AFTER projectDir (moved down from above), so it creates the SAME directory
-    // getDbPath(projectDir) below will open. Bare ensureMonetDir() created (or no-op'd on) the
-    // CWD-rooted .monet dir; with projectDir !== cwd (cwd has its own .monet, the target does
-    // not), the target's parent directory never got created and better-sqlite3's own open call
-    // failed CANTOPEN — it does not create missing parent directories, only the file.
-    ensureMonetDir(projectDir);
-    const circle = deriveCircle(projectDir);
-    // See src/index.ts / src/circle.ts: @team-monet/core only picks up source-authorization
-    // context from these two env vars (no options-object seam), so every entry point that
-    // constructs the server must set them before createMonetCoreMcpServer runs. Assign
-    // UNCONDITIONALLY (not setIfBlank/??=): deriveCallerId/deriveProjectId already implement the
-    // full precedence (non-blank override wins, TRIMMED; blank/unset → derived default), so
-    // reassigning here also normalizes a whitespace-padded operator override in place instead of
-    // leaving it raw for @team-monet/core's deriveOptsFromEnv (which does not trim) to deny every
-    // ACL match against.
-    process.env.MONET_CALLER_ID = deriveCallerId();
-    process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
-    // COMPONENT B (4b-D): wire mirror materialization into the ONE long-running serving process.
-    // Rooted at `projectDir` (not bare cwd) via getGateMirrorPath's own baseDir parameter — the
-    // SAME project dir `circle` was just derived from, and the SAME default `monet gate` itself
-    // resolves to when nothing overrides it (gate-cli.ts's own defaultGateCliDependencies) — one
-    // project notion, three call sites. See bootstrap.ts's ServedCoreOptions.gateSidecarPath for
-    // why this is the only writer surface.
+    // #13: EVERY throw from here down reaches the host as `-32000: Connection closed`, because the
+    // transport does not exist until createMonetCoreMcpServer connects it. The catch does not
+    // change what the host sees — nothing can, without a protocol channel — it leaves the cause
+    // somewhere addressable and rethrows into the shared parseAsync handler below, which still owns
+    // the message and the exit code. See startup-report.ts.
     //
-    // FIX 1 (Codex round 2 on PR #42): getDbPath(projectDir) — NOT bare getDbPath() — is the fix
-    // itself. Bare getDbPath() resolves via getMonetDir()'s own internal process.cwd() default, a
-    // SEPARATE "which project" notion from `projectDir` (resolveProjectDir(): MONET_PROJECT_DIR /
-    // CLAUDE_PROJECT_DIR, falling back to cwd — see that function's own doc comment, "a host may
-    // spawn monet from elsewhere"). With MONET_PROJECT_DIR=A and cwd=B (both with their own
-    // project-local .monet dirs), the OLD code opened the SERVED STORE at B (bare getDbPath()) while
-    // materializing the MIRROR at A (getGateMirrorPath(projectDir) already used projectDir) — a
-    // declaration made through this exact session would land in B's store but refresh A's mirror,
-    // the wrong-project class again, one layer deeper than the P1-B/round-1 fix (which paired
-    // circle.ts's OWN internal store lookup with projectDir; this pairs the SERVED CORE's store with
-    // it too). Rooting the store and the mirror at the SAME projectDir is what makes "one project
-    // notion, three call sites" (this comment's own opening line) actually true, not just asserted.
-    // SPOOL: the same "one long-running serving process is the one positioned to maintain it"
-    // argument the mirror above is wired on, applied to the governed-moment record. Without this,
-    // store-side interception, the ask signal and every conformance surface are silently inert in
-    // the shipped binary — the option is optional at the seam, never at an entry point.
+    // IT OPENS HERE, above ensureMonetDir, not at the store open (Codex round 1, PR #79). An
+    // uncreatable storage path — `--dir` under a regular file, an unwritable home — throws out of
+    // `ensureMonetDir` and is a STORAGE-PATH failure, the very class #13 names; with the try
+    // starting below it, `monet start` answered that with a bare ENOTDIR line and nothing else,
+    // while the stdio entry point (whose whole `main` is inside its handler) reported it properly.
+    // The one server behaved differently depending on which launch path a host used.
     //
-    // NOT rooted at `projectDir`, and the one line here that deliberately steps outside "one
-    // project notion, three call sites" above: unlike the store and the mirror, the spool is ONE
-    // stream shared with writers that do not run in this process at all — the installed hook
-    // wrapper and `monet gate` — and the fold's per-run sequence only proves completeness if all
-    // three append to the same file. Those two resolve MONET_STORAGE_DIR, else home; rooting THIS
-    // writer at `projectDir` would point it at a different file whenever the project carried its
-    // own `.monet`. `getMomentSpoolPath()` therefore takes no baseDir at all — see db/index.ts for
-    // why it resolves the two rungs it does, and why the generated wrapper is the fixed point.
-    const core = await openServedCore(getDbPath(projectDir), {
-      scopeContext: projectDir,
-      defaultCircle: circle,
-      gateSidecarPath: getGateMirrorPath(projectDir),
-      momentSpoolPath: getMomentSpoolPath(),
-    });
-    console.error(`Monet started`);
-    console.error(`Storage: ${getDbPath(projectDir)}`);
-    console.error(`Circle:  ${circle}`);
-    await createMonetCoreMcpServer(core);
+    // Scoped to `start` rather than folded into the shared parseAsync handler: that handler serves
+    // every subcommand, and `monet status`/`doctor`/`gate` failing is not a startup failure — a
+    // record written for one of those would be a false positive in the one file a reader trusts to
+    // mean "the server could not start".
+    //
+    // `resolveProjectDir()` stays OUTSIDE, and that boundary is deliberate: it is the call that
+    // decides where a record would even go, so a throw from it leaves nothing to root one at. Same
+    // honest limit as scripts/mcp-cli.ts's null `startedDbPath`.
+    let transportConnected = false;
+    try {
+      // P1-1 (Codex round 3 on PR #42): ensureMonetDir(projectDir) — NOT bare ensureMonetDir() —
+      // and computed AFTER projectDir (moved down from above), so it creates the SAME directory
+      // getDbPath(projectDir) below will open. Bare ensureMonetDir() created (or no-op'd on) the
+      // CWD-rooted .monet dir; with projectDir !== cwd (cwd has its own .monet, the target does
+      // not), the target's parent directory never got created and better-sqlite3's own open call
+      // failed CANTOPEN — it does not create missing parent directories, only the file.
+      ensureMonetDir(projectDir);
+      const circle = deriveCircle(projectDir);
+      // See src/index.ts / src/circle.ts: @team-monet/core only picks up source-authorization
+      // context from these two env vars (no options-object seam), so every entry point that
+      // constructs the server must set them before createMonetCoreMcpServer runs. Assign
+      // UNCONDITIONALLY (not setIfBlank/??=): deriveCallerId/deriveProjectId already implement the
+      // full precedence (non-blank override wins, TRIMMED; blank/unset → derived default), so
+      // reassigning here also normalizes a whitespace-padded operator override in place instead of
+      // leaving it raw for @team-monet/core's deriveOptsFromEnv (which does not trim) to deny every
+      // ACL match against.
+      process.env.MONET_CALLER_ID = deriveCallerId();
+      process.env.MONET_PROJECT_ID = deriveProjectId(projectDir);
+      // COMPONENT B (4b-D): wire mirror materialization into the ONE long-running serving process.
+      // Rooted at `projectDir` (not bare cwd) via getGateMirrorPath's own baseDir parameter — the
+      // SAME project dir `circle` was just derived from, and the SAME default `monet gate` itself
+      // resolves to when nothing overrides it (gate-cli.ts's own defaultGateCliDependencies) — one
+      // project notion, three call sites. See bootstrap.ts's ServedCoreOptions.gateSidecarPath for
+      // why this is the only writer surface.
+      //
+      // FIX 1 (Codex round 2 on PR #42): getDbPath(projectDir) — NOT bare getDbPath() — is the fix
+      // itself. Bare getDbPath() resolves via getMonetDir()'s own internal process.cwd() default, a
+      // SEPARATE "which project" notion from `projectDir` (resolveProjectDir(): MONET_PROJECT_DIR /
+      // CLAUDE_PROJECT_DIR, falling back to cwd — see that function's own doc comment, "a host may
+      // spawn monet from elsewhere"). With MONET_PROJECT_DIR=A and cwd=B (both with their own
+      // project-local .monet dirs), the OLD code opened the SERVED STORE at B (bare getDbPath()) while
+      // materializing the MIRROR at A (getGateMirrorPath(projectDir) already used projectDir) — a
+      // declaration made through this exact session would land in B's store but refresh A's mirror,
+      // the wrong-project class again, one layer deeper than the P1-B/round-1 fix (which paired
+      // circle.ts's OWN internal store lookup with projectDir; this pairs the SERVED CORE's store with
+      // it too). Rooting the store and the mirror at the SAME projectDir is what makes "one project
+      // notion, three call sites" (this comment's own opening line) actually true, not just asserted.
+      // SPOOL: the same "one long-running serving process is the one positioned to maintain it"
+      // argument the mirror above is wired on, applied to the governed-moment record. Without this,
+      // store-side interception, the ask signal and every conformance surface are silently inert in
+      // the shipped binary — the option is optional at the seam, never at an entry point.
+      //
+      // NOT rooted at `projectDir`, and the one line here that deliberately steps outside "one
+      // project notion, three call sites" above: unlike the store and the mirror, the spool is ONE
+      // stream shared with writers that do not run in this process at all — the installed hook
+      // wrapper and `monet gate` — and the fold's per-run sequence only proves completeness if all
+      // three append to the same file. Those two resolve MONET_STORAGE_DIR, else home; rooting THIS
+      // writer at `projectDir` would point it at a different file whenever the project carried its
+      // own `.monet`. `getMomentSpoolPath()` therefore takes no baseDir at all — see db/index.ts for
+      // why it resolves the two rungs it does, and why the generated wrapper is the fixed point.
+      const core = await openServedCore(getDbPath(projectDir), {
+        scopeContext: projectDir,
+        defaultCircle: circle,
+        gateSidecarPath: getGateMirrorPath(projectDir),
+        momentSpoolPath: getMomentSpoolPath(),
+      });
+      console.error(`Monet started`);
+      console.error(`Storage: ${getDbPath(projectDir)}`);
+      console.error(`Circle:  ${circle}`);
+      await createMonetCoreMcpServer(core);
+      transportConnected = true;
+    } catch (error) {
+      reportStartupFailure(error, { projectDir, transportConnected });
+      throw error;
+    }
   });
 
 program

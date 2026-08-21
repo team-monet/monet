@@ -25,6 +25,7 @@ import {
   STAGE_NAME_MAX_CHARS,
 } from "./gates";
 import { MIRROR_STALE_INSTRUCTION, SKELETON_CHANGED_INSTRUCTION } from "./skeleton-mirror";
+import { inStartupPhase, markStartupPhase } from "./startup-diagnosis";
 
 /**
  * Session lifecycle instructions surfaced to the host agent via McpServer's `instructions` option.
@@ -3585,7 +3586,12 @@ export async function createMonetCoreMcpServer(
   // call at every construction site. Throws UnsatisfiableEmbedderError (never silently substitutes
   // another embedder) if the store's pin can't be honored — propagates uncaught, so the server
   // must not start and the process exits non-zero (see scripts/mcp-cli.ts's main().catch()).
-  await core.ensureEmbedderPin();
+  //
+  // PHASE-TAGGED (#13): this is the LAST fallible step before the transport exists, and it runs
+  // with the store already open and migrated — a half-alive process whose failure is otherwise
+  // indistinguishable at the host from one that never opened anything. The tag rides on the
+  // original error (a non-enumerable symbol), so every `instanceof` check downstream is unaffected.
+  await inStartupPhase("embedder-pin", () => core.ensureEmbedderPin());
   const server = new McpServer(
     { name: "monet-core", version: "0.7.0" },
     {
@@ -3603,9 +3609,17 @@ export async function createMonetCoreMcpServer(
   // captured now, so whatever close behavior is wired in below is what runs.
   if (options.processShutdownHandlers !== false) installProcessShutdownHandlers(server, core);
   if (options.stdinEofShutdown !== false) installStdinEofShutdown(server, core);
+  // Which side of the protocol boundary a failure below fell on (#13). Tracked rather than inferred
+  // from where the throw came from: "the host never got a channel" and "the host had a live channel
+  // and the process died anyway" are different diagnoses, and the catch cannot tell them apart
+  // afterwards. Today nothing after connect() is expected to throw — that is a property of the
+  // current close-chain wiring, not a guarantee — so this exists to keep the phase honest if one
+  // ever does, rather than to serve a known failure.
+  let transportConnected = false;
   try {
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    transportConnected = true;
     // Explicit server.close() (an embedded host managing its own lifecycle, or a test) must ALSO
     // settle the shared shutdown coordinator even if no signal/EOF trigger ever fires — see
     // settleGracefulShutdownOnExplicitClose (Codex P2 #1). Installed LAST/outermost so it wraps
@@ -3616,10 +3630,11 @@ export async function createMonetCoreMcpServer(
     // registered real process/stdin listeners for this now-abandoned server — settle the
     // coordinator so those listeners detach and their guards clear (Codex pass-3 P2, the third
     // settle-family member: see settleGracefulShutdownOnStartupFailure). The caller constructed
-    // `core` and still owns it; this never touches it. Rethrow unchanged — this is cleanup, not
+    // `core` and still owns it; this never touches it. Rethrow the SAME error object — the phase
+    // tag is metadata attached to it, not a replacement for it, so this stays cleanup rather than
     // error handling.
     settleGracefulShutdownOnStartupFailure(server);
-    throw error;
+    throw markStartupPhase(error, transportConnected ? "post-connect" : "transport-connect");
   }
   return server;
 }

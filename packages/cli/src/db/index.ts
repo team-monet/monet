@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { MOMENT_SPOOL_FILENAME } from "@team-monet/core";
+import { MOMENT_SPOOL_FILENAME, startupFailurePath } from "@team-monet/core";
 
 /**
  * Storage path resolution for the local runtime. The store itself is provided by
@@ -88,6 +88,20 @@ export function getGateMirrorPath(baseDir?: string): string {
 export function getMomentSpoolPath(): string {
   const storageDir = process.env.MONET_STORAGE_DIR || path.join(os.homedir(), MONET_DIR);
   return path.join(storageDir, MOMENT_SPOOL_FILENAME);
+}
+
+/**
+ * Where a failed startup leaves its diagnosis (#13).
+ *
+ * DERIVED FROM THE STORE PATH, not assembled from the directory and a filename. The record is a
+ * sidecar of ONE database, and this directory routinely holds two — `monet.db` here and
+ * `monet-core.db` from core's own dev server — so a per-directory name gave them one file between
+ * them and let `doctor` report one store's failure as the other's (Codex round 1, PR #79). Composing
+ * `getDbPath` with core's own `startupFailurePath` keeps the record rooted at exactly the store this
+ * project resolves, with one spelling of the suffix, owned by the package that owns the format.
+ */
+export function getStartupFailurePath(baseDir?: string): string {
+  return startupFailurePath(getDbPath(baseDir));
 }
 
 /** The materialize registry/manifest shares the store home's established resolution chain. */

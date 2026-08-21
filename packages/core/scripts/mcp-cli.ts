@@ -13,6 +13,7 @@ import { chooseStoreEmbedder } from "../src/store-embedder";
 import type { EmbeddingProvider } from "../src/embedding";
 import { createMonetCoreMcpServer } from "../src/mcp-server";
 import { deriveCircle } from "../src/circle";
+import { inStartupPhase, recordStartupFailure, startupFailurePath } from "../src/startup-diagnosis";
 
 /** Exported so a script can REFUSE the live store by asking the resolver that owns the path,
  *  rather than reimplementing its precedence and getting a subset of it right (#160). */
@@ -30,12 +31,22 @@ export async function chooseStartupEmbedder(dbPath: string): Promise<EmbeddingPr
   return chooseStoreEmbedder(dbPath);
 }
 
+/** Set once the factory returns — see the same flag in the client's own entry points (#13). */
+let transportConnected = false;
+/** The store this run resolved, remembered for the failure handler. Null means the failure happened
+ *  in resolveDbPath itself — the one case where there is no directory to write a record into. */
+let startedDbPath: string | null = null;
+
 async function main(): Promise<void> {
   const dbPath = resolveDbPath();
+  startedDbPath = dbPath;
   // Per-project circle so a shared ~/.monet store isolates per project (MONET_CIRCLE overrides).
   const circle = process.env.MONET_CIRCLE || deriveCircle();
-  const core = new MonetCore(dbPath, {
-    embedder: await chooseStartupEmbedder(dbPath),
+  // Phase-tagged for the same reason the client's openServedCore tags its own two steps (#13): a
+  // model load and a store open fail for unrelated reasons, and are indistinguishable at the host.
+  const embedder = await inStartupPhase("embedder-selection", () => chooseStartupEmbedder(dbPath));
+  const core = await inStartupPhase("store-open", () => new MonetCore(dbPath, {
+    embedder,
     scopeContext: process.cwd(),
     defaultCircle: circle,
     // THE JOURNAL'S ONLY PRODUCTION WIRING (Codex P1 on PR #144, and it was right). `gateJournalPath`
@@ -46,8 +57,9 @@ async function main(): Promise<void> {
     //
     // Beside the resolved database, so it follows the store it describes rather than the process's
     // cwd — the same reasoning that keeps the host-side hook off the cwd rung.
-  });
+  }));
   await createMonetCoreMcpServer(core);
+  transportConnected = true;
   // stderr so it doesn't corrupt the stdio MCP channel
   console.error(`monet-core MCP server running (stdio) · ${dbPath} · circle=${circle}`);
 }
@@ -59,6 +71,38 @@ async function main(): Promise<void> {
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((e) => {
     console.error(e);
+    // #13: stderr is at the host's discretion — leave the cause beside the store too. Same record,
+    // same filename, same directory as the shipped entry points write, so one reader finds either.
+    // Keyed on the store, which for THIS script is `monet-core.db` — a different database from the
+    // shipped CLI's `monet.db`, routinely in the same directory. That is why the record's path is
+    // derived from the store rather than its directory (see startup-diagnosis.ts).
+    const written = startedDbPath === null
+      ? null
+      : recordStartupFailure({
+          store: startedDbPath,
+          error: e,
+          fallbackPhase: transportConnected ? "post-connect" : "unknown",
+        });
+    // SILENCE IS THE ONE THING THIS MAY NOT DO (Codex round 2, PR #79). A reader who checks the
+    // expected sidecar, finds nothing, and was told nothing concludes that no startup ever failed —
+    // the absent-record/absent-event conflation this whole mechanism exists to end, reappearing at
+    // the one entry point that had no null branch. The two shipped entry points already say this;
+    // saying it here too is what keeps the answer independent of which server a reader ran.
+    if (written !== null) {
+      console.error(`monet-core: the full startup diagnosis is at ${written}`);
+    } else if (startedDbPath !== null) {
+      console.error(
+        `monet-core: could not write the diagnosis to ${startupFailurePath(startedDbPath)} — ` +
+          `this stderr is the only record.`,
+      );
+    } else {
+      // The failure happened in resolveDbPath itself, so there is no store, and therefore no
+      // location a record could have gone. Say that, rather than naming a path that was never real.
+      console.error(
+        `monet-core: no store path could be resolved, so there is nowhere a startup diagnosis ` +
+          `could be written — this stderr is the only record.`,
+      );
+    }
     process.exit(1);
   });
 }
